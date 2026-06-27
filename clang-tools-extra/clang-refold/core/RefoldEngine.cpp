@@ -434,8 +434,8 @@ std::string RefoldEngine::Refold() {
 
   // The engine is single-pass: it first attempts structural refolding, then
   // (if structural proof discharge requests fallback) resolves the post-
-  // structural fallback choice between the proved intermediate expansion stage
-  // and the explicit raw-B terminal carrier.
+  // structural fallback choice between proved intermediate expansion and the
+  // explicit raw-B terminal carrier.
   terminalSink_.Reset();
   ResetAttemptStats();
   TheoremAudit().Reset();
@@ -650,8 +650,8 @@ bool RefoldEngine::MaybeConsumeOrdinarySeparatorGapForPunctuation(
       refoldLastLexToken(replacement, lexLang_);
 
   if (!leftTok || !rightTok || !replFirstTok || !replLastTok ||
-      leftTok->End != gapBegin || rightTok->Begin != 0 ||
-      !isSeparatorGapReplacementPunctuation(replFirstTok->Kind) ||
+      leftTok->end != gapBegin || rightTok->begin != 0 ||
+      !isSeparatorGapReplacementPunctuation(replFirstTok->kind) ||
       refoldNeedsLexicalSeparator(*leftTok, *replFirstTok, lexLang_) ||
       refoldNeedsLexicalSeparator(*replLastTok, *rightTok, lexLang_))
     return false;
@@ -701,38 +701,38 @@ TextEdit RefoldEngine::BuildDirectTUHunkTextEdit(
   // remains the compatibility bridge to the existing TextEdit/audit boundary:
   // it performs the same carrier stamping as the pre-10D implementation while
   // avoiding any change to final edit ordering or emitted text.
-  assert(plan.Resync && "direct TU hunk edit plan requires resync payload");
-  auto spanBytes = plan.Span.byteRange();
+  assert(plan.resync && "direct TU hunk edit plan requires resync payload");
+  auto spanBytes = plan.span.byteRange();
   TextEdit edit{spanBytes.first,
                 spanBytes.second,
-                std::move(plan.Resync->text),
-                std::move(plan.Resync->pending),
+                std::move(plan.resync->text),
+                std::move(plan.resync->pending),
                 std::nullopt,
                 {},
                 {},
                 {}};
   edit.lineControlPruneCandidates =
-      std::move(plan.Resync->lineControlPruneCandidates);
+      std::move(plan.resync->lineControlPruneCandidates);
   edit.isDirectTUHunkEdit = true;
-  edit.directTUHunkIndex = plan.HunkIndex;
-  edit.directTUHunkAStart = plan.Hunk.aStart;
-  edit.directTUHunkAEnd = plan.Hunk.aEnd;
-  edit.directTUHunkBStart = plan.Hunk.bStart;
-  edit.directTUHunkBEnd = plan.Hunk.bEnd;
-  edit.directTURawStart = plan.RawTUStart;
-  edit.directTURawEnd = plan.RawTUEnd;
+  edit.directTUHunkIndex = plan.hunkIndex;
+  edit.directTUHunkAStart = plan.hunk.aStart;
+  edit.directTUHunkAEnd = plan.hunk.aEnd;
+  edit.directTUHunkBStart = plan.hunk.bStart;
+  edit.directTUHunkBEnd = plan.hunk.bEnd;
+  edit.directTURawStart = plan.rawTUStart;
+  edit.directTURawEnd = plan.rawTUEnd;
   edit.directTUFinalStart = spanBytes.first;
   edit.directTUFinalEnd = spanBytes.second;
-  if (plan.MaterializedBByteBegin && plan.MaterializedBByteEnd)
+  if (plan.materializedBByteBegin && plan.materializedBByteEnd)
     textEditAssembler_->StampTextEditMaterializedBByteRange(
-        edit, *plan.MaterializedBByteBegin, *plan.MaterializedBByteEnd);
+        edit, *plan.materializedBByteBegin, *plan.materializedBByteEnd);
   AcceptedResultCandidate candidate =
       ProofLattice().BuildAcceptedTUTextEditCandidate(
-          plan.AcceptedPath, spanBytes.first, spanBytes.second,
-          plan.AcceptedPayload);
+          plan.acceptedPath, spanBytes.first, spanBytes.second,
+          plan.acceptedPayload);
   ProofLattice().AttachMixedOwnerTilingWitnessForTokenEnvelope(
-      candidate.proofSummary, plan.Hunk.aStart, plan.Hunk.aEnd,
-      plan.Hunk.bStart, plan.Hunk.bEnd);
+      candidate.proofSummary, plan.hunk.aStart, plan.hunk.aEnd,
+      plan.hunk.bStart, plan.hunk.bEnd);
   ProofLattice().AttachLineControlObserverWitness(candidate);
   ProofLattice().AttachCounterStateWitness(candidate);
   ProofLattice().RefreshAcceptedCandidateEmissionPathInventory(candidate);
@@ -801,7 +801,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // deterministic token-diff plan below.
   assert(tokenDiffPlanner_ && "token diff planner service not initialized");
   RefoldTokenDiffPlanner::TokenDiffPlan diffPlan = tokenDiffPlanner_->Plan();
-  std::vector<diffutils::Hunk> hunks = std::move(diffPlan.Hunks);
+  std::vector<diffutils::Hunk> hunks = std::move(diffPlan.hunks);
 
   REFOLD_LOG_DEBUG("plan",
         "refold model loaded: tu={0} includes={1} macroInvocations={2} "
@@ -817,7 +817,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
          "mixed-owner tiling planner service not initialized");
   RefoldMixedOwnerTilingPlanner::MixedOwnerTilingPlan mixedOwnerPlan =
       mixedOwnerTilingPlanner_->Plan(std::move(hunks), tuBytes);
-  hunks = std::move(mixedOwnerPlan.Hunks);
+  hunks = std::move(mixedOwnerPlan.hunks);
 
   if (inDebugMode()) {
     size_t insertOnlyHunks = 0;
@@ -976,7 +976,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
     auto spanPlan =
         TUEditPlanner().PlanTUByteSpan(hunk.aStart, hunk.aEnd, tuPath);
-    if (!spanPlan || spanPlan->TUByteBegin >= spanPlan->TUByteEnd)
+    if (!spanPlan || spanPlan->tuByteBegin >= spanPlan->tuByteEnd)
       return false;
     auto span = spanPlan->byteRange();
 
@@ -1138,18 +1138,18 @@ std::string RefoldEngine::RunSinglePassRefold() {
               structuralHunkDispatcher.PrepareMacroPatchStagingSlot(*target);
           RefoldMacroPatchPlanner::ExistingMacroPatchContext
               existingPatchContext;
-          existingPatchContext.Patch = stagingSlot.ExistingPatch;
-          existingPatchContext.IsCallsite = stagingSlot.ExistingIsCallsite;
+          existingPatchContext.patch = stagingSlot.existingPatch;
+          existingPatchContext.isCallsite = stagingSlot.existingIsCallsite;
 
           // Try to build a whole-cover replacement at the current target
           // invocation. If successful, install/replace the callsite patch for
           // this macro id and stop climbing the caller chain.
           auto updated = MacroPatchPlanner().BuildMacroInvocationPatchWholeCover(
-              *target, h, stagingSlot.CurrentInvocationText,
+              *target, h, stagingSlot.currentInvocationText,
               structuralHunkDispatcher.MacroPatchMergeBucketsForPlanner(),
               existingPatchContext);
           if (updated) {
-            if (!stagingSlot.ExistingPatch &&
+            if (!stagingSlot.existingPatch &&
                 theoremLatticePrefersExactTUArgEditOverMacroArgsOnly(
                     *target, h, *updated)) {
               break;
@@ -1157,14 +1157,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
             const Owner currentPatchOwner =
                 MacroPatchPlanner().NormalizeHunkOwnerForPatch(tuPath, h);
-            if (stagingSlot.ExistingPatch)
+            if (stagingSlot.existingPatch)
               MacroPatchPlanner().CarryMacroPatchOwnerCertificate(
-                  *updated, *stagingSlot.ExistingPatch);
+                  *updated, *stagingSlot.existingPatch);
             structuralHunkDispatcher.MergeMaterializedBTokenRangeFromSlot(
                 *updated, stagingSlot, h);
             MacroPatchPlanner().StampMacroPatchOwnerWitness(
                 *updated, currentPatchOwner);
-            updated->macroId = stagingSlot.PatchKey;
+            updated->macroId = stagingSlot.patchKey;
             structuralHunkDispatcher.StageMacroPatch(stagingSlot,
                                                      std::move(*updated));
             appliedMacroPatch = true;
@@ -1197,7 +1197,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
       const RefoldModel::IncludeItem *parentBoundaryInc = nullptr;
       if (auto boundaryPlan =
               TUEditPlanner().FindBoundaryParentIncludeForPureInsertion(h))
-        parentBoundaryInc = model_.GetIncludeById(boundaryPlan->IncludeId);
+        parentBoundaryInc = model_.GetIncludeById(boundaryPlan->includeId);
       if (parentBoundaryInc) {
         IncludePatch patch =
             IncludeInsertionPlanner().BuildIncludeInsertionPatch(
@@ -1646,7 +1646,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
       tuPath, tuBytes, &structuralHunkDispatcher, &tuEdits};
   RefoldMacroStateRepairPlanner::MacroStateRepairPlan macroStateRepairPlan =
       MacroStateRepairPlanner().Plan(macroStateRepairRequest);
-  if (!macroStateRepairPlan.Success)
+  if (!macroStateRepairPlan.success)
     return std::string();
 
   // Inject forced __COUNTER__ patches after normal hunk attribution.
@@ -1789,9 +1789,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
           structuralHunkDispatcher.PrepareMacroPatchStagingSlot(*site);
 
       MacroPatch patch{*invStart, *invEnd, plan->clippedText, site->id};
-      if (stagingSlot.ExistingPatch)
+      if (stagingSlot.existingPatch)
         MacroPatchPlanner().CarryMacroPatchOwnerCertificate(
-            patch, *stagingSlot.ExistingPatch);
+            patch, *stagingSlot.existingPatch);
       ProofLattice().StampMacroWholeCoverRealizationPatch(patch, *plan, *site);
       MacroPatchPlanner().StampMacroPatchOwnerWitness(
           patch, site->ownerIncludeId ? Owner::Include(*site->ownerIncludeId)
@@ -1827,33 +1827,34 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // 5) Schedule include materializations.  The scheduler owns the run-local
   // child index, materialization seed set, realized expansion cache, and
   // source-graph/line-control metadata shared by the early materialization
-  // phase and the later TU-root include edit emission phase.
+  // include-materialization path and the later TU-root include edit emission
+  // path.
   RefoldIncludeMaterializationScheduler::Dependencies includeSchedulerDeps;
-  includeSchedulerDeps.Model = &model_;
-  includeSchedulerDeps.PathIdentity = &pathIdentity_;
-  includeSchedulerDeps.IncludeMaterializer = includeMaterializer_.get();
-  includeSchedulerDeps.IncludeInsertionPlanner = includeInsertionPlanner_.get();
-  includeSchedulerDeps.LineObserverLayout = lineObserverLayout_.get();
-  includeSchedulerDeps.MacroStateRepairPlanner = macroStateRepairPlanner_.get();
-  includeSchedulerDeps.TextEditAssembler = textEditAssembler_.get();
-  includeSchedulerDeps.ProofLattice = proofLattice_.get();
-  includeSchedulerDeps.TerminalSink = &terminalSink_;
-  includeSchedulerDeps.SidebandPragmaEdits = &sidebandPragmaEdits_;
+  includeSchedulerDeps.model = &model_;
+  includeSchedulerDeps.pathIdentity = &pathIdentity_;
+  includeSchedulerDeps.includeMaterializer = includeMaterializer_.get();
+  includeSchedulerDeps.includeInsertionPlanner = includeInsertionPlanner_.get();
+  includeSchedulerDeps.lineObserverLayout = lineObserverLayout_.get();
+  includeSchedulerDeps.macroStateRepairPlanner = macroStateRepairPlanner_.get();
+  includeSchedulerDeps.textEditAssembler = textEditAssembler_.get();
+  includeSchedulerDeps.proofLattice = proofLattice_.get();
+  includeSchedulerDeps.terminalSink = &terminalSink_;
+  includeSchedulerDeps.sidebandPragmaEdits = &sidebandPragmaEdits_;
 
   RefoldIncludeMaterializationScheduler::IncludeMaterializationRequest
       includeSchedulerRequest;
-  includeSchedulerRequest.TUPath = tuPath;
-  includeSchedulerRequest.TUBytes = tuBytes;
-  includeSchedulerRequest.ASource = aSource_;
-  includeSchedulerRequest.BSource = bSource_;
-  includeSchedulerRequest.ATokens = aToks_;
-  includeSchedulerRequest.BTokens = bToks_;
-  includeSchedulerRequest.ATokenOffsets = aTokOff_;
-  includeSchedulerRequest.BTokenOffsets = bTokOff_;
-  includeSchedulerRequest.TokenHunks = hunks;
-  includeSchedulerRequest.RawByteHunks = abByteHunks_ ? &*abByteHunks_ : nullptr;
-  includeSchedulerRequest.StructuralHunkDispatcher = &structuralHunkDispatcher;
-  includeSchedulerRequest.SourceGraphOutputs = sourceGraphOutputs_;
+  includeSchedulerRequest.tuPath = tuPath;
+  includeSchedulerRequest.tuBytes = tuBytes;
+  includeSchedulerRequest.aSource = aSource_;
+  includeSchedulerRequest.bSource = bSource_;
+  includeSchedulerRequest.aTokens = aToks_;
+  includeSchedulerRequest.bTokens = bToks_;
+  includeSchedulerRequest.aTokenOffsets = aTokOff_;
+  includeSchedulerRequest.bTokenOffsets = bTokOff_;
+  includeSchedulerRequest.tokenHunks = hunks;
+  includeSchedulerRequest.rawByteHunks = abByteHunks_ ? &*abByteHunks_ : nullptr;
+  includeSchedulerRequest.structuralHunkDispatcher = &structuralHunkDispatcher;
+  includeSchedulerRequest.sourceGraphOutputs = sourceGraphOutputs_;
 
   RefoldIncludeMaterializationScheduler includeMaterializationScheduler(
       std::move(includeSchedulerDeps), std::move(includeSchedulerRequest));
@@ -1868,38 +1869,38 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // pending-resync-aware text assembly, final line-control prologue repair, and
   // final expanded-macro statistics.
   RefoldFinalTUEmissionPlanner::Dependencies finalEmissionDeps;
-  finalEmissionDeps.Model = &model_;
-  finalEmissionDeps.MacroTopology = &macroTopology_;
-  finalEmissionDeps.LineControlProof = &lineControlProof_;
-  finalEmissionDeps.LineDirs = &lineDirs_;
-  finalEmissionDeps.MacroStateRepairPlanner = macroStateRepairPlanner_.get();
-  finalEmissionDeps.TextEditAssembler = textEditAssembler_.get();
-  finalEmissionDeps.ProofLattice = proofLattice_.get();
-  finalEmissionDeps.TerminalSink = &terminalSink_;
-  finalEmissionDeps.MaterializedEditMappings = materializedEditMappings_;
-  finalEmissionDeps.FinalLineControlPruneCandidates =
+  finalEmissionDeps.model = &model_;
+  finalEmissionDeps.macroTopology = &macroTopology_;
+  finalEmissionDeps.lineControlProof = &lineControlProof_;
+  finalEmissionDeps.lineDirs = &lineDirs_;
+  finalEmissionDeps.macroStateRepairPlanner = macroStateRepairPlanner_.get();
+  finalEmissionDeps.textEditAssembler = textEditAssembler_.get();
+  finalEmissionDeps.proofLattice = proofLattice_.get();
+  finalEmissionDeps.terminalSink = &terminalSink_;
+  finalEmissionDeps.materializedEditMappings = materializedEditMappings_;
+  finalEmissionDeps.finalLineControlPruneCandidates =
       &finalLineControlPruneCandidates_;
-  finalEmissionDeps.FinalLineControlSourceMappings =
+  finalEmissionDeps.finalLineControlSourceMappings =
       &finalLineControlSourceMappings_;
 
   RefoldFinalTUEmissionPlanner::EmissionRequest finalEmissionRequest;
-  finalEmissionRequest.TUPath = tuPath;
-  finalEmissionRequest.TUBytes = tuBytes;
-  finalEmissionRequest.StructuralHunkDispatcher = &structuralHunkDispatcher;
-  finalEmissionRequest.IncludeMaterializationScheduler =
+  finalEmissionRequest.tuPath = tuPath;
+  finalEmissionRequest.tuBytes = tuBytes;
+  finalEmissionRequest.structuralHunkDispatcher = &structuralHunkDispatcher;
+  finalEmissionRequest.includeMaterializationScheduler =
       &includeMaterializationScheduler;
-  finalEmissionRequest.MacroStatePlan = &macroStateRepairPlan;
-  finalEmissionRequest.MacroStateRequest = &macroStateRepairRequest;
+  finalEmissionRequest.macroStatePlan = &macroStateRepairPlan;
+  finalEmissionRequest.macroStateRequest = &macroStateRepairRequest;
 
   RefoldFinalTUEmissionPlanner finalEmissionPlanner(
       std::move(finalEmissionDeps));
   RefoldFinalTUEmissionPlanner::EmissionResult finalEmission =
       finalEmissionPlanner.PlanAndEmit(finalEmissionRequest);
-  if (!finalEmission.Success)
+  if (!finalEmission.success)
     return std::string();
 
-  lastStats_.expandedMacros = finalEmission.ExpandedMacroCount;
-  return std::move(finalEmission.TUText);
+  lastStats_.expandedMacros = finalEmission.expandedMacroCount;
+  return std::move(finalEmission.tuText);
 }
 
 // =========================== Edit ordering helpers =========================
@@ -2042,7 +2043,7 @@ void RefoldEngine::AddForcedCounterPatches(
         structuralHunkDispatcher.PrepareMacroPatchStagingSlot(m);
 
     // Preserve an existing non-callsite (already-expanded) replacement.
-    if (stagingSlot.ExistingPatch && !stagingSlot.ExistingIsCallsite)
+    if (stagingSlot.existingPatch && !stagingSlot.existingIsCallsite)
       continue;
 
     CounterEventIdentity counterEventForWitness;
@@ -2102,9 +2103,9 @@ void RefoldEngine::AddForcedCounterPatches(
       patch.materializedBTokStart = materializedBTokenRange->first;
       patch.materializedBTokEnd = materializedBTokenRange->second;
     }
-    if (stagingSlot.ExistingPatch)
+    if (stagingSlot.existingPatch)
       MacroPatchPlanner().CarryMacroPatchOwnerCertificate(
-          patch, *stagingSlot.ExistingPatch);
+          patch, *stagingSlot.existingPatch);
     MacroPatchPlanner().StampMacroPatchOwnerWitness(
         patch, m.ownerIncludeId ? Owner::Include(*m.ownerIncludeId)
                                 : Owner::TU());

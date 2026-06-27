@@ -230,8 +230,8 @@ static bool isIncludeDirectiveHorizontalWhitespace(char c) {
 }
 
 struct IncludeDirectiveHeaderOperandRange {
-  size_t Begin = 0;
-  size_t End = 0;
+  size_t begin = 0;
+  size_t end = 0;
 };
 
 // Locate pieces of a source-spelled include directive without rebuilding the
@@ -757,12 +757,12 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
     return false;
   };
 
-  // 0) Sideband pragma edits owned by this include.  These pragmas were printed
-  // verbatim in the raw `.i` replay surface but deliberately removed from the
-  // normal A/B token streams before diffing.  When such a pragma lives in a
-  // header, deleting/replacing it is an include-owned source edit, not a TU
-  // edit.  Stage it here so it composes with the same owner-polymorphic header
-  // materialization path used for ordinary include and macro edits.
+  // Sideband pragma edits owned by this include were printed verbatim in the
+  // raw `.i` replay surface but deliberately removed from the normal A/B token
+  // streams before diffing. When such a pragma lives in a header, deleting or
+  // replacing it is an include-owned source edit, not a TU edit. Queue it here
+  // so it composes with the same owner-polymorphic header materialization path
+  // used for ordinary include and macro edits.
   for (const SidebandPragmaEdit &sideband : sidebandPragmaEdits_) {
     if (!sideband.TargetsInclude(includeId))
       continue;
@@ -1125,8 +1125,8 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
     headerOperand += operand;
     headerOperand.push_back(
         IncludeReplayProofContext::OrdinaryIncludeDelimiterClose(delimiterKind));
-    replacement.replace(targetRange->Begin,
-                        targetRange->End - targetRange->Begin, headerOperand);
+    replacement.replace(targetRange->begin,
+                        targetRange->end - targetRange->begin, headerOperand);
     if (child.subkind == "#include_next" &&
         !rewriteIncludeNextDirectiveAsOrdinaryInclude(replacement))
       return std::nullopt;
@@ -3733,7 +3733,7 @@ RefoldIncludeMaterializer::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
     }
 
-    // Stage the include-preserving mapped-header edit and attach the witness
+    // Queue the include-preserving mapped-header edit and attach the witness
     // that records which PP tokens and header bytes justified the edit range.
     TextEdit edit = emitsHeaderSourceLineDirectiveResume
                         ? TextEdit{*startByte,

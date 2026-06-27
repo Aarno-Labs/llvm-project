@@ -56,7 +56,7 @@ void RefoldTheoremAudit::ReportNoLegacyAuditFinding(
 
   ++audit_.noLegacyAuditFindings;
 
-  const LegacyPathDefinition definition = DescribeLegacyPathKind(evidence.kind);
+  const LegacyPathDefinition definition = describeLegacyPathKind(evidence.kind);
   const StringRef role =
       evidence.role.empty() ? StringRef("<unknown>") : StringRef(evidence.role);
   const std::string clippedDetail =
@@ -705,7 +705,7 @@ bool RefoldTheoremAudit::RejectNoLegacyAuditFindingIfStrict(
   ReportNoLegacyAuditFinding(evidence);
   ++audit_.noLegacyEmissionBoundaryViolations;
   ++audit_.noLegacyStrictRejections;
-  const LegacyPathDefinition definition = DescribeLegacyPathKind(evidence.kind);
+  const LegacyPathDefinition definition = describeLegacyPathKind(evidence.kind);
   const StringRef role =
       evidence.role.empty() ? StringRef("<unknown>") : StringRef(evidence.role);
   const std::string detail =

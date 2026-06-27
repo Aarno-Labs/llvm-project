@@ -593,7 +593,7 @@ void adjustCandidatesAfterDeletion(
 
 } // namespace
 
-FinalLineControlAuthorityContract GetFinalLineControlAuthorityContract() {
+FinalLineControlAuthorityContract getFinalLineControlAuthorityContract() {
   return FinalLineControlAuthorityContract();
 }
 
@@ -602,7 +602,7 @@ FinalLineControlPruneResult PruneFinalLineControlDirectives(
     ArrayRef<FinalLineControlPruneCandidate> removableCandidates,
     FinalLineControlValidationCallback validationCallback) {
   FinalLineControlPruneResult result;
-  result.authority = GetFinalLineControlAuthorityContract();
+  result.authority = getFinalLineControlAuthorityContract();
 
   std::string current = finalSource.str();
   std::vector<FinalLineControlPruneCandidate> currentCandidates(

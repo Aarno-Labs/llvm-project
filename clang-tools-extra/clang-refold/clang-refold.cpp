@@ -1530,7 +1530,7 @@ mapSidebandLinesToPragmaItems(ArrayRef<SidebandPragmaLine> lines,
                               ArrayRef<JsonIncludeItemForSideband> includes) {
   std::vector<SidebandPragmaItemBinding> out(lines.size());
   std::set<std::pair<size_t, uint64_t>> used;
-  constexpr uint64_t NoOwner = std::numeric_limits<uint64_t>::max();
+  constexpr uint64_t noOwner = std::numeric_limits<uint64_t>::max();
 
   struct Candidate {
     size_t pragmaIndex = 0;
@@ -1620,7 +1620,7 @@ mapSidebandLinesToPragmaItems(ArrayRef<SidebandPragmaLine> lines,
       if (isHeaderPragma && !owner)
         continue;
 
-      const uint64_t ownerKey = owner ? *owner : NoOwner;
+      const uint64_t ownerKey = owner ? *owner : noOwner;
       if (used.find(std::make_pair(j, ownerKey)) != used.end())
         continue;
       candidates.push_back(Candidate{j, owner});
@@ -1646,7 +1646,7 @@ mapSidebandLinesToPragmaItems(ArrayRef<SidebandPragmaLine> lines,
     // above by the stronger include-occurrence × physical-ordinal product.
     const Candidate chosen = candidates.front();
     const uint64_t ownerKey =
-        chosen.ownerIncludeId ? *chosen.ownerIncludeId : NoOwner;
+        chosen.ownerIncludeId ? *chosen.ownerIncludeId : noOwner;
     used.insert(std::make_pair(chosen.pragmaIndex, ownerKey));
     out[i].pragmaIndex = static_cast<int64_t>(chosen.pragmaIndex);
     out[i].ownerIncludeId = chosen.ownerIncludeId;
@@ -3468,13 +3468,13 @@ static cl::OptionCategory RefoldCategory("clang-refold options");
 
 cl::opt<LogLevel> LogLevelOpt(
     "log-level", cl::desc("Set log level"),
-    cl::values(clEnumValN(LogLevel::trace, "trace", "Trace"),
-               clEnumValN(LogLevel::debug, "debug", "Debug"),
-               clEnumValN(LogLevel::info, "info", "Info  (default)"),
-               clEnumValN(LogLevel::warn, "warn", "Warn"),
-               clEnumValN(LogLevel::error, "error", "Error"),
-               clEnumValN(LogLevel::fatal, "fatal", "Fatal")),
-    cl::init(LogLevel::info), cl::cat(RefoldCategory));
+    cl::values(clEnumValN(LogLevel::Trace, "trace", "Trace"),
+               clEnumValN(LogLevel::Debug, "debug", "Debug"),
+               clEnumValN(LogLevel::Info, "info", "Info  (default)"),
+               clEnumValN(LogLevel::Warn, "warn", "Warn"),
+               clEnumValN(LogLevel::Error, "error", "Error"),
+               clEnumValN(LogLevel::Fatal, "fatal", "Fatal")),
+    cl::init(LogLevel::Info), cl::cat(RefoldCategory));
 
 static cl::opt<std::string>
     PPPath("pp", // long name: --pp

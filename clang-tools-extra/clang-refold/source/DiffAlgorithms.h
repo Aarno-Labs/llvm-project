@@ -248,26 +248,26 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 /// identity-bearing fields below are used to certify boundary-preserving
 /// ambiguous-edge restoration without looking at neighboring token spellings.
 struct LcsAGapProvenance {
-  static constexpr uint64_t NoId = std::numeric_limits<uint64_t>::max();
+  static constexpr uint64_t noId = std::numeric_limits<uint64_t>::max();
 
   uint32_t ownerDepth = 0;
   uint32_t includeDepth = 0;
   uint32_t conditionalDepth = 0;
   uint32_t macroDepth = 0;
 
-  uint64_t leftIncludeId = NoId;
-  uint64_t rightIncludeId = NoId;
-  uint64_t lcaIncludeId = NoId;
+  uint64_t leftIncludeId = noId;
+  uint64_t rightIncludeId = noId;
+  uint64_t lcaIncludeId = noId;
 
-  uint64_t leftCondGroupId = NoId;
-  uint64_t leftCondArmId = NoId;
-  uint64_t rightCondGroupId = NoId;
-  uint64_t rightCondArmId = NoId;
+  uint64_t leftCondGroupId = noId;
+  uint64_t leftCondArmId = noId;
+  uint64_t rightCondGroupId = noId;
+  uint64_t rightCondArmId = noId;
 
-  uint64_t leftMacroRootId = NoId;
-  uint64_t leftMacroLeafId = NoId;
-  uint64_t rightMacroRootId = NoId;
-  uint64_t rightMacroLeafId = NoId;
+  uint64_t leftMacroRootId = noId;
+  uint64_t leftMacroLeafId = noId;
+  uint64_t rightMacroRootId = noId;
+  uint64_t rightMacroLeafId = noId;
 
   uint32_t leftMacroRoleMask = 0;
   uint32_t rightMacroRoleMask = 0;
@@ -282,7 +282,7 @@ struct LcsAGapProvenance {
 /// shape around adjacent tokens. It deliberately does not include neighboring
 /// token spellings, so using it is not the removed neighbor-coherence heuristic.
 struct LcsBGapProvenance {
-  static constexpr uint64_t NoOffset = std::numeric_limits<uint64_t>::max();
+  static constexpr uint64_t noOffset = std::numeric_limits<uint64_t>::max();
 
   bool hasLeftToken = false;
   bool hasRightToken = false;
@@ -298,12 +298,12 @@ struct LcsBGapProvenance {
   // Byte coordinates in the edited preprocessed stream. The production ranking
   // uses the boolean line/whitespace shape above; absolute offsets are retained
   // for trace output and postmortem diagnostics, not as proof inputs.
-  uint64_t gapBeginByte = NoOffset;
-  uint64_t gapEndByte = NoOffset;
-  uint64_t leftTokenBeginByte = NoOffset;
-  uint64_t leftTokenEndByte = NoOffset;
-  uint64_t rightTokenBeginByte = NoOffset;
-  uint64_t rightTokenEndByte = NoOffset;
+  uint64_t gapBeginByte = noOffset;
+  uint64_t gapEndByte = noOffset;
+  uint64_t leftTokenBeginByte = noOffset;
+  uint64_t leftTokenEndByte = noOffset;
+  uint64_t rightTokenBeginByte = noOffset;
+  uint64_t rightTokenEndByte = noOffset;
 };
 
 /// \brief Compute an owner-aware LCS backmap from sequence A to B.

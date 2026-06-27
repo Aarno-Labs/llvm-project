@@ -17,44 +17,44 @@ namespace source_graph {
 
 namespace {
 
-static bool isDirectiveHorizontalWhitespace(char C) {
-  return C == '\r' || stringutils::isNonNewlineWs(C);
+static bool isDirectiveHorizontalWhitespace(char c) {
+  return c == '\r' || stringutils::isNonNewlineWs(c);
 }
 
-static bool consumeDirectiveScannerNewline(llvm::StringRef Text,
-                                           size_t &Pos) {
-  if (Pos >= Text.size())
+static bool consumeDirectiveScannerNewline(llvm::StringRef text,
+                                           size_t &pos) {
+  if (pos >= text.size())
     return false;
-  if (Text[Pos] == '\r') {
-    ++Pos;
-    if (Pos < Text.size() && Text[Pos] == '\n')
-      ++Pos;
+  if (text[pos] == '\r') {
+    ++pos;
+    if (pos < text.size() && text[pos] == '\n')
+      ++pos;
     return true;
   }
-  if (Text[Pos] == '\n') {
-    ++Pos;
+  if (text[pos] == '\n') {
+    ++pos;
     return true;
   }
   return false;
 }
 
-static bool consumeDirectiveScannerEscapedNewline(llvm::StringRef Text,
-                                                  size_t &Pos) {
-  if (Pos >= Text.size() || Text[Pos] != '\\')
+static bool consumeDirectiveScannerEscapedNewline(llvm::StringRef text,
+                                                  size_t &pos) {
+  if (pos >= text.size() || text[pos] != '\\')
     return false;
 
-  size_t AfterBackslash = Pos + 1;
-  while (AfterBackslash < Text.size() &&
-         isDirectiveHorizontalWhitespace(Text[AfterBackslash]))
-    ++AfterBackslash;
-  if (!consumeDirectiveScannerNewline(Text, AfterBackslash))
+  size_t afterBackslash = pos + 1;
+  while (afterBackslash < text.size() &&
+         isDirectiveHorizontalWhitespace(text[afterBackslash]))
+    ++afterBackslash;
+  if (!consumeDirectiveScannerNewline(text, afterBackslash))
     return false;
 
   // Escaped-newline deletion removes the backslash-newline pair before
   // directive recognition.  Clang also accepts horizontal whitespace before the
   // newline as an extension, so the directive scanner consumes the same spelling
   // that source-range extension treats as a splice.
-  Pos = AfterBackslash;
+  pos = afterBackslash;
   return true;
 }
 
@@ -72,78 +72,78 @@ static bool consumeDirectiveScannerEscapedNewline(llvm::StringRef Text,
 /// being observed as directives by this scanner; callers that need stronger
 /// recovery already fail closed at the proof site.
 static std::optional<size_t>
-findPreprocessingDirectiveIntroducer(llvm::StringRef Text, size_t Start = 0) {
-  bool OnlyTriviaOnLogicalLine = true;
-  bool InBlockComment = false;
-  bool BlockCommentStartedInDirectivePrefix = false;
-  size_t Pos = Start;
+findPreprocessingDirectiveIntroducer(llvm::StringRef text, size_t start = 0) {
+  bool onlyTriviaOnLogicalLine = true;
+  bool inBlockComment = false;
+  bool blockCommentStartedInDirectivePrefix = false;
+  size_t pos = start;
 
-  while (Pos < Text.size()) {
-    if (consumeDirectiveScannerEscapedNewline(Text, Pos))
+  while (pos < text.size()) {
+    if (consumeDirectiveScannerEscapedNewline(text, pos))
       continue;
 
-    if (InBlockComment) {
-      if (Pos + 1 < Text.size() && Text[Pos] == '*' && Text[Pos + 1] == '/') {
+    if (inBlockComment) {
+      if (pos + 1 < text.size() && text[pos] == '*' && text[pos + 1] == '/') {
         // A complete block comment is preprocessing whitespace.  Once the
         // terminator is consumed, directive-prefix scanning must resume in the
         // surrounding logical line; otherwise a real directive such as
         // `/*\n*/#include` is hidden from macro-state and include-replay proofs.
-        Pos += 2;
-        InBlockComment = false;
+        pos += 2;
+        inBlockComment = false;
         continue;
       }
-      if (consumeDirectiveScannerNewline(Text, Pos)) {
+      if (consumeDirectiveScannerNewline(text, pos)) {
         // A newline inside a leading block comment still leaves the eventual
         // comment replacement in directive-prefix trivia.  A newline inside a
         // block comment that began after real source code does not retroactively
         // make the following bytes directive-prefix trivia.
-        OnlyTriviaOnLogicalLine = BlockCommentStartedInDirectivePrefix;
+        onlyTriviaOnLogicalLine = blockCommentStartedInDirectivePrefix;
         continue;
       }
-      ++Pos;
+      ++pos;
       continue;
     }
 
-    if (Pos + 1 < Text.size() && Text[Pos] == '/' && Text[Pos + 1] == '*') {
-      BlockCommentStartedInDirectivePrefix = OnlyTriviaOnLogicalLine;
-      Pos += 2;
-      InBlockComment = true;
+    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
+      blockCommentStartedInDirectivePrefix = onlyTriviaOnLogicalLine;
+      pos += 2;
+      inBlockComment = true;
       continue;
     }
 
-    if (Pos + 1 < Text.size() && Text[Pos] == '/' && Text[Pos + 1] == '/') {
-      Pos += 2;
-      while (Pos < Text.size()) {
-        if (consumeDirectiveScannerEscapedNewline(Text, Pos))
+    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '/') {
+      pos += 2;
+      while (pos < text.size()) {
+        if (consumeDirectiveScannerEscapedNewline(text, pos))
           continue;
-        if (consumeDirectiveScannerNewline(Text, Pos))
+        if (consumeDirectiveScannerNewline(text, pos))
           break;
-        ++Pos;
+        ++pos;
       }
-      OnlyTriviaOnLogicalLine = true;
+      onlyTriviaOnLogicalLine = true;
       continue;
     }
 
-    if (consumeDirectiveScannerNewline(Text, Pos)) {
-      OnlyTriviaOnLogicalLine = true;
+    if (consumeDirectiveScannerNewline(text, pos)) {
+      onlyTriviaOnLogicalLine = true;
       continue;
     }
 
-    if (!OnlyTriviaOnLogicalLine) {
-      ++Pos;
+    if (!onlyTriviaOnLogicalLine) {
+      ++pos;
       continue;
     }
 
-    if (isDirectiveHorizontalWhitespace(Text[Pos])) {
-      ++Pos;
+    if (isDirectiveHorizontalWhitespace(text[pos])) {
+      ++pos;
       continue;
     }
 
-    if (Text[Pos] == '#')
-      return Pos;
+    if (text[pos] == '#')
+      return pos;
 
-    OnlyTriviaOnLogicalLine = false;
-    ++Pos;
+    onlyTriviaOnLogicalLine = false;
+    ++pos;
   }
 
   return std::nullopt;
@@ -155,25 +155,25 @@ findPreprocessingDirectiveIntroducer(llvm::StringRef Text, size_t Start = 0) {
 /// including comments that span physical lines; Clang accepts constructs such
 /// as `#/*\n*/include` for the same reason.  Line comments are not skipped
 /// because they terminate the directive logical line.
-static bool skipDirectiveLogicalWhitespace(llvm::StringRef Text, size_t &Pos) {
-  while (Pos < Text.size()) {
-    if (isDirectiveHorizontalWhitespace(Text[Pos])) {
-      ++Pos;
+static bool skipDirectiveLogicalWhitespace(llvm::StringRef text, size_t &pos) {
+  while (pos < text.size()) {
+    if (isDirectiveHorizontalWhitespace(text[pos])) {
+      ++pos;
       continue;
     }
-    if (consumeDirectiveScannerEscapedNewline(Text, Pos))
+    if (consumeDirectiveScannerEscapedNewline(text, pos))
       continue;
-    if (Pos + 1 < Text.size() && Text[Pos] == '/' && Text[Pos + 1] == '*') {
-      Pos += 2;
-      while (Pos + 1 < Text.size() &&
-             !(Text[Pos] == '*' && Text[Pos + 1] == '/')) {
-        if (consumeDirectiveScannerEscapedNewline(Text, Pos))
+    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
+      pos += 2;
+      while (pos + 1 < text.size() &&
+             !(text[pos] == '*' && text[pos + 1] == '/')) {
+        if (consumeDirectiveScannerEscapedNewline(text, pos))
           continue;
-        ++Pos;
+        ++pos;
       }
-      if (Pos + 1 >= Text.size())
+      if (pos + 1 >= text.size())
         return false;
-      Pos += 2;
+      pos += 2;
       continue;
     }
     break;
@@ -181,39 +181,39 @@ static bool skipDirectiveLogicalWhitespace(llvm::StringRef Text, size_t &Pos) {
   return true;
 }
 
-static bool readDirectiveIdentifier(llvm::StringRef Text, size_t &Pos,
-                                    std::string &Identifier) {
-  Identifier.clear();
-  while (Pos < Text.size()) {
-    if (consumeDirectiveScannerEscapedNewline(Text, Pos))
+static bool readDirectiveIdentifier(llvm::StringRef text, size_t &pos,
+                                    std::string &identifier) {
+  identifier.clear();
+  while (pos < text.size()) {
+    if (consumeDirectiveScannerEscapedNewline(text, pos))
       continue;
-    const unsigned char C = static_cast<unsigned char>(Text[Pos]);
-    if (std::isalpha(C) || Text[Pos] == '_')
+    const unsigned char c = static_cast<unsigned char>(text[pos]);
+    if (std::isalpha(c) || text[pos] == '_')
       break;
     return false;
   }
 
-  while (Pos < Text.size()) {
-    if (consumeDirectiveScannerEscapedNewline(Text, Pos))
+  while (pos < text.size()) {
+    if (consumeDirectiveScannerEscapedNewline(text, pos))
       continue;
-    const unsigned char C = static_cast<unsigned char>(Text[Pos]);
-    if (!(std::isalnum(C) || Text[Pos] == '_'))
+    const unsigned char c = static_cast<unsigned char>(text[pos]);
+    if (!(std::isalnum(c) || text[pos] == '_'))
       break;
-    Identifier.push_back(Text[Pos]);
-    ++Pos;
+    identifier.push_back(text[pos]);
+    ++pos;
   }
 
-  return !Identifier.empty();
+  return !identifier.empty();
 }
 
 } // namespace
 
 std::optional<std::string>
-safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &Include) {
-  if (Include.angled)
+safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &include) {
+  if (include.angled)
     return std::nullopt;
 
-  llvm::StringRef Target = Include.target;
+  llvm::StringRef Target = include.target;
   if (Target.size() < 2 || Target.front() != '"' || Target.back() != '"')
     return std::nullopt;
 
@@ -224,60 +224,60 @@ safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &Include) {
   return Path.str();
 }
 
-bool lineHasPreprocessingDirectiveIntroducer(llvm::StringRef Text) {
-  return findPreprocessingDirectiveIntroducer(Text).has_value();
+bool lineHasPreprocessingDirectiveIntroducer(llvm::StringRef text) {
+  return findPreprocessingDirectiveIntroducer(text).has_value();
 }
 
 MaterializedIncludeReplayAlias classifyMaterializedIncludeReplayAlias(
-    llvm::StringRef MaterializedText, llvm::StringRef SourceGraphPath) {
-  size_t SearchPos = 0;
-  while (std::optional<size_t> Hash =
-             findPreprocessingDirectiveIntroducer(MaterializedText, SearchPos)) {
-    size_t Pos = *Hash + 1;
-    SearchPos = Pos;
+    llvm::StringRef materializedText, llvm::StringRef sourceGraphPath) {
+  size_t searchPos = 0;
+  while (std::optional<size_t> hash =
+             findPreprocessingDirectiveIntroducer(materializedText, searchPos)) {
+    size_t pos = *hash + 1;
+    searchPos = pos;
 
-    if (!skipDirectiveLogicalWhitespace(MaterializedText, Pos))
+    if (!skipDirectiveLogicalWhitespace(materializedText, pos))
       return MaterializedIncludeReplayAlias::UnprovenInclude;
 
-    std::string Keyword;
-    if (!readDirectiveIdentifier(MaterializedText, Pos, Keyword))
+    std::string keyword;
+    if (!readDirectiveIdentifier(materializedText, pos, keyword))
       continue;
-    if (Keyword != "include")
+    if (keyword != "include")
       continue;
 
-    if (!skipDirectiveLogicalWhitespace(MaterializedText, Pos))
+    if (!skipDirectiveLogicalWhitespace(materializedText, pos))
       return MaterializedIncludeReplayAlias::UnprovenInclude;
 
-    if (Pos >= MaterializedText.size() || MaterializedText[Pos] != '"')
+    if (pos >= materializedText.size() || materializedText[pos] != '"')
       return MaterializedIncludeReplayAlias::UnprovenInclude;
 
-    const size_t PathBegin = ++Pos;
-    while (Pos < MaterializedText.size() && MaterializedText[Pos] != '"') {
+    const size_t pathBegin = ++pos;
+    while (pos < materializedText.size() && materializedText[pos] != '"') {
       // Keep this classifier conservative.  A quoted include whose operand
       // itself uses a splice or reaches an unescaped newline is not a simple
       // path-level equality proof, so source-graph replay must fail closed.
-      if (MaterializedText[Pos] == '\\' || MaterializedText[Pos] == '\n' ||
-          MaterializedText[Pos] == '\r')
+      if (materializedText[pos] == '\\' || materializedText[pos] == '\n' ||
+          materializedText[pos] == '\r')
         return MaterializedIncludeReplayAlias::UnprovenInclude;
-      ++Pos;
+      ++pos;
     }
-    if (Pos >= MaterializedText.size())
+    if (pos >= materializedText.size())
       return MaterializedIncludeReplayAlias::UnprovenInclude;
 
-    if (MaterializedText.slice(PathBegin, Pos) == SourceGraphPath)
+    if (materializedText.slice(pathBegin, pos) == sourceGraphPath)
       return MaterializedIncludeReplayAlias::SamePath;
 
-    SearchPos = Pos + 1;
+    searchPos = pos + 1;
   }
 
   return MaterializedIncludeReplayAlias::None;
 }
 
 bool sourceGraphIncludePathIsUnaliasedOrCoherent(
-    const SourceGraphProofInputs &Inputs,
-    const RefoldModel::IncludeItem &Include,
-    llvm::StringRef SourceGraphPath, llvm::StringRef CandidateBytes,
-    const SourceGraphProofServices &Services) {
+    const SourceGraphProofInputs &inputs,
+    const RefoldModel::IncludeItem &include,
+    llvm::StringRef sourceGraphPath, llvm::StringRef candidateBytes,
+    const SourceGraphProofServices &services) {
   // A source-graph output written under an original quoted include path is a
   // path-level edit, not an include-site-local edit: every surviving
   // `#include "that/path.h"` in the emitted TU will read the generated bytes.
@@ -286,56 +286,56 @@ bool sourceGraphIncludePathIsUnaliasedOrCoherent(
   // source-graph-preserved with exactly the same owner bytes.  Otherwise the
   // sidecar would either change an untouched alias or create conflicting bytes
   // for the same generated file.
-  for (const RefoldModel::IncludeItem &Other : Inputs.Model.GetIncludes()) {
-    if (Other.id == Include.id)
+  for (const RefoldModel::IncludeItem &other : inputs.model.GetIncludes()) {
+    if (other.id == include.id)
       continue;
-    if (Other.parent || !Services.Paths.PathsEqual(Other.sitePath, Inputs.TuPath))
-      continue;
-
-    std::optional<std::string> OtherPath =
-        safeSourceGraphRelativeIncludePath(Other);
-    if (!OtherPath || llvm::StringRef(*OtherPath) != SourceGraphPath)
+    if (other.parent || !services.paths.PathsEqual(other.sitePath, inputs.tuPath))
       continue;
 
-    auto OtherExpansionIt = Inputs.IncludeExpansion.find(Other.id);
-    if (OtherExpansionIt == Inputs.IncludeExpansion.end())
+    std::optional<std::string> otherPath =
+        safeSourceGraphRelativeIncludePath(other);
+    if (!otherPath || llvm::StringRef(*otherPath) != sourceGraphPath)
+      continue;
+
+    auto otherExpansionIt = inputs.includeExpansion.find(other.id);
+    if (otherExpansionIt == inputs.includeExpansion.end())
       return false;
 
-    if (!Services.IncludeHasIncluderSuppliedLineControlMacroState(Other)) {
+    if (!services.includeHasIncluderSuppliedLineControlMacroState(other)) {
       // The alias is dirty but does not satisfy the source-graph proof, so the
       // normal single-output path will materialize it into the TU.  It will not
       // survive as a same-path include edge.
       continue;
     }
 
-    if (llvm::StringRef(OtherExpansionIt->second) != CandidateBytes)
+    if (llvm::StringRef(otherExpansionIt->second) != candidateBytes)
       return false;
   }
 
-  for (const RefoldModel::IncludeItem &Other : Inputs.Model.GetIncludes()) {
-    if (Other.id == Include.id)
+  for (const RefoldModel::IncludeItem &other : inputs.model.GetIncludes()) {
+    if (other.id == include.id)
       continue;
-    if (Other.parent || !Services.Paths.PathsEqual(Other.sitePath, Inputs.TuPath))
-      continue;
-
-    auto OtherExpansionIt = Inputs.IncludeExpansion.find(Other.id);
-    if (OtherExpansionIt == Inputs.IncludeExpansion.end())
+    if (other.parent || !services.paths.PathsEqual(other.sitePath, inputs.tuPath))
       continue;
 
-    const MaterializedIncludeReplayAlias ReplayAlias =
-        classifyMaterializedIncludeReplayAlias(OtherExpansionIt->second,
-                                               SourceGraphPath);
-    if (ReplayAlias == MaterializedIncludeReplayAlias::SamePath)
+    auto otherExpansionIt = inputs.includeExpansion.find(other.id);
+    if (otherExpansionIt == inputs.includeExpansion.end())
+      continue;
+
+    const MaterializedIncludeReplayAlias replayAlias =
+        classifyMaterializedIncludeReplayAlias(otherExpansionIt->second,
+                                               sourceGraphPath);
+    if (replayAlias == MaterializedIncludeReplayAlias::SamePath)
       return false;
-    if (ReplayAlias == MaterializedIncludeReplayAlias::UnprovenInclude)
+    if (replayAlias == MaterializedIncludeReplayAlias::UnprovenInclude)
       return false;
   }
 
-  const MaterializedIncludeReplayAlias CandidateReplayAlias =
-      classifyMaterializedIncludeReplayAlias(CandidateBytes, SourceGraphPath);
-  if (CandidateReplayAlias == MaterializedIncludeReplayAlias::SamePath)
+  const MaterializedIncludeReplayAlias candidateReplayAlias =
+      classifyMaterializedIncludeReplayAlias(candidateBytes, sourceGraphPath);
+  if (candidateReplayAlias == MaterializedIncludeReplayAlias::SamePath)
     return false;
-  if (CandidateReplayAlias == MaterializedIncludeReplayAlias::UnprovenInclude)
+  if (candidateReplayAlias == MaterializedIncludeReplayAlias::UnprovenInclude)
     return false;
 
   return true;
@@ -343,24 +343,24 @@ bool sourceGraphIncludePathIsUnaliasedOrCoherent(
 
 
 SourceGraphOutput makeSourceGraphOutput(
-    const RefoldModel::IncludeItem &Include, llvm::StringRef RelativePath,
-    llvm::StringRef Bytes, bool CleanupOnly) {
-  SourceGraphOutput Output;
-  Output.includeId = Include.id;
-  Output.relativePath = RelativePath.str();
-  Output.originalTarget = Include.target.str();
-  if (Include.resolvedPath)
-    Output.resolvedPath = Include.resolvedPath->str();
-  Output.bytes = Bytes.str();
-  Output.cleanupOnly = CleanupOnly;
-  return Output;
+    const RefoldModel::IncludeItem &include, llvm::StringRef relativePath,
+    llvm::StringRef bytes, bool cleanupOnly) {
+  SourceGraphOutput output;
+  output.includeId = include.id;
+  output.relativePath = relativePath.str();
+  output.originalTarget = include.target.str();
+  if (include.resolvedPath)
+    output.resolvedPath = include.resolvedPath->str();
+  output.bytes = bytes.str();
+  output.cleanupOnly = cleanupOnly;
+  return output;
 }
 
 SourceGraphOwnerPreservationPlan planSourceGraphOwnerPreservation(
-    const SourceGraphProofInputs &Inputs,
-    const RefoldModel::IncludeItem &Include, llvm::StringRef CandidateBytes,
-    const SourceGraphProofServices &Services) {
-  SourceGraphOwnerPreservationPlan Plan;
+    const SourceGraphProofInputs &inputs,
+    const RefoldModel::IncludeItem &include, llvm::StringRef candidateBytes,
+    const SourceGraphProofServices &services) {
+  SourceGraphOwnerPreservationPlan plan;
 
   // This is intentionally narrower than "dirty header".  Most header edits in
   // the existing single-output backend are supposed to materialize into the TU.
@@ -370,15 +370,15 @@ SourceGraphOwnerPreservationPlan planSourceGraphOwnerPreservation(
   // into the TU is token-sound, but it is no longer the most precise
   // source-graph refolding because the header remains the owner of the repaired
   // source line-control directive.
-  if (!Services.IncludeHasIncluderSuppliedLineControlMacroState(Include))
-    return Plan;
+  if (!services.includeHasIncluderSuppliedLineControlMacroState(include))
+    return plan;
 
-  std::optional<std::string> SourceGraphPath =
-      safeSourceGraphRelativeIncludePath(Include);
-  if (!SourceGraphPath)
-    return Plan;
+  std::optional<std::string> sourceGraphPath =
+      safeSourceGraphRelativeIncludePath(include);
+  if (!sourceGraphPath)
+    return plan;
 
-  if (Services.IncludeSubtreeHasLayoutOnlyMaterializationSeed(Include.id)) {
+  if (services.includeSubtreeHasLayoutOnlyMaterializationSeed(include.id)) {
     // Source-graph sidecars are path-level artifacts.  They can replace the
     // bytes read from a header path, but they cannot realize an edit to the
     // caller's PP layout at this particular include edge.  A byte-only raw
@@ -386,48 +386,48 @@ SourceGraphOwnerPreservationPlan planSourceGraphOwnerPreservation(
     // include-site-local obligation and must be emitted by replacing the include
     // directive in the owner surface, not by writing a sidecar that every
     // surviving same-path include would observe.
-    Plan.RejectedCleanupRelativePath = *SourceGraphPath;
-    return Plan;
+    plan.rejectedCleanupRelativePath = *sourceGraphPath;
+    return plan;
   }
 
   if (!sourceGraphIncludePathIsUnaliasedOrCoherent(
-          Inputs, Include, *SourceGraphPath, CandidateBytes, Services)) {
-    Plan.RejectedCleanupRelativePath = *SourceGraphPath;
-    return Plan;
+          inputs, include, *sourceGraphPath, candidateBytes, services)) {
+    plan.rejectedCleanupRelativePath = *sourceGraphPath;
+    return plan;
   }
 
-  Plan.PreservedRelativePath = *SourceGraphPath;
-  return Plan;
+  plan.preservedRelativePath = *sourceGraphPath;
+  return plan;
 }
 
 
 SourceGraphOwnerPreservationOutputPlan planSourceGraphOwnerPreservationOutput(
-    const SourceGraphProofInputs &Inputs,
-    const RefoldModel::IncludeItem &Include, llvm::StringRef CandidateBytes,
-    const SourceGraphProofServices &Services) {
-  SourceGraphOwnerPreservationOutputPlan OutputPlan;
-  SourceGraphOwnerPreservationPlan Plan =
-      planSourceGraphOwnerPreservation(Inputs, Include, CandidateBytes, Services);
+    const SourceGraphProofInputs &inputs,
+    const RefoldModel::IncludeItem &include, llvm::StringRef candidateBytes,
+    const SourceGraphProofServices &services) {
+  SourceGraphOwnerPreservationOutputPlan outputPlan;
+  SourceGraphOwnerPreservationPlan plan =
+      planSourceGraphOwnerPreservation(inputs, include, candidateBytes, services);
 
-  if (Plan.RejectedCleanupRelativePath) {
+  if (plan.rejectedCleanupRelativePath) {
     // Source-graph sidecars are path-level artifacts beside the emitted TU.  A
     // previous run may have written a sidecar for a path that this run no
     // longer proves admissible, for example after a same-spelling include
     // becomes a surviving alias.  The driver may remove the stale file only if
     // its bytes still exactly match this rejected generated body and the file
     // is not the producer-resolved input header.
-    OutputPlan.RejectedCleanupOutput = makeSourceGraphOutput(
-        Include, *Plan.RejectedCleanupRelativePath, CandidateBytes,
+    outputPlan.rejectedCleanupOutput = makeSourceGraphOutput(
+        include, *plan.rejectedCleanupRelativePath, candidateBytes,
         /*CleanupOnly=*/true);
   }
 
-  if (Plan.PreservedRelativePath) {
-    OutputPlan.PreservedOutput = makeSourceGraphOutput(
-        Include, *Plan.PreservedRelativePath, CandidateBytes,
+  if (plan.preservedRelativePath) {
+    outputPlan.preservedOutput = makeSourceGraphOutput(
+        include, *plan.preservedRelativePath, candidateBytes,
         /*CleanupOnly=*/false);
   }
 
-  return OutputPlan;
+  return outputPlan;
 }
 
 } // namespace source_graph

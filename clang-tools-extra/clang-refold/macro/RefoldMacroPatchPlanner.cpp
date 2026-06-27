@@ -5,8 +5,8 @@
 // This translation unit owns macro patch planning.  The large historical
 // algorithms are kept structurally intact here, but their state now comes from
 // explicit planner dependencies instead of a monolithic-engine back-reference.
-// Later roadmap steps will peel out pure helpers, stateful helper methods, and
-// carrier structs.
+// Helper methods and carrier structs stay here only where they still belong
+// to macro patch orchestration.
 //
 //===----------------------------------------------------------------------===//
 
@@ -64,42 +64,42 @@ namespace refold {
 
 RefoldMacroPatchPlanner::RefoldMacroPatchPlanner(Dependencies deps)
     : deps_(std::move(deps)) {
-  assert(deps_.Model && "macro planner requires a model");
-  assert(deps_.ABTokHunks && "macro planner requires token hunks");
-  assert(deps_.BInsertionLedger &&
+  assert(deps_.model && "macro planner requires a model");
+  assert(deps_.abTokHunks && "macro planner requires token hunks");
+  assert(deps_.bInsertionLedger &&
          "macro planner requires B insertion claim ledger");
-  assert(deps_.ArgTextRecovery && "macro planner requires arg recovery");
-  assert(deps_.LexLang && "macro planner requires lexer options");
-  assert(deps_.LineDirs && "macro planner requires line directives");
-  assert(deps_.MacroTopology && "macro planner requires macro topology");
-  assert(deps_.PathIdentity && "macro planner requires path identity");
-  assert(deps_.SourceMapper && "macro planner requires source mapper");
-  assert(deps_.OwnerClassifier &&
+  assert(deps_.argTextRecovery && "macro planner requires arg recovery");
+  assert(deps_.lexLang && "macro planner requires lexer options");
+  assert(deps_.lineDirs && "macro planner requires line directives");
+  assert(deps_.macroTopology && "macro planner requires macro topology");
+  assert(deps_.pathIdentity && "macro planner requires path identity");
+  assert(deps_.sourceMapper && "macro planner requires source mapper");
+  assert(deps_.ownerClassifier &&
          "macro planner requires owner/TU classifier");
-  assert(deps_.MacroStateProof && "macro planner requires macro-state proof");
-  assert(deps_.OwnerStateProof && "macro planner requires owner-state proof");
-  assert(deps_.ProofLattice && "macro planner requires proof lattice");
+  assert(deps_.macroStateProof && "macro planner requires macro-state proof");
+  assert(deps_.ownerStateProof && "macro planner requires owner-state proof");
+  assert(deps_.proofLattice && "macro planner requires proof lattice");
 }
 
 //===----------------------------------------------------------------------===//
 // Borrowed proof service accessors
 //===----------------------------------------------------------------------===//
 
-RefoldMacroStateProof &RefoldMacroPatchPlanner::macroStateProof() const {
-  assert(deps_.MacroStateProof &&
+RefoldMacroStateProof &RefoldMacroPatchPlanner::GetMacroStateProof() const {
+  assert(deps_.macroStateProof &&
          "macro planner requires macro-state proof");
-  return *deps_.MacroStateProof;
+  return *deps_.macroStateProof;
 }
 
-RefoldOwnerStateProof &RefoldMacroPatchPlanner::ownerStateProof() const {
-  assert(deps_.OwnerStateProof &&
+RefoldOwnerStateProof &RefoldMacroPatchPlanner::GetOwnerStateProof() const {
+  assert(deps_.ownerStateProof &&
          "macro planner requires owner-state proof");
-  return *deps_.OwnerStateProof;
+  return *deps_.ownerStateProof;
 }
 
-RefoldProofLattice &RefoldMacroPatchPlanner::proofLattice() const {
-  assert(deps_.ProofLattice && "macro planner requires proof lattice");
-  return *deps_.ProofLattice;
+RefoldProofLattice &RefoldMacroPatchPlanner::GetProofLattice() const {
+  assert(deps_.proofLattice && "macro planner requires proof lattice");
+  return *deps_.proofLattice;
 }
 
 //===----------------------------------------------------------------------===//
@@ -114,13 +114,13 @@ RefoldProofLattice &RefoldMacroPatchPlanner::proofLattice() const {
 
 
 RefoldMacroOccurrenceReplay RefoldMacroPatchPlanner::OccurrenceReplay() const {
-  return RefoldMacroOccurrenceReplay({deps_.AToks, deps_.BTokOff,
-                                      deps_.MacroTopology,
-                                      deps_.SourceMapper, deps_.Strict});
+  return RefoldMacroOccurrenceReplay({deps_.aToks, deps_.bTokOff,
+                                      deps_.macroTopology,
+                                      deps_.sourceMapper, deps_.strict});
 }
 
 RefoldMacroActualLayout RefoldMacroPatchPlanner::ActualLayout() const {
-  return RefoldMacroActualLayout({deps_.LexLang});
+  return RefoldMacroActualLayout({deps_.lexLang});
 }
 
 bool RefoldMacroPatchPlanner::MacroArgReplacementMatchesAllOccurrencesInB(
@@ -1300,30 +1300,30 @@ static PasteReplaySegmentationResult mergePasteReplayResults(
 /// ordinal to find the replay witness. The spelling check prevents accidental
 /// matches if the metadata is malformed or from a different schema generation.
 static const RefoldModel::PasteToken *
-findPasteTokenWitnessForSpan(const RefoldModel::MacroInvocation &M,
-                             const RefoldModel::PPArgSpan &Span,
-                             StringRef ATokSpelling) {
-  if (M.pasteTokens.empty())
+findPasteTokenWitnessForSpan(const RefoldModel::MacroInvocation &m,
+                             const RefoldModel::PPArgSpan &span,
+                             StringRef aTokSpelling) {
+  if (m.pasteTokens.empty())
     return nullptr;
 
   SmallVector<std::pair<uint64_t, uint64_t>, 8> tokenOrder;
-  for (const auto &PS : M.pasteSpans) {
-    std::pair<uint64_t, uint64_t> key{PS.begin, PS.end};
+  for (const auto &ps : m.pasteSpans) {
+    std::pair<uint64_t, uint64_t> key{ps.begin, ps.end};
     if (llvm::find(tokenOrder, key) == tokenOrder.end())
       tokenOrder.push_back(key);
   }
 
   auto it = llvm::find(tokenOrder,
-                       std::pair<uint64_t, uint64_t>{Span.begin, Span.end});
+                       std::pair<uint64_t, uint64_t>{span.begin, span.end});
   if (it == tokenOrder.end())
     return nullptr;
   const size_t index =
       static_cast<size_t>(std::distance(tokenOrder.begin(), it));
-  if (index >= M.pasteTokens.size())
+  if (index >= m.pasteTokens.size())
     return nullptr;
 
-  const RefoldModel::PasteToken &witness = M.pasteTokens[index];
-  if (witness.spelling != ATokSpelling)
+  const RefoldModel::PasteToken &witness = m.pasteTokens[index];
+  if (witness.spelling != aTokSpelling)
     return nullptr;
   return &witness;
 }
@@ -1337,14 +1337,14 @@ findPasteTokenWitnessForSpan(const RefoldModel::MacroInvocation &M,
 /// `ab | cd` may replay `wxyz` as `wx | yz`; a different total width remains
 /// out of domain unless literal anchors elsewhere pin the boundaries.
 static PasteReplaySegmentationResult segmentArgRunByReplayWidths(
-    StringRef BRun, ArrayRef<RefoldModel::PastePart> parts) {
+    StringRef bRun, ArrayRef<RefoldModel::PastePart> parts) {
   PasteReplaySegmentationResult result;
   if (parts.empty())
     return result;
 
   if (parts.size() == 1) {
     result.kind = PasteReplaySegmentationKind::Unique;
-    result.argSegments.push_back(BRun.str());
+    result.argSegments.push_back(bRun.str());
     return result;
   }
 
@@ -1355,7 +1355,7 @@ static PasteReplaySegmentationResult segmentArgRunByReplayWidths(
       return result;
     requiredLen += static_cast<size_t>(part.byteEnd - part.byteBegin);
   }
-  if (requiredLen != BRun.size()) {
+  if (requiredLen != bRun.size()) {
     result.kind = PasteReplaySegmentationKind::NoMatch;
     return result;
   }
@@ -1364,7 +1364,7 @@ static PasteReplaySegmentationResult segmentArgRunByReplayWidths(
   size_t pos = 0;
   for (const auto &part : parts) {
     const size_t width = static_cast<size_t>(part.byteEnd - part.byteBegin);
-    result.argSegments.push_back(BRun.substr(pos, width).str());
+    result.argSegments.push_back(bRun.substr(pos, width).str());
     pos += width;
   }
   return result;
@@ -1378,7 +1378,7 @@ static PasteReplaySegmentationResult segmentArgRunByReplayWidths(
 /// different argument segments, the result is ambiguous and rejected by the
 /// caller.
 static PasteReplaySegmentationResult segmentPastedTokenByReplayWitness(
-    StringRef BTokSpelling, const RefoldModel::PasteToken &witness) {
+    StringRef bTokSpelling, const RefoldModel::PasteToken &witness) {
   PasteReplaySegmentationResult unsupported;
   if (witness.parts.empty())
     return unsupported;
@@ -1423,7 +1423,7 @@ static PasteReplaySegmentationResult segmentPastedTokenByReplayWitness(
 
     // A split that has already consumed past the rewritten spelling cannot be
     // valid. Cache the negative result so later anchor searches fail cheaply.
-    if (posB > BTokSpelling.size()) {
+    if (posB > bTokSpelling.size()) {
       memo.emplace(key, result);
       return result;
     }
@@ -1432,7 +1432,7 @@ static PasteReplaySegmentationResult segmentPastedTokenByReplayWitness(
     // the entire rewritten pasted-token spelling. Otherwise this path matched
     // only a prefix and must be rejected.
     if (partIdx == witness.parts.size()) {
-      if (posB == BTokSpelling.size())
+      if (posB == bTokSpelling.size())
         result.kind = PasteReplaySegmentationKind::Unique;
       memo.emplace(key, result);
       return result;
@@ -1443,7 +1443,7 @@ static PasteReplaySegmentationResult segmentPastedTokenByReplayWitness(
     // Literal paste pieces are fixed anchors from the original paste
     // expression. They must appear verbatim at the current B spelling position.
     if (part.kind == RefoldModel::PastePartKind::Literal) {
-      if (!BTokSpelling.substr(posB).starts_with(part.spelling)) {
+      if (!bTokSpelling.substr(posB).starts_with(part.spelling)) {
         memo.emplace(key, result);
         return result;
       }
@@ -1467,7 +1467,7 @@ static PasteReplaySegmentationResult segmentPastedTokenByReplayWitness(
     auto tryRun = [&](size_t runEndB) -> PasteReplaySegmentationResult {
       // The candidate B interval for this argument run must be a valid slice of
       // the rewritten pasted-token spelling.
-      if (runEndB < posB || runEndB > BTokSpelling.size())
+      if (runEndB < posB || runEndB > bTokSpelling.size())
         return PasteReplaySegmentationResult{};
 
       ArrayRef<RefoldModel::PastePart> witnessParts(witness.parts);
@@ -1477,7 +1477,7 @@ static PasteReplaySegmentationResult segmentPastedTokenByReplayWitness(
       // non-unique segmentation is propagated upward so the caller can fail
       // closed rather than choosing an arbitrary split.
       auto runSeg = segmentArgRunByReplayWidths(
-          BTokSpelling.substr(posB, runEndB - posB),
+          bTokSpelling.substr(posB, runEndB - posB),
           witnessParts.slice(partIdx, runEnd - partIdx));
 
       if (runSeg.kind != PasteReplaySegmentationKind::Unique)
@@ -1500,7 +1500,7 @@ static PasteReplaySegmentationResult segmentPastedTokenByReplayWitness(
     // If the paste expression ends with this argument run, the run must consume
     // the rest of the rewritten pasted-token spelling.
     if (runEnd == witness.parts.size()) {
-      result = tryRun(BTokSpelling.size());
+      result = tryRun(bTokSpelling.size());
       memo.emplace(key, result);
       return result;
     }
@@ -1517,9 +1517,9 @@ static PasteReplaySegmentationResult segmentPastedTokenByReplayWitness(
       return result;
     }
 
-    for (size_t found = BTokSpelling.find(anchor, posB);
+    for (size_t found = bTokSpelling.find(anchor, posB);
          found != StringRef::npos;
-         found = BTokSpelling.find(anchor, found + 1)) {
+         found = bTokSpelling.find(anchor, found + 1)) {
       // Try treating this anchor occurrence as the end of the argument run.
       // Multiple successful segmentations are merged into Ambiguous rather than
       // resolved heuristically.
@@ -1865,7 +1865,7 @@ RefoldMacroPatchPlanner::RecoverInvocationActuals(
     const RefoldModel::MacroInvocation &invocation,
     StringRef baseInvocationText) const {
   // Args-only replay starts with data recovery, not candidate construction.
-  // Keep this phase fail-closed and limited to the historical availability
+  // Keep recovery fail-closed and limited to the historical availability
   // checks: a concrete invocation byte span, a literal callee origin, parsed
   // formal-content ranges, and the named actual-recovery precondition.
   if (!invocation.invB || !invocation.invE)
@@ -2082,7 +2082,7 @@ void RefoldMacroPatchPlanner::AddFinalMacroCandidate(
     return;
 
   candidate.selectionCandidate =
-      proofLattice().BuildMacroSelectionCandidate(
+      GetProofLattice().BuildMacroSelectionCandidate(
           candidate.patch, ctx.allowNonTopLevelMacroSelectorFailure);
   ctx.candidates.push_back(std::move(candidate));
   NoteFinalMacroCandidateOrigin(ctx, ctx.candidates.back().origin);
@@ -2091,7 +2091,7 @@ void RefoldMacroPatchPlanner::AddFinalMacroCandidate(
 bool RefoldMacroPatchPlanner::TheoremLatticeStructureCandidateDominatesRealization(
     const FinalMacroCandidateAdmissionContext &ctx,
     const MacroPatch &realizationPatch) const {
-  const RefoldProofLattice &lattice = proofLattice();
+  const RefoldProofLattice &lattice = GetProofLattice();
   AcceptedResultCandidate realizationCandidate =
       lattice.BuildAcceptedMacroCandidate(realizationPatch);
   if (!lattice.IsSelectableAcceptedResultCandidate(realizationCandidate))
@@ -2126,7 +2126,7 @@ RefoldMacroPatchPlanner::SelectPreferredFinalMacroCandidate(
   selectionCandidates.reserve(ctx.candidates.size());
   for (const FinalMacroCandidate &candidate : ctx.candidates)
     selectionCandidates.push_back(candidate.selectionCandidate);
-  return proofLattice().SelectPreferredMacroSelectionCandidate(
+  return GetProofLattice().SelectPreferredMacroSelectionCandidate(
       selectionCandidates);
 }
 
@@ -2135,7 +2135,7 @@ void RefoldMacroPatchPlanner::StampSelectedFinalMacroCandidate(
     const SelectedMacroSelectionCandidate &selectedCandidate,
     MacroPatch &selectedPatch) const {
   if (selectedCandidate.candidate.emittedCandidate) {
-    proofLattice().StampSelectedMacroPatchCandidate(
+    GetProofLattice().StampSelectedMacroPatchCandidate(
         selectedPatch, *selectedCandidate.candidate.emittedCandidate,
         "macro/final-selector");
     return;
@@ -2164,7 +2164,7 @@ struct RefoldMacroPatchPlanner::WholeCoverAdmissionContext {
 
 void RefoldMacroPatchPlanner::AttachWholeCoverProofCarrier(
     const WholeCoverAdmissionContext &ctx, MacroPatch &patch) const {
-  proofLattice().StampMacroWholeCoverRealizationPatch(
+  GetProofLattice().StampMacroWholeCoverRealizationPatch(
       patch, ctx.proofInputs.plan, ctx.proofInputs.invocation);
 }
 
@@ -2187,9 +2187,9 @@ void RefoldMacroPatchPlanner::StampReusedMacroPatchAcceptedCandidate(
 }
 
 
-// Final replay-stability gates are named methods after Step 7 so every final
-// macro candidate is admitted through explicit planner operations rather than
-// through stateful local closures in the whole-cover entry point.
+// Final replay-stability gates are named methods so every macro candidate is
+// admitted through explicit planner operations rather than through stateful
+// local closures in the whole-cover entry point.
 bool RefoldMacroPatchPlanner::CallsiteReplayObservesActiveHeaderMacroState(
     const RefoldModel::MacroInvocation &m, const MacroPatch &patch) const {
   // Only structure-preserving callsite replay can be unstable in this
@@ -2203,7 +2203,7 @@ bool RefoldMacroPatchPlanner::CallsiteReplayObservesActiveHeaderMacroState(
     return false;
   if (!m.ownerIncludeId || !m.invFile)
     return false;
-  if ((*deps_.PathIdentity).PathsEqual(*m.invFile, (*deps_.Model).GetSourcePath()))
+  if ((*deps_.pathIdentity).PathsEqual(*m.invFile, (*deps_.model).GetSourcePath()))
     return false;
 
   // Decide whether this structure-preserving candidate would observe a
@@ -2227,7 +2227,7 @@ bool RefoldMacroPatchPlanner::CallsiteReplayObservesActiveHeaderMacroState(
     if (headerBytesStorage)
       return StringRef(*headerBytesStorage);
     auto bufOrErr =
-        MemoryBuffer::getFile((*deps_.LineDirs).ToAbsolutePath(m.invFile->str()));
+        MemoryBuffer::getFile((*deps_.lineDirs).ToAbsolutePath(m.invFile->str()));
     if (!bufOrErr)
       return std::nullopt;
     const MemoryBuffer &mb = **bufOrErr;
@@ -2244,7 +2244,7 @@ bool RefoldMacroPatchPlanner::CallsiteReplayObservesActiveHeaderMacroState(
     std::optional<StringRef> headerBytes = getHeaderBytes();
     if (!headerBytes)
       return std::nullopt;
-    return macroStateProof().RecoverMacroStateDirectiveLineInterval(
+    return GetMacroStateProof().RecoverMacroStateDirectiveLineInterval(
         directive, *m.invFile, *headerBytes, m.ownerIncludeId);
   };
 
@@ -2257,7 +2257,7 @@ bool RefoldMacroPatchPlanner::CallsiteReplayObservesActiveHeaderMacroState(
           StringRef macroName) {
         const RefoldModel::MacroDirective *active = nullptr;
         uint64_t activeEnd = 0;
-        for (const auto &candidate : (*deps_.Model).GetMacroDirectives()) {
+        for (const auto &candidate : (*deps_.model).GetMacroDirectives()) {
           std::optional<HeaderDirectivePiece> piece =
               directiveInterval(candidate);
           if (!piece || piece->end > patch.invStart)
@@ -2278,7 +2278,7 @@ bool RefoldMacroPatchPlanner::CallsiteReplayObservesActiveHeaderMacroState(
   // is not enough that the rewritten text is token-equivalent somewhere;
   // it must be token-equivalent under the macro state at its final replay
   // position.
-  for (const auto &directive : (*deps_.Model).GetMacroDirectives()) {
+  for (const auto &directive : (*deps_.model).GetMacroDirectives()) {
     std::optional<HeaderDirectivePiece> piece = directiveInterval(directive);
     if (!piece || piece->end > patch.invStart)
       continue;
@@ -2344,7 +2344,7 @@ bool RefoldMacroPatchPlanner::ArgsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay
     return true;
 
   const std::optional<std::pair<size_t, size_t>> wholeB =
-      (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(cover->first,
+      (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(cover->first,
                                                               cover->second);
   if (!wholeB || wholeB->first >= wholeB->second)
     return true;
@@ -2359,7 +2359,7 @@ bool RefoldMacroPatchPlanner::ArgsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay
   // whole-cover envelope before this guard applies.
   std::pair<size_t, size_t> replayB = *wholeB;
   if (std::optional<std::pair<size_t, size_t>> trimmedB =
-          (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelope(cover->first, cover->second)) {
+          (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelope(cover->first, cover->second)) {
     if (wholeB->first <= trimmedB->first &&
         trimmedB->first <= trimmedB->second &&
         trimmedB->second <= wholeB->second)
@@ -2486,7 +2486,7 @@ bool RefoldMacroPatchPlanner::ArgsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay
       [&](const ReplayElem &elem)
       -> std::optional<std::pair<size_t, size_t>> {
     std::optional<std::pair<size_t, size_t>> mapped =
-        (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(elem.aBegin,
+        (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(elem.aBegin,
                                                                 elem.aEnd);
     if (!mapped)
       return std::nullopt;
@@ -2557,8 +2557,8 @@ bool RefoldMacroPatchPlanner::ArgsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay
 
     bool fixedMatches = true;
     for (size_t i = 0; i < len; ++i) {
-      if (deps_.AToks[static_cast<size_t>(elem.aBegin) + i].spelling !=
-          deps_.BToks[bCursor + i].spelling) {
+      if (deps_.aToks[static_cast<size_t>(elem.aBegin) + i].spelling !=
+          deps_.bToks[bCursor + i].spelling) {
         fixedMatches = false;
         break;
       }
@@ -2570,9 +2570,9 @@ bool RefoldMacroPatchPlanner::ArgsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay
             "claimed whole B envelope: A=[{2},{3}) B=[{4},{5}) "
             "Atext='{6}' Btext='{7}' replacement='{8}'",
             m.id, m.name, elem.aBegin, elem.aEnd, bCursor, bCursor + len,
-            stringutils::showWsWithClip((*deps_.SourceMapper).SliceASource(elem.aBegin, elem.aEnd),
+            stringutils::showWsWithClip((*deps_.sourceMapper).SliceASource(elem.aBegin, elem.aEnd),
                                         120),
-            stringutils::showWsWithClip((*deps_.SourceMapper).SliceBSource(bCursor, bCursor + len),
+            stringutils::showWsWithClip((*deps_.sourceMapper).SliceBSource(bCursor, bCursor + len),
                                         120),
             stringutils::showWsWithClip(patch.replacement, 220));
       return false;
@@ -2659,13 +2659,13 @@ bool RefoldMacroPatchPlanner::RootPreservingCandidateHasLiteralFixedRootBodyRepl
       // descendant cover before asking whether the remaining root-owned body
       // text is still literal.
       DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invById;
-      for (const auto &candidate : (*deps_.Model).GetMacroInvocations())
+      for (const auto &candidate : (*deps_.model).GetMacroInvocations())
         invById[candidate.id] = &candidate;
       SmallVector<std::pair<size_t, size_t>, 1> rootBodyReplayArgRanges;
       const MacroSubtreeReplayValidationContext rootBodyReplaySubtreeCtx{
           m, baseInvText, rootBodyReplayArgRanges, invById};
 
-      for (const auto &candidate : (*deps_.Model).GetMacroInvocations()) {
+      for (const auto &candidate : (*deps_.model).GetMacroInvocations()) {
         if (candidate.id == m.id || !candidate.cover.IsValid() ||
             candidate.cover.begin >= candidate.cover.end ||
             !CandidateBelongsToValidatedSubtree(rootBodyReplaySubtreeCtx,
@@ -2725,37 +2725,37 @@ bool RefoldMacroPatchPlanner::RootPreservingCandidateHasLiteralFixedRootBodyRepl
 
       for (const TokenInterval &fixed : fixedBodyA) {
         for (uint64_t aTok = fixed.begin; aTok < fixed.end; ++aTok) {
-          if (static_cast<size_t>(aTok) >= deps_.AToks.size())
+          if (static_cast<size_t>(aTok) >= deps_.aToks.size())
             return false;
 
           std::optional<std::pair<size_t, size_t>> bTok =
-              (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelope(aTok, aTok + 1);
+              (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelope(aTok, aTok + 1);
           if (!bTok || bTok->first >= bTok->second) {
             REFOLD_LOG_TRACE("macro/proof",
                   "suppress structure-preserving macro replay: inv id={0} "
                   "name={1} fixed root body token has no B replay "
                   "envelope: A=[{2},{3}) Atext='{4}' replacement='{5}'",
                   m.id, m.name, aTok, aTok + 1,
-                  stringutils::showWsWithClip((*deps_.SourceMapper).SliceASource(aTok, aTok + 1),
+                  stringutils::showWsWithClip((*deps_.sourceMapper).SliceASource(aTok, aTok + 1),
                                               120),
                   stringutils::showWsWithClip(patch.replacement, 220));
             return false;
           }
 
           if (bTok->second != bTok->first + 1 ||
-              bTok->first >= deps_.BToks.size() ||
-              deps_.AToks[static_cast<size_t>(aTok)].spelling !=
-                  deps_.BToks[bTok->first].spelling) {
+              bTok->first >= deps_.bToks.size() ||
+              deps_.aToks[static_cast<size_t>(aTok)].spelling !=
+                  deps_.bToks[bTok->first].spelling) {
             REFOLD_LOG_TRACE("macro/proof",
                   "suppress structure-preserving macro replay: inv id={0} "
                   "name={1} fixed root body changed while preserving the "
                   "root invocation: A=[{2},{3}) B=[{4},{5}) Atext='{6}' "
                   "Btext='{7}' replacement='{8}'",
                   m.id, m.name, aTok, aTok + 1, bTok->first, bTok->second,
-                  stringutils::showWsWithClip((*deps_.SourceMapper).SliceASource(aTok, aTok + 1),
+                  stringutils::showWsWithClip((*deps_.sourceMapper).SliceASource(aTok, aTok + 1),
                                               120),
                   stringutils::showWsWithClip(
-                      (*deps_.SourceMapper).SliceBSource(bTok->first, bTok->second), 120),
+                      (*deps_.sourceMapper).SliceBSource(bTok->first, bTok->second), 120),
                   stringutils::showWsWithClip(patch.replacement, 220));
             return false;
           }
@@ -2781,8 +2781,8 @@ MacroPatch RefoldMacroPatchPlanner::MaterializeWholeCoverPatch(
     const WholeCoverCandidate &candidate) const {
   // Whole-cover realization construction is intentionally narrow: the caller
   // supplies the already-proven plan and invocation span, and this method only
-  // builds the emitted patch and attaches the same proof carrier that the
-  // in-line selector used before this phase split.
+  // builds the emitted patch and attaches the same proof carrier used by the
+  // historical in-line selector.
   MacroPatch patch{candidate.invocationStart, candidate.invocationEnd,
                    candidate.plan.clippedText, candidate.invocation.id};
   const WholeCoverAdmissionContext wholeCoverAdmissionCtx{
@@ -2973,10 +2973,11 @@ RefoldMacroPatchPlanner::RecoverWholeCoverReuseContext(
     const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
         &patchMap,
     ExistingMacroPatchContext existingContext) const {
-  // Reuse discovery is a whole-cover phase because same-span reuse must see
-  // both the caller-owned patch map and the already coalesced same-pass
-  // context.  The resulting carrier borrows those accepted patches; it does
-  // not mutate map ownership or change the deterministic representative choice.
+  // Reuse discovery runs before whole-cover candidate assembly because
+  // same-span reuse must see both the caller-owned patch map and the already
+  // coalesced same-pass context. The resulting carrier borrows those accepted
+  // patches; it does not mutate map ownership or change the deterministic
+  // representative choice.
   MacroPatchReuseAdmissionContext ctx{invocation, currentPatchOwner,
                                       invocation.ownerIncludeId,
                                       invocationStart, invocationEnd};
@@ -3046,15 +3047,15 @@ void RefoldMacroPatchPlanner::CollectExistingMacroPatchReuseFromMap(
 void RefoldMacroPatchPlanner::AdmitCallerExistingMacroPatchContext(
     MacroPatchReuseAdmissionContext &ctx,
     RefoldMacroPatchPlanner::ExistingMacroPatchContext existingContext) const {
-  if (ctx.existingPatch || ctx.existingExpandedPatch || !existingContext.Patch)
+  if (ctx.existingPatch || ctx.existingExpandedPatch || !existingContext.patch)
     return;
 
-  const MacroPatch &patch = *existingContext.Patch;
+  const MacroPatch &patch = *existingContext.patch;
   if (!ExistingPatchMatchesReuseSite(ctx, patch))
     return;
 
   const bool contextIsCallsite =
-      existingContext.IsCallsite &&
+      existingContext.isCallsite &&
       ExistingPatchPreservesCurrentInvocation(ctx, patch);
   if (contextIsCallsite) {
     ctx.existingPatch = &patch;
@@ -3091,7 +3092,7 @@ RefoldMacroPatchPlanner::TryPairedPureInsertionRootArgsOnlyPatch(
   // If the current hunk is already fully contained in an argument span, then
   // it is not the split-frontier case this recovery path is meant for.
   SmallVector<char, 16> curTouched(argLikeSpans.size(), 0);
-  if ((*deps_.SourceMapper).HunkFullyWithinArgSpans(hEff, argLikeSpans,
+  if ((*deps_.sourceMapper).HunkFullyWithinArgSpans(hEff, argLikeSpans,
                                                     curTouched))
     return std::nullopt;
 
@@ -3114,7 +3115,7 @@ RefoldMacroPatchPlanner::TryPairedPureInsertionRootArgsOnlyPatch(
   if (occs.empty())
     return std::nullopt;
 
-  for (const auto &partner : (*deps_.ABTokHunks)) {
+  for (const auto &partner : (*deps_.abTokHunks)) {
     // Pair only with another pure B insertion. Replacement/deletion hunks are
     // outside this split-insertion recovery proof.
     if (partner.aStart != partner.aEnd || partner.bStart >= partner.bEnd)
@@ -3147,12 +3148,12 @@ RefoldMacroPatchPlanner::TryPairedPureInsertionRootArgsOnlyPatch(
     // Remove unchanged matching edge tokens so the synthetic envelope exposes
     // only the edited core between the paired insertion frontiers.
     const diffutils::Hunk envTrim =
-        trimCommonEdgeTokens(env, deps_.AToks, deps_.BToks);
+        trimCommonEdgeTokens(env, deps_.aToks, deps_.bToks);
 
     // The trimmed synthetic envelope must be fully explainable by argument
     // occurrences. Otherwise the paired insertions are not an args-only edit.
     std::vector<char> touchedOcc(occs.size(), 0);
-    if (!(*deps_.SourceMapper).HunkFullyWithinArgSpans(envTrim, occs,
+    if (!(*deps_.sourceMapper).HunkFullyWithinArgSpans(envTrim, occs,
                                                        touchedOcc))
       continue;
 
@@ -3175,9 +3176,9 @@ RefoldMacroPatchPlanner::TryPairedPureInsertionRootArgsOnlyPatch(
     if (!patch)
       continue;
 
-    proofLattice().SetMacroPatchProof(
+    GetProofLattice().SetMacroPatchProof(
         *patch,
-        proofLattice().MakeMacroPatchProof(
+        GetProofLattice().MakeMacroPatchProof(
             MacroPatchProofKind::ArgsOnlyPairedPureInsertion,
             /*preservesInvocationStructure=*/true, m.id));
     return patch;
@@ -3203,7 +3204,7 @@ RefoldMacroPatchPlanner::BuildWholeCoverArgsOnlyCandidate(
           : (m.invText ? StringRef(*m.invText) : StringRef(""));
   result.rootHasDirectArgLikeSurface =
       !argLikeSpans.empty() &&
-      (*deps_.SourceMapper).HunkFullyWithinArgSpans(hEff, argLikeSpans,
+      (*deps_.sourceMapper).HunkFullyWithinArgSpans(hEff, argLikeSpans,
                                                     argTouched) &&
       RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(invSpanText,
                                                                     m);
@@ -3361,7 +3362,7 @@ auto findGeneratedCallShape =
           [&](size_t begin, size_t end,
               unsigned depth) -> std::optional<uint32_t> {
     if (begin >= end || end > toks.size() ||
-        depth > (*deps_.Model).GetMacroDirectives().size())
+        depth > (*deps_.model).GetMacroDirectives().size())
       return std::nullopt;
 
     if (end == begin + 1 &&
@@ -3488,7 +3489,7 @@ auto findGeneratedCallShape =
 auto splitVariadicPackSourceSlot = [&](const GeneratedCalleeSourceSlot &slot,
                                        SmallVectorImpl<GeneratedCalleeSourceSlot> &out) {
   SmallVector<RefoldLexBoundaryToken, 32> toks;
-  refoldLexBoundaryTokens(StringRef(slot.text), (*deps_.LexLang), toks);
+  refoldLexBoundaryTokens(StringRef(slot.text), (*deps_.lexLang), toks);
 
   size_t elemBegin = 0;
   int parenDepth = 0;
@@ -3496,27 +3497,27 @@ auto splitVariadicPackSourceSlot = [&](const GeneratedCalleeSourceSlot &slot,
   SmallVector<std::pair<size_t, size_t>, 8> pieces;
 
   for (const RefoldLexBoundaryToken &tok : toks) {
-    if (tok.Spelling == "(") {
+    if (tok.spelling == "(") {
       ++parenDepth;
       continue;
     }
-    if (tok.Spelling == ")") {
+    if (tok.spelling == ")") {
       if (parenDepth > 0)
         --parenDepth;
       continue;
     }
-    if (tok.Spelling != "," || parenDepth != 0)
+    if (tok.spelling != "," || parenDepth != 0)
       continue;
 
     sawComma = true;
     StringRef elem =
-        StringRef(slot.text).slice(elemBegin, tok.Begin).trim();
+        StringRef(slot.text).slice(elemBegin, tok.begin).trim();
     if (elem.empty())
       return false;
     pieces.push_back({static_cast<size_t>(elem.data() - slot.text.data()),
                       static_cast<size_t>(elem.data() - slot.text.data()) +
                           elem.size()});
-    elemBegin = tok.End;
+    elemBegin = tok.end;
   }
 
   if (!sawComma) {
@@ -3729,7 +3730,7 @@ auto instantiateGeneratedArgument =
       return true;
     };
 
-for (size_t depth = 0; depth <= (*deps_.Model).GetMacroDirectives().size();
+for (size_t depth = 0; depth <= (*deps_.model).GetMacroDirectives().size();
      ++depth) {
   auto shape = findGeneratedCallShape(*generatedCalleeCtx.currentDefinition);
   if (!shape)
@@ -3810,9 +3811,9 @@ auto lexReplayTokens = [&](StringRef text,
                            SmallVectorImpl<ReplayTok> &out) {
   out.clear();
   SmallVector<RefoldLexBoundaryToken, 32> toks;
-  refoldLexBoundaryTokens(text, (*deps_.LexLang), toks);
+  refoldLexBoundaryTokens(text, (*deps_.lexLang), toks);
   for (const RefoldLexBoundaryToken &tok : toks)
-    out.push_back(ReplayTok{tok.Spelling, tok.Begin, tok.End});
+    out.push_back(ReplayTok{tok.spelling, tok.begin, tok.end});
 };
 
 auto tokenSpellingsForText = [&](StringRef text) {
@@ -4118,8 +4119,8 @@ auto solveExpansion =
   return solutions.front();
 };
 
-StringRef oldExpansion = (*deps_.SourceMapper).SliceASource(cover->first, cover->second).trim();
-StringRef newExpansion = (*deps_.SourceMapper).SliceBSource(bEnv->first, bEnv->second).trim();
+StringRef oldExpansion = (*deps_.sourceMapper).SliceASource(cover->first, cover->second).trim();
+StringRef newExpansion = (*deps_.sourceMapper).SliceBSource(bEnv->first, bEnv->second).trim();
 std::optional<SolvedActuals> oldSolved = solveExpansion(oldExpansion);
 std::optional<SolvedActuals> newSolved = solveExpansion(newExpansion);
 if (!oldSolved || !newSolved || oldSolved->size() != oldActuals.size() ||
@@ -4134,9 +4135,9 @@ auto rewriteSourceActualFromSolvedExpansion =
   SmallVector<RefoldLexBoundaryToken, 16> sourceToks;
   SmallVector<RefoldLexBoundaryToken, 16> oldToks;
   SmallVector<RefoldLexBoundaryToken, 16> newToks;
-  refoldLexBoundaryTokens(source, (*deps_.LexLang), sourceToks);
-  refoldLexBoundaryTokens(oldText, (*deps_.LexLang), oldToks);
-  refoldLexBoundaryTokens(newText, (*deps_.LexLang), newToks);
+  refoldLexBoundaryTokens(source, (*deps_.lexLang), sourceToks);
+  refoldLexBoundaryTokens(oldText, (*deps_.lexLang), oldToks);
+  refoldLexBoundaryTokens(newText, (*deps_.lexLang), newToks);
   if (!oldToks.empty() && oldToks.size() == newToks.size() &&
       sourceToks.size() >= oldToks.size()) {
     std::optional<size_t> matchBegin;
@@ -4144,7 +4145,7 @@ auto rewriteSourceActualFromSolvedExpansion =
     for (size_t i = 0; i + oldToks.size() <= sourceToks.size(); ++i) {
       bool same = true;
       for (size_t j = 0; j < oldToks.size(); ++j) {
-        if (sourceToks[i + j].Spelling != oldToks[j].Spelling) {
+        if (sourceToks[i + j].spelling != oldToks[j].spelling) {
           same = false;
           break;
         }
@@ -4162,8 +4163,8 @@ auto rewriteSourceActualFromSolvedExpansion =
       for (size_t j = oldToks.size(); j > 0; --j) {
         const size_t idx = *matchBegin + j - 1;
         rewritten = stringutils::replaceRange(
-            rewritten, sourceToks[idx].Begin, sourceToks[idx].End,
-            newToks[j - 1].Spelling);
+            rewritten, sourceToks[idx].begin, sourceToks[idx].end,
+            newToks[j - 1].spelling);
       }
       return rewritten;
     }
@@ -4265,7 +4266,7 @@ for (uint32_t i = 0; i < newSolved->size(); ++i) {
       source, StringRef((*oldSolved)[i]), StringRef((*newSolved)[i]));
   if (!rewritten)
     return std::nullopt;
-  if (!isMacroInvocationVariadicFormal(m, rootIdx) && replacementIntroducesTopLevelComma(*rewritten, (*deps_.LexLang)))
+  if (!isMacroInvocationVariadicFormal(m, rootIdx) && replacementIntroducesTopLevelComma(*rewritten, (*deps_.lexLang)))
     return std::nullopt;
 
   // Compose multiple solved final parameters that originate from the same
@@ -4326,9 +4327,9 @@ RefoldMacroPatchPlanner::BuildGeneratedLeafReplayCandidate(
 auto lexLeafTokens = [&](StringRef text, SmallVectorImpl<LeafTok> &out) {
   out.clear();
   SmallVector<RefoldLexBoundaryToken, 32> toks;
-  refoldLexBoundaryTokens(text, (*deps_.LexLang), toks);
+  refoldLexBoundaryTokens(text, (*deps_.lexLang), toks);
   for (const RefoldLexBoundaryToken &tok : toks)
-    out.push_back(LeafTok{tok.Spelling});
+    out.push_back(LeafTok{tok.spelling});
 };
 auto leafValueForToken = [&](StringRef spelling) -> std::string {
   if (std::optional<std::string> decoded =
@@ -4411,19 +4412,19 @@ auto tryGeneratedSelectorActualRewrite =
   auto appendLexedArgumentTokens = [&](StringRef text,
                                        SmallVectorImpl<std::string> &out) {
     SmallVector<RefoldLexBoundaryToken, 16> toks;
-    refoldLexBoundaryTokens(text, (*deps_.LexLang), toks);
+    refoldLexBoundaryTokens(text, (*deps_.lexLang), toks);
     for (const RefoldLexBoundaryToken &tok : toks)
-      out.push_back(tok.Spelling);
+      out.push_back(tok.spelling);
   };
 
   auto stringifyArgumentForReplay = [&](StringRef text) -> std::string {
     SmallVector<RefoldLexBoundaryToken, 16> toks;
-    refoldLexBoundaryTokens(text, (*deps_.LexLang), toks);
+    refoldLexBoundaryTokens(text, (*deps_.lexLang), toks);
     std::string body;
     for (const RefoldLexBoundaryToken &tok : toks) {
       if (!body.empty())
         body.push_back(' ');
-      body += tok.Spelling;
+      body += tok.spelling;
     }
     std::string out = "\"";
     for (char c : body) {
@@ -4543,7 +4544,7 @@ auto tryGeneratedSelectorActualRewrite =
     const bool oldSelectorWasAlias =
         IsObjectLikeSingleTokenAlias(selectorText);
     for (const RefoldModel::MacroDirective &sourceDirective :
-         (*deps_.Model).GetMacroDirectives()) {
+         (*deps_.model).GetMacroDirectives()) {
       if (sourceDirective.subkind != "#define" ||
           sourceDirective.name.empty() ||
           sourceDirective.name == selectorText)
@@ -4961,7 +4962,7 @@ auto tryMultiLeafPatternRewrite = [&]() -> std::optional<MacroPatch> {
           return std::nullopt;
       } else {
         if (!isMacroInvocationVariadicFormal(m, occs[i].argIdx) &&
-            replacementIntroducesTopLevelComma(sourceSolvedRef, (*deps_.LexLang)))
+            replacementIntroducesTopLevelComma(sourceSolvedRef, (*deps_.lexLang)))
           return std::nullopt;
         replByArgIdx[occs[i].argIdx] = std::move(*sourceSolved);
       }
@@ -5029,7 +5030,7 @@ for (uint32_t argIdx = 0;
     return std::nullopt;
   std::string rewrittenArg = stringutils::replaceRange(
       argText.str(), pos, pos + oldLeaf.size(), StringRef(newLeaf));
-  if (!isMacroInvocationVariadicFormal(m, argIdx) && replacementIntroducesTopLevelComma(rewrittenArg, (*deps_.LexLang)))
+  if (!isMacroInvocationVariadicFormal(m, argIdx) && replacementIntroducesTopLevelComma(rewrittenArg, (*deps_.lexLang)))
     return std::nullopt;
   targetArgIdx = argIdx;
   targetReplacement = std::move(rewrittenArg);
@@ -5048,17 +5049,17 @@ auto stableRootOccurrenceStillObservesOldLeaf =
       if (span.argIdx != *targetArgIdx || span.begin >= span.end)
         return false;
 
-      StringRef aText = (*deps_.SourceMapper).SliceASource(span.begin, span.end).trim();
+      StringRef aText = (*deps_.sourceMapper).SliceASource(span.begin, span.end).trim();
       if (aText.find(StringRef(oldLeaf)) == StringRef::npos)
         return false;
 
       std::optional<std::pair<size_t, size_t>> bEnv =
-          (*deps_.SourceMapper).MapAToBTokenEnvelopeByPPArgSpan(span);
+          (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(span);
       if (!bEnv || bEnv->second < bEnv->first) {
         return true;
       }
 
-      StringRef bText = (*deps_.SourceMapper).SliceBSource(bEnv->first, bEnv->second).trim();
+      StringRef bText = (*deps_.sourceMapper).SliceBSource(bEnv->first, bEnv->second).trim();
       if (bText.find(StringRef(oldLeaf)) == StringRef::npos)
         return false;
 
@@ -5118,7 +5119,7 @@ RefoldMacroPatchPlanner::BuildTupleGeneratedCalleeReplayCandidate(
 
   StringRef tuplePayload = parentTrim.drop_front().drop_back();
   SmallVector<TupleElementSlice, 8> tupleElems;
-  if (!splitTopLevelTupleElementsWithLexer(tuplePayload, (*deps_.LexLang),
+  if (!splitTopLevelTupleElementsWithLexer(tuplePayload, (*deps_.lexLang),
                                            tupleElems) ||
       tupleElems.size() < 2)
     return std::nullopt;
@@ -5288,8 +5289,8 @@ RefoldMacroPatchPlanner::BuildTupleGeneratedCalleeReplayCandidate(
   if (oldActuals.size() != calleeDefinition->defParams.size())
     return std::nullopt;
 
-  StringRef oldExpansion = (*deps_.SourceMapper).SliceASource(cover->first, cover->second).trim();
-  StringRef newExpansion = (*deps_.SourceMapper).SliceBSource(bEnv->first, bEnv->second).trim();
+  StringRef oldExpansion = (*deps_.sourceMapper).SliceASource(cover->first, cover->second).trim();
+  StringRef newExpansion = (*deps_.sourceMapper).SliceBSource(bEnv->first, bEnv->second).trim();
 
   // Replay the generated callee as a small replacement-list transducer over
   // tuple slots.  A generated callee contributes a sequence of literal
@@ -5302,9 +5303,9 @@ RefoldMacroPatchPlanner::BuildTupleGeneratedCalleeReplayCandidate(
                              SmallVectorImpl<ReplayTok> &out) {
     out.clear();
     SmallVector<RefoldLexBoundaryToken, 32> toks;
-    refoldLexBoundaryTokens(text, (*deps_.LexLang), toks);
+    refoldLexBoundaryTokens(text, (*deps_.lexLang), toks);
     for (const RefoldLexBoundaryToken &tok : toks)
-      out.push_back(ReplayTok{tok.Spelling, tok.Begin, tok.End});
+      out.push_back(ReplayTok{tok.spelling, tok.begin, tok.end});
   };
 
   auto tokenSpellingsForText = [&](StringRef text) {
@@ -5343,9 +5344,9 @@ RefoldMacroPatchPlanner::BuildTupleGeneratedCalleeReplayCandidate(
     SmallVector<RefoldLexBoundaryToken, 16> sourceToks;
     SmallVector<RefoldLexBoundaryToken, 16> oldToks;
     SmallVector<RefoldLexBoundaryToken, 16> newToks;
-    refoldLexBoundaryTokens(source, (*deps_.LexLang), sourceToks);
-    refoldLexBoundaryTokens(oldText, (*deps_.LexLang), oldToks);
-    refoldLexBoundaryTokens(newText, (*deps_.LexLang), newToks);
+    refoldLexBoundaryTokens(source, (*deps_.lexLang), sourceToks);
+    refoldLexBoundaryTokens(oldText, (*deps_.lexLang), oldToks);
+    refoldLexBoundaryTokens(newText, (*deps_.lexLang), newToks);
     if (!oldToks.empty() && oldToks.size() == newToks.size() &&
         sourceToks.size() >= oldToks.size()) {
       std::optional<size_t> matchBegin;
@@ -5353,7 +5354,7 @@ RefoldMacroPatchPlanner::BuildTupleGeneratedCalleeReplayCandidate(
       for (size_t i = 0; i + oldToks.size() <= sourceToks.size(); ++i) {
         bool same = true;
         for (size_t j = 0; j < oldToks.size(); ++j) {
-          if (sourceToks[i + j].Spelling != oldToks[j].Spelling) {
+          if (sourceToks[i + j].spelling != oldToks[j].spelling) {
             same = false;
             break;
           }
@@ -5371,8 +5372,8 @@ RefoldMacroPatchPlanner::BuildTupleGeneratedCalleeReplayCandidate(
         for (size_t j = oldToks.size(); j > 0; --j) {
           const size_t idx = *matchBegin + j - 1;
           rewritten = stringutils::replaceRange(
-              rewritten, sourceToks[idx].Begin, sourceToks[idx].End,
-              newToks[j - 1].Spelling);
+              rewritten, sourceToks[idx].begin, sourceToks[idx].end,
+              newToks[j - 1].spelling);
         }
         return rewritten;
       }
@@ -5822,7 +5823,7 @@ bool RefoldMacroPatchPlanner::StampMacroPatchWholeExpansionBRange(
     return false;
 
   std::optional<std::pair<size_t, size_t>> bEnv =
-      (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+      (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
           cover->first, cover->second);
   if (!bEnv || bEnv->first >= bEnv->second)
     return false;
@@ -5837,7 +5838,7 @@ void RefoldMacroPatchPlanner::SetArgsOnlyStandardProof(
     MacroPatch &patch, const RefoldModel::MacroInvocation &m,
     bool wholeEnvelopeReplayValidated,
     bool definitionTapeReplayValidated) const {
-  MacroPatchProof proof = proofLattice().MakeMacroPatchProof(
+  MacroPatchProof proof = GetProofLattice().MakeMacroPatchProof(
       MacroPatchProofKind::ArgsOnlyStandard,
       /*preservesInvocationStructure=*/true, m.id);
   if (wholeEnvelopeReplayValidated) {
@@ -5847,7 +5848,7 @@ void RefoldMacroPatchPlanner::SetArgsOnlyStandardProof(
     witness.definitionTapeReplayValidated = definitionTapeReplayValidated;
     proof.wholeEnvelopeReplay = witness;
   }
-  proofLattice().SetMacroPatchProof(patch, std::move(proof));
+  GetProofLattice().SetMacroPatchProof(patch, std::move(proof));
 }
 
 void RefoldMacroPatchPlanner::StampGeneratedCalleeReplayProof(
@@ -5875,7 +5876,7 @@ void RefoldMacroPatchPlanner::StampGeneratedCalleeReplayProof(
   witness.decodedStringLiteralEvidenceOnly =
       decodedStringLiteralEvidenceOnly || usesStringification;
   proof.generatedCalleeReplay = std::move(witness);
-  proofLattice().SetMacroPatchProof(patch, std::move(proof));
+  GetProofLattice().SetMacroPatchProof(patch, std::move(proof));
 }
 
 const RefoldModel::MacroDirective *
@@ -5884,7 +5885,7 @@ RefoldMacroPatchPlanner::GetDefinitionDirectiveForInvocation(
   if (!m.definitionDirectiveId)
     return nullptr;
   for (const RefoldModel::MacroDirective &directive :
-       (*deps_.Model).GetMacroDirectives()) {
+       (*deps_.model).GetMacroDirectives()) {
     if (directive.id == *m.definitionDirectiveId)
       return &directive;
   }
@@ -5893,8 +5894,8 @@ RefoldMacroPatchPlanner::GetDefinitionDirectiveForInvocation(
 
 bool RefoldMacroPatchPlanner::MatchLiteralAToken(
     uint64_t tok, llvm::StringRef spelling) const {
-  return tok < deps_.AToks.size() &&
-         deps_.AToks[static_cast<size_t>(tok)].spelling == spelling;
+  return tok < deps_.aToks.size() &&
+         deps_.aToks[static_cast<size_t>(tok)].spelling == spelling;
 }
 
 bool RefoldMacroPatchPlanner::CurrentLevelInvocationIsInSubtreeOf(
@@ -5909,7 +5910,7 @@ bool RefoldMacroPatchPlanner::CurrentLevelInvocationIsInSubtreeOf(
     seen.push_back(currentId);
 
     const RefoldModel::MacroInvocation *current =
-        (*deps_.MacroTopology).FindMacroInvocationById(currentId);
+        (*deps_.macroTopology).FindMacroInvocationById(currentId);
     if (!current || !current->callerMacroId)
       return false;
     currentId = *current->callerMacroId;
@@ -5918,10 +5919,10 @@ bool RefoldMacroPatchPlanner::CurrentLevelInvocationIsInSubtreeOf(
 
 bool RefoldMacroPatchPlanner::CurrentLevelSubtreeContainsCounterInvocation(
     uint64_t rootId) const {
-  if (!(*deps_.MacroTopology).FindMacroInvocationById(rootId))
+  if (!(*deps_.macroTopology).FindMacroInvocationById(rootId))
     return false;
   for (const RefoldModel::MacroInvocation &macro :
-       (*deps_.Model).GetMacroInvocations()) {
+       (*deps_.model).GetMacroInvocations()) {
     if (macro.name != "__COUNTER__")
       continue;
     if (CurrentLevelInvocationIsInSubtreeOf(macro, rootId))
@@ -6094,24 +6095,24 @@ bool RefoldMacroPatchPlanner::SubtreeReplayDoesNotContradictSiblingSurface(
   };
 
   for (const RefoldModel::MacroInvocation &inv :
-       (*deps_.Model).GetMacroInvocations()) {
-    if ((*deps_.MacroTopology).GetRootMacroId(inv.id) != root.id)
+       (*deps_.model).GetMacroInvocations()) {
+    if ((*deps_.macroTopology).GetRootMacroId(inv.id) != root.id)
       continue;
     for (const RefoldModel::PPArgSpan &span : inv.stringifySpans) {
       if (!HunkTouchesASpan(span.begin, span.end))
         continue;
 
       std::optional<std::pair<size_t, size_t>> bEnv =
-          (*deps_.SourceMapper)
+          (*deps_.sourceMapper)
               .MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
                   span.begin, span.end);
       if (!bEnv || bEnv->second <= bEnv->first)
         continue;
 
       std::optional<std::string> bPayload =
-          (*deps_.ArgTextRecovery)
+          (*deps_.argTextRecovery)
               .UnstringifyLiteralToArgText(
-                  (*deps_.SourceMapper).SliceBSource(bEnv->first, bEnv->second),
+                  (*deps_.sourceMapper).SliceBSource(bEnv->first, bEnv->second),
                   /*allowTopLevelComma=*/true);
       if (!bPayload)
         continue;
@@ -6163,7 +6164,7 @@ RefoldMacroPatchPlanner::ResolveFunctionLikeMacroThroughAliasesWithHops(
     return nullptr;
   SmallVector<std::string, 8> seen;
   std::string current = startName.trim().str();
-  for (size_t depth = 0; depth <= (*deps_.Model).GetMacroDirectives().size();
+  for (size_t depth = 0; depth <= (*deps_.model).GetMacroDirectives().size();
        ++depth) {
     if (llvm::is_contained(seen, current))
       return nullptr;
@@ -6172,7 +6173,7 @@ RefoldMacroPatchPlanner::ResolveFunctionLikeMacroThroughAliasesWithHops(
     const RefoldModel::MacroDirective *functionLike = nullptr;
     const RefoldModel::MacroDirective *alias = nullptr;
     for (const RefoldModel::MacroDirective &directive :
-         (*deps_.Model).GetMacroDirectives()) {
+         (*deps_.model).GetMacroDirectives()) {
       if (directive.subkind != "#define" ||
           directive.name != llvm::StringRef(current))
         continue;
@@ -6210,7 +6211,7 @@ RefoldMacroPatchPlanner::ResolveFunctionLikeMacroForReplay(
 bool RefoldMacroPatchPlanner::IsObjectLikeSingleTokenAlias(
     llvm::StringRef name) const {
   for (const RefoldModel::MacroDirective &directive :
-       (*deps_.Model).GetMacroDirectives()) {
+       (*deps_.model).GetMacroDirectives()) {
     if (directive.subkind != "#define" || directive.name != name ||
         directive.functionLike)
       continue;
@@ -6225,11 +6226,11 @@ bool RefoldMacroPatchPlanner::IsObjectLikeSingleTokenAlias(
 bool RefoldMacroPatchPlanner::TokenSpellingsEqualToA(
     llvm::ArrayRef<std::string> expected, uint64_t beginTok,
     uint64_t endTok) const {
-  if (endTok < beginTok || endTok > deps_.AToks.size() ||
+  if (endTok < beginTok || endTok > deps_.aToks.size() ||
       endTok - beginTok != expected.size())
     return false;
   for (size_t i = 0; i < expected.size(); ++i) {
-    if (deps_.AToks[static_cast<size_t>(beginTok) + i].spelling !=
+    if (deps_.aToks[static_cast<size_t>(beginTok) + i].spelling !=
         llvm::StringRef(expected[i]))
       return false;
   }
@@ -6239,11 +6240,11 @@ bool RefoldMacroPatchPlanner::TokenSpellingsEqualToA(
 bool RefoldMacroPatchPlanner::TokenSpellingsEqualToB(
     llvm::ArrayRef<std::string> expected, uint64_t beginTok,
     uint64_t endTok) const {
-  if (endTok < beginTok || endTok > deps_.BToks.size() ||
+  if (endTok < beginTok || endTok > deps_.bToks.size() ||
       endTok - beginTok != expected.size())
     return false;
   for (size_t i = 0; i < expected.size(); ++i) {
-    if (deps_.BToks[static_cast<size_t>(beginTok) + i].spelling !=
+    if (deps_.bToks[static_cast<size_t>(beginTok) + i].spelling !=
         llvm::StringRef(expected[i]))
       return false;
   }
@@ -6252,7 +6253,7 @@ bool RefoldMacroPatchPlanner::TokenSpellingsEqualToB(
 
 bool RefoldMacroPatchPlanner::HunkTouchesASpan(
     uint64_t begin, uint64_t end) const {
-  for (const diffutils::Hunk &hunk : (*deps_.ABTokHunks)) {
+  for (const diffutils::Hunk &hunk : (*deps_.abTokHunks)) {
     if (hunk.aStart < end && begin < hunk.aEnd)
       return true;
   }
@@ -6262,7 +6263,7 @@ bool RefoldMacroPatchPlanner::HunkTouchesASpan(
 bool RefoldMacroPatchPlanner::ReplacementObservesDirective(
     const RefoldModel::MacroDirective &directive, llvm::StringRef macroName,
     llvm::StringRef replacement) const {
-  return macroStateProof()
+  return GetMacroStateProof()
       .FirstMacroStateObservationOffsetInText(directive, macroName,
                                               replacement)
       .has_value();
@@ -6293,7 +6294,7 @@ bool RefoldMacroPatchPlanner::IsParenthesizedTuple(
     return false;
   SmallVector<TupleElementSlice, 8> elems;
   return splitTopLevelTupleElementsWithLexer(arg.drop_front().drop_back(),
-                                            (*deps_.LexLang), elems) &&
+                                            (*deps_.lexLang), elems) &&
          elems.size() >= 2;
 }
 
@@ -6319,7 +6320,7 @@ bool RefoldMacroPatchPlanner::StructurePreservingCallsiteHasStableFormalSyntax(
 
   auto parsedActuals =
       RefoldArgTextRecovery::LexMacroInvocationActualContentRanges(
-          patch.replacement, (*deps_.LexLang));
+          patch.replacement, (*deps_.lexLang));
   if (!parsedActuals) {
     REFOLD_LOG_TRACE("macro/proof",
           "suppress structure-preserving macro replay: inv id={0} "
@@ -6438,7 +6439,7 @@ RefoldMacroPatchPlanner::DerivePasteArgEdit(const RefoldModel::MacroInvocation &
   // Map the pasted token envelope in A to its corresponding envelope in B. For
   // paste edits we require a strict mapping: the A pasted token must map to
   // exactly one B token that we will diff against.
-  auto bEnvOpt = (*deps_.SourceMapper).MapAToBTokenEnvelopeByPPArgSpan(*tokenSpan);
+  auto bEnvOpt = (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(*tokenSpan);
   if (!bEnvOpt || bEnvOpt->second <= bEnvOpt->first)
     return std::nullopt;
 
@@ -6451,8 +6452,8 @@ RefoldMacroPatchPlanner::DerivePasteArgEdit(const RefoldModel::MacroInvocation &
   // Grab the raw token spellings for the pasted token in A and B.
   // tokenSpan.begin/end are A-token indices; bEnv[0]/bEnv[1] are B-token
   // indices.
-  StringRef aTokRaw = (*deps_.SourceMapper).SliceASource(tokenSpan->begin, tokenSpan->end);
-  StringRef bTokRaw = (*deps_.SourceMapper).SliceBSource(bEnvOpt->first, bEnvOpt->second);
+  StringRef aTokRaw = (*deps_.sourceMapper).SliceASource(tokenSpan->begin, tokenSpan->end);
+  StringRef bTokRaw = (*deps_.sourceMapper).SliceBSource(bEnvOpt->first, bEnvOpt->second);
 
   // Strip trailing newlines to stabilize within-token diffs.
   StringRef aTok = stringutils::stripTrailingNewlines(aTokRaw);
@@ -6589,7 +6590,7 @@ RefoldMacroPatchPlanner::DerivePasteArgEdits(const RefoldModel::MacroInvocation 
   // A.
   const auto *tokenSpan = cands[0];
 
-  auto bEnvOpt = (*deps_.SourceMapper).MapAToBTokenEnvelopeByPPArgSpan(*tokenSpan);
+  auto bEnvOpt = (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(*tokenSpan);
   if (!bEnvOpt || bEnvOpt->second <= bEnvOpt->first)
     return std::nullopt;
 
@@ -6598,8 +6599,8 @@ RefoldMacroPatchPlanner::DerivePasteArgEdits(const RefoldModel::MacroInvocation 
   if (bEnvOpt->second - bEnvOpt->first != 1)
     return std::nullopt;
 
-  StringRef aTokRaw = (*deps_.SourceMapper).SliceASource(tokenSpan->begin, tokenSpan->end);
-  StringRef bTokRaw = (*deps_.SourceMapper).SliceBSource(bEnvOpt->first, bEnvOpt->second);
+  StringRef aTokRaw = (*deps_.sourceMapper).SliceASource(tokenSpan->begin, tokenSpan->end);
+  StringRef bTokRaw = (*deps_.sourceMapper).SliceBSource(bEnvOpt->first, bEnvOpt->second);
 
   // Strip trailing newlines to stabilize within-token diffs for the
   // legacy source-slice segmenter. The replay-witness path below uses lexer
@@ -6616,9 +6617,9 @@ RefoldMacroPatchPlanner::DerivePasteArgEdits(const RefoldModel::MacroInvocation 
   // original part widths. All literal parts remain exact anchors.
   if (tokenSpan->end == tokenSpan->begin + 1 &&
       bEnvOpt->second == bEnvOpt->first + 1 &&
-      tokenSpan->begin < deps_.AToks.size() && bEnvOpt->first < deps_.BToks.size()) {
-    StringRef aTokSpelling = deps_.AToks[tokenSpan->begin].spelling;
-    StringRef bTokSpelling = deps_.BToks[bEnvOpt->first].spelling;
+      tokenSpan->begin < deps_.aToks.size() && bEnvOpt->first < deps_.bToks.size()) {
+    StringRef aTokSpelling = deps_.aToks[tokenSpan->begin].spelling;
+    StringRef bTokSpelling = deps_.bToks[bEnvOpt->first].spelling;
     if (const auto *witness =
             findPasteTokenWitnessForSpan(m, *tokenSpan, aTokSpelling)) {
       auto replay = segmentPastedTokenByReplayWitness(bTokSpelling, *witness);
@@ -7051,15 +7052,15 @@ bool RefoldMacroPatchPlanner::PasteArgReplacementsMatchAllPasteTokensInB(
       return false;
 
     // Map the A pasted-token occurrence to a single B token envelope.
-    auto bEnv = (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelope(beginTok, endTok);
+    auto bEnv = (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelope(beginTok, endTok);
     if (!bEnv || bEnv->second != bEnv->first + 1)
       return false;
 
     // Extract the pasted token text as produced in A and B. We strip newlines
     // defensively since slice helpers may include trailing '\n' depending on
     // how token ranges were formed.
-    std::string aTok = stripNewlines((*deps_.SourceMapper).SliceASource(beginTok, endTok));
-    std::string bTok = stripNewlines((*deps_.SourceMapper).SliceBSource(bEnv->first, bEnv->second));
+    std::string aTok = stripNewlines((*deps_.sourceMapper).SliceASource(beginTok, endTok));
+    std::string bTok = stripNewlines((*deps_.sourceMapper).SliceBSource(bEnv->first, bEnv->second));
 
     // Paste spans for this token reference character slices inside the pasted
     // token spelling. Apply edits in descending byteBegin so earlier rewrites
@@ -7309,17 +7310,17 @@ RefoldMacroPatchPlanner::GetCurrentLevelExpansionTextForInvocation(
     return std::nullopt;
 
   auto bEnv =
-      (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+      (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
           surface->coverBegin, surface->coverEnd);
   if (!bEnv || bEnv->first >= bEnv->second)
     return std::nullopt;
 
   return std::make_pair(
-      (*deps_.SourceMapper)
+      (*deps_.sourceMapper)
           .SliceASource(surface->coverBegin, surface->coverEnd)
           .trim()
           .str(),
-      (*deps_.SourceMapper)
+      (*deps_.sourceMapper)
           .SliceBSource(bEnv->first, bEnv->second)
           .trim()
           .str());
@@ -7329,10 +7330,10 @@ bool RefoldMacroPatchPlanner::ArgsOnlyTemplateReplayPreservesEnvelope(
     const RefoldModel::MacroInvocation &invocation,
     const CurrentLevelTemplateSurface &surface) const {
   std::optional<std::pair<size_t, size_t>> wholeBEnv =
-      (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+      (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
           surface.coverBegin, surface.coverEnd);
   if (!wholeBEnv || wholeBEnv->first >= wholeBEnv->second ||
-      wholeBEnv->second > deps_.BToks.size())
+      wholeBEnv->second > deps_.bToks.size())
     return false;
 
   struct ReplayElem {
@@ -7378,10 +7379,10 @@ bool RefoldMacroPatchPlanner::ArgsOnlyTemplateReplayPreservesEnvelope(
       if (!elem.argSpan)
         return false;
       elemBEnv =
-          (*deps_.SourceMapper).MapAToBTokenEnvelopeByPPArgSpan(*elem.argSpan);
+          (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(*elem.argSpan);
     } else {
       elemBEnv =
-          (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+          (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
               elem.begin, elem.end);
     }
     if (!elemBEnv || elemBEnv->first != bCursor ||
@@ -7396,8 +7397,8 @@ bool RefoldMacroPatchPlanner::ArgsOnlyTemplateReplayPreservesEnvelope(
       for (uint64_t i = 0; i < aLen; ++i) {
         const size_t ai = static_cast<size_t>(elem.begin + i);
         const size_t bi = elemBEnv->first + static_cast<size_t>(i);
-        if (ai >= deps_.AToks.size() || bi >= deps_.BToks.size() ||
-            deps_.AToks[ai].spelling != deps_.BToks[bi].spelling)
+        if (ai >= deps_.aToks.size() || bi >= deps_.bToks.size() ||
+            deps_.aToks[ai].spelling != deps_.bToks[bi].spelling)
           return false;
       }
     }
@@ -7465,7 +7466,7 @@ RefoldMacroPatchPlanner::TryTemplateSolvedArgsOnlyPatch(
     // The recursion follows recorded child invocation edges.  A path deeper
     // than the number of recorded invocations implies a cycle or stale
     // metadata, so use that structural bound instead of a fixed depth cap.
-    if (depth > (*deps_.Model).GetMacroInvocations().size() || !inv.invText ||
+    if (depth > (*deps_.model).GetMacroInvocations().size() || !inv.invText ||
         !inv.invB || !inv.invE || !inv.stringifySpans.empty() ||
         !inv.pasteSpans.empty())
       return std::nullopt;
@@ -7507,12 +7508,12 @@ RefoldMacroPatchPlanner::TryTemplateSolvedArgsOnlyPatch(
       StringRef baseTrim = rawArg.slice(trimLead, trimEnd);
 
       StringRef oldExpansion =
-          (*deps_.SourceMapper).SliceASource(sp.begin, sp.end).trim();
-      auto bEnv = (*deps_.SourceMapper).MapAToBTokenEnvelopeByPPArgSpan(sp);
+          (*deps_.sourceMapper).SliceASource(sp.begin, sp.end).trim();
+      auto bEnv = (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(sp);
       if (!bEnv)
         return std::nullopt;
       StringRef newExpansion =
-          (*deps_.SourceMapper).SliceBSource(bEnv->first, bEnv->second).trim();
+          (*deps_.sourceMapper).SliceBSource(bEnv->first, bEnv->second).trim();
       if (oldExpansion.empty() || newExpansion.empty())
         return std::nullopt;
 
@@ -7542,7 +7543,7 @@ RefoldMacroPatchPlanner::TryTemplateSolvedArgsOnlyPatch(
         // `callerMacroId` is honored when present, but absence of that edge
         // is not enough to accept a child; the file/range containment and the
         // expansion-bridge proof below still have to succeed.
-        for (const auto &child : (*deps_.Model).GetMacroInvocations()) {
+        for (const auto &child : (*deps_.model).GetMacroInvocations()) {
           if (child.id == inv.id || !child.invFile || !child.invB ||
               !child.invE || !child.invText)
             continue;
@@ -7629,7 +7630,7 @@ RefoldMacroPatchPlanner::TryTemplateSolvedArgsOnlyPatch(
       const bool allowComma =
           i < inv.defParams.size() && inv.defParams[i].variadic;
       if (!allowComma &&
-          refoldMacroActualHasTopLevelComma(StringRef(*replacement), (*deps_.LexLang)))
+          refoldMacroActualHasTopLevelComma(StringRef(*replacement), (*deps_.lexLang)))
         return std::nullopt;
 
       if (StringRef(*replacement).trim() != baseTrim)
@@ -7738,7 +7739,7 @@ RefoldMacroPatchPlanner::TryTemplateSolvedArgsOnlyPatch(
     StringRef baseArg =
         templateBaseInvocationText.substr(r.first, r.second - r.first).trim();
     StringRef occText =
-        (*deps_.SourceMapper).SliceASource(elem.aBegin, elem.aEnd).trim();
+        (*deps_.sourceMapper).SliceASource(elem.aBegin, elem.aEnd).trim();
     if (occText != baseArg)
       needsCrossOccurrenceProof = true;
   }
@@ -7770,7 +7771,7 @@ RefoldMacroPatchPlanner::TryTemplateSolvedArgsOnlyPatch(
   if (cursor != cover->second)
     return std::nullopt;
 
-  auto bEnv = (*deps_.SourceMapper)
+  auto bEnv = (*deps_.sourceMapper)
                   .MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
                       cover->first, cover->second);
   if (!bEnv || bEnv->first >= bEnv->second)
@@ -7788,8 +7789,8 @@ RefoldMacroPatchPlanner::TryTemplateSolvedArgsOnlyPatch(
     if (bPos + len > bEnv->second)
       return false;
     for (size_t i = 0; i < len; ++i) {
-      if (deps_.AToks[static_cast<size_t>(elem.aBegin) + i].spelling !=
-          deps_.BToks[bPos + i].spelling)
+      if (deps_.aToks[static_cast<size_t>(elem.aBegin) + i].spelling !=
+          deps_.bToks[bPos + i].spelling)
         return false;
     }
     return true;
@@ -7856,7 +7857,7 @@ RefoldMacroPatchPlanner::TryTemplateSolvedArgsOnlyPatch(
     bool matched = false;
     SmallVector<RefoldModel::TupleArgRef, 8> matchedRefs;
 
-    for (const auto &cand : (*deps_.Model).GetMacroInvocations()) {
+    for (const auto &cand : (*deps_.model).GetMacroInvocations()) {
       // Only direct children of the current invocation can provide direct
       // tuple references for this caller argument.
       if (!cand.callerMacroId || *cand.callerMacroId != templateInvocation.id)
@@ -7985,13 +7986,13 @@ RefoldMacroPatchPlanner::TryTemplateSolvedArgsOnlyPatch(
         if (!occElem)
           return std::nullopt;
 
-        oldOccs.push_back((*deps_.SourceMapper)
+        oldOccs.push_back((*deps_.sourceMapper)
                               .SliceASource(occElem->aBegin, occElem->aEnd)
                               .trim()
                               .str());
 
         const auto &range = sol[occOrdinal];
-        newOccs.push_back((*deps_.SourceMapper)
+        newOccs.push_back((*deps_.sourceMapper)
                               .SliceBSource(range.first, range.second)
                               .trim()
                               .str());
@@ -8026,7 +8027,7 @@ RefoldMacroPatchPlanner::TryTemplateSolvedArgsOnlyPatch(
         // nested syntax, comments, strings, or character literals as element
         // separators.
         SmallVector<TupleElementSlice, 8> tupleElems;
-        if (!splitTopLevelTupleElementsWithLexer(baseTrim, (*deps_.LexLang),
+        if (!splitTopLevelTupleElementsWithLexer(baseTrim, (*deps_.lexLang),
                                                  tupleElems))
           return std::nullopt;
         if (tupleElems.size() != oldOccs.size())
@@ -8082,7 +8083,7 @@ RefoldMacroPatchPlanner::TryTemplateSolvedArgsOnlyPatch(
       if (replacement.empty())
         return std::nullopt;
       if (!isMacroInvocationVariadicFormal(templateInvocation, argIdx) &&
-          replacementIntroducesTopLevelComma(replacement, (*deps_.LexLang)))
+          replacementIntroducesTopLevelComma(replacement, (*deps_.lexLang)))
         return std::nullopt;
 
       if (StringRef(replacement).trim() != baseTrim)
@@ -8286,7 +8287,7 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
         as.argIdx >= m.defParams.size() || !m.defParams[as.argIdx].variadic)
       continue;
     std::optional<std::pair<size_t, size_t>> bArg =
-        (*deps_.SourceMapper).MapAToBTokenEnvelopeByPPArgSpan(as);
+        (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(as);
     if (bArg && bArg->first == bArg->second) {
       hasVariadicFormalErasedInB = true;
       break;
@@ -8410,7 +8411,7 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
     // first token produced by this macro invocation and therefore lets the
     // definition tape decide which identical boundary literal is fixed macro
     // body and which token belongs to the rewritten formal.
-    bEnv = (*deps_.SourceMapper).MapAByteRangeToBTokenEnvelope(
+    bEnv = (*deps_.sourceMapper).MapAByteRangeToBTokenEnvelope(
         static_cast<size_t>(*m.invPPByteBegin),
         static_cast<size_t>(*m.invPPByteEnd));
 
@@ -8432,7 +8433,7 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
     // definition-tape solver below must still replay the entire adjusted
     // envelope and reconstruct one concrete invocation rewrite.
     if (bEnv && h.bEnd <= static_cast<uint64_t>(bEnv->first) &&
-        h.bEnd > h.bStart && h.bEnd <= deps_.BToks.size()) {
+        h.bEnd > h.bStart && h.bEnd <= deps_.bToks.size()) {
       SmallVector<StringRef, 8> fixedLiteralPrefix;
       for (const ReplayElem &elem : pattern) {
         if (elem.kind != ReplayElem::Kind::Literal)
@@ -8450,8 +8451,8 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
       // identical replacement-list punctuation and the ordinary byte envelope
       // remains the only proven replay surface.
       if (canReanchorAtPostInsertionFrontier) {
-        if (h.bStart >= deps_.BToks.size() || fixedLiteralPrefix.empty() ||
-            deps_.BToks[static_cast<size_t>(h.bStart)].spelling !=
+        if (h.bStart >= deps_.bToks.size() || fixedLiteralPrefix.empty() ||
+            deps_.bToks[static_cast<size_t>(h.bStart)].spelling !=
                 fixedLiteralPrefix.front()) {
           canReanchorAtPostInsertionFrontier = false;
         }
@@ -8459,8 +8460,8 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
 
       for (size_t i = 0; canReanchorAtPostInsertionFrontier &&
                          i < skippedPrefixWidth; ++i) {
-        if (postInsertionFrontier + i >= deps_.BToks.size() ||
-            deps_.BToks[postInsertionFrontier + i].spelling !=
+        if (postInsertionFrontier + i >= deps_.bToks.size() ||
+            deps_.bToks[postInsertionFrontier + i].spelling !=
                 fixedLiteralPrefix[i]) {
           canReanchorAtPostInsertionFrontier = false;
           break;
@@ -8491,11 +8492,11 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
           *m.invPPByteBegin, *m.invPPByteEnd, bEnv->first, bEnv->second);
     }
   } else {
-    bEnv = (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+    bEnv = (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
         cover->first, cover->second);
   }
   if (!bEnv || bEnv->first > bEnv->second ||
-      bEnv->second > deps_.BToks.size())
+      bEnv->second > deps_.bToks.size())
     return std::nullopt;
   // Count the old A-token contribution per formal.  The B replay uses this
   // to distinguish true empty-formal insertions, where a zero-length B range
@@ -8528,9 +8529,9 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
       return false;
     if (sol.assigned[argIdx]) {
       StringRef oldText =
-          (*deps_.SourceMapper).SliceBSource(sol.ranges[argIdx].first, sol.ranges[argIdx].second)
+          (*deps_.sourceMapper).SliceBSource(sol.ranges[argIdx].first, sol.ranges[argIdx].second)
               .trim();
-      StringRef newText = (*deps_.SourceMapper).SliceBSource(range.first, range.second).trim();
+      StringRef newText = (*deps_.sourceMapper).SliceBSource(range.first, range.second).trim();
       return oldText == newText;
     }
     sol.assigned[argIdx] = 1;
@@ -8560,7 +8561,7 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
     const ReplayElem &elem = elems[elemIdx];
     switch (elem.kind) {
     case ReplayElem::Kind::Literal:
-      if (bPos < bEnv->second && deps_.BToks[bPos].spelling == elem.spelling)
+      if (bPos < bEnv->second && deps_.bToks[bPos].spelling == elem.spelling)
         dfsElems(elems, elemIdx + 1, bPos + 1, sol, done);
       return;
     case ReplayElem::Kind::Param: {
@@ -8694,7 +8695,7 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
         return std::nullopt;
       std::string repl;
       if (sol.assigned[i])
-        repl = (*deps_.SourceMapper).SliceBSource(sol.ranges[i].first, sol.ranges[i].second)
+        repl = (*deps_.sourceMapper).SliceBSource(sol.ranges[i].first, sol.ranges[i].second)
                    .trim()
                    .str();
       else if (i < m.defParams.size() && m.defParams[i].variadic)
@@ -8716,7 +8717,7 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
           baseInvText.slice(r.first, r.second).trim())
         continue;
       if (i < m.defParams.size() && !m.defParams[i].variadic &&
-          !repl.empty() && replacementIntroducesTopLevelComma(repl, (*deps_.LexLang)))
+          !repl.empty() && replacementIntroducesTopLevelComma(repl, (*deps_.lexLang)))
         return std::nullopt;
 
       size_t editBegin = r.first;
@@ -8832,7 +8833,7 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
 
   const size_t parsedActualCount = [&]() -> size_t {
     auto parsed = RefoldArgTextRecovery::LexMacroInvocationActualContentRanges(
-        baseInvText, (*deps_.LexLang));
+        baseInvText, (*deps_.lexLang));
     return parsed ? parsed->size() : invArgRanges.size();
   }();
 
@@ -8845,7 +8846,7 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
     state.missing = parsedActualCount <= idx;
     state.explicitEmpty = !state.missing && text.empty();
     state.nonEmpty = !text.empty();
-    state.literalComma = state.nonEmpty && replacementIntroducesTopLevelComma(text, (*deps_.LexLang));
+    state.literalComma = state.nonEmpty && replacementIntroducesTopLevelComma(text, (*deps_.lexLang));
     return state;
   }();
 
@@ -8861,12 +8862,12 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
     const bool resultNonEmpty =
         assigned && sol.ranges[idx].first < sol.ranges[idx].second;
     const std::string resultText =
-        assigned ? (*deps_.SourceMapper).SliceBSource(sol.ranges[idx].first, sol.ranges[idx].second)
+        assigned ? (*deps_.sourceMapper).SliceBSource(sol.ranges[idx].first, sol.ranges[idx].second)
                        .trim()
                        .str()
                  : std::string();
     const bool literalComma =
-        !resultText.empty() && replacementIntroducesTopLevelComma(StringRef(resultText), (*deps_.LexLang));
+        !resultText.empty() && replacementIntroducesTopLevelComma(StringRef(resultText), (*deps_.lexLang));
     const bool vaOptResultActive = hasVaOpt && vaOptIncludedCount != 0;
     const bool vaOptOriginallyActive =
         hasVaOpt && originalVariadicState.nonEmpty;
@@ -8928,10 +8929,10 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
         assigned && sol.ranges[idx].first < sol.ranges[idx].second;
     if (assigned && witness.resultNonEmpty) {
       std::string text =
-          (*deps_.SourceMapper).SliceBSource(sol.ranges[idx].first, sol.ranges[idx].second)
+          (*deps_.sourceMapper).SliceBSource(sol.ranges[idx].first, sol.ranges[idx].second)
               .trim()
               .str();
-      witness.literalCommaInActual |= replacementIntroducesTopLevelComma(StringRef(text), (*deps_.LexLang));
+      witness.literalCommaInActual |= replacementIntroducesTopLevelComma(StringRef(text), (*deps_.lexLang));
     }
     witness.commaInserted =
         !witness.originalNonEmpty && witness.resultNonEmpty;
@@ -9074,8 +9075,8 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
   for (const ScoredSolution &scored : validSolutions)
     equivalenceClasses[scored.equivalenceKey].push_back(&scored);
 
-  if (proofLattice().ShouldEmitProofLog()) {
-    proofLattice().TraceWitnessAmbiguity("MacroActualDefinitionTapeReplay",
+  if (GetProofLattice().ShouldEmitProofLog()) {
+    GetProofLattice().TraceWitnessAmbiguity("MacroActualDefinitionTapeReplay",
                           solutions.size(), validSolutions.size(),
                           equivalenceClasses.size());
   }
@@ -9084,13 +9085,13 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
   // the refined variadic/VA_OPT key leaves exactly one semantic class.  If a
   // variadic replay still exposes multiple non-equivalent classes, keep the
   // legacy deterministic representative for now rather than guessing through
-  // this local gate; the global resolver stage will decide how such
-  // cross-class fallbacks compose with weaker proof families.
+  // this local gate; the global resolver decides how such cross-class
+  // fallbacks compose with weaker proof families.
   const bool definitionTapeEquivalenceAuthoritative =
       (!hasVariadicFormal && !hasVaOpt) || equivalenceClasses.size() == 1;
   if (definitionTapeEquivalenceAuthoritative &&
       equivalenceClasses.size() != 1) {
-    if (proofLattice().ShouldEmitProofLog()) {
+    if (GetProofLattice().ShouldEmitProofLog()) {
       RefoldWitness witness;
       witness.family = WitnessProofFamily::DefinitionTapeReplay;
       witness.owner = llvm::formatv("macro#{0}", m.id).str();
@@ -9099,7 +9100,7 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
                            definition->id, bEnv->first, bEnv->second,
                            equivalenceClasses.size())
                            .str();
-      proofLattice().TraceWitnessRejected(
+      GetProofLattice().TraceWitnessRejected(
           witness, WitnessRejectReason::NonEquivalentAmbiguity,
           "definition-tape replay produced multiple semantic classes");
     }
@@ -9147,7 +9148,7 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
           best->sol, static_cast<unsigned>(best->vaOptIncludedCount))) {
     MacroPatchProof proof = patch.proof;
     proof.variadicCommaReplay = std::move(*variadicWitness);
-    proofLattice().SetMacroPatchProof(patch, std::move(proof));
+    GetProofLattice().SetMacroPatchProof(patch, std::move(proof));
   }
 
   // definition-tape replay is the producer proof for empty actuals
@@ -9187,7 +9188,7 @@ RefoldMacroPatchPlanner::TryDefinitionTapeReplayArgsOnlyPatch(
             producerObligationKeyForSolution(best->sol))
             .str();
     proof.zeroTokenBoundaryReplay = std::move(witness);
-    proofLattice().SetMacroPatchProof(patch, std::move(proof));
+    GetProofLattice().SetMacroPatchProof(patch, std::move(proof));
   }
   return patch;
 
@@ -9249,7 +9250,7 @@ RefoldMacroPatchPlanner::BuildPasteAwareArgsOnlyPatch(
       // If the argument is not the variadic formal, replacing it with a
       // text that introduces a top-level comma would change the macro
       // invocation's argument list.
-      if (!isMacroInvocationVariadicFormal(m, argIdx) && replacementIntroducesTopLevelComma(newArg, (*deps_.LexLang)))
+      if (!isMacroInvocationVariadicFormal(m, argIdx) && replacementIntroducesTopLevelComma(newArg, (*deps_.lexLang)))
         return ArgsOnlyPatchAttempt::RejectResult();
 
       auto existing = replByArgIdx.find(argIdx);
@@ -9296,16 +9297,16 @@ RefoldMacroPatchPlanner::BuildPasteAwareArgsOnlyPatch(
         // source argument rewrite regenerates, not merely the first changed
         // pasted-token hunk.
         StampMacroPatchWholeExpansionBRange(m, patch);
-        proofLattice().SetMacroPatchProof(
+        GetProofLattice().SetMacroPatchProof(
             patch,
-            proofLattice().MakeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPasteMulti,
+            GetProofLattice().MakeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPasteMulti,
                                 /*preservesInvocationStructure=*/true, m.id));
         // The builder already proved this rewrite by replaying the rewritten
         // invocation arguments against every pasted token occurrence in B.
         // Carry that proof source onto the accepted patch for converted
         // selector-site discharge.
         patch.pasteReplayValidated = true;
-        proofLattice().SyncMacroPatchProofSummary(patch);
+        GetProofLattice().SyncMacroPatchProofSummary(patch);
         return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
       }
     }
@@ -9343,7 +9344,7 @@ RefoldMacroPatchPlanner::BuildPasteAwareArgsOnlyPatch(
         return ArgsOnlyPatchAttempt::RejectResult();
     }
 
-    if (!isMacroInvocationVariadicFormal(m, argIdx) && replacementIntroducesTopLevelComma(newArg, (*deps_.LexLang)))
+    if (!isMacroInvocationVariadicFormal(m, argIdx) && replacementIntroducesTopLevelComma(newArg, (*deps_.lexLang)))
       return ArgsOnlyPatchAttempt::RejectResult();
 
     // Safety gate: for single-segment paste edits we can directly validate
@@ -9369,15 +9370,15 @@ RefoldMacroPatchPlanner::BuildPasteAwareArgsOnlyPatch(
       // compact representation of the macro's replayed expansion surface.
       // Keep the B-side map anchored to that whole expansion envelope.
       StampMacroPatchWholeExpansionBRange(m, patch);
-      proofLattice().SetMacroPatchProof(
+      GetProofLattice().SetMacroPatchProof(
           patch,
-          proofLattice().MakeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPasteSingle,
+          GetProofLattice().MakeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPasteSingle,
                               /*preservesInvocationStructure=*/true, m.id));
       // Single-segment paste rewrites are admitted only after direct replay
       // validation against all touched occurrences in B. Record that proof
       // source explicitly for converted selector-site discharge.
       patch.pasteReplayValidated = true;
-      proofLattice().SyncMacroPatchProofSummary(patch);
+      GetProofLattice().SyncMacroPatchProofSummary(patch);
       return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
     }
   }
@@ -9424,7 +9425,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
         !definition->functionLike || definition->name != m.name ||
         definition->defParams.size() != m.defParams.size() || out.empty() ||
         !m.stringifySpans.empty() || !m.pasteSpans.empty() ||
-        !m.cover.IsValid() || m.cover.end > deps_.AToks.size())
+        !m.cover.IsValid() || m.cover.end > deps_.aToks.size())
       return out;
 
     // Extract the formal-reference order from the macro replacement-list tape.
@@ -9457,8 +9458,8 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
          definition->replacementTokens) {
       switch (repTok.kind) {
       case RefoldModel::MacroReplacementTokenKind::Literal:
-        if (tok >= m.cover.end || tok >= deps_.AToks.size() ||
-            deps_.AToks[static_cast<size_t>(tok)].spelling != repTok.spelling)
+        if (tok >= m.cover.end || tok >= deps_.aToks.size() ||
+            deps_.aToks[static_cast<size_t>(tok)].spelling != repTok.spelling)
           return m.argSpans;
         ++tok;
         break;
@@ -9468,7 +9469,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
         const RefoldModel::PPArgSpan &sp = out[argSpanIdx];
         if (sp.kind != PPArgSpanKind::Standard || sp.begin != tok ||
             sp.begin >= sp.end || sp.end > m.cover.end ||
-            sp.end > deps_.AToks.size())
+            sp.end > deps_.aToks.size())
           return m.argSpans;
         tok = sp.end;
         ++argSpanIdx;
@@ -9564,7 +9565,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
 
       // A non-variadic macro formal cannot be rewritten to text containing a
       // top-level comma, because that would change call-site arity.
-      if (!isMacroInvocationVariadicFormal(m, argIdx) && replacementIntroducesTopLevelComma(newArg, (*deps_.LexLang))) {
+      if (!isMacroInvocationVariadicFormal(m, argIdx) && replacementIntroducesTopLevelComma(newArg, (*deps_.lexLang))) {
         return std::nullopt;
       }
 
@@ -9608,14 +9609,14 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
       // a smaller B-side surface.  The proved replay unit is the full expansion
       // cover reconstructed from the rewritten invocation arguments.
       StampMacroPatchWholeExpansionBRange(m, patch);
-      proofLattice().SetMacroPatchProof(
+      GetProofLattice().SetMacroPatchProof(
           patch,
-          proofLattice().MakeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPurePasteOnly,
+          GetProofLattice().MakeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPurePasteOnly,
                               /*preservesInvocationStructure=*/true, m.id));
       // Pure-paste-only rewrites have no standard or stringify occurrences to
       // lean on, so successful all-paste replay is the decisive proof source.
       patch.pasteReplayValidated = true;
-      proofLattice().SyncMacroPatchProofSummary(patch);
+      GetProofLattice().SyncMacroPatchProofSummary(patch);
       return patch;
     }
   }
@@ -9647,16 +9648,16 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
         m.stringifySpans.empty() && m.pasteSpans.empty()) {
       auto cover = GetWholeCoverATokRange(m);
       if (cover && cover->first < cover->second) {
-        auto bEnv = (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelope(
+        auto bEnv = (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelope(
             cover->first, cover->second);
         if (!bEnv || bEnv->first >= bEnv->second)
-          bEnv = (*deps_.SourceMapper)
+          bEnv = (*deps_.sourceMapper)
                      .MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
                          cover->first, cover->second);
         if (bEnv && bEnv->first < bEnv->second) {
           const RefoldModel::MacroDirective *rootDefinition = nullptr;
           for (const RefoldModel::MacroDirective &directive :
-               (*deps_.Model).GetMacroDirectives()) {
+               (*deps_.model).GetMacroDirectives()) {
             if (directive.id == *m.definitionDirectiveId) {
               rootDefinition = &directive;
               break;
@@ -9736,7 +9737,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
     if (m.definitionDirectiveId && m.invB && m.invE) {
       const RefoldModel::MacroDirective *rootDefinition = nullptr;
       for (const RefoldModel::MacroDirective &directive :
-           (*deps_.Model).GetMacroDirectives()) {
+           (*deps_.model).GetMacroDirectives()) {
         if (directive.id == *m.definitionDirectiveId) {
           rootDefinition = &directive;
           break;
@@ -9760,36 +9761,36 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
 
         auto cover = GetWholeCoverATokRange(m);
         if (hasGeneratedCall && cover && cover->first < cover->second) {
-          auto bEnv = (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelope(
+          auto bEnv = (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelope(
               cover->first, cover->second);
           if (!bEnv || bEnv->first >= bEnv->second)
-            bEnv = (*deps_.SourceMapper)
+            bEnv = (*deps_.sourceMapper)
                        .MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
                            cover->first, cover->second);
           if (bEnv && bEnv->first < bEnv->second) {
             StringRef oldExpansion =
-                (*deps_.SourceMapper).SliceASource(cover->first, cover->second)
+                (*deps_.sourceMapper).SliceASource(cover->first, cover->second)
                     .trim();
             StringRef newExpansion =
-                (*deps_.SourceMapper).SliceBSource(bEnv->first, bEnv->second)
+                (*deps_.sourceMapper).SliceBSource(bEnv->first, bEnv->second)
                     .trim();
 
             if (oldExpansion == newExpansion && h.isInsertOnly() &&
                 h.aStart == cover->second && h.bStart == bEnv->second &&
                 h.bStart < h.bEnd) {
               bEnv->second = static_cast<size_t>(h.bEnd);
-              newExpansion = (*deps_.SourceMapper)
+              newExpansion = (*deps_.sourceMapper)
                                  .SliceBSource(bEnv->first, bEnv->second)
                                  .trim();
             }
 
             bool rootHasGeneratedSelectorDescendant = false;
             for (const RefoldModel::MacroInvocation &candidate :
-                 (*deps_.Model).GetMacroInvocations()) {
+                 (*deps_.model).GetMacroInvocations()) {
               const RefoldModel::MacroInvocation *cur = &candidate;
               bool isDescendant = false;
               for (size_t depth = 0;
-                   cur && depth <= (*deps_.Model).GetMacroInvocations().size();
+                   cur && depth <= (*deps_.model).GetMacroInvocations().size();
                    ++depth) {
                 if (cur->id == m.id) {
                   isDescendant = true;
@@ -9797,7 +9798,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
                 }
                 if (!cur->callerMacroId)
                   break;
-                cur = (*deps_.MacroTopology)
+                cur = (*deps_.macroTopology)
                           .FindMacroInvocationById(*cur->callerMacroId);
               }
               if (!isDescendant)
@@ -9814,13 +9815,13 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
                 (h.aStart == cover->first || h.aStart == cover->second)) {
               while (bEnv->first > 0 &&
                      bEnv->first - 1 <
-                         deps_.BInsertionLedger->BTokToInsertionId().size()) {
+                         deps_.bInsertionLedger->BTokToInsertionId().size()) {
                 int32_t insId =
-                    deps_.BInsertionLedger->BTokToInsertionId()[bEnv->first - 1];
+                    deps_.bInsertionLedger->BTokToInsertionId()[bEnv->first - 1];
                 if (insId < 0)
                   break;
                 const BInsertionProv &ins =
-                    deps_.BInsertionLedger
+                    deps_.bInsertionLedger
                         ->Insertions()[static_cast<size_t>(insId)];
                 if (ins.claim == BInsertionClaim::Standalone ||
                     ins.aGap != cover->first || ins.b1 != bEnv->first)
@@ -9828,20 +9829,20 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
                 bEnv->first = ins.b0;
               }
               while (bEnv->second <
-                     deps_.BInsertionLedger->BTokToInsertionId().size()) {
+                     deps_.bInsertionLedger->BTokToInsertionId().size()) {
                 int32_t insId =
-                    deps_.BInsertionLedger->BTokToInsertionId()[bEnv->second];
+                    deps_.bInsertionLedger->BTokToInsertionId()[bEnv->second];
                 if (insId < 0)
                   break;
                 const BInsertionProv &ins =
-                    deps_.BInsertionLedger
+                    deps_.bInsertionLedger
                         ->Insertions()[static_cast<size_t>(insId)];
                 if (ins.claim == BInsertionClaim::Standalone ||
                     ins.aGap != cover->second || ins.b0 != bEnv->second)
                   break;
                 bEnv->second = ins.b1;
               }
-              newExpansion = (*deps_.SourceMapper)
+              newExpansion = (*deps_.sourceMapper)
                                  .SliceBSource(bEnv->first, bEnv->second)
                                  .trim();
             }
@@ -9882,16 +9883,16 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
         m.stringifySpans.empty() && m.pasteSpans.empty()) {
       auto cover = GetWholeCoverATokRange(m);
       if (cover && cover->first < cover->second) {
-        auto bEnv = (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelope(
+        auto bEnv = (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelope(
             cover->first, cover->second);
         if (!bEnv || bEnv->first >= bEnv->second)
-          bEnv = (*deps_.SourceMapper)
+          bEnv = (*deps_.sourceMapper)
                      .MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
                          cover->first, cover->second);
         if (bEnv && bEnv->first < bEnv->second) {
           const RefoldModel::MacroDirective *rootDefinition = nullptr;
           for (const RefoldModel::MacroDirective &directive :
-               (*deps_.Model).GetMacroDirectives()) {
+               (*deps_.model).GetMacroDirectives()) {
             if (directive.id == *m.definitionDirectiveId) {
               rootDefinition = &directive;
               break;
@@ -9932,7 +9933,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
     return std::nullopt;
 
   std::vector<char> touchedOcc(occs.size(), 0);
-  if (!(*deps_.SourceMapper).HunkFullyWithinArgSpans(hArgs, occs, touchedOcc)) {
+  if (!(*deps_.sourceMapper).HunkFullyWithinArgSpans(hArgs, occs, touchedOcc)) {
     return std::nullopt;
   }
 
@@ -9965,7 +9966,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
     // argument-span ownership helper to prove that the B insertion belongs to
     // this occurrence.
     if (cand.aStart == cand.aEnd) {
-      auto bEnv = (*deps_.SourceMapper).MapAToBTokenEnvelopeByPPArgSpan(sp);
+      auto bEnv = (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(sp);
       if (!bEnv)
         return false;
       return OccurrenceReplay().GetOwnedPureInsertionBRangeForArgSpan(sp, occs, *bEnv, cand)
@@ -9984,7 +9985,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
   // the complete split edit before deciding whether an args-only rewrite is
   // actually proven.
   if (hArgs.aStart == hArgs.aEnd && hArgs.bStart < hArgs.bEnd) {
-    for (const diffutils::Hunk &cand : (*deps_.ABTokHunks)) {
+    for (const diffutils::Hunk &cand : (*deps_.abTokHunks)) {
       if (cand.aStart < m.cover.begin || cand.aEnd > m.cover.end)
         continue;
       if (cand.bStart >= cand.bEnd)
@@ -10018,7 +10019,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
   // Add sibling token hunks that also touch the same formal arguments. The
   // eventual argument replacement must explain the complete set of token edits
   // for those formals, otherwise we could accept a partial rewrite.
-  for (const auto &cand : (*deps_.ABTokHunks)) {
+  for (const auto &cand : (*deps_.abTokHunks)) {
     if (cand.aStart == hArgs.aStart && cand.aEnd == hArgs.aEnd &&
         cand.bStart == hArgs.bStart && cand.bEnd == hArgs.bEnd)
       continue;
@@ -10037,7 +10038,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
         if (anchor.aStart < m.cover.begin || anchor.aEnd > m.cover.end)
           return;
 
-        for (const auto &partner : (*deps_.ABTokHunks)) {
+        for (const auto &partner : (*deps_.abTokHunks)) {
           if (sameTokenHunk(anchor, partner))
             continue;
 
@@ -10051,7 +10052,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
 
           const diffutils::Hunk env =
               buildCombinedInsertionEnvelope(anchor, partner);
-          const diffutils::Hunk envTrim = trimCommonEdgeTokens(env, deps_.AToks, deps_.BToks);
+          const diffutils::Hunk envTrim = trimCommonEdgeTokens(env, deps_.aToks, deps_.bToks);
 
           // The trimmed synthetic envelope must expose a real A-side token
           // range.
@@ -10064,7 +10065,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
             continue;
 
           SmallVector<char, 8> envTouched(occs.size(), 0);
-          if (!(*deps_.SourceMapper).HunkFullyWithinArgSpans(envTrim, occs, envTouched))
+          if (!(*deps_.sourceMapper).HunkFullyWithinArgSpans(envTrim, occs, envTouched))
             continue;
 
           bool touchesThisExactOccurrence = false;
@@ -10231,7 +10232,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
 
       SmallVector<std::string, 8> seen;
       std::string current = startName.str();
-      for (size_t depth = 0; depth <= (*deps_.Model).GetMacroDirectives().size();
+      for (size_t depth = 0; depth <= (*deps_.model).GetMacroDirectives().size();
            ++depth) {
         if (llvm::is_contained(seen, current))
           return nullptr;
@@ -10240,7 +10241,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
         const RefoldModel::MacroDirective *functionLike = nullptr;
         const RefoldModel::MacroDirective *alias = nullptr;
         for (const RefoldModel::MacroDirective &directive :
-             (*deps_.Model).GetMacroDirectives()) {
+             (*deps_.model).GetMacroDirectives()) {
           if (directive.subkind != "#define" ||
               directive.name != StringRef(current))
             continue;
@@ -10288,7 +10289,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
 
       const RefoldModel::MacroDirective *rootDefinition = nullptr;
       for (const RefoldModel::MacroDirective &directive :
-           (*deps_.Model).GetMacroDirectives()) {
+           (*deps_.model).GetMacroDirectives()) {
         if (directive.id == *m.definitionDirectiveId) {
           rootDefinition = &directive;
           break;
@@ -10327,7 +10328,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
         return false;
       StringRef tuplePayload = parentTrim.drop_front().drop_back();
       SmallVector<TupleElementSlice, 8> tupleElems;
-      if (!splitTopLevelTupleElementsWithLexer(tuplePayload, (*deps_.LexLang),
+      if (!splitTopLevelTupleElementsWithLexer(tuplePayload, (*deps_.lexLang),
                                                tupleElems))
         return false;
       if (tupleElems.size() < 2)
@@ -10470,9 +10471,9 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
                                  SmallVectorImpl<ReplayTok> &out) {
         out.clear();
         SmallVector<RefoldLexBoundaryToken, 32> toks;
-        refoldLexBoundaryTokens(text, (*deps_.LexLang), toks);
+        refoldLexBoundaryTokens(text, (*deps_.lexLang), toks);
         for (const RefoldLexBoundaryToken &tok : toks)
-          out.push_back(ReplayTok{tok.Spelling, tok.Begin, tok.End});
+          out.push_back(ReplayTok{tok.spelling, tok.begin, tok.end});
       };
 
       auto tokenSpellingsForText = [&](StringRef text) {
@@ -11125,7 +11126,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
     // Search direct children of the current macro invocation for exactly one
     // forwarding witness. Multiple usable children would make the caller tuple
     // rewrite ambiguous, so the code fails closed if more than one is found.
-    for (const auto &cand : (*deps_.Model).GetMacroInvocations()) {
+    for (const auto &cand : (*deps_.model).GetMacroInvocations()) {
       if (!cand.callerMacroId || *cand.callerMacroId != m.id)
         continue;
 
@@ -11307,7 +11308,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
 
         const RefoldModel::MacroDirective *childDefinition = nullptr;
         for (const RefoldModel::MacroDirective &directive :
-             (*deps_.Model).GetMacroDirectives()) {
+             (*deps_.model).GetMacroDirectives()) {
           if (directive.id == *tupleChild->definitionDirectiveId) {
             childDefinition = &directive;
             break;
@@ -11351,7 +11352,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
 
         const RefoldModel::MacroDirective *calleeDefinition = nullptr;
         for (const RefoldModel::MacroDirective &directive :
-             (*deps_.Model).GetMacroDirectives()) {
+             (*deps_.model).GetMacroDirectives()) {
           if (directive.subkind == "#define" && directive.functionLike &&
               directive.name == *calleeName) {
             if (calleeDefinition)
@@ -11402,9 +11403,9 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
                                    SmallVectorImpl<ReplayTok> &out) {
           out.clear();
           SmallVector<RefoldLexBoundaryToken, 16> toks;
-          refoldLexBoundaryTokens(text, (*deps_.LexLang), toks);
+          refoldLexBoundaryTokens(text, (*deps_.lexLang), toks);
           for (const RefoldLexBoundaryToken &tok : toks)
-            out.push_back(ReplayTok{tok.Spelling, tok.Begin, tok.End});
+            out.push_back(ReplayTok{tok.spelling, tok.begin, tok.end});
         };
 
         auto tokenSpellingsForText = [&](StringRef text) {
@@ -11603,7 +11604,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
 
       // Split the caller variadic argument into top-level elements using the
       // lexer-backed splitter so nested commas do not create false elements.
-      if (!splitTopLevelTupleElementsWithLexer(parentTrim, (*deps_.LexLang),
+      if (!splitTopLevelTupleElementsWithLexer(parentTrim, (*deps_.lexLang),
                                                tupleElems))
         return false;
 
@@ -11652,7 +11653,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
   auto maybeExtendRightBoundaryClosers =
       [&](const RefoldModel::PPArgSpan &sp, std::pair<size_t, size_t> env,
           StringRef oldText) -> std::pair<size_t, size_t> {
-    StringRef curText = (*deps_.SourceMapper).SliceBSource(env.first, env.second).trim();
+    StringRef curText = (*deps_.sourceMapper).SliceBSource(env.first, env.second).trim();
     auto oldBal = computeDelimiterBalance(oldText);
     auto newBal = computeDelimiterBalance(curText);
 
@@ -11672,9 +11673,9 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
     // text that already matches on both sides and exactly satisfies the missing
     // delimiter balance.
     while ((needParen > 0 || needBracket > 0 || needBrace > 0) &&
-           aPos < deps_.AToks.size() && bPos < deps_.BToks.size()) {
-      StringRef aTok = deps_.AToks[static_cast<size_t>(aPos)].spelling;
-      StringRef bTok = deps_.BToks[bPos].spelling;
+           aPos < deps_.aToks.size() && bPos < deps_.bToks.size()) {
+      StringRef aTok = deps_.aToks[static_cast<size_t>(aPos)].spelling;
+      StringRef bTok = deps_.bToks[bPos].spelling;
       if (aTok != bTok)
         break;
 
@@ -11716,9 +11717,9 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
   auto standardArgReplacementMatchesAllReplayedOccurrencesInB =
       [&](uint32_t argIdx, StringRef newArg,
           ArrayRef<diffutils::Hunk> tokenHunks) -> bool {
-    const uint64_t maxTok = deps_.BTokOff.empty()
+    const uint64_t maxTok = deps_.bTokOff.empty()
                                 ? 0ULL
-                                : static_cast<uint64_t>(deps_.BTokOff.size() - 1);
+                                : static_cast<uint64_t>(deps_.bTokOff.size() - 1);
     const StringRef expected = newArg.trim();
     bool sawOccurrence = false;
 
@@ -11727,7 +11728,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
         continue;
       sawOccurrence = true;
 
-      auto bEnv = (*deps_.SourceMapper).MapAToBTokenEnvelopeByPPArgSpan(s);
+      auto bEnv = (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(s);
       if (!bEnv || bEnv->second < bEnv->first)
         return false;
 
@@ -11753,9 +11754,9 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
       lo = static_cast<size_t>(std::clamp<uint64_t>(lo, 0ULL, maxTok));
       hi = static_cast<size_t>(std::clamp<uint64_t>(hi, lo, maxTok));
 
-      StringRef oldText = (*deps_.SourceMapper).SliceASource(s.begin, s.end).trim();
+      StringRef oldText = (*deps_.sourceMapper).SliceASource(s.begin, s.end).trim();
       auto grownEnv = maybeExtendRightBoundaryClosers(s, {lo, hi}, oldText);
-      StringRef actual = (*deps_.SourceMapper).SliceBSource(grownEnv.first, grownEnv.second).trim();
+      StringRef actual = (*deps_.sourceMapper).SliceBSource(grownEnv.first, grownEnv.second).trim();
       if (actual != expected)
         return false;
     }
@@ -11800,7 +11801,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
       // occurrence. If the direct PP-arg mapping is unavailable, fall back to
       // the triggering hunk's B range so the path can still fail/validate
       // locally.
-      auto bEnv = (*deps_.SourceMapper).MapAToBTokenEnvelopeByPPArgSpan(sp);
+      auto bEnv = (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(sp);
       if (!bEnv) {
         if (h.bStart >= h.bEnd)
           return std::nullopt;
@@ -11863,7 +11864,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
       // `oldText` is the original occurrence spelling. `bEnv` is the candidate
       // B spelling that should replace this occurrence after all relevant hunks
       // for the same formal have been incorporated.
-      StringRef oldText = (*deps_.SourceMapper).SliceASource(sp.begin, sp.end).trim();
+      StringRef oldText = (*deps_.sourceMapper).SliceASource(sp.begin, sp.end).trim();
 
       // For ordinary argument occurrences, allow a narrow right-edge repair
       // over unchanged closer tokens when the diff split leaves balancing
@@ -11875,17 +11876,17 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
         }
       }
 
-      StringRef bSlice = (*deps_.SourceMapper).SliceBSource(bEnv->first, bEnv->second).trim();
+      StringRef bSlice = (*deps_.sourceMapper).SliceBSource(bEnv->first, bEnv->second).trim();
       std::string newArg = bSlice.str();
 
       std::optional<std::pair<uint64_t, uint64_t>>
           materializedNewTextRange;
       if (!occIsStringify[i] && ownedInsertionBRange &&
           !contributedNonInsertionHunk) {
-        if (auto insertedBytes = deps_.SourceMapper->BTokenRangeToByteRange(
+        if (auto insertedBytes = deps_.sourceMapper->BTokenRangeToByteRange(
                 ownedInsertionBRange->first, ownedInsertionBRange->second)) {
-          const char *sourceBegin = deps_.BSource.data();
-          const char *sourceEnd = sourceBegin + deps_.BSource.size();
+          const char *sourceBegin = deps_.bSource.data();
+          const char *sourceEnd = sourceBegin + deps_.bSource.size();
           const char *sliceBeginPtr = bSlice.data();
           const char *sliceEndPtr = sliceBeginPtr + bSlice.size();
           if (sourceBegin <= sliceBeginPtr && sliceBeginPtr <= sourceEnd &&
@@ -11909,7 +11910,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
         // the raw argument spelling. Invert the literal back to argument text,
         // then require canonicalization to be stable so ambiguous escapes fail
         // closed.
-        auto un = (*deps_.ArgTextRecovery).UnstringifyLiteralToArgText(
+        auto un = (*deps_.argTextRecovery).UnstringifyLiteralToArgText(
             bSlice, isMacroInvocationVariadicFormal(m, argIdx));
         if (!un)
           return std::nullopt;
@@ -11924,7 +11925,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
         // Normalize the old side into the same unstringified representation so
         // the later occurrence-consistency checks compare argument text to
         // argument text.
-        auto oldUn = (*deps_.ArgTextRecovery).UnstringifyLiteralToArgText(oldText, true);
+        auto oldUn = (*deps_.argTextRecovery).UnstringifyLiteralToArgText(oldText, true);
         if (oldUn)
           oldText = StringRef(*oldUn).trim();
       }
@@ -11939,7 +11940,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
         }
 
         if (argHasPaste) {
-          StringRef aSlice = (*deps_.SourceMapper).SliceASource(sp.begin, sp.end).trim();
+          StringRef aSlice = (*deps_.sourceMapper).SliceASource(sp.begin, sp.end).trim();
           if (!aSlice.empty()) {
             size_t pos = baseArgText.find(aSlice);
             if (pos != StringRef::npos) {
@@ -12027,7 +12028,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
 
     // Replacing a non-variadic formal with a top-level comma would change macro
     // invocation arity, so reject it before validating occurrence consistency.
-    if (!isMacroInvocationVariadicFormal(m, argIdx) && replacementIntroducesTopLevelComma(finalNewArg, (*deps_.LexLang)))
+    if (!isMacroInvocationVariadicFormal(m, argIdx) && replacementIntroducesTopLevelComma(finalNewArg, (*deps_.lexLang)))
       return std::nullopt;
 
     auto tupleSliceConsistencyMatchesAllOccurrencesInB = [&]() -> bool {
@@ -12053,12 +12054,12 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
         if (s.argIdx != argIdx || s.kind != PPArgSpanKind::Standard)
           continue;
 
-        StringRef oldSlice = (*deps_.SourceMapper).SliceASource(s.begin, s.end).trim();
+        StringRef oldSlice = (*deps_.sourceMapper).SliceASource(s.begin, s.end).trim();
         auto expectedIt = newTextByOld.find(oldSlice);
         if (expectedIt == newTextByOld.end())
           return false;
 
-        auto bEnv = (*deps_.SourceMapper).MapAToBTokenEnvelopeByPPArgSpan(s);
+        auto bEnv = (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(s);
         if (!bEnv)
           return false;
 
@@ -12092,7 +12093,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
           hi = grownEnv.second;
         }
 
-        StringRef tokText = (*deps_.SourceMapper).SliceBSource(lo, hi).trim();
+        StringRef tokText = (*deps_.sourceMapper).SliceBSource(lo, hi).trim();
         if (tokText != StringRef(expectedIt->second).trim())
           return false;
       }
@@ -12114,7 +12115,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
       // the global occurrence check. Before returning, gather tuple-specific
       // diagnostics when child tuple metadata exists for this argument.
       bool hasTupleChildForArg = false;
-      for (const auto &cand : (*deps_.Model).GetMacroInvocations()) {
+      for (const auto &cand : (*deps_.model).GetMacroInvocations()) {
         if (!cand.callerMacroId || *cand.callerMacroId != m.id)
           continue;
         if (cand.argTupleRefs.empty())
@@ -12141,7 +12142,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
           if (s.argIdx != argIdx || s.kind != PPArgSpanKind::Standard)
             continue;
 
-          auto bEnv = (*deps_.SourceMapper).MapAToBTokenEnvelopeByPPArgSpan(s);
+          auto bEnv = (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(s);
           if (!bEnv) {
             continue;
           }
@@ -12160,7 +12161,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
                   formatv("owned {0} -> [{1},{2}) '{3}'", hk, owned->first,
                           owned->second,
                           stringutils::showWsWithClip(
-                              (*deps_.SourceMapper).SliceBSource(owned->first, owned->second), 80))
+                              (*deps_.sourceMapper).SliceBSource(owned->first, owned->second), 80))
                       .str());
               lo = std::min(lo, owned->first);
               hi = std::max(hi, owned->second);
@@ -12176,7 +12177,7 @@ RefoldMacroPatchPlanner::BuildStandardArgsOnlyPatch(
                   formatv("overlap {0} -> [{1},{2}) '{3}'", hk,
                           (uint64_t)hk.bStart, (uint64_t)hk.bEnd,
                           stringutils::showWsWithClip(
-                              (*deps_.SourceMapper).SliceBSource(hk.bStart, hk.bEnd), 80))
+                              (*deps_.sourceMapper).SliceBSource(hk.bStart, hk.bEnd), 80))
                       .str());
               lo = static_cast<size_t>(std::min<uint64_t>(lo, hk.bStart));
               hi = static_cast<size_t>(std::max<uint64_t>(hi, hk.bEnd));
@@ -12321,7 +12322,7 @@ std::optional<WholeCoverPlan> RefoldMacroPatchPlanner::ComputeWholeCoverPlan(
 
   // Map the accepted A-token cover into B while preserving boundary insertions.
   // This gives the raw B envelope that the whole-cover candidate will replay.
-  auto bEnv = (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+  auto bEnv = (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
       plan.covLoA, plan.covHiA);
   if (!bEnv)
     return std::nullopt;
@@ -12337,11 +12338,11 @@ std::optional<WholeCoverPlan> RefoldMacroPatchPlanner::ComputeWholeCoverPlan(
   // left when the immediately preceding B token matches the first A cover
   // token. This repairs boundary-placement drift without choosing by lexical
   // neighbor preference: the token must exactly be the cover boundary token.
-  if (plan.covLoA < deps_.AToks.size() && plan.bTokStart < deps_.BToks.size()) {
-    StringRef want = deps_.AToks[static_cast<size_t>(plan.covLoA)].spelling;
+  if (plan.covLoA < deps_.aToks.size() && plan.bTokStart < deps_.bToks.size()) {
+    StringRef want = deps_.aToks[static_cast<size_t>(plan.covLoA)].spelling;
     if (!want.empty()) {
-      if (deps_.BToks[plan.bTokStart].spelling != want && plan.bTokStart > 0 &&
-          deps_.BToks[plan.bTokStart - 1].spelling == want) {
+      if (deps_.bToks[plan.bTokStart].spelling != want && plan.bTokStart > 0 &&
+          deps_.bToks[plan.bTokStart - 1].spelling == want) {
         plan.bTokStart--;
         plan.adjustedLeft = true;
       }
@@ -12352,17 +12353,17 @@ std::optional<WholeCoverPlan> RefoldMacroPatchPlanner::ComputeWholeCoverPlan(
   // right, contract it when the previous B token matches the last A cover
   // token. This keeps the replacement envelope aligned with the macro-owned
   // cover.
-  if (plan.covHiA > 0 && (plan.covHiA - 1) < deps_.AToks.size() &&
-      plan.bTokEnd > 0 && (plan.bTokEnd - 1) < deps_.BToks.size()) {
-    StringRef want = deps_.AToks[static_cast<size_t>(plan.covHiA - 1)].spelling;
+  if (plan.covHiA > 0 && (plan.covHiA - 1) < deps_.aToks.size() &&
+      plan.bTokEnd > 0 && (plan.bTokEnd - 1) < deps_.bToks.size()) {
+    StringRef want = deps_.aToks[static_cast<size_t>(plan.covHiA - 1)].spelling;
     if (!want.empty()) {
       // Do not contract a whole-cover replacement across a trailing B comment.
       // Comments are source trivia, not macro-body delimiter tokens; clipping
       // one out here splits an otherwise line-local insertion and forces a
       // spurious #line resynchronization before the comment text.
-      const bool rightIsComment = deps_.BToks[plan.bTokEnd - 1].kind == "comment";
-      if (!rightIsComment && deps_.BToks[plan.bTokEnd - 1].spelling != want &&
-          plan.bTokEnd >= 2 && deps_.BToks[plan.bTokEnd - 2].spelling == want) {
+      const bool rightIsComment = deps_.bToks[plan.bTokEnd - 1].kind == "comment";
+      if (!rightIsComment && deps_.bToks[plan.bTokEnd - 1].spelling != want &&
+          plan.bTokEnd >= 2 && deps_.bToks[plan.bTokEnd - 2].spelling == want) {
         plan.bTokEnd--;
         plan.adjustedRight = true;
       }
@@ -12376,8 +12377,8 @@ std::optional<WholeCoverPlan> RefoldMacroPatchPlanner::ComputeWholeCoverPlan(
   // material before using the whole-cover text. The raw vs. clipped comparison
   // records whether this candidate had to yield to existing claims.
   std::string unclipped =
-      (*deps_.SourceMapper).SliceBSource(plan.bTokStart, plan.bTokEnd).str();
-  std::string clipped = deps_.BInsertionLedger->SliceBSourceClippedAgainstClaims(
+      (*deps_.sourceMapper).SliceBSource(plan.bTokStart, plan.bTokEnd).str();
+  std::string clipped = deps_.bInsertionLedger->SliceBSourceClippedAgainstClaims(
       plan.bTokStart, plan.bTokEnd);
   plan.claimsClipped = (unclipped != clipped);
   plan.clippedText = StringRef(clipped).trim().str();
@@ -12409,9 +12410,9 @@ Owner
 RefoldMacroPatchPlanner::NormalizeHunkOwnerForPatch(StringRef tuPath,
                                          const diffutils::Hunk &h) const {
   Owner owner =
-      deps_.OwnerClassifier->ClassifyOwnerWithSegments(tuPath, h);
+      deps_.ownerClassifier->ClassifyOwnerWithSegments(tuPath, h);
   const bool mapsToTU =
-      deps_.OwnerClassifier->HunkMapsToTU(h.aStart, h.aEnd, tuPath);
+      deps_.ownerClassifier->HunkMapsToTU(h.aStart, h.aEnd, tuPath);
   if (mapsToTU)
     return Owner::TU(owner.condArmId);
   if (owner.kind == OwnerKind::Include && owner.includeId)
@@ -12522,56 +12523,56 @@ RefoldMacroPatchPlanner::TryCounterLiteralWholeCoverPatch(
   if (h.bEnd > h.bStart) {
     counterBTokenRange = std::make_pair(static_cast<uint64_t>(h.bStart),
                                         static_cast<uint64_t>(h.bEnd));
-    repl = (*deps_.SourceMapper)
+    repl = (*deps_.sourceMapper)
                .SliceBSource(static_cast<size_t>(h.bStart),
                              static_cast<size_t>(h.bEnd))
                .trim()
                .str();
   } else {
     auto bEnv =
-        (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelope(h.aStart, h.aEnd);
+        (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelope(h.aStart, h.aEnd);
     if (bEnv && bEnv->second > bEnv->first) {
       counterBTokenRange =
           std::make_pair(static_cast<uint64_t>(bEnv->first),
                          static_cast<uint64_t>(bEnv->second));
       repl =
-          (*deps_.SourceMapper).SliceBSource(bEnv->first, bEnv->second).trim().str();
+          (*deps_.sourceMapper).SliceBSource(bEnv->first, bEnv->second).trim().str();
     }
   }
   if (!repl)
     return std::nullopt;
 
-  CounterEventIdentity event = (*deps_.MacroTopology).BuildCounterEventIdentity(
+  CounterEventIdentity event = (*deps_.macroTopology).BuildCounterEventIdentity(
       m, /*occurrenceOrdinal=*/0, h.aStart, h.aEnd, m.ownerIncludeId);
   event.expectedBValue = *repl;
   const OwnerStateBoundary boundary =
-      ownerStateProof().CounterStateBoundaryForEvent(event);
+      GetOwnerStateProof().CounterStateBoundaryForEvent(event);
   const std::string detail =
       llvm::formatv("literalized direct __COUNTER__ invocation #{0} "
                     "A=[{1},{2})",
                     m.id, h.aStart, h.aEnd)
           .str();
   SuffixStabilityWitness counterWitness =
-      ownerStateProof().BuildStateTransitionWitness(
+      GetOwnerStateProof().BuildStateTransitionWitness(
           SuffixStabilityWitnessKind::Literalization,
           OwnerStateComponent::Counter, boundary,
           llvm::formatv(
               "{0}; {1}", detail,
-              ownerStateProof().FormatCounterEventForWitness(event))
+              GetOwnerStateProof().FormatCounterEventForWitness(event))
               .str());
-  (void)ownerStateProof().CheckStateTransitionAcrossEditBoundary(
+  (void)GetOwnerStateProof().CheckStateTransitionAcrossEditBoundary(
       boundary, OwnerStateComponent::Counter, StateMutationKind::Literalized,
       counterWitness, "counter", detail, /*requireKnownObserver=*/false);
 
   MacroPatch patch{invocationStart, invocationEnd, std::move(*repl), m.id};
   if (counterBTokenRange &&
       counterBTokenRange->first <= counterBTokenRange->second &&
-      counterBTokenRange->second <= deps_.BToks.size()) {
+      counterBTokenRange->second <= deps_.bToks.size()) {
     patch.hasMaterializedBTokenRange = true;
     patch.materializedBTokStart = counterBTokenRange->first;
     patch.materializedBTokEnd = counterBTokenRange->second;
   }
-  MacroPatchProof proof = proofLattice().MakeMacroPatchProof(
+  MacroPatchProof proof = GetProofLattice().MakeMacroPatchProof(
       MacroPatchProofKind::CounterLiteral,
       /*preservesInvocationStructure=*/false, m.id);
   CounterStateWitness counterState;
@@ -12586,7 +12587,7 @@ RefoldMacroPatchPlanner::TryCounterLiteralWholeCoverPatch(
   counterState.hasExpectedBValues = true;
   counterState.expectedBValueCount = 1;
   counterState.consumptionSignature =
-      ownerStateProof().FormatCounterEventForWitness(event);
+      GetOwnerStateProof().FormatCounterEventForWitness(event);
   counterState.orderSignature =
       llvm::formatv("ordinal={0}:macro={1}:A=[{2},{3})",
                     event.occurrenceOrdinal, event.macroInvocationId,
@@ -12601,7 +12602,7 @@ RefoldMacroPatchPlanner::TryCounterLiteralWholeCoverPatch(
       llvm::formatv("literalization:{0}", counterWitness.kind).str();
   proof.suffixStability = std::move(counterWitness);
   proof.counterState = std::move(counterState);
-  proofLattice().SetMacroPatchProof(patch, std::move(proof));
+  GetProofLattice().SetMacroPatchProof(patch, std::move(proof));
   return patch;
 }
 
@@ -12641,7 +12642,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
     return counterPatch;
 
   const Owner currentPatchOwner =
-      NormalizeHunkOwnerForPatch((*deps_.Model).GetSourcePath(), h);
+      NormalizeHunkOwnerForPatch((*deps_.model).GetSourcePath(), h);
 
   // Set when two different concrete subtree-backed witnesses for the same
   // root disagree on an overlapping expected-root formal rewrite. Once this is
@@ -12650,9 +12651,9 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
   // collapsing incompatible witnesses into one root replay.
   bool conflictingConcreteSubtreeWitnessForcesWholeCover = false;
 
-  // Existing-patch reuse is a named whole-cover phase.  Keep local aliases for
-  // the rest of this large planner so this split remains behavior-preserving
-  // and does not change candidate discovery order.
+  // Existing-patch reuse is computed before the rest of candidate assembly.
+  // Keep local aliases for the rest of this large planner so this remains
+  // behavior-preserving and does not change candidate discovery order.
   MacroPatchReuseAdmissionContext reuseAdmissionCtx =
       RecoverWholeCoverReuseContext(m, currentPatchOwner, *invStart, *invEnd,
                                     patchMap, existingContext);
@@ -12661,7 +12662,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
       reuseAdmissionCtx.existingExpandedPatch;
   bool &existingIsCallsite = reuseAdmissionCtx.existingIsCallsite;
 
-  const diffutils::Hunk hEff = trimCommonEdgeTokens(h, deps_.AToks, deps_.BToks);
+  const diffutils::Hunk hEff = trimCommonEdgeTokens(h, deps_.aToks, deps_.bToks);
 
   // 1) Prefer args-only patching when safe and fully validated. Treat normal
   //    arg spans, stringify spans, and paste spans as "argument-like"
@@ -12692,9 +12693,9 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
   argLikeSpans.append(m.stringifySpans.begin(), m.stringifySpans.end());
   argLikeSpans.append(m.pasteSpans.begin(), m.pasteSpans.end());
 
-  // Direct root args-only recovery is a named whole-cover phase.  It computes
-  // both the root candidate and the direct-root surface fact that the later DAG
-  // phase uses when deciding whether unsupported descendants force fallback.
+  // Direct root args-only recovery computes both the root candidate and the
+  // direct-root surface fact used later to decide whether unsupported
+  // descendants force fallback.
   const WholeCoverArgsOnlyCandidateContext argsOnlyPhaseCtx{
       m, hEff, baseInvText, argLikeSpans, reuseAdmissionCtx};
   const WholeCoverArgsOnlyCandidateResult argsOnlyPhase =
@@ -12719,7 +12720,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
   if (m.subkind == "func" && hasLiteralMacroCalleeOrigin(m)) {
     bool directRootPreservationInadmissible = false;
     auto tryDAGChainedArgsOnly = [&]() -> std::optional<MacroPatch> {
-      // --- Stage 0: Preconditions / root invocation parsing ------------------
+      // --- Root invocation parsing preconditions -----------------------------
       //
       // We can only "lift" edits back into the current root invocation (m) if
       // we can reliably parse *its current spelling* into formal argument byte
@@ -12743,14 +12744,14 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
       const auto &invArgRanges = *invArgRangesOpt;
       const size_t numArgs = invArgRanges.size();
 
-      // --- Stage 1: Build lookup structures for DAG traversal ----------------
+      // --- DAG traversal lookup structures ----------------------------------
       //
       // We lift edits along caller/callee edges between MacroInvocation items.
       // Build a fast lookup map from invocation id -> invocation* so we can
       // climb parent pointers without repeated O(N) scans.
       DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invById;
-      invById.reserve((*deps_.Model).GetMacroInvocations().size());
-      for (const auto &mi : (*deps_.Model).GetMacroInvocations())
+      invById.reserve((*deps_.model).GetMacroInvocations().size());
+      for (const auto &mi : (*deps_.model).GetMacroInvocations())
         invById[mi.id] = &mi;
 
       const MacroSubtreeReplayValidationContext subtreeValidationCtx{
@@ -12803,7 +12804,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
 
         // --- A-side extraction: exact bytes from the original pp token stream.
         if (!fromB) {
-          StringRef a = (*deps_.SourceMapper).SliceASource(static_cast<size_t>(sp.begin),
+          StringRef a = (*deps_.sourceMapper).SliceASource(static_cast<size_t>(sp.begin),
                                      static_cast<size_t>(sp.end));
           if ((sp.kind == PPArgSpanKind::Paste ||
              sp.kind == PPArgSpanKind::Stringify) &&
@@ -12822,12 +12823,12 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         }
 
         // --- B-side extraction: map the A-span to its B envelope and slice B.
-        auto bEnv = (*deps_.SourceMapper).MapAToBTokenEnvelopeByPPArgSpan(sp);
+        auto bEnv = (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(sp);
         if (!bEnv)
           return std::nullopt;
         if (bEnv->second <= bEnv->first)
           return std::nullopt;
-        StringRef b = (*deps_.SourceMapper).SliceBSource(bEnv->first, bEnv->second);
+        StringRef b = (*deps_.sourceMapper).SliceBSource(bEnv->first, bEnv->second);
         bool reliable = true;
 
         if ((sp.kind == PPArgSpanKind::Paste ||
@@ -12844,7 +12845,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           // using the raw [bb,be) slice can truncate the changed segment.
           // Re-derive the B-side segment by peeling any unchanged prefix/suffix
           // when possible.
-          StringRef aTok = (*deps_.SourceMapper).SliceASource(static_cast<size_t>(sp.begin),
+          StringRef aTok = (*deps_.sourceMapper).SliceASource(static_cast<size_t>(sp.begin),
                                         static_cast<size_t>(sp.end));
           if (be < bb || be > static_cast<uint64_t>(aTok.size()))
             return std::nullopt;
@@ -12884,7 +12885,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // For stringify spans, compare against the de-escaped payload so that
         // quote/escape choices do not create false diffs.
         if (sp.kind == PPArgSpanKind::Stringify) {
-          auto un = (*deps_.ArgTextRecovery).UnstringifyLiteralToArgText(
+          auto un = (*deps_.argTextRecovery).UnstringifyLiteralToArgText(
               raw, allowTopLevelComma);
           if (!un)
             return std::nullopt;
@@ -12913,7 +12914,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
             }
           }
           if (!invArgHasQuote) {
-            auto un = (*deps_.ArgTextRecovery).UnstringifyLiteralToArgText(raw);
+            auto un = (*deps_.argTextRecovery).UnstringifyLiteralToArgText(raw);
             if (!un)
               return std::nullopt;
             return *un;
@@ -12930,7 +12931,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           [&](SmallVectorImpl<RefoldModel::PPArgSpan> &spans) {
             SmallVector<RefoldModel::PPArgSpan, 8> valid;
             valid.reserve(spans.size());
-            const uint64_t maxATokCount = static_cast<uint64_t>(deps_.AToks.size());
+            const uint64_t maxATokCount = static_cast<uint64_t>(deps_.aToks.size());
             for (const auto &sp : spans) {
               if (sp.end <= sp.begin)
                 continue;
@@ -12993,7 +12994,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         return any;
       };
 
-      // --- Stage 2: Find leaf candidates touched by this hunk ----------------
+      // --- Leaf candidates touched by this hunk ------------------------------
       //
       // We search for descendant invocations whose *argument-like spans* are
       // fully covered by the hunk and exhibit an A->B text difference.
@@ -13016,13 +13017,13 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
       SmallVector<SplitInsertionRootCandidate, 8>
           splitInsertionRootCandidates;
 
-      if (hEff.aStart == hEff.aEnd && !(*deps_.ABTokHunks).empty()) {
+      if (hEff.aStart == hEff.aEnd && !(*deps_.abTokHunks).empty()) {
         // Collect sibling pure-insertion hunks inside the same macro cover.
         // Those partner insertions are later used to synthesize a wider
         // envelope for split insertion edits that are not explainable from the
         // current hunk alone.
         SmallVector<diffutils::Hunk, 8> partnerInsertions;
-        for (const auto &hh : (*deps_.ABTokHunks)) {
+        for (const auto &hh : (*deps_.abTokHunks)) {
           // Only pure insertions can serve as the second frontier of a
           // split-insertion envelope.
           if (hh.aStart != hh.aEnd)
@@ -13044,12 +13045,12 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           // the proof candidate passed to the args-only builder.
           const diffutils::Hunk env =
               buildCombinedInsertionEnvelope(hEff, partner);
-          const diffutils::Hunk envTrim = trimCommonEdgeTokens(env, deps_.AToks, deps_.BToks);
+          const diffutils::Hunk envTrim = trimCommonEdgeTokens(env, deps_.aToks, deps_.bToks);
 
           SmallVector<char, 16> envTrimRootTouched(argLikeSpans.size(), 0);
           const bool envTrimRootWithinArgLike =
               !argLikeSpans.empty() &&
-              (*deps_.SourceMapper).HunkFullyWithinArgSpans(envTrim, argLikeSpans,
+              (*deps_.sourceMapper).HunkFullyWithinArgSpans(envTrim, argLikeSpans,
                                       envTrimRootTouched);
 
           std::optional<MacroPatch> pairRootPatch;
@@ -13100,7 +13101,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
       SmallVector<LeafCandidate, 8> leafCands;
       directRootPreservationInadmissible = false;
 
-      for (const auto &cand : (*deps_.Model).GetMacroInvocations()) {
+      for (const auto &cand : (*deps_.model).GetMacroInvocations()) {
         // Only consider invocations that are strict descendants of the
         // validated root by producer-recorded caller ancestry.  Keep the
         // computed depth because leaf ordering uses the original distance-to-
@@ -13145,7 +13146,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // expects one flag per span occurrence, while the later DAG logic
         // reasons per formal arg index.
         SmallVector<char, 8> candTouchedBySpan(candArgLike.size(), 0);
-        if (!(*deps_.SourceMapper).HunkFullyWithinArgSpans(h, candArgLike, candTouchedBySpan)) {
+        if (!(*deps_.sourceMapper).HunkFullyWithinArgSpans(h, candArgLike, candTouchedBySpan)) {
           continue;
         }
 
@@ -13235,7 +13236,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
                 .trim();
       }
 
-      // --- Stage 3: Lift a leaf edit to the root invocation ------------------
+      // --- Leaf edit lifting to the root invocation --------------------------
       //
       // Generalized single-parent lifting uses the recorded arg_refs slices to
       // invert a nested callee argument back to the caller's raw invocation
@@ -13435,13 +13436,13 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
               StringRef observed) -> ArgRefInvertibilityCertificate {
         ArgRefInvertibilityCertificate cert;
 
-        constexpr size_t MaxDistinctCallerParams = 8;
+        constexpr size_t maxDistinctCallerParams = 8;
 
         // Empty templates do not prove forwarding, and very wide templates are
         // kept out of this local DFS to avoid turning malformed metadata into
         // an expensive search problem.
         if (tpl.refs.empty() || tpl.distinctCallerParams.empty() ||
-            tpl.distinctCallerParams.size() > MaxDistinctCallerParams)
+            tpl.distinctCallerParams.size() > maxDistinctCallerParams)
           return cert;
 
         // Decompose the template into:
@@ -13482,26 +13483,26 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // `assigns[i]` is the candidate observed text for
         // `tpl.distinctCallerParams[i]`. It remains empty until the DFS first
         // reaches that caller parameter placeholder.
-        SmallVector<std::optional<StringRef>, MaxDistinctCallerParams> assigns(
+        SmallVector<std::optional<StringRef>, maxDistinctCallerParams> assigns(
             tpl.distinctCallerParams.size());
 
         // Keep at most enough distinct solutions to distinguish Unique from
         // Ambiguous. Duplicate assignment vectors can arise through equivalent
         // split paths and are ignored.
-        SmallVector<SmallVector<std::string, MaxDistinctCallerParams>, 2>
+        SmallVector<SmallVector<std::string, maxDistinctCallerParams>, 2>
             solutions;
 
-        auto addSolution = [&](ArrayRef<std::optional<StringRef>> A) {
-          SmallVector<std::string, MaxDistinctCallerParams> S;
-          S.reserve(tpl.distinctCallerParams.size());
+        auto addSolution = [&](ArrayRef<std::optional<StringRef>> aLocal) {
+          SmallVector<std::string, maxDistinctCallerParams> sLocal;
+          sLocal.reserve(tpl.distinctCallerParams.size());
           for (size_t i = 0; i < tpl.distinctCallerParams.size(); ++i)
-            S.push_back(A[i] ? A[i]->str() : std::string());
+            sLocal.push_back(aLocal[i] ? aLocal[i]->str() : std::string());
 
           for (const auto &existing : solutions)
-            if (existing == S)
+            if (existing == sLocal)
               return;
 
-          solutions.push_back(std::move(S));
+          solutions.push_back(std::move(sLocal));
         };
 
         auto dfs = [&](auto &&self, size_t refIdx, size_t obsPos) -> void {
@@ -13677,7 +13678,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         }
         if (covLoA >= covHiA)
           return std::nullopt;
-        return (*deps_.SourceMapper).SliceASource(covLoA, covHiA).trim().str();
+        return (*deps_.sourceMapper).SliceASource(covLoA, covHiA).trim().str();
       };
 
       // Return true when `pos` is a plausible split point in refold text. The
@@ -13694,7 +13695,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
       // to the lexer-backed cut-point enumerator.
       auto isBalancedRefoldFragment = [&](StringRef s) -> bool {
         bool balancedAtEnd = false;
-        enumerateTopLevelBalancedCutPointsWithLexer(s, (*deps_.LexLang),
+        enumerateTopLevelBalancedCutPointsWithLexer(s, (*deps_.lexLang),
                                                     [&](unsigned cut) {
                                                       if (cut == s.size())
                                                         balancedAtEnd = true;
@@ -13712,7 +13713,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         if (needle.empty())
           return;
         enumerateTopLevelBalancedCutPointsWithLexer(
-            haystack, (*deps_.LexLang), [&](unsigned cut) {
+            haystack, (*deps_.lexLang), [&](unsigned cut) {
               const size_t pos = static_cast<size_t>(cut);
               if (pos > maxPos)
                 return;
@@ -13747,11 +13748,11 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
 
         SmallVector<LocalEdit, 8> edits;
         edits.reserve(replByFormal.size());
-        for (const auto &KV : replByFormal) {
+        for (const auto &kvLocal : replByFormal) {
           // Validate each replacement against the original formal slot before
           // editing the invocation surface. Non-variadic slots cannot receive a
           // top-level comma because that would change call arity.
-          const uint32_t argIdx = KV.first;
+          const uint32_t argIdx = kvLocal.first;
           if (argIdx >= rangesOpt->size())
             return std::nullopt;
           const auto &rng = (*rangesOpt)[argIdx];
@@ -13761,10 +13762,10 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           const uint64_t relB = rng.first;
           const uint64_t relE = rng.second;
 
-          StringRef newArg = StringRef(KV.second).trim();
+          StringRef newArg = StringRef(kvLocal.second).trim();
           const bool allowComma =
               argIdx < inv.defParams.size() && inv.defParams[argIdx].variadic;
-          if (!allowComma && refoldMacroActualHasTopLevelComma(newArg, (*deps_.LexLang)))
+          if (!allowComma && refoldMacroActualHasTopLevelComma(newArg, (*deps_.lexLang)))
             return std::nullopt;
 
           edits.push_back(LocalEdit{relB, relE, newArg.str()});
@@ -13791,7 +13792,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
               bool fromB) -> SmallVector<std::string, 4> {
         SmallVector<std::string, 4> out;
         std::optional<std::string> base =
-            fromB ? proofLattice().BuildWholeCoverReplacementText(inv)
+            fromB ? GetProofLattice().BuildWholeCoverReplacementText(inv)
                   : getInvocationCoverAText(inv);
         if (!base)
           return out;
@@ -13806,7 +13807,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
 
         auto tryAddUnstringified = [&](StringRef raw) {
           auto un =
-              (*deps_.ArgTextRecovery).UnstringifyLiteralToArgText(
+              (*deps_.argTextRecovery).UnstringifyLiteralToArgText(
                   raw, /*allowTopLevelComma=*/true);
           if (!un)
             return;
@@ -13879,7 +13880,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         if (!argInfo || !parent.invFile)
           return SmallVector<LexicalChildPlaceholder, 4>{};
 
-        for (const auto &cand : (*deps_.Model).GetMacroInvocations()) {
+        for (const auto &cand : (*deps_.model).GetMacroInvocations()) {
           // A lexical child must be a distinct invocation spelled in the same
           // file and wholly inside the parent argument's trimmed absolute byte
           // range.
@@ -14407,7 +14408,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           // equivalent escaped/whitespace-normalized payloads collapse
           // together.
           auto decoded =
-              (*deps_.ArgTextRecovery).UnstringifyLiteralToArgText(
+              (*deps_.argTextRecovery).UnstringifyLiteralToArgText(
                   piece0, /*allowTopLevelComma=*/true);
           if (!decoded)
             return false;
@@ -14663,7 +14664,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
               // is a possible slot endpoint. The uniqueness checks below
               // decide whether any such split is acceptable.
               enumerateTopLevelBalancedCutPointsWithLexer(
-                  rest, (*deps_.LexLang), [&](unsigned cut) {
+                  rest, (*deps_.lexLang), [&](unsigned cut) {
                     const size_t len = static_cast<size_t>(cut);
                     if (len > maxLen)
                       return;
@@ -14798,8 +14799,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           [&](const DenseMap<uint32_t, FormalTextPair> &formals) {
             SmallVector<uint32_t, 8> argIdxs;
             argIdxs.reserve(formals.size());
-            for (const auto &KV : formals)
-              argIdxs.push_back(KV.first);
+            for (const auto &kvLocal : formals)
+              argIdxs.push_back(kvLocal.first);
             llvm::sort(argIdxs);
 
             std::string out;
@@ -14923,7 +14924,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // would change the macro call's argument structure rather than only
         // replacing this formal's payload.
         if (!isVariadicFormalInInvocation(inv, argIdx) &&
-            refoldMacroActualHasTopLevelComma(newText, (*deps_.LexLang))) {
+            refoldMacroActualHasTopLevelComma(newText, (*deps_.lexLang))) {
           cert.failure = RawFormalValidationFailure::ArityChange;
           cert.detail = formatv("{0}: inv id={1} name={2} argIdx={3} arity "
                                 "safety failed",
@@ -16004,7 +16005,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           return std::nullopt;
 
         ArrayRef<const RefoldModel::MacroInvocation *> children =
-            (*deps_.MacroTopology).MacroChildrenOf(cur.id);
+            (*deps_.macroTopology).MacroChildrenOf(cur.id);
         if (children.empty())
           return std::nullopt;
 
@@ -16484,7 +16485,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // invocation spelling exactly matches the old observed child surface.
         // Multiple siblings with the same spelling would make the reroot target
         // ambiguous.
-        for (const auto &cand : (*deps_.Model).GetMacroInvocations()) {
+        for (const auto &cand : (*deps_.model).GetMacroInvocations()) {
           if (cand.id == cur.id || !cand.callerMacroId ||
               *cand.callerMacroId != parent.id || !cand.invText)
             continue;
@@ -16508,12 +16509,12 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
                 const DenseMap<uint32_t, FormalTextPair> &rhs) {
               if (lhs.size() != rhs.size())
                 return false;
-              for (const auto &KV : lhs) {
-                auto it = rhs.find(KV.first);
+              for (const auto &kvLocal : lhs) {
+                auto it = rhs.find(kvLocal.first);
                 if (it == rhs.end())
                   return false;
-                if (it->second.oldText != KV.second.oldText ||
-                    it->second.newText != KV.second.newText)
+                if (it->second.oldText != kvLocal.second.oldText ||
+                    it->second.newText != kvLocal.second.newText)
                   return false;
               }
               return true;
@@ -16545,7 +16546,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           }
 
           ConcreteExemplarReplayLiftResult result;
-          for (const auto &exemplar : (*deps_.Model).GetMacroInvocations()) {
+          for (const auto &exemplar : (*deps_.model).GetMacroInvocations()) {
             if (exemplar.id == matchedSibling->id ||
                 exemplar.name != matchedSibling->name ||
                 siblingFormal >= exemplar.invArgRanges.size())
@@ -16757,8 +16758,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // logging and, when needed, as preferred syntax for a parent formal
         // that contains this child invocation as a lexical placeholder.
         DenseMap<uint32_t, std::string> curFormalSyntax;
-        for (const auto &KV : curFormals)
-          curFormalSyntax[KV.first] = KV.second.newText;
+        for (const auto &kvLocal : curFormals)
+          curFormalSyntax[kvLocal.first] = kvLocal.second.newText;
         if (!curCert.rewrittenInvocationSyntax.empty()) {
           cert.rewrittenChildSyntax = curCert.rewrittenInvocationSyntax;
         } else if (auto curSyntax =
@@ -17017,7 +17018,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
             return rawTarget.str();
 
           ArrayRef<const RefoldModel::MacroInvocation *> children =
-              (*deps_.MacroTopology).MacroChildrenOf(target.id);
+              (*deps_.macroTopology).MacroChildrenOf(target.id);
           if (children.empty())
             return std::nullopt;
 
@@ -17093,8 +17094,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
             groupedObserved[kv.first].push_back(kv.second);
 
           DenseMap<uint32_t, FormalTextPair> targetFormals;
-          for (const auto &KV : groupedObserved) {
-            const uint32_t formalIdx = KV.first;
+          for (const auto &kvLocal : groupedObserved) {
+            const uint32_t formalIdx = kvLocal.first;
             auto argText = getInvocationArgText(target, formalIdx);
             if (!argText)
               return std::nullopt;
@@ -17104,11 +17105,11 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
             // try to preserve that nested child first. This keeps a chain such
             // as JOIN(JOIN(...), ...) instead of collapsing it to the already
             // materialized pasted token.
-            if (KV.second.size() == 1) {
+            if (kvLocal.second.size() == 1) {
               const StringRef segOld =
-                  StringRef(KV.second.front().oldText).trim();
+                  StringRef(kvLocal.second.front().oldText).trim();
               const StringRef segNew =
-                  StringRef(KV.second.front().newText).trim();
+                  StringRef(kvLocal.second.front().newText).trim();
               auto placeholders =
                   getTopLevelLexicalChildrenInArg(target, formalIdx);
               if (placeholders.size() == 1 && placeholders.front().child &&
@@ -17131,7 +17132,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
             // the wrapper-hop certificate rebuild the target invocation around
             // it.
             auto formalCert = buildObservedFormalRewriteCertificate(
-                target, formalIdx, KV.second, /*preferredChildSyntax=*/nullptr,
+                target, formalIdx, kvLocal.second, /*preferredChildSyntax=*/nullptr,
                 traceStage);
             if (formalCert.kind == FormalRewriteCertificateKind::Invalid)
               return std::nullopt;
@@ -17152,11 +17153,11 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           // If the placeholder certificate did not directly materialize syntax,
           // build it from only the formals that actually changed.
           DenseMap<uint32_t, std::string> replByFormal;
-          for (const auto &KV : targetFormals) {
-            StringRef oldText = StringRef(KV.second.oldText).trim();
-            StringRef newText = StringRef(KV.second.newText).trim();
+          for (const auto &kvLocal : targetFormals) {
+            StringRef oldText = StringRef(kvLocal.second.oldText).trim();
+            StringRef newText = StringRef(kvLocal.second.newText).trim();
             if (oldText != newText)
-              replByFormal[KV.first] = newText.str();
+              replByFormal[kvLocal.first] = newText.str();
           }
           return buildRewrittenInvocationSyntax(target, replByFormal);
         };
@@ -17266,10 +17267,10 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // formal dependency certificate. Failed inversions are not immediately
         // fatal because a sibling reroot or parent body-space proof may still
         // discharge the same obligation without requiring a lexical bridge.
-        for (const auto &KV : curFormals) {
-          const uint32_t curFormal = KV.first;
-          StringRef curOld = KV.second.oldText;
-          StringRef curNew = KV.second.newText;
+        for (const auto &kvLocal : curFormals) {
+          const uint32_t curFormal = kvLocal.first;
+          StringRef curOld = kvLocal.second.oldText;
+          StringRef curNew = kvLocal.second.newText;
 
           auto derivationCert = buildParentConstraintDerivationCertificate(
               cur, curFormal, curOld, curNew, "DAG per-hop");
@@ -17336,10 +17337,10 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // boundary: conflicting observations, missing structural templates, or
         // unsupported placeholder interactions all fail here.
         DenseMap<uint32_t, FormalTextPair> parentFormals;
-        for (const auto &KV : parentObserved) {
-          const uint32_t parentFormal = KV.first;
+        for (const auto &kvLocal : parentObserved) {
+          const uint32_t parentFormal = kvLocal.first;
           auto formalCert = buildObservedFormalRewriteCertificate(
-              *parent, parentFormal, KV.second,
+              *parent, parentFormal, kvLocal.second,
               preferredChildSyntax.empty() ? nullptr : &preferredChildSyntax,
               "DAG per-hop");
           cert.parentFormalCertificates.push_back(formalCert);
@@ -17530,13 +17531,13 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // Normalize the starting point of the chain to only the leaf formals
         // that actually changed. No-change formals do not need to be lifted and
         // would only add noise to later proof obligations.
-        for (const auto &KV : leafFormals) {
-          StringRef oldText = StringRef(KV.second.oldText).trim();
-          StringRef newText = StringRef(KV.second.newText).trim();
+        for (const auto &kvLocal : leafFormals) {
+          StringRef oldText = StringRef(kvLocal.second.oldText).trim();
+          StringRef newText = StringRef(kvLocal.second.newText).trim();
           if (oldText == newText)
             continue;
-          cert.leafArgIdxs.push_back(KV.first);
-          cert.leafFormals[KV.first] =
+          cert.leafArgIdxs.push_back(kvLocal.first);
+          cert.leafFormals[kvLocal.first] =
               FormalTextPair{oldText.str(), newText.str()};
         }
         llvm::sort(cert.leafArgIdxs);
@@ -17587,13 +17588,13 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
             // bridge-derived.
             DenseSet<uint32_t> nextBridgedCurFormals;
             if (!bridgedCurFormals.empty()) {
-              for (const auto &KV : step.nextFormals) {
-                auto srcIt = step.parentFormalSources.find(KV.first);
+              for (const auto &kvLocal : step.nextFormals) {
+                auto srcIt = step.parentFormalSources.find(kvLocal.first);
                 if (srcIt == step.parentFormalSources.end())
                   continue;
                 for (uint32_t sourceCurFormal : srcIt->second) {
                   if (bridgedCurFormals.contains(sourceCurFormal)) {
-                    nextBridgedCurFormals.insert(KV.first);
+                    nextBridgedCurFormals.insert(kvLocal.first);
                     break;
                   }
                 }
@@ -17643,17 +17644,17 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           cur = step.nextInv;
           curFormals = std::move(*bridged);
           bridgedCurFormals.clear();
-          for (const auto &KV : curFormals)
-            bridgedCurFormals.insert(KV.first);
+          for (const auto &kvLocal : curFormals)
+            bridgedCurFormals.insert(kvLocal.first);
           cert.steps.back().bridgedNextFormals = bridgedCurFormals;
         }
 
         // We have reached the root invocation. The current formal rewrite map
         // is now the root-formal rewrite map for the complete lift chain.
-        for (const auto &KV : curFormals) {
-          cert.rootFormals[KV.first] = KV.second;
-          if (bridgedCurFormals.contains(KV.first))
-            cert.bridgedRootArgIdxs.insert(KV.first);
+        for (const auto &kvLocal : curFormals) {
+          cert.rootFormals[kvLocal.first] = kvLocal.second;
+          if (bridgedCurFormals.contains(kvLocal.first))
+            cert.bridgedRootArgIdxs.insert(kvLocal.first);
         }
 
         cert.kind = LiftChainCertificateKind::Unique;
@@ -18345,8 +18346,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
       /// * every deferred paste obligation must be discharged, and
       /// * the combined subtree semantics must be admissible.
       ///
-      /// The result is fail-closed. If any stage rejects, the returned semantic
-      /// certificate is invalid and carries that stage's detail string.
+      /// The result is fail-closed. If any semantic gate rejects, the returned
+      /// certificate is invalid and carries that gate's detail string.
       auto buildSubtreeSemanticCertificate =
           [&](const InvocationRewriteCertificate &leafCert,
               ArrayRef<LiftChainCertificate> liftCertificates,
@@ -18612,8 +18613,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // even though the input map is a DenseMap.
         SmallVector<uint32_t, 8> argOrder;
         argOrder.reserve(leafFormals.size());
-        for (const auto &KV : leafFormals)
-          argOrder.push_back(KV.first);
+        for (const auto &kvLocal : leafFormals)
+          argOrder.push_back(kvLocal.first);
         llvm::sort(argOrder);
 
         DenseMap<uint32_t, SmallVector<uint32_t, 4>> adjacency;
@@ -18638,8 +18639,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // Add undirected edges between every pair of changed formals that share
         // a paste product. A connected component therefore represents the
         // smallest set of leaf formals that must be replayed together.
-        for (const auto &KV : tokenArgs) {
-          ArrayRef<uint32_t> args = KV.second;
+        for (const auto &kvLocal : tokenArgs) {
+          ArrayRef<uint32_t> args = kvLocal.second;
           if (args.size() < 2)
             continue;
           for (size_t i = 0; i < args.size(); ++i) {
@@ -18697,7 +18698,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
       /// * certify the final root invocation plus the collected subtree
       ///   semantics.
       ///
-      /// The returned certificate is `Unique` only if every stage is proven.
+      /// The returned certificate is `Unique` only if every required semantic
+      /// gate is proven.
       /// Otherwise it fails closed with the detail from the first failed proof
       /// obligation.
       auto buildSubtreeRewriteCertificate =
@@ -18712,12 +18714,12 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // edits are dropped here so later certificates only reason about actual
         // rewrite obligations.
         DenseMap<uint32_t, FormalTextPair> pendingLeafFormals;
-        for (const auto &KV : leafEdits) {
-          StringRef oldText = StringRef(KV.second.oldText).trim();
-          StringRef newText = StringRef(KV.second.newText).trim();
+        for (const auto &kvLocal : leafEdits) {
+          StringRef oldText = StringRef(kvLocal.second.oldText).trim();
+          StringRef newText = StringRef(kvLocal.second.newText).trim();
           if (oldText == newText)
             continue;
-          pendingLeafFormals[KV.first] =
+          pendingLeafFormals[kvLocal.first] =
               FormalTextPair{oldText.str(), newText.str()};
         }
 
@@ -18786,18 +18788,18 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           // actual compatibility check is delayed until the root merge
           // certificate so duplicate or overlapping chains are handled in one
           // proof location.
-          for (const auto &RK : liftCert.rootFormals) {
-            auto &rewrites = rootRewrites[RK.first];
+          for (const auto &rk : liftCert.rootFormals) {
+            auto &rewrites = rootRewrites[rk.first];
             bool seen = false;
             for (const auto &existing : rewrites) {
-              if (existing.oldText == RK.second.oldText &&
-                  existing.newText == RK.second.newText) {
+              if (existing.oldText == rk.second.oldText &&
+                  existing.newText == rk.second.newText) {
                 seen = true;
                 break;
               }
             }
             if (!seen)
-              rewrites.push_back(RK.second);
+              rewrites.push_back(rk.second);
           }
 
           // Remember root arguments whose final text came through a lexical
@@ -18825,10 +18827,10 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // argument text. This is where independently lifted leaf groups are
         // required to agree before they are allowed to affect the root.
         DenseMap<uint32_t, FormalTextPair> pendingRootFormals;
-        for (const auto &KV : rootRewrites) {
-          const uint32_t argIdx = KV.first;
+        for (const auto &kvLocal : rootRewrites) {
+          const uint32_t argIdx = kvLocal.first;
           auto mergeCert = buildRootFormalMergeCertificate(
-              argIdx, KV.second, "DAG subtree root merge");
+              argIdx, kvLocal.second, "DAG subtree root merge");
           cert.rootMergeCertificates.push_back(mergeCert);
           if (mergeCert.kind == RootFormalMergeCertificateKind::Invalid) {
             cert.detail = mergeCert.detail;
@@ -18848,9 +18850,9 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // by root invocation certification.
         cert.deferRootOccurrenceArgIdxs.clear();
         cert.deferRootOccurrenceArgIdxs.reserve(pendingRootFormals.size());
-        for (const auto &KV : pendingRootFormals) {
-          if (deferredRootOccurrenceArgIdxSet.contains(KV.first))
-            cert.deferRootOccurrenceArgIdxs.push_back(KV.first);
+        for (const auto &kvLocal : pendingRootFormals) {
+          if (deferredRootOccurrenceArgIdxSet.contains(kvLocal.first))
+            cert.deferRootOccurrenceArgIdxs.push_back(kvLocal.first);
         }
         llvm::sort(cert.deferRootOccurrenceArgIdxs);
 
@@ -18898,8 +18900,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           // from later subtree semantic admissibility failures.
           SmallVector<uint32_t, 8> rootFormalArgIdxs;
           rootFormalArgIdxs.reserve(cert.rootFormals.size());
-          for (const auto &KV : cert.rootFormals)
-            rootFormalArgIdxs.push_back(KV.first);
+          for (const auto &kvLocal : cert.rootFormals)
+            rootFormalArgIdxs.push_back(kvLocal.first);
           llvm::sort(rootFormalArgIdxs);
           trace("macro/proof",
                 "DAG subtree proof ledger: root id={0} name={1} leaf id={2} "
@@ -19084,8 +19086,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           [&](const StringMap<SemanticInteractionSignature> &sigs) {
             SmallVector<StringRef, 8> keys;
             keys.reserve(sigs.size());
-            for (const auto &KV : sigs)
-              keys.push_back(KV.getKey());
+            for (const auto &kvLocal : sigs)
+              keys.push_back(kvLocal.getKey());
             llvm::sort(keys);
 
             std::string out;
@@ -19108,7 +19110,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
             return os.str();
           };
 
-      // --- Stage 4: Try leaves, lift, validate, and ensure uniqueness --------
+      // --- Leaf lifting, validation, and uniqueness --------------------------
       //
       // We scan leaf candidates (deepest-first) and attempt to produce a root
       // invocation patch. We accept only if:
@@ -19274,9 +19276,9 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
               continue;
 
             std::optional<std::pair<size_t, size_t>> bEnv =
-                (*deps_.SourceMapper).MapAToBTokenEnvelopeByPPArgSpan(span);
+                (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(span);
             if (!bEnv || bEnv->second <= bEnv->first ||
-                bEnv->second > deps_.BToks.size())
+                bEnv->second > deps_.bToks.size())
               continue;
 
             const uint64_t bBegin = static_cast<uint64_t>(bEnv->first);
@@ -19351,15 +19353,15 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // same formal may appear in both candidates, but only with identical
         // semantic evidence; divergent signatures mean the candidates cannot be
         // soundly composed.
-        for (const auto &KV : lhs.bridgeSensitiveFormalSignatures)
-          merged.bridgeSensitiveFormalSignatures[KV.getKey()] = KV.getValue();
-        for (const auto &KV : rhs.bridgeSensitiveFormalSignatures) {
-          auto it = merged.bridgeSensitiveFormalSignatures.find(KV.getKey());
+        for (const auto &kvLocal : lhs.bridgeSensitiveFormalSignatures)
+          merged.bridgeSensitiveFormalSignatures[kvLocal.getKey()] = kvLocal.getValue();
+        for (const auto &kvLocal : rhs.bridgeSensitiveFormalSignatures) {
+          auto it = merged.bridgeSensitiveFormalSignatures.find(kvLocal.getKey());
           if (it == merged.bridgeSensitiveFormalSignatures.end()) {
-            merged.bridgeSensitiveFormalSignatures[KV.getKey()] = KV.getValue();
+            merged.bridgeSensitiveFormalSignatures[kvLocal.getKey()] = kvLocal.getValue();
             continue;
           }
-          if (!(it->second == KV.getValue()))
+          if (!(it->second == kvLocal.getValue()))
             return std::nullopt;
         }
 
@@ -19386,14 +19388,14 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         auto collect = [&](const DagCandidateValidationMetadata &meta) {
           if (!meta.hasExpectedRootFormals)
             return;
-          for (const auto &KV : meta.expectedRootFormals)
-            rewritesByArg[KV.first].push_back(KV.second);
+          for (const auto &kvLocal : meta.expectedRootFormals)
+            rewritesByArg[kvLocal.first].push_back(kvLocal.second);
         };
         collect(lhs);
         collect(rhs);
 
-        for (const auto &KV : rewritesByArg) {
-          const uint32_t argIdx = KV.first;
+        for (const auto &kvLocal : rewritesByArg) {
+          const uint32_t argIdx = kvLocal.first;
           if (argIdx >= rootInvocationArgRanges.size())
             return std::nullopt;
 
@@ -19407,7 +19409,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           // proposed rewrites are mutually compatible with the same base text.
           const StringRef baseArgText = rootInvocationText.slice(begin, end).trim();
           auto mergedArgText =
-              mergeCompatibleFormalRewrites(baseArgText, KV.second);
+              mergeCompatibleFormalRewrites(baseArgText, kvLocal.second);
           if (!mergedArgText)
             return std::nullopt;
           if (StringRef(*mergedArgText).trim() == baseArgText) {
@@ -19416,7 +19418,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
                   "argIdx={2} collapsed to base text base='{3}' variants={4}",
                   rootInvocation.id, rootInvocation.name, argIdx,
                   stringutils::showWsWithClip(baseArgText, 120),
-                  KV.second.size());
+                  kvLocal.second.size());
             continue;
           }
 
@@ -19445,7 +19447,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         StringRef trimmed = text.trim();
         auto argRangesOpt =
             RefoldArgTextRecovery::LexMacroInvocationActualContentRanges(trimmed,
-                                                                        (*deps_.LexLang));
+                                                                        (*deps_.lexLang));
         if (!argRangesOpt)
           return std::nullopt;
 
@@ -19497,10 +19499,10 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
 
         auto oldArgRangesOpt =
             RefoldArgTextRecovery::LexMacroInvocationActualContentRanges(
-                oldText.trim(), (*deps_.LexLang));
+                oldText.trim(), (*deps_.lexLang));
         auto newArgRangesOpt =
             RefoldArgTextRecovery::LexMacroInvocationActualContentRanges(
-                newText.trim(), (*deps_.LexLang));
+                newText.trim(), (*deps_.lexLang));
         if (!oldArgRangesOpt || !newArgRangesOpt ||
             oldArgRangesOpt->size() != newArgRangesOpt->size())
           return 0;
@@ -19553,12 +19555,12 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // Compare candidates formal-by-formal. The comparison is only valid if
         // both candidates cover exactly the same root formals and start from
         // the same base argument text for each formal.
-        for (const auto &KV : existingValidation.expectedRootFormals) {
-          auto it = candidateValidation.expectedRootFormals.find(KV.first);
+        for (const auto &kvLocal : existingValidation.expectedRootFormals) {
+          auto it = candidateValidation.expectedRootFormals.find(kvLocal.first);
           if (it == candidateValidation.expectedRootFormals.end())
             return 0;
 
-          const FormalTextPair &existingRewrite = KV.second;
+          const FormalTextPair &existingRewrite = kvLocal.second;
           const FormalTextPair &candidateRewrite = it->second;
           if (StringRef(existingRewrite.oldText).trim() !=
               StringRef(candidateRewrite.oldText).trim())
@@ -19728,9 +19730,9 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
               .str();
         };
 
-        for (const auto &KV : rootFormals) {
-          StringRef oldText = StringRef(KV.second.oldText).trim();
-          StringRef newText = StringRef(KV.second.newText).trim();
+        for (const auto &kvLocal : rootFormals) {
+          StringRef oldText = StringRef(kvLocal.second.oldText).trim();
+          StringRef newText = StringRef(kvLocal.second.newText).trim();
           if (oldText == newText)
             continue;
 
@@ -19739,7 +19741,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           SmallVector<std::pair<const RefoldModel::MacroInvocation *, uint32_t>,
                       32>
               work;
-          work.push_back({&m, KV.first});
+          work.push_back({&m, kvLocal.first});
 
           while (!work.empty()) {
             auto [cur, curFormal] = work.pop_back_val();
@@ -19766,7 +19768,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
             }
 
             ArrayRef<const RefoldModel::MacroInvocation *> children =
-                (*deps_.MacroTopology).MacroChildrenOf(cur->id);
+                (*deps_.macroTopology).MacroChildrenOf(cur->id);
             if (children.empty())
               continue;
 
@@ -19798,7 +19800,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
                   "{0}: root deferred paste replay dependent-use coverage "
                   "root id={1} name={2} argIdx={3} old='{4}' new='{5}' "
                   "uses={6} rejected={7}",
-                  traceStage, rootInvocation.id, rootInvocation.name, KV.first,
+                  traceStage, rootInvocation.id, rootInvocation.name, kvLocal.first,
                   stringutils::showWsWithClip(oldText, 120),
                   stringutils::showWsWithClip(newText, 120),
                   llvm::join(formattedUses, ", "),
@@ -19811,7 +19813,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
                         "wrapper replay root id={1} name='{2}' argIdx={3} "
                         "because changed root formal has unproven "
                         "dependent output uses: {4}",
-                        traceStage, rootInvocation.id, rootInvocation.name, KV.first,
+                        traceStage, rootInvocation.id, rootInvocation.name, kvLocal.first,
                         llvm::join(rejectedUses, ", "))
                     .str();
             return false;
@@ -19825,7 +19827,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
       /// proof machinery.
       ///
       /// This is the final replay check for a DAG candidate after some earlier
-      /// stage has proposed replacing `baseText` with `newText`. It derives the
+      /// caller has proposed replacing `baseText` with `newText`. It derives the
       /// root-formal rewrite map from the concrete callsite replacement, checks
       /// that it matches the expected root-formal proof metadata when provided,
       /// and then rebuilds an invocation rewrite certificate from the replayed
@@ -19899,17 +19901,17 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
 
           SmallVector<uint32_t, 8> replayAugmentedSupportOnlyArgIdxs;
           const bool traceRootProofValidation = inTraceMode();
-          for (const auto &KV : *expectedRootFormals) {
-            if (replayRootFormals->contains(KV.first))
+          for (const auto &kvLocal : *expectedRootFormals) {
+            if (replayRootFormals->contains(kvLocal.first))
               continue;
-            if (StringRef(KV.second.oldText).trim() !=
-                StringRef(KV.second.newText).trim())
+            if (StringRef(kvLocal.second.oldText).trim() !=
+                StringRef(kvLocal.second.newText).trim())
               continue;
-            if (!concreteArgMatchesExpectedUnchanged(KV.first, KV.second))
+            if (!concreteArgMatchesExpectedUnchanged(kvLocal.first, kvLocal.second))
               continue;
-            (*replayRootFormals)[KV.first] = KV.second;
+            (*replayRootFormals)[kvLocal.first] = kvLocal.second;
             if (traceRootProofValidation)
-              replayAugmentedSupportOnlyArgIdxs.push_back(KV.first);
+              replayAugmentedSupportOnlyArgIdxs.push_back(kvLocal.first);
           }
 
           if (traceRootProofValidation) {
@@ -19934,17 +19936,17 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
             // These traces make it clear whether failure came from missing
             // support-only formals, actual rewrite mismatches, or unexpected
             // replay-derived formals.
-            for (const auto &KV : *expectedRootFormals) {
-              auto it = replayRootFormals->find(KV.first);
+            for (const auto &kvLocal : *expectedRootFormals) {
+              auto it = replayRootFormals->find(kvLocal.first);
               if (it == replayRootFormals->end()) {
-                missingExpectedArgIdxs.push_back(KV.first);
-                if (KV.second.oldText == KV.second.newText)
-                  supportOnlyMissingArgIdxs.push_back(KV.first);
+                missingExpectedArgIdxs.push_back(kvLocal.first);
+                if (kvLocal.second.oldText == kvLocal.second.newText)
+                  supportOnlyMissingArgIdxs.push_back(kvLocal.first);
 
-                if (newRangesOpt && KV.first < rootInvocationArgRanges.size() &&
-                    KV.first < newRangesOpt->size()) {
-                  const auto &oldR = rootInvocationArgRanges[KV.first];
-                  const auto &newR = (*newRangesOpt)[KV.first];
+                if (newRangesOpt && kvLocal.first < rootInvocationArgRanges.size() &&
+                    kvLocal.first < newRangesOpt->size()) {
+                  const auto &oldR = rootInvocationArgRanges[kvLocal.first];
+                  const auto &newR = (*newRangesOpt)[kvLocal.first];
                   if (oldR.first <= oldR.second &&
                       oldR.second <= baseText.size() &&
                       newR.first <= newR.second &&
@@ -19956,43 +19958,43 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
                         newText.slice((size_t)newR.first, (size_t)newR.second)
                             .trim();
                     if (concreteOld == concreteNew &&
-                        concreteOld == StringRef(KV.second.oldText).trim() &&
-                        concreteNew == StringRef(KV.second.newText).trim()) {
-                      unchangedConcreteMissingArgIdxs.push_back(KV.first);
+                        concreteOld == StringRef(kvLocal.second.oldText).trim() &&
+                        concreteNew == StringRef(kvLocal.second.newText).trim()) {
+                      unchangedConcreteMissingArgIdxs.push_back(kvLocal.first);
                     }
                     trace("macro/proof",
                           "{0}: root proof missing expected arg root id={1} "
                           "name={2} argIdx={3} concreteOld='{4}' "
                           "concreteNew='{5}' expectedOld='{6}' "
                           "expectedNew='{7}'",
-                          traceStage, rootInvocation.id, rootInvocation.name, KV.first,
+                          traceStage, rootInvocation.id, rootInvocation.name, kvLocal.first,
                           stringutils::showWsWithClip(concreteOld, 120),
                           stringutils::showWsWithClip(concreteNew, 120),
-                          stringutils::showWsWithClip(KV.second.oldText, 120),
-                          stringutils::showWsWithClip(KV.second.newText, 120));
+                          stringutils::showWsWithClip(kvLocal.second.oldText, 120),
+                          stringutils::showWsWithClip(kvLocal.second.newText, 120));
                   }
                 }
                 continue;
               }
 
-              if (it->second.oldText != KV.second.oldText ||
-                  it->second.newText != KV.second.newText) {
-                mismatchedExpectedArgIdxs.push_back(KV.first);
+              if (it->second.oldText != kvLocal.second.oldText ||
+                  it->second.newText != kvLocal.second.newText) {
+                mismatchedExpectedArgIdxs.push_back(kvLocal.first);
                 trace("macro/proof",
                       "{0}: root proof mismatched expected arg root id={1} "
                       "name={2} argIdx={3} derivedOld='{4}' derivedNew='{5}' "
                       "expectedOld='{6}' expectedNew='{7}'",
-                      traceStage, rootInvocation.id, rootInvocation.name, KV.first,
+                      traceStage, rootInvocation.id, rootInvocation.name, kvLocal.first,
                       stringutils::showWsWithClip(it->second.oldText, 120),
                       stringutils::showWsWithClip(it->second.newText, 120),
-                      stringutils::showWsWithClip(KV.second.oldText, 120),
-                      stringutils::showWsWithClip(KV.second.newText, 120));
+                      stringutils::showWsWithClip(kvLocal.second.oldText, 120),
+                      stringutils::showWsWithClip(kvLocal.second.newText, 120));
               }
             }
 
-            for (const auto &KV : *replayRootFormals) {
-              if (!expectedRootFormals->contains(KV.first))
-                unexpectedReplayArgIdxs.push_back(KV.first);
+            for (const auto &kvLocal : *replayRootFormals) {
+              if (!expectedRootFormals->contains(kvLocal.first))
+                unexpectedReplayArgIdxs.push_back(kvLocal.first);
             }
 
             llvm::sort(missingExpectedArgIdxs);
@@ -20027,25 +20029,25 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
             return cert;
           }
 
-          for (const auto &KV : *expectedRootFormals) {
-            auto it = replayRootFormals->find(KV.first);
+          for (const auto &kvLocal : *expectedRootFormals) {
+            auto it = replayRootFormals->find(kvLocal.first);
             if (it == replayRootFormals->end() ||
-                it->second.oldText != KV.second.oldText ||
-                it->second.newText != KV.second.newText) {
+                it->second.oldText != kvLocal.second.oldText ||
+                it->second.newText != kvLocal.second.newText) {
               cert.detail =
                   formatv("{0}: root proof validation failed root "
                           "id={1} name='{2}' replay-derived root "
                           "formal mismatch argIdx={3} derivedOld='{4}' "
                           "derivedNew='{5}' expectedOld='{6}' "
                           "expectedNew='{7}'",
-                          traceStage, rootInvocation.id, rootInvocation.name, KV.first,
+                          traceStage, rootInvocation.id, rootInvocation.name, kvLocal.first,
                           it == replayRootFormals->end()
                               ? StringRef("")
                               : StringRef(it->second.oldText),
                           it == replayRootFormals->end()
                               ? StringRef("")
                               : StringRef(it->second.newText),
-                          KV.second.oldText, KV.second.newText)
+                          kvLocal.second.oldText, kvLocal.second.newText)
                       .str();
               return cert;
             }
@@ -20134,8 +20136,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           // and deferred occurrence arguments.
           SmallVector<uint32_t, 8> expectedRootArgIdxs;
           expectedRootArgIdxs.reserve(validation.expectedRootFormals.size());
-          for (const auto &KV : validation.expectedRootFormals)
-            expectedRootArgIdxs.push_back(KV.first);
+          for (const auto &kvLocal : validation.expectedRootFormals)
+            expectedRootArgIdxs.push_back(kvLocal.first);
           llvm::sort(expectedRootArgIdxs);
           SmallVector<uint32_t, 8> deferredArgs =
               validation.deferOccurrenceArgIdxs;
@@ -20207,8 +20209,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
 
         // These are the root rewrites the concrete DAG candidate must replay
         // exactly during final proof validation.
-        for (const auto &KV : subtreeCert.rootFormals)
-          validation.expectedRootFormals[KV.first] = KV.second;
+        for (const auto &kvLocal : subtreeCert.rootFormals)
+          validation.expectedRootFormals[kvLocal.first] = kvLocal.second;
 
         validation.deferOccurrenceArgIdxs.assign(
             subtreeCert.deferRootOccurrenceArgIdxs.begin(),
@@ -20258,7 +20260,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
             candPatch.macroId = m.id;
           if (!candPatch.proof.proofRootMacroId) {
             candPatch.proof.proofRootMacroId = m.id;
-            proofLattice().SyncMacroPatchProofSummary(candPatch);
+            GetProofLattice().SyncMacroPatchProofSummary(candPatch);
           }
           uniquePatch = std::move(candPatch);
           uniquePatchBaseText = baseText.str();
@@ -20406,7 +20408,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
             candPatch.macroId = m.id;
           if (!candPatch.proof.proofRootMacroId) {
             candPatch.proof.proofRootMacroId = m.id;
-            proofLattice().SyncMacroPatchProofSummary(candPatch);
+            GetProofLattice().SyncMacroPatchProofSummary(candPatch);
           }
           if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
             REFOLD_LOG_TRACE(
@@ -20553,8 +20555,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // already established that this is a structure-preserving args-only
         // root rewrite.
         MacroPatch splitRootPatch = candidate.patch;
-        proofLattice().SetMacroPatchProof(splitRootPatch,
-                           proofLattice().MakeMacroPatchProof(
+        GetProofLattice().SetMacroPatchProof(splitRootPatch,
+                           GetProofLattice().MakeMacroPatchProof(
                                MacroPatchProofKind::ArgsOnlyPairedPureInsertion,
                                /*preservesInvocationStructure=*/true, m.id));
 
@@ -20980,10 +20982,10 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // normalized old/new text. That seed still must pass the structured
         // lift/root pipeline below.
         DenseSet<uint32_t> observedLeafSeedArgIdxs;
-        for (const auto &KV : leafObserved) {
-          const uint32_t argIdx = KV.first;
+        for (const auto &kvLocal : leafObserved) {
+          const uint32_t argIdx = kvLocal.first;
           auto formalCert = buildObservedFormalRewriteCertificate(
-              leaf, argIdx, KV.second, /*preferredChildSyntax=*/nullptr,
+              leaf, argIdx, kvLocal.second, /*preferredChildSyntax=*/nullptr,
               "DAG subtree leaf formal");
           if (formalCert.kind == FormalRewriteCertificateKind::Invalid) {
             const bool uniformObservedSeedAllowed =
@@ -20991,7 +20993,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
                 FormalRewriteFailure::MissingStructuralTemplate;
             if (uniformObservedSeedAllowed) {
               auto observedSeed = buildUniformObservedLeafSeedCertificate(
-                  leaf, argIdx, KV.second, "DAG subtree leaf formal");
+                  leaf, argIdx, kvLocal.second, "DAG subtree leaf formal");
               if (observedSeed.kind ==
                   UniformObservedLeafSeedCertificateKind::Unique) {
                 observedLeafSeedArgIdxs.insert(argIdx);
@@ -21018,8 +21020,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
 
         SmallVector<uint32_t, 8> leafEditArgIdxs;
         leafEditArgIdxs.reserve(leafEdits.size());
-        for (const auto &KV : leafEdits)
-          leafEditArgIdxs.push_back(KV.first);
+        for (const auto &kvLocal : leafEdits)
+          leafEditArgIdxs.push_back(kvLocal.first);
 
         const bool leafTouchesPaste =
             !leaf.pasteSpans.empty() &&
@@ -21035,8 +21037,8 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // them up the caller chain.
         if (!leaf.pasteSpans.empty()) {
           DenseMap<uint32_t, std::string> leafReplByArgIdx;
-          for (const auto &KV : leafEdits)
-            leafReplByArgIdx[KV.first] = KV.second.newText;
+          for (const auto &kvLocal : leafEdits)
+            leafReplByArgIdx[kvLocal.first] = kvLocal.second.newText;
 
           if (leafTouchesPaste) {
             if (allTouchedPasteArgsFromObservedLeafSeed) {
@@ -21077,13 +21079,13 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // invocation file text.
         if (numArgs == 0 && leaf.callerMacroId && *leaf.callerMacroId == m.id &&
             m.invFile && leaf.invFile && *leaf.invFile == *m.invFile) {
-          const std::string absPath = (*deps_.LineDirs).ToAbsolutePath(*m.invFile);
+          const std::string absPath = (*deps_.lineDirs).ToAbsolutePath(*m.invFile);
           auto bufOrErr = llvm::MemoryBuffer::getFile(absPath);
           if (bufOrErr) {
             StringRef fileText = bufOrErr.get()->getBuffer();
 
             // Compute the chained call end in the same way as the application
-            // stage: consume any trailing "(...)" groups after the root
+            // Consume any trailing "(...)" groups after the root
             // invocation.
             const uint64_t chainEnd =
                 stringutils::extendChainedCallEnd(fileText, *invEnd, "((x)+1)");
@@ -21164,9 +21166,9 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
                 }
 
                 MacroPatch candPatch{*invStart, chainEnd, replText, m.id};
-                proofLattice().SetMacroPatchProof(
+                GetProofLattice().SetMacroPatchProof(
                     candPatch,
-                    proofLattice().MakeMacroPatchProof(MacroPatchProofKind::CallChainSuffix,
+                    GetProofLattice().MakeMacroPatchProof(MacroPatchProofKind::CallChainSuffix,
                                         /*preservesInvocationStructure=*/true,
                                         m.id));
 
@@ -21218,9 +21220,9 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // are audit metadata for the accepted result; the proof itself has
         // already been checked by the subtree/root validation certificates.
         rootPatchCert.patch->macroId = m.id;
-        proofLattice().SetMacroPatchProof(
+        GetProofLattice().SetMacroPatchProof(
             *rootPatchCert.patch,
-            proofLattice().MakeMacroPatchProof(MacroPatchProofKind::DagSubtreeRoot,
+            GetProofLattice().MakeMacroPatchProof(MacroPatchProofKind::DagSubtreeRoot,
                                 /*preservesInvocationStructure=*/true, m.id));
         rootPatchCert.patch->subtreeCertBacked = true;
         rootPatchCert.patch->subtreeLeafMacroId = leaf.id;
@@ -21278,7 +21280,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // The subtree certificate is filled after the primary proof stamp so
         // the classifier must see a refreshed MacroPatchProof carrier
         // before this candidate is merged, selected, or emitted.
-        proofLattice().SyncMacroPatchProofSummary(*rootPatchCert.patch);
+        GetProofLattice().SyncMacroPatchProofSummary(*rootPatchCert.patch);
 
         // Finally, merge this subtree-backed root patch with any previously
         // accepted DAG candidate for the same root invocation.
@@ -21298,7 +21300,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
     // bytes directly. This preserves the call chain and avoids whole-cover
     // expansion.
     if (hasLiteralMacroCalleeOrigin(m) && m.invFile && m.invB && m.invE) {
-      std::string invAbs = (*deps_.LineDirs).ToAbsolutePath(*m.invFile);
+      std::string invAbs = (*deps_.lineDirs).ToAbsolutePath(*m.invFile);
       auto bufOrErr = MemoryBuffer::getFile(invAbs);
       if (bufOrErr) {
         std::unique_ptr<MemoryBuffer> buf = std::move(*bufOrErr);
@@ -21330,7 +21332,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
               // byte range. Every token must come from the same invocation file
               // and lie wholly inside the chained-call suffix; otherwise this
               // hunk is not a local suffix rewrite.
-              const auto &tokmapByPP = (*deps_.Model).GetTokmapByPP();
+              const auto &tokmapByPP = (*deps_.model).GetTokmapByPP();
               for (uint64_t i = 0; i < aLen; ++i) {
                 const uint64_t ppIdx = h.aStart + i;
                 const uint64_t bTok = h.bStart + i;
@@ -21340,7 +21342,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
                   break;
                 }
                 const RefoldModel::TokMapEntry &tm = it->second;
-                if ((*deps_.LineDirs).ToAbsolutePath(tm.file) != invAbs) {
+                if ((*deps_.lineDirs).ToAbsolutePath(tm.file) != invAbs) {
                   ok = false;
                   break;
                 }
@@ -21352,7 +21354,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
                   ok = false;
                   break;
                 }
-                StringRef repl = (*deps_.SourceMapper).SliceBSource(bTok, bTok + 1);
+                StringRef repl = (*deps_.sourceMapper).SliceBSource(bTok, bTok + 1);
                 tokEdits.push_back(TokEdit{tm.b, tm.e, repl.str()});
                 minB = std::min(minB, tm.b);
                 maxE = std::max(maxE, tm.e);
@@ -21398,9 +21400,9 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
                   out.append(covered, cur, covered.size() - cur);
                   {
                     MacroPatch patch{minB, maxE, std::move(out), m.id};
-                    proofLattice().SetMacroPatchProof(
+                    GetProofLattice().SetMacroPatchProof(
                         patch,
-                        proofLattice().MakeMacroPatchProof(
+                        GetProofLattice().MakeMacroPatchProof(
                             MacroPatchProofKind::CallChainSuffix,
                             /*preservesInvocationStructure=*/true, m.id));
                     return patch;
@@ -21507,7 +21509,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
       lexBuf.push_back('\0');
       const char *bufStart = lexBuf.data();
       const char *bufEnd = bufStart + s.size();
-      Lexer lexer(baseLoc, (*deps_.LexLang), bufStart, bufStart, bufEnd);
+      Lexer lexer(baseLoc, (*deps_.lexLang), bufStart, bufStart, bufEnd);
 
       auto nextNonCommentToken = [&]() {
         Token token;
@@ -21644,12 +21646,12 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
               existing.subtreeExpectedRootFormalSummary);
           const auto candidateFormals = parseExpectedRootFormalSummary(
               candidate.subtreeExpectedRootFormalSummary);
-          for (const auto &KV : existingFormals) {
-            auto it = candidateFormals.find(KV.first);
+          for (const auto &kvLocal : existingFormals) {
+            auto it = candidateFormals.find(kvLocal.first);
             if (it == candidateFormals.end())
               continue;
-            if (KV.second.oldText != it->second.oldText ||
-                KV.second.newText != it->second.newText)
+            if (kvLocal.second.oldText != it->second.oldText ||
+                kvLocal.second.newText != it->second.newText)
               return true;
           }
           return false;
@@ -21765,7 +21767,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
                                                 StringRef name)
           -> std::optional<ProducerFunctionMacroDefinition> {
         const RefoldModel::MacroDirective *active = nullptr;
-        for (const auto &directive : (*deps_.Model).GetMacroDirectives()) {
+        for (const auto &directive : (*deps_.model).GetMacroDirectives()) {
           if (directive.id >= beforeItemId)
             continue;
           if (directive.subkind != "#define" && directive.subkind != "#undef")
@@ -21832,7 +21834,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
           -> std::optional<ArgumentTokenSpellings> {
         if (leaf.defParams.size() != 1 || !leaf.cover.IsValid() ||
             leaf.cover.begin >= leaf.cover.end ||
-            leaf.cover.end > deps_.AToks.size())
+            leaf.cover.end > deps_.aToks.size())
           return std::nullopt;
 
         SmallVector<RefoldModel::PPSpan, 4> body;
@@ -21842,11 +21844,11 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         auto collectGapTokens =
             [&](uint64_t beginTok,
                 uint64_t endTok) -> std::optional<TokenSpellings> {
-          if (endTok < beginTok || endTok > deps_.AToks.size())
+          if (endTok < beginTok || endTok > deps_.aToks.size())
             return std::nullopt;
           TokenSpellings out;
           for (uint64_t tok = beginTok; tok < endTok; ++tok)
-            out.push_back(deps_.AToks[static_cast<size_t>(tok)].spelling);
+            out.push_back(deps_.aToks[static_cast<size_t>(tok)].spelling);
           return out;
         };
 
@@ -21895,7 +21897,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
       // descendant callee back to the root invocation deterministically by
       // producer-recorded caller ids.
       DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invById;
-      for (const auto &mi : (*deps_.Model).GetMacroInvocations())
+      for (const auto &mi : (*deps_.model).GetMacroInvocations())
         invById[mi.id] = &mi;
 
       auto depthToRoot = [&](const RefoldModel::MacroInvocation &cand)
@@ -22033,7 +22035,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
       // body-owned tokens contain the edited A hunk.  This prevents selector
       // substitution from firing on unrelated paste tokens in the same root
       // DAG.
-      for (const auto &leaf : (*deps_.Model).GetMacroInvocations()) {
+      for (const auto &leaf : (*deps_.model).GetMacroInvocations()) {
         if (leaf.id == m.id || leaf.subkind != "func")
           continue;
         std::optional<unsigned> depth = depthToRoot(leaf);
@@ -22070,7 +22072,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // from the selected callee's original PP cover.  The selector proof
         // does not widen the edit or borrow neighboring B tokens.
         std::optional<std::pair<size_t, size_t>> bEnv =
-            (*deps_.SourceMapper).MapATokRangeAToBTokenEnvelope(leaf.cover.begin, leaf.cover.end);
+            (*deps_.sourceMapper).MapATokRangeAToBTokenEnvelope(leaf.cover.begin, leaf.cover.end);
         if (!bEnv || bEnv->second <= bEnv->first)
           continue;
 
@@ -22084,7 +22086,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // This is a finite namespace proof over definitions already present in
         // the source.  Each candidate must be active at the root expansion
         // point and must replay through producer-recorded replacement tokens.
-        for (const auto &directive : (*deps_.Model).GetMacroDirectives()) {
+        for (const auto &directive : (*deps_.model).GetMacroDirectives()) {
           std::optional<ProducerFunctionMacroDefinition> candidateDef =
               producerFunctionDefinitionFromDirective(directive);
           if (!candidateDef || candidateDef->name == leaf.name)
@@ -22181,14 +22183,14 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
       patch.materializedOutputByteStart = candidates.front().selectorByteBegin;
       patch.materializedOutputByteEnd = candidates.front().selectorByteBegin +
                                         candidates.front().newSelectorSize;
-      proofLattice().SetMacroPatchProof(
+      GetProofLattice().SetMacroPatchProof(
           patch,
-          proofLattice().MakeMacroPatchProof(MacroPatchProofKind::PasteDerivedCalleeSelector,
+          GetProofLattice().MakeMacroPatchProof(MacroPatchProofKind::PasteDerivedCalleeSelector,
                               /*preservesInvocationStructure=*/true, m.id));
       return patch;
     };
 
-    // Stage the DAG root replay as a final-selection candidate instead of
+    // Keep the DAG root replay as a final-selection candidate instead of
     // returning it immediately.
     //
     // `tryDAGChainedArgsOnly()` can produce a structure-preserving root patch
@@ -22219,9 +22221,9 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
         // choose the stronger compatible proof class by the explicit lattice
         // law rather than by an ad hoc direct-vs-DAG heuristic.
         if (directValid && dagValid) {
-          const bool preferDirect = proofLattice().LatticePrefers(
+          const bool preferDirect = GetProofLattice().LatticePrefers(
               argsOnlyCandidate->proofSummary, dag->proofSummary);
-          const bool preferDag = proofLattice().LatticePrefers(
+          const bool preferDag = GetProofLattice().LatticePrefers(
               dag->proofSummary, argsOnlyCandidate->proofSummary);
           preferDirectRootCandidate = preferDirect || !preferDag;
         }
@@ -22404,9 +22406,9 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
             // Both candidates are individually viable but not merge-compatible.
             // Defer to the proof lattice rather than letting the direct replay
             // win merely because it was produced in this local path.
-            const bool preferDirect = proofLattice().LatticePrefers(
+            const bool preferDirect = GetProofLattice().LatticePrefers(
                 argsOnlyCandidate->proofSummary, existingPatch->proofSummary);
-            const bool preferExisting = proofLattice().LatticePrefers(
+            const bool preferExisting = GetProofLattice().LatticePrefers(
                 existingPatch->proofSummary, argsOnlyCandidate->proofSummary);
             if (preferExisting && !preferDirect) {
               argsOnlyCandidate.reset();
@@ -22428,7 +22430,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
   // restamped onto an emission-discharged carrier before any byte edit is
   // emitted.
   const bool allowNonTopLevelMacroSelectorFailure =
-      (*deps_.MacroTopology).GetRootMacroId(m.id) != m.id;
+      (*deps_.macroTopology).GetRootMacroId(m.id) != m.id;
 
   // Reuse of an existing callsite patch is split into two cases:
   //
@@ -22483,18 +22485,18 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
   // gate.  The gate only borrows this local storage and does not affect final
   // candidate ordering or proof ranking.
   DenseMap<uint64_t, const RefoldModel::MacroInvocation *> finalSubtreeInvById;
-  finalSubtreeInvById.reserve((*deps_.Model).GetMacroInvocations().size());
+  finalSubtreeInvById.reserve((*deps_.model).GetMacroInvocations().size());
   for (const RefoldModel::MacroInvocation &inv :
-       (*deps_.Model).GetMacroInvocations())
+       (*deps_.model).GetMacroInvocations())
     finalSubtreeInvById[inv.id] = &inv;
   SmallVector<std::pair<size_t, size_t>, 1> finalSubtreeRootArgRanges;
   const MacroSubtreeReplayValidationContext finalSubtreeValidationCtx{
       m, baseInvText, finalSubtreeRootArgRanges, finalSubtreeInvById};
 
-  // Final candidate admission and proof-lattice selection are a named
-  // whole-cover phase.  Candidate discovery above remains in this method so
-  // recursive DAG/certificate solver state stays local, while the final
-  // admission order and stamping behavior are centralized below.
+  // Final candidate admission and proof-lattice selection are centralized
+  // after candidate discovery. The recursive DAG/certificate solver state
+  // remains local, while final admission order and stamping behavior are
+  // handled by the shared selector below.
   WholeCoverFinalSelectionContext finalSelectionCtx{
       m,
       hEff,

@@ -295,25 +295,25 @@ void RefoldEngine::InitializeMacroPatchPlanner() {
   // dependency bundle is intentionally explicit: macro planning reads source
   // data and proof services directly rather than calling back into RefoldEngine.
   RefoldMacroPatchPlanner::Dependencies deps;
-  deps.Model = &model_;
-  deps.BSource = bSource_;
-  deps.AToks = aToks_;
-  deps.BToks = bToks_;
-  deps.BTokOff = bTokOff_;
-  deps.ABTokHunks = &abTokHunks_;
-  deps.BInsertionLedger = &BInsertionLedger();
-  deps.ArgTextRecovery = &argTextRecovery_;
-  deps.LexLang = &lexLang_;
-  deps.LineDirs = &lineDirs_;
-  deps.MacroTopology = &macroTopology_;
-  deps.PathIdentity = &pathIdentity_;
-  deps.SourceMapper = &sourceMapper_;
-  deps.OwnerClassifier = &OwnerClassifier();
-  deps.Strict = strict_;
+  deps.model = &model_;
+  deps.bSource = bSource_;
+  deps.aToks = aToks_;
+  deps.bToks = bToks_;
+  deps.bTokOff = bTokOff_;
+  deps.abTokHunks = &abTokHunks_;
+  deps.bInsertionLedger = &BInsertionLedger();
+  deps.argTextRecovery = &argTextRecovery_;
+  deps.lexLang = &lexLang_;
+  deps.lineDirs = &lineDirs_;
+  deps.macroTopology = &macroTopology_;
+  deps.pathIdentity = &pathIdentity_;
+  deps.sourceMapper = &sourceMapper_;
+  deps.ownerClassifier = &OwnerClassifier();
+  deps.strict = strict_;
 
-  deps.MacroStateProof = &MacroStateProof();
-  deps.OwnerStateProof = &OwnerStateProof();
-  deps.ProofLattice = &ProofLattice();
+  deps.macroStateProof = &MacroStateProof();
+  deps.ownerStateProof = &OwnerStateProof();
+  deps.proofLattice = &ProofLattice();
   macroPatchPlanner_ =
       std::make_unique<RefoldMacroPatchPlanner>(std::move(deps));
 }
@@ -330,17 +330,17 @@ const RefoldMacroPatchPlanner &RefoldEngine::MacroPatchPlanner() const {
 
 void RefoldEngine::InitializeMacroStateRepairPlanner() {
   RefoldMacroStateRepairPlanner::Dependencies deps;
-  deps.Model = &model_;
-  deps.PathIdentity = &pathIdentity_;
-  deps.MacroTopology = &macroTopology_;
-  deps.TokenTextAnalysis = &tokenTextAnalysis_;
-  deps.MacroStateProof = &MacroStateProof();
-  deps.OwnerStateProof = &OwnerStateProof();
-  deps.ProofLattice = &ProofLattice();
-  deps.MacroPatchPlanner = &MacroPatchPlanner();
-  deps.TextEditAssembler = textEditAssembler_.get();
-  deps.TerminalSink = &terminalSink_;
-  deps.LexLang = &lexLang_;
+  deps.model = &model_;
+  deps.pathIdentity = &pathIdentity_;
+  deps.macroTopology = &macroTopology_;
+  deps.tokenTextAnalysis = &tokenTextAnalysis_;
+  deps.macroStateProof = &MacroStateProof();
+  deps.ownerStateProof = &OwnerStateProof();
+  deps.proofLattice = &ProofLattice();
+  deps.macroPatchPlanner = &MacroPatchPlanner();
+  deps.textEditAssembler = textEditAssembler_.get();
+  deps.terminalSink = &terminalSink_;
+  deps.lexLang = &lexLang_;
   macroStateRepairPlanner_ =
       std::make_unique<RefoldMacroStateRepairPlanner>(std::move(deps));
 }

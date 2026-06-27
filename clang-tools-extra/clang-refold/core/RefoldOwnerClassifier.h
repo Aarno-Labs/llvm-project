@@ -39,10 +39,10 @@ struct SidebandPragmaEdit;
 class RefoldOwnerClassifier {
 public:
   struct Deps {
-    const RefoldModel &Model;
-    const RefoldPathIdentity &PathIdentity;
-    const RefoldTUEditPlanner &TUEdits;
-    llvm::ArrayRef<SidebandPragmaEdit> SidebandPragmaEdits;
+    const RefoldModel &model;
+    const RefoldPathIdentity &pathIdentity;
+    const RefoldTUEditPlanner &tuEdits;
+    llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits;
   };
 
   explicit RefoldOwnerClassifier(Deps deps);
@@ -57,7 +57,7 @@ public:
                     llvm::StringRef tuPath) const;
 
 private:
-  Deps D_;
+  Deps deps_;
 };
 
 } // namespace refold

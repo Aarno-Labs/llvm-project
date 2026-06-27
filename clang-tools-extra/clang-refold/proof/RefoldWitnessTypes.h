@@ -72,7 +72,7 @@ struct LegacyPathDefinition {
   StringRef requiredClosure;
 };
 
-inline LegacyPathDefinition DescribeLegacyPathKind(LegacyPathKind kind) {
+inline LegacyPathDefinition describeLegacyPathKind(LegacyPathKind kind) {
   switch (kind) {
   case LegacyPathKind::Unknown:
     return {kind, "unclassified legacy dependency",
@@ -119,7 +119,7 @@ inline LegacyPathDefinition DescribeLegacyPathKind(LegacyPathKind kind) {
           "classify the dependency before it can be audited"};
 }
 
-inline bool IsDefinedLegacyPathKind(LegacyPathKind kind) {
+inline bool isDefinedLegacyPathKind(LegacyPathKind kind) {
   return kind != LegacyPathKind::Unknown;
 }
 
@@ -457,7 +457,7 @@ struct WitnessStrictDomainDecision {
 /// in equivalence-class partitioning.  An unknown dimension is never
 /// equivalent to another unknown dimension merely because both spell
 /// "unknown"; partition keys salt unknown dimensions with the witness id
-/// until a later proof stage supplies a real semantic value.
+/// until a later proof path supplies a real semantic value.
 struct WitnessEquivalenceDimension {
   bool known = false;
   std::string value;

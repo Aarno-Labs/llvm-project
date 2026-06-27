@@ -42,11 +42,11 @@ public:
   /// The object is intentionally lightweight so the macro planner can create a
   /// short-lived view whenever it needs occurrence consistency proof.
   struct Dependencies {
-    llvm::ArrayRef<PPTok> AToks;
-    llvm::ArrayRef<size_t> BTokOff;
-    const RefoldMacroTopology *MacroTopology = nullptr;
-    const RefoldSourceMapper *SourceMapper = nullptr;
-    bool Strict = false;
+    llvm::ArrayRef<PPTok> aToks;
+    llvm::ArrayRef<size_t> bTokOff;
+    const RefoldMacroTopology *macroTopology = nullptr;
+    const RefoldSourceMapper *sourceMapper = nullptr;
+    bool strict = false;
   };
 
   explicit RefoldMacroOccurrenceReplay(Dependencies deps);
@@ -96,7 +96,7 @@ private:
 class RefoldMacroActualLayout {
 public:
   struct Dependencies {
-    const clang::LangOptions *LexLang = nullptr;
+    const clang::LangOptions *lexLang = nullptr;
   };
 
   explicit RefoldMacroActualLayout(Dependencies deps);

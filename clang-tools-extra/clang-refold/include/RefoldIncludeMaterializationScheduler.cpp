@@ -32,45 +32,45 @@ namespace refold {
 namespace {
 
 template <typename T>
-T &requireNonNull(T *Ptr, const char *Message) {
-  assert(Ptr && Message);
-  (void)Message;
-  return *Ptr;
+T &requireNonNull(T *ptr, const char *message) {
+  assert(ptr && message);
+  (void)message;
+  return *ptr;
 }
 
 } // namespace
 
 RefoldIncludeMaterializationScheduler::RefoldIncludeMaterializationScheduler(
-    Dependencies Deps, IncludeMaterializationRequest Request)
-    : deps_(std::move(Deps)), request_(std::move(Request)),
-      model_(requireNonNull(deps_.Model,
+    Dependencies deps, IncludeMaterializationRequest request)
+    : deps_(std::move(deps)), request_(std::move(request)),
+      model_(requireNonNull(deps_.model,
                             "include scheduler requires RefoldModel")),
       pathIdentity_(requireNonNull(
-          deps_.PathIdentity, "include scheduler requires path identity")),
+          deps_.pathIdentity, "include scheduler requires path identity")),
       includeMaterializer_(requireNonNull(
-          deps_.IncludeMaterializer,
+          deps_.includeMaterializer,
           "include scheduler requires include materializer")),
       includeInsertionPlanner_(requireNonNull(
-          deps_.IncludeInsertionPlanner,
+          deps_.includeInsertionPlanner,
           "include scheduler requires include insertion planner")),
       lineObserverLayout_(requireNonNull(
-          deps_.LineObserverLayout,
+          deps_.lineObserverLayout,
           "include scheduler requires line observer layout")),
       macroStateRepairPlanner_(requireNonNull(
-          deps_.MacroStateRepairPlanner,
+          deps_.macroStateRepairPlanner,
           "include scheduler requires macro-state repair planner")),
       textEditAssembler_(requireNonNull(
-          deps_.TextEditAssembler,
+          deps_.textEditAssembler,
           "include scheduler requires text edit assembler")),
-      proofLattice_(requireNonNull(deps_.ProofLattice,
+      proofLattice_(requireNonNull(deps_.proofLattice,
                                    "include scheduler requires proof lattice")),
-      terminalSink_(requireNonNull(deps_.TerminalSink,
+      terminalSink_(requireNonNull(deps_.terminalSink,
                                    "include scheduler requires terminal sink")),
       sidebandPragmaEdits_(requireNonNull(
-          deps_.SidebandPragmaEdits,
+          deps_.sidebandPragmaEdits,
           "include scheduler requires sideband pragma edit list")),
       structuralHunkDispatcher_(requireNonNull(
-          request_.StructuralHunkDispatcher,
+          request_.structuralHunkDispatcher,
           "include scheduler requires structural dispatcher")),
       tuEdits_(structuralHunkDispatcher_.MutableTUEditsForRepairAndEmission()) {
   BuildChildrenIndex();
@@ -98,9 +98,9 @@ bool RefoldIncludeMaterializationScheduler::MaterializeIncludeExpansions() {
 }
 
 bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdits(
-    RefoldMacroStateRepairPlanner::MacroStateRepairPlan &MacroStatePlan,
+    RefoldMacroStateRepairPlanner::MacroStateRepairPlan &macroStatePlan,
     const RefoldMacroStateRepairPlanner::MacroStateRepairRequest
-        &MacroStateRequest) {
+        &macroStateRequest) {
   // Determinism: includeExpansion_ is a DenseMap, so iterate by sorted id.
   SmallVector<uint64_t, 32> includeIds;
   includeIds.reserve(includeExpansion_.size());
@@ -109,8 +109,8 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdits(
   llvm::sort(includeIds);
 
   for (uint64_t includeId : includeIds) {
-    if (!StageTURootIncludeExpansionEdit(includeId, MacroStatePlan,
-                                         MacroStateRequest))
+    if (!StageTURootIncludeExpansionEdit(includeId, macroStatePlan,
+                                         macroStateRequest))
       return false;
   }
   return true;
@@ -134,10 +134,10 @@ void RefoldIncludeMaterializationScheduler::BuildChildrenIndex() {
 
 const RefoldModel::MacroDirective *
 RefoldIncludeMaterializationScheduler::FindMacroDirectiveById(
-    uint64_t Id) const {
+    uint64_t id) const {
   for (const RefoldModel::MacroDirective &directive :
        model_.GetMacroDirectives()) {
-    if (directive.id == Id)
+    if (directive.id == id)
       return &directive;
   }
   return nullptr;
@@ -145,31 +145,31 @@ RefoldIncludeMaterializationScheduler::FindMacroDirectiveById(
 
 bool RefoldIncludeMaterializationScheduler::
     DefinitionIsSuppliedByImmediateIncluder(
-        const RefoldModel::IncludeItem &Include,
-        const RefoldModel::MacroDirective &Definition) const {
-  if (Definition.subkind != "#define")
+        const RefoldModel::IncludeItem &include,
+        const RefoldModel::MacroDirective &definition) const {
+  if (definition.subkind != "#define")
     return false;
-  if (!pathIdentity_.PathsEqual(Definition.sitePath, Include.sitePath))
+  if (!pathIdentity_.PathsEqual(definition.sitePath, include.sitePath))
     return false;
-  if (Definition.siteE > Include.siteB)
+  if (definition.siteE > include.siteB)
     return false;
-  return Definition.ownerIncludeId == Include.parent;
+  return definition.ownerIncludeId == include.parent;
 }
 
 bool RefoldIncludeMaterializationScheduler::
     IncludeHasIncluderSuppliedLineControlMacroState(
-        const RefoldModel::IncludeItem &Include) const {
+        const RefoldModel::IncludeItem &include) const {
   for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
     if (!event.active || !event.producerProven)
       continue;
-    if (event.ownerIncludeId != std::optional<uint64_t>(Include.id))
+    if (event.ownerIncludeId != std::optional<uint64_t>(include.id))
       continue;
     if (!event.siteB || !event.siteE)
       continue;
 
     for (const RefoldModel::MacroInvocation &macro :
          model_.GetMacroInvocations()) {
-      if (macro.ownerIncludeId != std::optional<uint64_t>(Include.id))
+      if (macro.ownerIncludeId != std::optional<uint64_t>(include.id))
         continue;
       if (!macro.invB || !macro.invE || !macro.definitionDirectiveId)
         continue;
@@ -180,7 +180,7 @@ bool RefoldIncludeMaterializationScheduler::
           FindMacroDirectiveById(*macro.definitionDirectiveId);
       if (!definition)
         continue;
-      if (DefinitionIsSuppliedByImmediateIncluder(Include, *definition))
+      if (DefinitionIsSuppliedByImmediateIncluder(include, *definition))
         return true;
     }
   }
@@ -189,61 +189,61 @@ bool RefoldIncludeMaterializationScheduler::
 }
 
 uint64_t RefoldIncludeMaterializationScheduler::TokenEndOffset(
-    ArrayRef<PPTok> Tokens, ArrayRef<size_t> TokenOffsets, size_t Index) {
-  return static_cast<uint64_t>(TokenOffsets[Index] +
-                               Tokens[Index].spelling.size());
+    ArrayRef<PPTok> tokens, ArrayRef<size_t> tokenOffsets, size_t index) {
+  return static_cast<uint64_t>(tokenOffsets[index] +
+                               tokens[index].spelling.size());
 }
 
 std::optional<uint64_t>
 RefoldIncludeMaterializationScheduler::FindTokenGapContainingByteRange(
-    StringRef Source, ArrayRef<PPTok> Tokens, ArrayRef<size_t> TokenOffsets,
-    uint64_t Begin, uint64_t End) const {
-  if (Begin > End || End > Source.size())
+    StringRef source, ArrayRef<PPTok> tokens, ArrayRef<size_t> tokenOffsets,
+    uint64_t begin, uint64_t end) const {
+  if (begin > end || end > source.size())
     return std::nullopt;
 
-  const size_t tokenCount = Tokens.size();
-  if (TokenOffsets.size() < tokenCount + 1)
+  const size_t tokenCount = tokens.size();
+  if (tokenOffsets.size() < tokenCount + 1)
     return std::nullopt;
 
   size_t gap = 0;
-  while (gap < tokenCount && static_cast<uint64_t>(TokenOffsets[gap]) < End)
+  while (gap < tokenCount && static_cast<uint64_t>(tokenOffsets[gap]) < end)
     ++gap;
 
   const uint64_t gapBegin =
-      gap == 0 ? 0 : TokenEndOffset(Tokens, TokenOffsets, gap - 1);
+      gap == 0 ? 0 : TokenEndOffset(tokens, tokenOffsets, gap - 1);
   const uint64_t gapEnd =
-      gap == tokenCount ? static_cast<uint64_t>(Source.size())
-                        : static_cast<uint64_t>(TokenOffsets[gap]);
+      gap == tokenCount ? static_cast<uint64_t>(source.size())
+                        : static_cast<uint64_t>(tokenOffsets[gap]);
 
-  if (Begin < gapBegin || End > gapEnd)
+  if (begin < gapBegin || end > gapEnd)
     return std::nullopt;
   return static_cast<uint64_t>(gap);
 }
 
 std::optional<uint64_t>
 RefoldIncludeMaterializationScheduler::LayoutOnlyIncludeSeedForRawByteHunk(
-    const diffutils::Hunk &Hunk) const {
-  if (Hunk.aStart > Hunk.aEnd || Hunk.bStart > Hunk.bEnd ||
-      Hunk.aEnd > request_.ASource.size() || Hunk.bEnd > request_.BSource.size())
+    const diffutils::Hunk &hunk) const {
+  if (hunk.aStart > hunk.aEnd || hunk.bStart > hunk.bEnd ||
+      hunk.aEnd > request_.aSource.size() || hunk.bEnd > request_.bSource.size())
     return std::nullopt;
 
-  StringRef aSlice = request_.ASource.slice(static_cast<size_t>(Hunk.aStart),
-                                           static_cast<size_t>(Hunk.aEnd));
-  StringRef bSlice = request_.BSource.slice(static_cast<size_t>(Hunk.bStart),
-                                           static_cast<size_t>(Hunk.bEnd));
+  StringRef aSlice = request_.aSource.slice(static_cast<size_t>(hunk.aStart),
+                                           static_cast<size_t>(hunk.aEnd));
+  StringRef bSlice = request_.bSource.slice(static_cast<size_t>(hunk.bStart),
+                                           static_cast<size_t>(hunk.bEnd));
   if (!aSlice.trim().empty() || !bSlice.trim().empty())
     return std::nullopt;
 
   std::optional<uint64_t> aGap = FindTokenGapContainingByteRange(
-      request_.ASource, request_.ATokens, request_.ATokenOffsets, Hunk.aStart,
-      Hunk.aEnd);
+      request_.aSource, request_.aTokens, request_.aTokenOffsets, hunk.aStart,
+      hunk.aEnd);
   std::optional<uint64_t> bGap = FindTokenGapContainingByteRange(
-      request_.BSource, request_.BTokens, request_.BTokenOffsets, Hunk.bStart,
-      Hunk.bEnd);
+      request_.bSource, request_.bTokens, request_.bTokenOffsets, hunk.bStart,
+      hunk.bEnd);
   if (!aGap || !bGap)
     return std::nullopt;
 
-  const uint64_t tokenCount = static_cast<uint64_t>(request_.ATokens.size());
+  const uint64_t tokenCount = static_cast<uint64_t>(request_.aTokens.size());
   std::optional<uint64_t> leftInclude =
       *aGap > 0 ? model_.InnermostIncludeAtPP(*aGap - 1) : std::nullopt;
   std::optional<uint64_t> rightInclude =
@@ -290,12 +290,12 @@ void RefoldIncludeMaterializationScheduler::
   // fallback handles only the fully byte-only surface where no stronger
   // structural repair exists.
   const bool mayUseByteOnlyIncludeLayoutSeed =
-      request_.TokenHunks.empty() && sidebandPragmaEdits_.empty() &&
+      request_.tokenHunks.empty() && sidebandPragmaEdits_.empty() &&
       tuEdits_.empty() && !structuralHunkDispatcher_.IncludeBucketsHavePatches() &&
       !structuralHunkDispatcher_.MacroBucketsHavePatches();
 
-  if (request_.RawByteHunks) {
-    for (const diffutils::Hunk &byteHunk : *request_.RawByteHunks) {
+  if (request_.rawByteHunks) {
+    for (const diffutils::Hunk &byteHunk : *request_.rawByteHunks) {
       std::optional<uint64_t> seed =
           LayoutOnlyIncludeSeedForRawByteHunk(byteHunk);
       if (!seed)
@@ -330,18 +330,18 @@ void RefoldIncludeMaterializationScheduler::
     }
   }
 
-  if (inTraceMode() && request_.RawByteHunks &&
-      !request_.RawByteHunks->empty() &&
+  if (inTraceMode() && request_.rawByteHunks &&
+      !request_.rawByteHunks->empty() &&
       layoutOnlyIncludeMaterializationSeeds_.empty()) {
     REFOLD_LOG_TRACE(
         "include/layout",
         "skip include layout seeding: tokenHunks={0} sidebandPragmas={1} "
         "tuEdits={2} includePatchBuckets={3} macroPatchBuckets={4} "
         "rawByteHunks={5}",
-        request_.TokenHunks.size(), sidebandPragmaEdits_.size(), tuEdits_.size(),
+        request_.tokenHunks.size(), sidebandPragmaEdits_.size(), tuEdits_.size(),
         structuralHunkDispatcher_.IncludeBucketCount(),
         structuralHunkDispatcher_.MacroOwnerBucketCount(),
-        request_.RawByteHunks->size());
+        request_.rawByteHunks->size());
   }
 }
 
@@ -376,13 +376,13 @@ RefoldIncludeMaterializationScheduler::BuildInitialMaterializationSeeds()
 }
 
 void RefoldIncludeMaterializationScheduler::AddAncestorMaterializationSeeds(
-    DenseSet<uint64_t> &Seeds) const {
-  SmallVector<uint64_t, 32> worklist(Seeds.begin(), Seeds.end());
+    DenseSet<uint64_t> &seeds) const {
+  SmallVector<uint64_t, 32> worklist(seeds.begin(), seeds.end());
   for (size_t i = 0; i < worklist.size(); ++i) {
     const RefoldModel::IncludeItem *cur = model_.GetIncludeById(worklist[i]);
     while (cur && cur->parent) {
       uint64_t parentId = *cur->parent;
-      auto inserted = Seeds.insert(parentId);
+      auto inserted = seeds.insert(parentId);
       if (!inserted.second)
         break;
       worklist.push_back(parentId);
@@ -392,10 +392,10 @@ void RefoldIncludeMaterializationScheduler::AddAncestorMaterializationSeeds(
 }
 
 unsigned RefoldIncludeMaterializationScheduler::IncludeMaterializationDepth(
-    uint64_t IncludeId) const {
+    uint64_t includeId) const {
   unsigned depth = 0;
   DenseSet<uint64_t> seen;
-  const RefoldModel::IncludeItem *cur = model_.GetIncludeById(IncludeId);
+  const RefoldModel::IncludeItem *cur = model_.GetIncludeById(includeId);
   while (cur && cur->parent) {
     if (!seen.insert(cur->id).second)
       break;
@@ -407,8 +407,8 @@ unsigned RefoldIncludeMaterializationScheduler::IncludeMaterializationDepth(
 
 SmallVector<uint64_t, 32>
 RefoldIncludeMaterializationScheduler::OrderedMaterializationSeeds(
-    const DenseSet<uint64_t> &Seeds) const {
-  SmallVector<uint64_t, 32> orderedSeeds(Seeds.begin(), Seeds.end());
+    const DenseSet<uint64_t> &seeds) const {
+  SmallVector<uint64_t, 32> orderedSeeds(seeds.begin(), seeds.end());
 
   // Materialize each include once.  Process ancestors before descendants rather
   // than iterating the DenseSet directly.  This ordering matters for
@@ -427,8 +427,8 @@ RefoldIncludeMaterializationScheduler::OrderedMaterializationSeeds(
 }
 
 void RefoldIncludeMaterializationScheduler::MaterializeOrderedSeeds(
-    ArrayRef<uint64_t> OrderedSeeds) {
-  for (uint64_t includeId : OrderedSeeds) {
+    ArrayRef<uint64_t> orderedSeeds) {
+  for (uint64_t includeId : orderedSeeds) {
     includeMaterializer_.MaterializeIncludeExpansion(
         includeId,
         structuralHunkDispatcher_.MutableIncludeEditBucketsForMaterialization(),
@@ -447,34 +447,34 @@ void RefoldIncludeMaterializationScheduler::RebuildExpandedIncludeIds() {
 }
 
 bool RefoldIncludeMaterializationScheduler::
-    IncludeHasLineDirectiveForcingSidebandWork(uint64_t IncludeId) const {
+    IncludeHasLineDirectiveForcingSidebandWork(uint64_t includeId) const {
   return llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &edit) {
-    return edit.TargetsInclude(IncludeId) &&
+    return edit.TargetsInclude(includeId) &&
            edit.ForcesIncludeLineDirectiveWrappers();
   });
 }
 
 bool RefoldIncludeMaterializationScheduler::IncludeHasOrdinaryReplayTokens(
-    uint64_t IncludeId) const {
-  if (const RefoldModel::IncludeItem *item = model_.GetIncludeById(IncludeId))
+    uint64_t includeId) const {
+  if (const RefoldModel::IncludeItem *item = model_.GetIncludeById(includeId))
     return item->cover.end > item->cover.begin;
   return false;
 }
 
 bool RefoldIncludeMaterializationScheduler::
-    IncludeUsesOnlySidebandReplayEnvelope(uint64_t IncludeId) const {
+    IncludeUsesOnlySidebandReplayEnvelope(uint64_t includeId) const {
   bool sawSideband = llvm::any_of(
       sidebandPragmaEdits_, [&](const SidebandPragmaEdit &edit) {
-        return edit.TargetsInclude(IncludeId);
+        return edit.TargetsInclude(includeId);
       });
-  if (IncludeHasOrdinaryReplayTokens(IncludeId))
+  if (IncludeHasOrdinaryReplayTokens(includeId))
     return false;
-  if (structuralHunkDispatcher_.HasIncludePatchesFor(IncludeId))
+  if (structuralHunkDispatcher_.HasIncludePatchesFor(includeId))
     return false;
   if (structuralHunkDispatcher_.HasFinalMacroPatchesForOwner(
-          std::optional<uint64_t>(IncludeId)))
+          std::optional<uint64_t>(includeId)))
     return false;
-  if (auto childIt = children_.find(IncludeId); childIt != children_.end()) {
+  if (auto childIt = children_.find(includeId); childIt != children_.end()) {
     for (const RefoldModel::IncludeItem *child : childIt->second) {
       if (!IncludeUsesOnlySidebandReplayEnvelope(child->id))
         return false;
@@ -486,24 +486,24 @@ bool RefoldIncludeMaterializationScheduler::
 
 RefoldIncludeMaterializationScheduler::TUIncludeMaterializationWorkClass
 RefoldIncludeMaterializationScheduler::ClassifyTUIncludeMaterializationWork(
-    uint64_t IncludeId) const {
-  if (layoutOnlyIncludeMaterializationSeeds_.contains(IncludeId))
+    uint64_t includeId) const {
+  if (layoutOnlyIncludeMaterializationSeeds_.contains(includeId))
     return TUIncludeMaterializationWorkClass::Ordinary;
 
   bool sawSideband = llvm::any_of(
       sidebandPragmaEdits_, [&](const SidebandPragmaEdit &edit) {
-        return edit.TargetsInclude(IncludeId);
+        return edit.TargetsInclude(includeId);
       });
-  if (IncludeHasLineDirectiveForcingSidebandWork(IncludeId))
+  if (IncludeHasLineDirectiveForcingSidebandWork(includeId))
     return TUIncludeMaterializationWorkClass::Ordinary;
-  if (sawSideband && IncludeHasOrdinaryReplayTokens(IncludeId))
+  if (sawSideband && IncludeHasOrdinaryReplayTokens(includeId))
     return TUIncludeMaterializationWorkClass::Ordinary;
-  if (structuralHunkDispatcher_.HasIncludePatchesFor(IncludeId))
+  if (structuralHunkDispatcher_.HasIncludePatchesFor(includeId))
     return TUIncludeMaterializationWorkClass::Ordinary;
   if (structuralHunkDispatcher_.HasFinalMacroPatchesForOwner(
-          std::optional<uint64_t>(IncludeId)))
+          std::optional<uint64_t>(includeId)))
     return TUIncludeMaterializationWorkClass::Ordinary;
-  if (auto childIt = children_.find(IncludeId); childIt != children_.end()) {
+  if (auto childIt = children_.find(includeId); childIt != children_.end()) {
     for (const RefoldModel::IncludeItem *child : childIt->second) {
       switch (ClassifyTUIncludeMaterializationWork(child->id)) {
       case TUIncludeMaterializationWorkClass::Ordinary:
@@ -521,10 +521,10 @@ RefoldIncludeMaterializationScheduler::ClassifyTUIncludeMaterializationWork(
 }
 
 bool RefoldIncludeMaterializationScheduler::
-    IncludeSubtreeHasLayoutOnlyMaterializationSeed(uint64_t IncludeId) const {
-  if (layoutOnlyIncludeMaterializationSeeds_.contains(IncludeId))
+    IncludeSubtreeHasLayoutOnlyMaterializationSeed(uint64_t includeId) const {
+  if (layoutOnlyIncludeMaterializationSeeds_.contains(includeId))
     return true;
-  if (auto childIt = children_.find(IncludeId); childIt != children_.end()) {
+  if (auto childIt = children_.find(includeId); childIt != children_.end()) {
     for (const RefoldModel::IncludeItem *child : childIt->second) {
       if (child && IncludeSubtreeHasLayoutOnlyMaterializationSeed(child->id))
         return true;
@@ -535,25 +535,25 @@ bool RefoldIncludeMaterializationScheduler::
 
 std::pair<uint64_t, uint64_t>
 RefoldIncludeMaterializationScheduler::ExtendedTUSiteRange(
-    const RefoldModel::IncludeItem &Include) const {
+    const RefoldModel::IncludeItem &include) const {
   // The producer's [siteB, siteE) range is supposed to cover the entire
   // physical `#include` directive in the TU. In some cases involving leading
   // line splices just before the directive, that recorded end can stop too
   // early. If we replace only the truncated range, part of the original
   // `#include` can remain in the TU, and checker replay may include the header
   // again.
-  uint64_t siteBegin = Include.siteB;
-  uint64_t siteEnd = Include.siteE;
-  if (siteBegin < request_.TUBytes.size()) {
+  uint64_t siteBegin = include.siteB;
+  uint64_t siteEnd = include.siteE;
+  if (siteBegin < request_.tuBytes.size()) {
     size_t i = static_cast<size_t>(siteBegin);
     while (true) {
-      size_t nl = request_.TUBytes.find('\n', i);
+      size_t nl = request_.tuBytes.find('\n', i);
       if (nl == StringRef::npos) {
-        siteEnd = request_.TUBytes.size();
+        siteEnd = request_.tuBytes.size();
         break;
       }
       i = nl + 1;
-      if (!stringutils::isLineSplice(request_.TUBytes, nl)) {
+      if (!stringutils::isLineSplice(request_.tuBytes, nl)) {
         uint64_t extended = static_cast<uint64_t>(i);
         if (extended > siteEnd)
           siteEnd = extended;
@@ -565,12 +565,12 @@ RefoldIncludeMaterializationScheduler::ExtendedTUSiteRange(
 }
 
 bool RefoldIncludeMaterializationScheduler::TryPreserveSourceGraphOutput(
-    const RefoldModel::IncludeItem &Include, StringRef ExpansionText) const {
-  if (!request_.SourceGraphOutputs)
+    const RefoldModel::IncludeItem &include, StringRef expansionText) const {
+  if (!request_.sourceGraphOutputs)
     return false;
 
   source_graph::SourceGraphProofInputs sourceGraphProofInputs{
-      model_, request_.TUPath, includeExpansion_};
+      model_, request_.tuPath, includeExpansion_};
 
   // function_ref does not own callable storage.  Keep the callback objects in
   // this scope so the proof-service bundle never observes dangling lambdas.
@@ -588,33 +588,33 @@ bool RefoldIncludeMaterializationScheduler::TryPreserveSourceGraphOutput(
 
   source_graph::SourceGraphOwnerPreservationOutputPlan sourceGraphPlan =
       source_graph::planSourceGraphOwnerPreservationOutput(
-          sourceGraphProofInputs, Include, ExpansionText,
+          sourceGraphProofInputs, include, expansionText,
           sourceGraphProofServices);
-  if (sourceGraphPlan.RejectedCleanupOutput)
-    request_.SourceGraphOutputs->push_back(
-        std::move(*sourceGraphPlan.RejectedCleanupOutput));
-  if (!sourceGraphPlan.PreservedOutput)
+  if (sourceGraphPlan.rejectedCleanupOutput)
+    request_.sourceGraphOutputs->push_back(
+        std::move(*sourceGraphPlan.rejectedCleanupOutput));
+  if (!sourceGraphPlan.preservedOutput)
     return false;
 
-  request_.SourceGraphOutputs->push_back(
-      std::move(*sourceGraphPlan.PreservedOutput));
+  request_.sourceGraphOutputs->push_back(
+      std::move(*sourceGraphPlan.preservedOutput));
   return true;
 }
 
 bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
-    uint64_t IncludeId,
-    RefoldMacroStateRepairPlanner::MacroStateRepairPlan &MacroStatePlan,
+    uint64_t includeId,
+    RefoldMacroStateRepairPlanner::MacroStateRepairPlan &macroStatePlan,
     const RefoldMacroStateRepairPlanner::MacroStateRepairRequest
-        &MacroStateRequest) {
-  auto expansionIt = includeExpansion_.find(IncludeId);
+        &macroStateRequest) {
+  auto expansionIt = includeExpansion_.find(includeId);
   if (expansionIt == includeExpansion_.end())
     return true;
 
-  const RefoldModel::IncludeItem *include = model_.GetIncludeById(IncludeId);
+  const RefoldModel::IncludeItem *include = model_.GetIncludeById(includeId);
   if (!include)
     return true;
   if (include->parent || !pathIdentity_.PathsEqual(include->sitePath,
-                                                  request_.TUPath))
+                                                  request_.tuPath))
     return true;
 
   std::string expansionText = expansionIt->second;
@@ -624,14 +624,14 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
     return true;
 
   if (!macroStateRepairPlanner_.RepairConsumedDefinitionsForMaterializedInclude(
-          MacroStatePlan, MacroStateRequest, *include, siteBegin, siteEnd,
+          macroStatePlan, macroStateRequest, *include, siteBegin, siteEnd,
           expansionText)) {
     return false;
   }
 
   LineDirectiveLocation parentResume =
       LineDirectiveInserter::LogicalLocationAtOffset(
-          request_.TUBytes, siteEnd, request_.TUPath, model_, request_.TUPath);
+          request_.tuBytes, siteEnd, request_.tuPath, model_, request_.tuPath);
   const bool sidebandOnly =
       ClassifyTUIncludeMaterializationWork(include->id) ==
       TUIncludeMaterializationWorkClass::SidebandPragmaOnly;
@@ -654,7 +654,7 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
 
   LineControlWrappedText wrapped =
       lineObserverLayout_.WrapIncludeExpansionForMaterialization(
-          *include, parentResume.fileSpelling, request_.TUPath, std::nullopt,
+          *include, parentResume.fileSpelling, request_.tuPath, std::nullopt,
           siteEnd, childEntryLineNo ? childEntryLineNo : 1,
           parentResume.lineNo, expansionText, includeLineCandidates,
           includeLineSourceMappings, sidebandOnly);
@@ -672,7 +672,7 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
   edit.lineControlSourceMappings =
       std::move(wrapped.lineControlSourceMappings);
 
-  auto acceptedIt = includeExpansionAcceptedResults_.find(IncludeId);
+  auto acceptedIt = includeExpansionAcceptedResults_.find(includeId);
   if (auto bEnv =
           includeInsertionPlanner_.ResolveIncludeRealizationBTokenEnvelope(
               include->cover.begin, include->cover.end)) {

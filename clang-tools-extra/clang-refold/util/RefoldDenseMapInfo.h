@@ -29,15 +29,15 @@ template <> struct DenseMapInfo<std::optional<uint64_t>> {
     return std::optional<uint64_t>(~1ULL);
   }
 
-  static unsigned getHashValue(const std::optional<uint64_t> &Val) {
+  static unsigned getHashValue(const std::optional<uint64_t> &val) {
     // `std::nullopt` is a real owner key in clang-refold; it must hash to a
     // stable value distinct from the DenseMap empty/tombstone sentinels above.
-    return Val ? static_cast<unsigned>(llvm::hash_value(*Val)) : 0u;
+    return val ? static_cast<unsigned>(llvm::hash_value(*val)) : 0u;
   }
 
-  static bool isEqual(const std::optional<uint64_t> &LHS,
-                      const std::optional<uint64_t> &RHS) {
-    return LHS == RHS;
+  static bool isEqual(const std::optional<uint64_t> &lhs,
+                      const std::optional<uint64_t> &rhs) {
+    return lhs == rhs;
   }
 };
 

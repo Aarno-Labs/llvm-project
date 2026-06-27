@@ -58,10 +58,10 @@ inline size_t refoldTokenEndOffsetFromBase(const Token &token,
 /// callers can prove token-boundary preservation without
 /// depending on textual inclusion order.
 struct RefoldLexBoundaryToken {
-  tok::TokenKind Kind = tok::unknown;
-  std::string Spelling;
-  size_t Begin = 0;
-  size_t End = 0;
+  tok::TokenKind kind = tok::unknown;
+  std::string spelling;
+  size_t begin = 0;
+  size_t end = 0;
 };
 
 /// Lex a snippet into non-comment boundary tokens for maximal-munch checks.
@@ -119,8 +119,8 @@ refoldLastLexToken(llvm::StringRef text, const LangOptions &lang) {
 inline bool refoldNeedsLexicalSeparator(const RefoldLexBoundaryToken &left,
                                         const RefoldLexBoundaryToken &right,
                                         const LangOptions &lang) {
-  const std::string noSpace = left.Spelling + right.Spelling;
-  const std::string withSpace = left.Spelling + " " + right.Spelling;
+  const std::string noSpace = left.spelling + right.spelling;
+  const std::string withSpace = left.spelling + " " + right.spelling;
 
   llvm::SmallVector<RefoldLexBoundaryToken, 8> noSpaceToks;
   llvm::SmallVector<RefoldLexBoundaryToken, 8> withSpaceToks;
@@ -130,8 +130,8 @@ inline bool refoldNeedsLexicalSeparator(const RefoldLexBoundaryToken &left,
   if (noSpaceToks.size() != withSpaceToks.size())
     return true;
   for (size_t i = 0; i < noSpaceToks.size(); ++i) {
-    if (noSpaceToks[i].Kind != withSpaceToks[i].Kind ||
-        noSpaceToks[i].Spelling != withSpaceToks[i].Spelling)
+    if (noSpaceToks[i].kind != withSpaceToks[i].kind ||
+        noSpaceToks[i].spelling != withSpaceToks[i].spelling)
       return true;
   }
   return false;

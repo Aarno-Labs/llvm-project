@@ -39,9 +39,9 @@ struct RefoldTerminalProofSinkCallbacks {
   using TraceTerminalRequestFn =
       std::function<void(const TerminalFallbackRequest &)>;
 
-  AuditLegacyAuthorityFn AuditLegacyAuthority;
-  NoteTheoremAuditViolationFn NoteTheoremAuditViolation;
-  TraceTerminalRequestFn TraceTerminalRequest;
+  AuditLegacyAuthorityFn auditLegacyAuthority;
+  NoteTheoremAuditViolationFn noteTheoremAuditViolation;
+  TraceTerminalRequestFn traceTerminalRequest;
 };
 
 /// Mutable terminal fallback request sink.

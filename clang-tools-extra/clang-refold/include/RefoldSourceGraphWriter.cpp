@@ -24,13 +24,13 @@ namespace refold {
 
 namespace {
 
-static bool pathSpellingMatchesAfterAbsolute(llvm::StringRef A,
-                                             llvm::StringRef B) {
-  if (A.empty() || B.empty())
+static bool pathSpellingMatchesAfterAbsolute(llvm::StringRef a,
+                                             llvm::StringRef b) {
+  if (a.empty() || b.empty())
     return false;
 
-  llvm::SmallString<256> AbsA(A);
-  llvm::SmallString<256> AbsB(B);
+  llvm::SmallString<256> AbsA(a);
+  llvm::SmallString<256> AbsB(b);
   if (std::error_code EC = llvm::sys::fs::make_absolute(AbsA))
     return false;
   if (std::error_code EC = llvm::sys::fs::make_absolute(AbsB))
@@ -48,88 +48,88 @@ static bool pathSpellingMatchesAfterAbsolute(llvm::StringRef A,
 /// observer stability; those decisions are made earlier by the proof/planning
 /// layer.  The writer rejects absolute paths, empty components, `.`/`..`, and
 /// spellings that would escape or corrupt a quoted include operand.
-static bool validateSourceGraphRelativeOutputPath(llvm::StringRef Rel) {
-  llvm::SmallVector<llvm::StringRef, 8> Components;
-  Rel.split(Components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
-  const bool HasUnsafeComponent = llvm::any_of(
-      Components, [](llvm::StringRef C) {
+static bool validateSourceGraphRelativeOutputPath(llvm::StringRef rel) {
+  llvm::SmallVector<llvm::StringRef, 8> components;
+  rel.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
+  const bool hasUnsafeComponent = llvm::any_of(
+      components, [](llvm::StringRef C) {
         return C.empty() || C == "." || C == "..";
       });
-  return !Rel.empty() && !llvm::sys::path::is_absolute(Rel) &&
-         !HasUnsafeComponent && !Rel.contains('\\') && !Rel.contains('"');
+  return !rel.empty() && !llvm::sys::path::is_absolute(rel) &&
+         !hasUnsafeComponent && !rel.contains('\\') && !rel.contains('"');
 }
 
 } // namespace
 
 SourceGraphWriteOptions
 makeSourceGraphWriteOptionsForModifiedSourcePath(
-    llvm::StringRef ModifiedSrcPath) {
-  llvm::SmallString<256> OutputDir(ModifiedSrcPath);
+    llvm::StringRef modifiedSrcPath) {
+  llvm::SmallString<256> OutputDir(modifiedSrcPath);
   llvm::sys::path::remove_filename(OutputDir);
   if (OutputDir.empty())
     OutputDir = ".";
 
-  SourceGraphWriteOptions Options;
-  Options.OutputDirectory = OutputDir.str().str();
-  return Options;
+  SourceGraphWriteOptions options;
+  options.outputDirectory = OutputDir.str().str();
+  return options;
 }
 
-void writeSourceGraphOutputs(llvm::ArrayRef<SourceGraphOutput> Outputs,
-                             const SourceGraphWriteOptions &Options) {
-  llvm::StringRef OutputDir = Options.OutputDirectory.empty()
+void writeSourceGraphOutputs(llvm::ArrayRef<SourceGraphOutput> outputs,
+                             const SourceGraphWriteOptions &options) {
+  llvm::StringRef OutputDir = options.outputDirectory.empty()
                                   ? llvm::StringRef(".")
-                                  : llvm::StringRef(Options.OutputDirectory);
+                                  : llvm::StringRef(options.outputDirectory);
 
-  std::map<std::string, SourceGraphOutput> CleanupOutputs;
-  std::map<std::string, std::string> UniqueOutputs;
-  for (const SourceGraphOutput &Output : Outputs) {
-    llvm::StringRef Rel(Output.relativePath);
+  std::map<std::string, SourceGraphOutput> cleanupOutputs;
+  std::map<std::string, std::string> uniqueOutputs;
+  for (const SourceGraphOutput &output : outputs) {
+    llvm::StringRef Rel(output.relativePath);
     if (!validateSourceGraphRelativeOutputPath(Rel))
       REFOLD_LOG_FATAL("source-graph/write",
             "refusing unsafe source-graph output path: {0}",
-            Output.relativePath);
+            output.relativePath);
 
-    if (Output.cleanupOnly) {
+    if (output.cleanupOnly) {
       // Multiple rejected include sites can point at the same stale sidecar.
       // Keeping the first candidate is enough: cleanup is byte-exact, so a
       // nonmatching file is left alone rather than guessed about.
-      CleanupOutputs.insert({Output.relativePath, Output});
+      cleanupOutputs.insert({output.relativePath, output});
       continue;
     }
 
     auto [It, Inserted] =
-        UniqueOutputs.insert({Output.relativePath, Output.bytes});
-    if (!Inserted && It->second != Output.bytes)
+        uniqueOutputs.insert({output.relativePath, output.bytes});
+    if (!Inserted && It->second != output.bytes)
       REFOLD_LOG_FATAL("source-graph/write",
             "conflicting source-graph contents for path: {0}",
-            Output.relativePath);
+            output.relativePath);
   }
 
-  for (const auto &Entry : CleanupOutputs) {
-    if (UniqueOutputs.count(Entry.first))
+  for (const auto &entry : cleanupOutputs) {
+    if (uniqueOutputs.count(entry.first))
       continue;
 
-    const SourceGraphOutput &Cleanup = Entry.second;
+    const SourceGraphOutput &cleanup = entry.second;
     llvm::SmallString<256> Path(OutputDir);
-    llvm::sys::path::append(Path, Entry.first);
+    llvm::sys::path::append(Path, entry.first);
 
-    if (!Cleanup.resolvedPath.empty() &&
-        pathSpellingMatchesAfterAbsolute(Path, Cleanup.resolvedPath)) {
+    if (!cleanup.resolvedPath.empty() &&
+        pathSpellingMatchesAfterAbsolute(Path, cleanup.resolvedPath)) {
       REFOLD_LOG_DEBUG("source-graph/write",
             "skip stale cleanup for {0}: output path names producer header {1}",
-            Path, Cleanup.resolvedPath);
+            Path, cleanup.resolvedPath);
       continue;
     }
 
-    auto ExistingOrErr = llvm::MemoryBuffer::getFile(Path);
-    if (!ExistingOrErr)
+    auto existingOrErr = llvm::MemoryBuffer::getFile(Path);
+    if (!existingOrErr)
       continue;
 
-    if ((*ExistingOrErr)->getBuffer() != Cleanup.bytes) {
+    if ((*existingOrErr)->getBuffer() != cleanup.bytes) {
       REFOLD_LOG_DEBUG("source-graph/write",
             "leave possible stale source-graph file {0}: bytes no longer match "
             "rejected generated body for include #{1}",
-            Path, Cleanup.includeId);
+            Path, cleanup.includeId);
       continue;
     }
 
@@ -140,12 +140,12 @@ void writeSourceGraphOutputs(llvm::ArrayRef<SourceGraphOutput> Outputs,
     REFOLD_LOG_INFO("finished", "removed stale source-graph header: {0}", Path);
   }
 
-  for (const auto &Entry : UniqueOutputs) {
+  for (const auto &entry : uniqueOutputs) {
     llvm::SmallString<256> Path(OutputDir);
-    llvm::sys::path::append(Path, Entry.first);
+    llvm::sys::path::append(Path, entry.first);
 
-    if (auto ExistingOrErr = llvm::MemoryBuffer::getFile(Path)) {
-      if ((*ExistingOrErr)->getBuffer() != Entry.second)
+    if (auto existingOrErr = llvm::MemoryBuffer::getFile(Path)) {
+      if ((*existingOrErr)->getBuffer() != entry.second)
         REFOLD_LOG_FATAL("source-graph/write",
               "refusing to overwrite existing different source-graph file: {0}",
               Path);
@@ -165,7 +165,7 @@ void writeSourceGraphOutputs(llvm::ArrayRef<SourceGraphOutput> Outputs,
     if (EC)
       REFOLD_LOG_FATAL("source-graph/write", "cannot write {0}: {1}", Path,
                        EC.message());
-    OS << Entry.second;
+    OS << entry.second;
     OS.close();
     REFOLD_LOG_INFO("finished", "wrote source-graph header: {0}", Path);
   }

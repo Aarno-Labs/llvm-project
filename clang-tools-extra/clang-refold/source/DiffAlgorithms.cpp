@@ -286,7 +286,7 @@ static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 
 /// Return true iff a provenance id is present rather than the sentinel zero.
 static bool hasProvenanceId(uint64_t value) {
-  return value != LcsAGapProvenance::NoId;
+  return value != LcsAGapProvenance::noId;
 }
 
 /// Rank the amount of original-side structural boundary retained at an
@@ -1139,15 +1139,15 @@ static void solveSmallUnweightedDP(const SpanView &aV, const SpanView &bV,
   const size_t stride = m + 1;
   const size_t cells = (n + 1) * (m + 1);
   std::vector<unsigned> dp(cells, 0);
-  auto DP = [&](size_t i, size_t j) -> unsigned & {
+  auto dpLocal = [&](size_t i, size_t j) -> unsigned & {
     return dp[i * stride + j];
   };
 
   // Build suffix DP: DP(i, j) is the LCS length of A[i..n) and B[j..m).
   for (size_t i = n; i-- > 0;) {
     for (size_t j = m; j-- > 0;) {
-      DP(i, j) = (aV.at(i) == bV.at(j)) ? DP(i + 1, j + 1) + 1U
-                                        : std::max(DP(i + 1, j), DP(i, j + 1));
+      dpLocal(i, j) = (aV.at(i) == bV.at(j)) ? dpLocal(i + 1, j + 1) + 1U
+                                        : std::max(dpLocal(i + 1, j), dpLocal(i, j + 1));
     }
   }
 
@@ -1159,7 +1159,7 @@ static void solveSmallUnweightedDP(const SpanView &aV, const SpanView &bV,
       outMap[aV.absIndex(i)] = static_cast<int64_t>(bV.absIndex(j));
       ++i;
       ++j;
-    } else if (DP(i + 1, j) >= DP(i, j + 1)) {
+    } else if (dpLocal(i + 1, j) >= dpLocal(i, j + 1)) {
       ++i;
     } else {
       ++j;
@@ -1467,15 +1467,15 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   const size_t cells = (n + 1) * (m + 1);
   std::vector<unsigned> dp(cells, 0);
 
-  auto DP = [&](size_t i, size_t j) -> unsigned & {
+  auto dpLocal = [&](size_t i, size_t j) -> unsigned & {
     return dp[i * stride + j];
   };
 
   // DP(i,j) = LCS length of a[i:] vs b[j:]
   for (size_t i = n; i-- > 0;) {
     for (size_t j = m; j-- > 0;) {
-      DP(i, j) = (a[i] == b[j]) ? static_cast<unsigned>(DP(i + 1, j + 1) + 1U)
-                                : std::max(DP(i + 1, j), DP(i, j + 1));
+      dpLocal(i, j) = (a[i] == b[j]) ? static_cast<unsigned>(dpLocal(i + 1, j + 1) + 1U)
+                                : std::max(dpLocal(i + 1, j), dpLocal(i, j + 1));
     }
   }
 
@@ -1487,7 +1487,7 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
       map[i] = static_cast<int64_t>(j);
       ++i;
       ++j;
-    } else if (DP(i + 1, j) >= DP(i, j + 1)) {
+    } else if (dpLocal(i + 1, j) >= dpLocal(i, j + 1)) {
       ++i; // skip a[i]
     } else {
       ++j; // skip b[j]

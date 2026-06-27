@@ -456,7 +456,7 @@ private:
   /// The planner owns lexeme mapping, LCS provenance/profile construction,
   /// initial token-hunk derivation, token-map cache population, and raw
   /// byte-hunk cache construction. Mixed-owner partitioning is handled by
-  /// RefoldMixedOwnerTilingPlanner after this initial diff phase.
+  /// RefoldMixedOwnerTilingPlanner after the initial token-diff plan is built.
   std::unique_ptr<RefoldTokenDiffPlanner> tokenDiffPlanner_;
 
   /// Macro-boundary selector for the narrow insertion-at-cover-edge cases that

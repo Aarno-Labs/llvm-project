@@ -47,10 +47,10 @@ buildFinalReplaySurface(const RefoldModel &model, StringRef finalOutputPath);
 /// borrowed from the current refold run and must outlive the short-lived proof
 /// context constructed for one materialization operation.
 struct IncludeReplayProofInputs {
-  const RefoldModel &Model;
-  StringRef ASource;
-  const LineDirectiveInserter &LineDirs;
-  const std::optional<FinalReplaySurface> &FinalReplaySurface;
+  const RefoldModel &model;
+  StringRef aSource;
+  const LineDirectiveInserter &lineDirs;
+  const std::optional<FinalReplaySurface> &finalReplaySurface;
 };
 
 /// Read-only services used by include replay proof.  The function_ref callables
@@ -61,17 +61,17 @@ struct IncludeReplayProofServices {
 
   llvm::function_ref<bool(StringRef CandidatePath,
                           const RefoldModel::IncludeItem &Include)>
-      SamePhysicalIncludeFile;
+      samePhysicalIncludeFile;
 
   llvm::function_ref<const RefoldModel::MacroInvocation *(
       const RefoldModel::MacroInvocation &Macro)>
-      LineStateObservableMacroSite;
+      lineStateObservableMacroSite;
 
   llvm::function_ref<bool(const RefoldModel::MacroInvocation &Macro)>
-      LineStateBuiltinInvocationIsPreservedObserver;
+      lineStateBuiltinInvocationIsPreservedObserver;
 
   llvm::function_ref<LineStateObserverDemand(uint64_t IncludeId)>
-      IncludeSubtreeLineStateObserverDemand;
+      includeSubtreeLineStateObserverDemand;
 };
 
 class IncludeReplayProofContext {
@@ -103,9 +103,9 @@ public:
 
   IncludeReplayProofContext(IncludeReplayProofInputs inputs,
                             IncludeReplayProofServices services)
-      : services_(services), model_(inputs.Model), aSource_(inputs.ASource),
-        lineDirs_(inputs.LineDirs),
-        finalReplaySurface_(inputs.FinalReplaySurface) {}
+      : services_(services), model_(inputs.model), aSource_(inputs.aSource),
+        lineDirs_(inputs.lineDirs),
+        finalReplaySurface_(inputs.finalReplaySurface) {}
 
   CleanChildIncludeReplayPlan PlanCleanChildIncludeReplayFromMaterializedParent(
       const RefoldModel::IncludeItem &child) const;
@@ -143,9 +143,9 @@ public:
 
 private:
   struct IncludeReplayCandidate {
-    std::filesystem::path PhysicalPath;
-    std::string EnteredFileSpelling;
-    std::string EnteredFileName;
+    std::filesystem::path physicalPath;
+    std::string enteredFileSpelling;
+    std::string enteredFileName;
 
     // Ordinary include replay has two independent facts to preserve:
     //
@@ -170,62 +170,62 @@ private:
       Unknown
     };
 
-    LookupKind Kind = LookupKind::Unknown;
+    LookupKind kind = LookupKind::Unknown;
 
     // Present only when Kind names a producer/legacy include-search entry.
     // New-schema candidates use the exact pp_ctx.include_search_chain index;
     // legacy argv-reconstructed candidates intentionally leave this empty so
     // future include-next proof cannot mistake argv inference for producer
     // cursor provenance.
-    std::optional<uint32_t> SearchChainIndex;
+    std::optional<uint32_t> searchChainIndex;
   };
 
   struct IncludeNextReplayCandidate {
-    std::filesystem::path PhysicalPath;
-    std::string EnteredFileSpelling;
-    std::string EnteredFileName;
+    std::filesystem::path physicalPath;
+    std::string enteredFileSpelling;
+    std::string enteredFileName;
 
     // The resume cursor is the first producer search-chain index examined by
     // #include_next replay.  Unlike ordinary includes, include_next never
     // starts from source-relative lookup or from the beginning of the search
     // chain; it resumes immediately after the search entry that selected the
     // containing file.
-    uint32_t ResumeSearchChainIndex = 0;
+    uint32_t resumeSearchChainIndex = 0;
 
     // The producer search-chain entry that replay selected.  This must be an
     // actual pp_ctx.include_search_chain index, not a legacy argv-derived
     // approximation, because descendant #include_next proof is a proof about
     // HeaderSearch cursor state.
-    uint32_t SelectedSearchChainIndex = 0;
-    IncludeLookupKind SelectedKind = IncludeLookupKind::Unknown;
+    uint32_t selectedSearchChainIndex = 0;
+    IncludeLookupKind selectedKind = IncludeLookupKind::Unknown;
   };
 
   struct IncludeReplaySearchDir {
-    std::filesystem::path LookupPath;
-    std::string EnteredSpellingPrefix;
-    IncludeReplayCandidate::LookupKind Kind =
+    std::filesystem::path lookupPath;
+    std::string enteredSpellingPrefix;
+    IncludeReplayCandidate::LookupKind kind =
         IncludeReplayCandidate::LookupKind::Unknown;
-    std::optional<uint32_t> SearchChainIndex;
+    std::optional<uint32_t> searchChainIndex;
 
     // True for producer search-chain entries that this consumer deliberately
     // does not model as ordinary directories.  Such entries are not skipped:
     // if lookup reaches one before finding the requested header, the replay
     // result is unknown because the unmodeled entry may have selected or
     // shadowed the target.
-    bool IsUnsupportedBarrier = false;
+    bool isUnsupportedBarrier = false;
   };
 
   struct OrdinaryIncludeReplayResult {
-    std::filesystem::path PhysicalPath;
-    std::string EnteredFileSpelling;
-    std::string EnteredFileName;
-    IncludeReplayCandidate::LookupKind LookupKind =
+    std::filesystem::path physicalPath;
+    std::string enteredFileSpelling;
+    std::string enteredFileName;
+    IncludeReplayCandidate::LookupKind lookupKind =
         IncludeReplayCandidate::LookupKind::Unknown;
 
     // Present only for results selected by a modeled producer search-chain
     // entry.  Source-relative and absolute-operand hits have no HeaderSearch
     // cursor; legacy argv-reconstructed hits intentionally leave this empty.
-    std::optional<uint32_t> SearchChainIndex;
+    std::optional<uint32_t> searchChainIndex;
   };
 
   enum class OrdinaryIncludeReplayFailureKind {
@@ -235,8 +235,8 @@ private:
   };
 
   struct IncludeReplaySurface {
-    std::filesystem::path SourceDirectoryPath;
-    std::string SourceDirectorySpelling;
+    std::filesystem::path sourceDirectoryPath;
+    std::string sourceDirectorySpelling;
   };
 
   struct RecordedIncludeSearchDirs {
@@ -245,8 +245,8 @@ private:
     // search, while the angled list contains only entries valid for angled
     // lookup.  New maps populate both lists from pp_ctx.include_search_chain,
     // preserving the producer's effective HeaderSearch order and entry index.
-    SmallVector<IncludeReplaySearchDir, 48> QuotedLookupDirs;
-    SmallVector<IncludeReplaySearchDir, 32> AngledLookupDirs;
+    SmallVector<IncludeReplaySearchDir, 48> quotedLookupDirs;
+    SmallVector<IncludeReplaySearchDir, 32> angledLookupDirs;
   };
 
   /// Convert producer lookup provenance to the ordinary directory replay kinds

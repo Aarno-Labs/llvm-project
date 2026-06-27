@@ -47,9 +47,9 @@ buildFinalReplaySurface(const RefoldModel &model, StringRef finalOutputPath) {
 
   std::filesystem::path outputPath(absoluteOutputPath.str().str());
   FinalReplaySurface surface;
-  surface.OutputPath = outputPath.lexically_normal();
-  surface.OutputDirectory = surface.OutputPath.parent_path();
-  surface.OriginalWorkingDirectory =
+  surface.outputPath = outputPath.lexically_normal();
+  surface.outputDirectory = surface.outputPath.parent_path();
+  surface.originalWorkingDirectory =
       std::filesystem::path(model.GetPPCwd().str());
 
   // Preserve the spelling Clang will use to derive direct quoted child header
@@ -63,8 +63,8 @@ buildFinalReplaySurface(const RefoldModel &model, StringRef finalOutputPath) {
   // would incorrectly fail a __FILE__ observer proof and force materialization.
   std::error_code relativeEC;
   std::filesystem::path relativeOutputDirectory =
-      std::filesystem::relative(surface.OutputDirectory,
-                                surface.OriginalWorkingDirectory, relativeEC);
+      std::filesystem::relative(surface.outputDirectory,
+                                surface.originalWorkingDirectory, relativeEC);
   if (!relativeEC && !relativeOutputDirectory.empty() &&
       !relativeOutputDirectory.is_absolute()) {
     bool escapesWorkingDirectory = false;
@@ -75,27 +75,27 @@ buildFinalReplaySurface(const RefoldModel &model, StringRef finalOutputPath) {
       }
     }
     if (!escapesWorkingDirectory) {
-      surface.OutputDirectorySpelling =
+      surface.outputDirectorySpelling =
           relativeOutputDirectory == std::filesystem::path(".")
               ? std::string(".")
               : relativeOutputDirectory.generic_string();
     }
   }
 
-  if (surface.OutputDirectorySpelling.empty()) {
+  if (surface.outputDirectorySpelling.empty()) {
     SmallString<256> outputDirectorySpelling(
-        surface.OutputPath.generic_string());
+        surface.outputPath.generic_string());
     llvm::sys::path::remove_filename(outputDirectorySpelling);
-    surface.OutputDirectorySpelling =
+    surface.outputDirectorySpelling =
         outputDirectorySpelling.empty() ? std::string(".")
                                         : outputDirectorySpelling.str().str();
   }
 
   REFOLD_LOG_DEBUG("include/replay",
                    "final replay surface: output='{0}' dir='{1}' cwd='{2}'",
-                   surface.OutputPath.generic_string(),
-                   surface.OutputDirectory.generic_string(),
-                   surface.OriginalWorkingDirectory.generic_string());
+                   surface.outputPath.generic_string(),
+                   surface.outputDirectory.generic_string(),
+                   surface.originalWorkingDirectory.generic_string());
   return surface;
 }
 
@@ -254,9 +254,9 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       return std::nullopt;
 
     IncludeReplaySurface surface;
-    surface.SourceDirectoryPath = *source;
-    surface.SourceDirectoryPath.remove_filename();
-    surface.SourceDirectorySpelling =
+    surface.sourceDirectoryPath = *source;
+    surface.sourceDirectoryPath.remove_filename();
+    surface.sourceDirectorySpelling =
         sourceDirectorySpellingForFile(fileSpelling);
     return surface;
   };
@@ -267,9 +267,9 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       return std::nullopt;
 
     IncludeReplaySurface surface;
-    surface.SourceDirectoryPath = finalReplaySurface_->OutputDirectory;
-    surface.SourceDirectorySpelling =
-        finalReplaySurface_->OutputDirectorySpelling;
+    surface.sourceDirectoryPath = finalReplaySurface_->outputDirectory;
+    surface.sourceDirectorySpelling =
+        finalReplaySurface_->outputDirectorySpelling;
     return surface;
   };
 
@@ -289,10 +289,10 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       return std::nullopt;
 
     IncludeReplaySearchDir dir;
-    dir.LookupPath = absolutePathInPPCwd(physicalPath);
-    dir.EnteredSpellingPrefix = enteredSpellingPrefix.str();
-    dir.Kind = kind;
-    dir.SearchChainIndex = searchChainIndex;
+    dir.lookupPath = absolutePathInPPCwd(physicalPath);
+    dir.enteredSpellingPrefix = enteredSpellingPrefix.str();
+    dir.kind = kind;
+    dir.searchChainIndex = searchChainIndex;
     return dir;
   };
 
@@ -314,9 +314,9 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       [&](RecordedIncludeSearchDirs &dirs,
           const RefoldModel::IncludeSearchEntry &entry) {
         IncludeReplaySearchDir barrier;
-        barrier.Kind = IncludeReplayCandidate::LookupKind::Unknown;
-        barrier.SearchChainIndex = entry.index;
-        barrier.IsUnsupportedBarrier = true;
+        barrier.kind = IncludeReplayCandidate::LookupKind::Unknown;
+        barrier.searchChainIndex = entry.index;
+        barrier.isUnsupportedBarrier = true;
 
         // Once ordinary replay reaches an unmodeled HeaderSearch entry, the
         // selected file is unknown: the entry could contain a header map,
@@ -325,9 +325,9 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
         // consumer replay.  Preserve the entry's ordinary-include
         // participation when installing the barrier; a quote-only entry cannot
         // shadow an angled include, but every other search-chain entry can.
-        dirs.QuotedLookupDirs.push_back(barrier);
+        dirs.quotedLookupDirs.push_back(barrier);
         if (entry.kind != IncludeLookupKind::QuoteDir)
-          dirs.AngledLookupDirs.push_back(barrier);
+          dirs.angledLookupDirs.push_back(barrier);
       };
 
   auto appendProducerSearchEntryIfSafe =
@@ -350,10 +350,10 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
                 makeIncludeReplaySearchDir(entry.path, entry.spelling, *kind,
                                            entry.index)) {
           if (entry.kind == IncludeLookupKind::QuoteDir) {
-            dirs.QuotedLookupDirs.push_back(*dir);
+            dirs.quotedLookupDirs.push_back(*dir);
           } else {
-            dirs.QuotedLookupDirs.push_back(*dir);
-            dirs.AngledLookupDirs.push_back(*dir);
+            dirs.quotedLookupDirs.push_back(*dir);
+            dirs.angledLookupDirs.push_back(*dir);
           }
         } else {
           // A search-chain entry with missing or otherwise unusable path/
@@ -459,9 +459,9 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
     // Preserve the legacy replay order: quoted lookup searches -iquote first,
     // then the ordinary include dirs; angled lookup uses only the ordinary
     // include dirs.
-    dirs.QuotedLookupDirs.append(quoteDirs.begin(), quoteDirs.end());
-    dirs.QuotedLookupDirs.append(includeDirs.begin(), includeDirs.end());
-    dirs.AngledLookupDirs.append(includeDirs.begin(), includeDirs.end());
+    dirs.quotedLookupDirs.append(quoteDirs.begin(), quoteDirs.end());
+    dirs.quotedLookupDirs.append(includeDirs.begin(), includeDirs.end());
+    dirs.angledLookupDirs.append(includeDirs.begin(), includeDirs.end());
     return dirs;
   };
 
@@ -498,7 +498,7 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
     //   ./original.c + "headers/child.h" -> "./headers/child.h"
     //   sub/original.c + "../leaf.h" -> "sub/../leaf.h"
     //   /abs/original.c + "leaf.h" -> "/abs/leaf.h"
-    return appendEnteredFileSpelling(surface.SourceDirectorySpelling, operand);
+    return appendEnteredFileSpelling(surface.sourceDirectorySpelling, operand);
   };
 
   auto computeAbsoluteIncludeReplayCandidate =
@@ -510,61 +510,61 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       return std::nullopt;
 
     IncludeReplayCandidate candidate;
-    candidate.PhysicalPath = operandPath.lexically_normal();
-    candidate.EnteredFileSpelling = operandPath.generic_string();
-    candidate.EnteredFileName =
-        stringutils::pathBasename(candidate.EnteredFileSpelling).str();
-    candidate.Kind = IncludeReplayCandidate::LookupKind::AbsoluteOperand;
+    candidate.physicalPath = operandPath.lexically_normal();
+    candidate.enteredFileSpelling = operandPath.generic_string();
+    candidate.enteredFileName =
+        stringutils::pathBasename(candidate.enteredFileSpelling).str();
+    candidate.kind = IncludeReplayCandidate::LookupKind::AbsoluteOperand;
     return candidate;
   };
 
   auto candidateFromSearchDir =
       [&](const IncludeReplaySearchDir &dir, StringRef operand)
       -> std::optional<IncludeReplayCandidate> {
-    if (dir.IsUnsupportedBarrier)
+    if (dir.isUnsupportedBarrier)
       return std::nullopt;
 
     // Check the exact filesystem path Clang would probe before any lexical
     // cleanup.  Collapsing `missing/../leaf.h` first is unsound: POSIX path
     // resolution and Clang header lookup must be able to enter every prefix
     // component before `..` can escape it.
-    std::filesystem::path physical = dir.LookupPath / operand.str();
+    std::filesystem::path physical = dir.lookupPath / operand.str();
     if (!pathExists(physical))
       return std::nullopt;
 
     IncludeReplayCandidate candidate;
-    candidate.PhysicalPath = physical.lexically_normal();
-    candidate.EnteredFileSpelling =
-        appendEnteredFileSpelling(dir.EnteredSpellingPrefix, operand);
-    candidate.EnteredFileName =
-        stringutils::pathBasename(candidate.EnteredFileSpelling).str();
-    candidate.Kind = dir.Kind;
-    candidate.SearchChainIndex = dir.SearchChainIndex;
+    candidate.physicalPath = physical.lexically_normal();
+    candidate.enteredFileSpelling =
+        appendEnteredFileSpelling(dir.enteredSpellingPrefix, operand);
+    candidate.enteredFileName =
+        stringutils::pathBasename(candidate.enteredFileSpelling).str();
+    candidate.kind = dir.kind;
+    candidate.searchChainIndex = dir.searchChainIndex;
     return candidate;
   };
 
   auto ordinaryIncludeResultFromCandidate =
       [](const IncludeReplayCandidate &candidate) -> OrdinaryIncludeReplayResult {
     OrdinaryIncludeReplayResult result;
-    result.PhysicalPath = candidate.PhysicalPath;
-    result.EnteredFileSpelling = candidate.EnteredFileSpelling;
-    result.EnteredFileName =
-        !candidate.EnteredFileName.empty()
-            ? candidate.EnteredFileName
-            : stringutils::pathBasename(candidate.EnteredFileSpelling).str();
-    result.LookupKind = candidate.Kind;
-    result.SearchChainIndex = candidate.SearchChainIndex;
+    result.physicalPath = candidate.physicalPath;
+    result.enteredFileSpelling = candidate.enteredFileSpelling;
+    result.enteredFileName =
+        !candidate.enteredFileName.empty()
+            ? candidate.enteredFileName
+            : stringutils::pathBasename(candidate.enteredFileSpelling).str();
+    result.lookupKind = candidate.kind;
+    result.searchChainIndex = candidate.searchChainIndex;
     return result;
   };
 
   auto includeReplayCandidateFromOrdinaryResult =
       [](const OrdinaryIncludeReplayResult &result) -> IncludeReplayCandidate {
     IncludeReplayCandidate candidate;
-    candidate.PhysicalPath = result.PhysicalPath;
-    candidate.EnteredFileSpelling = result.EnteredFileSpelling;
-    candidate.EnteredFileName = result.EnteredFileName;
-    candidate.Kind = result.LookupKind;
-    candidate.SearchChainIndex = result.SearchChainIndex;
+    candidate.physicalPath = result.physicalPath;
+    candidate.enteredFileSpelling = result.enteredFileSpelling;
+    candidate.enteredFileName = result.enteredFileName;
+    candidate.kind = result.lookupKind;
+    candidate.searchChainIndex = result.searchChainIndex;
     return candidate;
   };
 
@@ -606,7 +606,7 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
         [&](ArrayRef<IncludeReplaySearchDir> lookupDirs)
         -> std::optional<OrdinaryIncludeReplayResult> {
       for (const IncludeReplaySearchDir &dir : lookupDirs) {
-        if (dir.IsUnsupportedBarrier)
+        if (dir.isUnsupportedBarrier)
           return fail(OrdinaryIncludeReplayFailureKind::UnknownSearchChainEntry);
         if (std::optional<IncludeReplayCandidate> candidate =
                 candidateFromSearchDir(dir, operand))
@@ -625,23 +625,23 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       // spelling.  In both cases the existence check uses the exact path Clang
       // would probe, and only the returned physical payload is normalized.
       std::filesystem::path direct =
-          quotedSurface->SourceDirectoryPath / operand.str();
+          quotedSurface->sourceDirectoryPath / operand.str();
       if (pathExists(direct)) {
         IncludeReplayCandidate candidate;
-        candidate.PhysicalPath = direct.lexically_normal();
-        candidate.EnteredFileSpelling =
+        candidate.physicalPath = direct.lexically_normal();
+        candidate.enteredFileSpelling =
             directSourceRelativeEnteredFileSpelling(*quotedSurface, operand);
-        candidate.EnteredFileName =
-            stringutils::pathBasename(candidate.EnteredFileSpelling).str();
-        candidate.Kind =
+        candidate.enteredFileName =
+            stringutils::pathBasename(candidate.enteredFileSpelling).str();
+        candidate.kind =
             IncludeReplayCandidate::LookupKind::DirectSourceRelative;
         return success(candidate);
       }
 
-      return replayThroughSearchDirs(dirs.QuotedLookupDirs);
+      return replayThroughSearchDirs(dirs.quotedLookupDirs);
     }
 
-    return replayThroughSearchDirs(dirs.AngledLookupDirs);
+    return replayThroughSearchDirs(dirs.angledLookupDirs);
   };
 
   auto computeQuotedIncludeReplayCandidateOnSurface =
@@ -735,16 +735,16 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       if (!selected)
         continue;
 
-      if (!selected->SearchChainIndex || *selected->SearchChainIndex != i)
+      if (!selected->searchChainIndex || *selected->searchChainIndex != i)
         return std::nullopt;
 
       IncludeNextReplayCandidate candidate;
-      candidate.PhysicalPath = selected->PhysicalPath;
-      candidate.EnteredFileSpelling = selected->EnteredFileSpelling;
-      candidate.EnteredFileName = selected->EnteredFileName;
-      candidate.ResumeSearchChainIndex = resumeIndex;
-      candidate.SelectedSearchChainIndex = i;
-      candidate.SelectedKind = entry.kind;
+      candidate.physicalPath = selected->physicalPath;
+      candidate.enteredFileSpelling = selected->enteredFileSpelling;
+      candidate.enteredFileName = selected->enteredFileName;
+      candidate.resumeSearchChainIndex = resumeIndex;
+      candidate.selectedSearchChainIndex = i;
+      candidate.selectedKind = entry.kind;
       return candidate;
     }
 
@@ -927,13 +927,13 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       [&](const RefoldModel::MacroInvocation &macro, uint64_t includeId)
       -> std::optional<uint64_t> {
     const RefoldModel::MacroInvocation *site =
-        services_.LineStateObservableMacroSite(macro);
+        services_.lineStateObservableMacroSite(macro);
     std::optional<uint64_t> owner =
         site && site->ownerIncludeId ? site->ownerIncludeId
                                      : macro.ownerIncludeId;
     if (!owner || !includeIdIsDescendantOrSelf(*owner, includeId))
       return std::nullopt;
-    if (!services_.LineStateBuiltinInvocationIsPreservedObserver(macro))
+    if (!services_.lineStateBuiltinInvocationIsPreservedObserver(macro))
       return std::nullopt;
     return owner;
   };
@@ -1089,14 +1089,14 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
         std::optional<IncludeReplayCandidate> &candidate =
             getProducerCandidate();
         if (candidate)
-          demand.producerChildFileSpelling = candidate->EnteredFileSpelling;
+          demand.producerChildFileSpelling = candidate->enteredFileSpelling;
       }
       if (!demand.producerChildFileName && mayUseReplayFileName) {
         std::optional<IncludeReplayCandidate> &candidate =
             getProducerCandidate();
         if (candidate)
           demand.producerChildFileName =
-              stringutils::pathBasename(candidate->EnteredFileSpelling).str();
+              stringutils::pathBasename(candidate->enteredFileSpelling).str();
       }
     }
 
@@ -1150,12 +1150,12 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       [&](const IncludeReplayCandidate &candidate)
       -> std::optional<RefoldModel::IncludeLookupProvenance> {
     RefoldModel::IncludeLookupProvenance provenance;
-    provenance.kind = replayCandidateLookupKindAsProducerKind(candidate.Kind);
+    provenance.kind = replayCandidateLookupKindAsProducerKind(candidate.kind);
 
     if (isSearchChainIncludeLookupKind(provenance.kind)) {
-      if (!candidate.SearchChainIndex)
+      if (!candidate.searchChainIndex)
         return std::nullopt;
-      provenance.searchChainIndex = *candidate.SearchChainIndex;
+      provenance.searchChainIndex = *candidate.searchChainIndex;
     }
 
     if (provenance.kind == IncludeLookupKind::Unknown)
@@ -1166,15 +1166,15 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
   auto includeReplayCandidateMatchesProducerLookup =
       [&](const IncludeReplayCandidate &candidate,
           const RefoldModel::IncludeItem &include) -> bool {
-    const std::string physicalPath = candidate.PhysicalPath.generic_string();
-    if (!services_.SamePhysicalIncludeFile(physicalPath, include))
+    const std::string physicalPath = candidate.physicalPath.generic_string();
+    if (!services_.samePhysicalIncludeFile(physicalPath, include))
       return false;
 
     if (!include.lookup)
       return true;
 
     const IncludeLookupKind candidateKind =
-        replayCandidateLookupKindAsProducerKind(candidate.Kind);
+        replayCandidateLookupKindAsProducerKind(candidate.kind);
     const RefoldModel::IncludeLookupProvenance &producer = *include.lookup;
     if (candidateKind != producer.kind)
       return false;
@@ -1185,14 +1185,14 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
     // intentionally lack SearchChainIndex and therefore cannot satisfy this
     // new-schema proof.
     if (isSearchChainIncludeLookupKind(producer.kind))
-      return candidate.SearchChainIndex && producer.searchChainIndex &&
-             *candidate.SearchChainIndex == *producer.searchChainIndex;
+      return candidate.searchChainIndex && producer.searchChainIndex &&
+             *candidate.searchChainIndex == *producer.searchChainIndex;
 
     // Source-relative and absolute-operand hits have no search-chain cursor.
     // Physical equality plus kind equality is the complete ordinary-include
     // replay proof they can provide; any descendant #include_next that needs a
     // cursor will still fail closed when its containing-file proof is checked.
-    return !candidate.SearchChainIndex && !producer.searchChainIndex;
+    return !candidate.searchChainIndex && !producer.searchChainIndex;
   };
 
   auto directIncludeNextHasProducerSelectionProvenance =
@@ -1269,8 +1269,8 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
     if (!directIncludeNextSelectionUsesOnlyReplayableDirectories(include))
       return false;
 
-    const std::string physicalPath = candidate.PhysicalPath.generic_string();
-    if (!services_.SamePhysicalIncludeFile(physicalPath, include))
+    const std::string physicalPath = candidate.physicalPath.generic_string();
+    if (!services_.samePhysicalIncludeFile(physicalPath, include))
       return false;
 
     // A relocated #include_next can be replaced by an ordinary include in two
@@ -1288,9 +1288,9 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
     //    that cursor.  File-spelling observers are still checked later by the
     //    ordinary IncludeReplayProofResult gate before the rewrite is accepted.
     const bool directTargetNaming =
-        candidate.Kind ==
+        candidate.kind ==
             IncludeReplayCandidate::LookupKind::DirectSourceRelative ||
-        candidate.Kind == IncludeReplayCandidate::LookupKind::AbsoluteOperand;
+        candidate.kind == IncludeReplayCandidate::LookupKind::AbsoluteOperand;
     if (directTargetNaming)
       return demand.includeNextObligations.empty();
 
@@ -1303,8 +1303,8 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
 
     if (!include.includeNext || !include.includeNext->selectedSearchChainIndex)
       return false;
-    return candidate.SearchChainIndex &&
-           *candidate.SearchChainIndex ==
+    return candidate.searchChainIndex &&
+           *candidate.searchChainIndex ==
                *include.includeNext->selectedSearchChainIndex;
   };
 
@@ -1338,15 +1338,15 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       [&](const IncludeNextReplayCandidate &selected)
       -> std::optional<IncludeReplayCandidate> {
     IncludeReplayCandidate candidate;
-    candidate.PhysicalPath = selected.PhysicalPath;
-    candidate.EnteredFileSpelling = selected.EnteredFileSpelling;
-    candidate.EnteredFileName = selected.EnteredFileName;
+    candidate.physicalPath = selected.physicalPath;
+    candidate.enteredFileSpelling = selected.enteredFileSpelling;
+    candidate.enteredFileName = selected.enteredFileName;
     std::optional<IncludeReplayCandidate::LookupKind> kind =
-        ReplayableDirectoryLookupKind(selected.SelectedKind);
+        ReplayableDirectoryLookupKind(selected.selectedKind);
     if (!kind)
       return std::nullopt;
-    candidate.Kind = *kind;
-    candidate.SearchChainIndex = selected.SelectedSearchChainIndex;
+    candidate.kind = *kind;
+    candidate.searchChainIndex = selected.selectedSearchChainIndex;
     return candidate;
   };
 
@@ -1413,7 +1413,7 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
           if (!operand)
             return fail();
           std::optional<IncludeReplaySurface> surface =
-              includeReplaySurfaceForFile(parentCandidate->EnteredFileSpelling);
+              includeReplaySurfaceForFile(parentCandidate->enteredFileSpelling);
           if (!surface)
             return fail();
           candidate = computeQuotedIncludeReplayCandidateOnSurface(*operand,
@@ -1443,7 +1443,7 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
 
         std::optional<IncludeReplaySurface> surface =
             includeReplaySurfaceForFile(
-                containingCandidate->EnteredFileSpelling);
+                containingCandidate->enteredFileSpelling);
         if (!surface)
           return fail();
 
@@ -1455,9 +1455,9 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
             !include->includeNext->containingFileSearchChainIndex ||
             !containingProvenance->searchChainIndex)
           return fail();
-        if (selected->ResumeSearchChainIndex !=
+        if (selected->resumeSearchChainIndex !=
                 *include->includeNext->resumeSearchChainIndex ||
-            selected->SelectedSearchChainIndex !=
+            selected->selectedSearchChainIndex !=
                 *include->includeNext->selectedSearchChainIndex ||
             *containingProvenance->searchChainIndex !=
                 *include->includeNext->containingFileSearchChainIndex)
@@ -1503,7 +1503,7 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
         return false;
 
       std::optional<IncludeReplaySurface> surface =
-          includeReplaySurfaceForFile(containingCandidate->EnteredFileSpelling);
+          includeReplaySurfaceForFile(containingCandidate->enteredFileSpelling);
       if (!surface)
         return false;
 
@@ -1513,9 +1513,9 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       if (!candidate)
         return false;
 
-      if (candidate->ResumeSearchChainIndex !=
+      if (candidate->resumeSearchChainIndex !=
               *obligation.producer.resumeSearchChainIndex ||
-          candidate->SelectedSearchChainIndex !=
+          candidate->selectedSearchChainIndex !=
               *obligation.producer.selectedSearchChainIndex)
         return false;
 
@@ -1526,18 +1526,18 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       // malformed or old mixed-schema map could prove the resume cursor against
       // one witness while preserving a directive whose edge lookup says another.
       if (includeNext->lookup) {
-        if (includeNext->lookup->kind != candidate->SelectedKind)
+        if (includeNext->lookup->kind != candidate->selectedKind)
           return false;
         if (isSearchChainIncludeLookupKind(includeNext->lookup->kind)) {
           if (!includeNext->lookup->searchChainIndex ||
               *includeNext->lookup->searchChainIndex !=
-                  candidate->SelectedSearchChainIndex)
+                  candidate->selectedSearchChainIndex)
             return false;
         }
       }
 
-      const std::string physicalPath = candidate->PhysicalPath.generic_string();
-      if (!services_.SamePhysicalIncludeFile(physicalPath, *includeNext))
+      const std::string physicalPath = candidate->physicalPath.generic_string();
+      if (!services_.samePhysicalIncludeFile(physicalPath, *includeNext))
         return false;
 
       // A descendant #include_next can be selected through the same physical
@@ -1550,7 +1550,7 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       if (observerDemand.observesFile) {
         StringRef producerSpelling = producerEnteredFileSpelling(*includeNext);
         if (producerSpelling.empty() ||
-            StringRef(candidate->EnteredFileSpelling) != producerSpelling)
+            StringRef(candidate->enteredFileSpelling) != producerSpelling)
           return false;
       }
       if (observerDemand.observesFileName) {
@@ -1560,9 +1560,9 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
         // processPathToFileName() result; deriving a basename from
         // EnteredFileSpelling is only a legacy compatibility fallback.
         const std::string candidateName =
-            !candidate->EnteredFileName.empty()
-                ? candidate->EnteredFileName
-                : stringutils::pathBasename(candidate->EnteredFileSpelling)
+            !candidate->enteredFileName.empty()
+                ? candidate->enteredFileName
+                : stringutils::pathBasename(candidate->enteredFileSpelling)
                       .str();
         if (producerName.empty() || StringRef(candidateName) != producerName)
           return false;
@@ -1579,14 +1579,14 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
     // observer contracts.  Keep the proof bits separate so a candidate that has
     // the right basename but the wrong entered spelling cannot satisfy a
     // `__FILE__` demand, and vice versa.
-    bool SameEnteredFileSpelling = true;
+    bool sameEnteredFileSpelling = true;
     bool sameEnteredFileName = true;
 
     bool sameIncludeNextStack = true;
 
     bool proves(const CleanChildIncludeReplayDemand &demand) const {
       return samePhysicalFile &&
-             (!demand.observesFile || SameEnteredFileSpelling) &&
+             (!demand.observesFile || sameEnteredFileSpelling) &&
              (!demand.observesFileName || sameEnteredFileName) &&
              !demand.hasUnprovenFileSpellingObserver &&
              (demand.includeNextObligations.empty() ||
@@ -1600,14 +1600,14 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
           const CleanChildIncludeReplayDemand &demand)
       -> IncludeReplayProofResult {
     IncludeReplayProofResult result;
-    const std::string physicalPath = candidate.PhysicalPath.generic_string();
+    const std::string physicalPath = candidate.physicalPath.generic_string();
     result.samePhysicalFile =
-        services_.SamePhysicalIncludeFile(physicalPath, child);
+        services_.samePhysicalIncludeFile(physicalPath, child);
     result.sameIncludeNextStack =
         includeNextObligationsAreProven(candidate, child, demand);
     if (demand.observesFileSpelling()) {
       if (demand.hasUnprovenFileSpellingObserver) {
-        result.SameEnteredFileSpelling = false;
+        result.sameEnteredFileSpelling = false;
         result.sameEnteredFileName = false;
       }
 
@@ -1619,21 +1619,21 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       // producer metadata.
       if (demand.observesFile) {
         if (demand.producerChildFileSpelling) {
-          result.SameEnteredFileSpelling &=
-              StringRef(candidate.EnteredFileSpelling) ==
+          result.sameEnteredFileSpelling &=
+              StringRef(candidate.enteredFileSpelling) ==
               StringRef(*demand.producerChildFileSpelling);
         } else {
           for (const std::string &expected : demand.fileSpellingPayloads)
-            result.SameEnteredFileSpelling &=
-                StringRef(candidate.EnteredFileSpelling) ==
+            result.sameEnteredFileSpelling &=
+                StringRef(candidate.enteredFileSpelling) ==
                 StringRef(expected);
         }
       }
 
       const std::string candidateFileName =
-          !candidate.EnteredFileName.empty()
-              ? candidate.EnteredFileName
-              : stringutils::pathBasename(candidate.EnteredFileSpelling).str();
+          !candidate.enteredFileName.empty()
+              ? candidate.enteredFileName
+              : stringutils::pathBasename(candidate.enteredFileSpelling).str();
       if (demand.observesFileName) {
         if (demand.producerChildFileName) {
           result.sameEnteredFileName &=
@@ -1794,23 +1794,23 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
     // existing -I/-iquote entry, e.g. rewriting "leaf.h" to "headers/leaf.h".
     if (finalReplaySurface_) {
       if (std::optional<std::string> operand = stableContainedRelativeOperand(
-              *producerPhysicalPath, finalReplaySurface_->OutputDirectory))
+              *producerPhysicalPath, finalReplaySurface_->outputDirectory))
         appendCandidate(*operand);
     }
 
     SmallVector<std::string, 16> seenSearchDirectories;
     const RecordedIncludeSearchDirs &dirs = recordedIncludeSearchDirs();
-    for (const IncludeReplaySearchDir &dir : dirs.QuotedLookupDirs) {
-      if (dir.IsUnsupportedBarrier || dir.LookupPath.empty())
+    for (const IncludeReplaySearchDir &dir : dirs.quotedLookupDirs) {
+      if (dir.isUnsupportedBarrier || dir.lookupPath.empty())
         continue;
       const std::string key =
-          dir.LookupPath.lexically_normal().generic_string();
+          dir.lookupPath.lexically_normal().generic_string();
       if (llvm::is_contained(seenSearchDirectories, key))
         continue;
       seenSearchDirectories.push_back(key);
 
       if (std::optional<std::string> operand = stableContainedRelativeOperand(
-              *producerPhysicalPath, dir.LookupPath))
+              *producerPhysicalPath, dir.lookupPath))
         appendCandidate(*operand);
     }
 
@@ -1934,24 +1934,24 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
     SmallVector<std::string, 16> seenSearchDirectories;
     auto appendSearchDirectoryRelativeCandidate =
         [&](const IncludeReplaySearchDir &dir) {
-          if (dir.IsUnsupportedBarrier || dir.LookupPath.empty())
+          if (dir.isUnsupportedBarrier || dir.lookupPath.empty())
             return;
           const std::string key =
-              dir.LookupPath.lexically_normal().generic_string();
+              dir.lookupPath.lexically_normal().generic_string();
           if (llvm::is_contained(seenSearchDirectories, key))
             return;
           seenSearchDirectories.push_back(key);
 
           if (std::optional<std::string> operand =
                   stableContainedRelativeOperand(*producerPhysicalPath,
-                                                  dir.LookupPath))
+                                                  dir.lookupPath))
             appendWithPreferredDelimiters(*operand,
                                           "recorded-search-directory");
         };
     const RecordedIncludeSearchDirs &dirs = recordedIncludeSearchDirs();
-    for (const IncludeReplaySearchDir &dir : dirs.QuotedLookupDirs)
+    for (const IncludeReplaySearchDir &dir : dirs.quotedLookupDirs)
       appendSearchDirectoryRelativeCandidate(dir);
-    for (const IncludeReplaySearchDir &dir : dirs.AngledLookupDirs)
+    for (const IncludeReplaySearchDir &dir : dirs.angledLookupDirs)
       appendSearchDirectoryRelativeCandidate(dir);
 
     // 4. Output-directory-relative path.  Once a relocated #include_next is
@@ -1968,7 +1968,7 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
     //    descendant #include_next obligations before anything is emitted.
     if (finalReplaySurface_) {
       if (std::optional<std::string> operand = stableContainedRelativeOperand(
-              *producerPhysicalPath, finalReplaySurface_->OutputDirectory))
+              *producerPhysicalPath, finalReplaySurface_->outputDirectory))
         appendWithPreferredDelimiters(*operand, "output-directory-relative");
     }
 
@@ -2012,18 +2012,18 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
       return "physical-mismatch";
 
     if (!selectedTargetProven) {
-      if (rewrite.replay->Kind == IncludeReplayCandidate::LookupKind::Unknown)
+      if (rewrite.replay->kind == IncludeReplayCandidate::LookupKind::Unknown)
         return "unknown-search-chain-entry";
 
       if (child.lookup && isSearchChainIncludeLookupKind(child.lookup->kind) &&
-          !rewrite.replay->SearchChainIndex)
+          !rewrite.replay->searchChainIndex)
         return "missing-search-chain-index";
 
       return "shadowed-by-earlier-search-entry";
     }
 
     if ((demand.observesFile || demand.hasUnprovenFileSpellingObserver) &&
-        !proof->SameEnteredFileSpelling)
+        !proof->sameEnteredFileSpelling)
       return "entered-file-spelling-mismatch";
     if (demand.observesFileName && !proof->sameEnteredFileName)
       return "entered-file-name-mismatch";
@@ -2049,16 +2049,16 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
         producerPhysical ? producerPhysical->generic_string()
                          : std::string("(none)");
     const std::string replayPhysicalPath =
-        rewrite.replay ? rewrite.replay->PhysicalPath.generic_string()
+        rewrite.replay ? rewrite.replay->physicalPath.generic_string()
                        : std::string("(none)");
     const std::string replayLookupKind =
         rewrite.replay ? std::string(includeReplayLookupKindName(
-                             rewrite.replay->Kind))
+                             rewrite.replay->kind))
                        : std::string("(none)");
     const std::string replaySearchChainIndex =
         rewrite.replay
             ? optionalSearchChainIndexForTrace(
-                  rewrite.replay->SearchChainIndex)
+                  rewrite.replay->searchChainIndex)
             : std::string("(none)");
     const std::string producerLookupKind =
         child.lookup ? toString(child.lookup->kind).str()

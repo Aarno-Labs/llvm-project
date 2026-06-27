@@ -36,7 +36,7 @@ using namespace llvm;
 namespace clang {
 namespace refold {
 
-RefoldTUEditPlanner::RefoldTUEditPlanner(Deps deps) : D_(std::move(deps)) {}
+RefoldTUEditPlanner::RefoldTUEditPlanner(Deps deps) : deps_(std::move(deps)) {}
 
 bool RefoldTUEditPlanner::IsPPGapAtSelectedConditionalArmExit(
     uint64_t ppGap) const {
@@ -44,7 +44,7 @@ bool RefoldTUEditPlanner::IsPPGapAtSelectedConditionalArmExit(
     return false;
 
   std::optional<RefoldModel::ArmRef> leftArm =
-      D_.Model.FindArmRefAtPP(ppGap - 1);
+      deps_.model.FindArmRefAtPP(ppGap - 1);
   if (!leftArm || !leftArm->arm || !leftArm->arm->selected)
     return false;
 
@@ -52,8 +52,8 @@ bool RefoldTUEditPlanner::IsPPGapAtSelectedConditionalArmExit(
     return false;
 
   std::optional<RefoldModel::ArmRef> rightArm;
-  if (ppGap < D_.Model.GetTokensCountA())
-    rightArm = D_.Model.FindArmRefAtPP(ppGap);
+  if (ppGap < deps_.model.GetTokensCountA())
+    rightArm = deps_.model.FindArmRefAtPP(ppGap);
 
   if (rightArm && rightArm->arm && rightArm->arm->id == leftArm->arm->id)
     return false;
@@ -70,21 +70,21 @@ std::optional<uint64_t> RefoldTUEditPlanner::AnchorToExactSlotBoundaryFromPPGap(
   auto recordAcceptedAnchorCandidate =
       [&](AcceptedPathKind path, const TUAnchorWitness &anchorWitness) {
         AcceptedResultCandidate candidate =
-            D_.TUAnchorProof.BuildAcceptedTUAnchorCandidate(path, anchorWitness);
+            deps_.tuAnchorProof.BuildAcceptedTUAnchorCandidate(path, anchorWitness);
         if (acceptedCandidate)
           *acceptedCandidate = candidate;
       };
 
   struct Cand {
-    uint64_t PP;
-    uint64_t TUByte;
-    const RefoldModel::Slot *Slot;
+    uint64_t pp;
+    uint64_t tuByte;
+    const RefoldModel::Slot *slot;
 
     Cand(uint64_t pp, uint64_t tuByte, const RefoldModel::Slot *slot)
-        : PP(pp), TUByte(tuByte), Slot(slot) {}
+        : pp(pp), tuByte(tuByte), slot(slot) {}
   };
 
-  auto bufOrErr = MemoryBuffer::getFile(D_.LineDirs.ToAbsolutePath(tuPath));
+  auto bufOrErr = MemoryBuffer::getFile(deps_.lineDirs.ToAbsolutePath(tuPath));
   if (!bufOrErr) {
     REFOLD_LOG_FATAL("slot/anchor", "unable to read TU: {0}", tuPath);
   }
@@ -100,9 +100,9 @@ std::optional<uint64_t> RefoldTUEditPlanner::AnchorToExactSlotBoundaryFromPPGap(
     if (slot->kind == "arm_end" && slot->pp) {
       const uint64_t pp = *slot->pp;
       if (pp > 0) {
-        if (auto armRef = D_.Model.FindArmRefAtPP(pp - 1)) {
+        if (auto armRef = deps_.model.FindArmRefAtPP(pp - 1)) {
           if (armRef->group &&
-              D_.PathIdentity.PathsEqual(armRef->group->file, tuPath)) {
+              deps_.pathIdentity.PathsEqual(armRef->group->file, tuPath)) {
             const uint64_t groupEnd = armRef->group->groupE;
             if (groupEnd <= tuText.size())
               return groupEnd;
@@ -133,7 +133,7 @@ std::optional<uint64_t> RefoldTUEditPlanner::AnchorToExactSlotBoundaryFromPPGap(
 
   std::vector<Cand> candidates;
   for (const auto &slot :
-       D_.Model.FindSlots(tuPath, std::nullopt, std::nullopt, std::nullopt)) {
+       deps_.model.FindSlots(tuPath, std::nullopt, std::nullopt, std::nullopt)) {
     if (!slot->pp)
       continue;
 
@@ -151,7 +151,7 @@ std::optional<uint64_t> RefoldTUEditPlanner::AnchorToExactSlotBoundaryFromPPGap(
 
   std::vector<const Cand *> exact;
   for (const auto &candidate : candidates) {
-    if (candidate.PP == ppGap)
+    if (candidate.pp == ppGap)
       exact.push_back(&candidate);
   }
 
@@ -183,10 +183,10 @@ std::optional<uint64_t> RefoldTUEditPlanner::AnchorToExactSlotBoundaryFromPPGap(
       continue;
     }
 
-    unsigned candidatePriority = getPriority(candidate->Slot->kind);
-    unsigned bestPriority = getPriority(best->Slot->kind);
-    if (std::tie(candidatePriority, candidate->TUByte, candidate->Slot->id) <
-        std::tie(bestPriority, best->TUByte, best->Slot->id))
+    unsigned candidatePriority = getPriority(candidate->slot->kind);
+    unsigned bestPriority = getPriority(best->slot->kind);
+    if (std::tie(candidatePriority, candidate->tuByte, candidate->slot->id) <
+        std::tie(bestPriority, best->tuByte, best->slot->id))
       best = candidate;
   }
 
@@ -198,15 +198,15 @@ std::optional<uint64_t> RefoldTUEditPlanner::AnchorToExactSlotBoundaryFromPPGap(
   exactSlotWitness.hasPPGap = true;
   exactSlotWitness.ppGap = ppGap;
   exactSlotWitness.hasTUByte = true;
-  exactSlotWitness.tuByte = best->TUByte;
+  exactSlotWitness.tuByte = best->tuByte;
   exactSlotWitness.exactPPMatch = true;
-  exactSlotWitness.slotId = best->Slot->id;
-  exactSlotWitness.slotKind = best->Slot->kind.str();
+  exactSlotWitness.slotId = best->slot->id;
+  exactSlotWitness.slotKind = best->slot->kind.str();
   if (witness)
     *witness = exactSlotWitness;
   recordAcceptedAnchorCandidate(AcceptedPathKind::TUExactSlotBoundary,
                                 exactSlotWitness);
-  return best->TUByte;
+  return best->tuByte;
 }
 
 std::optional<uint64_t> RefoldTUEditPlanner::FindExactSlotBoundaryFromPPGap(
@@ -220,7 +220,7 @@ RefoldTUEditPlanner::IncludeIdCoveringPPIndex(uint64_t pp) const {
   std::optional<uint64_t> bestId;
   uint64_t bestLen = std::numeric_limits<uint64_t>::max();
 
-  for (const RefoldModel::IncludeItem &inc : D_.Model.GetIncludes()) {
+  for (const RefoldModel::IncludeItem &inc : deps_.model.GetIncludes()) {
     if (pp >= inc.cover.begin && pp < inc.cover.end) {
       uint64_t len = inc.cover.end - inc.cover.begin;
       if (len < bestLen) {
@@ -259,7 +259,7 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
   auto recordAcceptedAnchorCandidate =
       [&](AcceptedPathKind path, const TUAnchorWitness &anchorWitness) {
         AcceptedResultCandidate candidate =
-            D_.TUAnchorProof.BuildAcceptedTUAnchorCandidate(path, anchorWitness);
+            deps_.tuAnchorProof.BuildAcceptedTUAnchorCandidate(path, anchorWitness);
         if (acceptedCandidate)
           *acceptedCandidate = candidate;
       };
@@ -276,8 +276,8 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
     const RefoldModel::IncludeItem *leftInc = nullptr;
     const RefoldModel::IncludeItem *rightInc = nullptr;
 
-    for (const auto &inc : D_.Model.GetIncludes()) {
-      if (!inc.cover.IsValid() || !D_.PathIdentity.PathsEqual(inc.sitePath, tuPath))
+    for (const auto &inc : deps_.model.GetIncludes()) {
+      if (!inc.cover.IsValid() || !deps_.pathIdentity.PathsEqual(inc.sitePath, tuPath))
         continue;
       if (inc.cover.end == pp) {
         if (!leftInc || std::tie(inc.siteE, inc.id) <
@@ -337,7 +337,7 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
     auto firstExactSlot = [&](StringRef kind, uint64_t includeId)
         -> const RefoldModel::Slot * {
       std::vector<const RefoldModel::Slot *> slots =
-          D_.Model.FindSlots(tuPath, kind, includeId, std::nullopt);
+          deps_.model.FindSlots(tuPath, kind, includeId, std::nullopt);
       return slots.empty() ? nullptr : slots.front();
     };
 
@@ -350,10 +350,10 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
       // owner lies in a PP interval with real material, so the TU anchor is not
       // uniquely determined here.
       uint64_t leftGap = 0;
-      uint64_t rightGap = D_.Model.GetTokensCountA();
+      uint64_t rightGap = deps_.model.GetTokensCountA();
 
-      for (const auto &entry : D_.Model.GetTokmap()) {
-        if (D_.PathIdentity.PathsEqual(entry.file, tuPath)) {
+      for (const auto &entry : deps_.model.GetTokmap()) {
+        if (deps_.pathIdentity.PathsEqual(entry.file, tuPath)) {
           if (entry.e <= include.siteB)
             leftGap = std::max(leftGap, entry.pp + 1);
           if (entry.b >= include.siteE)
@@ -361,9 +361,9 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
         }
       }
 
-      for (const auto &other : D_.Model.GetIncludes()) {
+      for (const auto &other : deps_.model.GetIncludes()) {
         if (&other == &include || other.parent ||
-            !D_.PathIdentity.PathsEqual(other.sitePath, tuPath) || !other.cover.IsValid())
+            !deps_.pathIdentity.PathsEqual(other.sitePath, tuPath) || !other.cover.IsValid())
           continue;
         if (other.siteE <= include.siteB)
           leftGap = std::max(leftGap, other.cover.end);
@@ -377,13 +377,13 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
     };
 
     SmallVector<ZeroTokenIncludeBoundaryCandidate, 4> candidates;
-    for (const auto &include : D_.Model.GetIncludes()) {
+    for (const auto &include : deps_.model.GetIncludes()) {
       // This proof is deliberately limited to top-level TU include directives
       // whose expansion produced no normal PP tokens.  Non-empty includes have
       // token/cover evidence and must use the ordinary include/TU ownership
       // paths; nested zero-token includes need their parent owner to host the
       // insertion rather than a TU byte edit.
-      if (include.parent || !D_.PathIdentity.PathsEqual(include.sitePath, tuPath) ||
+      if (include.parent || !deps_.pathIdentity.PathsEqual(include.sitePath, tuPath) ||
           include.cover.IsValid())
         continue;
 
@@ -465,8 +465,8 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
   auto exactArgLikeBeginAnchor = [&]() -> std::optional<TUInsertionAnchor> {
     SmallVector<const RefoldModel::MacroInvocation *, 8> cands;
     DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invById;
-    invById.reserve(D_.Model.GetMacroInvocations().size());
-    for (const auto &mi : D_.Model.GetMacroInvocations())
+    invById.reserve(deps_.model.GetMacroInvocations().size());
+    for (const auto &mi : deps_.model.GetMacroInvocations())
       invById[mi.id] = &mi;
 
     auto appendIfExactBegin = [&](const RefoldModel::MacroInvocation &m,
@@ -479,15 +479,15 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
       }
     };
 
-    for (const auto &m : D_.Model.GetMacroInvocations()) {
+    for (const auto &m : deps_.model.GetMacroInvocations()) {
       // Only consider real TU-side invocations with stable byte-space
       // provenance. Ignore invocations inside macro definitions, since those do
       // not denote a concrete callsite insertion point in TU source.
       if (!m.invFile || !m.invB || !m.invE || !m.invText)
         continue;
-      if (!D_.PathIdentity.PathsEqual(*m.invFile, tuPath))
+      if (!deps_.pathIdentity.PathsEqual(*m.invFile, tuPath))
         continue;
-      if (D_.MacroTopology.IsInvocationInsideDefineDirective(m))
+      if (deps_.macroTopology.IsInvocationInsideDefineDirective(m))
         continue;
 
       // Treat argument, stringify, and paste projection starts as "arg-like"
@@ -565,17 +565,17 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
   if (auto argAnchor = exactArgLikeBeginAnchor())
     return argAnchor;
 
-  const auto &tokmapByPP = D_.Model.GetTokmapByPP();
+  const auto &tokmapByPP = deps_.model.GetTokmapByPP();
 
   // First try the mapped token immediately to the right of the PP gap. If it
   // belongs to the TU, anchor at that token's begin byte; if it is mapped to a
   // different file, fail closed rather than probing past contradictory local
   // evidence.
-  if (pp < D_.Model.GetTokensCountA()) {
+  if (pp < deps_.model.GetTokensCountA()) {
     auto rightIt = tokmapByPP.find(pp);
     if (rightIt != tokmapByPP.end()) {
       const auto &right = rightIt->second;
-      if (D_.PathIdentity.PathsEqual(tuPath, right.file)) {
+      if (deps_.pathIdentity.PathsEqual(tuPath, right.file)) {
         TUAnchorWitness rightWitness;
         rightWitness.evidence = TUAnchorEvidenceKind::ImmediateRightNeighbor;
         rightWitness.hasPPGap = true;
@@ -602,7 +602,7 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
     auto leftIt = tokmapByPP.find(pp - 1);
     if (leftIt != tokmapByPP.end()) {
       const auto &left = leftIt->second;
-      if (D_.PathIdentity.PathsEqual(tuPath, left.file)) {
+      if (deps_.pathIdentity.PathsEqual(tuPath, left.file)) {
         TUAnchorWitness leftWitness;
         leftWitness.evidence = TUAnchorEvidenceKind::ImmediateLeftNeighbor;
         leftWitness.hasPPGap = true;
@@ -624,14 +624,14 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
 
   // In strict mode we stop here: without an exact structural anchor, an exact
   // arg-like anchor, or an immediate TU neighbor, the gap is not provably TU.
-  if (D_.Strict)
+  if (deps_.strict)
     return std::nullopt;
 
-  static constexpr uint64_t MAX_SNAP_DISTANCE = 64;
+  static constexpr uint64_t maX_SNAP_DISTANCE = 64;
   const bool haveOwnerGaps =
-      (D_.OwnerDepthGap.size() == D_.Model.GetTokensCountA() + 1);
+      (deps_.ownerDepthGap.size() == deps_.model.GetTokensCountA() + 1);
   const uint32_t wantOwner =
-      (haveOwnerGaps && pp < D_.OwnerDepthGap.size()) ? D_.OwnerDepthGap[pp] : 0;
+      (haveOwnerGaps && pp < deps_.ownerDepthGap.size()) ? deps_.ownerDepthGap[pp] : 0;
 
   const RefoldModel::TokMapEntry *left = nullptr;
   uint64_t dLeft = std::numeric_limits<uint64_t>::max();
@@ -639,12 +639,12 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
   // Non-strict fallback: walk leftward through nearby unmapped whitespace, but
   // stop as soon as the owner-depth context changes. This prevents the probe
   // from drifting across a structural ownership seam.
-  for (uint64_t d = 2; d <= MAX_SNAP_DISTANCE; ++d) {
+  for (uint64_t d = 2; d <= maX_SNAP_DISTANCE; ++d) {
     if (pp < d)
       break;
     if (haveOwnerGaps) {
       const uint64_t gap = pp - (d - 1);
-      if (gap < D_.OwnerDepthGap.size() && D_.OwnerDepthGap[gap] != wantOwner)
+      if (gap < deps_.ownerDepthGap.size() && deps_.ownerDepthGap[gap] != wantOwner)
         break;
     }
     auto it = tokmapByPP.find(pp - d);
@@ -657,16 +657,16 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
 
   const RefoldModel::TokMapEntry *right = nullptr;
   uint64_t dRight = std::numeric_limits<uint64_t>::max();
-  const uint64_t maxPP = D_.Model.GetTokensCountA();
+  const uint64_t maxPP = deps_.model.GetTokensCountA();
 
   // Mirror the same bounded whitespace probe to the right, with the same
   // owner-depth guard.
-  for (uint64_t d = 1; d <= MAX_SNAP_DISTANCE; ++d) {
+  for (uint64_t d = 1; d <= maX_SNAP_DISTANCE; ++d) {
     uint64_t ppR = pp + d;
     if (ppR >= maxPP)
       break;
-    if (haveOwnerGaps && ppR < D_.OwnerDepthGap.size() &&
-        D_.OwnerDepthGap[ppR] != wantOwner)
+    if (haveOwnerGaps && ppR < deps_.ownerDepthGap.size() &&
+        deps_.ownerDepthGap[ppR] != wantOwner)
       break;
     auto it = tokmapByPP.find(ppR);
     if (it != tokmapByPP.end()) {
@@ -681,8 +681,8 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
   // enough to prove TU ownership.
   if (!left || !right)
     return std::nullopt;
-  if (!D_.PathIdentity.PathsEqual(tuPath, left->file) ||
-      !D_.PathIdentity.PathsEqual(tuPath, right->file))
+  if (!deps_.pathIdentity.PathsEqual(tuPath, left->file) ||
+      !deps_.pathIdentity.PathsEqual(tuPath, right->file))
     return std::nullopt;
 
   // Use the nearer corroborating TU boundary as the concrete zero-width anchor,
@@ -732,9 +732,9 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
 std::optional<TUInsertionAnchor>
 RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
     const TUEditPlanningContext &ctx) const {
-  if (!ctx.Hunk || !ctx.Hunk->isInsertOnly())
+  if (!ctx.hunk || !ctx.hunk->isInsertOnly())
     return std::nullopt;
-  return FindProvableTUInsertionAnchor(ctx.Hunk->aStart, ctx.TUPath);
+  return FindProvableTUInsertionAnchor(ctx.hunk->aStart, ctx.tuPath);
 }
 
 std::optional<TUByteSpanPlan>
@@ -744,14 +744,14 @@ RefoldTUEditPlanner::PlanTUByteSpan(uint64_t a0, uint64_t a1,
     std::swap(a0, a1);
 
   const bool isEmpty = (a0 == a1);
-  const auto &tokmapByPP = D_.Model.GetTokmapByPP();
+  const auto &tokmapByPP = deps_.model.GetTokmapByPP();
 
   // For pure insertions, use the same conservative TU-anchor proof used by
   // HunkMapsToTU so classification and concrete TU realization cannot diverge.
   if (isEmpty) {
     if (auto anchor = FindProvableTUInsertionAnchor(a0, tuPath))
-      return TUByteSpanPlan(a0, a1, anchor->TUByteOffset,
-                            anchor->TUByteOffset, std::move(anchor));
+      return TUByteSpanPlan(a0, a1, anchor->tuByteOffset,
+                            anchor->tuByteOffset, std::move(anchor));
   }
 
   // Non-empty: compute min/max over TU-mapped subset only.
@@ -767,7 +767,7 @@ RefoldTUEditPlanner::PlanTUByteSpan(uint64_t a0, uint64_t a1,
       continue;
 
     const auto &ent = it->second;
-    if (!D_.PathIdentity.PathsEqual(ent.file, tuPath))
+    if (!deps_.pathIdentity.PathsEqual(ent.file, tuPath))
       continue;
 
     if (ent.b < minB)
@@ -787,9 +787,9 @@ RefoldTUEditPlanner::PlanTUByteSpan(uint64_t a0, uint64_t a1,
 
 std::optional<TUByteSpanPlan>
 RefoldTUEditPlanner::PlanTUByteSpan(const TUEditPlanningContext &ctx) const {
-  if (!ctx.Hunk)
+  if (!ctx.hunk)
     return std::nullopt;
-  return PlanTUByteSpan(ctx.Hunk->aStart, ctx.Hunk->aEnd, ctx.TUPath);
+  return PlanTUByteSpan(ctx.hunk->aStart, ctx.hunk->aEnd, ctx.tuPath);
 }
 
 std::optional<BoundaryParentIncludePlan>
@@ -817,7 +817,7 @@ RefoldTUEditPlanner::FindBoundaryParentIncludeForPureInsertion(
   const RefoldModel::IncludeItem *rightBest = nullptr;
   uint64_t rightWidth = std::numeric_limits<uint64_t>::max();
 
-  for (const auto &inc : D_.Model.GetIncludes()) {
+  for (const auto &inc : deps_.model.GetIncludes()) {
     if (!inc.cover.IsValid())
       continue;
 
@@ -854,11 +854,11 @@ RefoldTUEditPlanner::FindBoundaryParentIncludeForPureInsertion(
   // structural parent shared by the left and right side. This handles both
   // "between siblings" and "at one side only" cases uniformly.
   const std::optional<uint64_t> parentId =
-      D_.Model.LeastCommonAncestorInclude(leftIncId, rightIncId);
+      deps_.model.LeastCommonAncestorInclude(leftIncId, rightIncId);
   if (!parentId)
     return std::nullopt;
 
-  const RefoldModel::IncludeItem *parent = D_.Model.GetIncludeById(*parentId);
+  const RefoldModel::IncludeItem *parent = deps_.model.GetIncludeById(*parentId);
   if (!parent)
     return std::nullopt;
 
@@ -868,9 +868,9 @@ RefoldTUEditPlanner::FindBoundaryParentIncludeForPureInsertion(
 std::optional<BoundaryParentIncludePlan>
 RefoldTUEditPlanner::FindBoundaryParentIncludeForPureInsertion(
     const TUEditPlanningContext &ctx) const {
-  if (!ctx.Hunk)
+  if (!ctx.hunk)
     return std::nullopt;
-  return FindBoundaryParentIncludeForPureInsertion(*ctx.Hunk);
+  return FindBoundaryParentIncludeForPureInsertion(*ctx.hunk);
 }
 
 bool RefoldTUEditPlanner::TUReplacementExtensionIsBTokenClosed(
@@ -878,10 +878,10 @@ bool RefoldTUEditPlanner::TUReplacementExtensionIsBTokenClosed(
     uint64_t bEnd, StringRef tuPath) const {
   if (extEnd <= oldEnd)
     return true;
-  if (D_.ABTokenMapA2B.empty())
+  if (deps_.abTokenMapA2B.empty())
     return false;
 
-  const uint64_t tokCount = static_cast<uint64_t>(D_.ATokens.size());
+  const uint64_t tokCount = static_cast<uint64_t>(deps_.aTokens.size());
   for (uint64_t aTok = std::min(aTokStart, tokCount); aTok < tokCount;
        ++aTok) {
     std::optional<TUByteSpanPlan> span =
@@ -889,21 +889,21 @@ bool RefoldTUEditPlanner::TUReplacementExtensionIsBTokenClosed(
     if (!span)
       continue;
 
-    if (span->TUByteEnd <= oldEnd)
+    if (span->tuByteEnd <= oldEnd)
       continue;
-    if (span->TUByteBegin >= extEnd)
+    if (span->tuByteBegin >= extEnd)
       break;
 
     // A partial-token overlap would mean the byte extension cut through an
     // A token. There is no token-closure proof for that shape, so preserve
     // the suffix rather than widening the edit.
-    if (span->TUByteBegin < oldEnd || extEnd < span->TUByteEnd)
+    if (span->tuByteBegin < oldEnd || extEnd < span->tuByteEnd)
       return false;
 
-    if (aTok >= static_cast<uint64_t>(D_.ABTokenMapA2B.size()))
+    if (aTok >= static_cast<uint64_t>(deps_.abTokenMapA2B.size()))
       return false;
 
-    const int64_t mappedB = D_.ABTokenMapA2B[static_cast<size_t>(aTok)];
+    const int64_t mappedB = deps_.abTokenMapA2B[static_cast<size_t>(aTok)];
     if (mappedB < 0)
       continue;
 
@@ -918,22 +918,22 @@ bool RefoldTUEditPlanner::TUReplacementExtensionIsBTokenClosed(
 bool RefoldTUEditPlanner::TUReplacementExtensionIsBTokenClosed(
     const TUEditPlanningContext &ctx,
     const TUTrailingCallSuffixExtension &extension) const {
-  if (!ctx.Hunk)
+  if (!ctx.hunk)
     return false;
   return TUReplacementExtensionIsBTokenClosed(
-      extension.OriginalATokenEnd, extension.OriginalTUByteEnd,
-      extension.ExtendedTUByteEnd, extension.BTokenBegin, extension.BTokenEnd,
-      ctx.TUPath);
+      extension.originalATokenEnd, extension.originalTUByteEnd,
+      extension.extendedTUByteEnd, extension.bTokenBegin, extension.bTokenEnd,
+      ctx.tuPath);
 }
 
 std::optional<TUTrailingCallSuffixExtension>
 RefoldTUEditPlanner::MaybeExtendTUSpanOverClosedTrailingCallSuffix(
     const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
     StringRef replacement, const TUByteSpanPlan &initialSpan) const {
-  if (initialSpan.TUByteBegin >= initialSpan.TUByteEnd)
+  if (initialSpan.tuByteBegin >= initialSpan.tuByteEnd)
     return std::nullopt;
 
-  const uint64_t oldEnd = initialSpan.TUByteEnd;
+  const uint64_t oldEnd = initialSpan.tuByteEnd;
   const uint64_t extEnd =
       stringutils::extendChainedCallEnd(tuBytes, oldEnd, replacement);
 
@@ -957,10 +957,10 @@ std::optional<TUTrailingCallSuffixExtension>
 RefoldTUEditPlanner::MaybeExtendTUSpanOverClosedTrailingCallSuffix(
     const TUEditPlanningContext &ctx, const TUByteSpanPlan &initialSpan,
     StringRef replacement) const {
-  if (!ctx.Hunk)
+  if (!ctx.hunk)
     return std::nullopt;
   return MaybeExtendTUSpanOverClosedTrailingCallSuffix(
-      *ctx.Hunk, ctx.TUPath, ctx.TUBytes, replacement, initialSpan);
+      *ctx.hunk, ctx.tuPath, ctx.tuBytes, replacement, initialSpan);
 }
 
 void RefoldTUEditPlanner::MaybeExtendTUSpanOverClosedTrailingCallSuffix(
@@ -969,7 +969,7 @@ void RefoldTUEditPlanner::MaybeExtendTUSpanOverClosedTrailingCallSuffix(
   TUByteSpanPlan initialSpan(h.aStart, h.aEnd, span.first, span.second);
   if (auto extension = MaybeExtendTUSpanOverClosedTrailingCallSuffix(
           h, tuPath, tuBytes, replacement, initialSpan))
-    span.second = extension->ExtendedTUByteEnd;
+    span.second = extension->extendedTUByteEnd;
 }
 
 DirectTUHunkEditPlan RefoldTUEditPlanner::BuildDirectTUHunkEditPlan(
@@ -998,11 +998,11 @@ RefoldTUEditPlanner::BuildDirectTUHunkEditPlan(
     uint64_t rawTUEnd, std::optional<uint64_t> materializedBByteBegin,
     std::optional<uint64_t> materializedBByteEnd,
     AcceptedPathKind acceptedPath) const {
-  if (!ctx.Hunk)
+  if (!ctx.hunk)
     return std::nullopt;
 
   return DirectTUHunkEditPlan(
-      *ctx.Hunk, ctx.HunkIndex, span,
+      *ctx.hunk, ctx.hunkIndex, span,
       std::optional<ResyncOutcome>(std::move(resync)), acceptedPayload.str(),
       rawTUStart, rawTUEnd, materializedBByteBegin, materializedBByteEnd,
       acceptedPath);

@@ -4,9 +4,9 @@
 //
 // This service owns the orchestration boundary for preserving or materializing
 // producer-recorded #define/#undef transitions after final TU edits have been
-// staged.  The public planner is intentionally thin: all phase-local policy and
-// shared query state live in the private MacroStateRepairContext implementation
-// class in RefoldMacroStateRepairPlanner.cpp.
+// staged. The public planner is intentionally thin: policy and shared query
+// state live in the private MacroStateRepairContext implementation class in
+// RefoldMacroStateRepairPlanner.cpp.
 //
 //===----------------------------------------------------------------------===//
 
@@ -47,60 +47,60 @@ class RefoldTokenTextAnalysis;
 class RefoldMacroStateRepairPlanner {
 public:
   struct Dependencies {
-    const RefoldModel *Model = nullptr;
-    const RefoldPathIdentity *PathIdentity = nullptr;
-    const RefoldMacroTopology *MacroTopology = nullptr;
-    const RefoldTokenTextAnalysis *TokenTextAnalysis = nullptr;
-    const RefoldMacroStateProof *MacroStateProof = nullptr;
-    RefoldOwnerStateProof *OwnerStateProof = nullptr;
-    RefoldProofLattice *ProofLattice = nullptr;
-    RefoldMacroPatchPlanner *MacroPatchPlanner = nullptr;
-    RefoldTextEditAssembler *TextEditAssembler = nullptr;
-    RefoldTerminalProofSink *TerminalSink = nullptr;
-    const clang::LangOptions *LexLang = nullptr;
+    const RefoldModel *model = nullptr;
+    const RefoldPathIdentity *pathIdentity = nullptr;
+    const RefoldMacroTopology *macroTopology = nullptr;
+    const RefoldTokenTextAnalysis *tokenTextAnalysis = nullptr;
+    const RefoldMacroStateProof *macroStateProof = nullptr;
+    RefoldOwnerStateProof *ownerStateProof = nullptr;
+    RefoldProofLattice *proofLattice = nullptr;
+    RefoldMacroPatchPlanner *macroPatchPlanner = nullptr;
+    RefoldTextEditAssembler *textEditAssembler = nullptr;
+    RefoldTerminalProofSink *terminalSink = nullptr;
+    const clang::LangOptions *lexLang = nullptr;
   };
 
   struct MacroStateRepairRequest {
-    llvm::StringRef TUPath;
-    llvm::StringRef TUBytes;
-    RefoldStructuralHunkDispatcher *StructuralHunkDispatcher = nullptr;
-    std::vector<TextEdit> *TUEdits = nullptr;
+    llvm::StringRef tuPath;
+    llvm::StringRef tuBytes;
+    RefoldStructuralHunkDispatcher *structuralHunkDispatcher = nullptr;
+    std::vector<TextEdit> *tuEdits = nullptr;
   };
 
   struct NamedMacroDirectiveRef {
-    const RefoldModel::MacroDirective *Directive = nullptr;
-    llvm::StringRef Name;
+    const RefoldModel::MacroDirective *directive = nullptr;
+    llvm::StringRef name;
   };
 
   struct MacroStateRepairPlan {
-    bool Success = true;
-    bool DirectiveIndexBuilt = false;
-    llvm::DenseMap<uint64_t, NamedMacroDirectiveRef> MacroDirectiveById;
-    llvm::SmallVector<NamedMacroDirectiveRef, 64> NamedMacroDirectives;
-    llvm::DenseSet<uint64_t> PreservedDefinitionDirectiveIds;
-    llvm::DenseSet<uint64_t> SyntheticUndefPartitionedDefinitionIds;
+    bool success = true;
+    bool directiveIndexBuilt = false;
+    llvm::DenseMap<uint64_t, NamedMacroDirectiveRef> macroDirectiveById;
+    llvm::SmallVector<NamedMacroDirectiveRef, 64> namedMacroDirectives;
+    llvm::DenseSet<uint64_t> preservedDefinitionDirectiveIds;
+    llvm::DenseSet<uint64_t> syntheticUndefPartitionedDefinitionIds;
   };
 
   /// Creates a macro-state repair planner bound to the extracted subsystem
   /// dependencies used by each repair context.
-  explicit RefoldMacroStateRepairPlanner(Dependencies Deps);
+  explicit RefoldMacroStateRepairPlanner(Dependencies deps);
 
   /// Builds the initial macro-state repair plan for the current final TU edit
   /// set and applies the first-pass repair mutations needed before emission.
-  MacroStateRepairPlan Plan(const MacroStateRepairRequest &Request) const;
+  MacroStateRepairPlan Plan(const MacroStateRepairRequest &request) const;
 
   /// Carries preserved gap definitions after replacements once later TU edits
   /// have been staged and their final boundaries are known.
   void CarryObservedGapDefinitionsAfterReplacements(
-      MacroStateRepairPlan &Plan, const MacroStateRepairRequest &Request) const;
+      MacroStateRepairPlan &plan, const MacroStateRepairRequest &request) const;
 
   /// Repairs macro definitions consumed by a materialized include replacement
   /// while preserving include ancestry and post-include observers.
   bool RepairConsumedDefinitionsForMaterializedInclude(
-      MacroStateRepairPlan &Plan, const MacroStateRepairRequest &Request,
-      const RefoldModel::IncludeItem &MaterializedInclude,
-      uint64_t MaterializedSiteBegin, uint64_t MaterializedSiteEnd,
-      std::string &ReplacementText) const;
+      MacroStateRepairPlan &plan, const MacroStateRepairRequest &request,
+      const RefoldModel::IncludeItem &materializedInclude,
+      uint64_t materializedSiteBegin, uint64_t materializedSiteEnd,
+      std::string &replacementText) const;
 
 private:
   Dependencies deps_;

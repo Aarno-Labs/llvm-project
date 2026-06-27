@@ -80,9 +80,9 @@ enum class MaterializedIncludeReplayAlias {
 /// materialization bytes; they do not authorize mutation of source-graph output
 /// records, edit maps, fallback state, or filesystem contents.
 struct SourceGraphProofInputs {
-  const RefoldModel &Model;
-  llvm::StringRef TuPath;
-  const llvm::DenseMap<uint64_t, std::string> &IncludeExpansion;
+  const RefoldModel &model;
+  llvm::StringRef tuPath;
+  const llvm::DenseMap<uint64_t, std::string> &includeExpansion;
 };
 
 /// Read-only services supplied by RefoldEngine for policy decisions that still
@@ -94,29 +94,29 @@ struct SourceGraphProofServices {
   ///
   /// Passing the concrete service keeps this proof layer independent from
   /// RefoldEngine while avoiding one-off forwarding lambdas at each call site.
-  const RefoldPathIdentity &Paths;
+  const RefoldPathIdentity &paths;
 
   /// Return true when the include has producer-proven source line-control state
   /// whose macro operands are supplied by the immediate includer.
   llvm::function_ref<bool(const RefoldModel::IncludeItem &)>
-      IncludeHasIncluderSuppliedLineControlMacroState;
+      includeHasIncluderSuppliedLineControlMacroState;
 
   /// Return true when this include subtree carries an include-site-local layout
   /// materialization obligation that a path-level sidecar cannot discharge.
   llvm::function_ref<bool(uint64_t)>
-      IncludeSubtreeHasLayoutOnlyMaterializationSeed;
+      includeSubtreeHasLayoutOnlyMaterializationSeed;
 };
 
 /// Decision returned by source-graph owner preservation planning.
 struct SourceGraphOwnerPreservationPlan {
   /// Relative sidecar path to emit when the include may remain a source-graph
   /// owner.  Empty means the caller must use the normal materialization path.
-  std::optional<std::string> PreservedRelativePath;
+  std::optional<std::string> preservedRelativePath;
 
   /// Relative sidecar path that the driver may clean up if it still contains
   /// exactly the rejected bytes.  This is only bookkeeping for stale sidecars;
   /// the proof module does not delete or write files.
-  std::optional<std::string> RejectedCleanupRelativePath;
+  std::optional<std::string> rejectedCleanupRelativePath;
 };
 
 /// Ready-to-append output records derived from a source-graph preservation
@@ -124,8 +124,8 @@ struct SourceGraphOwnerPreservationPlan {
 /// proof layer while leaving ownership of the destination vector and filesystem
 /// writes with RefoldEngine/RefoldSourceGraphWriter.
 struct SourceGraphOwnerPreservationOutputPlan {
-  std::optional<SourceGraphOutput> PreservedOutput;
-  std::optional<SourceGraphOutput> RejectedCleanupOutput;
+  std::optional<SourceGraphOutput> preservedOutput;
+  std::optional<SourceGraphOutput> rejectedCleanupOutput;
 };
 
 /// Return the quoted include operand as a safe relative path for automatic
@@ -143,7 +143,7 @@ bool lineHasPreprocessingDirectiveIntroducer(llvm::StringRef Text);
 /// preprocessing include directive that could observe a generated source-graph
 /// sidecar written under SourceGraphPath.
 MaterializedIncludeReplayAlias classifyMaterializedIncludeReplayAlias(
-    llvm::StringRef MaterializedText, llvm::StringRef SourceGraphPath);
+    llvm::StringRef materializedText, llvm::StringRef SourceGraphPath);
 
 /// Return true when preserving Include as a source-graph sidecar under
 /// SourceGraphPath cannot conflict with another top-level same-path include or
@@ -158,7 +158,7 @@ bool sourceGraphIncludePathIsUnaliasedOrCoherent(
 /// caller's output vector.
 SourceGraphOutput makeSourceGraphOutput(
     const RefoldModel::IncludeItem &Include, llvm::StringRef RelativePath,
-    llvm::StringRef Bytes, bool CleanupOnly = false);
+    llvm::StringRef bytes, bool cleanupOnly = false);
 
 /// Decide whether Include may remain a source-graph owner.  The returned plan
 /// contains either an emitted sidecar path, a cleanup-only rejected sidecar

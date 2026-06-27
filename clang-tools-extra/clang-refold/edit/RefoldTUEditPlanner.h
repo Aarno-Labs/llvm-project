@@ -42,12 +42,12 @@ class RefoldTUAnchorProof;
 /// context is for per-hunk/per-file inputs that vary between calls and keeps
 /// planner entry points from growing broad ad-hoc parameter lists.
 struct TUEditPlanningContext {
-  llvm::StringRef TUPath;
-  llvm::StringRef TUBytes;
-  const diffutils::Hunk *Hunk = nullptr;
-  uint64_t HunkIndex = 0;
-  llvm::ArrayRef<PPTok> ATokens;
-  llvm::ArrayRef<PPTok> BTokens;
+  llvm::StringRef tuPath;
+  llvm::StringRef tuBytes;
+  const diffutils::Hunk *hunk = nullptr;
+  uint64_t hunkIndex = 0;
+  llvm::ArrayRef<PPTok> aTokens;
+  llvm::ArrayRef<PPTok> bTokens;
 
   TUEditPlanningContext() = default;
 
@@ -55,8 +55,8 @@ struct TUEditPlanningContext {
                         const diffutils::Hunk &hunk, uint64_t hunkIndex,
                         llvm::ArrayRef<PPTok> aTokens,
                         llvm::ArrayRef<PPTok> bTokens)
-      : TUPath(tuPath), TUBytes(tuBytes), Hunk(&hunk), HunkIndex(hunkIndex),
-        ATokens(aTokens), BTokens(bTokens) {}
+      : tuPath(tuPath), tuBytes(tuBytes), hunk(&hunk), hunkIndex(hunkIndex),
+        aTokens(aTokens), bTokens(bTokens) {}
 };
 
 /// Result of proving that an A-side PP gap has a concrete TU byte anchor.
@@ -65,16 +65,16 @@ struct TUEditPlanningContext {
 /// that only need the concrete byte offset can use TUByteOffset; callers that
 /// forward accepted-result metadata can also preserve the witness unchanged.
 struct TUInsertionAnchor {
-  uint64_t PPGap = 0;
-  uint64_t TUByteOffset = 0;
-  std::optional<TUAnchorWitness> Witness;
+  uint64_t ppGap = 0;
+  uint64_t tuByteOffset = 0;
+  std::optional<TUAnchorWitness> witness;
 
   TUInsertionAnchor() = default;
 
   TUInsertionAnchor(uint64_t ppGap, uint64_t tuByteOffset,
                     std::optional<TUAnchorWitness> witness = std::nullopt)
-      : PPGap(ppGap), TUByteOffset(tuByteOffset),
-        Witness(std::move(witness)) {}
+      : ppGap(ppGap), tuByteOffset(tuByteOffset),
+        witness(std::move(witness)) {}
 };
 
 /// Planned TU byte span for a token hunk.
@@ -83,11 +83,11 @@ struct TUInsertionAnchor {
 /// by Begin == End and may carry the exact insertion anchor that justified the
 /// zero-width span.
 struct TUByteSpanPlan {
-  uint64_t ATokenBegin = 0;
-  uint64_t ATokenEnd = 0;
-  uint64_t TUByteBegin = 0;
-  uint64_t TUByteEnd = 0;
-  std::optional<TUInsertionAnchor> InsertionAnchor;
+  uint64_t aTokenBegin = 0;
+  uint64_t aTokenEnd = 0;
+  uint64_t tuByteBegin = 0;
+  uint64_t tuByteEnd = 0;
+  std::optional<TUInsertionAnchor> insertionAnchor;
 
   TUByteSpanPlan() = default;
 
@@ -95,13 +95,13 @@ struct TUByteSpanPlan {
                  uint64_t tuByteBegin, uint64_t tuByteEnd,
                  std::optional<TUInsertionAnchor> insertionAnchor =
                      std::nullopt)
-      : ATokenBegin(aTokenBegin), ATokenEnd(aTokenEnd),
-        TUByteBegin(tuByteBegin), TUByteEnd(tuByteEnd),
-        InsertionAnchor(std::move(insertionAnchor)) {}
+      : aTokenBegin(aTokenBegin), aTokenEnd(aTokenEnd),
+        tuByteBegin(tuByteBegin), tuByteEnd(tuByteEnd),
+        insertionAnchor(std::move(insertionAnchor)) {}
 
-  bool isPureInsertion() const { return ATokenBegin == ATokenEnd; }
+  bool isPureInsertion() const { return aTokenBegin == aTokenEnd; }
   std::pair<uint64_t, uint64_t> byteRange() const {
-    return {TUByteBegin, TUByteEnd};
+    return {tuByteBegin, tuByteEnd};
   }
 };
 
@@ -111,17 +111,17 @@ struct TUByteSpanPlan {
 /// carrier records stable ids instead so future call sites do not have to expose
 /// raw model storage when they only need the resolved boundary ownership.
 struct BoundaryParentIncludePlan {
-  uint64_t PPGap = 0;
-  uint64_t IncludeId = 0;
-  std::optional<uint64_t> ParentIncludeId;
+  uint64_t ppGap = 0;
+  uint64_t includeId = 0;
+  std::optional<uint64_t> parentIncludeId;
 
   BoundaryParentIncludePlan() = default;
 
   BoundaryParentIncludePlan(uint64_t ppGap, uint64_t includeId,
                             std::optional<uint64_t> parentIncludeId =
                                 std::nullopt)
-      : PPGap(ppGap), IncludeId(includeId),
-        ParentIncludeId(parentIncludeId) {}
+      : ppGap(ppGap), includeId(includeId),
+        parentIncludeId(parentIncludeId) {}
 };
 
 /// Result of deciding whether a TU replacement may absorb a closed trailing
@@ -133,13 +133,13 @@ struct BoundaryParentIncludePlan {
 /// mapped B-token interval; keeping the carrier separate prevents generic TU
 /// byte-span planning from widening spans accidentally.
 struct TUTrailingCallSuffixExtension {
-  uint64_t OriginalATokenEnd = 0;
-  uint64_t ExtendedATokenEnd = 0;
-  uint64_t OriginalTUByteEnd = 0;
-  uint64_t ExtendedTUByteEnd = 0;
-  uint64_t BTokenBegin = 0;
-  uint64_t BTokenEnd = 0;
-  bool BTokenSuffixClosed = false;
+  uint64_t originalATokenEnd = 0;
+  uint64_t extendedATokenEnd = 0;
+  uint64_t originalTUByteEnd = 0;
+  uint64_t extendedTUByteEnd = 0;
+  uint64_t bTokenBegin = 0;
+  uint64_t bTokenEnd = 0;
+  bool bTokenSuffixClosed = false;
 
   TUTrailingCallSuffixExtension() = default;
 
@@ -149,11 +149,11 @@ struct TUTrailingCallSuffixExtension {
                                 uint64_t extendedTUByteEnd,
                                 uint64_t bTokenBegin, uint64_t bTokenEnd,
                                 bool bTokenSuffixClosed)
-      : OriginalATokenEnd(originalATokenEnd),
-        ExtendedATokenEnd(extendedATokenEnd),
-        OriginalTUByteEnd(originalTUByteEnd),
-        ExtendedTUByteEnd(extendedTUByteEnd), BTokenBegin(bTokenBegin),
-        BTokenEnd(bTokenEnd), BTokenSuffixClosed(bTokenSuffixClosed) {}
+      : originalATokenEnd(originalATokenEnd),
+        extendedATokenEnd(extendedATokenEnd),
+        originalTUByteEnd(originalTUByteEnd),
+        extendedTUByteEnd(extendedTUByteEnd), bTokenBegin(bTokenBegin),
+        bTokenEnd(bTokenEnd), bTokenSuffixClosed(bTokenSuffixClosed) {}
 };
 
 /// Concrete direct-TU hunk edit plan before final TextEdit assembly.
@@ -163,16 +163,16 @@ struct TUTrailingCallSuffixExtension {
 /// this record; the compatibility wrapper/assembler boundary converts it into
 /// the final TextEdit carrier and attaches accepted-result metadata.
 struct DirectTUHunkEditPlan {
-  diffutils::Hunk Hunk;
-  uint64_t HunkIndex = 0;
-  TUByteSpanPlan Span;
-  std::optional<ResyncOutcome> Resync;
-  std::string AcceptedPayload;
-  uint64_t RawTUStart = 0;
-  uint64_t RawTUEnd = 0;
-  std::optional<uint64_t> MaterializedBByteBegin;
-  std::optional<uint64_t> MaterializedBByteEnd;
-  AcceptedPathKind AcceptedPath = AcceptedPathKind::Unknown;
+  diffutils::Hunk hunk;
+  uint64_t hunkIndex = 0;
+  TUByteSpanPlan span;
+  std::optional<ResyncOutcome> resync;
+  std::string acceptedPayload;
+  uint64_t rawTUStart = 0;
+  uint64_t rawTUEnd = 0;
+  std::optional<uint64_t> materializedBByteBegin;
+  std::optional<uint64_t> materializedBByteEnd;
+  AcceptedPathKind acceptedPath = AcceptedPathKind::Unknown;
 
   DirectTUHunkEditPlan() = default;
 
@@ -184,12 +184,12 @@ struct DirectTUHunkEditPlan {
                        std::optional<uint64_t> materializedBByteBegin,
                        std::optional<uint64_t> materializedBByteEnd,
                        AcceptedPathKind acceptedPath)
-      : Hunk(std::move(hunk)), HunkIndex(hunkIndex), Span(std::move(span)),
-        Resync(std::move(resync)), AcceptedPayload(std::move(acceptedPayload)),
-        RawTUStart(rawTUStart), RawTUEnd(rawTUEnd),
-        MaterializedBByteBegin(materializedBByteBegin),
-        MaterializedBByteEnd(materializedBByteEnd),
-        AcceptedPath(acceptedPath) {}
+      : hunk(std::move(hunk)), hunkIndex(hunkIndex), span(std::move(span)),
+        resync(std::move(resync)), acceptedPayload(std::move(acceptedPayload)),
+        rawTUStart(rawTUStart), rawTUEnd(rawTUEnd),
+        materializedBByteBegin(materializedBByteBegin),
+        materializedBByteEnd(materializedBByteEnd),
+        acceptedPath(acceptedPath) {}
 };
 
 /// Translation-unit edit planning service.
@@ -202,21 +202,21 @@ struct DirectTUHunkEditPlan {
 class RefoldTUEditPlanner {
 public:
   struct Deps {
-    const RefoldModel &Model;
-    const RefoldPathIdentity &PathIdentity;
-    const RefoldMacroTopology &MacroTopology;
-    const RefoldTUAnchorProof &TUAnchorProof;
-    const LineDirectiveInserter &LineDirs;
-    llvm::ArrayRef<PPTok> ATokens;
-    const std::vector<int64_t> &ABTokenMapA2B;
-    const std::vector<uint32_t> &OwnerDepthGap;
-    bool Strict = true;
+    const RefoldModel &model;
+    const RefoldPathIdentity &pathIdentity;
+    const RefoldMacroTopology &macroTopology;
+    const RefoldTUAnchorProof &tuAnchorProof;
+    const LineDirectiveInserter &lineDirs;
+    llvm::ArrayRef<PPTok> aTokens;
+    const std::vector<int64_t> &abTokenMapA2B;
+    const std::vector<uint32_t> &ownerDepthGap;
+    bool strict = true;
 
   };
 
   explicit RefoldTUEditPlanner(Deps deps);
 
-  const RefoldModel &model() const { return D_.Model; }
+  const RefoldModel &model() const { return deps_.model; }
 
   /// Anchors a pure insertion PP gap to an exact producer-recorded TU slot.
   ///
@@ -345,7 +345,7 @@ private:
   /// an include expansion.
   std::optional<uint64_t> IncludeIdCoveringPPIndex(uint64_t pp) const;
 
-  Deps D_;
+  Deps deps_;
 };
 
 } // namespace refold

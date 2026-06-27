@@ -108,23 +108,23 @@ RefoldStructuralHunkDispatcher::PrepareMacroPatchStagingSlot(
          "macro patch staging requires a physical invocation span");
 
   MacroPatchStagingSlot slot;
-  slot.OwnerIncludeId = macro.ownerIncludeId;
-  slot.PatchKey = FindMacroPatchKeyByInvocationSpan(
+  slot.ownerIncludeId = macro.ownerIncludeId;
+  slot.patchKey = FindMacroPatchKeyByInvocationSpan(
                       macro.ownerIncludeId, *macro.invB, *macro.invE)
                       .value_or(macro.id);
-  slot.ExistingPatch = FindMacroPatchByKey(macro.ownerIncludeId, slot.PatchKey);
-  slot.ExistingIsCallsite =
-      slot.ExistingPatch &&
+  slot.existingPatch = FindMacroPatchByKey(macro.ownerIncludeId, slot.patchKey);
+  slot.existingIsCallsite =
+      slot.existingPatch &&
       RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-          StringRef(slot.ExistingPatch->replacement), macro);
+          StringRef(slot.existingPatch->replacement), macro);
 
   // When the existing patch is an expanded/non-callsite realization, keep the
   // original callsite text as the next planning base.  That preserves the old
   // same-pass behavior where later hunks can still attempt an args-only or DAG
   // reconstruction instead of compounding an expanded surface.
-  slot.CurrentInvocationText =
-      (slot.ExistingPatch && slot.ExistingIsCallsite)
-          ? slot.ExistingPatch->replacement
+  slot.currentInvocationText =
+      (slot.existingPatch && slot.existingIsCallsite)
+          ? slot.existingPatch->replacement
           : (macro.invText ? macro.invText->str() : "");
   return slot;
 }
@@ -177,16 +177,16 @@ RefoldStructuralHunkDispatcher::FindMacroPatchKeyByInvocationSpan(
 void RefoldStructuralHunkDispatcher::MergeMaterializedBTokenRangeFromSlot(
     MacroPatch &patch, const MacroPatchStagingSlot &slot,
     const diffutils::Hunk &hunk) const {
-  if (slot.ExistingPatch && slot.ExistingPatch->hasMaterializedBTokenRange) {
+  if (slot.existingPatch && slot.existingPatch->hasMaterializedBTokenRange) {
     if (!patch.hasMaterializedBTokenRange) {
       patch.hasMaterializedBTokenRange = true;
-      patch.materializedBTokStart = slot.ExistingPatch->materializedBTokStart;
-      patch.materializedBTokEnd = slot.ExistingPatch->materializedBTokEnd;
+      patch.materializedBTokStart = slot.existingPatch->materializedBTokStart;
+      patch.materializedBTokEnd = slot.existingPatch->materializedBTokEnd;
     } else {
       patch.materializedBTokStart = std::min(
-          patch.materializedBTokStart, slot.ExistingPatch->materializedBTokStart);
+          patch.materializedBTokStart, slot.existingPatch->materializedBTokStart);
       patch.materializedBTokEnd = std::max(
-          patch.materializedBTokEnd, slot.ExistingPatch->materializedBTokEnd);
+          patch.materializedBTokEnd, slot.existingPatch->materializedBTokEnd);
     }
   }
 
@@ -205,7 +205,7 @@ void RefoldStructuralHunkDispatcher::MergeMaterializedBTokenRangeFromSlot(
 
 void RefoldStructuralHunkDispatcher::StageMacroPatch(
     const MacroPatchStagingSlot &slot, MacroPatch patch) {
-  StageMacroPatchUnderKey(slot.OwnerIncludeId, slot.PatchKey, std::move(patch));
+  StageMacroPatchUnderKey(slot.ownerIncludeId, slot.patchKey, std::move(patch));
 }
 
 void RefoldStructuralHunkDispatcher::StageMacroPatchUnderKey(

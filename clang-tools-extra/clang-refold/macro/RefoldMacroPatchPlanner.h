@@ -60,28 +60,28 @@ public:
   /// carries shared source state and proof services through stable non-owning
   /// links installed by the service graph.
   struct Dependencies {
-    const RefoldModel *Model = nullptr;
-    llvm::StringRef BSource;
-    llvm::ArrayRef<PPTok> AToks;
-    llvm::ArrayRef<PPTok> BToks;
-    llvm::ArrayRef<size_t> BTokOff;
-    const std::vector<diffutils::Hunk> *ABTokHunks = nullptr;
-    const RefoldBInsertionLedger *BInsertionLedger = nullptr;
-    const RefoldArgTextRecovery *ArgTextRecovery = nullptr;
-    const clang::LangOptions *LexLang = nullptr;
-    const LineDirectiveInserter *LineDirs = nullptr;
-    const RefoldMacroTopology *MacroTopology = nullptr;
-    const RefoldPathIdentity *PathIdentity = nullptr;
-    const RefoldSourceMapper *SourceMapper = nullptr;
-    const RefoldOwnerClassifier *OwnerClassifier = nullptr;
-    bool Strict = false;
+    const RefoldModel *model = nullptr;
+    llvm::StringRef bSource;
+    llvm::ArrayRef<PPTok> aToks;
+    llvm::ArrayRef<PPTok> bToks;
+    llvm::ArrayRef<size_t> bTokOff;
+    const std::vector<diffutils::Hunk> *abTokHunks = nullptr;
+    const RefoldBInsertionLedger *bInsertionLedger = nullptr;
+    const RefoldArgTextRecovery *argTextRecovery = nullptr;
+    const clang::LangOptions *lexLang = nullptr;
+    const LineDirectiveInserter *lineDirs = nullptr;
+    const RefoldMacroTopology *macroTopology = nullptr;
+    const RefoldPathIdentity *pathIdentity = nullptr;
+    const RefoldSourceMapper *sourceMapper = nullptr;
+    const RefoldOwnerClassifier *ownerClassifier = nullptr;
+    bool strict = false;
 
     // Borrowed proof services.  They are initialized before the macro planner
     // and outlive it; direct pointers keep the service graph explicit without
     // lazy engine accessors.
-    RefoldMacroStateProof *MacroStateProof = nullptr;
-    RefoldOwnerStateProof *OwnerStateProof = nullptr;
-    RefoldProofLattice *ProofLattice = nullptr;
+    RefoldMacroStateProof *macroStateProof = nullptr;
+    RefoldOwnerStateProof *ownerStateProof = nullptr;
+    RefoldProofLattice *proofLattice = nullptr;
   };
 
 
@@ -107,8 +107,8 @@ public:
   /// preserves same-pass reuse without making the planner depend on
   /// the engine object or re-discover caller-local map state.
   struct ExistingMacroPatchContext {
-    const MacroPatch *Patch = nullptr;
-    bool IsCallsite = false;
+    const MacroPatch *patch = nullptr;
+    bool isCallsite = false;
   };
 
   /// Construct the macro-planning service from explicit borrowed dependencies.
@@ -189,15 +189,15 @@ private:
   /// Return the borrowed macro-state proof service.  The named accessor
   /// centralizes the invariant that service-graph construction installed a
   /// stable proof service before the planner was created.
-  RefoldMacroStateProof &macroStateProof() const;
+  RefoldMacroStateProof &GetMacroStateProof() const;
 
   /// Return the borrowed owner-state proof service used while stamping
   /// invocation patches that cross observable owner-state boundaries.
-  RefoldOwnerStateProof &ownerStateProof() const;
+  RefoldOwnerStateProof &GetOwnerStateProof() const;
 
   /// Return the borrowed proof lattice used for macro-patch proof construction,
   /// ranking, logging, and summary synchronization.
-  RefoldProofLattice &proofLattice() const;
+  RefoldProofLattice &GetProofLattice() const;
 
   RefoldMacroOccurrenceReplay OccurrenceReplay() const;
   RefoldMacroActualLayout ActualLayout() const;
@@ -246,9 +246,9 @@ private:
   /// One parsed formal-actual content range inside the invocation spelling.
   ///
   /// The recovery service still exposes ranges as plain byte pairs.  This
-  /// carrier names the meaning of those two offsets at planner phase
-  /// boundaries without changing the underlying storage used by existing
-  /// ArrayRef-based helpers.
+  /// carrier names the meaning of those two offsets at planner API boundaries
+  /// without changing the underlying storage used by existing ArrayRef-based
+  /// helpers.
   struct ActualContentRange {
     size_t begin = 0;
     size_t end = 0;
@@ -258,8 +258,8 @@ private:
   ///
   /// The layout owns the recovered formal-content ranges for the duration of
   /// one args-only planning attempt.  Existing replay helpers can borrow the
-  /// pair-backed view, while newer phase code can talk about an invocation
-  /// actual layout instead of a loose vector of unrelated offsets.
+  /// pair-backed view, while the planner can talk about an invocation actual
+  /// layout instead of a loose vector of unrelated offsets.
   struct InvocationActualLayout {
     std::vector<std::pair<size_t, size_t>> contentRanges;
 
@@ -290,9 +290,8 @@ private:
   };
 
   /// Recover the parsed invocation-actual layout needed by args-only replay.
-  /// This is the first args-only phase boundary: it performs only the
-  /// historical availability checks and source-range recovery, leaving all
-  /// candidate construction and ranking to later phases.
+  /// This performs only the historical availability checks and source-range
+  /// recovery; candidate construction and ranking remain separate operations.
   std::optional<InvocationActualLayout>
   RecoverInvocationActuals(const RefoldModel::MacroInvocation &invocation,
                            llvm::StringRef baseInvocationText) const;
@@ -337,8 +336,8 @@ private:
 
   /// Shared read-only state for the args-only planning pipeline.
   ///
-  /// `BuildMacroInvocationPatchArgsOnly` owns the recovered layout.  The phase
-  /// methods borrow it through this carrier so the entry point can orchestrate
+  /// `BuildMacroInvocationPatchArgsOnly` owns the recovered layout. Replay
+  /// helpers borrow it through this carrier so the entry point can orchestrate
   /// definition-tape replay, paste-aware replay, and ordinary formal replay
   /// without promoting per-call state into planner fields.
   struct ArgsOnlyPlanningContext {
@@ -348,7 +347,7 @@ private:
     const InvocationActualLayout &actualLayout;
   };
 
-  /// Result of one args-only candidate phase.
+  /// Result of one args-only candidate attempt.
   ///
   /// Paste-aware replay needs to distinguish "no candidate, keep trying" from
   /// "the touched paste surface was invalid, fail closed."  The old monolithic
@@ -386,12 +385,12 @@ private:
 
   /// Try paste-aware argument replay.  The result distinguishes a non-terminal
   /// miss from a fail-closed paste-surface rejection so the caller preserves the
-  /// old monolithic function's control flow exactly.
+  /// same search/fail-closed control flow.
   ArgsOnlyPatchAttempt
   BuildPasteAwareArgsOnlyPatch(const ArgsOnlyPlanningContext &ctx) const;
 
-  /// Run the ordinary standard/stringify formal replay phase after earlier
-  /// specialized args-only phases did not produce a candidate.
+  /// Run ordinary standard/stringify formal replay after specialized
+  /// args-only replay paths did not produce a candidate.
   std::optional<MacroPatch>
   BuildStandardArgsOnlyPatch(const ArgsOnlyPlanningContext &ctx) const;
 
@@ -484,10 +483,10 @@ private:
     const WholeCoverPlan &plan;
   };
 
-  /// Inputs for the direct root args-only whole-cover phase.
+  /// Inputs for direct root args-only whole-cover recovery.
   ///
-  /// The phase borrows the already-trimmed hunk and the caller-owned reuse
-  /// carrier, then computes only the root-level args-only candidate facts.  It
+  /// The request borrows the already-trimmed hunk and the caller-owned reuse
+  /// carrier, then computes only the root-level args-only candidate facts. It
   /// deliberately does not run DAG lifting or whole-cover realization.
   struct WholeCoverArgsOnlyCandidateContext {
     const RefoldModel::MacroInvocation &invocation;
@@ -497,10 +496,10 @@ private:
     const MacroPatchReuseAdmissionContext &reuseAdmission;
   };
 
-  /// Output of the direct root args-only whole-cover phase.
+  /// Output of direct root args-only whole-cover recovery.
   ///
   /// `rootHasDirectArgLikeSurface` is intentionally carried forward because
-  /// the later DAG phase uses the same fact to decide whether unsupported
+  /// later DAG replay uses the same fact to decide whether unsupported
   /// descendant structure should suppress direct root preservation.
   struct WholeCoverArgsOnlyCandidateResult {
     std::optional<MacroPatch> argsOnlyCandidate;
@@ -508,11 +507,11 @@ private:
     bool rootHasDirectArgLikeSurface = false;
   };
 
-  /// Final whole-cover arbitration state.  The large whole-cover planner still
+  /// Final whole-cover arbitration state. The large whole-cover planner still
   /// owns candidate discovery, while replay-stability checks are routed through
-  /// the named subtree validation context.  This carrier names the already-
-  /// discovered candidates so final admission/selection can be a separate phase
-  /// without changing ownership or ranking.
+  /// the named subtree validation context. This carrier names the already-
+  /// discovered candidates so final admission/selection stays separate from
+  /// construction without changing ownership or ranking.
   struct WholeCoverFinalSelectionContext {
     const RefoldModel::MacroInvocation &invocation;
     const diffutils::Hunk &effectiveHunk;
@@ -692,8 +691,8 @@ private:
       const MacroPatchReuseAdmissionContext &ctx, MacroPatch &patch) const;
 
   /// Literalize a direct __COUNTER__ invocation when the B-side replacement is
-  /// recoverable.  This keeps the counter-specific owner-state proof as its own
-  /// whole-cover phase instead of burying it in the main planner body.
+  /// recoverable. This keeps the counter-specific owner-state proof explicit
+  /// instead of burying it in the main planner body.
   std::optional<MacroPatch> TryCounterLiteralWholeCoverPatch(
       const RefoldModel::MacroInvocation &invocation, const diffutils::Hunk &hunk,
       uint64_t invocationStart, uint64_t invocationEnd) const;
@@ -712,10 +711,10 @@ private:
 
   /// Recover a paired pure-insertion root args-only patch candidate.
   ///
-  /// This is a root whole-cover phase wrapper around the previous local proof:
-  /// two pure insertion frontiers may synthesize one argument envelope only
-  /// when the trimmed envelope is fully contained in exactly one ordinary or
-  /// stringify formal occurrence.
+  /// Recovers the root whole-cover args-only pure-insertion case. Two pure
+  /// insertion frontiers may synthesize one argument envelope only when the
+  /// trimmed envelope is fully contained in exactly one ordinary or stringify
+  /// formal occurrence.
   std::optional<MacroPatch> TryPairedPureInsertionRootArgsOnlyPatch(
       const WholeCoverArgsOnlyCandidateContext &ctx) const;
 

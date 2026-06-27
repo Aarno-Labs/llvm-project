@@ -188,7 +188,7 @@ static constexpr const char *RefoldSchema = R"json(
     },
     "pp_ctx": {
       "type": "object",
-      "description": "Preprocessor invocation context used to produce stream A; used by clang-refold --check to re-run preprocessing and validate alignment against edited stream B.",
+      "description": "Preprocessor invocation context used to produce stream a; used by clang-refold --check to re-run preprocessing and validate alignment against edited stream B.",
       "required": [
         "cwd",
         "argv",

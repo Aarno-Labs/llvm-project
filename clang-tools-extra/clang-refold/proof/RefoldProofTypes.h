@@ -112,10 +112,10 @@ enum class ProofAuditMode : uint8_t { Default, Off, Probe, Strict };
 /// proving an operand from the wrong directory is precisely the class of
 /// relocation bug this surface prevents.
 struct FinalReplaySurface {
-  std::filesystem::path OutputPath;
-  std::filesystem::path OutputDirectory;
-  std::filesystem::path OriginalWorkingDirectory;
-  std::string OutputDirectorySpelling;
+  std::filesystem::path outputPath;
+  std::filesystem::path outputDirectory;
+  std::filesystem::path originalWorkingDirectory;
+  std::string outputDirectorySpelling;
 };
 
 /// Describes which components of the logical location are observed by preserved

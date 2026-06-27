@@ -41,7 +41,7 @@
 //
 // Public API (summary)
 // --------------------
-//   enum class LogLevel { trace, debug, info, warn, error, fatal };
+//   enum class LogLevel { Trace, Debug, Info, Warn, Error, Fatal };
 //
 //   // Convenience wrappers:
 //   void trace(llvm::StringRef Cat, llvm::StringRef Fmt, auto&&... Args);
@@ -149,16 +149,16 @@ using namespace clang::refold::diffutils;
 
 // Detector for class/structs with a `ToString()` member function.
 template <typename T, typename = void>
-struct has_to_string : std::false_type {};
+struct HasToString : std::false_type {};
 
 template <typename T>
-struct has_to_string<T, std::void_t<decltype(std::declval<T>().ToString())>>
+struct HasToString<T, std::void_t<decltype(std::declval<T>().ToString())>>
     : std::is_same<decltype(std::declval<T>().ToString()), std::string> {};
 
 // General `ToString()` provider, excluding Hunk (we special case this)
 template <typename T>
 struct format_provider<
-    T, std::enable_if_t<has_to_string<T>::value && !std::is_same_v<T, Hunk>>> {
+    T, std::enable_if_t<HasToString<T>::value && !std::is_same_v<T, Hunk>>> {
   static void format(const T &val, raw_ostream &os, StringRef style) {
     os << val.ToString();
   }
@@ -166,15 +166,15 @@ struct format_provider<
 
 // Detector for enums that have a 'toString' function available via ADL
 template <typename T, typename = void>
-struct has_enum_to_string : std::false_type {};
+struct HasEnumToString : std::false_type {};
 
 template <typename T>
-struct has_enum_to_string<T, std::void_t<decltype(toString(std::declval<T>()))>>
+struct HasEnumToString<T, std::void_t<decltype(toString(std::declval<T>()))>>
     : std::is_enum<T> {};
 
 // The General Enum Provider
 template <typename T>
-struct format_provider<T, std::enable_if_t<has_enum_to_string<T>::value>> {
+struct format_provider<T, std::enable_if_t<HasEnumToString<T>::value>> {
   static void format(const T &val, llvm::raw_ostream &os, StringRef style) {
     // This calls the toString(T) function found via Argument Dependent Lookup
     os << toString(val);
@@ -199,27 +199,27 @@ struct format_provider<
 using namespace llvm;
 
 enum class LogLevel : unsigned {
-  fatal = 0,
-  error = 1,
-  warn = 2,
-  info = 3,
-  debug = 4,
-  trace = 5
+  Fatal = 0,
+  Error = 1,
+  Warn = 2,
+  Info = 3,
+  Debug = 4,
+  Trace = 5
 };
 
 static inline StringRef toString(LogLevel level) {
   switch (level) {
-  case LogLevel::trace:
+  case LogLevel::Trace:
     return "trace";
-  case LogLevel::debug:
+  case LogLevel::Debug:
     return "debug";
-  case LogLevel::info:
+  case LogLevel::Info:
     return "info";
-  case LogLevel::warn:
+  case LogLevel::Warn:
     return "warn";
-  case LogLevel::error:
+  case LogLevel::Error:
     return "error";
-  case LogLevel::fatal:
+  case LogLevel::Fatal:
     return "fatal";
   }
   llvm_unreachable("Invalid log level");
@@ -230,17 +230,17 @@ extern cl::opt<LogLevel> LogLevelOpt;
 inline raw_ostream::Colors levelColor(LogLevel level) {
   using color = raw_ostream::Colors;
   switch (level) {
-  case LogLevel::fatal:
+  case LogLevel::Fatal:
     return color::RED; // bold handled separately
-  case LogLevel::error:
+  case LogLevel::Error:
     return color::RED;
-  case LogLevel::warn:
+  case LogLevel::Warn:
     return color::YELLOW;
-  case LogLevel::info:
+  case LogLevel::Info:
     return color::CYAN;
-  case LogLevel::debug:
+  case LogLevel::Debug:
     return color::GREEN;
-  case LogLevel::trace:
+  case LogLevel::Trace:
     return color::SAVEDCOLOR; // default color
   }
   llvm_unreachable("Invalid LogLevel");
@@ -269,12 +269,12 @@ void logMsg(LogLevel level, StringRef tag, StringRef msg, Args &&...args) {
   };
 
   // Colored prefix based on level (fatal is bold “bright red”)
-  if (level == LogLevel::trace || !useColor) {
+  if (level == LogLevel::Trace || !useColor) {
     os << formatv("[{0,-5}][{1}]  ", level,
                   fmt_align(tag, AlignStyle::Left, 21, '.'));
     printMsg(os, msg, std::forward<Args>(args)...);
   } else {
-    const bool bold = (level == LogLevel::fatal);
+    const bool bold = (level == LogLevel::Fatal);
     WithColor _(os, levelColor(level), bold);
     os << formatv("[{0,-5}][{1}]  ", level,
                   fmt_align(tag, AlignStyle::Left, 21, '.'));
@@ -416,48 +416,48 @@ inline bool inLogLevel(LogLevel level) {
 namespace clang {
 namespace refold {
 
-inline bool inFatalMode() { return inLogLevel(LogLevel::fatal); }
+inline bool inFatalMode() { return inLogLevel(LogLevel::Fatal); }
 
-inline bool inErrorMode() { return inLogLevel(LogLevel::error); }
+inline bool inErrorMode() { return inLogLevel(LogLevel::Error); }
 
-inline bool inWarnMode() { return inLogLevel(LogLevel::warn); }
+inline bool inWarnMode() { return inLogLevel(LogLevel::Warn); }
 
-inline bool inInfoMode() { return inLogLevel(LogLevel::info); }
+inline bool inInfoMode() { return inLogLevel(LogLevel::Info); }
 
-inline bool inDebugMode() { return inLogLevel(LogLevel::debug); }
+inline bool inDebugMode() { return inLogLevel(LogLevel::Debug); }
 
-inline bool inTraceMode() { return inLogLevel(LogLevel::trace); }
+inline bool inTraceMode() { return inLogLevel(LogLevel::Trace); }
 
 template <typename... Args>
 [[noreturn]]
 static inline void fatal(StringRef tag, StringRef msg, Args &&...args) {
-  logMsg(LogLevel::fatal, tag, msg, std::forward<Args>(args)...);
+  logMsg(LogLevel::Fatal, tag, msg, std::forward<Args>(args)...);
   std::abort();
 }
 
 template <typename... Args>
 static inline void error(StringRef tag, StringRef msg, Args &&...args) {
-  logMsg(LogLevel::error, tag, msg, std::forward<Args>(args)...);
+  logMsg(LogLevel::Error, tag, msg, std::forward<Args>(args)...);
 }
 
 template <typename... Args>
 static inline void warn(StringRef tag, StringRef msg, Args &&...args) {
-  logMsg(LogLevel::warn, tag, msg, std::forward<Args>(args)...);
+  logMsg(LogLevel::Warn, tag, msg, std::forward<Args>(args)...);
 }
 
 template <typename... Args>
 static inline void info(StringRef tag, StringRef msg, Args &&...args) {
-  logMsg(LogLevel::info, tag, msg, std::forward<Args>(args)...);
+  logMsg(LogLevel::Info, tag, msg, std::forward<Args>(args)...);
 }
 
 template <typename... Args>
 static inline void debug(StringRef tag, StringRef msg, Args &&...args) {
-  logMsg(LogLevel::debug, tag, msg, std::forward<Args>(args)...);
+  logMsg(LogLevel::Debug, tag, msg, std::forward<Args>(args)...);
 }
 
 template <typename... Args>
 static inline void trace(StringRef tag, StringRef msg, Args &&...args) {
-  logMsg(LogLevel::trace, tag, msg, std::forward<Args>(args)...);
+  logMsg(LogLevel::Trace, tag, msg, std::forward<Args>(args)...);
 }
 
 } // namespace refold

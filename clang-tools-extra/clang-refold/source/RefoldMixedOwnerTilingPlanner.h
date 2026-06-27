@@ -41,27 +41,27 @@ class RefoldSourceMapper;
 class RefoldMixedOwnerTilingPlanner {
 public:
   struct Dependencies {
-    const RefoldModel &Model;
-    llvm::StringRef TUPath;
-    const RefoldPathIdentity &PathIdentity;
-    const LineDirectiveInserter &LineDirs;
-    const clang::LangOptions &LexLang;
-    const RefoldMacroTopology &MacroTopology;
-    RefoldSourceMapper &SourceMapper;
-    const RefoldOwnerClassifier &OwnerClassifier;
-    RefoldOwnerStateProof &OwnerStateProof;
-    std::vector<diffutils::Hunk> &ABTokHunks;
-    std::vector<MixedOwnerTilingWitness> &MixedOwnerTilingWitnesses;
-    std::vector<MixedOwnerTilingSegmentBinding> &MixedOwnerTilingSegmentBindings;
+    const RefoldModel &model;
+    llvm::StringRef tuPath;
+    const RefoldPathIdentity &pathIdentity;
+    const LineDirectiveInserter &lineDirs;
+    const clang::LangOptions &lexLang;
+    const RefoldMacroTopology &macroTopology;
+    RefoldSourceMapper &sourceMapper;
+    const RefoldOwnerClassifier &ownerClassifier;
+    RefoldOwnerStateProof &ownerStateProof;
+    std::vector<diffutils::Hunk> &abTokHunks;
+    std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses;
+    std::vector<MixedOwnerTilingSegmentBinding> &mixedOwnerTilingSegmentBindings;
   };
 
   struct MixedOwnerTilingPlan {
     /// Token hunks after deterministic mixed-owner splitting.
-    std::vector<diffutils::Hunk> Hunks;
+    std::vector<diffutils::Hunk> hunks;
     /// Number of durable mixed-owner witnesses emitted during this pass.
-    size_t MixedOwnerWitnessCount = 0;
+    size_t mixedOwnerWitnessCount = 0;
     /// Number of emitted token-segment bindings across those witnesses.
-    size_t SegmentBindingCount = 0;
+    size_t segmentBindingCount = 0;
   };
 
   explicit RefoldMixedOwnerTilingPlanner(Dependencies deps);

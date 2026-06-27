@@ -203,85 +203,85 @@ RefoldOwnerStateProof::BuildTheoremStateDelta(const OwnerStateFacts &facts,
   auto projectComponentFacts = [&](const OwnerStateFacts &bucket) {
     // Entry/Observes receive state requirements and observations.
     for (const MacroStateIdentity &identity : bucket.macroRequirements) {
-      projected.Entry.AddMacroRequirement(identity);
-      projected.Observes.AddMacroRequirement(identity);
+      projected.entry.AddMacroRequirement(identity);
+      projected.observes.AddMacroRequirement(identity);
     }
     for (const MacroStateObservation &observation :
          bucket.macroExpansionObservations) {
-      projected.Entry.AddMacroObservation(observation);
-      projected.Observes.AddMacroObservation(observation);
+      projected.entry.AddMacroObservation(observation);
+      projected.observes.AddMacroObservation(observation);
     }
     for (const MacroStateObservation &observation :
          bucket.definedOperatorObservations) {
-      projected.Entry.AddMacroObservation(observation);
-      projected.Observes.AddMacroObservation(observation);
+      projected.entry.AddMacroObservation(observation);
+      projected.observes.AddMacroObservation(observation);
     }
     for (const MacroStateObservation &observation :
          bucket.conditionalMacroObservations) {
-      projected.Entry.AddMacroObservation(observation);
-      projected.Observes.AddMacroObservation(observation);
+      projected.entry.AddMacroObservation(observation);
+      projected.observes.AddMacroObservation(observation);
     }
     for (const BuiltinLocationObservation &observation :
          bucket.builtinLocationObservations) {
-      projected.Entry.AddBuiltinLocationObservation(observation);
-      projected.Observes.AddBuiltinLocationObservation(observation);
+      projected.entry.AddBuiltinLocationObservation(observation);
+      projected.observes.AddBuiltinLocationObservation(observation);
     }
     for (const CounterEventIdentity &identity : bucket.counterEvents) {
-      projected.Entry.AddCounterObservation(identity);
-      projected.Observes.AddCounterObservation(identity);
-      projected.Mutates.AddCounterMutation(identity);
-      projected.Exit.AddCounterMutation(identity);
+      projected.entry.AddCounterObservation(identity);
+      projected.observes.AddCounterObservation(identity);
+      projected.mutates.AddCounterMutation(identity);
+      projected.exit.AddCounterMutation(identity);
     }
     for (const IncludeStateIdentity &identity : bucket.includeStateEvents) {
-      projected.Entry.AddIncludeStateEvent(identity);
-      projected.Observes.AddIncludeStateEvent(identity);
-      projected.Mutates.AddIncludeStateEvent(identity);
-      projected.Exit.AddIncludeStateEvent(identity);
+      projected.entry.AddIncludeStateEvent(identity);
+      projected.observes.AddIncludeStateEvent(identity);
+      projected.mutates.AddIncludeStateEvent(identity);
+      projected.exit.AddIncludeStateEvent(identity);
     }
     for (const IncludeGuardStateIdentity &identity :
          bucket.includeGuardStateEvents) {
-      projected.Entry.AddIncludeGuardStateEvent(identity);
-      projected.Observes.AddIncludeGuardStateEvent(identity);
-      projected.Mutates.AddIncludeGuardStateEvent(identity);
-      projected.Exit.AddIncludeGuardStateEvent(identity);
+      projected.entry.AddIncludeGuardStateEvent(identity);
+      projected.observes.AddIncludeGuardStateEvent(identity);
+      projected.mutates.AddIncludeGuardStateEvent(identity);
+      projected.exit.AddIncludeGuardStateEvent(identity);
     }
     for (const PragmaStateIdentity &identity : bucket.pragmaStateEvents) {
-      projected.Entry.AddPragmaStateEvent(identity);
-      projected.Observes.AddPragmaStateEvent(identity);
-      projected.Mutates.AddPragmaStateEvent(identity);
-      projected.Exit.AddPragmaStateEvent(identity);
+      projected.entry.AddPragmaStateEvent(identity);
+      projected.observes.AddPragmaStateEvent(identity);
+      projected.mutates.AddPragmaStateEvent(identity);
+      projected.exit.AddPragmaStateEvent(identity);
     }
     for (const ConditionalStateIdentity &identity :
          bucket.conditionalStateEvents) {
-      projected.Entry.AddConditionalStateEvent(identity);
-      projected.Observes.AddConditionalStateEvent(identity);
-      projected.Mutates.AddConditionalStateEvent(identity);
-      projected.Exit.AddConditionalStateEvent(identity);
+      projected.entry.AddConditionalStateEvent(identity);
+      projected.observes.AddConditionalStateEvent(identity);
+      projected.mutates.AddConditionalStateEvent(identity);
+      projected.exit.AddConditionalStateEvent(identity);
     }
 
     // Mutates/Exit receive state transitions.
     for (const MacroStateIdentity &identity : bucket.macroDefinitions) {
-      projected.Mutates.AddMacroDefinition(identity);
-      projected.Exit.AddMacroDefinition(identity);
+      projected.mutates.AddMacroDefinition(identity);
+      projected.exit.AddMacroDefinition(identity);
     }
     for (const MacroStateIdentity &identity : bucket.macroUndefinitions) {
-      projected.Mutates.AddMacroUndefinition(identity);
-      projected.Exit.AddMacroUndefinition(identity);
+      projected.mutates.AddMacroUndefinition(identity);
+      projected.exit.AddMacroUndefinition(identity);
     }
     for (const LineControlStateIdentity &identity :
          bucket.lineControlEvents) {
-      projected.Mutates.AddLineControlEvent(identity);
-      projected.Exit.AddLineControlEvent(identity);
+      projected.mutates.AddLineControlEvent(identity);
+      projected.exit.AddLineControlEvent(identity);
     }
 
     // Missing facts are theorem obligations, so they remain visible in every
     // bucket.  MissingOwnerOrderingFacts remains the precise unmodeled-ordering
     // marker; no flat poison bit is synthesized.
     for (const MissingStateFact &fact : bucket.missingStateFacts) {
-      projected.Entry.AddMissingStateFact(fact.kind, fact.detail);
-      projected.Observes.AddMissingStateFact(fact.kind, fact.detail);
-      projected.Mutates.AddMissingStateFact(fact.kind, fact.detail);
-      projected.Exit.AddMissingStateFact(fact.kind, fact.detail);
+      projected.entry.AddMissingStateFact(fact.kind, fact.detail);
+      projected.observes.AddMissingStateFact(fact.kind, fact.detail);
+      projected.mutates.AddMissingStateFact(fact.kind, fact.detail);
+      projected.exit.AddMissingStateFact(fact.kind, fact.detail);
     }
   };
 
@@ -296,32 +296,32 @@ RefoldOwnerStateProof::BuildTheoremStateDelta(const OwnerStateFacts &facts,
 
 bool RefoldOwnerStateProof::OwnerStateDeltaHasUnmodeledState(
     const OwnerStateDelta &delta) {
-  return delta.Entry.HasMissingFactKind(
+  return delta.entry.HasMissingFactKind(
              MissingStateFactKind::MissingOwnerOrderingFacts) ||
-         delta.Observes.HasMissingFactKind(
+         delta.observes.HasMissingFactKind(
              MissingStateFactKind::MissingOwnerOrderingFacts) ||
-         delta.Mutates.HasMissingFactKind(
+         delta.mutates.HasMissingFactKind(
              MissingStateFactKind::MissingOwnerOrderingFacts) ||
-         delta.Exit.HasMissingFactKind(
+         delta.exit.HasMissingFactKind(
              MissingStateFactKind::MissingOwnerOrderingFacts);
 }
 
 bool RefoldOwnerStateProof::OwnerStateDeltaHasUnknownPragmaState(
     const OwnerStateDelta &delta) {
-  return delta.Entry.HasTheoremUnknownPragmaState() ||
-         delta.Observes.HasTheoremUnknownPragmaState() ||
-         delta.Mutates.HasTheoremUnknownPragmaState() ||
-         delta.Exit.HasTheoremUnknownPragmaState();
+  return delta.entry.HasTheoremUnknownPragmaState() ||
+         delta.observes.HasTheoremUnknownPragmaState() ||
+         delta.mutates.HasTheoremUnknownPragmaState() ||
+         delta.exit.HasTheoremUnknownPragmaState();
 }
 
 bool RefoldOwnerStateProof::OwnerStateDeltaMutatesAnyState(
     const OwnerStateDelta &delta) {
-  return delta.Mutates.MutatesAnyState() || delta.Exit.MutatesAnyState();
+  return delta.mutates.MutatesAnyState() || delta.exit.MutatesAnyState();
 }
 
 OwnerObserverSummary
 RefoldOwnerStateProof::OwnerStateDeltaToObserverSummary(const OwnerStateDelta &delta) {
-  const StateObservations &observations = delta.Observes;
+  const StateObservations &observations = delta.observes;
   OwnerObserverSummary observers;
   observers.observesMacroExpansion =
       observations.HasMacroRequirements() ||
@@ -1642,7 +1642,7 @@ RefoldOwnerStateProof::ObservationKindForComponent(OwnerStateComponent component
 
 ArrayRef<uint64_t> RefoldOwnerStateProof::ObserverSiteIndexesForComponent(
     const OwnerStateGraph &graph, OwnerStateComponent component) {
-  static const std::vector<uint64_t> Empty;
+  static const std::vector<uint64_t> empty;
   switch (component) {
   case OwnerStateComponent::MacroState:
     return graph.observerIndex.macroStateObservers;
@@ -1667,7 +1667,7 @@ ArrayRef<uint64_t> RefoldOwnerStateProof::ObserverSiteIndexesForComponent(
   case OwnerStateComponent::UnmodeledState:
     return graph.observerIndex.unmodeledStateObservers;
   case OwnerStateComponent::Unknown:
-    return Empty;
+    return empty;
   }
   llvm_unreachable("Invalid owner state component");
 }
@@ -2144,27 +2144,27 @@ RefoldOwnerStateProof::BuildOwnerStateGraph() const {
     switch (component) {
     case OwnerStateComponent::MacroState:
     case OwnerStateComponent::DefinedOperator:
-      recordMacroBucket(delta.Entry);
-      recordMacroBucket(delta.Observes);
+      recordMacroBucket(delta.entry);
+      recordMacroBucket(delta.observes);
       break;
     case OwnerStateComponent::ConditionalState:
-      recordMacroBucket(delta.Entry);
-      recordMacroBucket(delta.Observes);
-      recordConditionalBucket(delta.Entry);
-      recordConditionalBucket(delta.Observes);
+      recordMacroBucket(delta.entry);
+      recordMacroBucket(delta.observes);
+      recordConditionalBucket(delta.entry);
+      recordConditionalBucket(delta.observes);
       break;
     case OwnerStateComponent::Counter:
-      recordCounterBucket(delta.Entry);
-      recordCounterBucket(delta.Observes);
+      recordCounterBucket(delta.entry);
+      recordCounterBucket(delta.observes);
       break;
     case OwnerStateComponent::PragmaState:
-      recordPragmaBucket(delta.Entry);
-      recordPragmaBucket(delta.Observes);
+      recordPragmaBucket(delta.entry);
+      recordPragmaBucket(delta.observes);
       break;
     case OwnerStateComponent::IncludeGuardState:
     case OwnerStateComponent::IncludeState:
-      recordIncludeBucket(delta.Entry);
-      recordIncludeBucket(delta.Observes);
+      recordIncludeBucket(delta.entry);
+      recordIncludeBucket(delta.observes);
       break;
     case OwnerStateComponent::LineNumber:
       appendKeyedIndex(graph.observerIndex.observersByConditionalState,
@@ -2185,10 +2185,10 @@ RefoldOwnerStateProof::BuildOwnerStateGraph() const {
   };
 
   auto countMissingFacts = [](const OwnerStateDelta &delta) -> uint64_t {
-    return delta.Entry.missingStateFacts.size() +
-           delta.Observes.missingStateFacts.size() +
-           delta.Mutates.missingStateFacts.size() +
-           delta.Exit.missingStateFacts.size();
+    return delta.entry.missingStateFacts.size() +
+           delta.observes.missingStateFacts.size() +
+           delta.mutates.missingStateFacts.size() +
+           delta.exit.missingStateFacts.size();
   };
 
   auto componentIsMutatedByDelta = [](const OwnerStateDelta &delta,
@@ -2221,7 +2221,7 @@ RefoldOwnerStateProof::BuildOwnerStateGraph() const {
       }
       llvm_unreachable("Invalid owner state component");
     };
-    return bucketMutates(delta.Mutates) || bucketMutates(delta.Exit);
+    return bucketMutates(delta.mutates) || bucketMutates(delta.exit);
   };
 
   auto rebuildObserverIndex = [&]() {
@@ -2295,7 +2295,7 @@ RefoldOwnerStateProof::BuildOwnerStateGraph() const {
     // CounterEventIdentity values to the macro owner; this loop splits them
     // into explicit graph nodes without inventing new counter facts.
     const OwnerStateDelta delta = closure.stateOut;
-    for (const CounterEventIdentity &counter : delta.Mutates.counterEvents) {
+    for (const CounterEventIdentity &counter : delta.mutates.counterEvents) {
       OwnerSourceRange source = node.source;
       if (!counter.expansionSiteFile.empty() && counter.expansionSiteBegin &&
           counter.expansionSiteEnd) {
@@ -2306,8 +2306,8 @@ RefoldOwnerStateProof::BuildOwnerStateGraph() const {
       OwnerStateGraphNode counterNode;
       counterNode.kind = OwnerStateGraphNodeKind::CounterEvent;
       counterNode.closure = closure;
-      counterNode.state.Mutates.AddCounterEvent(counter);
-      counterNode.state.Exit.AddCounterEvent(counter);
+      counterNode.state.mutates.AddCounterEvent(counter);
+      counterNode.state.exit.AddCounterEvent(counter);
       counterNode.source = source;
       counterNode.aTokens =
           OwnerTokenRange::From(counter.aTokenBegin, counter.aTokenEnd);
@@ -2509,7 +2509,7 @@ std::vector<OwnerStateComponent>
 RefoldOwnerStateProof::StateComponentsMutatedByDelta(
     const OwnerStateDelta &summary) {
   const OwnerStateDelta theoremDelta = summary;
-  const StateMutations &mutations = theoremDelta.Mutates;
+  const StateMutations &mutations = theoremDelta.mutates;
   std::vector<OwnerStateComponent> components;
   auto appendUnique = [&](OwnerStateComponent component) {
     if (component == OwnerStateComponent::Unknown)

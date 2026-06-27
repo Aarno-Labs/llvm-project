@@ -1058,21 +1058,21 @@ struct StateGuarantees : OwnerStateFacts {};
 /// The buckets are monotone.  A missing producer fact must set the relevant
 /// unmodeled bit in one or more buckets, never clear an obligation.
 struct OwnerStateDelta {
-  StateRequirements Entry;
-  StateObservations Observes;
-  StateMutations Mutates;
-  StateGuarantees Exit;
+  StateRequirements entry;
+  StateObservations observes;
+  StateMutations mutates;
+  StateGuarantees exit;
 
   bool Empty() const {
-    return Entry.Empty() && Observes.Empty() && Mutates.Empty() &&
-           Exit.Empty();
+    return entry.Empty() && observes.Empty() && mutates.Empty() &&
+           exit.Empty();
   }
 
   OwnerStateDelta &MergeFrom(const OwnerStateDelta &other) {
-    Entry.MergeFrom(other.Entry);
-    Observes.MergeFrom(other.Observes);
-    Mutates.MergeFrom(other.Mutates);
-    Exit.MergeFrom(other.Exit);
+    entry.MergeFrom(other.entry);
+    observes.MergeFrom(other.observes);
+    mutates.MergeFrom(other.mutates);
+    exit.MergeFrom(other.exit);
     return *this;
   }
 
@@ -1082,10 +1082,10 @@ struct OwnerStateDelta {
   /// while preserving the precise per-component facts already attached to the
   /// source delta.
   OwnerStateDelta &MergeTheoremFactsFrom(const OwnerStateDelta &other) {
-    Entry.MergeTheoremFactsFrom(other.Entry);
-    Observes.MergeTheoremFactsFrom(other.Observes);
-    Mutates.MergeTheoremFactsFrom(other.Mutates);
-    Exit.MergeTheoremFactsFrom(other.Exit);
+    entry.MergeTheoremFactsFrom(other.entry);
+    observes.MergeTheoremFactsFrom(other.observes);
+    mutates.MergeTheoremFactsFrom(other.mutates);
+    exit.MergeTheoremFactsFrom(other.exit);
     return *this;
   }
 };

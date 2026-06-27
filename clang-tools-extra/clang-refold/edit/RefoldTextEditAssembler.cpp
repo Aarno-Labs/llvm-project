@@ -237,7 +237,7 @@ bool RefoldTextEditAssembler::AuditAcceptedEditProofs(ArrayRef<TextEdit> edits,
                                           StringRef emissionStage,
                                           StringRef emissionOwner) const {
   // Centralize the final accepted-proof audit at the last byte-edit boundary.
-  // Earlier builders may still stage candidates path-by-path, but once the
+  // Earlier builders may still queue candidates path-by-path, but once the
   // normalized edit set is known the applicator must see a theorem carrier for
   // every emitted edit and a composition law for every multi-carrier edit.  The
   // state-transition audit is layered onto the same boundary:

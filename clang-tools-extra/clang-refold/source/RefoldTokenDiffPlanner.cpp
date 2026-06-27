@@ -1,7 +1,7 @@
 //===--- RefoldTokenDiffPlanner.cpp -----------------------------*- C++ -*-===//
 //
-// Implements the initial token-diff planning phase for clang-refold.  The
-// planner owns lexeme mapping, LCS provenance construction, normalized token
+// Implements token-diff planning for clang-refold. The planner owns lexeme
+// mapping, LCS provenance construction, normalized token
 // hunk derivation, and raw byte-hunk cache construction.
 //
 //===----------------------------------------------------------------------===//
@@ -33,13 +33,13 @@ RefoldTokenDiffPlanner::RefoldTokenDiffPlanner(Dependencies deps)
     : deps_(deps) {}
 
 RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
-  std::vector<StringRef> aSeq = MapLexemes(deps_.AToks, deps_.ATokOff);
-  std::vector<StringRef> bSeq = MapLexemes(deps_.BToks, deps_.BTokOff);
+  std::vector<StringRef> aSeq = MapLexemes(deps_.aToks, deps_.aTokOff);
+  std::vector<StringRef> bSeq = MapLexemes(deps_.bToks, deps_.bTokOff);
 
-  deps_.OwnerDepthGap = ComputeOwnerDepthGapsForPP();
+  deps_.ownerDepthGap = ComputeOwnerDepthGapsForPP();
 
   std::vector<diffutils::LcsAGapProvenance> gapProvenance =
-      ComputeLcsAGapProvenanceForPP(deps_.OwnerDepthGap);
+      ComputeLcsAGapProvenanceForPP(deps_.ownerDepthGap);
   std::vector<diffutils::LcsBGapProvenance> bGapProvenance =
       ComputeLcsBGapProvenanceForPP();
   std::vector<int64_t> a2b =
@@ -67,8 +67,8 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
       b2a[static_cast<size_t>(bj)] = static_cast<int64_t>(ai);
   }
 
-  deps_.ABTokMapA2B = a2b;
-  deps_.ABTokMapB2A = b2a;
+  deps_.abTokMapA2B = a2b;
+  deps_.abTokMapB2A = b2a;
 
   for (diffutils::Hunk &h : hunks) {
     if (!h.isInsertOnly())
@@ -107,13 +107,13 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
       hunks = std::move(merged);
   }
 
-  deps_.ABTokHunks = hunks;
+  deps_.abTokHunks = hunks;
 
   // Raw byte hunks are built alongside the token diff so every later
   // A-byte -> B-byte projection observes caches derived from the same A/B
   // inputs as the token hunk plan.
-  deps_.ABByteHunks = deps_.SourceMapper.BuildByteHunksFromRawText();
-  deps_.SourceMapper.BuildByteHunkPrefixDeltaCache();
+  deps_.abByteHunks = deps_.sourceMapper.BuildByteHunksFromRawText();
+  deps_.sourceMapper.BuildByteHunkPrefixDeltaCache();
   return TokenDiffPlan{std::move(hunks)};
 }
 
@@ -138,40 +138,40 @@ std::vector<uint32_t>
 RefoldTokenDiffPlanner::ComputeOwnerDepthGapsForPP() const {
   // aTokOff.size() == (#tokens) + 1 (sentinel). LCS expects N == #tokens,
   // and ownerDepthGap.size() == N + 1.
-  const size_t N = deps_.ATokOff.size() - 1;
-  std::vector<uint32_t> ownerDepthGap(N + 1, 0);
+  const size_t n = deps_.aTokOff.size() - 1;
+  std::vector<uint32_t> ownerDepthGap(n + 1, 0);
 
-  for (size_t k = 0; k <= N; ++k) {
+  for (size_t k = 0; k <= n; ++k) {
     // --------------------------- Include depth ----------------------------
     std::optional<uint64_t> leftInc;
     std::optional<uint64_t> rightInc;
 
     if (k > 0) {
-      leftInc = deps_.Model.InnermostIncludeAtPP(k - 1);
+      leftInc = deps_.model.InnermostIncludeAtPP(k - 1);
     }
-    if (k < N) {
-      rightInc = deps_.Model.InnermostIncludeAtPP(k);
+    if (k < n) {
+      rightInc = deps_.model.InnermostIncludeAtPP(k);
     }
 
     std::optional<uint64_t> lca =
-        deps_.Model.LeastCommonAncestorInclude(leftInc, rightInc);
-    uint32_t incDepth = deps_.Model.GetIncludeDepth(lca);
+        deps_.model.LeastCommonAncestorInclude(leftInc, rightInc);
+    uint32_t incDepth = deps_.model.GetIncludeDepth(lca);
 
     // ------------------------- Conditional depth --------------------------
     std::optional<RefoldModel::ArmRef> leftArmRef;
     std::optional<RefoldModel::ArmRef> rightArmRef;
 
     if (k > 0) {
-      leftArmRef = deps_.Model.FindArmRefAtPP(k - 1);
+      leftArmRef = deps_.model.FindArmRefAtPP(k - 1);
     }
-    if (k < N) {
-      rightArmRef = deps_.Model.FindArmRefAtPP(k);
+    if (k < n) {
+      rightArmRef = deps_.model.FindArmRefAtPP(k);
     }
 
     uint32_t leftCondDepth =
-        leftArmRef ? deps_.Model.GetCondArmDepth(leftArmRef->arm->id) : 0;
+        leftArmRef ? deps_.model.GetCondArmDepth(leftArmRef->arm->id) : 0;
     uint32_t rightCondDepth =
-        rightArmRef ? deps_.Model.GetCondArmDepth(rightArmRef->arm->id) : 0;
+        rightArmRef ? deps_.model.GetCondArmDepth(rightArmRef->arm->id) : 0;
     uint32_t condDepth = std::min(leftCondDepth, rightCondDepth);
 
     ownerDepthGap[k] = incDepth + condDepth;
@@ -190,14 +190,14 @@ RefoldTokenDiffPlanner::ComputeLcsAGapProvenanceForPP(
   // diff layer prove whether an ambiguous equal-token frontier preserves an
   // include, conditional, or macro boundary.
 
-  const size_t N = deps_.ATokOff.size() - 1;
-  std::vector<LcsAGapProvenance> profiles(N + 1);
-  assert(ownerDepthGap.size() == N + 1 &&
+  const size_t n = deps_.aTokOff.size() - 1;
+  std::vector<LcsAGapProvenance> profiles(n + 1);
+  assert(ownerDepthGap.size() == n + 1 &&
          "A-side LCS provenance requires one owner-depth entry per PP gap");
 
   struct MacroTokenContext {
-    uint64_t rootId = LcsAGapProvenance::NoId;
-    uint64_t leafId = LcsAGapProvenance::NoId;
+    uint64_t rootId = LcsAGapProvenance::noId;
+    uint64_t leafId = LcsAGapProvenance::noId;
     uint32_t depth = 0;
     uint32_t roleMask = 0;
   };
@@ -221,7 +221,7 @@ RefoldTokenDiffPlanner::ComputeLcsAGapProvenanceForPP(
         break;
       seen.insert(parentId);
       const RefoldModel::MacroInvocation *parent =
-          deps_.MacroTopology.FindMacroInvocationById(parentId);
+          deps_.macroTopology.FindMacroInvocationById(parentId);
       if (!parent)
         break;
       cur = parent;
@@ -272,7 +272,7 @@ RefoldTokenDiffPlanner::ComputeLcsAGapProvenanceForPP(
   auto macroContextAtPP = [&](uint64_t pp) -> MacroTokenContext {
     MacroTokenContext best;
     uint64_t bestCoverWidth = std::numeric_limits<uint64_t>::max();
-    for (const auto &m : deps_.Model.GetMacroInvocations()) {
+    for (const auto &m : deps_.model.GetMacroInvocations()) {
       if (!m.Covers(pp, pp + 1))
         continue;
 
@@ -301,12 +301,12 @@ RefoldTokenDiffPlanner::ComputeLcsAGapProvenanceForPP(
   auto fillSide = [&](LcsAGapProvenance &profile, uint64_t pp, bool leftSide) {
     // A gap has independent left/right token provenance. Preserve the side so
     // the LCS certifier can distinguish boundaries from interiors.
-    const std::optional<uint64_t> includeId = deps_.Model.InnermostIncludeAtPP(pp);
-    const std::optional<RefoldModel::ArmRef> armRef = deps_.Model.FindArmRefAtPP(pp);
+    const std::optional<uint64_t> includeId = deps_.model.InnermostIncludeAtPP(pp);
+    const std::optional<RefoldModel::ArmRef> armRef = deps_.model.FindArmRefAtPP(pp);
     const MacroTokenContext macro = macroContextAtPP(pp);
 
     if (leftSide) {
-      profile.leftIncludeId = includeId.value_or(LcsAGapProvenance::NoId);
+      profile.leftIncludeId = includeId.value_or(LcsAGapProvenance::noId);
       if (armRef) {
         profile.leftCondGroupId = armRef->group->id;
         profile.leftCondArmId = armRef->arm->id;
@@ -315,7 +315,7 @@ RefoldTokenDiffPlanner::ComputeLcsAGapProvenanceForPP(
       profile.leftMacroLeafId = macro.leafId;
       profile.leftMacroRoleMask = macro.roleMask;
     } else {
-      profile.rightIncludeId = includeId.value_or(LcsAGapProvenance::NoId);
+      profile.rightIncludeId = includeId.value_or(LcsAGapProvenance::noId);
       if (armRef) {
         profile.rightCondGroupId = armRef->group->id;
         profile.rightCondArmId = armRef->arm->id;
@@ -328,7 +328,7 @@ RefoldTokenDiffPlanner::ComputeLcsAGapProvenanceForPP(
     profile.macroDepth = std::max(profile.macroDepth, macro.depth);
   };
 
-  for (size_t k = 0; k <= N; ++k) {
+  for (size_t k = 0; k <= n; ++k) {
     LcsAGapProvenance profile;
 
     // `k` names the gap between PP tokens:
@@ -353,8 +353,8 @@ RefoldTokenDiffPlanner::ComputeLcsAGapProvenanceForPP(
     // its left boundary.
     if (k > 0) {
       const uint64_t leftPP = static_cast<uint64_t>(k - 1);
-      leftInc = deps_.Model.InnermostIncludeAtPP(leftPP);
-      leftArmRef = deps_.Model.FindArmRefAtPP(leftPP);
+      leftInc = deps_.model.InnermostIncludeAtPP(leftPP);
+      leftArmRef = deps_.model.FindArmRefAtPP(leftPP);
       fillSide(profile, leftPP, /*leftSide=*/true);
     }
 
@@ -362,10 +362,10 @@ RefoldTokenDiffPlanner::ComputeLcsAGapProvenanceForPP(
     // an interior gap, the final profile is therefore the shared boundary
     // context between adjacent PP tokens; for edge gaps, it is whichever side
     // exists.
-    if (k < N) {
+    if (k < n) {
       const uint64_t rightPP = static_cast<uint64_t>(k);
-      rightInc = deps_.Model.InnermostIncludeAtPP(rightPP);
-      rightArmRef = deps_.Model.FindArmRefAtPP(rightPP);
+      rightInc = deps_.model.InnermostIncludeAtPP(rightPP);
+      rightArmRef = deps_.model.FindArmRefAtPP(rightPP);
       fillSide(profile, rightPP, /*leftSide=*/false);
     }
 
@@ -375,9 +375,9 @@ RefoldTokenDiffPlanner::ComputeLcsAGapProvenanceForPP(
     // common include ancestor rather than pretending the gap belongs
     // exclusively to either side.
     const std::optional<uint64_t> lca =
-        deps_.Model.LeastCommonAncestorInclude(leftInc, rightInc);
-    profile.lcaIncludeId = lca.value_or(LcsAGapProvenance::NoId);
-    profile.includeDepth = deps_.Model.GetIncludeDepth(lca);
+        deps_.model.LeastCommonAncestorInclude(leftInc, rightInc);
+    profile.lcaIncludeId = lca.value_or(LcsAGapProvenance::noId);
+    profile.includeDepth = deps_.model.GetIncludeDepth(lca);
 
     // Conditional provenance is also boundary-shared: a gap can only safely
     // claim the conditional nesting common to both sides. Taking the minimum
@@ -385,9 +385,9 @@ RefoldTokenDiffPlanner::ComputeLcsAGapProvenanceForPP(
     // and its parent from being ranked as if it were fully inside the deeper
     // side.
     const uint32_t leftCondDepth =
-        leftArmRef ? deps_.Model.GetCondArmDepth(leftArmRef->arm->id) : 0;
+        leftArmRef ? deps_.model.GetCondArmDepth(leftArmRef->arm->id) : 0;
     const uint32_t rightCondDepth =
-        rightArmRef ? deps_.Model.GetCondArmDepth(rightArmRef->arm->id) : 0;
+        rightArmRef ? deps_.model.GetCondArmDepth(rightArmRef->arm->id) : 0;
     profile.conditionalDepth = std::min(leftCondDepth, rightCondDepth);
 
     // Store the completed gap profile. Later LCS certification uses these
@@ -408,28 +408,28 @@ RefoldTokenDiffPlanner::ComputeLcsBGapProvenanceForPP() const {
   // these facts to break otherwise equivalent pure-insertion frontiers without
   // reintroducing the removed neighboring-token spelling heuristic.
 
-  const size_t N = deps_.BToks.size();
-  std::vector<LcsBGapProvenance> profiles(N + 1);
+  const size_t n = deps_.bToks.size();
+  std::vector<LcsBGapProvenance> profiles(n + 1);
 
   auto tokenBegin = [&](size_t tok) -> size_t {
     // Token offsets come from B-source lexing; clamp every query so malformed
     // or truncated metadata cannot point outside the edited buffer.
-    if (tok >= deps_.BTokOff.size())
-      return deps_.BSource.size();
-    return std::min(deps_.BTokOff[tok], deps_.BSource.size());
+    if (tok >= deps_.bTokOff.size())
+      return deps_.bSource.size();
+    return std::min(deps_.bTokOff[tok], deps_.bSource.size());
   };
 
   auto tokenEnd = [&](size_t tok) -> size_t {
-    if (tok >= N)
-      return deps_.BSource.size();
+    if (tok >= n)
+      return deps_.bSource.size();
     const size_t begin = tokenBegin(tok);
-    const size_t spellingEnd = begin + deps_.BToks[tok].spelling.size();
-    if (tok + 1 < deps_.BTokOff.size())
-      return std::min(spellingEnd, deps_.BTokOff[tok + 1]);
-    return std::min(spellingEnd, deps_.BSource.size());
+    const size_t spellingEnd = begin + deps_.bToks[tok].spelling.size();
+    if (tok + 1 < deps_.bTokOff.size())
+      return std::min(spellingEnd, deps_.bTokOff[tok + 1]);
+    return std::min(spellingEnd, deps_.bSource.size());
   };
 
-  for (size_t gap = 0; gap <= N; ++gap) {
+  for (size_t gap = 0; gap <= n; ++gap) {
     LcsBGapProvenance profile;
 
     // `gap` names a boundary in the B token stream:
@@ -443,14 +443,14 @@ RefoldTokenDiffPlanner::ComputeLcsBGapProvenanceForPP() const {
     // line-shape facts that help choose deterministic insertion frontiers
     // without looking at neighboring token spellings.
     profile.hasLeftToken = gap > 0;
-    profile.hasRightToken = gap < N;
+    profile.hasRightToken = gap < n;
 
     // The physical gap is the byte interval after the left token spelling and
     // before the right token spelling. For edge gaps, clamp to the beginning
     // or end of the B source buffer.
     const size_t gapBegin = profile.hasLeftToken ? tokenEnd(gap - 1) : 0;
     const size_t gapEnd =
-        profile.hasRightToken ? tokenBegin(gap) : deps_.BSource.size();
+        profile.hasRightToken ? tokenBegin(gap) : deps_.bSource.size();
 
     profile.gapBeginByte = static_cast<uint64_t>(gapBegin);
     profile.gapEndByte = static_cast<uint64_t>(gapEnd);
@@ -460,13 +460,13 @@ RefoldTokenDiffPlanner::ComputeLcsBGapProvenanceForPP() const {
     // blank-line frontiers, while staying purely structural. They are not
     // lexical-neighbor heuristics.
     profile.gapContainsNewline =
-        stringutils::rangeContainsNewline(deps_.BSource, gapBegin, gapEnd);
+        stringutils::rangeContainsNewline(deps_.bSource, gapBegin, gapEnd);
     profile.gapContainsOnlyWs =
-        stringutils::rangeContainsOnlyWs(deps_.BSource, gapBegin, gapEnd);
+        stringutils::rangeContainsOnlyWs(deps_.bSource, gapBegin, gapEnd);
     profile.gapAtLineStart =
-        stringutils::beginsLineAfterWs(deps_.BSource, gapBegin);
+        stringutils::beginsLineAfterWs(deps_.bSource, gapBegin);
     profile.gapAtLineEnd =
-        stringutils::endsLineBeforeWs(deps_.BSource, gapEnd);
+        stringutils::endsLineBeforeWs(deps_.bSource, gapEnd);
 
     // If there is a token to the left, record its byte extent and whether that
     // token itself touches a logical line boundary. Later ranking can then
@@ -478,9 +478,9 @@ RefoldTokenDiffPlanner::ComputeLcsBGapProvenanceForPP() const {
       profile.leftTokenBeginByte = static_cast<uint64_t>(leftBegin);
       profile.leftTokenEndByte = static_cast<uint64_t>(leftEnd);
       profile.leftTokenStartsLine =
-          stringutils::beginsLineAfterWs(deps_.BSource, leftBegin);
+          stringutils::beginsLineAfterWs(deps_.bSource, leftBegin);
       profile.leftTokenEndsLine =
-          stringutils::endsLineBeforeWs(deps_.BSource, leftEnd);
+          stringutils::endsLineBeforeWs(deps_.bSource, leftEnd);
     }
 
     // Symmetrically record the right token's byte extent and line-boundary
@@ -492,9 +492,9 @@ RefoldTokenDiffPlanner::ComputeLcsBGapProvenanceForPP() const {
       profile.rightTokenBeginByte = static_cast<uint64_t>(rightBegin);
       profile.rightTokenEndByte = static_cast<uint64_t>(rightEnd);
       profile.rightTokenStartsLine =
-          stringutils::beginsLineAfterWs(deps_.BSource, rightBegin);
+          stringutils::beginsLineAfterWs(deps_.bSource, rightBegin);
       profile.rightTokenEndsLine =
-          stringutils::endsLineBeforeWs(deps_.BSource, rightEnd);
+          stringutils::endsLineBeforeWs(deps_.bSource, rightEnd);
     }
 
     // Store the completed B-gap profile. LCS tie resolution and edit-frontier

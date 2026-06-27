@@ -58,7 +58,7 @@ RefoldMacroOccurrenceReplay::GetOwnedPureInsertionBRangeForArgSpan(
     return std::make_pair(insB0, insB1);
 
   const bool isCommaSeparator =
-      aPos < deps_.AToks.size() && deps_.AToks[static_cast<size_t>(aPos)].spelling == ",";
+      aPos < deps_.aToks.size() && deps_.aToks[static_cast<size_t>(aPos)].spelling == ",";
 
   // Exact separator-before-right-occurrence case:
   //
@@ -174,7 +174,7 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
         // child formal also proves that this formal's material participates in
         // emitted output.
         ArrayRef<const RefoldModel::MacroInvocation *> children =
-            deps_.MacroTopology->MacroChildrenOf(inv.id);
+            deps_.macroTopology->MacroChildrenOf(inv.id);
         if (!children.empty()) {
           for (const auto *child : children) {
             for (uint32_t childFormalIdx = 0;
@@ -203,7 +203,7 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
         // occurrence appears in another child invocation of that caller.
         if (inv.callerMacroId && formalIdx < inv.argDeps.size()) {
           ArrayRef<const RefoldModel::MacroInvocation *> parentChildren =
-              deps_.MacroTopology->MacroChildrenOf(*inv.callerMacroId);
+              deps_.macroTopology->MacroChildrenOf(*inv.callerMacroId);
           if (!parentChildren.empty()) {
             ArrayRef<uint32_t> deps = inv.argDeps[formalIdx];
 
@@ -247,14 +247,14 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
   }
 
   const uint64_t maxTok =
-      deps_.BTokOff.empty() ? 0ULL : static_cast<uint64_t>(deps_.BTokOff.size() - 1);
+      deps_.bTokOff.empty() ? 0ULL : static_cast<uint64_t>(deps_.bTokOff.size() - 1);
   StringRef argTrim = newArg.trim();
   StringRef baseTrim = baseArg.trim();
 
   // If this arg is stringified anywhere, accept args-only without enforcing
   // paste-span checks.
   bool argIsStringified = false;
-  if (deps_.Strict) {
+  if (deps_.strict) {
     for (const auto &s : m.stringifySpans) {
       if (s.argIdx == argIdx) {
         argIsStringified = true;
@@ -272,7 +272,7 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
         if (s.argIdx != argIdx)
           continue;
 
-        auto bEnv = deps_.SourceMapper->MapAToBTokenEnvelopeByPPArgSpan(s);
+        auto bEnv = deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(s);
         if (!bEnv)
           return false;
 
@@ -308,7 +308,7 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
           bEnv = {lo, hi};
         }
 
-        StringRef tok = deps_.SourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
+        StringRef tok = deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
         if (tok.empty())
           return false;
 
@@ -322,7 +322,7 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
         if (s.byteBegin && s.byteEnd) {
           if ((bEnv->second - bEnv->first) != 1)
             return false;
-          StringRef aTok = deps_.SourceMapper->SliceASource(static_cast<size_t>(s.begin),
+          StringRef aTok = deps_.sourceMapper->SliceASource(static_cast<size_t>(s.begin),
                                         static_cast<size_t>(s.end));
           const uint64_t bb = *s.byteBegin;
           const uint64_t be = *s.byteEnd;
@@ -361,7 +361,7 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
     if (ps.argIdx != argIdx)
       continue;
 
-    StringRef aTokText = deps_.SourceMapper->SliceASource(ps.begin, ps.end).trim();
+    StringRef aTokText = deps_.sourceMapper->SliceASource(ps.begin, ps.end).trim();
     if (aTokText.empty() || !ps.byteBegin || *ps.byteEnd < *ps.byteBegin ||
         static_cast<size_t>(*ps.byteEnd) > aTokText.size())
       continue;
@@ -397,7 +397,7 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
     if (s.argIdx != argIdx || s.kind != PPArgSpanKind::Standard)
       continue;
 
-    auto bEnv = deps_.SourceMapper->MapAToBTokenEnvelopeByPPArgSpan(s);
+    auto bEnv = deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(s);
     if (!bEnv)
       return false;
 
@@ -438,7 +438,7 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
       bEnv = {lo, hi};
     }
 
-    StringRef tokText = deps_.SourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
+    StringRef tokText = deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
     if (tokText.empty()) {
       if (argTrim.empty())
         continue;
@@ -474,17 +474,17 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
       continue;
 
     // This projected occurrence must still correspond to exactly one token in B.
-    auto bEnv = deps_.SourceMapper->MapAToBTokenEnvelopeByPPArgSpan(ps);
+    auto bEnv = deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(ps);
     if (!bEnv || bEnv->second <= bEnv->first ||
         (bEnv->second - bEnv->first) != 1)
       return false;
 
     // Fetch the trimmed token text for this projected occurrence on both sides;
     // later checks will compare the corresponding projected subranges.
-    StringRef aTokText = deps_.SourceMapper->SliceASource(ps.begin, ps.end).trim();
+    StringRef aTokText = deps_.sourceMapper->SliceASource(ps.begin, ps.end).trim();
     if (aTokText.empty())
       return false;
-    StringRef bTokText = deps_.SourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
+    StringRef bTokText = deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
     if (bTokText.empty())
       return false;
 
@@ -635,7 +635,7 @@ RefoldMacroActualLayout::GetMacroInvocationFormalArgContentRanges(
     // actual list into one range per formal parameter.
     auto parsedOpt =
         RefoldArgTextRecovery::LexMacroInvocationActualContentRanges(text,
-                                                                     *deps_.LexLang);
+                                                                     *deps_.lexLang);
     if (!parsedOpt)
       return std::nullopt;
     return mapParsedActualsToFormalRanges(text, *parsedOpt);
@@ -649,12 +649,12 @@ RefoldMacroActualLayout::GetMacroInvocationFormalArgContentRanges(
 
     std::vector<std::pair<size_t, size_t>> out;
     out.reserve(m.normalizedInvArgTextRanges.size());
-    for (const auto &R : m.normalizedInvArgTextRanges) {
-      if (!R.first || !R.second || *R.second < *R.first ||
-          *R.second > invText.size())
+    for (const auto &r : m.normalizedInvArgTextRanges) {
+      if (!r.first || !r.second || *r.second < *r.first ||
+          *r.second > invText.size())
         return std::nullopt;
-      out.emplace_back(static_cast<size_t>(*R.first),
-                       static_cast<size_t>(*R.second));
+      out.emplace_back(static_cast<size_t>(*r.first),
+                       static_cast<size_t>(*r.second));
     }
     return out;
   };
@@ -671,17 +671,17 @@ RefoldMacroActualLayout::GetMacroInvocationFormalArgContentRanges(
     std::vector<std::pair<size_t, size_t>> out;
     out.reserve(m.invArgRanges.size());
 
-    for (const auto &R : m.invArgRanges) {
+    for (const auto &r : m.invArgRanges) {
       // Every formal range must be complete and ordered.
-      if (!R.first || !R.second)
+      if (!r.first || !r.second)
         return std::nullopt;
-      if (*R.first < invB || *R.second < *R.first)
+      if (*r.first < invB || *r.second < *r.first)
         return std::nullopt;
 
       // Convert absolute offsets to offsets relative to the invocation text
       // being examined.
-      const uint64_t relB64 = *R.first - invB;
-      const uint64_t relE64 = *R.second - invB;
+      const uint64_t relB64 = *r.first - invB;
+      const uint64_t relE64 = *r.second - invB;
       if (relE64 > invText.size() || relB64 > relE64)
         return std::nullopt;
 

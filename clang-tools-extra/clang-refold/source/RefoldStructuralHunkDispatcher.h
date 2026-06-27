@@ -8,8 +8,8 @@
 // services still make those decisions.  The dispatcher owns the staging rules:
 // coalescing macro patches by physical invocation span, sorting include-local
 // insertion patches, building closure-fallback claimed intervals, and exposing
-// narrow materialization/emission views only at the phase boundaries that still
-// require the historical map/vector carriers.
+// narrow materialization/emission views only where downstream code still
+// requires the historical map/vector carriers.
 //
 //===----------------------------------------------------------------------===//
 
@@ -54,11 +54,11 @@ public:
 
   /// Staging facts for one physical macro invocation span.
   struct MacroPatchStagingSlot {
-    std::optional<uint64_t> OwnerIncludeId;
-    uint64_t PatchKey = 0;
-    MacroPatch *ExistingPatch = nullptr;
-    bool ExistingIsCallsite = false;
-    std::string CurrentInvocationText;
+    std::optional<uint64_t> ownerIncludeId;
+    uint64_t patchKey = 0;
+    MacroPatch *existingPatch = nullptr;
+    bool existingIsCallsite = false;
+    std::string currentInvocationText;
   };
 
   /// Append a TU edit to the structural staging bucket.

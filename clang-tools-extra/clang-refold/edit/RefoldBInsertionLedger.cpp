@@ -32,7 +32,7 @@ void RefoldBInsertionLedger::BuildProvenance(ArrayRef<diffutils::Hunk> hunks) {
   // the global "emit each B-only segment exactly once" invariant without
   // borrowing RefoldEngine state.
   bInsertions_.clear();
-  bTokToInsertionId_.assign(deps_.BTokens.size(), -1);
+  bTokToInsertionId_.assign(deps_.bTokens.size(), -1);
   hunkToInsertionId_.assign(hunks.size(), -1);
 
   for (size_t hi = 0; hi < hunks.size(); ++hi) {
@@ -42,11 +42,11 @@ void RefoldBInsertionLedger::BuildProvenance(ArrayRef<diffutils::Hunk> hunks) {
 
     const size_t b0 = static_cast<size_t>(h.bStart);
     const size_t b1 = static_cast<size_t>(h.bEnd);
-    if (b1 > deps_.BTokens.size()) {
+    if (b1 > deps_.bTokens.size()) {
       REFOLD_LOG_FATAL(
           "prov/ins",
           "insertion hunk out of B bounds: hunk#{0} b=[{1},{2}) bToks={3}",
-          hi, b0, b1, deps_.BTokens.size());
+          hi, b0, b1, deps_.bTokens.size());
     }
 
     const size_t insId = bInsertions_.size();
@@ -108,8 +108,8 @@ void RefoldBInsertionLedger::PreclaimStandaloneInsertions(
 
     // Macro call-sites have priority; if this insertion lies within a patchable
     // macro's cover, leave it unclaimed so the macro patch may absorb it.
-    Owner owner = deps_.OwnerClassifier.ClassifyOwnerWithSegments(tuPath, h);
-    if (auto *m = deps_.MacroTopology.SmallestCoveringPatchableMacro(
+    Owner owner = deps_.ownerClassifier.ClassifyOwnerWithSegments(tuPath, h);
+    if (auto *m = deps_.macroTopology.SmallestCoveringPatchableMacro(
             h.aStart, h.aEnd, owner.includeId)) {
       if (m->invB && m->invE)
         continue;
@@ -120,9 +120,9 @@ void RefoldBInsertionLedger::PreclaimStandaloneInsertions(
     // `__VA_OPT__` tail or generated selector boundary.  This is deliberately
     // narrower than treating every `cover.end` insertion as macro-owned.
     if (h.isInsertOnly() &&
-        (deps_.MacroBoundarySelector.RightBoundaryVaOptActivationMacro(
+        (deps_.macroBoundarySelector.RightBoundaryVaOptActivationMacro(
              h.aStart, owner.includeId) ||
-         deps_.MacroBoundarySelector.BoundaryGeneratedSelectorMacro(
+         deps_.macroBoundarySelector.BoundaryGeneratedSelectorMacro(
              h.aStart, owner.includeId)))
       continue;
 
@@ -140,7 +140,7 @@ RefoldBInsertionLedger::ClipBTokenRangeAgainstClaims(size_t bTokStart,
   if (bTokEnd <= bTokStart)
     return segs;
 
-  const size_t bMax = deps_.BTokens.size();
+  const size_t bMax = deps_.bTokens.size();
   bTokStart = std::min(bTokStart, bMax);
   bTokEnd = std::min(bTokEnd, bMax);
 
@@ -184,7 +184,7 @@ std::string RefoldBInsertionLedger::SliceBSourceClippedAgainstClaims(
 
   std::string out;
   for (const auto &s : segs) {
-    StringRef frag = deps_.SourceMapper.SliceBSource(s.first, s.second);
+    StringRef frag = deps_.sourceMapper.SliceBSource(s.first, s.second);
     out.append(frag.begin(), frag.end());
   }
   return out;

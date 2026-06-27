@@ -40,11 +40,11 @@ class RefoldBInsertionLedger {
 public:
   /// Named service dependencies needed for insertion ownership and B slicing.
   struct Deps {
-    llvm::ArrayRef<PPTok> BTokens;
-    const RefoldSourceMapper &SourceMapper;
-    const RefoldOwnerClassifier &OwnerClassifier;
-    const RefoldMacroTopology &MacroTopology;
-    const RefoldMacroBoundarySelector &MacroBoundarySelector;
+    llvm::ArrayRef<PPTok> bTokens;
+    const RefoldSourceMapper &sourceMapper;
+    const RefoldOwnerClassifier &ownerClassifier;
+    const RefoldMacroTopology &macroTopology;
+    const RefoldMacroBoundarySelector &macroBoundarySelector;
   };
 
   explicit RefoldBInsertionLedger(Deps deps);

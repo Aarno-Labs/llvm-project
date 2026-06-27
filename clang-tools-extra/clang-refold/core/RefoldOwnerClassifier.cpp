@@ -24,7 +24,7 @@ namespace clang {
 namespace refold {
 
 RefoldOwnerClassifier::RefoldOwnerClassifier(Deps deps)
-    : D_(std::move(deps)) {}
+    : deps_(std::move(deps)) {}
 
 Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
     StringRef tuPath, const diffutils::Hunk &h) const {
@@ -41,26 +41,26 @@ Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
   // include's PP coverage, treat the insertion as include-owned.
   if (a0 == a1) {
     if (auto slotAnchor =
-            D_.TUEdits.FindExactSlotBoundaryFromPPGap(tuPath, a0)) {
+            deps_.tuEdits.FindExactSlotBoundaryFromPPGap(tuPath, a0)) {
       (void)slotAnchor;
       std::optional<uint64_t> leftInc =
-          (a0 > 0) ? D_.Model.InnermostIncludeAtPP(a0 - 1) : std::nullopt;
-      const uint64_t maxPP = D_.Model.GetTokensCountA();
+          (a0 > 0) ? deps_.model.InnermostIncludeAtPP(a0 - 1) : std::nullopt;
+      const uint64_t maxPP = deps_.model.GetTokensCountA();
       std::optional<uint64_t> rightInc =
-          a0 < maxPP ? D_.Model.InnermostIncludeAtPP(a0) : std::nullopt;
+          a0 < maxPP ? deps_.model.InnermostIncludeAtPP(a0) : std::nullopt;
 
       if (leftInc && rightInc && *leftInc == *rightInc)
         return Owner::Include(*rightInc);
 
       auto includeHasSidebandWork = [&](uint64_t includeId) {
-        return llvm::any_of(D_.SidebandPragmaEdits,
+        return llvm::any_of(deps_.sidebandPragmaEdits,
                             [&](const SidebandPragmaEdit &sideband) {
                               return sideband.TargetsInclude(includeId);
                             });
       };
 
       auto includeHasProvedSidebandInsertion = [&](uint64_t includeId) {
-        return llvm::any_of(D_.SidebandPragmaEdits,
+        return llvm::any_of(deps_.sidebandPragmaEdits,
                             [&](const SidebandPragmaEdit &sideband) {
                               // A header-owned sideband replacement/deletion
                               // proves that the header needs sideband work, but
@@ -97,7 +97,7 @@ Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
         // insertion into the child merely because the child's first ordinary
         // token is the first PP token in the TU; compose it on the parent
         // owner surface and let the child sideband edit remain child-owned.
-        if (const auto *rightInclude = D_.Model.GetIncludeById(*rightInc)) {
+        if (const auto *rightInclude = deps_.model.GetIncludeById(*rightInc)) {
           if (rightInclude->parent &&
               !includeHasProvedSidebandInsertion(*rightInc))
             return Owner::Include(*rightInclude->parent);
@@ -122,7 +122,7 @@ Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
   // belongs to a header, we still anchor via the TU span because segments for
   // includes and conditional arms in that header are projected into the TU
   // through slots.
-  auto span = D_.TUEdits.PlanTUByteSpan(a0, a1, tuPath); // [b, e)
+  auto span = deps_.tuEdits.PlanTUByteSpan(a0, a1, tuPath); // [b, e)
 
   // No truthful TU byte anchor exists for this PP segment, so choose its owner
   // using only preprocessed-token structure. This happens when the segment has
@@ -139,7 +139,7 @@ Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
   // indicates a TU-boundary case without a stronger slot anchor.
   if (!span) {
     const bool isInsert = (a0 == a1);
-    const size_t n = D_.Model.GetTokensCountA();
+    const size_t n = deps_.model.GetTokensCountA();
 
     std::optional<uint64_t> leftInc;
     std::optional<uint64_t> rightInc;
@@ -151,26 +151,26 @@ Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
       // Pure insertion: classify the gap from the PP token just before and just
       // after the insertion site, when those neighbors exist.
       if (a0 > 0) {
-        leftInc = D_.Model.InnermostIncludeAtPP(a0 - 1);
-        leftArmRef = D_.Model.FindArmRefAtPP(a0 - 1);
+        leftInc = deps_.model.InnermostIncludeAtPP(a0 - 1);
+        leftArmRef = deps_.model.FindArmRefAtPP(a0 - 1);
       }
       if (static_cast<size_t>(a0) < n) {
-        rightInc = D_.Model.InnermostIncludeAtPP(a0);
-        rightArmRef = D_.Model.FindArmRefAtPP(a0);
+        rightInc = deps_.model.InnermostIncludeAtPP(a0);
+        rightArmRef = deps_.model.FindArmRefAtPP(a0);
       }
     } else {
       // Non-insertion: classify from the PP endpoints actually covered by the
       // segment.
-      leftInc = D_.Model.InnermostIncludeAtPP(a0);
-      rightInc = D_.Model.InnermostIncludeAtPP(a1 - 1);
-      leftArmRef = D_.Model.FindArmRefAtPP(a0);
-      rightArmRef = D_.Model.FindArmRefAtPP(a1 - 1);
+      leftInc = deps_.model.InnermostIncludeAtPP(a0);
+      rightInc = deps_.model.InnermostIncludeAtPP(a1 - 1);
+      leftArmRef = deps_.model.FindArmRefAtPP(a0);
+      rightArmRef = deps_.model.FindArmRefAtPP(a1 - 1);
     }
 
     // Use the least common ancestor include of the left/right PP contexts as
     // the structural include owner, if one exists.
     std::optional<uint64_t> lcaInc =
-        D_.Model.LeastCommonAncestorInclude(leftInc, rightInc);
+        deps_.model.LeastCommonAncestorInclude(leftInc, rightInc);
 
     // Preserve a conditional-arm owner only when both PP sides are in the same
     // selected arm.
@@ -186,12 +186,12 @@ Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
     return Owner::TU(condArmId);
   }
 
-  uint64_t b = span->TUByteBegin, e = span->TUByteEnd;
+  uint64_t b = span->tuByteBegin, e = span->tuByteEnd;
   if (b > e)
     std::swap(b, e);
 
   // Build (or fetch) all segments projected into tuPath.
-  ArrayRef<RefoldModel::Segment> segs = D_.Model.GetSegmentsForFile(tuPath);
+  ArrayRef<RefoldModel::Segment> segs = deps_.model.GetSegmentsForFile(tuPath);
   if (segs.empty())
     return Owner::Unknown();
 
@@ -257,7 +257,7 @@ Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
 bool RefoldOwnerClassifier::HunkMapsToTU(uint64_t a0, uint64_t a1,
                                          StringRef tuPath) const {
   bool sawAnyTU = false;
-  const auto &tokmapByPP = D_.Model.GetTokmapByPP();
+  const auto &tokmapByPP = deps_.model.GetTokmapByPP();
 
   // Walk the A-side PP byte range and require every mapped byte to belong to
   // the translation unit itself. Unmapped bytes (whitespace/separators) are
@@ -268,7 +268,7 @@ bool RefoldOwnerClassifier::HunkMapsToTU(uint64_t a0, uint64_t a1,
     if (it == tokmapByPP.end())
       continue; // ignore unmapped (spaces/tabs/newlines)
     const auto &t = it->second;
-    if (!D_.PathIdentity.PathsEqual(t.file, tuPath))
+    if (!deps_.pathIdentity.PathsEqual(t.file, tuPath))
       return false; // spans a non-TU mapping
     sawAnyTU = true;
   }
@@ -280,7 +280,7 @@ bool RefoldOwnerClassifier::HunkMapsToTU(uint64_t a0, uint64_t a1,
 
   // INSERTION (A gap): classify TU ownership only when we can derive a truthful
   // TU insertion anchor at that exact PP gap.
-  return D_.TUEdits.FindProvableTUInsertionAnchor(a0, tuPath).has_value();
+  return deps_.tuEdits.FindProvableTUInsertionAnchor(a0, tuPath).has_value();
 }
 
 } // namespace refold

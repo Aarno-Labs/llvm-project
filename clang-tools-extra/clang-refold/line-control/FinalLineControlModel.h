@@ -231,7 +231,7 @@ struct FinalLineControlAuthorityContract {
   }
 };
 
-FinalLineControlAuthorityContract GetFinalLineControlAuthorityContract();
+FinalLineControlAuthorityContract getFinalLineControlAuthorityContract();
 
 struct FinalLineControlPruneResult {
   std::string output;

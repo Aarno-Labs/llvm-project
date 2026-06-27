@@ -41,7 +41,7 @@ void RefoldTerminalProofSink::RequestTerminalFallback(
   const StringRef stage(request.stage);
   const StringRef detail(request.detail);
 
-  callbacks_.AuditLegacyAuthority(failure, stage);
+  callbacks_.auditLegacyAuthority(failure, stage);
 
   if (!IsClassifiedTerminalFallbackProofFailure(failure)) {
     // An unclassified fallback request would be a theorem-audit bug: it would
@@ -53,7 +53,7 @@ void RefoldTerminalProofSink::RequestTerminalFallback(
         TerminalFallbackFailureReason::TheoremAuditInvariantViolation,
         TerminalFallbackFailureContext::ForStateComponent(
             "terminalFallbackRequest"));
-    callbacks_.NoteTheoremAuditViolation(
+    callbacks_.noteTheoremAuditViolation(
         formatv("terminal fallback request lacked a classified proof "
                 "failure: stage={0} detail={1}",
                 stage, stringutils::showWsWithClip(detail, 200))
@@ -70,7 +70,7 @@ void RefoldTerminalProofSink::RequestTerminalFallback(
         TerminalFallbackFailureReason::TheoremAuditInvariantViolation,
         TerminalFallbackFailureContext::ForStateComponent(
             "terminalFallbackRequest"));
-    callbacks_.NoteTheoremAuditViolation(
+    callbacks_.noteTheoremAuditViolation(
         formatv("terminal fallback request used generic "
                 "MissingProducerFacts without structured context: "
                 "stage={0} detail={1}",
@@ -86,7 +86,7 @@ void RefoldTerminalProofSink::RequestTerminalFallback(
         TerminalFallbackFailureReason::TheoremAuditInvariantViolation,
         TerminalFallbackFailureContext::ForStateComponent(
             "terminalFallbackRequest"));
-    callbacks_.NoteTheoremAuditViolation(
+    callbacks_.noteTheoremAuditViolation(
         formatv("terminal fallback request carried inconsistent theorem "
                 "failure normalization: stage={0} detail={1}",
                 stage, stringutils::showWsWithClip(detail, 200))
@@ -95,7 +95,7 @@ void RefoldTerminalProofSink::RequestTerminalFallback(
 
   requests_.push_back(request);
 
-  callbacks_.TraceTerminalRequest(request);
+  callbacks_.traceTerminalRequest(request);
   REFOLD_LOG_DEBUG("fallback", "{0}", request);
 }
 

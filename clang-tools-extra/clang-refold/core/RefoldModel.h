@@ -496,8 +496,8 @@ public:
     StringRef name;
     bool variadic;
 
-    MacroDefParam(StringRef Name, bool Variadic)
-        : name(Name), variadic(Variadic) {}
+    MacroDefParam(StringRef name, bool variadic)
+        : name(name), variadic(variadic) {}
   };
 
   /// Producer-owned replay token for a macro definition replacement list.

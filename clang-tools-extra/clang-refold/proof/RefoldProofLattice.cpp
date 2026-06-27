@@ -923,10 +923,10 @@ void RefoldProofLattice::AttachLineControlObserverWitness(
   };
 
   auto collectDelta = [&](const OwnerStateDelta &delta, llvm::StringRef role) {
-    collectFacts(delta.Entry, llvm::formatv("{0}.entry", role).str());
-    collectFacts(delta.Observes, llvm::formatv("{0}.observes", role).str());
-    collectFacts(delta.Mutates, llvm::formatv("{0}.mutates", role).str());
-    collectFacts(delta.Exit, llvm::formatv("{0}.exit", role).str());
+    collectFacts(delta.entry, llvm::formatv("{0}.entry", role).str());
+    collectFacts(delta.observes, llvm::formatv("{0}.observes", role).str());
+    collectFacts(delta.mutates, llvm::formatv("{0}.mutates", role).str());
+    collectFacts(delta.exit, llvm::formatv("{0}.exit", role).str());
   };
 
   if (summary.hasOwnerRealizationWitness &&
@@ -1107,13 +1107,13 @@ void RefoldProofLattice::AttachCounterStateWitness(
 
   auto collectDelta = [&](const OwnerStateDelta &delta,
                           llvm::StringRef bucket) {
-    collectFacts(delta.Entry, llvm::formatv("{0}.entry", bucket).str(),
+    collectFacts(delta.entry, llvm::formatv("{0}.entry", bucket).str(),
                  /*observation=*/true, /*mutation=*/false);
-    collectFacts(delta.Observes, llvm::formatv("{0}.observes", bucket).str(),
+    collectFacts(delta.observes, llvm::formatv("{0}.observes", bucket).str(),
                  /*observation=*/true, /*mutation=*/false);
-    collectFacts(delta.Mutates, llvm::formatv("{0}.mutates", bucket).str(),
+    collectFacts(delta.mutates, llvm::formatv("{0}.mutates", bucket).str(),
                  /*observation=*/false, /*mutation=*/true);
-    collectFacts(delta.Exit, llvm::formatv("{0}.exit", bucket).str(),
+    collectFacts(delta.exit, llvm::formatv("{0}.exit", bucket).str(),
                  /*observation=*/false, /*mutation=*/true);
   };
 
@@ -1642,49 +1642,49 @@ void RefoldProofLattice::AttachCounterStateWitness(
   };
 
   auto deltaHasAnyMissingFacts = [](const OwnerStateDelta &delta) {
-    return delta.Entry.HasMissingStateFacts() ||
-           delta.Observes.HasMissingStateFacts() ||
-           delta.Mutates.HasMissingStateFacts() ||
-           delta.Exit.HasMissingStateFacts();
+    return delta.entry.HasMissingStateFacts() ||
+           delta.observes.HasMissingStateFacts() ||
+           delta.mutates.HasMissingStateFacts() ||
+           delta.exit.HasMissingStateFacts();
   };
 
   auto deltaHasIncludeFacts = [&](const OwnerStateDelta &delta) {
-    return hasIncludeFacts(delta.Entry) || hasIncludeFacts(delta.Observes) ||
-           hasIncludeFacts(delta.Mutates) || hasIncludeFacts(delta.Exit);
+    return hasIncludeFacts(delta.entry) || hasIncludeFacts(delta.observes) ||
+           hasIncludeFacts(delta.mutates) || hasIncludeFacts(delta.exit);
   };
 
   auto deltaHasUnknownIncludeGuardFacts = [&](const OwnerStateDelta &delta) {
-    return hasUnknownIncludeGuardFacts(delta.Entry) ||
-           hasUnknownIncludeGuardFacts(delta.Observes) ||
-           hasUnknownIncludeGuardFacts(delta.Mutates) ||
-           hasUnknownIncludeGuardFacts(delta.Exit);
+    return hasUnknownIncludeGuardFacts(delta.entry) ||
+           hasUnknownIncludeGuardFacts(delta.observes) ||
+           hasUnknownIncludeGuardFacts(delta.mutates) ||
+           hasUnknownIncludeGuardFacts(delta.exit);
   };
 
   auto deltaHasConditionalFacts = [&](const OwnerStateDelta &delta) {
-    return hasConditionalFacts(delta.Entry) ||
-           hasConditionalFacts(delta.Observes) ||
-           hasConditionalFacts(delta.Mutates) ||
-           hasConditionalFacts(delta.Exit);
+    return hasConditionalFacts(delta.entry) ||
+           hasConditionalFacts(delta.observes) ||
+           hasConditionalFacts(delta.mutates) ||
+           hasConditionalFacts(delta.exit);
   };
 
   auto deltaHasUnknownConditionalFacts = [&](const OwnerStateDelta &delta) {
-    return hasUnknownConditionalFacts(delta.Entry) ||
-           hasUnknownConditionalFacts(delta.Observes) ||
-           hasUnknownConditionalFacts(delta.Mutates) ||
-           hasUnknownConditionalFacts(delta.Exit);
+    return hasUnknownConditionalFacts(delta.entry) ||
+           hasUnknownConditionalFacts(delta.observes) ||
+           hasUnknownConditionalFacts(delta.mutates) ||
+           hasUnknownConditionalFacts(delta.exit);
   };
 
   auto appendStateDeltaSignature = [&](llvm::raw_ostream &os,
                                        llvm::StringRef prefix,
                                        const OwnerStateDelta &delta) {
     appendFullStateFacts(os, llvm::formatv("{0}.entry", prefix).str(),
-                         delta.Entry);
+                         delta.entry);
     appendFullStateFacts(os, llvm::formatv("{0}.observes", prefix).str(),
-                         delta.Observes);
+                         delta.observes);
     appendFullStateFacts(os, llvm::formatv("{0}.mutates", prefix).str(),
-                         delta.Mutates);
+                         delta.mutates);
     appendFullStateFacts(os, llvm::formatv("{0}.exit", prefix).str(),
-                         delta.Exit);
+                         delta.exit);
   };
 
   auto ownerStateDeltaSignature = [&](const OwnerRealizationWitness &owner) {
@@ -1757,20 +1757,20 @@ void RefoldProofLattice::AttachCounterStateWitness(
   };
 
   auto deltaHasCounterProofObligation = [&](const OwnerStateDelta &delta) {
-    return stateFactsHaveCounterProofObligation(delta.Entry) ||
-           stateFactsHaveCounterProofObligation(delta.Observes) ||
-           stateFactsHaveCounterProofObligation(delta.Mutates) ||
-           stateFactsHaveCounterProofObligation(delta.Exit);
+    return stateFactsHaveCounterProofObligation(delta.entry) ||
+           stateFactsHaveCounterProofObligation(delta.observes) ||
+           stateFactsHaveCounterProofObligation(delta.mutates) ||
+           stateFactsHaveCounterProofObligation(delta.exit);
   };
 
   auto deltaHasMissingCounterProof = [](const OwnerStateDelta &delta) {
-    return delta.Entry.HasMissingFactKind(
+    return delta.entry.HasMissingFactKind(
                MissingStateFactKind::MissingCounterFacts) ||
-           delta.Observes.HasMissingFactKind(
+           delta.observes.HasMissingFactKind(
                MissingStateFactKind::MissingCounterFacts) ||
-           delta.Mutates.HasMissingFactKind(
+           delta.mutates.HasMissingFactKind(
                MissingStateFactKind::MissingCounterFacts) ||
-           delta.Exit.HasMissingFactKind(
+           delta.exit.HasMissingFactKind(
                MissingStateFactKind::MissingCounterFacts);
   };
 
@@ -1860,19 +1860,19 @@ void RefoldProofLattice::AttachCounterStateWitness(
 
         return (deltaHasConditionalFacts(owner.closure.stateIn) ||
                 deltaHasConditionalFacts(owner.closure.stateOut)) &&
-               factsAreKnownConditionalPathState(owner.closure.stateIn.Entry) &&
+               factsAreKnownConditionalPathState(owner.closure.stateIn.entry) &&
                factsAreKnownConditionalPathState(
-                   owner.closure.stateIn.Observes) &&
+                   owner.closure.stateIn.observes) &&
                factsAreKnownConditionalPathState(
-                   owner.closure.stateIn.Mutates) &&
-               factsAreKnownConditionalPathState(owner.closure.stateIn.Exit) &&
+                   owner.closure.stateIn.mutates) &&
+               factsAreKnownConditionalPathState(owner.closure.stateIn.exit) &&
                factsAreKnownConditionalPathState(
-                   owner.closure.stateOut.Entry) &&
+                   owner.closure.stateOut.entry) &&
                factsAreKnownConditionalPathState(
-                   owner.closure.stateOut.Observes) &&
+                   owner.closure.stateOut.observes) &&
                factsAreKnownConditionalPathState(
-                   owner.closure.stateOut.Mutates) &&
-               factsAreKnownConditionalPathState(owner.closure.stateOut.Exit);
+                   owner.closure.stateOut.mutates) &&
+               factsAreKnownConditionalPathState(owner.closure.stateOut.exit);
       };
   auto ownerRealizationHasKnownMacroObservationOnlyState =
       [&](const OwnerRealizationWitness &owner) {
@@ -1880,12 +1880,12 @@ void RefoldProofLattice::AttachCounterStateWitness(
         const OwnerStateDelta &out = owner.closure.stateOut;
         return !ownerStateProof_.OwnerStateDeltaMutatesAnyState(in) &&
                !ownerStateProof_.OwnerStateDeltaMutatesAnyState(out) &&
-               factsAreKnownMacroObservationOnly(in.Entry) &&
-               factsAreKnownMacroObservationOnly(in.Observes) &&
-               in.Mutates.Empty() && in.Exit.Empty() &&
-               factsAreKnownMacroObservationOnly(out.Entry) &&
-               factsAreKnownMacroObservationOnly(out.Observes) &&
-               out.Mutates.Empty() && out.Exit.Empty();
+               factsAreKnownMacroObservationOnly(in.entry) &&
+               factsAreKnownMacroObservationOnly(in.observes) &&
+               in.mutates.Empty() && in.exit.Empty() &&
+               factsAreKnownMacroObservationOnly(out.entry) &&
+               factsAreKnownMacroObservationOnly(out.observes) &&
+               out.mutates.Empty() && out.exit.Empty();
       };
   auto ownerRealizationHasKnownBuiltinLocationObservationState =
       [&](const OwnerRealizationWitness &owner) {
@@ -1899,32 +1899,32 @@ void RefoldProofLattice::AttachCounterStateWitness(
           return false;
 
         const bool observesBuiltinLocation =
-            factsHaveBuiltinLocationObservation(in.Entry) ||
-            factsHaveBuiltinLocationObservation(in.Observes) ||
-            factsHaveBuiltinLocationObservation(out.Entry) ||
-            factsHaveBuiltinLocationObservation(out.Observes);
+            factsHaveBuiltinLocationObservation(in.entry) ||
+            factsHaveBuiltinLocationObservation(in.observes) ||
+            factsHaveBuiltinLocationObservation(out.entry) ||
+            factsHaveBuiltinLocationObservation(out.observes);
         if (!observesBuiltinLocation)
           return false;
 
-        return factsAreKnownBuiltinLocationObservationOnly(in.Entry) &&
-               factsAreKnownBuiltinLocationObservationOnly(in.Observes) &&
-               in.Mutates.Empty() && in.Exit.Empty() &&
-               factsAreKnownBuiltinLocationObservationOnly(out.Entry) &&
-               factsAreKnownBuiltinLocationObservationOnly(out.Observes) &&
-               out.Mutates.Empty() && out.Exit.Empty();
+        return factsAreKnownBuiltinLocationObservationOnly(in.entry) &&
+               factsAreKnownBuiltinLocationObservationOnly(in.observes) &&
+               in.mutates.Empty() && in.exit.Empty() &&
+               factsAreKnownBuiltinLocationObservationOnly(out.entry) &&
+               factsAreKnownBuiltinLocationObservationOnly(out.observes) &&
+               out.mutates.Empty() && out.exit.Empty();
       };
   auto macroObservationOnlyStateSignature =
       [&](const OwnerRealizationWitness &owner) {
         std::string storage;
         llvm::raw_string_ostream os(storage);
         appendMacroObservationBucket(os, "in.entry",
-                                     owner.closure.stateIn.Entry);
+                                     owner.closure.stateIn.entry);
         appendMacroObservationBucket(os, "in.observes",
-                                     owner.closure.stateIn.Observes);
+                                     owner.closure.stateIn.observes);
         appendMacroObservationBucket(os, "out.entry",
-                                     owner.closure.stateOut.Entry);
+                                     owner.closure.stateOut.entry);
         appendMacroObservationBucket(os, "out.observes",
-                                     owner.closure.stateOut.Observes);
+                                     owner.closure.stateOut.observes);
         os.flush();
         return FormatWitnessTraceHash(storage);
       };
@@ -2720,7 +2720,7 @@ static std::string formatWitnessClosureAtom(StringRef value) {
 }
 
 template <typename FormatObject>
-static void LogProofLine(const FormatObject &line) {
+static void logProofLine(const FormatObject &line) {
   std::string text = line.str();
   while (!text.empty() && text.back() == '\n')
     text.pop_back();
@@ -3176,7 +3176,7 @@ void RefoldProofLattice::TraceWitnessStrictDomain(
       GetWitnessResolverMode() == WitnessResolverMode::Off)
     return;
 
-  LogProofLine(
+  logProofLine(
       llvm::formatv("REFOLD-WITNESS-DOMAIN role={0} domain={1} obligation={2} "
                     "fallback_class={3} reason={4}\n",
                     role, toString(decision.domainClass),
@@ -3191,7 +3191,7 @@ void RefoldProofLattice::TraceWitnessClosureLedger(
     return;
 
   for (const WitnessClosureLedgerEntry &entry : decision.closureLedger) {
-    LogProofLine(llvm::formatv(
+    logProofLine(llvm::formatv(
         "REFOLD-WITNESS-CLOSURE selector={0} family={1} "
         "test_region={2} missing={3} source_family={4} "
         "candidate_kind={5} theorem={6} witness_id={7} "
@@ -3247,7 +3247,7 @@ void RefoldProofLattice::TraceWitnessResolverDecision(
   else if (decision.mode == WitnessResolverMode::Strict)
     authority = "strict-fallback-legacy";
 
-  LogProofLine(llvm::formatv(
+  logProofLine(llvm::formatv(
       "REFOLD-WITNESS-RESOLVER role={0} mode={1} candidates={2} "
       "selectable={3} proof_invalid={4} classes={5} complete={6} "
       "incomplete={7} converted={8} unconverted={9} computed={10} "
@@ -3294,7 +3294,7 @@ void RefoldProofLattice::TraceWitnessCompositionDecision(
       GetWitnessResolverMode() == WitnessResolverMode::Off)
     return;
 
-  LogProofLine(llvm::formatv(
+  logProofLine(llvm::formatv(
       "REFOLD-WITNESS-COMPOSITION role={0} computed={1} tuples={2} "
       "complete={3} incomplete={4} incompatible={5} classes={6} "
       "compatible={7} fatal={8} reason={9}\n",
@@ -3696,13 +3696,13 @@ void RefoldProofLattice::TraceWitnessEmitted(const RefoldWitness &witness) const
   if (!ShouldEmitProofLog())
     return;
 
-  LogProofLine(llvm::formatv("REFOLD-WITNESS {0}\n", witness));
-  LogProofLine(llvm::formatv("REFOLD-WITNESS-KEY id={0} {1}\n",
+  logProofLine(llvm::formatv("REFOLD-WITNESS {0}\n", witness));
+  logProofLine(llvm::formatv("REFOLD-WITNESS-KEY id={0} {1}\n",
                              witness.witnessId, witness.key));
-  LogProofLine(llvm::formatv("REFOLD-WITNESS-COST id={0} {1}\n",
+  logProofLine(llvm::formatv("REFOLD-WITNESS-COST id={0} {1}\n",
                              witness.witnessId, witness.cost));
   if (!witness.payloadPreview.empty())
-    LogProofLine(llvm::formatv("REFOLD-WITNESS-PAYLOAD id={0} text={1}\n",
+    logProofLine(llvm::formatv("REFOLD-WITNESS-PAYLOAD id={0} text={1}\n",
                             witness.witnessId, witness.payloadPreview));
 }
 
@@ -3712,7 +3712,7 @@ void RefoldProofLattice::TraceWitnessRejected(const RefoldWitness &witness,
   if (!ShouldEmitProofLog())
     return;
 
-  LogProofLine(llvm::formatv("REFOLD-WITNESS-REJECT id={0} family={1} "
+  logProofLine(llvm::formatv("REFOLD-WITNESS-REJECT id={0} family={1} "
                           "owner={2} reason={3} detail={4}\n",
                           witness.witnessId, witness.family, witness.owner,
                           reason, detail.empty() ? StringRef("<none>")
@@ -3726,7 +3726,7 @@ void RefoldProofLattice::TraceWitnessAmbiguity(llvm::StringRef role,
   if (!ShouldEmitProofLog())
     return;
 
-  LogProofLine(llvm::formatv("REFOLD-WITNESS-AMBIGUITY role={0} "
+  logProofLine(llvm::formatv("REFOLD-WITNESS-AMBIGUITY role={0} "
                           "candidates={1} selectable={2} classes={3}\n",
                           role, candidateCount, selectableCount,
                           ambiguityClassCount));
@@ -3748,7 +3748,7 @@ void RefoldProofLattice::TraceWitnessSelectionProbe(
   else if (proofValidCount > 1 && equivalenceClassCount > 1)
     preferenceScope = "multiple-equivalence-classes";
 
-  LogProofLine(llvm::formatv(
+  logProofLine(llvm::formatv(
       "REFOLD-WITNESS-SELECTION role={0} candidates={1} "
       "proof_valid={2} proof_invalid={3} classes={4} "
       "complete={5} incomplete={6} preference_scope={7}\n",
@@ -3762,7 +3762,7 @@ void RefoldProofLattice::TraceWitnessChosen(const RefoldWitness &witness,
   if (!ShouldEmitProofLog())
     return;
 
-  LogProofLine(llvm::formatv("REFOLD-WITNESS-CHOOSE index={0} id={1} "
+  logProofLine(llvm::formatv("REFOLD-WITNESS-CHOOSE index={0} id={1} "
                           "family={2} owner={3} cost={4}\n",
                           selectedIndex, witness.witnessId, witness.family,
                           witness.owner, witness.cost));
@@ -3778,7 +3778,7 @@ void RefoldProofLattice::TraceWitnessFallback(
   const WitnessStrictDomainDecision domain =
       ClassifyStrictDomainForTerminalFallback(request.failure);
 
-  LogProofLine(llvm::formatv(
+  logProofLine(llvm::formatv(
       "REFOLD-WITNESS-FALLBACK reason={0} "
       "fallback_class={1} domain={2} obligation={3} "
       "domain_reason={4} stage={5} detail={6}\n",
@@ -3830,7 +3830,7 @@ void RefoldProofLattice::TraceWitnessFallback(
       break;
     }
 
-    LogProofLine(llvm::formatv(
+    logProofLine(llvm::formatv(
         "REFOLD-WITNESS-CLOSURE selector=TerminalFallback "
         "family={0} test_region=terminal missing={1} "
         "source_family=TerminalFallback candidate_kind=TerminalOutOfDomain "
@@ -6482,7 +6482,7 @@ std::string RefoldProofLattice::BuildOwnerUnresolvedNoTUAnchorDetail(
   if (isInsertion) {
     if (auto boundaryPlan =
             tuEdits_.FindBoundaryParentIncludeForPureInsertion(h))
-      boundaryInc = model_.GetIncludeById(boundaryPlan->IncludeId);
+      boundaryInc = model_.GetIncludeById(boundaryPlan->includeId);
   }
   const bool hasBoundaryInclude = boundaryInc != nullptr;
 
@@ -6516,7 +6516,7 @@ std::string RefoldProofLattice::BuildOwnerUnresolvedNoTUAnchorDetail(
 
     if (provableInsertionAnchor)
       insertionAnchor =
-          llvm::formatv("{0}", provableInsertionAnchor->TUByteOffset).str();
+          llvm::formatv("{0}", provableInsertionAnchor->tuByteOffset).str();
     else
       insertionAnchor = "none";
 
@@ -6527,8 +6527,8 @@ std::string RefoldProofLattice::BuildOwnerUnresolvedNoTUAnchorDetail(
   }
 
   const std::string tuSpanStr =
-      tuSpan ? llvm::formatv("[{0},{1})", tuSpan->TUByteBegin,
-                             tuSpan->TUByteEnd)
+      tuSpan ? llvm::formatv("[{0},{1})", tuSpan->tuByteBegin,
+                             tuSpan->tuByteEnd)
                    .str()
              : std::string("none");
 

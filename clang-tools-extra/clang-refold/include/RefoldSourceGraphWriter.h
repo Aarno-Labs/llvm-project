@@ -32,8 +32,8 @@ namespace refold {
 /// caller-side reporting controls; current diagnostics intentionally use the
 /// same RefoldLog channels and wording as the pre-extraction writer.
 struct SourceGraphWriteOptions {
-  std::string OutputDirectory;
-  bool Verbose = false;
+  std::string outputDirectory;
+  bool verbose = false;
 };
 
 /// Build writer options from the final refolded source path.

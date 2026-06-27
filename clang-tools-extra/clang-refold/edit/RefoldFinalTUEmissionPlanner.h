@@ -2,7 +2,7 @@
 //
 // Final translation-unit emission planning for clang-refold.
 //
-// This service owns the last TU-emission phase after structural hunk dispatch,
+// This service owns final TU emission after structural hunk dispatch,
 // macro-state repair, and include materialization scheduling have selected the
 // concrete edits that may affect the emitted translation unit.  It deliberately
 // does not implement low-level edit assembly: pending resync flushing,
@@ -41,52 +41,52 @@ class RefoldTextEditAssembler;
 /// been staged.
 class RefoldFinalTUEmissionPlanner {
 public:
-  /// Services borrowed by the final TU emission phase.
+  /// Services borrowed by final TU emission.
   struct Dependencies {
-    const RefoldModel *Model = nullptr;
-    const RefoldMacroTopology *MacroTopology = nullptr;
-    const RefoldLineControlProof *LineControlProof = nullptr;
-    const LineDirectiveInserter *LineDirs = nullptr;
-    const RefoldMacroStateRepairPlanner *MacroStateRepairPlanner = nullptr;
-    const RefoldTextEditAssembler *TextEditAssembler = nullptr;
-    const RefoldProofLattice *ProofLattice = nullptr;
-    RefoldTerminalProofSink *TerminalSink = nullptr;
-    std::vector<MaterializedEditMapping> *MaterializedEditMappings = nullptr;
-    std::vector<FinalLineControlPruneCandidate> *FinalLineControlPruneCandidates =
+    const RefoldModel *model = nullptr;
+    const RefoldMacroTopology *macroTopology = nullptr;
+    const RefoldLineControlProof *lineControlProof = nullptr;
+    const LineDirectiveInserter *lineDirs = nullptr;
+    const RefoldMacroStateRepairPlanner *macroStateRepairPlanner = nullptr;
+    const RefoldTextEditAssembler *textEditAssembler = nullptr;
+    const RefoldProofLattice *proofLattice = nullptr;
+    RefoldTerminalProofSink *terminalSink = nullptr;
+    std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr;
+    std::vector<FinalLineControlPruneCandidate> *finalLineControlPruneCandidates =
         nullptr;
-    std::vector<FinalLineControlSourceMapping> *FinalLineControlSourceMappings =
+    std::vector<FinalLineControlSourceMapping> *finalLineControlSourceMappings =
         nullptr;
   };
 
   /// Mutable run state needed to lower the staged structural result into final
   /// TU text.
   struct EmissionRequest {
-    llvm::StringRef TUPath;
-    llvm::StringRef TUBytes;
-    RefoldStructuralHunkDispatcher *StructuralHunkDispatcher = nullptr;
-    RefoldIncludeMaterializationScheduler *IncludeMaterializationScheduler =
+    llvm::StringRef tuPath;
+    llvm::StringRef tuBytes;
+    RefoldStructuralHunkDispatcher *structuralHunkDispatcher = nullptr;
+    RefoldIncludeMaterializationScheduler *includeMaterializationScheduler =
         nullptr;
-    RefoldMacroStateRepairPlanner::MacroStateRepairPlan *MacroStatePlan =
+    RefoldMacroStateRepairPlanner::MacroStateRepairPlan *macroStatePlan =
         nullptr;
     const RefoldMacroStateRepairPlanner::MacroStateRepairRequest
-        *MacroStateRequest = nullptr;
+        *macroStateRequest = nullptr;
   };
 
-  /// Result of the final emission phase.
+  /// Result of final TU emission.
   struct EmissionResult {
-    bool Success = false;
-    std::string TUText;
-    size_t ExpandedMacroCount = 0;
+    bool success = false;
+    std::string tuText;
+    size_t expandedMacroCount = 0;
   };
 
   /// Creates a final TU emission planner bound to the services that own proof,
   /// macro topology, line-control, and byte-edit assembly decisions.
-  explicit RefoldFinalTUEmissionPlanner(Dependencies Deps);
+  explicit RefoldFinalTUEmissionPlanner(Dependencies deps);
 
   /// Stages final TU macro/include edits, applies pending-resync-aware edit
   /// assembly, repairs the TU prologue when preserved file observers require
   /// it, and returns the emitted translation-unit text.
-  EmissionResult PlanAndEmit(const EmissionRequest &Request) const;
+  EmissionResult PlanAndEmit(const EmissionRequest &request) const;
 
 private:
   Dependencies deps_;

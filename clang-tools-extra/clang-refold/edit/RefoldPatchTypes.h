@@ -34,11 +34,11 @@ struct PasteArgEdit {
   std::optional<uint32_t> argByteBegin;
   std::optional<uint32_t> argByteEnd;
 
-  PasteArgEdit(uint32_t Idx, std::string New, std::string Old,
-               std::optional<uint32_t> ArgByteBegin = std::nullopt,
-               std::optional<uint32_t> ArgByteEnd = std::nullopt)
-      : argIdx(Idx), newSeg(std::move(New)), oldSeg(std::move(Old)),
-        argByteBegin(ArgByteBegin), argByteEnd(ArgByteEnd) {}
+  PasteArgEdit(uint32_t idx, std::string newSegText, std::string oldSegText,
+               std::optional<uint32_t> argByteBegin = std::nullopt,
+               std::optional<uint32_t> argByteEnd = std::nullopt)
+      : argIdx(idx), newSeg(std::move(newSegText)), oldSeg(std::move(oldSegText)),
+        argByteBegin(argByteBegin), argByteEnd(argByteEnd) {}
 };
 
 struct MacroPatch {
@@ -207,7 +207,7 @@ struct IncludeEdits {
 
   explicit IncludeEdits(const RefoldModel::IncludeItem *item) : include(item) {}
 
-  void Add(IncludePatch &&P) { patches.push_back(std::move(P)); }
+  void Add(IncludePatch &&p) { patches.push_back(std::move(p)); }
 };
 
 } // namespace refold

@@ -62,7 +62,7 @@ llvm::StringRef toString(TerminalFallbackObligationKind obligation);
 /// normalization to the final theorem vocabulary below.  The reason names the
 /// local domain wall; the obligation names the theorem condition.  Keeping both
 /// makes terminal fallback auditable without having to reverse-engineer the
-/// implementation stage that requested it.
+/// implementation site that requested it.
 enum class TerminalFallbackFailureReason : uint8_t {
   Unknown,
   NoOwnerClosedCover,
