@@ -341,13 +341,12 @@ parseOptionalIncludeLookupProvenance(
   lookup.directoryPath = asOptString(lookupObj, "directory_path");
 
   if (isSearchChainIncludeLookupKind(lookup.kind)) {
-    if (!lookup.searchChainIndex || !lookup.directorySpelling ||
-        !lookup.directoryPath)
+    if (!lookup.searchChainIndex)
       return createStringError(
           inconvertibleErrorCode(),
-          "%s.lookup search-chain kind '%s' requires search_chain_index, "
-          "directory_spelling, and directory_path",
+          "%s.lookup search-chain kind '%s' requires search_chain_index",
           ctx.str().c_str(), toString(lookup.kind).str().c_str());
+
     if (!includeSearchChain.empty()) {
       if (*lookup.searchChainIndex >= includeSearchChain.size())
         return createStringError(
@@ -355,6 +354,7 @@ parseOptionalIncludeLookupProvenance(
             "%s.lookup.search_chain_index %u is outside "
             "pp_ctx.include_search_chain",
             ctx.str().c_str(), *lookup.searchChainIndex);
+
       const auto &entry = includeSearchChain[*lookup.searchChainIndex];
       if (entry.kind != lookup.kind)
         return createStringError(
@@ -363,6 +363,30 @@ parseOptionalIncludeLookupProvenance(
             "kind '%s'",
             ctx.str().c_str(), toString(lookup.kind).str().c_str(),
             *lookup.searchChainIndex, toString(entry.kind).str().c_str());
+
+      // New-schema search-chain hits are selected by search_chain_index; the
+      // directory spelling/path live authoritatively on the referenced
+      // pp_ctx.include_search_chain entry.  Older producer maps may still carry
+      // these per-edge copies as audit redundancy.  Accept them only when they
+      // exactly match the chain entry, then normalize the in-memory lookup to
+      // the chain values so downstream proof code has one source of truth.
+      if (lookup.directorySpelling &&
+          *lookup.directorySpelling != entry.spelling)
+        return createStringError(
+            inconvertibleErrorCode(),
+            "%s.lookup.directory_spelling '%s' disagrees with "
+            "include_search_chain[%u].spelling '%s'",
+            ctx.str().c_str(), lookup.directorySpelling->str().c_str(),
+            *lookup.searchChainIndex, entry.spelling.str().c_str());
+      if (lookup.directoryPath && *lookup.directoryPath != entry.path)
+        return createStringError(
+            inconvertibleErrorCode(),
+            "%s.lookup.directory_path '%s' disagrees with "
+            "include_search_chain[%u].path '%s'",
+            ctx.str().c_str(), lookup.directoryPath->str().c_str(),
+            *lookup.searchChainIndex, entry.path.str().c_str());
+      lookup.directorySpelling = entry.spelling;
+      lookup.directoryPath = entry.path;
     }
   } else if (isPerEdgeIncludeLookupKind(lookup.kind)) {
     if (lookup.searchChainIndex)
@@ -489,10 +513,11 @@ static Error validateIncludeMetadataAudit(const RefoldModel &model) {
             "pp_ctx.include_search_chain is absent or empty",
             static_cast<unsigned long long>(include.id),
             toString(kind).str().c_str());
-      // parseOptionalIncludeLookupProvenance has already checked field
-      // presence, index range, and kind equality against the search-chain
-      // entry.  Keep this cross-entry audit here so the producer metadata
-      // contract remains enforced after model construction.
+      // parseOptionalIncludeLookupProvenance has already checked index
+      // presence/range, kind equality, and any legacy redundant directory
+      // copies against the search-chain entry.  Keep this cross-entry audit
+      // here so the producer metadata contract remains enforced after model
+      // construction.
       assert(include.lookup->searchChainIndex &&
              "search-chain lookup parsed without an index");
     }

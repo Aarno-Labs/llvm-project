@@ -1046,12 +1046,12 @@ static constexpr const char *RefoldSchema = R"json(
         "directory_spelling": {
           "type": "string",
           "minLength": 1,
-          "description": "Spelling of the directory that selected this include edge. For source_relative, this is the including file's directory spelling. For search-chain hits, this matches the referenced search-chain entry spelling when available."
+          "description": "Spelling of the directory that selected this include edge. Required for source_relative and absolute_operand. Deprecated audit redundancy for search-chain hits; when present it must match pp_ctx.include_search_chain[search_chain_index].spelling."
         },
         "directory_path": {
           "type": "string",
           "minLength": 1,
-          "description": "Physical/FileManager path of the directory that selected this include edge, suitable for path identity checks."
+          "description": "Physical/FileManager path of the directory that selected this include edge. Required for source_relative and absolute_operand. Deprecated audit redundancy for search-chain hits; when present it must match pp_ctx.include_search_chain[search_chain_index].path."
         }
       },
       "allOf": [
@@ -1075,9 +1075,7 @@ static constexpr const char *RefoldSchema = R"json(
           },
           "then": {
             "required": [
-              "search_chain_index",
-              "directory_spelling",
-              "directory_path"
+              "search_chain_index"
             ]
           }
         },
@@ -1141,7 +1139,7 @@ static constexpr const char *RefoldSchema = R"json(
           }
         }
       ],
-      "description": "Producer-owned lookup provenance for one include edge. This lets consumers compare replayed include resolution against producer facts instead of reconstructing Clang's lookup decision from argv."
+      "description": "Producer-owned lookup provenance for one include edge. Search-chain hits are keyed by search_chain_index into pp_ctx.include_search_chain; source_relative and absolute_operand carry per-edge directory spelling/path. Legacy redundant directory fields on search-chain hits are accepted only as audited copies."
     },
     "IncludeNextProvenance": {
       "type": "object",

@@ -347,8 +347,11 @@ public:
   /// Producer-owned lookup provenance for one include edge.
   ///
   /// Search-chain hits carry a search_chain_index that selects an entry in
-  /// pp_ctx.include_search_chain. Source-relative and absolute-operand hits
-  /// carry only their selecting directory spelling/path. Unknown carries no
+  /// pp_ctx.include_search_chain. New-schema JSON omits per-edge directory
+  /// copies for those hits; the parser normalizes the optional in-memory
+  /// directory spelling/path from the referenced chain entry after validating
+  /// any legacy redundant copies. Source-relative and absolute-operand hits
+  /// carry their selecting directory spelling/path directly. Unknown carries no
   /// directory or cursor data and therefore cannot satisfy replay proof.
   struct IncludeLookupProvenance {
     IncludeLookupKind kind = IncludeLookupKind::Unknown;

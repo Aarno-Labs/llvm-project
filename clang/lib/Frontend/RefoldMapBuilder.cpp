@@ -5602,14 +5602,25 @@ void RefoldMapBuilder::writeJSON() {
               JO.attributeObject("lookup", [&] {
                 JO.attribute("kind", It.LookupKind);
                 if (It.LookupKind != "unknown") {
-                  if (It.LookupSearchChainIndex)
+                  if (It.LookupSearchChainIndex) {
+                    // Search-chain hits are fully identified by their stable
+                    // pp_ctx.include_search_chain index.  Do not duplicate the
+                    // selected directory spelling/path on every edge; the
+                    // consumer derives them from the referenced chain entry and
+                    // still validates redundant copies from older maps.
                     JO.attribute("search_chain_index",
                                  *It.LookupSearchChainIndex);
-                  if (!It.LookupDirectorySpelling.empty())
-                    JO.attribute("directory_spelling",
-                                 It.LookupDirectorySpelling);
-                  if (!It.LookupDirectoryPath.empty())
-                    JO.attribute("directory_path", It.LookupDirectoryPath);
+                  } else {
+                    // Per-edge lookup kinds, such as source-relative and
+                    // absolute operands, are not entries in the global search
+                    // chain and therefore must carry their selecting directory
+                    // facts directly.
+                    if (!It.LookupDirectorySpelling.empty())
+                      JO.attribute("directory_spelling",
+                                   It.LookupDirectorySpelling);
+                    if (!It.LookupDirectoryPath.empty())
+                      JO.attribute("directory_path", It.LookupDirectoryPath);
+                  }
                 }
               });
             }
