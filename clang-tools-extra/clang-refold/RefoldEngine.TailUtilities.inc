@@ -3396,8 +3396,14 @@ void RefoldEngine::MaterializeIncludeExpansion(
     return surface;
   };
 
-  auto replayLookupKindForSearchEntry =
-      [](IncludeLookupKind kind) -> IncludeReplayCandidate::LookupKind {
+  // Keep the syntactic lookup-kind conversion separate from the question
+  // "can this producer HeaderSearch entry be replayed as `dir / operand`?".
+  // Framework and builtin entries have real search-chain cursor positions, but
+  // their lookup semantics are not modeled here as ordinary directory probes;
+  // treating them as paths would make include_next proof too strong.
+  auto replayableOrdinaryDirectoryKind =
+      [](IncludeLookupKind kind)
+      -> std::optional<IncludeReplayCandidate::LookupKind> {
     switch (kind) {
     case IncludeLookupKind::QuoteDir:
       return IncludeReplayCandidate::LookupKind::QuoteDir;
@@ -3408,18 +3414,20 @@ void RefoldEngine::MaterializeIncludeExpansion(
     case IncludeLookupKind::IdirAfter:
       return IncludeReplayCandidate::LookupKind::IdirAfter;
     case IncludeLookupKind::Framework:
-      return IncludeReplayCandidate::LookupKind::Framework;
     case IncludeLookupKind::Builtin:
-      return IncludeReplayCandidate::LookupKind::Builtin;
     case IncludeLookupKind::SourceRelative:
     case IncludeLookupKind::AbsoluteOperand:
     case IncludeLookupKind::Unknown:
-      return IncludeReplayCandidate::LookupKind::Unknown;
+      return std::nullopt;
     }
     llvm_unreachable("Invalid IncludeLookupKind");
   };
 
-  auto ordinaryReplayLookupKindForSearchEntry =
+  // include_next proof is cursor-sensitive, so use a dedicated gate even
+  // though the currently modeled directory kinds match ordinary include replay.
+  // Any unsupported entry encountered after the resume cursor is a hard barrier
+  // rather than something replay may skip past.
+  auto replayableIncludeNextDirectoryKind =
       [](IncludeLookupKind kind)
       -> std::optional<IncludeReplayCandidate::LookupKind> {
     switch (kind) {
@@ -3502,7 +3510,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
         // exact producer index that selected the target; later include_next
         // proof must compare that cursor against producer resume provenance.
         std::optional<IncludeReplayCandidate::LookupKind> kind =
-            ordinaryReplayLookupKindForSearchEntry(entry.kind);
+            replayableOrdinaryDirectoryKind(entry.kind);
         if (!kind) {
           appendUnsupportedOrdinarySearchEntryBarrier(dirs, entry);
           return;
@@ -3875,21 +3883,20 @@ void RefoldEngine::MaterializeIncludeExpansion(
       if (entry.index != i)
         return std::nullopt;
 
-      // Unknown entries are barriers for include_next proof.  Ordinary include
-      // replay may skip an unknown producer entry and still use later known
-      // entries as a best-effort compatibility aid, but include_next is a
-      // cursor-sensitive proof: an unmodeled entry between the resume cursor and
-      // a later match could have selected the target first.
-      if (entry.kind == IncludeLookupKind::Unknown)
-        return std::nullopt;
-
-      IncludeReplayCandidate::LookupKind replayKind =
-          replayLookupKindForSearchEntry(entry.kind);
-      if (replayKind == IncludeReplayCandidate::LookupKind::Unknown)
+      // Unsupported entries are barriers for include_next proof.  Unlike an
+      // ordinary include compatibility replay, include_next is a cursor-state
+      // proof over the producer HeaderSearch chain: an unmodeled framework,
+      // builtin, unknown, or otherwise non-directory entry between the resume
+      // cursor and a later directory hit could have selected or shadowed the
+      // target first.  Do not skip past it unless its lookup is explicitly
+      // modeled as ordinary directory probing.
+      std::optional<IncludeReplayCandidate::LookupKind> replayKind =
+          replayableIncludeNextDirectoryKind(entry.kind);
+      if (!replayKind)
         return std::nullopt;
 
       std::optional<IncludeReplaySearchDir> dir =
-          makeIncludeReplaySearchDir(entry.path, entry.spelling, replayKind,
+          makeIncludeReplaySearchDir(entry.path, entry.spelling, *replayKind,
                                      entry.index);
       if (!dir)
         return std::nullopt;
@@ -4392,11 +4399,49 @@ void RefoldEngine::MaterializeIncludeExpansion(
     return *include.lookup->searchChainIndex == *next.selectedSearchChainIndex;
   };
 
+  auto directIncludeNextSelectionUsesOnlyReplayableDirectories =
+      [&](const RefoldModel::IncludeItem &include) -> bool {
+    if (!directIncludeNextHasProducerSelectionProvenance(include))
+      return false;
+
+    const RefoldModel::IncludeNextProvenance &next = *include.includeNext;
+    const uint32_t resumeIndex = *next.resumeSearchChainIndex;
+    const uint32_t selectedIndex = *next.selectedSearchChainIndex;
+    if (resumeIndex > selectedIndex)
+      return false;
+
+    ArrayRef<RefoldModel::IncludeSearchEntry> chain =
+        model_.GetIncludeSearchChain();
+    if (chain.empty() || selectedIndex >= chain.size())
+      return false;
+
+    for (uint32_t i = resumeIndex; i <= selectedIndex; ++i) {
+      const RefoldModel::IncludeSearchEntry &entry = chain[i];
+      if (entry.index != i)
+        return false;
+
+      // Direct #include_next-to-ordinary rewrites may name the selected target
+      // without preserving the directive, but they still rely on the producer's
+      // include_next cursor proof to know which search-chain entry was selected.
+      // If that cursor path crosses a framework, builtin, unknown, malformed,
+      // or otherwise unmodeled entry, the safe answer is materialization.
+      std::optional<IncludeReplayCandidate::LookupKind> kind =
+          replayableIncludeNextDirectoryKind(entry.kind);
+      if (!kind)
+        return false;
+      if (!makeIncludeReplaySearchDir(entry.path, entry.spelling, *kind,
+                                      entry.index))
+        return false;
+    }
+
+    return true;
+  };
+
   auto directIncludeNextOrdinaryRewriteMatchesProducerSelection =
       [&](const IncludeReplayCandidate &candidate,
           const RefoldModel::IncludeItem &include,
           const CleanChildIncludeReplayDemand &demand) -> bool {
-    if (!directIncludeNextHasProducerSelectionProvenance(include))
+    if (!directIncludeNextSelectionUsesOnlyReplayableDirectories(include))
       return false;
 
     const std::string physicalPath = candidate.PhysicalPath.generic_string();
@@ -4471,9 +4516,11 @@ void RefoldEngine::MaterializeIncludeExpansion(
     candidate.PhysicalPath = selected.PhysicalPath;
     candidate.EnteredFileSpelling = selected.EnteredFileSpelling;
     candidate.EnteredFileName = selected.EnteredFileName;
-    candidate.Kind = replayLookupKindForSearchEntry(selected.SelectedKind);
-    if (candidate.Kind == IncludeReplayCandidate::LookupKind::Unknown)
+    std::optional<IncludeReplayCandidate::LookupKind> kind =
+        replayableIncludeNextDirectoryKind(selected.SelectedKind);
+    if (!kind)
       return std::nullopt;
+    candidate.Kind = *kind;
     candidate.SearchChainIndex = selected.SelectedSearchChainIndex;
     return candidate;
   };
@@ -5067,7 +5114,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
     // 2. Target path relative to the producer search-chain entry that selected
     // this #include_next target, when the producer recorded such an entry.
-    if (child.lookup && isSearchChainIncludeLookupKind(child.lookup->kind)) {
+    if (child.lookup && replayableIncludeNextDirectoryKind(child.lookup->kind)) {
       if (child.lookup->directoryPath) {
         if (std::optional<std::string> operand = stableContainedRelativeOperand(
                 *producerPhysicalPath,
