@@ -194,8 +194,8 @@ static bool safeReplayIncludeLookupOperandPath(StringRef path) {
 }
 
 /// Path-only predicate for relative operands the refolder may emit as a
-/// synthetic quoted include rewrite.  These are stricter than replay operands:
-/// no absolute path, empty component, `.`, or `..` is accepted.
+/// synthesized relative include rewrite.  These are stricter than replay
+/// operands: no absolute path, empty component, `.`, or `..` is accepted.
 static bool safeSynthesizedRelativeIncludeOperandPath(StringRef path) {
   return hasSafeIncludePathSpelling(path) &&
          hasValidIncludePathComponents(path, /*allowAbsolute=*/false,
@@ -335,7 +335,11 @@ static bool includeOperandHasParentComponent(StringRef path) {
   return llvm::is_contained(components, StringRef(".."));
 }
 
-static bool safeRewrittenQuotedIncludeOperand(StringRef path) {
+/// Predicate for synthesized relative operands that may be emitted into an
+/// include directive after replay proof has selected them.  The caller decides
+/// whether the directive uses quoted or angled delimiters; this helper only
+/// enforces the no-escape relative path contract shared by both spellings.
+static bool safeSynthesizedRelativeIncludeOperand(StringRef path) {
   return safeSynthesizedRelativeIncludeOperandPath(path);
 }
 

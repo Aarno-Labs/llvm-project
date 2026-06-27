@@ -2170,8 +2170,8 @@ RefoldMapBuilder::RefoldMapBuilder(Preprocessor &PP, llvm::StringRef OutputPath,
   // HeaderSearchOptions. HeaderSearch itself is the authority for effective
   // order; these maps are only used to annotate each public search-directory
   // entry with the user spelling/group when that mapping is unique. Ambiguous
-  // normalized directory keys are marked with a private sentinel and ignored by
-  // lookup helpers instead of guessed.
+  // normalized directory keys are marked with a private sentinel and ignored
+  // rather than guessed.
   auto recordUniqueIncludeDirValue = [](llvm::StringMap<std::string> &Map,
                                         llvm::StringRef Key,
                                         llvm::StringRef Value) {
@@ -4473,7 +4473,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "2.8");
+    JO.attribute("version", "2.9");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());

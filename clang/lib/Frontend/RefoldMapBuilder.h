@@ -518,11 +518,13 @@ class RefoldMapBuilder {
   bool EnableByteSpans;      // If true, then serialize the per-token byte spans
 
   /// Map resolved absolute include directories -> unique original include-dir
-  /// spelling. Ambiguous entries are erased rather than guessed.
+  /// spelling. Ambiguous entries are marked with a private sentinel and
+  /// ignored rather than guessed.
   llvm::StringMap<std::string> IncludeDirAbs2Spelling;
   /// Map resolved absolute include directories -> unique producer-known search
-  /// class from HeaderSearchOptions. Ambiguous entries are erased rather than
-  /// guessed; HeaderSearch public range checks still classify quote/user dirs.
+  /// class from HeaderSearchOptions. Ambiguous entries are marked with a
+  /// private sentinel and ignored rather than guessed; HeaderSearch public
+  /// range checks still classify quote/user dirs.
   llvm::StringMap<std::string> IncludeDirAbs2Kind;
   /// Map resolved absolute file paths -> chosen spelling (TU/header).
   llvm::StringMap<std::string> FileAbs2Spelling;

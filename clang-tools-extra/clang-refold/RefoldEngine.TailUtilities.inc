@@ -3978,7 +3978,7 @@ planCleanChildIncludeReplayFromMaterializedParent(
     return result;
   };
 
-  struct QuotedIncludeRewriteCandidate {
+  struct QuotedChildIncludeRewriteCandidate {
     std::string operand;
     IncludeReplayCandidate replay;
   };
@@ -4076,14 +4076,14 @@ planCleanChildIncludeReplayFromMaterializedParent(
       return std::nullopt;
 
     const std::string operand = relative.generic_string();
-    if (!safeRewrittenQuotedIncludeOperand(operand))
+    if (!safeSynthesizedRelativeIncludeOperand(operand))
       return std::nullopt;
     return operand;
   };
 
-  auto generateQuotedIncludeRewriteCandidatesForReplaySurface =
+  auto generateQuotedChildIncludeRewriteCandidates =
       [&](const RefoldModel::IncludeItem &child) {
-    SmallVector<QuotedIncludeRewriteCandidate, 8> candidates;
+    SmallVector<QuotedChildIncludeRewriteCandidate, 8> candidates;
     if (child.subkind != "#include" || child.angled)
       return candidates;
 
@@ -4093,9 +4093,9 @@ planCleanChildIncludeReplayFromMaterializedParent(
       return candidates;
 
     auto appendCandidate = [&](StringRef operand) {
-      if (operand.empty() || !safeRewrittenQuotedIncludeOperand(operand))
+      if (operand.empty() || !safeSynthesizedRelativeIncludeOperand(operand))
         return;
-      for (const QuotedIncludeRewriteCandidate &existing : candidates) {
+      for (const QuotedChildIncludeRewriteCandidate &existing : candidates) {
         if (StringRef(existing.operand) == operand)
           return;
       }
@@ -4105,7 +4105,7 @@ planCleanChildIncludeReplayFromMaterializedParent(
       if (!replay)
         return;
 
-      QuotedIncludeRewriteCandidate rewrite;
+      QuotedChildIncludeRewriteCandidate rewrite;
       rewrite.operand = operand.str();
       rewrite.replay = std::move(*replay);
       candidates.push_back(std::move(rewrite));
@@ -4710,8 +4710,8 @@ planCleanChildIncludeReplayFromMaterializedParent(
     if (mayRewriteUnstableOperand) {
       bool sawRewriteCandidate = false;
       std::string firstRewriteFailure;
-      for (QuotedIncludeRewriteCandidate &rewrite :
-           generateQuotedIncludeRewriteCandidatesForReplaySurface(child)) {
+      for (QuotedChildIncludeRewriteCandidate &rewrite :
+           generateQuotedChildIncludeRewriteCandidates(child)) {
         sawRewriteCandidate = true;
         IncludeReplayProofResult proof =
             evaluateIncludeReplayCandidate(rewrite.replay, child, demand);
