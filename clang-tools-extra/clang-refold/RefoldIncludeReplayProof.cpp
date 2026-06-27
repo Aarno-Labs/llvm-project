@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "RefoldIncludeReplayProof.h"
+#include "RefoldIncludePathProof.h"
 #include "RefoldLog.h"
 
 #include "llvm/ADT/SmallString.h"
@@ -100,28 +101,23 @@ buildFinalReplaySurface(const RefoldModel &model, StringRef finalOutputPath) {
 
 namespace {
 
-// Include operand spelling helpers remain local to this proof module when
-// they describe replay/rewrite syntax rather than producer metadata.  Producer
-// include identity/spelling helpers live in RefoldProofTypes.h so line-control
-// and include-replay proof use the same schema fallback rules.
-static bool isSafeSourceGraphIncludePathChar(char c) {
+// Replay-only include operand spelling helpers remain local to this proof
+// module.  Shared synthesized-operand safety helpers live in
+// RefoldIncludePathProof.*, and producer include identity/spelling helpers live
+// in RefoldProofTypes.h so proof modules use the same schema fallback rules.
+static bool isSafeReplayIncludePathChar(char c) {
   return std::isalnum(static_cast<unsigned char>(c)) || c == '_' ||
          c == '-' || c == '.' || c == '/';
 }
 
 /// Return true when \p path uses only the restricted ASCII include-path
-/// spelling alphabet that the refolder is willing to synthesize or replay.
-///
-/// This is intentionally a spelling-level predicate, not a filesystem proof:
-/// callers still have to replay the operand from the final source surface and
-/// compare the selected physical file / observer spelling against producer
-/// metadata.  Keeping the low-level spelling check in one helper prevents the
-/// include-replay and source-graph paths from drifting apart as new candidate
-/// classes are added.
-static bool hasSafeIncludePathSpelling(StringRef path) {
+/// spelling alphabet that replay analysis is willing to inspect.  This is a
+/// spelling-level predicate only: replay proof still has to compare the selected
+/// physical file and observer spelling against producer metadata.
+static bool hasSafeReplayIncludePathSpelling(StringRef path) {
   return !path.empty() && !path.contains('\\') && !path.contains('"') &&
          llvm::all_of(path, [](char c) {
-           return isSafeSourceGraphIncludePathChar(c);
+           return isSafeReplayIncludePathChar(c);
          });
 }
 
@@ -158,18 +154,9 @@ static bool hasValidIncludePathComponents(StringRef path, bool allowAbsolute,
 /// not appearance, decides whether such an operand actually names the producer
 /// target.
 static bool safeReplayIncludeLookupOperandPath(StringRef path) {
-  return hasSafeIncludePathSpelling(path) &&
+  return hasSafeReplayIncludePathSpelling(path) &&
          hasValidIncludePathComponents(path, /*allowAbsolute=*/true,
                                        /*allowDotComponents=*/true);
-}
-
-/// Path-only predicate for relative operands the refolder may emit as a
-/// synthesized relative include rewrite.  These are stricter than replay
-/// operands: no absolute path, empty component, `.`, or `..` is accepted.
-static bool safeSynthesizedRelativeIncludeOperandPath(StringRef path) {
-  return hasSafeIncludePathSpelling(path) &&
-         hasValidIncludePathComponents(path, /*allowAbsolute=*/false,
-                                       /*allowDotComponents=*/false);
 }
 
 /// Return a quoted include operand for lookup analysis, allowing parent
@@ -192,20 +179,6 @@ quotedIncludeReplayLookupOperand(const RefoldModel::IncludeItem &inc) {
     return std::nullopt;
 
   return path.str();
-}
-
-static bool includeOperandHasParentComponent(StringRef path) {
-  SmallVector<StringRef, 8> components;
-  path.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
-  return llvm::is_contained(components, StringRef(".."));
-}
-
-/// Predicate for synthesized relative operands that may be emitted into an
-/// include directive after replay proof has selected them.  The caller decides
-/// whether the directive uses quoted or angled delimiters; this helper only
-/// enforces the no-escape relative path contract shared by both spellings.
-static bool safeSynthesizedRelativeIncludeOperand(StringRef path) {
-  return safeSynthesizedRelativeIncludeOperandPath(path);
 }
 
 // Include replay decodes preserved #line filename spellings with the same
@@ -1195,11 +1168,7 @@ IncludeReplayProofContext::planCleanChildIncludeReplayFromMaterializedParent(
       return std::nullopt;
 
     StringRef path = target.drop_front().drop_back();
-    if (path.empty() || path.contains('\\') || path.contains('"'))
-      return std::nullopt;
-    if (!llvm::all_of(path, [](char c) {
-          return isSafeSourceGraphIncludePathChar(c);
-        }))
+    if (!hasSafeReplayIncludePathSpelling(path))
       return std::nullopt;
 
     return path.str();

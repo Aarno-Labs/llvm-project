@@ -65,10 +65,12 @@
 
 #include "RefoldLog.h"
 #include "RefoldEngine.h"
+#include "RefoldIncludePathProof.h"
 #include "RefoldIncludeReplayProof.h"
 #include "RefoldOwnerStateProof.h"
 #include "RefoldLineControlProof.h"
 #include "RefoldMacroStateProof.h"
+#include "RefoldSourceGraphProof.h"
 #include "FinalLineControlModel.h"
 
 #include "clang/Basic/SourceLocation.h"
@@ -138,89 +140,7 @@ struct LexBoundaryToken {
   size_t End = 0;
 };
 
-static bool isSafeSourceGraphIncludePathChar(char c) {
-  return std::isalnum(static_cast<unsigned char>(c)) || c == '_' ||
-         c == '-' || c == '.' || c == '/';
-}
-
-/// Return true when \p path uses only the restricted ASCII include-path
-/// spelling alphabet that the refolder is willing to synthesize or replay.
-///
-/// This is intentionally a spelling-level predicate, not a filesystem proof:
-/// callers still have to replay the operand from the final source surface and
-/// compare the selected physical file / observer spelling against producer
-/// metadata.  Keeping the low-level spelling check in one helper prevents the
-/// include-replay and source-graph paths from drifting apart as new candidate
-/// classes are added.
-static bool hasSafeIncludePathSpelling(StringRef path) {
-  return !path.empty() && !path.contains('\\') && !path.contains('"') &&
-         llvm::all_of(path, [](char c) {
-           return isSafeSourceGraphIncludePathChar(c);
-         });
-}
-
-/// Validate slash-separated include operand components under the exact policy
-/// requested by the caller.
-///
-/// * \p allowAbsolute permits the leading empty component of an absolute path.
-/// * \p allowDotComponents permits `.` and `..` components for replay-only
-///   operands.  Synthesized relative rewrite operands keep this disabled so
-///   emitted includes cannot escape the final surface by construction.
-static bool hasValidIncludePathComponents(StringRef path, bool allowAbsolute,
-                                          bool allowDotComponents) {
-  SmallVector<StringRef, 8> components;
-  path.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
-  const bool isAbsolute = llvm::sys::path::is_absolute(path);
-  if (isAbsolute && !allowAbsolute)
-    return false;
-
-  for (auto indexed : llvm::enumerate(components)) {
-    StringRef component = indexed.value();
-    if (component.empty()) {
-      if (allowAbsolute && isAbsolute && indexed.index() == 0)
-        continue;
-      return false;
-    }
-    if (!allowDotComponents && (component == "." || component == ".."))
-      return false;
-  }
-  return true;
-}
-
-/// Path-only predicate for relative operands the refolder may emit as a
-/// synthesized relative include rewrite.  These are stricter than replay
-/// operands: no absolute path, empty component, `.`, or `..` is accepted.
-static bool safeSynthesizedRelativeIncludeOperandPath(StringRef path) {
-  return hasSafeIncludePathSpelling(path) &&
-         hasValidIncludePathComponents(path, /*allowAbsolute=*/false,
-                                       /*allowDotComponents=*/false);
-}
-
-/// Return the quoted include operand as a safe relative path for automatic
-/// source-graph side output.
-///
-/// The automatic source-graph backend writes files beside `--out` using the
-/// original quoted include spelling.  That is only safe for simple relative
-/// include names.  Angle includes, absolute paths, backslashes, quotes, empty
-/// components, and `.`/`..` components stay in the normal single-output
-/// materialization path.
-static std::optional<std::string>
-safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &inc) {
-  if (inc.angled)
-    return std::nullopt;
-
-  StringRef target = inc.target;
-  if (target.size() < 2 || target.front() != '"' || target.back() != '"')
-    return std::nullopt;
-
-  StringRef path = target.drop_front().drop_back();
-  if (!safeSynthesizedRelativeIncludeOperandPath(path))
-    return std::nullopt;
-
-  return path.str();
-}
-
-static bool isSourceGraphDirectiveHorizontalWhitespace(char c) {
+static bool isIncludeDirectiveHorizontalWhitespace(char c) {
   return c == '\r' || stringutils::isNonNewlineWs(c);
 }
 
@@ -241,7 +161,7 @@ static bool consumeIncludeDirectiveEscapedNewline(StringRef text,
 
   size_t cursor = pos + 1;
   while (cursor < text.size() &&
-         isSourceGraphDirectiveHorizontalWhitespace(text[cursor]))
+         isIncludeDirectiveHorizontalWhitespace(text[cursor]))
     ++cursor;
   if (cursor >= text.size())
     return false;
@@ -261,7 +181,7 @@ static bool consumeIncludeDirectiveEscapedNewline(StringRef text,
 
 static bool skipIncludeDirectiveHorizontalTrivia(StringRef text, size_t &pos) {
   while (pos < text.size()) {
-    if (isSourceGraphDirectiveHorizontalWhitespace(text[pos])) {
+    if (isIncludeDirectiveHorizontalWhitespace(text[pos])) {
       ++pos;
       continue;
     }
@@ -352,264 +272,6 @@ findIncludeDirectiveHeaderOperandRange(StringRef directive,
     return std::nullopt;
 
   return IncludeDirectiveHeaderOperandRange{pos, pos + expectedTarget.size()};
-}
-
-static bool consumeDirectiveScannerNewline(StringRef text, size_t &pos) {
-  if (pos >= text.size())
-    return false;
-  if (text[pos] == '\r') {
-    ++pos;
-    if (pos < text.size() && text[pos] == '\n')
-      ++pos;
-    return true;
-  }
-  if (text[pos] == '\n') {
-    ++pos;
-    return true;
-  }
-  return false;
-}
-
-static bool consumeDirectiveScannerEscapedNewline(StringRef text,
-                                                  size_t &pos) {
-  if (pos >= text.size() || text[pos] != '\\')
-    return false;
-
-  size_t afterBackslash = pos + 1;
-  while (afterBackslash < text.size() &&
-         isSourceGraphDirectiveHorizontalWhitespace(text[afterBackslash]))
-    ++afterBackslash;
-  if (!consumeDirectiveScannerNewline(text, afterBackslash))
-    return false;
-
-  // Escaped-newline deletion removes the backslash-newline pair before
-  // directive recognition.  Clang also accepts horizontal whitespace before
-  // the newline as an extension, so the directive scanner consumes the same
-  // spelling that source-range extension treats as a splice.  Keep the caller's
-  // current logical-line state unchanged.
-  pos = afterBackslash;
-  return true;
-}
-
-/// Return the byte offset of the next preprocessing directive introducer.
-///
-/// This is intentionally a tiny preprocessing-aware scanner rather than a raw
-/// physical-line test.  Clang recognizes directives after deleting escaped
-/// newlines and after replacing comments with whitespace.  In particular,
-/// `#\\\ninclude` is `#include`, and a complete block comment may span a
-/// physical newline before the `#` that starts the directive.  Proof code that
-/// guards source-graph sidecars or macro-state motion must see the same
-/// directive boundary; otherwise it can preserve an include in the wrong lookup
-/// context or move macro state across an observing include.
-///
-/// Line comments are different: after escaped-newline deletion they consume the
-/// rest of the logical line, so a `#` inside `// ...` is not a directive
-/// introducer.  An
-/// unterminated block comment simply prevents later bytes from being observed as
-/// directives by this scanner; callers that need stronger recovery already fail
-/// closed at the proof site.
-static std::optional<size_t>
-findPreprocessingDirectiveIntroducer(StringRef text, size_t start = 0) {
-  bool onlyTriviaOnLogicalLine = true;
-  bool inBlockComment = false;
-  bool blockCommentStartedInDirectivePrefix = false;
-  size_t pos = start;
-
-  while (pos < text.size()) {
-    if (consumeDirectiveScannerEscapedNewline(text, pos))
-      continue;
-
-    if (inBlockComment) {
-      if (pos + 1 < text.size() && text[pos] == '*' && text[pos + 1] == '/') {
-        // A complete block comment is preprocessing whitespace.  Once the
-        // terminator is consumed, directive-prefix scanning must resume in
-        // the surrounding logical line; otherwise a real directive such as
-        // `/*\n*/#include` is hidden from macro-state and include-replay
-        // proofs.
-        pos += 2;
-        inBlockComment = false;
-        continue;
-      }
-      if (consumeDirectiveScannerNewline(text, pos)) {
-        // A newline inside a leading block comment still leaves the eventual
-        // comment replacement in directive-prefix trivia.  A newline inside a
-        // block comment that began after real source code does not retroactively
-        // make the following bytes directive-prefix trivia.
-        onlyTriviaOnLogicalLine = blockCommentStartedInDirectivePrefix;
-        continue;
-      }
-      ++pos;
-      continue;
-    }
-
-    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
-      blockCommentStartedInDirectivePrefix = onlyTriviaOnLogicalLine;
-      pos += 2;
-      inBlockComment = true;
-      continue;
-    }
-
-    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '/') {
-      pos += 2;
-      while (pos < text.size()) {
-        if (consumeDirectiveScannerEscapedNewline(text, pos))
-          continue;
-        if (consumeDirectiveScannerNewline(text, pos))
-          break;
-        ++pos;
-      }
-      onlyTriviaOnLogicalLine = true;
-      continue;
-    }
-
-    if (consumeDirectiveScannerNewline(text, pos)) {
-      onlyTriviaOnLogicalLine = true;
-      continue;
-    }
-
-    if (!onlyTriviaOnLogicalLine) {
-      ++pos;
-      continue;
-    }
-
-    if (isSourceGraphDirectiveHorizontalWhitespace(text[pos])) {
-      ++pos;
-      continue;
-    }
-
-    if (text[pos] == '#')
-      return pos;
-
-    onlyTriviaOnLogicalLine = false;
-    ++pos;
-  }
-
-  return std::nullopt;
-}
-
-/// Skip preprocessing whitespace after a directive introducer or keyword.
-/// Escaped newlines are ignored because preprocessing removes them before
-/// directive recognition.  Complete block comments are skipped as whitespace,
-/// including comments that span physical
-/// lines; Clang accepts constructs such as `#/*\n*/include` for the same
-/// reason.  Line comments are not skipped because they terminate the directive
-/// logical line.
-static bool skipDirectiveLogicalWhitespace(StringRef text, size_t &pos) {
-  while (pos < text.size()) {
-    if (isSourceGraphDirectiveHorizontalWhitespace(text[pos])) {
-      ++pos;
-      continue;
-    }
-    if (consumeDirectiveScannerEscapedNewline(text, pos))
-      continue;
-    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
-      pos += 2;
-      while (pos + 1 < text.size() &&
-             !(text[pos] == '*' && text[pos + 1] == '/')) {
-        if (consumeDirectiveScannerEscapedNewline(text, pos))
-          continue;
-        ++pos;
-      }
-      if (pos + 1 >= text.size())
-        return false;
-      pos += 2;
-      continue;
-    }
-    break;
-  }
-  return true;
-}
-
-static bool readDirectiveIdentifier(StringRef text, size_t &pos,
-                                    std::string &identifier) {
-  identifier.clear();
-  while (pos < text.size()) {
-    if (consumeDirectiveScannerEscapedNewline(text, pos))
-      continue;
-    const unsigned char c = static_cast<unsigned char>(text[pos]);
-    if (std::isalpha(c) || text[pos] == '_')
-      break;
-    return false;
-  }
-
-  while (pos < text.size()) {
-    if (consumeDirectiveScannerEscapedNewline(text, pos))
-      continue;
-    const unsigned char c = static_cast<unsigned char>(text[pos]);
-    if (!(std::isalnum(c) || text[pos] == '_'))
-      break;
-    identifier.push_back(text[pos]);
-    ++pos;
-  }
-
-  return !identifier.empty();
-}
-
-static bool lineHasPreprocessingDirectiveIntroducer(StringRef text) {
-  return findPreprocessingDirectiveIntroducer(text).has_value();
-}
-
-/// Classify whether a materialized include-owner expansion contains a surviving
-/// preprocessing include directive that could observe a generated source-graph
-/// sidecar written under \p sourceGraphPath.
-///
-/// A generated source-graph header is a path-level edit in the final replay
-/// surface.  If some other include owner is materialized into the TU and its
-/// materialized text still contains `#include "same/path.h"`, that nested
-/// include is no longer resolved relative to the original header's directory;
-/// it is replayed from the refolded TU output directory and will observe the
-/// sidecar.  Likewise, a non-literal include in materialized text cannot be
-/// proven not to expand to the sidecar path, so the source-graph proof must
-/// fail closed.
-enum class MaterializedIncludeReplayAlias {
-  None,
-  SamePath,
-  UnprovenInclude
-};
-
-static MaterializedIncludeReplayAlias classifyMaterializedIncludeReplayAlias(
-    StringRef materializedText, StringRef sourceGraphPath) {
-  size_t searchPos = 0;
-  while (std::optional<size_t> hash =
-             findPreprocessingDirectiveIntroducer(materializedText, searchPos)) {
-    size_t pos = *hash + 1;
-    searchPos = pos;
-
-    if (!skipDirectiveLogicalWhitespace(materializedText, pos))
-      return MaterializedIncludeReplayAlias::UnprovenInclude;
-
-    std::string keyword;
-    if (!readDirectiveIdentifier(materializedText, pos, keyword))
-      continue;
-    if (keyword != "include")
-      continue;
-
-    if (!skipDirectiveLogicalWhitespace(materializedText, pos))
-      return MaterializedIncludeReplayAlias::UnprovenInclude;
-
-    if (pos >= materializedText.size() || materializedText[pos] != '"')
-      return MaterializedIncludeReplayAlias::UnprovenInclude;
-
-    const size_t pathBegin = ++pos;
-    while (pos < materializedText.size() && materializedText[pos] != '"') {
-      // Keep this classifier conservative.  A quoted include whose operand
-      // itself uses a splice or reaches an unescaped newline is not a simple
-      // path-level equality proof, so source-graph replay must fail closed.
-      if (materializedText[pos] == '\\' || materializedText[pos] == '\n' ||
-          materializedText[pos] == '\r')
-        return MaterializedIncludeReplayAlias::UnprovenInclude;
-      ++pos;
-    }
-    if (pos >= materializedText.size())
-      return MaterializedIncludeReplayAlias::UnprovenInclude;
-
-    if (materializedText.slice(pathBegin, pos) == sourceGraphPath)
-      return MaterializedIncludeReplayAlias::SamePath;
-
-    searchPos = pos + 1;
-  }
-
-  return MaterializedIncludeReplayAlias::None;
 }
 
 /// Return the first non-comment raw token in \p text, if any.
@@ -9443,79 +9105,24 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return false;
   };
 
-  auto sourceGraphIncludePathIsUnaliasedOrCoherent =
-      [&](const RefoldModel::IncludeItem &inc, StringRef sourceGraphPath,
-          StringRef candidateBytes) {
-        // A source-graph output written under an original quoted include path
-        // is a path-level edit, not an include-site-local edit: every surviving
-        // `#include "that/path.h"` in the emitted TU will read the generated
-        // bytes.  Therefore preserving one include edge is admissible only when
-        // all same-path top-level include sites are either materialized away,
-        // or are themselves source-graph-preserved with exactly the same owner
-        // bytes.  Otherwise the sidecar would either change an untouched alias
-        // or create conflicting bytes for the same generated file.
-        for (const RefoldModel::IncludeItem &other : model_.GetIncludes()) {
-          if (other.id == inc.id)
-            continue;
-          if (other.parent || !PathsEqual(other.sitePath, tuPath))
-            continue;
-
-          std::optional<std::string> otherPath =
-              safeSourceGraphRelativeIncludePath(other);
-          if (!otherPath || StringRef(*otherPath) != sourceGraphPath)
-            continue;
-
-          auto otherExpansionIt = includeExpansion.find(other.id);
-          if (otherExpansionIt == includeExpansion.end()) {
-            return false;
-          }
-
-          if (!includeHasIncluderSuppliedLineControlMacroState(other)) {
-            // The alias is dirty but does not satisfy the source-graph proof,
-            // so the normal single-output path will materialize it into the TU.
-            // It will not survive as a same-path include edge.
-            continue;
-          }
-
-          if (StringRef(otherExpansionIt->second) != candidateBytes) {
-            return false;
-          }
-        }
-
-        for (const RefoldModel::IncludeItem &other : model_.GetIncludes()) {
-          if (other.id == inc.id)
-            continue;
-          if (other.parent || !PathsEqual(other.sitePath, tuPath))
-            continue;
-
-          auto otherExpansionIt = includeExpansion.find(other.id);
-          if (otherExpansionIt == includeExpansion.end())
-            continue;
-
-          const MaterializedIncludeReplayAlias replayAlias =
-              classifyMaterializedIncludeReplayAlias(otherExpansionIt->second,
-                                                     sourceGraphPath);
-          if (replayAlias == MaterializedIncludeReplayAlias::SamePath) {
-            return false;
-          }
-          if (replayAlias == MaterializedIncludeReplayAlias::UnprovenInclude) {
-            return false;
-          }
-        }
-
-        const MaterializedIncludeReplayAlias candidateReplayAlias =
-            classifyMaterializedIncludeReplayAlias(candidateBytes,
-                                                   sourceGraphPath);
-        if (candidateReplayAlias == MaterializedIncludeReplayAlias::SamePath) {
-          return false;
-        }
-        if (candidateReplayAlias ==
-            MaterializedIncludeReplayAlias::UnprovenInclude) {
-          return false;
-        }
-
-        return true;
+  auto sourceGraphPathsEqual = [&](StringRef a, StringRef b) {
+    return PathsEqual(a, b);
+  };
+  auto sourceGraphIncludeHasIncluderSuppliedLineControlMacroState =
+      [&](const RefoldModel::IncludeItem &item) {
+        return includeHasIncluderSuppliedLineControlMacroState(item);
       };
+  auto sourceGraphSubtreeHasLayoutOnlyMaterializationSeed =
+      [&](uint64_t includeId) {
+        return includeSubtreeHasLayoutOnlyMaterializationSeed(
+            includeSubtreeHasLayoutOnlyMaterializationSeed, includeId);
+      };
+  source_graph::SourceGraphProofInputs sourceGraphProofInputs{
+      model_, tuPath, includeExpansion};
+  source_graph::SourceGraphProofServices sourceGraphProofServices{
+      sourceGraphPathsEqual,
+      sourceGraphIncludeHasIncluderSuppliedLineControlMacroState,
+      sourceGraphSubtreeHasLayoutOnlyMaterializationSeed};
 
   auto recordRejectedSourceGraphCleanup =
       [&](const RefoldModel::IncludeItem &inc, StringRef sourceGraphPath,
@@ -9551,44 +9158,15 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (!sourceGraphOutputs_)
       return std::nullopt;
 
-    // This is intentionally narrower than "dirty header".  Most header edits
-    // in the existing single-output backend are supposed to materialize into
-    // the TU.  The source-graph path is selected only when the modified header
-    // contains producer-proven source line-control state whose operands depend
-    // on macro definitions supplied by the immediate includer.  Materializing
-    // that owner into the TU is token-sound, but it is no longer the most
-    // precise source-graph refolding because the header remains the owner of
-    // the repaired source line-control directive.
-    if (!includeHasIncluderSuppliedLineControlMacroState(inc))
-      return std::nullopt;
-
-    std::optional<std::string> sourceGraphPath =
-        safeSourceGraphRelativeIncludePath(inc);
-    if (!sourceGraphPath)
-      return std::nullopt;
-
-    if (includeSubtreeHasLayoutOnlyMaterializationSeed(
-            includeSubtreeHasLayoutOnlyMaterializationSeed, inc.id)) {
-      // Source-graph sidecars are path-level artifacts.  They can replace the
-      // bytes read from a header path, but they cannot realize an edit to the
-      // caller's PP layout at this particular include edge.  A byte-only raw
-      // layout hunk seeded from an include boundary is therefore an
-      // include-site-local obligation and must be emitted by replacing the
-      // include directive in the owner surface, not by writing a sidecar that
-      // every surviving same-path include would observe.
-      recordRejectedSourceGraphCleanup(inc, StringRef(*sourceGraphPath),
+    source_graph::SourceGraphOwnerPreservationPlan plan =
+        source_graph::planSourceGraphOwnerPreservation(
+            sourceGraphProofInputs, inc, candidateBytes,
+            sourceGraphProofServices);
+    if (plan.RejectedCleanupRelativePath) {
+      recordRejectedSourceGraphCleanup(inc, *plan.RejectedCleanupRelativePath,
                                        candidateBytes);
-      return std::nullopt;
     }
-
-    if (!sourceGraphIncludePathIsUnaliasedOrCoherent(
-            inc, StringRef(*sourceGraphPath), candidateBytes)) {
-      recordRejectedSourceGraphCleanup(inc, StringRef(*sourceGraphPath),
-                                       candidateBytes);
-      return std::nullopt;
-    }
-
-    return sourceGraphPath;
+    return plan.PreservedRelativePath;
   };
 
   // Apply TU-level include expansions by replacing the original `#include`
@@ -10857,7 +10435,7 @@ bool RefoldEngine::FunctionLikeInvocationAppearsInText(
 /// unsafe by default because conditionals, includes, and macro transitions have
 /// structural effects beyond token-level identifier observation.
 bool RefoldEngine::TextContainsDirectiveLine(StringRef text) const {
-  return lineHasPreprocessingDirectiveIntroducer(text);
+  return source_graph::lineHasPreprocessingDirectiveIntroducer(text);
 }
 
 std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,

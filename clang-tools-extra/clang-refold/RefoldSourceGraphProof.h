@@ -1,0 +1,129 @@
+//===--- RefoldSourceGraphProof.h -----------------------------*- C++ -*-===//
+//
+// Source-graph preservation proof helpers for clang-refold.
+//
+// This module decides whether a dirty include owner may remain represented as
+// a source-graph sidecar instead of being materialized into the refolded TU.
+// It is deliberately side-effect-free: it does not emit edits, mutate
+// RefoldEngine state, or write filesystem outputs.  Callers remain responsible
+// for acting on the returned plan.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDSOURCEGRAPHPROOF_H
+#define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDSOURCEGRAPHPROOF_H
+
+#include "RefoldModel.h"
+
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/StringRef.h"
+
+#include <cstdint>
+#include <optional>
+#include <string>
+
+namespace clang {
+namespace refold {
+namespace source_graph {
+
+/// A surviving include directive found inside materialized owner bytes, as
+/// classified for source-graph sidecar alias safety.
+enum class MaterializedIncludeReplayAlias {
+  /// No replayed include in the materialized text is relevant to the sidecar
+  /// path.
+  None,
+
+  /// The materialized text contains a literal quoted include of exactly the
+  /// sidecar path, so writing the sidecar would change that replay.
+  SamePath,
+
+  /// The materialized text contains an include directive whose operand cannot
+  /// be proven to avoid the sidecar path.  Source-graph preservation must fail
+  /// closed in this case.
+  UnprovenInclude
+};
+
+/// Immutable source-graph facts consumed by the proof layer.
+///
+/// The proof module receives these as explicit inputs instead of reaching back
+/// into RefoldEngine.  They describe the already-computed model and include
+/// materialization bytes; they do not authorize mutation of source-graph output
+/// records, edit maps, fallback state, or filesystem contents.
+struct SourceGraphProofInputs {
+  const RefoldModel &Model;
+  llvm::StringRef TuPath;
+  const llvm::DenseMap<uint64_t, std::string> &IncludeExpansion;
+};
+
+/// Read-only services supplied by RefoldEngine for policy decisions that still
+/// depend on engine-local proof facts.  These callbacks must not mutate engine
+/// state, emit edits, request fallbacks, recurse materialization, or write
+/// source-graph outputs.
+struct SourceGraphProofServices {
+  /// Compare two source paths using the engine's existing path-equality policy.
+  llvm::function_ref<bool(llvm::StringRef, llvm::StringRef)> PathsEqual;
+
+  /// Return true when the include has producer-proven source line-control state
+  /// whose macro operands are supplied by the immediate includer.
+  llvm::function_ref<bool(const RefoldModel::IncludeItem &)>
+      IncludeHasIncluderSuppliedLineControlMacroState;
+
+  /// Return true when this include subtree carries an include-site-local layout
+  /// materialization obligation that a path-level sidecar cannot discharge.
+  llvm::function_ref<bool(uint64_t)>
+      IncludeSubtreeHasLayoutOnlyMaterializationSeed;
+};
+
+/// Decision returned by source-graph owner preservation planning.
+struct SourceGraphOwnerPreservationPlan {
+  /// Relative sidecar path to emit when the include may remain a source-graph
+  /// owner.  Empty means the caller must use the normal materialization path.
+  std::optional<std::string> PreservedRelativePath;
+
+  /// Relative sidecar path that the driver may clean up if it still contains
+  /// exactly the rejected bytes.  This is only bookkeeping for stale sidecars;
+  /// the proof module does not delete or write files.
+  std::optional<std::string> RejectedCleanupRelativePath;
+};
+
+/// Return the quoted include operand as a safe relative path for automatic
+/// source-graph side output, if the include spelling satisfies the narrow
+/// no-escape path policy.
+std::optional<std::string>
+safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &Include);
+
+/// True when Text contains a preprocessing directive introducer after applying
+/// the small amount of preprocessing needed for directive recognition by this
+/// proof layer: escaped-newline deletion and comment-as-whitespace treatment.
+bool lineHasPreprocessingDirectiveIntroducer(llvm::StringRef Text);
+
+/// Classify whether materialized include-owner bytes contain a surviving
+/// preprocessing include directive that could observe a generated source-graph
+/// sidecar written under SourceGraphPath.
+MaterializedIncludeReplayAlias classifyMaterializedIncludeReplayAlias(
+    llvm::StringRef MaterializedText, llvm::StringRef SourceGraphPath);
+
+/// Return true when preserving Include as a source-graph sidecar under
+/// SourceGraphPath cannot conflict with another top-level same-path include or
+/// with a surviving include directive inside materialized owner bytes.
+bool sourceGraphIncludePathIsUnaliasedOrCoherent(
+    const SourceGraphProofInputs &Inputs,
+    const RefoldModel::IncludeItem &Include,
+    llvm::StringRef SourceGraphPath, llvm::StringRef CandidateBytes,
+    const SourceGraphProofServices &Services);
+
+/// Decide whether Include may remain a source-graph owner.  The returned plan
+/// contains either an emitted sidecar path, a cleanup-only rejected sidecar
+/// path, or neither.  This is a pure planning helper; the caller owns all state
+/// mutation and filesystem policy.
+SourceGraphOwnerPreservationPlan planSourceGraphOwnerPreservation(
+    const SourceGraphProofInputs &Inputs,
+    const RefoldModel::IncludeItem &Include, llvm::StringRef CandidateBytes,
+    const SourceGraphProofServices &Services);
+
+} // namespace source_graph
+} // namespace refold
+} // namespace clang
+
+#endif // LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDSOURCEGRAPHPROOF_H

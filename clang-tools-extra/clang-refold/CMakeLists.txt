@@ -6,6 +6,7 @@ add_clang_tool(clang-refold
   FinalLineControlModel.cpp
   LineDirectiveInserter.cpp
   RefoldEngine.cpp
+  RefoldIncludePathProof.cpp
   RefoldIncludeReplayProof.cpp
   RefoldProofLattice.cpp
   RefoldTerminalProof.cpp
@@ -13,6 +14,8 @@ add_clang_tool(clang-refold
   RefoldLineControlProof.cpp
   RefoldMacroStateProof.cpp
   RefoldSidebandReplayProof.cpp
+  RefoldSourceGraphProof.cpp
+  RefoldSourceGraphWriter.cpp
   RefoldModel.cpp
   StringUtils.cpp
 )

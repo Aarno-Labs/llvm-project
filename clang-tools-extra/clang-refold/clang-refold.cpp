@@ -62,6 +62,7 @@
 #include "RefoldLog.h"
 #include "RefoldEngine.h"
 #include "RefoldSchema.h"
+#include "RefoldSourceGraphWriter.h"
 #include "StringUtils.h"
 #include "DiffAlgorithms.h"
 
@@ -3411,142 +3412,6 @@ static Error compareTokensNoLinesAware(ArrayRef<PPTok> aToks,
   return Error::success();
 }
 
-static bool pathSpellingMatchesAfterAbsolute(StringRef a, StringRef b) {
-  if (a.empty() || b.empty())
-    return false;
-
-  SmallString<256> absA(a);
-  SmallString<256> absB(b);
-  if (std::error_code ec = sys::fs::make_absolute(absA))
-    return false;
-  if (std::error_code ec = sys::fs::make_absolute(absB))
-    return false;
-  sys::path::remove_dots(absA, /*remove_dot_dot=*/true);
-  sys::path::remove_dots(absB, /*remove_dot_dot=*/true);
-  return absA == absB;
-}
-
-/// Write modified include-owner files required by automatic source-graph
-/// refolding, and remove stale generated files from paths that this run proved
-/// are no longer admissible.
-///
-/// Source-graph sidecars are part of the checker-visible replay surface because
-/// quoted include lookup searches the directory containing the emitted `.c.mod`
-/// before the captured `-I` paths.  Therefore a sidecar emitted by an older run
-/// must not be allowed to shadow the original header after the current proof
-/// has fallen back to TU materialization.
-///
-/// Cleanup entries are intentionally conservative: the driver removes a stale
-/// file only when the existing bytes exactly match the rejected generated owner
-/// bytes and the path is not the producer-resolved input header.  This lets the
-/// backend clean up its own obsolete artifacts without deleting arbitrary user
-/// headers that happen to sit beside `--out`.
-static void writeSourceGraphOutputs(StringRef modifiedSrcPath,
-                                    ArrayRef<SourceGraphOutput> outputs) {
-  SmallString<256> outputDir(modifiedSrcPath);
-  sys::path::remove_filename(outputDir);
-  if (outputDir.empty())
-    outputDir = ".";
-
-  auto validateRelativePath = [](StringRef rel) {
-    SmallVector<StringRef, 8> components;
-    rel.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
-    const bool hasUnsafeComponent = llvm::any_of(components, [](StringRef c) {
-      return c.empty() || c == "." || c == "..";
-    });
-    return !rel.empty() && !sys::path::is_absolute(rel) &&
-           !hasUnsafeComponent && !rel.contains('\\') && !rel.contains('"');
-  };
-
-  std::map<std::string, SourceGraphOutput> cleanupOutputs;
-  std::map<std::string, std::string> uniqueOutputs;
-  for (const SourceGraphOutput &output : outputs) {
-    StringRef rel(output.relativePath);
-    if (!validateRelativePath(rel))
-      REFOLD_LOG_FATAL("source-graph/write",
-            "refusing unsafe source-graph output path: {0}",
-            output.relativePath);
-
-    if (output.cleanupOnly) {
-      // Multiple rejected include sites can point at the same stale sidecar.
-      // Keeping the first candidate is enough: cleanup is byte-exact, so a
-      // nonmatching file is left alone rather than guessed about.
-      cleanupOutputs.insert({output.relativePath, output});
-      continue;
-    }
-
-    auto [it, inserted] =
-        uniqueOutputs.insert({output.relativePath, output.bytes});
-    if (!inserted && it->second != output.bytes)
-      REFOLD_LOG_FATAL("source-graph/write",
-            "conflicting source-graph contents for path: {0}",
-            output.relativePath);
-  }
-
-  for (const auto &entry : cleanupOutputs) {
-    if (uniqueOutputs.count(entry.first))
-      continue;
-
-    const SourceGraphOutput &cleanup = entry.second;
-    SmallString<256> path(outputDir);
-    sys::path::append(path, entry.first);
-
-    if (!cleanup.resolvedPath.empty() &&
-        pathSpellingMatchesAfterAbsolute(path, cleanup.resolvedPath)) {
-      REFOLD_LOG_DEBUG("source-graph/write",
-            "skip stale cleanup for {0}: output path names producer header {1}",
-            path, cleanup.resolvedPath);
-      continue;
-    }
-
-    auto existingOrErr = MemoryBuffer::getFile(path);
-    if (!existingOrErr)
-      continue;
-
-    if ((*existingOrErr)->getBuffer() != cleanup.bytes) {
-      REFOLD_LOG_DEBUG("source-graph/write",
-            "leave possible stale source-graph file {0}: bytes no longer match "
-            "rejected generated body for include #{1}",
-            path, cleanup.includeId);
-      continue;
-    }
-
-    if (std::error_code ec = sys::fs::remove(path))
-      REFOLD_LOG_FATAL("source-graph/write",
-            "cannot remove stale source-graph file {0}: {1}", path,
-            ec.message());
-    REFOLD_LOG_INFO("finished", "removed stale source-graph header: {0}", path);
-  }
-
-  for (const auto &entry : uniqueOutputs) {
-    SmallString<256> path(outputDir);
-    sys::path::append(path, entry.first);
-
-    if (auto existingOrErr = MemoryBuffer::getFile(path)) {
-      if ((*existingOrErr)->getBuffer() != entry.second)
-        REFOLD_LOG_FATAL("source-graph/write",
-              "refusing to overwrite existing different source-graph file: {0}",
-              path);
-      REFOLD_LOG_INFO("finished", "source-graph header already up to date: {0}", path);
-      continue;
-    }
-
-    SmallString<256> parent(path);
-    sys::path::remove_filename(parent);
-    if (std::error_code ec = sys::fs::create_directories(parent))
-      REFOLD_LOG_FATAL("source-graph/write", "cannot create {0}: {1}", parent,
-            ec.message());
-
-    std::error_code ec;
-    raw_fd_ostream os(path, ec, sys::fs::OF_Text);
-    if (ec)
-      REFOLD_LOG_FATAL("source-graph/write", "cannot write {0}: {1}", path, ec.message());
-    os << entry.second;
-    os.close();
-    REFOLD_LOG_INFO("finished", "wrote source-graph header: {0}", path);
-  }
-}
-
 /// Write the optional materialized-edit map as stable, human-readable JSON.
 ///
 /// The schema is deliberately small: each entry records one materialized edit
@@ -3968,7 +3833,9 @@ int main(int argc, char **argv) {
   os.close();
   REFOLD_LOG_INFO("finished", "wrote refolded C source: {0}", ModifiedSrcPath);
 
-  writeSourceGraphOutputs(ModifiedSrcPath, sourceGraphOutputs);
+  writeSourceGraphOutputs(
+      sourceGraphOutputs,
+      makeSourceGraphWriteOptionsForModifiedSourcePath(ModifiedSrcPath));
 
   if (emitEditMap) {
     writeMaterializedEditMap(EmitEditMapPath.getValue(), PPModPath,
