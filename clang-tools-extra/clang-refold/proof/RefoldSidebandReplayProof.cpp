@@ -3,20 +3,20 @@
 // Sideband pragma replay proof and validation helpers.
 //
 // This file deliberately contains no RefoldEngine mutation or TextEdit staging:
-// callers provide already-classified sideband proof records and receive either a
-// structural validation failure, a replay-stripped payload, or a B-byte witness
-// envelope.  The sideband validation reporter records classified terminal
-// fallback requests through RefoldTerminalProofSink so TU and include paths share
-// the same fail-closed policy.
+// callers provide already-classified sideband proof records and receive either
+// a structural validation failure, a replay-stripped payload, or a B-byte
+// witness envelope.  The sideband validation reporter records classified
+// terminal fallback requests through RefoldTerminalProofSink so TU and include
+// paths share the same fail-closed policy.
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLog.h"
 #include "proof/RefoldSidebandReplayProof.h"
+#include "core/RefoldLog.h"
 #include "proof/RefoldTerminalProofSink.h"
 
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FormatVariadic.h"
 
 #include <algorithm>
@@ -140,9 +140,10 @@ std::string stripSeparatelyOwnedSidebandReplay(
       continue;
     if (!merged.empty() && range.begin < merged.back().end)
       REFOLD_LOG_FATAL("pragma/sideband",
-            "overlapping separately-owned sideband replay ranges "
-            "[{0},{1}) and [{2},{3})",
-            merged.back().begin, merged.back().end, range.begin, range.end);
+                       "overlapping separately-owned sideband replay ranges "
+                       "[{0},{1}) and [{2},{3})",
+                       merged.back().begin, merged.back().end, range.begin,
+                       range.end);
     if (!merged.empty() && range.begin == merged.back().end) {
       merged.back().end = range.end;
       continue;
@@ -154,8 +155,9 @@ std::string stripSeparatelyOwnedSidebandReplay(
   out.reserve(replayText.size());
   uint64_t cursor = 0;
   for (const RemovalRange &range : merged) {
-    out.append(replayText.slice(static_cast<size_t>(cursor),
-                                static_cast<size_t>(range.begin))
+    out.append(replayText
+                   .slice(static_cast<size_t>(cursor),
+                          static_cast<size_t>(range.begin))
                    .str());
     cursor = range.end;
   }

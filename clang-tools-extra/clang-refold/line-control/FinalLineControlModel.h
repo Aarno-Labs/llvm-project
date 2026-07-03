@@ -2,15 +2,22 @@
 //
 // Final-stream line-control proof and pruning support for clang-refold.
 //
-// Generation sites record typed obligations for each synthetic line-control
-// directive, and the fixed-point pruner discharges a deletion only when the
-// compact proof data and executable validation agree that removing that exact
-// final-stream range preserves the accepted preprocessed output.
+// Compact final-line-control proofs, plus executable validation, are the
+// pruning authority. Generation sites carry the typed obligation that explains
+// why a directive exists, while the fixed-point pruner discharges physical
+// deletion only when validation proves that removing that exact final-stream
+// range preserves the accepted preprocessed output.
+//
+// This header also exposes `buildFinalLineControlValidationCallback`, the
+// factory that constructs the executable preprocessing oracle the pruner
+// consumes for each proposed `#line` deletion.
 //
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_FINALLINECONTROLMODEL_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_FINALLINECONTROLMODEL_H
+
+#include "core/RefoldModel.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
@@ -26,6 +33,8 @@
 namespace clang {
 namespace refold {
 
+class RefoldTheoremAudit;
+
 /// Physical source-owner identity associated with a final-stream line-control
 /// fact.
 ///
@@ -40,16 +49,15 @@ struct FinalLineControlOwnerKey {
   FinalLineControlOwnerKey() = default;
   FinalLineControlOwnerKey(std::string physicalFile,
                            std::optional<uint64_t> ownerIncludeId)
-      : physicalFile(std::move(physicalFile)),
-        ownerIncludeId(ownerIncludeId) {}
+      : physicalFile(std::move(physicalFile)), ownerIncludeId(ownerIncludeId) {}
 };
 
 /// Byte-accurate mapping from a final-output slice back to the physical source
 /// bytes it copied verbatim.
 ///
-/// Source mappings are still maintained by the engine so downstream materialized
-/// ranges can be shifted deterministically after a deletion.  They no longer
-/// feed a final-stream observer/layout scanner.
+/// Source mappings are still maintained by the engine so downstream
+/// materialized ranges can be shifted deterministically after a deletion.  They
+/// no longer feed a final-stream observer/layout scanner.
 struct FinalLineControlSourceMapping {
   uint64_t finalBegin = 0;
   uint64_t finalEnd = 0;
@@ -104,6 +112,7 @@ enum class FinalLineControlObligation : uint8_t {
   DominatedSyntheticDirective,
 };
 
+/// Return a stable diagnostic spelling for a final-line-control obligation.
 const char *toString(FinalLineControlObligation obligation);
 
 /// Whether deletion of an exact final-stream directive has been discharged.
@@ -117,15 +126,16 @@ enum class FinalLineControlRemovalVerdict : uint8_t {
   Required,
 };
 
+/// Return a stable diagnostic spelling for a final-line-control removal
+/// verdict.
 const char *toString(FinalLineControlRemovalVerdict verdict);
 
 /// The theorem class that discharged physical deletion of a directive.
 ///
-/// `ValidationPreservedEquivalence` is the authoritative deletion discharge:
-/// after a typed obligation admits the candidate, executable validation proves
-/// the exact deletion preserves the accepted `-E -P` output.  The other values
-/// are retained only as serialized diagnostic categories for existing proof
-/// records.
+/// Observer/layout discharge values identify diagnostic provenance for
+/// already-created artifacts, while `ValidationPreservedEquivalence` is the
+/// live authority: after a typed obligation admits the candidate, executable
+/// validation proves the exact deletion preserves the accepted `-E -P` output.
 enum class FinalLineControlRemovalDischarge : uint8_t {
   None,
   ObserverAndLayoutDead,
@@ -135,6 +145,8 @@ enum class FinalLineControlRemovalDischarge : uint8_t {
   ValidationPreservedEquivalence,
 };
 
+/// Return a stable diagnostic spelling for a final-line-control removal
+/// discharge class.
 const char *toString(FinalLineControlRemovalDischarge discharge);
 
 /// Compact proof/provenance record for why a final-stream line-control
@@ -159,22 +171,31 @@ struct FinalLineControlRemovalProof {
   bool producerProven = false;
 };
 
+/// Return whether two optional physical-owner keys describe the same final
+/// line-control proof owner.
 bool SameFinalLineControlOwner(
     const std::optional<FinalLineControlOwnerKey> &lhs,
     const std::optional<FinalLineControlOwnerKey> &rhs);
 
+/// Return whether two optional obligation proofs are identical for final
+/// line-control deduplication.
 bool SameFinalLineControlObligationProof(
     const std::optional<FinalLineControlObligationProof> &lhs,
     const std::optional<FinalLineControlObligationProof> &rhs);
 
+/// Return whether two optional removal proofs are identical for final
+/// line-control deduplication.
 bool SameFinalLineControlRemovalProof(
     const std::optional<FinalLineControlRemovalProof> &lhs,
     const std::optional<FinalLineControlRemovalProof> &rhs);
 
+/// Build a compact obligation proof for one final-stream line-control
+/// directive.
 FinalLineControlObligationProof MakeFinalLineControlObligationProof(
     FinalLineControlObligation obligation, FinalLineDirective::Origin origin,
     std::optional<FinalLineControlOwnerKey> physicalOwner, bool producerProven);
 
+/// Build a compact removal proof for one final-stream line-control directive.
 FinalLineControlRemovalProof MakeFinalLineControlRemovalProof(
     FinalLineControlRemovalVerdict verdict, FinalLineDirective::Origin origin,
     std::optional<FinalLineControlOwnerKey> physicalOwner, bool producerProven,
@@ -197,13 +218,14 @@ struct FinalLineControlPruneCandidate {
 };
 
 FinalLineControlPruneCandidate MakeFinalLineControlPruneCandidate(
-    uint64_t finalBegin, uint64_t finalEnd,
-    FinalLineDirective::Origin origin,
+    uint64_t finalBegin, uint64_t finalEnd, FinalLineDirective::Origin origin,
     std::optional<FinalLineControlOwnerKey> physicalOwner, bool producerProven,
     FinalLineControlObligation obligation,
     FinalLineControlRemovalVerdict removalVerdict =
         FinalLineControlRemovalVerdict::NotProven);
 
+/// Return whether a pruning candidate carries both compact proof records
+/// required by the fixed-point pruner.
 bool HasCompleteFinalLineControlProof(
     const FinalLineControlPruneCandidate &candidate);
 
@@ -231,8 +253,10 @@ struct FinalLineControlAuthorityContract {
   }
 };
 
+/// Return the static final-line-control pruning authority contract.
 FinalLineControlAuthorityContract getFinalLineControlAuthorityContract();
 
+/// Result of one deterministic fixed-point final-line-control pruning run.
 struct FinalLineControlPruneResult {
   std::string output;
   uint32_t iterations = 0;
@@ -242,9 +266,9 @@ struct FinalLineControlPruneResult {
 };
 
 /// Optional executable oracle for a proposed final-stream #line deletion.
-using FinalLineControlValidationCallback = std::function<bool(
-    llvm::StringRef currentOutput, llvm::StringRef candidateOutput,
-    std::string &reason)>;
+using FinalLineControlValidationCallback =
+    std::function<bool(llvm::StringRef currentOutput,
+                       llvm::StringRef candidateOutput, std::string &reason)>;
 
 /// Run deterministic fixed-point pruning over explicit final-stream
 /// line-control candidates.
@@ -260,6 +284,42 @@ FinalLineControlPruneResult PruneFinalLineControlDirectives(
         llvm::ArrayRef<FinalLineControlPruneCandidate>(),
     FinalLineControlValidationCallback validationCallback =
         FinalLineControlValidationCallback());
+
+/// Build the executable oracle that validates one proposed final-stream
+/// `#line` deletion.
+///
+/// The returned callback is consumed by `RefoldEngine::Refold` and ultimately
+/// by the final-line-control pruner.  It re-invokes the producer-recorded
+/// preprocessor on the current accepted final source and the candidate final
+/// source using one stable temporary path located beside \p outputPath, so
+/// `__FILE__` and quoted-include lookup remain comparable across both inputs.
+/// Byte-for-byte preprocessor equivalence is accepted first; otherwise the
+/// callback falls back to token-sequence equality, which is the same oracle
+/// `--check` uses.
+FinalLineControlValidationCallback buildFinalLineControlValidationCallback(
+    llvm::StringRef outputPath, const RefoldModel::PreprocessContext &ctx);
+
+/// Audit the authority contract returned by the final-line-control pruner.
+///
+/// Reports a no-legacy audit finding for each pillar of the authority contract
+/// (compact removal proof, fixed-point pruning, validation callback) that is
+/// not marked authoritative.  Returns the contract's
+/// `IsClosedUnderCompactProofs` verdict so the caller can fail closed when a
+/// strict run has lost authority over the final pruning pass.
+bool AuditFinalLineControlAuthorityContract(
+    const RefoldTheoremAudit &audit,
+    const FinalLineControlAuthorityContract &authority, llvm::StringRef role);
+
+/// Audit the compact-proof population of \p candidates before fixed-point
+/// pruning runs.
+///
+/// Counts candidates that lack a complete obligation/removal proof and reports
+/// one no-legacy finding when any are missing.  Returns true iff every
+/// candidate carries the compact proof records the pruner needs.
+bool AuditFinalLineControlRemovalProofPopulation(
+    const RefoldTheoremAudit &audit,
+    llvm::ArrayRef<FinalLineControlPruneCandidate> candidates,
+    llvm::StringRef role);
 
 } // namespace refold
 } // namespace clang

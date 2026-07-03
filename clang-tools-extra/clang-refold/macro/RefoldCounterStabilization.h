@@ -35,6 +35,12 @@
 namespace clang {
 namespace refold {
 
+class RefoldMacroPatchPlanner;
+class RefoldOwnerStateProof;
+class RefoldProofLattice;
+class RefoldSourceMapper;
+class RefoldStructuralHunkDispatcher;
+
 /// Plans forced macro materializations required to keep `__COUNTER__` stable.
 ///
 /// The planner is intentionally read-only and deterministic.  It owns the
@@ -60,7 +66,8 @@ public:
   ComputeForcedCounterPatches(llvm::StringRef tuPath,
                               llvm::ArrayRef<int64_t> a2b) const;
 
-  /// Compute forced expansions caused by callsites that already remain expanded.
+  /// Compute forced expansions caused by callsites that already remain
+  /// expanded.
   ///
   /// This catches the case where ordinary hunk attribution selected an expanded
   /// macro realization whose expansion consumes `__COUNTER__`.  The first such
@@ -76,9 +83,8 @@ private:
   llvm::SmallVector<CounterOccurrence, 32>
   CollectCounterOccurrences(llvm::StringRef tuPath) const;
 
-  static void SortCounterOccurrences(
-      llvm::SmallVectorImpl<CounterOccurrence> &occs);
-
+  static void
+  SortCounterOccurrences(llvm::SmallVectorImpl<CounterOccurrence> &occs);
 
   const RefoldModel &model_;
   llvm::ArrayRef<PPTok> aToks_;
@@ -86,6 +92,25 @@ private:
   const RefoldMacroTopology &macroTopology_;
   const RefoldOwnerClassifier &ownerClassifier_;
 };
+
+/// Inject forced `__COUNTER__` stabilization macro patches after normal hunk
+/// attribution.
+///
+/// Each request names the smallest patchable callsite that must remain
+/// expanded.  For `__COUNTER__` itself the replacement is the B-side spelling
+/// of the specific A occurrence; for enclosing macro invocations the
+/// replacement is the whole-cover expansion text.  Every emitted patch is
+/// certified with the explicit `CounterLiteral` proof class and a typed
+/// state-stability witness, and staged through the dispatcher under the
+/// coalesced physical-invocation-span key shared with normal hunk attribution.
+void applyForcedCounterPatches(
+    llvm::ArrayRef<ForcedMacroPatchRequest> forced, llvm::ArrayRef<PPTok> bToks,
+    const RefoldSourceMapper &sourceMapper,
+    const RefoldMacroTopology &macroTopology,
+    const RefoldMacroPatchPlanner &macroPatchPlanner,
+    const RefoldProofLattice &proofLattice,
+    const RefoldOwnerStateProof &ownerStateProof,
+    RefoldStructuralHunkDispatcher &structuralHunkDispatcher);
 
 } // namespace refold
 } // namespace clang

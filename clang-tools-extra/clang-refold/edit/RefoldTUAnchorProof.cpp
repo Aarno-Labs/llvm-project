@@ -3,16 +3,14 @@
 // TU-anchor accepted-result proof construction.
 //
 // This file intentionally contains only the TU-anchor subset of the accepted
-// carrier builder that used to live in RefoldProofLattice.  It is not a general
-// proof lattice: it does not compare candidates, assemble text edits, or decide
-// whether an A/B hunk belongs to the TU.  Its job is to stamp a local
-// TUAnchorWitness into the normalized AcceptedResultCandidate shape used by the
-// existing selector/audit machinery.
+// carrier builder.  It is not a general proof lattice: it does not compare
+// candidates, assemble text edits, or decide whether an A/B hunk belongs to the
+// TU.  Its job is to certify a local TUAnchorWitness into the normalized
+// AcceptedResultCandidate shape used by the existing selector/audit machinery.
 //
 //===----------------------------------------------------------------------===//
 
 #include "edit/RefoldTUAnchorProof.h"
-#include "proof/RefoldProofDischarge.h"
 #include "proof/RefoldTheoremAudit.h"
 
 #include "llvm/Support/FormatVariadic.h"
@@ -49,8 +47,8 @@ bool tuAnchorWitnessHasProvableEvidence(const TUAnchorWitness &witness) {
 
 namespace {
 
-AcceptancePathInventory buildTUAnchorAcceptancePathInventory(
-    AcceptedPathKind currentPath) {
+AcceptancePathInventory
+buildTUAnchorAcceptancePathInventory(AcceptedPathKind currentPath) {
   AcceptancePathInventory inventory;
   inventory.currentPath = currentPath;
 
@@ -196,7 +194,8 @@ void configureTUAnchorProofSummary(ProofSummary &summary) {
   summary.primaryProofClassExplicit = true;
 }
 
-GlobalSelectionLattice buildTUAnchorSelectionLattice(const ProofSummary &summary) {
+GlobalSelectionLattice
+buildTUAnchorSelectionLattice(const ProofSummary &summary) {
   GlobalSelectionLattice lattice;
   switch (summary.inventory.currentPath) {
   case AcceptedPathKind::TUExactSlotBoundary:
@@ -234,8 +233,8 @@ GlobalSelectionLattice buildTUAnchorSelectionLattice(const ProofSummary &summary
   return lattice;
 }
 
-CompletenessContract buildTUAnchorCompletenessContract(
-    const ProofSummary &summary) {
+CompletenessContract
+buildTUAnchorCompletenessContract(const ProofSummary &summary) {
   CompletenessContract contract;
   if (summary.inventory.futureTarget != FutureProofTarget::Unknown &&
       summary.inventory.support == AcceptanceSupportKind::ExplicitProofBacked) {
@@ -248,14 +247,15 @@ CompletenessContract buildTUAnchorCompletenessContract(
   }
   if (summary.inventory.currentPath != AcceptedPathKind::Unknown) {
     contract.coverage = CompletenessCoverageKind::TransitionalGap;
-    contract.expectation = CompletenessExpectationKind::NoClaimPendingClassClosure;
+    contract.expectation =
+        CompletenessExpectationKind::NoClaimPendingClassClosure;
     contract.declaredTarget = summary.inventory.futureTarget;
   }
   return contract;
 }
 
-TheoremDomainContract buildTUAnchorTheoremDomainContract(
-    const ProofSummary &summary) {
+TheoremDomainContract
+buildTUAnchorTheoremDomainContract(const ProofSummary &summary) {
   TheoremDomainContract contract;
   switch (summary.completeness.coverage) {
   case CompletenessCoverageKind::DeclaredProofClass:
@@ -281,8 +281,9 @@ TheoremDomainContract buildTUAnchorTheoremDomainContract(
   return contract;
 }
 
-EmittedProof buildEmittedProofFromTUAnchorSummary(
-    TheoremProofClass theoremClass, const ProofSummary &summary) {
+EmittedProof
+buildEmittedProofFromTUAnchorSummary(TheoremProofClass theoremClass,
+                                     const ProofSummary &summary) {
   EmittedProof proof;
   proof.theoremClass = theoremClass;
   proof.discharge = summary.discharge;
@@ -291,8 +292,8 @@ EmittedProof buildEmittedProofFromTUAnchorSummary(
   return proof;
 }
 
-std::optional<EmittedProof> buildCanonicalEmittedTUAnchorProof(
-    const ProofSummary &summary) {
+std::optional<EmittedProof>
+buildCanonicalEmittedTUAnchorProof(const ProofSummary &summary) {
   if (summary.inventory.currentPath == AcceptedPathKind::Unknown)
     return std::nullopt;
   if (summary.inventory.support != AcceptanceSupportKind::ExplicitProofBacked)
@@ -335,8 +336,8 @@ void finalizeTUAnchorProofSummary(ProofSummary &summary) {
   summary.emittedProof = buildCanonicalEmittedTUAnchorProof(summary);
 }
 
-ProofSummary buildAcceptedTUAnchorProofSummary(
-    AcceptedPathKind currentPath, const TUAnchorWitness &witness) {
+ProofSummary buildAcceptedTUAnchorProofSummary(AcceptedPathKind currentPath,
+                                               const TUAnchorWitness &witness) {
   ProofSummary summary;
   summary.inventory = buildTUAnchorAcceptancePathInventory(currentPath);
 
@@ -388,8 +389,7 @@ void refreshTUAnchorEmissionPathInventory(AcceptedResultCandidate &candidate) {
 
 } // namespace
 
-RefoldTUAnchorProof::RefoldTUAnchorProof(
-    const RefoldTheoremAudit &theoremAudit)
+RefoldTUAnchorProof::RefoldTUAnchorProof(const RefoldTheoremAudit &theoremAudit)
     : theoremAudit_(theoremAudit) {}
 
 AcceptedResultCandidate RefoldTUAnchorProof::BuildAcceptedTUAnchorCandidate(
@@ -400,7 +400,8 @@ AcceptedResultCandidate RefoldTUAnchorProof::BuildAcceptedTUAnchorCandidate(
   // TU anchors are selector candidates for insertion/frontier proofs. Preserve
   // the witness-derived gap/byte position so later diagnostics can report the
   // exact anchor that discharged the path.
-  candidate.proofSummary = buildAcceptedTUAnchorProofSummary(currentPath, witness);
+  candidate.proofSummary =
+      buildAcceptedTUAnchorProofSummary(currentPath, witness);
 
   if (witness.hasPPGap)
     candidate.begin = candidate.end = witness.ppGap;
@@ -453,11 +454,11 @@ AcceptedResultCandidate RefoldTUAnchorProof::BuildAcceptedTUAnchorCandidate(
             .str();
   }
 
-  // These carrier-local witness helpers are intentionally not invoked here:
-  // for TU anchors the old generic line-control/counter helpers produced no
-  // attached witness unless another proof summary had already carried owner or
-  // suffix state.  TU-anchor candidates carry only their local zero-token
-  // boundary fields, preserving the previous selector-visible state.
+  // TU-anchor candidates preserve only the local zero-token boundary fields.
+  // Line-control, counter, owner, and suffix-state witness facts enter through
+  // proof summaries that explicitly own those facts, so this builder does not
+  // synthesize additional carrier-local witness state while restamping the
+  // selector-visible TU-anchor candidate.
   refreshTUAnchorEmissionPathInventory(candidate);
   theoremAudit_.AuditAcceptedResultCandidateForLegacyAuthority(
       candidate, "BuildAcceptedTUAnchorCandidate");

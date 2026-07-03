@@ -9,8 +9,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLog.h"
 #include "line-control/RefoldLineControlProof.h"
+#include "core/RefoldLog.h"
 #include "macro/RefoldMacroTopology.h"
 #include "source/RefoldTokenTextAnalysis.h"
 #include "util/RefoldPathIdentity.h"
@@ -79,9 +79,9 @@ static bool refoldIsHorizontalWhitespace(char c) {
   return c == ' ' || c == '\t' || c == '\f' || c == '\v' || c == '\r';
 }
 
-static std::optional<uint64_t>
-refoldFindDirectiveHashOffset(StringRef src, uint64_t lineBegin,
-                              uint64_t lineEnd) {
+static std::optional<uint64_t> refoldFindDirectiveHashOffset(StringRef src,
+                                                             uint64_t lineBegin,
+                                                             uint64_t lineEnd) {
   uint64_t p = lineBegin;
   while (p < lineEnd && p < src.size()) {
     if (refoldIsHorizontalWhitespace(src[p])) {
@@ -109,8 +109,7 @@ refoldFindDirectiveHashOffset(StringRef src, uint64_t lineBegin,
             p += 2;
             continue;
           }
-          if (p + 2 < lineEnd && src[p + 1] == '\r' &&
-              src[p + 2] == '\n') {
+          if (p + 2 < lineEnd && src[p + 1] == '\r' && src[p + 2] == '\n') {
             p += 3;
             continue;
           }
@@ -141,8 +140,7 @@ refoldFindDirectiveHashOffset(StringRef src, uint64_t lineBegin,
 bool RefoldLineControlProof::SourcePrefixHasProducerActiveLineControl(
     StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
     uint64_t offset) const {
-  auto bufOrErr =
-      MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(ownerFile));
+  auto bufOrErr = MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(ownerFile));
   if (!bufOrErr) {
     // This query is used only to suppress an otherwise demanded synthetic
     // include-entry #line.  If the owner source cannot be read, fail closed and
@@ -214,7 +212,8 @@ bool RefoldLineControlProof::SourcePrefixHasProducerActiveLineControl(
 }
 
 LineStateObserverDemand
-RefoldLineControlProof::IncludeSubtreeLineStateObserverDemand(uint64_t includeId) const {
+RefoldLineControlProof::IncludeSubtreeLineStateObserverDemand(
+    uint64_t includeId) const {
   LineStateObserverDemand demand;
 
   auto isDescendantOrSelf = [&](uint64_t owner) -> bool {
@@ -231,8 +230,8 @@ RefoldLineControlProof::IncludeSubtreeLineStateObserverDemand(uint64_t includeId
 
   for (const auto &macro : model_.GetMacroInvocations()) {
     const bool observesLine = macro.name == "__LINE__";
-    const bool observesFile = macro.name == "__FILE__" ||
-                              macro.name == "__BASE_FILE__";
+    const bool observesFile =
+        macro.name == "__FILE__" || macro.name == "__BASE_FILE__";
     const bool observesFileName = macro.name == "__FILE_NAME__";
     if (!observesLine && !observesFile && !observesFileName)
       continue;
@@ -293,9 +292,8 @@ bool RefoldLineControlProof::IncludeEntryLineDirectiveDischargesLayoutBarrier(
   auto bufOrErr =
       MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(parentOwnerFileForDemand));
   if (!bufOrErr) {
-    // Failing closed here preserves the old wrapper behavior. The minimization
-    // proof is source-backed; if the parent owner cannot be read, do not infer
-    // that a layout barrier is unneeded.
+    // Fail closed for the source-backed minimization proof: if the parent
+    // owner cannot be read, do not infer that a layout barrier is unneeded.
     return true;
   }
 
@@ -374,14 +372,14 @@ bool RefoldLineControlProof::IncludeEntryLineDirectiveDischargesLayoutBarrier(
     lineBegin = lineEnd + 1;
   }
 
-
   const bool needsBarrier =
       (!sawOutputLine && sawZeroTokenLineBeforeFirstOutput) ||
       (sawOutputLine && sawZeroTokenLineAfterLastOutput);
 
   std::optional<std::string> childProducerSpelling =
       paths_.ProducerEnteredFileSpelling(child);
-  if (needsBarrier && childProducerSpelling && !childProducerSpelling->empty()) {
+  if (needsBarrier && childProducerSpelling &&
+      !childProducerSpelling->empty()) {
     std::optional<uint64_t> firstChildOutputByte;
     const auto &tokmapByPP = model_.GetTokmapByPP();
     for (const RefoldModel::PPArgSpan::PPSpan &span : child.spans) {
@@ -400,9 +398,8 @@ bool RefoldLineControlProof::IncludeEntryLineDirectiveDischargesLayoutBarrier(
     }
 
     if (firstChildOutputByte &&
-        SourcePrefixHasProducerActiveLineControl(*childProducerSpelling,
-                                                 child.id,
-                                                 *firstChildOutputByte)) {
+        SourcePrefixHasProducerActiveLineControl(
+            *childProducerSpelling, child.id, *firstChildOutputByte)) {
       return false;
     }
   }
@@ -411,7 +408,7 @@ bool RefoldLineControlProof::IncludeEntryLineDirectiveDischargesLayoutBarrier(
 }
 
 bool RefoldLineControlProof::SameLineControlPhysicalFile(StringRef lhs,
-                                                   StringRef rhs) const {
+                                                         StringRef rhs) const {
   if (lhs == rhs)
     return true;
 
@@ -424,7 +421,8 @@ bool RefoldLineControlProof::SameLineControlPhysicalFile(StringRef lhs,
   return lineDirs_.ToAbsolutePath(lhs) == lineDirs_.ToAbsolutePath(rhs);
 }
 
-std::optional<uint64_t> RefoldLineControlProof::LatestProducerLineControlEndBefore(
+std::optional<uint64_t>
+RefoldLineControlProof::LatestProducerLineControlEndBefore(
     std::optional<uint64_t> ownerIncludeId, StringRef ownerFile,
     uint64_t offset) const {
   std::optional<uint64_t> result;
@@ -520,8 +518,7 @@ bool RefoldLineControlProof::LineStateBuiltinInvocationIsPreservedObserver(
       return false;
     if (static_cast<uint64_t>(bTok) >= abTokMapB2A_.size())
       return false;
-    if (abTokMapB2A_[static_cast<size_t>(bTok)] !=
-        static_cast<int64_t>(aTok))
+    if (abTokMapB2A_[static_cast<size_t>(bTok)] != static_cast<int64_t>(aTok))
       return false;
 
     if (previousB >= 0 && bTok != previousB + 1)
@@ -536,8 +533,9 @@ bool RefoldLineControlProof::LineStateBuiltinInvocationIsPreservedObserver(
   return true;
 }
 
-bool RefoldLineControlProof::LineStateBuiltinInvocationNeedsModelBackedLineStateDemand(
-    const RefoldModel::MacroInvocation &macro) const {
+bool RefoldLineControlProof::
+    LineStateBuiltinInvocationNeedsModelBackedLineStateDemand(
+        const RefoldModel::MacroInvocation &macro) const {
   // Direct lexical builtin tokens that survive into ordinary emitted source are
   // visible without extra model facts.  If a predefined builtin is
   // reached through a caller macro, the final source normally contains the
@@ -569,8 +567,8 @@ RefoldLineControlProof::OwnerSuffixLineStateObserverDemand(
 
   for (const auto &macro : model_.GetMacroInvocations()) {
     const bool observesLine = macro.name == "__LINE__";
-    const bool observesFile = macro.name == "__FILE__" ||
-                              macro.name == "__BASE_FILE__";
+    const bool observesFile =
+        macro.name == "__FILE__" || macro.name == "__BASE_FILE__";
     const bool observesFileName = macro.name == "__FILE_NAME__";
     if (!observesLine && !observesFile && !observesFileName)
       continue;
@@ -630,8 +628,8 @@ RefoldLineControlProof::FirstOwnerSuffixLineStateObserverSite(
   auto considerSite = [&](const RefoldModel::MacroInvocation &builtin,
                           const RefoldModel::MacroInvocation &site) {
     const bool observesLine = builtin.name == "__LINE__";
-    const bool observesFile = builtin.name == "__FILE__" ||
-                              builtin.name == "__BASE_FILE__";
+    const bool observesFile =
+        builtin.name == "__FILE__" || builtin.name == "__BASE_FILE__";
     const bool observesFileName = builtin.name == "__FILE_NAME__";
     if (!observesLine && !observesFile && !observesFileName)
       return;
@@ -661,8 +659,8 @@ RefoldLineControlProof::FirstOwnerSuffixLineStateObserverSite(
 
   for (const auto &macro : model_.GetMacroInvocations()) {
     const bool observesLine = macro.name == "__LINE__";
-    const bool observesFile = macro.name == "__FILE__" ||
-                              macro.name == "__BASE_FILE__";
+    const bool observesFile =
+        macro.name == "__FILE__" || macro.name == "__BASE_FILE__";
     const bool observesFileName = macro.name == "__FILE_NAME__";
     if (!observesLine && !observesFile && !observesFileName)
       continue;
@@ -689,7 +687,6 @@ bool RefoldLineControlProof::OwnerSuffixHasLineStateSensitiveBuiltin(
       .Any();
 }
 
-
 std::optional<uint64_t>
 RefoldLineControlProof::AdvanceInsertionAnchorPastSourceLineControlPrefix(
     StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
@@ -703,7 +700,8 @@ RefoldLineControlProof::AdvanceInsertionAnchorPastSourceLineControlPrefix(
   while (true) {
     const RefoldModel::LineControlEvent *best = nullptr;
 
-    for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
+    for (const RefoldModel::LineControlEvent &event :
+         model_.GetLineControls()) {
       if (!event.active || !event.producerProven || !event.siteB ||
           !event.siteE)
         continue;
@@ -716,8 +714,8 @@ RefoldLineControlProof::AdvanceInsertionAnchorPastSourceLineControlPrefix(
         continue;
 
       // Only slide across zero-token whitespace before the directive.  Comments
-      // or other trivia may be intentionally positioned before the directive and
-      // must not be silently crossed by this source-placement rule.
+      // or other trivia may be intentionally positioned before the directive
+      // and must not be silently crossed by this source-placement rule.
       if (!stringutils::isWs(ownerBytes.slice(cur, *event.siteB)))
         continue;
 
@@ -739,8 +737,35 @@ RefoldLineControlProof::AdvanceInsertionAnchorPastSourceLineControlPrefix(
   return cur;
 }
 
+bool RefoldLineControlProof::TUInsertionCanDeferResyncToConditionalJoin(
+    bool advancedOverSourceLineControlPrefix, StringRef tuPath,
+    uint64_t anchor) const {
+  if (!advancedOverSourceLineControlPrefix)
+    return false;
 
+  std::optional<LineStateObserverSite> firstObserver =
+      FirstOwnerSuffixLineStateObserverSite(std::nullopt, tuPath, anchor);
+  if (!firstObserver || !firstObserver->demand.needsLine)
+    return false;
 
+  const RefoldModel::CondGroup *innermost = nullptr;
+  for (const RefoldModel::CondGroup *group :
+       model_.GetCondGroups(tuPath, std::nullopt)) {
+    if (!group || !paths_.PathsEqual(group->file, tuPath) ||
+        group->parentIncludeId || !group->ContainsByte(anchor)) {
+      continue;
+    }
+    if (!innermost || (group->groupB >= innermost->groupB &&
+                       group->groupE <= innermost->groupE)) {
+      innermost = group;
+    }
+  }
+
+  if (!innermost || firstObserver->offset < innermost->groupE)
+    return false;
+
+  return true;
+}
 
 } // namespace refold
 } // namespace clang

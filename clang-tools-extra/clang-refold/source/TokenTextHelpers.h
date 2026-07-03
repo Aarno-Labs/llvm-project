@@ -54,9 +54,8 @@ inline size_t refoldTokenEndOffsetFromBase(const Token &token,
 
 /// Minimal raw-lexer token record used for boundary hygiene checks.
 ///
-/// This mirrors the old RefoldEngine.cpp anonymous-namespace record so moved
-/// callers can prove token-boundary preservation without
-/// depending on textual inclusion order.
+/// Callers across the refold pipeline use this record to prove token-boundary
+/// preservation without depending on textual inclusion order.
 struct RefoldLexBoundaryToken {
   tok::TokenKind kind = tok::unknown;
   std::string spelling;
@@ -65,8 +64,9 @@ struct RefoldLexBoundaryToken {
 };
 
 /// Lex a snippet into non-comment boundary tokens for maximal-munch checks.
-inline void refoldLexBoundaryTokens(llvm::StringRef text, const LangOptions &lang,
-                                    llvm::SmallVectorImpl<RefoldLexBoundaryToken> &out) {
+inline void
+refoldLexBoundaryTokens(llvm::StringRef text, const LangOptions &lang,
+                        llvm::SmallVectorImpl<RefoldLexBoundaryToken> &out) {
   out.clear();
   if (text.empty())
     return;
@@ -137,11 +137,21 @@ inline bool refoldNeedsLexicalSeparator(const RefoldLexBoundaryToken &left,
   return false;
 }
 
-
-/// Return \p text with at most one synthetic space added at either outer
-/// boundary when direct juxtaposition with \p base would change lexical
-/// tokenization.  This is a lexical hygiene helper only: callers must already
-/// have proven that the surrounding TU/include/macro replacement is valid.
+/// Add boundary padding spaces only when needed to preserve lexical
+/// tokenization.
+///
+/// Adds at most one space on the left and/or right edge of `text` so that, when
+/// `text` replaces `base[start,end)`, tokens do not glue across the replacement
+/// boundary.  Existing whitespace at either edge of `text`, or immediate
+/// boundary whitespace already present in `base`, counts as already separated.
+/// Callers can also suppress either side explicitly with `allowLeft` and
+/// `allowRight`, for example when preserving an existing source gap.
+///
+/// Decisions are deterministic and local: the helper compares Clang raw-lexing
+/// with and without a single inserted boundary space and pads only when
+/// omitting the space would change tokenization.  This is lexical hygiene only;
+/// callers must already have proven that the surrounding TU/include/macro
+/// replacement is valid.
 inline std::string refoldPadAtBoundaries(llvm::StringRef base, size_t start,
                                          size_t end, std::string text,
                                          bool allowLeft, bool allowRight,
@@ -184,7 +194,8 @@ inline std::string refoldPadAtBoundaries(llvm::StringRef base, size_t start,
       (!rightChar || !stringutils::isWs(*rightChar))) {
     if (std::optional<RefoldLexBoundaryToken> rightTok =
             refoldFirstLexToken(base.drop_front(end), lang)) {
-      addRightSpace = refoldNeedsLexicalSeparator(*textLastTok, *rightTok, lang);
+      addRightSpace =
+          refoldNeedsLexicalSeparator(*textLastTok, *rightTok, lang);
     }
   }
 
@@ -202,11 +213,9 @@ inline std::string refoldPadAtBoundaries(llvm::StringRef base, size_t start,
 /// The returned range begins at the first token's byte offset and ends at the
 /// last token's spelling end, excluding trailing inter-token whitespace that
 /// belongs to later untouched text.
-inline llvm::StringRef refoldSliceExactTokenCoverage(llvm::ArrayRef<size_t> tokOff,
-                                               llvm::ArrayRef<PPTok> toks,
-                                               llvm::StringRef source,
-                                               uint64_t startTok,
-                                               uint64_t endTok) {
+inline llvm::StringRef refoldSliceExactTokenCoverage(
+    llvm::ArrayRef<size_t> tokOff, llvm::ArrayRef<PPTok> toks,
+    llvm::StringRef source, uint64_t startTok, uint64_t endTok) {
   if (tokOff.empty() || toks.empty() || source.empty() || endTok <= startTok)
     return "";
 
@@ -232,9 +241,9 @@ inline llvm::StringRef refoldSliceExactTokenCoverage(llvm::ArrayRef<size_t> tokO
 /// up to the next token boundary because B-side insertion payloads may rely on
 /// that trivia for stable physical layout.
 inline llvm::StringRef refoldSliceTokenEnvelope(llvm::ArrayRef<size_t> tokOff,
-                                          llvm::StringRef source,
-                                          uint64_t startTok,
-                                          uint64_t endTok) {
+                                                llvm::StringRef source,
+                                                uint64_t startTok,
+                                                uint64_t endTok) {
   if (tokOff.empty() || source.empty() || endTok <= startTok)
     return "";
 

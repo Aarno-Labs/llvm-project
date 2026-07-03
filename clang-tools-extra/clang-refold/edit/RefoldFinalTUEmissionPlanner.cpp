@@ -46,10 +46,12 @@ public:
         textEditAssembler_(*deps.textEditAssembler),
         terminalSink_(*deps.terminalSink),
         structuralHunkDispatcher_(*request.structuralHunkDispatcher),
-        includeMaterializationScheduler_(*request.includeMaterializationScheduler),
+        includeMaterializationScheduler_(
+            *request.includeMaterializationScheduler),
         macroStatePlan_(*request.macroStatePlan),
         macroStateRequest_(*request.macroStateRequest),
-        tuEdits_(structuralHunkDispatcher_.MutableTUEditsForRepairAndEmission()),
+        tuEdits_(
+            structuralHunkDispatcher_.MutableTUEditsForRepairAndEmission()),
         finalLineControlPruneCandidates_(*deps.finalLineControlPruneCandidates),
         finalLineControlSourceMappings_(*deps.finalLineControlSourceMappings) {}
 
@@ -69,7 +71,8 @@ private:
       llvm::ArrayRef<std::pair<uint64_t, uint64_t>> acceptedRanges) const;
 
   /// Creates the concrete TU text edit for one accepted TU macro patch.
-  TextEdit BuildTUMacroPatchEdit(const MacroPatch &patch, uint64_t patchEnd) const;
+  TextEdit BuildTUMacroPatchEdit(const MacroPatch &patch,
+                                 uint64_t patchEnd) const;
 
   /// Runs the post-macro-edit macro-state carry pass and then lowers realized
   /// TU-root include expansions into TU edits.
@@ -87,8 +90,8 @@ private:
 
   /// Returns true when a macro invocation site is covered by a materialized
   /// macro patch in its owner bucket.
-  bool SiteHasMaterializedMacroPatch(
-      const RefoldModel::MacroInvocation &site) const;
+  bool
+  SiteHasMaterializedMacroPatch(const RefoldModel::MacroInvocation &site) const;
 
   /// Returns whether a preserved file observer projected through \p Site needs
   /// the synthetic TU prologue to preserve checker replay semantics.
@@ -122,8 +125,7 @@ private:
   const RefoldMacroStateRepairPlanner::MacroStateRepairRequest
       &macroStateRequest_;
   std::vector<TextEdit> &tuEdits_;
-  std::vector<FinalLineControlPruneCandidate>
-      &finalLineControlPruneCandidates_;
+  std::vector<FinalLineControlPruneCandidate> &finalLineControlPruneCandidates_;
   std::vector<FinalLineControlSourceMapping> &finalLineControlSourceMappings_;
 };
 
@@ -155,20 +157,20 @@ void FinalTUEmissionContext::StageTUMacroPatchEdits() {
   auto tuMacroPatches = *tuMacroPatchList;
   std::sort(tuMacroPatches.begin(), tuMacroPatches.end(),
             [](const MacroPatch &lhs, const MacroPatch &rhs) {
-              if (lhs.invStart != rhs.invStart)
-                return lhs.invStart < rhs.invStart;
-              return lhs.invEnd > rhs.invEnd;
+              if (lhs.invRange.begin != rhs.invRange.begin)
+                return lhs.invRange.begin < rhs.invRange.begin;
+              return lhs.invRange.end > rhs.invRange.end;
             });
 
   llvm::SmallVector<std::pair<uint64_t, uint64_t>, 16> accepted;
   for (const MacroPatch &patch : tuMacroPatches) {
     const uint64_t patchEnd = stringutils::extendChainedCallEnd(
-        request_.tuBytes, patch.invEnd, patch.replacement);
+        request_.tuBytes, patch.invRange.end, patch.replacement);
 
     if (MacroPatchIsShadowedByAccepted(patch, patchEnd, accepted))
       continue;
 
-    accepted.push_back({patch.invStart, patchEnd});
+    accepted.push_back({patch.invRange.begin, patchEnd});
     structuralHunkDispatcher_.AddTUEdit(BuildTUMacroPatchEdit(patch, patchEnd));
   }
 }
@@ -177,55 +179,58 @@ bool FinalTUEmissionContext::MacroPatchIsShadowedByAccepted(
     const MacroPatch &patch, uint64_t patchEnd,
     llvm::ArrayRef<std::pair<uint64_t, uint64_t>> acceptedRanges) const {
   for (const auto &accepted : acceptedRanges) {
-    if (patch.invStart >= accepted.first && patchEnd <= accepted.second)
+    if (patch.invRange.begin >= accepted.first && patchEnd <= accepted.second)
       return true;
 
     // Partial overlaps should never occur (macro invocation sites are either
     // disjoint or nested). If they do, fail fast rather than producing
     // order-dependent behavior.
-    if (patch.invStart < accepted.second && accepted.first < patchEnd) {
+    if (patch.invRange.begin < accepted.second && accepted.first < patchEnd) {
       REFOLD_LOG_FATAL("macro/tu",
                        "overlapping TU macro patches: mp=[{0},{1}) "
                        "acc=[{2},{3})",
-                       patch.invStart, patchEnd, accepted.first,
+                       patch.invRange.begin, patchEnd, accepted.first,
                        accepted.second);
     }
   }
   return false;
 }
 
-TextEdit FinalTUEmissionContext::BuildTUMacroPatchEdit(
-    const MacroPatch &patch, uint64_t patchEnd) const {
+TextEdit
+FinalTUEmissionContext::BuildTUMacroPatchEdit(const MacroPatch &patch,
+                                              uint64_t patchEnd) const {
   ResyncOutcome resync = textEditAssembler_.ApplyResyncOrPend(
-      request_.tuBytes, patch.invStart, patchEnd, patch.replacement,
+      request_.tuBytes, patch.invRange.begin, patchEnd, patch.replacement,
       request_.tuPath);
 
-  TextEdit edit{patch.invStart,
-                patchEnd,
-                std::move(resync.text),
-                std::move(resync.pending),
-                macroTopology_.MacroPatchRemainsExpanded(patch)
-                    ? std::make_optional(
-                          macroTopology_.GetRootMacroId(patch.macroId))
-                    : std::nullopt,
-                {},
-                {},
-                {}};
+  TextEdit edit{
+      patch.invRange.begin,
+      patchEnd,
+      std::move(resync.text),
+      std::move(resync.pending),
+      macroTopology_.MacroPatchRemainsExpanded(patch)
+          ? std::make_optional(macroTopology_.GetRootMacroId(patch.macroId))
+          : std::nullopt,
+      {},
+      {},
+      {}};
   edit.lineControlPruneCandidates =
       std::move(resync.lineControlPruneCandidates);
 
-  if (auto bRange = textEditAssembler_.MacroPatchMaterializedBByteRange(patch)) {
-    textEditAssembler_.StampTextEditMaterializedBByteRange(
+  if (auto bRange =
+          textEditAssembler_.MacroPatchMaterializedBByteRange(patch)) {
+    textEditAssembler_.CertifyTextEditMaterializedBByteRange(
         edit, bRange->first, bRange->second);
   }
   if (auto outRange =
           textEditAssembler_.MacroPatchMaterializedOutputTextRange(patch)) {
-    textEditAssembler_.StampTextEditMaterializedOutputTextRange(
+    textEditAssembler_.CertifyTextEditMaterializedOutputTextRange(
         edit, outRange->first, outRange->second);
   }
 
   textEditAssembler_.AttachAcceptedResultCarrier(
-      edit, deps_.proofLattice->BuildAcceptedEmittedMacroCandidate(patch));
+      edit, deps_.proofLattice->AcceptedCandidateBuilder()
+                .BuildAcceptedEmittedMacroCandidate(patch));
   return edit;
 }
 
@@ -276,12 +281,13 @@ bool FinalTUEmissionContext::SiteHasMaterializedMacroPatch(
     return false;
 
   const std::vector<MacroPatch> *patches =
-      structuralHunkDispatcher_.FindFinalMacroPatchesForOwner(site.ownerIncludeId);
+      structuralHunkDispatcher_.FindFinalMacroPatchesForOwner(
+          site.ownerIncludeId);
   if (!patches)
     return false;
 
   for (const MacroPatch &patch : *patches) {
-    if (patch.invStart <= *site.invB && *site.invE <= patch.invEnd)
+    if (patch.invRange.begin <= *site.invB && *site.invE <= patch.invRange.end)
       return true;
   }
   return false;
@@ -306,8 +312,8 @@ bool FinalTUEmissionContext::SiteNeedsTUPrologue(
     return false;
 
   // A source-authored #line before the observer dominates the synthetic TU
-  // prologue.  Only observers whose active logical file is still the producer TU
-  // need the prologue repair.
+  // prologue.  Only observers whose active logical file is still the producer
+  // TU need the prologue repair.
   if (site.invB) {
     LineDirectiveLocation loc = LineDirectiveInserter::LogicalLocationAtOffset(
         request_.tuBytes, *site.invB, request_.tuPath, model_, request_.tuPath);
@@ -320,7 +326,8 @@ bool FinalTUEmissionContext::SiteNeedsTUPrologue(
 }
 
 bool FinalTUEmissionContext::NeedsTUPrologueForPreservedFileObservers() const {
-  for (const RefoldModel::MacroInvocation &macro : model_.GetMacroInvocations()) {
+  for (const RefoldModel::MacroInvocation &macro :
+       model_.GetMacroInvocations()) {
     if (macro.name != "__FILE__" && macro.name != "__FILE_NAME__" &&
         macro.name != "__BASE_FILE__")
       continue;
@@ -358,13 +365,13 @@ void FinalTUEmissionContext::InsertTUPrologue(std::string &tuResult) const {
       /*finalBegin=*/0, insertedBytes,
       FinalLineDirective::Origin::SyntheticTUPrologue,
       FinalLineControlOwnerKey(request_.tuPath.str(), std::nullopt),
-      /*producerProven=*/true,
-      FinalLineControlObligation::TUPrologueRepair));
+      /*producerProven=*/true, FinalLineControlObligation::TUPrologueRepair));
 }
 
 size_t FinalTUEmissionContext::RecordExpandedMacroRoots() const {
   structuralHunkDispatcher_.RecordExpandedMacroRootsInMaterializedIncludes(
-      model_, macroTopology_, includeMaterializationScheduler_.ExpandedIncludeIds());
+      model_, macroTopology_,
+      includeMaterializationScheduler_.ExpandedIncludeIds());
   return structuralHunkDispatcher_.ExpandedMacroRootCount();
 }
 
@@ -374,7 +381,8 @@ RefoldFinalTUEmissionPlanner::RefoldFinalTUEmissionPlanner(Dependencies deps)
     : deps_(std::move(deps)) {}
 
 RefoldFinalTUEmissionPlanner::EmissionResult
-RefoldFinalTUEmissionPlanner::PlanAndEmit(const EmissionRequest &request) const {
+RefoldFinalTUEmissionPlanner::PlanAndEmit(
+    const EmissionRequest &request) const {
   FinalTUEmissionContext context(deps_, request);
   return context.Run();
 }

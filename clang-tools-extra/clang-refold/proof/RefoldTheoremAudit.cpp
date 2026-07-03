@@ -1,17 +1,21 @@
 //===--- RefoldTheoremAudit.cpp --------------------------------*- C++ -*-===//
 //
-// Central theorem/audit ledger and legacy-authority audit service.
+// Central theorem/audit ledger and legacy-authority audit service —
+// implementation.  Also owns the per-attempt stats reporting helpers that
+// read the same ledger at end-of-attempt.
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLog.h"
 #include "proof/RefoldTheoremAudit.h"
-#include "proof/RefoldProofLattice.h"
-#include "proof/RefoldTerminalProofSink.h"
+
+#include "core/RefoldLog.h"
+#include "core/RefoldModel.h"
+#include "proof/RefoldAcceptedResultPredicates.h"
 #include "util/StringUtils.h"
 
 #include "llvm/Support/FormatVariadic.h"
 
+#include <optional>
 #include <utility>
 
 using namespace llvm;
@@ -26,16 +30,15 @@ RefoldTheoremAudit::RefoldTheoremAudit(
       hooks_(std::move(hooks)) {}
 
 bool RefoldTheoremAudit::IsNoLegacyAuditEnabled() const {
-  // The no-legacy audit no longer depends on temporary environment-variable
-  // controls. It is now a regular strict/theorem invariant: non-strict runs do
-  // not emit diagnostic-only audit noise, and strict runs always fail closed if
-  // a legacy-authority seam reaches a theorem boundary.
+  // The no-legacy audit is a regular strict/theorem invariant. Non-strict
+  // runs do not emit diagnostic-only audit noise, and strict runs fail closed
+  // whenever a legacy-authority seam reaches a theorem boundary.
   return strict_;
 }
 
 LegacyAuditEvidence
-RefoldTheoremAudit::MakeLegacyAuditEvidence(LegacyPathKind kind,
-                                            StringRef role, StringRef detail) {
+RefoldTheoremAudit::MakeLegacyAuditEvidence(LegacyPathKind kind, StringRef role,
+                                            StringRef detail) {
   LegacyAuditEvidence evidence;
   evidence.kind = kind;
   evidence.role = role.str();
@@ -65,21 +68,23 @@ void RefoldTheoremAudit::ReportNoLegacyAuditFinding(
           : stringutils::showWsWithClip(evidence.detail, 240);
 
   if (clippedDetail.empty()) {
-    REFOLD_LOG_WARN("no-legacy-audit",
-         "kind={0} role={1} definition=\"{2}\" required-closure=\"{3}\"",
-         definition.kind, role, definition.definition,
-         definition.requiredClosure);
+    REFOLD_LOG_WARN(
+        "no-legacy-audit",
+        "kind={0} role={1} definition=\"{2}\" required-closure=\"{3}\"",
+        definition.kind, role, definition.definition,
+        definition.requiredClosure);
   } else {
-    REFOLD_LOG_WARN("no-legacy-audit",
-         "kind={0} role={1} definition=\"{2}\" required-closure=\"{3}\" "
-         "detail=\"{4}\"",
-         definition.kind, role, definition.definition,
-         definition.requiredClosure, clippedDetail);
+    REFOLD_LOG_WARN(
+        "no-legacy-audit",
+        "kind={0} role={1} definition=\"{2}\" required-closure=\"{3}\" "
+        "detail=\"{4}\"",
+        definition.kind, role, definition.definition,
+        definition.requiredClosure, clippedDetail);
   }
 
-  // No-legacy findings are theorem state whenever the strict/theorem guard is
-  // active. Record the finding here so every audit site shares one policy and
-  // cannot accidentally remain a diagnostic-only report.
+  // No-legacy findings are theorem state whenever the strict/theorem guard
+  // is active. Record the finding here so every audit site shares one policy
+  // and cannot accidentally remain a diagnostic-only report.
   NoteTheoremAuditViolation(
       llvm::formatv("strict/theorem no-legacy audit reported finding: "
                     "kind={0} role={1} detail={2}",
@@ -90,10 +95,10 @@ void RefoldTheoremAudit::ReportNoLegacyAuditFinding(
 }
 
 void RefoldTheoremAudit::EnforceTheoremAuditInvariants() const {
-  // The theorem audit is authoritative in strict mode: any emitted non-terminal
-  // result that is not declared, explicit-proof-backed, locally discharged,
-  // lattice-resolved, and in-domain violates the declared theorem domain and
-  // therefore forces terminal fallback in strict mode.
+  // The theorem audit is authoritative in strict mode: any emitted
+  // non-terminal result that is not declared, explicit-proof-backed, locally
+  // discharged, lattice-resolved, and in-domain violates the declared
+  // theorem domain and therefore forces terminal fallback in strict mode.
   if (audit_.selectorDirectBypasses != 0) {
     NoteTheoremAuditViolation(
         "selector resolved an emitted result through a direct bypass");
@@ -227,8 +232,7 @@ void RefoldTheoremAudit::RecordWitnessResolverTheoremAudit(
     NoteTheoremAuditViolation(
         llvm::formatv("strict resolver theorem audit rejected role={0}: {1}; "
                       "domain={2} fallback_class={3} reason={4}",
-                      decision.role, why,
-                      decision.strictDomain.domainClass,
+                      decision.role, why, decision.strictDomain.domainClass,
                       decision.fallbackClass,
                       decision.failureReason.empty()
                           ? StringRef("<none>")
@@ -294,7 +298,6 @@ void RefoldTheoremAudit::RecordWitnessResolverTheoremAudit(
   }
 }
 
-
 void RefoldTheoremAudit::RecordDirectStateCheckClosure(
     DirectStateCheckKind checkKind, OwnerStateComponent component,
     DirectStateCheckClosureKind closure, StateMutationKind mutation,
@@ -356,7 +359,8 @@ void RefoldTheoremAudit::RecordStateTransitionGatewayTerminalFailure() const {
   ++audit_.stateTransitionGatewayTerminalFailures;
 }
 
-void RefoldTheoremAudit::RecordStateTransitionUnknownComponentViolation() const {
+void RefoldTheoremAudit::RecordStateTransitionUnknownComponentViolation()
+    const {
   ++audit_.stateTransitionUnknownComponentViolations;
 }
 
@@ -423,7 +427,8 @@ bool RefoldTheoremAudit::AuditProofSummaryForLegacyAuthority(
           "terminal accepted class has no TerminalFallbackWitness"));
     } else {
       const TerminalFallbackWitness &witness = *summary.terminalFallbackWitness;
-      if (const TerminalFallbackProofFailure *primary = witness.PrimaryFailure())
+      if (const TerminalFallbackProofFailure *primary =
+              witness.PrimaryFailure())
         AuditTerminalFallbackForLegacyAuthority(*primary, role);
       else
         ReportNoLegacyAuditFinding(MakeLegacyAuditEvidence(
@@ -450,14 +455,14 @@ bool RefoldTheoremAudit::AuditAcceptedResultCandidateForLegacyAuthority(
   }
 
   const EmissionPathKind primaryPath =
-      RefoldProofLattice::PrimaryEmissionPathForCandidateKind(candidate.kind);
+      PrimaryEmissionPathForCandidateKind(candidate.kind);
   if (!candidate.emissionPaths.Contains(primaryPath)) {
     ReportNoLegacyAuditFinding(MakeLegacyAuditEvidence(
         LegacyPathKind::PathSpecificProofMirror, role,
-        llvm::formatv(
-            "accepted candidate kind {0} is not reflected in the accepted-result "
-            "emission-path inventory; expected primary path {1}",
-            candidate.kind, primaryPath)
+        llvm::formatv("accepted candidate kind {0} is not reflected in the "
+                      "accepted-result "
+                      "emission-path inventory; expected primary path {1}",
+                      candidate.kind, primaryPath)
             .str()));
   }
 
@@ -509,7 +514,8 @@ bool RefoldTheoremAudit::AuditAcceptedResultCandidateForLegacyAuthority(
     } else {
       const TerminalFallbackWitness &witness =
           *candidate.proofSummary.terminalFallbackWitness;
-      if (const TerminalFallbackProofFailure *primary = witness.PrimaryFailure())
+      if (const TerminalFallbackProofFailure *primary =
+              witness.PrimaryFailure())
         AuditTerminalFallbackForLegacyAuthority(*primary, role);
       else
         ReportNoLegacyAuditFinding(MakeLegacyAuditEvidence(
@@ -540,7 +546,8 @@ bool RefoldTheoremAudit::AuditMacroPatchProofForLegacyAuthority(
       patch.proofSummary.inventory.currentPath == AcceptedPathKind::Unknown;
   const bool staleSummary =
       patch.proofSummary.theoremClass != expected.theoremClass ||
-      patch.proofSummary.inventory.currentPath != expected.inventory.currentPath ||
+      patch.proofSummary.inventory.currentPath !=
+          expected.inventory.currentPath ||
       patch.proofSummary.structurePreserving != expected.structurePreserving ||
       patch.proofSummary.proofRootMacroId != expected.proofRootMacroId;
 
@@ -660,9 +667,10 @@ bool RefoldTheoremAudit::AuditTerminalFallbackProofFailure(
     ok = false;
     ++audit_.terminalFailureAuditViolations;
     NoteTheoremAuditViolation(
-        llvm::formatv("terminal fallback proof failure audit rejected {0}: {1}; "
-                      "failure={2}",
-                      role, reason, failure)
+        llvm::formatv(
+            "terminal fallback proof failure audit rejected {0}: {1}; "
+            "failure={2}",
+            role, reason, failure)
             .str());
   };
 
@@ -673,10 +681,10 @@ bool RefoldTheoremAudit::AuditTerminalFallbackProofFailure(
 
   // A generic MissingProducerFacts reason is intentionally allowed only when
   // the structured context identifies what producer fact is missing.  More
-  // specific local reasons that normalize to MissingProducerFacts already name
-  // the failed fact in their enum value (for example an unmappable include
-  // B-envelope), so requiring additional context for those would create a new
-  // fallback surface instead of improving theorem precision.
+  // specific local reasons that normalize to MissingProducerFacts already
+  // name the failed fact in their enum value (for example an unmappable
+  // include B-envelope), so requiring additional context for those would
+  // create a new fallback surface instead of improving theorem precision.
   if (failure.reason == TerminalFallbackFailureReason::MissingProducerFacts &&
       failure.context.Empty()) {
     reject("generic MissingProducerFacts did not identify the missing fact");
@@ -757,7 +765,7 @@ bool RefoldTheoremAudit::RejectMissingSelectedMacroPatchCarrier(
     NoteTheoremAuditViolation(
         llvm::formatv("macro patch bytes=[{0},{1}) reached emission without "
                       "MacroPatch.selectedAcceptedCandidate: {2}",
-                      patch.invStart, patch.invEnd,
+                      patch.invRange.begin, patch.invRange.end,
                       detail.empty() ? StringRef("<none>") : detail)
             .str());
     if (strict_ && !terminalSink_.HasRequest()) {
@@ -765,7 +773,7 @@ bool RefoldTheoremAudit::RejectMissingSelectedMacroPatchCarrier(
           failure, role,
           llvm::formatv("macro patch bytes=[{0},{1}) reached emission without "
                         "MacroPatch.selectedAcceptedCandidate: {2}",
-                        patch.invStart, patch.invEnd,
+                        patch.invRange.begin, patch.invRange.end,
                         detail.empty() ? StringRef("<none>") : detail)
               .str());
     }
@@ -846,9 +854,9 @@ void RefoldTheoremAudit::RecordTerminalFallbackTheoremAudit() const {
         IsClassifiedTerminalFallbackProofFailure(failure);
   const TerminalFallbackProofFailure *primaryFailure = witness.PrimaryFailure();
   // The terminal exclusion must remain explicit all the way through the
-  // normalized proof carrier. Merely requesting fallback is not sufficient; the
-  // resulting terminal witness must classify as the named explicit out-of-domain
-  // theorem result.
+  // normalized proof carrier. Merely requesting fallback is not sufficient;
+  // the resulting terminal witness must classify as the named explicit
+  // out-of-domain theorem result.
   const bool explicitTerminalCarrier =
       candidate.kind == AcceptedResultCandidateKind::TerminalOutOfDomain &&
       summary.theoremClass == TheoremProofClass::TerminalOutOfDomainProof &&
@@ -922,18 +930,145 @@ std::string RefoldTheoremAudit::BuildTheoremAuditInvariantDetail() const {
              audit_.stateTransitionAuditViolations,
              audit_.noLegacyAuditFindings,
              audit_.noLegacyEmissionBoundaryViolations,
-             audit_.noLegacyStrictRejections,
-             audit_.directStateChecksAudited,
+             audit_.noLegacyStrictRejections, audit_.directStateChecksAudited,
              audit_.directStateChecksUnclosedLocal,
              audit_.resolverPotentiallyMissingProof,
-             audit_.resolverUnknownDomain,
-             audit_.resolverStrictLegacyFallback,
+             audit_.resolverUnknownDomain, audit_.resolverStrictLegacyFallback,
              audit_.resolverStrictInvalidFailClosed,
              audit_.resolverDeclaredIncompleteKeys,
              audit_.resolverDeclaredIncompatibleComposition,
              audit_.resolverDeclaredUnconvertedWitnesses,
              audit_.resolverClosureLedgerRows)
       .str();
+}
+
+//===----------------------------------------------------------------------===//
+// Per-attempt stats reporting helpers.
+//===----------------------------------------------------------------------===//
+
+void resetRefoldAttemptStats(RefoldStats &stats, const RefoldModel &model) {
+  stats = RefoldStats{};
+  stats.totalIncludes = model.GetIncludes().size();
+  for (const auto &mi : model.GetMacroInvocations()) {
+    if (!mi.callerMacroId)
+      ++stats.totalMacros;
+  }
+}
+
+void emitRefoldAttemptStatsSummary(const RefoldStats &stats,
+                                   bool hasTerminalRequest) {
+  REFOLD_LOG_INFO(
+      "stats",
+      "refold summary: expandedIncludes={0}/{1} expandedRootMacros={2}/{3} "
+      "terminalFallback={4}",
+      stats.expandedIncludes, stats.totalIncludes, stats.expandedMacros,
+      stats.totalMacros, hasTerminalRequest ? "yes(raw-B)" : "no");
+}
+
+void emitTheoremAuditSummary(const TheoremAuditStats &audit) {
+  const bool satisfied = audit.theoremSatisfied;
+  const uint64_t unresolvedSelectorWork =
+      audit.selectorNoSelectable + audit.selectorUnresolvedCompetitions;
+  const uint64_t invalidCarrierCount =
+      audit.emittedSelectorOnlyExceptionCarriers +
+      audit.emittedTransitionalTheoremCarriers +
+      audit.emittedUndischargedCarriers + audit.emittedUnknownClassCarriers +
+      audit.emittedOutOfDomainCarriers;
+  const uint64_t resolverOpenObligations =
+      audit.resolverPotentiallyMissingProof + audit.resolverUnknownDomain +
+      audit.resolverDeclaredIncompleteKeys +
+      audit.resolverDeclaredIncompatibleComposition +
+      audit.resolverDeclaredUnconvertedWitnesses;
+  const uint64_t terminalAuditProblems = audit.nonExplicitTerminalExclusions +
+                                         audit.terminalFailureAuditViolations;
+
+  if (satisfied) {
+    REFOLD_LOG_INFO(
+        "theorem",
+        "audit passed: emittedEdits={0} carriers={1} resolverAudits={2} "
+        "terminalFailures={3} closureLedgerRows={4}",
+        audit.emittedNonTerminalEdits, audit.emittedCarriers,
+        audit.resolverDomainAudits, audit.terminalFailureObligations,
+        audit.resolverClosureLedgerRows);
+  } else {
+    REFOLD_LOG_WARN("theorem",
+                    "audit failed: invalidCarriers={0} unresolvedSelectors={1} "
+                    "resolverOpenObligations={2} terminalAuditProblems={3} "
+                    "closureLedgerRows={4}",
+                    invalidCarrierCount, unresolvedSelectorWork,
+                    resolverOpenObligations, terminalAuditProblems,
+                    audit.resolverClosureLedgerRows);
+    if (!audit.firstViolation.empty()) {
+      REFOLD_LOG_WARN("theorem", "first theorem-audit violation: {0}",
+                      stringutils::showWsWithClip(audit.firstViolation, 220));
+    }
+  }
+
+  REFOLD_LOG_DEBUG("theorem/carriers",
+                   "emitted carriers: total={0} declared={1} discharged={2} "
+                   "selectorOnly={3} transitional={4} undischarged={5} "
+                   "unknownClass={6} outOfDomain={7}",
+                   audit.emittedCarriers, audit.emittedDeclaredClassCarriers,
+                   audit.emittedDischargedCarriers,
+                   audit.emittedSelectorOnlyExceptionCarriers,
+                   audit.emittedTransitionalTheoremCarriers,
+                   audit.emittedUndischargedCarriers,
+                   audit.emittedUnknownClassCarriers,
+                   audit.emittedOutOfDomainCarriers);
+  REFOLD_LOG_DEBUG("theorem/composition",
+                   "composite edits: total={0} equivalent={1} ordered={2} "
+                   "uncomposed={3}",
+                   audit.emittedCompositeEdits,
+                   audit.emittedEquivalentCompositeEdits,
+                   audit.emittedOrderedCompositeEdits,
+                   audit.emittedUncomposedCompositeEdits);
+  REFOLD_LOG_DEBUG("theorem/selector",
+                   "selector resolution: competitions={0} resolved={1} "
+                   "noSelectable={2} unresolved={3} directBypass={4}",
+                   audit.selectorCompetitions, audit.selectorResolutions,
+                   audit.selectorNoSelectable,
+                   audit.selectorUnresolvedCompetitions,
+                   audit.selectorDirectBypasses);
+  REFOLD_LOG_DEBUG(
+      "theorem/terminal",
+      "terminal fallback audit: explicitExclusions={0} "
+      "nonExplicitExclusions={1} primaryFailures={2} secondaryFailures={3} "
+      "auditViolations={4}",
+      audit.explicitTerminalExclusions, audit.nonExplicitTerminalExclusions,
+      audit.terminalFailureObligations,
+      audit.terminalSecondaryFailureObligations,
+      audit.terminalFailureAuditViolations);
+  REFOLD_LOG_DEBUG(
+      "theorem/state",
+      "state graph: ownerNodes={0} zeroTokenNodes={1} observedComponents={2} "
+      "mutatedComponents={3} incomparableNodes={4} missingProducerFacts={5} "
+      "directChecks={6} deltaFacts={7} graphEdges={8} gatewayWitnesses={9} "
+      "terminalFailures={10} unclosedLocal={11}",
+      audit.graphOwnerNodes, audit.graphZeroTokenStateNodes,
+      audit.graphObservedStateComponents, audit.graphMutatedStateComponents,
+      audit.graphIncomparableNodes, audit.graphMissingProducerFacts,
+      audit.directStateChecksAudited, audit.directStateChecksDeltaFacts,
+      audit.directStateChecksGraphEdges,
+      audit.directStateChecksGatewayWitnesses,
+      audit.directStateChecksTerminalFailures,
+      audit.directStateChecksUnclosedLocal);
+  REFOLD_LOG_DEBUG(
+      "theorem/resolver",
+      "witness resolver: audits={0} declaredInDomain={1} "
+      "explicitOutOfDomain={2} ambiguousOutOfDomain={3} "
+      "missingProof={4} unknownDomain={5} strictAuthority={6} "
+      "strictLegacyFallback={7} strictFailClosed={8} invalidFailClosed={9} "
+      "incompleteKeys={10} incompatibleComposition={11} "
+      "unconvertedWitnesses={12} closureLedgerRows={13}",
+      audit.resolverDomainAudits, audit.resolverDeclaredInDomain,
+      audit.resolverExplicitOutOfDomain, audit.resolverAmbiguousOutOfDomain,
+      audit.resolverPotentiallyMissingProof, audit.resolverUnknownDomain,
+      audit.resolverStrictResolverAuthority, audit.resolverStrictLegacyFallback,
+      audit.resolverStrictFailClosed, audit.resolverStrictInvalidFailClosed,
+      audit.resolverDeclaredIncompleteKeys,
+      audit.resolverDeclaredIncompatibleComposition,
+      audit.resolverDeclaredUnconvertedWitnesses,
+      audit.resolverClosureLedgerRows);
 }
 
 } // namespace refold

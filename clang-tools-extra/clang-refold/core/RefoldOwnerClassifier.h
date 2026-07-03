@@ -33,28 +33,40 @@ struct SidebandPragmaEdit;
 ///
 /// The classifier receives stable read-only model/path/sideband inputs directly
 /// and queries TU-positioning through RefoldTUEditPlanner.  Keeping the planner
-/// as a named constructor dependency removes the old duplicated owner/TU
-/// callback bundle without letting this service build TU text edits or widen TU
-/// spans itself.
+/// as a named constructor dependency makes the owner/TU-anchor boundary
+/// explicit without letting this service build TU text edits or widen TU spans
+/// itself.
 class RefoldOwnerClassifier {
 public:
   struct Deps {
+    /// Producer model containing source segments, include ownership, and slots.
     const RefoldModel &model;
+    /// Path oracle used when physical TU identity must be canonicalized.
     const RefoldPathIdentity &pathIdentity;
+    /// TU-positioning service used only for proof queries, not edit building.
     const RefoldTUEditPlanner &tuEdits;
+    /// Sideband pragma edits already removed from the token streams.
     llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits;
   };
 
   explicit RefoldOwnerClassifier(Deps deps);
 
   /// Classify one A-token hunk into its structural source owner.
+  ///
+  /// The result is owner attribution only: macro/include/TU planners still own
+  /// admissibility, source-byte planning, and accepted-result proof carriers.
+  /// Pure insertions may be classified by neighboring model evidence, but this
+  /// service must not synthesize source edits or widen ownership envelopes.
   Owner ClassifyOwnerWithSegments(llvm::StringRef tuPath,
                                   const diffutils::Hunk &h) const;
 
   /// Return true when an A-token interval can be proven to map to the current
   /// translation-unit source surface.
-  bool HunkMapsToTU(uint64_t a0, uint64_t a1,
-                    llvm::StringRef tuPath) const;
+  ///
+  /// This is a classification predicate, not a fallback search. It succeeds
+  /// only when the model and TU edit-positioning service already provide a
+  /// truthful TU-owned mapping for the requested A-token interval.
+  bool HunkMapsToTU(uint64_t a0, uint64_t a1, llvm::StringRef tuPath) const;
 
 private:
   Deps deps_;

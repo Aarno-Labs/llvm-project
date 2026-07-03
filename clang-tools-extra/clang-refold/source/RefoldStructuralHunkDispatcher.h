@@ -1,4 +1,5 @@
-//===--- RefoldStructuralHunkDispatcher.h ------------------------*- C++ -*-===//
+//===--- RefoldStructuralHunkDispatcher.h ------------------------*- C++
+//-*-===//
 //
 // Structural hunk dispatch staging for clang-refold.
 //
@@ -9,7 +10,7 @@
 // coalescing macro patches by physical invocation span, sorting include-local
 // insertion patches, building closure-fallback claimed intervals, and exposing
 // narrow materialization/emission views only where downstream code still
-// requires the historical map/vector carriers.
+// consumes map/vector carrier surfaces.
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,6 +20,7 @@
 #include "edit/RefoldEditTypes.h"
 #include "edit/RefoldPatchTypes.h"
 #include "util/RefoldDenseMapInfo.h"
+#include "clang/Basic/LangOptions.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -31,15 +33,17 @@
 #include <utility>
 #include <vector>
 
+namespace clang {
+namespace refold {
+
 namespace diffutils {
 struct Hunk;
 }
 
-namespace clang {
-namespace refold {
-
 class RefoldLineObserverLayout;
 class RefoldMacroTopology;
+class RefoldModel;
+class RefoldPathIdentity;
 class RefoldProofLattice;
 
 /// Mutable staging area for one structural hunk-dispatch pass.
@@ -71,10 +75,18 @@ public:
   void AddIncludePatch(const RefoldModel::IncludeItem *include,
                        IncludePatch patch);
 
-  /// Sort each include-local patch list in deterministic emission order.
+  /// Sort each include-local patch list into deterministic emission order.
+  ///
+  /// Multiple insertion patches may be attributed to the same include instance.
+  /// Discovery order can depend on map traversal or incidental diff/LCS
+  /// reconstruction details, so this helper canonicalizes each include bucket
+  /// by `IncludePatch::aStart` first and `IncludePatch::bStart` second.  It
+  /// does not widen, merge, coalesce, rechunk, rewrite payloads, or make
+  /// ownership decisions; it only reorders already-attributed patches in place.
   void OrderIncludeInsertions();
 
-  /// Append line-observer realization edits to the staged TU and include buckets.
+  /// Append line-observer realization edits to the staged TU and include
+  /// buckets.
   bool AppendLineObserverRealizationEdits(RefoldLineObserverLayout &layout,
                                           llvm::StringRef tuPath,
                                           llvm::StringRef tuBytes);
@@ -86,16 +98,16 @@ public:
   IncludeEditMap &MutableIncludeEditBucketsForMaterialization();
 
   /// Prepare the coalesced staging slot for a macro invocation callsite.
-  MacroPatchStagingSlot PrepareMacroPatchStagingSlot(
-      const RefoldModel::MacroInvocation &macro);
+  MacroPatchStagingSlot
+  PrepareMacroPatchStagingSlot(const RefoldModel::MacroInvocation &macro);
 
   /// Return true if this physical macro invocation span already has a staged
   /// patch in the current dispatch pass.
-  bool HasMacroPatchForInvocation(
-      const RefoldModel::MacroInvocation &macro) const;
+  bool
+  HasMacroPatchForInvocation(const RefoldModel::MacroInvocation &macro) const;
 
-  /// Return the mutable merge buckets needed by macro-planning APIs that still
-  /// consume the historical owner->macro-id map surface.
+  /// Return the mutable owner->macro-id merge buckets consumed by
+  /// macro-planning APIs.
   MacroPatchByOwnerByMacroIdMap &MacroPatchMergeBucketsForPlanner();
 
   /// Merge the previous and current B-token materialization envelopes into the
@@ -111,19 +123,19 @@ public:
   ///
   /// The merge buckets use DenseMap storage while patches are discovered.
   /// Finalization sorts owners and macro ids explicitly before asking the proof
-  /// lattice whether each patch is selectable for emission, preserving the
-  /// previous deterministic output order.
+  /// lattice whether each patch is selectable for emission, preserving a
+  /// deterministic output order.
   void FinalizeMacroPatchBuckets(RefoldProofLattice &proofLattice);
 
   /// Return final macro patches for the given owner if the owner has any.
-  std::vector<MacroPatch> *FindFinalMacroPatchesForOwner(
-      std::optional<uint64_t> ownerIncludeId);
-  const std::vector<MacroPatch> *FindFinalMacroPatchesForOwner(
-      std::optional<uint64_t> ownerIncludeId) const;
+  std::vector<MacroPatch> *
+  FindFinalMacroPatchesForOwner(std::optional<uint64_t> ownerIncludeId);
+  const std::vector<MacroPatch> *
+  FindFinalMacroPatchesForOwner(std::optional<uint64_t> ownerIncludeId) const;
 
   /// Return true when the finalized owner bucket contains macro patches.
-  bool HasFinalMacroPatchesForOwner(
-      std::optional<uint64_t> ownerIncludeId) const;
+  bool
+  HasFinalMacroPatchesForOwner(std::optional<uint64_t> ownerIncludeId) const;
 
   /// Return true when any include bucket contains patches.
   bool IncludeBucketsHavePatches() const;
@@ -171,19 +183,19 @@ public:
 
 private:
   IncludeEdits &EnsureIncludeEdits(const RefoldModel::IncludeItem *include);
-  MacroPatchByMacroIdMap &MacroPatchBucketForOwner(
-      std::optional<uint64_t> ownerIncludeId);
-  MacroPatchByMacroIdMap *FindMacroPatchBucketForOwner(
-      std::optional<uint64_t> ownerIncludeId);
-  const MacroPatchByMacroIdMap *FindMacroPatchBucketForOwner(
-      std::optional<uint64_t> ownerIncludeId) const;
+  MacroPatchByMacroIdMap &
+  MacroPatchBucketForOwner(std::optional<uint64_t> ownerIncludeId);
+  MacroPatchByMacroIdMap *
+  FindMacroPatchBucketForOwner(std::optional<uint64_t> ownerIncludeId);
+  const MacroPatchByMacroIdMap *
+  FindMacroPatchBucketForOwner(std::optional<uint64_t> ownerIncludeId) const;
   void StageMacroPatchUnderKey(std::optional<uint64_t> ownerIncludeId,
-                       uint64_t macroPatchKey, MacroPatch patch);
+                               uint64_t macroPatchKey, MacroPatch patch);
   MacroPatch *FindMacroPatchByKey(std::optional<uint64_t> ownerIncludeId,
-                             uint64_t macroPatchKey);
-  std::optional<uint64_t> FindMacroPatchKeyByInvocationSpan(
-      std::optional<uint64_t> ownerIncludeId, uint64_t invStart,
-      uint64_t invEnd) const;
+                                  uint64_t macroPatchKey);
+  std::optional<uint64_t>
+  FindMacroPatchKeyByInvocationSpan(std::optional<uint64_t> ownerIncludeId,
+                                    uint64_t invStart, uint64_t invEnd) const;
 
   llvm::DenseSet<uint64_t> appliedExpandedMacroRootIds_;
   IncludeEditMap perInclude_;
@@ -191,6 +203,20 @@ private:
   MacroPatchByOwnerByMacroIdMap macroPatchByOwnerByMacroId_;
   std::vector<TextEdit> tuEdits_;
 };
+
+/// Widen a zero-width TU insertion left across one ordinary whitespace gap when
+/// the replacement begins with the narrow lexical-separation punctuation class.
+///
+/// This is limited to the punctuation set that may replace a horizontal source
+/// gap after lexical-separation proof.  The widening is allowed only when the
+/// absorbed gap does not overlap any recorded include or macro-invocation
+/// interval and the resulting left/right lexical neighbours do not require a
+/// synthesized separator on either side.
+bool maybeConsumeOrdinarySeparatorGapForPunctuation(
+    const RefoldModel &model, const RefoldPathIdentity &pathIdentity,
+    llvm::StringRef tuPath, llvm::StringRef tuBytes,
+    std::pair<uint64_t, uint64_t> &span, llvm::StringRef replacement,
+    const clang::LangOptions &lexLang);
 
 } // namespace refold
 } // namespace clang

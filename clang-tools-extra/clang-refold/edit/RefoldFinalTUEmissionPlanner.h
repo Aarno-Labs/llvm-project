@@ -6,7 +6,7 @@
 // macro-state repair, and include materialization scheduling have selected the
 // concrete edits that may affect the emitted translation unit.  It deliberately
 // does not implement low-level edit assembly: pending resync flushing,
-// materialized mapping stamping, and accepted-result carrier mechanics remain
+// materialized mapping certifying, and accepted-result carrier mechanics remain
 // in RefoldTextEditAssembler and the proof services.
 //
 //===----------------------------------------------------------------------===//
@@ -41,19 +41,34 @@ class RefoldTextEditAssembler;
 /// been staged.
 class RefoldFinalTUEmissionPlanner {
 public:
-  /// Services borrowed by final TU emission.
+  /// Services and output ledgers borrowed by final TU emission.
+  ///
+  /// All pointers are non-owning.  Null pointers are treated as missing service
+  /// wiring and cause the planner to fail closed through its normal result path
+  /// rather than manufacturing edits without the required proof surface.
   struct Dependencies {
+    /// Refold model containing source/include/macro facts.
     const RefoldModel *model = nullptr;
+    /// Macro topology service used to interpret staged macro edits.
     const RefoldMacroTopology *macroTopology = nullptr;
+    /// Line-control proof service for final observer repairs.
     const RefoldLineControlProof *lineControlProof = nullptr;
+    /// Directive inserter used for synthetic line-control text.
     const LineDirectiveInserter *lineDirs = nullptr;
+    /// Macro-state repair service whose plan is staged before final emission.
     const RefoldMacroStateRepairPlanner *macroStateRepairPlanner = nullptr;
+    /// Final byte-edit assembler used to lower staged edits into TU text.
     const RefoldTextEditAssembler *textEditAssembler = nullptr;
+    /// Proof lattice used for accepted-result carrier construction.
     const RefoldProofLattice *proofLattice = nullptr;
+    /// Terminal fallback sink for fail-closed emission failures.
     RefoldTerminalProofSink *terminalSink = nullptr;
+    /// Optional sidecar mapping output ledger.
     std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr;
-    std::vector<FinalLineControlPruneCandidate> *finalLineControlPruneCandidates =
-        nullptr;
+    /// Optional final-line-control pruning output ledger.
+    std::vector<FinalLineControlPruneCandidate>
+        *finalLineControlPruneCandidates = nullptr;
+    /// Optional final-line-control source mapping output ledger.
     std::vector<FinalLineControlSourceMapping> *finalLineControlSourceMappings =
         nullptr;
   };
@@ -61,21 +76,30 @@ public:
   /// Mutable run state needed to lower the staged structural result into final
   /// TU text.
   struct EmissionRequest {
+    /// Translation-unit path used for owner and line-control diagnostics.
     llvm::StringRef tuPath;
+    /// Original TU source bytes before final edit assembly.
     llvm::StringRef tuBytes;
+    /// Dispatcher containing staged structural edits and token hunk buckets.
     RefoldStructuralHunkDispatcher *structuralHunkDispatcher = nullptr;
+    /// Include scheduler containing materialized include state for this pass.
     RefoldIncludeMaterializationScheduler *includeMaterializationScheduler =
         nullptr;
+    /// Mutable macro-state repair plan to stage around final emission.
     RefoldMacroStateRepairPlanner::MacroStateRepairPlan *macroStatePlan =
         nullptr;
+    /// Immutable macro-state repair request that produced `macroStatePlan`.
     const RefoldMacroStateRepairPlanner::MacroStateRepairRequest
         *macroStateRequest = nullptr;
   };
 
   /// Result of final TU emission.
   struct EmissionResult {
+    /// True when final TU text was emitted without terminal fallback.
     bool success = false;
+    /// Complete emitted translation-unit text.
     std::string tuText;
+    /// Number of macro roots charged as expanded by surviving final edits.
     size_t expandedMacroCount = 0;
   };
 

@@ -230,17 +230,23 @@ static inline StringRef toString(MacroCalleeOriginKind kind) {
 class RefoldModel {
 public:
   // ========================== Coordinate primitives ==========================
+  /// Half-open producer-token interval in the original preprocessed stream A.
   struct PPSpan {
-    uint64_t begin; // inclusive A-token index
-    uint64_t end;   // exclusive A-token index
+    /// Inclusive A-token index in the original preprocessed stream.
+    uint64_t begin;
+    /// Exclusive A-token index in the original preprocessed stream.
+    uint64_t end;
 
     std::string ToString() const {
       return formatv("[{0},{1})", begin, end).str();
     }
 
+    /// Return true when this span consumes at least one A token.
     bool IsValid() const { return end > begin; }
   };
 
+  /// Return whether an argument span kind carries producer byte subranges in
+  /// addition to its A-token interval.
   static constexpr bool HasByteRange(PPArgSpanKind kind) {
     switch (kind) {
     case PPArgSpanKind::Standard:
@@ -252,6 +258,12 @@ public:
     llvm_unreachable("Invalid PPArgSpanKind");
   }
 
+  /// Producer span for one macro actual/formal contribution.
+  ///
+  /// `begin`/`end` name the A-token interval.  Stringification and paste spans
+  /// additionally carry byte offsets into the source-spelled argument and/or
+  /// produced preprocessed bytes so replay services can prove byte-exact
+  /// spelling recovery without guessing from token identity alone.
   struct PPArgSpan : public PPSpan {
     PPArgSpanKind kind = PPArgSpanKind::Standard;
     uint32_t argIdx;
@@ -264,13 +276,18 @@ public:
       return formatv("Arg {0}: [{1}, {2})", argIdx, begin, end).str();
     }
 
+    /// Return true when the A-token span and any required byte subranges are
+    /// internally consistent for this argument-span kind.
     bool IsValid() const;
   };
 
+  /// Minimal half-open A-token cover computed from producer span fragments.
   struct PPCover {
     uint64_t begin = 0;
     uint64_t end = 0;
 
+    /// Compute the smallest half-open A-token interval covering every valid
+    /// ordinary, argument, and body span supplied by the producer.
     void Init(const std::vector<PPSpan> &spans,
               const std::vector<PPArgSpan> *argSpans = nullptr,
               const std::vector<PPSpan> *bodySpans = nullptr) noexcept {
@@ -306,28 +323,43 @@ public:
       }
     }
 
+    /// Return true when the cover consumes at least one A token.
     bool IsValid() const noexcept { return end > begin; }
 
+    /// Return true when the cover contains the requested half-open A-token
+    /// interval.
     bool Covers(uint64_t aStart, uint64_t aEnd) const noexcept {
       return IsValid() && begin <= aStart && aEnd <= end;
     }
   };
 
+  /// Producer tokmap entry tying one A-token to a physical source byte range.
   struct TokMapEntry {
+    /// Physical source file that contributed the mapped token spelling.
     std::string file;
+    /// A-token index in the original preprocessed stream.
     uint64_t pp;
+    /// Inclusive physical source-byte offset in `file`.
     uint64_t b;
+    /// Exclusive physical source-byte offset in `file`.
     uint64_t e;
   };
 
   // ================================== Items ==================================
 
+  /// Header declaration surface recorded for an included file.
   struct HeaderDecl {
+    /// Producer classification for the declaration surface.
     StringRef kind;
+    /// Declaration spelling/name recorded by the producer.
     StringRef name;
+    /// Physical header file containing the declaration.
     StringRef file;
+    /// Inclusive physical header source-byte offset for the declaration.
     uint64_t headerB;
+    /// Exclusive physical header source-byte offset for the declaration.
     uint64_t headerE;
+    /// Half-open A-token span contributed by this declaration surface.
     PPSpan span;
   };
 
@@ -338,9 +370,13 @@ public:
   /// entries by index; consumers must not reconstruct this order from argv when
   /// the producer provided it.
   struct IncludeSearchEntry {
+    /// Zero-based entry index in `pp_ctx.include_search_chain`.
     uint32_t index = 0;
+    /// Producer-normalized include lookup bucket for this chain entry.
     IncludeLookupKind kind = IncludeLookupKind::Unknown;
+    /// Directory spelling as supplied to Clang's include search machinery.
     StringRef spelling;
+    /// Canonical physical directory path for identity comparison.
     StringRef path;
   };
 
@@ -354,9 +390,14 @@ public:
   /// carry their selecting directory spelling/path directly. Unknown carries no
   /// directory or cursor data and therefore cannot satisfy replay proof.
   struct IncludeLookupProvenance {
+    /// Producer-normalized lookup kind for this include edge.
     IncludeLookupKind kind = IncludeLookupKind::Unknown;
+    /// Search-chain index when `kind` is an include-search entry kind.
     std::optional<uint32_t> searchChainIndex;
+    /// Directory spelling selected by source-relative or absolute-operand
+    /// lookup, or normalized from the referenced search-chain entry.
     std::optional<StringRef> directorySpelling;
+    /// Canonical physical directory path selected by the include lookup.
     std::optional<StringRef> directoryPath;
   };
 
@@ -365,17 +406,22 @@ public:
   /// The JSON schema intentionally stores only the non-redundant facts: the
   /// containing include id and the resume cursor.  The selected target's
   /// search-chain index lives on this include edge's lookup object, and the
-  /// containing file's selected index lives on the referenced containing include
-  /// edge.  During model finalization we copy those two indices into the
-  /// optional derived fields below so replay proof code can consume a single
-  /// self-contained obligation without re-performing id lookups on every test.
+  /// containing file's selected index lives on the referenced containing
+  /// include edge.  During model finalization we copy those two indices into
+  /// the optional derived fields below so replay proof code can consume a
+  /// single self-contained obligation without re-performing id lookups on every
+  /// test.
   ///
   /// For old maps, missing or unknown provenance remains represented by
-  /// known=false with all cursor fields absent; consumers must keep the existing
-  /// conservative #include_next fallback in that case.
+  /// known=false with all cursor fields absent; consumers must keep the
+  /// existing conservative #include_next fallback in that case.
   struct IncludeNextProvenance {
+    /// True when the producer supplied structurally usable #include_next facts.
     bool known = false;
+    /// Include edge that opened the file containing this #include_next
+    /// directive.
     std::optional<uint64_t> containingFileIncludeId;
+    /// Search-chain cursor where Clang resumed lookup for this #include_next.
     std::optional<uint32_t> resumeSearchChainIndex;
 
     /// Derived from the containing include edge's lookup.search_chain_index
@@ -387,18 +433,27 @@ public:
     std::optional<uint32_t> selectedSearchChainIndex;
   };
 
+  /// Producer record for one include directive instance.
   struct IncludeItem {
+    /// Stable producer id for this include edge.
     uint64_t id;
-    StringRef subkind;  // "#include" | "#include_next"
-    StringRef text;     // directive line (optional)
-    StringRef sitePath; // includer path
+    /// Directive spelling class, either `#include` or `#include_next`.
+    StringRef subkind;
+    /// Full source directive line text, when serialized by the producer.
+    /// Full source directive line text.
+    StringRef text;
+    /// Physical source file that contains the directive site.
+    StringRef sitePath;
+    /// Inclusive physical source-byte offset of the directive site.
     uint64_t siteB;
+    /// Exclusive physical source-byte offset of the directive site.
     uint64_t siteE;
-    StringRef target; // as-written (e.g. "\"e.h\"" or "<vector>")
+    /// As-written include target token, e.g. `"e.h"` or `<vector>`.
+    StringRef target;
 
-    // Historical field name. Retained for backward compatibility only. New
-    // producer maps split this old overloaded value into openedPath for
-    // physical identity and enteredFileSpelling for filename observers.
+    // Legacy compatibility field.  Producer maps with normalized include
+    // resolution split this overloaded value into openedPath for physical
+    // identity and enteredFileSpelling for filename observers.
     std::optional<StringRef> resolvedPath;
 
     // New normalized include-resolution metadata. All fields are optional so
@@ -410,10 +465,16 @@ public:
     std::optional<IncludeLookupProvenance> lookup;
     std::optional<IncludeNextProvenance> includeNext;
 
+    /// True when the target was spelled with angle brackets.
     bool angled;
-    std::optional<uint64_t> parent; // parent include id
+    /// Parent include edge id; nullopt means this include was reached from the
+    /// TU.
+    std::optional<uint64_t> parent;
+    /// A-token spans contributed by the included file instance.
     std::vector<PPSpan> spans;
-    std::vector<HeaderDecl> decls; // header decls referenced by this include
+    /// Header declaration surfaces recorded inside this include instance.
+    std::vector<HeaderDecl> decls;
+    /// Minimal half-open A-token cover of `spans`.
     PPCover cover;
 
     IncludeItem(uint64_t id, StringRef subkind, StringRef text,
@@ -423,9 +484,8 @@ public:
                 std::optional<StringRef> enteredFileSpelling,
                 std::optional<StringRef> enteredFileName,
                 std::optional<IncludeLookupProvenance> lookup,
-                std::optional<IncludeNextProvenance> includeNext,
-                bool angled, std::optional<uint64_t> parent,
-                std::vector<PPSpan> spans,
+                std::optional<IncludeNextProvenance> includeNext, bool angled,
+                std::optional<uint64_t> parent, std::vector<PPSpan> spans,
                 std::vector<HeaderDecl> decls) noexcept
         : id(id), subkind(subkind), text(text), sitePath(sitePath),
           siteB(siteB), siteE(siteE), target(target),
@@ -437,27 +497,40 @@ public:
       cover.Init(this->spans);
     }
 
+    /// Return true when this include's producer cover contains the requested
+    /// half-open A-token interval.
     bool Covers(uint64_t aStart, uint64_t aEnd) const {
       return cover.Covers(aStart, aEnd);
     }
   };
 
+  /// Root invocation argument slice referenced by a nested macro argument.
   struct InvArgRef {
+    /// Formal parameter index in the caller invocation.
     uint32_t callerParamIndex;
+    /// Inclusive caller-argument-local byte offset for the referenced slice.
     uint32_t byteBegin;
+    /// Exclusive caller-argument-local byte offset for the referenced slice.
     uint32_t byteEnd;
   };
 
+  /// Root invocation tuple-element slice referenced by a nested macro argument.
   struct TupleArgRef {
+    /// Formal parameter index in the caller invocation.
     uint32_t callerParamIndex;
+    /// Inclusive caller-argument-local byte offset for the tuple slice.
     uint32_t callerByteBegin;
+    /// Exclusive caller-argument-local byte offset for the tuple slice.
     uint32_t callerByteEnd;
   };
 
+  /// Origin kind for one segment of a pasted-token spelling.
   enum class PastePartKind { Arg, Literal };
 
+  /// Producer token kind for a macro definition replacement-list replay token.
   enum class MacroReplacementTokenKind { Literal, ParamRef };
 
+  /// Origin kind for one segment of a generated macro-callee spelling.
   enum class CalleeOriginPartKind { Literal, CallerArgSlice };
 
   /// One contiguous contribution to a pasted token's final spelling.
@@ -492,8 +565,11 @@ public:
     std::vector<PastePart> parts;
   };
 
+  /// One formal parameter from a producer-recorded macro definition.
   struct MacroDefParam {
+    /// Formal parameter spelling.
     StringRef name;
+    /// True when this formal is the variadic parameter.
     bool variadic;
 
     MacroDefParam(StringRef name, bool variadic)
@@ -529,45 +605,76 @@ public:
     std::optional<uint32_t> byteEnd;
   };
 
+  /// Producer witness for the spelling source of a macro callee token.
   struct MacroCalleeOrigin {
+    /// High-level callee-origin kind recorded by the producer.
     MacroCalleeOriginKind kind = MacroCalleeOriginKind::LiteralMacroName;
+    /// Caller formal indices that contributed to the callee spelling.
     std::vector<uint32_t> callerParamIndices;
+    /// Literal callee spelling when it is available directly.
     std::optional<StringRef> spelling;
+    /// Ordered callee-origin segments for paste/generated callee cases.
     std::vector<CalleeOriginPart> parts;
   };
 
+  /// Producer record for one macro invocation instance.
   struct MacroInvocation {
+    /// Stable producer id for this physical macro invocation.
     uint64_t id;
-    StringRef subkind; // "func" | "obj"
+    /// Producer macro item subtype, such as object-like or function-like.
+    StringRef subkind;
+    /// Macro name spelling observed at the call site.
     StringRef name;
-    std::vector<PPSpan> spans; // expansion coverage (A tokens)
+    /// A-token spans produced by this macro invocation.
+    std::vector<PPSpan> spans;
+    /// Standard formal/actual A-token spans for each argument contribution.
     std::vector<PPArgSpan> argSpans;
+    /// Stringification A-token and argument-byte spans.
     std::vector<PPArgSpan> stringifySpans;
+    /// Token-paste A-token and argument/preprocessed-byte spans.
     std::vector<PPArgSpan> pasteSpans;
-    std::vector<PasteToken> pasteTokens; // exact producer-side ## witnesses
-    std::vector<MacroDefParam>
-        defParams; // formal parameters from macro definition
+    /// Exact producer witnesses for tokens synthesized by `##`.
+    std::vector<PasteToken> pasteTokens;
+    /// Formal parameters from the macro definition used by this invocation.
+    std::vector<MacroDefParam> defParams;
+    /// Optional half-open byte range whose endpoints may be absent
+    /// independently.
     using OptByteRange =
         std::pair<std::optional<uint64_t>, std::optional<uint64_t>>;
-    std::vector<OptByteRange>
-        invArgRanges; // per-formal invocation-argument byte ranges
+    /// Source-spelled invocation-argument byte ranges, indexed by formal.
+    std::vector<OptByteRange> invArgRanges;
+    /// Producer-normalized invocation text, when available.
     std::optional<StringRef> normalizedInvText;
-    std::vector<OptByteRange>
-        normalizedInvArgTextRanges; // per-formal argument ranges within
-                                    // normalizedInvText
+    /// Byte ranges inside `normalizedInvText`, indexed by formal.
+    std::vector<OptByteRange> normalizedInvArgTextRanges;
+    /// A-token spans for definition-body tokens replayed by this invocation.
     std::vector<PPSpan> bodySpans;
+    /// Source-spelled invocation text at the physical call site, when
+    /// available.
     std::optional<StringRef> invText;
-    std::optional<StringRef> invFile;   // file containing invocation
-    std::optional<uint64_t> invB, invE; // byte offsets within invFile
-    std::optional<uint64_t> invPPByteBegin,
-        invPPByteEnd; // A-stream byte envelope
+    /// Physical source file containing the invocation spelling.
+    std::optional<StringRef> invFile;
+    /// Half-open physical source-byte range for `invText` in `invFile`.
+    std::optional<uint64_t> invB, invE;
+    /// Half-open byte range in the original preprocessed A stream for
+    /// `invText`.
+    std::optional<uint64_t> invPPByteBegin, invPPByteEnd;
+    /// Include instance that owns the invocation callsite, or nullopt for TU.
     std::optional<uint64_t> ownerIncludeId;
+    /// Macro directive id whose definition was used for this invocation.
     std::optional<uint64_t> definitionDirectiveId;
+    /// Parent macro invocation id for nested/generated invocations.
     std::optional<uint64_t> callerMacroId;
+    /// Producer witness describing how the callee token spelling was formed.
     MacroCalleeOrigin calleeOrigin;
+    /// Formal dependency graph: callee formal -> caller formal indices.
     std::vector<std::vector<uint32_t>> argDeps;
+    /// Root invocation argument slices used by each formal.
     std::vector<std::vector<InvArgRef>> argRefs;
+    /// Root invocation tuple-element slices used by each formal.
     std::vector<std::vector<TupleArgRef>> argTupleRefs;
+    /// Minimal half-open A-token cover for spans, argument spans, and body
+    /// spans.
     PPCover cover;
 
     MacroInvocation(uint64_t id, StringRef subkind, StringRef name,
@@ -592,12 +699,12 @@ public:
                     std::vector<std::vector<uint32_t>> argDeps,
                     std::vector<std::vector<InvArgRef>> argRefs,
                     std::vector<std::vector<TupleArgRef>> argTupleRefs) noexcept
-        : id(id), subkind(subkind), name(name),
-          spans(std::move(spans)), argSpans(std::move(argSpans)),
+        : id(id), subkind(subkind), name(name), spans(std::move(spans)),
+          argSpans(std::move(argSpans)),
           stringifySpans(std::move(stringifySpans)),
           pasteSpans(std::move(pasteSpans)),
-          pasteTokens(std::move(pasteTokens)),
-          defParams(std::move(defParams)), invArgRanges(std::move(invArgRanges)),
+          pasteTokens(std::move(pasteTokens)), defParams(std::move(defParams)),
+          invArgRanges(std::move(invArgRanges)),
           normalizedInvText(normalizedInvText),
           normalizedInvArgTextRanges(std::move(normalizedInvArgTextRanges)),
           bodySpans(std::move(bodySpans)), invText(invText), invFile(invFile),
@@ -610,6 +717,12 @@ public:
       cover.Init(this->spans, &this->argSpans, &this->bodySpans);
     }
 
+    /// Return true when the macro invocation's producer cover contains the
+    /// requested half-open A-token interval.
+    ///
+    /// Empty insertion gaps at the invocation boundary are deliberately
+    /// excluded so boundary edits are not forced into macro ownership when a
+    /// neighboring TU/include proof can own them instead.
     bool Covers(uint64_t aStart, uint64_t aEnd) const {
       if (!cover.IsValid())
         return false;
@@ -624,9 +737,12 @@ public:
     }
   };
 
+  /// Producer record for one macro-state directive.
   struct MacroDirective {
+    /// Stable producer id for this directive.
     uint64_t id;
-    StringRef subkind; // "#define" | "#undef"
+    /// Directive spelling class, either `#define` or `#undef`.
+    StringRef subkind;
     /// Producer-recorded macro-state key for this #define/#undef directive.
     /// Keeping the name in the model lets replay proofs resolve macro state
     /// without reparsing raw directive text in the consumer.
@@ -636,20 +752,33 @@ public:
     /// This is producer-owned macro-state shape data; consumers use it instead
     /// of reparsing directive text to distinguish NAME from NAME(...).
     bool functionLike = false;
+    /// Physical source file containing the directive site.
     StringRef sitePath;
+    /// Inclusive physical source-byte offset of the directive site.
     uint64_t siteB;
+    /// Exclusive physical source-byte offset of the directive site.
     uint64_t siteE;
+    /// Include instance that owns the directive site, or nullopt for TU.
     std::optional<uint64_t> ownerIncludeId;
+    /// A-token spans contributed by this directive, when any.
     std::vector<PPSpan> spans;
+    /// Formal parameters for a function-like #define.
     std::vector<MacroDefParam> defParams;
+    /// Producer replacement-list replay tokens for a #define.
     std::vector<MacroReplacementToken> replacementTokens;
   };
 
+  /// Producer record for one pragma directive line.
   struct PragmaDirective {
+    /// Stable producer id for this pragma directive.
     uint64_t id;
+    /// Full source pragma directive line text.
     StringRef text;
+    /// Physical source file containing the directive site.
     StringRef sitePath;
+    /// Inclusive physical source-byte offset of the directive site.
     uint64_t siteB;
+    /// Exclusive physical source-byte offset of the directive site.
     uint64_t siteE;
     /// Include instance that owned this pragma directive, when the producer
     /// recorded it.  Older maps omit the field, so consumers must either infer
@@ -658,34 +787,54 @@ public:
     std::optional<uint64_t> ownerIncludeId;
   };
 
+  /// Producer record for one physical file's emitted A-token contribution.
   struct FileItem {
+    /// Stable producer id for the file record.
     uint64_t id;
+    /// Canonical physical file path.
     StringRef path;
+    /// A-token spans emitted while this file was the active source file.
     std::vector<PPSpan> spans;
   };
 
   // ================================== Slots ==================================
 
+  /// Producer-recorded deterministic insertion/replacement anchor.
   struct Slot {
+    /// Stable producer id for this slot.
     uint64_t id;
+    /// Physical source file containing the slot.
     StringRef file;
-    StringRef kind;              // enum per schema
-    std::optional<uint64_t> ref; // include id or cond-arm id
+    /// Slot kind string from the schema.
+    StringRef kind;
+    /// Referenced include id or conditional-arm id, when the slot is scoped.
+    std::optional<uint64_t> ref;
+    /// A-token or PP-gap coordinate associated with this slot, when any.
     std::optional<uint64_t> pp;
+    /// Inclusive physical source-byte offset of the slot.
     uint64_t b;
+    /// Exclusive physical source-byte offset of the slot.
     uint64_t e;
+    /// Include instance that owns the slot, or nullopt for TU.
     std::optional<uint64_t> ownerIncludeId;
   };
 
   // ================================ Segments =================================
 
+  /// Physical source-byte ownership segment.
   struct Segment {
+    /// Physical source file covered by this segment.
     StringRef file;
+    /// Inclusive physical source-byte offset.
     uint64_t b;
+    /// Exclusive physical source-byte offset.
     uint64_t e;
-    std::optional<uint64_t>
-        ownerIncludeId; // current include ownership at [b,e)
-    std::optional<uint64_t> ownerCondArmId; // current conditional arm at [b,e)
+    /// Include owner for the half-open physical source-byte range [b,e), if
+    /// any.
+    std::optional<uint64_t> ownerIncludeId;
+    /// Conditional-arm owner for the half-open physical source-byte range
+    /// [b,e), if any.
+    std::optional<uint64_t> ownerCondArmId;
 
     std::string ToString() const {
       return formatv("Segment{file='{0}', b={1}, e={2}, ownerIncludeId={3} "
@@ -696,14 +845,23 @@ public:
 
   // =============================== Conditionals ==============================
 
+  /// One arm of a producer-recorded conditional group.
   struct CondArm {
+    /// Stable producer id for this arm.
     uint64_t id;
-    uint64_t groupId; // owning CondGroup id
-    StringRef kind;   // if/ifdef/ifndef/elif/else
+    /// Owning conditional group id.
+    uint64_t groupId;
+    /// Arm kind string, such as `if`, `ifdef`, `elif`, or `else`.
+    StringRef kind;
+    /// Source condition spelling when the arm has one.
     std::optional<StringRef> cond;
+    /// Inclusive physical source-byte offset of the arm body.
     uint64_t bodyB;
+    /// Exclusive physical source-byte offset of the arm body.
     uint64_t bodyE;
-    std::optional<PPSpan> span; // optional A-token span for this arm
+    /// Optional A-token span emitted by the selected arm.
+    std::optional<PPSpan> span;
+    /// True when this arm was selected by the producer preprocessing run.
     bool selected;
 
     bool ContainsByte(uint64_t byteOffset) const {
@@ -711,22 +869,35 @@ public:
     }
   };
 
+  /// Producer-recorded conditional directive group in one physical file.
   struct CondGroup {
+    /// Stable producer id for this conditional group.
     uint64_t id;
+    /// Physical source file containing the group.
     StringRef file;
+    /// Parent conditional arm id when this group is nested in another arm.
     std::optional<uint64_t> parentArmId;
+    /// Parent include instance id when this group is header-owned.
     std::optional<uint64_t> parentIncludeId;
+    /// Inclusive physical source-byte offset of the whole conditional group.
     uint64_t groupB;
+    /// Exclusive physical source-byte offset of the whole conditional group.
     uint64_t groupE;
+    /// Conditional arms in producer source order.
     std::vector<CondArm> arms;
 
+    /// Return true when \p byteOffset lies inside the physical conditional
+    /// group byte extent.
     bool ContainsByte(uint64_t byteOffset) const {
       return groupB <= byteOffset && byteOffset < groupE;
     }
   };
 
+  /// Borrowed pointer pair identifying one conditional arm and its group.
   struct ArmRef {
+    /// Owning conditional group; points into RefoldModel storage.
     const CondGroup *group;
+    /// Conditional arm; points into RefoldModel storage.
     const CondArm *arm;
   };
 
@@ -737,17 +908,62 @@ public:
   /// arbitrary source `#line` forms, including macro-expanded operands, without
   /// requiring the consumer to re-evaluate preprocessor expressions.
   struct LineControlEvent {
+    /// Stable producer id for the event.
     uint64_t id = 0;
+    /// Physical source file containing the line-control directive.
     StringRef physicalFile;
+    /// Inclusive physical source-byte offset of the directive site, when known.
     std::optional<uint64_t> siteB;
+    /// Exclusive physical source-byte offset of the directive site, when known.
     std::optional<uint64_t> siteE;
+    /// True when this event was active in the producer preprocessing run.
     bool active = false;
+    /// True when Clang supplied semantic line-control evidence for this event.
     bool producerProven = false;
+    /// Logical line immediately after the directive takes effect.
     uint64_t logicalLineAfter = 0;
+    /// Logical file spelling immediately after the directive takes effect.
     StringRef logicalFileAfter;
+    /// Include instance that owns the directive site, or nullopt for TU.
     std::optional<uint64_t> ownerIncludeId;
+    /// Full source directive text.
     StringRef text;
   };
+
+  /// \brief Producer-recorded preprocessing context recovered from the
+  /// refold-map `pp_ctx` field.
+  ///
+  /// `cwd` is the working directory the producer ran `cpp` from.  `argv` is
+  /// the preprocessor command line (program + flags).  `lang` is the
+  /// producer-asserted language mode token (e.g. "c", "c++").  Driver code that
+  /// needs to re-invoke the preprocessor on a candidate source consumes this
+  /// carrier; the same fields are also stored as individual model members and
+  /// available through `GetPPCwd()` / `GetPPLang()` / `GetPPArgv()` once the
+  /// full model has been constructed.
+  struct PreprocessContext {
+    /// Producer preprocessing working directory.
+    std::string cwd;
+    /// Producer preprocessor command line, including program and flags.
+    std::vector<std::string> argv;
+    /// Producer language token used to configure raw lexing.
+    std::string lang;
+  };
+
+  /// \brief Extract the `pp_ctx` object from a refold-map JSON root.
+  ///
+  /// This is exposed as a free-standing static so the driver can obtain the
+  /// preprocessing context before constructing the full model (e.g. to
+  /// re-invoke `cpp` during `--check` mode without paying for full model
+  /// parsing).  `FromJson` performs the same extraction internally and stores
+  /// the resulting fields on the model.
+  static Expected<PreprocessContext>
+  ParsePreprocessContext(const json::Object &root);
+
+  /// \brief Extract the top-level `source` path from a refold-map JSON root.
+  ///
+  /// Returns an error when the field is missing or empty.  The full model
+  /// also exposes this value via `GetSourcePath()` once `FromJson` succeeds.
+  static Expected<std::string> ParseSourcePath(const json::Object &root);
 
   /// \brief Constructs a RefoldModel instance from a parsed JSON object.
   ///
@@ -766,40 +982,61 @@ public:
 
   // ============================== Basic getters ==============================
 
+  /// Return the producer map version string.
   StringRef GetVersion() const { return version_; }
+  /// Return the original physical translation-unit source path.
   StringRef GetSourcePath() const { return sourcePath_; }
+  /// Return the producer preprocessing working directory.
   StringRef GetPPCwd() const { return ppCwd_; }
+  /// Return the producer language token used to configure the raw lexer for
+  /// source-byte slices in this model.
   StringRef GetPPLang() const { return ppLang_; }
+  /// Return the producer preprocessor argv captured in the map.
   ArrayRef<std::string> GetPPArgv() const { return ppArgv_; }
+  /// Return the producer include-search chain in recorded lookup order.
   ArrayRef<IncludeSearchEntry> GetIncludeSearchChain() const {
     return includeSearchChain_;
   }
+  /// Return the number of producer A tokens recorded in the map.
   uint64_t GetTokensCountA() const { return tokensCountA_; }
 
+  /// Return tokmap entries keyed by preprocessed A-token index.
   const DenseMap<uint64_t, TokMapEntry> &GetTokmapByPP() const {
     return tokmapByPP_;
   }
+  /// Return the ordered producer A-token to physical source-byte map entries.
   ArrayRef<TokMapEntry> GetTokmap() const { return tokmap_; }
 
+  /// Return producer include instances.
   ArrayRef<IncludeItem> GetIncludes() const { return includes_; }
+  /// Return producer macro invocation instances.
   ArrayRef<MacroInvocation> GetMacroInvocations() const { return macroInvs_; }
+  /// Return producer macro state directives.
   ArrayRef<MacroDirective> GetMacroDirectives() const { return macroDirs_; }
+  /// Return producer pragma directives.
   ArrayRef<PragmaDirective> GetPragmas() const { return pragmas_; }
+  /// Return producer file records.
   ArrayRef<FileItem> GetFileItems() const { return fileItems_; }
+  /// Return source insertion/replacement slots recorded by the producer.
   ArrayRef<Slot> GetSlots() const { return slots_; }
+  /// Return producer conditional groups.
   ArrayRef<CondGroup> GetConds() const { return conds_; }
+  /// Return producer-proven active line-control events.
   ArrayRef<LineControlEvent> GetLineControls() const { return lineControls_; }
 
+  /// Look up a producer include instance by stable ID.
   const IncludeItem *GetIncludeById(uint64_t id) const {
     auto it = includeById_.find(id);
     return it == includeById_.end() ? nullptr : it->second;
   }
 
+  /// Look up a producer conditional group by stable ID.
   const CondGroup *GetCondGroupById(uint64_t id) const {
     auto it = condGroupById_.find(id);
     return it == condGroupById_.end() ? nullptr : it->second;
   }
 
+  /// Look up a selected or inactive conditional arm by stable arm ID.
   std::optional<ArmRef> GetArmRefById(uint64_t armId) const {
     auto it = armById_.find(armId);
     if (it == armById_.end())
@@ -810,6 +1047,8 @@ public:
   // ========================= Helpers for the engine  =========================
 
   // --- Segments ---
+  /// Return physical source ownership segments for \p file, or an empty range
+  /// when the map contains no segment table for that file.
   ArrayRef<Segment> GetSegmentsForFile(StringRef file) const {
     auto it = segmentsByFile_.find(file);
     if (it == segmentsByFile_.end())
@@ -818,27 +1057,36 @@ public:
   }
 
   // --- Include nesting ---
+  /// Return include nesting depth for an optional include owner.
   uint32_t GetIncludeDepth(std::optional<uint64_t> includeId) const;
+  /// Return the innermost include owner that produced A-token \p ppIndex.
   std::optional<uint64_t> InnermostIncludeAtPP(uint64_t ppIndex) const;
+  /// Return the least common include ancestor of two optional include owners.
   std::optional<uint64_t>
   LeastCommonAncestorInclude(std::optional<uint64_t> a,
                              std::optional<uint64_t> b) const;
 
   // --- Conditional nesting ---
+  /// Return nesting depth for a producer conditional group.
   uint32_t GetCondGroupDepth(uint64_t groupId) const;
+  /// Return nesting depth for a producer conditional arm.
   uint32_t GetCondArmDepth(uint64_t armId) const {
     if (auto ref = GetArmRefById(armId))
       return GetCondGroupDepth(ref->group->id);
     return 0;
   }
 
+  /// Return conditional groups physically owned by \p file and optional
+  /// parent include.
   std::vector<const CondGroup *>
   GetCondGroups(StringRef file, std::optional<uint64_t> parentIncludeId) const;
 
+  /// Find the innermost conditional arm containing a physical source byte.
   std::optional<ArmRef>
   FindArmRefForByte(StringRef file, std::optional<uint64_t> parentIncludeId,
                     uint64_t byteOffset) const;
 
+  /// Convenience wrapper returning only the conditional arm pointer.
   std::optional<const CondArm *>
   FindArmForByte(StringRef file, std::optional<uint64_t> parentIncludeId,
                  uint64_t byteOffset) const {
@@ -847,6 +1095,7 @@ public:
     return std::nullopt;
   }
 
+  /// Find the selected conditional arm that produced A-token `ppIndex`.
   std::optional<ArmRef> FindArmRefAtPP(uint64_t ppIndex) const;
   std::optional<const CondArm *> FindArmForPP(uint64_t ppIndex) const {
     auto ref = FindArmRefAtPP(ppIndex);
@@ -855,6 +1104,7 @@ public:
     return ref->arm;
   }
 
+  /// Return the first A-token index emitted by the selected arm of `group`.
   std::optional<uint64_t>
   FirstConditionalArmStartA(const CondGroup &group) const;
   std::optional<uint64_t> FirstConditionalArmStartA(uint64_t groupId) const {
@@ -876,6 +1126,8 @@ public:
             std::optional<uint64_t> ref,
             std::optional<uint64_t> ownerIncludeId) const;
 
+  /// Return the deterministic slot immediately before `includeId`, when
+  /// present.
   std::optional<const Slot *> GetBeforeIncludeSlot(uint64_t includeId) const {
     auto slots =
         FindSlots(std::nullopt, "before_include", includeId, std::nullopt);
@@ -884,6 +1136,7 @@ public:
     return slots.front();
   }
 
+  /// Return the deterministic slot immediately after `includeId`, when present.
   std::optional<const Slot *> GetAfterIncludeSlot(uint64_t includeId) const {
     auto slots =
         FindSlots(std::nullopt, "after_include", includeId, std::nullopt);
@@ -892,10 +1145,13 @@ public:
     return slots.front();
   }
 
+  /// Return the deterministic slot at the beginning of a conditional arm.
   std::optional<const Slot *> GetArmBeginSlot(uint64_t armId) const;
+  /// Return the deterministic slot at the end of a conditional arm.
   std::optional<const Slot *> GetArmEndSlot(uint64_t armId) const;
 
   // --- Tokmap queries ---
+  /// Map one A-token index to its physical source-byte tokmap entry.
   std::optional<TokMapEntry> MapPP(uint64_t pp) const {
     auto it = tokmapByPP_.find(pp);
     if (it == tokmapByPP_.end())
@@ -905,9 +1161,9 @@ public:
 
   /// Map a half-open A-token span to the producer tokmap entries it contains.
   ///
-  /// Invalid spans return an empty vector. Missing PP indices are skipped rather
-  /// than synthesized, because not every preprocessed token is guaranteed to
-  /// have a concrete source spelling in tokmap.
+  /// Invalid spans return an empty vector. Missing PP indices are skipped
+  /// rather than synthesized, because not every preprocessed token is
+  /// guaranteed to have a concrete source spelling in tokmap.
   std::vector<TokMapEntry> MapSpan(const PPSpan &span) const;
 
 private:
@@ -925,8 +1181,11 @@ private:
   std::vector<IncludeSearchEntry> includeSearchChain_;
   uint64_t tokensCountA_ = 0;
 
-  /// Optional per-token byte offsets in the preprocessed output (A stream).
+  /// Optional inclusive byte offsets for each A token in the original
+  /// preprocessed output stream.
   std::optional<std::vector<uint64_t>> tokPPByteBeginA_;
+  /// Optional exclusive byte offsets for each A token in the original
+  /// preprocessed output stream.
   std::optional<std::vector<uint64_t>> tokPPByteEndA_;
 
   DenseMap<uint64_t, TokMapEntry> tokmapByPP_; // key = pp

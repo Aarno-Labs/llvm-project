@@ -77,8 +77,8 @@ RefoldTokenTextAnalysis::FirstRawIdentifierObservationOffsetInText(
   }
 }
 
-bool RefoldTokenTextAnalysis::RawIdentifierAppearsInText(
-    StringRef name, StringRef text) const {
+bool RefoldTokenTextAnalysis::RawIdentifierAppearsInText(StringRef name,
+                                                         StringRef text) const {
   return FirstRawIdentifierObservationOffsetInText(name, text).has_value();
 }
 
@@ -133,7 +133,8 @@ RefoldTokenTextAnalysis::FirstFunctionLikeInvocationOffsetInText(
 
 bool RefoldTokenTextAnalysis::FunctionLikeInvocationAppearsInText(
     StringRef name, StringRef text, StringRef suffix) const {
-  return FirstFunctionLikeInvocationOffsetInText(name, text, suffix).has_value();
+  return FirstFunctionLikeInvocationOffsetInText(name, text, suffix)
+      .has_value();
 }
 
 bool RefoldTokenTextAnalysis::TextMentionsLineObserver(StringRef text) const {
@@ -146,7 +147,8 @@ bool RefoldTokenTextAnalysis::TextMentionsFileObserver(StringRef text) const {
          RawIdentifierAppearsInText("__BASE_FILE__", text);
 }
 
-bool RefoldTokenTextAnalysis::TextMentionsCounterObserver(StringRef text) const {
+bool RefoldTokenTextAnalysis::TextMentionsCounterObserver(
+    StringRef text) const {
   return RawIdentifierAppearsInText("__COUNTER__", text);
 }
 

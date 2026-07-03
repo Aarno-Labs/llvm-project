@@ -43,8 +43,7 @@ decodeBoundedLineControlHexEscapeValue(StringRef &rest) {
 }
 
 std::optional<uint32_t>
-decodeLineControlUniversalCharacterNameValue(StringRef &rest,
-                                             unsigned digits) {
+decodeLineControlUniversalCharacterNameValue(StringRef &rest, unsigned digits) {
   if (rest.size() < digits)
     return std::nullopt;
 
@@ -167,16 +166,14 @@ bool isValidLineControlUTF8(StringRef text) {
 
     if (lead == 0xf0) {
       std::optional<unsigned char> b1 = continuation(i + 1);
-      if (!b1 || *b1 < 0x90 || !continuation(i + 2) ||
-          !continuation(i + 3))
+      if (!b1 || *b1 < 0x90 || !continuation(i + 2) || !continuation(i + 3))
         return false;
       i += 4;
       continue;
     }
 
     if (0xf1 <= lead && lead <= 0xf3) {
-      if (!continuation(i + 1) || !continuation(i + 2) ||
-          !continuation(i + 3))
+      if (!continuation(i + 1) || !continuation(i + 2) || !continuation(i + 3))
         return false;
       i += 4;
       continue;
@@ -184,8 +181,7 @@ bool isValidLineControlUTF8(StringRef text) {
 
     if (lead == 0xf4) {
       std::optional<unsigned char> b1 = continuation(i + 1);
-      if (!b1 || *b1 > 0x8f || !continuation(i + 2) ||
-          !continuation(i + 3))
+      if (!b1 || *b1 > 0x8f || !continuation(i + 2) || !continuation(i + 3))
         return false;
       i += 4;
       continue;
@@ -236,8 +232,8 @@ decodeLineControlFilenameEscape(StringRef &rest) {
   if (escaped == 'u' || escaped == 'U') {
     rest = rest.drop_front();
     std::optional<uint32_t> value =
-        decodeLineControlUniversalCharacterNameValue(
-            rest, escaped == 'u' ? 4u : 8u);
+        decodeLineControlUniversalCharacterNameValue(rest,
+                                                     escaped == 'u' ? 4u : 8u);
     if (!value)
       return std::nullopt;
 
@@ -291,8 +287,7 @@ decodeLineControlFilenameEscape(StringRef &rest) {
   }
 }
 
-std::optional<std::string>
-parseLineControlFilenameLiteral(StringRef &rest) {
+std::optional<std::string> parseLineControlFilenameLiteral(StringRef &rest) {
   if (!rest.consume_front("\""))
     return std::nullopt;
 

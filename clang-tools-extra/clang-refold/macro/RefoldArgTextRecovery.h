@@ -2,9 +2,17 @@
 //
 // Macro-argument text recovery helpers for clang-refold.
 //
-// This service owns the small raw-lexing operations used when a macro
+// This module owns the small raw-lexing operations used when a macro
 // invocation patch has to reason about source spelling rather than producer
-// token ranges.  It deliberately has no access to RefoldEngine state: callers
+// token ranges.  It exposes:
+//   - the free predicate `refoldMacroActualHasTopLevelComma`, which decides
+//     whether a candidate replacement would split a function-like macro
+//     actual; and
+//   - the `RefoldArgTextRecovery` class, which inverts stringified literal
+//     tokens and recovers per-actual byte ranges from a raw invocation
+//     spelling.
+//
+// Everything here deliberately has no access to RefoldEngine state: callers
 // provide the captured language options and receive either a fully proved text
 // range/result or std::nullopt.
 //
@@ -25,6 +33,16 @@
 
 namespace clang {
 namespace refold {
+
+/// Return true when \p text contains a comma that would split a single
+/// function-like macro actual.
+///
+/// This deliberately models macro-argument collection rather than general C
+/// expression tuple parsing: nested parentheses protect commas, while brackets
+/// and braces do not.  Comments and literals are tokenized as opaque raw-lexer
+/// tokens so commas inside them cannot produce a false positive.
+bool refoldMacroActualHasTopLevelComma(llvm::StringRef text,
+                                       const LangOptions &lang);
 
 /// Recovers macro actual-argument spellings from textual surfaces that are not
 /// already represented by producer-owned model ranges.

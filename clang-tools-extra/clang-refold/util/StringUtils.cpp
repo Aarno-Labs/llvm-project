@@ -8,7 +8,7 @@
 // refolding pipeline. These routines mirror the C/C++ preprocessor’s notion of
 // whitespace and identifier characters and intentionally avoid locale/Unicode-
 // dependent behavior to keep results stable across platforms and toolchains.
-//  
+//
 // What’s here
 // -----------
 //  • Whitespace predicates:
@@ -27,7 +27,7 @@
 //      - showWs(StringRef)           : visualize whitespace (·, \t, \n, \r, \f,
 //                                      \v)
 //      - clip(StringRef, size_t)     : truncate with length suffix
-//  
+//
 // Design notes
 // ------------
 //  • ASCII by construction: no std::is* or Unicode categories.
@@ -46,8 +46,8 @@
 //  • Keep helpers minimal and allocation-free where practical.
 //  • Behavior must not depend on locale or environment.
 //
-// Author:               
-//   jeikenberry 
+// Author:
+//   jeikenberry
 //
 //===----------------------------------------------------------------------===//
 
@@ -112,17 +112,39 @@ std::string escapeLineDirectivePath(StringRef path) {
   escaped.reserve(path.size());
   for (char c : path) {
     switch (c) {
-    case '\\': escaped.append("\\\\"); break;
-    case '\"': escaped.append("\\\""); break;
-    case '\a': escaped.append("\\a"); break;
-    case '\b': escaped.append("\\b"); break;
-    case '\f': escaped.append("\\f"); break;
-    case '\n': escaped.append("\\n"); break;
-    case '\r': escaped.append("\\r"); break;
-    case '\t': escaped.append("\\t"); break;
-    case '\v': escaped.append("\\v"); break;
-    case static_cast<char>(0x1b): escaped.append("\\e"); break;
-    default: escaped.push_back(c); break;
+    case '\\':
+      escaped.append("\\\\");
+      break;
+    case '\"':
+      escaped.append("\\\"");
+      break;
+    case '\a':
+      escaped.append("\\a");
+      break;
+    case '\b':
+      escaped.append("\\b");
+      break;
+    case '\f':
+      escaped.append("\\f");
+      break;
+    case '\n':
+      escaped.append("\\n");
+      break;
+    case '\r':
+      escaped.append("\\r");
+      break;
+    case '\t':
+      escaped.append("\\t");
+      break;
+    case '\v':
+      escaped.append("\\v");
+      break;
+    case static_cast<char>(0x1b):
+      escaped.append("\\e");
+      break;
+    default:
+      escaped.push_back(c);
+      break;
     }
   }
   return std::string(escaped.str());
@@ -182,13 +204,13 @@ uint64_t extendLineToLogicalDirective(StringRef bytes, uint64_t lineBegin) {
   uint64_t curBegin = lineBegin;
   size_t nl = bytes.find('\n', curBegin);
   uint64_t curEnd = nl == StringRef::npos ? static_cast<uint64_t>(bytes.size())
-                                           : static_cast<uint64_t>(nl + 1);
+                                          : static_cast<uint64_t>(nl + 1);
   while (physicalLineEndsWithSplice(bytes, curBegin, curEnd) &&
          curEnd < bytes.size()) {
     curBegin = curEnd;
     nl = bytes.find('\n', curBegin);
     curEnd = nl == StringRef::npos ? static_cast<uint64_t>(bytes.size())
-                                    : static_cast<uint64_t>(nl + 1);
+                                   : static_cast<uint64_t>(nl + 1);
   }
   return curEnd;
 }

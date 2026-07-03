@@ -3,11 +3,11 @@
 // Include materialization scheduling for clang-refold.
 //
 // This service owns the run-local orchestration that decides which include
-// instances must be materialized, orders those materializations deterministically,
-// and lowers realized TU-root include expansions into final TU text edits.  It
-// deliberately does not own include replay proof or include body realization:
-// RefoldIncludeReplayProof and RefoldIncludeMaterializer remain the proof and
-// mechanics boundaries.
+// instances must be materialized, orders those materializations
+// deterministically, and lowers realized TU-root include expansions into final
+// TU text edits.  It deliberately does not own include replay proof or include
+// body realization: RefoldIncludeReplayProof and RefoldIncludeMaterializer
+// remain the proof and mechanics boundaries.
 //
 //===----------------------------------------------------------------------===//
 
@@ -54,52 +54,78 @@ struct SidebandPragmaEdit;
 /// Schedules include materialization and TU-root include-emission edits.
 ///
 /// A scheduler instance is intentionally run-scoped: include child indexes,
-/// layout-only seed decisions, realized include text, line-control metadata, and
-/// accepted-result carriers are shared across include materialization and
-/// TU-root emission. Keeping this state in one object avoids
-/// rebuilding helper indexes or changing the historical ordering around TU macro
-/// edit staging.
+/// layout-only seed decisions, realized include text, line-control metadata,
+/// and accepted-result carriers are shared across include materialization and
+/// TU-root emission. Keeping this state in one object avoids rebuilding helper
+/// indexes and preserves deterministic ordering around TU macro edit staging.
 class RefoldIncludeMaterializationScheduler {
 public:
   /// Services used by the scheduler while proof and realization remain in their
   /// dedicated include/proof subsystems.
+  ///
+  /// All pointers are borrowed from the engine service graph.  Null means the
+  /// scheduler is not fully wired and cannot safely perform include
+  /// materialization for the current pass.
   struct Dependencies {
+    /// Producer model containing include and source facts.
     const RefoldModel *model = nullptr;
+    /// Path identity service for include/source comparisons.
     const RefoldPathIdentity *pathIdentity = nullptr;
+    /// Include materializer that realizes selected include bodies.
     const RefoldIncludeMaterializer *includeMaterializer = nullptr;
+    /// Include insertion planner for include-boundary insertion repairs.
     const RefoldIncludeInsertionPlanner *includeInsertionPlanner = nullptr;
+    /// Line observer layout service for include-entry/exit wrappers.
     const RefoldLineObserverLayout *lineObserverLayout = nullptr;
+    /// Macro-state repair planner consulted around include realization.
     const RefoldMacroStateRepairPlanner *macroStateRepairPlanner = nullptr;
+    /// Final text-edit assembler used for TU-root include edits.
     const RefoldTextEditAssembler *textEditAssembler = nullptr;
+    /// Proof lattice used to construct accepted-result carriers.
     const RefoldProofLattice *proofLattice = nullptr;
+    /// Terminal fallback sink for fail-closed include scheduling failures.
     RefoldTerminalProofSink *terminalSink = nullptr;
+    /// Sideband pragma edits that may be owned by materialized includes.
     const std::vector<SidebandPragmaEdit> *sidebandPragmaEdits = nullptr;
   };
 
   /// Immutable run inputs and mutable staging surfaces for one include
   /// materialization scheduling pass.
   struct IncludeMaterializationRequest {
+    /// Translation-unit path for diagnostics and owner classification.
     llvm::StringRef tuPath;
+    /// Translation-unit source bytes before final edit assembly.
     llvm::StringRef tuBytes;
+    /// Original preprocessed A source bytes.
     llvm::StringRef aSource;
+    /// Edited preprocessed B source bytes.
     llvm::StringRef bSource;
+    /// Original preprocessed token stream A.
     llvm::ArrayRef<PPTok> aTokens;
+    /// Edited preprocessed token stream B.
     llvm::ArrayRef<PPTok> bTokens;
+    /// Byte offsets for A tokens in `aSource`.
     llvm::ArrayRef<size_t> aTokenOffsets;
+    /// Byte offsets for B tokens in `bSource`.
     llvm::ArrayRef<size_t> bTokenOffsets;
+    /// Token hunks after owner-aware normalization.
     llvm::ArrayRef<diffutils::Hunk> tokenHunks;
+    /// Optional raw byte hunks used for sidecar/source-graph proof.
     const std::vector<diffutils::Hunk> *rawByteHunks = nullptr;
+    /// Dispatcher that receives staged include-owned/TU-root edits.
     RefoldStructuralHunkDispatcher *structuralHunkDispatcher = nullptr;
+    /// Optional source-graph sidecar output ledger.
     std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr;
   };
 
   /// Constructs a run-scoped scheduler and builds the include child index once.
-  RefoldIncludeMaterializationScheduler(
-      Dependencies deps, IncludeMaterializationRequest request);
+  RefoldIncludeMaterializationScheduler(Dependencies deps,
+                                        IncludeMaterializationRequest request);
 
-  /// Decides which include instances must be realized, pulls in their ancestors,
-  /// orders them deterministically, and asks RefoldIncludeMaterializer to build
-  /// the materialized expansion text for each selected include.
+  /// Decides which include instances must be realized, pulls in their
+  /// ancestors, orders them deterministically, and asks
+  /// RefoldIncludeMaterializer to build the materialized expansion text for
+  /// each selected include.
   bool MaterializeIncludeExpansions();
 
   /// Emits TU text edits for already-realized TU-root include expansions after
@@ -110,23 +136,36 @@ public:
       const RefoldMacroStateRepairPlanner::MacroStateRepairRequest
           &macroStateRequest);
 
-  /// Returns the include ids whose expansion text was materialized in this pass.
+  /// Returns the include ids whose expansion text was materialized in this
+  /// pass.
   const llvm::DenseSet<uint64_t> &ExpandedIncludeIds() const;
 
   /// Returns the number of include expansions realized by this scheduler.
   size_t MaterializedIncludeCount() const;
 
 private:
+  /// Kind of realized work contributed by a TU-root include subtree.
+  ///
+  /// Only genuinely sideband-only owner replay may suppress the ordinary
+  /// line-control wrappers that --with-lines include materialization would
+  /// emit. If the include contributes ordinary PP tokens, macro edits,
+  /// layout-only obligations, or nested ordinary work, replacing its directive
+  /// with header bytes is a real logical file transition and keeps the
+  /// enter/exit wrapper.
   enum class TUIncludeMaterializationWorkClass {
+    /// The subtree contributes no realized work.
     None,
+    /// The subtree contributes only sideband pragma replay.
     SidebandPragmaOnly,
+    /// The subtree contributes ordinary header bytes or layout/proof work.
     Ordinary
   };
 
   /// Build parent-to-child include edges once for recursive materialization.
   void BuildChildrenIndex();
 
-  /// Finds a macro directive by producer id for line-control source-graph proof.
+  /// Finds a macro directive by producer id for line-control source-graph
+  /// proof.
   const RefoldModel::MacroDirective *FindMacroDirectiveById(uint64_t id) const;
 
   /// Returns whether a definition used inside an include's line-control region
@@ -148,8 +187,7 @@ private:
   /// Locates the PP-token gap that wholly contains a raw source byte range.
   std::optional<uint64_t> FindTokenGapContainingByteRange(
       llvm::StringRef source, llvm::ArrayRef<PPTok> tokens,
-      llvm::ArrayRef<size_t> tokenOffsets, uint64_t begin,
-      uint64_t end) const;
+      llvm::ArrayRef<size_t> tokenOffsets, uint64_t begin, uint64_t end) const;
 
   /// Returns the include owner whose edge-local layout is witnessed by a raw
   /// byte-only hunk, or std::nullopt when the hunk is not an include-layout
@@ -161,6 +199,10 @@ private:
   void BuildLayoutOnlyIncludeMaterializationSeeds();
 
   /// Adds direct include, layout-only, sideband, and header-macro seeds.
+  ///
+  /// The seed set is the scheduler's first proof boundary: it records every
+  /// include subtree that must be realized before ancestor closure and
+  /// deterministic ordering are applied.
   llvm::DenseSet<uint64_t> BuildInitialMaterializationSeeds() const;
 
   /// Pulls selected include ancestors into the seed set so parent surfaces are
@@ -202,12 +244,16 @@ private:
 
   /// Returns the producer site range extended to the full physical include
   /// directive when line-spliced source made the recorded range too short.
-  std::pair<uint64_t, uint64_t> ExtendedTUSiteRange(
-      const RefoldModel::IncludeItem &include) const;
+  std::pair<uint64_t, uint64_t>
+  ExtendedTUSiteRange(const RefoldModel::IncludeItem &include) const;
 
   /// Tries to preserve an include as a source-graph sidecar instead of emitting
   /// it into the TU, appending output carriers when the proof layer accepts or
   /// rejects a sidecar path.
+  ///
+  /// A rejected source-graph path can still produce a cleanup-only carrier for
+  /// a stale generated sidecar.  The scheduler records those carriers but does
+  /// not perform filesystem writes; RefoldSourceGraphWriter owns the I/O side.
   bool TryPreserveSourceGraphOutput(const RefoldModel::IncludeItem &include,
                                     llvm::StringRef expansionText) const;
 

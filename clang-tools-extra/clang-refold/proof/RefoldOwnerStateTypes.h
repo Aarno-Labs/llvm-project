@@ -14,7 +14,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDOWNERSTATETYPES_H
 
 #include "core/RefoldModel.h"
-#include "proof/RefoldTerminalProof.h"
+#include "proof/RefoldProofVocabulary.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -81,7 +81,6 @@ inline StringRef toString(OwnerKind kind) {
   llvm_unreachable("Invalid owner kind");
 }
 
-
 /// Stable identity for one refolding owner.
 ///
 /// `Owner` is deliberately small and value-semantic: it names the owner only.
@@ -123,9 +122,9 @@ struct Owner {
     return o;
   }
 
-  static Owner MacroInvocation(
-      uint64_t macroInvocationId,
-      std::optional<uint64_t> condArmId = std::nullopt) {
+  static Owner
+  MacroInvocation(uint64_t macroInvocationId,
+                  std::optional<uint64_t> condArmId = std::nullopt) {
     Owner o;
     o.kind = OwnerKind::MacroInvocation;
     o.macroInvocationId = macroInvocationId;
@@ -133,9 +132,9 @@ struct Owner {
     return o;
   }
 
-  static Owner MacroDirective(
-      uint64_t macroDirectiveId,
-      std::optional<uint64_t> condArmId = std::nullopt) {
+  static Owner
+  MacroDirective(uint64_t macroDirectiveId,
+                 std::optional<uint64_t> condArmId = std::nullopt) {
     Owner o;
     o.kind = OwnerKind::MacroDirective;
     o.macroDirectiveId = macroDirectiveId;
@@ -143,9 +142,9 @@ struct Owner {
     return o;
   }
 
-  static Owner LineControlIsland(
-      uint64_t lineControlId,
-      std::optional<uint64_t> condArmId = std::nullopt) {
+  static Owner
+  LineControlIsland(uint64_t lineControlId,
+                    std::optional<uint64_t> condArmId = std::nullopt) {
     Owner o;
     o.kind = OwnerKind::LineControlIsland;
     o.lineControlId = lineControlId;
@@ -153,9 +152,8 @@ struct Owner {
     return o;
   }
 
-  static Owner PragmaIsland(
-      uint64_t pragmaId,
-      std::optional<uint64_t> condArmId = std::nullopt) {
+  static Owner PragmaIsland(uint64_t pragmaId,
+                            std::optional<uint64_t> condArmId = std::nullopt) {
     Owner o;
     o.kind = OwnerKind::PragmaIsland;
     o.pragmaId = pragmaId;
@@ -185,37 +183,28 @@ struct Owner {
 
   bool IsInclude() const { return kind == OwnerKind::Include; }
 
-  bool IsMacroInvocation() const {
-    return kind == OwnerKind::MacroInvocation;
-  }
+  bool IsMacroInvocation() const { return kind == OwnerKind::MacroInvocation; }
 
-  bool IsMacroDirective() const {
-    return kind == OwnerKind::MacroDirective;
-  }
+  bool IsMacroDirective() const { return kind == OwnerKind::MacroDirective; }
 
   bool IsLineControlIsland() const {
     return kind == OwnerKind::LineControlIsland;
   }
 
-  bool IsPragmaIsland() const {
-    return kind == OwnerKind::PragmaIsland;
-  }
+  bool IsPragmaIsland() const { return kind == OwnerKind::PragmaIsland; }
 
   bool IsConditionalGroup() const {
     return kind == OwnerKind::ConditionalGroup;
   }
 
-  bool IsConditionalArm() const {
-    return kind == OwnerKind::ConditionalArm;
-  }
+  bool IsConditionalArm() const { return kind == OwnerKind::ConditionalArm; }
 
   bool HasSameIdentity(const Owner &other) const {
     return kind == other.kind && includeId == other.includeId &&
            macroInvocationId == other.macroInvocationId &&
            macroDirectiveId == other.macroDirectiveId &&
-           lineControlId == other.lineControlId &&
-           pragmaId == other.pragmaId && condGroupId == other.condGroupId &&
-           condArmId == other.condArmId;
+           lineControlId == other.lineControlId && pragmaId == other.pragmaId &&
+           condGroupId == other.condGroupId && condArmId == other.condArmId;
   }
 };
 
@@ -254,9 +243,9 @@ struct OwnerSourceRange {
   uint64_t end = 0;
   std::optional<uint64_t> includeId = std::nullopt;
 
-  static OwnerSourceRange From(StringRef path, uint64_t begin, uint64_t end,
-                               std::optional<uint64_t> includeId =
-                                   std::nullopt) {
+  static OwnerSourceRange
+  From(StringRef path, uint64_t begin, uint64_t end,
+       std::optional<uint64_t> includeId = std::nullopt) {
     OwnerSourceRange r;
     r.path = path.str();
     r.begin = begin;
@@ -470,13 +459,10 @@ struct CounterEventIdentity {
            expansionSiteBegin == other.expansionSiteBegin &&
            expansionSiteEnd == other.expansionSiteEnd &&
            aValue == other.aValue && expectedBValue == other.expectedBValue &&
-           canStabilizeByLiteralization ==
-               other.canStabilizeByLiteralization &&
-           canStabilizeByMaterialization ==
-               other.canStabilizeByMaterialization;
+           canStabilizeByLiteralization == other.canStabilizeByLiteralization &&
+           canStabilizeByMaterialization == other.canStabilizeByMaterialization;
   }
 };
-
 
 /// Producer-derived identity for a concrete include directive occurrence.
 ///
@@ -499,11 +485,10 @@ struct IncludeStateIdentity {
 
   bool operator==(const IncludeStateIdentity &other) const {
     return includeId == other.includeId &&
-           directiveKind == other.directiveKind &&
-           sitePath == other.sitePath && siteBegin == other.siteBegin &&
-           siteEnd == other.siteEnd && target == other.target &&
-           resolvedPath == other.resolvedPath && angled == other.angled &&
-           parentIncludeId == other.parentIncludeId &&
+           directiveKind == other.directiveKind && sitePath == other.sitePath &&
+           siteBegin == other.siteBegin && siteEnd == other.siteEnd &&
+           target == other.target && resolvedPath == other.resolvedPath &&
+           angled == other.angled && parentIncludeId == other.parentIncludeId &&
            hasTokenMaterialization == other.hasTokenMaterialization;
   }
 };
@@ -643,8 +628,7 @@ struct ConditionalStateIdentity {
            armKind == other.armKind && conditionText == other.conditionText &&
            selected == other.selected && aTokenBegin == other.aTokenBegin &&
            aTokenEnd == other.aTokenEnd &&
-           conditionTruthProducerProven ==
-               other.conditionTruthProducerProven &&
+           conditionTruthProducerProven == other.conditionTruthProducerProven &&
            reverseSolvedDirectiveRequired ==
                other.reverseSolvedDirectiveRequired;
   }
@@ -654,9 +638,9 @@ struct ConditionalStateIdentity {
 /// summary.
 ///
 /// Precise missing-fact markers let theorem-facing code distinguish a missing
-/// macro definition identity from missing line-control operands, counter events,
-/// pragma classification, include-guard facts, conditional branch facts, or
-/// owner ordering.
+/// macro definition identity from missing line-control operands, counter
+/// events, pragma classification, include-guard facts, conditional branch
+/// facts, or owner ordering.
 enum class MissingStateFactKind : uint8_t {
   MissingMacroFacts,
   MissingLineControlFacts,
@@ -725,7 +709,7 @@ struct OwnerStateFacts {
   // to the event identity instead of a global poison bit.
   std::vector<PragmaStateIdentity> pragmaStateEvents;
 
-  // component-specific include facts.  These keep include pathcresolution,
+  // component-specific include facts.  These keep include path resolution,
   // file identity, token materialization, and guard effects separable.
   std::vector<IncludeStateIdentity> includeStateEvents;
   std::vector<IncludeGuardStateIdentity> includeGuardStateEvents;
@@ -815,8 +799,7 @@ struct OwnerStateFacts {
     for (const MacroStateObservation &observation :
          other.conditionalMacroObservations)
       AddMacroObservation(observation);
-    for (const LineControlStateIdentity &identity :
-         other.lineControlEvents)
+    for (const LineControlStateIdentity &identity : other.lineControlEvents)
       AddLineControlEvent(identity);
     for (const BuiltinLocationObservation &observation :
          other.builtinLocationObservations)
@@ -841,11 +824,11 @@ struct OwnerStateFacts {
   bool HasTheoremUnknownPragmaState() const {
     if (HasMissingFactKind(MissingStateFactKind::MissingPragmaFacts))
       return true;
-    return llvm::any_of(
-        pragmaStateEvents, [](const PragmaStateIdentity &identity) {
-          return identity.classification ==
-                 PragmaStateClassification::UnknownPragmaState;
-        });
+    return llvm::any_of(pragmaStateEvents,
+                        [](const PragmaStateIdentity &identity) {
+                          return identity.classification ==
+                                 PragmaStateClassification::UnknownPragmaState;
+                        });
   }
 
   bool MutatesMacroState() const {
@@ -864,21 +847,15 @@ struct OwnerStateFacts {
 
   bool ObservesIncludeState() const { return HasIncludeStateEvents(); }
 
-  bool MutatesIncludeGuardState() const {
-    return HasIncludeGuardStateEvents();
-  }
+  bool MutatesIncludeGuardState() const { return HasIncludeGuardStateEvents(); }
 
   bool ObservesIncludeGuardState() const {
     return HasIncludeGuardStateEvents();
   }
 
-  bool MutatesConditionalState() const {
-    return HasConditionalStateEvents();
-  }
+  bool MutatesConditionalState() const { return HasConditionalStateEvents(); }
 
-  bool ObservesConditionalState() const {
-    return HasConditionalStateEvents();
-  }
+  bool ObservesConditionalState() const { return HasConditionalStateEvents(); }
 
   bool MutatesAnyState() const {
     return MutatesMacroState() || MutatesLineFileState() ||
@@ -907,9 +884,7 @@ struct OwnerStateFacts {
 
   template <typename T>
   static void AppendUniqueOne(std::vector<T> &dst, const T &item) {
-    if (llvm::none_of(dst, [&](const T &existing) {
-          return existing == item;
-        }))
+    if (llvm::none_of(dst, [&](const T &existing) { return existing == item; }))
       dst.push_back(item);
   }
 
@@ -950,8 +925,8 @@ struct OwnerStateFacts {
     AppendUniqueOne(lineControlEvents, identity);
   }
 
-  void AddBuiltinLocationObservation(
-      const BuiltinLocationObservation &observation) {
+  void
+  AddBuiltinLocationObservation(const BuiltinLocationObservation &observation) {
     AppendUniqueOne(builtinLocationObservations, observation);
   }
 
@@ -975,17 +950,16 @@ struct OwnerStateFacts {
     AppendUniqueOne(includeStateEvents, identity);
   }
 
-  void AddIncludeGuardStateEvent(
-      const IncludeGuardStateIdentity &identity) {
+  void AddIncludeGuardStateEvent(const IncludeGuardStateIdentity &identity) {
     AppendUniqueOne(includeGuardStateEvents, identity);
     // Missing guard-oracle facts are represented in the identity itself.
-    // will convert component-specific missing facts into named
+    // State-transition proof will convert component-specific missing facts
+    // into named
     // obligations; do not collapse them back into the global unmodeled bit
     // here, or every include would conservatively poison unrelated state.
   }
 
-  void AddConditionalStateEvent(
-      const ConditionalStateIdentity &identity) {
+  void AddConditionalStateEvent(const ConditionalStateIdentity &identity) {
     AppendUniqueOne(conditionalStateEvents, identity);
   }
 
@@ -996,15 +970,15 @@ struct OwnerStateFacts {
                  ArrayRef<MacroStateIdentity>(other.macroUndefinitions));
     AppendUnique(macroRequirements,
                  ArrayRef<MacroStateIdentity>(other.macroRequirements));
-    AppendUnique(macroExpansionObservations,
-                 ArrayRef<MacroStateObservation>(
-                     other.macroExpansionObservations));
-    AppendUnique(definedOperatorObservations,
-                 ArrayRef<MacroStateObservation>(
-                     other.definedOperatorObservations));
-    AppendUnique(conditionalMacroObservations,
-                 ArrayRef<MacroStateObservation>(
-                     other.conditionalMacroObservations));
+    AppendUnique(
+        macroExpansionObservations,
+        ArrayRef<MacroStateObservation>(other.macroExpansionObservations));
+    AppendUnique(
+        definedOperatorObservations,
+        ArrayRef<MacroStateObservation>(other.definedOperatorObservations));
+    AppendUnique(
+        conditionalMacroObservations,
+        ArrayRef<MacroStateObservation>(other.conditionalMacroObservations));
     AppendUnique(lineControlEvents,
                  ArrayRef<LineControlStateIdentity>(other.lineControlEvents));
     AppendUnique(builtinLocationObservations,
@@ -1016,12 +990,10 @@ struct OwnerStateFacts {
                  ArrayRef<PragmaStateIdentity>(other.pragmaStateEvents));
     AppendUnique(includeStateEvents,
                  ArrayRef<IncludeStateIdentity>(other.includeStateEvents));
-    AppendUnique(includeGuardStateEvents,
-                 ArrayRef<IncludeGuardStateIdentity>(
-                     other.includeGuardStateEvents));
-    AppendUnique(conditionalStateEvents,
-                 ArrayRef<ConditionalStateIdentity>(
-                     other.conditionalStateEvents));
+    AppendUnique(includeGuardStateEvents, ArrayRef<IncludeGuardStateIdentity>(
+                                              other.includeGuardStateEvents));
+    AppendUnique(conditionalStateEvents, ArrayRef<ConditionalStateIdentity>(
+                                             other.conditionalStateEvents));
     AppendUnique(missingStateFacts,
                  ArrayRef<MissingStateFact>(other.missingStateFacts));
     return *this;
@@ -1047,8 +1019,7 @@ struct StateGuarantees : OwnerStateFacts {};
 
 /// Canonical state-delta model for one owner.
 ///
-/// This is the theorem-facing answer to four different questions that the old
-/// boolean-only summary could not separate:
+/// This is the theorem-facing answer to four separate owner-state questions:
 ///
 ///   * Entry:    what state must already be true before this owner?
 ///   * Observes: what state does this owner read?
@@ -1064,8 +1035,7 @@ struct OwnerStateDelta {
   StateGuarantees exit;
 
   bool Empty() const {
-    return entry.Empty() && observes.Empty() && mutates.Empty() &&
-           exit.Empty();
+    return entry.Empty() && observes.Empty() && mutates.Empty() && exit.Empty();
   }
 
   OwnerStateDelta &MergeFrom(const OwnerStateDelta &other) {
@@ -1115,8 +1085,8 @@ struct OwnerObserverSummary {
     return !observesMacroExpansion && !observesDefinedOperator &&
            !observesConditionalEvaluation && !observesLineNumber &&
            !observesFileState && !observesFileName && !observesCounter &&
-           !observesPragmaState &&
-           !observesIncludeGuardState && !observesIncludeState;
+           !observesPragmaState && !observesIncludeGuardState &&
+           !observesIncludeState;
   }
 
   OwnerObserverSummary &MergeFrom(const OwnerObserverSummary &other) {
@@ -1154,20 +1124,17 @@ struct OwnerClosure {
   OwnerObserverSummary observers;
 
   static OwnerClosure From(Owner owner, OwnerSourceRange source,
-                           OwnerTokenRange aTokens,
-                           OwnerTokenRange bTokens) {
+                           OwnerTokenRange aTokens, OwnerTokenRange bTokens) {
     OwnerStateDelta stateIn;
     OwnerStateDelta stateOut;
     OwnerObserverSummary observers;
-    return From(std::move(owner), std::move(source), aTokens, bTokens,
-                stateIn, stateOut, observers);
+    return From(std::move(owner), std::move(source), aTokens, bTokens, stateIn,
+                stateOut, observers);
   }
 
   static OwnerClosure From(Owner owner, OwnerSourceRange source,
-                           OwnerTokenRange aTokens,
-                           OwnerTokenRange bTokens,
-                           OwnerStateDelta stateIn,
-                           OwnerStateDelta stateOut,
+                           OwnerTokenRange aTokens, OwnerTokenRange bTokens,
+                           OwnerStateDelta stateIn, OwnerStateDelta stateOut,
                            OwnerObserverSummary observers) {
     OwnerClosure closure;
     closure.owner = std::move(owner);
@@ -1361,9 +1328,7 @@ struct OwnerStateGraphNode {
   std::optional<uint64_t> containingConditionalArmId = std::nullopt;
   std::string detail;
 
-  bool HasTokenAnchor() const {
-    return aTokens.IsValid() && !aTokens.Empty();
-  }
+  bool HasTokenAnchor() const { return aTokens.IsValid() && !aTokens.Empty(); }
 
   bool IsZeroTokenEvent() const { return !HasTokenAnchor(); }
 };
@@ -1423,8 +1388,9 @@ inline StringRef toString(SuffixObservationKind kind) {
 /// Proof that a suffix observer was ordered relative to an edit boundary.
 ///
 /// Incomparable observer order is a named missing-producer-facts condition,
-/// never absence of observation.  consumes this value to decide whether state
-/// repair may be inserted before the first observer.
+/// never absence of observation.  The state-transition gateway consumes this
+/// value to decide whether state repair may be inserted before the first
+/// observer.
 enum class SuffixOrderingProofKind : uint8_t {
   SourceOrder,
   TokenOrder,
@@ -1520,7 +1486,6 @@ struct OwnerStateGraphAuditStats {
   uint64_t missingProducerFacts = 0;
 };
 
-
 /// Persistent owner/state-event graph.
 ///
 /// The graph is built once per RefoldEngine instance from producer facts.  It
@@ -1549,8 +1514,7 @@ struct OwnerStateFactIndex {
       macroDirectiveById;
   llvm::DenseMap<uint64_t, const RefoldModel::LineControlEvent *>
       lineControlById;
-  llvm::DenseMap<uint64_t, const RefoldModel::PragmaDirective *>
-      pragmaById;
+  llvm::DenseMap<uint64_t, const RefoldModel::PragmaDirective *> pragmaById;
   llvm::DenseMap<uint64_t, const RefoldModel::MacroInvocation *>
       macroInvocationById;
 
@@ -1573,8 +1537,8 @@ struct OwnerStateFactIndex {
 /// `sites` contains observers that are proven to occur after the boundary.
 /// `hasIncomparableObserver` is a conservative signal: some owner observes the
 /// requested component, but the available producer facts were insufficient to
-/// order it relative to the boundary.  must treat that as an undischarged
-/// suffix-stability obligation, not as absence of observation.
+/// order it relative to the boundary.  Callers must treat that as an
+/// undischarged suffix-stability obligation, not as absence of observation.
 struct SuffixObserverQueryResult {
   std::vector<SuffixStateObserverSite> sites;
   std::vector<SuffixObserverResult> orderedObservers;
@@ -1584,13 +1548,11 @@ struct SuffixObserverQueryResult {
   bool hasNoCanonicalSuffixOrder = false;
   OwnerObserverSummary incomparableObservers;
 
-  bool Empty() const {
-    return sites.empty() && !hasIncomparableObserver;
-  }
+  bool Empty() const { return sites.empty() && !hasIncomparableObserver; }
 };
 
-// Owner-state proof behavior is implemented by RefoldOwnerStateProof.
-// Use OwnerStateProof() instead of adding RefoldEngine forwarding wrappers.
+// Owner-state proof behavior is implemented by RefoldOwnerStateProof; this
+// header remains value-only proof vocabulary.
 
 /// How a source edit changes one state component at an edit boundary.
 ///
@@ -1647,20 +1609,20 @@ inline StringRef toString(StateMutationKind kind) {
 /// represented by OwnerStateDelta, OwnerStateGraph, the state-transition
 /// gateway, or a terminal proof failure before it can justify emitted bytes.
 #define REFOLD_DIRECT_STATE_CHECK_KIND_LIST(REFOLD_X)                          \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(MacroDefinitionDirective)                                           \
-REFOLD_X(MacroUndefDirective)                                                \
-REFOLD_X(LineControlDirective)                                               \
-REFOLD_X(BuiltinLineObserver)                                                \
-REFOLD_X(BuiltinFileObserver)                                                \
-REFOLD_X(BuiltinFileNameObserver)                                            \
-REFOLD_X(CounterEvent)                                                       \
-REFOLD_X(PragmaDirective)                                                    \
-REFOLD_X(IncludeDirectiveState)                                              \
-REFOLD_X(IncludeGuardState)                                                  \
-REFOLD_X(ConditionalDirectiveState)                                          \
-REFOLD_X(MacroExpansionState)                                                \
-REFOLD_X(UnmodeledStateFact)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(MacroDefinitionDirective)                                           \
+  REFOLD_X(MacroUndefDirective)                                                \
+  REFOLD_X(LineControlDirective)                                               \
+  REFOLD_X(BuiltinLineObserver)                                                \
+  REFOLD_X(BuiltinFileObserver)                                                \
+  REFOLD_X(BuiltinFileNameObserver)                                            \
+  REFOLD_X(CounterEvent)                                                       \
+  REFOLD_X(PragmaDirective)                                                    \
+  REFOLD_X(IncludeDirectiveState)                                              \
+  REFOLD_X(IncludeGuardState)                                                  \
+  REFOLD_X(ConditionalDirectiveState)                                          \
+  REFOLD_X(MacroExpansionState)                                                \
+  REFOLD_X(UnmodeledStateFact)
 
 enum class DirectStateCheckKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -1670,7 +1632,9 @@ enum class DirectStateCheckKind : uint8_t {
 
 inline StringRef toString(DirectStateCheckKind kind) {
   switch (kind) {
-#define REFOLD_X(name) case DirectStateCheckKind::name: return #name;
+#define REFOLD_X(name)                                                         \
+  case DirectStateCheckKind::name:                                             \
+    return #name;
     REFOLD_DIRECT_STATE_CHECK_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -1894,8 +1858,8 @@ struct SuffixStabilityWitness {
 /// caller, the typed suffix witnesses accepted by the gateway, the closure-
 /// widening subset needed by theorem consumers, and the classified terminal
 /// failure when the transition is outside the strict domain. Component-local
-/// approvals should
-/// move onto this proof instead of introducing another parallel state flag.
+/// approvals should move onto this proof instead of introducing another
+/// parallel state flag.
 struct StateTransitionProof {
   OwnerStateDelta before;
   OwnerStateDelta after;
@@ -1927,7 +1891,6 @@ struct StateTransitionGatewayRequest {
       DirectiveClosureStatus::NotADirectiveStateRewrite;
   std::string directiveKind;
 };
-
 
 } // namespace refold
 } // namespace clang

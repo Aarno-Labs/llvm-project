@@ -27,8 +27,6 @@
 using namespace llvm;
 using namespace clang::refold;
 
-
-
 //===----------------------------------------------------------------------===//
 // RefoldMacroOccurrenceReplay
 //===----------------------------------------------------------------------===//
@@ -40,8 +38,7 @@ std::optional<std::pair<size_t, size_t>>
 RefoldMacroOccurrenceReplay::GetOwnedPureInsertionBRangeForArgSpan(
     const RefoldModel::PPArgSpan &span,
     ArrayRef<RefoldModel::PPArgSpan> argSpans,
-    std::pair<size_t, size_t> mappedEnv,
-    const diffutils::Hunk &h) const {
+    std::pair<size_t, size_t> mappedEnv, const diffutils::Hunk &h) const {
   // This helper only applies to pure insertions with a non-empty B-side token
   // range.
   if (h.aStart != h.aEnd || h.bStart >= h.bEnd)
@@ -58,7 +55,8 @@ RefoldMacroOccurrenceReplay::GetOwnedPureInsertionBRangeForArgSpan(
     return std::make_pair(insB0, insB1);
 
   const bool isCommaSeparator =
-      aPos < deps_.aToks.size() && deps_.aToks[static_cast<size_t>(aPos)].spelling == ",";
+      aPos < deps_.aToks.size() &&
+      deps_.aToks[static_cast<size_t>(aPos)].spelling == ",";
 
   // Exact separator-before-right-occurrence case:
   //
@@ -102,10 +100,12 @@ RefoldMacroOccurrenceReplay::GetOwnedPureInsertionBRangeForArgSpan(
   return std::nullopt;
 }
 
-bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImpl(
-    const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
-    StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks,
-    bool checkPasteSpans, OccurrenceSupportMode supportMode) const {
+bool RefoldMacroOccurrenceReplay::
+    MacroArgReplacementMatchesAllOccurrencesInBImpl(
+        const RefoldModel::MacroInvocation &m, uint32_t argIdx,
+        StringRef baseArg, StringRef newArg,
+        ArrayRef<diffutils::Hunk> tokenHunks, bool checkPasteSpans,
+        OccurrenceSupportMode supportMode) const {
   if (newArg.data() == nullptr)
     return false;
 
@@ -246,8 +246,9 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
     }
   }
 
-  const uint64_t maxTok =
-      deps_.bTokOff.empty() ? 0ULL : static_cast<uint64_t>(deps_.bTokOff.size() - 1);
+  const uint64_t maxTok = deps_.bTokOff.empty()
+                              ? 0ULL
+                              : static_cast<uint64_t>(deps_.bTokOff.size() - 1);
   StringRef argTrim = newArg.trim();
   StringRef baseTrim = baseArg.trim();
 
@@ -308,7 +309,8 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
           bEnv = {lo, hi};
         }
 
-        StringRef tok = deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
+        StringRef tok =
+            deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
         if (tok.empty())
           return false;
 
@@ -322,8 +324,8 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
         if (s.byteBegin && s.byteEnd) {
           if ((bEnv->second - bEnv->first) != 1)
             return false;
-          StringRef aTok = deps_.sourceMapper->SliceASource(static_cast<size_t>(s.begin),
-                                        static_cast<size_t>(s.end));
+          StringRef aTok = deps_.sourceMapper->SliceASource(
+              static_cast<size_t>(s.begin), static_cast<size_t>(s.end));
           const uint64_t bb = *s.byteBegin;
           const uint64_t be = *s.byteEnd;
           if (be < bb || be > static_cast<uint64_t>(aTok.size()))
@@ -361,7 +363,8 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
     if (ps.argIdx != argIdx)
       continue;
 
-    StringRef aTokText = deps_.sourceMapper->SliceASource(ps.begin, ps.end).trim();
+    StringRef aTokText =
+        deps_.sourceMapper->SliceASource(ps.begin, ps.end).trim();
     if (aTokText.empty() || !ps.byteBegin || *ps.byteEnd < *ps.byteBegin ||
         static_cast<size_t>(*ps.byteEnd) > aTokText.size())
       continue;
@@ -414,9 +417,8 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
       size_t lo = bEnv->first;
       size_t hi = bEnv->second;
       for (const auto &h : tokenHunks) {
-        if (auto owned =
-                GetOwnedPureInsertionBRangeForArgSpan(s, m.argSpans, *bEnv,
-                                                      h)) {
+        if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(s, m.argSpans,
+                                                               *bEnv, h)) {
           lo = std::min(lo, owned->first);
           hi = std::max(hi, owned->second);
           continue;
@@ -438,7 +440,8 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
       bEnv = {lo, hi};
     }
 
-    StringRef tokText = deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
+    StringRef tokText =
+        deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
     if (tokText.empty()) {
       if (argTrim.empty())
         continue;
@@ -473,7 +476,8 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
     if (ps.argIdx != argIdx)
       continue;
 
-    // This projected occurrence must still correspond to exactly one token in B.
+    // This projected occurrence must still correspond to exactly one token in
+    // B.
     auto bEnv = deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(ps);
     if (!bEnv || bEnv->second <= bEnv->first ||
         (bEnv->second - bEnv->first) != 1)
@@ -481,10 +485,12 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
 
     // Fetch the trimmed token text for this projected occurrence on both sides;
     // later checks will compare the corresponding projected subranges.
-    StringRef aTokText = deps_.sourceMapper->SliceASource(ps.begin, ps.end).trim();
+    StringRef aTokText =
+        deps_.sourceMapper->SliceASource(ps.begin, ps.end).trim();
     if (aTokText.empty())
       return false;
-    StringRef bTokText = deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
+    StringRef bTokText =
+        deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
     if (bTokText.empty())
       return false;
 
@@ -546,7 +552,6 @@ bool RefoldMacroOccurrenceReplay::MacroArgReplacementMatchesAllOccurrencesInBImp
   return true;
 }
 
-
 //===----------------------------------------------------------------------===//
 // RefoldMacroActualLayout
 //===----------------------------------------------------------------------===//
@@ -585,8 +590,7 @@ RefoldMacroActualLayout::GetMacroInvocationFormalArgContentRanges(
   };
 
   auto mapParsedActualsToFormalRanges =
-      [&](StringRef text,
-          const std::vector<std::pair<size_t, size_t>> &parsed)
+      [&](StringRef text, const std::vector<std::pair<size_t, size_t>> &parsed)
       -> std::optional<std::vector<std::pair<size_t, size_t>>> {
     const size_t formalN = m.defParams.size();
     const size_t actualN = parsed.size();
@@ -634,15 +638,15 @@ RefoldMacroActualLayout::GetMacroInvocationFormalArgContentRanges(
     // Parse actual argument content ranges syntactically, then normalize the
     // actual list into one range per formal parameter.
     auto parsedOpt =
-        RefoldArgTextRecovery::LexMacroInvocationActualContentRanges(text,
-                                                                     *deps_.lexLang);
+        RefoldArgTextRecovery::LexMacroInvocationActualContentRanges(
+            text, *deps_.lexLang);
     if (!parsedOpt)
       return std::nullopt;
     return mapParsedActualsToFormalRanges(text, *parsedOpt);
   };
 
-  auto tryNormalizedInvocationRanges = [&]()
-      -> std::optional<std::vector<std::pair<size_t, size_t>>> {
+  auto tryNormalizedInvocationRanges =
+      [&]() -> std::optional<std::vector<std::pair<size_t, size_t>>> {
     if (!m.normalizedInvText || invText != *m.normalizedInvText ||
         m.normalizedInvArgTextRanges.empty())
       return std::nullopt;
@@ -659,8 +663,8 @@ RefoldMacroActualLayout::GetMacroInvocationFormalArgContentRanges(
     return out;
   };
 
-  auto tryProducerRelativeRanges = [&]()
-      -> std::optional<std::vector<std::pair<size_t, size_t>>> {
+  auto tryProducerRelativeRanges =
+      [&]() -> std::optional<std::vector<std::pair<size_t, size_t>>> {
     // Producer ranges are absolute source offsets. They are usable here only if
     // we know the invocation's absolute begin offset so they can be made
     // relative to `invText`.
@@ -698,7 +702,8 @@ RefoldMacroActualLayout::GetMacroInvocationFormalArgContentRanges(
           StringRef currentText,
           const std::vector<std::pair<size_t, size_t>> &currentRanges) -> bool {
     // The producer and current invocation spellings must expose the same formal
-    // slot structure before producer ranges can be trusted for the current text.
+    // slot structure before producer ranges can be trusted for the current
+    // text.
     if (producerRanges.size() != currentRanges.size())
       return false;
 
@@ -770,7 +775,6 @@ RefoldMacroActualLayout::GetMacroInvocationFormalArgContentRanges(
   // syntactic parsing of the supplied invocation text.
   return parseAndMapFormalRanges(invText);
 }
-
 
 //===----------------------------------------------------------------------===//
 // RefoldMacroWholeCoverProof
@@ -861,14 +865,12 @@ bool RefoldMacroWholeCoverProof::MacroWholeCoverIsSelfContained(
   return cur >= covHiA;
 }
 
-
 //===----------------------------------------------------------------------===//
 // RefoldMacroPasteSpelling
 //===----------------------------------------------------------------------===//
 
-std::string RefoldMacroPasteSpelling::SplicePasteSegmentIntoSpellingArg(StringRef baseArg,
-                                                            StringRef oldSeg,
-                                                            StringRef newSeg) {
+std::string RefoldMacroPasteSpelling::SplicePasteSegmentIntoSpellingArg(
+    StringRef baseArg, StringRef oldSeg, StringRef newSeg) {
   StringRef baseTrim = baseArg.trim();
   StringRef oldTrim = oldSeg.trim();
   StringRef newTrim = newSeg.trim();
@@ -926,7 +928,6 @@ std::string RefoldMacroPasteSpelling::SplicePasteSegmentIntoSpellingArgExact(
   return stringutils::replaceRange(baseArg, argByteBegin, argByteEnd, newSeg);
 }
 
-
 //===----------------------------------------------------------------------===//
 // RefoldMacroBoundarySelector
 //===----------------------------------------------------------------------===//
@@ -968,8 +969,8 @@ RefoldMacroBoundarySelector::RightBoundaryVaOptActivationMacro(
   auto isDescendantOf = [&](const RefoldModel::MacroInvocation &child,
                             const RefoldModel::MacroInvocation &root) {
     const RefoldModel::MacroInvocation *cur = &child;
-    for (size_t depth = 0;
-         cur && depth <= model_.GetMacroInvocations().size(); ++depth) {
+    for (size_t depth = 0; cur && depth <= model_.GetMacroInvocations().size();
+         ++depth) {
       if (cur->id == root.id)
         return true;
       if (!cur->callerMacroId)
@@ -981,16 +982,17 @@ RefoldMacroBoundarySelector::RightBoundaryVaOptActivationMacro(
 
   auto hasVaOptDescendantAtBoundary =
       [&](const RefoldModel::MacroInvocation &root) {
-    for (const RefoldModel::MacroInvocation &candidate :
-         model_.GetMacroInvocations()) {
-      if (!isDescendantOf(candidate, root))
-        continue;
-      const RefoldModel::MacroDirective *definition = definitionFor(candidate);
-      if (definition && definitionContainsVaOpt(*definition))
-        return true;
-    }
-    return false;
-  };
+        for (const RefoldModel::MacroInvocation &candidate :
+             model_.GetMacroInvocations()) {
+          if (!isDescendantOf(candidate, root))
+            continue;
+          const RefoldModel::MacroDirective *definition =
+              definitionFor(candidate);
+          if (definition && definitionContainsVaOpt(*definition))
+            return true;
+        }
+        return false;
+      };
 
   for (const RefoldModel::MacroInvocation &m : model_.GetMacroInvocations()) {
     if (ownerIncludeId) {
@@ -1033,8 +1035,8 @@ RefoldMacroBoundarySelector::BoundaryGeneratedSelectorMacro(
   auto isDescendantOf = [&](const RefoldModel::MacroInvocation &child,
                             const RefoldModel::MacroInvocation &root) {
     const RefoldModel::MacroInvocation *cur = &child;
-    for (size_t depth = 0;
-         cur && depth <= model_.GetMacroInvocations().size(); ++depth) {
+    for (size_t depth = 0; cur && depth <= model_.GetMacroInvocations().size();
+         ++depth) {
       if (cur->id == root.id)
         return true;
       if (!cur->callerMacroId)
@@ -1046,16 +1048,17 @@ RefoldMacroBoundarySelector::BoundaryGeneratedSelectorMacro(
 
   auto hasGeneratedSelectorDescendant =
       [&](const RefoldModel::MacroInvocation &root) {
-    for (const RefoldModel::MacroInvocation &candidate :
-         model_.GetMacroInvocations()) {
-      if (!isDescendantOf(candidate, root))
-        continue;
-      if (candidate.calleeOrigin.kind == MacroCalleeOriginKind::CallerParam &&
-          !candidate.calleeOrigin.callerParamIndices.empty())
-        return true;
-    }
-    return false;
-  };
+        for (const RefoldModel::MacroInvocation &candidate :
+             model_.GetMacroInvocations()) {
+          if (!isDescendantOf(candidate, root))
+            continue;
+          if (candidate.calleeOrigin.kind ==
+                  MacroCalleeOriginKind::CallerParam &&
+              !candidate.calleeOrigin.callerParamIndices.empty())
+            return true;
+        }
+        return false;
+      };
 
   for (const RefoldModel::MacroInvocation &m : model_.GetMacroInvocations()) {
     if (ownerIncludeId) {
@@ -1092,8 +1095,7 @@ RefoldMacroBoundarySelector::BoundaryGeneratedSelectorMacro(
 
 const RefoldModel::MacroInvocation *
 RefoldMacroBoundarySelector::BoundaryDefinitionTapeReplayMacro(
-    const diffutils::Hunk &hunk,
-    std::optional<uint64_t> ownerIncludeId) const {
+    const diffutils::Hunk &hunk, std::optional<uint64_t> ownerIncludeId) const {
   // A pure insertion immediately before or after a macro expansion can still be
   // macro-owned when the defining replacement-list tape contains a zero-token
   // proof surface at that boundary.  This selector only exposes such boundary
@@ -1167,10 +1169,10 @@ RefoldMacroBoundarySelector::BoundaryDefinitionTapeReplayMacro(
       continue;
 
     // Ordinary empty-slot boundary repairs are real B-token insertions at the
-    // recorded macro-cover frontier, so the inserted B range must lie inside the
-    // cover envelope.  The one-token-left case is an LCS placement artifact: the
-    // replay solver must still prove a concrete invocation rewrite before the
-    // candidate can absorb the hunk.
+    // recorded macro-cover frontier, so the inserted B range must lie inside
+    // the cover envelope.  The one-token-left case is an LCS placement
+    // artifact: the replay solver must still prove a concrete invocation
+    // rewrite before the candidate can absorb the hunk.
     if (!immediatelyBeforeRecordedCover &&
         (hunk.bStart < static_cast<uint64_t>(bEnv->first) ||
          hunk.bEnd > static_cast<uint64_t>(bEnv->second)))
@@ -1223,4 +1225,3 @@ RefoldMacroBoundarySelector::BoundaryDefinitionTapeReplayMacro(
 
   return best;
 }
-

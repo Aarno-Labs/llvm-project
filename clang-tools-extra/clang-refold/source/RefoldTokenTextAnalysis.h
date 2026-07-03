@@ -33,37 +33,39 @@ class RefoldTokenTextAnalysis {
 public:
   explicit RefoldTokenTextAnalysis(const clang::LangOptions &lexLang);
 
-  /// Return the byte offset of the first identifier token in \p text whose
-  /// spelling is exactly \p name, if any.
+  /// Return the first raw identifier observation of `name` in `text`.
   ///
-  /// This is the object-like macro-state observation primitive.  It lexes the
-  /// supplied text as a raw scratch buffer and ignores comments, literals, and
-  /// partial identifier matches.
+  /// This is the object-like macro-state observation primitive.  It uses
+  /// Clang's raw lexer instead of substring search so comments, string
+  /// literals, character literals, and identifier prefixes/suffixes do not
+  /// become false observations.  The returned byte offset names the beginning
+  /// of the NAME token in the supplied scratch text.
   std::optional<size_t>
   FirstRawIdentifierObservationOffsetInText(llvm::StringRef name,
                                             llvm::StringRef text) const;
 
-  /// True iff \p text contains \p name as a preprocessing identifier token.
+  /// Return true when `text` contains `name` as a real preprocessing identifier
+  /// token.
   bool RawIdentifierAppearsInText(llvm::StringRef name,
                                   llvm::StringRef text) const;
 
-  /// Return the byte offset of the NAME token that starts the first
-  /// function-like macro invocation observation in \p text, if any.
+  /// Return the byte offset of the first function-like invocation of `name`.
   ///
-  /// The following `(` may be in \p text or in \p suffix.  Observations are
-  /// still reported only when the NAME token itself starts in \p text.
-  std::optional<size_t>
-  FirstFunctionLikeInvocationOffsetInText(llvm::StringRef name,
-                                          llvm::StringRef text,
-                                          llvm::StringRef suffix =
-                                              llvm::StringRef()) const;
+  /// A function-like macro is observed only by a macro-name preprocessing token
+  /// followed by `(` after whitespace/comments are skipped.  `suffix` is
+  /// included so an edit whose replacement ends at `name` can still detect an
+  /// invocation whose opening parenthesis remains in the preserved source
+  /// suffix.  The NAME token itself must start in `text`; only the following
+  /// `(` may come from `suffix`.
+  std::optional<size_t> FirstFunctionLikeInvocationOffsetInText(
+      llvm::StringRef name, llvm::StringRef text,
+      llvm::StringRef suffix = llvm::StringRef()) const;
 
-  /// True iff \p text plus the optional preserved \p suffix contains a real
-  /// function-like invocation of \p name.
-  bool FunctionLikeInvocationAppearsInText(llvm::StringRef name,
-                                           llvm::StringRef text,
-                                           llvm::StringRef suffix =
-                                               llvm::StringRef()) const;
+  /// Return true when `text` plus the optional preserved `suffix` contains a
+  /// real function-like invocation of `name`.
+  bool FunctionLikeInvocationAppearsInText(
+      llvm::StringRef name, llvm::StringRef text,
+      llvm::StringRef suffix = llvm::StringRef()) const;
 
   /// True iff \p text contains a line-state builtin observer token.
   bool TextMentionsLineObserver(llvm::StringRef text) const;
@@ -74,11 +76,14 @@ public:
   /// True iff \p text contains a `__COUNTER__` observer/consumer token.
   bool TextMentionsCounterObserver(llvm::StringRef text) const;
 
-  /// True iff \p text contains a physical preprocessor directive line.
+  /// Return true when `text` contains a physical preprocessor directive line.
   ///
-  /// This remains a textual classification, not a macro-state policy decision:
-  /// callers decide whether a directive line is a barrier for the proof they
-  /// are constructing.
+  /// Macro-state transitions may cross ordinary source bytes only when those
+  /// bytes cannot observe the moved transition.  Crossing a directive line is
+  /// unsafe by default because conditionals, includes, and macro transitions
+  /// have structural effects beyond token-level identifier observation.  This
+  /// remains a textual classification; callers choose the proof policy that
+  /// consumes the result.
   bool TextContainsDirectiveLine(llvm::StringRef text) const;
 
 private:

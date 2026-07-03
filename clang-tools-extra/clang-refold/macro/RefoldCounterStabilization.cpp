@@ -2,20 +2,28 @@
 //
 // __COUNTER__ stabilization planner implementation.
 //
-// This file implements the read-only suffix-forcing policy for counter-sensitive
-// macro realizations.  The planner uses macro topology plus explicit owner and
-// patch-disposition predicates to decide which later counter-bearing macro
-// callsites must remain expanded.
+// This file implements the read-only suffix-forcing policy for
+// counter-sensitive macro realizations.  The planner uses macro topology plus
+// explicit owner and patch-disposition predicates to decide which later
+// counter-bearing macro callsites must remain expanded.
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLog.h"
 #include "macro/RefoldCounterStabilization.h"
+#include "core/RefoldLog.h"
+
+#include "macro/RefoldMacroPatchPlanner.h"
+#include "proof/RefoldOwnerStateProof.h"
+#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldWitnessTrace.h"
+#include "source/RefoldSourceMapper.h"
+#include "source/RefoldStructuralHunkDispatcher.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -36,7 +44,6 @@ RefoldCounterStabilization::RefoldCounterStabilization(
     : model_(model), aToks_(aToks), bToks_(bToks),
       macroTopology_(macroTopology), ownerClassifier_(ownerClassifier) {}
 
-
 SmallVector<CounterOccurrence, 32>
 RefoldCounterStabilization::CollectCounterOccurrences(StringRef tuPath) const {
   SmallVector<CounterOccurrence, 32> occs;
@@ -55,8 +62,8 @@ RefoldCounterStabilization::CollectCounterOccurrences(StringRef tuPath) const {
     if (e <= b)
       return;
 
-    CounterEventIdentity event = macroTopology_.BuildCounterEventIdentity(
-        mi, occurrenceOrdinal++, b, e);
+    CounterEventIdentity event =
+        macroTopology_.BuildCounterEventIdentity(mi, occurrenceOrdinal++, b, e);
     occs.push_back(CounterOccurrence{&mi, b, e, std::nullopt, event});
   };
 
@@ -126,16 +133,16 @@ RefoldCounterStabilization::CollectCounterOccurrences(StringRef tuPath) const {
 
 void RefoldCounterStabilization::SortCounterOccurrences(
     SmallVectorImpl<CounterOccurrence> &occs) {
-  llvm::sort(occs, [](const CounterOccurrence &lhs,
-                      const CounterOccurrence &rhs) {
-    if (lhs.aStart != rhs.aStart)
-      return lhs.aStart < rhs.aStart;
-    if (lhs.aEnd != rhs.aEnd)
-      return lhs.aEnd < rhs.aEnd;
-    if (lhs.ownerIncludeId != rhs.ownerIncludeId)
-      return lhs.ownerIncludeId < rhs.ownerIncludeId;
-    return lhs.macro->id < rhs.macro->id;
-  });
+  llvm::sort(occs,
+             [](const CounterOccurrence &lhs, const CounterOccurrence &rhs) {
+               if (lhs.aStart != rhs.aStart)
+                 return lhs.aStart < rhs.aStart;
+               if (lhs.aEnd != rhs.aEnd)
+                 return lhs.aEnd < rhs.aEnd;
+               if (lhs.ownerIncludeId != rhs.ownerIncludeId)
+                 return lhs.ownerIncludeId < rhs.ownerIncludeId;
+               return lhs.macro->id < rhs.macro->id;
+             });
 }
 
 SmallVector<ForcedMacroPatchRequest, 32>
@@ -263,7 +270,8 @@ RefoldCounterStabilization::ComputeForcedCounterPatches(
         -> std::optional<std::pair<uint64_t, uint64_t>> {
       uint64_t lo = std::numeric_limits<uint64_t>::max();
       uint64_t hi = 0;
-      for (const auto &range : macroTopology_.CounterOutputRangesForInvocation(m)) {
+      for (const auto &range :
+           macroTopology_.CounterOutputRangesForInvocation(m)) {
         uint64_t begin = range.first;
         uint64_t end = range.second;
         if (end == begin && begin < aToks_.size())
@@ -308,12 +316,13 @@ RefoldCounterStabilization::ComputeForcedCounterPatches(
       }
 
       if (idx >= 0) {
-        REFOLD_LOG_TRACE("counter",
-              "__COUNTER__: lifted edit detection found firstEditedIdx={0} at "
-              "A=[{1},{2}) root='{3}'",
-              idx, lifted[static_cast<size_t>(idx)].aStart,
-              lifted[static_cast<size_t>(idx)].aEnd,
-              lifted[static_cast<size_t>(idx)].macro->name);
+        REFOLD_LOG_TRACE(
+            "counter",
+            "__COUNTER__: lifted edit detection found firstEditedIdx={0} at "
+            "A=[{1},{2}) root='{3}'",
+            idx, lifted[static_cast<size_t>(idx)].aStart,
+            lifted[static_cast<size_t>(idx)].aEnd,
+            lifted[static_cast<size_t>(idx)].macro->name);
         filtered.swap(lifted);
         firstEditedIdx = idx;
       }
@@ -321,7 +330,8 @@ RefoldCounterStabilization::ComputeForcedCounterPatches(
   }
 
   if (firstEditedIdx < 0) {
-    REFOLD_LOG_TRACE("counter", "__COUNTER__: no edited occurrences; no forced expansion");
+    REFOLD_LOG_TRACE("counter",
+                     "__COUNTER__: no edited occurrences; no forced expansion");
     return {};
   }
 
@@ -357,18 +367,18 @@ RefoldCounterStabilization::ComputeForcedCounterPatches(
     forced.push_back({root, o.aStart, o.aEnd, o.event});
 
     REFOLD_LOG_TRACE("counter",
-          "__COUNTER__: force root id={0} name='{1}' ownerInc={2} "
-          "inv=[{3},{4}) for occ A=[{5},{6})",
-          root->id, root->name, root->ownerIncludeId, *invStart, *invEnd,
-          o.aStart, o.aEnd);
+                     "__COUNTER__: force root id={0} name='{1}' ownerInc={2} "
+                     "inv=[{3},{4}) for occ A=[{5},{6})",
+                     root->id, root->name, root->ownerIncludeId, *invStart,
+                     *invEnd, o.aStart, o.aEnd);
   }
 
   REFOLD_LOG_DEBUG("counter",
-        "__COUNTER__: occurrences={0} firstEditedIdx={1} forced={2} "
-        "firstOccA=[{3},{4})",
-        filtered.size(), firstEditedIdx, forced.size(),
-        filtered[static_cast<size_t>(firstEditedIdx)].aStart,
-        filtered[static_cast<size_t>(firstEditedIdx)].aEnd);
+                   "__COUNTER__: occurrences={0} firstEditedIdx={1} forced={2} "
+                   "firstOccA=[{3},{4})",
+                   filtered.size(), firstEditedIdx, forced.size(),
+                   filtered[static_cast<size_t>(firstEditedIdx)].aStart,
+                   filtered[static_cast<size_t>(firstEditedIdx)].aEnd);
 
   return forced;
 }
@@ -386,8 +396,8 @@ RefoldCounterStabilization::ComputeForcedCounterPatchesFromExpandedMacros(
   // Return true when the patch already selected for `root` is an expanded
   // realization. Once one counter-bearing macro remains expanded, all following
   // counter-bearing roots must also be forced to preserve counter sequencing.
-  auto hasExpandedPatchFor = [&](const RefoldModel::MacroInvocation &root)
-      -> bool {
+  auto hasExpandedPatchFor =
+      [&](const RefoldModel::MacroInvocation &root) -> bool {
     const auto oit = macroPatchByOwnerByMacroId.find(root.ownerIncludeId);
     if (oit == macroPatchByOwnerByMacroId.end())
       return false;
@@ -399,7 +409,7 @@ RefoldCounterStabilization::ComputeForcedCounterPatchesFromExpandedMacros(
 
     for (const auto &kv : oit->second) {
       const MacroPatch &p = kv.second;
-      if (p.invStart != *invStart || p.invEnd != *invEnd)
+      if (p.invRange.begin != *invStart || p.invRange.end != *invEnd)
         continue;
       if (macroTopology_.MacroPatchRemainsExpanded(p))
         return true;
@@ -408,8 +418,8 @@ RefoldCounterStabilization::ComputeForcedCounterPatchesFromExpandedMacros(
   };
 
   // Find the first __COUNTER__ occurrence whose smallest patchable owner is
-  // already going to remain expanded. That point starts the forced-stabilization
-  // suffix.
+  // already going to remain expanded. That point starts the
+  // forced-stabilization suffix.
   int firstExpandedIdx = -1;
   for (size_t i = 0; i < filtered.size(); ++i) {
     const auto *root = macroTopology_.SmallestCoveringPatchableMacro(
@@ -448,15 +458,228 @@ RefoldCounterStabilization::ComputeForcedCounterPatchesFromExpandedMacros(
       continue;
 
     forced.push_back({root, o.aStart, o.aEnd, o.event});
-    REFOLD_LOG_TRACE("counter",
-          "__COUNTER__: expanded-macro stabilization firstExpandedIdx={0} "
-          "force root id={1} name='{2}' ownerInc={3} inv=[{4},{5}) for occ "
-          "A=[{6},{7})",
-          firstExpandedIdx, root->id, root->name, root->ownerIncludeId,
-          *invStart, *invEnd, o.aStart, o.aEnd);
+    REFOLD_LOG_TRACE(
+        "counter",
+        "__COUNTER__: expanded-macro stabilization firstExpandedIdx={0} "
+        "force root id={1} name='{2}' ownerInc={3} inv=[{4},{5}) for occ "
+        "A=[{6},{7})",
+        firstExpandedIdx, root->id, root->name, root->ownerIncludeId, *invStart,
+        *invEnd, o.aStart, o.aEnd);
   }
 
   return forced;
+}
+
+// =================== Forced __COUNTER__ patch construction =================
+
+void applyForcedCounterPatches(
+    ArrayRef<ForcedMacroPatchRequest> forced, ArrayRef<PPTok> bToks,
+    const RefoldSourceMapper &sourceMapper,
+    const RefoldMacroTopology &macroTopology,
+    const RefoldMacroPatchPlanner &macroPatchPlanner,
+    const RefoldProofLattice &proofLattice,
+    const RefoldOwnerStateProof &ownerStateProof,
+    RefoldStructuralHunkDispatcher &structuralHunkDispatcher) {
+  struct CounterReplacementSurface {
+    std::string text;
+    uint64_t bTokStart = 0;
+    uint64_t bTokEnd = 0;
+  };
+
+  auto buildOccReplacement =
+      [&](uint64_t aStart,
+          uint64_t aEnd) -> std::optional<CounterReplacementSurface> {
+    // For __COUNTER__, the replacement is tied to the specific expanded
+    // occurrence, not to reusable macro-body text. Map that occurrence's
+    // A-token range into B and use the resulting B spelling directly.  Keep
+    // the B-token envelope together with the text so the accepted witness can
+    // prove target-PP identity without relying on the spelling preview.
+    auto bEnv = sourceMapper.MapATokRangeAToBTokenEnvelope(aStart, aEnd);
+    if (!bEnv)
+      return std::nullopt;
+    if (bEnv->second <= bEnv->first)
+      return std::nullopt;
+
+    CounterReplacementSurface surface;
+    surface.text =
+        sourceMapper.SliceBSource(bEnv->first, bEnv->second).trim().str();
+    surface.bTokStart = static_cast<uint64_t>(bEnv->first);
+    surface.bTokEnd = static_cast<uint64_t>(bEnv->second);
+    return surface;
+  };
+
+  auto deriveWholeCoverBTokenRange = [&](const RefoldModel::MacroInvocation &m)
+      -> std::optional<std::pair<uint64_t, uint64_t>> {
+    std::optional<std::pair<uint64_t, uint64_t>> cover =
+        macroPatchPlanner.GetWholeCoverATokRange(m);
+    if (!cover)
+      return std::nullopt;
+
+    std::optional<std::pair<size_t, size_t>> bEnv =
+        sourceMapper.MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+            cover->first, cover->second);
+    if (!bEnv || bEnv->second <= bEnv->first || bEnv->second > bToks.size())
+      return std::nullopt;
+
+    return std::make_pair(static_cast<uint64_t>(bEnv->first),
+                          static_cast<uint64_t>(bEnv->second));
+  };
+
+  for (const auto &req : forced) {
+    const RefoldModel::MacroInvocation *pm = req.macro;
+    if (!pm)
+      continue;
+    const RefoldModel::MacroInvocation &m = *pm;
+
+    // Safety: do not patch macro definitions.
+    if (macroTopology.IsInvocationInsideDefineDirective(m))
+      continue;
+
+    // Forced patches still require a concrete physical invocation span; without
+    // it there is no call-site text to replace.
+    const auto invStart = m.invB;
+    const auto invEnd = m.invE;
+    if (!invStart || !invEnd || *invEnd < *invStart)
+      continue;
+
+    std::optional<CounterReplacementSurface> counterSurface;
+    std::optional<std::string> nonCounterReplacement;
+    if (m.name == "__COUNTER__") {
+      counterSurface = buildOccReplacement(req.aStart, req.aEnd);
+    } else {
+      // Other forced counter-related requests use the normal whole-cover text
+      // builder so they remain aligned with whole macro invocation replay.
+      nonCounterReplacement = proofLattice.BuildWholeCoverReplacementText(m);
+    }
+    if (!counterSurface && !nonCounterReplacement)
+      continue;
+
+    // Coalesce by physical invocation span (inv_b/inv_e), matching the hunk
+    // coalescing logic used during normal classification.
+    RefoldStructuralHunkDispatcher::MacroPatchStagingSlot stagingSlot =
+        structuralHunkDispatcher.PrepareMacroPatchStagingSlot(m);
+
+    // Preserve an existing non-callsite (already-expanded) replacement.
+    if (stagingSlot.existingPatch && !stagingSlot.existingIsCallsite)
+      continue;
+
+    CounterEventIdentity counterEventForWitness;
+    SuffixStabilityWitness counterWitness = SuffixStabilityWitness::None();
+    {
+      CounterEventIdentity event = req.event;
+      if (event.macroInvocationId == 0)
+        event = macroTopology.BuildCounterEventIdentity(
+            m, /*occurrenceOrdinal=*/0, req.aStart, req.aEnd, m.ownerIncludeId);
+      if (!event.expectedBValue) {
+        if (counterSurface)
+          event.expectedBValue = counterSurface->text;
+        else if (nonCounterReplacement)
+          event.expectedBValue = *nonCounterReplacement;
+      }
+      counterEventForWitness = event;
+      const OwnerStateBoundary boundary =
+          ownerStateProof.CounterStateBoundaryForEvent(event);
+      const std::string detail =
+          llvm::formatv(
+              "forced materialization of counter-sensitive invocation "
+              "#{0} after edited counter occurrence A=[{1},{2})",
+              m.id, req.aStart, req.aEnd)
+              .str();
+      counterWitness = ownerStateProof.BuildStateTransitionWitness(
+          SuffixStabilityWitnessKind::OwnerMaterialization,
+          OwnerStateComponent::Counter, boundary,
+          llvm::formatv("{0}; {1}", detail,
+                        ownerStateProof.FormatCounterEventForWitness(event))
+              .str());
+      (void)ownerStateProof.CheckStateTransitionAcrossEditBoundary(
+          boundary, OwnerStateComponent::Counter,
+          StateMutationKind::Materialized, counterWitness, "counter", detail,
+          /*requireKnownObserver=*/false);
+    }
+
+    // Install the forced patch under the coalesced physical-span key. If this
+    // replaces a previous call-site-shaped patch, carry its owner certificate
+    // forward before certifying the current invocation owner.
+    std::optional<std::pair<uint64_t, uint64_t>> materializedBTokenRange;
+    if (counterSurface) {
+      materializedBTokenRange =
+          std::make_pair(counterSurface->bTokStart, counterSurface->bTokEnd);
+    } else if (nonCounterReplacement) {
+      // Enclosing macro materializations are whole-cover counter-stabilization
+      // repairs. Their target-PP proof is the exact B-token envelope of the
+      // whole macro expansion, not the replacement string constructed from it.
+      materializedBTokenRange = deriveWholeCoverBTokenRange(m);
+    }
+
+    std::string replacementText = counterSurface
+                                      ? std::move(counterSurface->text)
+                                      : std::move(*nonCounterReplacement);
+    MacroPatch patch{*invStart, *invEnd, std::move(replacementText)};
+    if (materializedBTokenRange &&
+        materializedBTokenRange->first <= materializedBTokenRange->second &&
+        materializedBTokenRange->second <= bToks.size()) {
+      patch.materialized.hasBTokenRange = true;
+      patch.materialized.bTokStart = materializedBTokenRange->first;
+      patch.materialized.bTokEnd = materializedBTokenRange->second;
+    }
+    if (stagingSlot.existingPatch)
+      macroPatchPlanner.CarryMacroPatchOwnerCertificate(
+          patch, *stagingSlot.existingPatch);
+    macroPatchPlanner.CertifyMacroPatchOwnerWitness(
+        patch,
+        m.ownerIncludeId ? Owner::Include(*m.ownerIncludeId) : Owner::TU());
+
+    // Forced __COUNTER__ stabilization is an invocation-realization proof, not
+    // an anonymous text edit.  The forced root is often the spelling of
+    // __COUNTER__ itself, but it can also be an enclosing macro invocation
+    // whose expansion observes __COUNTER__ (for example PRINT(...) wrapping
+    // __COUNTER__).  In both cases the emitted patch is required solely to keep
+    // the counter sequence consistent after an earlier counter occurrence was
+    // realized, so certify every forced counter-stabilization patch with the
+    // explicit counter proof class and its typed state-stability witness.
+    MacroPatchProof proof = proofLattice.MakeMacroPatchProof(
+        MacroPatchProofKind::CounterLiteral,
+        /*preservesInvocationStructure=*/false, m.id);
+    CounterStateWitness counterState;
+    counterState.hasCounterEvents = true;
+    counterState.counterOrderKnown = true;
+    counterState.suffixStateStable = true;
+    counterState.materializationStable = true;
+    counterState.counterConsumptionCount = 1;
+    counterState.counterMutationCount = 1;
+    if (counterWitness.kind != SuffixStabilityWitnessKind::None)
+      counterState.preservedSuffixObserverCount = 1;
+    if (counterEventForWitness.expectedBValue) {
+      counterState.hasExpectedBValues = true;
+      counterState.expectedBValueCount = 1;
+      counterState.suffixValueSignature =
+          llvm::formatv("expected={0}",
+                        RefoldWitnessTrace::FormatWitnessTraceHash(
+                            *counterEventForWitness.expectedBValue))
+              .str();
+    } else {
+      counterState.hasMissingExpectedBValues = true;
+      counterState.missingExpectedBValueCount = 1;
+    }
+    counterState.consumptionSignature =
+        ownerStateProof.FormatCounterEventForWitness(counterEventForWitness);
+    counterState.orderSignature =
+        llvm::formatv("ordinal={0}:macro={1}:A=[{2},{3})",
+                      counterEventForWitness.occurrenceOrdinal,
+                      counterEventForWitness.macroInvocationId,
+                      counterEventForWitness.aTokenBegin,
+                      counterEventForWitness.aTokenEnd)
+            .str();
+    counterState.suffixObserverSignature =
+        llvm::formatv("forced-materialization:{0}", counterWitness.kind).str();
+    proof.suffixStability = std::move(counterWitness);
+    proof.counterState = std::move(counterState);
+    proofLattice.SetMacroPatchProof(patch, std::move(proof));
+
+    // Use the coalesced key as the patch macro ID so later owner/macro maps see
+    // one canonical patch per physical invocation span.
+    structuralHunkDispatcher.StageMacroPatch(stagingSlot, std::move(patch));
+  }
 }
 
 } // namespace refold

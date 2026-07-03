@@ -8,13 +8,14 @@
 
 #include "core/RefoldLog.h"
 #include "edit/RefoldTextEditAssembler.h"
+#include "include/RefoldIncludeInsertionPlanner.h"
 #include "include/RefoldIncludeMaterializer.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroStateRepairPlanner.h"
 #include "proof/RefoldProofLattice.h"
 #include "proof/RefoldSidebandReplayProof.h"
-#include "proof/RefoldTerminalProofSink.h"
+#include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
 #include "util/RefoldPathIdentity.h"
 #include "util/StringUtils.h"
@@ -31,8 +32,7 @@ namespace refold {
 
 namespace {
 
-template <typename T>
-T &requireNonNull(T *ptr, const char *message) {
+template <typename T> T &requireNonNull(T *ptr, const char *message) {
   assert(ptr && message);
   (void)message;
   return *ptr;
@@ -45,23 +45,23 @@ RefoldIncludeMaterializationScheduler::RefoldIncludeMaterializationScheduler(
     : deps_(std::move(deps)), request_(std::move(request)),
       model_(requireNonNull(deps_.model,
                             "include scheduler requires RefoldModel")),
-      pathIdentity_(requireNonNull(
-          deps_.pathIdentity, "include scheduler requires path identity")),
-      includeMaterializer_(requireNonNull(
-          deps_.includeMaterializer,
-          "include scheduler requires include materializer")),
+      pathIdentity_(requireNonNull(deps_.pathIdentity,
+                                   "include scheduler requires path identity")),
+      includeMaterializer_(
+          requireNonNull(deps_.includeMaterializer,
+                         "include scheduler requires include materializer")),
       includeInsertionPlanner_(requireNonNull(
           deps_.includeInsertionPlanner,
           "include scheduler requires include insertion planner")),
-      lineObserverLayout_(requireNonNull(
-          deps_.lineObserverLayout,
-          "include scheduler requires line observer layout")),
+      lineObserverLayout_(
+          requireNonNull(deps_.lineObserverLayout,
+                         "include scheduler requires line observer layout")),
       macroStateRepairPlanner_(requireNonNull(
           deps_.macroStateRepairPlanner,
           "include scheduler requires macro-state repair planner")),
-      textEditAssembler_(requireNonNull(
-          deps_.textEditAssembler,
-          "include scheduler requires text edit assembler")),
+      textEditAssembler_(
+          requireNonNull(deps_.textEditAssembler,
+                         "include scheduler requires text edit assembler")),
       proofLattice_(requireNonNull(deps_.proofLattice,
                                    "include scheduler requires proof lattice")),
       terminalSink_(requireNonNull(deps_.terminalSink,
@@ -69,9 +69,9 @@ RefoldIncludeMaterializationScheduler::RefoldIncludeMaterializationScheduler(
       sidebandPragmaEdits_(requireNonNull(
           deps_.sidebandPragmaEdits,
           "include scheduler requires sideband pragma edit list")),
-      structuralHunkDispatcher_(requireNonNull(
-          request_.structuralHunkDispatcher,
-          "include scheduler requires structural dispatcher")),
+      structuralHunkDispatcher_(
+          requireNonNull(request_.structuralHunkDispatcher,
+                         "include scheduler requires structural dispatcher")),
       tuEdits_(structuralHunkDispatcher_.MutableTUEditsForRepairAndEmission()) {
   BuildChildrenIndex();
 }
@@ -88,7 +88,8 @@ bool RefoldIncludeMaterializationScheduler::MaterializeIncludeExpansions() {
   // terminal fallback in this single pass, stop here rather than continuing to
   // compose or return mixed structural artifacts.
   if (terminalSink_.HasRequest()) {
-    REFOLD_LOG_DEBUG("fallback", "single-pass refold aborted after include "
+    REFOLD_LOG_DEBUG("fallback",
+                     "single-pass refold aborted after include "
                      "materialization; terminal fallback will be emitted");
     return false;
   }
@@ -211,9 +212,9 @@ RefoldIncludeMaterializationScheduler::FindTokenGapContainingByteRange(
 
   const uint64_t gapBegin =
       gap == 0 ? 0 : TokenEndOffset(tokens, tokenOffsets, gap - 1);
-  const uint64_t gapEnd =
-      gap == tokenCount ? static_cast<uint64_t>(source.size())
-                        : static_cast<uint64_t>(tokenOffsets[gap]);
+  const uint64_t gapEnd = gap == tokenCount
+                              ? static_cast<uint64_t>(source.size())
+                              : static_cast<uint64_t>(tokenOffsets[gap]);
 
   if (begin < gapBegin || end > gapEnd)
     return std::nullopt;
@@ -224,13 +225,14 @@ std::optional<uint64_t>
 RefoldIncludeMaterializationScheduler::LayoutOnlyIncludeSeedForRawByteHunk(
     const diffutils::Hunk &hunk) const {
   if (hunk.aStart > hunk.aEnd || hunk.bStart > hunk.bEnd ||
-      hunk.aEnd > request_.aSource.size() || hunk.bEnd > request_.bSource.size())
+      hunk.aEnd > request_.aSource.size() ||
+      hunk.bEnd > request_.bSource.size())
     return std::nullopt;
 
   StringRef aSlice = request_.aSource.slice(static_cast<size_t>(hunk.aStart),
-                                           static_cast<size_t>(hunk.aEnd));
+                                            static_cast<size_t>(hunk.aEnd));
   StringRef bSlice = request_.bSource.slice(static_cast<size_t>(hunk.bStart),
-                                           static_cast<size_t>(hunk.bEnd));
+                                            static_cast<size_t>(hunk.bEnd));
   if (!aSlice.trim().empty() || !bSlice.trim().empty())
     return std::nullopt;
 
@@ -281,17 +283,18 @@ void RefoldIncludeMaterializationScheduler::
   //
   // The important proof boundary is "byte-only".  Once a normal token hunk, a
   // sideband pragma edit, a TU text edit, an include patch, or a macro patch
-  // already explains part of the modified stream, an adjacent whitespace hunk is
-  // not by itself an owner witness for a clean neighboring include.  Treating it
-  // as one would be a non-minimal heuristic: leading/trailing `-E -P` newline
-  // drift commonly appears around otherwise valid repairs and does not prove
-  // that the first or last include must be opened.  Composite layout edits need
-  // a real tiling proof before they may force extra materialization; this
-  // fallback handles only the fully byte-only surface where no stronger
+  // already explains part of the modified stream, an adjacent whitespace hunk
+  // is not by itself an owner witness for a clean neighboring include. Treating
+  // it as one would be a non-minimal heuristic: leading/trailing `-E -P`
+  // newline drift commonly appears around otherwise valid repairs and does not
+  // prove that the first or last include must be opened.  Composite layout
+  // edits need a real tiling proof before they may force extra materialization;
+  // this fallback handles only the fully byte-only surface where no stronger
   // structural repair exists.
   const bool mayUseByteOnlyIncludeLayoutSeed =
       request_.tokenHunks.empty() && sidebandPragmaEdits_.empty() &&
-      tuEdits_.empty() && !structuralHunkDispatcher_.IncludeBucketsHavePatches() &&
+      tuEdits_.empty() &&
+      !structuralHunkDispatcher_.IncludeBucketsHavePatches() &&
       !structuralHunkDispatcher_.MacroBucketsHavePatches();
 
   if (request_.rawByteHunks) {
@@ -301,7 +304,8 @@ void RefoldIncludeMaterializationScheduler::
       if (!seed)
         continue;
 
-      const RefoldModel::IncludeItem *seedInclude = model_.GetIncludeById(*seed);
+      const RefoldModel::IncludeItem *seedInclude =
+          model_.GetIncludeById(*seed);
       const bool lineControlIncludeEdge =
           seedInclude &&
           IncludeHasIncluderSuppliedLineControlMacroState(*seedInclude);
@@ -311,8 +315,8 @@ void RefoldIncludeMaterializationScheduler::
       // motivated the byte-only gate were exactly incidental `-E -P` newline
       // drift next to clean includes while some other owner carried the real
       // edit.  A line-control include edge is different.  Preserving that
-      // directive asks Clang to regenerate caller-edge line-control layout, so a
-      // raw PP byte hunk in the owned gap is itself an include-site-local
+      // directive asks Clang to regenerate caller-edge line-control layout, so
+      // a raw PP byte hunk in the owned gap is itself an include-site-local
       // obligation even when a sibling or parent token hunk exists.  Keep the
       // proof deterministic by requiring the producer-proven includer-supplied
       // line-control state, rather than selecting arbitrary adjacent includes.
@@ -320,13 +324,13 @@ void RefoldIncludeMaterializationScheduler::
         continue;
 
       layoutOnlyIncludeMaterializationSeeds_.insert(*seed);
-      REFOLD_LOG_TRACE(
-          "include/layout",
-          "seed include materialization from raw layout hunk "
-          "A[{0},{1}) -> B[{2},{3}) inc#{4} byteOnly={5} "
-          "lineControlEdge={6}",
-          byteHunk.aStart, byteHunk.aEnd, byteHunk.bStart, byteHunk.bEnd,
-          *seed, mayUseByteOnlyIncludeLayoutSeed, lineControlIncludeEdge);
+      REFOLD_LOG_TRACE("include/layout",
+                       "seed include materialization from raw layout hunk "
+                       "A[{0},{1}) -> B[{2},{3}) inc#{4} byteOnly={5} "
+                       "lineControlEdge={6}",
+                       byteHunk.aStart, byteHunk.aEnd, byteHunk.bStart,
+                       byteHunk.bEnd, *seed, mayUseByteOnlyIncludeLayoutSeed,
+                       lineControlIncludeEdge);
     }
   }
 
@@ -338,8 +342,8 @@ void RefoldIncludeMaterializationScheduler::
         "skip include layout seeding: tokenHunks={0} sidebandPragmas={1} "
         "tuEdits={2} includePatchBuckets={3} macroPatchBuckets={4} "
         "rawByteHunks={5}",
-        request_.tokenHunks.size(), sidebandPragmaEdits_.size(), tuEdits_.size(),
-        structuralHunkDispatcher_.IncludeBucketCount(),
+        request_.tokenHunks.size(), sidebandPragmaEdits_.size(),
+        tuEdits_.size(), structuralHunkDispatcher_.IncludeBucketCount(),
         structuralHunkDispatcher_.MacroOwnerBucketCount(),
         request_.rawByteHunks->size());
   }
@@ -359,12 +363,12 @@ RefoldIncludeMaterializationScheduler::BuildInitialMaterializationSeeds()
   seeds.insert(layoutOnlyIncludeMaterializationSeeds_.begin(),
                layoutOnlyIncludeMaterializationSeeds_.end());
 
-  // (a.1) Header-owned sideband pragma edits are zero-normal-token source edits.
-  // They do not create an include patch from an A/B hunk, but they still dirty
-  // the include instance whose header text contains the pragma. Seed that
+  // (a.1) Header-owned sideband pragma edits are zero-normal-token source
+  // edits. They do not create an include patch from an A/B hunk, but they still
+  // dirty the include instance whose header text contains the pragma. Seed that
   // include so the normal owner-polymorphic materialization path applies the
-  // source edit inside the header and then folds the materialized expansion back
-  // through its parent include chain.
+  // source edit inside the header and then folds the materialized expansion
+  // back through its parent include chain.
   for (const SidebandPragmaEdit &sideband : sidebandPragmaEdits_) {
     if (std::optional<uint64_t> owner = sideband.OwnerIncludeId())
       seeds.insert(*owner);
@@ -433,9 +437,10 @@ void RefoldIncludeMaterializationScheduler::MaterializeOrderedSeeds(
         includeId,
         structuralHunkDispatcher_.MutableIncludeEditBucketsForMaterialization(),
         structuralHunkDispatcher_.FinalMacroPatchesByOwnerForMaterialization(),
-        children_, includeExpansion_, includeExpansionLineControlPruneCandidates_,
-        includeExpansionLineControlSourceMappings_, includeExpansionStartLineNos_,
-        includeExpansionAcceptedResults_,
+        children_, includeExpansion_,
+        includeExpansionLineControlPruneCandidates_,
+        includeExpansionLineControlSourceMappings_,
+        includeExpansionStartLineNos_, includeExpansionAcceptedResults_,
         &structuralHunkDispatcher_.MutableAppliedExpandedMacroRootIds());
   }
 }
@@ -448,10 +453,11 @@ void RefoldIncludeMaterializationScheduler::RebuildExpandedIncludeIds() {
 
 bool RefoldIncludeMaterializationScheduler::
     IncludeHasLineDirectiveForcingSidebandWork(uint64_t includeId) const {
-  return llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &edit) {
-    return edit.TargetsInclude(includeId) &&
-           edit.ForcesIncludeLineDirectiveWrappers();
-  });
+  return llvm::any_of(sidebandPragmaEdits_,
+                      [&](const SidebandPragmaEdit &edit) {
+                        return edit.TargetsInclude(includeId) &&
+                               edit.ForcesIncludeLineDirectiveWrappers();
+                      });
 }
 
 bool RefoldIncludeMaterializationScheduler::IncludeHasOrdinaryReplayTokens(
@@ -463,8 +469,8 @@ bool RefoldIncludeMaterializationScheduler::IncludeHasOrdinaryReplayTokens(
 
 bool RefoldIncludeMaterializationScheduler::
     IncludeUsesOnlySidebandReplayEnvelope(uint64_t includeId) const {
-  bool sawSideband = llvm::any_of(
-      sidebandPragmaEdits_, [&](const SidebandPragmaEdit &edit) {
+  bool sawSideband =
+      llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &edit) {
         return edit.TargetsInclude(includeId);
       });
   if (IncludeHasOrdinaryReplayTokens(includeId))
@@ -490,8 +496,8 @@ RefoldIncludeMaterializationScheduler::ClassifyTUIncludeMaterializationWork(
   if (layoutOnlyIncludeMaterializationSeeds_.contains(includeId))
     return TUIncludeMaterializationWorkClass::Ordinary;
 
-  bool sawSideband = llvm::any_of(
-      sidebandPragmaEdits_, [&](const SidebandPragmaEdit &edit) {
+  bool sawSideband =
+      llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &edit) {
         return edit.TargetsInclude(includeId);
       });
   if (IncludeHasLineDirectiveForcingSidebandWork(includeId))
@@ -613,16 +619,23 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
   const RefoldModel::IncludeItem *include = model_.GetIncludeById(includeId);
   if (!include)
     return true;
-  if (include->parent || !pathIdentity_.PathsEqual(include->sitePath,
-                                                  request_.tuPath))
+
+  // Only the translation-unit root include is rewritten here. Nested includes
+  // are folded into the already-materialized parent expansion.
+  if (include->parent ||
+      !pathIdentity_.PathsEqual(include->sitePath, request_.tuPath))
     return true;
 
   std::string expansionText = expansionIt->second;
   auto [siteBegin, siteEnd] = ExtendedTUSiteRange(*include);
 
+  // If the source-graph writer can preserve this root include without replacing
+  // the site, it owns the output and no structural TU edit is needed.
   if (TryPreserveSourceGraphOutput(*include, expansionText))
     return true;
 
+  // Repair consumed macro-state directives before wrapping the expansion so the
+  // final TU edit carries the macro state required by the materialized header.
   if (!macroStateRepairPlanner_.RepairConsumedDefinitionsForMaterializedInclude(
           macroStatePlan, macroStateRequest, *include, siteBegin, siteEnd,
           expansionText)) {
@@ -638,10 +651,13 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
   const size_t childEntryLineNo =
       includeExpansionStartLineNos_.lookup(include->id);
 
+  // Forward any line-control pruning and source-mapping evidence produced while
+  // materializing the include body into the final TU wrapper.
   ArrayRef<FinalLineControlPruneCandidate> includeLineCandidates;
   if (auto includeCandidatesIt =
           includeExpansionLineControlPruneCandidates_.find(include->id);
-      includeCandidatesIt != includeExpansionLineControlPruneCandidates_.end()) {
+      includeCandidatesIt !=
+      includeExpansionLineControlPruneCandidates_.end()) {
     includeLineCandidates = includeCandidatesIt->second;
   }
 
@@ -655,9 +671,9 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
   LineControlWrappedText wrapped =
       lineObserverLayout_.WrapIncludeExpansionForMaterialization(
           *include, parentResume.fileSpelling, request_.tuPath, std::nullopt,
-          siteEnd, childEntryLineNo ? childEntryLineNo : 1,
-          parentResume.lineNo, expansionText, includeLineCandidates,
-          includeLineSourceMappings, sidebandOnly);
+          siteEnd, childEntryLineNo ? childEntryLineNo : 1, parentResume.lineNo,
+          expansionText, includeLineCandidates, includeLineSourceMappings,
+          sidebandOnly);
 
   TextEdit edit{siteBegin,
                 siteEnd,
@@ -669,31 +685,38 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
                 {}};
   edit.lineControlPruneCandidates =
       std::move(wrapped.lineControlPruneCandidates);
-  edit.lineControlSourceMappings =
-      std::move(wrapped.lineControlSourceMappings);
+  edit.lineControlSourceMappings = std::move(wrapped.lineControlSourceMappings);
 
+  // Certify the materialized-B extent carried by the edit. Prefer the full
+  // include realization envelope, but allow sideband-only materializations to
+  // certify the narrower sideband pragma replay range.
   auto acceptedIt = includeExpansionAcceptedResults_.find(includeId);
   if (auto bEnv =
           includeInsertionPlanner_.ResolveIncludeRealizationBTokenEnvelope(
               include->cover.begin, include->cover.end)) {
-    textEditAssembler_.StampTextEditMaterializedBTokenRange(edit, bEnv->first,
-                                                            bEnv->second);
+    textEditAssembler_.CertifyTextEditMaterializedBTokenRange(edit, bEnv->first,
+                                                              bEnv->second);
   } else if (sidebandOnly ||
              IncludeUsesOnlySidebandReplayEnvelope(include->id)) {
     if (auto sidebandBRange =
             textEditAssembler_.SidebandPragmaMaterializedBByteRangeForInclude(
                 include->id)) {
-      textEditAssembler_.StampTextEditMaterializedBByteRange(
+      textEditAssembler_.CertifyTextEditMaterializedBByteRange(
           edit, sidebandBRange->first, sidebandBRange->second);
     }
   }
 
+  // Preserve the accepted-result proof produced by the include materializer
+  // when available; otherwise stamp the edit as an include materialized
+  // expansion.
   if (acceptedIt != includeExpansionAcceptedResults_.end()) {
     textEditAssembler_.AttachAcceptedResultCarrier(edit, acceptedIt->second);
   } else {
     textEditAssembler_.AttachAcceptedResultCarrier(
-        edit, proofLattice_.BuildAcceptedIncludeRealizationCandidate(
-                  AcceptedPathKind::IncludeMaterializedExpansion, *include));
+        edit,
+        proofLattice_.AcceptedCandidateBuilder()
+            .BuildAcceptedIncludeRealizationCandidate(
+                AcceptedPathKind::IncludeMaterializedExpansion, *include));
   }
 
   structuralHunkDispatcher_.AddTUEdit(std::move(edit));

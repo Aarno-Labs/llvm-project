@@ -11,7 +11,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_INCLUDESPELLINGHELPERS_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_INCLUDESPELLINGHELPERS_H
 
-#include "proof/RefoldProofTypes.h"
+#include "proof/RefoldProofVocabulary.h"
 #include "util/StringUtils.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -36,10 +36,10 @@ inline bool includeOperandHasParentComponent(llvm::StringRef path) {
   return llvm::is_contained(components, llvm::StringRef(".."));
 }
 
-/// Return true when \p path uses only the restricted ASCII include-path spelling
-/// alphabet that clang-refold is willing to synthesize.  This is only a
-/// spelling predicate; it intentionally does not consult the filesystem or model
-/// any include search path.
+/// Return true when \p path uses only the restricted ASCII include-path
+/// spelling alphabet that clang-refold is willing to synthesize.  This is only
+/// a spelling predicate; it intentionally does not consult the filesystem or
+/// model any include search path.
 inline bool refoldHasSafeIncludePathSpelling(llvm::StringRef path) {
   auto isSafeIncludePathChar = [](char c) {
     return std::isalnum(static_cast<unsigned char>(c)) || c == '_' ||
@@ -77,8 +77,8 @@ inline bool safeSynthesizedRelativeIncludeOperandPath(llvm::StringRef path) {
 
 /// Predicate for synthesized relative operands that may be emitted into an
 /// include directive after the caller has separately proven replay/source-graph
-/// semantics.  The caller chooses quoted vs. angled delimiters; this helper only
-/// enforces the relative no-escape path contract.
+/// semantics.  The caller chooses quoted vs. angled delimiters; this helper
+/// only enforces the relative no-escape path contract.
 inline bool safeSynthesizedRelativeIncludeOperand(llvm::StringRef path) {
   return safeSynthesizedRelativeIncludeOperandPath(path);
 }
@@ -87,8 +87,8 @@ inline bool safeSynthesizedRelativeIncludeOperand(llvm::StringRef path) {
 ///
 /// This is the spelling observed by preserved `__FILE__` / `__FILE_NAME__`
 /// sites when line-control repair wraps a materialized include body.  Prefer
-/// producer-entered spelling metadata and keep the old target-token fallback
-/// only for legacy maps that lack split include metadata.
+/// producer-entered spelling metadata and use the target-token fallback only
+/// for legacy maps that lack split include metadata.
 inline std::string
 refoldIncludeEnteredFileSpelling(const RefoldModel::IncludeItem &include) {
   llvm::StringRef producerSpelling = producerEnteredFileSpelling(include);
@@ -102,9 +102,9 @@ refoldIncludeEnteredFileSpelling(const RefoldModel::IncludeItem &include) {
 /// Do not use this value as a `#line` filename or file-observer proof target.
 /// New maps deliberately split physical identity (`opened_path`) from the
 /// producer-entered filename spelling (`entered_file_spelling`); conflating the
-/// two would either make `__FILE__` observe a canonicalized path or fail to read
-/// headers whose entered spelling was only meaningful inside Clang's search
-/// context.
+/// two would either make `__FILE__` observe a canonicalized path or fail to
+/// read headers whose entered spelling was only meaningful inside Clang's
+/// search context.
 inline std::string
 refoldIncludeLoadPath(const RefoldModel::IncludeItem &include) {
   if (std::optional<std::filesystem::path> physical =

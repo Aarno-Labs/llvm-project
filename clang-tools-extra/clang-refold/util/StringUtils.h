@@ -95,9 +95,7 @@ inline constexpr bool isWs(char c) noexcept {
 /// True for PP whitespace other than a line-feed.  This intentionally keeps
 /// carriage return in the accepted set to preserve existing byte-level scans
 /// that treat LF as the only directive-line terminator.
-inline constexpr bool isWsNoLF(char c) noexcept {
-  return isWs(c) && c != '\n';
-}
+inline constexpr bool isWsNoLF(char c) noexcept { return isWs(c) && c != '\n'; }
 
 /// True for the ASCII start character of an identifier-like spelling.
 inline constexpr bool isIdentStart(char c) noexcept {
@@ -168,7 +166,6 @@ inline constexpr void skipNonNewlineWs(StringRef text, size_t &pos) {
     ++pos;
 }
 
-
 /// Advance over one C backslash-newline splice at \p pos.
 ///
 /// The splice must be fully contained in the half-open byte range
@@ -177,7 +174,8 @@ inline constexpr void skipNonNewlineWs(StringRef text, size_t &pos) {
 /// caller decides where backslash-newline splicing is admissible for its
 /// proof domain.
 template <typename OffsetT>
-inline bool skipBackslashNewlineSplice(StringRef text, OffsetT limit, OffsetT &pos) {
+inline bool skipBackslashNewlineSplice(StringRef text, OffsetT limit,
+                                       OffsetT &pos) {
   const OffsetT size = static_cast<OffsetT>(text.size());
   if (pos >= limit || pos >= size)
     return false;
@@ -227,7 +225,6 @@ inline bool consumeDirectiveHash(StringRef text, size_t &pos, size_t end) {
   skipWsNoLF(text, pos, end);
   return true;
 }
-
 
 /// Copy or skip one C/C++ string/character literal at \p pos.
 bool copyQuotedLiteral(StringRef text, size_t &pos, std::string &out);
@@ -368,13 +365,13 @@ inline std::pair<size_t, size_t> trimWsRange(StringRef s, size_t b, size_t e) {
 StringRef trimEdgeSpaces(StringRef s);
 
 inline StringRef trimHorizontal(StringRef text) {
-  while (!text.empty() && (text.front() == ' ' || text.front() == '\t' ||
-                           text.front() == '\r' || text.front() == '\f' ||
-                           text.front() == '\v'))
+  while (!text.empty() &&
+         (text.front() == ' ' || text.front() == '\t' || text.front() == '\r' ||
+          text.front() == '\f' || text.front() == '\v'))
     text = text.drop_front();
-  while (!text.empty() && (text.back() == ' ' || text.back() == '\t' ||
-                           text.back() == '\r' || text.back() == '\f' ||
-                           text.back() == '\v'))
+  while (!text.empty() &&
+         (text.back() == ' ' || text.back() == '\t' || text.back() == '\r' ||
+          text.back() == '\f' || text.back() == '\v'))
     text = text.drop_back();
   return text;
 }
@@ -471,8 +468,7 @@ std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw);
 
 /// Clamp a possibly unordered half-open byte range into \p text.
 inline std::pair<size_t, size_t> clampUnorderedRange(StringRef text,
-                                                    size_t begin,
-                                                    size_t end) {
+                                                     size_t begin, size_t end) {
   begin = std::min(begin, text.size());
   end = std::min(end, text.size());
   if (end < begin)
@@ -485,8 +481,7 @@ inline std::pair<size_t, size_t> clampUnorderedRange(StringRef text,
 /// The endpoints are first clamped into [0, text.size()]. If the resulting end
 /// precedes the begin, the bounds are swapped so callers may pass unordered
 /// byte offsets without changing the queried set of bytes.
-inline bool rangeContainsNewline(StringRef text, size_t begin,
-                                           size_t end) {
+inline bool rangeContainsNewline(StringRef text, size_t begin, size_t end) {
   const auto range = clampUnorderedRange(text, begin, end);
   return text.substr(range.first, range.second - range.first).find('\n') !=
          StringRef::npos;
@@ -509,8 +504,7 @@ inline StringRef trimWsNoLF(StringRef text) {
 /// The accepted whitespace set is the same ASCII set as isWs(): space, HT, LF,
 /// VT, FF, and CR. The endpoints are clamped and unordered bounds are swapped
 /// using the same policy as rangeContainsNewline().
-inline bool rangeContainsOnlyWs(StringRef text, size_t begin,
-                                          size_t end) {
+inline bool rangeContainsOnlyWs(StringRef text, size_t begin, size_t end) {
   const auto range = clampUnorderedRange(text, begin, end);
   return isWs(text.substr(range.first, range.second - range.first));
 }
@@ -741,7 +735,6 @@ inline size_t countNonSplicedNewlines(StringRef s, size_t from, size_t to) {
   }
   return count;
 }
-
 
 } // namespace stringutils
 } // namespace refold

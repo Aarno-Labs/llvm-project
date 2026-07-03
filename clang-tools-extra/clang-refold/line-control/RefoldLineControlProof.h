@@ -16,7 +16,7 @@
 #include "core/RefoldModel.h"
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/LineDirectiveInserter.h"
-#include "proof/RefoldProofTypes.h"
+#include "proof/RefoldProofVocabulary.h"
 #include "source/RefoldSourceMapper.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -50,16 +50,13 @@ struct LineStateObserverSite {
 class RefoldLineControlProof {
 public:
   /// Construct a proof service over producer line-control and token-map facts.
-  RefoldLineControlProof(const RefoldModel &model,
-                         const RefoldSourceMapper &sourceMapper,
-                         const RefoldPathIdentity &paths,
-                         const RefoldTokenTextAnalysis &tokenText,
-                         const RefoldMacroTopology &macroTopology,
-                         const LineDirectiveInserter &lineDirs,
-                         llvm::ArrayRef<PPTok> aToks,
-                         llvm::ArrayRef<PPTok> bToks,
-                         const std::vector<int64_t> &abTokMapA2B,
-                         const std::vector<int64_t> &abTokMapB2A)
+  RefoldLineControlProof(
+      const RefoldModel &model, const RefoldSourceMapper &sourceMapper,
+      const RefoldPathIdentity &paths, const RefoldTokenTextAnalysis &tokenText,
+      const RefoldMacroTopology &macroTopology,
+      const LineDirectiveInserter &lineDirs, llvm::ArrayRef<PPTok> aToks,
+      llvm::ArrayRef<PPTok> bToks, const std::vector<int64_t> &abTokMapA2B,
+      const std::vector<int64_t> &abTokMapB2A)
       : model_(model), paths_(paths), macroTopology_(macroTopology),
         lineDirs_(lineDirs), aToks_(aToks), bToks_(bToks),
         abTokMapA2B_(abTokMapA2B), abTokMapB2A_(abTokMapB2A) {}
@@ -93,9 +90,10 @@ public:
                                    llvm::StringRef rhs) const;
 
   /// Return the latest active producer-backed line-control end before `offset`.
-  std::optional<uint64_t> LatestProducerLineControlEndBefore(
-      std::optional<uint64_t> ownerIncludeId, llvm::StringRef ownerFile,
-      uint64_t offset) const;
+  std::optional<uint64_t>
+  LatestProducerLineControlEndBefore(std::optional<uint64_t> ownerIncludeId,
+                                     llvm::StringRef ownerFile,
+                                     uint64_t offset) const;
 
   /// Compute the logical location at `locationOffset` from the latest eligible
   /// producer-backed line-control event ending no later than `eventEndLimit`.
@@ -122,14 +120,16 @@ public:
 
   /// Summarize preserved line-state observer demand at or after `offset` in an
   /// owner file.
-  LineStateObserverDemand OwnerSuffixLineStateObserverDemand(
-      std::optional<uint64_t> ownerIncludeId, llvm::StringRef ownerFile,
-      uint64_t offset) const;
+  LineStateObserverDemand
+  OwnerSuffixLineStateObserverDemand(std::optional<uint64_t> ownerIncludeId,
+                                     llvm::StringRef ownerFile,
+                                     uint64_t offset) const;
 
   /// Return the earliest preserved line-state observer site in an owner suffix.
-  std::optional<LineStateObserverSite> FirstOwnerSuffixLineStateObserverSite(
-      std::optional<uint64_t> ownerIncludeId, llvm::StringRef ownerFile,
-      uint64_t offset) const;
+  std::optional<LineStateObserverSite>
+  FirstOwnerSuffixLineStateObserverSite(std::optional<uint64_t> ownerIncludeId,
+                                        llvm::StringRef ownerFile,
+                                        uint64_t offset) const;
 
   /// Return whether an owner suffix contains any preserved line-state observer.
   bool OwnerSuffixHasLineStateSensitiveBuiltin(
@@ -141,6 +141,16 @@ public:
   std::optional<uint64_t> AdvanceInsertionAnchorPastSourceLineControlPrefix(
       llvm::StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
       llvm::StringRef ownerBytes, uint64_t anchor) const;
+
+  /// Return whether a TU insertion that already advanced past a source
+  /// line-control prefix may also defer its local newline resync to the
+  /// conditional-group join that closes the innermost top-level cond group
+  /// covering the anchor.  The deferral is allowed only when the first
+  /// preserved suffix observer demands a line directive and sits at or after
+  /// the cond-group end.
+  bool TUInsertionCanDeferResyncToConditionalJoin(
+      bool advancedOverSourceLineControlPrefix, llvm::StringRef tuPath,
+      uint64_t anchor) const;
 
 private:
   const RefoldModel &model_;

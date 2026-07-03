@@ -20,8 +20,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
+#include "core/RefoldLog.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -113,13 +113,14 @@ asOptArray(const json::Object &obj, StringRef key, bool canBeNull = false) {
     if (val->getAsNull()) {
       if (canBeNull)
         return std::nullopt;
-      REFOLD_LOG_FATAL("model", "encountered unexpected null for property '{0}'", key);
+      REFOLD_LOG_FATAL("model",
+                       "encountered unexpected null for property '{0}'", key);
     }
     auto arr = val->getAsArray();
     if (!arr) {
-      REFOLD_LOG_FATAL("model",
-            "invalid json value type on field '{0}': expected array value",
-            key);
+      REFOLD_LOG_FATAL(
+          "model",
+          "invalid json value type on field '{0}': expected array value", key);
     }
     return arr;
   }
@@ -136,7 +137,8 @@ std::optional<StringRef> asOptString(const json::Object &obj, StringRef key,
     if (val->getAsNull()) {
       if (canBeNull)
         return std::nullopt;
-      REFOLD_LOG_FATAL("model", "encountered unexpected null for property '{0}'", key);
+      REFOLD_LOG_FATAL("model",
+                       "encountered unexpected null for property '{0}'", key);
     }
     return val->getAsString();
   }
@@ -155,14 +157,16 @@ std::optional<uint32_t> asOptUInt32(const json::Object &obj, StringRef key,
     if (val->getAsNull()) {
       if (canBeNull)
         return std::nullopt;
-      REFOLD_LOG_FATAL("model", "encountered unexpected null for property '{0}'", key);
+      REFOLD_LOG_FATAL("model",
+                       "encountered unexpected null for property '{0}'", key);
     }
     if (auto n = val->getAsUINT64()) {
       if (*n <= std::numeric_limits<uint32_t>::max())
         return static_cast<uint32_t>(*n);
-      REFOLD_LOG_FATAL("model",
-            "uint32_t type out of bounds for value {0} on property '{1}'", *n,
-            key);
+      REFOLD_LOG_FATAL(
+          "model",
+          "uint32_t type out of bounds for value {0} on property '{1}'", *n,
+          key);
     }
   }
   return std::nullopt;
@@ -178,7 +182,8 @@ std::optional<uint64_t> asOptUInt64(const json::Object &obj, StringRef key,
     if (val->getAsNull()) {
       if (canBeNull)
         return std::nullopt;
-      REFOLD_LOG_FATAL("model", "encountered unexpected null for property '{0}'", key);
+      REFOLD_LOG_FATAL("model",
+                       "encountered unexpected null for property '{0}'", key);
     }
     return val->getAsUINT64();
   }
@@ -196,7 +201,8 @@ std::optional<bool> asOptBool(const json::Object &obj, StringRef key,
     if (val->getAsNull()) {
       if (canBeNull)
         return std::nullopt;
-      REFOLD_LOG_FATAL("model", "encountered unexpected null for property '{0}'", key);
+      REFOLD_LOG_FATAL("model",
+                       "encountered unexpected null for property '{0}'", key);
     }
     return val->getAsBoolean();
   }
@@ -290,10 +296,10 @@ parseIncludeSearchEntry(const json::Object &obj, uint32_t expectedIndex,
   entry.kind = *parsedKind;
   if (!isSearchChainIncludeLookupKind(entry.kind) &&
       entry.kind != IncludeLookupKind::Unknown)
-    return createStringError(
-        inconvertibleErrorCode(),
-        "Invalid per-edge include lookup kind '%s' in include_search_chain at %s",
-        kindOrErr->str().c_str(), ctx.str().c_str());
+    return createStringError(inconvertibleErrorCode(),
+                             "Invalid per-edge include lookup kind '%s' in "
+                             "include_search_chain at %s",
+                             kindOrErr->str().c_str(), ctx.str().c_str());
 
   auto spellingOrErr = applyToField(asString, obj, "spelling", ctx);
   if (!spellingOrErr)
@@ -330,8 +336,8 @@ parseOptionalIncludeLookupProvenance(
       applyToField(asString, lookupObj, "kind", (Twine(ctx) + ".lookup").str());
   if (!kindStrOrErr)
     return kindStrOrErr.takeError();
-  auto kindOrErr = parseIncludeLookupKind(
-      *kindStrOrErr, (Twine(ctx) + ".lookup.kind").str());
+  auto kindOrErr = parseIncludeLookupKind(*kindStrOrErr,
+                                          (Twine(ctx) + ".lookup.kind").str());
   if (!kindOrErr)
     return kindOrErr.takeError();
 
@@ -350,11 +356,10 @@ parseOptionalIncludeLookupProvenance(
 
     if (!includeSearchChain.empty()) {
       if (*lookup.searchChainIndex >= includeSearchChain.size())
-        return createStringError(
-            inconvertibleErrorCode(),
-            "%s.lookup.search_chain_index %u is outside "
-            "pp_ctx.include_search_chain",
-            ctx.str().c_str(), *lookup.searchChainIndex);
+        return createStringError(inconvertibleErrorCode(),
+                                 "%s.lookup.search_chain_index %u is outside "
+                                 "pp_ctx.include_search_chain",
+                                 ctx.str().c_str(), *lookup.searchChainIndex);
 
       const auto &entry = includeSearchChain[*lookup.searchChainIndex];
       if (entry.kind != lookup.kind)
@@ -437,25 +442,24 @@ parseOptionalIncludeNextProvenance(
     return nextObjOrErr.takeError();
   const json::Object &nextObj = **nextObjOrErr;
 
-  auto provenanceOrErr =
-      applyToField(asString, nextObj, "provenance",
-                   (Twine(ctx) + ".include_next").str());
+  auto provenanceOrErr = applyToField(asString, nextObj, "provenance",
+                                      (Twine(ctx) + ".include_next").str());
   if (!provenanceOrErr)
     return provenanceOrErr.takeError();
 
   RefoldModel::IncludeNextProvenance provenance;
   if (*provenanceOrErr == "known") {
     provenance.known = true;
-    auto containingOrErr = applyToField(
-        asUInt64, nextObj, "containing_file_include_id",
-        (Twine(ctx) + ".include_next").str());
+    auto containingOrErr =
+        applyToField(asUInt64, nextObj, "containing_file_include_id",
+                     (Twine(ctx) + ".include_next").str());
     if (!containingOrErr)
       return containingOrErr.takeError();
     provenance.containingFileIncludeId = *containingOrErr;
 
-    auto resumeOrErr = applyToField(
-        asUInt32, nextObj, "resume_search_chain_index",
-        (Twine(ctx) + ".include_next").str());
+    auto resumeOrErr =
+        applyToField(asUInt32, nextObj, "resume_search_chain_index",
+                     (Twine(ctx) + ".include_next").str());
     if (!resumeOrErr)
       return resumeOrErr.takeError();
     provenance.resumeSearchChainIndex = *resumeOrErr;
@@ -478,8 +482,7 @@ parseOptionalIncludeNextProvenance(
   } else {
     return createStringError(inconvertibleErrorCode(),
                              "Invalid include_next provenance '%s' at %s",
-                             provenanceOrErr->str().c_str(),
-                             ctx.str().c_str());
+                             provenanceOrErr->str().c_str(), ctx.str().c_str());
   }
 
   return std::optional<RefoldModel::IncludeNextProvenance>(
@@ -641,8 +644,9 @@ parseSpans(const json::Value &val, StringRef ctx,
       span.argIdx = *argOrErr;
 
       // byte_begin/byte_end describe a token-internal slice within the
-      // spelled output token. Historically only paste spans carried these,
-      // but wrapped stringify spans may also need them (for example L## #x).
+      // spelled output token.  They are required whenever a span identifies
+      // only part of the spelled token, including paste spans and wrapped
+      // stringify spans such as L## #x.
       span.byteBegin = asOptUInt32(*obj, "byte_begin");
       if (span.byteBegin) {
         auto beOrErr = applyToField(asUInt32, *obj, "byte_end", ctxItem);
@@ -674,13 +678,12 @@ parseSpans(const json::Value &val, StringRef ctx,
 }
 } // namespace
 
-
 // Public wrapper for parsing PPSpan arrays from JSON. This is used by the
 // clang-refold driver for ancillary checks (e.g., --check + --no-lines ignore
 // masks) without duplicating parsing logic.
 /// Parse ordinary preprocessor token spans.
-Expected<std::vector<RefoldModel::PPSpan>>
-parsePPSpans(const json::Value &val, StringRef ctx) {
+Expected<std::vector<RefoldModel::PPSpan>> parsePPSpans(const json::Value &val,
+                                                        StringRef ctx) {
   return parseSpans<RefoldModel::PPSpan>(val, ctx);
 }
 
@@ -689,7 +692,7 @@ bool RefoldModel::PPArgSpan::IsValid() const {
     return false;
 
   bool okTokenSubrange = (!byteBegin && !byteEnd) ||
-                        (byteBegin && byteEnd && *byteEnd > *byteBegin);
+                         (byteBegin && byteEnd && *byteEnd > *byteBegin);
   bool okPaste = (kind != PPArgSpanKind::Paste) || okTokenSubrange;
   bool okStringify = (kind != PPArgSpanKind::Stringify) || okTokenSubrange;
 
@@ -699,6 +702,57 @@ bool RefoldModel::PPArgSpan::IsValid() const {
 }
 
 // ========================== RefoldModel construction =========================
+
+Expected<RefoldModel::PreprocessContext>
+RefoldModel::ParsePreprocessContext(const json::Object &root) {
+  const json::Object *ctxObj = root.getObject("pp_ctx");
+  if (!ctxObj) {
+    return createStringError(inconvertibleErrorCode(),
+                             "missing required top-level key 'pp_ctx'");
+  }
+
+  PreprocessContext ctx;
+
+  if (auto cwd = ctxObj->getString("cwd")) {
+    ctx.cwd = cwd->str();
+  } else {
+    return createStringError(inconvertibleErrorCode(),
+                             "pp_ctx.cwd must be a string");
+  }
+
+  if (auto lang = ctxObj->getString("lang")) {
+    ctx.lang = lang->str();
+  } else {
+    return createStringError(inconvertibleErrorCode(),
+                             "pp_ctx.lang must be a string");
+  }
+
+  const json::Array *argvArr = ctxObj->getArray("argv");
+  if (!argvArr) {
+    return createStringError(inconvertibleErrorCode(),
+                             "pp_ctx.argv must be an array");
+  }
+
+  ctx.argv.reserve(argvArr->size());
+  for (const json::Value &v : *argvArr) {
+    auto s = v.getAsString();
+    if (!s) {
+      return createStringError(inconvertibleErrorCode(),
+                               "pp_ctx.argv must contain only strings");
+    }
+    ctx.argv.emplace_back(s->str());
+  }
+
+  return ctx;
+}
+
+Expected<std::string> RefoldModel::ParseSourcePath(const json::Object &root) {
+  auto s = root.getString("source");
+  if (!s || s->empty())
+    return createStringError(inconvertibleErrorCode(),
+                             "refold map missing required 'source' path");
+  return s->str();
+}
 
 Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
   RefoldModel model;
@@ -801,8 +855,9 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
        model.tokPPByteBeginA_->size() != (size_t)model.tokensCountA_)) {
     model.tokPPByteBeginA_ = std::nullopt;
     model.tokPPByteEndA_ = std::nullopt;
-    REFOLD_LOG_WARN("model",
-         "pp byte begin/end spans size does not match the A-side token count");
+    REFOLD_LOG_WARN(
+        "model",
+        "pp byte begin/end spans size does not match the A-side token count");
   }
 
   auto parseMacroDefParams =
@@ -815,26 +870,29 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         auto objOrErrLocal =
             asObject(Elem, (Twine(ctxItem) + ": " + fieldName + "[]").str());
         if (!objOrErrLocal)
-          REFOLD_LOG_FATAL("model", "{0}: {1} element is not an object", ctxItem,
-                fieldName);
+          REFOLD_LOG_FATAL("model", "{0}: {1} element is not an object",
+                           ctxItem, fieldName);
         const json::Object &ParamObj = **objOrErrLocal;
 
         const json::Value *NameVal = ParamObj.get("name");
         if (!NameVal)
-          REFOLD_LOG_FATAL("model", "{0}: {1} element missing name", ctxItem, fieldName);
+          REFOLD_LOG_FATAL("model", "{0}: {1} element missing name", ctxItem,
+                           fieldName);
         auto nameOrErrLocal = asString(
             *NameVal, (Twine(ctxItem) + ": " + fieldName + ".name").str());
         if (!nameOrErrLocal)
-          REFOLD_LOG_FATAL("model", "{0}: {1}.name is not a string", ctxItem, fieldName);
+          REFOLD_LOG_FATAL("model", "{0}: {1}.name is not a string", ctxItem,
+                           fieldName);
 
         const json::Value *VarVal = ParamObj.get("variadic");
         if (!VarVal)
-          REFOLD_LOG_FATAL("model", "{0}: {1} element missing variadic", ctxItem,
-                fieldName);
+          REFOLD_LOG_FATAL("model", "{0}: {1} element missing variadic",
+                           ctxItem, fieldName);
         auto varOrErr = asBool(
             *VarVal, (Twine(ctxItem) + ": " + fieldName + ".variadic").str());
         if (!varOrErr)
-          REFOLD_LOG_FATAL("model", "{0}: {1}.variadic is not a bool", ctxItem, fieldName);
+          REFOLD_LOG_FATAL("model", "{0}: {1}.variadic is not a bool", ctxItem,
+                           fieldName);
 
         params.emplace_back(*nameOrErrLocal, *varOrErr);
       }
@@ -853,67 +911,76 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         auto objOrErrLocal =
             asObject(Elem, (Twine(ctxItem) + ": replacement_tokens[]").str());
         if (!objOrErrLocal)
-          REFOLD_LOG_FATAL("model", "{0}: replacement_tokens element is not an object",
-                ctxItem);
+          REFOLD_LOG_FATAL("model",
+                           "{0}: replacement_tokens element is not an object",
+                           ctxItem);
         const json::Object &TokObj = **objOrErrLocal;
 
         const json::Value *KindVal = TokObj.get("kind");
         if (!KindVal)
-          REFOLD_LOG_FATAL("model", "{0}: replacement_tokens element missing kind",
-                ctxItem);
+          REFOLD_LOG_FATAL(
+              "model", "{0}: replacement_tokens element missing kind", ctxItem);
         auto kindOrErrLocal = asString(
             *KindVal, (Twine(ctxItem) + ": replacement_tokens.kind").str());
         if (!kindOrErrLocal)
-          REFOLD_LOG_FATAL("model", "{0}: replacement_tokens.kind is not a string",
-                ctxItem);
+          REFOLD_LOG_FATAL(
+              "model", "{0}: replacement_tokens.kind is not a string", ctxItem);
 
         const json::Value *SpellingVal = TokObj.get("spelling");
         if (!SpellingVal)
-          REFOLD_LOG_FATAL("model", "{0}: replacement_tokens element missing spelling",
-                ctxItem);
+          REFOLD_LOG_FATAL("model",
+                           "{0}: replacement_tokens element missing spelling",
+                           ctxItem);
         auto spellingOrErr =
             asString(*SpellingVal,
                      (Twine(ctxItem) + ": replacement_tokens.spelling").str());
         if (!spellingOrErr)
-          REFOLD_LOG_FATAL("model", "{0}: replacement_tokens.spelling is not a string",
-                ctxItem);
+          REFOLD_LOG_FATAL("model",
+                           "{0}: replacement_tokens.spelling is not a string",
+                           ctxItem);
 
         MacroReplacementToken token;
         token.spelling = *spellingOrErr;
         if (*kindOrErrLocal == "literal") {
           token.kind = MacroReplacementTokenKind::Literal;
           if (TokObj.get("param_index"))
-            REFOLD_LOG_FATAL("model",
-                  "{0}: literal replacement_tokens element has param_index",
-                  ctxItem);
+            REFOLD_LOG_FATAL(
+                "model",
+                "{0}: literal replacement_tokens element has param_index",
+                ctxItem);
         } else if (*kindOrErrLocal == "param_ref") {
           token.kind = MacroReplacementTokenKind::ParamRef;
           const json::Value *ParamVal = TokObj.get("param_index");
           if (!ParamVal)
-            REFOLD_LOG_FATAL("model",
-                  "{0}: param_ref replacement_tokens element missing "
-                  "param_index",
-                  ctxItem);
+            REFOLD_LOG_FATAL(
+                "model",
+                "{0}: param_ref replacement_tokens element missing "
+                "param_index",
+                ctxItem);
           auto paramOrErr = asUInt32(
               *ParamVal,
               (Twine(ctxItem) + ": replacement_tokens.param_index").str());
           if (!paramOrErr)
-            REFOLD_LOG_FATAL("model", "{0}: replacement_tokens.param_index is invalid",
-                  ctxItem);
+            REFOLD_LOG_FATAL("model",
+                             "{0}: replacement_tokens.param_index is invalid",
+                             ctxItem);
           if (*paramOrErr >= defParams.size())
-            REFOLD_LOG_FATAL("model",
-                  "{0}: replacement_tokens.param_index references missing "
-                  "macro formal",
-                  ctxItem);
+            REFOLD_LOG_FATAL(
+                "model",
+                "{0}: replacement_tokens.param_index references missing "
+                "macro formal",
+                ctxItem);
           if (defParams[*paramOrErr].name != token.spelling)
-            REFOLD_LOG_FATAL("model",
-                  "{0}: replacement_tokens param_ref spelling does not match "
-                  "the referenced macro formal",
-                  ctxItem);
+            REFOLD_LOG_FATAL(
+                "model",
+                "{0}: replacement_tokens param_ref spelling does not match "
+                "the referenced macro formal",
+                ctxItem);
           token.paramIndex = *paramOrErr;
         } else {
-          REFOLD_LOG_FATAL("model", "{0}: invalid replacement_tokens.kind '{1}'", ctxItem,
-                *kindOrErrLocal);
+          REFOLD_LOG_FATAL("model",
+                           "{0}: invalid replacement_tokens.kind '{1}'",
+                           ctxItem, *kindOrErrLocal);
         }
 
         tokens.push_back(std::move(token));
@@ -936,30 +1003,33 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
       auto objOrErrLocal =
           asObject(Elem, (Twine(ctxItem) + ": callee_origin.parts[]").str());
       if (!objOrErrLocal)
-        REFOLD_LOG_FATAL("model", "{0}: callee_origin.parts element is not an object",
-              ctxItem);
+        REFOLD_LOG_FATAL("model",
+                         "{0}: callee_origin.parts element is not an object",
+                         ctxItem);
       const json::Object &PartObj = **objOrErrLocal;
 
       const json::Value *KindVal = PartObj.get("kind");
       if (!KindVal)
-        REFOLD_LOG_FATAL("model", "{0}: callee_origin.parts element missing kind",
-              ctxItem);
+        REFOLD_LOG_FATAL(
+            "model", "{0}: callee_origin.parts element missing kind", ctxItem);
       auto kindOrErrLocal = asString(
           *KindVal, (Twine(ctxItem) + ": callee_origin.parts.kind").str());
       if (!kindOrErrLocal)
-        REFOLD_LOG_FATAL("model", "{0}: callee_origin.parts.kind is not a string",
-              ctxItem);
+        REFOLD_LOG_FATAL(
+            "model", "{0}: callee_origin.parts.kind is not a string", ctxItem);
 
       const json::Value *SpellingVal = PartObj.get("spelling");
       if (!SpellingVal)
-        REFOLD_LOG_FATAL("model", "{0}: callee_origin.parts element missing spelling",
-              ctxItem);
+        REFOLD_LOG_FATAL("model",
+                         "{0}: callee_origin.parts element missing spelling",
+                         ctxItem);
       auto spellingOrErr =
           asString(*SpellingVal,
                    (Twine(ctxItem) + ": callee_origin.parts.spelling").str());
       if (!spellingOrErr)
-        REFOLD_LOG_FATAL("model", "{0}: callee_origin.parts.spelling is not a string",
-              ctxItem);
+        REFOLD_LOG_FATAL("model",
+                         "{0}: callee_origin.parts.spelling is not a string",
+                         ctxItem);
 
       CalleeOriginPart part;
       part.spelling = *spellingOrErr;
@@ -967,45 +1037,50 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         part.kind = CalleeOriginPartKind::Literal;
         if (PartObj.get("root_macro_id") || PartObj.get("root_param_index") ||
             PartObj.get("byte_begin") || PartObj.get("byte_end"))
-          REFOLD_LOG_FATAL("model",
-                "{0}: literal callee_origin part carries selector-slice fields",
-                ctxItem);
+          REFOLD_LOG_FATAL(
+              "model",
+              "{0}: literal callee_origin part carries selector-slice fields",
+              ctxItem);
       } else if (*kindOrErrLocal == "caller_arg_slice") {
         part.kind = CalleeOriginPartKind::CallerArgSlice;
         auto rootOrErr =
             applyToField(asUInt64, PartObj, "root_macro_id",
                          (Twine(ctxItem) + ": callee_origin.parts").str());
         if (!rootOrErr)
-          REFOLD_LOG_FATAL("model", "{0}: callee_origin.parts.root_macro_id is invalid",
-                ctxItem);
+          REFOLD_LOG_FATAL("model",
+                           "{0}: callee_origin.parts.root_macro_id is invalid",
+                           ctxItem);
         auto paramOrErr =
             applyToField(asUInt32, PartObj, "root_param_index",
                          (Twine(ctxItem) + ": callee_origin.parts").str());
         if (!paramOrErr)
-          REFOLD_LOG_FATAL("model", "{0}: callee_origin.parts.root_param_index is invalid",
-                ctxItem);
+          REFOLD_LOG_FATAL(
+              "model", "{0}: callee_origin.parts.root_param_index is invalid",
+              ctxItem);
         auto beginOrErrLocal =
             applyToField(asUInt32, PartObj, "byte_begin",
                          (Twine(ctxItem) + ": callee_origin.parts").str());
         if (!beginOrErrLocal)
-          REFOLD_LOG_FATAL("model", "{0}: callee_origin.parts.byte_begin is invalid",
-                ctxItem);
+          REFOLD_LOG_FATAL("model",
+                           "{0}: callee_origin.parts.byte_begin is invalid",
+                           ctxItem);
         auto endOrErrLocal =
             applyToField(asUInt32, PartObj, "byte_end",
                          (Twine(ctxItem) + ": callee_origin.parts").str());
         if (!endOrErrLocal)
-          REFOLD_LOG_FATAL("model", "{0}: callee_origin.parts.byte_end is invalid",
-                ctxItem);
+          REFOLD_LOG_FATAL(
+              "model", "{0}: callee_origin.parts.byte_end is invalid", ctxItem);
         if (*endOrErrLocal < *beginOrErrLocal)
-          REFOLD_LOG_FATAL("model", "{0}: callee_origin selector slice range is invalid",
-                ctxItem);
+          REFOLD_LOG_FATAL("model",
+                           "{0}: callee_origin selector slice range is invalid",
+                           ctxItem);
         part.rootMacroId = *rootOrErr;
         part.rootParamIndex = *paramOrErr;
         part.byteBegin = *beginOrErrLocal;
         part.byteEnd = *endOrErrLocal;
       } else {
-        REFOLD_LOG_FATAL("model", "{0}: invalid callee_origin.parts.kind '{1}'", ctxItem,
-              *kindOrErrLocal);
+        REFOLD_LOG_FATAL("model", "{0}: invalid callee_origin.parts.kind '{1}'",
+                         ctxItem, *kindOrErrLocal);
       }
 
       tiled.append(part.spelling.begin(), part.spelling.end());
@@ -1013,9 +1088,10 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
     }
 
     if (tiled != finalSpelling)
-      REFOLD_LOG_FATAL("model",
-            "{0}: callee_origin.parts do not tile the final callee spelling",
-            ctxItem);
+      REFOLD_LOG_FATAL(
+          "model",
+          "{0}: callee_origin.parts do not tile the final callee spelling",
+          ctxItem);
     return parts;
   };
 
@@ -1431,18 +1507,20 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
             for (const auto &elem : **arr) {
               auto *rObj = elem.getAsObject();
               if (!rObj) {
-                REFOLD_LOG_FATAL("model",
-                      "invalid json value type on field '%s': expected object "
-                      "value",
-                      fieldName.str().c_str());
+                REFOLD_LOG_FATAL(
+                    "model",
+                    "invalid json value type on field '%s': expected object "
+                    "value",
+                    fieldName.str().c_str());
               }
 
               const json::Value *bVal = rObj->get("b");
               const json::Value *eVal = rObj->get("e");
               if (!bVal || !eVal) {
-                REFOLD_LOG_FATAL("model",
-                      "missing required fields on '%s' element: expected {b,e}",
-                      fieldName.str().c_str());
+                REFOLD_LOG_FATAL(
+                    "model",
+                    "missing required fields on '%s' element: expected {b,e}",
+                    fieldName.str().c_str());
               }
 
               std::optional<uint64_t> b;
@@ -1510,36 +1588,39 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           for (const json::Value &Entry : **tokensArr) {
             auto objOrErrLocal = asObject(Entry, ctxItem);
             if (!objOrErrLocal)
-              REFOLD_LOG_FATAL("model", "{0}: paste_tokens entry is not an object",
-                    ctxItem);
+              REFOLD_LOG_FATAL(
+                  "model", "{0}: paste_tokens entry is not an object", ctxItem);
             const json::Object &TokObj = **objOrErrLocal;
 
             const json::Value *SpellingVal = TokObj.get("spelling");
             if (!SpellingVal)
-              REFOLD_LOG_FATAL("model", "{0}: paste_tokens entry missing spelling",
-                    ctxItem);
+              REFOLD_LOG_FATAL(
+                  "model", "{0}: paste_tokens entry missing spelling", ctxItem);
             auto spellingOrErr =
                 asString(*SpellingVal, ctxItem + ": paste_tokens.spelling");
             if (!spellingOrErr)
-              REFOLD_LOG_FATAL("model", "{0}: paste_tokens.spelling is not a string",
-                    ctxItem);
+              REFOLD_LOG_FATAL("model",
+                               "{0}: paste_tokens.spelling is not a string",
+                               ctxItem);
 
             const json::Value *PartsVal = TokObj.get("parts");
             if (!PartsVal)
-              REFOLD_LOG_FATAL("model", "{0}: paste_tokens entry missing parts", ctxItem);
+              REFOLD_LOG_FATAL("model", "{0}: paste_tokens entry missing parts",
+                               ctxItem);
             auto partsArrOrErr =
                 asArray(*PartsVal, ctxItem + ": paste_tokens.parts");
             if (!partsArrOrErr)
-              REFOLD_LOG_FATAL("model", "{0}: paste_tokens.parts is not an array",
-                    ctxItem);
+              REFOLD_LOG_FATAL(
+                  "model", "{0}: paste_tokens.parts is not an array", ctxItem);
 
             std::vector<RefoldModel::PastePart> parts;
             parts.reserve((**partsArrOrErr).size());
             for (const json::Value &PartVal : **partsArrOrErr) {
               auto partObjOrErr = asObject(PartVal, ctxItem);
               if (!partObjOrErr)
-                REFOLD_LOG_FATAL("model", "{0}: paste_tokens part is not an object",
-                      ctxItem);
+                REFOLD_LOG_FATAL("model",
+                                 "{0}: paste_tokens part is not an object",
+                                 ctxItem);
               const json::Object &PartObj = **partObjOrErr;
 
               std::optional<uint32_t> argIndex =
@@ -1559,41 +1640,48 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                 else if (*kindText == "literal")
                   kindLocal = RefoldModel::PastePartKind::Literal;
                 else
-                  REFOLD_LOG_FATAL("model", "{0}: paste_tokens.part.kind is invalid: {1}",
-                        ctxItem, *kindText);
+                  REFOLD_LOG_FATAL(
+                      "model", "{0}: paste_tokens.part.kind is invalid: {1}",
+                      ctxItem, *kindText);
               }
               if (kindLocal == RefoldModel::PastePartKind::Arg && !argIndex)
-                REFOLD_LOG_FATAL("model", "{0}: arg paste_tokens part missing arg_index",
-                      ctxItem);
+                REFOLD_LOG_FATAL("model",
+                                 "{0}: arg paste_tokens part missing arg_index",
+                                 ctxItem);
               if (kindLocal == RefoldModel::PastePartKind::Literal && argIndex)
-                REFOLD_LOG_FATAL("model", "{0}: literal paste_tokens part has arg_index",
-                      ctxItem);
+                REFOLD_LOG_FATAL("model",
+                                 "{0}: literal paste_tokens part has arg_index",
+                                 ctxItem);
 
               const json::Value *ByteBVal = PartObj.get("byte_begin");
               if (!ByteBVal)
-                REFOLD_LOG_FATAL("model", "{0}: paste_tokens part missing byte_begin",
-                      ctxItem);
+                REFOLD_LOG_FATAL("model",
+                                 "{0}: paste_tokens part missing byte_begin",
+                                 ctxItem);
               auto byteBOrErr = asUInt32(
                   *ByteBVal, ctxItem + ": paste_tokens.part.byte_begin");
               if (!byteBOrErr)
-                REFOLD_LOG_FATAL("model",
-                      "{0}: paste_tokens.part.byte_begin is not a uint32",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model",
+                    "{0}: paste_tokens.part.byte_begin is not a uint32",
+                    ctxItem);
 
               const json::Value *ByteEVal = PartObj.get("byte_end");
               if (!ByteEVal)
-                REFOLD_LOG_FATAL("model", "{0}: paste_tokens part missing byte_end",
-                      ctxItem);
+                REFOLD_LOG_FATAL("model",
+                                 "{0}: paste_tokens part missing byte_end",
+                                 ctxItem);
               auto byteEOrErr =
                   asUInt32(*ByteEVal, ctxItem + ": paste_tokens.part.byte_end");
               if (!byteEOrErr)
-                REFOLD_LOG_FATAL("model",
-                      "{0}: paste_tokens.part.byte_end is not a uint32",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model", "{0}: paste_tokens.part.byte_end is not a uint32",
+                    ctxItem);
               if (*byteEOrErr < *byteBOrErr ||
                   *byteEOrErr > spellingOrErr->size())
-                REFOLD_LOG_FATAL("model", "{0}: paste_tokens part byte range is invalid",
-                      ctxItem);
+                REFOLD_LOG_FATAL("model",
+                                 "{0}: paste_tokens part byte range is invalid",
+                                 ctxItem);
 
               std::optional<StringRef> partSpelling =
                   asOptString(PartObj, "spelling", /*canBeNull=*/true);
@@ -1614,15 +1702,19 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
               std::optional<uint32_t> argByteEnd =
                   asOptUInt32(PartObj, "arg_byte_end", /*canBeNull=*/true);
               if (argByteBegin.has_value() != argByteEnd.has_value())
-                REFOLD_LOG_FATAL("model", "{0}: paste_tokens arg byte range is incomplete",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model", "{0}: paste_tokens arg byte range is incomplete",
+                    ctxItem);
               if (argByteBegin && *argByteEnd < *argByteBegin)
-                REFOLD_LOG_FATAL("model", "{0}: paste_tokens arg byte range is invalid",
-                      ctxItem);
-              if (kindLocal == RefoldModel::PastePartKind::Literal && argByteBegin)
                 REFOLD_LOG_FATAL("model",
-                      "{0}: literal paste_tokens part has arg byte range",
-                      ctxItem);
+                                 "{0}: paste_tokens arg byte range is invalid",
+                                 ctxItem);
+              if (kindLocal == RefoldModel::PastePartKind::Literal &&
+                  argByteBegin)
+                REFOLD_LOG_FATAL(
+                    "model",
+                    "{0}: literal paste_tokens part has arg byte range",
+                    ctxItem);
 
               parts.push_back(RefoldModel::PastePart{
                   kindLocal, argIndex, *byteBOrErr, *byteEOrErr, storedSpelling,
@@ -1641,17 +1733,17 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         if (const json::Value *OriginVal = obj->get("callee_origin")) {
           auto originObjOrErr = asObject(*OriginVal, ctxItem);
           if (!originObjOrErr)
-            REFOLD_LOG_FATAL("model", "{0}: callee_origin is not an object", ctxItem);
+            REFOLD_LOG_FATAL("model", "{0}: callee_origin is not an object",
+                             ctxItem);
           const json::Object &OriginObj = **originObjOrErr;
 
           auto kindOrErrLocal = applyToField(asString, OriginObj, "kind",
-                                        ctxItem + ": callee_origin");
+                                             ctxItem + ": callee_origin");
           if (!kindOrErrLocal)
             return kindOrErrLocal.takeError();
 
           if (*kindOrErrLocal == "literal_macro_name") {
-            calleeOrigin.kind =
-                MacroCalleeOriginKind::LiteralMacroName;
+            calleeOrigin.kind = MacroCalleeOriginKind::LiteralMacroName;
           } else if (*kindOrErrLocal == "caller_param") {
             calleeOrigin.kind = MacroCalleeOriginKind::CallerParam;
           } else if (*kindOrErrLocal == "paste") {
@@ -1659,8 +1751,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           } else if (*kindOrErrLocal == "opaque") {
             calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
           } else {
-            REFOLD_LOG_FATAL("model", "{0}: invalid callee_origin.kind '{1}'", ctxItem,
-                  *kindOrErrLocal);
+            REFOLD_LOG_FATAL("model", "{0}: invalid callee_origin.kind '{1}'",
+                             ctxItem, *kindOrErrLocal);
           }
 
           if (auto idxsArr = asOptArray(OriginObj, "caller_param_indices",
@@ -1669,10 +1761,11 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
               auto uOrErr = asUInt32(
                   Elem, ctxItem + ": callee_origin.caller_param_indices");
               if (!uOrErr)
-                REFOLD_LOG_FATAL("model",
-                      "{0}: callee_origin.caller_param_indices element is not "
-                      "a uint32",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model",
+                    "{0}: callee_origin.caller_param_indices element is not "
+                    "a uint32",
+                    ctxItem);
               calleeOrigin.callerParamIndices.push_back(*uOrErr);
             }
           }
@@ -1685,16 +1778,16 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           calleeOrigin.spelling =
               asOptString(OriginObj, "spelling", /*canBeNull=*/true);
           if (calleeOrigin.spelling)
-            calleeOrigin.parts =
-                parseCalleeOriginParts(OriginObj, *calleeOrigin.spelling,
-                                       ctxItem);
+            calleeOrigin.parts = parseCalleeOriginParts(
+                OriginObj, *calleeOrigin.spelling, ctxItem);
 
           if (calleeOrigin.kind == MacroCalleeOriginKind::Paste &&
               (!calleeOrigin.spelling || calleeOrigin.parts.empty())) {
-            REFOLD_LOG_FATAL("model",
-                  "{0}: paste callee_origin is missing producer-owned spelling "
-                  "or parts",
-                  ctxItem);
+            REFOLD_LOG_FATAL(
+                "model",
+                "{0}: paste callee_origin is missing producer-owned spelling "
+                "or parts",
+                ctxItem);
           }
         } else if (callerMacroId) {
           // Nested invocations from older producer maps lack precise callee
@@ -1702,8 +1795,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           // literal macro-name owner.
           calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
         } else {
-          calleeOrigin.kind =
-              MacroCalleeOriginKind::LiteralMacroName;
+          calleeOrigin.kind = MacroCalleeOriginKind::LiteralMacroName;
         }
 
         std::vector<std::vector<uint32_t>> argDeps;
@@ -1711,7 +1803,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           for (const json::Value &Entry : **depsArr) {
             auto aOrErr = asArray(Entry, ctxItem);
             if (!aOrErr)
-              REFOLD_LOG_FATAL("model", "{0}: arg_deps entry is not an array", ctxItem);
+              REFOLD_LOG_FATAL("model", "{0}: arg_deps entry is not an array",
+                               ctxItem);
             const json::Array &a = **aOrErr;
 
             std::vector<uint32_t> deps;
@@ -1719,8 +1812,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
             for (const json::Value &Elem : a) {
               auto uOrErr = asUInt32(Elem, ctxItem);
               if (!uOrErr)
-                REFOLD_LOG_FATAL("model", "{0}: arg_deps element is not a uint32",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model", "{0}: arg_deps element is not a uint32", ctxItem);
               deps.push_back(*uOrErr);
             }
             argDeps.push_back(std::move(deps));
@@ -1732,7 +1825,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           for (const json::Value &Entry : **refsArr) {
             auto aOrErr = asArray(Entry, ctxItem);
             if (!aOrErr)
-              REFOLD_LOG_FATAL("model", "{0}: arg_refs entry is not an array", ctxItem);
+              REFOLD_LOG_FATAL("model", "{0}: arg_refs entry is not an array",
+                               ctxItem);
             const json::Array &a = **aOrErr;
 
             std::vector<RefoldModel::InvArgRef> refs;
@@ -1740,42 +1834,44 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
             for (const json::Value &Elem : a) {
               auto objOrErrLocal = asObject(Elem, ctxItem);
               if (!objOrErrLocal)
-                REFOLD_LOG_FATAL("model", "{0}: arg_refs element is not an object",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model", "{0}: arg_refs element is not an object", ctxItem);
               const json::Object &RefObj = **objOrErrLocal;
 
               const json::Value *CallerIdxVal =
                   RefObj.get("caller_param_index");
               if (!CallerIdxVal)
-                REFOLD_LOG_FATAL("model",
-                      "{0}: arg_refs element missing caller_param_index",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model", "{0}: arg_refs element missing caller_param_index",
+                    ctxItem);
               auto callerIdxOrErr = asUInt32(
                   *CallerIdxVal, ctxItem + ": arg_refs.caller_param_index");
               if (!callerIdxOrErr)
-                REFOLD_LOG_FATAL("model",
-                      "{0}: arg_refs.caller_param_index is not a uint32",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model", "{0}: arg_refs.caller_param_index is not a uint32",
+                    ctxItem);
 
               const json::Value *ByteBVal = RefObj.get("byte_begin");
               if (!ByteBVal)
-                REFOLD_LOG_FATAL("model", "{0}: arg_refs element missing byte_begin",
-                      ctxItem);
+                REFOLD_LOG_FATAL("model",
+                                 "{0}: arg_refs element missing byte_begin",
+                                 ctxItem);
               auto byteBOrErr =
                   asUInt32(*ByteBVal, ctxItem + ": arg_refs.byte_begin");
               if (!byteBOrErr)
-                REFOLD_LOG_FATAL("model", "{0}: arg_refs.byte_begin is not a uint32",
-                      ctxItem);
+                REFOLD_LOG_FATAL("model",
+                                 "{0}: arg_refs.byte_begin is not a uint32",
+                                 ctxItem);
 
               const json::Value *ByteEVal = RefObj.get("byte_end");
               if (!ByteEVal)
-                REFOLD_LOG_FATAL("model", "{0}: arg_refs element missing byte_end",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model", "{0}: arg_refs element missing byte_end", ctxItem);
               auto byteEOrErr =
                   asUInt32(*ByteEVal, ctxItem + ": arg_refs.byte_end");
               if (!byteEOrErr)
-                REFOLD_LOG_FATAL("model", "{0}: arg_refs.byte_end is not a uint32",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model", "{0}: arg_refs.byte_end is not a uint32", ctxItem);
 
               refs.push_back(RefoldModel::InvArgRef{*callerIdxOrErr,
                                                     *byteBOrErr, *byteEOrErr});
@@ -1790,8 +1886,9 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           for (const json::Value &Entry : **refsArr) {
             auto aOrErr = asArray(Entry, ctxItem);
             if (!aOrErr) {
-              REFOLD_LOG_FATAL("model", "{0}: arg_tuple_refs entry is not an array",
-                    ctxItem);
+              REFOLD_LOG_FATAL("model",
+                               "{0}: arg_tuple_refs entry is not an array",
+                               ctxItem);
             }
             const json::Array &a = **aOrErr;
 
@@ -1800,53 +1897,60 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
             for (const json::Value &Elem : a) {
               auto objOrErrLocal = asObject(Elem, ctxItem);
               if (!objOrErrLocal) {
-                REFOLD_LOG_FATAL("model", "{0}: arg_tuple_refs element is not an object",
-                      ctxItem);
+                REFOLD_LOG_FATAL("model",
+                                 "{0}: arg_tuple_refs element is not an object",
+                                 ctxItem);
               }
               const json::Object &RefObj = **objOrErrLocal;
 
               const json::Value *CallerIdxVal =
                   RefObj.get("caller_param_index");
               if (!CallerIdxVal) {
-                REFOLD_LOG_FATAL("model",
-                      "{0}: arg_tuple_refs element missing caller_param_index",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model",
+                    "{0}: arg_tuple_refs element missing caller_param_index",
+                    ctxItem);
               }
               auto callerIdxOrErr =
                   asUInt32(*CallerIdxVal,
                            ctxItem + ": arg_tuple_refs.caller_param_index");
               if (!callerIdxOrErr) {
-                REFOLD_LOG_FATAL("model",
-                      "{0}: arg_tuple_refs.caller_param_index is not a uint32",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model",
+                    "{0}: arg_tuple_refs.caller_param_index is not a uint32",
+                    ctxItem);
               }
 
               const json::Value *ByteBVal = RefObj.get("caller_byte_begin");
               if (!ByteBVal) {
-                REFOLD_LOG_FATAL("model",
-                      "{0}: arg_tuple_refs element missing caller_byte_begin",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model",
+                    "{0}: arg_tuple_refs element missing caller_byte_begin",
+                    ctxItem);
               }
               auto byteBOrErr = asUInt32(
                   *ByteBVal, ctxItem + ": arg_tuple_refs.caller_byte_begin");
               if (!byteBOrErr) {
-                REFOLD_LOG_FATAL("model",
-                      "{0}: arg_tuple_refs.caller_byte_begin is not a uint32",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model",
+                    "{0}: arg_tuple_refs.caller_byte_begin is not a uint32",
+                    ctxItem);
               }
 
               const json::Value *ByteEVal = RefObj.get("caller_byte_end");
               if (!ByteEVal) {
-                REFOLD_LOG_FATAL("model",
-                      "{0}: arg_tuple_refs element missing caller_byte_end",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model",
+                    "{0}: arg_tuple_refs element missing caller_byte_end",
+                    ctxItem);
               }
               auto byteEOrErr = asUInt32(
                   *ByteEVal, ctxItem + ": arg_tuple_refs.caller_byte_end");
               if (!byteEOrErr) {
-                REFOLD_LOG_FATAL("model",
-                      "{0}: arg_tuple_refs.caller_byte_end is not a uint32",
-                      ctxItem);
+                REFOLD_LOG_FATAL(
+                    "model",
+                    "{0}: arg_tuple_refs.caller_byte_end is not a uint32",
+                    ctxItem);
               }
 
               refs.push_back(RefoldModel::TupleArgRef{
@@ -2004,8 +2108,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         return activeOrErr.takeError();
       event.active = *activeOrErr;
 
-      auto provenOrErr =
-          applyToField(asBool, *obj, "producer_proven", ctxItem);
+      auto provenOrErr = applyToField(asBool, *obj, "producer_proven", ctxItem);
       if (!provenOrErr)
         return provenOrErr.takeError();
       event.producerProven = *provenOrErr;
@@ -2246,9 +2349,10 @@ void RefoldModel::SanitizeMacroCallerGraph() {
           MacroInvocation *cycleNode = macroById.lookup(path[i]);
           if (!cycleNode || !cycleNode->callerMacroId)
             continue;
-          REFOLD_LOG_WARN("model",
-               "dropping cyclic caller_macro_id edge child={0} parent={1}",
-               cycleNode->id, *cycleNode->callerMacroId);
+          REFOLD_LOG_WARN(
+              "model",
+              "dropping cyclic caller_macro_id edge child={0} parent={1}",
+              cycleNode->id, *cycleNode->callerMacroId);
           cycleNode->callerMacroId.reset();
         }
         break;
@@ -2268,9 +2372,10 @@ void RefoldModel::SanitizeMacroCallerGraph() {
       if (parentId == cur || macroById.find(parentId) == macroById.end()) {
         // Self-edges and references to missing invocations cannot be used as
         // structural caller links, so remove them before proof construction.
-        REFOLD_LOG_WARN("model",
-             "dropping invalid caller_macro_id edge child={0} parent={1}",
-             node->id, parentId);
+        REFOLD_LOG_WARN(
+            "model",
+            "dropping invalid caller_macro_id edge child={0} parent={1}",
+            node->id, parentId);
         node->callerMacroId.reset();
         break;
       }
@@ -2331,10 +2436,11 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
     if (!mi.invText || !mi.invB) {
       if (!mi.invArgRanges.empty() || !mi.argDeps.empty() ||
           !mi.argRefs.empty()) {
-        REFOLD_LOG_WARN("model",
-             "dropping raw invocation proof for macro id={0}: exact raw "
-             "invocation text is unavailable",
-             mi.id);
+        REFOLD_LOG_WARN(
+            "model",
+            "dropping raw invocation proof for macro id={0}: exact raw "
+            "invocation text is unavailable",
+            mi.id);
         mi.invArgRanges.clear();
         clearRawProofRefsOnly(mi);
       }
@@ -2358,9 +2464,10 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
       }
 
       if (dropRawRanges) {
-        REFOLD_LOG_WARN("model",
-             "dropping inconsistent raw invocation ranges for macro id={0}",
-             mi.id);
+        REFOLD_LOG_WARN(
+            "model",
+            "dropping inconsistent raw invocation ranges for macro id={0}",
+            mi.id);
         mi.invArgRanges.clear();
         clearRawProofRefsOnly(mi);
       } else {
@@ -2425,10 +2532,11 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
         }
 
         if (dropRawRefs) {
-          REFOLD_LOG_WARN("model",
-               "dropping inconsistent raw invocation dependency/ref proof for "
-               "macro id={0}",
-               mi.id);
+          REFOLD_LOG_WARN(
+              "model",
+              "dropping inconsistent raw invocation dependency/ref proof for "
+              "macro id={0}",
+              mi.id);
           clearRawProofRefsOnly(mi);
         }
       }
@@ -2441,10 +2549,11 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
     // ranges/tuple refs cannot be validated or replayed safely.
     if (!mi.normalizedInvText) {
       if (!mi.normalizedInvArgTextRanges.empty() || !mi.argTupleRefs.empty()) {
-        REFOLD_LOG_WARN("model",
-             "dropping normalized invocation proof for macro id={0}: "
-             "normalized_inv_text is unavailable",
-             mi.id);
+        REFOLD_LOG_WARN(
+            "model",
+            "dropping normalized invocation proof for macro id={0}: "
+            "normalized_inv_text is unavailable",
+            mi.id);
         clearNormalizedProofRefsOnly(mi);
       }
     } else {
@@ -2465,10 +2574,11 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
       }
 
       if (dropNormalizedRanges) {
-        REFOLD_LOG_WARN("model",
-             "dropping inconsistent normalized invocation ranges for macro "
-             "id={0}",
-             mi.id);
+        REFOLD_LOG_WARN(
+            "model",
+            "dropping inconsistent normalized invocation ranges for macro "
+            "id={0}",
+            mi.id);
         clearNormalizedProofRefsOnly(mi);
       } else {
         // Tuple refs are parallel to normalized argument ranges.
@@ -2495,10 +2605,11 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
         }
 
         if (dropTupleRefs) {
-          REFOLD_LOG_WARN("model",
-               "dropping inconsistent normalized invocation tuple proof for "
-               "macro id={0}",
-               mi.id);
+          REFOLD_LOG_WARN(
+              "model",
+              "dropping inconsistent normalized invocation tuple proof for "
+              "macro id={0}",
+              mi.id);
           mi.argTupleRefs.clear();
         }
       }
@@ -2518,10 +2629,11 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
         }
       }
       if (opaqueOrigin) {
-        REFOLD_LOG_WARN("model",
-             "downgrading invalid callee_origin caller-param metadata for "
-             "macro id={0} to opaque",
-             mi.id);
+        REFOLD_LOG_WARN(
+            "model",
+            "downgrading invalid callee_origin caller-param metadata for "
+            "macro id={0} to opaque",
+            mi.id);
         mi.calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
         mi.calleeOrigin.callerParamIndices.clear();
         mi.calleeOrigin.spelling.reset();
@@ -2554,10 +2666,11 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
       }
     }
     if (dropSegmentedOrigin) {
-      REFOLD_LOG_WARN("model",
-           "downgrading invalid segmented callee_origin proof for macro id={0} "
-           "to opaque",
-           mi.id);
+      REFOLD_LOG_WARN(
+          "model",
+          "downgrading invalid segmented callee_origin proof for macro id={0} "
+          "to opaque",
+          mi.id);
       mi.calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
       mi.calleeOrigin.callerParamIndices.clear();
       mi.calleeOrigin.spelling.reset();
@@ -2567,10 +2680,11 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
       for (const CalleeOriginPart &part : mi.calleeOrigin.parts)
         tiled.append(part.spelling.begin(), part.spelling.end());
       if (tiled != *mi.calleeOrigin.spelling) {
-        REFOLD_LOG_WARN("model",
-             "downgrading non-tiling segmented callee_origin proof for macro "
-             "id={0} to opaque",
-             mi.id);
+        REFOLD_LOG_WARN(
+            "model",
+            "downgrading non-tiling segmented callee_origin proof for macro "
+            "id={0} to opaque",
+            mi.id);
         mi.calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
         mi.calleeOrigin.callerParamIndices.clear();
         mi.calleeOrigin.spelling.reset();
@@ -2582,10 +2696,11 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
       // If the caller is gone, degrade any caller-dependent origin metadata to
       // opaque and drop caller-relative proof that cannot be validated anymore.
       if (!mi.calleeOrigin.callerParamIndices.empty()) {
-        REFOLD_LOG_WARN("model",
-             "downgrading callee_origin caller-param metadata for macro "
-             "id={0}: caller invocation is unavailable",
-             mi.id);
+        REFOLD_LOG_WARN(
+            "model",
+            "downgrading callee_origin caller-param metadata for macro "
+            "id={0}: caller invocation is unavailable",
+            mi.id);
         mi.calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
         mi.calleeOrigin.callerParamIndices.clear();
         mi.calleeOrigin.spelling.reset();
@@ -2593,26 +2708,29 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
       }
       if (!mi.calleeOrigin.parts.empty() ||
           mi.calleeOrigin.kind == MacroCalleeOriginKind::Paste) {
-        REFOLD_LOG_WARN("model",
-             "dropping segmented callee_origin proof for macro id={0}: "
-             "caller invocation is unavailable",
-             mi.id);
+        REFOLD_LOG_WARN(
+            "model",
+            "dropping segmented callee_origin proof for macro id={0}: "
+            "caller invocation is unavailable",
+            mi.id);
         mi.calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
         mi.calleeOrigin.spelling.reset();
         mi.calleeOrigin.parts.clear();
       }
       if (!mi.argDeps.empty() || !mi.argRefs.empty()) {
-        REFOLD_LOG_WARN("model",
-             "dropping raw invocation dependency/ref proof for macro id={0}: "
-             "caller invocation is unavailable",
-             mi.id);
+        REFOLD_LOG_WARN(
+            "model",
+            "dropping raw invocation dependency/ref proof for macro id={0}: "
+            "caller invocation is unavailable",
+            mi.id);
         clearRawProofRefsOnly(mi);
       }
       if (!mi.argTupleRefs.empty()) {
-        REFOLD_LOG_WARN("model",
-             "dropping normalized invocation tuple proof for macro id={0}: "
-             "caller invocation is unavailable",
-             mi.id);
+        REFOLD_LOG_WARN(
+            "model",
+            "dropping normalized invocation tuple proof for macro id={0}: "
+            "caller invocation is unavailable",
+            mi.id);
         mi.argTupleRefs.clear();
       }
     }
@@ -2703,7 +2821,8 @@ void RefoldModel::BuildIndicesAndSort() {
           inc.id, *inc.includeNext->containingFileIncludeId);
 
     if (inc.lookup && inc.lookup->searchChainIndex &&
-        *inc.lookup->searchChainIndex < *inc.includeNext->resumeSearchChainIndex)
+        *inc.lookup->searchChainIndex <
+            *inc.includeNext->resumeSearchChainIndex)
       REFOLD_LOG_FATAL(
           "model",
           "#include_next item id={0} selected search-chain index {1} before "

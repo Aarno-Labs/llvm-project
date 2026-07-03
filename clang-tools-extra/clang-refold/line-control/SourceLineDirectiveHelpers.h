@@ -73,8 +73,7 @@ bool isWsOrCompleteCommentTrivia(StringRef text);
 /// rejects escaped physical lines, macro-dependent conditions, trailing tokens,
 /// and every directive with side effects. In particular, this is not a general
 /// preprocessor directive parser.
-bool parseLiteralEmptyConditionalDirectiveLine(StringRef line,
-                                                      unsigned &depth);
+bool parseLiteralEmptyConditionalDirectiveLine(StringRef line, unsigned &depth);
 
 /// Return true iff `text` may be carried through a TU include-closure edit.
 ///
@@ -96,6 +95,8 @@ bool isPreservableIncludeClosureGapTrivia(StringRef text);
 /// start of a physical line when appended after materialized B tokens.
 bool startsWithPreprocessorDirectiveTrivia(StringRef text);
 
+/// Logical file/line state that must be re-established after consuming a
+/// source-only line-control gap.
 struct SourceLineDirectiveGapResume {
   size_t lineAtResume = 0;
   std::string fileSpelling;
@@ -105,6 +106,7 @@ struct SourceLineDirectiveGapResume {
   std::string lineMarkerFlags;
 };
 
+/// Parsed result for one admitted source-spelled line-control logical line.
 struct ParsedSourceLineDirectiveLogicalLine {
   size_t lineAfterDirective = 0;
   std::string fileSpelling;
@@ -121,11 +123,14 @@ struct ParsedSourceLineDirectiveLogicalLine {
   std::string lineMarkerFlags;
 };
 
+/// Rewritten logical line plus the macro invocations that supplied its
+/// deterministic replacement text.
 struct SourceLineDirectiveLogicalLineRewrite {
   std::string line;
   SmallVector<uint64_t, 4> macroInvocationIds;
 };
 
+/// Recovered macro replacement text for a source-only line-control operand.
 struct SourceLineDirectiveMacroReplacement {
   std::string text;
   SmallVector<uint64_t, 4> macroInvocationIds;
@@ -148,22 +153,22 @@ using SourceLineDirectiveLogicalLineRewriter =
 /// crosses a literal backslash-newline pair, compare and substitute the
 /// post-splice spelling rather than requiring physically contiguous source
 /// bytes.
-std::optional<std::string>
-removeLineSplicesForLineControl(StringRef text);
+std::optional<std::string> removeLineSplicesForLineControl(StringRef text);
 
-/// Build the directive-logical spelling of one source line after splice deletion.
+/// Build the directive-logical spelling of one source line after splice
+/// deletion.
 ///
 /// Source-level `#line` gaps are parsed from raw file bytes because they do not
 /// have ordinary PP tokens in the refold map.  Directive recognition occurs
 /// after C line splicing, so a `#` line whose trailing backslash splices the
 /// following `line 123` text is the same logical directive as `#line 123`.
 /// Block comments inside a directive are recognized before choosing the
-/// terminating newline, because comment replacement turns a complete comment into one
-/// whitespace character; physical newlines inside such comments are therefore
-/// part of the directive spelling, not the directive terminator.  This helper
-/// removes only literal backslash-newline and backslash-CRLF pairs that are
-/// fully contained in the proved source gap, then returns the byte just after
-/// the terminating non-spliced newline.
+/// terminating newline, because comment replacement turns a complete comment
+/// into one whitespace character; physical newlines inside such comments are
+/// therefore part of the directive spelling, not the directive terminator. This
+/// helper removes only literal backslash-newline and backslash-CRLF pairs that
+/// are fully contained in the proved source gap, then returns the byte just
+/// after the terminating non-spliced newline.
 bool collectLineSpliceLogicalLine(
     StringRef fileText, uint64_t lineBegin, uint64_t limit,
     std::string &logicalLine, uint64_t &afterLine,
@@ -172,8 +177,8 @@ bool collectLineSpliceLogicalLine(
 /// Return the raw source offset from which physical newlines inside a proved
 /// line-control directive affect the resumed line state.
 ///
-/// `collectLineSpliceLogicalLine()` removes backslash-newline splices before the
-/// directive is parsed, but not every removed physical newline advances the
+/// `collectLineSpliceLogicalLine()` removes backslash-newline splices before
+/// the directive is parsed, but not every removed physical newline advances the
 /// presumed line established by the directive.  Splices that merely form the
 /// directive introducer itself, such as `#\nline 123` or `#li\nne 123`, are
 /// consumed before the line operand is recognized and do not add to the resumed
@@ -181,18 +186,20 @@ bool collectLineSpliceLogicalLine(
 /// including line continuations inside the filename macro argument and newlines
 /// inside block comments, do advance the line observed by the copied suffix.
 ///
-/// The returned offset is just after the whitespace that separates the directive
-/// keyword/marker from its line operand.  Counting physical LF bytes from that
-/// raw offset through the collected directive line, minus the terminating
-/// directive newline, gives exactly the internal physical-line advance that must
-/// be added to the parsed line number.
+/// The returned offset is just after the whitespace that separates the
+/// directive keyword/marker from its line operand.  Counting physical LF bytes
+/// from that raw offset through the collected directive line, minus the
+/// terminating directive newline, gives exactly the internal physical-line
+/// advance that must be added to the parsed line number.
 std::optional<uint64_t> sourceLineDirectiveResumeCountBegin(
     StringRef logicalLine, ArrayRef<uint64_t> logicalLineSourceOffsets);
 
 /// Count physical source lines inside a complete line-control directive that
-/// are part of the directive body rather than the terminating directive newline.
-size_t countLineControlDirectiveBodyPhysicalNewlines(
-    StringRef fileText, uint64_t countBegin, uint64_t afterLine);
+/// are part of the directive body rather than the terminating directive
+/// newline.
+size_t countLineControlDirectiveBodyPhysicalNewlines(StringRef fileText,
+                                                     uint64_t countBegin,
+                                                     uint64_t afterLine);
 
 /// Return true if the source prefix may already have changed the presumed
 /// line-control state before a zero-token `__LINE__` operand is encountered.
@@ -206,7 +213,7 @@ size_t countLineControlDirectiveBodyPhysicalNewlines(
 /// computeSourceLineDirectiveGapResume()'s running state before the builtin is
 /// substituted.
 bool sourcePrefixMayContainLineControlDirective(StringRef fileText,
-                                                       uint64_t limit);
+                                                uint64_t limit);
 
 // #line filename string-literal parsing is declared in
 // RefoldLineControlFilename.h and shared with include replay.
@@ -231,7 +238,6 @@ std::optional<ParsedSourceLineDirectiveLogicalLine>
 parseSourceLineDirectiveLogicalLine(StringRef line,
                                     StringRef currentFileSpelling);
 
-
 /// Return true iff a macro invocation produced ordinary PP material that would
 /// need the normal macro-realization machinery rather than line-control repair.
 bool sourceLineDirectiveMacroHasMaterializedPPTokens(
@@ -240,10 +246,10 @@ bool sourceLineDirectiveMacroHasMaterializedPPTokens(
 /// Return true iff the untouched suffix may observe the current presumed file.
 ///
 /// Volatile string-valued predefined macros such as `__DATE__` can be valid
-/// filename operands in a source-only line-control directive, but the refold map
-/// does not record their concrete expansion value.  Such a gap is still
-/// token-preservable when the remaining source can only observe the resumed line
-/// number.  This conservative predicate rejects any later `__FILE__` or
+/// filename operands in a source-only line-control directive, but the refold
+/// map does not record their concrete expansion value.  Such a gap is still
+/// token-preservable when the remaining source can only observe the resumed
+/// line number.  This conservative predicate rejects any later `__FILE__` or
 /// `__FILE_NAME__` use recorded by the producer, and also rejects raw source
 /// spellings of those builtins in the suffix as a fail-closed backstop for
 /// cases not represented by an invocation with a usable source range.
@@ -361,7 +367,8 @@ std::optional<std::string> substituteLineControlMacroParameters(
 /// #line directive operands.  Therefore the repair only substitutes complete
 /// callsites whose replacement list is spelled directly in the recorded #define
 /// text.  For function-like macros with parameters, direct formal-token
-/// substitution, conservative `# formal` stringification, and producer-witnessed
+/// substitution, conservative `# formal` stringification, and
+/// producer-witnessed
 /// `##` paste runs are allowed.  Variadic formals use the producer-recorded
 /// tail argument as an ordinary substitution operand; comments, multiline
 /// replacement lists, and any resulting non-line-control spelling fail closed
@@ -392,8 +399,7 @@ findLineControlMacroNameOccurrences(StringRef text, StringRef name);
 /// same-spelling children and textual whole-token occurrences, then match them
 /// by source order and occurrence order.  Any unrecorded extra occurrence,
 /// missing source range, or ordering ambiguity still fails closed.
-std::optional<std::pair<size_t, size_t>>
-findLineControlMacroOccurrenceForChild(
+std::optional<std::pair<size_t, size_t>> findLineControlMacroOccurrenceForChild(
     const RefoldModel &model, const RefoldModel::MacroInvocation &parent,
     const RefoldModel::MacroInvocation &child, StringRef text);
 
@@ -409,21 +415,22 @@ std::optional<SmallVector<StringRef, 4>>
 lineControlNestedMacroInvocationArgTexts(
     const RefoldModel::MacroInvocation &macro);
 
-/// Recursively expand the bounded macro DAG recorded for a line-control operand.
+/// Recursively expand the bounded macro DAG recorded for a line-control
+/// operand.
 ///
 /// This is still not a general macro expander.  It starts from the same simple
 /// replacement-list recovery used for directly spelled macro operands, then
-/// follows only producer-recorded child macro invocations whose `caller_macro_id`
-/// is the macro being expanded.  Each child must occur unambiguously as a whole
-/// identifier in the current replacement text and must itself satisfy the same
-/// simple line-control replacement rules, or be a recorded predefined builtin
-/// accepted by the caller's line-control builtin resolver.  The builtin hook is
-/// needed for forms such as `#line LINE_NO(__LINE__)`: after substituting
-/// `LINE_NO(x)` with its argument, the producer-recorded child `__LINE__`
-/// invocation is the only deterministic witness for the numeric operand.
-/// Cycles, unsupported macro operators, ambiguous repeated child spellings, and
-/// excessive expansion depth all fail closed before the strict line-control
-/// parser sees the rewritten directive.
+/// follows only producer-recorded child macro invocations whose
+/// `caller_macro_id` is the macro being expanded.  Each child must occur
+/// unambiguously as a whole identifier in the current replacement text and must
+/// itself satisfy the same simple line-control replacement rules, or be a
+/// recorded predefined builtin accepted by the caller's line-control builtin
+/// resolver.  The builtin hook is needed for forms such as `#line
+/// LINE_NO(__LINE__)`: after substituting `LINE_NO(x)` with its argument, the
+/// producer-recorded child `__LINE__` invocation is the only deterministic
+/// witness for the numeric operand. Cycles, unsupported macro operators,
+/// ambiguous repeated child spellings, and excessive expansion depth all fail
+/// closed before the strict line-control parser sees the rewritten directive.
 std::optional<SourceLineDirectiveMacroReplacement>
 expandLineControlMacroReplacementText(
     const RefoldModel &model, const RefoldModel::MacroInvocation &macro,
@@ -470,8 +477,7 @@ formatSourceLineDirectiveGapResume(const SourceLineDirectiveGapResume &resume);
 /// source interval, so a directive before a consumed include line is rewritten
 /// to the line that the suffix would have observed after that include line had
 /// executed.
-std::optional<SourceLineDirectiveGapResume>
-computeSourceLineDirectiveGapResume(
+std::optional<SourceLineDirectiveGapResume> computeSourceLineDirectiveGapResume(
     StringRef fileText, uint64_t gapBegin, uint64_t gapEnd,
     uint64_t resumeOffset, StringRef defaultFileSpelling,
     SourceLineDirectiveLogicalLineRewriter logicalLineRewriter = nullptr,

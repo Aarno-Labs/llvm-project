@@ -248,7 +248,8 @@ Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
   }
 
   // Convert the selected segment's stored ownership into a concrete TU/include
-  // owner result, preserving any conditional-arm owner attached to that segment.
+  // owner result, preserving any conditional-arm owner attached to that
+  // segment.
   if (!selected->ownerIncludeId)
     return Owner::TU(selected->ownerCondArmId);
   return Owner::Include(*selected->ownerIncludeId, selected->ownerCondArmId);

@@ -51,8 +51,8 @@ static bool pathSpellingMatchesAfterAbsolute(llvm::StringRef a,
 static bool validateSourceGraphRelativeOutputPath(llvm::StringRef rel) {
   llvm::SmallVector<llvm::StringRef, 8> components;
   rel.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
-  const bool hasUnsafeComponent = llvm::any_of(
-      components, [](llvm::StringRef C) {
+  const bool hasUnsafeComponent =
+      llvm::any_of(components, [](llvm::StringRef C) {
         return C.empty() || C == "." || C == "..";
       });
   return !rel.empty() && !llvm::sys::path::is_absolute(rel) &&
@@ -61,8 +61,7 @@ static bool validateSourceGraphRelativeOutputPath(llvm::StringRef rel) {
 
 } // namespace
 
-SourceGraphWriteOptions
-makeSourceGraphWriteOptionsForModifiedSourcePath(
+SourceGraphWriteOptions makeSourceGraphWriteOptionsForModifiedSourcePath(
     llvm::StringRef modifiedSrcPath) {
   llvm::SmallString<256> OutputDir(modifiedSrcPath);
   llvm::sys::path::remove_filename(OutputDir);
@@ -86,8 +85,8 @@ void writeSourceGraphOutputs(llvm::ArrayRef<SourceGraphOutput> outputs,
     llvm::StringRef Rel(output.relativePath);
     if (!validateSourceGraphRelativeOutputPath(Rel))
       REFOLD_LOG_FATAL("source-graph/write",
-            "refusing unsafe source-graph output path: {0}",
-            output.relativePath);
+                       "refusing unsafe source-graph output path: {0}",
+                       output.relativePath);
 
     if (output.cleanupOnly) {
       // Multiple rejected include sites can point at the same stale sidecar.
@@ -101,8 +100,8 @@ void writeSourceGraphOutputs(llvm::ArrayRef<SourceGraphOutput> outputs,
         uniqueOutputs.insert({output.relativePath, output.bytes});
     if (!Inserted && It->second != output.bytes)
       REFOLD_LOG_FATAL("source-graph/write",
-            "conflicting source-graph contents for path: {0}",
-            output.relativePath);
+                       "conflicting source-graph contents for path: {0}",
+                       output.relativePath);
   }
 
   for (const auto &entry : cleanupOutputs) {
@@ -115,9 +114,10 @@ void writeSourceGraphOutputs(llvm::ArrayRef<SourceGraphOutput> outputs,
 
     if (!cleanup.resolvedPath.empty() &&
         pathSpellingMatchesAfterAbsolute(Path, cleanup.resolvedPath)) {
-      REFOLD_LOG_DEBUG("source-graph/write",
-            "skip stale cleanup for {0}: output path names producer header {1}",
-            Path, cleanup.resolvedPath);
+      REFOLD_LOG_DEBUG(
+          "source-graph/write",
+          "skip stale cleanup for {0}: output path names producer header {1}",
+          Path, cleanup.resolvedPath);
       continue;
     }
 
@@ -126,17 +126,18 @@ void writeSourceGraphOutputs(llvm::ArrayRef<SourceGraphOutput> outputs,
       continue;
 
     if ((*existingOrErr)->getBuffer() != cleanup.bytes) {
-      REFOLD_LOG_DEBUG("source-graph/write",
-            "leave possible stale source-graph file {0}: bytes no longer match "
-            "rejected generated body for include #{1}",
-            Path, cleanup.includeId);
+      REFOLD_LOG_DEBUG(
+          "source-graph/write",
+          "leave possible stale source-graph file {0}: bytes no longer match "
+          "rejected generated body for include #{1}",
+          Path, cleanup.includeId);
       continue;
     }
 
     if (std::error_code EC = llvm::sys::fs::remove(Path))
       REFOLD_LOG_FATAL("source-graph/write",
-            "cannot remove stale source-graph file {0}: {1}", Path,
-            EC.message());
+                       "cannot remove stale source-graph file {0}: {1}", Path,
+                       EC.message());
     REFOLD_LOG_INFO("finished", "removed stale source-graph header: {0}", Path);
   }
 
@@ -146,11 +147,12 @@ void writeSourceGraphOutputs(llvm::ArrayRef<SourceGraphOutput> outputs,
 
     if (auto existingOrErr = llvm::MemoryBuffer::getFile(Path)) {
       if ((*existingOrErr)->getBuffer() != entry.second)
-        REFOLD_LOG_FATAL("source-graph/write",
-              "refusing to overwrite existing different source-graph file: {0}",
-              Path);
-      REFOLD_LOG_INFO("finished",
-                      "source-graph header already up to date: {0}", Path);
+        REFOLD_LOG_FATAL(
+            "source-graph/write",
+            "refusing to overwrite existing different source-graph file: {0}",
+            Path);
+      REFOLD_LOG_INFO("finished", "source-graph header already up to date: {0}",
+                      Path);
       continue;
     }
 
@@ -158,7 +160,7 @@ void writeSourceGraphOutputs(llvm::ArrayRef<SourceGraphOutput> outputs,
     llvm::sys::path::remove_filename(Parent);
     if (std::error_code EC = llvm::sys::fs::create_directories(Parent))
       REFOLD_LOG_FATAL("source-graph/write", "cannot create {0}: {1}", Parent,
-            EC.message());
+                       EC.message());
 
     std::error_code EC;
     llvm::raw_fd_ostream OS(Path, EC, llvm::sys::fs::OF_Text);

@@ -40,7 +40,8 @@ inline bool isPhysicalLineControlDirectiveLine(llvm::StringRef line) {
   line = line.drop_front().ltrim();
   if (line.starts_with("line")) {
     line = line.drop_front(4);
-    return line.empty() || line.front() == '/' || stringutils::isWs(line.front());
+    return line.empty() || line.front() == '/' ||
+           stringutils::isWs(line.front());
   }
 
   // Clang/GCC line-marker spelling: `# 42 "file" ...`.
@@ -72,7 +73,7 @@ findLastLineControlDirectiveRangeBefore(llvm::StringRef out,
       --lineBegin;
 
     llvm::StringRef line(out.data() + lineBegin,
-                   static_cast<size_t>(contentEnd - lineBegin));
+                         static_cast<size_t>(contentEnd - lineBegin));
     if (isPhysicalLineControlDirectiveLine(line))
       return std::make_pair(lineBegin, rangeEnd);
 
@@ -212,7 +213,6 @@ inline void deduplicateLineControlPruneCandidates(
 
   candidates = std::move(deduped);
 }
-
 
 } // namespace refold
 } // namespace clang

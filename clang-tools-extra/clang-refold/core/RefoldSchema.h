@@ -32,8 +32,8 @@
 //   "version": "<opaque format version string>",
 //   "pp_ctx": {
 //     "cwd":  "<working directory for the preprocessing invocation>",
-//     "argv": ["<clang arg token>", ...],   // replayed for deterministic --check
-//     "lang": "<high-level language>"       // e.g. "c", "c++", "objc"
+//     "argv": ["<clang arg token>", ...],   // replayed for deterministic
+//     --check "lang": "<high-level language>"       // e.g. "c", "c++", "objc"
 //   },
 //   "source": "<path of the TU we refold back into>",
 //   "tokens": {
@@ -45,7 +45,8 @@
 //   "slots":  [ Slot, ... ],                // explicit insertion anchors
 //   "conds":  [ Cond, ... ],                // conditional groups
 //   "line_controls": [ LineControlEvent, ... ] // active #line events
-//   "items":  [ Item, ... ]                 // macros/includes/defs/pragmas/files
+//   "items":  [ Item, ... ]                 //
+//   macros/includes/defs/pragmas/files
 // }
 //
 // Core definitions (selected)
@@ -58,7 +59,8 @@
 //     Like PPSpan, but additionally records:
 //       - arg_index: the 0-based argument index this span originates from
 //       - optional byte envelopes for that occurrence:
-//         * byte_begin/byte_end      : bytes in the original source (when known)
+//         * byte_begin/byte_end      : bytes in the original source (when
+//         known)
 //         * pp_byte_begin/pp_byte_end: bytes in the A preprocessed output
 //
 // * MacroItem
@@ -103,11 +105,13 @@
 //       - pp: token index in A
 //       - file: absolute/canonical path
 //       - [b,e): byte range in that file corresponding to token pp
-//     Consumers should key by pp; producers typically emit one entry per A token.
+//     Consumers should key by pp; producers typically emit one entry per A
+//     token.
 //
 // * Slot
 //     Explicit insertion anchors in original source bytes. Kinds include:
-//     { file_begin, file_end, after_last_include, before_include, after_include,
+//     { file_begin, file_end, after_last_include, before_include,
+//     after_include,
 //       arm_begin, arm_end }.
 //       - file, [b,e): byte range in file (point slots have b == e)
 //       - ref: required for include/arm kinds; identifies include item id or
@@ -116,8 +120,8 @@
 //       - owner_include_id: include instance that opened file (when nested)
 //
 // * Cond / Arm
-//     Conditional groups with absolute byte bounds [group_b, group_e) in a file,
-//     plus ordered arms. Each Arm records:
+//     Conditional groups with absolute byte bounds [group_b, group_e) in a
+//     file, plus ordered arms. Each Arm records:
 //       - kind: if/ifdef/ifndef/elif/else
 //       - cond: textual condition / macro name (required except for else)
 //       - body byte range [body_b, body_e)
@@ -126,7 +130,8 @@
 //
 // Invariants & conventions
 // ------------------------
-// * All token intervals are half-open A-token ranges [begin, end) with end >= begin.
+// * All token intervals are half-open A-token ranges [begin, end) with end >=
+// begin.
 // * All byte intervals are half-open file byte ranges [b, e) with e >= b.
 // * Some location fields are nullable when the producer cannot compute bytes;
 //   optional fields may be omitted entirely as allowed by the schema.
@@ -147,8 +152,8 @@
 // Rationale
 // ---------
 // The map is intentionally sufficient for a deterministic refolder: it records
-// A-token spans for PP constructs, byte locations for directive/invocation sites
-// when available, and the conditional/include structure governing token
+// A-token spans for PP constructs, byte locations for directive/invocation
+// sites when available, and the conditional/include structure governing token
 // production, plus explicit insertion anchors (slots) to avoid heuristic
 // placement.
 //

@@ -37,8 +37,8 @@ public:
 
   /// Ensure that \p path has a cached weakly-canonical spelling.
   ///
-  /// Canonicalization failures are fatal, matching the historical
-  /// RefoldPathIdentity::PathsEqual() behavior exactly.
+  /// Canonicalization failures are fatal, matching the path-identity
+  /// comparison policy used by `PathsEqual()`.
   void CacheCanonicalPath(llvm::StringRef path) const;
 
   /// Compare two paths for equality after weak canonicalization.

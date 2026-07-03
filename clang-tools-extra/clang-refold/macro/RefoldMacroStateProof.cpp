@@ -12,8 +12,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLog.h"
 #include "macro/RefoldMacroStateProof.h"
+#include "core/RefoldLog.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "source/RefoldTokenTextAnalysis.h"
 #include "util/RefoldPathIdentity.h"
@@ -32,7 +32,6 @@ using namespace llvm;
 
 namespace clang {
 namespace refold {
-
 
 /// Classify the source observation needed to make `directive` visible.
 ///
@@ -55,16 +54,17 @@ RefoldMacroStateProof::MacroStateObservationKindForDirective(
 /// This centralizes the object-like/function-like distinction so TU repair,
 /// include materialization, and fallback proofs apply the same observation
 /// invariant.
-std::optional<size_t> RefoldMacroStateProof::FirstMacroStateObservationOffsetInText(
+std::optional<size_t>
+RefoldMacroStateProof::FirstMacroStateObservationOffsetInText(
     const RefoldModel::MacroDirective &directive, StringRef macroName,
     StringRef text, StringRef suffix) const {
   switch (MacroStateObservationKindForDirective(directive, macroName)) {
   case MacroStateObservationKind::IdentifierToken:
-    return tokenText_.FirstRawIdentifierObservationOffsetInText(
-        macroName, text);
+    return tokenText_.FirstRawIdentifierObservationOffsetInText(macroName,
+                                                                text);
   case MacroStateObservationKind::FunctionLikeInvocation:
-    return tokenText_.FirstFunctionLikeInvocationOffsetInText(
-        macroName, text, suffix);
+    return tokenText_.FirstFunctionLikeInvocationOffsetInText(macroName, text,
+                                                              suffix);
   }
   return std::nullopt;
 }
@@ -104,15 +104,15 @@ bool RefoldMacroStateProof::SourceChunkObservesMacroStateDirectiveWhenCrossed(
 /// Recover the complete physical source interval for a recorded macro-state
 /// directive line.
 ///
-/// The producer anchors MacroDirective::siteB at the macro name, not at the `#`.
-/// This helper reparses the recorded directive spelling to find the name offset,
-/// translates that anchor back to the physical line start, and accepts the
-/// interval only if the recovered file bytes exactly equal MacroDirective::text.
+/// The producer anchors MacroDirective::siteB at the macro name, not at the
+/// `#`. This helper reparses the recorded directive spelling to find the name
+/// offset, translates that anchor back to the physical line start, and accepts
+/// the interval only if the recovered file bytes exactly equal
+/// MacroDirective::text.
 std::optional<MacroStateDirectiveLineInterval>
 RefoldMacroStateProof::RecoverMacroStateDirectiveLineInterval(
     const RefoldModel::MacroDirective &directive, StringRef expectedPath,
-    StringRef fileBytes,
-    std::optional<uint64_t> requiredOwnerIncludeId) const {
+    StringRef fileBytes, std::optional<uint64_t> requiredOwnerIncludeId) const {
   if (directive.subkind != "#define" && directive.subkind != "#undef")
     return std::nullopt;
   if (directive.name.empty() || directive.text.empty())
@@ -174,10 +174,10 @@ RefoldMacroStateProof::RecoverMacroStateDirectiveLineInterval(
 /// definition used by `invocation`.
 ///
 /// The interval is used by directive-repair logic that needs to reason about
-/// preserving or replaying only the definition body, not the `#define NAME(...)`
-/// prefix.  The parse is intentionally shallow and fail-closed: it recognizes
-/// the directive prefix and balanced function-like parameter list, then returns
-/// the remaining replacement-list bytes.
+/// preserving or replaying only the definition body, not the `#define
+/// NAME(...)` prefix.  The parse is intentionally shallow and fail-closed: it
+/// recognizes the directive prefix and balanced function-like parameter list,
+/// then returns the remaining replacement-list bytes.
 std::optional<MacroDefinitionReplacementListInterval>
 RefoldMacroStateProof::RecoverMacroDefinitionReplacementListInterval(
     const RefoldModel::MacroInvocation &invocation) const {
@@ -260,7 +260,6 @@ RefoldMacroStateProof::RecoverMacroDefinitionReplacementListInterval(
   return result;
 }
 
-
 std::optional<StabilizedMaterializedHeaderMacroPatch>
 RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
     MacroStatePatchReplayInput mp, uint64_t mpEnd, StringRef headerPath,
@@ -315,9 +314,9 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
       };
 
   // Reconstruct the active definition for `macroName` immediately before a
-  // header byte offset using only directives owned by this materialized include.
-  // The last matching #define/#undef before the offset wins, with directive id
-  // as a deterministic tie-breaker for equal byte endpoints.
+  // header byte offset using only directives owned by this materialized
+  // include. The last matching #define/#undef before the offset wins, with
+  // directive id as a deterministic tie-breaker for equal byte endpoints.
   auto activeMaterializedHeaderDefinitionAtByte =
       [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
           uint64_t offset) {
@@ -450,8 +449,7 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
   // non-observation: if it observes the definition being delayed, movement is
   // not semantics-preserving.
   auto appendCrossedSourceExcludingCarried = [&](std::string &out,
-                                                 uint64_t begin,
-                                                 uint64_t end) {
+                                                 uint64_t begin, uint64_t end) {
     uint64_t cursor = begin;
     for (const auto &candidate : candidates) {
       if (candidate.end <= cursor || candidate.begin >= end)
@@ -516,8 +514,7 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
               .str());
       return StabilizedMaterializedHeaderMacroPatch{};
     }
-    replacement.append(bytes.begin() + cursor,
-                       bytes.begin() + candidate.begin);
+    replacement.append(bytes.begin() + cursor, bytes.begin() + candidate.begin);
     cursor = candidate.end;
   }
   replacement.append(bytes.begin() + cursor, bytes.begin() + mp.invStart);

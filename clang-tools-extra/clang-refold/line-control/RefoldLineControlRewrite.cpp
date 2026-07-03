@@ -72,7 +72,7 @@ bool isWsOrCompleteCommentTrivia(StringRef text) {
 }
 
 bool parseLiteralEmptyConditionalDirectiveLine(StringRef line,
-                                                      unsigned &depth) {
+                                               unsigned &depth) {
   if (line.ends_with("\n"))
     line = line.drop_back();
   if (line.ends_with("\r"))
@@ -217,8 +217,7 @@ bool startsWithPreprocessorDirectiveTrivia(StringRef text) {
   return rest.starts_with("#");
 }
 
-std::optional<std::string>
-removeLineSplicesForLineControl(StringRef text) {
+std::optional<std::string> removeLineSplicesForLineControl(StringRef text) {
   std::string out;
   out.reserve(text.size());
 
@@ -243,8 +242,7 @@ removeLineSplicesForLineControl(StringRef text) {
         out.push_back(text[pos++]);
         continue;
       }
-      if (pos + 1 < text.size() && text[pos] == '/' &&
-          text[pos + 1] == '*') {
+      if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
         state = ScanState::BlockComment;
         out.push_back(text[pos++]);
         out.push_back(text[pos++]);
@@ -416,8 +414,9 @@ std::optional<uint64_t> sourceLineDirectiveResumeCountBegin(
   return std::nullopt;
 }
 
-size_t countLineControlDirectiveBodyPhysicalNewlines(
-    StringRef fileText, uint64_t countBegin, uint64_t afterLine) {
+size_t countLineControlDirectiveBodyPhysicalNewlines(StringRef fileText,
+                                                     uint64_t countBegin,
+                                                     uint64_t afterLine) {
   if (countBegin >= afterLine || afterLine > fileText.size())
     return 0;
 
@@ -428,14 +427,14 @@ size_t countLineControlDirectiveBodyPhysicalNewlines(
 }
 
 bool sourcePrefixMayContainLineControlDirective(StringRef fileText,
-                                                       uint64_t limit) {
+                                                uint64_t limit) {
   limit = std::min<uint64_t>(limit, fileText.size());
 
   for (uint64_t lineBegin = 0; lineBegin < limit;) {
     std::string logicalLine;
     uint64_t afterLine = lineBegin;
     if (!collectLineSpliceLogicalLine(fileText, lineBegin, limit, logicalLine,
-                                  afterLine))
+                                      afterLine))
       return true;
 
     StringRef rest = StringRef(logicalLine).ltrim(" \t\v\f");
@@ -492,7 +491,8 @@ parseSourceLineDirectiveLogicalLine(StringRef line,
     return std::nullopt;
   }
 
-  StringRef digits = rest.take_while([](char c) { return '0' <= c && c <= '9'; });
+  StringRef digits =
+      rest.take_while([](char c) { return '0' <= c && c <= '9'; });
   if (digits.empty())
     return std::nullopt;
 
@@ -545,9 +545,8 @@ parseSourceLineDirectiveLogicalLine(StringRef line,
     bool sawFlag3 = false;
     bool sawFlag4 = false;
     while (!rest.empty()) {
-      StringRef flagText = rest.take_while([](char c) {
-        return '0' <= c && c <= '9';
-      });
+      StringRef flagText =
+          rest.take_while([](char c) { return '0' <= c && c <= '9'; });
       if (flagText.empty())
         return std::nullopt;
 
@@ -609,8 +608,8 @@ bool sourceSuffixMayObservePresumedFileSpelling(
     const RefoldModel &model, StringRef file, uint64_t resumeOffset,
     llvm::function_ref<bool(StringRef, StringRef)> pathsEqual,
     StringRef fileText) {
-  auto findMacroById = [&](uint64_t id)
-      -> const RefoldModel::MacroInvocation * {
+  auto findMacroById =
+      [&](uint64_t id) -> const RefoldModel::MacroInvocation * {
     for (const RefoldModel::MacroInvocation &candidate :
          model.GetMacroInvocations())
       if (candidate.id == id)
@@ -711,8 +710,8 @@ findAdmittedLineControlRawStringifyEscapeEnd(StringRef text,
   if (escaped == 'u' || escaped == 'U') {
     StringRef tail = text.substr(cursor + 1);
     std::optional<uint32_t> value =
-        decodeLineControlUniversalCharacterNameValue(
-            tail, escaped == 'u' ? 4u : 8u);
+        decodeLineControlUniversalCharacterNameValue(tail,
+                                                     escaped == 'u' ? 4u : 8u);
     if (!value || !isReplayableLineControlUniversalCharacterName(*value))
       return std::nullopt;
     return text.size() - tail.size();
@@ -878,13 +877,12 @@ lineControlArgumentContainsPPTokens(StringRef argument,
     if (!token.is(tok::comment))
       return true;
 
-    const size_t tokenBegin = std::min(refoldTokenOffsetFromBase(token, baseLoc),
-                                       argument.size());
-    const size_t tokenEnd = std::min(refoldTokenEndOffsetFromBase(token, baseLoc),
-                                     argument.size());
+    const size_t tokenBegin =
+        std::min(refoldTokenOffsetFromBase(token, baseLoc), argument.size());
+    const size_t tokenEnd =
+        std::min(refoldTokenEndOffsetFromBase(token, baseLoc), argument.size());
     StringRef spelling = argument.slice(tokenBegin, tokenEnd);
-    if (spelling.starts_with("//") ||
-        !rawLexerCommentTokenIsComplete(spelling))
+    if (spelling.starts_with("//") || !rawLexerCommentTokenIsComplete(spelling))
       return std::nullopt;
   }
 }
@@ -914,10 +912,10 @@ parseLineControlVaOptPayload(StringRef replacement, size_t openParen,
     if (token.is(tok::eof))
       return std::nullopt;
 
-    const size_t tokenBegin = std::min(refoldTokenOffsetFromBase(token, baseLoc),
-                                       replacement.size());
-    const size_t tokenEnd = std::min(refoldTokenEndOffsetFromBase(token, baseLoc),
-                                     replacement.size());
+    const size_t tokenBegin =
+        std::min(refoldTokenOffsetFromBase(token, baseLoc), replacement.size());
+    const size_t tokenEnd = std::min(
+        refoldTokenEndOffsetFromBase(token, baseLoc), replacement.size());
 
     if (tokenEnd <= openParen)
       continue;
@@ -1060,14 +1058,12 @@ std::optional<std::string> substituteLineControlMacroParameters(
   // the same formal substitution, stringification, paste-witness replay, and
   // strict final line-control parse as any other replacement-list text.
   if (replacement.contains("__VA_OPT__")) {
-    std::optional<std::string> expandedVaOpt =
-        expandLineControlVaOptOperators(replacement, params,
-                                        invocationArgTexts, lang);
+    std::optional<std::string> expandedVaOpt = expandLineControlVaOptOperators(
+        replacement, params, invocationArgTexts, lang);
     if (!expandedVaOpt)
       return std::nullopt;
-    return substituteLineControlMacroParameters(*expandedVaOpt, params,
-                                                invocationArgTexts,
-                                                pasteTokens, lang);
+    return substituteLineControlMacroParameters(
+        *expandedVaOpt, params, invocationArgTexts, pasteTokens, lang);
   }
 
   // Variadic formals are safe to substitute in this bounded proof when the
@@ -1086,9 +1082,8 @@ std::optional<std::string> substituteLineControlMacroParameters(
     return std::nullopt;
   };
 
-  auto parseReplacementAtom =
-      [&](size_t atomBegin)
-          -> std::optional<std::tuple<size_t, std::string, bool>> {
+  auto parseReplacementAtom = [&](size_t atomBegin)
+      -> std::optional<std::tuple<size_t, std::string, bool>> {
     if (atomBegin >= replacement.size())
       return std::nullopt;
 
@@ -1119,8 +1114,8 @@ std::optional<std::string> substituteLineControlMacroParameters(
       }
       if (!closed)
         return std::nullopt;
-      return std::make_tuple(
-          end, replacement.slice(atomBegin, end).str(), false);
+      return std::make_tuple(end, replacement.slice(atomBegin, end).str(),
+                             false);
     }
 
     if (stringutils::isIdentStart(atomCh)) {
@@ -1217,8 +1212,9 @@ std::optional<std::string> substituteLineControlMacroParameters(
         return std::nullopt;
 
       // The stringification operator is deterministic for complete recorded
-      // arguments.  Accept only `# formal` and let the final line-control parser
-      // certify that the produced string literal is legal in this directive.
+      // arguments.  Accept only `# formal` and let the final line-control
+      // parser certify that the produced string literal is legal in this
+      // directive.
       size_t identBegin = pos + 1;
       stringutils::skipNonNewlineWs(replacement, identBegin);
       if (identBegin >= replacement.size() ||
@@ -1418,8 +1414,7 @@ findLineControlMacroNameOccurrences(StringRef text, StringRef name) {
   return occurrences;
 }
 
-std::optional<std::pair<size_t, size_t>>
-findLineControlMacroOccurrenceForChild(
+std::optional<std::pair<size_t, size_t>> findLineControlMacroOccurrenceForChild(
     const RefoldModel &model, const RefoldModel::MacroInvocation &parent,
     const RefoldModel::MacroInvocation &child, StringRef text) {
   if (!child.invText || child.invText->empty())
@@ -1504,7 +1499,8 @@ expandLineControlMacroReplacementText(
     return std::nullopt;
 
   std::optional<std::string> replacement =
-      simpleLineControlMacroReplacementText(model, macro, invocationArgTexts, lang);
+      simpleLineControlMacroReplacementText(model, macro, invocationArgTexts,
+                                            lang);
   if (!replacement) {
     if (!builtinMacroResolver)
       return std::nullopt;
@@ -1532,7 +1528,8 @@ expandLineControlMacroReplacementText(
   };
 
   SmallVector<ChildReplacementPiece, 4> childPieces;
-  for (const RefoldModel::MacroInvocation &child : model.GetMacroInvocations()) {
+  for (const RefoldModel::MacroInvocation &child :
+       model.GetMacroInvocations()) {
     if (!child.callerMacroId || *child.callerMacroId != macro.id)
       continue;
     if (!child.invText || child.invText->empty()) {
@@ -1555,9 +1552,9 @@ expandLineControlMacroReplacementText(
     }
 
     std::optional<SourceLineDirectiveMacroReplacement> childReplacement =
-        expandLineControlMacroReplacementText(
-            model, child, *childArgTexts, activeMacroIds, lang,
-            builtinMacroResolver);
+        expandLineControlMacroReplacementText(model, child, *childArgTexts,
+                                              activeMacroIds, lang,
+                                              builtinMacroResolver);
     if (!childReplacement) {
       activeMacroIds.pop_back();
       return std::nullopt;
@@ -1602,8 +1599,7 @@ rewriteSourceLineDirectiveLogicalLineMacros(
     const RefoldModel &model, StringRef file, StringRef logicalLine,
     ArrayRef<uint64_t> logicalLineSourceOffsets,
     llvm::function_ref<bool(StringRef, StringRef)> pathsEqual,
-    const LangOptions &lang,
-    std::optional<uint64_t> ownerIncludeId,
+    const LangOptions &lang, std::optional<uint64_t> ownerIncludeId,
     SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver) {
   if (logicalLineSourceOffsets.size() != logicalLine.size())
     return std::nullopt;
@@ -1721,10 +1717,9 @@ rewriteSourceLineDirectiveLogicalLineMacros(
         if (relativeArgBegin > relativeArgEnd ||
             relativeArgEnd > macro.invText->size())
           return std::nullopt;
-        std::optional<std::string> splicedArg =
-            removeLineSplicesForLineControl(
-                macro.invText->slice(static_cast<size_t>(relativeArgBegin),
-                                     static_cast<size_t>(relativeArgEnd)));
+        std::optional<std::string> splicedArg = removeLineSplicesForLineControl(
+            macro.invText->slice(static_cast<size_t>(relativeArgBegin),
+                                 static_cast<size_t>(relativeArgEnd)));
         if (!splicedArg || logicalArg != *splicedArg)
           return std::nullopt;
 
@@ -1769,14 +1764,14 @@ rewriteSourceLineDirectiveLogicalLineMacros(
   if (pieces.empty())
     return std::nullopt;
 
-  llvm::sort(pieces, [](const ReplacementPiece &lhs,
-                        const ReplacementPiece &rhs) {
-    if (lhs.begin != rhs.begin)
-      return lhs.begin < rhs.begin;
-    if (lhs.end != rhs.end)
-      return lhs.end < rhs.end;
-    return lhs.macroId < rhs.macroId;
-  });
+  llvm::sort(pieces,
+             [](const ReplacementPiece &lhs, const ReplacementPiece &rhs) {
+               if (lhs.begin != rhs.begin)
+                 return lhs.begin < rhs.begin;
+               if (lhs.end != rhs.end)
+                 return lhs.end < rhs.end;
+               return lhs.macroId < rhs.macroId;
+             });
 
   SourceLineDirectiveLogicalLineRewrite out;
   size_t cursor = 0;
@@ -1810,14 +1805,12 @@ formatSourceLineDirectiveGapResume(const SourceLineDirectiveGapResume &resume) {
   return result;
 }
 
-std::optional<SourceLineDirectiveGapResume>
-computeSourceLineDirectiveGapResume(
+std::optional<SourceLineDirectiveGapResume> computeSourceLineDirectiveGapResume(
     StringRef fileText, uint64_t gapBegin, uint64_t gapEnd,
     uint64_t resumeOffset, StringRef defaultFileSpelling,
     SourceLineDirectiveLogicalLineRewriter logicalLineRewriter,
     SmallVectorImpl<uint64_t> *acceptedMacroInvocationIds,
-    StringRef baseFileSpelling,
-    bool allowUnknownFilenameOperand) {
+    StringRef baseFileSpelling, bool allowUnknownFilenameOperand) {
   if (gapBegin >= gapEnd || gapEnd > fileText.size() || resumeOffset < gapEnd ||
       resumeOffset > fileText.size())
     return std::nullopt;
@@ -1892,7 +1885,7 @@ computeSourceLineDirectiveGapResume(
     SmallVector<uint64_t, 64> logicalLineSourceOffsets;
     uint64_t afterLine = cursor;
     if (!collectLineSpliceLogicalLine(fileText, cursor, gapEnd, logicalLine,
-                                  afterLine, &logicalLineSourceOffsets))
+                                      afterLine, &logicalLineSourceOffsets))
       return std::nullopt;
 
     std::optional<SourceLineDirectiveLogicalLineRewrite> rewrite;

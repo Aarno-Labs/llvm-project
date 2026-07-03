@@ -2,46 +2,84 @@ set(LLVM_LINK_COMPONENTS Support)
 
 add_clang_tool(clang-refold
   clang-refold.cpp
+  sideband/RefoldSidebandPragmaEdits.cpp
   source/DiffAlgorithms.cpp
   line-control/FinalLineControlModel.cpp
   line-control/LineDirectiveInserter.cpp
   line-control/RefoldLineControlFilename.cpp
   line-control/RefoldLineControlRewrite.cpp
+  line-control/RefoldNoLinesPruning.cpp
   edit/RefoldExpansionFallbackPlanner.cpp
   edit/RefoldBInsertionLedger.cpp
   core/RefoldEngine.cpp
+  core/RefoldPreprocessRecheck.cpp
   core/RefoldServiceGraphBuilder.cpp
   line-control/RefoldLineObserverLayout.cpp
+  include/RefoldHeaderIncludeEditPlanner.cpp
+  include/RefoldIncludeInsertionPlanner.cpp
+  include/RefoldIncludeSubtreeWorkClassifier.cpp
   include/RefoldIncludeMaterializer.cpp
   include/RefoldIncludeMaterializationScheduler.cpp
   edit/RefoldTextEditAssembler.cpp
   util/RefoldPathIdentity.cpp
   source/RefoldTokenTextAnalysis.cpp
   source/RefoldSourceMapper.cpp
+  source/RefoldToken.cpp
   source/RefoldTokenDiffPlanner.cpp
   source/RefoldMixedOwnerTilingPlanner.cpp
   source/RefoldStructuralHunkDispatcher.cpp
   macro/RefoldMacroTopology.cpp
   macro/RefoldMacroReplay.cpp
-  macro/RefoldMacroTextUtils.cpp
+  macro/RefoldMacroArgsOnlyTemplateSolver.cpp
+  macro/RefoldMacroDefinitionTapeSolver.cpp
+  macro/RefoldMacroGeneratedLeafReplayEngine.cpp
+  macro/RefoldMacroOccurrenceProofValidator.cpp
+  macro/RefoldMacroPasteArgumentBuilder.cpp
   macro/RefoldMacroPatchPlanner.cpp
+  macro/RefoldMacroArgsOnlyWholeCoverPhase.cpp
+  macro/RefoldMacroDAGLeafDiscoveryPhase.cpp
+  macro/RefoldMacroDAGLiftingPhase.cpp
+  macro/RefoldMacroDAGCandidateValidator.cpp
+  macro/RefoldMacroDAGInvertibilitySolver.cpp
+  macro/RefoldMacroDAGStructuredLifter.cpp
+  macro/RefoldMacroDAGSubtreeCertifier.cpp
+  macro/RefoldMacroDAGTextPrimitives.cpp
+  macro/RefoldMacroFinalCandidateSelector.cpp
+  macro/RefoldMacroPatchProofCertifier.cpp
+  macro/RefoldMacroPatchReusePhase.cpp
+  macro/RefoldMacroSelectorSubstitutionPhase.cpp
+  macro/RefoldMacroStandardArgsOnlyPatchBuilder.cpp
+  macro/RefoldMacroSubtreeReplayValidator.cpp
+  macro/RefoldMacroReplayStabilityValidator.cpp
+  macro/RefoldMacroGeneratedCalleeReplayEngine.cpp
+  macro/RefoldMacroTupleHelpers.cpp
+  macro/RefoldMacroWholeCoverOrchestrator.cpp
   macro/RefoldMacroStateRepairPlanner.cpp
   core/RefoldOwnerClassifier.cpp
   edit/RefoldTUEditPlanner.cpp
   edit/RefoldFinalTUEmissionPlanner.cpp
   edit/RefoldTUAnchorProof.cpp
+  proof/RefoldTerminalProofSink.cpp
   proof/RefoldTheoremAudit.cpp
   macro/RefoldArgTextRecovery.cpp
   macro/RefoldCounterStabilization.cpp
   include/RefoldIncludeReplayProof.cpp
+  proof/RefoldAcceptancePathClassifier.cpp
+  proof/RefoldAcceptedCandidateBuilder.cpp
+  proof/RefoldAcceptedResultRanker.cpp
+  proof/RefoldMacroPatchProofClassifier.cpp
+  proof/RefoldOwnerRealizationProofBuilder.cpp
   proof/RefoldProofLattice.cpp
-  proof/RefoldTerminalProof.cpp
-  proof/RefoldTerminalProofSink.cpp
+  proof/RefoldProofSummaryBuilder.cpp
+  proof/RefoldWitnessClassifier.cpp
+  proof/RefoldWitnessEquivalenceKeyBuilder.cpp
+  proof/RefoldWitnessResolver.cpp
+  proof/RefoldWitnessTrace.cpp
   proof/RefoldOwnerStateProof.cpp
   line-control/RefoldLineControlProof.cpp
   macro/RefoldMacroStateProof.cpp
   proof/RefoldSidebandReplayProof.cpp
-  proof/RefoldSourceNeutralityProof.cpp
+  proof/RefoldNeutralityProof.cpp
   include/RefoldSourceGraphProof.cpp
   include/RefoldSourceGraphWriter.cpp
   core/RefoldModel.cpp

@@ -4,9 +4,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLog.h"
 #include "util/RefoldPathIdentity.h"
-#include "proof/RefoldProofTypes.h"
+#include "core/RefoldLog.h"
+#include "proof/RefoldProofVocabulary.h"
 
 #include <filesystem>
 #include <system_error>
@@ -34,8 +34,8 @@ void RefoldPathIdentity::CacheCanonicalPath(StringRef path) const {
     return;
 
   std::error_code ec;
-  const auto canonical = std::filesystem::weakly_canonical(
-      std::filesystem::path(path.str()), ec);
+  const auto canonical =
+      std::filesystem::weakly_canonical(std::filesystem::path(path.str()), ec);
   if (ec) {
     REFOLD_LOG_FATAL("path/canon", "failed to canonicalize '{0}': {1}", path,
                      ec.message());
@@ -66,7 +66,8 @@ std::optional<std::string> RefoldPathIdentity::ProducerPhysicalIncludePath(
 
 std::optional<std::string> RefoldPathIdentity::ProducerEnteredFileSpelling(
     const RefoldModel::IncludeItem &include) const {
-  StringRef producerSpelling = ::clang::refold::producerEnteredFileSpelling(include);
+  StringRef producerSpelling =
+      ::clang::refold::producerEnteredFileSpelling(include);
   if (producerSpelling.empty())
     return std::nullopt;
   return producerSpelling.str();
@@ -74,7 +75,8 @@ std::optional<std::string> RefoldPathIdentity::ProducerEnteredFileSpelling(
 
 bool RefoldPathIdentity::SamePhysicalIncludeFile(
     StringRef candidatePath, const RefoldModel::IncludeItem &include) const {
-  std::optional<std::string> producerPath = ProducerPhysicalIncludePath(include);
+  std::optional<std::string> producerPath =
+      ProducerPhysicalIncludePath(include);
   if (!producerPath)
     return candidatePath.empty();
 
@@ -82,7 +84,8 @@ bool RefoldPathIdentity::SamePhysicalIncludeFile(
 }
 
 bool RefoldPathIdentity::SameEnteredFileSpelling(
-    StringRef candidateSpelling, const RefoldModel::IncludeItem &include) const {
+    StringRef candidateSpelling,
+    const RefoldModel::IncludeItem &include) const {
   std::optional<std::string> producerSpelling =
       ProducerEnteredFileSpelling(include);
   if (!producerSpelling)

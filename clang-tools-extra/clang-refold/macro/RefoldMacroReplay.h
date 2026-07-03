@@ -3,10 +3,10 @@
 // Macro replay, layout, paste-spelling, whole-cover, and boundary-selection
 // helpers for clang-refold.
 //
-// The classes in this header are small macro-domain services extracted from
-// RefoldEngine and RefoldMacroPatchPlanner.  They intentionally share one file
-// pair so related replay/proof helpers live together without creating a new
-// top-level file for every narrow macro primitive.
+// The classes in this header are small macro-domain replay services used by
+// RefoldMacroPatchPlanner and its phase helpers.  They intentionally share one
+// file pair so related replay/proof helpers live together without creating a
+// new top-level file for every narrow macro primitive.
 //
 //===----------------------------------------------------------------------===//
 
@@ -36,6 +36,10 @@ namespace refold {
 class RefoldMacroTopology;
 class RefoldSourceMapper;
 
+/// Provides shared occurrence-level macro replay helpers.
+///
+/// The service recovers invocation occurrence surfaces and validates replay
+/// inputs that are independent of a specific macro-patch construction phase.
 class RefoldMacroOccurrenceReplay {
 public:
   /// Borrowed state required to replay macro formal occurrences against B.
@@ -51,6 +55,8 @@ public:
 
   explicit RefoldMacroOccurrenceReplay(Dependencies deps);
 
+  /// Return whether a proposed replacement for one formal agrees with every
+  /// directly modeled occurrence of that formal in B, including paste spans.
   bool MacroArgReplacementMatchesAllOccurrencesInB(
       const RefoldModel::MacroInvocation &m, uint32_t argIdx,
       llvm::StringRef baseArg, llvm::StringRef newArg,
@@ -60,6 +66,13 @@ public:
         OccurrenceSupportMode::CurrentInvocationOnly);
   }
 
+  /// Variant of `MacroArgReplacementMatchesAllOccurrencesInB` that
+  /// intentionally skips per-span paste validation.
+  ///
+  /// This is used when the caller performs pasted-token validation at a higher
+  /// level, such as validating that a set of argument replacements reconstructs
+  /// the entire pasted token exactly.  STANDARD occurrences and, in strict
+  /// mode, STRINGIFY occurrences are still enforced.
   bool MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
       const RefoldModel::MacroInvocation &m, uint32_t argIdx,
       llvm::StringRef baseArg, llvm::StringRef newArg,
@@ -69,6 +82,9 @@ public:
         OccurrenceSupportMode::CurrentInvocationOnly);
   }
 
+  /// Variant used by DAG semantic proof paths that can justify a replacement
+  /// through graph-supported occurrence evidence rather than only the current
+  /// invocation's direct occurrence spans.
   bool MacroArgReplacementMatchesAllOccurrencesInBIgnorePasteSemanticProof(
       const RefoldModel::MacroInvocation &m, uint32_t argIdx,
       llvm::StringRef baseArg, llvm::StringRef newArg,
@@ -78,13 +94,31 @@ public:
         OccurrenceSupportMode::AllowGraphSupport);
   }
 
+  /// Core implementation for validating whether a proposed args-only rewrite
+  /// of a macro parameter is consistent with the edited preprocessed stream B.
+  ///
+  /// Evidence comes from STANDARD spans, strict-mode STRINGIFY spans, and
+  /// optionally PASTE spans.  The method is conservative: if an occurrence
+  /// cannot be mapped or compared deterministically in the requested support
+  /// mode, the candidate is rejected rather than guessed.
   bool MacroArgReplacementMatchesAllOccurrencesInBImpl(
       const RefoldModel::MacroInvocation &m, uint32_t argIdx,
       llvm::StringRef baseArg, llvm::StringRef newArg,
       llvm::ArrayRef<diffutils::Hunk> tokenHunks, bool checkPasteSpans,
       OccurrenceSupportMode supportMode) const;
 
-  std::optional<std::pair<size_t, size_t>> GetOwnedPureInsertionBRangeForArgSpan(
+  /// Return the B-side token range owned by \p span for the pure insertion hunk
+  /// \p h.
+  ///
+  /// Converts a pure insertion from the raw hunk-local B token range into the
+  /// effective occurrence-owned B range used for argument derivation and
+  /// cross-occurrence verification.  For ordinary interior/begin/end ownership,
+  /// the owned range is the raw inserted B range.  For the exact
+  /// separator-before-right-occurrence case, the owned range is shifted so that
+  /// it excludes the shared leading separator and includes the separator that
+  /// now precedes the original occurrence in B.
+  std::optional<std::pair<size_t, size_t>>
+  GetOwnedPureInsertionBRangeForArgSpan(
       const RefoldModel::PPArgSpan &span,
       llvm::ArrayRef<RefoldModel::PPArgSpan> argSpans,
       std::pair<size_t, size_t> mappedEnv, const diffutils::Hunk &h) const;
@@ -93,6 +127,9 @@ private:
   Dependencies deps_;
 };
 
+/// Recovers source-spelled actual-argument layouts for function-like macro
+/// invocations.  The layout service preserves caller spelling and delimiter
+/// ranges needed by args-only and whole-cover replay.
 class RefoldMacroActualLayout {
 public:
   struct Dependencies {
@@ -113,26 +150,67 @@ private:
   Dependencies deps_;
 };
 
+/// Validates whole-cover macro replay proof surfaces.
+///
+/// This helper checks whether a replacement covers the complete invocation
+/// envelope and whether that envelope can be certified as a macro realization.
 class RefoldMacroWholeCoverProof {
 public:
+  /// Compute the A-token interval used for whole-cover replacement of a macro
+  /// invocation.
+  ///
+  /// This usually matches \c m.cover, but some zero-parameter function-like
+  /// macros are conservatively widened by the producer when nested in parent
+  /// arguments. In those cases, the precise replacement slice is derived from
+  /// the bounding box of \c bodySpans.
   static std::optional<std::pair<uint64_t, uint64_t>>
   GetWholeCoverATokRange(const RefoldModel::MacroInvocation &m);
 
+  /// Return true when the invocation's whole-cover replacement surface is
+  /// self-contained at the callsite.
+  ///
+  /// Whole-cover replacement is only valid when every A token in the chosen
+  /// cover interval is claimed by this invocation through its own body, arg,
+  /// stringify, or paste spans. Nested child invocations whose emitted tokens
+  /// are interleaved with parent-owned syntax are not self-contained and must
+  /// be lifted through an ancestor rather than replaced at the child callsite.
   static bool
   MacroWholeCoverIsSelfContained(const RefoldModel::MacroInvocation &m);
 };
 
+/// Builds and validates paste-spelling replay surfaces.
+///
+/// Paste spelling helpers splice argument-derived text into macro body glue
+/// without assuming that producer paste spans form a contiguous partition of
+/// the final token spelling.
 class RefoldMacroPasteSpelling {
 public:
-  static std::string SplicePasteSegmentIntoSpellingArg(
-      llvm::StringRef baseArg, llvm::StringRef oldSeg,
-      llvm::StringRef newSeg);
+  /// Splice a derived paste-segment edit into a macro argument's spelling text.
+  ///
+  /// This helper is used after paste-edit derivation determines that an edit
+  /// inside a token-pasted (`##`) output token can be attributed to a single
+  /// argument slice.  The splice is conservative: it only applies to an
+  /// unambiguous whole-argument, prefix, or suffix occurrence after trimming
+  /// edge whitespace.
+  static std::string SplicePasteSegmentIntoSpellingArg(llvm::StringRef baseArg,
+                                                       llvm::StringRef oldSeg,
+                                                       llvm::StringRef newSeg);
 
+  /// Splice a replay-derived paste edit through an exact producer slice.
+  ///
+  /// The producer has already recorded the byte range inside the original
+  /// invocation argument that supplied the paste part, so the consumer only
+  /// verifies that the range still spells `oldSeg` and then replaces exactly
+  /// that range with `newSeg`.
   static std::string SplicePasteSegmentIntoSpellingArgExact(
       llvm::StringRef baseArg, uint32_t argByteBegin, uint32_t argByteEnd,
       llvm::StringRef oldSeg, llvm::StringRef newSeg);
 };
 
+/// Selects macro replay boundaries from token and source envelopes.
+///
+/// The selector answers boundary questions used by args-only, generated, and
+/// whole-cover replay paths without owning candidate ranking or proof stamping.
 class RefoldMacroBoundarySelector {
 public:
   RefoldMacroBoundarySelector(const RefoldModel &model,
@@ -160,8 +238,8 @@ public:
   /// Selector replacement can change only tokens immediately around the old
   /// generated callee expansion, for example `STR(x)` -> `WRAP(x)` changes
   /// `"x"` into `"[" "x" "]"`.  Those prefix/suffix tokens are pure
-  /// insertions at the old owner cover boundaries, but they are macro-owned only
-  /// if a generated descendant callee came from a caller parameter.
+  /// insertions at the old owner cover boundaries, but they are macro-owned
+  /// only if a generated descendant callee came from a caller parameter.
   const RefoldModel::MacroInvocation *BoundaryGeneratedSelectorMacro(
       uint64_t aGap,
       std::optional<uint64_t> ownerIncludeId = std::nullopt) const;

@@ -10,8 +10,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "proof/RefoldOwnerStateProof.h"
-#include "proof/RefoldProofLattice.h"
 #include "proof/RefoldTheoremAudit.h"
+#include "proof/RefoldWitnessTrace.h"
 
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TokenKinds.h"
@@ -40,16 +40,9 @@ RefoldOwnerStateProof::RefoldOwnerStateProof(
     const RefoldTheoremAudit &theoremAudit,
     const RefoldTerminalProofSink &terminalSink)
     : model_(inputs.model), aToks_(inputs.aToks), lexLang_(inputs.lexLang),
-      paths_(paths), tokenText_(tokenText),
-      macroTopology_(macroTopology), theoremAudit_(theoremAudit),
-      terminalSink_(terminalSink) {}
+      paths_(paths), tokenText_(tokenText), macroTopology_(macroTopology),
+      theoremAudit_(theoremAudit), terminalSink_(terminalSink) {}
 
-
-/// Return true iff a retained raw-lexer comment token has a complete spelling.
-///
-/// The owner-state proof and expansion fallback helpers share this predicate so
-/// that extracting owner-state proof does not change which retained raw comments
-/// are considered safe trivia.
 bool rawLexerCommentTokenIsComplete(StringRef spelling) {
   if (spelling.starts_with("//"))
     return true;
@@ -83,8 +76,8 @@ static bool sourceTextIsOnlyLexerTrivia(StringRef text,
     const size_t tokenBegin = std::min<size_t>(
         token.getLocation().getRawEncoding() - baseLoc.getRawEncoding(),
         text.size());
-    const size_t tokenEnd = std::min<size_t>(tokenBegin + token.getLength(),
-                                             text.size());
+    const size_t tokenEnd =
+        std::min<size_t>(tokenBegin + token.getLength(), text.size());
     if (!rawLexerCommentTokenIsComplete(text.slice(tokenBegin, tokenEnd)))
       return false;
   }
@@ -98,9 +91,9 @@ static bool consumePragmaIdentifier(StringRef text, size_t &pos, size_t end,
   return actual == expected;
 }
 
-static bool consumeDiagnosticOptionStringLiteral(StringRef text, size_t &pos,
-                                                 size_t end,
-                                                 StringRef *spelling = nullptr) {
+static bool
+consumeDiagnosticOptionStringLiteral(StringRef text, size_t &pos, size_t end,
+                                     StringRef *spelling = nullptr) {
   stringutils::skipWsNoLF(text, pos, end);
   if (pos >= end || text[pos] != '"')
     return false;
@@ -133,8 +126,8 @@ static bool diagnosticPragmaSettingAction(StringRef action) {
 
 } // namespace
 
-bool sourceTextIsOnlyWhitespaceAndCompleteComments(
-    StringRef text, const LangOptions &lang) {
+bool sourceTextIsOnlyWhitespaceAndCompleteComments(StringRef text,
+                                                   const LangOptions &lang) {
   return sourceTextIsOnlyLexerTrivia(text, lang);
 }
 
@@ -175,8 +168,7 @@ parseDiagnosticPragmaStateDirective(StringRef text, const LangOptions &lang) {
     parsed.action = DiagnosticPragmaStateAction::Pop;
   } else if (diagnosticPragmaSettingAction(action)) {
     StringRef optionSpelling;
-    if (!consumeDiagnosticOptionStringLiteral(text, pos, end,
-                                              &optionSpelling))
+    if (!consumeDiagnosticOptionStringLiteral(text, pos, end, &optionSpelling))
       return std::nullopt;
     parsed.action = DiagnosticPragmaStateAction::Setting;
     parsed.optionSpelling = optionSpelling;
@@ -184,7 +176,8 @@ parseDiagnosticPragmaStateDirective(StringRef text, const LangOptions &lang) {
     return std::nullopt;
   }
 
-  if (!sourceTextIsOnlyWhitespaceAndCompleteComments(text.drop_front(pos), lang))
+  if (!sourceTextIsOnlyWhitespaceAndCompleteComments(text.drop_front(pos),
+                                                     lang))
     return std::nullopt;
   return parsed;
 }
@@ -195,9 +188,8 @@ bool intervalsOverlap(uint64_t beginA, uint64_t endA, uint64_t beginB,
   return beginA < endA && beginB < endB && beginA < endB && beginB < endA;
 }
 
-OwnerStateDelta
-RefoldOwnerStateProof::BuildTheoremStateDelta(const OwnerStateFacts &facts,
-                                     const OwnerStateDelta &directDelta) {
+OwnerStateDelta RefoldOwnerStateProof::BuildTheoremStateDelta(
+    const OwnerStateFacts &facts, const OwnerStateDelta &directDelta) {
   OwnerStateDelta projected;
 
   auto projectComponentFacts = [&](const OwnerStateFacts &bucket) {
@@ -268,8 +260,7 @@ RefoldOwnerStateProof::BuildTheoremStateDelta(const OwnerStateFacts &facts,
       projected.mutates.AddMacroUndefinition(identity);
       projected.exit.AddMacroUndefinition(identity);
     }
-    for (const LineControlStateIdentity &identity :
-         bucket.lineControlEvents) {
+    for (const LineControlStateIdentity &identity : bucket.lineControlEvents) {
       projected.mutates.AddLineControlEvent(identity);
       projected.exit.AddLineControlEvent(identity);
     }
@@ -319,8 +310,8 @@ bool RefoldOwnerStateProof::OwnerStateDeltaMutatesAnyState(
   return delta.mutates.MutatesAnyState() || delta.exit.MutatesAnyState();
 }
 
-OwnerObserverSummary
-RefoldOwnerStateProof::OwnerStateDeltaToObserverSummary(const OwnerStateDelta &delta) {
+OwnerObserverSummary RefoldOwnerStateProof::OwnerStateDeltaToObserverSummary(
+    const OwnerStateDelta &delta) {
   const StateObservations &observations = delta.observes;
   OwnerObserverSummary observers;
   observers.observesMacroExpansion =
@@ -386,9 +377,8 @@ RefoldOwnerStateProof::OwnerStateDeltaToObserverSummary(const OwnerStateDelta &d
   return observers;
 }
 
-
-DirectStateCheckKind
-RefoldOwnerStateProof::DirectStateCheckKindForComponent(OwnerStateComponent component) {
+DirectStateCheckKind RefoldOwnerStateProof::DirectStateCheckKindForComponent(
+    OwnerStateComponent component) {
   switch (component) {
   case OwnerStateComponent::MacroState:
   case OwnerStateComponent::DefinedOperator:
@@ -417,8 +407,8 @@ RefoldOwnerStateProof::DirectStateCheckKindForComponent(OwnerStateComponent comp
   llvm_unreachable("Invalid owner state component");
 }
 
-DirectStateCheckKind
-RefoldOwnerStateProof::DirectStateCheckKindForGraphNode(OwnerStateGraphNodeKind kind) {
+DirectStateCheckKind RefoldOwnerStateProof::DirectStateCheckKindForGraphNode(
+    OwnerStateGraphNodeKind kind) {
   switch (kind) {
   case OwnerStateGraphNodeKind::MacroDefineEvent:
     return DirectStateCheckKind::MacroDefinitionDirective;
@@ -445,8 +435,8 @@ RefoldOwnerStateProof::DirectStateCheckKindForGraphNode(OwnerStateGraphNodeKind 
   llvm_unreachable("Invalid owner state graph node kind");
 }
 
-OwnerStateComponent
-RefoldOwnerStateProof::DirectStateComponentForGraphNode(OwnerStateGraphNodeKind kind) {
+OwnerStateComponent RefoldOwnerStateProof::DirectStateComponentForGraphNode(
+    OwnerStateGraphNodeKind kind) {
   switch (kind) {
   case OwnerStateGraphNodeKind::MacroDefineEvent:
   case OwnerStateGraphNodeKind::MacroUndefEvent:
@@ -476,7 +466,7 @@ void RefoldOwnerStateProof::AuditDirectStateCheckClosure(
     DirectStateCheckClosureKind closure, StateMutationKind mutation,
     StringRef stage, StringRef detail) const {
   theoremAudit_.RecordDirectStateCheckClosure(checkKind, component, closure,
-                                           mutation, stage, detail);
+                                              mutation, stage, detail);
 }
 bool RefoldOwnerStateProof::OwnerMatchesSourceSite(
     const Owner &owner, StringRef file, std::optional<uint64_t> ownerIncludeId,
@@ -487,8 +477,8 @@ bool RefoldOwnerStateProof::OwnerMatchesSourceSite(
   if (owner.IsConditionalArm()) {
     if (!owner.condArmId)
       return false;
-    return macroTopology_.SourceRangeInsideConditionalArm(*owner.condArmId, file,
-                                           ownerIncludeId, begin, end);
+    return macroTopology_.SourceRangeInsideConditionalArm(
+        *owner.condArmId, file, ownerIncludeId, begin, end);
   }
 
   if (owner.IsConditionalGroup()) {
@@ -497,20 +487,20 @@ bool RefoldOwnerStateProof::OwnerMatchesSourceSite(
     const RefoldModel::CondGroup *group =
         model_.GetCondGroupById(*owner.condGroupId);
     return group && paths_.PathsEqual(group->file, file) &&
-           group->parentIncludeId == ownerIncludeId &&
-           group->groupB <= begin && begin <= end && end <= group->groupE;
+           group->parentIncludeId == ownerIncludeId && group->groupB <= begin &&
+           begin <= end && end <= group->groupE;
   }
 
-  const bool includeOwnerMatches =
-      owner.IsTU() ? !ownerIncludeId
-                   : (owner.includeId && ownerIncludeId &&
-                      *owner.includeId == *ownerIncludeId);
+  const bool includeOwnerMatches = owner.IsTU()
+                                       ? !ownerIncludeId
+                                       : (owner.includeId && ownerIncludeId &&
+                                          *owner.includeId == *ownerIncludeId);
   if (!includeOwnerMatches)
     return false;
 
   if (owner.condArmId) {
-    return macroTopology_.SourceRangeInsideConditionalArm(*owner.condArmId, file,
-                                           ownerIncludeId, begin, end);
+    return macroTopology_.SourceRangeInsideConditionalArm(
+        *owner.condArmId, file, ownerIncludeId, begin, end);
   }
 
   return true;
@@ -539,31 +529,29 @@ RefoldOwnerStateProof::OwnerSourceBucketKey(const Owner &owner) {
 
 std::string RefoldOwnerStateProof::OwnerStateDeltaCacheKey(const Owner &owner) {
   const uint64_t none = std::numeric_limits<uint64_t>::max();
-  return llvm::formatv("{0}:{1}:{2}:{3}:{4}:{5}:{6}:{7}",
-                       static_cast<unsigned>(owner.kind),
-                       owner.includeId.value_or(none),
-                       owner.macroInvocationId.value_or(none),
-                       owner.macroDirectiveId.value_or(none),
-                       owner.lineControlId.value_or(none),
-                       owner.pragmaId.value_or(none),
-                       owner.condGroupId.value_or(none),
-                       owner.condArmId.value_or(none))
+  return llvm::formatv(
+             "{0}:{1}:{2}:{3}:{4}:{5}:{6}:{7}",
+             static_cast<unsigned>(owner.kind), owner.includeId.value_or(none),
+             owner.macroInvocationId.value_or(none),
+             owner.macroDirectiveId.value_or(none),
+             owner.lineControlId.value_or(none), owner.pragmaId.value_or(none),
+             owner.condGroupId.value_or(none), owner.condArmId.value_or(none))
       .str();
 }
 
-bool RefoldOwnerStateProof::IsVirtualInitialMacroDirectiveSource(StringRef sitePath) {
+bool RefoldOwnerStateProof::IsVirtualInitialMacroDirectiveSource(
+    StringRef sitePath) {
   // Clang serializes its predefined macro environment as #define directives in
   // the pseudo-file "<built-in>".  Those directives seed the initial macro
   // state before any source byte in the translation unit exists; they are not
   // source-editable directive islands and cannot be ordered as suffix observers
   // after a TU/header edit boundary.  They remain available through the exact
-  // macro-directive index for owner-state accounting, but the graph builder must
-  // not manufacture ordinary source-order nodes for them.
+  // macro-directive index for owner-state accounting, but the graph builder
+  // must not manufacture ordinary source-order nodes for them.
   return sitePath == "<built-in>";
 }
 
-OwnerStateFactIndex
-RefoldOwnerStateProof::BuildOwnerStateFactIndex() const {
+OwnerStateFactIndex RefoldOwnerStateProof::BuildOwnerStateFactIndex() const {
   OwnerStateFactIndex index;
 
   for (const RefoldModel::IncludeItem &include : model_.GetIncludes()) {
@@ -665,8 +653,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
   const bool auditDirectState = theoremAudit_.IsNoLegacyAuditEnabled();
 
   auto auditDeltaFact = [&](DirectStateCheckKind checkKind,
-                            OwnerStateComponent component,
-                            StringRef detail) {
+                            OwnerStateComponent component, StringRef detail) {
     if (!auditDirectState)
       return;
     AuditDirectStateCheckClosure(
@@ -706,39 +693,39 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     return finalize();
   }
 
-  auto recordBuiltinLocationObservation = [&](
-      BuiltinLocationObservationKind kind,
-      std::optional<uint64_t> ownerIncludeId = std::nullopt,
-      std::optional<uint64_t> sourceBegin = std::nullopt,
-      std::optional<uint64_t> sourceEnd = std::nullopt,
-      std::optional<uint64_t> aTokenBegin = std::nullopt,
-      std::optional<uint64_t> aTokenEnd = std::nullopt) {
-    switch (kind) {
-    case BuiltinLocationObservationKind::LineState:
-      auditDeltaFact(DirectStateCheckKind::BuiltinLineObserver,
-                     OwnerStateComponent::LineNumber,
-                     "producer/textual __LINE__ observation");
-      break;
-    case BuiltinLocationObservationKind::FileState:
-      auditDeltaFact(DirectStateCheckKind::BuiltinFileObserver,
-                     OwnerStateComponent::FileState,
-                     "producer/textual __FILE__ observation");
-      break;
-    case BuiltinLocationObservationKind::FileNameState:
-      auditDeltaFact(DirectStateCheckKind::BuiltinFileNameObserver,
-                     OwnerStateComponent::FileName,
-                     "producer/textual __FILE_NAME__ observation");
-      break;
-    }
-    BuiltinLocationObservation observation;
-    observation.kind = kind;
-    observation.ownerIncludeId = ownerIncludeId;
-    observation.sourceBegin = sourceBegin;
-    observation.sourceEnd = sourceEnd;
-    observation.aTokenBegin = aTokenBegin;
-    observation.aTokenEnd = aTokenEnd;
-    facts.AddBuiltinLocationObservation(observation);
-  };
+  auto recordBuiltinLocationObservation =
+      [&](BuiltinLocationObservationKind kind,
+          std::optional<uint64_t> ownerIncludeId = std::nullopt,
+          std::optional<uint64_t> sourceBegin = std::nullopt,
+          std::optional<uint64_t> sourceEnd = std::nullopt,
+          std::optional<uint64_t> aTokenBegin = std::nullopt,
+          std::optional<uint64_t> aTokenEnd = std::nullopt) {
+        switch (kind) {
+        case BuiltinLocationObservationKind::LineState:
+          auditDeltaFact(DirectStateCheckKind::BuiltinLineObserver,
+                         OwnerStateComponent::LineNumber,
+                         "producer/textual __LINE__ observation");
+          break;
+        case BuiltinLocationObservationKind::FileState:
+          auditDeltaFact(DirectStateCheckKind::BuiltinFileObserver,
+                         OwnerStateComponent::FileState,
+                         "producer/textual __FILE__ observation");
+          break;
+        case BuiltinLocationObservationKind::FileNameState:
+          auditDeltaFact(DirectStateCheckKind::BuiltinFileNameObserver,
+                         OwnerStateComponent::FileName,
+                         "producer/textual __FILE_NAME__ observation");
+          break;
+        }
+        BuiltinLocationObservation observation;
+        observation.kind = kind;
+        observation.ownerIncludeId = ownerIncludeId;
+        observation.sourceBegin = sourceBegin;
+        observation.sourceEnd = sourceEnd;
+        observation.aTokenBegin = aTokenBegin;
+        observation.aTokenEnd = aTokenEnd;
+        facts.AddBuiltinLocationObservation(observation);
+      };
 
   auto scanTextForBuiltins = [&](StringRef text) {
     if (text.empty())
@@ -791,8 +778,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
                               "producer PP span extends past A-token stream");
   };
 
-  auto macroReplacementTokenFingerprint = [&](
-      ArrayRef<RefoldModel::MacroReplacementToken> tokens) -> std::string {
+  auto macroReplacementTokenFingerprint =
+      [&](ArrayRef<RefoldModel::MacroReplacementToken> tokens) -> std::string {
     std::string fingerprint;
     llvm::raw_string_ostream os(fingerprint);
     for (const RefoldModel::MacroReplacementToken &token : tokens) {
@@ -816,8 +803,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     });
   };
 
-  auto identityFromDirective = [&](
-      const RefoldModel::MacroDirective &directive) -> MacroStateIdentity {
+  auto identityFromDirective =
+      [&](const RefoldModel::MacroDirective &directive) -> MacroStateIdentity {
     MacroStateIdentity identity;
     identity.macroName = directive.name.str();
     if (directive.subkind == "#define")
@@ -832,8 +819,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     return identity;
   };
 
-  auto identityFromInvocation = [&](
-      const RefoldModel::MacroInvocation &macro) -> MacroStateIdentity {
+  auto identityFromInvocation =
+      [&](const RefoldModel::MacroInvocation &macro) -> MacroStateIdentity {
     MacroStateIdentity identity;
     identity.macroName = macro.name.str();
     identity.definitionDirectiveId = macro.definitionDirectiveId;
@@ -891,8 +878,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     return identity;
   };
 
-  auto includeStateIdentityFromInclude = [&](
-      const RefoldModel::IncludeItem &include) -> IncludeStateIdentity {
+  auto includeStateIdentityFromInclude =
+      [&](const RefoldModel::IncludeItem &include) -> IncludeStateIdentity {
     IncludeStateIdentity identity;
     identity.includeId = include.id;
     identity.directiveKind = include.subkind.str();
@@ -930,8 +917,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     return identity;
   };
 
-  auto pragmaClassificationFromText = [&](
-      StringRef text) -> PragmaStateClassification {
+  auto pragmaClassificationFromText =
+      [&](StringRef text) -> PragmaStateClassification {
     std::optional<ParsedDiagnosticPragmaStateDirective> parsed =
         parseDiagnosticPragmaStateDirective(text, lexLang_);
     if (!parsed)
@@ -946,8 +933,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     llvm_unreachable("Invalid diagnostic pragma action");
   };
 
-  auto pragmaIdentityFromPragma = [&](
-      const RefoldModel::PragmaDirective &pragma) -> PragmaStateIdentity {
+  auto pragmaIdentityFromPragma =
+      [&](const RefoldModel::PragmaDirective &pragma) -> PragmaStateIdentity {
     PragmaStateIdentity identity;
     identity.pragmaId = pragma.id;
     identity.sitePath = pragma.sitePath.str();
@@ -962,8 +949,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     return identity;
   };
 
-  auto conditionalSelectedArmCount = [](
-      const RefoldModel::CondGroup &group) -> uint64_t {
+  auto conditionalSelectedArmCount =
+      [](const RefoldModel::CondGroup &group) -> uint64_t {
     uint64_t selectedCount = 0;
     for (const RefoldModel::CondArm &arm : group.arms)
       if (arm.selected)
@@ -971,28 +958,28 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     return selectedCount;
   };
 
-  auto conditionalGroupHasUniqueSelectedArm = [&](
-      const RefoldModel::CondGroup &group) {
-    return conditionalSelectedArmCount(group) == 1;
-  };
+  auto conditionalGroupHasUniqueSelectedArm =
+      [&](const RefoldModel::CondGroup &group) {
+        return conditionalSelectedArmCount(group) == 1;
+      };
 
-  auto conditionalArmConditionWasProducerEvaluated = [](
-      const RefoldModel::CondGroup &group,
-      const RefoldModel::CondArm &queriedArm) {
-    // Only conditions reached by the producer's selected branch path are
-    // semantic observations.  For an #if/#elif/#else chain, conditions are
-    // evaluated until the selected arm is reached.  Later #elif conditions are
-    // source text, but they were not queried by the preprocessor and cannot be
-    // used as suffix-state proof.
-    bool reachedByProducer = true;
-    for (const RefoldModel::CondArm &arm : group.arms) {
-      if (arm.id == queriedArm.id)
-        return reachedByProducer && arm.cond.has_value();
-      if (arm.selected)
-        reachedByProducer = false;
-    }
-    return false;
-  };
+  auto conditionalArmConditionWasProducerEvaluated =
+      [](const RefoldModel::CondGroup &group,
+         const RefoldModel::CondArm &queriedArm) {
+        // Only conditions reached by the producer's selected branch path are
+        // semantic observations.  For an #if/#elif/#else chain, conditions are
+        // evaluated until the selected arm is reached.  Later #elif conditions
+        // are source text, but they were not queried by the preprocessor and
+        // cannot be used as suffix-state proof.
+        bool reachedByProducer = true;
+        for (const RefoldModel::CondArm &arm : group.arms) {
+          if (arm.id == queriedArm.id)
+            return reachedByProducer && arm.cond.has_value();
+          if (arm.selected)
+            reachedByProducer = false;
+        }
+        return false;
+      };
 
   auto conditionalArmSelectionTruthProducerProven =
       [&](const RefoldModel::CondGroup &group,
@@ -1056,7 +1043,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
                        "producer __COUNTER__ invocation events");
 
         uint64_t ordinal = 0;
-        for (const auto &range : macroTopology_.CounterOutputRangesForInvocation(macro)) {
+        for (const auto &range :
+             macroTopology_.CounterOutputRangesForInvocation(macro)) {
           facts.AddCounterEvent(macroTopology_.BuildCounterEventIdentity(
               macro, ordinal++, range.first, range.second));
         }
@@ -1532,8 +1520,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
       if (!pragmaOwnerIncludeId) {
         // The index uses this same recovery to choose the bucket.  Recompute
         // the value here only for the final OwnerMatchesSourceSite() proof
-        // predicate so the delta semantics stay byte-for-byte equivalent to the
-        // old scan.
+        // predicate so the delta semantics match the canonical owner-site
+        // recovery.
         for (const RefoldModel::Segment &segment :
              model_.GetSegmentsForFile(pragma->sitePath)) {
           if (segment.b <= pragma->siteB && pragma->siteE <= segment.e) {
@@ -1609,8 +1597,8 @@ bool RefoldOwnerStateProof::OwnerObserverSummaryObservesComponent(
   llvm_unreachable("Invalid owner state component");
 }
 
-SuffixObservationKind
-RefoldOwnerStateProof::ObservationKindForComponent(OwnerStateComponent component) {
+SuffixObservationKind RefoldOwnerStateProof::ObservationKindForComponent(
+    OwnerStateComponent component) {
   switch (component) {
   case OwnerStateComponent::MacroState:
     return SuffixObservationKind::MacroExpansionObservation;
@@ -1672,8 +1660,7 @@ ArrayRef<uint64_t> RefoldOwnerStateProof::ObserverSiteIndexesForComponent(
   llvm_unreachable("Invalid owner state component");
 }
 
-OwnerStateGraph
-RefoldOwnerStateProof::BuildOwnerStateGraph() const {
+OwnerStateGraph RefoldOwnerStateProof::BuildOwnerStateGraph() const {
   OwnerStateGraph graph;
   const bool auditDirectState = theoremAudit_.IsNoLegacyAuditEnabled();
 
@@ -1693,10 +1680,9 @@ RefoldOwnerStateProof::BuildOwnerStateGraph() const {
     return OwnerTokenRange::From(begin, end);
   };
 
-  auto segmentOwnerForRange = [&](StringRef file, uint64_t begin,
-                                  uint64_t end)
-      -> std::optional<std::pair<std::optional<uint64_t>,
-                                 std::optional<uint64_t>>> {
+  auto segmentOwnerForRange = [&](StringRef file, uint64_t begin, uint64_t end)
+      -> std::optional<
+          std::pair<std::optional<uint64_t>, std::optional<uint64_t>>> {
     ArrayRef<RefoldModel::Segment> segments = model_.GetSegmentsForFile(file);
     if (segments.empty())
       return std::nullopt;
@@ -1731,16 +1717,15 @@ RefoldOwnerStateProof::BuildOwnerStateGraph() const {
     return std::make_pair(includeId, condArmId);
   };
 
-  auto enclosingCondArmId = [&](StringRef file,
-                                std::optional<uint64_t> ownerIncludeId,
-                                uint64_t begin,
-                                uint64_t end) -> std::optional<uint64_t> {
+  auto enclosingCondArmId =
+      [&](StringRef file, std::optional<uint64_t> ownerIncludeId,
+          uint64_t begin, uint64_t end) -> std::optional<uint64_t> {
     const std::optional<RefoldModel::ArmRef> armRef =
         model_.FindArmRefForByte(file, ownerIncludeId, begin);
     if (!armRef || !armRef->arm)
       return std::nullopt;
-    if (!macroTopology_.SourceRangeInsideConditionalArm(armRef->arm->id, file,
-                                         ownerIncludeId, begin, end))
+    if (!macroTopology_.SourceRangeInsideConditionalArm(
+            armRef->arm->id, file, ownerIncludeId, begin, end))
       return std::nullopt;
     return armRef->arm->id;
   };
@@ -1750,10 +1735,10 @@ RefoldOwnerStateProof::BuildOwnerStateGraph() const {
                      StringRef detail) {
     // is a census, not an admission gate.  Unknown or source-less
     // owners cannot be ordered against a source boundary.  Token-only ordinary
-    // owners may still be added by later proof passes, but the current producer map
-    // gives every directive/event node a source anchor, so missing source facts
-    // are represented by the component-specific missing-state markers instead
-    // of manufacturing a false order.
+    // owners may still be added by later proof passes, but the current producer
+    // map gives every directive/event node a source anchor, so missing source
+    // facts are represented by the component-specific missing-state markers
+    // instead of manufacturing a false order.
     if (!owner.IsKnown() || !source.IsComplete())
       return;
 
@@ -1863,19 +1848,19 @@ RefoldOwnerStateProof::BuildOwnerStateGraph() const {
   for (const RefoldModel::PragmaDirective &pragma : model_.GetPragmas()) {
     std::optional<uint64_t> ownerIncludeId = pragma.ownerIncludeId;
     std::optional<uint64_t> condArmId;
-    if (auto owner = segmentOwnerForRange(pragma.sitePath, pragma.siteB,
-                                          pragma.siteE)) {
+    if (auto owner =
+            segmentOwnerForRange(pragma.sitePath, pragma.siteB, pragma.siteE)) {
       if (!ownerIncludeId)
         ownerIncludeId = owner->first;
       condArmId = owner->second;
     }
     if (!condArmId)
       condArmId = enclosingCondArmId(pragma.sitePath, ownerIncludeId,
-                                    pragma.siteB, pragma.siteE);
+                                     pragma.siteB, pragma.siteE);
     addNode(OwnerStateGraphNodeKind::PragmaEvent,
             Owner::PragmaIsland(pragma.id, condArmId),
-            OwnerSourceRange::From(pragma.sitePath, pragma.siteB,
-                                   pragma.siteE, ownerIncludeId),
+            OwnerSourceRange::From(pragma.sitePath, pragma.siteB, pragma.siteE,
+                                   ownerIncludeId),
             OwnerTokenRange::From(0, 0),
             formatv("pragma event {0}", pragma.id).str());
   }
@@ -1920,14 +1905,12 @@ RefoldOwnerStateProof::BuildOwnerStateGraph() const {
       -> std::tuple<unsigned, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                     uint64_t, uint64_t> {
     const uint64_t none = std::numeric_limits<uint64_t>::max();
-    return std::make_tuple(static_cast<unsigned>(owner.kind),
-                           owner.includeId.value_or(none),
-                           owner.macroInvocationId.value_or(none),
-                           owner.macroDirectiveId.value_or(none),
-                           owner.lineControlId.value_or(none),
-                           owner.pragmaId.value_or(none),
-                           owner.condGroupId.value_or(none),
-                           owner.condArmId.value_or(none));
+    return std::make_tuple(
+        static_cast<unsigned>(owner.kind), owner.includeId.value_or(none),
+        owner.macroInvocationId.value_or(none),
+        owner.macroDirectiveId.value_or(none),
+        owner.lineControlId.value_or(none), owner.pragmaId.value_or(none),
+        owner.condGroupId.value_or(none), owner.condArmId.value_or(none));
   };
 
   auto sourceDomainKey = [](const OwnerSourceRange &source)
@@ -2082,8 +2065,7 @@ RefoldOwnerStateProof::BuildOwnerStateGraph() const {
       appendUniqueIndex(graph.observerIndex.includeStateObservers, siteIndex);
       return;
     case OwnerStateComponent::UnmodeledState:
-      appendUniqueIndex(graph.observerIndex.unmodeledStateObservers,
-                        siteIndex);
+      appendUniqueIndex(graph.observerIndex.unmodeledStateObservers, siteIndex);
       return;
     case OwnerStateComponent::Unknown:
       return;
@@ -2333,26 +2315,25 @@ RefoldOwnerStateProof::BuildOwnerStateGraph() const {
   return graph;
 }
 
-const OwnerStateGraph &
-RefoldOwnerStateProof::GetOwnerStateGraph() const {
+const OwnerStateGraph &RefoldOwnerStateProof::GetOwnerStateGraph() const {
   if (!ownerStateGraphCache_) {
     ownerStateGraphCache_ = BuildOwnerStateGraph();
     const OwnerStateGraphAuditStats &audit = ownerStateGraphCache_->audit;
     theoremAudit_.RecordOwnerStateGraphAudit(audit);
     REFOLD_LOG_TRACE("state/graph",
-          "owner-state graph: nodes={0} zeroTokenStateNodes={1} "
-          "observedComponents={2} mutatedComponents={3} "
-          "incomparableNodes={4} missingProducerFacts={5}",
-          audit.ownerNodes, audit.zeroTokenStateNodes,
-          audit.observedStateComponents, audit.mutatedStateComponents,
-          audit.incomparableNodes, audit.missingProducerFacts);
+                     "owner-state graph: nodes={0} zeroTokenStateNodes={1} "
+                     "observedComponents={2} mutatedComponents={3} "
+                     "incomparableNodes={4} missingProducerFacts={5}",
+                     audit.ownerNodes, audit.zeroTokenStateNodes,
+                     audit.observedStateComponents,
+                     audit.mutatedStateComponents, audit.incomparableNodes,
+                     audit.missingProducerFacts);
   }
   return *ownerStateGraphCache_;
 }
 
-SuffixObserverQueryResult
-RefoldOwnerStateProof::FindSuffixObservers(const OwnerStateBoundary &boundary,
-                                  OwnerStateComponent component) const {
+SuffixObserverQueryResult RefoldOwnerStateProof::FindSuffixObservers(
+    const OwnerStateBoundary &boundary, OwnerStateComponent component) const {
   SuffixObserverQueryResult result;
   if (component == OwnerStateComponent::Unknown)
     return result;
@@ -2363,7 +2344,8 @@ RefoldOwnerStateProof::FindSuffixObservers(const OwnerStateBoundary &boundary,
 
   auto sourceComparable = [&](const OwnerSourceRange &site) -> bool {
     return boundary.hasSourceBoundary && boundary.source.HasPath() &&
-           site.HasPath() && paths_.PathsEqual(boundary.source.path, site.path) &&
+           site.HasPath() &&
+           paths_.PathsEqual(boundary.source.path, site.path) &&
            boundary.source.includeId == site.includeId;
   };
 
@@ -2466,8 +2448,8 @@ RefoldOwnerStateProof::FindSuffixObservers(const OwnerStateBoundary &boundary,
   return result;
 }
 
-OwnerStateComponent
-RefoldOwnerStateProof::StateComponentForMissingStateFact(MissingStateFactKind kind) {
+OwnerStateComponent RefoldOwnerStateProof::StateComponentForMissingStateFact(
+    MissingStateFactKind kind) {
   switch (kind) {
   case MissingStateFactKind::MissingMacroFacts:
     return OwnerStateComponent::MacroState;
@@ -2488,8 +2470,8 @@ RefoldOwnerStateProof::StateComponentForMissingStateFact(MissingStateFactKind ki
 }
 
 TerminalFallbackProofFailure
-RefoldOwnerStateProof::MissingStateFactTerminalFailure(MissingStateFactKind kind,
-                                              StringRef detail) {
+RefoldOwnerStateProof::MissingStateFactTerminalFailure(
+    MissingStateFactKind kind, StringRef detail) {
   TerminalFallbackProofFailure failure =
       SuffixStabilityTerminalFailureForComponent(
           StateComponentForMissingStateFact(kind));
@@ -2644,9 +2626,8 @@ RefoldOwnerStateProof::BuildReverseSolvedDirectiveTerminalWitness(
   TerminalStateFailureWitness witness;
   witness.component = component;
   witness.boundary = boundary;
-  witness.failure =
-      ReverseSolvedDirectiveTerminalFailure(component, boundary, directiveKind,
-                                            detail);
+  witness.failure = ReverseSolvedDirectiveTerminalFailure(
+      component, boundary, directiveKind, detail);
   witness.hasFailure = true;
   witness.detail = detail.str();
   return SuffixStabilityWitness::From(std::move(witness));
@@ -2707,15 +2688,14 @@ RefoldOwnerStateProof::CheckStateTransitionAcrossEditBoundary(
   size_t observerCount = 0;
 
   auto finalizeGatewayResult = [&]() -> StateTransitionProof {
-    // removes the compatibility scalar result.  The typed proof is now
-    // the gateway result: it records the accepted suffix witness, separates the
+    // The typed proof is the gateway result: it records the accepted suffix
+    // witness, separates the
     // closure-widening subset for theorem consumers, and records a terminal
     // failure only when the gateway actually failed closed.
     if (acceptedWitness.kind != SuffixStabilityWitnessKind::None) {
       if (proof.suffixWitnesses.empty())
         proof.suffixWitnesses.push_back(acceptedWitness);
-      if (acceptedWitness.kind ==
-              SuffixStabilityWitnessKind::ClosureWidening &&
+      if (acceptedWitness.kind == SuffixStabilityWitnessKind::ClosureWidening &&
           acceptedWitness.closureWidening && proof.wideningWitnesses.empty())
         proof.wideningWitnesses.push_back(*acceptedWitness.closureWidening);
     }
@@ -2736,7 +2716,8 @@ RefoldOwnerStateProof::CheckStateTransitionAcrossEditBoundary(
                              std::string message) {
     proof.failure = failure;
     theoremAudit_.RecordStateTransitionGatewayTerminalFailure();
-    if (!theoremAudit_.AuditTerminalFallbackProofFailure(failure, request.stage))
+    if (!theoremAudit_.AuditTerminalFallbackProofFailure(failure,
+                                                         request.stage))
       noteGatewayViolation("terminal state failure lacked a classified "
                            "component-specific obligation");
     if (auditDirectState)
@@ -2745,7 +2726,8 @@ RefoldOwnerStateProof::CheckStateTransitionAcrossEditBoundary(
           request.component,
           DirectStateCheckClosureKind::TerminalFallbackProofFailure,
           request.mutation, request.stage, message);
-    terminalSink_.RequestTerminalFallback(std::move(failure), request.stage, message);
+    terminalSink_.RequestTerminalFallback(std::move(failure), request.stage,
+                                          message);
     return finalizeGatewayResult();
   };
 
@@ -2782,24 +2764,25 @@ RefoldOwnerStateProof::CheckStateTransitionAcrossEditBoundary(
     if (request.directiveClosureStatus !=
         DirectiveClosureStatus::DirectiveOwnerInsideAcceptedClosure) {
       return requestTerminal(
-          ReverseSolvedDirectiveTerminalFailure(
-              request.component, request.boundary, directiveLabel,
-              request.detail),
+          ReverseSolvedDirectiveTerminalFailure(request.component,
+                                                request.boundary,
+                                                directiveLabel, request.detail),
           llvm::formatv("state-transition gateway rejected reverse-solved "
                         "directive rewrite: component={0} mutation={1} "
                         "directive={2} closureStatus={3} stage={4} detail={5}",
-                        request.component, request.mutation,
-                        directiveLabel, request.directiveClosureStatus,
-                        request.stage, request.detail)
+                        request.component, request.mutation, directiveLabel,
+                        request.directiveClosureStatus, request.stage,
+                        request.detail)
               .str());
     }
 
-    REFOLD_LOG_TRACE("state/gateway",
-          "state-transition gateway accepted directive-closure proof before "
-          "suffix query: component={0} mutation={1} directive={2} stage={3} "
-          "detail={4}",
-          request.component, request.mutation, directiveLabel, request.stage,
-          request.detail);
+    REFOLD_LOG_TRACE(
+        "state/gateway",
+        "state-transition gateway accepted directive-closure proof before "
+        "suffix query: component={0} mutation={1} directive={2} stage={3} "
+        "detail={4}",
+        request.component, request.mutation, directiveLabel, request.stage,
+        request.detail);
   }
 
   const SuffixObserverQueryResult observers =
@@ -2816,10 +2799,11 @@ RefoldOwnerStateProof::CheckStateTransitionAcrossEditBoundary(
       witness.boundary = request.boundary;
       witness.detail = request.detail;
       acceptedWitness = SuffixStabilityWitness::From(std::move(witness));
-      REFOLD_LOG_TRACE("state/gateway",
-            "state-transition gateway discharged: component={0} "
-            "mutation={1} no preserved suffix observer stage={2} detail={3}",
-            request.component, request.mutation, request.stage, request.detail);
+      REFOLD_LOG_TRACE(
+          "state/gateway",
+          "state-transition gateway discharged: component={0} "
+          "mutation={1} no preserved suffix observer stage={2} detail={3}",
+          request.component, request.mutation, request.stage, request.detail);
       return finalizeGatewayResult();
     }
 
@@ -2897,14 +2881,14 @@ RefoldOwnerStateProof::CheckStateTransitionAcrossEditBoundary(
     attachFirstObserverToWitness();
     theoremAudit_.RecordStateTransitionGatewayStable();
     acceptedWitness = std::move(normalizedWitness);
-    REFOLD_LOG_TRACE("state/gateway",
-          "state-transition gateway discharged: component={0} mutation={1} "
-          "witness={2} orderedObservers={3} incomparable={4} stage={5} "
-          "detail={6}",
-          request.component, request.mutation,
-          acceptedWitness.kind, static_cast<uint64_t>(observerCount),
-          hasIncomparableObserver ? "YES" : "NO", request.stage,
-          request.detail);
+    REFOLD_LOG_TRACE(
+        "state/gateway",
+        "state-transition gateway discharged: component={0} mutation={1} "
+        "witness={2} orderedObservers={3} incomparable={4} stage={5} "
+        "detail={6}",
+        request.component, request.mutation, acceptedWitness.kind,
+        static_cast<uint64_t>(observerCount),
+        hasIncomparableObserver ? "YES" : "NO", request.stage, request.detail);
     return finalizeGatewayResult();
 
   case SuffixStabilityWitnessKind::TerminalStateFailure: {
@@ -2996,11 +2980,9 @@ RefoldOwnerStateProof::CheckStateTransitionAcrossEditBoundary(
   return CheckStateTransitionAcrossEditBoundary(request);
 }
 
-SuffixStabilityWitness
-RefoldOwnerStateProof::BuildStateTransitionWitness(SuffixStabilityWitnessKind kind,
-                                          OwnerStateComponent component,
-                                          const OwnerStateBoundary &boundary,
-                                          StringRef detail) {
+SuffixStabilityWitness RefoldOwnerStateProof::BuildStateTransitionWitness(
+    SuffixStabilityWitnessKind kind, OwnerStateComponent component,
+    const OwnerStateBoundary &boundary, StringRef detail) {
   switch (kind) {
   case SuffixStabilityWitnessKind::StateRepair: {
     StateRepairWitness witness;
@@ -3046,8 +3028,8 @@ RefoldOwnerStateProof::BuildStateTransitionWitness(SuffixStabilityWitnessKind ki
   llvm_unreachable("invalid state-transition witness kind");
 }
 
-OwnerStateBoundary
-RefoldOwnerStateProof::CounterStateBoundaryForEvent(const CounterEventIdentity &event) {
+OwnerStateBoundary RefoldOwnerStateProof::CounterStateBoundaryForEvent(
+    const CounterEventIdentity &event) {
   OwnerTokenRange tokens =
       OwnerTokenRange::From(event.aTokenBegin, event.aTokenEnd);
 
@@ -3063,8 +3045,8 @@ RefoldOwnerStateProof::CounterStateBoundaryForEvent(const CounterEventIdentity &
   return OwnerStateBoundary::FromATokens(tokens);
 }
 
-std::string
-RefoldOwnerStateProof::FormatCounterEventForWitness(const CounterEventIdentity &event) {
+std::string RefoldOwnerStateProof::FormatCounterEventForWitness(
+    const CounterEventIdentity &event) {
   return llvm::formatv("counter_event:macro={0}:ordinal={1}:owner_include={2}:"
                        "caller={3}:A=[{4},{5}):AValue={6}:expectedB={7}:"
                        "site_file={8}:site=[{9},{10}):literalizable={11}:"
@@ -3077,13 +3059,15 @@ RefoldOwnerStateProof::FormatCounterEventForWitness(const CounterEventIdentity &
                            ? llvm::formatv("{0}", *event.callerMacroId).str()
                            : std::string("none"),
                        event.aTokenBegin, event.aTokenEnd,
-                       RefoldProofLattice::FormatWitnessTraceHash(event.aValue),
+                       RefoldWitnessTrace::FormatWitnessTraceHash(event.aValue),
                        event.expectedBValue
-                           ? RefoldProofLattice::FormatWitnessTraceHash(*event.expectedBValue)
+                           ? RefoldWitnessTrace::FormatWitnessTraceHash(
+                                 *event.expectedBValue)
                            : std::string("none"),
                        event.expansionSiteFile.empty()
                            ? std::string("none")
-                           : RefoldProofLattice::FormatWitnessTraceHash(event.expansionSiteFile),
+                           : RefoldWitnessTrace::FormatWitnessTraceHash(
+                                 event.expansionSiteFile),
                        event.expansionSiteBegin.value_or(0),
                        event.expansionSiteEnd.value_or(0),
                        event.canStabilizeByLiteralization ? 1 : 0,
@@ -3153,16 +3137,13 @@ std::string RefoldOwnerStateProof::FormatBuiltinLocationObservationForWitness(
       .str();
 }
 
-OwnerStateBoundary
-RefoldOwnerStateProof::IncludeStateBoundaryForIncludeSite(
+OwnerStateBoundary RefoldOwnerStateProof::IncludeStateBoundaryForIncludeSite(
     const RefoldModel::IncludeItem &include) {
   return OwnerStateBoundary::FromSourceAndATokens(
       OwnerSourceRange::From(include.sitePath, include.siteB, include.siteE,
                              include.parent),
       OwnerTokenRange::From(include.cover.begin, include.cover.end));
 }
-
-
 
 } // namespace refold
 } // namespace clang

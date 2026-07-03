@@ -7,8 +7,8 @@
 // directive text in the raw preprocessed replay stream even though the ordinary
 // PP-token model has deliberately removed those tokens before structural
 // diffing.  This module owns the proof objects, pure replay helpers, and shared
-// validation reporter that binds such source-side pragma edits to explicit raw-B
-// byte witnesses.
+// validation reporter that binds such source-side pragma edits to explicit
+// raw-B byte witnesses.
 //
 // Callers remain responsible for edit emission, line-resync application,
 // and accepted-result attachment.  Terminal-fallback requests for failed
@@ -123,9 +123,7 @@ public:
   bool IsValid() const { return begin <= end; }
 
   /// Return the owner-local source byte range carried by this proof.
-  std::pair<uint64_t, uint64_t> SourceByteRange() const {
-    return {begin, end};
-  }
+  std::pair<uint64_t, uint64_t> SourceByteRange() const { return {begin, end}; }
 
   /// Return true when the proof targets a concrete include owner.
   bool HasConcreteIncludeOwner() const { return ownerIncludeId.has_value(); }
@@ -138,9 +136,10 @@ public:
   /// Return true when the next source atom is on the same owner-local surface
   /// and is ordered after the current source proof.  The caller remains
   /// responsible for proving that the intervening bytes are whitespace-only.
-  bool CanExtendThroughSourceAtom(
-      StringRef nextPath, uint64_t nextBegin, uint64_t nextEnd,
-      std::optional<uint64_t> nextOwnerIncludeId) const {
+  bool
+  CanExtendThroughSourceAtom(StringRef nextPath, uint64_t nextBegin,
+                             uint64_t nextEnd,
+                             std::optional<uint64_t> nextOwnerIncludeId) const {
     return IsValid() && StringRef(path) == nextPath &&
            ownerIncludeId == nextOwnerIncludeId && end <= nextBegin &&
            nextBegin <= nextEnd;
@@ -165,9 +164,7 @@ public:
     return begin <= end && end <= ownerSize;
   }
 
-  bool HasClosureProof() const {
-    return closureKind != ClosureKind::Unknown;
-  }
+  bool HasClosureProof() const { return closureKind != ClosureKind::Unknown; }
 
   /// Return true when the proof is exactly a zero-width insertion site.
   ///
@@ -319,9 +316,7 @@ public:
 
   /// Return the emitted replacement-text length carried by this sideband
   /// proof.
-  uint64_t ReplacementTextSize() const {
-    return replay.ReplacementTextSize();
-  }
+  uint64_t ReplacementTextSize() const { return replay.ReplacementTextSize(); }
 
   /// Return true when the B replay proof owns trailing blank-line material
   /// after the visible sideband line.
@@ -380,25 +375,24 @@ public:
   }
 };
 
-
 /// Return an implementation-local validation failure for a complete sideband
-/// proof, or std::nullopt when the proof is structurally valid for the B buffer.
+/// proof, or std::nullopt when the proof is structurally valid for the B
+/// buffer.
 ///
 /// This helper is intentionally side-effect free: it checks the source closure
 /// proof and B replay envelope without mutating the terminal fallback ledger.
 std::optional<StringRef>
-validateSidebandPragmaEditProof(const SidebandPragmaEdit &edit,
-                                uint64_t bSize);
+validateSidebandPragmaEditProof(const SidebandPragmaEdit &edit, uint64_t bSize);
 
 /// Validate one sideband pragma proof and report a classified terminal fallback
 /// request when validation fails.
 ///
 /// This is the shared fail-closed reporting gate for TU and include-owned
-/// sideband edits.  Keeping the predicate above pure and the failure translation
-/// here prevents each caller from hand-encoding the same terminal-fallback
-/// obligation, reason, and diagnostic detail.  `traceSuccess` preserves the
-/// engine-level owner-local trace without forcing include materialization to add
-/// new success logs.
+/// sideband edits.  Keeping the predicate above pure and the failure
+/// translation here prevents each caller from hand-encoding the same
+/// terminal-fallback obligation, reason, and diagnostic detail.  `traceSuccess`
+/// preserves the engine-level owner-local trace without forcing include
+/// materialization to add new success logs.
 bool validateAndReportSidebandPragmaEditProof(
     const SidebandPragmaEdit &edit, uint64_t bSize,
     const RefoldTerminalProofSink &terminalSink, llvm::StringRef stage,
@@ -408,9 +402,9 @@ bool validateAndReportSidebandPragmaEditProof(
 /// those bytes are owned by separate, non-insertion sideband source edits.
 ///
 /// B-only sideband insertions may be carried by the surrounding ordinary
-/// insertion island.  Sideband replacements/deletions have their own source edit
-/// and must be removed from the ordinary replay payload to avoid duplicating the
-/// emitted pragma text.
+/// insertion island.  Sideband replacements/deletions have their own source
+/// edit and must be removed from the ordinary replay payload to avoid
+/// duplicating the emitted pragma text.
 std::string stripSeparatelyOwnedSidebandReplay(
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits, StringRef replayText,
     std::optional<uint64_t> replayBByteBegin,
@@ -419,9 +413,9 @@ std::string stripSeparatelyOwnedSidebandReplay(
 /// Return the union of B-byte envelopes contributed by sideband pragma edits
 /// owned by one materialized include.
 ///
-/// The helper is a pure proof-envelope query: it validates each candidate replay
-/// range against the B buffer size and returns std::nullopt when no complete
-/// sideband witness exists for the include.
+/// The helper is a pure proof-envelope query: it validates each candidate
+/// replay range against the B buffer size and returns std::nullopt when no
+/// complete sideband witness exists for the include.
 std::optional<std::pair<uint64_t, uint64_t>>
 sidebandPragmaMaterializedBByteRangeForInclude(
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits, uint64_t includeId,

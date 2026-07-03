@@ -21,7 +21,7 @@
 //     the owner-aware LCS objective and then suppresses/restores ambiguous
 //     anchors using provenance certificates.
 //   • hunksFromMap: convert an A→B map into ordered edit hunks between anchors.
-//   • myersDiff / coalesce: produce SES steps (EQUAL/INSERT/DELETE) and merge
+//   • diff / coalesce: produce SES steps (EQUAL/INSERT/DELETE) and merge
 //     adjacent non-EQUAL runs into hunks.
 //
 // Determinism & Policy
@@ -35,7 +35,7 @@
 // Complexity
 // ----------
 //   • LCS:      time O(N*M); DP uses O(N*M) space, Hirschberg uses O(N+M).
-//   • Myers:    expected time O((N+M)*D), space O(N+M).
+//   • diff:     expected time O((N+M)*D), space O(N+M).
 //   • Hunking:  O(N) over the alignment/map.
 //
 // Public Surface
@@ -43,12 +43,12 @@
 //   • std::vector<int64_t> lcsMapAB(...):
 //       A[i] -> B[j] (j >= 0) or -1; owner-aware/provenance-certified when
 //       structured gap profiles are supplied.
-//   • std::vector<Hunk> hunksFromMap(const std::vector<int>& map,
+//   • std::vector<Hunk> hunksFromMap(ArrayRef<int64_t> map,
 //                                    size_t nA, size_t nB):
 //       contiguous edit regions between anchors, half-open indices.
-//   • std::vector<Step> myersDiff(const Seq& A, const Seq& B):
+//   • std::vector<Step> diff(ArrayRef<StringRef> A, ArrayRef<StringRef> B):
 //       shortest edit script (EQUAL/INSERT/DELETE).
-//   • std::vector<Hunk> coalesce(const std::vector<Step>& steps):
+//   • std::vector<Hunk> coalesce(ArrayRef<Step> steps):
 //       merges non-EQUAL runs into larger hunks.
 //
 // Notes
@@ -240,7 +240,6 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 
 // ========================== LCS alignment utilities ==========================
 
-
 /// \brief Structured provenance for one A-side token gap used by LCS.
 ///
 /// `ownerDepthGap` intentionally collapses nested ownership into one scalar.
@@ -273,14 +272,14 @@ struct LcsAGapProvenance {
   uint32_t rightMacroRoleMask = 0;
 };
 
-
 /// \brief Edited-side structural surface for one B-side token gap.
 ///
 /// `LcsAGapProvenance` describes where an A-side gap came from in the original
 /// preprocessor provenance graph. B-side gap provenance describes the edited
 /// insertion island's structural surface: line affinity and whitespace/newline
 /// shape around adjacent tokens. It deliberately does not include neighboring
-/// token spellings, so using it is not the removed neighbor-coherence heuristic.
+/// token spellings, so using it is not the removed neighbor-coherence
+/// heuristic.
 struct LcsBGapProvenance {
   static constexpr uint64_t noOffset = std::numeric_limits<uint64_t>::max();
 
@@ -330,7 +329,8 @@ struct LcsBGapProvenance {
 /// - **DP Path:** Used for small-to-medium sequences where the product of
 ///   lengths is less than \p maxCells. Employs a cost-model-augmented
 ///   Dynamic Programming approach.
-/// - **Hirschberg Fallback:** If \p maxCells is exceeded, the algorithm switches
+/// - **Hirschberg Fallback:** If \p maxCells is exceeded, the algorithm
+/// switches
 ///   to Hirschberg recursion (exact) using O(N+M) space.
 ///
 /// ### Complexity

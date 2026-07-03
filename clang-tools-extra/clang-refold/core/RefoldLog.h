@@ -86,7 +86,7 @@
   do {                                                                         \
     if (::clang::refold::inFatalMode())                                        \
       ::clang::refold::fatal(__VA_ARGS__);                                     \
-    llvm_unreachable("fatal logging unexpectedly disabled");                  \
+    llvm_unreachable("fatal logging unexpectedly disabled");                   \
   } while (false)
 #endif
 
@@ -148,8 +148,7 @@ template <typename T> struct format_provider<std::optional<T>, void> {
 using namespace clang::refold::diffutils;
 
 // Detector for class/structs with a `ToString()` member function.
-template <typename T, typename = void>
-struct HasToString : std::false_type {};
+template <typename T, typename = void> struct HasToString : std::false_type {};
 
 template <typename T>
 struct HasToString<T, std::void_t<decltype(std::declval<T>().ToString())>>
@@ -388,7 +387,7 @@ void logFormattedArray(ArrayRef<T> array, size_t k, bool sameWidth,
     const size_t rowEnd = std::min(i + columnsPerRow - 1, length - 1);
 
     std::string line;
-    line.reserve(k + 16);  // Add an extra cushion of space.
+    line.reserve(k + 16); // Add an extra cushion of space.
 
     line += stringutils::zpadUnsigned(i, indexDigits);
     line += "-";

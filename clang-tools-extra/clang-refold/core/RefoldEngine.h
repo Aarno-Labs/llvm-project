@@ -80,8 +80,8 @@
 //     text.
 //   • Refold(): runs the single engine instance.
 //   • The remaining declarations are orchestration seams between the engine and
-//     extracted proof/planning services; carrier definitions live in focused
-//     subsystem headers rather than in RefoldEngine.h.
+//     proof/planning services; carrier definitions live in focused subsystem
+//     headers rather than in RefoldEngine.h.
 //
 // Notes
 // -----
@@ -109,12 +109,9 @@
 #include "macro/RefoldMacroTopology.h"
 #include "proof/RefoldAcceptedResultTypes.h"
 #include "proof/RefoldOwnerStateTypes.h"
-#include "proof/RefoldProofTypes.h"
+#include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldSidebandReplayProof.h"
-#include "proof/RefoldTerminalProof.h"
-#include "proof/RefoldTerminalProofSink.h"
 #include "proof/RefoldTheoremAudit.h"
-#include "proof/RefoldWitnessTypes.h"
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/RefoldTokenTextAnalysis.h"
@@ -238,7 +235,6 @@ class RefoldTUEditPlanner;
 /// \author jeikenberry
 class RefoldEngine {
 public:
-
   /// \brief Perform the end-to-end refolding process for a translation unit.
   ///
   /// This method takes the original preprocessed text *A* (e.g. `test.c.i`),
@@ -280,22 +276,20 @@ public:
   ///                  this path, not the producer TU path, as their direct
   ///                  quoted-lookup surface.
   /// \returns          The refolded, partially expanded C source.
-  static Expected<std::string>
-  Refold(const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
-         ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
-         ArrayRef<size_t> bTokOff, bool noLines, bool strict,
-         ProofAuditMode proofAuditMode = ProofAuditMode::Default,
-         StringRef finalOutputPath = StringRef(),
-         ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits = {},
-         std::vector<MaterializedEditMapping> *materializedEditMappings =
-             nullptr,
-         FinalLineControlValidationCallback finalLineControlValidationCallback =
-             FinalLineControlValidationCallback(),
-         std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr);
+  static Expected<std::string> Refold(
+      const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
+      ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
+      ArrayRef<size_t> bTokOff, bool noLines, bool strict,
+      ProofAuditMode proofAuditMode = ProofAuditMode::Default,
+      StringRef finalOutputPath = StringRef(),
+      ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits = {},
+      std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr,
+      FinalLineControlValidationCallback finalLineControlValidationCallback =
+          FinalLineControlValidationCallback(),
+      std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr);
 
   /// Build lexer language options from the producer-captured language name.
   static clang::LangOptions MakeLexLangOptions(llvm::StringRef langName);
-
 
 private:
   const RefoldModel model_;
@@ -304,10 +298,11 @@ private:
   ArrayRef<size_t> aTokOff_, bTokOff_;
   LineDirectiveInserter lineDirs_;
 
-  /// Path identity service shared by the engine and extracted proof/planning
-  /// services.  It owns canonical-path caching and include physical/spelling
-  /// identity predicates so later services can depend on path proof without
-  /// borrowing arbitrary RefoldEngine internals.
+  /// Path identity service shared by the engine and proof/planning services.
+  ///
+  /// It owns canonical-path caching and include physical/spelling identity
+  /// predicates so later services can depend on path proof without borrowing
+  /// arbitrary RefoldEngine internals.
   RefoldPathIdentity pathIdentity_;
 
   bool strict_;
@@ -330,7 +325,7 @@ private:
   /// Terminal fallback request sink for the current refold attempt.
   ///
   /// The sink owns the mutable ordered request ledger and the centralized
-  /// classification/normalization gate for terminal raw-B fallback.  Extracted
+  /// classification/normalization gate for terminal raw-B fallback.  Subsystem
   /// services receive this sink directly instead of calling back into
   /// RefoldEngine just to record a failed terminal proof obligation.
   RefoldTerminalProofSink terminalSink_;
@@ -365,33 +360,6 @@ private:
   RefoldStats lastStats_;
   mutable TheoremAuditStats lastTheoremAudit_;
   std::unique_ptr<RefoldTheoremAudit> theoremAudit_;
-
-  /// Reset the per-attempt refold statistics to a clean baseline.
-  ///
-  /// This clears the counters accumulated for the current refolding attempt and
-  /// reinitializes the invariant totals from the loaded refold model. The
-  /// include total is the size of the recorded include tree. The macro total is
-  /// the number of top-level macro invocation roots recorded during
-  /// preprocessing, excluding nested expansion nodes that are attributable to
-  /// an outer caller via \c callerMacroId.
-  void ResetAttemptStats();
-
-  /// Emit a readable theorem-audit summary for the current run.
-  ///
-  /// The first line answers the operational question: did the emitted result
-  /// satisfy the strict theorem audit?  Follow-up debug lines group the dense
-  /// counters by proof obligation so a failure can be read without decoding one
-  /// very long ledger row.
-  void EmitTheoremAudit() const;
-
-  /// Emit a one-line summary of the final refolding statistics.
-  ///
-  /// The summary reports how many includes and top-level macro invocations
-  /// remained expanded in the chosen refold result, relative to the total
-  /// number of includes and root macro invocations recorded in the model. The
-  /// line is annotated when refolding terminated by falling back to the fully
-  /// expanded B-side text.
-  void EmitRefoldStats() const;
 
   /// Per-gap ownership depth for insertion before PP token k (k in [0..N]).
   /// Computed once per refold run and reused to bound best-effort snapping.
@@ -438,9 +406,9 @@ private:
   /// Source/byte/token coordinate mapper over this refold run's A/B streams.
   ///
   /// The mapper is constructed from explicit source/token inputs plus mutable
-  /// hunk caches, and it has no access to include, macro, line-control, or proof
-  /// orchestration state.  This keeps coordinate projection as an explicit
-  /// service instead of another RefoldEngine responsibility.
+  /// hunk caches, and it has no access to include, macro, line-control, or
+  /// proof orchestration state.  This keeps coordinate projection as an
+  /// explicit service instead of another RefoldEngine responsibility.
   RefoldSourceMapper sourceMapper_;
 
   /// Macro graph/topology service over producer-recorded invocations.
@@ -459,10 +427,10 @@ private:
   /// RefoldMixedOwnerTilingPlanner after the initial token-diff plan is built.
   std::unique_ptr<RefoldTokenDiffPlanner> tokenDiffPlanner_;
 
-  /// Macro-boundary selector for the narrow insertion-at-cover-edge cases that
-  /// may be macro-owned after later whole-cover proof.  Keeping this policy in
-  /// a macro-domain service avoids retaining boundary replay helpers on
-  /// RefoldEngine.
+  /// Macro-boundary selector for narrow A/B token insertion-at-cover-edge cases
+  /// that may be macro-owned after later whole-cover proof.  Keeping this
+  /// policy in a macro-domain service avoids retaining boundary replay helpers
+  /// on RefoldEngine.
   RefoldMacroBoundarySelector macroBoundarySelector_;
 
   /// Owner/TU classification service shared by macro, counter, and proof
@@ -488,10 +456,11 @@ private:
 
   /// TU-anchor accepted-result proof builder.
   ///
-  /// This service stamps proven TU insertion-anchor witnesses into normalized
-  /// accepted-result carriers.  It is separate from RefoldProofLattice so the
-  /// TU edit planner can build anchor candidates without depending on the
-  /// lattice service that will later query TU planning diagnostics.
+  /// This service certifies proven TU insertion-anchor witnesses into
+  /// normalized accepted-result carriers.  It is separate from
+  /// RefoldProofLattice so the TU edit planner can build anchor candidates
+  /// without depending on the lattice service that will later query TU planning
+  /// diagnostics.
   std::unique_ptr<RefoldTUAnchorProof> tuAnchorProof_;
 
   /// Counter-stabilization planner over producer macro topology.
@@ -507,9 +476,8 @@ private:
   /// Line-control proof service over producer line-control metadata.
   ///
   /// The service owns read-only line-state observer and producer-backed #line
-  /// proof queries.  Extracted materialization/assembly services receive this
-  /// narrow dependency instead of calling line-control helpers through
-  /// RefoldEngine.
+  /// proof queries.  Materialization and assembly services receive this narrow
+  /// dependency instead of calling line-control helpers through RefoldEngine.
   RefoldLineControlProof lineControlProof_;
 
   /// Owner-state proof service owned by the engine.
@@ -546,18 +514,20 @@ private:
   /// Macro patch planner owned by the engine object graph.
   ///
   /// This service is the ownership boundary for args-only and whole-cover macro
-  /// patch planning.  Macro-specific helper extraction should happen inside the
-  /// planner instead of returning macro policy to RefoldEngine.
+  /// patch planning.  Macro-specific helper logic belongs inside the macro
+  /// subsystem instead of returning macro policy to RefoldEngine.
   std::unique_ptr<RefoldMacroPatchPlanner> macroPatchPlanner_;
 
   /// Macro-state repair planner owned by the engine object graph.
   ///
-  /// This service preserves, moves, or materializes macro-state transitions after
-  /// TU edits consume #define/#undef source.  It keeps repair liveness policy out
-  /// of RefoldEngine while still mutating the already-staged TU edits explicitly.
+  /// This service preserves, moves, or materializes macro-state transitions
+  /// after TU edits consume #define/#undef source.  It keeps repair liveness
+  /// policy out of RefoldEngine while still mutating the already-staged TU
+  /// edits explicitly.
   std::unique_ptr<RefoldMacroStateRepairPlanner> macroStateRepairPlanner_;
 
-  /// Include-insertion patch and include-realization envelope planner.
+  /// Include-insertion patch and include-realization A/B token envelope
+  /// planner.
   ///
   /// This service owns the deterministic B-envelope proof and staging patch
   /// construction for include preservation and realization.  Include
@@ -568,8 +538,9 @@ private:
   /// Final byte-edit assembler owned by the engine.
   ///
   /// The assembler is intentionally a separate object from RefoldEngine: it
-  /// owns final splice/application behavior and edit-map stamping while receiving
-  /// proof, state, line-control, and terminal dependencies explicitly.
+  /// owns final splice/application behavior and edit-map certifying while
+  /// receiving proof, state, line-control, and terminal dependencies
+  /// explicitly.
   std::unique_ptr<RefoldTextEditAssembler> textEditAssembler_;
 
   /// Line-observer layout realization service owned by the engine.
@@ -577,8 +548,9 @@ private:
   /// The service emits TU/header materialization edits and include `#line`
   /// wrappers needed by preserved line-state observers.  It depends on proof
   /// services and the final text-edit assembler, but it owns no orchestration
-  /// state from RefoldEngine.  It is declared before the include materializer so
-  /// the materializer's borrowed reference remains valid through destruction.
+  /// state from RefoldEngine.  It is declared before the include materializer
+  /// so the materializer's borrowed reference remains valid through
+  /// destruction.
   std::unique_ptr<RefoldLineObserverLayout> lineObserverLayout_;
 
   /// Include-materialization planner/realizer owned by the engine.
@@ -660,8 +632,8 @@ private:
   RefoldTUEditPlanner &TUEditPlanner();
   const RefoldTUEditPlanner &TUEditPlanner() const;
 
-  /// Allocate and access the macro patch planner after the proof lattice exists.
-  /// Macro-planning orchestration calls this service directly.
+  /// Allocate and access the macro patch planner after the proof lattice
+  /// exists. Macro-planning orchestration calls this service directly.
   void InitializeMacroPatchPlanner();
   RefoldMacroPatchPlanner &MacroPatchPlanner();
   const RefoldMacroPatchPlanner &MacroPatchPlanner() const;
@@ -686,12 +658,16 @@ private:
 
   /// Allocate and access the line-observer layout realization service after the
   /// final text-edit assembler exists.  The layout service emits concrete
-  /// observer-preserving materialization edits and include wrappers; RefoldEngine
-  /// only coordinates when those edits are requested.
+  /// observer-preserving materialization edits and include wrappers;
+  /// RefoldEngine only coordinates when those edits are requested.
   void InitializeLineObserverLayout();
   RefoldLineObserverLayout &LineObserverLayout();
   const RefoldLineObserverLayout &LineObserverLayout() const;
 
+  /// Allocate the include materializer after include insertion, line-observer
+  /// layout, proof, and final text-edit services are available.  The
+  /// materializer owns recursive include realization; RefoldEngine owns only
+  /// construction order and final orchestration.
   void InitializeIncludeMaterializer();
 
   /// Allocate the final text-edit assembler after all borrowed engine
@@ -709,17 +685,16 @@ private:
   /// This constructor is intentionally defined out-of-line: `RefoldEngine` owns
   /// `std::unique_ptr` subsystem services, and libc++ must see each service's
   /// complete type when generating constructor cleanup paths.
-  RefoldEngine(RefoldModel model, StringRef aSource, ArrayRef<PPTok> aToks,
-               ArrayRef<size_t> aTokOff, StringRef bSource,
-               ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff, bool noLines,
-               bool strict, ProofAuditMode proofAuditMode,
-               StringRef finalOutputPath,
-               ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
-               std::vector<MaterializedEditMapping> *materializedEditMappings =
-                   nullptr,
-               FinalLineControlValidationCallback finalLineControlValidationCallback =
-                   FinalLineControlValidationCallback(),
-               std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr);
+  RefoldEngine(
+      RefoldModel model, StringRef aSource, ArrayRef<PPTok> aToks,
+      ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
+      ArrayRef<size_t> bTokOff, bool noLines, bool strict,
+      ProofAuditMode proofAuditMode, StringRef finalOutputPath,
+      ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
+      std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr,
+      FinalLineControlValidationCallback finalLineControlValidationCallback =
+          FinalLineControlValidationCallback(),
+      std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr);
 
   ~RefoldEngine();
 
@@ -738,158 +713,9 @@ private:
   /// The caller reacts to typed requests recorded in RefoldTerminalProofSink by
   /// selecting the explicit terminal fallback result.
   std::string RunSinglePassRefold();
-
-  /// Append source edits for sideband pragma directive text that was present in
-  /// the raw `.i` replay surface but removed before token-level diffing.
-  /// Returns false after requesting terminal fallback when an edit targets a
-  /// non-TU owner or has an invalid source range.
-  bool AppendSidebandPragmaSourceEdits(
-      StringRef tuPath, StringRef tuBytes,
-      RefoldStructuralHunkDispatcher &structuralHunkDispatcher);
-
-  // ---------------------------- Ownership Helpers ----------------------------
-
-
-private:
-  // ------------------------------- Core Helpers ------------------------------
-
-  /// \brief Add boundary padding spaces only when needed to preserve lexical
-  /// tokenization.
-  ///
-  /// Adds at most one space on the left and/or right edge of `text` so that,
-  /// when `text` replaces `base[start,end)` (half-open), tokens do not glue
-  /// across the replacement boundary. Existing whitespace at either edge of
-  /// `text`, or immediate boundary whitespace already present in `base`, counts
-  /// as already-separated and suppresses padding on that side. Callers can also
-  /// suppress padding explicitly via `allowLeft` / `allowRight` (for example,
-  /// when preserving an existing gap).
-  ///
-  /// #### Behavior
-  /// * Find the first and last non-whitespace token in `text`.
-  /// * On each allowed side, first check whether the immediate boundary is
-  ///   already separated by whitespace in `text` or `base`.
-  /// * If not already separated, compare Clang raw-lexing with and without an
-  ///   inserted boundary space; add a single space only when omitting it would
-  ///   change tokenization across that boundary.
-  /// * Never inserts more than one space per side and never modifies `base`.
-  ///
-  /// Deterministic and local — decisions are based on the actual lexical
-  /// boundary, not on broader formatting preferences.
-  ///
-  /// \param base       The original target string being patched.
-  /// \param start      Start index (inclusive) of the slice in `base` to
-  ///                   replace.
-  /// \param end        End index (exclusive) of the slice in `base` to replace.
-  /// \param text       The replacement snippet to be inserted.
-  /// \param allowLeft  Whether a left-side pad is permitted.
-  /// \param allowRight Whether a right-side pad is permitted.
-  /// \returns `text`, possibly prefixed and/or suffixed with a single space to
-  ///          preserve lexical separation across the replacement boundary.
-  std::string PadAtBoundaries(StringRef base, size_t start, size_t end,
-                              std::string text, bool allowLeft,
-                              bool allowRight) const;
-
-  bool MaybeConsumeOrdinarySeparatorGapForPunctuation(
-      StringRef tuPath, StringRef tuBytes, std::pair<uint64_t, uint64_t> &span,
-      StringRef replacement, StringRef tracePrefix) const;
-
-  bool MaybeAdvanceTUInsertionPastSourceLineControlPrefix(
-      const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
-      std::pair<uint64_t, uint64_t> &span, StringRef tracePrefix) const;
-
-  bool TUInsertionCanDeferResyncToConditionalJoin(
-      bool advancedOverSourceLineControlPrefix, StringRef tuPath,
-      uint64_t anchor, StringRef tracePrefix) const;
-
-  bool TUInsertionBeforeMaterializedInclude(
-      const diffutils::Hunk &h, StringRef tuPath,
-      const std::pair<uint64_t, uint64_t> &span,
-      bool requireVisibleReplayText) const;
-
-  TextEdit BuildDirectTUHunkTextEdit(
-      const diffutils::Hunk &h, uint64_t hunkIndex,
-      const std::pair<uint64_t, uint64_t> &span, ResyncOutcome resync,
-      StringRef acceptedPayload, uint64_t rawTUStart, uint64_t rawTUEnd,
-      std::optional<uint64_t> materializedBByteBegin,
-      std::optional<uint64_t> materializedBByteEnd,
-      AcceptedPathKind acceptedPath) const;
-
-  // ------------------------- __COUNTER__ stabilization -----------------------
-
-  /// \brief Inject forced __COUNTER__ stabilization patches after normal hunk
-  /// attribution.
-  ///
-  /// __COUNTER__ expansions are time-dependent and can shift when unrelated
-  /// edits add/remove counter uses earlier in the stream. After the main hunk
-  /// attribution pass, this routine injects additional whole-cover MacroPatches
-  /// for each forced occurrence so that all __COUNTER__ sites match the edited
-  /// preprocessed stream, even if no diff hunk directly touched the invocation.
-  void AddForcedCounterPatches(
-      ArrayRef<ForcedMacroPatchRequest> forced,
-      RefoldStructuralHunkDispatcher &structuralHunkDispatcher) const;
-
-  bool AuditFinalLineControlAuthorityContract(
-      const FinalLineControlAuthorityContract &authority,
-      llvm::StringRef role) const;
-  bool AuditFinalLineControlRemovalProofPopulation(
-      llvm::ArrayRef<FinalLineControlPruneCandidate> candidates,
-      llvm::StringRef role) const;
-
-  /// Validate the compact owner-local proof attached to a sideband pragma edit.
-  ///
-  /// This is the first consolidation gate for the sideband proof system: every
-  /// accepted sideband edit must explicitly discharge identity, owner, ordered
-  /// anchor, closure, realization, state, location/provenance, and composition
-  /// obligations before it is lowered into TU or include materialization edits.
-  bool ValidateSidebandPragmaEditProof(const SidebandPragmaEdit &edit,
-                                       StringRef stage) const;
-
-  // ------------------------ Low-level Mapping & Utils ------------------------
-
-  /// \brief Resolves the TU/file byte start offset corresponding to a PP
-  /// coordinate for a specific file.
-  ///
-  /// The refold model maintains a PP->(file, byte-range) mapping (e.g.
-  /// \c tokmapByPP) that allows code working in PP space to locate the
-  /// corresponding region in an owning file (TU or header).
-  ///
-  /// deliberately makes this helper exact-only.  A PP coordinate that does not
-  /// map into \p file is not silently projected to physical EOF.  EOF
-  /// insertions are admissible only through an explicit include-anchor proof
-  /// (for example a mapped left-neighbor insertion whose zero-width patch is at
-  /// the include cover end), or else the caller must realize the include/fall
-  /// closed to a wider declared proof class.
-  ///
-  /// \param file the file path whose mapping is being queried (TU or included
-  ///        header)
-  /// \param pp the PP token index in the A-side preprocessed token stream to
-  ///        resolve
-  /// \return the mapped start byte offset in \p file, or `std::nullopt` if the
-  ///         PP coordinate has no exact source mapping into \p file
-  std::optional<uint64_t> ByteStartForPPInFile(StringRef file,
-                                               uint64_t pp) const;
-
-  /// \brief Resolves the TU/file byte end offset corresponding to a PP
-  /// coordinate for a specific file.
-  ///
-  /// Analogous to ByteStartForPPInFile() but returns the mapped end byte offset
-  /// (\c e).  This helper is also exact-only: an unmapped PP coordinate must
-  /// not manufacture an EOF byte anchor.
-  ///
-  /// \param file the file path whose mapping is being queried (TU or included
-  ///        header)
-  /// \param pp the PP token index in the A-side preprocessed token stream to
-  ///        resolve
-  /// \return the mapped end byte offset in \p file, or `std::nullopt` if the PP
-  ///         coordinate has no exact source mapping into \p file
-  std::optional<uint64_t> ByteEndForPPInFile(StringRef file,
-                                             uint64_t pp) const;
-
 };
-
 
 } // namespace refold
 } // namespace clang
-
 
 #endif // LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDENGINE_H

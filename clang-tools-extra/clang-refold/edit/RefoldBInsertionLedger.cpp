@@ -4,8 +4,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLog.h"
 #include "edit/RefoldBInsertionLedger.h"
+#include "core/RefoldLog.h"
 #include "core/RefoldOwnerClassifier.h"
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroTopology.h"
@@ -28,9 +28,9 @@ void RefoldBInsertionLedger::BuildProvenance(ArrayRef<diffutils::Hunk> hunks) {
   //   h.aStart == h.aEnd && h.bStart < h.bEnd
   //
   // The ledger records a compact insertion table, a per-B-token reverse index,
-  // and a per-hunk insertion index.  Those indices let later proof paths enforce
-  // the global "emit each B-only segment exactly once" invariant without
-  // borrowing RefoldEngine state.
+  // and a per-hunk insertion index.  Those indices let later proof paths
+  // enforce the global "emit each B-only segment exactly once" invariant
+  // without borrowing RefoldEngine state.
   bInsertions_.clear();
   bTokToInsertionId_.assign(deps_.bTokens.size(), -1);
   hunkToInsertionId_.assign(hunks.size(), -1);
@@ -45,8 +45,8 @@ void RefoldBInsertionLedger::BuildProvenance(ArrayRef<diffutils::Hunk> hunks) {
     if (b1 > deps_.bTokens.size()) {
       REFOLD_LOG_FATAL(
           "prov/ins",
-          "insertion hunk out of B bounds: hunk#{0} b=[{1},{2}) bToks={3}",
-          hi, b0, b1, deps_.bTokens.size());
+          "insertion hunk out of B bounds: hunk#{0} b=[{1},{2}) bToks={3}", hi,
+          b0, b1, deps_.bTokens.size());
     }
 
     const size_t insId = bInsertions_.size();
@@ -175,8 +175,9 @@ RefoldBInsertionLedger::ClipBTokenRangeAgainstClaims(size_t bTokStart,
   return segs;
 }
 
-std::string RefoldBInsertionLedger::SliceBSourceClippedAgainstClaims(
-    size_t bTokStart, size_t bTokEnd) const {
+std::string
+RefoldBInsertionLedger::SliceBSourceClippedAgainstClaims(size_t bTokStart,
+                                                         size_t bTokEnd) const {
   SmallVector<std::pair<size_t, size_t>, 4> segs =
       ClipBTokenRangeAgainstClaims(bTokStart, bTokEnd);
   if (segs.empty())

@@ -10,9 +10,9 @@
 //
 // This service owns the read-only proof primitives for #define/#undef state
 // motion and the materialized-header macro-state stabilization planner.  It is
-// deliberately narrower than RefoldEngine: callers pass macro-state surfaces and
-// already-staged edit intervals explicitly, while owner-state proof/audit remains
-// behind the RefoldOwnerStateProof dependency.
+// deliberately narrower than RefoldEngine: callers pass macro-state surfaces
+// and already-staged edit intervals explicitly, while owner-state proof/audit
+// remains behind the RefoldOwnerStateProof dependency.
 //
 //===----------------------------------------------------------------------===//
 
@@ -50,8 +50,8 @@ enum class MacroStateObservationKind {
 /// Exact source-line interval for a producer-recorded macro-state directive.
 ///
 /// MacroDirective::siteB is anchored at the macro name, not necessarily at the
-/// beginning of the physical directive line.  This witness records the validated
-/// full-line interval recovered from the recorded directive text.
+/// beginning of the physical directive line.  This witness records the
+/// validated full-line interval recovered from the recorded directive text.
 struct MacroStateDirectiveLineInterval {
   const RefoldModel::MacroDirective *directive = nullptr;
   uint64_t begin = 0;
@@ -96,13 +96,11 @@ struct MacroStateStagedEditInterval {
   uint64_t end = 0;
 };
 
-/// Replacement interval produced by include-owned macro-state replay
-/// stabilization.
+/// Replacement interval produced by replay stabilization.
 ///
-/// A materialized header macro patch may need to consume earlier #define lines
-/// and the callsite line suffix, then re-emit those definitions after the
-/// replacement payload so the B-surface replay sees the same macro environment
-/// that produced it.
+/// The interval may be wider than the original macro invocation because it can
+/// consume earlier #define lines and the invocation's physical-line suffix,
+/// then re-emit the carried definitions after the replacement payload.
 struct StabilizedMaterializedHeaderMacroPatch {
   uint64_t start = 0;
   uint64_t end = 0;
@@ -124,7 +122,8 @@ public:
       : model_(model), paths_(paths), tokenText_(tokenText),
         ownerStateProof_(ownerStateProof) {}
 
-  /// Classify how `directive` can be observed for `macroName`.
+  /// Return the observation mode for \p directive when it controls \p
+  /// macroName.
   MacroStateObservationKind MacroStateObservationKindForDirective(
       const RefoldModel::MacroDirective &directive,
       llvm::StringRef macroName) const;
@@ -137,11 +136,13 @@ public:
       const RefoldModel::MacroDirective &directive, llvm::StringRef macroName,
       llvm::StringRef text, llvm::StringRef suffix = llvm::StringRef()) const;
 
-  /// Return whether replacement text would preprocess differently under
-  /// `directive`; unnamed directives use `unprovenObserves` fail-closed policy.
+  /// True iff \p replacement can observe a macro-state directive if that
+  /// directive is active before the replacement payload.  Malformed producer
+  /// proof data is handled by \p unprovenObserves so callers can remain
+  /// fail-closed in their own proof domain.
   bool ReplacementObservesMacroStateDirective(
-      const RefoldModel::MacroDirective &directive,
-      llvm::StringRef replacement, bool unprovenObserves) const;
+      const RefoldModel::MacroDirective &directive, llvm::StringRef replacement,
+      bool unprovenObserves) const;
 
   /// Return whether moving `directive` across `chunk` could change semantics.
   ///
@@ -152,21 +153,41 @@ public:
       llvm::StringRef chunk,
       llvm::StringRef following = llvm::StringRef()) const;
 
-  /// Recover the validated physical source-line interval for `directive`.
+  /// Recover and byte-verify the complete physical source line for a recorded
+  /// #define/#undef directive in \p fileBytes.
+  ///
+  /// The helper is the single owner for the repeated proof used by TU carry,
+  /// header materialization, include edits, expansion fallback, and replay
+  /// stability: the directive must match \p expectedPath, match the requested
+  /// include-owner instance, have a producer-recorded macro name, and its
+  /// reconstructed full-line bytes must exactly equal MacroDirective::text.
   std::optional<MacroStateDirectiveLineInterval>
   RecoverMacroStateDirectiveLineInterval(
-      const RefoldModel::MacroDirective &directive, llvm::StringRef expectedPath,
-      llvm::StringRef fileBytes,
+      const RefoldModel::MacroDirective &directive,
+      llvm::StringRef expectedPath, llvm::StringRef fileBytes,
       std::optional<uint64_t> requiredOwnerIncludeId) const;
 
-  /// Recover the source interval of the #define replacement list used by
-  /// `invocation`.
+  /// Recover the source interval for the replacement list of the #define used
+  /// by \p invocation, if the defining directive and invocation shape are
+  /// producer-proven and byte-coordinate translation is well-formed.
   std::optional<MacroDefinitionReplacementListInterval>
   RecoverMacroDefinitionReplacementListInterval(
       const RefoldModel::MacroInvocation &invocation) const;
 
-  /// Widen and reorder a materialized-header macro patch when active #define
-  /// lines must be carried after the B replacement to preserve replay state.
+  /// Stabilize an include-owned macro patch against the macro state at its
+  /// final replay position.
+  ///
+  /// Return value protocol:
+  /// * std::nullopt: no active header definition is observed by the B text, so
+  ///   the original patch can be staged unchanged;
+  /// * non-empty StabilizedMaterializedHeaderMacroPatch: stage the widened,
+  ///   replay-stable repair interval returned here; and
+  /// * empty {0,0,""}: terminal fallback was requested and materialization of
+  ///   this include must stop.
+  ///
+  /// This keeps candidate selection deterministic: the function either proves a
+  /// concrete source rewrite that restores B's macro context, proves that no
+  /// rewrite is needed, or records the missing proof obligation.
   std::optional<StabilizedMaterializedHeaderMacroPatch>
   StabilizeMaterializedHeaderMacroPatchReplay(
       MacroStatePatchReplayInput patch, uint64_t patchEnd,

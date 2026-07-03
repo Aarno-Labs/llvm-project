@@ -3,13 +3,13 @@
 // Final text-edit assembly and accepted-result audit attachment.
 //
 // This file implements the final byte-edit assembler: pending line-resync
-// application, accepted-result carrier attachment/auditing, sideband replay range
-// stamping, and materialized edit-map range recovery.
+// application, accepted-result carrier attachment/auditing, sideband replay
+// range certifying, and materialized edit-map range recovery.
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLog.h"
 #include "edit/RefoldTextEditAssembler.h"
+#include "core/RefoldLog.h"
 #include "edit/RefoldTUEditPlanner.h"
 #include "include/IncludeSpellingHelpers.h"
 #include "include/RefoldIncludeReplayProof.h"
@@ -21,7 +21,6 @@
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofLattice.h"
 #include "proof/RefoldSidebandReplayProof.h"
-#include "proof/RefoldTerminalProof.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
@@ -35,11 +34,11 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -63,10 +62,10 @@ namespace clang {
 namespace refold {
 
 RefoldTextEditAssembler::ResyncOutcome
-RefoldTextEditAssembler::ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
-                                uint64_t end, StringRef replacement,
-                                StringRef fileSpellingForDirective,
-                                std::optional<uint64_t> ownerIncludeId) const {
+RefoldTextEditAssembler::ApplyResyncOrPend(
+    StringRef originalFileText, uint64_t start, uint64_t end,
+    StringRef replacement, StringRef fileSpellingForDirective,
+    std::optional<uint64_t> ownerIncludeId) const {
   // If the replacement preserves the original newline count, no line-state
   // correction is needed.
   size_t origNl = stringutils::countNewlines(originalFileText, start, end);
@@ -80,8 +79,9 @@ RefoldTextEditAssembler::ApplyResyncOrPend(StringRef originalFileText, uint64_t 
   // because physical newline counts changed: materialized __LINE__ values do
   // not observe the stream, and preserved __FILE__/__FILE_NAME__ only observe
   // the file component, which newline drift alone does not change.
-  LineStateObserverDemand demand = lineControlProof_.OwnerSuffixLineStateObserverDemand(
-      ownerIncludeId, fileSpellingForDirective, end);
+  LineStateObserverDemand demand =
+      lineControlProof_.OwnerSuffixLineStateObserverDemand(
+          ownerIncludeId, fileSpellingForDirective, end);
   const OwnerStateBoundary suffixBoundary =
       OwnerStateBoundary::FromSource(OwnerSourceRange::From(
           fileSpellingForDirective, end, end, ownerIncludeId));
@@ -101,8 +101,9 @@ RefoldTextEditAssembler::ApplyResyncOrPend(StringRef originalFileText, uint64_t 
           StringRef detail, bool requireKnownObserver = false) {
         return checkLineControlStateWithWitness(
             component, mutation,
-            ownerStateProof_.BuildStateTransitionWitness(SuffixStabilityWitnessKind::StateRepair,
-                                        component, suffixBoundary, detail),
+            ownerStateProof_.BuildStateTransitionWitness(
+                SuffixStabilityWitnessKind::StateRepair, component,
+                suffixBoundary, detail),
             detail, requireKnownObserver);
       };
 
@@ -147,17 +148,18 @@ RefoldTextEditAssembler::ApplyResyncOrPend(StringRef originalFileText, uint64_t 
     }
 
     if (std::optional<LineDirectiveLocation> producerLoc =
-            lineControlProof_.ProducerBackedLineControlLocationAt(originalFileText,
-                                                fileSpellingForDirective,
-                                                ownerIncludeId, start, end)) {
+            lineControlProof_.ProducerBackedLineControlLocationAt(
+                originalFileText, fileSpellingForDirective, ownerIncludeId,
+                start, end)) {
       resumeLoc = std::move(*producerLoc);
     } else {
       return ResyncOutcome(replacement.str(), std::nullopt);
     }
   }
 
-  const bool deferToConditionalJoin = hooks_.lineResyncShouldDeferToConditionalJoin(
-      fileSpellingForDirective, ownerIncludeId, end);
+  const bool deferToConditionalJoin =
+      hooks_.lineResyncShouldDeferToConditionalJoin(fileSpellingForDirective,
+                                                    ownerIncludeId, end);
   if (deferToConditionalJoin) {
     (void)checkLineControlStateRepaired(
         OwnerStateComponent::LineNumber, StateMutationKind::MovedLater,
@@ -233,9 +235,9 @@ void RefoldTextEditAssembler::AttachAcceptedResultCarrier(
       std::make_shared<AcceptedResultCandidate>(candidate));
 }
 
-bool RefoldTextEditAssembler::AuditAcceptedEditProofs(ArrayRef<TextEdit> edits,
-                                          StringRef emissionStage,
-                                          StringRef emissionOwner) const {
+bool RefoldTextEditAssembler::AuditAcceptedEditProofs(
+    ArrayRef<TextEdit> edits, StringRef emissionStage,
+    StringRef emissionOwner) const {
   // Centralize the final accepted-proof audit at the last byte-edit boundary.
   // Earlier builders may still queue candidates path-by-path, but once the
   // normalized edit set is known the applicator must see a theorem carrier for
@@ -244,7 +246,8 @@ bool RefoldTextEditAssembler::AuditAcceptedEditProofs(ArrayRef<TextEdit> edits,
   // any edit path that already routed state through the gateway must have a
   // typed, component-named suffix-stability witness or a named terminal failure
   // before non-terminal bytes can be emitted.
-  if (!theoremAuditService_.AuditStateTransitionGatewayProofs(emissionStage, emissionOwner))
+  if (!theoremAuditService_.AuditStateTransitionGatewayProofs(emissionStage,
+                                                              emissionOwner))
     return false;
 
   for (const TextEdit &edit : edits) {
@@ -274,7 +277,8 @@ bool RefoldTextEditAssembler::EmittedTextEditHasDischargedAcceptedResults(
     // proof-family metadata discharge one final theorem proof class.
     if (carrier.kind == AcceptedResultCandidateKind::Unknown) {
       ++theoremAudit_.emittedUnknownClassCarriers;
-      theoremAuditService_.NoteTheoremAuditViolation("emitted carrier had unknown candidate kind");
+      theoremAuditService_.NoteTheoremAuditViolation(
+          "emitted carrier had unknown candidate kind");
       return false;
     }
     if (carrier.kind == AcceptedResultCandidateKind::TerminalOutOfDomain) {
@@ -285,7 +289,7 @@ bool RefoldTextEditAssembler::EmittedTextEditHasDischargedAcceptedResults(
     }
 
     const std::optional<TheoremProofClass> theoremProof =
-        proofLattice_.NormalizeAcceptedProof(carrier);
+        proofLattice_.ProofSummaryBuilder().NormalizeAcceptedProof(carrier);
     if (!theoremProof) {
       if (carrier.proofSummary.theoremClass == TheoremProofClass::Unknown) {
         ++theoremAudit_.emittedUnknownClassCarriers;
@@ -311,10 +315,11 @@ bool RefoldTextEditAssembler::EmittedTextEditHasDischargedAcceptedResults(
 
     ++theoremAudit_.emittedDeclaredClassCarriers;
     ++theoremAudit_.emittedDischargedCarriers;
-    REFOLD_LOG_TRACE("proof/normalize",
-          "emitted carrier normalized theoremProof={0} kind={1} path={2}",
-          *theoremProof, carrier.kind,
-          carrier.proofSummary.inventory.currentPath);
+    REFOLD_LOG_TRACE(
+        "proof/normalize",
+        "emitted carrier normalized theoremProof={0} kind={1} path={2}",
+        *theoremProof, carrier.kind,
+        carrier.proofSummary.inventory.currentPath);
     return true;
   };
 
@@ -328,17 +333,18 @@ bool RefoldTextEditAssembler::EmittedTextEditHasDischargedAcceptedResults(
             TerminalFallbackFailureReason::UndischargedEmissionArtifact,
             TerminalFallbackFailureContext::ForStateComponent(
                 "TextEdit.acceptedResults"));
-    const bool strictRejected = theoremAuditService_.RejectNoLegacyAuditFindingIfStrict(
-        RefoldTheoremAudit::MakeLegacyAuditEvidence(
-            LegacyPathKind::PathSpecificProofMirror, emissionStage,
-            llvm::formatv(
-                "emitted edit bytes=[{0},{1}) in {2} has no "
-                "AcceptedResultCandidate / ProofSummary carrier",
-                edit.start, edit.end, owner)
-                .str()),
-        failure);
-    theoremAuditService_.NoteTheoremAuditViolation("emitted edit reached the byte-edit boundary "
-                              "without accepted-result carriers");
+    const bool strictRejected =
+        theoremAuditService_.RejectNoLegacyAuditFindingIfStrict(
+            RefoldTheoremAudit::MakeLegacyAuditEvidence(
+                LegacyPathKind::PathSpecificProofMirror, emissionStage,
+                llvm::formatv("emitted edit bytes=[{0},{1}) in {2} has no "
+                              "AcceptedResultCandidate / ProofSummary carrier",
+                              edit.start, edit.end, owner)
+                    .str()),
+            failure);
+    theoremAuditService_.NoteTheoremAuditViolation(
+        "emitted edit reached the byte-edit boundary "
+        "without accepted-result carriers");
     if (!strictRejected) {
       terminalSink_.RequestTerminalFallback(
           failure, emissionStage,
@@ -363,15 +369,15 @@ bool RefoldTextEditAssembler::EmittedTextEditHasDischargedAcceptedResults(
               TerminalFallbackFailureReason::UndischargedEmissionArtifact,
               TerminalFallbackFailureContext::ForStateComponent(
                   "TextEdit.acceptedResults.null"));
-      const bool strictRejected = theoremAuditService_.RejectNoLegacyAuditFindingIfStrict(
-          RefoldTheoremAudit::MakeLegacyAuditEvidence(
-              LegacyPathKind::PathSpecificProofMirror, emissionStage,
-              llvm::formatv(
-                  "emitted edit bytes=[{0},{1}) in {2} has null "
-                  "AcceptedResultCandidate carrier #{3}",
-                  edit.start, edit.end, owner, i)
-                  .str()),
-          failure);
+      const bool strictRejected =
+          theoremAuditService_.RejectNoLegacyAuditFindingIfStrict(
+              RefoldTheoremAudit::MakeLegacyAuditEvidence(
+                  LegacyPathKind::PathSpecificProofMirror, emissionStage,
+                  llvm::formatv("emitted edit bytes=[{0},{1}) in {2} has null "
+                                "AcceptedResultCandidate carrier #{3}",
+                                edit.start, edit.end, owner, i)
+                      .str()),
+              failure);
       theoremAuditService_.NoteTheoremAuditViolation(
           "emitted edit carried a null accepted-result carrier");
       if (!strictRejected) {
@@ -399,8 +405,8 @@ bool RefoldTextEditAssembler::EmittedTextEditHasDischargedAcceptedResults(
     }
   }
 
-  return EmittedTextEditHasOrderedAcceptedProofComposition(
-      edit, emissionStage, emissionOwner);
+  return EmittedTextEditHasOrderedAcceptedProofComposition(edit, emissionStage,
+                                                           emissionOwner);
 }
 
 bool RefoldTextEditAssembler::EmittedTextEditHasOrderedAcceptedProofComposition(
@@ -447,10 +453,9 @@ bool RefoldTextEditAssembler::EmittedTextEditHasOrderedAcceptedProofComposition(
     return false;
   };
 
-  auto extractSpan = [&](const AcceptedResultCandidate &carrier,
-                         size_t carrierIndex,
-                         TheoremProofClass theoremProof)
-      -> std::optional<CarrierSpan> {
+  auto extractSpan =
+      [&](const AcceptedResultCandidate &carrier, size_t carrierIndex,
+          TheoremProofClass theoremProof) -> std::optional<CarrierSpan> {
     CarrierSpan span;
     span.carrierIndex = carrierIndex;
     span.theoremProof = theoremProof;
@@ -504,7 +509,7 @@ bool RefoldTextEditAssembler::EmittedTextEditHasOrderedAcceptedProofComposition(
       return failComposition("composite edit carried a null proof segment");
 
     const std::optional<TheoremProofClass> theoremProof =
-        proofLattice_.NormalizeAcceptedProof(*carrierPtr);
+        proofLattice_.ProofSummaryBuilder().NormalizeAcceptedProof(*carrierPtr);
     if (!theoremProof)
       return failComposition(
           "composite edit contained a carrier that did not normalize");
@@ -534,10 +539,10 @@ bool RefoldTextEditAssembler::EmittedTextEditHasOrderedAcceptedProofComposition(
   if (sameSurface) {
     ++theoremAudit_.emittedEquivalentCompositeEdits;
     REFOLD_LOG_TRACE("proof/compose",
-          "composite edit bytes=[{0},{1}) in {2} has {3} equivalent "
-          "proof carriers over {4}[{5},{6})",
-          edit.start, edit.end, owner, spans.size(),
-          domainName(spans[0].domain), spans[0].begin, spans[0].end);
+                     "composite edit bytes=[{0},{1}) in {2} has {3} equivalent "
+                     "proof carriers over {4}[{5},{6})",
+                     edit.start, edit.end, owner, spans.size(),
+                     domainName(spans[0].domain), spans[0].begin, spans[0].end);
     return true;
   }
 
@@ -551,12 +556,13 @@ bool RefoldTextEditAssembler::EmittedTextEditHasOrderedAcceptedProofComposition(
     if (span.domain == CarrierSpanDomain::TUByte && span.begin == edit.start &&
         span.end == edit.end) {
       ++theoremAudit_.emittedEquivalentCompositeEdits;
-      REFOLD_LOG_TRACE("proof/compose",
-            "composite edit bytes=[{0},{1}) in {2} is dominated by carrier "
-            "#{3} theoremProof={4} over TUByte[{5},{6}); {7} auxiliary "
-            "carriers remain individually discharged",
-            edit.start, edit.end, owner, span.carrierIndex, span.theoremProof,
-            span.begin, span.end, spans.size() - 1);
+      REFOLD_LOG_TRACE(
+          "proof/compose",
+          "composite edit bytes=[{0},{1}) in {2} is dominated by carrier "
+          "#{3} theoremProof={4} over TUByte[{5},{6}); {7} auxiliary "
+          "carriers remain individually discharged",
+          edit.start, edit.end, owner, span.carrierIndex, span.theoremProof,
+          span.begin, span.end, spans.size() - 1);
       return true;
     }
   }
@@ -565,15 +571,14 @@ bool RefoldTextEditAssembler::EmittedTextEditHasOrderedAcceptedProofComposition(
   // zero-width carriers may therefore share one physical insertion edit without
   // needing an inter-segment source-gap proof; the emitted text order was fixed
   // by the duplicate-insertion merge that built this TextEdit.
-  const bool allZeroWidth = llvm::all_of(spans, [](const CarrierSpan &span) {
-    return span.begin == span.end;
-  });
+  const bool allZeroWidth = llvm::all_of(
+      spans, [](const CarrierSpan &span) { return span.begin == span.end; });
   if (allZeroWidth && edit.start == edit.end) {
     ++theoremAudit_.emittedEquivalentCompositeEdits;
     REFOLD_LOG_TRACE("proof/compose",
-          "composite insertion edit bytes=[{0},{1}) in {2} has {3} "
-          "zero-width proof carriers",
-          edit.start, edit.end, owner, spans.size());
+                     "composite insertion edit bytes=[{0},{1}) in {2} has {3} "
+                     "zero-width proof carriers",
+                     edit.start, edit.end, owner, spans.size());
     return true;
   }
 
@@ -611,12 +616,13 @@ bool RefoldTextEditAssembler::EmittedTextEditHasOrderedAcceptedProofComposition(
     }
     if (cur.begin > prev.end) {
       return failComposition(
-          llvm::formatv("carrier #{0} span {1}[{2},{3}) leaves non-empty "
-                        "unproved gap after carrier #{4} span {1}[{5},{6}); "
-                        "current composition proof admits only empty gaps until "
-                        "state-gap witnesses are available",
-                        cur.carrierIndex, domainName(cur.domain), cur.begin,
-                        cur.end, prev.carrierIndex, prev.begin, prev.end)
+          llvm::formatv(
+              "carrier #{0} span {1}[{2},{3}) leaves non-empty "
+              "unproved gap after carrier #{4} span {1}[{5},{6}); "
+              "current composition proof admits only empty gaps until "
+              "state-gap witnesses are available",
+              cur.carrierIndex, domainName(cur.domain), cur.begin, cur.end,
+              prev.carrierIndex, prev.begin, prev.end)
               .str());
     }
   }
@@ -637,44 +643,45 @@ bool RefoldTextEditAssembler::EmittedTextEditHasOrderedAcceptedProofComposition(
   }
 
   ++theoremAudit_.emittedOrderedCompositeEdits;
-  REFOLD_LOG_TRACE("proof/compose",
-        "composite edit bytes=[{0},{1}) in {2} has {3} ordered contiguous "
-        "proof segments in {4} coordinates",
-        edit.start, edit.end, owner, spans.size(), domainName(spans[0].domain));
+  REFOLD_LOG_TRACE(
+      "proof/compose",
+      "composite edit bytes=[{0},{1}) in {2} has {3} ordered contiguous "
+      "proof segments in {4} coordinates",
+      edit.start, edit.end, owner, spans.size(), domainName(spans[0].domain));
   return true;
 }
 
-
-void RefoldTextEditAssembler::StampTextEditMaterializedBByteRange(TextEdit &edit,
-                                                       uint64_t begin,
-                                                       uint64_t end) const {
+void RefoldTextEditAssembler::CertifyTextEditMaterializedBByteRange(
+    TextEdit &edit, uint64_t begin, uint64_t end) const {
   if (end < begin || end > static_cast<uint64_t>(bSource_.size()))
-    REFOLD_LOG_FATAL("edit-map", "invalid materialized B byte range [{0},{1}) bLen={2}",
-          begin, end, bSource_.size());
+    REFOLD_LOG_FATAL("edit-map",
+                     "invalid materialized B byte range [{0},{1}) bLen={2}",
+                     begin, end, bSource_.size());
   edit.materializedBByteBegin = begin;
   edit.materializedBByteEnd = end;
 }
 
-void RefoldTextEditAssembler::StampTextEditMaterializedBTokenRange(
+void RefoldTextEditAssembler::CertifyTextEditMaterializedBTokenRange(
     TextEdit &edit, uint64_t bTokBegin, uint64_t bTokEnd) const {
   std::optional<std::pair<uint64_t, uint64_t>> bytes =
       sourceMapper_.BTokenRangeToByteRange(bTokBegin, bTokEnd);
   if (!bytes)
-    REFOLD_LOG_FATAL("edit-map", "invalid materialized B token range [{0},{1}) bToks={2}",
-          bTokBegin, bTokEnd, bToks_.size());
-  StampTextEditMaterializedBByteRange(edit, bytes->first, bytes->second);
+    REFOLD_LOG_FATAL("edit-map",
+                     "invalid materialized B token range [{0},{1}) bToks={2}",
+                     bTokBegin, bTokEnd, bToks_.size());
+  CertifyTextEditMaterializedBByteRange(edit, bytes->first, bytes->second);
 }
 
-void RefoldTextEditAssembler::StampTextEditMaterializedBReplayProof(
+void RefoldTextEditAssembler::CertifyTextEditMaterializedBReplayProof(
     TextEdit &edit, const SidebandPragmaEdit &sideband) const {
   const std::pair<uint64_t, uint64_t> bRange =
       sideband.MaterializedBByteRange();
-  StampTextEditMaterializedBByteRange(edit, bRange.first, bRange.second);
+  CertifyTextEditMaterializedBByteRange(edit, bRange.first, bRange.second);
 
   const std::pair<uint64_t, uint64_t> outputRange =
       sideband.MaterializedOutputTextRange();
-  StampTextEditMaterializedOutputTextRange(edit, outputRange.first,
-                                           outputRange.second);
+  CertifyTextEditMaterializedOutputTextRange(edit, outputRange.first,
+                                             outputRange.second);
 }
 
 std::string RefoldTextEditAssembler::StripSeparatelyOwnedSidebandReplay(
@@ -691,18 +698,20 @@ RefoldTextEditAssembler::SidebandPragmaMaterializedBByteRangeForInclude(
       sidebandPragmaEdits_, includeId, static_cast<uint64_t>(bSource_.size()));
 }
 
-void RefoldTextEditAssembler::StampTextEditMaterializedOutputTextRange(
+void RefoldTextEditAssembler::CertifyTextEditMaterializedOutputTextRange(
     TextEdit &edit, uint64_t begin, uint64_t end) const {
   if (end < begin || end > static_cast<uint64_t>(edit.text.size()))
-    REFOLD_LOG_FATAL("edit-map",
-          "invalid materialized output byte range [{0},{1}) textLen={2}",
-          begin, end, edit.text.size());
+    REFOLD_LOG_FATAL(
+        "edit-map",
+        "invalid materialized output byte range [{0},{1}) textLen={2}", begin,
+        end, edit.text.size());
   edit.materializedOutputTextBegin = begin;
   edit.materializedOutputTextEnd = end;
 }
 
 std::optional<std::pair<uint64_t, uint64_t>>
-RefoldTextEditAssembler::TextEditMaterializedOutputTextRange(const TextEdit &edit) const {
+RefoldTextEditAssembler::TextEditMaterializedOutputTextRange(
+    const TextEdit &edit) const {
   if (edit.materializedOutputTextBegin && edit.materializedOutputTextEnd) {
     if (*edit.materializedOutputTextEnd < *edit.materializedOutputTextBegin ||
         *edit.materializedOutputTextEnd >
@@ -718,18 +727,19 @@ RefoldTextEditAssembler::TextEditMaterializedOutputTextRange(const TextEdit &edi
 std::optional<std::pair<uint64_t, uint64_t>>
 RefoldTextEditAssembler::MacroPatchMaterializedOutputTextRange(
     const MacroPatch &patch) const {
-  if (!patch.hasMaterializedOutputByteRange)
+  if (!patch.materialized.hasOutputByteRange)
     return std::nullopt;
-  if (patch.materializedOutputByteEnd < patch.materializedOutputByteStart ||
-      patch.materializedOutputByteEnd >
+  if (patch.materialized.outputByteEnd < patch.materialized.outputByteStart ||
+      patch.materialized.outputByteEnd >
           static_cast<uint64_t>(patch.replacement.size()))
     return std::nullopt;
-  return std::make_pair(patch.materializedOutputByteStart,
-                        patch.materializedOutputByteEnd);
+  return std::make_pair(patch.materialized.outputByteStart,
+                        patch.materialized.outputByteEnd);
 }
 
 std::optional<std::pair<uint64_t, uint64_t>>
-RefoldTextEditAssembler::TextEditMaterializedBByteRange(const TextEdit &edit) const {
+RefoldTextEditAssembler::TextEditMaterializedBByteRange(
+    const TextEdit &edit) const {
   if (edit.materializedBByteBegin && edit.materializedBByteEnd) {
     if (*edit.materializedBByteEnd < *edit.materializedBByteBegin ||
         *edit.materializedBByteEnd > static_cast<uint64_t>(bSource_.size()))
@@ -739,31 +749,34 @@ RefoldTextEditAssembler::TextEditMaterializedBByteRange(const TextEdit &edit) co
   }
 
   if (edit.directTUHunkBStart && edit.directTUHunkBEnd)
-    return sourceMapper_.BTokenRangeToByteRange(
-        *edit.directTUHunkBStart, *edit.directTUHunkBEnd);
+    return sourceMapper_.BTokenRangeToByteRange(*edit.directTUHunkBStart,
+                                                *edit.directTUHunkBEnd);
 
   return std::nullopt;
 }
 
 std::optional<std::pair<uint64_t, uint64_t>>
-RefoldTextEditAssembler::MacroPatchMaterializedBByteRange(const MacroPatch &patch) const {
-  // Prefer an explicitly stamped envelope.  Structure-preserving macro patches
-  // use this to distinguish two edit-map meanings that share the same physical
-  // TextEdit: ordinary argument rewrites map the B side to the whole expansion
-  // envelope they regenerate, while pure insertions intentionally stay narrow
-  // and let the final TextEdit/hunk metadata provide the inserted payload.
-  if (patch.hasMaterializedBTokenRange) {
+RefoldTextEditAssembler::MacroPatchMaterializedBByteRange(
+    const MacroPatch &patch) const {
+  // Prefer an explicitly certified envelope.  Structure-preserving macro
+  // patches use this to distinguish two edit-map meanings that share the same
+  // physical TextEdit: ordinary argument rewrites map the B side to the whole
+  // expansion envelope they regenerate, while pure insertions intentionally
+  // stay narrow and let the final TextEdit/hunk metadata provide the inserted
+  // payload.
+  if (patch.materialized.hasBTokenRange) {
     if (auto bytes = sourceMapper_.BTokenRangeToByteRange(
-            patch.materializedBTokStart, patch.materializedBTokEnd))
+            patch.materialized.bTokStart, patch.materialized.bTokEnd))
       return bytes;
   }
 
   uint64_t macroId = patch.proof.proofRootMacroId ? patch.proof.proofRootMacroId
-                                            : patch.macroId;
+                                                  : patch.macroId;
   if (macroId == 0)
     return std::nullopt;
 
-  const RefoldModel::MacroInvocation *macro = macroTopology_.FindMacroInvocationById(macroId);
+  const RefoldModel::MacroInvocation *macro =
+      macroTopology_.FindMacroInvocationById(macroId);
   if (!macro)
     return std::nullopt;
 
@@ -780,13 +793,12 @@ RefoldTextEditAssembler::MacroPatchMaterializedBByteRange(const MacroPatch &patc
 
 std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     StringRef originalFileText, ArrayRef<TextEdit> edits,
-    DenseSet<uint64_t> *appliedExpandedMacroRootIds,
-    StringRef emissionOwner, std::optional<uint64_t> ownerIncludeId,
+    DenseSet<uint64_t> *appliedExpandedMacroRootIds, StringRef emissionOwner,
+    std::optional<uint64_t> ownerIncludeId,
     std::vector<MaterializedEditMapping> *materializedEditMappings,
-    std::vector<FinalLineControlPruneCandidate>
-        *lineControlPruneCandidates,
-    std::vector<FinalLineControlSourceMapping>
-        *lineControlSourceMappings) const {
+    std::vector<FinalLineControlPruneCandidate> *lineControlPruneCandidates,
+    std::vector<FinalLineControlSourceMapping> *lineControlSourceMappings)
+    const {
   // Source-side ranges are only knowable at this final splice boundary: every
   // earlier candidate still may be merged, dropped, widened, or followed by a
   // pending resync before it becomes physical output.
@@ -803,24 +815,22 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     if (lineControlSourceMappings && !originalFileText.empty() &&
         !sourceMappingOwner.empty()) {
       lineControlSourceMappings->push_back(FinalLineControlSourceMapping{
-          0, static_cast<uint64_t>(originalFileText.size()),
-          sourceMappingOwner, 0,
-          static_cast<uint64_t>(originalFileText.size()), ownerIncludeId});
+          0, static_cast<uint64_t>(originalFileText.size()), sourceMappingOwner,
+          0, static_cast<uint64_t>(originalFileText.size()), ownerIncludeId});
     }
     return originalFileText.str();
   }
 
   // Normalize edits by span.
   //
-  // Historically we deduped by (start,end) using a map, which accidentally
-  // dropped legitimate *multiple insertions* at the same byte offset.
-  // This happens when the diff produces adjacent insert-only hunks (e.g. when
+  // Multiple insertions may legitimately share the same zero-length span.  This
+  // happens when the diff produces adjacent insert-only hunks (for example when
   // comments tokenize separately), and both map to the same insertion point.
   //
-  // We now:
-  //  * Preserve and concatenate multiple INSERT edits with identical
+  // The assembler:
+  //  * preserves and concatenates multiple INSERT edits with identical
   //    zero-length spans ([x,x)) in their original order.
-  //  * Merge duplicate non-zero edits only when they carry the same
+  //  * merges duplicate non-zero edits only when they carry the same
   //    replacement payload; conflicting duplicate replacements request the
   //    explicit terminal fallback instead of selecting a writer by order.
 
@@ -911,19 +921,19 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
                 TextEditMaterializedOutputTextRange(*ordered[k].e)) {
           const uint64_t outBegin = fragmentOutputBase + outRange->first;
           const uint64_t outEnd = fragmentOutputBase + outRange->second;
-          mergedOutByteBegin =
-              mergedOutByteBegin ? std::min(*mergedOutByteBegin, outBegin)
-                                 : outBegin;
+          mergedOutByteBegin = mergedOutByteBegin
+                                   ? std::min(*mergedOutByteBegin, outBegin)
+                                   : outBegin;
           mergedOutByteEnd =
               mergedOutByteEnd ? std::max(*mergedOutByteEnd, outEnd) : outEnd;
         }
       }
       if (mergedBByteBegin && mergedBByteEnd && mergedBByteRangeContiguous)
-        StampTextEditMaterializedBByteRange(merged, *mergedBByteBegin,
-                                            *mergedBByteEnd);
+        CertifyTextEditMaterializedBByteRange(merged, *mergedBByteBegin,
+                                              *mergedBByteEnd);
       if (mergedOutByteBegin && mergedOutByteEnd)
-        StampTextEditMaterializedOutputTextRange(merged, *mergedOutByteBegin,
-                                                 *mergedOutByteEnd);
+        CertifyTextEditMaterializedOutputTextRange(merged, *mergedOutByteBegin,
+                                                   *mergedOutByteEnd);
 
       deduplicateLineControlPruneCandidates(merged.lineControlPruneCandidates);
       deduplicateLineControlSourceMappings(merged.lineControlSourceMappings);
@@ -994,21 +1004,21 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
         if (bBegin >= bEnd || bEnd > static_cast<uint64_t>(bToks_.size()))
           return std::nullopt;
 
-        StringRef replacement =
-            refoldSliceExactTokenCoverage(bTokOff_, bToks_, bSource_, bBegin, bEnd);
+        StringRef replacement = refoldSliceExactTokenCoverage(
+            bTokOff_, bToks_, bSource_, bBegin, bEnd);
         if (replacement.empty())
           return std::nullopt;
 
         // Apply normal resync handling to the whole duplicate byte span, rather
         // than preserving each fragment's already-conflicting local resync.
-        ResyncOutcome ro = ApplyResyncOrPend(originalFileText, s, t,
-                                             replacement, emissionOwner,
-                                             ownerIncludeId);
-        TextEdit merged{s, t, std::move(ro.text), std::move(ro.pending),
-                        std::nullopt, {}, {}, {}};
+        ResyncOutcome ro = ApplyResyncOrPend(
+            originalFileText, s, t, replacement, emissionOwner, ownerIncludeId);
+        TextEdit merged{
+            s,  t, std::move(ro.text), std::move(ro.pending), std::nullopt, {},
+            {}, {}};
         merged.lineControlPruneCandidates =
             std::move(ro.lineControlPruneCandidates);
-        StampTextEditMaterializedBTokenRange(merged, bBegin, bEnd);
+        CertifyTextEditMaterializedBTokenRange(merged, bBegin, bEnd);
 
         // Preserve existing proof carriers from the fragments. If the fragments
         // carry macro-root provenance, they must all agree on the same root.
@@ -1028,9 +1038,10 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
         // proof gate can reason about this replacement as one conservative TU
         // edit.
         AttachAcceptedResultCarrier(
-            merged, proofLattice_.BuildAcceptedTUTextEditCandidate(
-                        AcceptedPathKind::TUByteSpanConservativeEdit, s, t,
-                        replacement));
+            merged, proofLattice_.AcceptedCandidateBuilder()
+                        .BuildAcceptedTUTextEditCandidate(
+                            AcceptedPathKind::TUByteSpanConservativeEdit, s, t,
+                            replacement));
 
         return merged;
       };
@@ -1123,12 +1134,12 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
       // Keep all accepted-result carriers from the equivalent duplicates. The
       // text replacement is shared, but each proof witness still explains one
       // path that contributed to the emitted edit.
-      appendShiftedLineControlPruneCandidates(
-          merged.lineControlPruneCandidates, dup.lineControlPruneCandidates,
-          /*delta=*/0);
-      appendShiftedLineControlSourceMappings(
-          merged.lineControlSourceMappings, dup.lineControlSourceMappings,
-          /*delta=*/0);
+      appendShiftedLineControlPruneCandidates(merged.lineControlPruneCandidates,
+                                              dup.lineControlPruneCandidates,
+                                              /*delta=*/0);
+      appendShiftedLineControlSourceMappings(merged.lineControlSourceMappings,
+                                             dup.lineControlSourceMappings,
+                                             /*delta=*/0);
       merged.acceptedResults.insert(merged.acceptedResults.end(),
                                     dup.acceptedResults.begin(),
                                     dup.acceptedResults.end());
@@ -1160,11 +1171,11 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
       return originalFileText.str();
     }
     if (mergedBRange)
-      StampTextEditMaterializedBByteRange(merged, mergedBRange->first,
-                                          mergedBRange->second);
+      CertifyTextEditMaterializedBByteRange(merged, mergedBRange->first,
+                                            mergedBRange->second);
     if (mergedOutRange)
-      StampTextEditMaterializedOutputTextRange(merged, mergedOutRange->first,
-                                               mergedOutRange->second);
+      CertifyTextEditMaterializedOutputTextRange(merged, mergedOutRange->first,
+                                                 mergedOutRange->second);
 
     deduplicateLineControlPruneCandidates(merged.lineControlPruneCandidates);
     deduplicateLineControlSourceMappings(merged.lineControlSourceMappings);
@@ -1181,8 +1192,8 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     });
   };
 
-  auto findDirectEditForHunk = [&](uint64_t hunkIndex)
-      -> std::optional<size_t> {
+  auto findDirectEditForHunk =
+      [&](uint64_t hunkIndex) -> std::optional<size_t> {
     for (size_t idx = 0; idx < norm.size(); ++idx) {
       const TextEdit &edit = norm[idx];
       if (edit.directTUHunkIndex && *edit.directTUHunkIndex == hunkIndex)
@@ -1191,8 +1202,8 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     return std::nullopt;
   };
 
-  auto sourceTokenSpan = [&](uint64_t aTok)
-      -> std::optional<std::pair<uint64_t, uint64_t>> {
+  auto sourceTokenSpan =
+      [&](uint64_t aTok) -> std::optional<std::pair<uint64_t, uint64_t>> {
     if (aTok >= static_cast<uint64_t>(aToks_.size()))
       return std::nullopt;
     if (auto span = tuEdits_.PlanTUByteSpan(aTok, aTok + 1, emissionOwner))
@@ -1436,21 +1447,27 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
 
     // Materialize exactly the proven B-token envelope, then apply the same
     // line-resync machinery used by ordinary emitted edits.
-    StringRef replacement = refoldSliceExactTokenCoverage(bTokOff_, bToks_, bSource_,
-                                                    best->bBegin, best->bEnd);
+    StringRef replacement = refoldSliceExactTokenCoverage(
+        bTokOff_, bToks_, bSource_, best->bBegin, best->bEnd);
     ResyncOutcome ro =
         ApplyResyncOrPend(originalFileText, best->sourceBegin, best->sourceEnd,
                           replacement, emissionOwner, ownerIncludeId);
-    closure =
-        TextEdit{best->sourceBegin,     best->sourceEnd, std::move(ro.text),
-                 std::move(ro.pending), std::nullopt,    {}, {}, {}};
+    closure = TextEdit{best->sourceBegin,
+                       best->sourceEnd,
+                       std::move(ro.text),
+                       std::move(ro.pending),
+                       std::nullopt,
+                       {},
+                       {},
+                       {}};
     closure.lineControlPruneCandidates =
         std::move(ro.lineControlPruneCandidates);
-    StampTextEditMaterializedBTokenRange(closure, best->bBegin, best->bEnd);
+    CertifyTextEditMaterializedBTokenRange(closure, best->bBegin, best->bEnd);
     AttachAcceptedResultCarrier(
-        closure, proofLattice_.BuildAcceptedTUTextEditCandidate(
-                     AcceptedPathKind::TUByteSpanConservativeEdit,
-                     best->sourceBegin, best->sourceEnd, replacement));
+        closure, proofLattice_.AcceptedCandidateBuilder()
+                     .BuildAcceptedTUTextEditCandidate(
+                         AcceptedPathKind::TUByteSpanConservativeEdit,
+                         best->sourceBegin, best->sourceEnd, replacement));
 
     // Replace the absorbed direct edits with the single closed realization and
     // re-sort so downstream application sees a normal non-overlapping edit set.
@@ -1561,8 +1578,8 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
 
   for (const auto &e : norm) {
     // Copy the untouched source before this edit. If a previous replacement
-    // could not safely emit its #line resync locally, this copy step is also the
-    // next opportunity to flush that pending resync at a safe boundary.
+    // could not safely emit its #line resync locally, this copy step is also
+    // the next opportunity to flush that pending resync at a safe boundary.
     pending = AppendOriginalSliceWithPending(
         out, originalFileText, cursor, e.start, std::move(pending),
         sourceMappingOwner, ownerIncludeId, lineControlPruneCandidates,
@@ -1594,8 +1611,9 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
       if (!bRange) {
         terminalSink_.RequestTerminalFallback(
             MakeTerminalFallbackProofFailure(
-        TerminalFallbackObligationKind::EmissionArtifactDischarged,
-        TerminalFallbackFailureReason::UndischargedEmissionArtifact), "edit-map",
+                TerminalFallbackObligationKind::EmissionArtifactDischarged,
+                TerminalFallbackFailureReason::UndischargedEmissionArtifact),
+            "edit-map",
             llvm::formatv("emitted edit in {0} at source=[{1},{2}) lacks a "
                           "deterministic B-side materialization range",
                           emissionOwner, e.start, e.end)
@@ -1639,7 +1657,7 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
       ownerIncludeId, lineControlPruneCandidates, lineControlSourceMappings);
 
   auto shiftLineControlMetadataAfterInsertion = [&](uint64_t pos,
-                                                     uint64_t len) {
+                                                    uint64_t len) {
     if (len == 0)
       return;
 
@@ -1746,8 +1764,8 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
         continue;
 
       std::optional<LineStateObserverSite> firstObserver =
-          lineControlProof_.FirstOwnerSuffixLineStateObserverSite(ownerIncludeId, emissionOwner,
-                                               group->groupE);
+          lineControlProof_.FirstOwnerSuffixLineStateObserverSite(
+              ownerIncludeId, emissionOwner, group->groupE);
       if (!firstObserver || !firstObserver->demand.Any())
         continue;
 
@@ -1761,9 +1779,9 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
       std::optional<uint64_t> finalOffset =
           sourceOffsetToFinalOffset(firstObserver->offset);
       const OwnerStateBoundary observerBoundary =
-          OwnerStateBoundary::FromSource(OwnerSourceRange::From(
-              emissionOwner, firstObserver->offset, firstObserver->offset,
-              ownerIncludeId));
+          OwnerStateBoundary::FromSource(
+              OwnerSourceRange::From(emissionOwner, firstObserver->offset,
+                                     firstObserver->offset, ownerIncludeId));
 
       auto forEachLineControlDemandComponent =
           [&](const LineStateObserverDemand &componentDemand, auto &&fn) {
@@ -1935,23 +1953,21 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
   }
 
   if (!joinRepairs.empty()) {
-    llvm::sort(joinRepairs,
-               [](const ConditionalJoinLineRepair &lhs,
-                  const ConditionalJoinLineRepair &rhs) {
-                 if (lhs.finalOffset != rhs.finalOffset)
-                   return lhs.finalOffset > rhs.finalOffset;
-                 if (lhs.sourceOffset != rhs.sourceOffset)
-                   return lhs.sourceOffset > rhs.sourceOffset;
-                 return lhs.directive < rhs.directive;
-               });
-    joinRepairs.erase(
-        std::unique(joinRepairs.begin(), joinRepairs.end(),
-                    [](const ConditionalJoinLineRepair &lhs,
-                       const ConditionalJoinLineRepair &rhs) {
-                      return lhs.finalOffset == rhs.finalOffset &&
-                             lhs.directive == rhs.directive;
-                    }),
-        joinRepairs.end());
+    llvm::sort(joinRepairs, [](const ConditionalJoinLineRepair &lhs,
+                               const ConditionalJoinLineRepair &rhs) {
+      if (lhs.finalOffset != rhs.finalOffset)
+        return lhs.finalOffset > rhs.finalOffset;
+      if (lhs.sourceOffset != rhs.sourceOffset)
+        return lhs.sourceOffset > rhs.sourceOffset;
+      return lhs.directive < rhs.directive;
+    });
+    joinRepairs.erase(std::unique(joinRepairs.begin(), joinRepairs.end(),
+                                  [](const ConditionalJoinLineRepair &lhs,
+                                     const ConditionalJoinLineRepair &rhs) {
+                                    return lhs.finalOffset == rhs.finalOffset &&
+                                           lhs.directive == rhs.directive;
+                                  }),
+                      joinRepairs.end());
 
     for (const ConditionalJoinLineRepair &repair : joinRepairs) {
       out.insert(out.begin() + static_cast<size_t>(repair.finalOffset),
@@ -1973,16 +1989,15 @@ RefoldTextEditAssembler::AppendOriginalSliceWithPending(
     SmallVectorImpl<char> &out, llvm::StringRef original, uint64_t from,
     uint64_t to, std::optional<RefoldTextEditAssembler::PendingResync> pending,
     StringRef emissionOwner, std::optional<uint64_t> ownerIncludeId,
-    std::vector<FinalLineControlPruneCandidate>
-        *lineControlPruneCandidates,
-    std::vector<FinalLineControlSourceMapping>
-        *lineControlSourceMappings) const {
+    std::vector<FinalLineControlPruneCandidate> *lineControlPruneCandidates,
+    std::vector<FinalLineControlSourceMapping> *lineControlSourceMappings)
+    const {
   auto appendMappedOriginalSlice = [&](uint64_t begin, uint64_t end) {
     if (begin >= end)
       return;
     const uint64_t finalBegin = static_cast<uint64_t>(out.size());
-    auto slice = original.slice(static_cast<size_t>(begin),
-                                static_cast<size_t>(end));
+    auto slice =
+        original.slice(static_cast<size_t>(begin), static_cast<size_t>(end));
     out.append(slice.begin(), slice.end());
     const uint64_t finalEnd = static_cast<uint64_t>(out.size());
     if (lineControlSourceMappings && !emissionOwner.empty()) {
@@ -2012,9 +2027,9 @@ RefoldTextEditAssembler::AppendOriginalSliceWithPending(
                                    sourceOffset, pending->ownerIncludeId));
         return ownerStateProof_.CheckStateTransitionAcrossEditBoundary(
             boundary, OwnerStateComponent::LineNumber, mutation,
-            ownerStateProof_.BuildStateTransitionWitness(SuffixStabilityWitnessKind::StateRepair,
-                                        OwnerStateComponent::LineNumber,
-                                        boundary, detail),
+            ownerStateProof_.BuildStateTransitionWitness(
+                SuffixStabilityWitnessKind::StateRepair,
+                OwnerStateComponent::LineNumber, boundary, detail),
             "line/pending", detail, /*requireKnownObserver=*/false);
       };
 
@@ -2200,5 +2215,60 @@ RefoldTextEditAssembler::AppendOriginalSliceWithPending(
   }
   return pending;
 }
+
+TextEdit RefoldTextEditAssembler::BuildDirectTUHunkTextEdit(
+    const diffutils::Hunk &h, uint64_t hunkIndex,
+    const std::pair<uint64_t, uint64_t> &span, ResyncOutcome resync,
+    StringRef acceptedPayload, uint64_t rawTUStart, uint64_t rawTUEnd,
+    std::optional<uint64_t> materializedBByteBegin,
+    std::optional<uint64_t> materializedBByteEnd,
+    AcceptedPathKind acceptedPath) const {
+  DirectTUHunkEditPlan plan = tuEdits_.BuildDirectTUHunkEditPlan(
+      h, hunkIndex, span, std::move(resync), acceptedPayload, rawTUStart,
+      rawTUEnd, materializedBByteBegin, materializedBByteEnd, acceptedPath);
+
+  assert(plan.resync && "direct TU hunk edit plan requires resync payload");
+  auto spanBytes = plan.span.byteRange();
+  TextEdit edit{spanBytes.first,
+                spanBytes.second,
+                std::move(plan.resync->text),
+                std::move(plan.resync->pending),
+                std::nullopt,
+                {},
+                {},
+                {}};
+  edit.lineControlPruneCandidates =
+      std::move(plan.resync->lineControlPruneCandidates);
+  edit.isDirectTUHunkEdit = true;
+  edit.directTUHunkIndex = plan.hunkIndex;
+  edit.directTUHunkAStart = plan.hunk.aStart;
+  edit.directTUHunkAEnd = plan.hunk.aEnd;
+  edit.directTUHunkBStart = plan.hunk.bStart;
+  edit.directTUHunkBEnd = plan.hunk.bEnd;
+  edit.directTURawStart = plan.rawTUStart;
+  edit.directTURawEnd = plan.rawTUEnd;
+  edit.directTUFinalStart = spanBytes.first;
+  edit.directTUFinalEnd = spanBytes.second;
+  if (plan.materializedBByteBegin && plan.materializedBByteEnd)
+    CertifyTextEditMaterializedBByteRange(edit, *plan.materializedBByteBegin,
+                                          *plan.materializedBByteEnd);
+  AcceptedResultCandidate candidate =
+      proofLattice_.AcceptedCandidateBuilder().BuildAcceptedTUTextEditCandidate(
+          plan.acceptedPath, spanBytes.first, spanBytes.second,
+          plan.acceptedPayload);
+  proofLattice_.OwnerRealizationProofBuilder()
+      .AttachMixedOwnerTilingWitnessForTokenEnvelope(
+          candidate.proofSummary, plan.hunk.aStart, plan.hunk.aEnd,
+          plan.hunk.bStart, plan.hunk.bEnd);
+  proofLattice_.OwnerRealizationProofBuilder().AttachLineControlObserverWitness(
+      candidate);
+  proofLattice_.OwnerRealizationProofBuilder().AttachCounterStateWitness(
+      candidate);
+  proofLattice_.AcceptedCandidateBuilder()
+      .RefreshAcceptedCandidateEmissionPathInventory(candidate);
+  AttachAcceptedResultCarrier(edit, candidate);
+  return edit;
+}
+
 } // namespace refold
 } // namespace clang

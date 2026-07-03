@@ -4,8 +4,8 @@
 //
 // This file builds and queries derived indices over the producer-recorded macro
 // graph, conditional containment, #define containment, and __COUNTER__ event
-// identity.  Proof and planning services use this narrow topology oracle instead
-// of duplicating graph traversal logic.
+// identity.  Proof and planning services use this narrow topology oracle
+// instead of duplicating graph traversal logic.
 //
 //===----------------------------------------------------------------------===//
 
@@ -15,8 +15,8 @@
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
-#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -31,9 +31,11 @@ using namespace llvm;
 namespace clang {
 namespace refold {
 
-RefoldMacroTopology::RefoldMacroTopology(
-    const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
-    const RefoldSourceMapper &sourceMapper, const RefoldPathIdentity &paths)
+RefoldMacroTopology::RefoldMacroTopology(const RefoldModel &model,
+                                         ArrayRef<PPTok> aToks,
+                                         ArrayRef<PPTok> bToks,
+                                         const RefoldSourceMapper &sourceMapper,
+                                         const RefoldPathIdentity &paths)
     : model_(model), aToks_(aToks), paths_(paths) {
   // The constructor receives the complete dependency set for the topology
   // service.  The current indices use the A-token stream and path service; keep
@@ -53,9 +55,9 @@ void RefoldMacroTopology::BuildMacroInvocationGraph() {
   macroInvocationById_.reserve(macroInvocations.size());
 
   for (const auto &mi : macroInvocations) {
-    // Preserve the old RefoldEngine linear scan's first-match behavior for
-    // malformed producer maps with duplicate invocation IDs while making valid
-    // model lookups constant-time.
+    // Preserve producer-order first-match behavior for malformed producer maps
+    // with duplicate invocation IDs while making valid model lookups
+    // constant-time.
     macroInvocationById_.insert(std::make_pair(mi.id, &mi));
 
     if (mi.callerMacroId)
@@ -85,8 +87,8 @@ uint64_t RefoldMacroTopology::GetRootMacroId(uint64_t macroId) const {
     return macroId;
 
   // Walk callerMacroId links to the outermost invocation in this expansion
-  // chain.  If a malformed model has a missing parent link, preserve the
-  // historical fail-soft behavior and return the highest resolved invocation.
+  // chain.  If a malformed model has a missing parent link, fail softly and
+  // return the highest resolved invocation.
   while (cur->callerMacroId) {
     const RefoldModel::MacroInvocation *parent =
         FindMacroInvocationById(*cur->callerMacroId);
@@ -105,7 +107,8 @@ std::string RefoldMacroTopology::ToAbsolutePath(StringRef spelledPath) const {
       sys::fs::make_absolute(path);
     } else {
       // Use the producer working directory captured in the refold map rather
-      // than the replay process CWD, matching LineDirectiveInserter::ToAbsolutePath.
+      // than the replay process CWD, matching
+      // LineDirectiveInserter::ToAbsolutePath.
       SmallString<256> base(model_.GetPPCwd());
       sys::path::append(base, path);
       path = base;
@@ -162,8 +165,8 @@ void RefoldMacroTopology::BuildDefineDirectiveIndex() const {
       if (itTxt != defineFileTextCache_.end()) {
         StringRef bytes(itTxt->second);
 
-        // Begin scanning at the directive start, clamped defensively in case the
-        // producer offset is outside the replay-time source buffer.
+        // Begin scanning at the directive start, clamped defensively in case
+        // the producer offset is outside the replay-time source buffer.
         uint64_t i = d.siteB;
         if (i > bytes.size())
           i = bytes.size();
@@ -244,8 +247,8 @@ bool RefoldMacroTopology::IsInvocationInsideDefineDirective(
   if (lo != 0 && contains(vec[lo - 1]))
     return true;
 
-  // Preserve the previous adjacent-window scan for unusual overlapping #define
-  // extents in producer metadata.
+  // Use a small adjacent-window scan for unusual overlapping #define extents
+  // in producer metadata.
   for (size_t i = lo; i < vec.size() && i < lo + 4; ++i) {
     if (contains(vec[i]))
       return true;
@@ -266,10 +269,9 @@ bool RefoldMacroTopology::SourceRangeInsideConditionalArm(
   if (!armRef || !armRef->group || !armRef->arm)
     return false;
 
-  // Preserve the historical RefoldPathIdentity::PathsEqual comparison used by this
-  // proof predicate.  Conditional arm ownership is still source-byte evidence,
-  // but file identity must use the same canonical path policy as the previous
-  // engine helper.
+  // Use the canonical RefoldPathIdentity::PathsEqual comparison for this
+  // proof predicate. Conditional arm ownership is source-byte evidence, but
+  // file identity must use the same path policy as the rest of the refolder.
   if (!paths_.PathsEqual(armRef->group->file, file))
     return false;
   if (armRef->group->parentIncludeId != ownerIncludeId)
@@ -277,9 +279,9 @@ bool RefoldMacroTopology::SourceRangeInsideConditionalArm(
 
   // The whole site must be inside the producer-recorded active arm body before
   // it can inherit that conditional-owner state.
-  return armRef->arm->bodyB <= begin && begin <= end && end <= armRef->arm->bodyE;
+  return armRef->arm->bodyB <= begin && begin <= end &&
+         end <= armRef->arm->bodyE;
 }
-
 
 namespace {
 
@@ -333,8 +335,8 @@ RefoldMacroTopology::SmallestCoveringPatchableMacro(
   // Return the smallest covering span length among this invocation's argument-
   // derived projections: ordinary argument spans, stringify spans, and paste
   // spans. Used to prefer the tightest argument-local cover inside the macro.
-  auto minCoverLenInArgs = [&](const RefoldModel::MacroInvocation &m)
-      -> std::optional<uint64_t> {
+  auto minCoverLenInArgs =
+      [&](const RefoldModel::MacroInvocation &m) -> std::optional<uint64_t> {
     std::optional<uint64_t> out;
     for (const auto &sp : m.argSpans) {
       if (spanCovers(sp.begin, sp.end)) {
@@ -484,7 +486,8 @@ CounterEventIdentity RefoldMacroTopology::BuildCounterEventIdentity(
   event.expansionSiteEnd = macro.invE;
   event.aValue = CounterValueForTokenRange(begin, end);
   event.canStabilizeByLiteralization = begin < end && end <= aToks_.size();
-  event.canStabilizeByMaterialization = macro.invFile && macro.invB && macro.invE;
+  event.canStabilizeByMaterialization =
+      macro.invFile && macro.invB && macro.invE;
   return event;
 }
 

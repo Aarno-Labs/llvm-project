@@ -1,9 +1,9 @@
 //===--- RefoldLineObserverLayout.cpp -----------------------*- C++ -*-===//
 //
 // This file contains the line-observer layout realization service.  It repairs
-// TU and include-owner source layout when line-state observers such as `__LINE__`
-// remain source-spelled but the edited preprocessed stream collapses physical
-// line boundaries that a source-spelled observer would still observe.
+// TU and include-owner source layout when line-state observers such as
+// `__LINE__` remain source-spelled but the edited preprocessed stream collapses
+// physical line boundaries that a source-spelled observer would still observe.
 //
 //===----------------------------------------------------------------------===//
 
@@ -32,7 +32,6 @@ using namespace llvm;
 
 namespace clang {
 namespace refold {
-
 
 bool RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
     StringRef invSpanText, const RefoldModel::MacroInvocation &m) {
@@ -149,8 +148,7 @@ static bool lineObserverCoverIsTokenPreserved(
     const int64_t bTok = abTokMapA2B[static_cast<size_t>(aTok)];
     if (bTok < 0 || bTok >= static_cast<int64_t>(bToks.size()) ||
         static_cast<uint64_t>(bTok) >= abTokMapB2A.size() ||
-        abTokMapB2A[static_cast<size_t>(bTok)] !=
-            static_cast<int64_t>(aTok) ||
+        abTokMapB2A[static_cast<size_t>(bTok)] != static_cast<int64_t>(aTok) ||
         aToks[static_cast<size_t>(aTok)].spelling !=
             bToks[static_cast<size_t>(bTok)].spelling ||
         (previousB >= 0 && bTok != previousB + 1))
@@ -170,19 +168,15 @@ struct LineObserverConstructTokens {
   uint64_t bEnd = 0;
 };
 
-static std::optional<LineObserverConstructTokens>
-lineObserverConstructTokens(
+static std::optional<LineObserverConstructTokens> lineObserverConstructTokens(
     StringRef ownerFile, uint64_t constructBegin, uint64_t constructEnd,
-    const RefoldModel::MacroInvocation &macro,
-    const RefoldPathIdentity &paths,
+    const RefoldModel::MacroInvocation &macro, const RefoldPathIdentity &paths,
     const DenseMap<uint64_t, RefoldModel::TokMapEntry> &tokmapByPP,
-    ArrayRef<int64_t> abTokMapA2B, ArrayRef<PPTok> aToks,
-    ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff,
-    bool requirePreviousATok) {
+    ArrayRef<int64_t> abTokMapA2B, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
+    ArrayRef<size_t> bTokOff, bool requirePreviousATok) {
   std::optional<uint64_t> firstATok;
   std::optional<uint64_t> lastATok;
-  for (uint64_t aTok = 0; aTok < static_cast<uint64_t>(aToks.size());
-       ++aTok) {
+  for (uint64_t aTok = 0; aTok < static_cast<uint64_t>(aToks.size()); ++aTok) {
     auto it = tokmapByPP.find(aTok);
     if (it == tokmapByPP.end())
       continue;
@@ -218,7 +212,10 @@ lineObserverConstructTokens(
   const size_t firstBTok = static_cast<size_t>(firstBTokI);
   const size_t lastBTok = static_cast<size_t>(lastBTokI);
   return LineObserverConstructTokens{
-      *firstATok, *lastATok, firstBTok, lastBTok,
+      *firstATok,
+      *lastATok,
+      firstBTok,
+      lastBTok,
       static_cast<uint64_t>(bTokOff[firstBTok]),
       static_cast<uint64_t>(bTokOff[lastBTok] +
                             bToks[lastBTok].spelling.size())};
@@ -232,12 +229,10 @@ struct LineObserverCollapsedGap {
   uint64_t leftBEnd = 0;
 };
 
-static std::optional<LineObserverCollapsedGap>
-findLineObserverCollapsedPreGap(
+static std::optional<LineObserverCollapsedGap> findLineObserverCollapsedPreGap(
     StringRef ownerBytes, StringRef ownerFile, StringRef bSource,
     uint64_t searchBegin, uint64_t observerLineBegin,
-    uint64_t firstObserverATok,
-    const RefoldPathIdentity &paths,
+    uint64_t firstObserverATok, const RefoldPathIdentity &paths,
     const DenseMap<uint64_t, RefoldModel::TokMapEntry> &tokmapByPP,
     ArrayRef<int64_t> abTokMapA2B, ArrayRef<int64_t> abTokMapB2A,
     ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff) {
@@ -327,8 +322,7 @@ struct LineObserverRightClosure {
   std::string sourceSpelledExtension;
 };
 
-static std::optional<LineObserverRightClosure>
-extendLineObserverRightClosure(
+static std::optional<LineObserverRightClosure> extendLineObserverRightClosure(
     StringRef ownerBytes, StringRef ownerFile, StringRef bSource,
     const RefoldPathIdentity &paths,
     const DenseMap<uint64_t, RefoldModel::TokMapEntry> &tokmapByPP,
@@ -342,8 +336,7 @@ extendLineObserverRightClosure(
       return std::nullopt;
     const int64_t bTokI = abTokMapA2B[static_cast<size_t>(aTok)];
     if (bTokI < 0 || static_cast<uint64_t>(bTokI) >= abTokMapB2A.size() ||
-        abTokMapB2A[static_cast<size_t>(bTokI)] !=
-            static_cast<int64_t>(aTok))
+        abTokMapB2A[static_cast<size_t>(bTokI)] != static_cast<int64_t>(aTok))
       return std::nullopt;
     const size_t bTok = static_cast<size_t>(bTokI);
     if (bTok >= bTokOff.size() || bTok >= bToks.size())
@@ -432,7 +425,6 @@ extendLineObserverRightClosure(
   }
 }
 
-
 struct LineObserverOwnLineMerge {
   uint64_t previousATok = 0;
   const RefoldModel::TokMapEntry *prevEntry = nullptr;
@@ -454,9 +446,8 @@ static std::optional<LineObserverOwnLineMerge> resolveLineObserverOwnLineMerge(
     const RefoldPathIdentity &paths,
     const DenseMap<uint64_t, RefoldModel::TokMapEntry> &tokmapByPP,
     ArrayRef<int64_t> abTokMapA2B, ArrayRef<int64_t> abTokMapB2A,
-    ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff,
-    uint64_t sourceLineBegin, uint64_t sourceLineEnd,
-    const LineObserverConstructTokens &observerTokens) {
+    ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff, uint64_t sourceLineBegin,
+    uint64_t sourceLineEnd, const LineObserverConstructTokens &observerTokens) {
   if (observerTokens.firstATok == 0)
     return std::nullopt;
 
@@ -498,17 +489,16 @@ static std::optional<LineObserverOwnLineMerge> resolveLineObserverOwnLineMerge(
 
   std::optional<LineObserverRightClosure> closure =
       extendLineObserverRightClosure(
-          ownerBytes, ownerFile, bSource, paths, tokmapByPP,
-          abTokMapA2B,
+          ownerBytes, ownerFile, bSource, paths, tokmapByPP, abTokMapA2B,
           abTokMapB2A, bToks, bTokOff, sourceLineEnd, initialBEnd,
           observerTokens.lastATok, observerTokens.lastBTok);
   if (!closure)
     return std::nullopt;
 
-  return LineObserverOwnLineMerge{previousATok, &prevEntry, prevBTok, prevBEnd,
-                                  firstBBegin, initialBEnd, std::move(*closure)};
+  return LineObserverOwnLineMerge{previousATok,       &prevEntry,  prevBTok,
+                                  prevBEnd,           firstBBegin, initialBEnd,
+                                  std::move(*closure)};
 }
-
 
 /// Source-spelled prefix segment for a collapsed pre-observer B line.
 ///
@@ -541,8 +531,7 @@ static bool lineObserverMappedContiguousBRange(
   for (uint64_t aTok = firstATok; aTok <= lastATok; ++aTok) {
     const int64_t bTokI = abTokMapA2B[static_cast<size_t>(aTok)];
     if (bTokI < 0 || static_cast<uint64_t>(bTokI) >= abTokMapB2A.size() ||
-        abTokMapB2A[static_cast<size_t>(bTokI)] !=
-            static_cast<int64_t>(aTok))
+        abTokMapB2A[static_cast<size_t>(bTokI)] != static_cast<int64_t>(aTok))
       return false;
     const size_t bTok = static_cast<size_t>(bTokI);
     if (bTok >= bTokOff.size() || bTok >= bToks.size())
@@ -561,12 +550,10 @@ static bool lineObserverMappedContiguousBRange(
   return true;
 }
 
-static const RefoldModel::MacroInvocation *
-lineObserverSourceMacroConstructAt(
+static const RefoldModel::MacroInvocation *lineObserverSourceMacroConstructAt(
     ArrayRef<RefoldModel::MacroInvocation> macroInvocations, uint64_t aTok,
     uint64_t limitATok, StringRef ownerFile,
-    std::optional<uint64_t> ownerIncludeId,
-    const RefoldPathIdentity &paths) {
+    std::optional<uint64_t> ownerIncludeId, const RefoldPathIdentity &paths) {
   const RefoldModel::MacroInvocation *best = nullptr;
   for (const RefoldModel::MacroInvocation &macro : macroInvocations) {
     if (!macro.cover.IsValid() || macro.name == "__LINE__")
@@ -659,8 +646,8 @@ buildLineObserverSourceSpelledPrefix(
     result.lastBTok = constructLastBTok;
 
     cursor = constructEnd;
-    bCursor = static_cast<uint64_t>(
-        bTokOff[constructLastBTok] + bToks[constructLastBTok].spelling.size());
+    bCursor = static_cast<uint64_t>(bTokOff[constructLastBTok] +
+                                    bToks[constructLastBTok].spelling.size());
     aTok = constructLastATok + 1;
   }
 
@@ -713,20 +700,18 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
       continue;
 
     std::optional<LineObserverConstructTokens> observerTokens =
-        lineObserverConstructTokens(
-            tuPath, sourceLineBegin, sourceLineEnd, macro,
-            paths_,
-            tokmapByPP, abTokMapA2B_, aToks_, bToks_, bTokOff_,
-            /*requirePreviousATok=*/true);
+        lineObserverConstructTokens(tuPath, sourceLineBegin, sourceLineEnd,
+                                    macro, paths_, tokmapByPP, abTokMapA2B_,
+                                    aToks_, bToks_, bTokOff_,
+                                    /*requirePreviousATok=*/true);
     if (!observerTokens)
       continue;
 
     std::optional<LineObserverOwnLineMerge> ownLineMerge =
-        resolveLineObserverOwnLineMerge(
-            tuBytes, tuPath, bSource_,
-            paths_,
-            tokmapByPP, abTokMapA2B_, abTokMapB2A_, bToks_, bTokOff_,
-            sourceLineBegin, sourceLineEnd, *observerTokens);
+        resolveLineObserverOwnLineMerge(tuBytes, tuPath, bSource_, paths_,
+                                        tokmapByPP, abTokMapA2B_, abTokMapB2A_,
+                                        bToks_, bTokOff_, sourceLineBegin,
+                                        sourceLineEnd, *observerTokens);
     if (!ownLineMerge)
       continue;
 
@@ -754,15 +739,16 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
     if (replacement.empty())
       continue;
 
-    TextEdit edit{editBegin, editEnd, replacement, std::nullopt, std::nullopt,
-                  {}, {}, {}};
-    textEditAssembler_.StampTextEditMaterializedBByteRange(edit, prevBEnd, initialBEnd);
+    TextEdit edit{editBegin,    editEnd, replacement, std::nullopt,
+                  std::nullopt, {},      {},          {}};
+    textEditAssembler_.CertifyTextEditMaterializedBByteRange(edit, prevBEnd,
+                                                             initialBEnd);
     textEditAssembler_.AttachAcceptedResultCarrier(
-        edit, proofLattice_.BuildAcceptedTUTextEditCandidate(
-                  AcceptedPathKind::TUByteSpanConservativeEdit, editBegin,
-                  editEnd, replacement));
+        edit, proofLattice_.AcceptedCandidateBuilder()
+                  .BuildAcceptedTUTextEditCandidate(
+                      AcceptedPathKind::TUByteSpanConservativeEdit, editBegin,
+                      editEnd, replacement));
     tuEdits.push_back(std::move(edit));
-
   }
 
   // A preserved source-spelled __LINE__ observer can remain source-spelled when
@@ -799,8 +785,7 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
 
     std::optional<LineObserverConstructTokens> observerTokens =
         lineObserverConstructTokens(
-            tuPath, observerLineBegin, observerConstructEnd, macro,
-            paths_,
+            tuPath, observerLineBegin, observerConstructEnd, macro, paths_,
             tokmapByPP, abTokMapA2B_, aToks_, bToks_, bTokOff_,
             /*requirePreviousATok=*/true);
     if (!observerTokens)
@@ -810,16 +795,15 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
     const uint64_t observerBEnd = observerTokens->bEnd;
 
     const std::optional<uint64_t> latestLineControlEnd =
-        lineControlProof_.LatestProducerLineControlEndBefore(std::nullopt, tuPath,
-                                           observerLineBegin);
+        lineControlProof_.LatestProducerLineControlEndBefore(
+            std::nullopt, tuPath, observerLineBegin);
     const uint64_t searchBegin = latestLineControlEnd.value_or(0);
 
     std::optional<LineObserverCollapsedGap> collapsedGap =
         findLineObserverCollapsedPreGap(
             tuBytes, tuPath, bSource_, searchBegin, observerLineBegin,
-            observerTokens->firstATok,
-            paths_,
-            tokmapByPP, abTokMapA2B_, abTokMapB2A_, bToks_, bTokOff_);
+            observerTokens->firstATok, paths_, tokmapByPP, abTokMapA2B_,
+            abTokMapB2A_, bToks_, bTokOff_);
     if (!collapsedGap)
       continue;
 
@@ -829,21 +813,18 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
 
     std::optional<LineObserverSourcePrefix> sourcePrefix =
         buildLineObserverSourceSpelledPrefix(
-            tuBytes, tuPath, std::nullopt, bSource_,
-            paths_,
-            tokmapByPP, model_.GetMacroInvocations(), abTokMapA2B_,
-            abTokMapB2A_, bToks_, bTokOff_, collapsedGap->leftEntry->e,
-            collapsedGap->leftBEnd, collapsedGap->rightATok,
-            observerTokens->firstATok, observerLineBegin, firstObserverBBegin);
+            tuBytes, tuPath, std::nullopt, bSource_, paths_, tokmapByPP,
+            model_.GetMacroInvocations(), abTokMapA2B_, abTokMapB2A_, bToks_,
+            bTokOff_, collapsedGap->leftEntry->e, collapsedGap->leftBEnd,
+            collapsedGap->rightATok, observerTokens->firstATok,
+            observerLineBegin, firstObserverBBegin);
     if (!sourcePrefix)
       continue;
 
     std::optional<LineObserverRightClosure> closure =
         extendLineObserverRightClosure(
-            tuBytes, tuPath, bSource_,
-            paths_,
-            tokmapByPP, abTokMapA2B_, abTokMapB2A_, bToks_, bTokOff_,
-            observerConstructEnd, observerBEnd,
+            tuBytes, tuPath, bSource_, paths_, tokmapByPP, abTokMapA2B_,
+            abTokMapB2A_, bToks_, bTokOff_, observerConstructEnd, observerBEnd,
             observerTokens->lastATok, observerTokens->lastBTok);
     if (!closure)
       continue;
@@ -870,14 +851,15 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
     replacement += tuBytes.slice(observerLineBegin, observerConstructEnd).str();
     replacement += closure->sourceSpelledExtension;
 
-    TextEdit edit{editBegin, editEnd, replacement, std::nullopt,
-                  std::nullopt, {}, {}, {}};
-    textEditAssembler_.StampTextEditMaterializedBByteRange(edit, collapsedGap->leftBEnd,
-                                        firstObserverBBegin);
+    TextEdit edit{editBegin,    editEnd, replacement, std::nullopt,
+                  std::nullopt, {},      {},          {}};
+    textEditAssembler_.CertifyTextEditMaterializedBByteRange(
+        edit, collapsedGap->leftBEnd, firstObserverBBegin);
     textEditAssembler_.AttachAcceptedResultCarrier(
-        edit, proofLattice_.BuildAcceptedTUTextEditCandidate(
-                  AcceptedPathKind::TUByteSpanConservativeEdit, editBegin,
-                  editEnd, replacement));
+        edit, proofLattice_.AcceptedCandidateBuilder()
+                  .BuildAcceptedTUTextEditCandidate(
+                      AcceptedPathKind::TUByteSpanConservativeEdit, editBegin,
+                      editEnd, replacement));
     tuEdits.push_back(std::move(edit));
   }
 
@@ -945,20 +927,18 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
       continue;
 
     std::optional<LineObserverConstructTokens> observerTokens =
-        lineObserverConstructTokens(
-            ownerFile, sourceLineBegin, sourceLineEnd, macro,
-            paths_,
-            tokmapByPP, abTokMapA2B_, aToks_, bToks_, bTokOff_,
-            /*requirePreviousATok=*/true);
+        lineObserverConstructTokens(ownerFile, sourceLineBegin, sourceLineEnd,
+                                    macro, paths_, tokmapByPP, abTokMapA2B_,
+                                    aToks_, bToks_, bTokOff_,
+                                    /*requirePreviousATok=*/true);
     if (!observerTokens)
       continue;
 
     std::optional<LineObserverOwnLineMerge> ownLineMerge =
         resolveLineObserverOwnLineMerge(
-            headerBytes, ownerFile, bSource_,
-            paths_,
-            tokmapByPP, abTokMapA2B_, abTokMapB2A_, bToks_, bTokOff_,
-            sourceLineBegin, sourceLineEnd, *observerTokens);
+            headerBytes, ownerFile, bSource_, paths_, tokmapByPP, abTokMapA2B_,
+            abTokMapB2A_, bToks_, bTokOff_, sourceLineBegin, sourceLineEnd,
+            *observerTokens);
     if (!ownLineMerge)
       continue;
 
@@ -988,7 +968,8 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
     std::string replacement = bSource_.slice(prevBEnd, initialBEnd).str();
     replacement += ownLineClosure.sourceSpelledExtension;
 
-    IncludePatch patch{include, std::move(replacement), patchAStart, patchAEnd,
+    IncludePatch patch{include,     std::move(replacement),
+                       patchAStart, patchAEnd,
                        patchBStart, patchBEnd};
     patch.hasDirectHeaderByteRange = true;
     patch.directHeaderByteBegin = prevEntry.e;
@@ -996,7 +977,6 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
 
     auto [it, _] = perInclude.try_emplace(include->id, include);
     it->second.Add(std::move(patch));
-
   }
 
   // Header-owned analogue of the TU pre-observer layout theorem.  When B
@@ -1049,8 +1029,7 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
 
     std::optional<LineObserverConstructTokens> observerTokens =
         lineObserverConstructTokens(
-            ownerFile, observerLineBegin, observerConstructEnd, macro,
-            paths_,
+            ownerFile, observerLineBegin, observerConstructEnd, macro, paths_,
             tokmapByPP, abTokMapA2B_, aToks_, bToks_, bTokOff_,
             /*requirePreviousATok=*/true);
     if (!observerTokens)
@@ -1058,10 +1037,9 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
 
     const uint64_t firstObserverBBegin = observerTokens->firstBBegin;
 
-
     const std::optional<uint64_t> latestLineControlEnd =
-        lineControlProof_.LatestProducerLineControlEndBefore(site->ownerIncludeId, ownerFile,
-                                           observerLineBegin);
+        lineControlProof_.LatestProducerLineControlEndBefore(
+            site->ownerIncludeId, ownerFile, observerLineBegin);
     const uint64_t searchBegin = latestLineControlEnd.value_or(0);
 
     const uint64_t observerBEnd = observerTokens->bEnd;
@@ -1069,9 +1047,8 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
     std::optional<LineObserverCollapsedGap> collapsedGap =
         findLineObserverCollapsedPreGap(
             headerBytes, ownerFile, bSource_, searchBegin, observerLineBegin,
-            observerTokens->firstATok,
-            paths_,
-            tokmapByPP, abTokMapA2B_, abTokMapB2A_, bToks_, bTokOff_);
+            observerTokens->firstATok, paths_, tokmapByPP, abTokMapA2B_,
+            abTokMapB2A_, bToks_, bTokOff_);
     if (!collapsedGap)
       continue;
 
@@ -1085,22 +1062,19 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
 
     std::optional<LineObserverSourcePrefix> sourcePrefix =
         buildLineObserverSourceSpelledPrefix(
-            headerBytes, ownerFile, site->ownerIncludeId, bSource_,
-            paths_,
+            headerBytes, ownerFile, site->ownerIncludeId, bSource_, paths_,
             tokmapByPP, model_.GetMacroInvocations(), abTokMapA2B_,
-            abTokMapB2A_, bToks_, bTokOff_, leftEntry.e,
-            collapsedGap->leftBEnd, collapsedGap->rightATok,
-            observerTokens->firstATok, observerLineBegin, firstObserverBBegin);
+            abTokMapB2A_, bToks_, bTokOff_, leftEntry.e, collapsedGap->leftBEnd,
+            collapsedGap->rightATok, observerTokens->firstATok,
+            observerLineBegin, firstObserverBBegin);
     if (!sourcePrefix)
       continue;
 
     std::optional<LineObserverRightClosure> closure =
         extendLineObserverRightClosure(
-            headerBytes, ownerFile, bSource_,
-            paths_,
-            tokmapByPP, abTokMapA2B_, abTokMapB2A_, bToks_, bTokOff_,
-            observerConstructEnd, observerBEnd, observerTokens->lastATok,
-            observerTokens->lastBTok);
+            headerBytes, ownerFile, bSource_, paths_, tokmapByPP, abTokMapA2B_,
+            abTokMapB2A_, bToks_, bTokOff_, observerConstructEnd, observerBEnd,
+            observerTokens->lastATok, observerTokens->lastBTok);
     if (!closure)
       continue;
 
@@ -1127,7 +1101,8 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
       continue;
     }
 
-    IncludePatch patch{include, std::move(replacement), patchAStart, patchAEnd,
+    IncludePatch patch{include,     std::move(replacement),
+                       patchAStart, patchAEnd,
                        patchBStart, patchBEnd};
     patch.hasDirectHeaderByteRange = true;
     patch.directHeaderByteBegin = leftEntry.e;
@@ -1140,13 +1115,12 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
   return true;
 }
 
-
 bool RefoldLineObserverLayout::LineResyncShouldDeferToConditionalJoin(
     StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
     uint64_t resumeOffset) const {
   std::optional<LineStateObserverSite> firstObserver =
-      lineControlProof_.FirstOwnerSuffixLineStateObserverSite(ownerIncludeId, ownerFile,
-                                           resumeOffset);
+      lineControlProof_.FirstOwnerSuffixLineStateObserverSite(
+          ownerIncludeId, ownerFile, resumeOffset);
   if (!firstObserver || !firstObserver->demand.Any())
     return false;
 
@@ -1182,12 +1156,12 @@ RefoldLineObserverLayout::WrapIncludeExpansionForMaterialization(
   auto appendChildBody = [&]() {
     const uint64_t bodyBegin = static_cast<uint64_t>(wrapped.text.size());
     wrapped.text += childBody.str();
-    appendShiftedLineControlPruneCandidates(
-        wrapped.lineControlPruneCandidates, childBodyLineControlCandidates,
-        bodyBegin);
-    appendShiftedLineControlSourceMappings(
-        wrapped.lineControlSourceMappings, childBodyLineControlSourceMappings,
-        bodyBegin);
+    appendShiftedLineControlPruneCandidates(wrapped.lineControlPruneCandidates,
+                                            childBodyLineControlCandidates,
+                                            bodyBegin);
+    appendShiftedLineControlSourceMappings(wrapped.lineControlSourceMappings,
+                                           childBodyLineControlSourceMappings,
+                                           bodyBegin);
   };
 
   if (!lineDirs_.Enabled()) {
@@ -1200,9 +1174,8 @@ RefoldLineObserverLayout::WrapIncludeExpansionForMaterialization(
   const LineStateObserverDemand childDemand =
       lineControlProof_.IncludeSubtreeLineStateObserverDemand(child.id);
   const LineStateObserverDemand parentDemand =
-      lineControlProof_.OwnerSuffixLineStateObserverDemand(parentOwnerIncludeId,
-                                         parentOwnerFileForDemand,
-                                         parentResumeOffset);
+      lineControlProof_.OwnerSuffixLineStateObserverDemand(
+          parentOwnerIncludeId, parentOwnerFileForDemand, parentResumeOffset);
   const bool childNeedsLineState = childDemand.Any();
   const bool parentNeedsLineState = parentDemand.Any();
   const bool childNeedsLayoutBarrier =
@@ -1242,8 +1215,9 @@ RefoldLineObserverLayout::WrapIncludeExpansionForMaterialization(
           bool requireKnownObserver) {
         return OwnerStateProof().CheckStateTransitionAcrossEditBoundary(
             boundary, component, mutation,
-            OwnerStateProof().BuildStateTransitionWitness(SuffixStabilityWitnessKind::StateRepair,
-                                        component, boundary, detail),
+            OwnerStateProof().BuildStateTransitionWitness(
+                SuffixStabilityWitnessKind::StateRepair, component, boundary,
+                detail),
             stage, detail, requireKnownObserver);
       };
 
@@ -1371,9 +1345,7 @@ RefoldLineObserverLayout::WrapIncludeExpansionForMaterialization(
   deduplicateLineControlPruneCandidates(wrapped.lineControlPruneCandidates);
   deduplicateLineControlSourceMappings(wrapped.lineControlSourceMappings);
   return wrapped;
-
 }
-
 
 } // namespace refold
 } // namespace clang

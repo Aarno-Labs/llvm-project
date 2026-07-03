@@ -7,8 +7,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLog.h"
 #include "source/RefoldSourceMapper.h"
+#include "core/RefoldLog.h"
 #include "util/StringUtils.h"
 
 #include <algorithm>
@@ -23,8 +23,9 @@ using namespace llvm;
 namespace clang {
 namespace refold {
 
-StringRef RefoldSourceMapper::SliceSource(ArrayRef<size_t> tokOff, StringRef source,
-                                    uint64_t startTok, uint64_t endTok) {
+StringRef RefoldSourceMapper::SliceSource(ArrayRef<size_t> tokOff,
+                                          StringRef source, uint64_t startTok,
+                                          uint64_t endTok) {
   if (tokOff.empty() || source.empty())
     return "";
 
@@ -68,8 +69,7 @@ std::optional<size_t>
 RefoldSourceMapper::FindExactOwningArgSpanForPureInsertion(
     uint64_t aPos, ArrayRef<RefoldModel::PPArgSpan> argSpans) const {
   auto isCommaTok = [&](uint64_t a) -> bool {
-    return a < aToks_.size() &&
-           aToks_[static_cast<size_t>(a)].spelling == ",";
+    return a < aToks_.size() && aToks_[static_cast<size_t>(a)].spelling == ",";
   };
 
   // First prefer the simple containment case: if the pure-insertion gap lies
@@ -230,10 +230,9 @@ size_t RefoldSourceMapper::MapAByteToBByteLowerBound(size_t aByte) const {
   // length drift from all prior hunks to project the byte into B space.
   const size_t prefixIndex =
       static_cast<size_t>(std::distance(abByteHunks_->begin(), it));
-  const int64_t delta =
-      prefixIndex < abByteHunkPrefixDelta_.size()
-          ? abByteHunkPrefixDelta_[prefixIndex]
-          : 0;
+  const int64_t delta = prefixIndex < abByteHunkPrefixDelta_.size()
+                            ? abByteHunkPrefixDelta_[prefixIndex]
+                            : 0;
 
   int64_t result = static_cast<int64_t>(aByte) + delta;
   return static_cast<size_t>(std::max<int64_t>(0, result));
@@ -350,7 +349,7 @@ size_t RefoldSourceMapper::BTokIndexCeil(size_t bByte) const {
 
 std::pair<size_t, size_t>
 RefoldSourceMapper::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
-                                            size_t aByteEnd) const {
+                                                  size_t aByteEnd) const {
   // Normalize malformed ranges to an empty A-byte interval. Callers may pass
   // zero-width ranges for insertion anchors, so do not reject them here.
   if (aByteEnd < aByteBegin)
@@ -449,10 +448,11 @@ RefoldSourceMapper::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
               StringRef trimmed =
                   bSource_.slice(bByteEnd, std::min(bByteEnd + 200, oldEnd));
               REFOLD_LOG_TRACE("byte/env",
-                    "trimEnd: Abytes=[{0},{1}) hunkBbytes=[{2},{3}) "
-                    "Btrim=[{4},{5}) text='{6}'",
-                    aByteBegin, aByteEnd, cur->bStart, cur->bEnd, bByteEnd,
-                    oldEnd, stringutils::showWsWithClip(trimmed, 220));
+                               "trimEnd: Abytes=[{0},{1}) hunkBbytes=[{2},{3}) "
+                               "Btrim=[{4},{5}) text='{6}'",
+                               aByteBegin, aByteEnd, cur->bStart, cur->bEnd,
+                               bByteEnd, oldEnd,
+                               stringutils::showWsWithClip(trimmed, 220));
             }
           }
         }
@@ -588,11 +588,12 @@ RefoldSourceMapper::MapAToBTokenEnvelopeByPPArgSpan(
   // edited B token stream.
   if (sp.ppByteBegin && sp.ppByteEnd) {
     if (auto exactTokEnv = tryMapSingleStandardTokenExactly(sp.begin)) {
-      REFOLD_LOG_TRACE("byte/env",
-            "PPArgSpan['{0}' arg={1} Aidx={2} single-token exact map -> "
-            "Btok=[{3},{4}) tok='{5}'",
-            sp.kind, sp.argIdx, sp.begin, exactTokEnv->first,
-            exactTokEnv->second, bToks_[exactTokEnv->first].spelling);
+      REFOLD_LOG_TRACE(
+          "byte/env",
+          "PPArgSpan['{0}' arg={1} Aidx={2} single-token exact map -> "
+          "Btok=[{3},{4}) tok='{5}'",
+          sp.kind, sp.argIdx, sp.begin, exactTokEnv->first, exactTokEnv->second,
+          bToks_[exactTokEnv->first].spelling);
       return exactTokEnv;
     }
 
@@ -600,9 +601,10 @@ RefoldSourceMapper::MapAToBTokenEnvelopeByPPArgSpan(
     size_t pp1 = static_cast<size_t>(*sp.ppByteEnd);
     auto env = MapAByteRangeToBTokenEnvelope(pp0, pp1);
     REFOLD_LOG_TRACE("byte/env",
-          "PPArgSpan['{0}' arg={1} Aidx={2} PPbytes=[{3},{4})] -> "
-          "Btok=[{5},{6})",
-          sp.kind, sp.argIdx, sp.begin, pp0, pp1, env.first, env.second);
+                     "PPArgSpan['{0}' arg={1} Aidx={2} PPbytes=[{3},{4})] -> "
+                     "Btok=[{5},{6})",
+                     sp.kind, sp.argIdx, sp.begin, pp0, pp1, env.first,
+                     env.second);
     return env;
   }
 
@@ -610,10 +612,11 @@ RefoldSourceMapper::MapAToBTokenEnvelopeByPPArgSpan(
   // not silently snap token offsets in strict mode because that would downgrade
   // a producer-backed witness into a consumer-side approximation.
   if (strict_) {
-    REFOLD_LOG_FATAL("macro/pparg/span",
-          "PPArgSpan missing producer ppByte span (kind='{0}' argIdx={1} "
-          "A=[{2},{3}) ppByte=[4},{5}]) - cannot map without snapping",
-          sp.kind, sp.argIdx, sp.begin, sp.end, sp.ppByteBegin, sp.ppByteEnd);
+    REFOLD_LOG_FATAL(
+        "macro/pparg/span",
+        "PPArgSpan missing producer ppByte span (kind='{0}' argIdx={1} "
+        "A=[{2},{3}) ppByte=[4},{5}]) - cannot map without snapping",
+        sp.kind, sp.argIdx, sp.begin, sp.end, sp.ppByteBegin, sp.ppByteEnd);
     return std::nullopt;
   }
 
@@ -782,7 +785,7 @@ RefoldSourceMapper::TryMapUnchangedATokRangeToExactContiguousBImage(
 
 std::optional<std::pair<size_t, size_t>>
 RefoldSourceMapper::MapATokRangeAToBTokenEnvelope(uint64_t beginTok,
-                                            uint64_t endTok) const {
+                                                  uint64_t endTok) const {
   const uint64_t nA = static_cast<uint64_t>(aToks_.size());
 
   if (nA == 0 || aTokOff_.empty())
@@ -843,8 +846,8 @@ RefoldSourceMapper::MapATokRangeAToBTokenEnvelope(uint64_t beginTok,
 }
 
 std::optional<std::pair<size_t, size_t>>
-RefoldSourceMapper::MapATokRangeAToBTokenEnvelopeWholeCover(uint64_t beginTok,
-                                                      uint64_t endTok) const {
+RefoldSourceMapper::MapATokRangeAToBTokenEnvelopeWholeCover(
+    uint64_t beginTok, uint64_t endTok) const {
   const uint64_t nA = static_cast<uint64_t>(aToks_.size());
 
   if (nA == 0 || aTokOff_.empty())
@@ -945,6 +948,24 @@ RefoldSourceMapper::MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(
     bBegin = bEnd;
 
   return std::make_pair(bBegin, bEnd);
+}
+
+std::optional<uint64_t>
+RefoldSourceMapper::ByteStartForPPInFile(StringRef file, uint64_t pp) const {
+  auto it = model_.GetTokmapByPP().find(pp);
+  if (it != model_.GetTokmapByPP().end() &&
+      paths_.PathsEqual(it->second.file, file))
+    return it->second.b;
+  return std::nullopt;
+}
+
+std::optional<uint64_t>
+RefoldSourceMapper::ByteEndForPPInFile(StringRef file, uint64_t pp) const {
+  auto it = model_.GetTokmapByPP().find(pp);
+  if (it != model_.GetTokmapByPP().end() &&
+      paths_.PathsEqual(it->second.file, file))
+    return it->second.e;
+  return std::nullopt;
 }
 
 } // namespace refold

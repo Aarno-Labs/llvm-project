@@ -28,9 +28,8 @@ namespace refold {
 ///
 /// OutputDirectory is the directory that contains the emitted `.c.mod` file;
 /// source-graph relative paths are resolved beneath it, matching quoted include
-/// lookup from the final refolded source.  Verbose is reserved for future
-/// caller-side reporting controls; current diagnostics intentionally use the
-/// same RefoldLog channels and wording as the pre-extraction writer.
+/// lookup from the final refolded source.  Verbose is reserved for caller-side
+/// reporting controls; diagnostics use the shared RefoldLog channels.
 struct SourceGraphWriteOptions {
   std::string outputDirectory;
   bool verbose = false;
@@ -38,19 +37,20 @@ struct SourceGraphWriteOptions {
 
 /// Build writer options from the final refolded source path.
 ///
-/// Keeping this helper beside the writer preserves the old CLI behavior exactly:
-/// sidecars are emitted relative to the directory containing `--out`, and a
-/// basename-only output path writes sidecars relative to `.`.
-SourceGraphWriteOptions
-makeSourceGraphWriteOptionsForModifiedSourcePath(llvm::StringRef ModifiedSrcPath);
+/// Sidecars are emitted relative to the directory containing `--out`, and a
+/// basename-only output path writes sidecars relative to `.`. Keeping this
+/// path policy beside the writer keeps source-graph I/O localized.
+SourceGraphWriteOptions makeSourceGraphWriteOptionsForModifiedSourcePath(
+    llvm::StringRef ModifiedSrcPath);
 
 /// Write source-graph sidecar files and remove byte-exact stale sidecars.
 ///
-/// The Outputs vector is assumed to have been produced by RefoldEngine after
-/// source-graph proof planning.  This function performs no proof decisions and
-/// never calls back into the engine; it only validates paths and applies the
-/// requested filesystem writes/cleanup with the existing fail-closed logging
-/// behavior.
+/// The output records must already be the result of source-graph proof
+/// planning and include-materialization scheduling.  This function performs no
+/// proof decisions and never calls back into planning services; it only
+/// validates paths and applies the requested filesystem writes/cleanup with the
+/// existing fail-closed logging behavior.  Cleanup records are honored only
+/// when the on-disk sidecar still matches the recorded bytes exactly.
 void writeSourceGraphOutputs(llvm::ArrayRef<SourceGraphOutput> Outputs,
                              const SourceGraphWriteOptions &Options);
 

@@ -15,8 +15,7 @@
 #include "line-control/FinalLineControlModel.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "proof/RefoldOwnerStateTypes.h"
-#include "proof/RefoldTerminalProof.h"
-#include "proof/RefoldWitnessTypes.h"
+#include "proof/RefoldProofVocabulary.h"
 #include "util/StringUtils.h"
 
 #include "llvm/ADT/StringRef.h"
@@ -55,20 +54,20 @@ struct BInsertionProv {
 /// \brief Closed inventory of concrete emission surfaces.
 ///
 /// This enum intentionally does not replace TheoremProofClass.  It answers
-/// only "which concrete artifact surface can reach emission?" so the proof model
-/// can force every such surface through AcceptedResultCandidate without
+/// only "which concrete artifact surface can reach emission?" so the proof
+/// model can force every such surface through AcceptedResultCandidate without
 /// rediscovering path names by grep.  Some entries are primary artifact
 /// surfaces, while mixed-owner tiling and owner-realization materialization
 /// are proof overlays that can coexist with a macro/include/TU primary path.
-#define REFOLD_EMISSION_PATH_KIND_LIST(REFOLD_X)                              \
-REFOLD_X(Unknown)                                                           \
-REFOLD_X(MacroPatch)                                                        \
-REFOLD_X(IncludePatch)                                                      \
-REFOLD_X(TUAnchor)                                                          \
-REFOLD_X(TUTextEdit)                                                        \
-REFOLD_X(TerminalOutOfDomain)                                               \
-REFOLD_X(MixedOwnerTilingSegment)                                           \
-REFOLD_X(OwnerRealizationMaterialization)
+#define REFOLD_EMISSION_PATH_KIND_LIST(REFOLD_X)                               \
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(MacroPatch)                                                         \
+  REFOLD_X(IncludePatch)                                                       \
+  REFOLD_X(TUAnchor)                                                           \
+  REFOLD_X(TUTextEdit)                                                         \
+  REFOLD_X(TerminalOutOfDomain)                                                \
+  REFOLD_X(MixedOwnerTilingSegment)                                            \
+  REFOLD_X(OwnerRealizationMaterialization)
 
 enum class EmissionPathKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -78,7 +77,9 @@ enum class EmissionPathKind : uint8_t {
 
 inline StringRef toString(EmissionPathKind value) {
   switch (value) {
-#define REFOLD_X(name) case EmissionPathKind::name: return #name;
+#define REFOLD_X(name)                                                         \
+  case EmissionPathKind::name:                                                 \
+    return #name;
     REFOLD_EMISSION_PATH_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -124,15 +125,15 @@ struct EmissionPathInventory {
 /// must normalize into exactly one of these theorem classes before it can be
 /// selected or attached to a byte edit.
 #define REFOLD_THEOREM_PROOF_CLASS_LIST(REFOLD_X)                              \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(IdentityPreservingProof)                                            \
-REFOLD_X(InvocationPreservingProof)                                          \
-REFOLD_X(DirectivePreservingProof)                                           \
-REFOLD_X(StateRepairProof)                                                   \
-REFOLD_X(OwnerRealizationProof)                                              \
-REFOLD_X(MixedOwnerTilingProof)                                              \
-REFOLD_X(SuffixStabilizationProof)                                           \
-REFOLD_X(TerminalOutOfDomainProof)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(IdentityPreservingProof)                                            \
+  REFOLD_X(InvocationPreservingProof)                                          \
+  REFOLD_X(DirectivePreservingProof)                                           \
+  REFOLD_X(StateRepairProof)                                                   \
+  REFOLD_X(OwnerRealizationProof)                                              \
+  REFOLD_X(MixedOwnerTilingProof)                                              \
+  REFOLD_X(SuffixStabilizationProof)                                           \
+  REFOLD_X(TerminalOutOfDomainProof)
 
 enum class TheoremProofClass : uint8_t {
 #define REFOLD_X(name) name,
@@ -142,7 +143,9 @@ enum class TheoremProofClass : uint8_t {
 
 inline StringRef toString(TheoremProofClass value) {
   switch (value) {
-#define REFOLD_X(name) case TheoremProofClass::name: return #name;
+#define REFOLD_X(name)                                                         \
+  case TheoremProofClass::name:                                                \
+    return #name;
     REFOLD_THEOREM_PROOF_CLASS_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -158,14 +161,14 @@ inline StringRef toString(TheoremProofClass value) {
 /// to be renamed en masse, but selection and emission must use the
 /// summary-owned theorem class before treating a candidate as discharged.
 #define REFOLD_ACCEPTED_PROOF_CLASS_LIST(REFOLD_X)                             \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(InvocationPreserving)                                               \
-REFOLD_X(InvocationRealization)                                              \
-REFOLD_X(IncludePreserving)                                                  \
-REFOLD_X(IncludeRealization)                                                 \
-REFOLD_X(TUAnchor)                                                           \
-REFOLD_X(TUTextualEdit)                                                      \
-REFOLD_X(TerminalOutOfDomain)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(InvocationPreserving)                                               \
+  REFOLD_X(InvocationRealization)                                              \
+  REFOLD_X(IncludePreserving)                                                  \
+  REFOLD_X(IncludeRealization)                                                 \
+  REFOLD_X(TUAnchor)                                                           \
+  REFOLD_X(TUTextualEdit)                                                      \
+  REFOLD_X(TerminalOutOfDomain)
 
 enum class AcceptedProofClass : uint8_t {
 #define REFOLD_X(name) name,
@@ -175,7 +178,9 @@ enum class AcceptedProofClass : uint8_t {
 
 inline StringRef toString(AcceptedProofClass value) {
   switch (value) {
-#define REFOLD_X(name) case AcceptedProofClass::name: return #name;
+#define REFOLD_X(name)                                                         \
+  case AcceptedProofClass::name:                                               \
+    return #name;
     REFOLD_ACCEPTED_PROOF_CLASS_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -186,9 +191,9 @@ inline StringRef toString(AcceptedProofClass value) {
 /// \brief Whether an accepted result preserves original structure or emits
 /// a realized edited surface.
 #define REFOLD_REALIZATION_MODE_LIST(REFOLD_X)                                 \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(PreserveOriginalStructure)                                          \
-REFOLD_X(RealizeEditedSurface)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(PreserveOriginalStructure)                                          \
+  REFOLD_X(RealizeEditedSurface)
 
 enum class RealizationMode : uint8_t {
 #define REFOLD_X(name) name,
@@ -198,7 +203,9 @@ enum class RealizationMode : uint8_t {
 
 inline StringRef toString(RealizationMode value) {
   switch (value) {
-#define REFOLD_X(name) case RealizationMode::name: return #name;
+#define REFOLD_X(name)                                                         \
+  case RealizationMode::name:                                                  \
+    return #name;
     REFOLD_REALIZATION_MODE_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -211,10 +218,10 @@ inline StringRef toString(RealizationMode value) {
 /// Preference is tracked separately from proof validity so ordering policy
 /// remains explicit rather than being hidden in construction order.
 #define REFOLD_SELECTION_PREFERENCE_LIST(REFOLD_X)                             \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(PreferStructurePreservation)                                        \
-REFOLD_X(PreferSurfaceRealization)                                           \
-REFOLD_X(PreferExactAnchoring)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(PreferStructurePreservation)                                        \
+  REFOLD_X(PreferSurfaceRealization)                                           \
+  REFOLD_X(PreferExactAnchoring)
 
 enum class SelectionPreference : uint8_t {
 #define REFOLD_X(name) name,
@@ -224,7 +231,9 @@ enum class SelectionPreference : uint8_t {
 
 inline StringRef toString(SelectionPreference value) {
   switch (value) {
-#define REFOLD_X(name) case SelectionPreference::name: return #name;
+#define REFOLD_X(name)                                                         \
+  case SelectionPreference::name:                                              \
+    return #name;
     REFOLD_SELECTION_PREFERENCE_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -234,12 +243,12 @@ inline StringRef toString(SelectionPreference value) {
 
 /// \brief Surface realization choices kept distinct from proof metadata.
 #define REFOLD_SURFACE_DISPOSITION_LIST(REFOLD_X)                              \
-REFOLD_X(None)                                                               \
-REFOLD_X(RealizeWholeCoverMacros)                                            \
-REFOLD_X(RealizeInlineTouchedIncludesFromB)                                  \
-REFOLD_X(RealizeMaterializedIncludeExpansion)                                \
-REFOLD_X(RealizeTranslationUnitByteEdit)                                     \
-REFOLD_X(EmitEditedPreprocessedStream)
+  REFOLD_X(None)                                                               \
+  REFOLD_X(RealizeWholeCoverMacros)                                            \
+  REFOLD_X(RealizeInlineTouchedIncludesFromB)                                  \
+  REFOLD_X(RealizeMaterializedIncludeExpansion)                                \
+  REFOLD_X(RealizeTranslationUnitByteEdit)                                     \
+  REFOLD_X(EmitEditedPreprocessedStream)
 
 enum class SurfaceDisposition : uint8_t {
 #define REFOLD_X(name) name,
@@ -249,7 +258,9 @@ enum class SurfaceDisposition : uint8_t {
 
 inline StringRef toString(SurfaceDisposition value) {
   switch (value) {
-#define REFOLD_X(name) case SurfaceDisposition::name: return #name;
+#define REFOLD_X(name)                                                         \
+  case SurfaceDisposition::name:                                               \
+    return #name;
     REFOLD_SURFACE_DISPOSITION_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -264,8 +275,8 @@ inline StringRef toString(SurfaceDisposition value) {
 /// corresponding witness preconditions; the shared lattice selector then owns
 /// the actual preference decision.  Unknown means no special tie-breaker.
 #define REFOLD_THEOREM_SELECTION_TIE_BREAKER_LIST(REFOLD_X)                    \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(ExactTUArgumentEditOverEquivalentMacroArgsOnly)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(ExactTUArgumentEditOverEquivalentMacroArgsOnly)
 
 enum class TheoremSelectionTieBreakerKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -275,7 +286,9 @@ enum class TheoremSelectionTieBreakerKind : uint8_t {
 
 inline StringRef toString(TheoremSelectionTieBreakerKind value) {
   switch (value) {
-#define REFOLD_X(name) case TheoremSelectionTieBreakerKind::name: return #name;
+#define REFOLD_X(name)                                                         \
+  case TheoremSelectionTieBreakerKind::name:                                   \
+    return #name;
     REFOLD_THEOREM_SELECTION_TIE_BREAKER_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -291,32 +304,32 @@ inline StringRef toString(TheoremSelectionTieBreakerKind value) {
 /// should be added here only when they also map onto the strict-domain theorem
 /// vocabulary.
 #define REFOLD_ACCEPTED_PATH_KIND_LIST(REFOLD_X)                               \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(MacroArgsOnlyStandard)                                              \
-REFOLD_X(MacroArgsOnlyPasteSingle)                                           \
-REFOLD_X(MacroArgsOnlyPasteMulti)                                            \
-REFOLD_X(MacroArgsOnlyPurePasteOnly)                                         \
-REFOLD_X(MacroArgsOnlyPairedPureInsertion)                                   \
-REFOLD_X(MacroPasteDerivedCalleeSelector)                                    \
-REFOLD_X(MacroDagSubtreeRoot)                                                \
-REFOLD_X(MacroCallChainSuffix)                                               \
-REFOLD_X(MacroCounterLiteral)                                                \
-REFOLD_X(MacroWholeCoverRealization)                                         \
-REFOLD_X(IncludePatchPendingMaterialization)                                 \
-REFOLD_X(IncludeDeleteReplaceMappedHeaderTokens)                             \
-REFOLD_X(IncludeInsertSelectedConditionalBoundary)                           \
-REFOLD_X(IncludeInsertChildBoundary)                                         \
-REFOLD_X(IncludeInsertRightNeighborPP)                                       \
-REFOLD_X(IncludeInsertLeftNeighborPP)                                        \
-REFOLD_X(IncludeInsertDeclBoundary)                                          \
-REFOLD_X(IncludeRealizationInlineFromB)                                      \
-REFOLD_X(IncludeMaterializedExpansion)                                       \
-REFOLD_X(TUExactSlotBoundary)                                                \
-REFOLD_X(TUProvableInsertionAnchor)                                          \
-REFOLD_X(TUByteSpanMappedEdit)                                               \
-REFOLD_X(TUByteSpanConservativeEdit)                                         \
-REFOLD_X(TUIncludeClosureEdit)                                               \
-REFOLD_X(TerminalEmitEditedPreprocessedStream)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(MacroArgsOnlyStandard)                                              \
+  REFOLD_X(MacroArgsOnlyPasteSingle)                                           \
+  REFOLD_X(MacroArgsOnlyPasteMulti)                                            \
+  REFOLD_X(MacroArgsOnlyPurePasteOnly)                                         \
+  REFOLD_X(MacroArgsOnlyPairedPureInsertion)                                   \
+  REFOLD_X(MacroPasteDerivedCalleeSelector)                                    \
+  REFOLD_X(MacroDagSubtreeRoot)                                                \
+  REFOLD_X(MacroCallChainSuffix)                                               \
+  REFOLD_X(MacroCounterLiteral)                                                \
+  REFOLD_X(MacroWholeCoverRealization)                                         \
+  REFOLD_X(IncludePatchPendingMaterialization)                                 \
+  REFOLD_X(IncludeDeleteReplaceMappedHeaderTokens)                             \
+  REFOLD_X(IncludeInsertSelectedConditionalBoundary)                           \
+  REFOLD_X(IncludeInsertChildBoundary)                                         \
+  REFOLD_X(IncludeInsertRightNeighborPP)                                       \
+  REFOLD_X(IncludeInsertLeftNeighborPP)                                        \
+  REFOLD_X(IncludeInsertDeclBoundary)                                          \
+  REFOLD_X(IncludeRealizationInlineFromB)                                      \
+  REFOLD_X(IncludeMaterializedExpansion)                                       \
+  REFOLD_X(TUExactSlotBoundary)                                                \
+  REFOLD_X(TUProvableInsertionAnchor)                                          \
+  REFOLD_X(TUByteSpanMappedEdit)                                               \
+  REFOLD_X(TUByteSpanConservativeEdit)                                         \
+  REFOLD_X(TUIncludeClosureEdit)                                               \
+  REFOLD_X(TerminalEmitEditedPreprocessedStream)
 
 enum class AcceptedPathKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -326,7 +339,9 @@ enum class AcceptedPathKind : uint8_t {
 
 inline StringRef toString(AcceptedPathKind value) {
   switch (value) {
-#define REFOLD_X(name) case AcceptedPathKind::name: return #name;
+#define REFOLD_X(name)                                                         \
+  case AcceptedPathKind::name:                                                 \
+    return #name;
     REFOLD_ACCEPTED_PATH_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -343,12 +358,12 @@ inline StringRef toString(AcceptedPathKind value) {
 /// branch may survive only as an in-domain proof class or as the explicit
 /// terminal out-of-domain carrier.
 #define REFOLD_EXPANSION_FALLBACK_BRANCH_PROOF_CLASS_LIST(REFOLD_X)            \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(OwnerRealizationProof)                                              \
-REFOLD_X(MixedOwnerTilingProof)                                              \
-REFOLD_X(DirectivePreservingProof)                                           \
-REFOLD_X(TUTextualEditProof)                                                 \
-REFOLD_X(TerminalOutOfDomainProof)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(OwnerRealizationProof)                                              \
+  REFOLD_X(MixedOwnerTilingProof)                                              \
+  REFOLD_X(DirectivePreservingProof)                                           \
+  REFOLD_X(TUTextualEditProof)                                                 \
+  REFOLD_X(TerminalOutOfDomainProof)
 
 enum class ExpansionFallbackBranchProofClass : uint8_t {
 #define REFOLD_X(name) name,
@@ -359,8 +374,8 @@ enum class ExpansionFallbackBranchProofClass : uint8_t {
 inline StringRef toString(ExpansionFallbackBranchProofClass value) {
   switch (value) {
 #define REFOLD_X(name)                                                         \
-case ExpansionFallbackBranchProofClass::name:                                \
-  return #name;
+  case ExpansionFallbackBranchProofClass::name:                                \
+    return #name;
     REFOLD_EXPANSION_FALLBACK_BRANCH_PROOF_CLASS_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -370,15 +385,15 @@ case ExpansionFallbackBranchProofClass::name:                                \
 
 /// \brief Closed inventory of expansion-fallback branches that can emit.
 ///
-/// deliberately enumerates emitting fallback branches separately
-/// from their internal rejection checks.  Rejections do not emit; the emitted
-/// surfaces that remain in this file are the TU/include source-closure edit
+/// This enum deliberately enumerates emitting fallback branches separately
+/// from their internal rejection checks.  Rejections do not emit; the only
+/// emitted surfaces in this inventory are the TU/include source-closure edit
 /// and the declared raw-B terminal carrier.  Adding another emitting branch
 /// requires adding it here and assigning exactly one proof class below.
 #define REFOLD_EXPANSION_FALLBACK_BRANCH_KIND_LIST(REFOLD_X)                   \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(TUIncludeClosureEdit)                                               \
-REFOLD_X(PostStructuralTerminalOutOfDomain)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(TUIncludeClosureEdit)                                               \
+  REFOLD_X(PostStructuralTerminalOutOfDomain)
 
 enum class ExpansionFallbackBranchKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -388,7 +403,9 @@ enum class ExpansionFallbackBranchKind : uint8_t {
 
 inline StringRef toString(ExpansionFallbackBranchKind value) {
   switch (value) {
-#define REFOLD_X(name) case ExpansionFallbackBranchKind::name: return #name;
+#define REFOLD_X(name)                                                         \
+  case ExpansionFallbackBranchKind::name:                                      \
+    return #name;
     REFOLD_EXPANSION_FALLBACK_BRANCH_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -428,8 +445,7 @@ ClassifyExpansionFallbackBranch(ExpansionFallbackBranchKind branch) {
             TheoremProofClass::OwnerRealizationProof,
             AcceptedPathKind::TUIncludeClosureEdit};
   case ExpansionFallbackBranchKind::PostStructuralTerminalOutOfDomain:
-    return {branch,
-            ExpansionFallbackBranchProofClass::TerminalOutOfDomainProof,
+    return {branch, ExpansionFallbackBranchProofClass::TerminalOutOfDomainProof,
             TheoremProofClass::TerminalOutOfDomainProof,
             AcceptedPathKind::TerminalEmitEditedPreprocessedStream};
   case ExpansionFallbackBranchKind::Unknown:
@@ -440,10 +456,10 @@ ClassifyExpansionFallbackBranch(ExpansionFallbackBranchKind branch) {
 
 /// \brief How directly the current acceptance path is backed by a proof.
 #define REFOLD_ACCEPTANCE_SUPPORT_KIND_LIST(REFOLD_X)                          \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(ExplicitProofBacked)                                                \
-REFOLD_X(DeterministicButNotFirstClass)                                      \
-REFOLD_X(ExplicitOutOfDomainClass)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(ExplicitProofBacked)                                                \
+  REFOLD_X(DeterministicButNotFirstClass)                                      \
+  REFOLD_X(ExplicitOutOfDomainClass)
 
 enum class AcceptanceSupportKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -454,8 +470,8 @@ enum class AcceptanceSupportKind : uint8_t {
 inline StringRef toString(AcceptanceSupportKind value) {
   switch (value) {
 #define REFOLD_X(name)                                                         \
-case AcceptanceSupportKind::name:                                            \
-  return #name;
+  case AcceptanceSupportKind::name:                                            \
+    return #name;
     REFOLD_ACCEPTANCE_SUPPORT_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -465,38 +481,38 @@ case AcceptanceSupportKind::name:                                            \
 
 /// \brief Future proof-class placeholder targeted by a current path.
 #define REFOLD_FUTURE_PROOF_TARGET_LIST(REFOLD_X)                              \
-REFOLD_X(Unknown, "Unknown")                                                 \
-REFOLD_X(MacroStandardArgsOnly, "MacroStandardArgsOnly")                     \
-REFOLD_X(MacroPasteSingle, "MacroPasteSingle")                               \
-REFOLD_X(MacroPasteMultiFixedAnchor, "MacroPasteMultiFixedAnchor")           \
-REFOLD_X(MacroPurePasteOnly, "MacroPurePasteOnly")                           \
-REFOLD_X(MacroPairedPureInsertion, "MacroPairedPureInsertion")               \
-REFOLD_X(MacroPasteDerivedCalleeSelector, "MacroPasteDerivedCalleeSelector") \
-REFOLD_X(MacroDagLift, "MacroDagLift")                                       \
-REFOLD_X(MacroCallChainSuffixPreservation,                                   \
-         "MacroCallChainSuffixPreservation")                                 \
-REFOLD_X(MacroCounterStabilizationRealization,                               \
-         "MacroCounterStabilizationRealization")                             \
-REFOLD_X(MacroRealizationWholeCover, "MacroRealizationWholeCover")           \
-REFOLD_X(IncludePatchByMappedHeaderTokens,                                   \
-         "IncludePatchByMappedHeaderTokens")                                 \
-REFOLD_X(IncludeConditionalArmCertifiedInsertion,                            \
-         "IncludeConditionalArmCertifiedInsertion")                          \
-REFOLD_X(IncludeInsertionByChildBoundary, "IncludeInsertionByChildBoundary") \
-REFOLD_X(IncludeInsertionByRightNeighborPP,                                  \
-         "IncludeInsertionByRightNeighborPP")                                \
-REFOLD_X(IncludeInsertionByLeftNeighborPP,                                   \
-         "IncludeInsertionByLeftNeighborPP")                                 \
-REFOLD_X(IncludeInsertionByDeclBoundary, "IncludeInsertionByDeclBoundary")   \
-REFOLD_X(IncludeRealizationCover, "IncludeRealizationCover")                 \
-REFOLD_X(IncludeMaterializedExpansionRealization,                            \
-         "IncludeMaterializedExpansionRealization")                          \
-REFOLD_X(TUExactSlotAnchor, "TUExactSlotAnchor")                             \
-REFOLD_X(TUProvableInsertionAnchor, "TUProvableInsertionAnchor")             \
-REFOLD_X(TUByteSpanTextualEdit, "TUByteSpanTextualEdit")                     \
-REFOLD_X(TUIncludeClosureEdit, "TUIncludeClosureEdit")                       \
-REFOLD_X(EditedPreprocessedStreamFallback,                                   \
-         "ExplicitOutOfDomainTerminalResult")
+  REFOLD_X(Unknown, "Unknown")                                                 \
+  REFOLD_X(MacroStandardArgsOnly, "MacroStandardArgsOnly")                     \
+  REFOLD_X(MacroPasteSingle, "MacroPasteSingle")                               \
+  REFOLD_X(MacroPasteMultiFixedAnchor, "MacroPasteMultiFixedAnchor")           \
+  REFOLD_X(MacroPurePasteOnly, "MacroPurePasteOnly")                           \
+  REFOLD_X(MacroPairedPureInsertion, "MacroPairedPureInsertion")               \
+  REFOLD_X(MacroPasteDerivedCalleeSelector, "MacroPasteDerivedCalleeSelector") \
+  REFOLD_X(MacroDagLift, "MacroDagLift")                                       \
+  REFOLD_X(MacroCallChainSuffixPreservation,                                   \
+           "MacroCallChainSuffixPreservation")                                 \
+  REFOLD_X(MacroCounterStabilizationRealization,                               \
+           "MacroCounterStabilizationRealization")                             \
+  REFOLD_X(MacroRealizationWholeCover, "MacroRealizationWholeCover")           \
+  REFOLD_X(IncludePatchByMappedHeaderTokens,                                   \
+           "IncludePatchByMappedHeaderTokens")                                 \
+  REFOLD_X(IncludeConditionalArmCertifiedInsertion,                            \
+           "IncludeConditionalArmCertifiedInsertion")                          \
+  REFOLD_X(IncludeInsertionByChildBoundary, "IncludeInsertionByChildBoundary") \
+  REFOLD_X(IncludeInsertionByRightNeighborPP,                                  \
+           "IncludeInsertionByRightNeighborPP")                                \
+  REFOLD_X(IncludeInsertionByLeftNeighborPP,                                   \
+           "IncludeInsertionByLeftNeighborPP")                                 \
+  REFOLD_X(IncludeInsertionByDeclBoundary, "IncludeInsertionByDeclBoundary")   \
+  REFOLD_X(IncludeRealizationCover, "IncludeRealizationCover")                 \
+  REFOLD_X(IncludeMaterializedExpansionRealization,                            \
+           "IncludeMaterializedExpansionRealization")                          \
+  REFOLD_X(TUExactSlotAnchor, "TUExactSlotAnchor")                             \
+  REFOLD_X(TUProvableInsertionAnchor, "TUProvableInsertionAnchor")             \
+  REFOLD_X(TUByteSpanTextualEdit, "TUByteSpanTextualEdit")                     \
+  REFOLD_X(TUIncludeClosureEdit, "TUIncludeClosureEdit")                       \
+  REFOLD_X(EditedPreprocessedStreamFallback,                                   \
+           "ExplicitOutOfDomainTerminalResult")
 
 enum class FutureProofTarget : uint8_t {
 #define REFOLD_X(name, text) name,
@@ -506,7 +522,9 @@ enum class FutureProofTarget : uint8_t {
 
 inline StringRef toString(FutureProofTarget value) {
   switch (value) {
-#define REFOLD_X(name, text) case FutureProofTarget::name: return text;
+#define REFOLD_X(name, text)                                                   \
+  case FutureProofTarget::name:                                                \
+    return text;
     REFOLD_FUTURE_PROOF_TARGET_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -529,11 +547,11 @@ struct AcceptancePathInventory {
 /// selection and overlap rules can be described explicitly and audited in one
 /// place.
 #define REFOLD_LATTICE_CONFLICT_DOMAIN_LIST(REFOLD_X)                          \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(MacroInvocationRootSpan)                                            \
-REFOLD_X(IncludeOwnerRegion)                                                 \
-REFOLD_X(TUAnchorPoint)                                                      \
-REFOLD_X(WholeTranslationUnit)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(MacroInvocationRootSpan)                                            \
+  REFOLD_X(IncludeOwnerRegion)                                                 \
+  REFOLD_X(TUAnchorPoint)                                                      \
+  REFOLD_X(WholeTranslationUnit)
 
 enum class LatticeConflictDomain : uint8_t {
 #define REFOLD_X(name) name,
@@ -543,7 +561,9 @@ enum class LatticeConflictDomain : uint8_t {
 
 inline StringRef toString(LatticeConflictDomain value) {
   switch (value) {
-#define REFOLD_X(name) case LatticeConflictDomain::name: return #name;
+#define REFOLD_X(name)                                                         \
+  case LatticeConflictDomain::name:                                            \
+    return #name;
     REFOLD_LATTICE_CONFLICT_DOMAIN_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -554,11 +574,11 @@ inline StringRef toString(LatticeConflictDomain value) {
 /// \brief Merge law used when two artifacts in the same lattice domain are
 /// compatible.
 #define REFOLD_LATTICE_MERGE_LAW_LIST(REFOLD_X)                                \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(DisjointCompose)                                                    \
-REFOLD_X(NestedOuterShadowsInner)                                            \
-REFOLD_X(SelectSingleWitness)                                                \
-REFOLD_X(TerminalReplacesAll)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(DisjointCompose)                                                    \
+  REFOLD_X(NestedOuterShadowsInner)                                            \
+  REFOLD_X(SelectSingleWitness)                                                \
+  REFOLD_X(TerminalReplacesAll)
 
 enum class LatticeMergeLaw : uint8_t {
 #define REFOLD_X(name) name,
@@ -569,8 +589,8 @@ enum class LatticeMergeLaw : uint8_t {
 inline StringRef toString(LatticeMergeLaw value) {
   switch (value) {
 #define REFOLD_X(name)                                                         \
-case LatticeMergeLaw::name:                                                  \
-  return #name;
+  case LatticeMergeLaw::name:                                                  \
+    return #name;
     REFOLD_LATTICE_MERGE_LAW_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -581,12 +601,12 @@ case LatticeMergeLaw::name:                                                  \
 /// \brief Conflict law used when two artifacts in the same lattice domain
 /// are not simultaneously admissible.
 #define REFOLD_LATTICE_CONFLICT_LAW_LIST(REFOLD_X)                             \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(RejectPartialOverlap)                                               \
-REFOLD_X(PreferStructurePreservation)                                        \
-REFOLD_X(PreferExactAnchorWitness)                                           \
-REFOLD_X(PreferOwnerPreservingBeforeRealization)                             \
-REFOLD_X(ExplicitOutOfDomainTerminalResult)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(RejectPartialOverlap)                                               \
+  REFOLD_X(PreferStructurePreservation)                                        \
+  REFOLD_X(PreferExactAnchorWitness)                                           \
+  REFOLD_X(PreferOwnerPreservingBeforeRealization)                             \
+  REFOLD_X(ExplicitOutOfDomainTerminalResult)
 
 enum class LatticeConflictLaw : uint8_t {
 #define REFOLD_X(name) name,
@@ -596,7 +616,9 @@ enum class LatticeConflictLaw : uint8_t {
 
 inline StringRef toString(LatticeConflictLaw value) {
   switch (value) {
-#define REFOLD_X(name) case LatticeConflictLaw::name: return #name;
+#define REFOLD_X(name)                                                         \
+  case LatticeConflictLaw::name:                                               \
+    return #name;
     REFOLD_LATTICE_CONFLICT_LAW_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -620,10 +642,10 @@ struct GlobalSelectionLattice {
 /// class is still being closed, or sit outside the declared class set
 /// entirely (for example an explicit terminal out-of-domain result).
 #define REFOLD_COMPLETENESS_COVERAGE_KIND_LIST(REFOLD_X)                       \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(DeclaredProofClass)                                                 \
-REFOLD_X(TransitionalGap)                                                    \
-REFOLD_X(ExplicitOutOfDomainClass)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(DeclaredProofClass)                                                 \
+  REFOLD_X(TransitionalGap)                                                    \
+  REFOLD_X(ExplicitOutOfDomainClass)
 
 enum class CompletenessCoverageKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -634,8 +656,8 @@ enum class CompletenessCoverageKind : uint8_t {
 inline StringRef toString(CompletenessCoverageKind value) {
   switch (value) {
 #define REFOLD_X(name)                                                         \
-case CompletenessCoverageKind::name:                                         \
-  return #name;
+  case CompletenessCoverageKind::name:                                         \
+    return #name;
     REFOLD_COMPLETENESS_COVERAGE_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -645,10 +667,10 @@ case CompletenessCoverageKind::name:                                         \
 
 /// \brief What completeness promise the engine makes for a covered path.
 #define REFOLD_COMPLETENESS_EXPECTATION_KIND_LIST(REFOLD_X)                    \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(MustDiscoverDeclaredOrStrongerCompatible)                           \
-REFOLD_X(NoClaimPendingClassClosure)                                         \
-REFOLD_X(ExplicitlyOutsideDeclaredSet)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(MustDiscoverDeclaredOrStrongerCompatible)                           \
+  REFOLD_X(NoClaimPendingClassClosure)                                         \
+  REFOLD_X(ExplicitlyOutsideDeclaredSet)
 
 enum class CompletenessExpectationKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -659,8 +681,8 @@ enum class CompletenessExpectationKind : uint8_t {
 inline StringRef toString(CompletenessExpectationKind value) {
   switch (value) {
 #define REFOLD_X(name)                                                         \
-case CompletenessExpectationKind::name:                                      \
-  return #name;
+  case CompletenessExpectationKind::name:                                      \
+    return #name;
     REFOLD_COMPLETENESS_EXPECTATION_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -692,10 +714,10 @@ struct CompletenessContract {
 /// classes or explicit named out-of-domain classes. Transitional states may
 /// still exist internally, but they are not allowed to survive to emission.
 #define REFOLD_THEOREM_DOMAIN_KIND_LIST(REFOLD_X)                              \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(DeclaredInDomainClass)                                              \
-REFOLD_X(TransitionalGap)                                                    \
-REFOLD_X(ExplicitOutOfDomainClass)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(DeclaredInDomainClass)                                              \
+  REFOLD_X(TransitionalGap)                                                    \
+  REFOLD_X(ExplicitOutOfDomainClass)
 
 enum class TheoremDomainKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -706,8 +728,8 @@ enum class TheoremDomainKind : uint8_t {
 inline StringRef toString(TheoremDomainKind value) {
   switch (value) {
 #define REFOLD_X(name)                                                         \
-case TheoremDomainKind::name:                                                \
-  return #name;
+  case TheoremDomainKind::name:                                                \
+    return #name;
     REFOLD_THEOREM_DOMAIN_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -737,15 +759,15 @@ struct TheoremDomainContract {
 /// witnesses so accepted TU-owned insertions can explain which anchor source
 /// was used and which non-crossing facts were relied upon.
 #define REFOLD_TUANCHOR_EVIDENCE_KIND_LIST(REFOLD_X)                           \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(ExactSlotBoundary)                                                  \
-REFOLD_X(ArgLikeBegin)                                                       \
-REFOLD_X(ImmediateRightNeighbor)                                             \
-REFOLD_X(ImmediateLeftNeighbor)                                              \
-REFOLD_X(IncludeDirectiveBoundary)                                           \
-REFOLD_X(ZeroTokenIncludeBoundary)                                           \
-REFOLD_X(CorroboratedRightNeighbor)                                          \
-REFOLD_X(CorroboratedLeftNeighbor)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(ExactSlotBoundary)                                                  \
+  REFOLD_X(ArgLikeBegin)                                                       \
+  REFOLD_X(ImmediateRightNeighbor)                                             \
+  REFOLD_X(ImmediateLeftNeighbor)                                              \
+  REFOLD_X(IncludeDirectiveBoundary)                                           \
+  REFOLD_X(ZeroTokenIncludeBoundary)                                           \
+  REFOLD_X(CorroboratedRightNeighbor)                                          \
+  REFOLD_X(CorroboratedLeftNeighbor)
 
 enum class TUAnchorEvidenceKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -756,8 +778,8 @@ enum class TUAnchorEvidenceKind : uint8_t {
 inline StringRef toString(TUAnchorEvidenceKind value) {
   switch (value) {
 #define REFOLD_X(name)                                                         \
-case TUAnchorEvidenceKind::name:                                             \
-  return #name;
+  case TUAnchorEvidenceKind::name:                                             \
+    return #name;
     REFOLD_TUANCHOR_EVIDENCE_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -798,14 +820,14 @@ struct TUAnchorWitness {
 /// Include-preserving materialization paths use explicit local witnesses so
 /// each accepted include patch can explain which deterministic
 /// anchoring or mapping rule was used.
-#define REFOLD_INCLUDE_ANCHOR_EVIDENCE_KIND_LIST(REFOLD_X) \
-REFOLD_X(Unknown) \
-REFOLD_X(MappedHeaderTokens) \
-REFOLD_X(SelectedConditionalBoundary) \
-REFOLD_X(ChildBoundary) \
-REFOLD_X(RightNeighborPP) \
-REFOLD_X(LeftNeighborPP) \
-REFOLD_X(DeclBoundary)
+#define REFOLD_INCLUDE_ANCHOR_EVIDENCE_KIND_LIST(REFOLD_X)                     \
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(MappedHeaderTokens)                                                 \
+  REFOLD_X(SelectedConditionalBoundary)                                        \
+  REFOLD_X(ChildBoundary)                                                      \
+  REFOLD_X(RightNeighborPP)                                                    \
+  REFOLD_X(LeftNeighborPP)                                                     \
+  REFOLD_X(DeclBoundary)
 
 enum class IncludeAnchorEvidenceKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -815,7 +837,9 @@ enum class IncludeAnchorEvidenceKind : uint8_t {
 
 inline StringRef toString(IncludeAnchorEvidenceKind value) {
   switch (value) {
-#define REFOLD_X(name) case IncludeAnchorEvidenceKind::name: return #name;
+#define REFOLD_X(name)                                                         \
+  case IncludeAnchorEvidenceKind::name:                                        \
+    return #name;
     REFOLD_INCLUDE_ANCHOR_EVIDENCE_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -866,9 +890,9 @@ struct IncludeAnchorWitness {
 /// realization outside those declared witnesses remains an explicit terminal
 /// out-of-domain case instead of manufacturing a weaker proof class.
 #define REFOLD_INCLUDE_REALIZATION_EVIDENCE_KIND_LIST(REFOLD_X)                \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(CanonicalBCoverEnvelope)                                            \
-REFOLD_X(BoundaryStableConsensusBCoverEnvelope)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(CanonicalBCoverEnvelope)                                            \
+  REFOLD_X(BoundaryStableConsensusBCoverEnvelope)
 
 enum class IncludeRealizationEvidenceKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -879,8 +903,8 @@ enum class IncludeRealizationEvidenceKind : uint8_t {
 inline StringRef toString(IncludeRealizationEvidenceKind value) {
   switch (value) {
 #define REFOLD_X(name)                                                         \
-case IncludeRealizationEvidenceKind::name:                                   \
-  return #name;
+  case IncludeRealizationEvidenceKind::name:                                   \
+    return #name;
     REFOLD_INCLUDE_REALIZATION_EVIDENCE_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -893,15 +917,15 @@ using IncludeRealizationBTokenEnvelope = std::pair<size_t, size_t>;
 /// Owner-polymorphic evidence kind for realized output.
 ///
 /// Macro whole-cover realization, include realization, and direct TU byte
-/// realization still use owner-specific spelling mechanics.  gives
+/// realization still use owner-specific spelling mechanics.  This enum gives
 /// those paths one shared theorem-facing carrier so the proof lattice can
 /// audit all realized output as an OwnerRealizationProof.
 #define REFOLD_OWNER_REALIZATION_EVIDENCE_KIND_LIST(REFOLD_X)                  \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(MacroWholeCover)                                                    \
-REFOLD_X(IncludeBEnvelope)                                                   \
-REFOLD_X(IncludeMaterializedExpansion)                                       \
-REFOLD_X(TUByteSpan)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(MacroWholeCover)                                                    \
+  REFOLD_X(IncludeBEnvelope)                                                   \
+  REFOLD_X(IncludeMaterializedExpansion)                                       \
+  REFOLD_X(TUByteSpan)
 
 enum class OwnerRealizationEvidenceKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -912,8 +936,8 @@ enum class OwnerRealizationEvidenceKind : uint8_t {
 inline StringRef toString(OwnerRealizationEvidenceKind value) {
   switch (value) {
 #define REFOLD_X(name)                                                         \
-case OwnerRealizationEvidenceKind::name:                                     \
-  return #name;
+  case OwnerRealizationEvidenceKind::name:                                     \
+    return #name;
     REFOLD_OWNER_REALIZATION_EVIDENCE_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -931,8 +955,7 @@ case OwnerRealizationEvidenceKind::name:                                     \
 /// should only construct the owner-specific closure and spelling, then
 /// delegate the shared admissibility proof to that helper.
 struct OwnerRealizationWitness {
-  OwnerRealizationEvidenceKind evidence =
-      OwnerRealizationEvidenceKind::Unknown;
+  OwnerRealizationEvidenceKind evidence = OwnerRealizationEvidenceKind::Unknown;
   OwnerClosure closure;
 
   // Typed state witnesses for the realized owner.  Each witness names
@@ -966,9 +989,9 @@ struct OwnerRealizationResult {
 /// they are part of the proof that the source gap was fully covered and
 /// state-composable.
 #define REFOLD_MIXED_OWNER_TILING_EDGE_KIND_LIST(REFOLD_X)                     \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(TokenSegment)                                                       \
-REFOLD_X(StateGap)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(TokenSegment)                                                       \
+  REFOLD_X(StateGap)
 
 enum class MixedOwnerTilingEdgeKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -979,8 +1002,8 @@ enum class MixedOwnerTilingEdgeKind : uint8_t {
 inline StringRef toString(MixedOwnerTilingEdgeKind value) {
   switch (value) {
 #define REFOLD_X(name)                                                         \
-case MixedOwnerTilingEdgeKind::name:                                         \
-  return #name;
+  case MixedOwnerTilingEdgeKind::name:                                         \
+    return #name;
     REFOLD_MIXED_OWNER_TILING_EDGE_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -1063,10 +1086,10 @@ struct MixedOwnerTilingSegmentBinding {
 /// facts mirror them into the same record so the theorem boundary stays
 /// explicit.
 #define REFOLD_PROOF_DISCHARGE_STATUS_LIST(REFOLD_X)                           \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(PendingMaterialization)                                             \
-REFOLD_X(Discharged)                                                         \
-REFOLD_X(Rejected)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(PendingMaterialization)                                             \
+  REFOLD_X(Discharged)                                                         \
+  REFOLD_X(Rejected)
 
 enum class ProofDischargeStatus : uint8_t {
 #define REFOLD_X(name) name,
@@ -1077,8 +1100,8 @@ enum class ProofDischargeStatus : uint8_t {
 inline StringRef toString(ProofDischargeStatus value) {
   switch (value) {
 #define REFOLD_X(name)                                                         \
-case ProofDischargeStatus::name:                                             \
-  return #name;
+  case ProofDischargeStatus::name:                                             \
+    return #name;
     REFOLD_PROOF_DISCHARGE_STATUS_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -1088,45 +1111,45 @@ case ProofDischargeStatus::name:                                             \
 
 /// \brief Named local obligations used by proof-discharge records.
 #define REFOLD_PROOF_OBLIGATION_KIND_LIST(REFOLD_X)                            \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(AcceptedPathClassified)                                             \
-REFOLD_X(FutureTargetMapped)                                                 \
-REFOLD_X(ProofRootTracked)                                                   \
-REFOLD_X(MacroProofRootResolved)                                             \
-REFOLD_X(MacroProofRootIsTopLevel)                                           \
-REFOLD_X(MacroPasteWitnessPresent)                                           \
-REFOLD_X(MacroPasteWitnessWellFormed)                                        \
-REFOLD_X(MacroPasteFreeSurfaceTracked)                                       \
-REFOLD_X(MacroSubtreeCertificateTracked)                                     \
-REFOLD_X(MacroCallChainWitnessTracked)                                       \
-REFOLD_X(CounterStateWitnessTracked)                                         \
-REFOLD_X(SubtreeAdmissibilityTracked)                                        \
-REFOLD_X(WholeCoverBoundsTracked)                                            \
-REFOLD_X(WholeCoverContainmentTracked)                                       \
-REFOLD_X(WholeCoverBoundaryAccountingTracked)                                \
-REFOLD_X(IncludePendingMaterializationClassified)                            \
-REFOLD_X(IncludePatchShapeTracked)                                           \
-REFOLD_X(IncludeAnchorWitnessTracked)                                        \
-REFOLD_X(IncludeAnchorByteTracked)                                           \
-REFOLD_X(IncludeConditionalOwnershipTracked)                                 \
-REFOLD_X(IncludeMappedHeaderRangeTracked)                                    \
-REFOLD_X(IncludeMappedHeaderByteRangeTracked)                                \
-REFOLD_X(IncludeSelectedConditionalBoundaryWitnessTracked)                   \
-REFOLD_X(IncludeChildBoundaryWitnessTracked)                                 \
-REFOLD_X(IncludeRightNeighborWitnessTracked)                                 \
-REFOLD_X(IncludeLeftNeighborWitnessTracked)                                  \
-REFOLD_X(IncludeDeclBoundaryWitnessTracked)                                  \
-REFOLD_X(TUAnchorPathClassified)                                             \
-REFOLD_X(TUAnchorWitnessTracked)                                             \
-REFOLD_X(TUAnchorPPGapTracked)                                               \
-REFOLD_X(TUAnchorByteTracked)                                                \
-REFOLD_X(TUExactSlotWitnessTracked)                                          \
-REFOLD_X(TUProvableEvidenceTracked)                                          \
-REFOLD_X(TUOutsideIncludeCoverageTracked)                                    \
-REFOLD_X(TUOwnerDepthStableTracked)                                          \
-REFOLD_X(ExplicitOutOfDomainResultTracked)                                   \
-REFOLD_X(PrimaryProofClassDeclared)                                          \
-REFOLD_X(OwnerRealizationWitnessTracked)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(AcceptedPathClassified)                                             \
+  REFOLD_X(FutureTargetMapped)                                                 \
+  REFOLD_X(ProofRootTracked)                                                   \
+  REFOLD_X(MacroProofRootResolved)                                             \
+  REFOLD_X(MacroProofRootIsTopLevel)                                           \
+  REFOLD_X(MacroPasteWitnessPresent)                                           \
+  REFOLD_X(MacroPasteWitnessWellFormed)                                        \
+  REFOLD_X(MacroPasteFreeSurfaceTracked)                                       \
+  REFOLD_X(MacroSubtreeCertificateTracked)                                     \
+  REFOLD_X(MacroCallChainWitnessTracked)                                       \
+  REFOLD_X(CounterStateWitnessTracked)                                         \
+  REFOLD_X(SubtreeAdmissibilityTracked)                                        \
+  REFOLD_X(WholeCoverBoundsTracked)                                            \
+  REFOLD_X(WholeCoverContainmentTracked)                                       \
+  REFOLD_X(WholeCoverBoundaryAccountingTracked)                                \
+  REFOLD_X(IncludePendingMaterializationClassified)                            \
+  REFOLD_X(IncludePatchShapeTracked)                                           \
+  REFOLD_X(IncludeAnchorWitnessTracked)                                        \
+  REFOLD_X(IncludeAnchorByteTracked)                                           \
+  REFOLD_X(IncludeConditionalOwnershipTracked)                                 \
+  REFOLD_X(IncludeMappedHeaderRangeTracked)                                    \
+  REFOLD_X(IncludeMappedHeaderByteRangeTracked)                                \
+  REFOLD_X(IncludeSelectedConditionalBoundaryWitnessTracked)                   \
+  REFOLD_X(IncludeChildBoundaryWitnessTracked)                                 \
+  REFOLD_X(IncludeRightNeighborWitnessTracked)                                 \
+  REFOLD_X(IncludeLeftNeighborWitnessTracked)                                  \
+  REFOLD_X(IncludeDeclBoundaryWitnessTracked)                                  \
+  REFOLD_X(TUAnchorPathClassified)                                             \
+  REFOLD_X(TUAnchorWitnessTracked)                                             \
+  REFOLD_X(TUAnchorPPGapTracked)                                               \
+  REFOLD_X(TUAnchorByteTracked)                                                \
+  REFOLD_X(TUExactSlotWitnessTracked)                                          \
+  REFOLD_X(TUProvableEvidenceTracked)                                          \
+  REFOLD_X(TUOutsideIncludeCoverageTracked)                                    \
+  REFOLD_X(TUOwnerDepthStableTracked)                                          \
+  REFOLD_X(ExplicitOutOfDomainResultTracked)                                   \
+  REFOLD_X(PrimaryProofClassDeclared)                                          \
+  REFOLD_X(OwnerRealizationWitnessTracked)
 
 enum class ProofObligationKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -1137,8 +1160,8 @@ enum class ProofObligationKind : uint8_t {
 inline StringRef toString(ProofObligationKind obligation) {
   switch (obligation) {
 #define REFOLD_X(name)                                                         \
-case ProofObligationKind::name:                                              \
-  return #name;
+  case ProofObligationKind::name:                                              \
+    return #name;
     REFOLD_PROOF_OBLIGATION_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -1148,45 +1171,45 @@ case ProofObligationKind::name:                                              \
 
 /// \brief Why a local proof contract could not be discharged.
 #define REFOLD_PROOF_FAILURE_REASON_LIST(REFOLD_X)                             \
-REFOLD_X(None)                                                               \
-REFOLD_X(PendingMaterialization)                                             \
-REFOLD_X(MissingAcceptedPathClassification)                                  \
-REFOLD_X(MissingFutureTargetMapping)                                         \
-REFOLD_X(MissingProofRoot)                                                   \
-REFOLD_X(MissingMacroProofRootResolution)                                    \
-REFOLD_X(NonTopLevelMacroProofRoot)                                          \
-REFOLD_X(MissingPasteWitness)                                                \
-REFOLD_X(MalformedPasteWitness)                                              \
-REFOLD_X(UnexpectedPasteSurface)                                             \
-REFOLD_X(MissingSubtreeCertificate)                                          \
-REFOLD_X(MissingCallChainWitness)                                            \
-REFOLD_X(MissingCounterStateWitness)                                         \
-REFOLD_X(MissingSubtreeAdmissibility)                                        \
-REFOLD_X(MissingWholeCoverBounds)                                            \
-REFOLD_X(MissingWholeCoverContainment)                                       \
-REFOLD_X(MissingWholeCoverBoundaryAccounting)                                \
-REFOLD_X(MissingIncludePatchShape)                                           \
-REFOLD_X(MissingIncludeAnchorWitness)                                        \
-REFOLD_X(MissingIncludeAnchorByte)                                           \
-REFOLD_X(MissingConditionalOwnership)                                        \
-REFOLD_X(MissingMappedHeaderRange)                                           \
-REFOLD_X(MissingMappedHeaderByteRange)                                       \
-REFOLD_X(MissingIncludeSelectedConditionalBoundaryWitness)                   \
-REFOLD_X(MissingIncludeChildBoundaryWitness)                                 \
-REFOLD_X(MissingIncludeRightNeighborWitness)                                 \
-REFOLD_X(MissingIncludeLeftNeighborWitness)                                  \
-REFOLD_X(MissingIncludeDeclBoundaryWitness)                                  \
-REFOLD_X(MissingTUAnchorClassification)                                      \
-REFOLD_X(MissingTUAnchorWitness)                                             \
-REFOLD_X(MissingTUAnchorGap)                                                 \
-REFOLD_X(MissingTUAnchorByte)                                                \
-REFOLD_X(MissingTUExactSlotWitness)                                          \
-REFOLD_X(MissingTUProvableAnchorWitness)                                     \
-REFOLD_X(MissingTUOutsideIncludeCoverageProof)                               \
-REFOLD_X(MissingTUOwnerDepthStability)                                       \
-REFOLD_X(ExplicitOutOfDomainResult)                                          \
-REFOLD_X(MissingPrimaryProofClass)                                           \
-REFOLD_X(MissingOwnerRealizationWitness)
+  REFOLD_X(None)                                                               \
+  REFOLD_X(PendingMaterialization)                                             \
+  REFOLD_X(MissingAcceptedPathClassification)                                  \
+  REFOLD_X(MissingFutureTargetMapping)                                         \
+  REFOLD_X(MissingProofRoot)                                                   \
+  REFOLD_X(MissingMacroProofRootResolution)                                    \
+  REFOLD_X(NonTopLevelMacroProofRoot)                                          \
+  REFOLD_X(MissingPasteWitness)                                                \
+  REFOLD_X(MalformedPasteWitness)                                              \
+  REFOLD_X(UnexpectedPasteSurface)                                             \
+  REFOLD_X(MissingSubtreeCertificate)                                          \
+  REFOLD_X(MissingCallChainWitness)                                            \
+  REFOLD_X(MissingCounterStateWitness)                                         \
+  REFOLD_X(MissingSubtreeAdmissibility)                                        \
+  REFOLD_X(MissingWholeCoverBounds)                                            \
+  REFOLD_X(MissingWholeCoverContainment)                                       \
+  REFOLD_X(MissingWholeCoverBoundaryAccounting)                                \
+  REFOLD_X(MissingIncludePatchShape)                                           \
+  REFOLD_X(MissingIncludeAnchorWitness)                                        \
+  REFOLD_X(MissingIncludeAnchorByte)                                           \
+  REFOLD_X(MissingConditionalOwnership)                                        \
+  REFOLD_X(MissingMappedHeaderRange)                                           \
+  REFOLD_X(MissingMappedHeaderByteRange)                                       \
+  REFOLD_X(MissingIncludeSelectedConditionalBoundaryWitness)                   \
+  REFOLD_X(MissingIncludeChildBoundaryWitness)                                 \
+  REFOLD_X(MissingIncludeRightNeighborWitness)                                 \
+  REFOLD_X(MissingIncludeLeftNeighborWitness)                                  \
+  REFOLD_X(MissingIncludeDeclBoundaryWitness)                                  \
+  REFOLD_X(MissingTUAnchorClassification)                                      \
+  REFOLD_X(MissingTUAnchorWitness)                                             \
+  REFOLD_X(MissingTUAnchorGap)                                                 \
+  REFOLD_X(MissingTUAnchorByte)                                                \
+  REFOLD_X(MissingTUExactSlotWitness)                                          \
+  REFOLD_X(MissingTUProvableAnchorWitness)                                     \
+  REFOLD_X(MissingTUOutsideIncludeCoverageProof)                               \
+  REFOLD_X(MissingTUOwnerDepthStability)                                       \
+  REFOLD_X(ExplicitOutOfDomainResult)                                          \
+  REFOLD_X(MissingPrimaryProofClass)                                           \
+  REFOLD_X(MissingOwnerRealizationWitness)
 
 enum class ProofFailureReason : uint8_t {
 #define REFOLD_X(name) name,
@@ -1197,8 +1220,8 @@ enum class ProofFailureReason : uint8_t {
 inline StringRef toString(ProofFailureReason reason) {
   switch (reason) {
 #define REFOLD_X(name)                                                         \
-case ProofFailureReason::name:                                               \
-  return #name;
+  case ProofFailureReason::name:                                               \
+    return #name;
     REFOLD_PROOF_FAILURE_REASON_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -1215,10 +1238,58 @@ struct ProofDischargeRecord {
   uint16_t obligationsSatisfied = 0;
 };
 
-/// \brief Shared helper, defined in RefoldProofDischarge.h, that accumulates
-/// class-local proof obligations without making discharge bookkeeping part of
-/// RefoldEngine.
-struct ProofDischargeAccumulator;
+/// \brief Accumulates deterministic local proof-obligation discharge state.
+///
+/// Callers use Require() for ordinary obligations, Fail() for an explicit
+/// fail-closed rejection, and Finish() to normalize an otherwise untouched
+/// accumulator to a discharged record.  The first failure remains the canonical
+/// diagnostic reason so later checks cannot overwrite the original proof gap.
+/// The accumulator lives alongside ProofDischargeRecord because its only
+/// dependency is that record and the obligation/reason enums above; promoting
+/// it to RefoldProofVocabulary.h would create a header cycle.
+struct ProofDischargeAccumulator {
+  ProofDischargeRecord record;
+
+  explicit ProofDischargeAccumulator(
+      ProofDischargeStatus initialStatus = ProofDischargeStatus::Unknown) {
+    record.status = initialStatus;
+  }
+
+  /// Record a satisfied obligation.
+  void Satisfy(ProofObligationKind obligation) {
+    (void)obligation;
+    ++record.obligationsEvaluated;
+    ++record.obligationsSatisfied;
+    if (record.status == ProofDischargeStatus::Unknown)
+      record.status = ProofDischargeStatus::Discharged;
+  }
+
+  /// Record a failed obligation without overwriting the first failure reason.
+  void Fail(ProofObligationKind obligation, ProofFailureReason reason) {
+    ++record.obligationsEvaluated;
+    if (record.failedObligation == ProofObligationKind::Unknown)
+      record.failedObligation = obligation;
+    if (record.failureReason == ProofFailureReason::None)
+      record.failureReason = reason;
+    record.status = ProofDischargeStatus::Rejected;
+  }
+
+  /// Check one obligation and update the discharge record monotonically.
+  void Require(bool condition, ProofObligationKind obligation,
+               ProofFailureReason reason) {
+    if (condition)
+      Satisfy(obligation);
+    else
+      Fail(obligation, reason);
+  }
+
+  /// Return the normalized record, discharging an untouched accumulator.
+  ProofDischargeRecord Finish() {
+    if (record.status == ProofDischargeStatus::Unknown)
+      record.status = ProofDischargeStatus::Discharged;
+    return record;
+  }
+};
 struct ProofSummary;
 /// \brief Canonical theorem-facing proof carried by an emitted result.
 ///
@@ -1249,8 +1320,8 @@ struct EmittedProof {
 ///
 /// The summary packages the construction inventory, local discharge result,
 /// lattice law, completeness contract, explicit theorem-domain position, and
-/// canonical emitted proof for one accepted artifact.  Older construction
-/// fields remain temporarily so call sites can migrate deliberately, but
+/// canonical emitted proof for one accepted artifact.  Compatibility
+/// construction fields remain available to construction sites, but
 /// theorem-facing code must consume `emittedProof` rather than re-deriving
 /// proof authority from AcceptedProofClass or local side bits.
 struct ProofSummary {
@@ -1262,8 +1333,7 @@ struct ProofSummary {
   AcceptedProofClass acceptedClass = AcceptedProofClass::Unknown;
   RealizationMode realizationMode = RealizationMode::Unknown;
   SelectionPreference preference = SelectionPreference::Unknown;
-  SurfaceDisposition surfaceDisposition =
-      SurfaceDisposition::None;
+  SurfaceDisposition surfaceDisposition = SurfaceDisposition::None;
   TheoremSelectionTieBreakerKind selectionTieBreaker =
       TheoremSelectionTieBreakerKind::Unknown;
   AcceptancePathInventory inventory;
@@ -1326,12 +1396,12 @@ struct ProofSummary {
 /// shape directly; path-specific callers must populate the same proof summary
 /// so they can be audited against the global selection law.
 #define REFOLD_ACCEPTED_RESULT_CANDIDATE_KIND_LIST(REFOLD_X)                   \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(MacroPatch)                                                         \
-REFOLD_X(IncludePatch)                                                       \
-REFOLD_X(TUAnchor)                                                           \
-REFOLD_X(TUTextEdit)                                                         \
-REFOLD_X(TerminalOutOfDomain)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(MacroPatch)                                                         \
+  REFOLD_X(IncludePatch)                                                       \
+  REFOLD_X(TUAnchor)                                                           \
+  REFOLD_X(TUTextEdit)                                                         \
+  REFOLD_X(TerminalOutOfDomain)
 
 enum class AcceptedResultCandidateKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -1342,8 +1412,8 @@ enum class AcceptedResultCandidateKind : uint8_t {
 inline StringRef toString(AcceptedResultCandidateKind value) {
   switch (value) {
 #define REFOLD_X(name)                                                         \
-case AcceptedResultCandidateKind::name:                                      \
-  return #name;
+  case AcceptedResultCandidateKind::name:                                      \
+    return #name;
     REFOLD_ACCEPTED_RESULT_CANDIDATE_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }
@@ -1351,17 +1421,11 @@ case AcceptedResultCandidateKind::name:                                      \
 }
 #undef REFOLD_ACCEPTED_RESULT_CANDIDATE_KIND_LIST
 
-/// \brief Normalized wrapper for a concrete accepted result.
-///
-/// The carrier stays intentionally small and explicit. It holds the
-/// normalized proof summary plus enough artifact-local provenance for the
-/// converted Patch-B selection sites to compare accepted outcomes through the
-/// lattice without rebuilding path-specific ordering logic.
 /// \brief Explicit witness state for line-control and builtin-location
 /// preservation.
 ///
-/// moves logical line/file/file-name observer facts into the shared
-/// witness vocabulary.  This carrier is deliberately a projection of
+/// This carrier moves logical line/file/file-name observer facts into the
+/// shared witness vocabulary.  It is deliberately a projection of
 /// producer/state-graph facts that already exist on accepted candidates; it
 /// does not rescan source text or infer #line semantics from spelling.
 struct LineControlObserverWitness {
@@ -1398,8 +1462,7 @@ struct LineControlObserverWitness {
 
   bool Empty() const {
     return !observesLineNumber && !observesFileState && !observesFileName &&
-           lineControlEventCount == 0 &&
-           builtinLocationObservationCount == 0 &&
+           lineControlEventCount == 0 && builtinLocationObservationCount == 0 &&
            !hasSuffixLineControlDischarge;
   }
 };
@@ -1436,12 +1499,17 @@ struct CounterStateWitness {
   std::string suffixValueSignature;
 
   bool Empty() const {
-    return !observesCounter && !hasCounterEvents &&
-           !suffixStateStable && counterConsumptionCount == 0 &&
-           preservedSuffixObserverCount == 0;
+    return !observesCounter && !hasCounterEvents && !suffixStateStable &&
+           counterConsumptionCount == 0 && preservedSuffixObserverCount == 0;
   }
 };
 
+/// \brief Normalized wrapper for a concrete accepted result.
+///
+/// The carrier stays intentionally small and explicit. It holds the
+/// normalized proof summary plus enough artifact-local provenance for the
+/// Patch-B selection sites to compare accepted outcomes through the lattice
+/// without rebuilding path-specific ordering logic.
 struct AcceptedResultCandidate {
   AcceptedResultCandidateKind kind = AcceptedResultCandidateKind::Unknown;
   ProofSummary proofSummary = {};
@@ -1623,7 +1691,7 @@ struct SelectedAcceptedResultCandidate {
 /// candidate whose remaining obligation is the top-level proof-root rule.
 /// That selector proof is not an emitted accepted artifact. When the same
 /// concrete macro patch also has an emission-normalized proof, the emitted
-/// carrier is stored separately and is the only object allowed to be stamped
+/// carrier is stored separately and is the only object allowed to be certified
 /// onto MacroPatch::selectedAcceptedCandidate.
 struct MacroSelectionCandidate {
   AcceptedResultCandidate selectorCandidate;
@@ -1635,7 +1703,7 @@ struct MacroSelectionCandidate {
 ///
 /// The index points back to the caller-owned MacroPatch entry. The selected
 /// macro carrier may have ranked by a selector-only proof, but callers must
-/// stamp only emittedCandidate, never selectorCandidate, onto an emitted
+/// certify only emittedCandidate, never selectorCandidate, onto an emitted
 /// MacroPatch.
 struct SelectedMacroSelectionCandidate {
   MacroSelectionCandidate candidate;
@@ -1643,17 +1711,17 @@ struct SelectedMacroSelectionCandidate {
 };
 
 #define REFOLD_MACRO_PATCH_PROOF_KIND_LIST(REFOLD_X)                           \
-REFOLD_X(Unknown)                                                            \
-REFOLD_X(CounterLiteral)                                                     \
-REFOLD_X(ArgsOnlyPasteMulti)                                                 \
-REFOLD_X(ArgsOnlyPasteSingle)                                                \
-REFOLD_X(ArgsOnlyPurePasteOnly)                                              \
-REFOLD_X(ArgsOnlyStandard)                                                   \
-REFOLD_X(ArgsOnlyPairedPureInsertion)                                        \
-REFOLD_X(PasteDerivedCalleeSelector)                                         \
-REFOLD_X(DagSubtreeRoot)                                                     \
-REFOLD_X(CallChainSuffix)                                                    \
-REFOLD_X(WholeCoverRealization)
+  REFOLD_X(Unknown)                                                            \
+  REFOLD_X(CounterLiteral)                                                     \
+  REFOLD_X(ArgsOnlyPasteMulti)                                                 \
+  REFOLD_X(ArgsOnlyPasteSingle)                                                \
+  REFOLD_X(ArgsOnlyPurePasteOnly)                                              \
+  REFOLD_X(ArgsOnlyStandard)                                                   \
+  REFOLD_X(ArgsOnlyPairedPureInsertion)                                        \
+  REFOLD_X(PasteDerivedCalleeSelector)                                         \
+  REFOLD_X(DagSubtreeRoot)                                                     \
+  REFOLD_X(CallChainSuffix)                                                    \
+  REFOLD_X(WholeCoverRealization)
 
 enum class MacroPatchProofKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -1664,8 +1732,8 @@ enum class MacroPatchProofKind : uint8_t {
 inline StringRef toString(MacroPatchProofKind value) {
   switch (value) {
 #define REFOLD_X(name)                                                         \
-case MacroPatchProofKind::name:                                              \
-  return #name;
+  case MacroPatchProofKind::name:                                              \
+    return #name;
     REFOLD_MACRO_PATCH_PROOF_KIND_LIST(REFOLD_X)
 #undef REFOLD_X
   }

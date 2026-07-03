@@ -21,7 +21,7 @@
 //     the owner-aware LCS objective and then suppresses/restores ambiguous
 //     anchors using provenance certificates.
 //   • hunksFromMap: convert an A→B map into ordered edit hunks between anchors.
-//   • myersDiff / coalesce: produce SES steps (EQUAL/INSERT/DELETE) and merge
+//   • diff / coalesce: produce SES steps (EQUAL/INSERT/DELETE) and merge
 //     adjacent non-EQUAL runs into hunks.
 //
 // Determinism & Policy
@@ -35,7 +35,7 @@
 // Complexity
 // ----------
 //   • LCS:      time O(N*M); DP uses O(N*M) space, Hirschberg uses O(N+M).
-//   • Myers:    expected time O((N+M)*D), space O(N+M).
+//   • diff:     expected time O((N+M)*D), space O(N+M).
 //   • Hunking:  O(N) over the alignment/map.
 //
 // Public Surface
@@ -43,12 +43,12 @@
 //   • std::vector<int64_t> lcsMapAB(...):
 //       A[i] -> B[j] (j >= 0) or -1; owner-aware/provenance-certified when
 //       structured gap profiles are supplied.
-//   • std::vector<Hunk> hunksFromMap(const std::vector<int>& map,
-//                                    int nA, int nB):
+//   • std::vector<Hunk> hunksFromMap(ArrayRef<int64_t> map,
+//                                    size_t nA, size_t nB):
 //       contiguous edit regions between anchors, half-open indices.
-//   • std::vector<Step> myersDiff(const Seq& A, const Seq& B):
+//   • std::vector<Step> diff(ArrayRef<StringRef> A, ArrayRef<StringRef> B):
 //       shortest edit script (EQUAL/INSERT/DELETE).
-//   • std::vector<Hunk> coalesce(const std::vector<Step>& steps):
+//   • std::vector<Hunk> coalesce(ArrayRef<Step> steps):
 //       merges non-EQUAL runs into larger hunks.
 //
 // Notes
@@ -62,8 +62,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLog.h"
 #include "source/DiffAlgorithms.h"
+#include "core/RefoldLog.h"
 #include "util/StringUtils.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -80,21 +80,21 @@ namespace clang {
 namespace refold {
 namespace diffutils {
 
-constexpr size_t MAX =
-    static_cast<size_t>(std::numeric_limits<int64_t>::max());
+constexpr size_t MAX = static_cast<size_t>(std::numeric_limits<int64_t>::max());
 
 namespace {
 /// Return true when the exact full DP table would exceed the configured cell or
 /// allocation budget and the caller must use the exact linear-space Hirschberg
-/// path. The function name is historical; the fallback is not greedy.
+/// path. Despite the conservative helper name, the fallback is not greedy.
 bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
                              unsigned long long maxCells) {
   if (n >= std::numeric_limits<unsigned long long>::max() - 1ULL ||
       m >= std::numeric_limits<unsigned long long>::max() - 1ULL) {
-    REFOLD_LOG_WARN("lcs/map",
-         "hirschberg fallback: (n+1) or (m+1) would overflow unsigned long long"
-         " (n={0}, m={1})",
-         n, m);
+    REFOLD_LOG_WARN(
+        "lcs/map",
+        "hirschberg fallback: (n+1) or (m+1) would overflow unsigned long long"
+        " (n={0}, m={1})",
+        n, m);
     return true; // (n+1) or (m+1) would overflow ULL anyway
   } else {
     const unsigned long long n1 = n + 1ULL;
@@ -105,7 +105,8 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
     if (n1 > maxN1) {
       REFOLD_LOG_WARN(
           "lcs/map",
-          "hirschberg fallback: DP cell budget exceeded: (n+1)*(m+1) > maxCells "
+          "hirschberg fallback: DP cell budget exceeded: (n+1)*(m+1) > "
+          "maxCells "
           "(n={0}, m={1}, n1={2}, m1={3}, maxCells={4}, maxAllowedN1ForM1={5})",
           n, m, n1, m1, maxCells, maxN1);
       return true;
@@ -119,11 +120,12 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
           std::numeric_limits<size_t>::max() / sizeof(unsigned));
 
       if (cells > cellLimit) {
-        REFOLD_LOG_WARN("lcs/map",
-             "hirschberg fallback: DP allocation would overflow size_t for "
-             "unsigned table "
-             "(cells={0} > size_t/sizeof(unsigned)={1}; n={2}, m={3})",
-             cells, cellLimit, n, m);
+        REFOLD_LOG_WARN(
+            "lcs/map",
+            "hirschberg fallback: DP allocation would overflow size_t for "
+            "unsigned table "
+            "(cells={0} > size_t/sizeof(unsigned)={1}; n={2}, m={3})",
+            cells, cellLimit, n, m);
         return true;
       }
     }
@@ -155,10 +157,10 @@ static bool addCostChecked(uint64_t base, uint32_t extra, uint64_t &out) {
 
 /// DP cell for the heuristic-free structural LCS objective.
 ///
-/// This intentionally omits the old neighbor-coherence tie penalty. It models
-/// only the proof-relevant core objective: maximize LCS length, then minimize
-/// ownerDepthGap cost. The forward/suffix tables built from this cell certify
-/// whether a token pair is admissible in any optimal core solution.
+/// This models only the proof-relevant core objective: maximize LCS length,
+/// then minimize ownerDepthGap cost.  Neighbor-coherence is deliberately
+/// outside this certified core objective, so the forward/suffix tables can
+/// prove whether a token pair is admissible in any optimal core solution.
 struct CoreLcsCell {
   uint32_t len = 0;
   uint64_t cost = 0;
@@ -366,8 +368,8 @@ static uint64_t bGapSurfaceRank(ArrayRef<LcsBGapProvenance> profiles,
 /// Rank a matched B-token pair using the surrounding B-gap surfaces.
 static uint64_t bPairSurfaceRank(ArrayRef<LcsBGapProvenance> profiles,
                                  uint64_t bStart, uint64_t bEnd) {
-  uint64_t rank = bGapSurfaceRank(profiles, bStart) +
-                  bGapSurfaceRank(profiles, bEnd);
+  uint64_t rank =
+      bGapSurfaceRank(profiles, bStart) + bGapSurfaceRank(profiles, bEnd);
   if (bStart < profiles.size() && bEnd < profiles.size() &&
       sameBLineShape(profiles[static_cast<size_t>(bStart)],
                      profiles[static_cast<size_t>(bEnd)])) {
@@ -450,8 +452,8 @@ static size_t suppressOrderConflictingAnchors(std::vector<int64_t> &map) {
 static bool buildBoundaryPureCertifiedMap(
     ArrayRef<StringRef> a, ArrayRef<StringRef> b,
     ArrayRef<uint32_t> ownerDepthGap, ArrayRef<LcsAGapProvenance> gapProvenance,
-    ArrayRef<LcsBGapProvenance> bGapProvenance,
-    unsigned long long maxCells, std::vector<int64_t> &outMap) {
+    ArrayRef<LcsBGapProvenance> bGapProvenance, unsigned long long maxCells,
+    std::vector<int64_t> &outMap) {
   const size_t n = a.size();
   const size_t m = b.size();
   outMap.assign(n, -1);
@@ -474,7 +476,8 @@ static bool buildBoundaryPureCertifiedMap(
 
   auto isCoreAdmissible = [&](size_t ai, size_t bj) -> bool {
     // Splice prefix + this match + suffix. The candidate is admissible only if
-    // it preserves both the optimal LCS length and the optimal owner-depth cost.
+    // it preserves both the optimal LCS length and the optimal owner-depth
+    // cost.
     if (ai >= n || bj >= m || a[ai] != b[bj])
       return false;
     const CoreLcsCell &prefix = forward[idx(ai, bj)];
@@ -844,9 +847,9 @@ struct GapView {
 };
 
 /// Compute one weighted Hirschberg LCS DP row for the given span views.
-static std::vector<Score>
-computeRowWeighted(const SpanView &aV, const SpanView &bV,
-                   const GapView &gapV) {
+static std::vector<Score> computeRowWeighted(const SpanView &aV,
+                                             const SpanView &bV,
+                                             const GapView &gapV) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (gapV.size() != n + 1)
@@ -977,8 +980,7 @@ static void solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
 
     // Diagonal match
     if (i > 0 && j > 0 && aV.at(i - 1) == bV.at(j - 1)) {
-      if (len(i - 1, j - 1) == curLen - 1U &&
-          cost(i - 1, j - 1) == curCost) {
+      if (len(i - 1, j - 1) == curLen - 1U && cost(i - 1, j - 1) == curCost) {
         outMap[aV.absIndex(i - 1)] = static_cast<int64_t>(bV.absIndex(j - 1));
         --i;
         --j;
@@ -1046,8 +1048,7 @@ static void hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
 
   // Compute the best weighted LCS objective for every possible B split after
   // solving the left half of A against each prefix of B.
-  const std::vector<Score> leftRow =
-      computeRowWeighted(aLeft, bV, gapLeft);
+  const std::vector<Score> leftRow = computeRowWeighted(aLeft, bV, gapLeft);
 
   // Compute the corresponding suffix objectives by solving the right half of A
   // and B in reverse. rightRowRev[m - j] is the score for A[mid..n) against
@@ -1146,8 +1147,9 @@ static void solveSmallUnweightedDP(const SpanView &aV, const SpanView &bV,
   // Build suffix DP: DP(i, j) is the LCS length of A[i..n) and B[j..m).
   for (size_t i = n; i-- > 0;) {
     for (size_t j = m; j-- > 0;) {
-      dpLocal(i, j) = (aV.at(i) == bV.at(j)) ? dpLocal(i + 1, j + 1) + 1U
-                                        : std::max(dpLocal(i + 1, j), dpLocal(i, j + 1));
+      dpLocal(i, j) = (aV.at(i) == bV.at(j))
+                          ? dpLocal(i + 1, j + 1) + 1U
+                          : std::max(dpLocal(i + 1, j), dpLocal(i, j + 1));
     }
   }
 
@@ -1349,8 +1351,7 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 
     // Diagonal (match).
     if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
-      if (len(i - 1, j - 1) == curLen - 1U &&
-          cost(i - 1, j - 1) == curCost) {
+      if (len(i - 1, j - 1) == curLen - 1U && cost(i - 1, j - 1) == curCost) {
         map[i - 1] = static_cast<int64_t>(j - 1);
         --i;
         --j;
@@ -1433,8 +1434,9 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
     return map;
   }
 
-  // See the A-only overload above: this is the exact core fallback, not a
-  // return to the old neighbor-coherence heuristic.
+  // See the A-only overload above: this is the exact certified-core fallback;
+  // it keeps neighbor-coherence outside the objective rather than using it as a
+  // hidden tie-breaker.
   return lcsMapAB(a, b, ArrayRef<uint32_t>(ownerDepthGap), maxCells);
 }
 
@@ -1474,8 +1476,9 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   // DP(i,j) = LCS length of a[i:] vs b[j:]
   for (size_t i = n; i-- > 0;) {
     for (size_t j = m; j-- > 0;) {
-      dpLocal(i, j) = (a[i] == b[j]) ? static_cast<unsigned>(dpLocal(i + 1, j + 1) + 1U)
-                                : std::max(dpLocal(i + 1, j), dpLocal(i, j + 1));
+      dpLocal(i, j) = (a[i] == b[j])
+                          ? static_cast<unsigned>(dpLocal(i + 1, j + 1) + 1U)
+                          : std::max(dpLocal(i + 1, j), dpLocal(i, j + 1));
     }
   }
 
@@ -1544,8 +1547,7 @@ struct MiddleSnake {
 static void appendEqualSteps(std::vector<Step> &out, uint64_t aLo, uint64_t bLo,
                              uint64_t len) {
   for (uint64_t i = 0; i < len; ++i) {
-    out.push_back(
-        Step{Op::Equal, aLo + i, aLo + i + 1, bLo + i, bLo + i + 1});
+    out.push_back(Step{Op::Equal, aLo + i, aLo + i + 1, bLo + i, bLo + i + 1});
   }
 }
 

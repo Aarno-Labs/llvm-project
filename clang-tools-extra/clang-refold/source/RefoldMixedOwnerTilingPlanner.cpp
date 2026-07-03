@@ -15,9 +15,10 @@
 #include "core/RefoldOwnerClassifier.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "macro/RefoldMacroTopology.h"
-#include "proof/NeutralSourceIslandProof.h"
+#include "proof/RefoldNeutralityProof.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofLattice.h"
+#include "proof/RefoldWitnessTrace.h"
 #include "source/RefoldSourceMapper.h"
 #include "util/RefoldPathIdentity.h"
 
@@ -58,7 +59,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
   // include/gap proofs do not repeatedly hit the file system. Missing files
   // make the gap proof non-applicable; the cache never synthesizes text.
   llvm::StringMap<std::unique_ptr<llvm::MemoryBuffer>> sourceGapBufferCache;
-  auto getSourceBytesForGapPath = [&](StringRef path) -> std::optional<StringRef> {
+  auto getSourceBytesForGapPath =
+      [&](StringRef path) -> std::optional<StringRef> {
     if (deps_.pathIdentity.PathsEqual(path, deps_.tuPath))
       return tuBytes;
 
@@ -86,10 +88,10 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
   // Split replace hunks when a deterministic mixed-owner partition can be
   // proven.
   //
-  // The old normalizer accepted only the two-piece case where one interior
-  // A-token boundary also proved one exact interior B-token boundary. That was
-  // sound, but incomplete for hunks containing more than two independently
-  // realizable regions. Generalize the proof to an ordered partition:
+  // The proof admits ordered partitions with more than one interior boundary
+  // when each segment has an independently provable realizer and B-token
+  // envelope.  This preserves the same exact-boundary obligation while
+  // covering hunks with more than two independently realizable regions:
   //
   //   * every segment consumes a non-empty A subrange;
   //   * every segment has a known TU/include/macro realizer;
@@ -141,7 +143,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
         return {};
 
       diffutils::Hunk probe{aStart, aEnd, 0, 0};
-      Owner probeOwner = deps_.ownerClassifier.ClassifyOwnerWithSegments(deps_.tuPath, probe);
+      Owner probeOwner =
+          deps_.ownerClassifier.ClassifyOwnerWithSegments(deps_.tuPath, probe);
       if (auto *m = deps_.macroTopology.SmallestCoveringPatchableMacro(
               aStart, aEnd, probeOwner.includeId)) {
         if (m->invB && m->invE)
@@ -293,22 +296,24 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
         return std::nullopt;
       }
 
-      return deps_.ownerStateProof.AttachCanonicalStateSummary(OwnerClosure::From(
-          std::move(owner), std::move(*source),
-          OwnerTokenRange::From(edge.aStart, edge.aEnd),
-          OwnerTokenRange::From(edge.bStart, edge.bEnd)));
+      return deps_.ownerStateProof.AttachCanonicalStateSummary(
+          OwnerClosure::From(std::move(owner), std::move(*source),
+                             OwnerTokenRange::From(edge.aStart, edge.aEnd),
+                             OwnerTokenRange::From(edge.bStart, edge.bEnd)));
     };
 
     auto sourceSitesComparable = [&](const OwnerSourceRange &lhs,
                                      const OwnerSourceRange &rhs) {
       return lhs.IsComplete() && rhs.IsComplete() &&
-             deps_.pathIdentity.PathsEqual(lhs.path, rhs.path) && lhs.includeId == rhs.includeId;
+             deps_.pathIdentity.PathsEqual(lhs.path, rhs.path) &&
+             lhs.includeId == rhs.includeId;
     };
 
     auto sourceSiteMatchesGap = [&](const OwnerSourceRange &gap, StringRef file,
                                     std::optional<uint64_t> ownerIncludeId,
                                     uint64_t begin, uint64_t end) {
-      return gap.IsComplete() && deps_.pathIdentity.PathsEqual(gap.path, file) &&
+      return gap.IsComplete() &&
+             deps_.pathIdentity.PathsEqual(gap.path, file) &&
              gap.includeId == ownerIncludeId && gap.begin <= begin &&
              begin <= end && end <= gap.end;
     };
@@ -316,7 +321,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
     auto sourceSitePathMatchesGap = [&](const OwnerSourceRange &gap,
                                         StringRef file, uint64_t begin,
                                         uint64_t end) {
-      return gap.IsComplete() && deps_.pathIdentity.PathsEqual(gap.path, file) &&
+      return gap.IsComplete() &&
+             deps_.pathIdentity.PathsEqual(gap.path, file) &&
              gap.begin <= begin && begin <= end && end <= gap.end;
     };
 
@@ -328,7 +334,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
     auto resolveSourceOwnerIdentity =
         [&](StringRef file, uint64_t begin,
             uint64_t end) -> std::optional<SourceOwnerIdentity> {
-      ArrayRef<RefoldModel::Segment> segments = deps_.model.GetSegmentsForFile(file);
+      ArrayRef<RefoldModel::Segment> segments =
+          deps_.model.GetSegmentsForFile(file);
       if (segments.empty())
         return std::nullopt;
 
@@ -425,12 +432,12 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
         gaps.push_back(makeStateGapEdge(
             Owner::MacroDirective(directive.id),
             OwnerSourceRange::From(directive.sitePath, directive.siteB,
-                                   directive.siteE,
-                                   directive.ownerIncludeId),
+                                   directive.siteE, directive.ownerIncludeId),
             aBoundary, bBoundary));
       }
 
-      for (const RefoldModel::LineControlEvent &event : deps_.model.GetLineControls()) {
+      for (const RefoldModel::LineControlEvent &event :
+           deps_.model.GetLineControls()) {
         if (!event.siteB || !event.siteE)
           continue;
         if (!sourceSiteMatchesGap(gapSource, event.physicalFile,
@@ -444,7 +451,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
             aBoundary, bBoundary));
       }
 
-      for (const RefoldModel::PragmaDirective &pragma : deps_.model.GetPragmas()) {
+      for (const RefoldModel::PragmaDirective &pragma :
+           deps_.model.GetPragmas()) {
         // bind zero-token pragmas to the same source owner as the gap.  Newer
         // maps can carry owner_include_id directly; older maps are resolved
         // through segment facts.  A repeated-header pragma must never be
@@ -454,8 +462,9 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
           unsigned samePhysicalSiteWithoutOwner = 0;
           for (const RefoldModel::PragmaDirective &other :
                deps_.model.GetPragmas()) {
-            if (!other.ownerIncludeId && deps_.pathIdentity.PathsEqual(other.sitePath,
-                                                    pragma.sitePath) &&
+            if (!other.ownerIncludeId &&
+                deps_.pathIdentity.PathsEqual(other.sitePath,
+                                              pragma.sitePath) &&
                 other.siteB == pragma.siteB && other.siteE == pragma.siteE)
               ++samePhysicalSiteWithoutOwner;
           }
@@ -482,12 +491,13 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
         // The segment-derived identity is the stronger proof here.
         gaps.push_back(makeStateGapEdge(
             Owner::PragmaIsland(pragma.id, identity->condArmId),
-            OwnerSourceRange::From(pragma.sitePath, pragma.siteB,
-                                   pragma.siteE, identity->includeId),
+            OwnerSourceRange::From(pragma.sitePath, pragma.siteB, pragma.siteE,
+                                   identity->includeId),
             aBoundary, bBoundary));
       }
 
-      for (const RefoldModel::IncludeItem &include : deps_.model.GetIncludes()) {
+      for (const RefoldModel::IncludeItem &include :
+           deps_.model.GetIncludes()) {
         if (!sourceSiteMatchesGap(gapSource, include.sitePath, include.parent,
                                   include.siteB, include.siteE))
           continue;
@@ -523,11 +533,11 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
         if (!sourceSiteMatchesGap(gapSource, group.file, group.parentIncludeId,
                                   group.groupB, group.groupE))
           continue;
-        // A conditional group owns the directive island (#if/#elif/#else/#endif)
-        // and the branch-selection state.  Individual arms own only their body
-        // intervals.  Using arm ids for the whole group created overlapping
-        // zero-token owners and lost the distinction between branch structure
-        // and selected-arm content.
+        // A conditional group owns the directive island
+        // (#if/#elif/#else/#endif) and the branch-selection state.  Individual
+        // arms own only their body intervals.  Using arm ids for the whole
+        // group created overlapping zero-token owners and lost the distinction
+        // between branch structure and selected-arm content.
         gaps.push_back(makeStateGapEdge(
             Owner::ConditionalGroup(group.id),
             OwnerSourceRange::From(group.file, group.groupB, group.groupE,
@@ -603,9 +613,9 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
       return false;
     };
 
-    auto sourceGapIsFullyCovered =
-        [&](const OwnerSourceRange &gapSource,
-            ArrayRef<PartitionEdge> gaps, std::string *reason) -> bool {
+    auto sourceGapIsFullyCovered = [&](const OwnerSourceRange &gapSource,
+                                       ArrayRef<PartitionEdge> gaps,
+                                       std::string *reason) -> bool {
       if (!gapSource.IsComplete()) {
         if (reason)
           *reason = "source gap has incomplete source coordinates";
@@ -651,8 +661,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
 
         if (owned.begin < cursor) {
           if (reason) {
-            *reason = llvm::formatv(
-                          "state-gap owners overlap at byte {0}", owned.begin)
+            *reason = llvm::formatv("state-gap owners overlap at byte {0}",
+                                    owned.begin)
                           .str();
           }
           return false;
@@ -668,8 +678,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
                                         reason);
     };
 
-    auto stateGapComposesSafely =
-        [&](const PartitionEdge &gap, std::string *reason) -> bool {
+    auto stateGapComposesSafely = [&](const PartitionEdge &gap,
+                                      std::string *reason) -> bool {
       if (!gap.IsStateGap() || !gap.closure) {
         if (reason)
           *reason = "state-gap edge has no closure";
@@ -697,13 +707,14 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
       return true;
     };
 
-    auto appendUniqueStateComponent = [](SmallVectorImpl<OwnerStateComponent> &out,
-                                         OwnerStateComponent component) {
-      if (component == OwnerStateComponent::Unknown)
-        return;
-      if (!llvm::is_contained(out, component))
-        out.push_back(component);
-    };
+    auto appendUniqueStateComponent =
+        [](SmallVectorImpl<OwnerStateComponent> &out,
+           OwnerStateComponent component) {
+          if (component == OwnerStateComponent::Unknown)
+            return;
+          if (!llvm::is_contained(out, component))
+            out.push_back(component);
+        };
 
     auto stateComponentsObservedBySummary = [&](const OwnerStateDelta
                                                     &summary) {
@@ -763,7 +774,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
           continue;
         }
         appendUniqueStateComponent(
-            components, deps_.ownerStateProof.StateComponentForMissingStateFact(fact.kind));
+            components,
+            deps_.ownerStateProof.StateComponentForMissingStateFact(fact.kind));
       }
       if (observations.HasMissingFactKind(
               MissingStateFactKind::MissingOwnerOrderingFacts))
@@ -782,7 +794,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
         missingFacts.AddMissingStateFact(
             MissingStateFactKind::MissingOwnerOrderingFacts,
             "partition edge has no owner closure");
-        summary = deps_.ownerStateProof.BuildTheoremStateDelta(missingFacts, OwnerStateDelta());
+        summary = deps_.ownerStateProof.BuildTheoremStateDelta(
+            missingFacts, OwnerStateDelta());
       }
       return summary;
     };
@@ -808,13 +821,15 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
         }
 
         const OwnerStateDelta summary = mergedEdgeStateSummary(edge);
-        if (edge.IsStateGap() && deps_.ownerStateProof.OwnerStateDeltaHasUnmodeledState(summary)) {
+        if (edge.IsStateGap() &&
+            deps_.ownerStateProof.OwnerStateDeltaHasUnmodeledState(summary)) {
           if (reason)
             *reason = "zero-token state gap contains unmodeled state";
           return false;
         }
         if (edge.IsStateGap() &&
-            deps_.ownerStateProof.OwnerStateDeltaHasUnknownPragmaState(summary)) {
+            deps_.ownerStateProof.OwnerStateDeltaHasUnknownPragmaState(
+                summary)) {
           if (reason)
             *reason = "zero-token state gap contains unknown pragma state";
           return false;
@@ -864,13 +879,13 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
       witness.compositionEdgesProven = true;
       witness.globalTargetPPTokenSignature =
           llvm::formatv("B=[{0},{1}):hash={2}", h.bStart, h.bEnd,
-                        RefoldProofLattice::FormatWitnessTraceHash(deps_.sourceMapper.SliceBSource(h.bStart, h.bEnd)))
+                        RefoldWitnessTrace::FormatWitnessTraceHash(
+                            deps_.sourceMapper.SliceBSource(h.bStart, h.bEnd)))
               .str();
       witness.segments.reserve(path.size());
 
       auto formatOptionalId = [](std::optional<uint64_t> value) {
-        return value ? llvm::formatv("{0}", *value).str()
-                     : std::string("none");
+        return value ? llvm::formatv("{0}", *value).str() : std::string("none");
       };
 
       auto formatOwnerSignature = [&](const Owner &owner) {
@@ -915,7 +930,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
 
       auto formatBTokenSignature = [&](uint64_t begin, uint64_t end) {
         return llvm::formatv("B=[{0},{1}):hash={2}", begin, end,
-                             RefoldProofLattice::FormatWitnessTraceHash(deps_.sourceMapper.SliceBSource(begin, end)))
+                             RefoldWitnessTrace::FormatWitnessTraceHash(
+                                 deps_.sourceMapper.SliceBSource(begin, end)))
             .str();
       };
 
@@ -933,8 +949,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
       std::string compositionStorage;
       llvm::raw_string_ostream compositionOS(compositionStorage);
       compositionOS << "tiling=" << witnessId << ":A=[" << h.aStart << ','
-                    << h.aEnd << "):B=[" << h.bStart << ',' << h.bEnd
-                    << ")";
+                    << h.aEnd << "):B=[" << h.bStart << ',' << h.bEnd << ")";
       for (const PartitionEdge &edge : path) {
         const MixedOwnerTilingEdgeKind edgeKind =
             edge.IsStateGap() ? MixedOwnerTilingEdgeKind::StateGap
@@ -962,8 +977,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
         }
         segmentWitness.producerPathSignature =
             edge.IsStateGap()
-                ? llvm::formatv("state_gap:{0}",
-                                segmentWitness.ownerSignature)
+                ? llvm::formatv("state_gap:{0}", segmentWitness.ownerSignature)
                       .str()
                 : llvm::formatv("{0}:owner={1}",
                                 formatRealizerSignature(edge.realizer),
@@ -990,14 +1004,14 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
       }
       compositionOS.flush();
       witness.globalCompositionSignature =
-          RefoldProofLattice::FormatWitnessTraceHash(compositionStorage);
+          RefoldWitnessTrace::FormatWitnessTraceHash(compositionStorage);
       return witness;
     };
 
-    auto buildClosedStateGapTransition =
-        [&](const diffutils::Hunk &h, const PartitionEdge *prev,
-            const PartitionEdge &cur)
-            -> std::optional<SmallVector<PartitionEdge, 4>> {
+    auto buildClosedStateGapTransition = [&](const diffutils::Hunk &h,
+                                             const PartitionEdge *prev,
+                                             const PartitionEdge &cur)
+        -> std::optional<SmallVector<PartitionEdge, 4>> {
       SmallVector<PartitionEdge, 4> gaps;
 
       // The first token segment has no predecessor, and token owners from
@@ -1040,7 +1054,6 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
       return gaps;
     };
 
-
     // boundary: failures while *searching* for a mixed-owner
     // partition are non-applicability, not terminal proof failures.  Until a
     // partition has been accepted and durable segment witnesses have been
@@ -1048,16 +1061,15 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
     // the hunk.  Returning std::nullopt here therefore preserves the existing
     // lattice ordering instead of prematurely forcing raw-B terminal output.
 
-    auto tryBuildMixedOwnerPartition =
-        [&](const diffutils::Hunk &h)
-            -> std::optional<SmallVector<PartitionEdge, 8>> {
+    auto tryBuildMixedOwnerPartition = [&](const diffutils::Hunk &h)
+        -> std::optional<SmallVector<PartitionEdge, 8>> {
       const bool replaceHunk = h.isReplace();
       const bool deleteOnlyHunk = h.isDeleteOnly();
 
       // extends deterministic mixed-owner tiling beyond non-empty
       // replacements only where the theorem obligations are still meaningful.
       // Delete-only hunks have an A-side owner cover and an empty B envelope,
-      // so they can be partitioned by the same owner-closure proof.  Insert-only
+      // so they can be partitioned by the same owner-closure proof. Insert-only
       // hunks have no A-side owner cover; they require insertion-anchor proofs
       // handled by the existing insertion/macro/include machinery, not by this
       // mixed-owner tiler.  Equal/state-only hunks are likewise classified as
@@ -1075,7 +1087,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
       // one hunk. Splitting inside an already-proven whole macro candidate
       // would make this normalization pass compete with the macro lattice
       // rather than merely exposing otherwise independent owners.
-      Owner wholeOwner = deps_.ownerClassifier.ClassifyOwnerWithSegments(deps_.tuPath, h);
+      Owner wholeOwner =
+          deps_.ownerClassifier.ClassifyOwnerWithSegments(deps_.tuPath, h);
       if (auto *wholeMacro = deps_.macroTopology.SmallestCoveringPatchableMacro(
               h.aStart, h.aEnd, wholeOwner.includeId)) {
         if (wholeMacro->invB && wholeMacro->invE)
@@ -1099,7 +1112,9 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
           uint64_t edgeBStart = h.bStart;
           uint64_t edgeBEnd = h.bStart;
           if (!deleteOnlyHunk) {
-            auto env = deps_.sourceMapper.MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(aLo, aHi);
+            auto env =
+                deps_.sourceMapper
+                    .MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(aLo, aHi);
             if (!env)
               continue;
             if (env->first < static_cast<size_t>(h.bStart) ||
@@ -1323,10 +1338,10 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
 
       // A mixed-owner tiling is admissible only if the edge sequence covers the
       // entire original hunk and actually crosses an owner/realizer boundary.
-      // Otherwise this is either an incomplete cover or a single-owner case that
-      // should be handled by the ordinary owner-specific realization machinery.
-      if (expectedA != h.aEnd || expectedB != h.bEnd ||
-          !sawDifferentRealizer) {
+      // Otherwise this is either an incomplete cover or a single-owner case
+      // that should be handled by the ordinary owner-specific realization
+      // machinery.
+      if (expectedA != h.aEnd || expectedB != h.bEnd || !sawDifferentRealizer) {
         return std::nullopt;
       }
 
@@ -1349,16 +1364,18 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
           if (!edge.closure)
             return std::nullopt;
           if (edge.IsStateGap() ||
-              deps_.ownerStateProof.OwnerStateDeltaMutatesAnyState(edge.closure->stateIn) ||
-              deps_.ownerStateProof.OwnerStateDeltaMutatesAnyState(edge.closure->stateOut)) {
+              deps_.ownerStateProof.OwnerStateDeltaMutatesAnyState(
+                  edge.closure->stateIn) ||
+              deps_.ownerStateProof.OwnerStateDeltaMutatesAnyState(
+                  edge.closure->stateOut)) {
             return std::nullopt;
           }
         }
       }
 
       std::string stateCompositionReason;
-      if (!mixedOwnerTilingStateSummariesCompose(
-              h, path, &stateCompositionReason)) {
+      if (!mixedOwnerTilingStateSummariesCompose(h, path,
+                                                 &stateCompositionReason)) {
         return std::nullopt;
       }
 
@@ -1397,13 +1414,11 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
           }
 
           deps_.mixedOwnerTilingSegmentBindings.push_back(
-              MixedOwnerTilingSegmentBinding{edge.aStart, edge.aEnd,
-                                             edge.bStart, edge.bEnd,
-                                             mixedWitnessIndex,
-                                             mixedWitnessId,
-                                             currentSegmentIndex});
-          splitHunks.push_back(diffutils::Hunk{edge.aStart, edge.aEnd,
-                                               edge.bStart, edge.bEnd});
+              MixedOwnerTilingSegmentBinding{
+                  edge.aStart, edge.aEnd, edge.bStart, edge.bEnd,
+                  mixedWitnessIndex, mixedWitnessId, currentSegmentIndex});
+          splitHunks.push_back(
+              diffutils::Hunk{edge.aStart, edge.aEnd, edge.bStart, edge.bEnd});
         }
 
         changed = true;
@@ -1414,12 +1429,10 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
         deps_.abTokHunks = hunks;
       }
     }
-
   }
 
   // Refresh the token-level hunk cache after normalization.
   deps_.abTokHunks = hunks;
-
 
   MixedOwnerTilingPlan plan;
   plan.hunks = std::move(hunks);
@@ -1427,7 +1440,6 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
   plan.segmentBindingCount = deps_.mixedOwnerTilingSegmentBindings.size();
   return plan;
 }
-
 
 } // namespace refold
 } // namespace clang

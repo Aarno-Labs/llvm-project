@@ -1,4 +1,5 @@
-//===--- RefoldStructuralHunkDispatcher.cpp ----------------------*- C++ -*-===//
+//===--- RefoldStructuralHunkDispatcher.cpp ----------------------*- C++
+//-*-===//
 //
 // Structural hunk dispatch staging for clang-refold.
 //
@@ -6,14 +7,21 @@
 
 #include "source/RefoldStructuralHunkDispatcher.h"
 
+#include "core/RefoldModel.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroTopology.h"
 #include "proof/RefoldProofLattice.h"
 #include "source/DiffAlgorithms.h"
+#include "source/RefoldToken.h"
+#include "source/TokenTextHelpers.h"
+#include "util/RefoldPathIdentity.h"
+#include "util/StringUtils.h"
+#include "clang/Basic/TokenKinds.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <algorithm>
 #include <cassert>
+#include <optional>
 #include <utility>
 
 using namespace llvm;
@@ -76,7 +84,6 @@ RefoldStructuralHunkDispatcher::MutableIncludeEditBucketsForMaterialization() {
   return perInclude_;
 }
 
-
 RefoldStructuralHunkDispatcher::MacroPatchByMacroIdMap &
 RefoldStructuralHunkDispatcher::MacroPatchBucketForOwner(
     std::optional<uint64_t> ownerIncludeId) {
@@ -109,8 +116,8 @@ RefoldStructuralHunkDispatcher::PrepareMacroPatchStagingSlot(
 
   MacroPatchStagingSlot slot;
   slot.ownerIncludeId = macro.ownerIncludeId;
-  slot.patchKey = FindMacroPatchKeyByInvocationSpan(
-                      macro.ownerIncludeId, *macro.invB, *macro.invE)
+  slot.patchKey = FindMacroPatchKeyByInvocationSpan(macro.ownerIncludeId,
+                                                    *macro.invB, *macro.invE)
                       .value_or(macro.id);
   slot.existingPatch = FindMacroPatchByKey(macro.ownerIncludeId, slot.patchKey);
   slot.existingIsCallsite =
@@ -119,9 +126,9 @@ RefoldStructuralHunkDispatcher::PrepareMacroPatchStagingSlot(
           StringRef(slot.existingPatch->replacement), macro);
 
   // When the existing patch is an expanded/non-callsite realization, keep the
-  // original callsite text as the next planning base.  That preserves the old
-  // same-pass behavior where later hunks can still attempt an args-only or DAG
-  // reconstruction instead of compounding an expanded surface.
+  // original callsite text as the next planning base.  Later hunks can still
+  // attempt an args-only or DAG reconstruction from the stable invocation
+  // surface instead of compounding an already-expanded replacement.
   slot.currentInvocationText =
       (slot.existingPatch && slot.existingIsCallsite)
           ? slot.existingPatch->replacement
@@ -166,7 +173,7 @@ RefoldStructuralHunkDispatcher::FindMacroPatchKeyByInvocationSpan(
   std::optional<uint64_t> existingKey;
   for (const auto &kv : *bucket) {
     const MacroPatch &patch = kv.second;
-    if (patch.invStart == invStart && patch.invEnd == invEnd) {
+    if (patch.invRange.begin == invStart && patch.invRange.end == invEnd) {
       if (!existingKey || kv.first < *existingKey)
         existingKey = kv.first;
     }
@@ -177,30 +184,31 @@ RefoldStructuralHunkDispatcher::FindMacroPatchKeyByInvocationSpan(
 void RefoldStructuralHunkDispatcher::MergeMaterializedBTokenRangeFromSlot(
     MacroPatch &patch, const MacroPatchStagingSlot &slot,
     const diffutils::Hunk &hunk) const {
-  if (slot.existingPatch && slot.existingPatch->hasMaterializedBTokenRange) {
-    if (!patch.hasMaterializedBTokenRange) {
-      patch.hasMaterializedBTokenRange = true;
-      patch.materializedBTokStart = slot.existingPatch->materializedBTokStart;
-      patch.materializedBTokEnd = slot.existingPatch->materializedBTokEnd;
+  if (slot.existingPatch && slot.existingPatch->materialized.hasBTokenRange) {
+    if (!patch.materialized.hasBTokenRange) {
+      patch.materialized.hasBTokenRange = true;
+      patch.materialized.bTokStart = slot.existingPatch->materialized.bTokStart;
+      patch.materialized.bTokEnd = slot.existingPatch->materialized.bTokEnd;
     } else {
-      patch.materializedBTokStart = std::min(
-          patch.materializedBTokStart, slot.existingPatch->materializedBTokStart);
-      patch.materializedBTokEnd = std::max(
-          patch.materializedBTokEnd, slot.existingPatch->materializedBTokEnd);
+      patch.materialized.bTokStart =
+          std::min(patch.materialized.bTokStart,
+                   slot.existingPatch->materialized.bTokStart);
+      patch.materialized.bTokEnd = std::max(
+          patch.materialized.bTokEnd, slot.existingPatch->materialized.bTokEnd);
     }
   }
 
-  if (!patch.hasMaterializedBTokenRange) {
-    patch.hasMaterializedBTokenRange = true;
-    patch.materializedBTokStart = hunk.bStart;
-    patch.materializedBTokEnd = hunk.bEnd;
+  if (!patch.materialized.hasBTokenRange) {
+    patch.materialized.hasBTokenRange = true;
+    patch.materialized.bTokStart = hunk.bStart;
+    patch.materialized.bTokEnd = hunk.bEnd;
     return;
   }
 
-  patch.materializedBTokStart = std::min(patch.materializedBTokStart,
-                                         static_cast<uint64_t>(hunk.bStart));
-  patch.materializedBTokEnd = std::max(patch.materializedBTokEnd,
-                                       static_cast<uint64_t>(hunk.bEnd));
+  patch.materialized.bTokStart = std::min(patch.materialized.bTokStart,
+                                          static_cast<uint64_t>(hunk.bStart));
+  patch.materialized.bTokEnd =
+      std::max(patch.materialized.bTokEnd, static_cast<uint64_t>(hunk.bEnd));
 }
 
 void RefoldStructuralHunkDispatcher::StageMacroPatch(
@@ -255,8 +263,9 @@ void RefoldStructuralHunkDispatcher::FinalizeMacroPatchBuckets(
         continue;
 
       MacroPatch &patch = it->second;
-      if (!proofLattice.FinalizeSelectedMacroPatchForEmission(
-              patch, "macro/final-emission-bucket"))
+      if (!proofLattice.AcceptedCandidateBuilder()
+               .FinalizeSelectedMacroPatchForEmission(
+                   patch, "macro/final-emission-bucket"))
         continue;
       finalPatches.push_back(std::move(patch));
     }
@@ -345,7 +354,7 @@ RefoldStructuralHunkDispatcher::BuildTUClosureSourceIntervals() const {
   if (const MacroPatchByMacroIdMap *bucket =
           FindMacroPatchBucketForOwner(std::nullopt)) {
     for (const auto &kv : *bucket)
-      intervals.push_back({kv.second.invStart, kv.second.invEnd});
+      intervals.push_back({kv.second.invRange.begin, kv.second.invRange.end});
   }
   return intervals;
 }
@@ -360,9 +369,10 @@ RefoldStructuralHunkDispatcher::MutableAppliedExpandedMacroRootIds() {
   return appliedExpandedMacroRootIds_;
 }
 
-void RefoldStructuralHunkDispatcher::RecordExpandedMacroRootsInMaterializedIncludes(
-    const RefoldModel &model, const RefoldMacroTopology &macroTopology,
-    const DenseSet<uint64_t> &expandedIncludeIds) {
+void RefoldStructuralHunkDispatcher::
+    RecordExpandedMacroRootsInMaterializedIncludes(
+        const RefoldModel &model, const RefoldMacroTopology &macroTopology,
+        const DenseSet<uint64_t> &expandedIncludeIds) {
   for (const auto &mi : model.GetMacroInvocations()) {
     if (mi.ownerIncludeId &&
         expandedIncludeIds.find(*mi.ownerIncludeId) != expandedIncludeIds.end())
@@ -372,6 +382,84 @@ void RefoldStructuralHunkDispatcher::RecordExpandedMacroRootsInMaterializedInclu
 
 size_t RefoldStructuralHunkDispatcher::ExpandedMacroRootCount() const {
   return appliedExpandedMacroRootIds_.size();
+}
+
+namespace {
+/// Return true iff \p kind is separator punctuation that may legitimately
+/// replace a horizontal source gap between two tokens.
+///
+/// This is intentionally narrower than "left-attachable punctuation": closing
+/// delimiters and operators can carry context-sensitive spacing conventions, so
+/// they are not treated as gap replacements here. Callers must still prove with
+/// `refoldNeedsLexicalSeparator()` that attaching the punctuation to the
+/// token on its left preserves lexical tokenization.
+bool isSeparatorGapReplacementPunctuation(tok::TokenKind kind) {
+  switch (kind) {
+  case tok::comma:
+  case tok::semi:
+  case tok::colon:
+    return true;
+  default:
+    return false;
+  }
+}
+} // namespace
+
+bool maybeConsumeOrdinarySeparatorGapForPunctuation(
+    const RefoldModel &model, const RefoldPathIdentity &pathIdentity,
+    StringRef tuPath, StringRef tuBytes, std::pair<uint64_t, uint64_t> &span,
+    StringRef replacement, const clang::LangOptions &lexLang) {
+  if (span.first != span.second || replacement.empty() ||
+      stringutils::isWs(replacement.front()) || span.first == 0 ||
+      span.first >= tuBytes.size() ||
+      (tuBytes[span.first - 1] != ' ' && tuBytes[span.first - 1] != '\t') ||
+      stringutils::isWs(tuBytes[span.first]))
+    return false;
+
+  auto intervalOverlapsSpelledArtifact = [&](uint64_t begin,
+                                             uint64_t end) -> bool {
+    for (const auto &inc : model.GetIncludes()) {
+      if (pathIdentity.PathsEqual(inc.sitePath, tuPath) && inc.siteB < end &&
+          begin < inc.siteE)
+        return true;
+    }
+    for (const auto &m : model.GetMacroInvocations()) {
+      if (m.invFile && !m.invFile->empty() &&
+          !pathIdentity.PathsEqual(*m.invFile, tuPath))
+        continue;
+      if (m.invB && m.invE && *m.invB < end && begin < *m.invE)
+        return true;
+    }
+    return false;
+  };
+
+  uint64_t gapBegin = span.first;
+  while (gapBegin > 0 &&
+         (tuBytes[gapBegin - 1] == ' ' || tuBytes[gapBegin - 1] == '\t'))
+    --gapBegin;
+
+  if (gapBegin >= span.first ||
+      intervalOverlapsSpelledArtifact(gapBegin, span.first))
+    return false;
+
+  std::optional<RefoldLexBoundaryToken> leftTok =
+      refoldLastLexToken(tuBytes.take_front(gapBegin), lexLang);
+  std::optional<RefoldLexBoundaryToken> rightTok =
+      refoldFirstLexToken(tuBytes.drop_front(span.first), lexLang);
+  std::optional<RefoldLexBoundaryToken> replFirstTok =
+      refoldFirstLexToken(replacement, lexLang);
+  std::optional<RefoldLexBoundaryToken> replLastTok =
+      refoldLastLexToken(replacement, lexLang);
+
+  if (!leftTok || !rightTok || !replFirstTok || !replLastTok ||
+      leftTok->end != gapBegin || rightTok->begin != 0 ||
+      !isSeparatorGapReplacementPunctuation(replFirstTok->kind) ||
+      refoldNeedsLexicalSeparator(*leftTok, *replFirstTok, lexLang) ||
+      refoldNeedsLexicalSeparator(*replLastTok, *rightTok, lexLang))
+    return false;
+
+  span.first = gapBegin;
+  return true;
 }
 
 } // namespace refold

@@ -2,11 +2,12 @@
 //
 // TU-anchor accepted-result proof construction for clang-refold.
 //
-// This service owns only the normalized AcceptedResultCandidate construction for
-// translation-unit insertion anchors.  It deliberately does not find anchors,
-// classify owners, plan TU byte spans, or participate in accepted-result
-// selection.  Keeping this builder separate lets RefoldTUEditPlanner mint the
-// same TU-anchor proof carriers without depending on RefoldProofLattice.
+// This service owns only the normalized AcceptedResultCandidate construction
+// for translation-unit insertion anchors.  It deliberately does not find
+// anchors, classify owners, plan TU byte spans, or participate in
+// accepted-result selection.  Keeping this builder separate lets
+// RefoldTUEditPlanner mint the same TU-anchor proof carriers without depending
+// on RefoldProofLattice.
 //
 //===----------------------------------------------------------------------===//
 
@@ -46,8 +47,7 @@ validateTUAnchorProof(AcceptedPathKind currentPath,
 /// Builds accepted-result carriers for TU insertion anchors.
 ///
 /// The class is intentionally narrow: it converts an already-proven
-/// TUAnchorWitness into the same AcceptedResultCandidate that previously came
-/// from RefoldProofLattice::BuildAcceptedTUAnchorCandidate().  The anchor
+/// TUAnchorWitness into a normalized AcceptedResultCandidate.  The anchor
 /// search/proof policy remains in RefoldTUEditPlanner; the lattice remains
 /// responsible for ranking and theorem-selection behavior.
 class RefoldTUAnchorProof {

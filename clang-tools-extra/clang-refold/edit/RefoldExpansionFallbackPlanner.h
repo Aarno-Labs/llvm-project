@@ -20,7 +20,7 @@
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroTopology.h"
 #include "proof/RefoldAcceptedResultTypes.h"
-#include "proof/RefoldTerminalProofSink.h"
+#include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/RefoldToken.h"
 
@@ -45,6 +45,10 @@ class RefoldProofLattice;
 class RefoldIncludeInsertionPlanner;
 class RefoldTheoremAudit;
 
+/// Plans explicit expansion fallback when no declared structural proof owns a
+/// hunk.  The planner builds fallback edits, records theorem-audit evidence,
+/// and requests terminal fallback for strict-mode proof-domain escapes without
+/// silently authorizing raw-B output.
 class RefoldExpansionFallbackPlanner {
 public:
   using TextEdit = ::clang::refold::TextEdit;
@@ -60,7 +64,7 @@ public:
                                 std::optional<uint64_t>)>
         applyResyncOrPend;
     std::function<void(TextEdit &, uint64_t, uint64_t)>
-        stampTextEditMaterializedBTokenRange;
+        certifyTextEditMaterializedBTokenRange;
     std::function<void(TextEdit &, const AcceptedResultCandidate &)>
         attachAcceptedResultCarrier;
     std::function<void()> resetAttemptStats;
@@ -72,8 +76,7 @@ public:
       const std::vector<diffutils::Hunk> &abTokHunks,
       const std::vector<int64_t> &abTokMapB2A,
       const LineDirectiveInserter &lineDirs,
-      const RefoldSourceMapper &sourceMapper,
-      const RefoldPathIdentity &paths,
+      const RefoldSourceMapper &sourceMapper, const RefoldPathIdentity &paths,
       const RefoldMacroTopology &macroTopology,
       const RefoldLineControlProof &lineControlProof,
       const RefoldMacroStateProof &macroStateProof,
@@ -81,29 +84,27 @@ public:
       const clang::LangOptions &lexLang,
       const RefoldIncludeInsertionPlanner &includeInsertionPlanner,
       RefoldProofLattice &proofLattice,
-      const RefoldTheoremAudit &theoremAuditService,
-      RefoldStats &lastStats,
+      const RefoldTheoremAudit &theoremAuditService, RefoldStats &lastStats,
       std::vector<MaterializedEditMapping> *materializedEditMappings,
       Hooks hooks)
       : model_(model), bSource_(bSource), aToks_(aToks),
-        abTokHunks_(abTokHunks), abTokMapB2A_(abTokMapB2A),
-        lineDirs_(lineDirs), sourceMapper_(sourceMapper), paths_(paths),
+        abTokHunks_(abTokHunks), abTokMapB2A_(abTokMapB2A), lineDirs_(lineDirs),
+        sourceMapper_(sourceMapper), paths_(paths),
         macroTopology_(macroTopology), lineControlProof_(lineControlProof),
         macroStateProof_(macroStateProof), terminalSink_(terminalSink),
         lexLang_(lexLang), includeInsertionPlanner_(includeInsertionPlanner),
-        proofLattice_(proofLattice),
-        theoremAuditService_(theoremAuditService), lastStats_(lastStats),
+        proofLattice_(proofLattice), theoremAuditService_(theoremAuditService),
+        lastStats_(lastStats),
         materializedEditMappings_(materializedEditMappings),
         hooks_(std::move(hooks)) {}
 
   /// Try to realize one unresolved PP hunk as the explicit
   /// TUIncludeClosureEdit proof class.  The implementation remains fail-closed:
   /// it only returns an edit after discharging the include-cover, source-gap,
-  /// B-envelope, line-control, macro-state, and already-staged-edit obligations
-  /// documented on the corresponding RefoldEngine forwarding wrapper.
+  /// B-envelope, line-control, macro-state, and already-staged-edit
+  /// obligations.
   std::optional<TextEdit> BuildTUIncludeClosureEditForUnresolvedHunk(
-      const diffutils::Hunk &h, llvm::StringRef tuPath,
-      llvm::StringRef tuBytes,
+      const diffutils::Hunk &h, llvm::StringRef tuPath, llvm::StringRef tuBytes,
       llvm::ArrayRef<std::pair<uint64_t, uint64_t>> stagedSourceIntervals)
       const;
 

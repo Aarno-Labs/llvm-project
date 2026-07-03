@@ -51,8 +51,8 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
     if (j < 0)
       continue;
     if (j < last) {
-      REFOLD_LOG_FATAL("lcs/map", "non-monotone map at A[{0}]={1} after {2}",
-                       i, j, last);
+      REFOLD_LOG_FATAL("lcs/map", "non-monotone map at A[{0}]={1} after {2}", i,
+                       j, last);
     }
     last = j;
   }
@@ -209,7 +209,8 @@ RefoldTokenDiffPlanner::ComputeLcsAGapProvenanceForPP(
   auto macroDepthAndRoot = [&](const RefoldModel::MacroInvocation &m,
                                uint64_t &rootId) -> uint32_t {
     // Walk the caller chain to identify both the leaf depth and the root macro
-    // that owns this token. The seen set makes malformed/cyclic metadata benign.
+    // that owns this token. The seen set makes malformed/cyclic metadata
+    // benign.
     rootId = m.id;
     uint32_t depth = 1;
     const RefoldModel::MacroInvocation *cur = &m;
@@ -301,8 +302,10 @@ RefoldTokenDiffPlanner::ComputeLcsAGapProvenanceForPP(
   auto fillSide = [&](LcsAGapProvenance &profile, uint64_t pp, bool leftSide) {
     // A gap has independent left/right token provenance. Preserve the side so
     // the LCS certifier can distinguish boundaries from interiors.
-    const std::optional<uint64_t> includeId = deps_.model.InnermostIncludeAtPP(pp);
-    const std::optional<RefoldModel::ArmRef> armRef = deps_.model.FindArmRefAtPP(pp);
+    const std::optional<uint64_t> includeId =
+        deps_.model.InnermostIncludeAtPP(pp);
+    const std::optional<RefoldModel::ArmRef> armRef =
+        deps_.model.FindArmRefAtPP(pp);
     const MacroTokenContext macro = macroContextAtPP(pp);
 
     if (leftSide) {
@@ -465,8 +468,7 @@ RefoldTokenDiffPlanner::ComputeLcsBGapProvenanceForPP() const {
         stringutils::rangeContainsOnlyWs(deps_.bSource, gapBegin, gapEnd);
     profile.gapAtLineStart =
         stringutils::beginsLineAfterWs(deps_.bSource, gapBegin);
-    profile.gapAtLineEnd =
-        stringutils::endsLineBeforeWs(deps_.bSource, gapEnd);
+    profile.gapAtLineEnd = stringutils::endsLineBeforeWs(deps_.bSource, gapEnd);
 
     // If there is a token to the left, record its byte extent and whether that
     // token itself touches a logical line boundary. Later ranking can then

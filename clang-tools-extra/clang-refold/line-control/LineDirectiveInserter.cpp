@@ -10,24 +10,24 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLog.h"
 #include "line-control/LineDirectiveInserter.h"
+#include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
 #include "util/StringUtils.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
-#include <optional>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
-#include <utility>
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/FileSystem.h>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 using namespace llvm;
 
@@ -84,9 +84,10 @@ static std::string collapseWhitespaceForStringification(StringRef text) {
   return out;
 }
 
-// Spell the result of stringifying one raw macro argument as a C string literal.
-// The later #line filename parser decodes that literal, so this routine should
-// preserve the preprocessor spelling contract rather than the decoded filename.
+// Spell the result of stringifying one raw macro argument as a C string
+// literal. The later #line filename parser decodes that literal, so this
+// routine should preserve the preprocessor spelling contract rather than the
+// decoded filename.
 static std::string spellStringifiedMacroArgument(StringRef arg) {
   std::string normalized = collapseWhitespaceForStringification(arg);
   std::string out;
@@ -105,8 +106,8 @@ static std::string spellStringifiedMacroArgument(StringRef arg) {
 // operands.  Arguments may contain nested parentheses and quoted literals; the
 // result is raw, trimmed argument spelling because stringification must see raw
 // arguments, while ordinary substitution separately uses expanded arguments.
-static std::optional<std::vector<std::string>> parseMacroArguments(
-    StringRef text, size_t openParen, size_t &afterClose) {
+static std::optional<std::vector<std::string>>
+parseMacroArguments(StringRef text, size_t openParen, size_t &afterClose) {
   if (openParen >= text.size() || text[openParen] != '(')
     return std::nullopt;
 
@@ -162,8 +163,9 @@ static std::optional<std::vector<std::string>> parseMacroArguments(
 // literals.  This helper returns the raw spelling inside the outer parentheses
 // so the ordinary replacement-list substitution code can evaluate the content
 // if the variadic argument is present.
-static std::optional<std::string> parseBalancedParenthesizedContent(
-    StringRef text, size_t openParen, size_t &afterClose) {
+static std::optional<std::string>
+parseBalancedParenthesizedContent(StringRef text, size_t openParen,
+                                  size_t &afterClose) {
   if (openParen >= text.size() || text[openParen] != '(')
     return std::nullopt;
 
@@ -222,10 +224,10 @@ static std::string joinRawMacroArguments(ArrayRef<std::string> args,
 }
 
 // The #line evaluator only needs the spelling produced by simple token paste in
-// line-control operands.  After parameter substitution, remove `##` and adjacent
-// horizontal padding so pasted numeric/string/file-name fragments can be parsed
-// by the normal #line parser.  This stays local to line-control recovery and is
-// not used for refolding arbitrary macro programs.
+// line-control operands.  After parameter substitution, remove `##` and
+// adjacent horizontal padding so pasted numeric/string/file-name fragments can
+// be parsed by the normal #line parser.  This stays local to line-control
+// recovery and is not used for refolding arbitrary macro programs.
 static std::string removeTokenPasteOperators(StringRef text) {
   std::string out;
   out.reserve(text.size());
@@ -249,13 +251,15 @@ static std::string removeTokenPasteOperators(StringRef text) {
   return out;
 }
 
-static std::string expandLineControlMacros(
-    StringRef text, const LineControlMacroMap &macros,
-    std::unordered_set<std::string> &disabled, size_t logicalLineAtLineStart,
-    StringRef activeFileSpelling);
+static std::string
+expandLineControlMacros(StringRef text, const LineControlMacroMap &macros,
+                        std::unordered_set<std::string> &disabled,
+                        size_t logicalLineAtLineStart,
+                        StringRef activeFileSpelling);
 
 static std::string substituteLineControlReplacementFragment(
-    StringRef repl, const std::unordered_map<std::string, std::string> &rawByParam,
+    StringRef repl,
+    const std::unordered_map<std::string, std::string> &rawByParam,
     const std::unordered_map<std::string, std::string> &expandedByParam,
     bool variadicArgumentHasTokens, const LineControlMacroMap &macros,
     std::unordered_set<std::string> &disabled, size_t logicalLineAtLineStart,
@@ -264,8 +268,8 @@ static std::string substituteLineControlReplacementFragment(
 // Return true iff the replacement-list token [nameBegin, nameEnd) is an
 // operand of a token-paste operator.  Macro arguments adjacent to `##` are not
 // macro-expanded before substitution; their raw tokens are substituted, the
-// paste is formed, and the pasted token is then rescanned.  This is the critical
-// preprocessor invariant for source line-control macros such as:
+// paste is formed, and the pasted token is then rescanned.  This is the
+// critical preprocessor invariant for source line-control macros such as:
 //
 //   #define RAW 4
 //   #define RAW00 910
@@ -300,8 +304,9 @@ static bool replacementTokenIsAdjacentToPaste(StringRef repl, size_t nameBegin,
 // unexpanded instead of causing unbounded recursion.
 static std::string substituteFunctionLikeLineControlMacro(
     const LineControlMacroDefinition &def, ArrayRef<std::string> rawArgs,
-    const LineControlMacroMap &macros, std::unordered_set<std::string> &disabled,
-    size_t logicalLineAtLineStart, StringRef activeFileSpelling) {
+    const LineControlMacroMap &macros,
+    std::unordered_set<std::string> &disabled, size_t logicalLineAtLineStart,
+    StringRef activeFileSpelling) {
   std::unordered_map<std::string, std::string> rawByParam;
   std::unordered_map<std::string, std::string> expandedByParam;
   bool variadicArgumentHasTokens = false;
@@ -310,7 +315,8 @@ static std::string substituteFunctionLikeLineControlMacro(
     std::string raw;
     if (def.variadic && def.params[i] == def.variadicParam) {
       raw = joinRawMacroArguments(rawArgs, i);
-      variadicArgumentHasTokens = !stringutils::trimWsNoLF(StringRef(raw)).empty();
+      variadicArgumentHasTokens =
+          !stringutils::trimWsNoLF(StringRef(raw)).empty();
     } else {
       raw = i < rawArgs.size() ? rawArgs[i] : std::string();
     }
@@ -438,10 +444,11 @@ static std::string substituteLineControlReplacementFragment(
 // directive.  The expansion context is the logical location at the directive
 // line itself, which is what predefined macros such as __LINE__ and __FILE__
 // observe when they appear inside `#line` operands.
-static std::string expandLineControlMacros(
-    StringRef text, const LineControlMacroMap &macros,
-    std::unordered_set<std::string> &disabled, size_t logicalLineAtLineStart,
-    StringRef activeFileSpelling) {
+static std::string
+expandLineControlMacros(StringRef text, const LineControlMacroMap &macros,
+                        std::unordered_set<std::string> &disabled,
+                        size_t logicalLineAtLineStart,
+                        StringRef activeFileSpelling) {
   std::string out;
   out.reserve(text.size());
 
@@ -496,9 +503,9 @@ static std::string expandLineControlMacros(
       disabled.insert(name);
       std::string pasted =
           removeTokenPasteOperators(StringRef(def.replacement));
-      out += expandLineControlMacros(StringRef(pasted), macros, disabled,
-                                     logicalLineAtLineStart,
-                                     activeFileSpelling);
+      out +=
+          expandLineControlMacros(StringRef(pasted), macros, disabled,
+                                  logicalLineAtLineStart, activeFileSpelling);
       disabled.erase(name);
       continue;
     }
@@ -533,9 +540,10 @@ static std::string expandLineControlMacros(
   return out;
 }
 
-static std::string expandLineControlMacros(
-    StringRef text, const LineControlMacroMap &macros,
-    size_t logicalLineAtLineStart, StringRef activeFileSpelling) {
+static std::string expandLineControlMacros(StringRef text,
+                                           const LineControlMacroMap &macros,
+                                           size_t logicalLineAtLineStart,
+                                           StringRef activeFileSpelling) {
   std::unordered_set<std::string> disabled;
   return expandLineControlMacros(text, macros, disabled, logicalLineAtLineStart,
                                  activeFileSpelling);
@@ -571,8 +579,8 @@ static bool lineControlSpellingIsLineDirective(StringRef line) {
     return true;
 
   // GCC/Clang numeric line-control form: # <digits> ["file"].  The actual
-  // numeric operand may be macro-produced, but a digit here is enough to classify
-  // the directive as line-control for proof gating.
+  // numeric operand may be macro-produced, but a digit here is enough to
+  // classify the directive as line-control for proof gating.
   return p < to && std::isdigit(static_cast<unsigned char>(line[p]));
 }
 
@@ -791,7 +799,7 @@ static size_t logicalLineAtSourceOffset(StringRef prefix, size_t lineStart,
 
   return activeLineAfterDirective +
          stringutils::countNonSplicedNewlines(prefix, activeAfterDirectiveIdx,
-                                             lineStart);
+                                              lineStart);
 }
 
 // A source-authored line-control directive is parsed after backslash-newline
@@ -817,10 +825,9 @@ static size_t physicalLineControlDirectiveAdjustment(StringRef src,
   return physicalNewlines - 1;
 }
 
-
 static void appendDecodedLineControlFilenameEscape(StringRef src, size_t &p,
-                                                     size_t to,
-                                                     SmallString<64> &out) {
+                                                   size_t to,
+                                                   SmallString<64> &out) {
   char escaped = src[p++];
   if (escaped == 'x' || escaped == 'X') {
     unsigned value = 0;
@@ -887,8 +894,20 @@ static void appendDecodedLineControlFilenameEscape(StringRef src, size_t &p,
   }
 }
 
-// Parse a single logical preprocessing line as a line-control directive.  This
-// namespace-local helper is shared by the member API and the model-backed
+// Parse one logical preprocessing line as a line-control directive.
+//
+// Expected source line-control shapes:
+//
+//     #line <digits> ["file"]
+//     # line <digits> ["file"]
+//     # <digits> ["file"]
+//
+// Within the quoted file spelling, it decodes C string-literal escapes used by
+// line-control filename operands. The optional filename operand is tracked
+// separately from an explicitly empty filename string so callers can model
+// `#line 200` as preserving the current file spelling.
+//
+// This namespace-local helper is shared by the member API and the model-backed
 // logical-location scanner below; keeping the parser out of the class member
 // avoids translation-order dependencies when source-prefix recovery runs before
 // the public LineDirectiveInserter methods are defined.
@@ -985,8 +1004,8 @@ parseLineDirectiveForLineControl(StringRef src, size_t from, size_t to) {
 }
 
 // Expand only the operand part of a possible line-control directive.  Non-line
-// preprocessor directives are harmless: after expansion, the line-directive parser
-// will reject them and the caller will only use them to update the macro
+// preprocessor directives are harmless: after expansion, the line-directive
+// parser will reject them and the caller will only use them to update the macro
 // environment.
 static std::string expandSourceLineControlDirective(
     StringRef line, const LineControlMacroMap &macros,
@@ -1009,16 +1028,15 @@ static std::string expandSourceLineControlDirective(
   std::string expanded;
   expanded.reserve(line.size());
   expanded += line.substr(0, operandBegin).str();
-  expanded += expandLineControlMacros(line.substr(operandBegin), macros,
-                                      logicalLineAtLineStart,
-                                      activeFileSpelling);
+  expanded +=
+      expandLineControlMacros(line.substr(operandBegin), macros,
+                              logicalLineAtLineStart, activeFileSpelling);
 
   // Keep non-`#line` directives unchanged.  For `# <tokens>` line-control, the
   // expanded operands are enough; for ordinary directives such as `#define`,
   // parsing will fail and the caller will ignore the result.
   return expanded;
 }
-
 
 // Return the original-source byte of the directive-introducing '#'.  The
 // logical line scanner has already applied backslash-newline splicing for
@@ -1076,23 +1094,26 @@ enum class LineControlDirectiveActivity { Active, Inactive, Unknown };
 // witness.  That distinction creates three cases for a source-authored #line
 // directive inside a conditional group:
 //
-//   * Active:   every enclosing group has a selected arm, and the directive byte
+//   * Active:   every enclosing group has a selected arm, and the directive
+//   byte
 //               lies inside that selected arm.
 //   * Inactive: some enclosing group has a selected arm, but the directive byte
 //               lies outside it.  The preprocessor did not execute this
 //               directive, so it must be ignored without poisoning later
 //               resync proof.
-//   * Unknown:  an enclosing group contains the directive, but the refold map has
+//   * Unknown:  an enclosing group contains the directive, but the refold map
+//   has
 //               no selected PP-material arm for that group.  This happens when
 //               the selected branch executed only directive effects such as
 //               #line and produced no PP tokens.  The consumer cannot prove
 //               which #line executed from CondArm::selected alone, so callers
-//               must fail closed or preserve the real source line-control stream
-//               rather than emit an inferred physical fallback.
+//               must fail closed or preserve the real source line-control
+//               stream rather than emit an inferred physical fallback.
 //
 // The consumer must not re-evaluate #if expressions here: the producer already
 // ran Clang's preprocessor with the correct macro state, target semantics,
-// feature predicates, include search state, and conditional short-circuit rules.
+// feature predicates, include search state, and conditional short-circuit
+// rules.
 static LineControlDirectiveActivity classifyLineControlDirectiveActivity(
     const RefoldModel &model, StringRef ownerFile,
     std::optional<uint64_t> ownerIncludeId, uint64_t directiveHashOffset) {
@@ -1137,9 +1158,9 @@ static LineControlDirectiveActivity classifyLineControlDirectiveActivity(
 /// when an arm contributed A-side tokens, not merely when Clang selected that
 /// branch.  A selected arm that only performs `#define`/`#undef` therefore has
 /// no selected-arm PP span, but its macro-state directive is still represented
-/// explicitly in the refold map as a MacroDirective item.  Line-control recovery
-/// must use that item as the activity proof for source-authored macro state;
-/// otherwise live branch-local definitions such as `#define LOC ...` are
+/// explicitly in the refold map as a MacroDirective item.  Line-control
+/// recovery must use that item as the activity proof for source-authored macro
+/// state; otherwise live branch-local definitions such as `#define LOC ...` are
 /// suppressed before a later `#line LOC` resync.
 static bool lineControlMacroDirectiveWasProducerObserved(
     const RefoldModel &model, StringRef ownerFile,
@@ -1187,10 +1208,11 @@ std::string LineDirectiveInserter::ToAbsolutePath(StringRef spelledPath) const {
   return std::string(path.str());
 }
 
-static LineDirectiveLocation logicalLocationAtOffsetImpl(
-    StringRef src, uint64_t offset, StringRef defaultFileSpelling,
-    const RefoldModel &model, StringRef ownerFile,
-    std::optional<uint64_t> ownerIncludeId) {
+static LineDirectiveLocation
+logicalLocationAtOffsetImpl(StringRef src, uint64_t offset,
+                            StringRef defaultFileSpelling,
+                            const RefoldModel &model, StringRef ownerFile,
+                            std::optional<uint64_t> ownerIncludeId) {
   const size_t clampedOffset =
       static_cast<size_t>(std::min<uint64_t>(offset, src.size()));
   StringRef prefix = src.take_front(clampedOffset);
@@ -1217,9 +1239,9 @@ static LineDirectiveLocation logicalLocationAtOffsetImpl(
     }
 
     // Directive recognition, macro replacement in directive operands, and
-    // #define replacement-list capture all occur after backslash-newline deletion
-    // and comment replacement.  Reusing this directive-logical spelling
-    // keeps the owner-local line-control model aligned with the actual
+    // #define replacement-list capture all occur after backslash-newline
+    // deletion and comment replacement.  Reusing this directive-logical
+    // spelling keeps the owner-local line-control model aligned with the actual
     // preprocessor without changing any refolding ownership decisions.
     std::string directiveLogicalLine =
         stringutils::replaceCommentsWithWhitespacePreservingLiterals(
@@ -1274,8 +1296,8 @@ static LineDirectiveLocation logicalLocationAtOffsetImpl(
     // execution could observe.
     if (directiveEffectsAreActive) {
       std::string expandedLine = expandSourceLineControlDirective(
-          StringRef(directiveLogicalLine), lineControlMacros, logicalLineAtLineStart,
-          activeFileForExpansion);
+          StringRef(directiveLogicalLine), lineControlMacros,
+          logicalLineAtLineStart, activeFileForExpansion);
       if (std::optional<LineDirectiveState> state =
               parseLineDirectiveForLineControl(StringRef(expandedLine), 0,
                                                expandedLine.size())) {
@@ -1294,8 +1316,8 @@ static LineDirectiveLocation logicalLocationAtOffsetImpl(
             state->lineAfterDir + physicalLineControlDirectiveAdjustment(
                                       prefix, lineStart, afterLine);
         // The active line state starts after the whole physical directive,
-        // including any source lines consumed by backslash-newline splices, not after the
-        // temporary expanded spelling used only for operand parsing.
+        // including any source lines consumed by backslash-newline splices, not
+        // after the temporary expanded spelling used only for operand parsing.
         activeAfterDirectiveIdx = afterLine;
       } else if (isLineControlDirectiveSpelling && hashOffset) {
         // The directive is syntactically line-control and lies on a
@@ -1352,11 +1374,10 @@ LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
 }
 
 static bool rejoinsUntouchedTailSafelyAtBOL(StringRef originalFileText,
-                                             uint64_t editEnd) {
+                                            uint64_t editEnd) {
   const size_t n = originalFileText.size();
-  const size_t pos = (editEnd >= static_cast<uint64_t>(n))
-                         ? n
-                         : static_cast<size_t>(editEnd);
+  const size_t pos =
+      (editEnd >= static_cast<uint64_t>(n)) ? n : static_cast<size_t>(editEnd);
 
   if (pos == n || stringutils::isBOL(originalFileText, pos))
     return true;
@@ -1521,7 +1542,6 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
   return replacement.str();
 }
 
-
 std::optional<LineDirectiveState>
 LineDirectiveInserter::FindLastLineDirectiveState(StringRef src) {
   if (src.empty())
@@ -1551,7 +1571,6 @@ LineDirectiveInserter::FindLastLineDirectiveState(StringRef src) {
   }
   return std::nullopt;
 }
-
 
 std::string LineDirectiveInserter::EscapeForLineDirective(StringRef path) {
   return stringutils::escapeLineDirectivePath(path);

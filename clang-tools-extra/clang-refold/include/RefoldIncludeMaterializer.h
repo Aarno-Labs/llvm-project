@@ -3,11 +3,11 @@
 // Include materialization and include-owned edit planning for clang-refold.
 //
 // RefoldIncludeMaterializer owns the deterministic realization path for include
-// subtrees: inline realization from B, header-local include edits, child-include
-// boundary anchoring, macro-state carry decisions, and final materialized
-// include text assembly.  All immutable run inputs, proof services, text-
-// assembly services, and orchestration callbacks are supplied explicitly at
-// construction time.
+// subtrees: inline realization from B, header-local include edits,
+// child-include boundary anchoring, macro-state carry decisions, and final
+// materialized include text assembly.  All immutable run inputs, proof
+// services, text-assembly services, and orchestration callbacks are supplied
+// explicitly at construction time.
 //
 //===----------------------------------------------------------------------===//
 
@@ -17,15 +17,15 @@
 #include "core/RefoldModel.h"
 #include "edit/RefoldEditTypes.h"
 #include "edit/RefoldPatchTypes.h"
+#include "include/RefoldIncludeReplayProof.h"
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/RefoldLineControlProof.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroTopology.h"
 #include "proof/RefoldAcceptedResultTypes.h"
-#include "proof/RefoldProofTypes.h"
+#include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTerminalProofSink.h"
-#include "source/DiffAlgorithms.h"
 #include "source/RefoldToken.h"
 #include "util/RefoldDenseMapInfo.h"
 #include "util/RefoldPathIdentity.h"
@@ -54,50 +54,13 @@ class RefoldLineObserverLayout;
 class RefoldSourceMapper;
 class RefoldTextEditAssembler;
 
-/// Builds include-owned insertion patches and include-realization
-/// B-token envelopes.  This helper is co-located with the include
-/// materializer because it is only useful to include materialization and
-/// fallback paths; keeping it here avoids a tiny standalone translation unit
-/// without changing the deterministic staging/proof policy.
-class RefoldIncludeInsertionPlanner {
-public:
-  RefoldIncludeInsertionPlanner(llvm::StringRef bSource,
-                                llvm::ArrayRef<PPTok> bToks,
-                                llvm::ArrayRef<size_t> bTokOff,
-                                const RefoldSourceMapper &sourceMapper,
-                                const RefoldProofLattice &proofLattice);
+class RefoldIncludeInsertionPlanner;
 
-  /// Resolve an include-realization B-token envelope from an A-token cover.
-  ///
-  /// The canonical path is the ordinary A-cover -> B-envelope mapper.  If that
-  /// proof is unavailable, this method permits exactly the declared
-  /// BoundaryStableConsensusBCoverEnvelope proof: all usable non-canonical
-  /// boundary-stable projections must agree on the same non-empty B-token
-  /// envelope.  Missing or empty projections are ignored, but conflicting usable
-  /// projections fail closed.
-  std::optional<std::pair<size_t, size_t>>
-  ResolveIncludeRealizationBTokenEnvelope(
-      uint64_t beginTok, uint64_t endTok,
-      IncludeRealizationEvidenceKind *evidenceKind = nullptr) const;
-
-  /// Build an include-owned staging patch from an already-attributed diff hunk.
-  ///
-  /// The returned IncludePatch carries the A/B token intervals from \p h and the
-  /// exact bytes copied from B.  Replacement/deletion hunks use exact token
-  /// coverage so surrounding inter-token whitespace stays with the neighboring
-  /// owner; pure insertions keep the full token envelope because there is no
-  /// original source span whose boundary whitespace can be retained.
-  IncludePatch BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
-                                          const diffutils::Hunk &h) const;
-
-private:
-  llvm::StringRef bSource_;
-  llvm::ArrayRef<PPTok> bToks_;
-  llvm::ArrayRef<size_t> bTokOff_;
-  const RefoldSourceMapper &sourceMapper_;
-  const RefoldProofLattice &proofLattice_;
-};
-
+/// Materializes include-owned edits after include replay proof and scheduling.
+///
+/// The service builds inline include realization text, coordinates recursive
+/// materialization, attaches source-graph/line-control evidence, and emits
+/// include-local patch buckets without owning include search-chain proof.
 class RefoldIncludeMaterializer {
 public:
   using AcceptedPathKind = ::clang::refold::AcceptedPathKind;
@@ -122,9 +85,16 @@ public:
   using StabilizedMaterializedHeaderMacroPatch =
       ::clang::refold::StabilizedMaterializedHeaderMacroPatch;
   using StateMutationKind = ::clang::refold::StateMutationKind;
-  using SuffixStabilityWitnessKind = ::clang::refold::SuffixStabilityWitnessKind;
+  using SuffixStabilityWitnessKind =
+      ::clang::refold::SuffixStabilityWitnessKind;
   using TextEdit = ::clang::refold::TextEdit;
 
+  /// Construct an include materializer over immutable A/B token/source inputs
+  /// and explicit proof/edit services.
+  ///
+  /// The materializer does not own pass-level staging maps.  Callers pass those
+  /// maps to the realization methods so recursive include materialization stays
+  /// deterministic and run-scoped.
   RefoldIncludeMaterializer(
       const RefoldModel &model, llvm::StringRef aSource,
       llvm::StringRef bSource, llvm::ArrayRef<PPTok> aToks,
@@ -133,8 +103,7 @@ public:
       const LineDirectiveInserter &lineDirs,
       const std::optional<FinalReplaySurface> &finalReplaySurface,
       const std::vector<SidebandPragmaEdit> &sidebandPragmaEdits,
-      const RefoldSourceMapper &sourceMapper,
-      const RefoldPathIdentity &paths,
+      const RefoldSourceMapper &sourceMapper, const RefoldPathIdentity &paths,
       const RefoldMacroTopology &macroTopology,
       const RefoldLineControlProof &lineControlProof,
       const RefoldLineObserverLayout &lineObserverLayout,
@@ -145,16 +114,14 @@ public:
       const RefoldTextEditAssembler &textEditAssembler,
       const RefoldTerminalProofSink &terminalSink,
       const clang::LangOptions &lexLang)
-      : model_(model), aSource_(aSource), bSource_(bSource),
-        aToks_(aToks), bToks_(bToks), bTokOff_(bTokOff),
-        abTokMapA2B_(abTokMapA2B), lineDirs_(lineDirs),
-        finalReplaySurface_(finalReplaySurface),
+      : model_(model), aSource_(aSource), bSource_(bSource), aToks_(aToks),
+        bToks_(bToks), bTokOff_(bTokOff), abTokMapA2B_(abTokMapA2B),
+        lineDirs_(lineDirs), finalReplaySurface_(finalReplaySurface),
         sidebandPragmaEdits_(sidebandPragmaEdits), sourceMapper_(sourceMapper),
         paths_(paths), macroTopology_(macroTopology),
         lineControlProof_(lineControlProof),
         lineObserverLayout_(lineObserverLayout),
-        macroStateProof_(macroStateProof),
-        ownerStateProof_(ownerStateProof),
+        macroStateProof_(macroStateProof), ownerStateProof_(ownerStateProof),
         includeInsertionPlanner_(includeInsertionPlanner),
         proofLattice_(proofLattice), textEditAssembler_(textEditAssembler),
         terminalSink_(terminalSink), lexLang_(lexLang) {}
@@ -162,19 +129,33 @@ public:
   /// Realize an include expansion directly from the edited preprocessed stream
   /// B after the include-realization envelope has been proven by the shared
   /// accepted-result machinery.
+  ///
+  /// Inline include realization is theorem-facing only when the include's
+  /// A-cover can be projected to a concrete B-token envelope by an accepted
+  /// witness: either the canonical A-cover mapping or the boundary-stable
+  /// consensus proof.  If no such envelope exists, callers must use the
+  /// explicit terminal-fallback path instead of synthesizing a weaker
+  /// realization.
   std::optional<std::string> BuildInlineIncludeRealizationFromB(
       const RefoldModel::IncludeItem &inc, llvm::StringRef reason,
       AcceptedResultCandidate *acceptedCandidate = nullptr) const;
 
   /// Fully materialize one include instance, recursively realizing any child
   /// include that cannot remain a proven source-spelled include directive.
+  ///
+  /// Parent includes are materialized before descendants, but child directives
+  /// are not blindly expanded: include replay proof decides whether each clean
+  /// child directive can be preserved, rewritten, or must be materialized.
+  /// Macro patches, include-local patches, line-control pruning/mapping
+  /// records, and accepted-result carriers are all accumulated through
+  /// caller-owned run-scoped maps.
   void MaterializeIncludeExpansion(
-      uint64_t includeId, const llvm::DenseMap<uint64_t, IncludeEdits> &perInclude,
+      uint64_t includeId,
+      const llvm::DenseMap<uint64_t, IncludeEdits> &perInclude,
       const llvm::DenseMap<std::optional<uint64_t>, std::vector<MacroPatch>>
           &macroPatchesByOwner,
-      const llvm::DenseMap<uint64_t,
-                           std::vector<const RefoldModel::IncludeItem *>>
-          &children,
+      const llvm::DenseMap<
+          uint64_t, std::vector<const RefoldModel::IncludeItem *>> &children,
       llvm::DenseMap<uint64_t, std::string> &includeExpansion,
       llvm::DenseMap<uint64_t, std::vector<FinalLineControlPruneCandidate>>
           &includeExpansionLineControlPruneCandidates,
@@ -194,39 +175,70 @@ public:
                          const IncludePatch &p);
 
   /// Compute header-local byte edits for include-scoped patches without
-  /// applying them.  Returned edits are sorted for high-to-low application.
+  /// applying them.
+  ///
+  /// Returned edits are sorted for high-to-low application so byte offsets stay
+  /// valid while the caller splices the materialized header text.  The plan
+  /// also carries line-control prune/source-mapping candidates that must remain
+  /// tied to the include-local realization.
   IncludeTextEditPlan ComputeIncludeTextEdits(const IncludeEdits &ie,
                                               std::string headerText) const;
 
   /// Prove a parent-header pure insertion anchor at a preserved direct child
   /// include directive boundary.
-  std::optional<uint64_t> ComputeChildBoundaryInsertByte(
-      const IncludePatch &p, llvm::StringRef file,
-      IncludeAnchorWitness *witness = nullptr) const;
+  ///
+  /// The returned byte offset is valid only when the include patch is a pure
+  /// insertion whose owner-local boundary is exactly a direct child include
+  /// site.  When requested, \p witness records the include-boundary evidence
+  /// used by the accepted-result proof.
+  std::optional<uint64_t>
+  ComputeChildBoundaryInsertByte(const IncludePatch &p, llvm::StringRef file,
+                                 IncludeAnchorWitness *witness = nullptr) const;
 
 private:
-  /// Return the exact producer file byte start for an A-side PP coordinate.
-  /// This helper remains exact-only and uses RefoldPathIdentity for physical
-  /// spelling comparison rather than manufacturing EOF anchors.
-  std::optional<uint64_t> ByteStartForPPInFile(llvm::StringRef file,
-                                               uint64_t pp) const;
+  /// Returns whether a path names the header currently being materialized.
+  /// Logical and load-path spellings are both accepted, with physical-file
+  /// equivalence used only as a hardening predicate.
+  bool PathNamesMaterializedHeader(llvm::StringRef path,
+                                   llvm::StringRef headerPath,
+                                   llvm::StringRef headerLoadPath) const;
 
-  /// Return the exact producer file byte end for an A-side PP coordinate.
-  std::optional<uint64_t> ByteEndForPPInFile(llvm::StringRef file,
-                                             uint64_t pp) const;
+  /// Returns the producer-B realization reason for an unsafe copied header, if
+  /// any.  The policy rejects source-spelled relocation when builtins or
+  /// conditional control would observe a different replay context.
+  std::optional<std::string> MaterializedHeaderRequiresBRealizationReason(
+      const RefoldModel::IncludeItem &include, llvm::StringRef headerPath,
+      llvm::StringRef headerLoadPath) const;
+
+  /// Records an inline include realization from the producer-proven B envelope.
+  /// The caller-owned realization maps are updated together so recursive
+  /// include materialization observes a complete memoized result.
+  bool TryRecordInlineIncludeRealizationFromB(
+      const RefoldModel::IncludeItem &include, llvm::StringRef reason,
+      llvm::DenseMap<uint64_t, std::string> &includeExpansion,
+      llvm::DenseMap<uint64_t, size_t> &includeExpansionStartLineNos,
+      llvm::DenseMap<uint64_t, AcceptedResultCandidate>
+          &includeExpansionAcceptedResults) const;
+
+  /// Builds the parent-surface edit that rewrites a clean child include.
+  /// The edit is accepted only when include replay proof has already supplied a
+  /// deterministic ordinary include operand and delimiter.
+  std::optional<TextEdit> MakeCleanChildIncludeOperandRewriteEdit(
+      const RefoldModel::IncludeItem &child, llvm::StringRef rewrittenOperand,
+      IncludeReplayProofContext::OrdinaryIncludeDelimiterKind delimiterKind,
+      llvm::StringRef ownerBytes) const;
 
   /// Build a TextEdit while applying local or pending #line resync behavior
   /// through the text-edit assembler service.
+  ///
+  /// Include materialization may need an immediate local resync or a deferred
+  /// pending resync depending on whether the emitted replacement crosses a
+  /// logical file boundary.  This helper keeps that policy in the final edit
+  /// assembler rather than duplicating it inside the include materializer.
   TextEdit MakeTextEditWithResyncOrPending(
       llvm::StringRef original, uint64_t start, uint64_t end,
       llvm::StringRef replacement, llvm::StringRef fileSpelling,
       std::optional<uint64_t> ownerIncludeId = std::nullopt) const;
-
-  /// Validate an include-owned sideband pragma edit and record the same
-  /// terminal-fallback obligation that the engine wrapper records for TU-owned
-  /// sideband edits.
-  bool ValidateSidebandPragmaEditProof(const SidebandPragmaEdit &edit,
-                                       llvm::StringRef stage) const;
 
   const RefoldModel &model_;
   llvm::StringRef aSource_;

@@ -3,11 +3,11 @@
 // Centralized RefoldEngine service-graph construction.
 //
 // This translation unit intentionally contains the RefoldEngine::Initialize*()
-// and service-accessor definitions for extracted subsystems.  Subsystem .cpp
-// files implement subsystem behavior; this file owns the engine object-graph
-// wiring and dependency order.  Hooks remain only for explicit cycle-breaking
-// or engine-owned emission ledgers; theorem/audit policy, owner/TU
-// classification, and TU edit planning flow through named services.
+// and service-accessor definitions.  Subsystem .cpp files implement subsystem
+// behavior; this file owns the engine object-graph wiring and dependency order.
+// Hooks remain only for explicit cycle-breaking or engine-owned emission
+// ledgers; theorem/audit policy, owner/TU classification, and TU edit planning
+// flow through named services.
 //
 //===----------------------------------------------------------------------===//
 
@@ -18,6 +18,7 @@
 #include "edit/RefoldTUAnchorProof.h"
 #include "edit/RefoldTUEditPlanner.h"
 #include "edit/RefoldTextEditAssembler.h"
+#include "include/RefoldIncludeInsertionPlanner.h"
 #include "include/RefoldIncludeMaterializer.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldCounterStabilization.h"
@@ -53,12 +54,12 @@ const RefoldMacroStateProof &RefoldEngine::MacroStateProof() const {
 
 void RefoldEngine::InitializeOwnerClassifier() {
   // Owner classification depends on the TU edit-planning service as a named,
-  // read-only dependency.  RefoldTUEditPlanner no longer depends on the owner
-  // classifier, so normal constructor injection can replace the old duplicated
-  // TU-anchor/TU-span callback bundle without creating a service cycle.
-  ownerClassifier_ = std::make_unique<RefoldOwnerClassifier>(
-      RefoldOwnerClassifier::Deps{model_, pathIdentity_, TUEditPlanner(),
-                                  sidebandPragmaEdits_});
+  // read-only dependency.  RefoldTUEditPlanner does not depend on the owner
+  // classifier, so normal constructor injection keeps the TU-anchor/TU-span
+  // boundary explicit without creating a service cycle.
+  ownerClassifier_ =
+      std::make_unique<RefoldOwnerClassifier>(RefoldOwnerClassifier::Deps{
+          model_, pathIdentity_, TUEditPlanner(), sidebandPragmaEdits_});
 }
 
 RefoldOwnerClassifier &RefoldEngine::OwnerClassifier() {
@@ -73,9 +74,9 @@ const RefoldOwnerClassifier &RefoldEngine::OwnerClassifier() const {
 
 void RefoldEngine::InitializeBInsertionLedger() {
   // Pure B-token insertion ownership is a named edit-domain ledger.  The
-  // ledger borrows the owner classifier and macro-boundary selector directly so
-  // standalone preclaims no longer depend on RefoldEngine-private vectors or
-  // anonymous callbacks.
+  // ledger borrows the owner classifier and macro-boundary selector directly;
+  // standalone preclaims depend only on these explicit services and the
+  // ledger's own run-local state.
   bInsertionLedger_ = std::make_unique<RefoldBInsertionLedger>(
       RefoldBInsertionLedger::Deps{bToks_, sourceMapper_, OwnerClassifier(),
                                    macroTopology_, macroBoundarySelector_});
@@ -91,11 +92,10 @@ const RefoldBInsertionLedger &RefoldEngine::BInsertionLedger() const {
   return *bInsertionLedger_;
 }
 
-
 void RefoldEngine::InitializeTUAnchorProof() {
-  // TU-anchor accepted-result construction is a narrow proof service rather
-  // than a proof-lattice responsibility.  Audit now flows through the shared
-  // theorem/audit service instead of a bespoke callback bundle.
+  // TU-anchor accepted-result construction is a narrow proof service.  Audit
+  // flows through the shared theorem/audit service, while the anchor proof
+  // builder owns only TU-anchor carrier construction.
   tuAnchorProof_ = std::make_unique<RefoldTUAnchorProof>(TheoremAudit());
 }
 
@@ -111,17 +111,14 @@ const RefoldTUAnchorProof &RefoldEngine::TUAnchorProof() const {
 
 void RefoldEngine::InitializeTokenDiffPlanner() {
   // Token diff planning borrows the per-run source/token inputs and writes the
-  // same engine-owned diff caches later services already observe.  Keeping this
-  // as a named service removes lexeme/LCS provenance construction from
-  // RunSinglePassRefold without changing cache ownership or lifetime.
+  // engine-owned diff caches later services observe.  The named service owns
+  // lexeme/LCS provenance construction while preserving cache ownership and
+  // lifetime on the engine object graph.
   tokenDiffPlanner_ = std::make_unique<RefoldTokenDiffPlanner>(
-      RefoldTokenDiffPlanner::Dependencies{model_,       bSource_,
-                                           aToks_,       bToks_,
-                                           aTokOff_,     bTokOff_,
-                                           macroTopology_, sourceMapper_,
-                                           ownerDepthGap_, abTokHunks_,
-                                           abByteHunks_, abTokMapA2B_,
-                                           abTokMapB2A_});
+      RefoldTokenDiffPlanner::Dependencies{
+          model_, bSource_, aToks_, bToks_, aTokOff_, bTokOff_, macroTopology_,
+          sourceMapper_, ownerDepthGap_, abTokHunks_, abByteHunks_,
+          abTokMapA2B_, abTokMapB2A_});
 }
 
 void RefoldEngine::InitializeMixedOwnerTilingPlanner() {
@@ -131,20 +128,20 @@ void RefoldEngine::InitializeMixedOwnerTilingPlanner() {
   // consumers see the same normalized state without engine callbacks.
   mixedOwnerTilingPlanner_ = std::make_unique<RefoldMixedOwnerTilingPlanner>(
       RefoldMixedOwnerTilingPlanner::Dependencies{
-          model_,       model_.GetSourcePath(), pathIdentity_, lineDirs_,
-          lexLang_,     macroTopology_,         sourceMapper_,
-          OwnerClassifier(), OwnerStateProof(), abTokHunks_,
-          mixedOwnerTilingWitnesses_, mixedOwnerTilingSegmentBindings_});
+          model_, model_.GetSourcePath(), pathIdentity_, lineDirs_, lexLang_,
+          macroTopology_, sourceMapper_, OwnerClassifier(), OwnerStateProof(),
+          abTokHunks_, mixedOwnerTilingWitnesses_,
+          mixedOwnerTilingSegmentBindings_});
 }
 
 void RefoldEngine::InitializeTUEditPlanner() {
   // TU edit planning has a real owner.  The planner receives only read-only
   // services and token-map state; final TextEdit assembly intentionally remains
   // outside this service.
-  tuEditPlanner_ = std::make_unique<RefoldTUEditPlanner>(
-      RefoldTUEditPlanner::Deps{model_, pathIdentity_, macroTopology_,
-                                  TUAnchorProof(), lineDirs_, aToks_,
-                                  abTokMapA2B_, ownerDepthGap_, strict_});
+  tuEditPlanner_ =
+      std::make_unique<RefoldTUEditPlanner>(RefoldTUEditPlanner::Deps{
+          model_, pathIdentity_, macroTopology_, TUAnchorProof(), lineDirs_,
+          aToks_, abTokMapA2B_, ownerDepthGap_, strict_});
 }
 
 RefoldTUEditPlanner &RefoldEngine::TUEditPlanner() {
@@ -168,8 +165,7 @@ RefoldCounterStabilization &RefoldEngine::CounterStabilization() {
   return *counterStabilization_;
 }
 
-const RefoldCounterStabilization &
-RefoldEngine::CounterStabilization() const {
+const RefoldCounterStabilization &RefoldEngine::CounterStabilization() const {
   assert(counterStabilization_ &&
          "counter-stabilization service not initialized");
   return *counterStabilization_;
@@ -200,9 +196,9 @@ RefoldEngine::IncludeInsertionPlanner() const {
 
 void RefoldEngine::InitializeLineObserverLayout() {
   lineObserverLayout_ = std::make_unique<RefoldLineObserverLayout>(
-      model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_,
-      abTokMapB2A_, pathIdentity_, lineControlProof_, OwnerStateProof(),
-      ProofLattice(), *textEditAssembler_, lineDirs_);
+      model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, abTokMapB2A_,
+      pathIdentity_, lineControlProof_, OwnerStateProof(), ProofLattice(),
+      *textEditAssembler_, lineDirs_);
 }
 
 RefoldLineObserverLayout &RefoldEngine::LineObserverLayout() {
@@ -215,25 +211,28 @@ const RefoldLineObserverLayout &RefoldEngine::LineObserverLayout() const {
   return *lineObserverLayout_;
 }
 
-
 void RefoldEngine::InitializeTheoremAudit() {
   RefoldTheoremAudit::Hooks hooks;
   hooks.normalizeAcceptedProof =
       [this](const AcceptedResultCandidate &candidate) {
-        return ProofLattice().NormalizeAcceptedProof(candidate);
+        return ProofLattice().ProofSummaryBuilder().NormalizeAcceptedProof(
+            candidate);
       };
   hooks.classifyMacroPatchProof = [this](const MacroPatch &patch) {
-    return ProofLattice().ClassifyMacroPatchProof(patch);
+    return ProofLattice().MacroPatchProofClassifier().ClassifyMacroPatchProof(
+        patch);
   };
   hooks.getWitnessResolverMode = [this]() {
-    return ProofLattice().GetWitnessResolverMode();
+    return ProofLattice().WitnessTrace().GetWitnessResolverMode();
   };
   hooks.buildTerminalFallbackWitness = [this]() {
     return ProofLattice().BuildTerminalFallbackWitness();
   };
   hooks.buildAcceptedTerminalCandidate =
       [this](const TerminalFallbackWitness &witness) {
-        return ProofLattice().BuildAcceptedTerminalCandidate(witness);
+        return ProofLattice()
+            .AcceptedCandidateBuilder()
+            .BuildAcceptedTerminalCandidate(witness);
       };
 
   theoremAudit_ = std::make_unique<RefoldTheoremAudit>(
@@ -263,8 +262,8 @@ const RefoldOwnerStateProof &RefoldEngine::OwnerStateProof() const {
 void RefoldEngine::InitializeProofLattice() {
   // The proof lattice receives only the inputs and callbacks it needs.  TU
   // owner/anchor diagnostics use RefoldTUEditPlanner through constructor
-  // injection; this keeps TU planning out of the callback bundle and avoids the
-  // late-bound planner/lattice cycle that the TU-anchor proof extraction broke.
+  // injection, which keeps TU planning out of the callback bundle and makes the
+  // late-bound planner/lattice dependency explicit.
   RefoldProofLattice::Hooks hooks;
   // Non-audit orchestration hook.
   hooks.computeWholeCoverPlan =
@@ -276,24 +275,21 @@ void RefoldEngine::InitializeProofLattice() {
       model_, bSource_, bToks_, sourceMapper_, tokenTextAnalysis_,
       argTextRecovery_, macroTopology_, OwnerStateProof(), terminalSink_,
       TUEditPlanner(), TheoremAudit(), lastTheoremAudit_, strict_,
-      proofAuditMode_,
-      mixedOwnerTilingSegmentBindings_, mixedOwnerTilingWitnesses_,
-      std::move(hooks));
+      proofAuditMode_, mixedOwnerTilingSegmentBindings_,
+      mixedOwnerTilingWitnesses_, std::move(hooks));
 }
 
-RefoldProofLattice &RefoldEngine::ProofLattice() {
-  return *proofLattice_;
-}
+RefoldProofLattice &RefoldEngine::ProofLattice() { return *proofLattice_; }
 
 const RefoldProofLattice &RefoldEngine::ProofLattice() const {
   return *proofLattice_;
 }
 
-
 void RefoldEngine::InitializeMacroPatchPlanner() {
   // The planner is constructed after the proof services it borrows.  The
   // dependency bundle is intentionally explicit: macro planning reads source
-  // data and proof services directly rather than calling back into RefoldEngine.
+  // data and proof services directly rather than calling back into
+  // RefoldEngine.
   RefoldMacroPatchPlanner::Dependencies deps;
   deps.model = &model_;
   deps.bSource = bSource_;
@@ -393,10 +389,10 @@ void RefoldEngine::InitializeTextEditAssembler() {
 // Include-materializer construction
 //===----------------------------------------------------------------------===//
 //
-// The materializer now receives explicit proof/text/edit services only; the
-// old include-facing hook bundle has collapsed into named proof, topology,
-// and terminal services.  Lexical boundary padding is a shared helper rather
-// than another one-method service.
+// The materializer receives explicit proof/text/edit services.  Include proof,
+// topology, and terminal services are named constructor dependencies, while
+// lexical boundary padding remains a shared helper rather than another
+// one-method service.
 
 void RefoldEngine::InitializeIncludeMaterializer() {
   includeMaterializer_ = std::make_unique<RefoldIncludeMaterializer>(
@@ -404,42 +400,43 @@ void RefoldEngine::InitializeIncludeMaterializer() {
       lineDirs_, finalReplaySurface_, sidebandPragmaEdits_, sourceMapper_,
       pathIdentity_, macroTopology_, lineControlProof_, LineObserverLayout(),
       MacroStateProof(), OwnerStateProof(), IncludeInsertionPlanner(),
-      ProofLattice(),
-      *textEditAssembler_, terminalSink_, lexLang_);
+      ProofLattice(), *textEditAssembler_, terminalSink_, lexLang_);
 }
 
 //===----------------------------------------------------------------------===//
 // Expansion-fallback planner construction
 //===----------------------------------------------------------------------===//
 //
-// The fallback planner is allocated after the materialization and proof services
-// it calls into are available.  Its hook bundle is intentionally visible here as
-// service-graph wiring for non-audit emission/orchestration decisions.
+// The fallback planner is allocated after the materialization and proof
+// services it calls into are available.  Its hook bundle is intentionally
+// visible here as service-graph wiring for non-audit emission/orchestration
+// decisions.
 
 void RefoldEngine::InitializeExpansionFallbackPlanner() {
   RefoldExpansionFallbackPlanner::Hooks hooks;
-  // Non-audit emission/orchestration hooks.  These callbacks now route
-  // directly to the assembler service instead of bouncing through RefoldEngine
-  // forwarding wrappers, leaving the hook bundle as the only cycle-breaking
-  // boundary for fallback emission.
-  hooks.applyResyncOrPend =
-      [this](StringRef originalFileText, uint64_t start, uint64_t end,
-             StringRef replacement, StringRef fileSpellingForDirective,
-             std::optional<uint64_t> ownerIncludeId) {
-        return textEditAssembler_->ApplyResyncOrPend(
-            originalFileText, start, end, replacement,
-            fileSpellingForDirective, ownerIncludeId);
-      };
-  hooks.stampTextEditMaterializedBTokenRange =
+  // Non-audit emission/orchestration hooks.  These callbacks route directly to
+  // the assembler service; the hook bundle stays limited to the cycle-breaking
+  // boundary required by fallback emission.
+  hooks.applyResyncOrPend = [this](StringRef originalFileText, uint64_t start,
+                                   uint64_t end, StringRef replacement,
+                                   StringRef fileSpellingForDirective,
+                                   std::optional<uint64_t> ownerIncludeId) {
+    return textEditAssembler_->ApplyResyncOrPend(
+        originalFileText, start, end, replacement, fileSpellingForDirective,
+        ownerIncludeId);
+  };
+  hooks.certifyTextEditMaterializedBTokenRange =
       [this](TextEdit &edit, uint64_t bTokBegin, uint64_t bTokEnd) {
-        textEditAssembler_->StampTextEditMaterializedBTokenRange(
+        textEditAssembler_->CertifyTextEditMaterializedBTokenRange(
             edit, bTokBegin, bTokEnd);
       };
   hooks.attachAcceptedResultCarrier =
       [this](TextEdit &edit, const AcceptedResultCandidate &candidate) {
         textEditAssembler_->AttachAcceptedResultCarrier(edit, candidate);
       };
-  hooks.resetAttemptStats = [this]() { ResetAttemptStats(); };
+  hooks.resetAttemptStats = [this]() {
+    resetRefoldAttemptStats(lastStats_, model_);
+  };
 
   expansionFallbackPlanner_ = std::make_unique<RefoldExpansionFallbackPlanner>(
       model_, bSource_, aToks_, abTokHunks_, abTokMapB2A_, lineDirs_,

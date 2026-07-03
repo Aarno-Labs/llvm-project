@@ -5,8 +5,8 @@
 // These records are intentionally data-only.  They describe byte edits,
 // deferred line-state resync state, and final sidecar materialization mappings
 // without depending on RefoldEngine.  Keeping them namespace-scoped lets proof,
-// materialization, and text-assembly services exchange edit state through narrow
-// typed APIs instead of naming private RefoldEngine nested types.
+// materialization, and text-assembly services exchange edit state through
+// narrow typed APIs instead of naming private RefoldEngine nested types.
 //
 //===----------------------------------------------------------------------===//
 
@@ -41,9 +41,13 @@ namespace refold {
 /// whole B-side macro expansion envelope to the compact argument text in the
 /// preserved source invocation that regenerates that expansion.
 struct MaterializedEditMapping {
+  /// Inclusive byte offset in the edited preprocessed stream B.
   uint64_t modifiedPreprocessedBegin = 0;
+  /// Exclusive byte offset in the edited preprocessed stream B.
   uint64_t modifiedPreprocessedEnd = 0;
+  /// Beginning of the corresponding emitted-source byte envelope.
   uint64_t refoldedSourceBegin = 0;
+  /// End of the corresponding emitted-source byte envelope.
   uint64_t refoldedSourceEnd = 0;
 };
 
@@ -56,28 +60,33 @@ struct MaterializedEditMapping {
 /// recovery must carry the include-instance identity through to the eventual
 /// flush point.
 struct PendingResync {
+  /// Filename spelling to emit in the eventual synthetic `#line` directive.
   std::string fileSpellingForDir;
+  /// Optional include-instance owner that constrains the deferred flush domain.
   std::optional<uint64_t> ownerIncludeId;
 
-  // True when the pending synthetic resync was emitted for a concrete
-  // line-state demand and may therefore enter the fixed-point pruning candidate
-  // set. Exact deletion attempts are validated directly rather than consulting a
-  // late final-stream liveness scanner.
+  /// True when the pending synthetic resync was emitted for a concrete
+  /// line-state demand and may therefore enter the fixed-point pruning
+  /// candidate set. Exact deletion attempts are validated directly rather than
+  /// consulting a late final-stream liveness scanner.
   bool finalLineControlPruneEligible = false;
 
-  // Logical state proved at the original source offset where the replacement
-  // rejoins untouched text. Pending flushes may occur later, after copying a
-  // prefix of that untouched text; in that case the state advances by the
-  // non-spliced newlines copied between resumeOffset and the flush point.
+  /// Logical file spelling proved at the original TU/source-byte rejoin offset.
   std::string resumeFileSpelling;
+  /// Logical line number proved at the original TU/source-byte rejoin offset.
   size_t resumeLineNo = 0;
+  /// Source byte offset where replacement rejoins untouched text.
+  ///
+  /// Pending flushes may occur later, after copying a prefix of that untouched
+  /// text; in that case the logical state advances by the non-spliced newlines
+  /// copied between this offset and the flush point.
   uint64_t resumeOffset = 0;
 
-  // True when the pending correction is dominated by a preserved conditional
-  // join rather than by the next textual BOL inside the selected arm. In that
-  // case the line-state repair must be emitted by the join pass at the first
-  // post-group observer, not before an intervening preprocessor directive in
-  // only the selected arm.
+  /// True when the pending correction is dominated by a preserved conditional
+  /// join rather than by the next textual BOL inside the selected arm. In that
+  /// case the line-state repair must be emitted by the join pass at the first
+  /// post-group observer, not before an intervening preprocessor directive in
+  /// only the selected arm.
   bool deferToConditionalJoin = false;
 
   explicit PendingResync(llvm::StringRef file,
@@ -95,8 +104,11 @@ struct PendingResync {
 
 /// The final text and optional pending line-state resync for an edit.
 struct ResyncOutcome {
+  /// Replacement text after local line-control wrapping, if any.
   std::string text;
+  /// Deferred line-state repair that must be flushed by a later copy boundary.
   std::optional<PendingResync> pending;
+  /// Synthetic final-line-control directives created inside `text`.
   std::vector<FinalLineControlPruneCandidate> lineControlPruneCandidates;
 
   ResyncOutcome(std::string t, std::optional<PendingResync> p)
@@ -110,65 +122,76 @@ struct ResyncOutcome {
 
 /// One byte edit selected for final source emission.
 struct TextEdit {
+  /// Half-open TU source-byte range replaced by this edit.
   uint64_t start, end;
+  /// Replacement bytes to splice at `[start, end)`.
   std::string text;
+  /// Deferred line-state resync produced while building `text`, if any.
   std::optional<PendingResync> pending;
 
-  // Root macro invocation id to charge as expanded if this edit survives
-  // normalization and is applied in the final chosen refold result.
+  /// Root macro invocation id to charge as expanded if this edit survives
+  /// normalization and is applied in the final chosen refold result.
   std::optional<uint64_t> expandedMacroRootId = std::nullopt;
 
-  // Normalized accepted-result carriers for the non-terminal artifacts that
-  // were composed into this final emitted edit. This is structural only: it does
-  // not change emission semantics, but it makes the proof-bearing source of each
-  // emitted artifact explicit at the byte-edit boundary so a later universal
-  // proof gate can reason over the actual emitted surface.
+  /// Normalized accepted-result carriers for the non-terminal artifacts that
+  /// were composed into this final emitted edit. This is structural only: it
+  /// does not change emission semantics, but it makes the proof-bearing source
+  /// of each emitted artifact explicit at the byte-edit boundary so a later
+  /// universal proof gate can reason over the actual emitted surface.
   std::vector<std::shared_ptr<const AcceptedResultCandidate>> acceptedResults;
 
-  // Final-output line-control pruning candidates carried by this edit, using
-  // byte offsets relative to `text`. Only synthetic directives that a local
-  // emitter explicitly proves eligible are listed here; source-authored
-  // directives copied through materialized text remain fail-closed until the
-  // final model has producer-backed source-line-control evidence.
+  /// Final-output line-control pruning candidates carried by this edit, using
+  /// byte offsets relative to this edit's replacement `text`. Only synthetic
+  /// directives that a local emitter explicitly proves eligible are listed
+  /// here; source-authored directives copied through materialized text remain
+  /// fail-closed until the final model has producer-backed source-line-control
+  /// evidence.
   std::vector<FinalLineControlPruneCandidate> lineControlPruneCandidates = {};
 
-  // Final-output source mappings carried by replacement text, using byte offsets
-  // relative to `text`. These are present only for byte-for-byte source material
-  // threaded through a replacement, such as materialized include bodies.
-  // Replayed B payloads and synthetic text remain unmapped.
+  /// Final-output source mappings carried by replacement text, using byte
+  /// offsets relative to this edit's replacement `text`. These are present only
+  /// for byte-for-byte source material threaded through a replacement, such as
+  /// materialized include bodies. Replayed B payloads and synthetic text remain
+  /// unmapped.
   std::vector<FinalLineControlSourceMapping> lineControlSourceMappings = {};
 
-  // Optional provenance for a TextEdit emitted directly from a single token-level
-  // TU hunk. This is deliberately not inferred for macro, include, or
-  // synthesized closure edits: the closed-realization resolver may only coalesce
-  // edits that still have a one-to-one token-hunk witness.
+  /// True when this edit has one-to-one provenance from a single token-level TU
+  /// hunk.
   bool isDirectTUHunkEdit = false;
+  /// Token-hunk index for direct TU hunk provenance, when present.
   std::optional<uint64_t> directTUHunkIndex = std::nullopt;
+  /// Beginning of the A-token interval for direct TU hunk provenance.
   std::optional<uint64_t> directTUHunkAStart = std::nullopt;
+  /// End of the A-token interval for direct TU hunk provenance.
   std::optional<uint64_t> directTUHunkAEnd = std::nullopt;
+  /// Beginning of the B-token interval for direct TU hunk provenance.
   std::optional<uint64_t> directTUHunkBStart = std::nullopt;
+  /// End of the B-token interval for direct TU hunk provenance.
   std::optional<uint64_t> directTUHunkBEnd = std::nullopt;
 
-  // Raw and final TU byte spans for direct TU hunk edits. raw* records the
-  // immediate token-map span before lexical widening/spacing repair; final*
-  // records the span actually handed to the byte applicator.
+  /// Raw TU byte span before lexical widening/spacing repair.
   std::optional<uint64_t> directTURawStart = std::nullopt;
+  /// End of the raw TU byte span before lexical widening/spacing repair.
   std::optional<uint64_t> directTURawEnd = std::nullopt;
+  /// Final TU byte span handed to the byte applicator.
   std::optional<uint64_t> directTUFinalStart = std::nullopt;
+  /// End of the final TU byte span handed to the byte applicator.
   std::optional<uint64_t> directTUFinalEnd = std::nullopt;
 
-  // Optional B-side byte range for the materialized replacement. This is set by
-  // the producer of the final edit surface, then consumed only by the optional
-  // sidecar mapping writer at the final TU emission boundary.
+  /// Inclusive byte offset in the edited preprocessed stream B for the
+  /// materialized replacement. This is set by the producer of the final edit
+  /// surface, then consumed only by the optional sidecar mapping writer at the
+  /// final TU emission boundary.
   std::optional<uint64_t> materializedBByteBegin = std::nullopt;
+  /// Exclusive byte offset in the edited preprocessed stream B for the
+  /// materialized replacement.
   std::optional<uint64_t> materializedBByteEnd = std::nullopt;
 
-  // Optional byte range inside `text` that should be reported as the
-  // refolded-output side of the materialized edit map. Most edits map to their
-  // whole replacement text. Invocation-preserving macro rewrites can replace a
-  // full callsite while only the rewritten argument envelope is the source
-  // surface corresponding to the B-side materialization witness.
+  /// Inclusive byte offset inside this edit's replacement `text` to report as
+  /// the refolded-output side of the materialized edit map.
   std::optional<uint64_t> materializedOutputTextBegin = std::nullopt;
+  /// Exclusive byte offset inside this edit's replacement `text` to report as
+  /// the refolded-output side of the materialized edit map.
   std::optional<uint64_t> materializedOutputTextEnd = std::nullopt;
 };
 
@@ -178,8 +201,11 @@ struct TextEdit {
 /// applicator translates them to final-output offsets only after all edit
 /// normalization and pending-resync flushing has been resolved.
 struct LineControlWrappedText {
+  /// Wrapped replacement bytes, including any synthetic line-control text.
   std::string text;
+  /// Synthetic directives inside `text`, with offsets relative to `text`.
   std::vector<FinalLineControlPruneCandidate> lineControlPruneCandidates = {};
+  /// Source-line mappings inside `text`, with offsets relative to `text`.
   std::vector<FinalLineControlSourceMapping> lineControlSourceMappings = {};
 };
 
@@ -189,8 +215,12 @@ struct LineControlWrappedText {
 /// anchor header-local edits and realize the include directly from the edited
 /// preprocessed stream B instead.
 struct IncludeTextEditPlan {
+  /// Header-local edits that can be applied without realizing the include.
   std::vector<TextEdit> edits;
+  /// True when header-local anchoring failed closed and include realization is
+  /// required instead.
   bool requiresIncludeRealization = false;
+  /// Deterministic diagnostic reason explaining the realization requirement.
   std::string realizationReason;
 };
 

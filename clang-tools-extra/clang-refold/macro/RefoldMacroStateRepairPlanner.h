@@ -81,8 +81,8 @@ public:
     llvm::DenseSet<uint64_t> syntheticUndefPartitionedDefinitionIds;
   };
 
-  /// Creates a macro-state repair planner bound to the extracted subsystem
-  /// dependencies used by each repair context.
+  /// Creates a macro-state repair planner bound to the subsystem dependencies
+  /// used by each repair context.
   explicit RefoldMacroStateRepairPlanner(Dependencies deps);
 
   /// Builds the initial macro-state repair plan for the current final TU edit

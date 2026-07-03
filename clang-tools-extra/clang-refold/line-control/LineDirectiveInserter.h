@@ -5,8 +5,9 @@
 // LineDirectiveInserter formats synthetic #line directives, suppresses no-op
 // resyncs, wraps materialized include bodies with entry/return directives, and
 // evaluates source-authored line-control state when a caller needs the logical
-// location at a source byte offset.  It does not own refold orchestration state;
-// callers provide source text, producer spellings, and candidate offsets.
+// location at a source byte offset.  It does not own refold orchestration
+// state; callers provide source text, producer spellings, and candidate
+// offsets.
 //
 //===----------------------------------------------------------------------===//
 
@@ -172,7 +173,8 @@ public:
   /// directives use producer-observed MacroDirective items; line-control
   /// directives use producer-proven selected conditional ownership.
   ///
-  /// \param model producer refold map model containing conditional arm selection
+  /// \param model producer refold map model containing conditional arm
+  /// selection
   /// \param ownerFile file whose bytes are being scanned
   /// \param ownerIncludeId include instance that owns \p ownerFile, or
   ///        std::nullopt for the TU owner
@@ -180,7 +182,6 @@ public:
       StringRef src, uint64_t offset, StringRef defaultFileSpelling,
       const RefoldModel &model, StringRef ownerFile,
       std::optional<uint64_t> ownerIncludeId = std::nullopt);
-
 
   /// \brief Attempts a *local* resynchronization by injecting a #line directive
   /// into the replacement text when (and only when) the replacement changes the
@@ -226,8 +227,8 @@ public:
   /// \return either replacement unchanged, or replacement with a
   ///         locally-inserted directive
   std::string MaybeAppendResyncAfterReplacement(
-      StringRef originalFileText, uint64_t s, uint64_t e,
-      StringRef replacement, const LineDirectiveLocation &resumeLoc) const;
+      StringRef originalFileText, uint64_t s, uint64_t e, StringRef replacement,
+      const LineDirectiveLocation &resumeLoc) const;
 
   /// \brief Determines whether a #line directive should be emitted at the
   /// *current output position*.
