@@ -1,15 +1,15 @@
 //===--- RefoldMacroStandardArgsOnlyPatchBuilder.h --------------*- C++ -*-===//
 //
-// Standard (non-paste) args-only patch builder for clang-refold.
+// Standard args-only patch builder for clang-refold.
 //
 // Owns `BuildStandardArgsOnlyPatch`: the entry point for the standard
-// args-only proof path that runs after specialized paste-aware proofs have
+// args-only ranking slot, including the pure paste-only fallback path that
+// belongs to that same slot after specialized paste-aware proofs have
 // declined.  The builder collects arg-span occurrences (and stringify
 // occurrences) for the touched hunk, requires hunk coverage by those spans,
 // and derives per-arg replacements from the B-side slices.  Higher-order
-// generated-callee, generated-leaf, and tuple-forwarded paths are delegated
-// to the `RefoldMacroGeneratedCalleeReplayEngine` and
-// `RefoldMacroGeneratedLeafReplayEngine` services through the references
+// generated-callee, generated-leaf, tuple-forwarded, and pure paste-only paths
+// remain private implementation details reached through the references
 // supplied in `Dependencies`.
 //
 // The builder has no back-reference to `RefoldMacroPatchPlanner`.
@@ -65,7 +65,8 @@ class RefoldSourceMapper;
 /// Builds standard args-only macro patches from validated argument layouts.
 ///
 /// The builder materializes the replacement text and proof envelope for the
-/// ordinary args-only replay path after a solver has established admissibility.
+/// standard args-only ranking slot, including the deterministic pure paste-only
+/// fallback that is still certified as an args-only candidate.
 class RefoldMacroStandardArgsOnlyPatchBuilder {
 public:
   /// Borrowed inputs needed by the standard args-only patch builder.

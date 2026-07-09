@@ -50,6 +50,9 @@ add_clang_tool(clang-refold
   macro/RefoldMacroPatchReusePhase.cpp
   macro/RefoldMacroSelectorSubstitutionPhase.cpp
   macro/RefoldMacroStandardArgsOnlyPatchBuilder.cpp
+  macro/RefoldMacroStandardArgsOnlyOccurrence.cpp
+  macro/RefoldMacroStandardArgsOnlyProof.cpp
+  macro/RefoldMacroStandardArgsOnlyGeneratedReplay.cpp
   macro/RefoldMacroSubtreeReplayValidator.cpp
   macro/RefoldMacroReplayStabilityValidator.cpp
   macro/RefoldMacroGeneratedCalleeReplayEngine.cpp
