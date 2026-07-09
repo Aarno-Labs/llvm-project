@@ -1,10 +1,11 @@
-//===--- RefoldMacroGeneratedLeafReplayEngine.cpp ------------*- C++ -*-===//
+//===--- RefoldMacroGeneratedLeafReplayEngine.cpp ---------------*- C++ -*-===//
 //
 // Generated-leaf fallback replay for clang-refold.
 //
 //===----------------------------------------------------------------------===//
 
 #include "macro/RefoldMacroGeneratedLeafReplayEngine.h"
+
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroPatchProofCertifier.h"
 #include "macro/RefoldMacroPlannerHelpers.h"

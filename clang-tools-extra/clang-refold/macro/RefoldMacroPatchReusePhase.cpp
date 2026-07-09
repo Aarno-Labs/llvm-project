@@ -1,4 +1,4 @@
-//===--- RefoldMacroPatchReusePhase.cpp ------------------------*- C++ -*-===//
+//===--- RefoldMacroPatchReusePhase.cpp -------------------------*- C++ -*-===//
 //
 // Same-root macro-patch reuse, merge, and conflict utilities.
 //

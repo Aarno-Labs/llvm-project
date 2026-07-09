@@ -1,4 +1,4 @@
-//===--- RefoldMacroStandardArgsOnlyGeneratedReplay.cpp -------*- C++ -*-===//
+//===--- RefoldMacroStandardArgsOnlyGeneratedReplay.cpp ---------*- C++ -*-===//
 //
 // Private generated replay and tuple-forwarding helpers for the standard
 // args-only macro patch builder.

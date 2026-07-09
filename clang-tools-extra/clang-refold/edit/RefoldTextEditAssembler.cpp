@@ -1,4 +1,4 @@
-//===--- RefoldTextEditAssembler.cpp ---------------------------*- C++ -*-===//
+//===--- RefoldTextEditAssembler.cpp ----------------------------*- C++ -*-===//
 //
 // Final text-edit assembly and accepted-result audit attachment.
 //
@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "edit/RefoldTextEditAssembler.h"
+
 #include "core/RefoldLog.h"
 #include "edit/RefoldTUEditPlanner.h"
 #include "include/IncludeSpellingHelpers.h"

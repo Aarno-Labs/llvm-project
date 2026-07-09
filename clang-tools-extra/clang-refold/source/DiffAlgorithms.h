@@ -65,6 +65,11 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_DIFFALGORITHMS_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_DIFFALGORITHMS_H
 
+// Brings in the generic format providers (optional/ToString/enum/cl::opt) so
+// they are visible before this header's own `formatv` uses and before the
+// explicit `format_provider<Hunk>` specialization defined at the bottom.
+#include "core/RefoldFormatProviders.h"
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FormatAdapters.h"

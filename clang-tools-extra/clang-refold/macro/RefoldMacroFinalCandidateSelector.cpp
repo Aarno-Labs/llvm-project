@@ -1,4 +1,4 @@
-//===--- RefoldMacroFinalCandidateSelector.cpp ----------------*- C++ -*-===//
+//===--- RefoldMacroFinalCandidateSelector.cpp ------------------*- C++ -*-===//
 //
 // Final macro candidate selector service implementation.
 //

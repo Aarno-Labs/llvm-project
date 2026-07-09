@@ -1,4 +1,4 @@
-//===--- RefoldMacroSelectorSubstitutionPhase.cpp --------------*- C++ -*-===//
+//===--- RefoldMacroSelectorSubstitutionPhase.cpp ---------------*- C++ -*-===//
 //
 // Paste-derived callee-selector substitution phase.
 //

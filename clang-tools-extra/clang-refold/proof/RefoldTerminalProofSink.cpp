@@ -1,4 +1,4 @@
-//===--- RefoldTerminalProofSink.cpp ---------------------------*- C++ -*-===//
+//===--- RefoldTerminalProofSink.cpp ----------------------------*- C++ -*-===//
 //
 // Terminal fallback proof sink implementation.
 //

@@ -1,10 +1,11 @@
-//===--- RefoldMacroPasteArgumentBuilder.cpp ------------------*- C++ -*-===//
+//===--- RefoldMacroPasteArgumentBuilder.cpp --------------------*- C++ -*-===//
 //
 // Paste-aware argument derivation for macro args-only patch construction.
 //
 //===----------------------------------------------------------------------===//
 
 #include "macro/RefoldMacroPasteArgumentBuilder.h"
+
 #include "macro/RefoldMacroReplay.h"
 #include "source/RefoldSourceMapper.h"
 #include "util/StringUtils.h"

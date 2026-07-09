@@ -1,4 +1,4 @@
-//===--- RefoldSourceGraphWriter.cpp -------------------------*- C++ -*-===//
+//===--- RefoldSourceGraphWriter.cpp ----------------------------*- C++ -*-===//
 //
 // Source-graph filesystem output writer for clang-refold.
 //

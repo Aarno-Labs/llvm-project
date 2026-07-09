@@ -1,4 +1,4 @@
-//===--- RefoldPreprocessRecheck.cpp ---------------------------*- C++ -*-===//
+//===--- RefoldPreprocessRecheck.cpp ----------------------------*- C++ -*-===//
 //
 // Preprocessing-recheck primitive implementations for clang-refold.
 //

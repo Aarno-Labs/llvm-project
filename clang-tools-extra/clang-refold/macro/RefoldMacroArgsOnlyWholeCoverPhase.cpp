@@ -1,4 +1,4 @@
-//===--- RefoldMacroArgsOnlyWholeCoverPhase.cpp --------------*- C++ -*-===//
+//===--- RefoldMacroArgsOnlyWholeCoverPhase.cpp -----------------*- C++ -*-===//
 //
 // Implementation of the direct root args-only whole-cover phase.  Inputs
 // come from `RefoldMacroWholeCoverPlanningContext`, results are written back

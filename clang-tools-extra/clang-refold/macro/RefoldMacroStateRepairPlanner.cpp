@@ -1,4 +1,4 @@
-//===--- RefoldMacroStateRepairPlanner.cpp ---------------------*- C++ -*-===//
+//===--- RefoldMacroStateRepairPlanner.cpp ----------------------*- C++ -*-===//
 //
 // This file implements the macro-state repair planner used after TU-level
 // source edits have been staged.  The public planner owns only dependency

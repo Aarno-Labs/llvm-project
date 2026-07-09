@@ -1,4 +1,4 @@
-//===--- RefoldMacroDAGSubtreeCertifier.cpp -------------------*- C++ -*-===//
+//===--- RefoldMacroDAGSubtreeCertifier.cpp ---------------------*- C++ -*-===//
 //
 // Subtree semantic certifier for macro DAG lifting.
 //

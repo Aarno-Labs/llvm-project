@@ -1,4 +1,4 @@
-//===--- RefoldTUAnchorProof.cpp -----------------------------*- C++ -*-===//
+//===--- RefoldTUAnchorProof.cpp --------------------------------*- C++ -*-===//
 //
 // TU-anchor accepted-result proof construction.
 //
@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "edit/RefoldTUAnchorProof.h"
+
 #include "proof/RefoldTheoremAudit.h"
 
 #include "llvm/Support/FormatVariadic.h"

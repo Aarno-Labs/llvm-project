@@ -1,4 +1,4 @@
-//===--- FinalLineControlModel.cpp -----------------------------*- C++ -*-===//
+//===--- FinalLineControlModel.cpp ------------------------------*- C++ -*-===//
 //
 // Final-stream line-control proof and pruning support for clang-refold.
 //

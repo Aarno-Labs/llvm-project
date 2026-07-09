@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "include/RefoldIncludeInsertionPlanner.h"
+
 #include "core/RefoldLog.h"
 #include "proof/RefoldProofLattice.h"
 #include "source/RefoldSourceMapper.h"

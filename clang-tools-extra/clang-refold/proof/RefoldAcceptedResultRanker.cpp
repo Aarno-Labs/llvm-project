@@ -1,5 +1,4 @@
-//===--- RefoldAcceptedResultRanker.cpp --------------------------*- C++
-//-*-===//
+//===--- RefoldAcceptedResultRanker.cpp -------------------------*- C++ -*-===//
 //
 // Implementation of the accepted-result ranking and selection service.  See
 // the header for the architectural contract; the per-method comments below

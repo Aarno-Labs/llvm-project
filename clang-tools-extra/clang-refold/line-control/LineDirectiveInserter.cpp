@@ -1,4 +1,4 @@
-//===--- LineDirectiveInserter.cpp -----------------------------*- C++ -*-===//
+//===--- LineDirectiveInserter.cpp ------------------------------*- C++ -*-===//
 //
 // Source #line directive formatting, parsing, and local resync helpers.
 //
@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "line-control/LineDirectiveInserter.h"
+
 #include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
 #include "util/StringUtils.h"

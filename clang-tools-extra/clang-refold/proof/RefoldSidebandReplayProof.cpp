@@ -1,4 +1,4 @@
-//===--- RefoldSidebandReplayProof.cpp ------------------------*- C++ -*-===//
+//===--- RefoldSidebandReplayProof.cpp --------------------------*- C++ -*-===//
 //
 // Sideband pragma replay proof and validation helpers.
 //
@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "proof/RefoldSidebandReplayProof.h"
+
 #include "core/RefoldLog.h"
 #include "proof/RefoldTerminalProofSink.h"
 

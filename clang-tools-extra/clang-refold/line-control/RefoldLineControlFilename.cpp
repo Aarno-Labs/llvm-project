@@ -1,4 +1,4 @@
-//===--- RefoldLineControlFilename.cpp ------------------------*- C++ -*-===//
+//===--- RefoldLineControlFilename.cpp --------------------------*- C++ -*-===//
 //
 // Shared implementation for the conservative #line filename string-literal
 // parser used by include replay and source-line rewrite proof.

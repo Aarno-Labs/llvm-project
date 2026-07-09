@@ -77,6 +77,16 @@ class RefoldMacroPatchPlanner {
   // getters, spelling/tuple predicates, `RecoverWholeCoverReuseContext`,
   // and the sub-service accessors).
 public:
+  /// Nested alias for `::clang::refold::MacroPatchReuseAdmissionContext`
+  /// (defined in `RefoldMacroPlannerHelpers.h`).  Declared ahead of its first
+  /// use so the name has a single, consistent meaning throughout the class
+  /// scope (GCC's -Wchanges-meaning otherwise flags the earlier bare uses),
+  /// and kept so planner-internal references — including the qualified
+  /// `RefoldMacroPatchPlanner::MacroPatchReuseAdmissionContext` spellings in
+  /// the .cpp — continue to compile.
+  using MacroPatchReuseAdmissionContext =
+      ::clang::refold::MacroPatchReuseAdmissionContext;
+
   /// Explicit object-graph inputs for the macro-planning service.
   ///
   /// The planner borrows source/model/proof services directly.  Macro
@@ -294,12 +304,6 @@ public:
       ExistingMacroPatchContext existingContext) const;
 
 private:
-  /// Nested alias for `::clang::refold::MacroPatchReuseAdmissionContext`
-  /// (defined in `RefoldMacroPlannerHelpers.h`).  Kept so existing
-  /// planner-internal references continue to compile.
-  using MacroPatchReuseAdmissionContext =
-      ::clang::refold::MacroPatchReuseAdmissionContext;
-
   /// Return the borrowed macro-state proof service.  The named accessor
   /// centralizes the invariant that service-graph construction installed a
   /// stable proof service before the planner was created.

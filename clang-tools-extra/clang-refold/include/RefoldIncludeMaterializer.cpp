@@ -1,4 +1,4 @@
-//===--- RefoldIncludeMaterializer.cpp -----------------*- C++ -*-===//
+//===--- RefoldIncludeMaterializer.cpp --------------------------*- C++ -*-===//
 //
 // Include materialization and include-owned edit planning.
 //
@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "include/RefoldIncludeMaterializer.h"
+
 #include "core/RefoldLog.h"
 #include "edit/RefoldSourceEnvelopeTiling.h"
 #include "edit/RefoldTextEditAssembler.h"

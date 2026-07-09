@@ -1,5 +1,4 @@
-//===--- RefoldWitnessResolver.cpp -------------------------------*- C++
-//-*-===//
+//===--- RefoldWitnessResolver.cpp ------------------------------*- C++ -*-===//
 //
 // Implementation of the central witness resolver.  See the header for the
 // architectural contract.  Internal helpers (closure-ledger entry builders,

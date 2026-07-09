@@ -1,10 +1,11 @@
-//===--- RefoldMacroOccurrenceProofValidator.cpp --------------*- C++ -*-===//
+//===--- RefoldMacroOccurrenceProofValidator.cpp ----------------*- C++ -*-===//
 //
 // Macro subtree-membership / occurrence-proof predicates for clang-refold.
 //
 //===----------------------------------------------------------------------===//
 
 #include "macro/RefoldMacroOccurrenceProofValidator.h"
+
 #include "macro/RefoldMacroTopology.h"
 
 #include "llvm/ADT/SmallVector.h"

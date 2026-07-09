@@ -1,4 +1,4 @@
-//===--- RefoldNoLinesPruning.cpp ------------------------------*- C++ -*-===//
+//===--- RefoldNoLinesPruning.cpp -------------------------------*- C++ -*-===//
 //
 // `--no-lines` pruning recheck pipeline for clang-refold.
 //

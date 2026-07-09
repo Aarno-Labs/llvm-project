@@ -1,5 +1,4 @@
-//===--- RefoldStructuralHunkDispatcher.cpp ----------------------*- C++
-//-*-===//
+//===--- RefoldStructuralHunkDispatcher.cpp ---------------------*- C++ -*-===//
 //
 // Structural hunk dispatch staging for clang-refold.
 //

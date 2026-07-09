@@ -1,10 +1,11 @@
-//===--- RefoldSourceGraphProof.cpp ---------------------------*- C++ -*-===//
+//===--- RefoldSourceGraphProof.cpp -----------------------------*- C++ -*-===//
 //
 // Source-graph preservation proof helpers for clang-refold.
 //
 //===----------------------------------------------------------------------===//
 
 #include "include/RefoldSourceGraphProof.h"
+
 #include "include/IncludeSpellingHelpers.h"
 #include "util/StringUtils.h"
 

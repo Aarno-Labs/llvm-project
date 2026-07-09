@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "macro/RefoldMacroDefinitionTapeSolver.h"
+
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"

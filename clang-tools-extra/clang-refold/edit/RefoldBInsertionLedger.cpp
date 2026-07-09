@@ -1,10 +1,11 @@
-//===--- RefoldBInsertionLedger.cpp ----------------------------*- C++ -*-===//
+//===--- RefoldBInsertionLedger.cpp -----------------------------*- C++ -*-===//
 //
 // Implements B-token pure-insertion provenance and claim clipping.
 //
 //===----------------------------------------------------------------------===//
 
 #include "edit/RefoldBInsertionLedger.h"
+
 #include "core/RefoldLog.h"
 #include "core/RefoldOwnerClassifier.h"
 #include "macro/RefoldMacroReplay.h"

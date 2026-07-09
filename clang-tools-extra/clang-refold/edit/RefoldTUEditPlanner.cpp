@@ -1,4 +1,4 @@
-//===--- RefoldTUEditPlanner.cpp -------------------------------*- C++ -*-===//
+//===--- RefoldTUEditPlanner.cpp --------------------------------*- C++ -*-===//
 //
 // Translation-unit edit planning service.
 //
@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "edit/RefoldTUEditPlanner.h"
+
 #include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
 #include "edit/RefoldTUAnchorProof.h"

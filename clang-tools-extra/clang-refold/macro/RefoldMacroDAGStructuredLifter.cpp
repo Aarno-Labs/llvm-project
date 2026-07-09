@@ -1,4 +1,4 @@
-//===--- RefoldMacroDAGStructuredLifter.cpp -------------------*- C++ -*-===//
+//===--- RefoldMacroDAGStructuredLifter.cpp ---------------------*- C++ -*-===//
 //
 // Structured invocation-lift and root-formal merge service for macro DAGs.
 //

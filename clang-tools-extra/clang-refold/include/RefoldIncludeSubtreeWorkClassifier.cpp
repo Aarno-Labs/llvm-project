@@ -1,4 +1,4 @@
-//===--- RefoldIncludeSubtreeWorkClassifier.cpp ----------------*- C++ -*-===//
+//===--- RefoldIncludeSubtreeWorkClassifier.cpp -----------------*- C++ -*-===//
 //
 // Include-subtree work classification for clang-refold.
 //

@@ -65,6 +65,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "core/RefoldEngine.h"
+
 #include "core/RefoldLangOptions.h"
 #include "core/RefoldLog.h"
 #include "core/RefoldOwnerClassifier.h"

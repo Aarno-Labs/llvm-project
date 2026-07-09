@@ -1,4 +1,4 @@
-//===--- RefoldExpansionFallbackPlanner.cpp --------------------*- C++ -*-===//
+//===--- RefoldExpansionFallbackPlanner.cpp ---------------------*- C++ -*-===//
 //
 // Expansion fallback planning and TU include-closure realization.
 //
@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "edit/RefoldExpansionFallbackPlanner.h"
+
 #include "core/RefoldLog.h"
 #include "edit/RefoldSourceEnvelopeTiling.h"
 #include "include/IncludeSpellingHelpers.h"

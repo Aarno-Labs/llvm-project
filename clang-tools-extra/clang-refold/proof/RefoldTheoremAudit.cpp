@@ -1,4 +1,4 @@
-//===--- RefoldTheoremAudit.cpp --------------------------------*- C++ -*-===//
+//===--- RefoldTheoremAudit.cpp ---------------------------------*- C++ -*-===//
 //
 // Central theorem/audit ledger and legacy-authority audit service —
 // implementation.  Also owns the per-attempt stats reporting helpers that

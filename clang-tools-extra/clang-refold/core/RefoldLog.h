@@ -67,6 +67,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLDLOG_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLDLOG_H
 
+#include "core/RefoldFormatProviders.h"
 #include "source/DiffAlgorithms.h"
 #include "util/StringUtils.h"
 
@@ -130,70 +131,12 @@
   } while (false)
 #endif
 
-namespace llvm {
-// General provider for `std::optional<>`
-template <typename T> struct format_provider<std::optional<T>, void> {
-  static void format(const std::optional<T> &opt, raw_ostream &os,
-                     StringRef style) {
-    if (!opt) {
-      // Default "none" text; adjust to taste ("" for empty, etc.)
-      os << "(none)";
-      return;
-    }
-    // Delegate formatting of the contained value, honoring any :Style
-    format_provider<T>::format(*opt, os, style);
-  }
-};
-
-using namespace clang::refold::diffutils;
-
-// Detector for class/structs with a `ToString()` member function.
-template <typename T, typename = void> struct HasToString : std::false_type {};
-
-template <typename T>
-struct HasToString<T, std::void_t<decltype(std::declval<T>().ToString())>>
-    : std::is_same<decltype(std::declval<T>().ToString()), std::string> {};
-
-// General `ToString()` provider, excluding Hunk (we special case this)
-template <typename T>
-struct format_provider<
-    T, std::enable_if_t<HasToString<T>::value && !std::is_same_v<T, Hunk>>> {
-  static void format(const T &val, raw_ostream &os, StringRef style) {
-    os << val.ToString();
-  }
-};
-
-// Detector for enums that have a 'toString' function available via ADL
-template <typename T, typename = void>
-struct HasEnumToString : std::false_type {};
-
-template <typename T>
-struct HasEnumToString<T, std::void_t<decltype(toString(std::declval<T>()))>>
-    : std::is_enum<T> {};
-
-// The General Enum Provider
-template <typename T>
-struct format_provider<T, std::enable_if_t<HasEnumToString<T>::value>> {
-  static void format(const T &val, llvm::raw_ostream &os, StringRef style) {
-    // This calls the toString(T) function found via Argument Dependent Lookup
-    os << toString(val);
-  }
-};
-
-// This handles cl::opt wrapper specifically
-template <typename T>
-struct format_provider<
-    llvm::cl::opt<T>,
-    std::enable_if_t<!llvm::support::detail::use_string_formatter<
-        llvm::cl::opt<T>>::value>> {
-  static void format(const llvm::cl::opt<T> &val, llvm::raw_ostream &os,
-                     StringRef style) {
-    // We delegate to the provider for the underlying type T
-    // Note: We use val.getValue() because operator* doesn't exist
-    format_provider<T>::format(val.getValue(), os, style);
-  }
-};
-} // namespace llvm
+// NOTE: The custom `llvm::format_provider<>` specializations used here (for
+// `std::optional<>`, `ToString()`-bearing types, ADL-`toString()` enums, and
+// `cl::opt<>`) now live in "core/RefoldFormatProviders.h", included above.
+// They were moved out of this header so they are always declared before the
+// first `formatv` instantiation in lower-level headers (GCC rejects a
+// specialization seen after an implicit instantiation; Clang tolerated it).
 
 using namespace llvm;
 

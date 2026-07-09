@@ -1,4 +1,4 @@
-//===--- RefoldMacroPatchPlanner.cpp ---------------------------*- C++ -*-===//
+//===--- RefoldMacroPatchPlanner.cpp ----------------------------*- C++ -*-===//
 //
 // Macro invocation patch planning service for clang-refold.
 //
@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "macro/RefoldMacroPatchPlanner.h"
+
 #include "core/RefoldLog.h"
 #include "core/RefoldOwnerClassifier.h"
 #include "edit/RefoldBInsertionLedger.h"

@@ -1,4 +1,4 @@
-//===--- RefoldAcceptedCandidateBuilder.cpp -------------------*- C++ -*-===//
+//===--- RefoldAcceptedCandidateBuilder.cpp ---------------------*- C++ -*-===//
 //
 // Accepted-result candidate factory — implementation.
 //

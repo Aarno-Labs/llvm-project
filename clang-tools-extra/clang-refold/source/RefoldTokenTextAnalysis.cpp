@@ -1,10 +1,11 @@
-//===--- RefoldTokenTextAnalysis.cpp --------------------------*- C++ -*-===//
+//===--- RefoldTokenTextAnalysis.cpp ----------------------------*- C++ -*-===//
 //
 // Raw-lexer based token/text observation predicates.
 //
 //===----------------------------------------------------------------------===//
 
 #include "source/RefoldTokenTextAnalysis.h"
+
 #include "include/RefoldSourceGraphProof.h"
 
 #include "clang/Basic/SourceLocation.h"

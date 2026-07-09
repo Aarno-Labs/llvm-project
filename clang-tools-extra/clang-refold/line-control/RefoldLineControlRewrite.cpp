@@ -1,4 +1,4 @@
-//===--- RefoldLineControlRewrite.cpp --------------------------*- C++ -*-===//
+//===--- RefoldLineControlRewrite.cpp ---------------------------*- C++ -*-===//
 //
 // Source-line directive parsing and rewriting helpers.
 //
@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "line-control/SourceLineDirectiveHelpers.h"
+
 #include "proof/RefoldOwnerStateProof.h"
 
 namespace clang {

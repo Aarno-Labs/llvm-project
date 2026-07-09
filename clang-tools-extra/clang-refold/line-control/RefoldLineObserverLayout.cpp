@@ -1,4 +1,4 @@
-//===--- RefoldLineObserverLayout.cpp -----------------------*- C++ -*-===//
+//===--- RefoldLineObserverLayout.cpp ---------------------------*- C++ -*-===//
 //
 // This file contains the line-observer layout realization service.  It repairs
 // TU and include-owner source layout when line-state observers such as
@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "line-control/RefoldLineObserverLayout.h"
+
 #include "edit/RefoldTextEditAssembler.h"
 #include "include/IncludeSpellingHelpers.h"
 #include "line-control/LineControlEditHelpers.h"

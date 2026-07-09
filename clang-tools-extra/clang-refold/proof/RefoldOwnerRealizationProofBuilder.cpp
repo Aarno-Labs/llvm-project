@@ -1,7 +1,6 @@
-//===--- RefoldOwnerRealizationProofBuilder.cpp ---------------*- C++ -*-===//
+//===--- RefoldOwnerRealizationProofBuilder.cpp -----------------*- C++ -*-===//
 //
-// Owner-realization proof construction + witness attachment —
-// implementation.
+// Owner-realization proof construction + witness attachment — implementation.
 //
 //===----------------------------------------------------------------------===//
 

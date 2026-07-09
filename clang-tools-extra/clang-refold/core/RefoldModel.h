@@ -23,6 +23,11 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMODEL_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMODEL_H
 
+// Must precede any `formatv` use below (e.g. the `std::optional<>` fields
+// formatted from inline `ToString()` members): the custom format providers
+// have to be visible before their first implicit instantiation under GCC.
+#include "core/RefoldFormatProviders.h"
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"

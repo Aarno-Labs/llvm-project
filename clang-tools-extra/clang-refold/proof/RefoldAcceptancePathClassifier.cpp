@@ -1,4 +1,4 @@
-//===--- RefoldAcceptancePathClassifier.cpp -------------------*- C++ -*-===//
+//===--- RefoldAcceptancePathClassifier.cpp ---------------------*- C++ -*-===//
 //
 // Acceptance-path proof-summary classifier — implementation.
 //

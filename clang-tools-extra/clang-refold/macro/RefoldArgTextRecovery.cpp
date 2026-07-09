@@ -1,4 +1,4 @@
-//===--- RefoldArgTextRecovery.cpp -----------------------------*- C++ -*-===//
+//===--- RefoldArgTextRecovery.cpp ------------------------------*- C++ -*-===//
 //
 // Macro-argument text recovery service implementation.
 //
@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "macro/RefoldArgTextRecovery.h"
+
 #include "util/StringUtils.h"
 
 #include "clang/Basic/SourceLocation.h"

@@ -1,4 +1,4 @@
-//===--- RefoldHeaderIncludeEditPlanner.cpp --------------------*- C++ -*-===//
+//===--- RefoldHeaderIncludeEditPlanner.cpp ---------------------*- C++ -*-===//
 //
 // Header-local include edit planning for clang-refold.
 //
@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "include/RefoldHeaderIncludeEditPlanner.h"
+
 #include "core/RefoldLog.h"
 #include "edit/RefoldSourceEnvelopeTiling.h"
 #include "edit/RefoldTextEditAssembler.h"

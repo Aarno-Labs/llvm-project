@@ -1,4 +1,4 @@
-//===--- RefoldMacroTopology.cpp -------------------------------*- C++ -*-===//
+//===--- RefoldMacroTopology.cpp --------------------------------*- C++ -*-===//
 //
 // Macro-topology service implementation for clang-refold.
 //
@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "macro/RefoldMacroTopology.h"
+
 #include "line-control/RefoldLineObserverLayout.h"
 #include "util/StringUtils.h"
 

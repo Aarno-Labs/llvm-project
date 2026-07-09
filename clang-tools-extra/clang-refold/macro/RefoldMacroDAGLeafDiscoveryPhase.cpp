@@ -1,4 +1,4 @@
-//===--- RefoldMacroDAGLeafDiscoveryPhase.cpp ------------------*- C++ -*-===//
+//===--- RefoldMacroDAGLeafDiscoveryPhase.cpp -------------------*- C++ -*-===//
 //
 // Implementation of DAG leaf discovery for args-only whole-cover replay.
 // Inputs are read from `RefoldMacroWholeCoverPlanningContext`, outputs are

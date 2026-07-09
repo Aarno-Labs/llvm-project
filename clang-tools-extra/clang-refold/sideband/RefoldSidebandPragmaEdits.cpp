@@ -1,4 +1,4 @@
-//===--- RefoldSidebandPragmaEdits.cpp -------------------------*- C++ -*-===//
+//===--- RefoldSidebandPragmaEdits.cpp --------------------------*- C++ -*-===//
 //
 // Sideband pragma normalization and source-edit construction for clang-refold.
 //

@@ -1,4 +1,4 @@
-//===--- RefoldMacroReplay.cpp ---------------------------------*- C++ -*-===//
+//===--- RefoldMacroReplay.cpp ----------------------------------*- C++ -*-===//
 //
 // Implements macro replay, actual-layout, whole-cover, paste-spelling, and
 // boundary-selection helpers.  Keeping these adjacent macro primitives in one
@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "macro/RefoldMacroReplay.h"
+
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroTopology.h"
 #include "source/RefoldSourceMapper.h"

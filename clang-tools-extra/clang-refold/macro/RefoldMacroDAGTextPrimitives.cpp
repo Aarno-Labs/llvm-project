@@ -1,4 +1,4 @@
-//===--- RefoldMacroDAGTextPrimitives.cpp --------------------*- C++ -*-===//
+//===--- RefoldMacroDAGTextPrimitives.cpp -----------------------*- C++ -*-===//
 //
 // Text and token primitive service for macro DAG lifting.
 //

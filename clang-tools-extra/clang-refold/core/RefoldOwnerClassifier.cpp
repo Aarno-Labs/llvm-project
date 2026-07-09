@@ -1,10 +1,11 @@
-//===--- RefoldOwnerClassifier.cpp -----------------------------*- C++ -*-===//
+//===--- RefoldOwnerClassifier.cpp ------------------------------*- C++ -*-===//
 //
 // Owner and translation-unit ownership classification service implementation.
 //
 //===----------------------------------------------------------------------===//
 
 #include "core/RefoldOwnerClassifier.h"
+
 #include "edit/RefoldTUEditPlanner.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "util/RefoldPathIdentity.h"

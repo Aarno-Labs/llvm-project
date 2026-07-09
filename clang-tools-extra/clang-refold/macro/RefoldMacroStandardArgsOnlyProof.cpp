@@ -1,4 +1,4 @@
-//===--- RefoldMacroStandardArgsOnlyProof.cpp ------------------*- C++ -*-===//
+//===--- RefoldMacroStandardArgsOnlyProof.cpp -------------------*- C++ -*-===//
 //
 // Private proof and final-candidate construction helpers for the standard
 // args-only macro patch builder.

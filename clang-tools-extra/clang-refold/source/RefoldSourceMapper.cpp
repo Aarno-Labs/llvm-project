@@ -1,4 +1,4 @@
-//===--- RefoldSourceMapper.cpp -----------------------------*- C++ -*-===//
+//===--- RefoldSourceMapper.cpp ---------------------------------*- C++ -*-===//
 //
 // This file implements RefoldSourceMapper, the deterministic A/B source, byte,
 // and token coordinate mapping service used by RefoldEngine.  The mapper is
@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "source/RefoldSourceMapper.h"
+
 #include "core/RefoldLog.h"
 #include "util/StringUtils.h"
 

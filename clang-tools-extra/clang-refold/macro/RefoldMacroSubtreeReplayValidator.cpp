@@ -1,5 +1,4 @@
-//===--- RefoldMacroSubtreeReplayValidator.cpp -------------------*- C++
-//-*-===//
+//===--- RefoldMacroSubtreeReplayValidator.cpp ------------------*- C++ -*-===//
 //
 // Implementation of the heavy macro-subtree replay-stability validator.  See
 // the header for the architectural contract.  The two long lambdas that used

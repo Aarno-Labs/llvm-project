@@ -1,4 +1,4 @@
-//===--- RefoldCounterStabilization.cpp ------------------------*- C++ -*-===//
+//===--- RefoldCounterStabilization.cpp -------------------------*- C++ -*-===//
 //
 // __COUNTER__ stabilization planner implementation.
 //
@@ -10,8 +10,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "macro/RefoldCounterStabilization.h"
-#include "core/RefoldLog.h"
 
+#include "core/RefoldLog.h"
 #include "macro/RefoldMacroPatchPlanner.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofLattice.h"

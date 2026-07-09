@@ -1,4 +1,4 @@
-//===--- RefoldMacroPatchProofClassifier.cpp ------------------*- C++ -*-===//
+//===--- RefoldMacroPatchProofClassifier.cpp --------------------*- C++ -*-===//
 //
 // Macro-patch proof classification and validation — implementation.
 //

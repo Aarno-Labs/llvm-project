@@ -1,4 +1,4 @@
-//===--- RefoldWitnessTrace.cpp --------------------------------*- C++ -*-===//
+//===--- RefoldWitnessTrace.cpp ---------------------------------*- C++ -*-===//
 //
 // Witness trace and proof-audit logging implementation.
 //

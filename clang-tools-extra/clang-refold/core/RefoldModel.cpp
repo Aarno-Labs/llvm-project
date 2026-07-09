@@ -21,6 +21,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "core/RefoldModel.h"
+
 #include "core/RefoldLog.h"
 
 #include "llvm/ADT/ArrayRef.h"

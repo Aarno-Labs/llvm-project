@@ -1,4 +1,4 @@
-//===--- RefoldProofLattice.cpp --------------------------------*- C++ -*-===//
+//===--- RefoldProofLattice.cpp ---------------------------------*- C++ -*-===//
 //
 // This file implements clang-refold's accepted-result proof lattice.  The code
 // here is intentionally side-effect-free with respect to source emission: it
@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "proof/RefoldProofLattice.h"
+
 #include "edit/RefoldTUAnchorProof.h"
 #include "edit/RefoldTUEditPlanner.h"
 #include "macro/RefoldArgTextRecovery.h"

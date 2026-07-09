@@ -63,6 +63,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "source/DiffAlgorithms.h"
+
 #include "core/RefoldLog.h"
 #include "util/StringUtils.h"
 

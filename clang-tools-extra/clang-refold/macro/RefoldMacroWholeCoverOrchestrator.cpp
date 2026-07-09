@@ -1,10 +1,11 @@
-//===--- RefoldMacroWholeCoverOrchestrator.cpp ---------------*- C++ -*-===//
+//===--- RefoldMacroWholeCoverOrchestrator.cpp ------------------*- C++ -*-===//
 //
 // Whole-cover macro patch orchestrator for clang-refold.
 //
 //===----------------------------------------------------------------------===//
 
 #include "macro/RefoldMacroWholeCoverOrchestrator.h"
+
 #include "edit/RefoldBInsertionLedger.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldArgTextRecovery.h"

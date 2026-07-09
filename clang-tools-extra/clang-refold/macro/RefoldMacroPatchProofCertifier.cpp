@@ -1,5 +1,4 @@
-//===--- RefoldMacroPatchProofCertifier.cpp ----------------------*- C++
-//-*-===//
+//===--- RefoldMacroPatchProofCertifier.cpp ---------------------*- C++ -*-===//
 //
 // Implementation of the macro-patch proof certifier.  See the header for the
 // architectural contract.  Each method is a small, focused certification

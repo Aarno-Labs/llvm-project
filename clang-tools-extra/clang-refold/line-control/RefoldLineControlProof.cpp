@@ -1,4 +1,4 @@
-//===--- RefoldLineControlProof.cpp ---------------------------*- C++ -*-===//
+//===--- RefoldLineControlProof.cpp -----------------------------*- C++ -*-===//
 //
 // Proof-side line-control helpers for clang-refold.
 //
@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "line-control/RefoldLineControlProof.h"
+
 #include "core/RefoldLog.h"
 #include "macro/RefoldMacroTopology.h"
 #include "source/RefoldTokenTextAnalysis.h"

@@ -1,4 +1,4 @@
-//===--- RefoldMacroArgsOnlyTemplateSolver.cpp ----------------*- C++ -*-===//
+//===--- RefoldMacroArgsOnlyTemplateSolver.cpp ------------------*- C++ -*-===//
 //
 // Recursive current-level template-surface recovery and template-solved
 // args-only patch construction for clang-refold.
@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "macro/RefoldMacroArgsOnlyTemplateSolver.h"
+
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"

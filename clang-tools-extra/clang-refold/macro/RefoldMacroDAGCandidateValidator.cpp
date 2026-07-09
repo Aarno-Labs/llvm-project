@@ -1,4 +1,4 @@
-//===--- RefoldMacroDAGCandidateValidator.cpp -----------------*- C++ -*-===//
+//===--- RefoldMacroDAGCandidateValidator.cpp -------------------*- C++ -*-===//
 //
 // Final DAG candidate validation service.
 //

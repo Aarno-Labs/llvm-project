@@ -1,5 +1,4 @@
-//===--- RefoldProofSummaryBuilder.cpp ---------------------------*- C++
-//-*-===//
+//===--- RefoldProofSummaryBuilder.cpp --------------------------*- C++ -*-===//
 //
 // Implementation of the proof-summary builder service.  See the header for
 // the architectural contract.  The per-method comments below restate the

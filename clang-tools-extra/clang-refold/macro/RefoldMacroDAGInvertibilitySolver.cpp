@@ -1,4 +1,4 @@
-//===--- RefoldMacroDAGInvertibilitySolver.cpp ----------------*- C++ -*-===//
+//===--- RefoldMacroDAGInvertibilitySolver.cpp ------------------*- C++ -*-===//
 //
 // Formal/argument invertibility solver for macro DAG lifting.
 //

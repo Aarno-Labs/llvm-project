@@ -1,10 +1,11 @@
-//===--- RefoldPathIdentity.cpp --------------------------------*- C++ -*-===//
+//===--- RefoldPathIdentity.cpp ---------------------------------*- C++ -*-===//
 //
 // Path canonicalization and include-edge identity proof implementation.
 //
 //===----------------------------------------------------------------------===//
 
 #include "util/RefoldPathIdentity.h"
+
 #include "core/RefoldLog.h"
 #include "proof/RefoldProofVocabulary.h"
 

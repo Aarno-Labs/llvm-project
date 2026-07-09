@@ -1,4 +1,4 @@
-//===--- RefoldMacroTupleHelpers.cpp ---------------------------*- C++ -*-===//
+//===--- RefoldMacroTupleHelpers.cpp ----------------------------*- C++ -*-===//
 //
 // Implementation of the shared caller-tuple parsing helpers used by macro
 // replay paths that need lexer-aware top-level tuple element splitting and

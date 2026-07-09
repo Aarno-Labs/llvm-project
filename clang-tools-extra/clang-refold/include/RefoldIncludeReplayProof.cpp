@@ -1,4 +1,4 @@
-//===--- RefoldIncludeReplayProof.cpp -------------------------*- C++ -*-===//
+//===--- RefoldIncludeReplayProof.cpp ---------------------------*- C++ -*-===//
 //
 // Include/include_next replay proof context implementation.
 //
@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "include/RefoldIncludeReplayProof.h"
+
 #include "core/RefoldLog.h"
 #include "include/IncludeSpellingHelpers.h"
 #include "line-control/RefoldLineControlFilename.h"

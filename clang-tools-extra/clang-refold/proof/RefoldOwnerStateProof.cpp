@@ -1,4 +1,4 @@
-//===--- RefoldOwnerStateProof.cpp -----------------------------*- C++ -*-===//
+//===--- RefoldOwnerStateProof.cpp ------------------------------*- C++ -*-===//
 //
 // Owner-state proof implementation for clang-refold.
 //
@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "proof/RefoldOwnerStateProof.h"
+
 #include "proof/RefoldTheoremAudit.h"
 #include "proof/RefoldWitnessTrace.h"
 

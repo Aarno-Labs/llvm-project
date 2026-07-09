@@ -1,4 +1,4 @@
-//===--- RefoldNeutralityProof.cpp -----------------------------*- C++ -*-===//
+//===--- RefoldNeutralityProof.cpp ------------------------------*- C++ -*-===//
 //
 // Source-neutrality proof subsystem — implementation.
 //
@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "proof/RefoldNeutralityProof.h"
+
 #include "macro/RefoldMacroStateProof.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "util/RefoldPathIdentity.h"
