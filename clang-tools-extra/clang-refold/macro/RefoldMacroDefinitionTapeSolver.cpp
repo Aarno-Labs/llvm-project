@@ -909,6 +909,22 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
           isTrailingVariadic && sol.assigned[i] &&
           sol.ranges[i].first == sol.ranges[i].second;
       if (isTrailingVariadic && r.first == r.second && !editText.empty()) {
+        // The reconstructed variadic text may begin with a comma that belongs
+        // to the separator before the tail rather than to the argument itself.
+        // This happens when the edit activates a `__VA_OPT__(,)` payload
+        // (empty -> non-empty varargs): the expansion gains a comma that the
+        // definition-tape replay folds into the variadic slot.  Drop one such
+        // leading comma so the tail is spelled once with the separator added
+        // below, rather than doubling it (`M2(1, , 2)` instead of `M2(1, 2)`).
+        // Mirrors the leading-comma normalization in the standard args-only
+        // patch builder.
+        StringRef tail = StringRef(editText).ltrim();
+        if (tail.starts_with(",")) {
+          tail = tail.drop_front().ltrim();
+          editText = tail.str();
+        }
+        if (editText.empty())
+          continue;
         editText = (", " + editText);
       } else if (isTrailingVariadic &&
                  !baseInvText.slice(r.first, r.second).empty() &&

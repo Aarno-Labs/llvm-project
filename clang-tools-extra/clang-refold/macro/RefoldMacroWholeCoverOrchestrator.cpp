@@ -205,9 +205,14 @@ RefoldMacroWholeCoverOrchestrator::ComputeWholeCoverPlan(
 
   // Map the accepted A-token cover into B while preserving boundary insertions.
   // This gives the raw B envelope that the whole-cover candidate will replay.
+  // Use the token-level projection here: whole-cover replaces the invocation's
+  // entire expansion envelope, and the byte-level mapper can drift the envelope
+  // start into an unrelated statement insertion that happens to precede a
+  // re-materialized value token (repeated `int `/` = ` byte runs), causing the
+  // realized text to swallow the inserted tokens.
   auto bEnv = (*planner_->Deps().sourceMapper)
-                  .MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
-                      plan.covLoA, plan.covHiA);
+                  .MapATokRangeToBTokenEnvelopeByTokenDiff(plan.covLoA,
+                                                           plan.covHiA);
   if (!bEnv)
     return std::nullopt;
 

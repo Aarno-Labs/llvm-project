@@ -539,6 +539,85 @@ RefoldSourceMapper::MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
 }
 
 std::optional<std::pair<size_t, size_t>>
+RefoldSourceMapper::MapATokRangeToBTokenEnvelopeByTokenDiff(
+    uint64_t beginTok, uint64_t endTok) const {
+  const uint64_t nA = static_cast<uint64_t>(aToks_.size());
+  beginTok = std::clamp(beginTok, static_cast<uint64_t>(0), nA);
+  endTok = std::clamp(endTok, beginTok, nA);
+  if (endTok <= beginTok)
+    return std::nullopt;
+
+  // Project an A-token cover into B using the TOKEN-level diff rather than the
+  // byte-level diff.  The byte diff can misalign across repeated byte
+  // substrings (e.g. the duplicated `int `/` = ` runs produced when a whole
+  // statement is inserted ahead of a re-materialized value token), which drifts
+  // the projected B envelope into an unrelated boundary insertion.  The token
+  // diff is atomic and unambiguous, while still preserving a genuine boundary
+  // insertion anchored exactly at the cover's own start/end token.
+  const std::vector<diffutils::Hunk> &H = abTokHunks_;
+
+  // Cumulative B-vs-A length delta contributed by every hunk strictly before
+  // iterator `it`.
+  auto prefixDelta = [&](std::vector<diffutils::Hunk>::const_iterator it) {
+    int64_t delta = 0;
+    for (auto h = H.begin(); h != it; ++h)
+      delta += static_cast<int64_t>(h->bEnd - h->bStart) -
+               static_cast<int64_t>(h->aEnd - h->aStart);
+    return delta;
+  };
+
+  // Lower-bound projection of the cover-begin token.  A token interior to a
+  // replace/delete hunk projects to that hunk's B start; otherwise it drifts by
+  // the cumulative prefix delta.  A pure boundary insertion anchored exactly at
+  // `beginTok` is naturally included: the projection lands on its B start.
+  auto lowerBound = [&](uint64_t aTok) -> uint64_t {
+    if (H.empty())
+      return aTok;
+    auto it = std::lower_bound(
+        H.begin(), H.end(), aTok,
+        [](const diffutils::Hunk &h, uint64_t v) { return h.aStart < v; });
+    if (it != H.begin()) {
+      auto prev = std::prev(it);
+      if (aTok < prev->aEnd)
+        return prev->bStart;
+    }
+    return static_cast<uint64_t>(
+        std::max<int64_t>(0, static_cast<int64_t>(aTok) + prefixDelta(it)));
+  };
+
+  // Upper-bound projection of the cover-end token.  A boundary insertion whose
+  // A anchor equals the end token is included; a token interior to a
+  // replace/delete hunk projects to that hunk's B end.
+  auto upperBound = [&](uint64_t aTok) -> uint64_t {
+    if (H.empty())
+      return aTok;
+    auto it = std::lower_bound(
+        H.begin(), H.end(), aTok,
+        [](const diffutils::Hunk &h, uint64_t v) { return h.aStart < v; });
+    int64_t delta = prefixDelta(it);
+    if (it != H.end()) {
+      if (aTok == it->aStart) {
+        if (it->aStart == it->aEnd)
+          delta += static_cast<int64_t>(it->bEnd - it->bStart);
+      } else if (aTok > it->aStart && aTok < it->aEnd) {
+        return it->bEnd;
+      }
+    }
+    return static_cast<uint64_t>(
+        std::max<int64_t>(0, static_cast<int64_t>(aTok) + delta));
+  };
+
+  const uint64_t nB = static_cast<uint64_t>(bToks_.size());
+  size_t bLo = static_cast<size_t>(std::min(lowerBound(beginTok), nB));
+  size_t bHi = static_cast<size_t>(std::min(upperBound(endTok), nB));
+  if (bHi < bLo)
+    bHi = bLo;
+  if (bHi <= bLo)
+    return std::nullopt;
+  return std::make_pair(bLo, bHi);
+}
+
+std::optional<std::pair<size_t, size_t>>
 RefoldSourceMapper::MapAToBTokenEnvelopeByPPArgSpan(
     const RefoldModel::PPArgSpan &sp) const {
   // For a standard span that covers exactly one A token, prefer a direct

@@ -3679,7 +3679,8 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
       if (It.Subkind == "func") {
         auto ArgIndex = argIndexForSpellingLoc(It, L, SM, Lang, EmitAbsPaths);
         if (ArgIndex)
-          touchArgTokSpan(It.ArgSpans, TokIndex, *ArgIndex);
+          touchArgTokSpan(It.ArgSpans, TokIndex, *ArgIndex,
+                          SM.getSpellingLoc(L).getRawEncoding());
         else
           touchTokSpan(It.BodySpans, TokIndex); // fallback: keep schema-valid
       } else {
@@ -4236,7 +4237,8 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
         if (MI.Subkind == "func") {
           auto ArgIndex = argIndexForSpellingLoc(MI, L, SM, Lang, EmitAbsPaths);
           if (ArgIndex)
-            touchArgTokSpan(MI.ArgSpans, TokIndex, *ArgIndex);
+            touchArgTokSpan(MI.ArgSpans, TokIndex, *ArgIndex,
+                            SM.getSpellingLoc(L).getRawEncoding());
           else
             touchTokSpan(MI.BodySpans, TokIndex); // fallback: keep schema-valid
         } else {

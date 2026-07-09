@@ -230,6 +230,19 @@ public:
   MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
       uint64_t beginTok, uint64_t endTok) const;
 
+  /// Map an A-token cover to its B-token envelope using the token-level diff.
+  ///
+  /// Like MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions, but projects
+  /// through the token diff instead of the byte diff.  The byte diff can
+  /// misalign across repeated byte substrings and drift the envelope into an
+  /// unrelated boundary insertion; the token diff is atomic and avoids that
+  /// while still attaching a genuine boundary insertion anchored exactly at the
+  /// cover's start/end token.  Returns std::nullopt for an empty/degenerate
+  /// projected range.
+  std::optional<std::pair<size_t, size_t>>
+  MapATokRangeToBTokenEnvelopeByTokenDiff(uint64_t beginTok,
+                                          uint64_t endTok) const;
+
   /// Map a whole-cover A-token replacement interval to its B-token envelope.
   ///
   /// Whole-cover mapping intentionally preserves pure-insertion payloads

@@ -83,6 +83,15 @@ struct ArgTokenSpan {
   std::optional<uint32_t> ArgIndex;
   bool Open = false;
 
+  // Raw spelling location of the last expansion token folded into this span.
+  // Two occurrences of the same single-token formal re-substitute the SAME
+  // source token, so their fully resolved spelling locations are identical;
+  // every other adjacency (a multi-token argument, or a nested macro-body token
+  // that intrudes into the argument's expansion) resolves to distinct
+  // locations.  See touchArgTokSpan().
+  uint64_t LastSpellingLocRaw = 0;
+  bool HasSpelling = false;
+
   // For token-internal provenance spans (currently paste_spans and wrapped
   // stringify_spans): byte range within the spelled output token
   // [ByteBegin, ByteEnd). When HasByteRange is false, ByteBegin/ByteEnd are
@@ -362,12 +371,37 @@ inline void touchTokSpan(std::vector<TokenSpan> &V, uint64_t TokIdx) {
 }
 
 // Small utility to append/extend a half-open token span list (args only).
+//
+// When \p SpellingLocRaw is provided it is the raw fully-resolved spelling
+// location of this token.  Index-adjacent expansion tokens of the same argument
+// are merged into one span unless the new token resolves to the SAME spelling
+// location as the previous one.  That happens only when the exact same source
+// token is substituted again, i.e. a repeated occurrence of a single-token
+// formal (e.g. `#define D2(x) x x`).  Merging those would fold both occurrences
+// into one arg span, and the consumer would then reconstruct the argument as
+// the concatenation of every occurrence (`D2(9 9)` instead of `D2(9)`).  A
+// genuine multi-token argument, and any nested macro-body token that intrudes
+// into the argument's expansion, resolve to distinct locations and still merge.
+// Callers that do not pass a location keep the original merge behavior.
 inline void touchArgTokSpan(std::vector<ArgTokenSpan> &V, uint64_t TokIdx,
-                            uint32_t ArgIndex) {
+                            uint32_t ArgIndex,
+                            std::optional<uint64_t> SpellingLocRaw = std::nullopt) {
   if (!V.empty() && V.back().Open && V.back().End == TokIdx &&
       V.back().ArgIndex == ArgIndex) {
-    V.back().End = TokIdx + 1;
-    return;
+    const bool repeatedOccurrence =
+        SpellingLocRaw && V.back().HasSpelling &&
+        *SpellingLocRaw == V.back().LastSpellingLocRaw;
+    if (!repeatedOccurrence) {
+      V.back().End = TokIdx + 1;
+      if (SpellingLocRaw) {
+        V.back().LastSpellingLocRaw = *SpellingLocRaw;
+        V.back().HasSpelling = true;
+      }
+      return;
+    }
+    // A repeated occurrence of the same formal: close the current span so the
+    // occurrence below starts a fresh one.
+    V.back().Open = false;
   }
 
   if (!V.empty() && V.back().Open)
@@ -378,6 +412,10 @@ inline void touchArgTokSpan(std::vector<ArgTokenSpan> &V, uint64_t TokIdx,
   S.End = TokIdx + 1;
   S.ArgIndex = ArgIndex;
   S.Open = true;
+  if (SpellingLocRaw) {
+    S.LastSpellingLocRaw = *SpellingLocRaw;
+    S.HasSpelling = true;
+  }
   V.push_back(S);
 }
 
