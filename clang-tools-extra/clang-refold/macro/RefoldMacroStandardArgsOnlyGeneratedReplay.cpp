@@ -213,9 +213,9 @@ struct StandardArgsGeneratedCalleeReplayElem {
 /// Parses a standard-args generated-callee replacement list into replay nodes.
 ///
 /// The parser trusts the selected callee definition and the recovered old
-/// actual slots.  It preserves replacement-token order and rejects malformed
-/// stringification, paste chains, out-of-range formal references, and malformed
-/// `__VA_OPT__` payloads fail-closed.
+/// actual slots.  It preserves replacement-token order and fails closed for
+/// malformed stringification, malformed paste chains, out-of-range formal
+/// references, and unsupported `__VA_OPT__` payloads.
 class StandardArgsGeneratedCalleeReplayParser {
 public:
   StandardArgsGeneratedCalleeReplayParser(

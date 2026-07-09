@@ -1187,10 +1187,10 @@ using GeneratedSolvedActuals = SmallVector<std::string, 8>;
 /// The caller trusts the current macro definition and the recovered old actual
 /// slots.  The parser owns the syntactic rejection obligations for unsupported
 /// token forms: malformed stringification, malformed paste chains,
-/// out-of-range formal references, and `__VA_OPT__` all fail closed.  It sets
-/// the generated-callee proof facts for stringification and paste exactly when
-/// the old inline parser did, while preserving replacement-token order in the
-/// emitted replay pattern.
+/// out-of-range formal references, and `__VA_OPT__` all fail closed.  The
+/// stringification and paste proof facts are meaningful only after a successful
+/// parse, and are raised only for replay elements that are emitted into the
+/// accepted pattern.
 class GeneratedCalleeReplayPatternParser {
 public:
   GeneratedCalleeReplayPatternParser(
@@ -1214,7 +1214,6 @@ public:
       //   # <formal-param>
       // Any missing, non-param, or out-of-range operand is rejected.
       if (tok.spelling == "#") {
-        usesStringification_ = true;
         if (i + 1 >= end ||
             tokens[i + 1].kind !=
                 RefoldModel::MacroReplacementTokenKind::ParamRef ||
@@ -1223,6 +1222,7 @@ public:
         const uint32_t paramIdx = *tokens[i + 1].paramIndex;
         if (paramIdx >= oldActuals_.size())
           return false;
+        usesStringification_ = true;
         GeneratedReplayElem elem;
         elem.kind = GeneratedReplayKind::Stringify;
         elem.paramIdx = paramIdx;
@@ -1235,7 +1235,6 @@ public:
       // consumed left-to-right so paste-piece ordering matches the replacement
       // tape exactly.
       if (i + 1 < end && tokens[i + 1].spelling == "##") {
-        usesPaste_ = true;
         GeneratedReplayElem elem;
         elem.kind = GeneratedReplayKind::Paste;
         GeneratedPastePiece first;
@@ -1256,6 +1255,7 @@ public:
             break;
           ++i;
         }
+        usesPaste_ = true;
         out.push_back(std::move(elem));
         continue;
       }
@@ -1944,8 +1944,9 @@ using TupleSolvedActuals = SmallVector<std::string, 8>;
 /// actuals.  This parser owns the tuple replay syntactic gates: malformed
 /// stringification, malformed paste chains, out-of-range formal references,
 /// and unsupported `__VA_OPT__` all fail closed.  It preserves replacement-token
-/// order and records tuple-specific stringification/paste facts exactly when
-/// the local parser did.
+/// order.  Tuple-specific stringification and paste facts are meaningful only
+/// after a successful parse, and are raised only for replay elements emitted
+/// into the accepted tuple pattern.
 class TupleGeneratedCalleeReplayPatternParser {
 public:
   TupleGeneratedCalleeReplayPatternParser(
@@ -1958,7 +1959,7 @@ public:
   /// Parses `begin..end` into ordered tuple generated-callee replay elements.
   ///
   /// Unsupported tuple replay syntax fails closed.  Stringification and paste
-  /// facts are set only after the corresponding replay form is accepted.
+  /// facts are raised only for replay forms emitted into the accepted pattern.
   bool Parse(size_t begin, size_t end,
              std::vector<TupleCalleeReplayElem> &out) const {
     for (size_t i = begin; i < end;) {
@@ -1991,7 +1992,6 @@ public:
       // The chain is consumed left-to-right to preserve replacement-tape order.
       if (i + 1 < end &&
           definition_.replacementTokens[i + 1].spelling == "##") {
-        usesPaste_ = true;
         TupleCalleeReplayElem elem;
         elem.kind = TupleCalleeReplayKind::Paste;
         TupleCalleePastePiece first;
@@ -2014,6 +2014,7 @@ public:
             break;
           ++i;
         }
+        usesPaste_ = true;
         out.push_back(std::move(elem));
         continue;
       }

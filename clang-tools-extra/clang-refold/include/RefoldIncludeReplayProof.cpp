@@ -1131,7 +1131,7 @@ IncludeReplayProofContext::ProducerObservedFileSpellingPayload(
   if (macro.cover.IsValid()) {
     if (std::optional<std::string> decoded =
             decodeObservedFileStringLiteralPayload(
-                services_.SliceASource(macro.cover.begin, macro.cover.end)))
+                services_.sliceASource(macro.cover.begin, macro.cover.end)))
       return decoded;
   }
 

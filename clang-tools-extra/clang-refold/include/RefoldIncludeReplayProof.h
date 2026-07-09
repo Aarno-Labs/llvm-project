@@ -61,20 +61,20 @@ struct IncludeReplayProofInputs {
 /// are deliberately non-owning so this layer cannot retain mutable state beyond
 /// the caller's materialization scope.
 struct IncludeReplayProofServices {
-  llvm::function_ref<StringRef(uint64_t Begin, uint64_t End)> SliceASource;
+  llvm::function_ref<StringRef(uint64_t begin, uint64_t end)> sliceASource;
 
-  llvm::function_ref<bool(StringRef CandidatePath,
-                          const RefoldModel::IncludeItem &Include)>
+  llvm::function_ref<bool(StringRef candidatePath,
+                          const RefoldModel::IncludeItem &include)>
       samePhysicalIncludeFile;
 
   llvm::function_ref<const RefoldModel::MacroInvocation *(
-      const RefoldModel::MacroInvocation &Macro)>
+      const RefoldModel::MacroInvocation &macro)>
       lineStateObservableMacroSite;
 
-  llvm::function_ref<bool(const RefoldModel::MacroInvocation &Macro)>
+  llvm::function_ref<bool(const RefoldModel::MacroInvocation &macro)>
       lineStateBuiltinInvocationIsPreservedObserver;
 
-  llvm::function_ref<LineStateObserverDemand(uint64_t IncludeId)>
+  llvm::function_ref<LineStateObserverDemand(uint64_t includeId)>
       includeSubtreeLineStateObserverDemand;
 };
 

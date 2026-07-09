@@ -214,15 +214,15 @@ safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &include) {
   if (include.angled)
     return std::nullopt;
 
-  llvm::StringRef Target = include.target;
-  if (Target.size() < 2 || Target.front() != '"' || Target.back() != '"')
+  llvm::StringRef target = include.target;
+  if (target.size() < 2 || target.front() != '"' || target.back() != '"')
     return std::nullopt;
 
-  llvm::StringRef Path = Target.drop_front().drop_back();
-  if (!safeSynthesizedRelativeIncludeOperandPath(Path))
+  llvm::StringRef path = target.drop_front().drop_back();
+  if (!safeSynthesizedRelativeIncludeOperandPath(path))
     return std::nullopt;
 
-  return Path.str();
+  return path.str();
 }
 
 bool lineHasPreprocessingDirectiveIntroducer(llvm::StringRef text) {
