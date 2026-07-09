@@ -3387,6 +3387,9 @@ void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
 
   std::optional<std::pair<uint64_t, uint64_t>> Line;
   std::optional<std::string> SourceText;
+  bool ViaOperator = false;
+  std::optional<uint64_t> OperatorBegin;
+  std::optional<uint64_t> OperatorEnd;
 
   // Pragma callbacks are not uniform about the exact location they provide:
   // the generic PPCallbacks hook normally points at the pragma introducer,
@@ -3416,6 +3419,52 @@ void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
 
     Line = std::make_pair(static_cast<uint64_t>(B), static_cast<uint64_t>(E));
     SourceText = Buf.slice(B, E).str();
+
+    // Distinguish a `_Pragma("...")` operator from a `#pragma` directive.  The
+    // callback file offset points at the introducer: `#` for `#pragma`, the
+    // identifier `_Pragma` for the operator (even mid-line).  For the operator,
+    // capture the precise `_Pragma ( "..." )` byte range so the consumer can
+    // fold a content edit back into the operator and edit a mid-line `_Pragma`
+    // in place instead of rejecting a site that overlaps ordinary tokens.
+    StringRef AtOff = Buf.substr(Off);
+    StringRef Kw("_Pragma");
+    auto IsIdentPart = [](char c) {
+      return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+             (c >= '0' && c <= '9') || c == '_';
+    };
+    if (AtOff.starts_with(Kw) &&
+        (AtOff.size() == Kw.size() || !IsIdentPart(AtOff[Kw.size()]))) {
+      ViaOperator = true;
+      size_t P = Off + Kw.size();
+      while (P < N && (Buf[P] == ' ' || Buf[P] == '\t'))
+        ++P;
+      if (P < N && Buf[P] == '(') {
+        size_t Q = P + 1;
+        int Depth = 1;
+        bool InStr = false;
+        for (; Q < N && Depth > 0; ++Q) {
+          const char C = Buf[Q];
+          if (InStr) {
+            if (C == '\\' && Q + 1 < N) {
+              ++Q;
+              continue;
+            }
+            if (C == '"')
+              InStr = false;
+          } else if (C == '"') {
+            InStr = true;
+          } else if (C == '(') {
+            ++Depth;
+          } else if (C == ')') {
+            --Depth;
+          }
+        }
+        if (Depth == 0) {
+          OperatorBegin = static_cast<uint64_t>(Off);
+          OperatorEnd = static_cast<uint64_t>(Q);
+        }
+      }
+    }
   }
 
   const std::string SitePath = filePathForLocAbs(SM, FileLoc, EmitAbsPaths);
@@ -3465,6 +3514,9 @@ void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
     It.SiteEnd = Line->second;
   }
   It.SitePath = SitePath;
+  It.ViaPragmaOperator = ViaOperator;
+  It.PragmaOperatorBegin = OperatorBegin;
+  It.PragmaOperatorEnd = OperatorEnd;
 
   Items.push_back(std::move(It));
 
@@ -4475,7 +4527,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "2.9");
+    JO.attribute("version", "3.0");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -5585,6 +5637,17 @@ void RefoldMapBuilder::writeJSON() {
                     });
                   }
                 });
+              }
+            }
+
+            // Pragma-operator provenance.  Emitted only for `_Pragma("...")`
+            // (absent means a plain `#pragma` directive line), so existing maps
+            // and directive pragmas stay byte-identical.
+            if (It.Subkind == "#pragma" && It.ViaPragmaOperator) {
+              JO.attribute("via_pragma_operator", true);
+              if (It.PragmaOperatorBegin && It.PragmaOperatorEnd) {
+                JO.attribute("operator_b", *It.PragmaOperatorBegin);
+                JO.attribute("operator_e", *It.PragmaOperatorEnd);
               }
             }
           }

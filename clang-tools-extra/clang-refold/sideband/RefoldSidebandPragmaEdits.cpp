@@ -65,6 +65,13 @@ struct JsonPragmaItem {
   uint64_t siteB = 0;
   uint64_t siteE = 0;
   std::optional<uint64_t> ownerIncludeId = std::nullopt;
+  // True when the directive was spelled with the `_Pragma("...")` operator.
+  bool viaPragmaOperator = false;
+  // Precise `_Pragma("...")` operator byte range (producer `operator_b/e`), used
+  // as the edit target so a mid-line `_Pragma` is edited in place rather than
+  // rewriting the whole line.  Falls back to [siteB, siteE) when absent.
+  std::optional<uint64_t> operatorB;
+  std::optional<uint64_t> operatorE;
 };
 
 struct JsonZeroTokenDirectiveForSideband {
@@ -169,6 +176,95 @@ static std::string collapsePragmaWhitespacePreservingLiterals(StringRef text) {
   return out;
 }
 
+/// If \p body is a `_Pragma("...")` operator spelling, return the equivalent
+/// `#pragma ...` directive text by destringizing its single string-literal
+/// operand.  Per the C `_Pragma` destringization rule the operand's outer quotes
+/// are dropped and only `\"` and `\\` escapes are undone.  Returns std::nullopt
+/// when \p body is not a plain `_Pragma("...")` operator (e.g. a real `#pragma`
+/// directive, or a `_Pragma` whose operand is not a single string literal).
+static std::optional<std::string> destringizePragmaOperator(StringRef body) {
+  StringRef s = body.ltrim();
+  if (!s.consume_front("_Pragma"))
+    return std::nullopt;
+  s = s.ltrim();
+  if (!s.consume_front("("))
+    return std::nullopt;
+  s = s.ltrim();
+  // Skip an optional encoding prefix on the string literal (order matters so
+  // `u8` is not mistaken for `u`).  The destringized content is prefix-agnostic.
+  for (StringRef prefix : {"u8", "L", "u", "U"})
+    if (s.consume_front(prefix))
+      break;
+  if (s.empty() || s.front() != '"')
+    return std::nullopt;
+  s = s.drop_front(); // opening quote
+
+  std::string content;
+  bool closed = false;
+  size_t k = 0;
+  for (; k < s.size(); ++k) {
+    const char c = s[k];
+    if (c == '\\' && k + 1 < s.size() &&
+        (s[k + 1] == '"' || s[k + 1] == '\\')) {
+      content.push_back(s[k + 1]);
+      ++k;
+      continue;
+    }
+    if (c == '"') {
+      closed = true;
+      break;
+    }
+    content.push_back(c);
+  }
+  if (!closed)
+    return std::nullopt;
+
+  s = s.drop_front(k + 1).ltrim(); // past the closing quote
+  if (!s.consume_front(")"))
+    return std::nullopt;
+  if (!s.ltrim().empty()) // trailing junk after the operator is not canonical
+    return std::nullopt;
+  return "#pragma " + content;
+}
+
+/// Fold a raw `#pragma ...` replacement back into a `_Pragma("...")` operator
+/// when the original source site \p siteText was spelled with `_Pragma`.
+///
+/// A sideband pragma content edit replays the edited directive as the raw
+/// `#pragma` text the preprocessor printed.  When the source was a `_Pragma`
+/// operator, emitting a bare `#pragma` there would silently change the source
+/// construct (and is invalid mid-line).  Re-stringize the directive body back
+/// into the operator form: escape `\` and `"` (the inverse of _Pragma
+/// destringization) and wrap it as `_Pragma("...")`, preserving any trailing
+/// newline the replay text carried.  Returns \p directive unchanged when the
+/// site is not a `_Pragma` operator or the directive is not a `#pragma`.
+static std::string
+foldPragmaDirectiveBackIntoOperator(StringRef siteText, StringRef directive) {
+  if (!siteText.ltrim().starts_with("_Pragma"))
+    return directive.str();
+  // Strip surrounding whitespace, including any trailing newline plus the next
+  // line's leading indentation that a mid-line pragma's replay block carries;
+  // the operator form must contain only the directive body.
+  StringRef trimmed = directive.trim();
+  if (!trimmed.consume_front("#pragma"))
+    return directive.str();
+  trimmed = trimmed.ltrim();
+
+  // The edit target is the precise `_Pragma(...)` operator range, which does not
+  // include the trailing newline, so the operator form must not carry one
+  // either (a mid-line operator has no line of its own, and a line-start one
+  // keeps the source's existing newline after the range).
+  std::string out = "_Pragma(\"";
+  out.reserve(trimmed.size() + 12);
+  for (char c : trimmed) {
+    if (c == '\\' || c == '"')
+      out.push_back('\\');
+    out.push_back(c);
+  }
+  out += "\")";
+  return out;
+}
+
 /// Convert a physical or replayed pragma directive spelling to the canonical
 /// sideband identity used for matching.
 ///
@@ -203,6 +299,18 @@ static std::string canonicalizeSidebandPragmaText(StringRef text) {
 
   if (body.empty())
     return "\n";
+
+  // Destringize a leading `_Pragma("...")` operator to the `#pragma ...` form
+  // the preprocessor prints in raw `.i`.  The producer records the source
+  // spelling of a `_Pragma`-produced directive (e.g. `_Pragma("message(\"x\")")`)
+  // while the replay surface contains `#pragma message("x")`; canonicalizing
+  // both to the same identity lets the sideband edit bind the `_Pragma` source
+  // range instead of forcing whole-file terminal fallback.
+  if (std::optional<std::string> destringized =
+          destringizePragmaOperator(body)) {
+    noComments = std::move(*destringized);  // stable storage for `body`
+    body = StringRef(noComments).trim();
+  }
 
   size_t i = 0;
   while (i < body.size() && stringutils::isNonNewlineWs(body[i]))
@@ -747,9 +855,37 @@ collectJsonPragmaItems(const json::Object &rootJson, StringRef refoldMapPath) {
     item.siteB = static_cast<uint64_t>(*b);
     item.siteE = static_cast<uint64_t>(*e);
 
+    // Producer `_Pragma("...")` provenance (Level 1/2).  `via_pragma_operator`
+    // marks operator-spelled pragmas; `operator_b/e` give the precise operator
+    // byte range so a mid-line operator can be edited in place.
+    item.viaPragmaOperator =
+        obj->getBoolean("via_pragma_operator").value_or(false);
+    {
+      auto opB = obj->getInteger("operator_b");
+      auto opE = obj->getInteger("operator_e");
+      if (item.viaPragmaOperator && opB && opE && *opB >= 0 && *opE >= 0 &&
+          *opB <= *opE) {
+        item.operatorB = static_cast<uint64_t>(*opB);
+        item.operatorE = static_cast<uint64_t>(*opE);
+      }
+    }
+
     if (auto sourceBytes = readMappedSourceFileForSideband(
             item.sitePath, rootSourcePath, refoldMapPath)) {
-      if (item.siteB <= item.siteE && item.siteE <= sourceBytes->size()) {
+      if (item.viaPragmaOperator && item.operatorB && item.operatorE &&
+          *item.operatorE <= sourceBytes->size()) {
+        // Use the precise `_Pragma("...")` operator range as both the edit site
+        // and the sideband identity.  The whole-line site the producer also
+        // records would overlap ordinary tokens for a mid-line operator; the
+        // operator range is the exact, token-free edit target.  Its bytes
+        // canonicalize (via destringizePragmaOperator) to the `#pragma ...` the
+        // replay surface prints, so the sideband line binds.
+        item.siteB = *item.operatorB;
+        item.siteE = *item.operatorE;
+        item.canonicalText = canonicalizeSidebandPragmaText(
+            StringRef(*sourceBytes).slice(item.siteB, item.siteE));
+      } else if (item.siteB <= item.siteE &&
+                 item.siteE <= sourceBytes->size()) {
         const uint64_t extendedE = stringutils::extendRangeToLogicalDirective(
             StringRef(*sourceBytes), item.siteB, item.siteE);
         item.siteE = extendedE;
@@ -2253,9 +2389,21 @@ bool appendSidebandPragmaSourceEdits(
     // replacement's physical line count.  The materialized edit-map range still
     // describes only the B-side sideband payload, not the synthetic #line
     // directive that may be appended for resynchronization.
+    // When the source directive was spelled with the `_Pragma("...")` operator,
+    // fold the replayed `#pragma` replacement back into that operator form so
+    // the edit preserves the source construct instead of materializing a raw
+    // `#pragma` (which also would be invalid at a mid-line `_Pragma`).  The
+    // re-materialized text still re-preprocesses to the same directive, so the
+    // proof discharged above continues to hold.
+    StringRef siteText = tuBytes.slice(
+        sourceRange.first, std::min<uint64_t>(sourceRange.second,
+                                              static_cast<uint64_t>(tuBytes.size())));
+    std::string foldedReplacement = foldPragmaDirectiveBackIntoOperator(
+        siteText, sideband.ReplacementText());
+
     ResyncOutcome ro = textEditAssembler.ApplyResyncOrPend(
-        tuBytes, sourceRange.first, sourceRange.second,
-        sideband.ReplacementText(), tuPath);
+        tuBytes, sourceRange.first, sourceRange.second, foldedReplacement,
+        tuPath);
     TextEdit edit{sourceRange.first,
                   sourceRange.second,
                   std::move(ro.text),
@@ -2265,13 +2413,31 @@ bool appendSidebandPragmaSourceEdits(
                   {},
                   {}};
     edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
-    textEditAssembler.CertifyTextEditMaterializedBReplayProof(edit, sideband);
+
+    const bool folded =
+        StringRef(foldedReplacement) != sideband.ReplacementText();
+    if (!folded) {
+      textEditAssembler.CertifyTextEditMaterializedBReplayProof(edit, sideband);
+    } else {
+      // The replay text was re-materialized into the `_Pragma(...)` operator
+      // form, which has a different length than the raw-B `#pragma` replay.
+      // Keep the raw-B byte witness, but the materialized output-text range is
+      // the folded operator text at the front of the (possibly resync-suffixed)
+      // edit text.
+      const auto bRange = sideband.MaterializedBByteRange();
+      textEditAssembler.CertifyTextEditMaterializedBByteRange(edit, bRange.first,
+                                                              bRange.second);
+      textEditAssembler.CertifyTextEditMaterializedOutputTextRange(
+          edit, 0,
+          std::min<uint64_t>(static_cast<uint64_t>(foldedReplacement.size()),
+                             static_cast<uint64_t>(edit.text.size())));
+    }
     textEditAssembler.AttachAcceptedResultCarrier(
         edit,
         proofLattice.AcceptedCandidateBuilder()
             .BuildAcceptedTUTextEditCandidate(
                 AcceptedPathKind::TUByteSpanConservativeEdit, sourceRange.first,
-                sourceRange.second, sideband.ReplacementText()));
+                sourceRange.second, foldedReplacement));
     structuralHunkDispatcher.AddTUEdit(std::move(edit));
   }
 

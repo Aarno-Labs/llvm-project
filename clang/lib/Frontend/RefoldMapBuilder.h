@@ -334,6 +334,19 @@ struct Item {
   std::optional<uint64_t>
       SiteEnd;                 // one-past-end of the directive line (incl. EOL)
   std::string SitePath;        // file path that contains the directive
+
+  // --- Pragma-operator provenance (Subkind == "#pragma") ---
+  // True when the directive was spelled with the `_Pragma("...")` operator
+  // rather than a `#pragma` directive line.  Lets the consumer fold a pragma
+  // content edit back into the operator form instead of a raw `#pragma`.
+  bool ViaPragmaOperator = false;
+  // For a `_Pragma` operator, the exact source byte range of the operator
+  // expression `_Pragma ( "..." )` (not the whole physical line).  Present only
+  // when ViaPragmaOperator is true and the range was recoverable; lets the
+  // consumer edit a mid-line `_Pragma` in place instead of rejecting a site
+  // that overlaps ordinary tokens.
+  std::optional<uint64_t> PragmaOperatorBegin;
+  std::optional<uint64_t> PragmaOperatorEnd;
   std::string TargetAsWritten; // as-written header token ("e.h" or <vector>)
   // Historical JSON name `resolved_path`.  With the current producer default
   // EmitAbsPaths == false, this stores the producer-observed entered-file

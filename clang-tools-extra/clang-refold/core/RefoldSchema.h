@@ -1561,6 +1561,20 @@ static constexpr const char *RefoldSchema = R"json(
           ],
           "minimum": 0,
           "description": "Include item id that opened site_path for this pragma occurrence, when known. Used to disambiguate repeated header instances."
+        },
+        "via_pragma_operator": {
+          "type": "boolean",
+          "description": "True when this pragma was spelled with the _Pragma(\"...\") operator rather than a #pragma directive line. Omitted (defaults false) for directive pragmas and older maps; lets the consumer fold a pragma content edit back into the operator form."
+        },
+        "operator_b": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For a _Pragma operator, begin byte offset of the _Pragma(\"...\") expression within 'site_path'. May be narrower than [site_b, site_e) when the operator is mid-line."
+        },
+        "operator_e": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For a _Pragma operator, end byte offset (exclusive) of the _Pragma(\"...\") expression within 'site_path'."
         }
       }
     },
