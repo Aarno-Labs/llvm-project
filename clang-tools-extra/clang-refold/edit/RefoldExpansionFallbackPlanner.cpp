@@ -40,13 +40,13 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/Path.h"
 
 #include <algorithm>
 #include <cstdint>
-#include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -78,6 +78,358 @@ namespace refold {
 // TerminalOutOfDomain carrier; any in-domain macro whole-cover case must have
 // been accepted by the
 // normal proof lattice.
+
+namespace {
+
+/// Resolves the transitive side-effect proof for a zero-token include closure.
+///
+/// The trusted inputs are the immutable refold model, path-identity service, and
+/// the caller's deliberately narrow pragma-state predicate.  The resolver owns
+/// only recursion-local cycle state: it preserves the original include/directive
+/// traversal order and returns the first diagnostic reason encountered.  Cyclic
+/// include-parent metadata is treated as an unprovable closure and therefore
+/// fails closed rather than authorizing deletion of uncertain source state.
+class RecordedIncludeSideEffectResolver {
+public:
+  RecordedIncludeSideEffectResolver(
+      const RefoldModel &model, const RefoldPathIdentity &paths,
+      llvm::function_ref<bool(const RefoldModel::PragmaDirective &)>
+          pragmaIsConsumableIncludeLocalState)
+      : model_(model), paths_(paths),
+        pragmaIsConsumableIncludeLocalState_(
+            pragmaIsConsumableIncludeLocalState) {}
+
+  /// Return the first recorded reason that prevents treating `inc` and its
+  /// descendants as a consumable zero-token source gap, or std::nullopt when the
+  /// include tree is source-neutral for this closure proof.
+  std::optional<std::string>
+  FindReason(const RefoldModel::IncludeItem &inc) const {
+    DenseSet<uint64_t> visiting;
+    return FindReasonImpl(inc, visiting);
+  }
+
+private:
+  std::optional<std::string>
+  FindReasonImpl(const RefoldModel::IncludeItem &inc,
+                 DenseSet<uint64_t> &visiting) const {
+    // A cycle would indicate malformed include-parent metadata.  Do not try to
+    // prove closure through it; reject rather than deleting uncertain state.
+    if (!visiting.insert(inc.id).second)
+      return llvm::formatv("include-parent cycle reaches include id={0}",
+                           inc.id)
+          .str();
+
+    auto finish = [&](std::optional<std::string> reason) {
+      visiting.erase(inc.id);
+      return reason;
+    };
+
+    // Header declarations are semantic structure, even if this include did not
+    // contribute tokens to the particular A-side hunk being refolded.
+    if (!inc.decls.empty())
+      return finish(llvm::formatv("include id={0} path='{1}' has {2} "
+                                  "recorded header declaration(s)",
+                                  inc.id, IncludePathForDiagnostic(inc),
+                                  inc.decls.size())
+                        .str());
+
+    // A nested include is not inherently a side effect.  It is consumable when
+    // its own expansion is empty and its descendants/directives are consumable
+    // by the same zero-token include-gap proof.  Record which child blocked the
+    // proof so the mixed-closure rejection points at the real source structure.
+    for (const auto &child : model_.GetIncludes()) {
+      if (!child.parent || *child.parent != inc.id)
+        continue;
+      if (child.cover.IsValid())
+        return finish(llvm::formatv("child include id={0} path='{1}' "
+                                    "materializes PP cover=[{2},{3})",
+                                    child.id, IncludePathForDiagnostic(child),
+                                    child.cover.begin, child.cover.end)
+                          .str());
+      if (std::optional<std::string> childReason =
+              FindReasonImpl(child, visiting))
+        return finish(llvm::formatv("child include id={0} path='{1}' rejected: "
+                                    "{2}",
+                                    child.id, IncludePathForDiagnostic(child),
+                                    *childReason)
+                          .str());
+    }
+
+    // Include-owned #define/#undef directives are macro-state transitions, not
+    // PP tokens.  When their containing zero-token include lies inside the
+    // replacement envelope, the directive is consumed with that envelope.  Any
+    // surviving source that still observes the removed macro state is handled
+    // later by the macro-state liveness repair passes: consumed #defines can be
+    // preserved or replaced with whole-cover callsite realizations, and
+    // consumed #undefs can be preserved when removing them would resurrect an
+    // earlier definition.  Directives outside that nameable macro-state class
+    // remain side-effect-bearing structure that this closure must not erase.
+    for (const auto &directive : model_.GetMacroDirectives()) {
+      if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id &&
+          directive.subkind != "#define" && directive.subkind != "#undef") {
+        return finish(
+            llvm::formatv("include id={0} path='{1}' owns "
+                          "non-consumable macro directive id={2} "
+                          "subkind='{3}' text='{4}'",
+                          inc.id, IncludePathForDiagnostic(inc), directive.id,
+                          directive.subkind,
+                          stringutils::showWsWithClip(directive.text, 120))
+                .str());
+      }
+    }
+
+    // Conditional control directives are also source structure, but an
+    // include-local conditional group with no materialized A tokens is source
+    // order only: it contributed no PP material and any real side effects
+    // inside the group are represented separately as macro directives, child
+    // includes, pragmas, or declarations.  When such a group lies inside the
+    // source envelope being replaced, consuming it is the same kind of closure
+    // as consuming an empty include gap.  Reject only a conditional group that
+    // owns materialized tokens; that would make this a token-producing include,
+    // not a zero-token gap.
+    for (const auto &group : model_.GetConds()) {
+      if (!group.parentIncludeId || *group.parentIncludeId != inc.id)
+        continue;
+
+      for (const RefoldModel::CondArm &arm : group.arms) {
+        if (arm.span && arm.span->IsValid() &&
+            arm.span->begin < arm.span->end) {
+          return finish(llvm::formatv("include id={0} path='{1}' owns "
+                                      "conditional group id={2} arm id={3} "
+                                      "with materialized PP span=[{4},{5})",
+                                      inc.id, IncludePathForDiagnostic(inc),
+                                      group.id, arm.id, arm.span->begin,
+                                      arm.span->end)
+                            .str());
+        }
+      }
+    }
+
+    // Pragmas are keyed by physical file path rather than include id, so check
+    // the resolved header path when available.  Unknown pragmas are always
+    // side-effect-bearing here: they can affect diagnostics, layout,
+    // optimization, visibility, attributes, or later preprocessing state while
+    // contributing no PP tokens.  The only pragma admitted by this closure is
+    // an explicitly parsed `#pragma once` in an otherwise source-neutral
+    // zero-token include.  Anything richer must wait for a pragma-state proof
+    // or a repair mechanism analogous to macro-state liveness.
+    if (inc.resolvedPath)
+      for (const auto &pragma : model_.GetPragmas()) {
+        if (!paths_.PathsEqual(pragma.sitePath, *inc.resolvedPath))
+          continue;
+        if (!pragmaIsConsumableIncludeLocalState_(pragma)) {
+          return finish(
+              llvm::formatv("include id={0} path='{1}' contains "
+                            "non-consumable pragma id={2} text='{3}'",
+                            inc.id, IncludePathForDiagnostic(inc), pragma.id,
+                            stringutils::showWsWithClip(pragma.text, 120))
+                  .str());
+        }
+        if (IncludeHasNonPragmaStructure(inc)) {
+          return finish(llvm::formatv("include id={0} path='{1}' contains "
+                                      "#pragma once with additional recorded "
+                                      "source structure",
+                                      inc.id, IncludePathForDiagnostic(inc))
+                            .str());
+        }
+      }
+
+    return finish(std::nullopt);
+  }
+
+  StringRef IncludePathForDiagnostic(
+      const RefoldModel::IncludeItem &inc) const {
+    return inc.resolvedPath ? *inc.resolvedPath : inc.target;
+  }
+
+  /// Return true iff the include has structure other than an explicitly
+  /// consumable pragma.  This keeps the pragma-once exception fail-closed when
+  /// the include also owns macro state, conditional structure, children, or
+  /// declarations, while preserving the model traversal order used by the old
+  /// local proof lambda.
+  bool IncludeHasNonPragmaStructure(
+      const RefoldModel::IncludeItem &inc) const {
+    if (!inc.decls.empty())
+      return true;
+
+    for (const auto &child : model_.GetIncludes())
+      if (child.parent && *child.parent == inc.id)
+        return true;
+
+    for (const auto &directive : model_.GetMacroDirectives())
+      if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id)
+        return true;
+
+    for (const auto &group : model_.GetConds())
+      if (group.parentIncludeId && *group.parentIncludeId == inc.id)
+        return true;
+
+    return false;
+  }
+
+  const RefoldModel &model_;
+  const RefoldPathIdentity &paths_;
+  llvm::function_ref<bool(const RefoldModel::PragmaDirective &)>
+      pragmaIsConsumableIncludeLocalState_;
+};
+
+/// Resolves whether a complete include directive may be preserved inside a
+/// conditional source island while its subtree carries modeled macro-state.
+///
+/// Trusted inputs are the immutable refold model, path identity, macro-state
+/// proof service, source mapper, current token hunk, and the same narrow pragma
+/// predicate used by the zero-token include closure proof.  The resolver owns
+/// only recursion-local cycle state.  It preserves child/directive/conditional/
+/// macro/pragma ordering and fails closed for declarations, token-producing
+/// descendants, unsupported pragmas, non-macro-state structure, and replacement
+/// text that would observe macro state introduced only after the payload.
+class ConditionalStateIncludePreservationResolver {
+public:
+  ConditionalStateIncludePreservationResolver(
+      const RefoldModel &model, const RefoldPathIdentity &paths,
+      const RefoldMacroStateProof &macroStateProof,
+      const RefoldSourceMapper &sourceMapper, const diffutils::Hunk &h,
+      llvm::function_ref<bool(const RefoldModel::PragmaDirective &)>
+          pragmaIsConsumableIncludeLocalState)
+      : model_(model), paths_(paths), macroStateProof_(macroStateProof),
+        sourceMapper_(sourceMapper), h_(h),
+        pragmaIsConsumableIncludeLocalState_(
+            pragmaIsConsumableIncludeLocalState) {}
+
+  /// Return true iff the include's directive can remain in the preserved
+  /// conditional island without requiring a new raw-B fallback authority.
+  bool IsPreservable(const RefoldModel::IncludeItem &inc) const {
+    DenseSet<uint64_t> visiting;
+    return IsPreservableImpl(inc, visiting);
+  }
+
+private:
+  bool IsPreservableImpl(const RefoldModel::IncludeItem &inc,
+                         DenseSet<uint64_t> &visiting) const {
+    if (inc.cover.IsValid())
+      return false;
+    if (!visiting.insert(inc.id).second)
+      return false;
+
+    auto finish = [&](bool result) {
+      visiting.erase(inc.id);
+      return result;
+    };
+
+    if (!inc.decls.empty())
+      return finish(false);
+
+    for (const auto &child : model_.GetIncludes()) {
+      if (!child.parent || *child.parent != inc.id)
+        continue;
+      if (!IsPreservableImpl(child, visiting))
+        return finish(false);
+    }
+
+    for (const auto &directive : model_.GetMacroDirectives()) {
+      if (!directive.ownerIncludeId)
+        continue;
+      bool ownedByInclude = *directive.ownerIncludeId == inc.id;
+      if (!ownedByInclude)
+        for (const auto &child : model_.GetIncludes())
+          if (child.id == *directive.ownerIncludeId &&
+              IncludeIsDescendantOf(child, inc)) {
+            ownedByInclude = true;
+            break;
+          }
+      if (!ownedByInclude)
+        continue;
+
+      if (HunkReplacementObservesMacroStateDirective(directive))
+        return finish(false);
+    }
+
+    for (const auto &group : model_.GetConds()) {
+      if (!group.parentIncludeId)
+        continue;
+      bool ownedByInclude = *group.parentIncludeId == inc.id;
+      if (!ownedByInclude)
+        for (const auto &child : model_.GetIncludes())
+          if (child.id == *group.parentIncludeId &&
+              IncludeIsDescendantOf(child, inc)) {
+            ownedByInclude = true;
+            break;
+          }
+      if (!ownedByInclude)
+        continue;
+      for (const RefoldModel::CondArm &arm : group.arms)
+        if (arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end)
+          return finish(false);
+    }
+
+    for (const auto &macro : model_.GetMacroInvocations()) {
+      if (!macro.ownerIncludeId)
+        continue;
+      bool ownedByInclude = *macro.ownerIncludeId == inc.id;
+      if (!ownedByInclude)
+        for (const auto &child : model_.GetIncludes())
+          if (child.id == *macro.ownerIncludeId &&
+              IncludeIsDescendantOf(child, inc)) {
+            ownedByInclude = true;
+            break;
+          }
+      if (!ownedByInclude)
+        continue;
+      if (macro.cover.IsValid())
+        return finish(false);
+      for (const auto &span : macro.stringifySpans)
+        if (span.IsValid())
+          return finish(false);
+      for (const auto &span : macro.pasteSpans)
+        if (span.IsValid())
+          return finish(false);
+    }
+
+    if (inc.resolvedPath)
+      for (const auto &pragma : model_.GetPragmas())
+        if (paths_.PathsEqual(pragma.sitePath, *inc.resolvedPath) &&
+            !pragmaIsConsumableIncludeLocalState_(pragma))
+          return finish(false);
+
+    return finish(true);
+  }
+
+  bool HunkReplacementObservesMacroStateDirective(
+      const RefoldModel::MacroDirective &directive) const {
+    return macroStateProof_.ReplacementObservesMacroStateDirective(
+        directive, sourceMapper_.SliceBSource(h_.bStart, h_.bEnd),
+        /*unprovenObserves=*/true);
+  }
+
+  bool IncludeIsDescendantOf(const RefoldModel::IncludeItem &candidate,
+                             const RefoldModel::IncludeItem &root) const {
+    std::optional<uint64_t> cur = candidate.parent;
+    while (cur) {
+      if (*cur == root.id)
+        return true;
+      const RefoldModel::IncludeItem *parent = nullptr;
+      for (const auto &inc : model_.GetIncludes())
+        if (inc.id == *cur) {
+          parent = &inc;
+          break;
+        }
+      if (!parent)
+        return false;
+      cur = parent->parent;
+    }
+    return false;
+  }
+
+  const RefoldModel &model_;
+  const RefoldPathIdentity &paths_;
+  const RefoldMacroStateProof &macroStateProof_;
+  const RefoldSourceMapper &sourceMapper_;
+  const diffutils::Hunk &h_;
+  llvm::function_ref<bool(const RefoldModel::PragmaDirective &)>
+      pragmaIsConsumableIncludeLocalState_;
+};
+
+} // namespace
 
 std::optional<RefoldExpansionFallbackPlanner::TextEdit>
 RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
@@ -351,181 +703,12 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     return isWsOrCompleteCommentTrivia(text.drop_front(pos));
   };
 
-  // Return true iff the include has structure other than an explicitly
-  // consumable pragma.  This is stricter than the general zero-token include
-  // proof: `#pragma once` is considered source-neutral only for an otherwise
-  // empty include.  If a pragma appears next to macro-state, conditionals,
-  // nested includes, declarations, or any other recorded structure, keep the
-  // include outside this proof class until the refold map records enough
-  // pragma-state information to prove the combined effect.
-  auto includeHasNonPragmaStructure =
-      [&](const RefoldModel::IncludeItem &inc) -> bool {
-    if (!inc.decls.empty())
-      return true;
-
-    for (const auto &child : model_.GetIncludes())
-      if (child.parent && *child.parent == inc.id)
-        return true;
-
-    for (const auto &directive : model_.GetMacroDirectives())
-      if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id)
-        return true;
-
-    for (const auto &group : model_.GetConds())
-      if (group.parentIncludeId && *group.parentIncludeId == inc.id)
-        return true;
-
-    return false;
-  };
-
-  auto includePathForDiagnostic = [](const RefoldModel::IncludeItem &inc) {
-    return inc.resolvedPath ? *inc.resolvedPath : inc.target;
-  };
-
-  // Return the first recorded reason that prevents treating this include as a
-  // consumable zero-token source gap, or std::nullopt when the include tree is
-  // source-neutral for this closure proof.
-  //
-  // The predicate is intentionally transitive: a top-level zero-token include
-  // may contain nested zero-token includes, and the outer directive is still
-  // safe to consume when every descendant is itself source-neutral.  Returning
-  // a concrete reason keeps the later terminal-fallback trace actionable
-  // instead of merely saying that an unrelated include was absorbed.
-  std::function<std::optional<std::string>(const RefoldModel::IncludeItem &,
-                                           DenseSet<uint64_t> &)>
-      includeRecordedSideEffectReasonImpl;
-  includeRecordedSideEffectReasonImpl =
-      [&](const RefoldModel::IncludeItem &inc,
-          DenseSet<uint64_t> &visiting) -> std::optional<std::string> {
-    // A cycle would indicate malformed include-parent metadata.  Do not try to
-    // prove closure through it; reject rather than deleting uncertain state.
-    if (!visiting.insert(inc.id).second)
-      return llvm::formatv("include-parent cycle reaches include id={0}",
-                           inc.id)
-          .str();
-
-    auto finish = [&](std::optional<std::string> reason) {
-      visiting.erase(inc.id);
-      return reason;
-    };
-
-    // Header declarations are semantic structure, even if this include did not
-    // contribute tokens to the particular A-side hunk being refolded.
-    if (!inc.decls.empty())
-      return finish(llvm::formatv("include id={0} path='{1}' has {2} "
-                                  "recorded header declaration(s)",
-                                  inc.id, includePathForDiagnostic(inc),
-                                  inc.decls.size())
-                        .str());
-
-    // A nested include is not inherently a side effect.  It is consumable when
-    // its own expansion is empty and its descendants/directives are consumable
-    // by the same zero-token include-gap proof.  Record which child blocked the
-    // proof so the mixed-closure rejection points at the real source structure.
-    for (const auto &child : model_.GetIncludes()) {
-      if (!child.parent || *child.parent != inc.id)
-        continue;
-      if (child.cover.IsValid())
-        return finish(llvm::formatv("child include id={0} path='{1}' "
-                                    "materializes PP cover=[{2},{3})",
-                                    child.id, includePathForDiagnostic(child),
-                                    child.cover.begin, child.cover.end)
-                          .str());
-      if (std::optional<std::string> childReason =
-              includeRecordedSideEffectReasonImpl(child, visiting))
-        return finish(llvm::formatv("child include id={0} path='{1}' rejected: "
-                                    "{2}",
-                                    child.id, includePathForDiagnostic(child),
-                                    *childReason)
-                          .str());
-    }
-
-    // Include-owned #define/#undef directives are macro-state transitions, not
-    // PP tokens.  When their containing zero-token include lies inside the
-    // replacement envelope, the directive is consumed with that envelope.  Any
-    // surviving source that still observes the removed macro state is handled
-    // later by the macro-state liveness repair passes: consumed #defines can be
-    // preserved or replaced with whole-cover callsite realizations, and
-    // consumed #undefs can be preserved when removing them would resurrect an
-    // earlier definition.  Directives outside that nameable macro-state class
-    // remain side-effect-bearing structure that this closure must not erase.
-    for (const auto &directive : model_.GetMacroDirectives()) {
-      if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id &&
-          directive.subkind != "#define" && directive.subkind != "#undef") {
-        return finish(
-            llvm::formatv("include id={0} path='{1}' owns "
-                          "non-consumable macro directive id={2} "
-                          "subkind='{3}' text='{4}'",
-                          inc.id, includePathForDiagnostic(inc), directive.id,
-                          directive.subkind,
-                          stringutils::showWsWithClip(directive.text, 120))
-                .str());
-      }
-    }
-
-    // Conditional control directives are also source structure, but an
-    // include-local conditional group with no materialized A tokens is source
-    // order only: it contributed no PP material and any real side effects
-    // inside the group are represented separately as macro directives, child
-    // includes, pragmas, or declarations.  When such a group lies inside the
-    // source envelope being replaced, consuming it is the same kind of closure
-    // as consuming an empty include gap.  Reject only a conditional group that
-    // owns materialized tokens; that would make this a token-producing include,
-    // not a zero-token gap.
-    for (const auto &group : model_.GetConds()) {
-      if (!group.parentIncludeId || *group.parentIncludeId != inc.id)
-        continue;
-
-      for (const RefoldModel::CondArm &arm : group.arms) {
-        if (arm.span && arm.span->IsValid() &&
-            arm.span->begin < arm.span->end) {
-          return finish(llvm::formatv("include id={0} path='{1}' owns "
-                                      "conditional group id={2} arm id={3} "
-                                      "with materialized PP span=[{4},{5})",
-                                      inc.id, includePathForDiagnostic(inc),
-                                      group.id, arm.id, arm.span->begin,
-                                      arm.span->end)
-                            .str());
-        }
-      }
-    }
-
-    // Pragmas are keyed by physical file path rather than include id, so check
-    // the resolved header path when available.  Unknown pragmas are always
-    // side-effect-bearing here: they can affect diagnostics, layout,
-    // optimization, visibility, attributes, or later preprocessing state while
-    // contributing no PP tokens.  The only pragma admitted by this closure is
-    // an explicitly parsed `#pragma once` in an otherwise source-neutral
-    // zero-token include.  Anything richer must wait for a pragma-state proof
-    // or a repair mechanism analogous to macro-state liveness.
-    if (inc.resolvedPath)
-      for (const auto &pragma : model_.GetPragmas()) {
-        if (!paths_.PathsEqual(pragma.sitePath, *inc.resolvedPath))
-          continue;
-        if (!pragmaIsConsumableIncludeLocalState(pragma)) {
-          return finish(
-              llvm::formatv("include id={0} path='{1}' contains "
-                            "non-consumable pragma id={2} text='{3}'",
-                            inc.id, includePathForDiagnostic(inc), pragma.id,
-                            stringutils::showWsWithClip(pragma.text, 120))
-                  .str());
-        }
-        if (includeHasNonPragmaStructure(inc)) {
-          return finish(llvm::formatv("include id={0} path='{1}' contains "
-                                      "#pragma once with additional recorded "
-                                      "source structure",
-                                      inc.id, includePathForDiagnostic(inc))
-                            .str());
-        }
-      }
-
-    return finish(std::nullopt);
-  };
+  const RecordedIncludeSideEffectResolver recordedIncludeSideEffectResolver(
+      model_, paths_, pragmaIsConsumableIncludeLocalState);
 
   auto includeRecordedSideEffectReason =
       [&](const RefoldModel::IncludeItem &inc) -> std::optional<std::string> {
-    DenseSet<uint64_t> visiting;
-    return includeRecordedSideEffectReasonImpl(inc, visiting);
+    return recordedIncludeSideEffectResolver.FindReason(inc);
   };
 
   auto includeHasRecordedSideEffects =
@@ -533,140 +716,14 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     return includeRecordedSideEffectReason(inc).has_value();
   };
 
-  auto hunkReplacementObservesMacroStateDirective =
-      [&](const RefoldModel::MacroDirective &directive) {
-        return macroStateProof_.ReplacementObservesMacroStateDirective(
-            directive, sourceMapper_.SliceBSource(h.bStart, h.bEnd),
-            /*unprovenObserves=*/true);
-      };
-
-  auto includeIsDescendantOf = [&](const RefoldModel::IncludeItem &candidate,
-                                   const RefoldModel::IncludeItem &root) {
-    std::optional<uint64_t> cur = candidate.parent;
-    while (cur) {
-      if (*cur == root.id)
-        return true;
-      const RefoldModel::IncludeItem *parent = nullptr;
-      for (const auto &inc : model_.GetIncludes())
-        if (inc.id == *cur) {
-          parent = &inc;
-          break;
-        }
-      if (!parent)
-        return false;
-      cur = parent->parent;
-    }
-    return false;
-  };
-
-  // Return true iff a complete include directive can be carried forward as part
-  // of a preserved conditional island even though its subtree has modeled
-  // macro-state effects.
-  //
-  // This is deliberately stricter than ordinary include preservation and
-  // different from the zero-token include consumption proof above.  The include
-  // is not deleted: its directive remains in the emitted conditional island, so
-  // #define/#undef state transitions and #pragma once remain in source order.
-  // Still fail closed for declarations, token-producing descendants, generic
-  // pragmas, non-macro-state directives, and replacement text that mentions a
-  // macro whose state would be introduced only after the replacement payload.
-  std::function<bool(const RefoldModel::IncludeItem &, DenseSet<uint64_t> &)>
-      includeIsPreservableConditionalStateIncludeImpl;
-  includeIsPreservableConditionalStateIncludeImpl =
-      [&](const RefoldModel::IncludeItem &inc,
-          DenseSet<uint64_t> &visiting) -> bool {
-    if (inc.cover.IsValid())
-      return false;
-    if (!visiting.insert(inc.id).second)
-      return false;
-
-    auto finish = [&](bool result) {
-      visiting.erase(inc.id);
-      return result;
-    };
-
-    if (!inc.decls.empty())
-      return finish(false);
-
-    for (const auto &child : model_.GetIncludes()) {
-      if (!child.parent || *child.parent != inc.id)
-        continue;
-      if (!includeIsPreservableConditionalStateIncludeImpl(child, visiting))
-        return finish(false);
-    }
-
-    for (const auto &directive : model_.GetMacroDirectives()) {
-      if (!directive.ownerIncludeId)
-        continue;
-      bool ownedByInclude = *directive.ownerIncludeId == inc.id;
-      if (!ownedByInclude)
-        for (const auto &child : model_.GetIncludes())
-          if (child.id == *directive.ownerIncludeId &&
-              includeIsDescendantOf(child, inc)) {
-            ownedByInclude = true;
-            break;
-          }
-      if (!ownedByInclude)
-        continue;
-
-      if (hunkReplacementObservesMacroStateDirective(directive))
-        return finish(false);
-    }
-
-    for (const auto &group : model_.GetConds()) {
-      if (!group.parentIncludeId)
-        continue;
-      bool ownedByInclude = *group.parentIncludeId == inc.id;
-      if (!ownedByInclude)
-        for (const auto &child : model_.GetIncludes())
-          if (child.id == *group.parentIncludeId &&
-              includeIsDescendantOf(child, inc)) {
-            ownedByInclude = true;
-            break;
-          }
-      if (!ownedByInclude)
-        continue;
-      for (const RefoldModel::CondArm &arm : group.arms)
-        if (arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end)
-          return finish(false);
-    }
-
-    for (const auto &macro : model_.GetMacroInvocations()) {
-      if (!macro.ownerIncludeId)
-        continue;
-      bool ownedByInclude = *macro.ownerIncludeId == inc.id;
-      if (!ownedByInclude)
-        for (const auto &child : model_.GetIncludes())
-          if (child.id == *macro.ownerIncludeId &&
-              includeIsDescendantOf(child, inc)) {
-            ownedByInclude = true;
-            break;
-          }
-      if (!ownedByInclude)
-        continue;
-      if (macro.cover.IsValid())
-        return finish(false);
-      for (const auto &span : macro.stringifySpans)
-        if (span.IsValid())
-          return finish(false);
-      for (const auto &span : macro.pasteSpans)
-        if (span.IsValid())
-          return finish(false);
-    }
-
-    if (inc.resolvedPath)
-      for (const auto &pragma : model_.GetPragmas())
-        if (paths_.PathsEqual(pragma.sitePath, *inc.resolvedPath) &&
-            !pragmaIsConsumableIncludeLocalState(pragma))
-          return finish(false);
-
-    return finish(true);
-  };
+  const ConditionalStateIncludePreservationResolver
+      conditionalStateIncludePreservationResolver(
+          model_, paths_, macroStateProof_, sourceMapper_, h,
+          pragmaIsConsumableIncludeLocalState);
 
   auto includeIsPreservableConditionalStateInclude =
       [&](const RefoldModel::IncludeItem &inc) -> bool {
-    DenseSet<uint64_t> visiting;
-    return includeIsPreservableConditionalStateIncludeImpl(inc, visiting);
+    return conditionalStateIncludePreservationResolver.IsPreservable(inc);
   };
 
   // Recursively prove that a zero-token macro invocation is source-neutral.
@@ -1711,17 +1768,14 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       return std::nullopt;
     }
 
-    auto pathIdentityPathsEqual = [this](StringRef lhs, StringRef rhs) {
-      return paths_.PathsEqual(lhs, rhs);
-    };
 
     SourceLineDirectiveLogicalLineRewriter sourceLineDirectiveLineRewriter =
         [&](StringRef logicalLine, ArrayRef<uint64_t> sourceOffsets,
             SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver)
         -> std::optional<SourceLineDirectiveLogicalLineRewrite> {
       return rewriteSourceLineDirectiveLogicalLineMacros(
-          model_, tuPath, logicalLine, sourceOffsets, pathIdentityPathsEqual,
-          lexLang_, std::nullopt, std::move(builtinMacroResolver));
+          model_, tuPath, logicalLine, sourceOffsets, paths_, lexLang_,
+          std::nullopt, std::move(builtinMacroResolver));
     };
 
     DenseSet<uint64_t> mixedSourceLineDirectiveMacroIds;
@@ -1749,8 +1803,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
                 tuBytes, gapBegin, gapEnd, sourceEnd, tuPath,
                 sourceLineDirectiveLineRewriter, &acceptedMacroIds, StringRef(),
                 !sourceSuffixMayObservePresumedFileSpelling(
-                    model_, tuPath, sourceEnd, pathIdentityPathsEqual,
-                    tuBytes)))
+                    model_, tuPath, sourceEnd, paths_, tuBytes)))
           continue;
 
         recordSourceLineDirectiveMacroIds(acceptedMacroIds);
@@ -1863,8 +1916,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
                       sourceLineDirectiveLineRewriter, &acceptedMacroIds,
                       StringRef(),
                       !sourceSuffixMayObservePresumedFileSpelling(
-                          model_, tuPath, sourceEnd, pathIdentityPathsEqual,
-                          tuBytes))) {
+                          model_, tuPath, sourceEnd, paths_, tuBytes))) {
             // A source-spelled line-control directive contributes no PP
             // tokens, but it is not disposable trivia.  If the copied
             // suffix has no live line-state observer, preserve the original

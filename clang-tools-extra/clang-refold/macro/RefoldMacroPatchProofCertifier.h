@@ -5,8 +5,9 @@
 // Owns the small, focused operations that *certify* a `MacroPatch` — i.e.,
 // audit + write theorem-proof metadata (proof carriers, witnesses,
 // accepted-result candidates, materialized-output ranges) onto the patch.
-// The certifier is the shared proof-stamping boundary for macro services that
-// construct candidate patches but should not depend on planner-private methods.
+// The certifier is the shared proof-certification boundary for macro services
+// that construct candidate patches but should not depend on planner-private
+// methods.
 //
 // The certifier is intentionally a thin layer over `RefoldProofLattice`:
 // most methods either install a `MacroPatchProof` via `SetMacroPatchProof`,
@@ -34,7 +35,7 @@ namespace refold {
 
 class RefoldProofLattice;
 
-/// Stamps and certifies macro-patch proof carriers.
+/// Certifies macro-patch proof carriers.
 ///
 /// The certifier attaches args-only, generated-callee, whole-cover, and
 /// materialized-range proof facts to MacroPatch objects before they reach
@@ -58,7 +59,7 @@ public:
                                                   uint64_t outputByteEnd) const;
 
   /// Certify the macro candidate that the final selector chose: if the
-  /// selected candidate carries an emitted accepted candidate, stamp it onto
+  /// selected candidate carries an emitted accepted candidate, attach it to
   /// the patch via the lattice; otherwise leave the patch uncertified and
   /// trace the selector-only outcome.
   void CertifySelectedFinalMacroCandidate(

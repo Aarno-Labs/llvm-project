@@ -140,7 +140,7 @@ public:
   /// Include patches are created before materialization chooses a concrete
   /// preserving anchor or realization envelope. The resulting summary therefore
   /// is only a staging object, so the default summary intentionally avoids
-  /// claiming any normalized accepted path. Callers must restamp the emitted
+  /// claiming any normalized accepted path. Callers must recertify the emitted
   /// accepted result onto a concrete witness-backed include class once
   /// materialization chooses the final path.
   ProofSummary BuildIncludePatchProofSummary(bool realizedSurface,

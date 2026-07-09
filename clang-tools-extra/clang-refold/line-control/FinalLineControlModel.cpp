@@ -15,7 +15,7 @@
 
 #include "line-control/FinalLineControlModel.h"
 
-#include "core/RefoldEngine.h"
+#include "core/RefoldLangOptions.h"
 #include "core/RefoldPreprocessRecheck.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldTheoremAudit.h"
@@ -712,7 +712,7 @@ static bool
 preprocessedTokensEqualForLinePrune(StringRef currentPP, StringRef candidatePP,
                                     const RefoldModel::PreprocessContext &ctx,
                                     std::string &reason) {
-  const LangOptions lexLang = RefoldEngine::MakeLexLangOptions(ctx.lang);
+  const LangOptions lexLang = makeRefoldLexLangOptions(ctx.lang);
   std::vector<PPTok> currentTokens;
   std::vector<PPTok> candidateTokens;
   std::vector<std::size_t> currentOffsets;

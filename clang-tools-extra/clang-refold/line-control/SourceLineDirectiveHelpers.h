@@ -15,6 +15,7 @@
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlFilename.h"
 #include "source/TokenTextHelpers.h"
+#include "util/RefoldPathIdentity.h"
 #include "util/StringUtils.h"
 
 #include "clang/Basic/LangOptions.h"
@@ -255,8 +256,7 @@ bool sourceLineDirectiveMacroHasMaterializedPPTokens(
 /// cases not represented by an invocation with a usable source range.
 bool sourceSuffixMayObservePresumedFileSpelling(
     const RefoldModel &model, StringRef file, uint64_t resumeOffset,
-    llvm::function_ref<bool(StringRef, StringRef)> pathsEqual,
-    StringRef fileText);
+    const RefoldPathIdentity &paths, StringRef fileText);
 
 /// Return the end offset of an admitted raw backslash escape in an argument
 /// that is about to be macro-stringified for a line-control filename operand.
@@ -455,8 +455,7 @@ std::optional<SourceLineDirectiveLogicalLineRewrite>
 rewriteSourceLineDirectiveLogicalLineMacros(
     const RefoldModel &model, StringRef file, StringRef logicalLine,
     ArrayRef<uint64_t> logicalLineSourceOffsets,
-    llvm::function_ref<bool(StringRef, StringRef)> pathsEqual,
-    const LangOptions &lang,
+    const RefoldPathIdentity &paths, const LangOptions &lang,
     std::optional<uint64_t> ownerIncludeId = std::nullopt,
     SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver = nullptr);
 

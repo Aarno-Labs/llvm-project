@@ -28,7 +28,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -386,6 +386,322 @@ struct CurrentLevelChildSlotRewrite {
   std::string newSyntax;
 };
 
+
+/// Rebuilds current-level invocation spelling from proven formal-slot templates.
+///
+/// The resolver trusts the model's recorded invocation/source ranges and the
+/// current-level template-surface helpers.  It owns the recursive child walk:
+/// child invocations are visited in recorded model order, recursion is bounded
+/// by the finite invocation count, and ambiguous or overlapping child rewrites
+/// fail closed instead of choosing a source spelling heuristically.
+class CurrentLevelInvocationSyntaxBuilder {
+public:
+  CurrentLevelInvocationSyntaxBuilder(
+      const RefoldMacroArgsOnlyTemplateSolver &solver,
+      const RefoldMacroArgsOnlyTemplateSolver::Dependencies &deps)
+      : solver_(solver), deps_(deps) {}
+
+  /// Rebuilds `inv` as source syntax when every changed formal is provable.
+  std::optional<std::string>
+  Build(const RefoldModel::MacroInvocation &inv) const {
+    return Build(inv, 0);
+  }
+
+private:
+  /// Recursively rebuilds `inv`, preserving child traversal and depth bounds.
+  std::optional<std::string> Build(const RefoldModel::MacroInvocation &inv,
+                                   unsigned depth) const {
+    // The recursion follows recorded child invocation edges.  A path deeper
+    // than the number of recorded invocations implies a cycle or stale
+    // metadata, so use that structural bound instead of a fixed depth cap.
+    if (depth > (*deps_.model).GetMacroInvocations().size() || !inv.invText ||
+        !inv.invB || !inv.invE || !inv.stringifySpans.empty() ||
+        !inv.pasteSpans.empty())
+      return std::nullopt;
+
+    auto formalRangesOpt =
+        RefoldMacroActualLayout({deps_.lexLang})
+            .GetMacroInvocationFormalArgContentRanges(inv, *inv.invText);
+    if (!formalRangesOpt)
+      return std::nullopt;
+    const auto &formalRanges = *formalRangesOpt;
+
+    auto standardSpansOpt =
+        solver_.GetCurrentLevelStandardArgSpansForInvocation(inv, formalRanges);
+    if (!standardSpansOpt)
+      return std::nullopt;
+    const auto &standardSpans = *standardSpansOpt;
+    if (standardSpans.size() != formalRanges.size())
+      return std::nullopt;
+
+    // Accumulate replacements by parsed formal slot.  Each replacement is
+    // derived from one standard span's old expansion and its mapped B-side
+    // expansion, then later applied directly to the invocation spelling.
+    DenseMap<uint32_t, std::string> replByFormal;
+    for (size_t i = 0; i < standardSpans.size(); ++i) {
+      const RefoldModel::PPArgSpan &sp = standardSpans[i];
+      if (sp.argIdx != i || i >= formalRanges.size())
+        return std::nullopt;
+
+      const auto &argRange = formalRanges[i];
+      if (argRange.second < argRange.first ||
+          argRange.second > inv.invText->size())
+        return std::nullopt;
+
+      StringRef rawArg =
+          StringRef(*inv.invText).slice(argRange.first, argRange.second);
+      size_t trimLead = 0;
+      size_t trimEnd = rawArg.size();
+      std::tie(trimLead, trimEnd) =
+          stringutils::trimWsRange(rawArg, 0, rawArg.size());
+      StringRef baseTrim = rawArg.slice(trimLead, trimEnd);
+
+      StringRef oldExpansion =
+          (*deps_.sourceMapper).SliceASource(sp.begin, sp.end).trim();
+      auto bEnv = (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(sp);
+      if (!bEnv)
+        return std::nullopt;
+      StringRef newExpansion =
+          (*deps_.sourceMapper).SliceBSource(bEnv->first, bEnv->second).trim();
+      if (oldExpansion.empty() || newExpansion.empty())
+        return std::nullopt;
+
+      std::optional<std::string> replacement;
+      if (oldExpansion == baseTrim) {
+        replacement = newExpansion.str();
+      } else if (auto loc = findUniqueTrimmedSubstring(baseTrim, oldExpansion)) {
+        replacement = stringutils::replaceRange(baseTrim.str(), loc->first,
+                                                loc->second, newExpansion);
+      } else {
+        // The formal spelling does not directly contain its old expansion; it
+        // may contain a nested macro invocation whose expansion accounts for
+        // that text.  Preserve such a child only if replacing the child
+        // spelling with its proven old expansion reconstructs `oldExpansion`,
+        // and replacing it with its proven new expansion reconstructs
+        // `newExpansion`.
+        if (!inv.invFile)
+          return std::nullopt;
+
+        SmallVector<CurrentLevelChildSlotRewrite, 4> childSlots;
+
+        const uint64_t absTrimBegin = *inv.invB + argRange.first + trimLead;
+        const uint64_t absTrimEnd = *inv.invB + argRange.first + trimEnd;
+
+        // Search lexical child invocations contained in this formal slot.
+        // `callerMacroId` is honored when present, but absence of that edge is
+        // not enough to accept a child; the file/range containment and the
+        // expansion-bridge proof below still have to succeed.
+        for (const auto &child : (*deps_.model).GetMacroInvocations()) {
+          if (child.id == inv.id || !child.invFile || !child.invB ||
+              !child.invE || !child.invText)
+            continue;
+          if (*child.invFile != *inv.invFile)
+            continue;
+          if (child.callerMacroId && *child.callerMacroId != inv.id)
+            continue;
+          if (*child.invB < absTrimBegin || *child.invE > absTrimEnd ||
+              *child.invE <= *child.invB)
+            continue;
+
+          auto childExpansion =
+              solver_.GetCurrentLevelExpansionTextForInvocation(child);
+          if (!childExpansion)
+            continue;
+          auto childNewSyntax = Build(child, depth + 1);
+          if (!childNewSyntax)
+            continue;
+
+          const uint64_t relB64 = *child.invB - absTrimBegin;
+          const uint64_t relE64 = *child.invE - absTrimBegin;
+          if (relE64 < relB64 || relE64 > baseTrim.size())
+            continue;
+
+          childSlots.push_back(CurrentLevelChildSlotRewrite{
+              static_cast<size_t>(relB64), static_cast<size_t>(relE64),
+              StringRef(childExpansion->first).trim().str(),
+              StringRef(childExpansion->second).trim().str(),
+              StringRef(*childNewSyntax).trim().str()});
+        }
+
+        if (childSlots.empty())
+          return std::nullopt;
+
+        // Apply child replacements from right to left so byte offsets remain
+        // relative to the original formal spelling.  Overlap is rejected by
+        // the monotonic `previousBegin` check in the loop.
+        llvm::sort(childSlots, [](const CurrentLevelChildSlotRewrite &lhs,
+                                  const CurrentLevelChildSlotRewrite &rhs) {
+          if (lhs.relBegin != rhs.relBegin)
+            return lhs.relBegin > rhs.relBegin;
+          return lhs.relEnd > rhs.relEnd;
+        });
+
+        // Maintain three parallel projections of the same formal spelling:
+        //   * oldExpanded: child syntax replaced by old local expansions;
+        //   * newExpanded: child syntax replaced by new local expansions;
+        //   * syntaxExpanded: child syntax replaced by updated child calls.
+        // The first two must exactly equal the parent formal's old/new
+        // expansion slices before the third may be used as source output.
+        std::string oldExpanded = baseTrim.str();
+        std::string newExpanded = baseTrim.str();
+        std::string syntaxExpanded = baseTrim.str();
+        size_t previousBegin = std::numeric_limits<size_t>::max();
+        for (const CurrentLevelChildSlotRewrite &slot : childSlots) {
+          if (slot.relEnd < slot.relBegin || slot.relEnd > baseTrim.size())
+            return std::nullopt;
+          if (previousBegin != std::numeric_limits<size_t>::max() &&
+              slot.relEnd > previousBegin)
+            return std::nullopt;
+          previousBegin = slot.relBegin;
+
+          oldExpanded = stringutils::replaceRange(
+              oldExpanded, slot.relBegin, slot.relEnd, slot.oldExpansion);
+          newExpanded = stringutils::replaceRange(
+              newExpanded, slot.relBegin, slot.relEnd, slot.newExpansion);
+          syntaxExpanded = stringutils::replaceRange(
+              syntaxExpanded, slot.relBegin, slot.relEnd, slot.newSyntax);
+        }
+
+        if (StringRef(oldExpanded).trim() != oldExpansion ||
+            StringRef(newExpanded).trim() != newExpansion)
+          return std::nullopt;
+        replacement = StringRef(syntaxExpanded).trim().str();
+      }
+
+      if (!replacement || StringRef(*replacement).trim().empty())
+        return std::nullopt;
+
+      // Do not emit a replacement that would change the current invocation's
+      // arity.  Macro argument collection protects commas only with nested
+      // parentheses; brackets and braces deliberately do not suppress this
+      // check for non-variadic formals.
+      const bool allowComma =
+          i < inv.defParams.size() && inv.defParams[i].variadic;
+      if (!allowComma && refoldMacroActualHasTopLevelComma(
+                             StringRef(*replacement), (*deps_.lexLang)))
+        return std::nullopt;
+
+      if (StringRef(*replacement).trim() != baseTrim)
+        replByFormal[static_cast<uint32_t>(i)] =
+            StringRef(*replacement).trim().str();
+    }
+
+    if (replByFormal.empty())
+      return std::nullopt;
+
+    // Apply formal-slot edits to the invocation spelling right-to-left, again
+    // preserving original byte offsets and avoiding dependence on map order.
+    struct LocalEdit {
+      size_t begin = 0;
+      size_t end = 0;
+      std::string repl;
+    };
+    SmallVector<LocalEdit, 8> edits;
+    for (const auto &entry : replByFormal) {
+      const uint32_t argIdx = entry.first;
+      if (argIdx >= formalRanges.size())
+        return std::nullopt;
+      const auto &range = formalRanges[argIdx];
+      edits.push_back(LocalEdit{range.first, range.second, entry.second});
+    }
+    llvm::sort(edits, [](const LocalEdit &lhs, const LocalEdit &rhs) {
+      return lhs.begin > rhs.begin;
+    });
+
+    std::string rewritten = inv.invText->str();
+    for (const LocalEdit &edit : edits) {
+      if (edit.end < edit.begin || edit.end > rewritten.size())
+        return std::nullopt;
+      rewritten =
+          stringutils::replaceRange(rewritten, edit.begin, edit.end, edit.repl);
+    }
+    return StringRef(rewritten).trim().str();
+  }
+
+  const RefoldMacroArgsOnlyTemplateSolver &solver_;
+  const RefoldMacroArgsOnlyTemplateSolver::Dependencies &deps_;
+};
+
+/// Enumerates bounded B-token assignments for args-only template occurrences.
+///
+/// The caller supplies an exact A-side template partition and the whole B-side
+/// token envelope.  This resolver owns only the mutable DFS state: fixed body
+/// spans must match literally, argument occurrences enumerate B-token intervals
+/// in increasing end-position order, and enumeration stops after the existing
+/// ambiguity cap so downstream candidate construction stays fail-closed.
+class TemplateAssignmentEnumerator {
+public:
+  using Assignment = std::vector<std::pair<size_t, size_t>>;
+
+  TemplateAssignmentEnumerator(
+      ArrayRef<ArgsOnlyTemplateElem> elems, std::pair<size_t, size_t> bEnv,
+      const RefoldMacroArgsOnlyTemplateSolver::Dependencies &deps)
+      : elems_(elems), bEnv_(bEnv), deps_(deps) {}
+
+  /// Enumerates all assignments up to the existing ambiguity cutoff.
+  std::vector<Assignment> Enumerate(size_t occurrenceCount) {
+    const std::pair<size_t, size_t> unset = {
+        std::numeric_limits<size_t>::max(),
+        std::numeric_limits<size_t>::max()};
+    curAssign_.assign(occurrenceCount, unset);
+    solutions_.clear();
+    Dfs(0, bEnv_.first);
+    return solutions_;
+  }
+
+private:
+  /// Returns whether fixed A-side body tokens match at `bPos`.
+  bool BodyMatchesAt(const ArgsOnlyTemplateElem &elem, size_t bPos) const {
+    const size_t len = static_cast<size_t>(elem.aEnd - elem.aBegin);
+    if (bPos + len > bEnv_.second)
+      return false;
+    for (size_t i = 0; i < len; ++i) {
+      if (deps_.aToks[static_cast<size_t>(elem.aBegin) + i].spelling !=
+          deps_.bToks[bPos + i].spelling)
+        return false;
+    }
+    return true;
+  }
+
+  /// DFSes template elements while preserving B-side interval order.
+  void Dfs(size_t elemIdx, size_t bPos) {
+    if (solutions_.size() > 16)
+      return;
+    if (elemIdx == elems_.size()) {
+      if (bPos == bEnv_.second)
+        solutions_.push_back(curAssign_);
+      return;
+    }
+
+    const ArgsOnlyTemplateElem &elem = elems_[elemIdx];
+    if (!elem.isArg) {
+      const size_t len = static_cast<size_t>(elem.aEnd - elem.aBegin);
+      if (BodyMatchesAt(elem, bPos))
+        Dfs(elemIdx + 1, bPos + len);
+      return;
+    }
+
+    // Argument occurrences enumerate non-empty B-token intervals in increasing
+    // end order.  Reset the slot after recursion so sibling branches cannot
+    // inherit speculative assignments.
+    for (size_t end = bPos + 1; end <= bEnv_.second; ++end) {
+      curAssign_[elem.occurrenceOrdinal] = {bPos, end};
+      Dfs(elemIdx + 1, end);
+      curAssign_[elem.occurrenceOrdinal] = {
+          std::numeric_limits<size_t>::max(),
+          std::numeric_limits<size_t>::max()};
+      if (solutions_.size() > 16)
+        return;
+    }
+  }
+
+  ArrayRef<ArgsOnlyTemplateElem> elems_;
+  std::pair<size_t, size_t> bEnv_;
+  const RefoldMacroArgsOnlyTemplateSolver::Dependencies &deps_;
+  Assignment curAssign_;
+  std::vector<Assignment> solutions_;
+};
+
 } // namespace
 
 std::optional<std::vector<RefoldModel::PPArgSpan>>
@@ -644,230 +960,13 @@ RefoldMacroArgsOnlyTemplateSolver::TryTemplateSolvedArgsOnlyPatch(
     return std::nullopt;
   }
 
-  // Recursively rebuild a macro invocation's source spelling from its
-  // current-level template proof.  The recursion is used only to preserve
-  // nested lexical child invocations whose old and new local expansion
-  // surfaces can be proven to bridge the parent argument.
-  std::function<std::optional<std::string>(const RefoldModel::MacroInvocation &,
-                                           unsigned)>
-      buildInvocationSyntaxFromCurrentLevelTemplate;
-
-  buildInvocationSyntaxFromCurrentLevelTemplate =
-      [&](const RefoldModel::MacroInvocation &inv,
-          unsigned depth) -> std::optional<std::string> {
-    // The recursion follows recorded child invocation edges.  A path deeper
-    // than the number of recorded invocations implies a cycle or stale
-    // metadata, so use that structural bound instead of a fixed depth cap.
-    if (depth > (*deps_.model).GetMacroInvocations().size() || !inv.invText ||
-        !inv.invB || !inv.invE || !inv.stringifySpans.empty() ||
-        !inv.pasteSpans.empty())
-      return std::nullopt;
-
-    auto formalRangesOpt =
-        RefoldMacroActualLayout({deps_.lexLang})
-            .GetMacroInvocationFormalArgContentRanges(inv, *inv.invText);
-    if (!formalRangesOpt)
-      return std::nullopt;
-    const auto &formalRanges = *formalRangesOpt;
-
-    auto standardSpansOpt =
-        GetCurrentLevelStandardArgSpansForInvocation(inv, formalRanges);
-    if (!standardSpansOpt)
-      return std::nullopt;
-    const auto &standardSpans = *standardSpansOpt;
-    if (standardSpans.size() != formalRanges.size())
-      return std::nullopt;
-
-    // Accumulate replacements by parsed formal slot.  Each replacement is
-    // derived from one standard span's old expansion and its mapped B-side
-    // expansion, then later applied directly to the invocation spelling.
-    DenseMap<uint32_t, std::string> replByFormal;
-    for (size_t i = 0; i < standardSpans.size(); ++i) {
-      const RefoldModel::PPArgSpan &sp = standardSpans[i];
-      if (sp.argIdx != i || i >= formalRanges.size())
-        return std::nullopt;
-
-      const auto &argRange = formalRanges[i];
-      if (argRange.second < argRange.first ||
-          argRange.second > inv.invText->size())
-        return std::nullopt;
-
-      StringRef rawArg =
-          StringRef(*inv.invText).slice(argRange.first, argRange.second);
-      size_t trimLead = 0;
-      size_t trimEnd = rawArg.size();
-      std::tie(trimLead, trimEnd) =
-          stringutils::trimWsRange(rawArg, 0, rawArg.size());
-      StringRef baseTrim = rawArg.slice(trimLead, trimEnd);
-
-      StringRef oldExpansion =
-          (*deps_.sourceMapper).SliceASource(sp.begin, sp.end).trim();
-      auto bEnv = (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(sp);
-      if (!bEnv)
-        return std::nullopt;
-      StringRef newExpansion =
-          (*deps_.sourceMapper).SliceBSource(bEnv->first, bEnv->second).trim();
-      if (oldExpansion.empty() || newExpansion.empty())
-        return std::nullopt;
-
-      std::optional<std::string> replacement;
-      if (oldExpansion == baseTrim) {
-        replacement = newExpansion.str();
-      } else if (auto loc =
-                     findUniqueTrimmedSubstring(baseTrim, oldExpansion)) {
-        replacement = stringutils::replaceRange(baseTrim.str(), loc->first,
-                                                loc->second, newExpansion);
-      } else {
-        // The formal spelling does not directly contain its old expansion; it
-        // may contain a nested macro invocation whose expansion accounts for
-        // that text.  Preserve such a child only if replacing the child
-        // spelling with its proven old expansion reconstructs `oldExpansion`,
-        // and replacing it with its proven new expansion reconstructs
-        // `newExpansion`.
-        if (!inv.invFile)
-          return std::nullopt;
-
-        SmallVector<CurrentLevelChildSlotRewrite, 4> childSlots;
-
-        const uint64_t absTrimBegin = *inv.invB + argRange.first + trimLead;
-        const uint64_t absTrimEnd = *inv.invB + argRange.first + trimEnd;
-
-        // Search lexical child invocations contained in this formal slot.
-        // `callerMacroId` is honored when present, but absence of that edge
-        // is not enough to accept a child; the file/range containment and the
-        // expansion-bridge proof below still have to succeed.
-        for (const auto &child : (*deps_.model).GetMacroInvocations()) {
-          if (child.id == inv.id || !child.invFile || !child.invB ||
-              !child.invE || !child.invText)
-            continue;
-          if (*child.invFile != *inv.invFile)
-            continue;
-          if (child.callerMacroId && *child.callerMacroId != inv.id)
-            continue;
-          if (*child.invB < absTrimBegin || *child.invE > absTrimEnd ||
-              *child.invE <= *child.invB)
-            continue;
-
-          auto childExpansion =
-              GetCurrentLevelExpansionTextForInvocation(child);
-          if (!childExpansion)
-            continue;
-          auto childNewSyntax =
-              buildInvocationSyntaxFromCurrentLevelTemplate(child, depth + 1);
-          if (!childNewSyntax)
-            continue;
-
-          const uint64_t relB64 = *child.invB - absTrimBegin;
-          const uint64_t relE64 = *child.invE - absTrimBegin;
-          if (relE64 < relB64 || relE64 > baseTrim.size())
-            continue;
-
-          childSlots.push_back(CurrentLevelChildSlotRewrite{
-              static_cast<size_t>(relB64), static_cast<size_t>(relE64),
-              StringRef(childExpansion->first).trim().str(),
-              StringRef(childExpansion->second).trim().str(),
-              StringRef(*childNewSyntax).trim().str()});
-        }
-
-        if (childSlots.empty())
-          return std::nullopt;
-
-        // Apply child replacements from right to left so byte offsets remain
-        // relative to the original formal spelling.  Overlap is rejected by
-        // the monotonic `previousBegin` check in the loop.
-        llvm::sort(childSlots, [](const CurrentLevelChildSlotRewrite &lhs,
-                                  const CurrentLevelChildSlotRewrite &rhs) {
-          if (lhs.relBegin != rhs.relBegin)
-            return lhs.relBegin > rhs.relBegin;
-          return lhs.relEnd > rhs.relEnd;
-        });
-
-        // Maintain three parallel projections of the same formal spelling:
-        //   * oldExpanded: child syntax replaced by old local expansions;
-        //   * newExpanded: child syntax replaced by new local expansions;
-        //   * syntaxExpanded: child syntax replaced by updated child calls.
-        // The first two must exactly equal the parent formal's old/new
-        // expansion slices before the third may be used as source output.
-        std::string oldExpanded = baseTrim.str();
-        std::string newExpanded = baseTrim.str();
-        std::string syntaxExpanded = baseTrim.str();
-        size_t previousBegin = std::numeric_limits<size_t>::max();
-        for (const CurrentLevelChildSlotRewrite &slot : childSlots) {
-          if (slot.relEnd < slot.relBegin || slot.relEnd > baseTrim.size())
-            return std::nullopt;
-          if (previousBegin != std::numeric_limits<size_t>::max() &&
-              slot.relEnd > previousBegin)
-            return std::nullopt;
-          previousBegin = slot.relBegin;
-
-          oldExpanded = stringutils::replaceRange(
-              oldExpanded, slot.relBegin, slot.relEnd, slot.oldExpansion);
-          newExpanded = stringutils::replaceRange(
-              newExpanded, slot.relBegin, slot.relEnd, slot.newExpansion);
-          syntaxExpanded = stringutils::replaceRange(
-              syntaxExpanded, slot.relBegin, slot.relEnd, slot.newSyntax);
-        }
-
-        if (StringRef(oldExpanded).trim() != oldExpansion ||
-            StringRef(newExpanded).trim() != newExpansion)
-          return std::nullopt;
-        replacement = StringRef(syntaxExpanded).trim().str();
-      }
-
-      if (!replacement || StringRef(*replacement).trim().empty())
-        return std::nullopt;
-      // Do not emit a replacement that would change the current invocation's
-      // arity.  Macro argument collection protects commas only with nested
-      // parentheses; brackets and braces deliberately do not suppress this
-      // check for non-variadic formals.
-      const bool allowComma =
-          i < inv.defParams.size() && inv.defParams[i].variadic;
-      if (!allowComma && refoldMacroActualHasTopLevelComma(
-                             StringRef(*replacement), (*deps_.lexLang)))
-        return std::nullopt;
-
-      if (StringRef(*replacement).trim() != baseTrim)
-        replByFormal[static_cast<uint32_t>(i)] =
-            StringRef(*replacement).trim().str();
-    }
-
-    if (replByFormal.empty())
-      return std::nullopt;
-
-    // Apply formal-slot edits to the invocation spelling right-to-left, again
-    // preserving original byte offsets and avoiding dependence on map order.
-    struct LocalEdit {
-      size_t begin = 0;
-      size_t end = 0;
-      std::string repl;
-    };
-    SmallVector<LocalEdit, 8> edits;
-    for (const auto &entry : replByFormal) {
-      const uint32_t argIdx = entry.first;
-      if (argIdx >= formalRanges.size())
-        return std::nullopt;
-      const auto &range = formalRanges[argIdx];
-      edits.push_back(LocalEdit{range.first, range.second, entry.second});
-    }
-    llvm::sort(edits, [](const LocalEdit &lhs, const LocalEdit &rhs) {
-      return lhs.begin > rhs.begin;
-    });
-
-    std::string rewritten = inv.invText->str();
-    for (const LocalEdit &edit : edits) {
-      if (edit.end < edit.begin || edit.end > rewritten.size())
-        return std::nullopt;
-      rewritten =
-          stringutils::replaceRange(rewritten, edit.begin, edit.end, edit.repl);
-    }
-    return StringRef(rewritten).trim().str();
-  };
+  CurrentLevelInvocationSyntaxBuilder currentLevelSyntaxBuilder(*this, deps_);
 
   // Prefer the current-level template proof when it can rewrite the whole
   // invocation. It captures brace/bracket comma-split cases before a narrower
   // hunk-local proof can accept a partial patch.
-  if (auto currentLevelRewrite = buildInvocationSyntaxFromCurrentLevelTemplate(
-          templateInvocation, 0)) {
+  if (auto currentLevelRewrite =
+          currentLevelSyntaxBuilder.Build(templateInvocation)) {
     if (StringRef(*currentLevelRewrite).trim() !=
         templateBaseInvocationText.trim()) {
       bool counterWholeEnvelopeReplayValidated = false;
@@ -993,54 +1092,10 @@ RefoldMacroArgsOnlyTemplateSolver::TryTemplateSolvedArgsOnlyPatch(
       occurrenceCount > 32)
     return std::nullopt;
 
-  auto bodyMatchesAt = [&](const ArgsOnlyTemplateElem &elem,
-                           size_t bPos) -> bool {
-    const size_t len = static_cast<size_t>(elem.aEnd - elem.aBegin);
-    if (bPos + len > bEnv->second)
-      return false;
-    for (size_t i = 0; i < len; ++i) {
-      if (deps_.aToks[static_cast<size_t>(elem.aBegin) + i].spelling !=
-          deps_.bToks[bPos + i].spelling)
-        return false;
-    }
-    return true;
-  };
-
-  const std::pair<size_t, size_t> unset = {std::numeric_limits<size_t>::max(),
-                                           std::numeric_limits<size_t>::max()};
-  std::vector<std::pair<size_t, size_t>> curAssign(occurrenceCount, unset);
-  std::vector<std::vector<std::pair<size_t, size_t>>> solutions;
-
-  // Enumerate all bounded assignments of B-token intervals to argument
-  // occurrences while requiring fixed body spans to match literally. The cap
-  // keeps this a small proof search rather than an unbounded parser.
-  std::function<void(size_t, size_t)> dfs = [&](size_t elemIdx, size_t bPos) {
-    if (solutions.size() > 16)
-      return;
-    if (elemIdx == elems.size()) {
-      if (bPos == bEnv->second)
-        solutions.push_back(curAssign);
-      return;
-    }
-
-    const ArgsOnlyTemplateElem &elem = elems[elemIdx];
-    if (!elem.isArg) {
-      const size_t len = static_cast<size_t>(elem.aEnd - elem.aBegin);
-      if (bodyMatchesAt(elem, bPos))
-        dfs(elemIdx + 1, bPos + len);
-      return;
-    }
-
-    for (size_t end = bPos + 1; end <= bEnv->second; ++end) {
-      curAssign[elem.occurrenceOrdinal] = {bPos, end};
-      dfs(elemIdx + 1, end);
-      curAssign[elem.occurrenceOrdinal] = unset;
-      if (solutions.size() > 16)
-        return;
-    }
-  };
-
-  dfs(0, bEnv->first);
+  TemplateAssignmentEnumerator assignmentEnumerator(
+      ArrayRef<ArgsOnlyTemplateElem>(elems.data(), elems.size()), *bEnv, deps_);
+  std::vector<TemplateAssignmentEnumerator::Assignment> solutions =
+      assignmentEnumerator.Enumerate(occurrenceCount);
   if (solutions.empty() || solutions.size() > 16)
     return std::nullopt;
 

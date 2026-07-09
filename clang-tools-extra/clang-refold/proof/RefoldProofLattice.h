@@ -204,7 +204,7 @@ public:
 
   /// Install the canonical macro proof carrier and refresh summaries.
   ///
-  /// This is the only primary stamping API for macro-patch proof identity.  The
+  /// This is the only primary certification API for macro-patch proof identity.  The
   /// normalized ProofSummary and its canonical EmittedProof are rebuilt from
   /// MacroPatchProof immediately through `MacroPatchProofClassifier()`.
   void SetMacroPatchProof(MacroPatch &patch, MacroPatchProof proof) const;
@@ -212,7 +212,7 @@ public:
   /// Materialize the explicit whole-cover realization proof.
   ///
   /// Whole-cover output is not tracked as an anonymous fallback result.  This
-  /// helper stamps the accepted patch as a first-class invocation-realization
+  /// helper certifies the accepted patch as a first-class invocation-realization
   /// proof and copies the exact realization envelope derived by the whole-cover
   /// plan into the patch-local certificate fields.
   void CertifyMacroWholeCoverRealizationPatch(

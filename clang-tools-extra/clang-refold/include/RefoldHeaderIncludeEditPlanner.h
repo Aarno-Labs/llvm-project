@@ -150,7 +150,7 @@ private:
   };
 
   /// Selected insertion anchor plus its accepted-result carrier.
-  /// The carrier is produced before commit so edit stamping does not rebuild or
+  /// The carrier is produced before commit so edit certification does not rebuild or
   /// reinterpret the winning proof.
   struct SelectedInsertAnchorCandidate {
     /// Local byte-anchor candidate selected by the proof lattice.
@@ -637,7 +637,7 @@ private:
                             const IncludePatch &patch) const;
 
   /// Commits a selected pure-insertion anchor into the output plan.
-  /// Boundary padding, local line resync, and accepted-result stamping are
+  /// Boundary padding, local line resync, and accepted-result certification are
   /// applied in the same operation.
   void
   CommitInsertCandidate(const HeaderInsertionPlanningState &state,

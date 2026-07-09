@@ -15,7 +15,7 @@
 
 #include "line-control/RefoldNoLinesPruning.h"
 
-#include "core/RefoldEngine.h"
+#include "core/RefoldLangOptions.h"
 #include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
 #include "line-control/FinalLineControlModel.h"
@@ -509,7 +509,7 @@ buildNoLinesIgnoreMask(const json::Object &rootJson, const PPCtx &ctx,
 
   std::vector<PPTok> a0Toks;
   std::vector<std::size_t> a0Off;
-  const LangOptions lexLang = RefoldEngine::MakeLexLangOptions(ctx.lang);
+  const LangOptions lexLang = makeRefoldLexLangOptions(ctx.lang);
   lexPPTokens(a0Bytes, a0Toks, a0Off, lexLang);
 
   std::vector<uint8_t> a0Sensitive(a0Toks.size(), 0);

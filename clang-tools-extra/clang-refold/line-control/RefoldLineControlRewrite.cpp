@@ -604,24 +604,43 @@ bool sourceLineDirectiveMacroHasMaterializedPPTokens(
   return false;
 }
 
-bool sourceSuffixMayObservePresumedFileSpelling(
-    const RefoldModel &model, StringRef file, uint64_t resumeOffset,
-    llvm::function_ref<bool(StringRef, StringRef)> pathsEqual,
-    StringRef fileText) {
-  auto findMacroById =
-      [&](uint64_t id) -> const RefoldModel::MacroInvocation * {
+namespace {
+
+/// Checks whether a file-spelling macro can be observed in a source suffix.
+///
+/// The model and path identity service are trusted by the line-control proof caller.
+/// Cycles, missing callers, and unknown locations stay conservative positives;
+/// only a known invocation in another file with no caller chain is ruled out.
+class LineControlSuffixInvocationResolver {
+public:
+  LineControlSuffixInvocationResolver(
+      const RefoldModel &model, StringRef file, uint64_t resumeOffset,
+      const RefoldPathIdentity &paths)
+      : model_(model), file_(file), resumeOffset_(resumeOffset),
+        paths_(paths) {}
+
+  /// Starts one cycle-detected caller-chain walk for `macro`.
+  bool MayOccurInSuffix(const RefoldModel::MacroInvocation &macro) const {
+    SmallVector<uint64_t, 8> activeIds;
+    return MayOccurInSuffix(macro, activeIds);
+  }
+
+private:
+  /// Finds a recorded macro invocation by stable model ID.
+  const RefoldModel::MacroInvocation *FindMacroById(uint64_t id) const {
     for (const RefoldModel::MacroInvocation &candidate :
-         model.GetMacroInvocations())
+         model_.GetMacroInvocations())
       if (candidate.id == id)
         return &candidate;
     return nullptr;
-  };
+  }
 
-  std::function<bool(const RefoldModel::MacroInvocation &,
-                     SmallVectorImpl<uint64_t> &)>
-      invocationMayOccurInSuffix =
-          [&](const RefoldModel::MacroInvocation &macro,
-              SmallVectorImpl<uint64_t> &activeIds) -> bool {
+  /// Recursively walks a macro invocation and its recorded caller chain.
+  ///
+  /// The ordering and fail-closed cases match the old local resolver: direct
+  /// suffix hits win first, then caller recursion, then unknown locations.
+  bool MayOccurInSuffix(const RefoldModel::MacroInvocation &macro,
+                        SmallVectorImpl<uint64_t> &activeIds) const {
     if (std::find(activeIds.begin(), activeIds.end(), macro.id) !=
         activeIds.end())
       return true;
@@ -633,33 +652,46 @@ bool sourceSuffixMayObservePresumedFileSpelling(
     };
 
     if (macro.invFile && !macro.invFile->empty() &&
-        pathsEqual(*macro.invFile, file)) {
-      if (!macro.invB)
-        return popAndReturn(true);
-      if (*macro.invB >= resumeOffset)
+        paths_.PathsEqual(*macro.invFile, file_)) {
+      // Unknown B-offsets and offsets inside the suffix remain observable.
+      if (!macro.invB || *macro.invB >= resumeOffset_)
         return popAndReturn(true);
     }
 
     if (macro.callerMacroId) {
       const RefoldModel::MacroInvocation *caller =
-          findMacroById(*macro.callerMacroId);
+          FindMacroById(*macro.callerMacroId);
+      // A missing caller record is not enough evidence to move line control.
       if (!caller)
         return popAndReturn(true);
-      return popAndReturn(invocationMayOccurInSuffix(*caller, activeIds));
+      return popAndReturn(MayOccurInSuffix(*caller, activeIds));
     }
 
-    if (!macro.invFile || macro.invFile->empty())
-      return popAndReturn(true);
-    return popAndReturn(false);
-  };
+    // Unknown physical locations are conservative; a known different file with
+    // no caller chain is the only non-observable case.
+    return popAndReturn(!macro.invFile || macro.invFile->empty());
+  }
+
+  const RefoldModel &model_;
+  StringRef file_;
+  uint64_t resumeOffset_;
+  const RefoldPathIdentity &paths_;
+};
+
+} // namespace
+
+bool sourceSuffixMayObservePresumedFileSpelling(
+    const RefoldModel &model, StringRef file, uint64_t resumeOffset,
+    const RefoldPathIdentity &paths, StringRef fileText) {
+  LineControlSuffixInvocationResolver suffixInvocationResolver(
+      model, file, resumeOffset, paths);
 
   for (const RefoldModel::MacroInvocation &macro :
        model.GetMacroInvocations()) {
     if (macro.name != "__FILE__" && macro.name != "__FILE_NAME__")
       continue;
 
-    SmallVector<uint64_t, 8> activeIds;
-    if (invocationMayOccurInSuffix(macro, activeIds))
+    if (suffixInvocationResolver.MayOccurInSuffix(macro))
       return true;
   }
 
@@ -1598,8 +1630,8 @@ std::optional<SourceLineDirectiveLogicalLineRewrite>
 rewriteSourceLineDirectiveLogicalLineMacros(
     const RefoldModel &model, StringRef file, StringRef logicalLine,
     ArrayRef<uint64_t> logicalLineSourceOffsets,
-    llvm::function_ref<bool(StringRef, StringRef)> pathsEqual,
-    const LangOptions &lang, std::optional<uint64_t> ownerIncludeId,
+    const RefoldPathIdentity &paths, const LangOptions &lang,
+    std::optional<uint64_t> ownerIncludeId,
     SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver) {
   if (logicalLineSourceOffsets.size() != logicalLine.size())
     return std::nullopt;
@@ -1656,7 +1688,7 @@ rewriteSourceLineDirectiveLogicalLineMacros(
     if (macro.callerMacroId)
       continue;
     if (!macro.invFile || macro.invFile->empty() ||
-        !pathsEqual(*macro.invFile, file))
+        !paths.PathsEqual(*macro.invFile, file))
       continue;
     if (ownerIncludeId &&
         (!macro.ownerIncludeId || *macro.ownerIncludeId != *ownerIncludeId))

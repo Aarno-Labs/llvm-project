@@ -1004,17 +1004,14 @@ bool RefoldHeaderIncludeEditPlanner::ProveHeaderSourceEnvelopeGap(
     const SourceEnvelopeInterval &sourceEnvelope, uint64_t gapBegin,
     uint64_t gapEnd,
     SmallVectorImpl<HeaderPreservedGapPiece> &preservedPieces) const {
-  auto pathIdentityPathsEqual = [this](StringRef lhs, StringRef rhs) {
-    return paths_.PathsEqual(lhs, rhs);
-  };
 
   SourceLineDirectiveLogicalLineRewriter headerSourceLineDirectiveLineRewriter =
       [&](StringRef logicalLine, ArrayRef<uint64_t> sourceOffsets,
           SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver)
       -> std::optional<SourceLineDirectiveLogicalLineRewrite> {
     return rewriteSourceLineDirectiveLogicalLineMacros(
-        model_, state.file, logicalLine, sourceOffsets, pathIdentityPathsEqual,
-        lexLang_, state.include.id, std::move(builtinMacroResolver));
+        model_, state.file, logicalLine, sourceOffsets, paths_, lexLang_,
+        state.include.id, std::move(builtinMacroResolver));
   };
 
   if (std::optional<SourceLineDirectiveGapResume> lineResume =
@@ -1023,8 +1020,8 @@ bool RefoldHeaderIncludeEditPlanner::ProveHeaderSourceEnvelopeGap(
               state.file, headerSourceLineDirectiveLineRewriter, nullptr,
               model_.GetSourcePath(),
               !sourceSuffixMayObservePresumedFileSpelling(
-                  model_, state.file, sourceEnvelope.end,
-                  pathIdentityPathsEqual, state.headerText))) {
+                  model_, state.file, sourceEnvelope.end, paths_,
+                  state.headerText))) {
     // Header full-envelope widening uses the same owner-piece gap proof as
     // TU/include closure. A source-spelled line-control gap is not disposable
     // trivia, but it is preservable by carrying its net line state forward to

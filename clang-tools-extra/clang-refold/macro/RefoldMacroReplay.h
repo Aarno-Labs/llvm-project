@@ -210,7 +210,7 @@ public:
 /// Selects macro replay boundaries from token and source envelopes.
 ///
 /// The selector answers boundary questions used by args-only, generated, and
-/// whole-cover replay paths without owning candidate ranking or proof stamping.
+/// whole-cover replay paths without owning candidate ranking or proof certification.
 class RefoldMacroBoundarySelector {
 public:
   RefoldMacroBoundarySelector(const RefoldModel &model,

@@ -5,7 +5,7 @@
 //
 // This service owns the mutable buckets populated while token hunks are
 // classified into TU edits, include edits, and macro patches.  It deliberately
-// does not choose proof classes; RunSinglePassRefold and the dedicated proof
+// does not choose proof classes; RunRefoldPass and the dedicated proof
 // services still make those decisions.  The dispatcher owns the staging rules:
 // coalescing macro patches by physical invocation span, sorting include-local
 // insertion patches, building closure-fallback claimed intervals, and exposing

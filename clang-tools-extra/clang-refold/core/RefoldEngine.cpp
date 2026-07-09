@@ -65,6 +65,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "core/RefoldEngine.h"
+#include "core/RefoldLangOptions.h"
 #include "core/RefoldLog.h"
 #include "core/RefoldOwnerClassifier.h"
 #include "edit/RefoldBInsertionLedger.h"
@@ -97,13 +98,10 @@
 #include "source/TokenTextHelpers.h"
 #include "util/StringUtils.h"
 
-#include "clang/Basic/Diagnostic.h"
-#include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TokenKinds.h"
-#include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Lex/Lexer.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -165,7 +163,7 @@ RefoldEngine::RefoldEngine(
       lineDirs_(!noLines, model_.GetPPCwd()),
       pathIdentity_(model_, model_.GetPPCwd(), /*emitAbsPaths=*/false),
       strict_(strict), proofAuditMode_(proofAuditMode),
-      lexLang_(MakeLexLangOptions(model_.GetPPLang())),
+      lexLang_(makeRefoldLexLangOptions(model_.GetPPLang())),
       argTextRecovery_(lexLang_), tokenTextAnalysis_(lexLang_),
       terminalSink_(RefoldTerminalProofSinkCallbacks{
           [this](const TerminalFallbackProofFailure &failure, StringRef role) {
@@ -219,25 +217,6 @@ RefoldEngine::RefoldEngine(
 
 RefoldEngine::~RefoldEngine() = default;
 
-/// Construct the LangOptions used by all raw-lexer helper paths.
-///
-/// The producer records the language spelling that was used to preprocess the
-/// TU. Replaying that spelling through CompilerInvocation keeps tokenization
-/// decisions, especially literal and comment handling, aligned with the map.
-clang::LangOptions RefoldEngine::MakeLexLangOptions(llvm::StringRef langName) {
-  DiagnosticOptions diagOpts;
-  IntrusiveRefCntPtr<DiagnosticIDs> diagIDs(new DiagnosticIDs());
-  auto *client = new IgnoringDiagConsumer();
-  DiagnosticsEngine diags(diagIDs, diagOpts, client, /*ShouldOwnClient=*/true);
-
-  auto invocation = std::make_shared<CompilerInvocation>();
-  std::string lang = langName.empty() ? "c" : langName.str();
-  std::vector<const char *> args = {"-x", lang.c_str()};
-  CompilerInvocation::CreateFromArgs(*invocation, ArrayRef<const char *>(args),
-                                     diags);
-  return invocation->getLangOpts();
-}
-
 // ========================== Public entry points ==========================
 
 Expected<std::string> RefoldEngine::Refold(
@@ -271,15 +250,14 @@ std::string RefoldEngine::Refold() {
   finalLineControlPruneCandidates_.clear();
   finalLineControlSourceMappings_.clear();
 
-  // The engine is single-pass: it first attempts structural refolding, then
-  // (if structural proof discharge requests fallback) resolves the post-
-  // structural fallback choice between proved intermediate expansion and the
-  // explicit raw-B terminal carrier.
+  // The engine first attempts structural refolding, then resolves the
+  // post-structural fallback choice between proved intermediate expansion and
+  // the explicit raw-B terminal carrier when proof discharge requests fallback.
   terminalSink_.Reset();
   resetRefoldAttemptStats(lastStats_, model_);
   TheoremAudit().Reset();
 
-  std::string out = RunSinglePassRefold();
+  std::string out = RunRefoldPass();
 
   // Once the structural pass finishes, any surviving theorem-audit violation
   // must be converted into the one explicit terminal fallback rather than
@@ -345,7 +323,7 @@ std::string RefoldEngine::Refold() {
   return out;
 }
 
-std::string RefoldEngine::RunSinglePassRefold() {
+bool RefoldEngine::ValidateTokenCount() {
   // Make sure that when we re-lex the A-stream tokens that it matches the token
   // count as listed in the refold map JSON file.
   if (static_cast<size_t>(model_.GetTokensCountA()) != aToks_.size()) {
@@ -368,21 +346,13 @@ std::string RefoldEngine::RunSinglePassRefold() {
             "lexed sequence (aToks) has {1} tokens",
             model_.GetTokensCountA(), aToks_.size())
             .str());
-    return std::string();
+    return false;
   }
+  return true;
+}
 
-  StringRef tuPath = model_.GetSourcePath();
-
-  REFOLD_LOG_INFO(
-      "plan",
-      "starting refold: tu={0} ppBytes={1} ppModBytes={2} ppTokens={3} "
-      "ppModTokens={4}",
-      tuPath, aSource_.size(), bSource_.size(), aToks_.size(), bToks_.size());
-
-  abTokHunks_.clear();
-  abTokMapA2B_.clear();
-  abTokMapB2A_.clear();
-
+std::unique_ptr<llvm::MemoryBuffer>
+RefoldEngine::LoadTUSource(StringRef tuPath) {
   // Read in the translation unit file / C source.
   std::unique_ptr<llvm::MemoryBuffer> tuBuffer;
   {
@@ -397,8 +367,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
     // Don't need a copy of the bytes here due to lifetime reasoning.
     tuBuffer = std::move(*bufOrErr);
   }
-  StringRef tuBytes = tuBuffer->getBuffer();
+  return tuBuffer;
+}
 
+std::vector<diffutils::Hunk>
+RefoldEngine::PlanTokenDiff(StringRef tuPath, StringRef tuBytes) {
   // 1) Build the initial A/B token diff and refresh the per-run diff caches.
   //
   // RefoldTokenDiffPlanner owns lexeme mapping, LCS provenance construction,
@@ -452,7 +425,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // payloads.
   BInsertionLedger().BuildProvenance(hunks);
   BInsertionLedger().PreclaimStandaloneInsertions(tuPath, hunks);
+  return hunks;
+}
 
+void RefoldEngine::TraceStructuralHunkEnvelopes(
+    ArrayRef<diffutils::Hunk> hunks) {
   // Validate B-token envelopes for every hunk. In trace mode, also show the
   // exact B-side fragment that later owner/macro/include proofs must explain.
   for (size_t i = 0; i < hunks.size(); ++i) {
@@ -505,31 +482,26 @@ std::string RefoldEngine::RunSinglePassRefold() {
             stringutils::showWsWithClip(bfrag, 160));
     }
   }
+}
 
-  // 4) Classify hunks and collect per-target edits.  The dispatcher owns the
-  // mutable staging state for TU edits, include-local patches, and macro patch
-  // merge buckets; this function coordinates the proof/owner decisions that
-  // select the appropriate planning service for each hunk.
-  RefoldStructuralHunkDispatcher structuralHunkDispatcher;
-  std::vector<TextEdit> &tuEdits =
-      structuralHunkDispatcher.MutableTUEditsForRepairAndEmission();
-  if (!appendSidebandPragmaSourceEdits(sidebandPragmaEdits_, tuPath, tuBytes,
-                                       pathIdentity_, *textEditAssembler_,
-                                       ProofLattice(), terminalSink_,
-                                       structuralHunkDispatcher))
-    return std::string();
+bool RefoldEngine::StageSidebandEdits(
+    StringRef tuPath, StringRef tuBytes,
+    RefoldStructuralHunkDispatcher &structuralHunkDispatcher) {
+  // Sideband pragmas are staged before ordinary structural dispatch so later
+  // TU/include/macro realization can strip or avoid any separately-owned
+  // sideband replay bytes from ordinary hunk replacements.
+  return appendSidebandPragmaSourceEdits(
+      sidebandPragmaEdits_, tuPath, tuBytes, pathIdentity_, *textEditAssembler_,
+      ProofLattice(), terminalSink_, structuralHunkDispatcher);
+}
 
-  // Diagnostic-only helper: derive the B-token envelope that corresponds to an
-  // A-token interval by looking only at the final A->B token map.
-  //
-  // This is used to compare two independent views of the same hunk:
-  //
-  //   1. the B envelope selected from byte-hunk provenance, and
-  //   2. the B envelope implied by token-level A->B matches.
-  //
-  // The returned interval is therefore for logging/auditing envelope drift
-  // only. It must not become a semantic proof source, because unmatched edit
-  // interiors may require approximation from neighboring mapped tokens.
+bool RefoldEngine::DispatchStructuralHunks(
+    StringRef tuPath, StringRef tuBytes, ArrayRef<diffutils::Hunk> hunks,
+    RefoldStructuralHunkDispatcher &structuralHunkDispatcher) {
+  // Local lexical predicate used by the theorem-lattice tie-breaker below.
+  // A top-level comma in replacement text would split the original invocation
+  // argument list, so the otherwise-equivalent TU edit must stay behind the
+  // macro reconstruction proof path.
   auto hasTopLevelCommaInReplacement = [&](StringRef text) -> bool {
     return refoldMacroActualHasTopLevelComma(text, lexLang_);
   };
@@ -1246,6 +1218,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
     continue;
   }
 
+  return true;
+}
+
+std::string RefoldEngine::FinalizeStructuralResult(
+    StringRef tuPath, StringRef tuBytes, ArrayRef<diffutils::Hunk> hunks,
+    RefoldStructuralHunkDispatcher &structuralHunkDispatcher) {
+  std::vector<TextEdit> &tuEdits =
+      structuralHunkDispatcher.MutableTUEditsForRepairAndEmission();
   // Global fail-closed composition rule: once this single structural pass has
   // requested terminal fallback, do not continue composing structural
   // artifacts. The outer driver will discard the current attempt and emit B
@@ -1525,6 +1505,40 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
   lastStats_.expandedMacros = finalEmission.expandedMacroCount;
   return std::move(finalEmission.tuText);
+}
+
+std::string RefoldEngine::RunRefoldPass() {
+  if (!ValidateTokenCount())
+    return std::string();
+
+  StringRef tuPath = model_.GetSourcePath();
+  REFOLD_LOG_INFO(
+      "plan",
+      "starting refold: tu={0} ppBytes={1} ppModBytes={2} ppTokens={3} "
+      "ppModTokens={4}",
+      tuPath, aSource_.size(), bSource_.size(), aToks_.size(), bToks_.size());
+
+  // Reset run-local token diff caches before any stage repopulates them for
+  // this structural pass.
+  abTokHunks_.clear();
+  abTokMapA2B_.clear();
+  abTokMapB2A_.clear();
+
+  std::unique_ptr<llvm::MemoryBuffer> tuBuffer = LoadTUSource(tuPath);
+  StringRef tuBytes = tuBuffer->getBuffer();
+
+  std::vector<diffutils::Hunk> hunks = PlanTokenDiff(tuPath, tuBytes);
+  TraceStructuralHunkEnvelopes(hunks);
+
+  RefoldStructuralHunkDispatcher structuralHunkDispatcher;
+  if (!StageSidebandEdits(tuPath, tuBytes, structuralHunkDispatcher))
+    return std::string();
+  if (!DispatchStructuralHunks(tuPath, tuBytes, hunks,
+                                structuralHunkDispatcher))
+    return std::string();
+
+  return FinalizeStructuralResult(tuPath, tuBytes, hunks,
+                                  structuralHunkDispatcher);
 }
 
 } // namespace refold

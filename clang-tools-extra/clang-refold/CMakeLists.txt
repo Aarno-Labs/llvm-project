@@ -12,6 +12,7 @@ add_clang_tool(clang-refold
   edit/RefoldExpansionFallbackPlanner.cpp
   edit/RefoldBInsertionLedger.cpp
   core/RefoldEngine.cpp
+  core/RefoldLangOptions.cpp
   core/RefoldPreprocessRecheck.cpp
   core/RefoldServiceGraphBuilder.cpp
   line-control/RefoldLineObserverLayout.cpp

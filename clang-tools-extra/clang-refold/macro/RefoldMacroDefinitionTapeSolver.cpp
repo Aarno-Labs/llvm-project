@@ -15,6 +15,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FormatVariadic.h"
 
@@ -22,7 +23,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -167,6 +167,418 @@ definitionTapeScoredSolutionLess(const DefinitionTapeScoredSolution &lhs,
   return lhs.rewritten < rhs.rewritten;
 }
 
+/// Return whether the parsed definition replay tree contains any `__VA_OPT__`
+/// node.
+///
+/// Proof obligation: this is the pure tree query that decides whether the
+/// definition-tape solver must stay enabled for a possible VA_OPT branch flip.
+/// The trusted input is the already parsed replacement-list replay tree; this
+/// helper does not inspect source text, candidate edits, or proof state.  It
+/// does not make an ambiguity decision itself, but preserving the complete
+/// pre-order walk keeps the solver's fail-closed gate tied to exactly the same
+/// tree surface as the former local recursive query.
+bool definitionTapePatternHasVaOpt(ArrayRef<DefinitionTapeReplayElem> elems) {
+  bool hasVaOpt = false;
+  for (const DefinitionTapeReplayElem &elem : elems) {
+    if (elem.kind == DefinitionTapeReplayElem::Kind::VaOpt)
+      hasVaOpt = true;
+    if (definitionTapePatternHasVaOpt(elem.children))
+      hasVaOpt = true;
+  }
+  return hasVaOpt;
+}
+
+/// Accumulate replay-tree profile fields while preserving replacement-list
+/// traversal order.
+///
+/// Proof obligation: count the literal, formal-use, and VA_OPT structure that
+/// every later replay witness must explain.  The trusted inputs are the parsed
+/// replay tree and a replacement-use vector sized to the macro's formal count.
+/// Out-of-range formals are ignored exactly as before so malformed surfaces
+/// remain rejected by the surrounding solver gates, not by this profile pass.
+/// This helper introduces no ambiguity cutoff; it only preserves the original
+/// depth-first accumulation order used before equivalence-class scoring.
+void collectDefinitionTapeProfileInto(
+    ArrayRef<DefinitionTapeReplayElem> elems, DefinitionTapeProfile &profile,
+    std::vector<uint64_t> &replacementUseCount) {
+  for (const DefinitionTapeReplayElem &elem : elems) {
+    switch (elem.kind) {
+    case DefinitionTapeReplayElem::Kind::Literal:
+      ++profile.literalCount;
+      break;
+    case DefinitionTapeReplayElem::Kind::Param:
+      ++profile.paramUseCount;
+      if (elem.argIdx < replacementUseCount.size())
+        ++replacementUseCount[elem.argIdx];
+      break;
+    case DefinitionTapeReplayElem::Kind::VaOpt:
+      ++profile.vaOptNodeCount;
+      collectDefinitionTapeProfileInto(elem.children, profile,
+                                       replacementUseCount);
+      break;
+    }
+  }
+}
+
+/// Build the definition-tape profile shared by all replay candidates.
+///
+/// Proof obligation: summarize the parsed replacement-list tree without
+/// looking at a candidate's chosen B-token assignment.  The trusted input is a
+/// validated replay tree plus the macro formal count.  Duplicate and unused
+/// formal counts are derived after the same ordered tree walk, preserving the
+/// scoring/proof surface used by the existing equivalence-class logic.  No
+/// ambiguity is accepted here; unique-solution rejection remains in the replay
+/// solver that consumes this profile.
+DefinitionTapeProfile collectDefinitionTapeProfile(
+    ArrayRef<DefinitionTapeReplayElem> elems, size_t formalCount) {
+  DefinitionTapeProfile profile;
+  std::vector<uint64_t> replacementUseCount(formalCount, 0);
+  collectDefinitionTapeProfileInto(elems, profile, replacementUseCount);
+
+  for (uint64_t useCount : replacementUseCount) {
+    if (useCount == 0)
+      ++profile.unusedFormalCount;
+    else if (useCount > 1)
+      ++profile.duplicatedFormalCount;
+  }
+  return profile;
+}
+
+/// Return whether any `__VA_OPT__` payload contains a literal comma.
+///
+/// Proof obligation: detect the proof-relevant VA_OPT comma surface that can
+/// interact with variadic empty/missing actual replay.  The trusted input is the
+/// already parsed replacement-list replay tree.  The helper preserves the prior
+/// ordering by inspecting each VA_OPT node's immediate payload before recursing
+/// into nested VA_OPT payloads.  It does not resolve ambiguity or admit a
+/// candidate; fail-closed unique-solution handling remains in the caller's
+/// replay-equivalence checks.
+bool definitionTapeVaOptPayloadContainsComma(
+    ArrayRef<DefinitionTapeReplayElem> elems) {
+  for (const DefinitionTapeReplayElem &elem : elems) {
+    if (elem.kind == DefinitionTapeReplayElem::Kind::VaOpt) {
+      for (const DefinitionTapeReplayElem &child : elem.children) {
+        if (child.kind == DefinitionTapeReplayElem::Kind::Literal &&
+            child.spelling == ",")
+          return true;
+      }
+      if (definitionTapeVaOptPayloadContainsComma(elem.children))
+        return true;
+    }
+  }
+  return false;
+}
+
+/// Parser for the definition replacement-token tape used by replay proof.
+///
+/// Proof/search obligation: normalize the recorded `#define` replacement list
+/// into replay nodes without interpreting any candidate B-side spelling.  The
+/// trusted inputs are the macro directive's recorded replacement tokens and the
+/// caller-validated formal count.  Unsupported stringification and token-paste
+/// nodes, malformed `__VA_OPT__` parentheses, and invalid formal references all
+/// reject fail-closed here because raw definition-tape replay cannot prove those
+/// transformed surfaces.  The parser appends nodes in replacement-list order and
+/// recurses into `__VA_OPT__` payloads at the same point as the original local
+/// parser, preserving the later matcher/enumerator ordering exactly.
+class DefinitionTapeParser {
+public:
+  DefinitionTapeParser(const RefoldModel::MacroDirective &definition,
+                       size_t formalCount)
+      : definition_(definition), formalCount_(formalCount) {}
+
+  /// Parse the entire replacement-token tape into replay nodes.
+  bool Parse(std::vector<DefinitionTapeReplayElem> &out) const {
+    return ParseRange(0, definition_.replacementTokens.size(), out);
+  }
+
+private:
+  bool ParseRange(size_t begin, size_t end,
+                  std::vector<DefinitionTapeReplayElem> &out) const {
+    for (size_t i = begin; i < end;) {
+      const RefoldModel::MacroReplacementToken &tok =
+          definition_.replacementTokens[i];
+      if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
+        if (!tok.paramIndex || *tok.paramIndex >= formalCount_)
+          return false;
+        DefinitionTapeReplayElem elem;
+        elem.kind = DefinitionTapeReplayElem::Kind::Param;
+        elem.argIdx = *tok.paramIndex;
+        out.push_back(std::move(elem));
+        ++i;
+        continue;
+      }
+
+      if (tok.spelling == "#" || tok.spelling == "##")
+        return false;
+
+      if (tok.spelling == "__VA_OPT__") {
+        // __VA_OPT__ contributes either nothing or its parenthesized payload.
+        // Parse the payload recursively so later A/B replay can choose the
+        // erased or exposed branch by matching concrete expansion tokens.
+        if (i + 1 >= end ||
+            definition_.replacementTokens[i + 1].kind !=
+                RefoldModel::MacroReplacementTokenKind::Literal ||
+            definition_.replacementTokens[i + 1].spelling != "(")
+          return false;
+
+        unsigned depth = 1;
+        size_t j = i + 2;
+        for (; j < end; ++j) {
+          const auto &inner = definition_.replacementTokens[j];
+          if (inner.kind != RefoldModel::MacroReplacementTokenKind::Literal)
+            continue;
+          if (inner.spelling == "(") {
+            ++depth;
+            continue;
+          }
+          if (inner.spelling == ")") {
+            if (--depth == 0)
+              break;
+          }
+        }
+        if (depth != 0 || j >= end)
+          return false;
+
+        DefinitionTapeReplayElem elem;
+        elem.kind = DefinitionTapeReplayElem::Kind::VaOpt;
+        if (!ParseRange(i + 2, j, elem.children))
+          return false;
+        out.push_back(std::move(elem));
+        i = j + 1;
+        continue;
+      }
+
+      DefinitionTapeReplayElem elem;
+      elem.kind = DefinitionTapeReplayElem::Kind::Literal;
+      elem.spelling = tok.spelling.str();
+      out.push_back(std::move(elem));
+      ++i;
+    }
+    return true;
+  }
+
+  const RefoldModel::MacroDirective &definition_;
+  size_t formalCount_ = 0;
+};
+
+/// A-side matcher for proving the definition tape regenerates the recorded
+/// producer expansion cover.
+///
+/// Proof/search obligation: replay the parsed definition tree over the A-token
+/// cover and record standard formal occurrences in the same order as the
+/// producer spans.  The trusted inputs are the parsed replay tree, the full
+/// A-token stream, and caller-sorted standard PPArgSpans.  A literal mismatch,
+/// out-of-order span, uncovered token, or unconsumed span rejects fail-closed.
+/// `__VA_OPT__` preserves the prior branch policy: include the payload only
+/// when it consumes concrete A tokens or spans; otherwise keep the erased branch
+/// and leave ambiguity-sensitive acceptance to later B-side equivalence checks.
+class DefinitionTapeAReplayMatcher {
+public:
+  DefinitionTapeAReplayMatcher(ArrayRef<DefinitionTapeReplayElem> pattern,
+                               ArrayRef<PPTok> aToks,
+                               ArrayRef<RefoldModel::PPArgSpan> standardSpans)
+      : pattern_(pattern), aToks_(aToks), standardSpans_(standardSpans) {}
+
+  /// Match the entire A cover and return ordered formal occurrences on success.
+  bool Match(uint64_t coverBegin, uint64_t coverEnd,
+             std::vector<DefinitionTapeReplayAOcc> &occs) const {
+    uint64_t cursor = coverBegin;
+    size_t spanIdx = 0;
+    std::vector<DefinitionTapeReplayAOcc> matchedOccs;
+    if (!MatchElems(pattern_, cursor, spanIdx, matchedOccs) ||
+        cursor != coverEnd || spanIdx != standardSpans_.size())
+      return false;
+    occs = std::move(matchedOccs);
+    return true;
+  }
+
+private:
+  bool MatchElems(ArrayRef<DefinitionTapeReplayElem> elems, uint64_t &cursor,
+                  size_t &spanIdx,
+                  std::vector<DefinitionTapeReplayAOcc> &occs) const {
+    for (const DefinitionTapeReplayElem &elem : elems) {
+      if (spanIdx < standardSpans_.size() &&
+          standardSpans_[spanIdx].begin < cursor)
+        return false;
+
+      switch (elem.kind) {
+      case DefinitionTapeReplayElem::Kind::Literal:
+        if (!matchLiteralAToken(aToks_, cursor, elem.spelling))
+          return false;
+        ++cursor;
+        break;
+      case DefinitionTapeReplayElem::Kind::Param: {
+        DefinitionTapeReplayAOcc occ;
+        occ.argIdx = elem.argIdx;
+        // Start as a zero-width occurrence.  A following PPArgSpan for the
+        // same formal turns this into an ordinary token-bearing occurrence;
+        // otherwise the zero-width marker is the proof surface for an empty
+        // source actual or a zero-token child actual.
+        occ.aBegin = cursor;
+        occ.aEnd = cursor;
+        if (spanIdx < standardSpans_.size() &&
+            standardSpans_[spanIdx].begin == cursor &&
+            standardSpans_[spanIdx].argIdx == elem.argIdx) {
+          occ.span = standardSpans_[spanIdx];
+          occ.aBegin = standardSpans_[spanIdx].begin;
+          occ.aEnd = standardSpans_[spanIdx].end;
+          cursor = standardSpans_[spanIdx].end;
+          ++spanIdx;
+        }
+        occs.push_back(std::move(occ));
+        break;
+      }
+      case DefinitionTapeReplayElem::Kind::VaOpt: {
+        uint64_t includeCursor = cursor;
+        size_t includeSpanIdx = spanIdx;
+        std::vector<DefinitionTapeReplayAOcc> includeOccs = occs;
+        const bool includeOK = MatchElems(elem.children, includeCursor,
+                                          includeSpanIdx, includeOccs);
+
+        // Skipping __VA_OPT__ consumes no A tokens.  If the include branch
+        // consumes tokens/spans, prefer it because those tokens are concrete
+        // evidence that the payload was exposed in A.  A zero-width include
+        // branch is indistinguishable here and remains the erased branch.
+        if (includeOK &&
+            (includeCursor != cursor || includeSpanIdx != spanIdx)) {
+          cursor = includeCursor;
+          spanIdx = includeSpanIdx;
+          occs = std::move(includeOccs);
+        }
+        break;
+      }
+      }
+    }
+    return true;
+  }
+
+  ArrayRef<DefinitionTapeReplayElem> pattern_;
+  ArrayRef<PPTok> aToks_;
+  ArrayRef<RefoldModel::PPArgSpan> standardSpans_;
+};
+
+/// B-side enumerator for assigning replacement-tape formal occurrences to the
+/// target B-token envelope.
+///
+/// Proof/search obligation: enumerate every B-token segmentation that can be
+/// replayed by the parsed definition tree, while enforcing repeated-formal
+/// spelling equality.  The trusted inputs are the parsed replay tree, the
+/// caller-proven B envelope, the current B tokens/source mapper, macro formal
+/// metadata, and the A-side token count per formal.  This resolver deliberately
+/// does not choose a winner: ambiguous semantic classes must still be rejected
+/// by the downstream equivalence/scoring code.  DFS visits literals, increasing
+/// formal interval ends, erased VA_OPT branches, and exposed VA_OPT payloads in
+/// the exact order used by the former local recursive enumerator.
+class DefinitionTapeBReplayEnumerator {
+public:
+  DefinitionTapeBReplayEnumerator(
+      ArrayRef<DefinitionTapeReplayElem> pattern, ArrayRef<PPTok> bToks,
+      const RefoldSourceMapper &sourceMapper,
+      ArrayRef<RefoldModel::MacroDefParam> defParams,
+      ArrayRef<unsigned> oldTokenCountByFormal,
+      std::pair<size_t, size_t> bEnv, size_t formalCount)
+      : pattern_(pattern), bToks_(bToks), sourceMapper_(sourceMapper),
+        defParams_(defParams), oldTokenCountByFormal_(oldTokenCountByFormal),
+        bEnv_(bEnv), formalCount_(formalCount) {}
+
+  /// Enumerate all B replay solutions in deterministic DFS order.
+  void Enumerate(std::vector<DefinitionTapeReplaySolution> &solutions) const {
+    DefinitionTapeReplaySolution seed;
+    seed.ranges.resize(formalCount_, {0, 0});
+    seed.assigned.resize(formalCount_, 0);
+
+    DfsElems(pattern_, 0, bEnv_.first, seed,
+             [&](size_t finalPos, DefinitionTapeReplaySolution &sol) {
+               if (finalPos == bEnv_.second)
+                 solutions.push_back(sol);
+             });
+  }
+
+private:
+  bool AssignFormalRange(DefinitionTapeReplaySolution &sol, uint32_t argIdx,
+                         std::pair<size_t, size_t> range) const {
+    if (argIdx >= sol.ranges.size() || range.second < range.first)
+      return false;
+    if (sol.assigned[argIdx]) {
+      StringRef oldText =
+          sourceMapper_.SliceBSource(sol.ranges[argIdx].first,
+                                     sol.ranges[argIdx].second)
+              .trim();
+      StringRef newText =
+          sourceMapper_.SliceBSource(range.first, range.second).trim();
+      return oldText == newText;
+    }
+    sol.assigned[argIdx] = 1;
+    sol.ranges[argIdx] = range;
+    return true;
+  }
+
+  void DfsElems(
+      ArrayRef<DefinitionTapeReplayElem> elems, size_t elemIdx, size_t bPos,
+      DefinitionTapeReplaySolution &sol,
+      function_ref<void(size_t, DefinitionTapeReplaySolution &)> done) const {
+    if (elemIdx == elems.size()) {
+      done(bPos, sol);
+      return;
+    }
+
+    const DefinitionTapeReplayElem &elem = elems[elemIdx];
+    switch (elem.kind) {
+    case DefinitionTapeReplayElem::Kind::Literal:
+      if (bPos < bEnv_.second && bToks_[bPos].spelling == elem.spelling)
+        DfsElems(elems, elemIdx + 1, bPos + 1, sol, done);
+      return;
+    case DefinitionTapeReplayElem::Kind::Param: {
+      // Only empty old formals and variadic formals may be assigned an empty
+      // B interval.  A zero-token assignment for an ordinary non-variadic
+      // formal would silently erase required source structure, but an explicit
+      // empty variadic actual is a valid source spelling (`M(x, )`) whose
+      // surrounding punctuation is replayed by the definition tape.
+      const bool oldWasEmpty = elem.argIdx < oldTokenCountByFormal_.size() &&
+                               oldTokenCountByFormal_[elem.argIdx] == 0;
+      const bool variadicFormal =
+          elem.argIdx < defParams_.size() && defParams_[elem.argIdx].variadic;
+      for (size_t end = bPos; end <= bEnv_.second; ++end) {
+        if (!oldWasEmpty && !variadicFormal && end == bPos)
+          continue;
+        DefinitionTapeReplaySolution next = sol;
+        if (!AssignFormalRange(next, elem.argIdx, {bPos, end}))
+          continue;
+        DfsElems(elems, elemIdx + 1, end, next, done);
+      }
+      return;
+    }
+    case DefinitionTapeReplayElem::Kind::VaOpt: {
+      // Erased branch.
+      DfsElems(elems, elemIdx + 1, bPos, sol, done);
+
+      // Exposed branch.  The payload must consume at least one B token; an
+      // empty exposed payload is indistinguishable from the erased branch here.
+      DefinitionTapeReplaySolution withPayload = sol;
+      const size_t payloadBegin = bPos;
+      DfsElems(elem.children, 0, bPos, withPayload,
+               [&](size_t payloadEnd,
+                   DefinitionTapeReplaySolution &afterPayload) {
+                 if (payloadEnd == payloadBegin)
+                   return;
+                 DefinitionTapeReplaySolution cont = afterPayload;
+                 ++cont.vaOptIncludedCount;
+                 DfsElems(elems, elemIdx + 1, payloadEnd, cont, done);
+               });
+      return;
+    }
+    }
+  }
+
+  ArrayRef<DefinitionTapeReplayElem> pattern_;
+  ArrayRef<PPTok> bToks_;
+  const RefoldSourceMapper &sourceMapper_;
+  ArrayRef<RefoldModel::MacroDefParam> defParams_;
+  ArrayRef<unsigned> oldTokenCountByFormal_;
+  std::pair<size_t, size_t> bEnv_ = {0, 0};
+  size_t formalCount_ = 0;
+};
+
 } // namespace
 
 std::optional<MacroPatch>
@@ -194,98 +606,15 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
   if (!cover || cover->first >= cover->second)
     return std::nullopt;
 
-  // Use the file-scope replacement-list node carrier so replay semantics are
-  // shared by the solver helpers without introducing function-local types.
-  using ReplayElem = DefinitionTapeReplayElem;
-
-  // Parse the producer's replacement-token tape into ReplayElem nodes.
-  // Stringification and token-paste are rejected here because they transform
-  // argument spelling before it reaches the PP output; those cases require
-  // the dedicated stringify/paste proof paths rather than raw token replay.
-  std::function<bool(size_t, size_t, std::vector<ReplayElem> &)>
-      parseReplayRange =
-          [&](size_t begin, size_t end, std::vector<ReplayElem> &out) -> bool {
-    for (size_t i = begin; i < end;) {
-      const RefoldModel::MacroReplacementToken &tok =
-          definition->replacementTokens[i];
-      if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
-        if (!tok.paramIndex || *tok.paramIndex >= m.defParams.size())
-          return false;
-        ReplayElem elem;
-        elem.kind = ReplayElem::Kind::Param;
-        elem.argIdx = *tok.paramIndex;
-        out.push_back(std::move(elem));
-        ++i;
-        continue;
-      }
-
-      if (tok.spelling == "#" || tok.spelling == "##")
-        return false;
-
-      if (tok.spelling == "__VA_OPT__") {
-        // __VA_OPT__ contributes either nothing or its parenthesized payload.
-        // Parse the payload recursively so later A/B replay can choose the
-        // erased or exposed branch by matching concrete expansion tokens.
-        if (i + 1 >= end ||
-            definition->replacementTokens[i + 1].kind !=
-                RefoldModel::MacroReplacementTokenKind::Literal ||
-            definition->replacementTokens[i + 1].spelling != "(")
-          return false;
-
-        unsigned depth = 1;
-        size_t j = i + 2;
-        for (; j < end; ++j) {
-          const auto &inner = definition->replacementTokens[j];
-          if (inner.kind != RefoldModel::MacroReplacementTokenKind::Literal)
-            continue;
-          if (inner.spelling == "(") {
-            ++depth;
-            continue;
-          }
-          if (inner.spelling == ")") {
-            if (--depth == 0)
-              break;
-          }
-        }
-        if (depth != 0 || j >= end)
-          return false;
-
-        ReplayElem elem;
-        elem.kind = ReplayElem::Kind::VaOpt;
-        if (!parseReplayRange(i + 2, j, elem.children))
-          return false;
-        out.push_back(std::move(elem));
-        i = j + 1;
-        continue;
-      }
-
-      ReplayElem elem;
-      elem.kind = ReplayElem::Kind::Literal;
-      elem.spelling = tok.spelling.str();
-      out.push_back(std::move(elem));
-      ++i;
-    }
-    return true;
-  };
-
-  std::vector<ReplayElem> pattern;
-  if (!parseReplayRange(0, definition->replacementTokens.size(), pattern) ||
-      pattern.empty())
+  std::vector<DefinitionTapeReplayElem> pattern;
+  DefinitionTapeParser parser(*definition, m.defParams.size());
+  if (!parser.Parse(pattern) || pattern.empty())
     return std::nullopt;
 
   // Keep this heavier replay solver out of the ordinary non-empty argument
   // case.  It exists for missing proof surfaces: a token-empty source slot, a
   // formal with no recorded expansion span, or a __VA_OPT__ branch flip.
-  bool hasVaOpt = false;
-  std::function<void(ArrayRef<ReplayElem>)> markVaOpt =
-      [&](ArrayRef<ReplayElem> elems) {
-        for (const ReplayElem &elem : elems) {
-          if (elem.kind == ReplayElem::Kind::VaOpt)
-            hasVaOpt = true;
-          markVaOpt(elem.children);
-        }
-      };
-  markVaOpt(pattern);
+  const bool hasVaOpt = definitionTapePatternHasVaOpt(pattern);
 
   bool hasEmptyFormalSourceSlot = false;
   for (size_t i = 0; i < invArgRanges.size(); ++i) {
@@ -349,10 +678,6 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
       !hasVariadicFormalErasedInB && !hasLeftBoundaryDefinitionTapeSlide)
     return std::nullopt;
 
-  // Use the file-scope A-occurrence carrier so replay matching helpers share a
-  // stable parameter type across the definition-tape solver.
-  using ReplayAOcc = DefinitionTapeReplayAOcc;
-
   std::vector<RefoldModel::PPArgSpan> standardSpans;
   for (const auto &as : m.argSpans) {
     if (as.kind == PPArgSpanKind::Standard && as.begin < as.end)
@@ -360,77 +685,10 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
   }
   llvm::sort(standardSpans, ppArgSpanLessByTokenRangeAndArg);
 
-  // Prove that the normalized replacement-list tree exactly regenerates the
-  // original A expansion cover.  Literal nodes must match one token; formal
-  // nodes either consume the next standard span for that formal or record a
-  // zero-width occurrence; __VA_OPT__ consumes its payload only when the
-  // payload has concrete A-side evidence.
-  std::function<bool(ArrayRef<ReplayElem>, uint64_t &, size_t &,
-                     std::vector<ReplayAOcc> &)>
-      matchAReplay = [&](ArrayRef<ReplayElem> elems, uint64_t &cursor,
-                         size_t &spanIdx,
-                         std::vector<ReplayAOcc> &occs) -> bool {
-    for (const ReplayElem &elem : elems) {
-      if (spanIdx < standardSpans.size() &&
-          standardSpans[spanIdx].begin < cursor)
-        return false;
-
-      switch (elem.kind) {
-      case ReplayElem::Kind::Literal:
-        if (!matchLiteralAToken(deps_.aToks, cursor, elem.spelling))
-          return false;
-        ++cursor;
-        break;
-      case ReplayElem::Kind::Param: {
-        ReplayAOcc occ;
-        occ.argIdx = elem.argIdx;
-        // Start as a zero-width occurrence.  A following PPArgSpan for the
-        // same formal turns this into an ordinary token-bearing occurrence;
-        // otherwise the zero-width marker is the proof surface for an empty
-        // source actual or a zero-token child actual.
-        occ.aBegin = cursor;
-        occ.aEnd = cursor;
-        if (spanIdx < standardSpans.size() &&
-            standardSpans[spanIdx].begin == cursor &&
-            standardSpans[spanIdx].argIdx == elem.argIdx) {
-          occ.span = standardSpans[spanIdx];
-          occ.aBegin = standardSpans[spanIdx].begin;
-          occ.aEnd = standardSpans[spanIdx].end;
-          cursor = standardSpans[spanIdx].end;
-          ++spanIdx;
-        }
-        occs.push_back(std::move(occ));
-        break;
-      }
-      case ReplayElem::Kind::VaOpt: {
-        uint64_t includeCursor = cursor;
-        size_t includeSpanIdx = spanIdx;
-        std::vector<ReplayAOcc> includeOccs = occs;
-        const bool includeOK = matchAReplay(elem.children, includeCursor,
-                                            includeSpanIdx, includeOccs);
-
-        // Skipping __VA_OPT__ consumes no A tokens.  If both branches match
-        // without consuming anything, the A-side replay is ambiguous; if the
-        // include branch consumes tokens/spans, prefer it because those
-        // tokens are concrete evidence that the payload was exposed in A.
-        if (includeOK &&
-            (includeCursor != cursor || includeSpanIdx != spanIdx)) {
-          cursor = includeCursor;
-          spanIdx = includeSpanIdx;
-          occs = std::move(includeOccs);
-        }
-        break;
-      }
-      }
-    }
-    return true;
-  };
-
-  uint64_t aCursor = cover->first;
-  size_t spanIdx = 0;
-  std::vector<ReplayAOcc> aOccs;
-  if (!matchAReplay(pattern, aCursor, spanIdx, aOccs) ||
-      aCursor != cover->second || spanIdx != standardSpans.size())
+  std::vector<DefinitionTapeReplayAOcc> aOccs;
+  DefinitionTapeAReplayMatcher aReplayMatcher(pattern, deps_.aToks,
+                                              standardSpans);
+  if (!aReplayMatcher.Match(cover->first, cover->second, aOccs))
     return std::nullopt;
 
   // Map the proven A replay cover to the B-side envelope that must be
@@ -472,8 +730,8 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
     if (bEnv && h.bEnd <= static_cast<uint64_t>(bEnv->first) &&
         h.bEnd > h.bStart && h.bEnd <= deps_.bToks.size()) {
       SmallVector<StringRef, 8> fixedLiteralPrefix;
-      for (const ReplayElem &elem : pattern) {
-        if (elem.kind != ReplayElem::Kind::Literal)
+      for (const DefinitionTapeReplayElem &elem : pattern) {
+        if (elem.kind != DefinitionTapeReplayElem::Kind::Literal)
           break;
         fixedLiteralPrefix.push_back(elem.spelling);
       }
@@ -541,116 +799,18 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
   // is legal, from ordinary non-empty formals, where assigning no B tokens
   // would silently erase source structure.
   std::vector<unsigned> oldTokenCountByFormal(invArgRanges.size(), 0);
-  for (const ReplayAOcc &occ : aOccs) {
+  for (const DefinitionTapeReplayAOcc &occ : aOccs) {
     if (occ.argIdx < oldTokenCountByFormal.size())
       oldTokenCountByFormal[occ.argIdx] +=
           static_cast<unsigned>(occ.aEnd - occ.aBegin);
   }
 
-  // Use the file-scope B-assignment carrier so replay enumeration and scoring
-  // helpers can become named operations without carrying a function-local
-  // result type.
   using ReplaySolution = DefinitionTapeReplaySolution;
-
-  ReplaySolution seed;
-  seed.ranges.resize(invArgRanges.size(), {0, 0});
-  seed.assigned.resize(invArgRanges.size(), 0);
   std::vector<ReplaySolution> solutions;
-
-  // Assign a candidate B-token interval to a formal.  If the formal appears
-  // multiple times in the replacement list, every occurrence must spell the
-  // same trimmed B text; otherwise one call-site argument could not satisfy
-  // all replayed occurrences.
-  auto assignFormalRange = [&](ReplaySolution &sol, uint32_t argIdx,
-                               std::pair<size_t, size_t> range) -> bool {
-    if (argIdx >= sol.ranges.size() || range.second < range.first)
-      return false;
-    if (sol.assigned[argIdx]) {
-      StringRef oldText =
-          (*deps_.sourceMapper)
-              .SliceBSource(sol.ranges[argIdx].first, sol.ranges[argIdx].second)
-              .trim();
-      StringRef newText =
-          (*deps_.sourceMapper).SliceBSource(range.first, range.second).trim();
-      return oldText == newText;
-    }
-    sol.assigned[argIdx] = 1;
-    sol.ranges[argIdx] = range;
-    return true;
-  };
-
-  // Exhaustively segment the B envelope according to the same replay tree.
-  // Literal nodes consume fixed tokens, parameter nodes choose a token range
-  // for the corresponding formal, and __VA_OPT__ tries both the erased and
-  // exposed branches.  Every recursive step either advances the pattern or
-  // advances the B cursor, so the search is finite for a finite token
-  // envelope. Ambiguity is handled after enumeration by scoring and tie
-  // rejection; the solver must not pick an arbitrary partition just because
-  // it is found first.
-  std::function<void(ArrayRef<ReplayElem>, size_t, size_t, ReplaySolution &,
-                     std::function<void(size_t, ReplaySolution &)>)>
-      dfsElems;
-  dfsElems = [&](ArrayRef<ReplayElem> elems, size_t elemIdx, size_t bPos,
-                 ReplaySolution &sol,
-                 std::function<void(size_t, ReplaySolution &)> done) {
-    if (elemIdx == elems.size()) {
-      done(bPos, sol);
-      return;
-    }
-
-    const ReplayElem &elem = elems[elemIdx];
-    switch (elem.kind) {
-    case ReplayElem::Kind::Literal:
-      if (bPos < bEnv->second && deps_.bToks[bPos].spelling == elem.spelling)
-        dfsElems(elems, elemIdx + 1, bPos + 1, sol, done);
-      return;
-    case ReplayElem::Kind::Param: {
-      // Only empty old formals and variadic formals may be assigned an empty
-      // B interval.  A zero-token assignment for an ordinary non-variadic
-      // formal would silently erase required source structure, but an
-      // explicit empty variadic actual is a valid source spelling (`M(x, )`)
-      // whose surrounding punctuation is replayed by the definition tape.
-      const bool oldWasEmpty = elem.argIdx < oldTokenCountByFormal.size() &&
-                               oldTokenCountByFormal[elem.argIdx] == 0;
-      const bool variadicFormal =
-          elem.argIdx < m.defParams.size() && m.defParams[elem.argIdx].variadic;
-      for (size_t end = bPos; end <= bEnv->second; ++end) {
-        if (!oldWasEmpty && !variadicFormal && end == bPos)
-          continue;
-        ReplaySolution next = sol;
-        if (!assignFormalRange(next, elem.argIdx, {bPos, end}))
-          continue;
-        dfsElems(elems, elemIdx + 1, end, next, done);
-      }
-      return;
-    }
-    case ReplayElem::Kind::VaOpt: {
-      // Erased branch.
-      dfsElems(elems, elemIdx + 1, bPos, sol, done);
-
-      // Exposed branch.  The payload must consume at least one B token; an
-      // empty exposed payload is indistinguishable from the erased branch
-      // here.
-      ReplaySolution withPayload = sol;
-      const size_t payloadBegin = bPos;
-      dfsElems(elem.children, 0, bPos, withPayload,
-               [&](size_t payloadEnd, ReplaySolution &afterPayload) {
-                 if (payloadEnd == payloadBegin)
-                   return;
-                 ReplaySolution cont = afterPayload;
-                 ++cont.vaOptIncludedCount;
-                 dfsElems(elems, elemIdx + 1, payloadEnd, cont, done);
-               });
-      return;
-    }
-    }
-  };
-
-  dfsElems(pattern, 0, bEnv->first, seed,
-           [&](size_t finalPos, ReplaySolution &sol) {
-             if (finalPos == bEnv->second)
-               solutions.push_back(sol);
-           });
+  DefinitionTapeBReplayEnumerator bReplayEnumerator(
+      pattern, deps_.bToks, *deps_.sourceMapper, m.defParams,
+      oldTokenCountByFormal, *bEnv, invArgRanges.size());
+  bReplayEnumerator.Enumerate(solutions);
 
   if (solutions.empty())
     return std::nullopt;
@@ -675,43 +835,16 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
   };
 
   // Replacement-list profile shared by every replay solution for this
-  // definition.  The file-scope carrier records the semantic tape surface
-  // without mentioning the candidate's source spelling.
-  DefinitionTapeProfile tapeProfile;
+  // definition.  The helper records the semantic tape surface without
+  // mentioning any candidate's chosen source spelling.
+  DefinitionTapeProfile tapeProfile =
+      collectDefinitionTapeProfile(pattern, invArgRanges.size());
 
-  std::vector<uint64_t> replacementUseCount(invArgRanges.size(), 0);
-  std::function<void(ArrayRef<ReplayElem>)> collectTapeProfile =
-      [&](ArrayRef<ReplayElem> elems) {
-        for (const ReplayElem &elem : elems) {
-          switch (elem.kind) {
-          case ReplayElem::Kind::Literal:
-            ++tapeProfile.literalCount;
-            break;
-          case ReplayElem::Kind::Param:
-            ++tapeProfile.paramUseCount;
-            if (elem.argIdx < replacementUseCount.size())
-              ++replacementUseCount[elem.argIdx];
-            break;
-          case ReplayElem::Kind::VaOpt:
-            ++tapeProfile.vaOptNodeCount;
-            collectTapeProfile(elem.children);
-            break;
-          }
-        }
-      };
-  collectTapeProfile(pattern);
-
-  for (uint64_t useCount : replacementUseCount) {
-    if (useCount == 0)
-      ++tapeProfile.unusedFormalCount;
-    else if (useCount > 1)
-      ++tapeProfile.duplicatedFormalCount;
-  }
   for (size_t i = 0; i < invArgRanges.size(); ++i) {
     if (formalSourceTrim(static_cast<uint32_t>(i)).empty())
       ++tapeProfile.emptySourceSlotCount;
   }
-  for (const ReplayAOcc &occ : aOccs) {
+  for (const DefinitionTapeReplayAOcc &occ : aOccs) {
     if (occ.aBegin == occ.aEnd)
       ++tapeProfile.zeroTokenAOccurrenceCount;
   }
@@ -831,23 +964,8 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
     }
   }
 
-  const bool hasVaOptCommaPayload = [&]() {
-    std::function<bool(ArrayRef<ReplayElem>)> containsVaOptComma =
-        [&](ArrayRef<ReplayElem> elems) -> bool {
-      for (const ReplayElem &elem : elems) {
-        if (elem.kind == ReplayElem::Kind::VaOpt) {
-          for (const ReplayElem &child : elem.children)
-            if (child.kind == ReplayElem::Kind::Literal &&
-                child.spelling == ",")
-              return true;
-          if (containsVaOptComma(elem.children))
-            return true;
-        }
-      }
-      return false;
-    };
-    return containsVaOptComma(pattern);
-  }();
+  const bool hasVaOptCommaPayload =
+      definitionTapeVaOptPayloadContainsComma(pattern);
 
   const bool hasGnuVariadicCommaPaste = [&]() {
     if (!variadicFormalIndex)
@@ -1187,7 +1305,7 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
                                            static_cast<uint64_t>(bEnv->first),
                                            static_cast<uint64_t>(bEnv->second));
   // Attach the args-only standard proof directly through the proof lattice so
-  // this service does not depend on planner-owned proof stamping helpers.
+  // this service does not depend on planner-owned proof certification helpers.
   {
     MacroPatchProof proof =
         (*deps_.proofLattice)

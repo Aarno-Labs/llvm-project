@@ -15,7 +15,7 @@
 //     callee.
 //
 // Owns generated-callee replay construction and admission so patch dispatch,
-// replay synthesis, and proof stamping remain separate. Calls into
+// replay synthesis, and proof certification remain separate. Calls into
 // `RefoldMacroPatchProofCertifier` and into three thin planner-side helpers
 // (`BuildInvocationRewriteWithRange`, `ResolveFunctionLikeMacroForReplay`,
 // `ResolveFunctionLikeMacroThroughAliasesWithHops`) via explicit

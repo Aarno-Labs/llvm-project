@@ -707,7 +707,7 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
   }
 
   // Preserve the accepted-result proof produced by the include materializer
-  // when available; otherwise stamp the edit as an include materialized
+  // when available; otherwise certify the edit as include materialized
   // expansion.
   if (acceptedIt != includeExpansionAcceptedResults_.end()) {
     textEditAssembler_.AttachAcceptedResultCarrier(edit, acceptedIt->second);

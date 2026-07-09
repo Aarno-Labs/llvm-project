@@ -140,7 +140,7 @@ public:
   AcceptedResultCandidate
   BuildAcceptedMacroCandidate(const MacroPatch &patch) const;
 
-  /// Restamp a macro selector carrier for byte-edit emission.
+  /// Recertify a macro selector carrier for byte-edit emission.
   ///
   /// The input candidate must come from BuildAcceptedMacroCandidate().  This
   /// helper owns only the selector-to-emission proof transition, so macro
@@ -158,7 +158,7 @@ public:
   /// emitted-artifact contract instead of being reclassified as a selector-only
   /// candidate.  This helper is the single normalization point for that emitted
   /// macro carrier so selection finalization and TextEdit attachment do not
-  /// duplicate the restamping logic.
+  /// duplicate the recertification logic.
   AcceptedResultCandidate
   BuildAcceptedMacroEmissionCandidate(const MacroPatch &patch) const;
 
@@ -166,7 +166,7 @@ public:
   /// boundary.
   ///
   /// This helper is a pure boundary accessor: proof authority must already
-  /// have been selected and stamped before the MacroPatch entered the final
+  /// have been selected and certified before the MacroPatch entered the final
   /// emission bucket.  A missing selectedAcceptedCandidate is therefore an
   /// invariant violation and is never repaired here by rebuilding from the raw
   /// MacroPatch.
@@ -179,9 +179,9 @@ public:
   /// helper before they can later materialize as TextEdit objects.  It
   /// refreshes the canonical MacroPatchProof summary, builds the
   /// emitted-boundary AcceptedResultCandidate through the shared theorem gate,
-  /// and stamps the selected carrier on the patch.  If the patch cannot
+  /// and certifies the selected carrier on the patch.  If the patch cannot
   /// normalize to one final theorem proof, the shared missing-carrier invariant
-  /// requests terminal fallback instead of allowing an unstamped raw MacroPatch
+  /// requests terminal fallback instead of allowing an uncertified raw MacroPatch
   /// to survive to emission.
   bool FinalizeSelectedMacroPatchForEmission(MacroPatch &patch,
                                              llvm::StringRef role) const;

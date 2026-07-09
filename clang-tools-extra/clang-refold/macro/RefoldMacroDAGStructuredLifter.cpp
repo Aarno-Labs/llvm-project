@@ -29,6 +29,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
@@ -51,6 +52,315 @@ namespace refold {
 RefoldMacroDAGStructuredLifter::RefoldMacroDAGStructuredLifter(
     Dependencies deps)
     : deps_(std::move(deps)) {}
+
+namespace {
+
+/// Resolves the unique inverse split of a rewritten pasted-token core.
+///
+/// The resolver is deliberately local to this translation unit because it owns
+/// no proof state and trusts callers to supply already-validated paste operands,
+/// delimiters, and sibling-surface context. Its only mutable state is the DFS
+/// frontier and the distinct split solutions needed to preserve the existing
+/// fail-closed ambiguity cutoff.
+class PastedCoreSplitResolver {
+public:
+  PastedCoreSplitResolver(ArrayRef<StringRef> oldSegs,
+                          ArrayRef<StringRef> midBodies)
+      : oldSegs_(oldSegs), midBodies_(midBodies) {}
+
+  /// Splits a rewritten pasted-token core into one segment per original paste
+  /// operand.
+  ///
+  /// The trusted inputs are the already-rebased old operand surfaces and the
+  /// non-empty delimiter text that originally separated adjacent paste
+  /// operands. This resolver owns only the inverse-split search obligation:
+  /// it tries delimiter occurrences in left-to-right order, reserves delimiter
+  /// occurrences that must remain inside neighboring operands, and records
+  /// distinct segmentations in the same order the local DFS used before this
+  /// extraction. If more than one distinct segmentation is found, the replay is
+  /// ambiguous and the caller must fail closed rather than choose a split
+  /// heuristically. Sibling-surface contradiction checks and proof admission
+  /// remain with the callers that consume the unique split.
+  std::optional<SmallVector<StringRef, 4>> Resolve(StringRef core) {
+    Dfs(0, core);
+    if (splitSolutions_.size() != 1)
+      return std::nullopt;
+    return std::move(splitSolutions_[0]);
+  }
+
+private:
+  uint64_t SuffixDelimiterNeed(size_t delimIdx) const {
+    const StringRef delim = midBodies_[delimIdx];
+    uint64_t need = 0;
+    for (size_t segIdx = delimIdx + 1; segIdx < oldSegs_.size(); ++segIdx)
+      need += countSubstringOccurrences(oldSegs_[segIdx], delim);
+    for (size_t later = delimIdx + 1; later < midBodies_.size(); ++later)
+      if (midBodies_[later] == delim)
+        ++need;
+    return need;
+  }
+
+  void AddSplitSolution(const SmallVectorImpl<StringRef> &parts) {
+    SmallVector<StringRef, 4> copy(parts.begin(), parts.end());
+    for (const auto &existing : splitSolutions_)
+      if (existing == copy)
+        return;
+    splitSolutions_.push_back(std::move(copy));
+  }
+
+  void Dfs(size_t delimIdx, StringRef rest) {
+    if (splitSolutions_.size() > 1)
+      return;
+    if (delimIdx == midBodies_.size()) {
+      curSegs_.push_back(rest);
+      AddSplitSolution(curSegs_);
+      curSegs_.pop_back();
+      return;
+    }
+
+    const StringRef delim = midBodies_[delimIdx];
+    const uint64_t needLeft =
+        countSubstringOccurrences(oldSegs_[delimIdx], delim);
+    const uint64_t needRight = SuffixDelimiterNeed(delimIdx);
+
+    // Try each occurrence of the old delimiter as the next split point. The
+    // occurrence-count guards keep delimiter text that originally belonged
+    // inside neighboring segments from being consumed as a split.
+    for (size_t pos = 0; (pos = rest.find(delim, pos)) != StringRef::npos;
+         ++pos) {
+      StringRef left = rest.slice(0, pos);
+      StringRef tail = rest.drop_front(pos + delim.size());
+      if (countSubstringOccurrences(left, delim) < needLeft)
+        continue;
+      if (countSubstringOccurrences(tail, delim) < needRight)
+        continue;
+      curSegs_.push_back(left);
+      Dfs(delimIdx + 1, tail);
+      curSegs_.pop_back();
+    }
+  }
+
+  ArrayRef<StringRef> oldSegs_;
+  ArrayRef<StringRef> midBodies_;
+  SmallVector<StringRef, 4> curSegs_;
+  SmallVector<SmallVector<StringRef, 4>, 2> splitSolutions_;
+};
+
+/// Returns the unique delimiter-respecting pasted-core split, or std::nullopt
+/// when the original delimiter ordering admits no split or more than one
+/// distinct split. Callers preserve proof construction and sibling-surface
+/// checks by validating the returned segment count before consuming it.
+std::optional<SmallVector<StringRef, 4>> splitPastedCoreByDelimiters(
+    StringRef core, ArrayRef<StringRef> oldSegs, ArrayRef<StringRef> midBodies) {
+  PastedCoreSplitResolver resolver(oldSegs, midBodies);
+  return resolver.Resolve(core);
+}
+
+/// Rebuilds exact original nested paste syntax from already-certified DAG
+/// evidence.
+///
+/// This resolver owns the recursive preservation search that was previously a
+/// local self-capturing lambda in `BuildStructuredLiftCertificate`. Its trusted
+/// inputs are the caller's DAG lifting context, the topology/text/proof services
+/// borrowed through Dependencies, and a direct-paste derivation callback that
+/// has already preserved delimiter splitting, sibling-surface checks, and
+/// parent-constraint proof construction. The resolver preserves child traversal
+/// order from `MacroChildrenOf`, keeps derived formal constraints in their
+/// existing sorted order, and fails closed whenever direct-child selection is
+/// ambiguous or a nested child/formal certificate cannot uniquely rebuild the
+/// original paste shape. It does not rank candidates or admit edits; it only
+/// returns replay syntax after the existing wrapper-placeholder proof gate
+/// accepts the reconstructed invocation.
+class ExactOriginalShapePasteReplayResolver {
+public:
+  using DerivedConstraintList =
+      SmallVector<std::pair<uint32_t, ObservedFormalConstraint>, 4>;
+  using DirectPasteDerivationFn = function_ref<std::optional<DerivedConstraintList>(
+      const RefoldModel::MacroInvocation &, const RefoldModel::MacroInvocation &,
+      StringRef, StringRef, StringRef)>;
+
+  ExactOriginalShapePasteReplayResolver(
+      const RefoldMacroDAGStructuredLifter &lifter,
+      const RefoldMacroDAGStructuredLifter::Dependencies &deps,
+      const RefoldMacroDAGLiftingContext &ctx,
+      DirectPasteDerivationFn deriveDirectPasteConstraints)
+      : lifter_(lifter), deps_(deps), ctx_(ctx),
+        deriveDirectPasteConstraints_(deriveDirectPasteConstraints) {}
+
+  /// Returns exact nested replay syntax for `target` when the observed rewrite
+  /// still has one certificate-backed direct-paste explanation.
+  ///
+  /// The observed surfaces are trusted to be the hop-local old/new texts being
+  /// discharged by the caller. This method preserves the previous recursive
+  /// ordering: scan direct children in topology order, prefer a sole full-arg
+  /// nested child before falling back to the normal formal certificate, then
+  /// rebuild the target invocation through the existing wrapper-placeholder
+  /// certificate. A second child with a different derivation, a failed nested
+  /// proof, or any invalid formal/invocation certificate rejects the replay
+  /// rather than choosing a heuristic paste shape.
+  std::optional<std::string> Resolve(
+      const RefoldModel::MacroInvocation &target, StringRef observedOld0,
+      StringRef observedNew0, StringRef traceStage) const {
+    StringRef observedOld = observedOld0.trim();
+    StringRef observedNew = observedNew0.trim();
+    if (!target.invText)
+      return std::nullopt;
+
+    StringRef rawTarget = StringRef(*target.invText).trim();
+    if (rawTarget.empty())
+      return std::nullopt;
+    if (observedOld == observedNew)
+      return rawTarget.str();
+
+    ArrayRef<const RefoldModel::MacroInvocation *> children =
+        deps_.macroTopology.MacroChildrenOf(target.id);
+    if (children.empty())
+      return std::nullopt;
+
+    const RefoldModel::MacroInvocation *directPasteChild = nullptr;
+    std::optional<DerivedConstraintList> derivedConstraints;
+    if (!TrySelectDirectChildForSurface(target, children, observedOld,
+                                        observedNew, traceStage,
+                                        directPasteChild, derivedConstraints))
+      return std::nullopt;
+    if (!directPasteChild) {
+      // Some observed paste surfaces are represented through the quoted
+      // spelling produced by stringification. Retry with quoted surfaces, but
+      // still require the same unique direct-child proof.
+      std::string quotedOld = stringutils::quoteCStringLiteral(observedOld);
+      std::string quotedNew = stringutils::quoteCStringLiteral(observedNew);
+      if (!TrySelectDirectChildForSurface(target, children, quotedOld, quotedNew,
+                                          traceStage, directPasteChild,
+                                          derivedConstraints))
+        return std::nullopt;
+    }
+    if (!directPasteChild || !derivedConstraints)
+      return std::nullopt;
+
+    // Group the derived constraints by the target's formals. Each group is
+    // later replayed either by recursively preserving a nested child or by
+    // falling back to the normal observed-formal certificate.
+    DenseMap<uint32_t, SmallVector<ObservedFormalConstraint, 2>> groupedObserved;
+    for (const auto &kv : *derivedConstraints)
+      groupedObserved[kv.first].push_back(kv.second);
+
+    DenseMap<uint32_t, FormalTextPair> targetFormals;
+    for (const auto &kvLocal : groupedObserved) {
+      const uint32_t formalIdx = kvLocal.first;
+      auto argText =
+          deps_.textPrimitives.GetInvocationArgText(target, formalIdx);
+      if (!argText)
+        return std::nullopt;
+      const StringRef rawOldArg = argText->trim();
+
+      // When the target formal is exactly one nested child invocation, try to
+      // preserve that nested child first. This keeps a chain such as
+      // JOIN(JOIN(...), ...) instead of collapsing it to the already
+      // materialized pasted token.
+      if (kvLocal.second.size() == 1) {
+        const StringRef segOld =
+            StringRef(kvLocal.second.front().oldText).trim();
+        const StringRef segNew =
+            StringRef(kvLocal.second.front().newText).trim();
+        auto placeholders = deps_.textPrimitives.GetTopLevelLexicalChildrenInArg(
+            target, formalIdx);
+        if (placeholders.size() == 1 && placeholders.front().child &&
+            placeholders.front().relBegin == 0 &&
+            placeholders.front().relEnd == rawOldArg.size()) {
+          const RefoldModel::MacroInvocation *nestedChild =
+              placeholders.front().child;
+          if (auto nestedSyntax = Resolve(
+                  *nestedChild, segOld, segNew,
+                  "DAG per-hop exact original-shape replay")) {
+            targetFormals[formalIdx] =
+                FormalTextPair{rawOldArg.str(), std::move(*nestedSyntax)};
+            continue;
+          }
+        }
+      }
+
+      // Otherwise, certify the formal rewrite in the usual way and let the
+      // wrapper-hop certificate rebuild the target invocation around it.
+      auto formalCert =
+          deps_.invertibilitySolver.BuildObservedFormalRewriteCertificate(
+              target, formalIdx, kvLocal.second,
+              /*preferredChildSyntax=*/nullptr, traceStage, ctx_.tokenHunksAR);
+      if (formalCert.kind == FormalRewriteCertificateKind::Invalid)
+        return std::nullopt;
+      targetFormals[formalIdx] =
+          FormalTextPair{formalCert.oldText, formalCert.newText};
+    }
+
+    // Finally, prove that the rewritten formals still fit the target's
+    // original placeholder structure. This is the soundness gate for the
+    // exact-shape replay at this invocation boundary.
+    auto replayCert = lifter_.BuildWrapperPlaceholderHopInvocationCertificate(
+        ctx_, target, targetFormals, traceStage);
+    if (replayCert.kind == InvocationRewriteCertificateKind::Invalid)
+      return std::nullopt;
+    if (!replayCert.rewrittenInvocationSyntax.empty())
+      return replayCert.rewrittenInvocationSyntax;
+
+    // If the placeholder certificate did not directly materialize syntax,
+    // build it from only the formals that actually changed.
+    DenseMap<uint32_t, std::string> replByFormal;
+    for (const auto &kvLocal : targetFormals) {
+      StringRef oldText = StringRef(kvLocal.second.oldText).trim();
+      StringRef newText = StringRef(kvLocal.second.newText).trim();
+      if (oldText != newText)
+        replByFormal[kvLocal.first] = newText.str();
+    }
+    return deps_.textPrimitives.BuildRewrittenInvocationSyntax(target,
+                                                               replByFormal);
+  }
+
+private:
+  static bool SameDerivedConstraints(const DerivedConstraintList &lhs,
+                                     const DerivedConstraintList &rhs) {
+    if (lhs.size() != rhs.size())
+      return false;
+    for (size_t i = 0; i < lhs.size(); ++i) {
+      if (lhs[i].first != rhs[i].first)
+        return false;
+      if (lhs[i].second.oldText != rhs[i].second.oldText ||
+          lhs[i].second.newText != rhs[i].second.newText)
+        return false;
+    }
+    return true;
+  }
+
+  bool TrySelectDirectChildForSurface(
+      const RefoldModel::MacroInvocation &target,
+      ArrayRef<const RefoldModel::MacroInvocation *> children,
+      StringRef surfaceOld, StringRef surfaceNew, StringRef traceStage,
+      const RefoldModel::MacroInvocation *&directPasteChild,
+      std::optional<DerivedConstraintList> &derivedConstraints) const {
+    for (const auto *cand : children) {
+      if (!cand || cand->pasteSpans.empty())
+        continue;
+      auto derived = deriveDirectPasteConstraints_(target, *cand, surfaceOld,
+                                                   surfaceNew, traceStage);
+      if (!derived)
+        continue;
+      if (directPasteChild) {
+        if (directPasteChild != cand || !derivedConstraints ||
+            !SameDerivedConstraints(*derivedConstraints, *derived))
+          return false;
+        continue;
+      }
+      directPasteChild = cand;
+      derivedConstraints = std::move(derived);
+    }
+    return true;
+  }
+
+  const RefoldMacroDAGStructuredLifter &lifter_;
+  const RefoldMacroDAGStructuredLifter::Dependencies &deps_;
+  const RefoldMacroDAGLiftingContext &ctx_;
+  DirectPasteDerivationFn deriveDirectPasteConstraints_;
+};
+
+} // namespace
 
 RefoldMacroPasteArgumentBuilder
 RefoldMacroDAGStructuredLifter::pasteArgumentBuilder() const {
@@ -571,64 +881,10 @@ RefoldMacroDAGStructuredLifter::TryBuildNestedPasteChainDerivation(
   StringRef core =
       newTok.slice(leading.size(), newTok.size() - trailing.size());
 
-  auto suffixDelimiterNeed = [&](size_t delimIdx) -> uint64_t {
-    const StringRef delim = midBodies[delimIdx];
-    uint64_t need = 0;
-    for (size_t segIdx = delimIdx + 1; segIdx < oldSegs.size(); ++segIdx)
-      need += countSubstringOccurrences(oldSegs[segIdx], delim);
-    for (size_t later = delimIdx + 1; later < midBodies.size(); ++later)
-      if (midBodies[later] == delim)
-        ++need;
-    return need;
-  };
-
-  SmallVector<StringRef, 4> curSegs;
-  SmallVector<SmallVector<StringRef, 4>, 2> splitSolutions;
-  auto addSplitSolution = [&](const SmallVectorImpl<StringRef> &parts) {
-    SmallVector<StringRef, 4> copy(parts.begin(), parts.end());
-    for (const auto &existing : splitSolutions)
-      if (existing == copy)
-        return;
-    splitSolutions.push_back(std::move(copy));
-  };
-
-  auto splitCore = [&](auto &&self, size_t delimIdx, StringRef rest) -> void {
-    if (splitSolutions.size() > 1)
-      return;
-    if (delimIdx == midBodies.size()) {
-      curSegs.push_back(rest);
-      addSplitSolution(curSegs);
-      curSegs.pop_back();
-      return;
-    }
-
-    const StringRef delim = midBodies[delimIdx];
-    const uint64_t needLeft =
-        countSubstringOccurrences(oldSegs[delimIdx], delim);
-    const uint64_t needRight = suffixDelimiterNeed(delimIdx);
-
-    // Try each occurrence of the old delimiter as the next split point.
-    // The occurrence-count guards keep delimiter text that originally
-    // belonged inside neighboring segments from being consumed as a
-    // split.
-    for (size_t pos = 0; (pos = rest.find(delim, pos)) != StringRef::npos;
-         ++pos) {
-      StringRef left = rest.slice(0, pos);
-      StringRef tail = rest.drop_front(pos + delim.size());
-      if (countSubstringOccurrences(left, delim) < needLeft)
-        continue;
-      if (countSubstringOccurrences(tail, delim) < needRight)
-        continue;
-      curSegs.push_back(left);
-      self(self, delimIdx + 1, tail);
-      curSegs.pop_back();
-    }
-  };
-  splitCore(splitCore, 0, core);
-
   // Accept only a unique split with one new segment for each old paste
   // contribution. Anything else is ambiguous or structurally incomplete.
-  if (splitSolutions.size() != 1 || splitSolutions[0].size() != group.size())
+  auto splitSolution = splitPastedCoreByDelimiters(core, oldSegs, midBodies);
+  if (!splitSolution || splitSolution->size() != group.size())
     return std::nullopt;
 
   ParentConstraintDerivationCertificate cert;
@@ -641,7 +897,7 @@ RefoldMacroDAGStructuredLifter::TryBuildNestedPasteChainDerivation(
   for (size_t i = 0; i < group.size(); ++i) {
     const uint32_t nestedFormal = group[i]->argIdx;
     auto nestedCert = this->BuildParentConstraintDerivationCertificate(
-        ctx, *nested, nestedFormal, oldSegs[i], splitSolutions[0][i],
+        ctx, *nested, nestedFormal, oldSegs[i], (*splitSolution)[i],
         traceStage);
     if (!nestedCert.valid)
       return std::nullopt;
@@ -1263,64 +1519,12 @@ RefoldMacroDAGStructuredLifter::BuildStructuredLiftCertificate(
     StringRef core =
         observedNew.slice(leading.size(), observedNew.size() - trailing.size());
 
-    // Count how many future occurrences of the current delimiter must be
-    // reserved to make the remainder splittable. This lets the splitter
-    // reject early cuts that would strand a later operand.
-    auto suffixDelimiterNeed = [&](size_t delimIdx) -> uint64_t {
-      const StringRef delim = midBodies[delimIdx];
-      uint64_t need = 0;
-      for (size_t segIdx = delimIdx + 1; segIdx < oldSegs.size(); ++segIdx)
-        need += countSubstringOccurrences(oldSegs[segIdx], delim);
-      for (size_t later = delimIdx + 1; later < midBodies.size(); ++later)
-        if (midBodies[later] == delim)
-          ++need;
-      return need;
-    };
-
-    SmallVector<StringRef, 4> curSegs;
-    SmallVector<SmallVector<StringRef, 4>, 2> splitSolutions;
-    auto addSplitSolution = [&](const SmallVectorImpl<StringRef> &parts) {
-      SmallVector<StringRef, 4> copy(parts.begin(), parts.end());
-      for (const auto &existing : splitSolutions)
-        if (existing == copy)
-          return;
-      splitSolutions.push_back(std::move(copy));
-    };
-
     // Split the rewritten pasted core around the original inter-operand
-    // delimiters. We only accept a unique segmentation; if multiple
-    // splits work, the inverse-paste explanation is ambiguous and
-    // therefore not a valid replay certificate.
-    auto splitCore = [&](auto &&self, size_t delimIdx, StringRef rest) -> void {
-      if (splitSolutions.size() > 1)
-        return;
-      if (delimIdx == midBodies.size()) {
-        curSegs.push_back(rest);
-        addSplitSolution(curSegs);
-        curSegs.pop_back();
-        return;
-      }
-
-      const StringRef delim = midBodies[delimIdx];
-      const uint64_t needLeft =
-          countSubstringOccurrences(oldSegs[delimIdx], delim);
-      const uint64_t needRight = suffixDelimiterNeed(delimIdx);
-
-      for (size_t pos = 0; (pos = rest.find(delim, pos)) != StringRef::npos;
-           ++pos) {
-        StringRef left = rest.slice(0, pos);
-        StringRef tail = rest.drop_front(pos + delim.size());
-        if (countSubstringOccurrences(left, delim) < needLeft)
-          continue;
-        if (countSubstringOccurrences(tail, delim) < needRight)
-          continue;
-        curSegs.push_back(left);
-        self(self, delimIdx + 1, tail);
-        curSegs.pop_back();
-      }
-    };
-    splitCore(splitCore, 0, core);
-    if (splitSolutions.size() != 1 || splitSolutions[0].size() != group.size())
+    // delimiters. We only accept a unique segmentation; if multiple splits
+    // work, the inverse-paste explanation is ambiguous and therefore not a
+    // valid replay certificate.
+    auto splitSolution = splitPastedCoreByDelimiters(core, oldSegs, midBodies);
+    if (!splitSolution || splitSolution->size() != group.size())
       return std::nullopt;
 
     // Lift each recovered child-operand rewrite through the child's
@@ -1332,7 +1536,7 @@ RefoldMacroDAGStructuredLifter::BuildStructuredLiftCertificate(
     for (size_t i = 0; i < group.size(); ++i) {
       const uint32_t childFormal = group[i]->argIdx;
       auto derived = this->BuildParentConstraintDerivationCertificate(
-          ctx, directChild, childFormal, oldSegs[i], splitSolutions[0][i],
+          ctx, directChild, childFormal, oldSegs[i], (*splitSolution)[i],
           traceStage);
       if (!derived.valid)
         return std::nullopt;
@@ -1359,177 +1563,12 @@ RefoldMacroDAGStructuredLifter::BuildStructuredLiftCertificate(
     return out;
   };
 
-  /// Rebuild the exact original nested paste shape for `target` when the
-  /// observed edit still admits a unique, certificate-backed replay of
-  /// that shape.
-  ///
-  /// This is a preservation path, not a synthesis path. It only reuses
-  /// child invocations that already existed in the original source and
-  /// only accepts the replay after the usual formal and placeholder
-  /// certificates prove that the rebuilt invocation is structurally
-  /// valid.
-  std::function<std::optional<std::string>(const RefoldModel::MacroInvocation &,
-                                           StringRef, StringRef, StringRef)>
-      tryBuildExactOriginalShapePasteReplaySyntax;
-
-  tryBuildExactOriginalShapePasteReplaySyntax =
-      [&](const RefoldModel::MacroInvocation &target, StringRef observedOld0,
-          StringRef observedNew0,
-          StringRef traceStage) -> std::optional<std::string> {
-    StringRef observedOld = observedOld0.trim();
-    StringRef observedNew = observedNew0.trim();
-    if (!target.invText)
-      return std::nullopt;
-
-    StringRef rawTarget = StringRef(*target.invText).trim();
-    if (rawTarget.empty())
-      return std::nullopt;
-    if (observedOld == observedNew)
-      return rawTarget.str();
-
-    ArrayRef<const RefoldModel::MacroInvocation *> children =
-        deps_.macroTopology.MacroChildrenOf(target.id);
-    if (children.empty())
-      return std::nullopt;
-
-    const RefoldModel::MacroInvocation *directPasteChild = nullptr;
-    std::optional<SmallVector<std::pair<uint32_t, ObservedFormalConstraint>, 4>>
-        derivedConstraints;
-    auto sameDerivedConstraints =
-        [&](const SmallVectorImpl<std::pair<uint32_t, ObservedFormalConstraint>>
-                &lhs,
-            const SmallVectorImpl<std::pair<uint32_t, ObservedFormalConstraint>>
-                &rhs) -> bool {
-      if (lhs.size() != rhs.size())
-        return false;
-      for (size_t i = 0; i < lhs.size(); ++i) {
-        if (lhs[i].first != rhs[i].first)
-          return false;
-        if (lhs[i].second.oldText != rhs[i].second.oldText ||
-            lhs[i].second.newText != rhs[i].second.newText)
-          return false;
-      }
-      return true;
-    };
-
-    // Find the unique direct child whose paste spans can explain the
-    // observed rewrite. If more than one child derives different parent
-    // constraints, the replay would be ambiguous and must be rejected.
-    auto trySelectDirectChildForSurface = [&](StringRef surfaceOld,
-                                              StringRef surfaceNew) -> bool {
-      for (const auto *cand : children) {
-        if (!cand || cand->pasteSpans.empty())
-          continue;
-        auto derived = tryDeriveObservedConstraintsFromDirectPasteChild(
-            target, *cand, surfaceOld, surfaceNew, traceStage);
-        if (!derived)
-          continue;
-        if (directPasteChild) {
-          if (directPasteChild != cand || !derivedConstraints ||
-              !sameDerivedConstraints(*derivedConstraints, *derived))
-            return false;
-          continue;
-        }
-        directPasteChild = cand;
-        derivedConstraints = std::move(derived);
-      }
-      return true;
-    };
-
-    if (!trySelectDirectChildForSurface(observedOld, observedNew))
-      return std::nullopt;
-    if (!directPasteChild) {
-      // Some observed paste surfaces are represented through the quoted
-      // spelling produced by stringification. Retry with quoted surfaces,
-      // but still require the same unique direct-child proof.
-      std::string quotedOld = stringutils::quoteCStringLiteral(observedOld);
-      std::string quotedNew = stringutils::quoteCStringLiteral(observedNew);
-      if (!trySelectDirectChildForSurface(quotedOld, quotedNew))
-        return std::nullopt;
-    }
-    if (!directPasteChild || !derivedConstraints) {
-      return std::nullopt;
-    }
-
-    // Group the derived constraints by the target's formals. Each group
-    // is later replayed either by recursively preserving a nested child
-    // or by falling back to the normal observed-formal certificate.
-    DenseMap<uint32_t, SmallVector<ObservedFormalConstraint, 2>>
-        groupedObserved;
-    for (const auto &kv : *derivedConstraints)
-      groupedObserved[kv.first].push_back(kv.second);
-
-    DenseMap<uint32_t, FormalTextPair> targetFormals;
-    for (const auto &kvLocal : groupedObserved) {
-      const uint32_t formalIdx = kvLocal.first;
-      auto argText =
-          deps_.textPrimitives.GetInvocationArgText(target, formalIdx);
-      if (!argText)
-        return std::nullopt;
-      const StringRef rawOldArg = argText->trim();
-
-      // When the target formal is exactly one nested child invocation,
-      // try to preserve that nested child first. This keeps a chain such
-      // as JOIN(JOIN(...), ...) instead of collapsing it to the already
-      // materialized pasted token.
-      if (kvLocal.second.size() == 1) {
-        const StringRef segOld =
-            StringRef(kvLocal.second.front().oldText).trim();
-        const StringRef segNew =
-            StringRef(kvLocal.second.front().newText).trim();
-        auto placeholders =
-            deps_.textPrimitives.GetTopLevelLexicalChildrenInArg(target,
-                                                                 formalIdx);
-        if (placeholders.size() == 1 && placeholders.front().child &&
-            placeholders.front().relBegin == 0 &&
-            placeholders.front().relEnd == rawOldArg.size()) {
-          const RefoldModel::MacroInvocation *nestedChild =
-              placeholders.front().child;
-          if (auto nestedSyntax = tryBuildExactOriginalShapePasteReplaySyntax(
-                  *nestedChild, segOld, segNew,
-                  "DAG per-hop exact original-shape replay")) {
-            targetFormals[formalIdx] =
-                FormalTextPair{rawOldArg.str(), std::move(*nestedSyntax)};
-            continue;
-          }
-        }
-      }
-
-      // Otherwise, certify the formal rewrite in the usual way and let
-      // the wrapper-hop certificate rebuild the target invocation around
-      // it.
-      auto formalCert =
-          deps_.invertibilitySolver.BuildObservedFormalRewriteCertificate(
-              target, formalIdx, kvLocal.second,
-              /*preferredChildSyntax=*/nullptr, traceStage, ctx.tokenHunksAR);
-      if (formalCert.kind == FormalRewriteCertificateKind::Invalid)
-        return std::nullopt;
-      targetFormals[formalIdx] =
-          FormalTextPair{formalCert.oldText, formalCert.newText};
-    }
-
-    // Finally, prove that the rewritten formals still fit the target's
-    // original placeholder structure. This is the soundness gate for the
-    // exact-shape replay at this invocation boundary.
-    auto replayCert = this->BuildWrapperPlaceholderHopInvocationCertificate(
-        ctx, target, targetFormals, traceStage);
-    if (replayCert.kind == InvocationRewriteCertificateKind::Invalid)
-      return std::nullopt;
-    if (!replayCert.rewrittenInvocationSyntax.empty())
-      return replayCert.rewrittenInvocationSyntax;
-
-    // If the placeholder certificate did not directly materialize syntax,
-    // build it from only the formals that actually changed.
-    DenseMap<uint32_t, std::string> replByFormal;
-    for (const auto &kvLocal : targetFormals) {
-      StringRef oldText = StringRef(kvLocal.second.oldText).trim();
-      StringRef newText = StringRef(kvLocal.second.newText).trim();
-      if (oldText != newText)
-        replByFormal[kvLocal.first] = newText.str();
-    }
-    return deps_.textPrimitives.BuildRewrittenInvocationSyntax(target,
-                                                               replByFormal);
-  };
+  // Rebuild exact original nested paste syntax through a named resolver so the
+  // recursive proof search has explicit state and keeps the same child-order,
+  // ambiguity, and wrapper-placeholder proof obligations as the previous local
+  // lambda.
+  ExactOriginalShapePasteReplayResolver exactOriginalShapePasteReplayResolver(
+      *this, deps_, ctx, tryDeriveObservedConstraintsFromDirectPasteChild);
 
   /// Handle the common DAG hop where one child formal maps directly to
   /// one parent formal.
@@ -1588,7 +1627,7 @@ RefoldMacroDAGStructuredLifter::BuildStructuredLiftCertificate(
           placeholders.front().relEnd == oldTrim.size()) {
         const RefoldModel::MacroInvocation *nestedChild =
             placeholders.front().child;
-        if (auto replaySyntax = tryBuildExactOriginalShapePasteReplaySyntax(
+        if (auto replaySyntax = exactOriginalShapePasteReplayResolver.Resolve(
                 *nestedChild, childObservedOld, newTrim,
                 "DAG per-hop exact original-shape replay")) {
           return FormalTextPair{oldTrim.str(), std::move(*replaySyntax)};

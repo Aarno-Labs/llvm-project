@@ -457,7 +457,7 @@ AcceptedResultCandidate RefoldTUAnchorProof::BuildAcceptedTUAnchorCandidate(
   // TU-anchor candidates preserve only the local zero-token boundary fields.
   // Line-control, counter, owner, and suffix-state witness facts enter through
   // proof summaries that explicitly own those facts, so this builder does not
-  // synthesize additional carrier-local witness state while restamping the
+  // synthesize additional carrier-local witness state while recertifying the
   // selector-visible TU-anchor candidate.
   refreshTUAnchorEmissionPathInventory(candidate);
   theoremAudit_.AuditAcceptedResultCandidateForLegacyAuthority(

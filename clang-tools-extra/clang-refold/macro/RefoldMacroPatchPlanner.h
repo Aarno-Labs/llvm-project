@@ -137,7 +137,7 @@ public:
   /// planner was constructed with, without needing friend access.
   const Dependencies &Deps() const { return deps_; }
 
-  /// Read-only access to the macro-patch proof certifier for stamping
+  /// Read-only access to the macro-patch proof certifier for certification
   /// selected macro candidates and whole-cover proof carriers.
   const RefoldMacroPatchProofCertifier &ProofCertifier() const {
     return proofCertifier_;

@@ -93,7 +93,7 @@ public:
   /// The input vector is consumed by value so the caller can hand off the
   /// current token-diff plan without retaining a stale pre-normalization copy.
   /// The TU bytes are supplied per run because the buffer is loaded inside
-  /// `RunSinglePassRefold`.  The planner refreshes the borrowed `ABTokHunks`
+  /// `RunRefoldPass`.  The planner refreshes the borrowed `ABTokHunks`
   /// cache, durable mixed-owner witnesses, and emitted segment bindings as one
   /// deterministic normalization pass.  Source gaps are crossed only when they
   /// are explained by modeled zero-token state owners or lexer-ignorable

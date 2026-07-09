@@ -67,6 +67,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "core/RefoldEngine.h"
+#include "core/RefoldLangOptions.h"
 #include "core/RefoldLog.h"
 #include "core/RefoldPreprocessRecheck.h"
 #include "core/RefoldSchema.h"
@@ -501,7 +502,7 @@ int main(int argc, char **argv) {
     });
   }
   const PPCtx ctx = *ctxOrErr;
-  const LangOptions lexLang = RefoldEngine::MakeLexLangOptions(ctx.lang);
+  const LangOptions lexLang = makeRefoldLexLangOptions(ctx.lang);
 
   std::optional<PPCtx> checkCtx;
   if (onlyCheck) {

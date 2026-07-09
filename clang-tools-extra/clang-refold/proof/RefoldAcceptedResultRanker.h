@@ -146,7 +146,7 @@ public:
   /// Return whether one macro selector carrier outranks another.
   ///
   /// Macro-local ranking is intentionally based on selectorCandidate only. The
-  /// emittedCandidate exists solely for the later emission stamp and must not
+  /// emittedCandidate exists solely for the later emission certificate and must not
   /// change selector ordering.
   bool MacroSelectionCandidatePrefers(const MacroSelectionCandidate &lhs,
                                       const MacroSelectionCandidate &rhs) const;

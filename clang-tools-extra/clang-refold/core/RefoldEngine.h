@@ -133,6 +133,10 @@
 #include <utility>
 #include <vector>
 
+namespace llvm {
+class MemoryBuffer;
+}
+
 using namespace llvm;
 
 namespace clang {
@@ -287,9 +291,6 @@ public:
       FinalLineControlValidationCallback finalLineControlValidationCallback =
           FinalLineControlValidationCallback(),
       std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr);
-
-  /// Build lexer language options from the producer-captured language name.
-  static clang::LangOptions MakeLexLangOptions(llvm::StringRef langName);
 
 private:
   const RefoldModel model_;
@@ -702,17 +703,76 @@ private:
   ///
   /// This is the main instance entry point. It classifies token hunks, plans
   /// TU/include/macro edits under the structural policy, materializes the
-  /// refolded translation unit, and either returns that single-pass result or
+  /// refolded translation unit, and either returns that structural result or
   /// falls back to the explicit terminal edited-preprocessed-stream outcome.
   ///
   /// \returns The refolded C/C++ source text for the translation unit.
   std::string Refold();
 
-  /// \brief Run the single structural refold pass.
+  /// Validate that the producer-recorded A token count still matches the
+  /// re-lexed A stream for the current refold attempt.
+  ///
+  /// A mismatch means the structural pass cannot discharge token provenance, so
+  /// this stage records the existing terminal fallback request instead of
+  /// continuing with stale token ownership facts.
+  bool ValidateTokenCount();
+
+  /// Load the physical translation-unit source bytes for structural refolding.
+  ///
+  /// The returned memory buffer must outlive all later pipeline stages because
+  /// those stages borrow `StringRef` views into the TU bytes while planning and
+  /// materializing edits.
+  std::unique_ptr<llvm::MemoryBuffer> LoadTUSource(StringRef tuPath);
+
+  /// Build and normalize the A/B token diff used by structural hunk dispatch.
+  ///
+  /// This stage refreshes the token-diff planner's run-local caches, applies
+  /// mixed-owner tiling, and records pure-insertion provenance before any
+  /// macro/include/TU edit planner can consume the hunk sequence.
+  std::vector<diffutils::Hunk> PlanTokenDiff(StringRef tuPath,
+                                             StringRef tuBytes);
+
+  /// Emit trace diagnostics for each B-token envelope selected by the token
+  /// diff and owner-aware tiling stages.
+  ///
+  /// The diagnostics validate token-to-byte envelope shape and never become a
+  /// proof source for accepting a hunk.
+  void TraceStructuralHunkEnvelopes(ArrayRef<diffutils::Hunk> hunks);
+
+  /// Stage source edits for sideband pragma lines before ordinary hunk dispatch.
+  ///
+  /// Sideband edits have already been stripped from the normal token streams,
+  /// so staging them first lets later TU/include/macro realization avoid
+  /// replaying the same B bytes through ordinary structural hunks.
+  bool StageSidebandEdits(
+      StringRef tuPath, StringRef tuBytes,
+      RefoldStructuralHunkDispatcher &structuralHunkDispatcher);
+
+  /// Classify each structural hunk and stage the selected TU/include/macro edit.
+  ///
+  /// This preserves the existing dispatch order: macro call-site proofs are
+  /// tried first, include ownership is honored next, truthful TU byte-span edits
+  /// follow, and unresolved ownership records the explicit terminal fallback
+  /// obligation instead of manufacturing a weaker success class.
+  bool DispatchStructuralHunks(
+      StringRef tuPath, StringRef tuBytes, ArrayRef<diffutils::Hunk> hunks,
+      RefoldStructuralHunkDispatcher &structuralHunkDispatcher);
+
+  /// Complete macro-state repair, include materialization, and final TU emission
+  /// after all structural hunks have been dispatched.
+  ///
+  /// This stage owns only final orchestration. The macro-state, include
+  /// scheduler, and final-emission services continue to own their respective
+  /// proof obligations and fail-closed mechanics.
+  std::string FinalizeStructuralResult(
+      StringRef tuPath, StringRef tuBytes, ArrayRef<diffutils::Hunk> hunks,
+      RefoldStructuralHunkDispatcher &structuralHunkDispatcher);
+
+  /// \brief Run the structural refold pass.
   ///
   /// The caller reacts to typed requests recorded in RefoldTerminalProofSink by
   /// selecting the explicit terminal fallback result.
-  std::string RunSinglePassRefold();
+  std::string RunRefoldPass();
 };
 
 } // namespace refold
