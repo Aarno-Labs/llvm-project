@@ -520,10 +520,24 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
                             FinalMacroCandidateOrigin::ReuseExistingExpanded});
   }
 
-  if (wholeCoverPlan) {
+  bool wholeCoverCanReplaceInvocationSource = true;
+  if (m.subkind == "func") {
+    StringRef invocationText =
+        !baseInvText.empty()
+            ? baseInvText
+            : (m.invText ? StringRef(*m.invText) : StringRef(""));
+    wholeCoverCanReplaceInvocationSource =
+        RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
+            invocationText, m);
+  }
+
+  if (wholeCoverPlan && wholeCoverCanReplaceInvocationSource) {
     // Whole-cover realization is added as another final candidate unless
     // a selectable structure-preserving candidate for the same root
-    // already wins the named lattice tie-breaker above.
+    // already wins the named lattice tie-breaker above.  Function-like
+    // realization also requires a real source callsite.  Producer pseudo-
+    // invocations for generated callees, such as `ADD, (1, 2)`, are not
+    // syntactic callsites and cannot safely be replaced directly.
     const WholeCoverCandidate wholeCoverCandidate{m, invStart, invEnd,
                                                   *wholeCoverPlan};
     MacroPatch patch =

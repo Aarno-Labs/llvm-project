@@ -861,11 +861,35 @@ private:
     Token Tok;
     MacroDefinition MD;
     SourceRange Range;
+    uint64_t ExpansionFrameId = 0;
+    uint64_t ParentExpansionFrameId = 0;
 
-    MacroExpandsInfo(Token Tok, MacroDefinition MD, SourceRange Range)
-        : Tok(Tok), MD(MD), Range(Range) {}
+    MacroExpandsInfo(Token Tok, MacroDefinition MD, SourceRange Range,
+                     uint64_t ExpansionFrameId,
+                     uint64_t ParentExpansionFrameId)
+        : Tok(Tok), MD(MD), Range(Range),
+          ExpansionFrameId(ExpansionFrameId),
+          ParentExpansionFrameId(ParentExpansionFrameId) {}
   };
   SmallVector<MacroExpandsInfo, 2> DelayedMacroExpandsCallbacks;
+
+  uint64_t NextMacroExpansionFrameId = 1;
+
+public:
+  struct MacroExpansionCallbackContext {
+    uint64_t ExpansionFrameId = 0;
+    uint64_t ParentExpansionFrameId = 0;
+  };
+
+  /// Return the exact expansion-frame relationship for the MacroExpands
+  /// callback currently being delivered. The value is zero outside that
+  /// callback.
+  MacroExpansionCallbackContext getMacroExpansionCallbackContext() const {
+    return CurrentMacroExpansionCallbackContext;
+  }
+
+private:
+  MacroExpansionCallbackContext CurrentMacroExpansionCallbackContext;
 
   /// Information about a name that has been used to define a module macro.
   struct ModuleMacroInfo {
@@ -1724,7 +1748,7 @@ public:
   /// \param ILEnd specifies the location of the ')' for a function-like macro
   /// or the identifier for an object-like macro.
   void EnterMacro(Token &Tok, SourceLocation ILEnd, MacroInfo *Macro,
-                  MacroArgs *Args);
+                  MacroArgs *Args, uint64_t ExpansionFrameId);
 
 private:
   /// Add a "macro" context to the top of the include stack,

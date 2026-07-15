@@ -130,6 +130,36 @@ struct TupleGeneratedCalleeReplayContext {
   uint32_t &objectAliasHopCount;
 };
 
+/// Request for solving one already-composed terminal generated callee.
+///
+/// The recursive tuple-generated-callee resolver uses this narrow engine entry
+/// point after it has independently proven the producer ancestry path and
+/// terminal-actual source slices.  The generated-callee engine still owns the
+/// replacement-list parser, old/new expansion replay, stringification/paste
+/// handling, and unique-solution policy.
+struct TerminalGeneratedCalleeReplayRequest {
+  /// Terminal generated function-like macro definition to replay.
+  const RefoldModel::MacroDirective &terminalDefinition;
+  /// Old terminal actual spellings in terminal callee formal order.
+  llvm::ArrayRef<std::string> oldActuals;
+  /// Whole-cover A-token envelope for the root recursive invocation.
+  const std::pair<uint64_t, uint64_t> &wholeCoverATokens;
+  /// B-token envelope being realized by terminal generated-callee replay.
+  const std::pair<size_t, size_t> &bTokenEnvelope;
+};
+
+/// Unique old/new replay solution for one terminal generated callee.
+struct TerminalGeneratedCalleeReplaySolution {
+  /// Solved old actuals in terminal callee formal order.
+  llvm::SmallVector<std::string, 8> oldSolvedActuals;
+  /// Solved edited actuals in terminal callee formal order.
+  llvm::SmallVector<std::string, 8> newSolvedActuals;
+  /// True when the accepted terminal replay inverted stringification.
+  bool usesStringification = false;
+  /// True when the accepted terminal replay inverted token paste.
+  bool usesPaste = false;
+};
+
 /// Builds and validates generated-callee replay candidates.
 ///
 /// Generated-callee replay handles edits whose visible callee surface was
@@ -191,6 +221,16 @@ public:
   /// nullopt for a non-terminal miss.
   std::optional<MacroPatch> BuildTupleGeneratedCalleeReplayCandidate(
       const TupleGeneratedCalleeReplayContext &ctx) const;
+
+  /// Solve an already-composed terminal generated-callee replay.
+  ///
+  /// This method exposes only the existing generated-callee solver boundary:
+  /// callers provide the terminal definition and old actuals, while the engine
+  /// parses the terminal replacement tape and requires unique old/new replay
+  /// solutions.  It constructs no patch and performs no root tuple edits.
+  std::optional<TerminalGeneratedCalleeReplaySolution>
+  SolveTerminalGeneratedCalleeReplay(
+      const TerminalGeneratedCalleeReplayRequest &ctx) const;
 
 private:
   Dependencies deps_;

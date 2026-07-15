@@ -10,6 +10,7 @@
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroDAGSharedHelpers.h"
+#include "macro/RefoldMacroOccurrenceProofValidator.h"
 #include "macro/RefoldMacroPatchPlanner.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
@@ -53,6 +54,11 @@ using namespace llvm;
 
 namespace clang {
 namespace refold {
+
+/// Hard cap for walking caller_macro_id ancestors during generated-descendant
+/// recursive tuple replay recovery.  Reaching the cap rejects the recovery
+/// path rather than truncating producer ancestry.
+constexpr unsigned RecursiveTupleAncestorDepthLimit = 64;
 
 // Small token-spelling / PP-span helpers shared across the DAG phase
 // services live in `macro/RefoldMacroDAGSharedHelpers.h`
@@ -416,6 +422,107 @@ RefoldMacroWholeCoverOrchestrator::TryCounterLiteralWholeCoverPatch(
 }
 
 std::optional<MacroPatch>
+RefoldMacroWholeCoverOrchestrator::TryRecursiveTupleGeneratedReplayFromCallerAncestor(
+    const RefoldModel::MacroInvocation &invocation,
+    const diffutils::Hunk &hunk) const {
+  if (!invocation.callerMacroId)
+    return std::nullopt;
+
+  auto findUniqueInvocationById =
+      [this](uint64_t invocationId) -> const RefoldModel::MacroInvocation * {
+    const RefoldModel::MacroInvocation *found = nullptr;
+    for (const RefoldModel::MacroInvocation &candidate :
+         planner_->Deps().model->GetMacroInvocations()) {
+      if (candidate.id != invocationId)
+        continue;
+      if (found)
+        return nullptr;
+      found = &candidate;
+    }
+    return found;
+  };
+
+  DenseSet<uint64_t> visitedInvocationIds;
+  visitedInvocationIds.insert(invocation.id);
+
+  std::optional<MacroPatch> uniqueCandidate;
+  const RefoldModel::MacroInvocation *cursor = &invocation;
+  for (unsigned depth = 0; depth < RecursiveTupleAncestorDepthLimit; ++depth) {
+    if (!cursor->callerMacroId)
+      break;
+    if (!visitedInvocationIds.insert(*cursor->callerMacroId).second)
+      return std::nullopt;
+
+    const RefoldModel::MacroInvocation *ancestor =
+        findUniqueInvocationById(*cursor->callerMacroId);
+    if (!ancestor)
+      return std::nullopt;
+    cursor = ancestor;
+
+    if (!ancestor->invText || !ancestor->invB || !ancestor->invE)
+      continue;
+    if (ancestor->calleeOrigin.kind != MacroCalleeOriginKind::LiteralMacroName)
+      continue;
+    if (!RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
+            *ancestor->invText, *ancestor))
+      continue;
+
+    std::optional<std::pair<uint64_t, uint64_t>> ancestorCover =
+        RefoldMacroWholeCoverProof::GetWholeCoverATokRange(*ancestor);
+    if (!ancestorCover || hunk.aStart < ancestorCover->first ||
+        hunk.aEnd > ancestorCover->second)
+      continue;
+
+    std::optional<MacroPatch> candidate =
+        planner_->BuildMacroInvocationPatchArgsOnly(*ancestor, hunk,
+                                                   *ancestor->invText);
+    if (!candidate)
+      continue;
+
+    // The ancestor probe is only for the recursive tuple-generated-callee
+    // theorem.  Do not let an ordinary args-only or realization proof discovered
+    // while walking upward escape under a descendant planning frame.
+    if (candidate->proof.kind !=
+            MacroPatchProofKind::RecursiveTupleGeneratedCalleeReplay ||
+        !candidate->proof.preservesInvocationStructure ||
+        candidate->proof.proofRootMacroId != ancestor->id ||
+        candidate->macroId != ancestor->id)
+      continue;
+
+    std::optional<std::vector<std::pair<size_t, size_t>>> ancestorArgRanges =
+        planner_->GetMacroInvocationFormalArgContentRanges(*ancestor,
+                                                           *ancestor->invText);
+    if (!ancestorArgRanges)
+      continue;
+
+    DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invocationById;
+    invocationById.reserve(planner_->Deps().model->GetMacroInvocations().size());
+    for (const RefoldModel::MacroInvocation &modelInvocation :
+         planner_->Deps().model->GetMacroInvocations())
+      invocationById[modelInvocation.id] = &modelInvocation;
+
+    const MacroSubtreeReplayValidationContext replayCtx{
+        *ancestor, *ancestor->invText,
+        ArrayRef<std::pair<size_t, size_t>>(ancestorArgRanges->data(),
+                                            ancestorArgRanges->size()),
+        invocationById};
+    if (!planner_->ReplayStabilityValidator()
+             .MacroCandidateReplayIsStableForFinalSelection(replayCtx,
+                                                            *candidate))
+      continue;
+
+    if (uniqueCandidate)
+      return std::nullopt;
+    uniqueCandidate = std::move(candidate);
+  }
+
+  if (cursor->callerMacroId)
+    return std::nullopt;
+
+  return uniqueCandidate;
+}
+
+std::optional<MacroPatch>
 RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
     StringRef baseInvText,
@@ -461,6 +568,27 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
       (*planner_->Deps().model).GetSourcePath(), h);
   const diffutils::Hunk hEff =
       trimCommonEdgeTokens(h, planner_->Deps().aToks, planner_->Deps().bToks);
+
+  // Generated function-like callees can be represented by producer pseudo-
+  // invocations whose source span is not a real callsite, for example
+  // `ADD, (1, 2)` inside `A(ADD, (1, 2))`.  Such descendants cannot enter the
+  // ordinary callsite-shaped args-only phase, but they may still have an exact
+  // recursive tuple-generated-callee proof rooted at a caller ancestor.  Try
+  // that proof before owner realization can replace the pseudo-invocation
+  // bytes with an expanded expression.
+  if (m.subkind == "func") {
+    StringRef invocationText =
+        !baseInvText.empty()
+            ? baseInvText
+            : (m.invText ? StringRef(*m.invText) : StringRef(""));
+    if (!RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
+            invocationText, m)) {
+      if (std::optional<MacroPatch> ancestorPatch =
+              TryRecursiveTupleGeneratedReplayFromCallerAncestor(m, hEff))
+        return ancestorPatch;
+    }
+  }
+
   MacroPatchReuseAdmissionContext reuseAdmissionCtx =
       planner_->RecoverWholeCoverReuseContext(
           m, currentPatchOwner, *invStart, *invEnd, patchMap, existingContext);

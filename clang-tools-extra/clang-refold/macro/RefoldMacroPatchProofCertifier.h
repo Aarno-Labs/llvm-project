@@ -28,6 +28,7 @@
 #include "edit/RefoldPatchTypes.h"
 #include "proof/RefoldAcceptedResultTypes.h"
 
+
 #include <cstdint>
 
 namespace clang {
@@ -102,6 +103,16 @@ public:
       uint64_t finalDirectiveId, uint32_t generatedCallDepth,
       uint32_t objectAliasHops, bool usesStringification, bool usesPaste,
       bool usesVariadicForwarding, bool decodedStringLiteralEvidenceOnly) const;
+
+  /// Install the recursive tuple-generated-callee proof carrier.
+  ///
+  /// The caller must have already proven the recursive theorem obligations and
+  /// populated the witness with durable producer-path and tuple-slice facts.
+  /// This method only attaches the first-class proof identity and rebuilds the
+  /// normalized proof summary through the lattice.
+  void SetRecursiveTupleGeneratedCalleeReplayProof(
+      MacroPatch &patch, const RefoldModel::MacroInvocation &rootInvocation,
+      RecursiveTupleGeneratedCalleeReplayWitness witness) const;
 
   /// Install the args-only proof carrier on the patch.  Thin wrapper over
   /// `SetArgsOnlyStandardProof` named for the args-only-template-solver call

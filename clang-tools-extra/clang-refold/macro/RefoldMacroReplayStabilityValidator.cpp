@@ -240,6 +240,7 @@ bool RefoldMacroReplayStabilityValidator::
     case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
       return true;
     case MacroPatchProofKind::PasteDerivedCalleeSelector:
+    case MacroPatchProofKind::RecursiveTupleGeneratedCalleeReplay:
     case MacroPatchProofKind::DagSubtreeRoot:
     case MacroPatchProofKind::CallChainSuffix:
     case MacroPatchProofKind::CounterLiteral:

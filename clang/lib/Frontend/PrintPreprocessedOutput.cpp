@@ -1260,7 +1260,11 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
 
       void MacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
                         SourceRange Range, const MacroArgs *Args) override {
-        R->onMacroExpands(MacroNameTok, MD, Range, Args);
+        const auto ExpansionContext =
+            PP.getMacroExpansionCallbackContext();
+        R->onMacroExpands(MacroNameTok, MD, Range, Args,
+                          ExpansionContext.ExpansionFrameId,
+                          ExpansionContext.ParentExpansionFrameId);
       }
 
       void FileChanged(SourceLocation Loc, FileChangeReason Reason,

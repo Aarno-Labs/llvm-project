@@ -121,6 +121,22 @@ void RefoldMacroPatchProofCertifier::CertifyGeneratedCalleeReplayProof(
   deps_.lattice.SetMacroPatchProof(patch, std::move(proof));
 }
 
+void RefoldMacroPatchProofCertifier::
+    SetRecursiveTupleGeneratedCalleeReplayProof(
+        MacroPatch &patch, const RefoldModel::MacroInvocation &rootInvocation,
+        RecursiveTupleGeneratedCalleeReplayWitness witness) const {
+  // The recursive tuple theorem is not an ArgsOnlyStandard flavor.  Install a
+  // distinct proof kind so proof summaries, diagnostics, and accepted-path
+  // ranking can audit the recursive path instead of merging it with direct
+  // current-level argument replay.
+  MacroPatchProof proof = deps_.lattice.MakeMacroPatchProof(
+      MacroPatchProofKind::RecursiveTupleGeneratedCalleeReplay,
+      /*preservesInvocationStructure=*/true, rootInvocation.id);
+  witness.rootInvocationId = rootInvocation.id;
+  proof.recursiveTupleGeneratedCalleeReplay = std::move(witness);
+  deps_.lattice.SetMacroPatchProof(patch, std::move(proof));
+}
+
 void RefoldMacroPatchProofCertifier::AttachArgsOnlyProofCarrier(
     MacroPatch &patch, const RefoldModel::MacroInvocation &invocation,
     bool wholeEnvelopeReplayValidated,

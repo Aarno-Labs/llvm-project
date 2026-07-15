@@ -19,6 +19,7 @@
 #include "macro/RefoldMacroGeneratedCalleeReplayEngine.h"
 #include "macro/RefoldMacroGeneratedLeafReplayEngine.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
+#include "macro/RefoldMacroRecursiveTupleGeneratedReplay.h"
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroTupleHelpers.h"
@@ -1896,8 +1897,8 @@ HigherOrderGeneratedReplayProbe::HigherOrderGeneratedReplayProbe(
     const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps)
     : deps_(deps) {}
 
-/// Return the first higher-order generated replay candidate in the exact
-/// historical probe order, or nullopt when no generated replay proof applies.
+/// Return the first higher-order generated replay candidate in theorem order,
+/// or nullopt when no generated replay proof applies.
 std::optional<MacroPatch> HigherOrderGeneratedReplayProbe::TryBuild(
     const RefoldModel::MacroInvocation &invocation, const diffutils::Hunk &hunk,
     StringRef baseInvocationText,
@@ -1906,12 +1907,17 @@ std::optional<MacroPatch> HigherOrderGeneratedReplayProbe::TryBuild(
           invocation, baseInvocationText, invocationArgRanges))
     return generatedCalleePatch;
 
-  if (auto generatedLeafPatch = TryBuildGeneratedLeafReplay(
-          invocation, hunk, baseInvocationText, invocationArgRanges))
-    return generatedLeafPatch;
+  if (auto tupleGeneratedPatch = TryBuildTupleGeneratedCalleeReplay(
+          invocation, baseInvocationText, invocationArgRanges))
+    return tupleGeneratedPatch;
 
-  return TryBuildTupleGeneratedCalleeReplay(invocation, baseInvocationText,
-                                           invocationArgRanges);
+  if (auto recursiveTupleGeneratedPatch =
+          TryBuildRecursiveTupleGeneratedCalleeReplay(
+              invocation, baseInvocationText, invocationArgRanges))
+    return recursiveTupleGeneratedPatch;
+
+  return TryBuildGeneratedLeafReplay(invocation, hunk, baseInvocationText,
+                                     invocationArgRanges);
 }
 
 
@@ -2152,9 +2158,43 @@ HigherOrderGeneratedReplayProbe::TryBuildGeneratedLeafReplay(
 }
 
 
-/// Try the tuple-generated-callee proof after generated-leaf replay.  The
-/// probe remains restricted to a literal callee plus one forwarded tuple
-/// formal and preserves alias-hop accounting for the replay proof.
+/// Try the recursive tuple-generated-callee theorem after direct generated and
+/// direct tuple-generated proofs have declined, but before generated-leaf /
+/// whole-cover fallback can materialize the edited expansion directly.
+std::optional<MacroPatch>
+HigherOrderGeneratedReplayProbe::TryBuildRecursiveTupleGeneratedCalleeReplay(
+    const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
+  if (!invocation.definitionDirectiveId || !invocation.invB ||
+      !invocation.invE)
+    return std::nullopt;
+
+  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
+  if (!cover || cover->first >= cover->second)
+    return std::nullopt;
+
+  auto bEnv = MapWholeCoverBEnvelope(*cover);
+  if (!bEnv)
+    return std::nullopt;
+
+  const RefoldModel::MacroDirective *rootDefinition =
+      FindRootDefinition(invocation);
+  if (!rootDefinition || rootDefinition->subkind != "#define" ||
+      !rootDefinition->functionLike)
+    return std::nullopt;
+
+  RefoldMacroRecursiveTupleGeneratedReplay recursiveReplay(
+      RefoldMacroRecursiveTupleGeneratedReplay::Dependencies{
+          deps_.model, deps_.sourceMapper, deps_.macroTopology,
+          deps_.generatedCalleeReplayEngine, deps_.proofCertifier,
+          deps_.lexLang});
+  RecursiveTupleGeneratedReplayRequest recursiveRequest{
+      invocation, *rootDefinition, baseInvocationText, invocationArgRanges,
+      *cover, *bEnv};
+  return recursiveReplay.BuildCandidate(recursiveRequest);
+}
+
+
 std::optional<MacroPatch>
 HigherOrderGeneratedReplayProbe::TryBuildTupleGeneratedCalleeReplay(
     const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,

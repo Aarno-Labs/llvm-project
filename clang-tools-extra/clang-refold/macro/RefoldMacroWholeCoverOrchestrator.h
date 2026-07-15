@@ -103,6 +103,17 @@ public:
       ExistingMacroPatchContext existingContext) const;
 
 private:
+  /// Try the recursive tuple-generated-callee theorem from a generated
+  /// descendant back to a source-spelled caller ancestor.
+  ///
+  /// This is deliberately separate from ordinary args-only admission because a
+  /// terminal generated callee can have a producer invocation range such as
+  /// `ADD, (1, 2)`, which is not a source callsite and therefore never reaches
+  /// the normal callsite-shaped args-only phase.
+  std::optional<MacroPatch> TryRecursiveTupleGeneratedReplayFromCallerAncestor(
+      const RefoldModel::MacroInvocation &invocation,
+      const diffutils::Hunk &hunk) const;
+
   const RefoldMacroPatchPlanner *planner_;
   RefoldMacroArgsOnlyWholeCoverPhase argsOnlyPhase_;
   RefoldMacroDAGLeafDiscoveryPhase dagLeafDiscoveryPhase_;

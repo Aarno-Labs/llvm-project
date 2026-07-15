@@ -319,20 +319,20 @@ private:
 
 /// Probes generated replay candidates before ordinary occurrence collection.
 ///
-/// The probe preserves the historical higher-order ranking sequence: ordinary
-/// generated-callee chain replay first, generated-leaf replay second, and
-/// tuple-generated-callee replay third.  It owns only the short-lived context
-/// construction needed by those existing replay engines.  A miss remains
-/// non-terminal and returns nullopt; ambiguity, unsupported shapes, and
-/// unprovable B envelopes continue to fail closed through the delegated replay
-/// engines rather than introducing a fallback candidate.
+/// The probe owns the higher-order ranking sequence used before ordinary
+/// occurrence collection: direct generated-callee replay, direct
+/// tuple-generated-callee replay, recursive tuple-generated-callee replay, and
+/// finally generated-leaf fallback.  A miss remains non-terminal and returns
+/// nullopt; ambiguity, unsupported shapes, and unprovable B envelopes continue
+/// to fail closed through the delegated replay engines rather than introducing a
+/// fallback candidate.
 class HigherOrderGeneratedReplayProbe {
 public:
   explicit HigherOrderGeneratedReplayProbe(
       const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps);
 
-  /// Return the first higher-order generated replay candidate in the exact
-  /// historical probe order, or nullopt when no generated replay proof applies.
+  /// Return the first higher-order generated replay candidate in theorem order,
+  /// or nullopt when no generated replay proof applies.
   std::optional<MacroPatch>
   TryBuild(const RefoldModel::MacroInvocation &invocation,
            const diffutils::Hunk &hunk, llvm::StringRef baseInvocationText,
@@ -354,6 +354,11 @@ private:
   std::optional<MacroPatch> TryBuildGeneratedLeafReplay(
       const RefoldModel::MacroInvocation &invocation,
       const diffutils::Hunk &hunk, llvm::StringRef baseInvocationText,
+      llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
+
+  std::optional<MacroPatch> TryBuildRecursiveTupleGeneratedCalleeReplay(
+      const RefoldModel::MacroInvocation &invocation,
+      llvm::StringRef baseInvocationText,
       llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
 
   std::optional<MacroPatch> TryBuildTupleGeneratedCalleeReplay(

@@ -426,6 +426,22 @@ bool Preprocessor::HandleMacroExpandedIdentifier(Token &Identifier,
 
   MacroInfo *MI = M.getMacroInfo();
 
+  const uint64_t ExpansionFrameId = NextMacroExpansionFrameId++;
+  const uint64_t ParentExpansionFrameId =
+      CurTokenLexer ? CurTokenLexer->getMacroExpansionFrameId() : 0;
+
+  auto DeliverMacroExpandsCallback =
+      [&](const Token &Tok, const MacroDefinition &Definition,
+          SourceRange CallbackRange, const MacroArgs *CallbackArgs,
+          uint64_t CallbackFrameId, uint64_t CallbackParentFrameId) {
+        const MacroExpansionCallbackContext SavedContext =
+            CurrentMacroExpansionCallbackContext;
+        CurrentMacroExpansionCallbackContext =
+            {CallbackFrameId, CallbackParentFrameId};
+        Callbacks->MacroExpands(Tok, Definition, CallbackRange, CallbackArgs);
+        CurrentMacroExpansionCallbackContext = SavedContext;
+      };
+
   // If this is a macro expansion in the "#if !defined(x)" line for the file,
   // then the macro could expand to different things in other contexts, we need
   // to disable the optimization in this case.
@@ -434,8 +450,9 @@ bool Preprocessor::HandleMacroExpandedIdentifier(Token &Identifier,
   // If this is a builtin macro, like __LINE__ or _Pragma, handle it specially.
   if (MI->isBuiltinMacro()) {
     if (Callbacks)
-      Callbacks->MacroExpands(Identifier, M, Identifier.getLocation(),
-                              /*Args=*/nullptr);
+      DeliverMacroExpandsCallback(Identifier, M, Identifier.getLocation(),
+                                  /*CallbackArgs=*/nullptr, ExpansionFrameId,
+                                  ParentExpansionFrameId);
     ExpandBuiltinMacro(Identifier);
     return true;
   }
@@ -485,14 +502,17 @@ bool Preprocessor::HandleMacroExpandedIdentifier(Token &Identifier,
       // MacroExpands callbacks still happen in source order, queue this
       // callback to have it happen after the function macro callback.
       DelayedMacroExpandsCallbacks.push_back(
-          MacroExpandsInfo(Identifier, M, ExpansionRange));
+          MacroExpandsInfo(Identifier, M, ExpansionRange, ExpansionFrameId,
+                           ParentExpansionFrameId));
     } else {
-      Callbacks->MacroExpands(Identifier, M, ExpansionRange, Args);
+      DeliverMacroExpandsCallback(Identifier, M, ExpansionRange, Args,
+                                  ExpansionFrameId, ParentExpansionFrameId);
       if (!DelayedMacroExpandsCallbacks.empty()) {
         for (const MacroExpandsInfo &Info : DelayedMacroExpandsCallbacks) {
           // FIXME: We lose macro args info with delayed callback.
-          Callbacks->MacroExpands(Info.Tok, Info.MD, Info.Range,
-                                  /*Args=*/nullptr);
+          DeliverMacroExpandsCallback(
+              Info.Tok, Info.MD, Info.Range, /*CallbackArgs=*/nullptr,
+              Info.ExpansionFrameId, Info.ParentExpansionFrameId);
         }
         DelayedMacroExpandsCallbacks.clear();
       }
@@ -575,7 +595,7 @@ bool Preprocessor::HandleMacroExpandedIdentifier(Token &Identifier,
   }
 
   // Start expanding the macro.
-  EnterMacro(Identifier, ExpansionEnd, MI, Args);
+  EnterMacro(Identifier, ExpansionEnd, MI, Args, ExpansionFrameId);
   return false;
 }
 

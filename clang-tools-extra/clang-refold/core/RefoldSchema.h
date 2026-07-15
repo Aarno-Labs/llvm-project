@@ -72,6 +72,10 @@
 //       - optional invocation envelope in A output bytes:
 //         inv_pp_byte_begin / inv_pp_byte_end
 //       - owner_include_id: include instance that opened inv_file (when nested)
+//       - optional immediate-caller and argument-flow provenance:
+//         caller_macro_id / callee_origin / arg_refs / arg_tuple_refs
+//       - optional normalized invocation spelling and argument ranges for
+//         generated function-like calls without an ordinary NAME(...) site
 //
 // * DirectiveIncludeItem
 //     A single #include/#include_next instance, with:
@@ -815,12 +819,12 @@ static constexpr const char *RefoldSchema = R"json(
             "null"
           ],
           "minLength": 1,
-          "description": "Exact bytes at the macro call site in the source (e.g., 'FOO(1, 2)'). Null means the producer could not prove an exact raw invocation spelling and intentionally withheld raw-invocation proof material."
+          "description": "Exact bytes from the producer-selected source envelope for this macro invocation. For an ordinary source call this is usually a normal NAME(...) spelling such as 'FOO(1, 2)'. For generated function-like invocations, however, the exact source envelope may be noncanonical, such as a caller argument segment 'ADD, (1, 2)' that is not itself a valid NAME(...) call. Null means the producer could not prove an exact raw source envelope and intentionally withheld raw-invocation proof material. Consumers that require a canonical function-like invocation must use normalized_inv_text when present rather than reinterpret inv_text."
         },
         "normalized_inv_text": {
           "type": "string",
           "minLength": 1,
-          "description": "Canonicalized function-like invocation text synthesized from actual callee arguments when the source spelling is not a normal NAME(...) form (for example, higher-order tuple forwarding such as '(G z)')."
+          "description": "Canonical function-like invocation text synthesized from the resolved callee spelling and actual argument spellings when no ordinary source NAME(...) invocation spelling is available or suitable. This is producer-owned proof material for generated calls, including literal or caller-parameter callees whose arguments are unpacked from a caller tuple. When present, this field is the invocation text consumers must use for generated-call replay and NAME(...)-shape parsing; inv_text remains only the exact raw source envelope and may be noncanonical. Consumers must not reconstruct this field heuristically."
         },
         "inv_file": {
           "type": "string",
@@ -861,7 +865,7 @@ static constexpr const char *RefoldSchema = R"json(
         },
         "normalized_inv_arg_text_ranges": {
           "type": "array",
-          "description": "Per-formal-parameter byte ranges within normalized_inv_text. Entry i corresponds to formal parameter index i. These ranges are relative to the synthesized normalized_inv_text string rather than inv_file source bytes.",
+          "description": "Half-open byte ranges [b,e) within normalized_inv_text, one per generated invocation argument in invocation order. Entry i selects only argument i's spelling and is parallel to arg_tuple_refs[i] when tuple provenance is present. These offsets are relative to normalized_inv_text, not inv_file or inv_text; null endpoints mean the producer withheld that range.",
           "items": {
             "$ref": "#/$defs/OptByteRange"
           }
@@ -877,11 +881,11 @@ static constexpr const char *RefoldSchema = R"json(
         "caller_macro_id": {
           "type": "integer",
           "minimum": 0,
-          "description": "If this macro invocation occurred while expanding another macro, this is the item id of the immediately enclosing (caller) macro invocation. This encodes the structural nesting DAG only; argument flow is described separately by arg_deps/arg_refs and callee_origin."
+          "description": "If this invocation was generated while expanding another recorded macro invocation, this is the item id of that immediate generating caller. The edge is local to one expansion step, never a transitive root link. Argument flow across the edge is described separately by arg_deps/arg_refs/arg_tuple_refs, while callee_origin describes the invoked-name token. The field may be omitted when the producer cannot prove the immediate caller."
         },
         "callee_origin": {
           "$ref": "#/$defs/CalleeOrigin",
-          "description": "Origin of the callee token for this invocation. A literal callee name is safe for generalized nested args-only refolding; caller-param, paste, or opaque origins must be conservatively expanded."
+          "description": "Producer-proven immediate-edge origin of the complete callee token for this invocation. literal_macro_name identifies a fixed replacement-list name; caller_param identifies direct contribution from formal(s) of caller_macro_id; paste and opaque retain their conservative meanings. Consumers may compose caller_param provenance through caller edges only when each required edge is independently proven."
         },
         "def_params": {
           "type": "array",
@@ -933,7 +937,7 @@ static constexpr const char *RefoldSchema = R"json(
               }
             }
           },
-          "description": "Per-callee-parameter mapping back to slices of caller formal arguments. For parameter i, arg_refs[i] is an ordered sequence of (caller_param_index, byte_begin, byte_end) triples describing which caller argument slices were substituted into this callee parameter's raw argument text. This refines arg_deps for argument-text lifting only and does not encode callee-token provenance."
+          "description": "Immediate-edge argument provenance in invocation order. For child argument i, arg_refs[i] is an ordered sequence of (caller_param_index, byte_begin, byte_end) triples identifying half-open byte slices [byte_begin,byte_end) within that child's raw argument spelling that came from formals of caller_macro_id. The indices therefore name only the immediate caller's formals; transitive root provenance must be composed by the consumer. This refines arg_deps for argument-text lifting and never describes the callee token."
         },
         "arg_tuple_refs": {
           "type": [
@@ -946,7 +950,7 @@ static constexpr const char *RefoldSchema = R"json(
               "$ref": "#/$defs/TupleArgRef"
             }
           },
-          "description": "Per-callee-parameter structural forwarding from a caller formal tuple/signature. For parameter i, arg_tuple_refs[i] is an ordered sequence of slices within the trimmed caller-formal text that produce this callee argument. This is used for higher-order forms such as '(G z)' where callee arguments are unpacked from a single caller formal rather than referenced by name."
+          "description": "Immediate-edge structural provenance for generated invocation arguments unpacked from a caller tuple/signature. For generated argument i, arg_tuple_refs[i] is an ordered sequence of exact half-open byte slices within trimmed actual-argument text for a formal of caller_macro_id. The array is parallel to normalized_inv_arg_text_ranges when both are present. This supports literal and caller-parameter generated callees such as 'G z' and 'f t'; it is not transitive root provenance and must be composed by the consumer."
         },
         "paste_tokens": {
           "type": "array",
@@ -1847,17 +1851,17 @@ static constexpr const char *RefoldSchema = R"json(
         "caller_param_index": {
           "type": "integer",
           "minimum": 0,
-          "description": "Zero-based index of the caller formal that owns the tuple/signature text."
+          "description": "Zero-based formal index in caller_macro_id whose trimmed actual-argument spelling owns this tuple/signature slice."
         },
         "caller_byte_begin": {
           "type": "integer",
           "minimum": 0,
-          "description": "Begin byte offset (inclusive) of the forwarded slice within the trimmed caller-formal text."
+          "description": "Begin byte offset (inclusive) of the forwarded slice within the trimmed actual-argument spelling for caller_param_index. The outer tuple delimiters remain in this coordinate space."
         },
         "caller_byte_end": {
           "type": "integer",
           "minimum": 0,
-          "description": "End byte offset (exclusive) of the forwarded slice within the trimmed caller-formal text."
+          "description": "End byte offset (exclusive) of the forwarded slice within the trimmed actual-argument spelling for caller_param_index. Together with caller_byte_begin this forms a half-open byte interval."
         }
       }
     },
@@ -1885,7 +1889,7 @@ static constexpr const char *RefoldSchema = R"json(
             "minimum": 0
           },
           "uniqueItems": true,
-          "description": "When kind is caller_param, the caller formal parameter indices that directly contributed the callee token spelling at this invocation site. Empty or omitted for literal_macro_name, paste, or opaque."
+          "description": "When kind is caller_param, the zero-based formal indices in caller_macro_id that directly contributed the complete callee token spelling at this invocation site. The indices are immediate-edge provenance, not transitive root indices. A uniquely forwarded caller-supplied callee is represented by exactly one index; multiple indices remain explicit and require separate consumer proof. Empty or omitted for literal_macro_name, paste, or opaque."
         },
         "spelling": {
           "type": "string",
@@ -1899,7 +1903,7 @@ static constexpr const char *RefoldSchema = R"json(
           "description": "Ordered producer-proven decomposition of the callee token spelling. For paste origins, these parts tile spelling and identify the root selector argument slices that contributed to the pasted callee name."
         }
       },
-      "description": "Structural provenance for the invoked macro name itself. The consumer uses this to conservatively disable args-only and DAG-lift refolding for higher-order or otherwise non-literal callee origins.",
+      "description": "Producer-proven structural provenance for the complete invoked macro name at one caller edge. literal_macro_name is fixed replacement-list text; caller_param identifies formal(s) of caller_macro_id that supplied the callee token; paste records synthesized spelling; opaque withholds a stronger claim. Consumers may admit higher-order replay only by composing these explicit edge-local facts and must fail closed when required provenance is missing or non-unique.",
       "allOf": [
         {
           "if": {

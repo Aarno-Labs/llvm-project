@@ -311,6 +311,7 @@ inline StringRef toString(TheoremSelectionTieBreakerKind value) {
   REFOLD_X(MacroArgsOnlyPurePasteOnly)                                         \
   REFOLD_X(MacroArgsOnlyPairedPureInsertion)                                   \
   REFOLD_X(MacroPasteDerivedCalleeSelector)                                    \
+  REFOLD_X(MacroRecursiveTupleGeneratedCalleeReplay)                           \
   REFOLD_X(MacroDagSubtreeRoot)                                                \
   REFOLD_X(MacroCallChainSuffix)                                               \
   REFOLD_X(MacroCounterLiteral)                                                \
@@ -488,6 +489,8 @@ inline StringRef toString(AcceptanceSupportKind value) {
   REFOLD_X(MacroPurePasteOnly, "MacroPurePasteOnly")                           \
   REFOLD_X(MacroPairedPureInsertion, "MacroPairedPureInsertion")               \
   REFOLD_X(MacroPasteDerivedCalleeSelector, "MacroPasteDerivedCalleeSelector") \
+  REFOLD_X(MacroRecursiveTupleGeneratedCalleeReplay,                           \
+           "MacroRecursiveTupleGeneratedCalleeReplay")                         \
   REFOLD_X(MacroDagLift, "MacroDagLift")                                       \
   REFOLD_X(MacroCallChainSuffixPreservation,                                   \
            "MacroCallChainSuffixPreservation")                                 \
@@ -1120,6 +1123,12 @@ inline StringRef toString(ProofDischargeStatus value) {
   REFOLD_X(MacroPasteWitnessPresent)                                           \
   REFOLD_X(MacroPasteWitnessWellFormed)                                        \
   REFOLD_X(MacroPasteFreeSurfaceTracked)                                       \
+  REFOLD_X(MacroRecursiveTupleGeneratedCalleeReplayWitnessTracked)             \
+  REFOLD_X(MacroRecursiveTupleGeneratedCalleeReplayPathUnique)                 \
+  REFOLD_X(MacroRecursiveTupleGeneratedCalleeReplayTupleUnique)                \
+  REFOLD_X(MacroRecursiveTupleGeneratedCalleeReplayReplayUnique)               \
+  REFOLD_X(MacroRecursiveTupleGeneratedCalleeReplaySlicesTracked)              \
+  REFOLD_X(MacroRecursiveTupleGeneratedCalleeReplaySlicesNonOverlapping)       \
   REFOLD_X(MacroSubtreeCertificateTracked)                                     \
   REFOLD_X(MacroCallChainWitnessTracked)                                       \
   REFOLD_X(CounterStateWitnessTracked)                                         \
@@ -1181,6 +1190,12 @@ inline StringRef toString(ProofObligationKind obligation) {
   REFOLD_X(MissingPasteWitness)                                                \
   REFOLD_X(MalformedPasteWitness)                                              \
   REFOLD_X(UnexpectedPasteSurface)                                             \
+  REFOLD_X(MissingRecursiveTupleGeneratedCalleeReplayWitness)                  \
+  REFOLD_X(NonUniqueRecursiveTupleGeneratedCalleeReplayPath)                   \
+  REFOLD_X(NonUniqueRecursiveTupleGeneratedCalleeReplayTuple)                  \
+  REFOLD_X(NonUniqueRecursiveTupleGeneratedCalleeReplaySolution)               \
+  REFOLD_X(MissingRecursiveTupleGeneratedCalleeReplaySlices)                   \
+  REFOLD_X(OverlappingRecursiveTupleGeneratedCalleeReplaySlices)               \
   REFOLD_X(MissingSubtreeCertificate)                                          \
   REFOLD_X(MissingCallChainWitness)                                            \
   REFOLD_X(MissingCounterStateWitness)                                         \
@@ -1719,6 +1734,7 @@ struct SelectedMacroSelectionCandidate {
   REFOLD_X(ArgsOnlyStandard)                                                   \
   REFOLD_X(ArgsOnlyPairedPureInsertion)                                        \
   REFOLD_X(PasteDerivedCalleeSelector)                                         \
+  REFOLD_X(RecursiveTupleGeneratedCalleeReplay)                                \
   REFOLD_X(DagSubtreeRoot)                                                     \
   REFOLD_X(CallChainSuffix)                                                    \
   REFOLD_X(WholeCoverRealization)
@@ -1822,6 +1838,44 @@ struct GeneratedCalleeReplayWitness {
   bool usesVariadicForwarding = false;
   bool usesObjectAlias = false;
   bool decodedStringLiteralEvidenceOnly = false;
+};
+
+/// \brief One terminal generated-callee actual bound to a root tuple slice.
+///
+/// The byte offsets are relative to the source-spelled tuple payload, not the
+/// complete invocation and not the edited replacement text.  The recursive
+/// tuple-generated-callee theorem requires these slices to be exact, ordered,
+/// and non-overlapping before any root tuple edit can be emitted.
+struct GeneratedActualRootTupleSlice {
+  uint32_t generatedActualIndex = 0;
+  uint32_t generatedFormalIndex = 0;
+  uint32_t rootTupleFormalIndex = 0;
+  uint64_t rootTuplePayloadByteBegin = 0;
+  uint64_t rootTuplePayloadByteEnd = 0;
+};
+
+/// \brief Durable proof carrier for recursive tuple-generated-callee replay.
+///
+/// This witness is deliberately narrower than ordinary generated-callee replay.
+/// It certifies that a root invocation forwards a selector formal and a tuple
+/// formal through producer-recorded `caller_macro_id` / `arg_refs` edges until a
+/// single terminal generated function-like macro consumes exact elements of
+/// that root tuple.  Builders must set the uniqueness and validation bits only
+/// after separately proving the named obligation; the classifier rejects the
+/// proof kind unless those obligations are all recorded here.
+struct RecursiveTupleGeneratedCalleeReplayWitness {
+  uint64_t rootInvocationId = 0;
+  uint64_t terminalGeneratedInvocationId = 0;
+  uint64_t terminalCalleeDefinitionDirectiveId = 0;
+
+  uint32_t rootCalleeFormalIndex = 0;
+  uint32_t rootTupleFormalIndex = 0;
+
+  std::vector<GeneratedActualRootTupleSlice> actualSlices;
+
+  bool uniquePath = false;
+  bool uniqueTupleFormal = false;
+  bool uniqueReplaySolution = false;
 };
 
 /// \brief Evidence that an invocation-preserving patch replayed the whole
@@ -1930,6 +1984,8 @@ struct MacroPatchProof {
   std::optional<SubtreeCertificate> subtree;
   std::optional<CallChainWitness> callChain;
   std::optional<GeneratedCalleeReplayWitness> generatedCalleeReplay;
+  std::optional<RecursiveTupleGeneratedCalleeReplayWitness>
+      recursiveTupleGeneratedCalleeReplay;
   std::optional<WholeEnvelopeReplayWitness> wholeEnvelopeReplay;
   std::optional<VariadicCommaWitness> variadicCommaReplay;
   std::optional<ZeroTokenBoundaryWitness> zeroTokenBoundaryReplay;

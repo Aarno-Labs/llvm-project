@@ -142,13 +142,15 @@ void Preprocessor::EnterSourceFileWithLexer(Lexer *TheLexer,
 /// EnterMacro - Add a Macro to the top of the include stack and start lexing
 /// tokens from it instead of the current buffer.
 void Preprocessor::EnterMacro(Token &Tok, SourceLocation ILEnd,
-                              MacroInfo *Macro, MacroArgs *Args) {
+                              MacroInfo *Macro, MacroArgs *Args,
+                              uint64_t ExpansionFrameId) {
   std::unique_ptr<TokenLexer> TokLexer;
   if (NumCachedTokenLexers == 0) {
-    TokLexer = std::make_unique<TokenLexer>(Tok, ILEnd, Macro, Args, *this);
+    TokLexer = std::make_unique<TokenLexer>(Tok, ILEnd, Macro, Args,
+                                            ExpansionFrameId, *this);
   } else {
     TokLexer = std::move(TokenLexerCache[--NumCachedTokenLexers]);
-    TokLexer->Init(Tok, ILEnd, Macro, Args);
+    TokLexer->Init(Tok, ILEnd, Macro, Args, ExpansionFrameId);
   }
 
   PushIncludeMacroStack();

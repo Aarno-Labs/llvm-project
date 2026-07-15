@@ -15,6 +15,7 @@
 
 #include "clang/Basic/SourceLocation.h"
 #include "llvm/ADT/ArrayRef.h"
+#include <cstdint>
 
 namespace clang {
 
@@ -36,6 +37,10 @@ class TokenLexer {
   /// The actual arguments specified for a function-like macro, or null. The
   /// TokenLexer owns the pointed-to object.
   MacroArgs *ActualArgs = nullptr;
+
+  /// Producer-owned identity of this macro expansion frame. Zero denotes a
+  /// generic injected token stream rather than a macro expansion.
+  uint64_t MacroExpansionFrameId = 0;
 
   /// The current preprocessor object we are expanding for.
   Preprocessor &PP;
@@ -106,9 +111,10 @@ public:
   /// ILEnd specifies the location of the ')' for a function-like macro or the
   /// identifier for an object-like macro.
   TokenLexer(Token &Tok, SourceLocation ILEnd, MacroInfo *MI,
-             MacroArgs *ActualArgs, Preprocessor &pp)
+             MacroArgs *ActualArgs, uint64_t ExpansionFrameId,
+             Preprocessor &pp)
       : PP(pp), OwnsTokens(false) {
-    Init(Tok, ILEnd, MI, ActualArgs);
+    Init(Tok, ILEnd, MI, ActualArgs, ExpansionFrameId);
   }
 
   /// Create a TokenLexer for the specified token stream.  If 'OwnsTokens' is
@@ -129,7 +135,10 @@ public:
   /// ownership of the ActualArgs pointer.  ILEnd specifies the location of the
   /// ')' for a function-like macro or the identifier for an object-like macro.
   void Init(Token &Tok, SourceLocation ELEnd, MacroInfo *MI,
-            MacroArgs *Actuals);
+            MacroArgs *Actuals, uint64_t ExpansionFrameId);
+
+  /// Return the producer-owned identity of this macro expansion frame.
+  uint64_t getMacroExpansionFrameId() const { return MacroExpansionFrameId; }
 
   /// Initialize this TokenLexer with the specified token stream.
   /// This does not take ownership of the specified token vector.

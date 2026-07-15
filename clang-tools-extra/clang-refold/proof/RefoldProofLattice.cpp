@@ -322,6 +322,7 @@ RefoldProofLattice::ValidateIncludePreservingProof(
   case AcceptedPathKind::MacroArgsOnlyPasteMulti:
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
   case AcceptedPathKind::MacroDagSubtreeRoot:
   case AcceptedPathKind::MacroCallChainSuffix:
   case AcceptedPathKind::MacroCounterLiteral:

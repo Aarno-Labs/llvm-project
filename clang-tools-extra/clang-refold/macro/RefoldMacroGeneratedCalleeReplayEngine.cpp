@@ -2719,6 +2719,59 @@ bool RefoldMacroGeneratedCalleeReplayEngine::GeneratedCalleeReplayIsAdmissible(
                                            ctx.currentActuals.size());
 }
 
+std::optional<TerminalGeneratedCalleeReplaySolution>
+RefoldMacroGeneratedCalleeReplayEngine::SolveTerminalGeneratedCalleeReplay(
+    const TerminalGeneratedCalleeReplayRequest &ctx) const {
+  if (ctx.wholeCoverATokens.first >= ctx.wholeCoverATokens.second ||
+      ctx.bTokenEnvelope.first >= ctx.bTokenEnvelope.second)
+    return std::nullopt;
+  if (!ctx.terminalDefinition.functionLike || ctx.oldActuals.empty() ||
+      ctx.terminalDefinition.defParams.size() != ctx.oldActuals.size())
+    return std::nullopt;
+  if (!macroDefinitionAcceptsActualCount(ctx.terminalDefinition,
+                                         ctx.oldActuals.size()))
+    return std::nullopt;
+
+  bool usesStringification = false;
+  bool usesPaste = false;
+  std::vector<GeneratedReplayElem> replayPattern;
+  const GeneratedCalleeReplayPatternParser replayPatternParser(
+      ctx.terminalDefinition, ctx.oldActuals, usesStringification, usesPaste);
+  if (!replayPatternParser.Parse(
+          0, ctx.terminalDefinition.replacementTokens.size(), replayPattern) ||
+      replayPattern.empty())
+    return std::nullopt;
+
+  const FormalActualConstraintSolver formalSolver(
+      ArrayRef<GeneratedReplayElem>(replayPattern.data(),
+                                    replayPattern.size()),
+      ctx.oldActuals, deps_.lexLang);
+
+  StringRef oldExpansion = deps_.sourceMapper
+                               .SliceASource(ctx.wholeCoverATokens.first,
+                                             ctx.wholeCoverATokens.second)
+                               .trim();
+  StringRef newExpansion = deps_.sourceMapper
+                               .SliceBSource(ctx.bTokenEnvelope.first,
+                                             ctx.bTokenEnvelope.second)
+                               .trim();
+
+  std::optional<GeneratedSolvedActuals> oldSolved =
+      formalSolver.SolveExpansion(oldExpansion);
+  std::optional<GeneratedSolvedActuals> newSolved =
+      formalSolver.SolveExpansion(newExpansion);
+  if (!oldSolved || !newSolved || oldSolved->size() != ctx.oldActuals.size() ||
+      newSolved->size() != ctx.oldActuals.size())
+    return std::nullopt;
+
+  TerminalGeneratedCalleeReplaySolution solution;
+  solution.oldSolvedActuals.assign(oldSolved->begin(), oldSolved->end());
+  solution.newSolvedActuals.assign(newSolved->begin(), newSolved->end());
+  solution.usesStringification = usesStringification;
+  solution.usesPaste = usesPaste;
+  return solution;
+}
+
 std::optional<MacroPatch>
 RefoldMacroGeneratedCalleeReplayEngine::BuildGeneratedCalleeReplayCandidate(
     const GeneratedCalleeReplayContext &generatedCalleeCtx) const {

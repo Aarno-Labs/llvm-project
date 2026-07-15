@@ -15,14 +15,85 @@
 #include "llvm/Support/FormatVariadic.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <utility>
+#include <vector>
 
 using namespace llvm;
 
 namespace clang {
 namespace refold {
+
+namespace {
+
+/// Return whether the recursive tuple witness names exact, non-overlapping
+/// slices of one root tuple formal.
+bool recursiveTupleGeneratedCalleeReplaySlicesAreWellFormed(
+    const RecursiveTupleGeneratedCalleeReplayWitness &witness) {
+  if (witness.actualSlices.empty())
+    return false;
+
+  for (size_t i = 0; i < witness.actualSlices.size(); ++i) {
+    const GeneratedActualRootTupleSlice &slice = witness.actualSlices[i];
+    if (slice.rootTupleFormalIndex != witness.rootTupleFormalIndex)
+      return false;
+    if (slice.rootTuplePayloadByteBegin >= slice.rootTuplePayloadByteEnd)
+      return false;
+
+    for (size_t j = i + 1; j < witness.actualSlices.size(); ++j) {
+      const GeneratedActualRootTupleSlice &other = witness.actualSlices[j];
+      if (slice.generatedActualIndex == other.generatedActualIndex)
+        return false;
+      if (slice.generatedFormalIndex == other.generatedFormalIndex)
+        return false;
+    }
+  }
+
+  std::vector<GeneratedActualRootTupleSlice> ordered = witness.actualSlices;
+  llvm::sort(ordered, [](const GeneratedActualRootTupleSlice &lhs,
+                         const GeneratedActualRootTupleSlice &rhs) {
+    if (lhs.rootTuplePayloadByteBegin != rhs.rootTuplePayloadByteBegin)
+      return lhs.rootTuplePayloadByteBegin < rhs.rootTuplePayloadByteBegin;
+    if (lhs.rootTuplePayloadByteEnd != rhs.rootTuplePayloadByteEnd)
+      return lhs.rootTuplePayloadByteEnd < rhs.rootTuplePayloadByteEnd;
+    return lhs.generatedActualIndex < rhs.generatedActualIndex;
+  });
+
+  uint64_t previousEnd = 0;
+  bool havePrevious = false;
+  for (const GeneratedActualRootTupleSlice &slice : ordered) {
+    if (havePrevious && slice.rootTuplePayloadByteBegin < previousEnd)
+      return false;
+    previousEnd = slice.rootTuplePayloadByteEnd;
+    havePrevious = true;
+  }
+
+  return true;
+}
+
+/// Return whether the recursive tuple theorem witness names the same root and
+/// carries the mandatory unique path / tuple / replay obligations.
+bool recursiveTupleGeneratedCalleeReplayWitnessIsWellFormed(
+    const MacroPatchProof &proof) {
+  if (!proof.recursiveTupleGeneratedCalleeReplay)
+    return false;
+
+  const RecursiveTupleGeneratedCalleeReplayWitness &witness =
+      *proof.recursiveTupleGeneratedCalleeReplay;
+  return witness.rootInvocationId != 0 &&
+         witness.rootInvocationId == proof.proofRootMacroId &&
+         witness.terminalGeneratedInvocationId != 0 &&
+         witness.terminalCalleeDefinitionDirectiveId != 0 &&
+         witness.terminalGeneratedInvocationId != witness.rootInvocationId &&
+         witness.rootCalleeFormalIndex != witness.rootTupleFormalIndex &&
+         witness.uniquePath && witness.uniqueTupleFormal &&
+         witness.uniqueReplaySolution &&
+         recursiveTupleGeneratedCalleeReplaySlicesAreWellFormed(witness);
+}
+
+} // namespace
 
 RefoldMacroPatchProofClassifier::RefoldMacroPatchProofClassifier(
     Dependencies deps)
@@ -66,6 +137,10 @@ RefoldMacroPatchProofClassifier::ClassifyMacroPatchProof(
     // emitted edit rewrites only a root invocation argument, after proving that
     // a unique existing pasted callee macro exactly explains the edited B
     // expansion under the same non-selector arguments.
+  case MacroPatchProofKind::RecursiveTupleGeneratedCalleeReplay:
+    // Recursive tuple-generated-callee replay is structure-preserving only when
+    // its witness proves one producer-recorded forwarding path and exact tuple
+    // element slices for the terminal generated invocation.
   case MacroPatchProofKind::DagSubtreeRoot:
     // DAG-preserving rewrites must carry the explicit subtree certificate
     // recorded on accepted root patches.
@@ -342,6 +417,56 @@ RefoldMacroPatchProofClassifier::ValidateInvocationPreservingProofImpl(
     // merges do not become invalid merely because their materialized edit-map
     // subrange is no longer representable as one selector slice.
     break;
+
+  case MacroPatchProofKind::RecursiveTupleGeneratedCalleeReplay: {
+    const RecursiveTupleGeneratedCalleeReplayWitness *witness =
+        proof.recursiveTupleGeneratedCalleeReplay
+            ? &*proof.recursiveTupleGeneratedCalleeReplay
+            : nullptr;
+    const RefoldModel::MacroInvocation *terminal =
+        witness ? deps_.macroTopology.FindMacroInvocationById(
+                      witness->terminalGeneratedInvocationId)
+                : nullptr;
+    const bool terminalDefinitionMatchesWitness =
+        terminal && terminal->definitionDirectiveId &&
+        *terminal->definitionDirectiveId ==
+            witness->terminalCalleeDefinitionDirectiveId;
+    discharge.Require(
+        recursiveTupleGeneratedCalleeReplayWitnessIsWellFormed(proof) &&
+            terminalDefinitionMatchesWitness,
+        ProofObligationKind::
+            MacroRecursiveTupleGeneratedCalleeReplayWitnessTracked,
+        ProofFailureReason::MissingRecursiveTupleGeneratedCalleeReplayWitness);
+    discharge.Require(
+        witness && witness->uniquePath,
+        ProofObligationKind::
+            MacroRecursiveTupleGeneratedCalleeReplayPathUnique,
+        ProofFailureReason::NonUniqueRecursiveTupleGeneratedCalleeReplayPath);
+    discharge.Require(
+        witness && witness->uniqueTupleFormal,
+        ProofObligationKind::
+            MacroRecursiveTupleGeneratedCalleeReplayTupleUnique,
+        ProofFailureReason::NonUniqueRecursiveTupleGeneratedCalleeReplayTuple);
+    discharge.Require(
+        witness && witness->uniqueReplaySolution,
+        ProofObligationKind::
+            MacroRecursiveTupleGeneratedCalleeReplayReplayUnique,
+        ProofFailureReason::
+            NonUniqueRecursiveTupleGeneratedCalleeReplaySolution);
+    discharge.Require(
+        witness && !witness->actualSlices.empty(),
+        ProofObligationKind::
+            MacroRecursiveTupleGeneratedCalleeReplaySlicesTracked,
+        ProofFailureReason::MissingRecursiveTupleGeneratedCalleeReplaySlices);
+    discharge.Require(
+        witness &&
+            recursiveTupleGeneratedCalleeReplaySlicesAreWellFormed(*witness),
+        ProofObligationKind::
+            MacroRecursiveTupleGeneratedCalleeReplaySlicesNonOverlapping,
+        ProofFailureReason::
+            OverlappingRecursiveTupleGeneratedCalleeReplaySlices);
+    break;
+  }
 
   case MacroPatchProofKind::DagSubtreeRoot:
     discharge.Require(proof.subtree && proof.subtree->backed,

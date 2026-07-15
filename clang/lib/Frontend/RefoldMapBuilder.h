@@ -230,12 +230,23 @@ struct Item {
   // directives.
   bool FunctionLikeDefinition = false;
   std::string Text;    // directive text
-  std::string InvText; // macro call text
+  // Exact bytes from the producer-selected source envelope for this macro
+  // invocation. Ordinary source calls generally have NAME(...) spelling, but
+  // generated function-like invocations can have noncanonical envelopes such
+  // as the caller argument segment "ADD, (1, 2)".  Consumers that require a
+  // canonical generated call must use NormalizedInvText when it is present.
+  std::string InvText;
   std::string InvFile; // file containing the macro invocation
 
   bool IsBuiltinMacro =
       false;          // true for predefined/builtin macros (e.g. __FILE__)
   SourceLocation Loc; // primary location
+
+  // Exact producer-observed location of the invoked macro name token. This is
+  // retained only until finalization so callee-token provenance can be
+  // recomputed against the sanitized immediate caller graph rather than the
+  // provisional callback-time caller.
+  SourceLocation CalleeLoc;
   std::vector<TokenSpan> Spans;
   std::vector<ArgTokenSpan> ArgSpans;       // tokens from any actual arguments
   std::vector<ArgTokenSpan> StringifySpans; // tokens produced by #param
@@ -280,6 +291,13 @@ struct Item {
   std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>>
       InvArgRanges;
 
+  // Exact unexpanded actual-argument spellings captured while MacroArgs is
+  // available. This producer-internal evidence is retained until finalization
+  // so tuple forwarding metadata can be derived only after the immediate caller
+  // graph and callee origin have been finalized. A null entry means that the
+  // producer could not recover that argument spelling exactly.
+  std::vector<std::optional<std::string>> UnexpandedArgTexts;
+
   // Macro nesting DAG + deterministic dependency edges for nested expansions:
   //
   // If this invocation occurs while expanding another macro, CallerMacroId
@@ -289,6 +307,11 @@ struct Item {
   // Exact #define directive item used as the active definition for this
   // invocation, when the defining directive was recorded in this map.
   std::optional<uint64_t> DefinitionDirectiveId;
+
+  // Exact producer-owned expansion-frame identities. These remain internal
+  // to finalization and are not serialized.
+  uint64_t ExpansionFrameId = 0;
+  uint64_t ParentExpansionFrameId = 0;
 
   std::optional<uint64_t> CallerMacroId;
   MacroCalleeOrigin CalleeOrigin;
@@ -315,10 +338,12 @@ struct Item {
   std::vector<std::vector<InvArgTupleRef>> InvArgTupleRefs;
 
   // Canonicalized invocation text for higher-order function-like invocations
-  // whose source spelling is not a normal NAME(...) form. When present, this
-  // string is synthesized deterministically from the callee name and actual
-  // callee arguments, and NormalizedInvArgTextRanges are byte ranges within
-  // this string.
+  // whose raw source envelope is not a normal NAME(...) form. When present,
+  // this string is synthesized deterministically from the callee name and
+  // actual callee arguments, and NormalizedInvArgTextRanges are byte ranges
+  // within this string. This metadata is committed atomically with tuple
+  // provenance and is the only producer-owned NAME(...)-shape representation
+  // for generated calls.
   std::optional<std::string> NormalizedInvText;
   std::vector<std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
       NormalizedInvArgTextRanges;
@@ -723,7 +748,9 @@ public:
   ///  - Owner include id (to disambiguate repeated includes),
   ///  - Token spans contributed by the expansion while it is active.
   void onMacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
-                      SourceRange Range, const MacroArgs *Args);
+                      SourceRange Range, const MacroArgs *Args,
+                      uint64_t ExpansionFrameId,
+                      uint64_t ParentExpansionFrameId);
 
   /// Callback for an active source `#line` / GNU line-marker directive.
   ///

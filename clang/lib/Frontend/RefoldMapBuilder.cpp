@@ -2878,7 +2878,9 @@ void RefoldMapBuilder::onMacroUndefined(const Token &MacroNameTok,
 void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
                                       const MacroDefinition &MD,
                                       SourceRange Range,
-                                      const MacroArgs *Args) {
+                                      const MacroArgs *Args,
+                                      uint64_t ExpansionFrameId,
+                                      uint64_t ParentExpansionFrameId) {
   if (!enabled())
     return;
 
@@ -2909,9 +2911,20 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
       P.Variadic = (MI->isVariadic() && I + 1 == NumParams);
       It.DefParams.push_back(std::move(P));
     }
+
+    // MacroArgs is callback-local. Preserve exact unexpanded actual spellings
+    // now, but defer all tuple-forwarding proof construction until the caller
+    // graph and callee origin have been finalized.
+    It.UnexpandedArgTexts.reserve(NumParams);
+    for (unsigned I = 0; I != NumParams; ++I)
+      It.UnexpandedArgTexts.push_back(
+          getUnexpandedMacroArgText(Args, I, SM, PP.getLangOpts()));
   }
 
   It.Loc = Range.getBegin();
+  It.ExpansionFrameId = ExpansionFrameId;
+  It.ParentExpansionFrameId = ParentExpansionFrameId;
+  It.CalleeLoc = MacroNameTok.getLocation();
   It.IsBuiltinMacro = (MI != nullptr && MI->isBuiltinMacro());
   if (MI) {
     auto DefIt = MacroInfo2DefinitionDirectiveId.find(MI);
@@ -2997,8 +3010,13 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
     MacroKey2Item[keyForMacroLoc(KLoc)] = NewIdx;
   };
 
-  RegisterMacroKey(MacroNameTok.getLocation());
-  RegisterMacroKey(Range.getBegin());
+  // Do not publish the new invocation's aliases until its immediate caller has
+  // been resolved. Nested generated invocations can share an expansion key
+  // with their caller; overwriting that key here would destroy the only direct
+  // producer-owned edge before LookupMacroItem() can consume it. No callback
+  // can observe the partially initialized item while onMacroExpands() runs, so
+  // delaying registration is deterministic and preserves existing token
+  // attribution behavior.
 
   // Helper: map a macro-related location to the corresponding Item index.
   //
@@ -3017,14 +3035,14 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
       return std::nullopt;
 
     const std::string Key = keyForMacroLoc(Loc);
+    const size_t Limit = std::min(SearchLimit, Items.size());
     auto It = MacroKey2Item.find(Key);
-    if (It != MacroKey2Item.end())
+    if (It != MacroKey2Item.end() && It->second < Limit)
       return It->second;
 
     if (!Loc.isMacroID())
       return std::nullopt;
 
-    const size_t Limit = std::min(SearchLimit, Items.size());
     for (size_t I = Limit; I != 0; --I) {
       const size_t CandIdx = I - 1;
       const Item &Cand = Items[CandIdx];
@@ -3208,109 +3226,13 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
         CurIt.CalleeOrigin.Kind = MCO_Opaque;
       }
     }
-
-    // Higher-order signature forwarding: detect function-like nested calls
-    // whose callee is literal but whose arguments are structurally unpacked
-    // from a single caller formal, such as `(G z)` where `z` expands to a
-    // parenthesized tuple. The current source-based invocation text/ranges can
-    // be malformed for such cases, so record a normalized synthetic invocation
-    // text and precise tuple-slice provenance for each callee argument.
-    if (MI && MI->isFunctionLike() && Args && CurIt.CallerMacroId &&
-        CurIt.CalleeOrigin.Kind == MCO_LiteralMacroName) {
-      const Item *CallerIt = nullptr;
-      for (const Item &Cand : Items) {
-        if (Cand.ID == *CurIt.CallerMacroId) {
-          CallerIt = &Cand;
-          break;
-        }
-      }
-
-      if (CallerIt) {
-        SmallVector<std::string, 8> CalleeArgTexts;
-        CalleeArgTexts.reserve(MI->getNumParams());
-        bool MissingArgText = false;
-        for (unsigned ArgIdx = 0; ArgIdx < MI->getNumParams(); ++ArgIdx) {
-          auto ArgText =
-              getUnexpandedMacroArgText(Args, ArgIdx, SM, PP.getLangOpts());
-          if (!ArgText) {
-            MissingArgText = true;
-            break;
-          }
-          CalleeArgTexts.push_back(std::move(*ArgText));
-        }
-
-        if (!MissingArgText && !CalleeArgTexts.empty()) {
-          std::optional<uint32_t> UniqueCallerFormal;
-          std::vector<std::vector<InvArgTupleRef>> TupleRefs;
-          std::string NormalizedInvText;
-          std::vector<
-              std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
-              NormalizedRanges;
-
-          for (uint32_t CallerFormal = 0;
-               CallerFormal < CallerIt->InvArgRanges.size(); ++CallerFormal) {
-            auto CallerArgText =
-                getItemInvocationArgText(*CallerIt, CallerFormal);
-            if (!CallerArgText)
-              continue;
-
-            std::vector<
-                std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
-                TupleRanges;
-            if (!computeTupleElementRangesFromText(
-                    *CallerArgText, PP.getLangOpts(), TupleRanges))
-              continue;
-            if (TupleRanges.size() != CalleeArgTexts.size())
-              continue;
-
-            bool Match = true;
-            SmallVector<llvm::StringRef, 8> TupleArgTexts;
-            std::vector<std::vector<InvArgTupleRef>> CandidateRefs;
-            CandidateRefs.resize(TupleRanges.size());
-            for (size_t I = 0; I < TupleRanges.size(); ++I) {
-              const auto &TR = TupleRanges[I];
-              if (!TR.first || !TR.second || *TR.second < *TR.first ||
-                  *TR.second > CallerArgText->size()) {
-                Match = false;
-                break;
-              }
-              llvm::StringRef Slice =
-                  CallerArgText->slice(*TR.first, *TR.second).trim();
-              if (Slice != llvm::StringRef(CalleeArgTexts[I]).trim()) {
-                Match = false;
-                break;
-              }
-              TupleArgTexts.push_back(Slice);
-              CandidateRefs[I].push_back(
-                  InvArgTupleRef{CallerFormal, *TR.first, *TR.second});
-            }
-            if (!Match)
-              continue;
-
-            if (UniqueCallerFormal) {
-              UniqueCallerFormal = std::nullopt;
-              TupleRefs.clear();
-              NormalizedInvText.clear();
-              NormalizedRanges.clear();
-              break;
-            }
-
-            UniqueCallerFormal = CallerFormal;
-            TupleRefs = std::move(CandidateRefs);
-            buildSyntheticFunctionLikeInvocationText(
-                CurIt.Name, llvm::ArrayRef<llvm::StringRef>(TupleArgTexts),
-                NormalizedInvText, NormalizedRanges);
-          }
-
-          if (UniqueCallerFormal && !NormalizedInvText.empty()) {
-            CurIt.InvArgTupleRefs = std::move(TupleRefs);
-            CurIt.NormalizedInvText = std::move(NormalizedInvText);
-            CurIt.NormalizedInvArgTextRanges = std::move(NormalizedRanges);
-          }
-        }
-      }
-    }
   }
+
+  // Caller recovery above must see the previously registered invocation for a
+  // shared expansion key. Publish this invocation only after that edge-local
+  // relationship and its immediately dependent provenance have been resolved.
+  RegisterMacroKey(MacroNameTok.getLocation());
+  RegisterMacroKey(Range.getBegin());
 
   computeMacroProjectionSites(Items[NewIdx], PP, MacroNameTok, MI, Args, Lang,
                               llvm::ArrayRef<Item>(Items));
@@ -4683,11 +4605,26 @@ void RefoldMapBuilder::writeJSON() {
       MacroStack.push_back(Env);
     }
 
+    llvm::DenseMap<uint64_t, uint64_t> MacroItemIdByExpansionFrameId;
+    MacroItemIdByExpansionFrameId.reserve(MacroEnvs.size());
+    for (const Item &It : Items) {
+      if (It.Kind == IK_Macro && It.ExpansionFrameId != 0)
+        MacroItemIdByExpansionFrameId.try_emplace(It.ExpansionFrameId, It.ID);
+    }
+
     llvm::DenseMap<uint64_t, uint64_t> ResolvedCallerByID;
     ResolvedCallerByID.reserve(MacroEnvs.size());
     for (const Item &It : Items) {
       if (It.Kind != IK_Macro)
         continue;
+      if (It.ParentExpansionFrameId != 0) {
+        auto ParentIt =
+            MacroItemIdByExpansionFrameId.find(It.ParentExpansionFrameId);
+        if (ParentIt != MacroItemIdByExpansionFrameId.end()) {
+          ResolvedCallerByID[It.ID] = ParentIt->second;
+          continue;
+        }
+      }
       if (It.CallerMacroId) {
         ResolvedCallerByID[It.ID] = *It.CallerMacroId;
         continue;
@@ -4932,16 +4869,16 @@ void RefoldMapBuilder::writeJSON() {
 
         llvm::StringRef ArgText = It.InvText;
 
-        // Defensive bounds: if begin is past inv_text, treat as missing.
-        if (B >= ArgText.size()) {
+        // Edge-local references are proof material, so the complete argument
+        // range must be represented by inv_text. Do not clamp malformed or
+        // incomplete ranges and then emit references from a truncated slice.
+        if (B > E || E > ArgText.size()) {
           Deps.push_back({});
           Refs.push_back({});
           continue;
         }
 
-        // Clamp the end to inv_text size to avoid out-of-bounds slices.
-        const uint64_t EClamped = std::min(E, (uint64_t)ArgText.size());
-        llvm::StringRef Slice = ArgText.slice(B, EClamped);
+        llvm::StringRef Slice = ArgText.slice(B, E);
 
         // collectCallerFormalDeps:
         //   returns stable (sorted) unique caller-formal indices referenced in
@@ -4973,7 +4910,13 @@ void RefoldMapBuilder::writeJSON() {
       else
         It.CallerMacroId.reset();
 
+      // Replace callback-time or otherwise provisional dependency material
+      // with data computed exclusively from the finalized immediate caller.
+      // Missing finalized evidence must serialize as absent rather than leave
+      // stale references attached to the item.
       It.InvArgDeps.clear();
+      It.InvArgRefs.clear();
+
       auto DIt = ArgDepsByID.find(It.ID);
       if (DIt != ArgDepsByID.end())
         It.InvArgDeps = DIt->second;
@@ -4981,6 +4924,267 @@ void RefoldMapBuilder::writeJSON() {
       auto RIt = ArgRefsByID.find(It.ID);
       if (RIt != ArgRefsByID.end())
         It.InvArgRefs = RIt->second;
+    }
+
+    // Recompute each macro invocation's edge-local callee-token provenance
+    // from the sanitized immediate caller graph. Callback-time classification
+    // can observe a provisional caller; finalization must therefore repeat the
+    // same SourceManager proof against the caller that will actually be
+    // serialized. This pass records only literal, uniquely proven single-caller
+    // formal, or opaque origins. Paste-origin certification runs afterward and
+    // replaces this classification only when its stronger witness succeeds.
+    auto recoverImmediateCallerParam =
+        [&](const Item &caller, SourceLocation calleeLoc)
+        -> std::optional<uint32_t> {
+      if (!calleeLoc.isValid())
+        return std::nullopt;
+
+      // For tuple-generated callees such as `UNPACK(ADD, (1, 2))`, the callee
+      // token may be reported as the file spelling of the caller's selector
+      // actual rather than as a macro-argument SourceLocation.  Prove that
+      // class directly from byte identity: the complete callee token must have
+      // the same half-open source range as exactly one immediate caller actual.
+      // This is an edge-local proof over producer-recorded source coordinates;
+      // it does not inspect token text or infer from expansion envelopes.
+      auto recoverExactCallerArgFromTokenRange =
+          [&](SourceLocation loc) -> std::optional<uint32_t> {
+        if (loc.isInvalid() || caller.InvFile.empty() ||
+            caller.InvArgRanges.empty())
+          return std::nullopt;
+
+        SourceLocation fileLoc = loc.isMacroID() ? SM.getFileLoc(loc) : loc;
+        if (fileLoc.isInvalid())
+          return std::nullopt;
+
+        if (filePathForLocAbs(SM, fileLoc, EmitAbsPaths) != caller.InvFile)
+          return std::nullopt;
+
+        const uint64_t tokenBegin = SM.getFileOffset(fileLoc);
+        SourceLocation tokenEndLoc =
+            Lexer::getLocForEndOfToken(fileLoc, 0, SM, Lang);
+        if (tokenEndLoc.isInvalid())
+          return std::nullopt;
+        const uint64_t tokenEnd = SM.getFileOffset(tokenEndLoc);
+        if (tokenEnd < tokenBegin)
+          return std::nullopt;
+
+        std::optional<uint32_t> matchedArgIndex;
+        for (size_t argIndex = 0; argIndex < caller.InvArgRanges.size();
+             ++argIndex) {
+          const auto &range = caller.InvArgRanges[argIndex];
+          if (!range.first || !range.second)
+            continue;
+          if (*range.first != tokenBegin || *range.second != tokenEnd)
+            continue;
+          if (argIndex > std::numeric_limits<uint32_t>::max())
+            return std::nullopt;
+          if (matchedArgIndex)
+            return std::nullopt;
+          matchedArgIndex = static_cast<uint32_t>(argIndex);
+        }
+        return matchedArgIndex;
+      };
+
+      if (auto exactArgIndex =
+              recoverExactCallerArgFromTokenRange(calleeLoc))
+        return exactArgIndex;
+
+      if (!calleeLoc.isMacroID())
+        return std::nullopt;
+
+      if (auto argIndex = argIndexForSpellingLoc(caller, calleeLoc, SM, Lang,
+                                                 EmitAbsPaths))
+        return argIndex;
+
+      if (!SM.isMacroArgExpansion(calleeLoc))
+        return std::nullopt;
+
+      SmallVector<SourceLocation, 4> probeLocs;
+      llvm::SmallDenseSet<unsigned, 8> seenLocs;
+      auto addProbeLoc = [&](SourceLocation loc) {
+        if (!loc.isValid())
+          return;
+        const unsigned rawLoc = loc.getRawEncoding();
+        if (seenLocs.insert(rawLoc).second)
+          probeLocs.push_back(loc);
+      };
+
+      addProbeLoc(calleeLoc);
+      addProbeLoc(SM.getImmediateSpellingLoc(calleeLoc));
+      addProbeLoc(SM.getImmediateMacroCallerLoc(calleeLoc));
+      CharSourceRange expansionRange =
+          SM.getImmediateExpansionRange(calleeLoc);
+      if (expansionRange.isValid())
+        addProbeLoc(expansionRange.getBegin());
+
+      std::optional<uint32_t> recoveredArgIndex;
+      for (SourceLocation probeLoc : probeLocs) {
+        auto probeArgIndex = recoverExactCallerArgFromTokenRange(probeLoc);
+        if (!probeArgIndex)
+          probeArgIndex = argIndexForSpellingLoc(
+              caller, probeLoc, SM, Lang, EmitAbsPaths);
+        if (!probeArgIndex)
+          continue;
+        if (!recoveredArgIndex) {
+          recoveredArgIndex = *probeArgIndex;
+          continue;
+        }
+        if (*recoveredArgIndex != *probeArgIndex)
+          return std::nullopt;
+      }
+      return recoveredArgIndex;
+    };
+
+    for (Item &Callee : Items) {
+      if (Callee.Kind != IK_Macro)
+        continue;
+
+      Callee.CalleeOrigin = MacroCalleeOrigin();
+      Callee.CalleeOrigin.Kind = MCO_LiteralMacroName;
+
+      if (!Callee.CallerMacroId) {
+        if (Callee.CalleeLoc.isMacroID())
+          Callee.CalleeOrigin.Kind = MCO_Opaque;
+        continue;
+      }
+
+      const Item *Caller = findItemByID(Items, *Callee.CallerMacroId);
+      if (!Caller) {
+        Callee.CalleeOrigin.Kind = MCO_Opaque;
+        continue;
+      }
+
+      if (auto ArgIdx =
+              recoverImmediateCallerParam(*Caller, Callee.CalleeLoc)) {
+        Callee.CalleeOrigin.Kind = MCO_CallerParam;
+        Callee.CalleeOrigin.CallerParamIndices.push_back(*ArgIdx);
+      } else if (Callee.CalleeLoc.isMacroID() &&
+                 SM.isMacroArgExpansion(Callee.CalleeLoc)) {
+        Callee.CalleeOrigin.Kind = MCO_Opaque;
+      }
+    }
+
+    // Compute higher-order tuple forwarding metadata from finalized edge-local
+    // provenance. Callback-time construction is intentionally avoided because
+    // the immediate caller and caller-param callee origin may still be
+    // provisional while MacroArgs is available. The exact unexpanded actual
+    // spellings captured on each item let this pass reuse the same structural
+    // tuple proof after those prerequisite edges are stable.
+    for (Item &Callee : Items) {
+      if (Callee.Kind != IK_Macro)
+        continue;
+
+      // Finalized evidence replaces any callback-time or stale metadata.
+      Callee.InvArgTupleRefs.clear();
+      Callee.NormalizedInvText.reset();
+      Callee.NormalizedInvArgTextRanges.clear();
+
+      const bool hasSupportedTupleGeneratedCalleeOrigin =
+          Callee.CalleeOrigin.Kind == MCO_LiteralMacroName ||
+          (Callee.CalleeOrigin.Kind == MCO_CallerParam &&
+           Callee.CalleeOrigin.CallerParamIndices.size() == 1);
+      if (!Callee.CallerMacroId || !hasSupportedTupleGeneratedCalleeOrigin ||
+          Callee.UnexpandedArgTexts.empty())
+        continue;
+
+      // Unexpanded actual spellings are captured while MacroArgs is alive,
+      // but this late tuple proof is certified against the finalized macro
+      // item. Require that the retained evidence is exactly parallel to the
+      // generated callee definition's formal list before comparing any tuple
+      // elements. A mismatch means the callback-local actuals were incomplete
+      // for this item, so the producer must withhold tuple metadata.
+      if (Callee.UnexpandedArgTexts.size() != Callee.DefParams.size())
+        continue;
+
+      const Item *Caller = findItemByID(Items, *Callee.CallerMacroId);
+      if (!Caller)
+        continue;
+
+      SmallVector<llvm::StringRef, 8> calleeArgTexts;
+      calleeArgTexts.reserve(Callee.UnexpandedArgTexts.size());
+      bool missingArgText = false;
+      for (const std::optional<std::string> &argText :
+           Callee.UnexpandedArgTexts) {
+        if (!argText) {
+          missingArgText = true;
+          break;
+        }
+        calleeArgTexts.push_back(*argText);
+      }
+      if (missingArgText || calleeArgTexts.empty())
+        continue;
+
+      std::optional<uint32_t> uniqueCallerFormal;
+      std::vector<std::vector<InvArgTupleRef>> tupleRefs;
+      std::string normalizedInvText;
+      std::vector<
+          std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
+          normalizedRanges;
+
+      for (uint32_t callerFormal = 0;
+           callerFormal < Caller->InvArgRanges.size(); ++callerFormal) {
+        auto callerArgText =
+            getItemInvocationArgText(*Caller, callerFormal);
+        if (!callerArgText)
+          continue;
+
+        std::vector<
+            std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
+            tupleRanges;
+        if (!computeTupleElementRangesFromText(
+                *callerArgText, PP.getLangOpts(), tupleRanges) ||
+            tupleRanges.size() != calleeArgTexts.size())
+          continue;
+
+        bool match = true;
+        SmallVector<llvm::StringRef, 8> tupleArgTexts;
+        std::vector<std::vector<InvArgTupleRef>> candidateRefs(
+            tupleRanges.size());
+        for (size_t I = 0; I < tupleRanges.size(); ++I) {
+          const auto &range = tupleRanges[I];
+          if (!range.first || !range.second || *range.second < *range.first ||
+              *range.second > callerArgText->size()) {
+            match = false;
+            break;
+          }
+
+          llvm::StringRef slice =
+              callerArgText->slice(*range.first, *range.second).trim();
+          if (slice != calleeArgTexts[I].trim()) {
+            match = false;
+            break;
+          }
+
+          tupleArgTexts.push_back(slice);
+          candidateRefs[I].push_back(InvArgTupleRef{
+              callerFormal, *range.first, *range.second});
+        }
+        if (!match)
+          continue;
+
+        // More than one caller formal matching the complete generated
+        // signature is ambiguous proof, so emit no tuple metadata.
+        if (uniqueCallerFormal) {
+          uniqueCallerFormal.reset();
+          tupleRefs.clear();
+          normalizedInvText.clear();
+          normalizedRanges.clear();
+          break;
+        }
+
+        uniqueCallerFormal = callerFormal;
+        tupleRefs = std::move(candidateRefs);
+        buildSyntheticFunctionLikeInvocationText(
+            Callee.Name, llvm::ArrayRef<llvm::StringRef>(tupleArgTexts),
+            normalizedInvText, normalizedRanges);
+      }
+
+      if (!uniqueCallerFormal || normalizedInvText.empty())
+        continue;
+
+      Callee.InvArgTupleRefs = std::move(tupleRefs);
+      Callee.NormalizedInvText = std::move(normalizedInvText);
+      Callee.NormalizedInvArgTextRanges = std::move(normalizedRanges);
     }
 
     // Materialize producer-owned paste callee-origin records now that the

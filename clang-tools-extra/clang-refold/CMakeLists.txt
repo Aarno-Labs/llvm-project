@@ -53,6 +53,7 @@ add_clang_tool(clang-refold
   macro/RefoldMacroStandardArgsOnlyOccurrence.cpp
   macro/RefoldMacroStandardArgsOnlyProof.cpp
   macro/RefoldMacroStandardArgsOnlyGeneratedReplay.cpp
+  macro/RefoldMacroRecursiveTupleGeneratedReplay.cpp
   macro/RefoldMacroSubtreeReplayValidator.cpp
   macro/RefoldMacroReplayStabilityValidator.cpp
   macro/RefoldMacroGeneratedCalleeReplayEngine.cpp

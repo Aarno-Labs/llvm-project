@@ -37,13 +37,14 @@ using namespace clang;
 /// Create a TokenLexer for the specified macro with the specified actual
 /// arguments.  Note that this ctor takes ownership of the ActualArgs pointer.
 void TokenLexer::Init(Token &Tok, SourceLocation ELEnd, MacroInfo *MI,
-                      MacroArgs *Actuals) {
+                      MacroArgs *Actuals, uint64_t ExpansionFrameId) {
   // If the client is reusing a TokenLexer, make sure to free any memory
   // associated with it.
   destroy();
 
   Macro = MI;
   ActualArgs = Actuals;
+  MacroExpansionFrameId = ExpansionFrameId;
   CurTokenIdx = 0;
 
   ExpandLocStart = Tok.getLocation();
@@ -102,6 +103,7 @@ void TokenLexer::Init(const Token *TokArray, unsigned NumToks,
 
   Macro = nullptr;
   ActualArgs = nullptr;
+  MacroExpansionFrameId = 0;
   Tokens = TokArray;
   OwnsTokens = ownsTokens;
   DisableMacroExpansion = disableMacroExpansion;

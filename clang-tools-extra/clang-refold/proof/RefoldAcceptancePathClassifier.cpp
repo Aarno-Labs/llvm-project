@@ -56,6 +56,9 @@ RefoldAcceptancePathClassifier::InventoryMacroPatchProofAcceptancePath(
   case MacroPatchProofKind::PasteDerivedCalleeSelector:
     return BuildAcceptancePathInventory(
         AcceptedPathKind::MacroPasteDerivedCalleeSelector);
+  case MacroPatchProofKind::RecursiveTupleGeneratedCalleeReplay:
+    return BuildAcceptancePathInventory(
+        AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay);
   case MacroPatchProofKind::DagSubtreeRoot:
     // DAG-preserving rewrites must carry the explicit subtree certificate
     // recorded on accepted root patches.
@@ -115,6 +118,11 @@ RefoldAcceptancePathClassifier::BuildAcceptancePathInventory(
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
     inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::MacroPasteDerivedCalleeSelector;
+    break;
+  case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
+    inventory.futureTarget =
+        FutureProofTarget::MacroRecursiveTupleGeneratedCalleeReplay;
     break;
   case AcceptedPathKind::MacroDagSubtreeRoot:
     inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
@@ -243,6 +251,7 @@ RefoldAcceptancePathClassifier::BuildTheoremProofClassForAcceptedPath(
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
+  case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
   case AcceptedPathKind::MacroDagSubtreeRoot:
   case AcceptedPathKind::MacroCallChainSuffix:
     return TheoremProofClass::InvocationPreservingProof;
@@ -438,6 +447,7 @@ RefoldAcceptancePathClassifier::BuildAcceptedPathProofSummary(
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
+  case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
   case AcceptedPathKind::MacroDagSubtreeRoot:
   case AcceptedPathKind::MacroCallChainSuffix:
   case AcceptedPathKind::MacroCounterLiteral:

@@ -24,6 +24,8 @@ witnessFamilyForAcceptedPath(AcceptedPathKind path) {
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
     return WitnessProofFamily::TokenPaste;
+  case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
+    return WitnessProofFamily::GeneratedCalleeReplay;
   case AcceptedPathKind::MacroDagSubtreeRoot:
   case AcceptedPathKind::MacroCallChainSuffix:
     return WitnessProofFamily::GeneratedCalleeReplay;
@@ -68,6 +70,8 @@ witnessProducerKindForAcceptedPath(AcceptedPathKind path) {
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
     return WitnessProducerKind::PasteResult;
+  case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
+    return WitnessProducerKind::GeneratedCallee;
   case AcceptedPathKind::MacroDagSubtreeRoot:
   case AcceptedPathKind::MacroCallChainSuffix:
     return WitnessProducerKind::GeneratedCallee;
