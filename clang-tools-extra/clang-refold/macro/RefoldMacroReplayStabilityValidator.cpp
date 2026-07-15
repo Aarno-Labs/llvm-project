@@ -230,7 +230,9 @@ bool RefoldMacroReplayStabilityValidator::
 
 bool RefoldMacroReplayStabilityValidator::
     ArgsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay(
-        const RefoldModel::MacroInvocation &m, const MacroPatch &patch) const {
+        const MacroSubtreeReplayValidationContext &ctx,
+        const MacroPatch &patch) const {
+  const RefoldModel::MacroInvocation &m = ctx.rootInvocation;
   auto isArgsOnlyInvocationPreservingProof = [&]() {
     switch (patch.proof.kind) {
     case MacroPatchProofKind::ArgsOnlyStandard:
@@ -332,6 +334,30 @@ bool RefoldMacroReplayStabilityValidator::
     addArgumentDependentInterval(span.begin, span.end);
   for (const auto &span : m.pasteSpans)
     addArgumentDependentInterval(span.begin, span.end);
+
+  // A root producer body span may contain output emitted by nested macro
+  // invocations.  That output is not fixed root replacement-list text: the
+  // subtree replay validator owns its semantic replay obligation.  Exclude
+  // each proven descendant cover from this local literal-body audit while
+  // retaining exact A/B envelope tiling below.  Membership is established
+  // solely from recorded caller ancestry, so malformed or unrelated producer
+  // nodes remain fail-closed and continue to be checked as fixed root body.
+  RefoldMacroOccurrenceProofValidator occurrenceProofValidator(
+      RefoldMacroOccurrenceProofValidator::Dependencies{&deps_.model,
+                                                        &deps_.macroTopology});
+  for (const auto &candidate : deps_.model.GetMacroInvocations()) {
+    if (candidate.id == m.id || !candidate.cover.IsValid() ||
+        candidate.cover.begin >= candidate.cover.end ||
+        !occurrenceProofValidator.CandidateBelongsToValidatedSubtree(
+            ctx, candidate))
+      continue;
+
+    const uint64_t begin =
+        std::max<uint64_t>(candidate.cover.begin, cover->first);
+    const uint64_t end =
+        std::min<uint64_t>(candidate.cover.end, cover->second);
+    addArgumentDependentInterval(begin, end);
+  }
 
   llvm::sort(argumentDependentIntervals, tokenIntervalLess);
   SmallVector<TokenInterval, 32> mergedArgumentIntervals;
@@ -763,7 +789,7 @@ bool RefoldMacroReplayStabilityValidator::
         const MacroPatch &patch) const {
   const RefoldModel::MacroInvocation &m = ctx.rootInvocation;
   return StructurePreservingCallsiteHasStableFormalSyntax(patch, m) &&
-         ArgsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay(m, patch) &&
+         ArgsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay(ctx, patch) &&
          RootPreservingCandidateHasLiteralFixedRootBodyReplay(
              m, ctx.rootInvocationText, patch) &&
          deps_.subtreeReplayValidator.ClaimedWholeEnvelopeIsReplaySafe(ctx,

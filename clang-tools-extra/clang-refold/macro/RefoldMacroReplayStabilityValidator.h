@@ -102,7 +102,8 @@ public:
   /// True when an args-only whole-envelope claim proves that every fixed
   /// replacement-list body surface still replays literally in B.
   bool ArgsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay(
-      const RefoldModel::MacroInvocation &m, const MacroPatch &patch) const;
+      const MacroSubtreeReplayValidationContext &ctx,
+      const MacroPatch &patch) const;
 
   /// True when a root-preserving candidate leaves the root-owned fixed body
   /// literal in B, after excluding argument-dependent and descendant macro
