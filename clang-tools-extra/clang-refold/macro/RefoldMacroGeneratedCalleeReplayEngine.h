@@ -142,9 +142,14 @@ struct TerminalGeneratedCalleeReplayRequest {
   const RefoldModel::MacroDirective &terminalDefinition;
   /// Old terminal actual spellings in terminal callee formal order.
   llvm::ArrayRef<std::string> oldActuals;
-  /// Whole-cover A-token envelope for the root recursive invocation.
+  /// A-token replay surface for the terminal generated invocation.
+  ///
+  /// For direct recursive tuple replay this is usually the root whole-cover
+  /// envelope.  For nested generated callees it is the terminal callee's own
+  /// producer-recorded expansion surface, excluding enclosing generated-macro
+  /// wrapper tokens that are not part of the terminal replacement list.
   const std::pair<uint64_t, uint64_t> &wholeCoverATokens;
-  /// B-token envelope being realized by terminal generated-callee replay.
+  /// B-token envelope corresponding to `wholeCoverATokens`.
   const std::pair<size_t, size_t> &bTokenEnvelope;
 };
 

@@ -262,6 +262,33 @@ struct ComposedGeneratedCalleePath {
   llvm::SmallVector<RootTupleSliceBinding, 8> actualSlices;
 };
 
+
+/// Formal slice state after following one generated-callee invocation.
+///
+/// The first recursive tuple theorem level proves that a root selector formal
+/// selected a generated callee, and that each generated callee actual is a
+/// top-level element of one root tuple formal.  A generated callee may itself
+/// forward a tuple-shaped actual into another generated callee, for example
+/// `ADD(f, t) -> f t` followed by `SUB(a, b)`.  This private state carries the
+/// root-tuple slice owned by each current generated formal so such descendant
+/// generated-callee edges can be followed without re-inferring anything from
+/// source overlap.
+struct GeneratedTupleFormalState {
+  /// Current generated invocation described by this state.
+  const RefoldModel::MacroInvocation *invocation = nullptr;
+  /// Exact definition directive used by `invocation`.
+  const RefoldModel::MacroDirective *definition = nullptr;
+  /// Original root formal that selected the first generated callee.
+  uint32_t rootCalleeFormalIndex = 0;
+  /// Root tuple formal that owns every slice in this state.
+  uint32_t rootTupleFormalIndex = 0;
+  /// Current generated formal index -> exact root tuple payload slice.
+  llvm::SmallVector<std::optional<RootTupleSliceBinding>, 8>
+      rootTupleSliceByLocalFormal;
+  /// Exact actual slices for `invocation`, in generated formal order.
+  llvm::SmallVector<RootTupleSliceBinding, 8> actualSlices;
+};
+
 /// Unique terminal generated-callee replay result for the composed path.
 ///
 /// The recursive resolver uses this internal carrier to keep the old terminal
@@ -975,17 +1002,251 @@ private:
     if (!derivation)
       return std::nullopt;
 
+    std::optional<GeneratedTupleFormalState> generatedState =
+        MakeGeneratedTupleFormalState(edge, *derivation);
+    if (!generatedState)
+      return std::nullopt;
+
+    llvm::SmallVector<ComposedGeneratedCalleePath, 2> nestedPaths;
+    if (!CollectNestedGeneratedCalleePaths(request, rootInvocation,
+                                          *generatedState, 0, nestedPaths))
+      return std::nullopt;
+    if (nestedPaths.size() > 1)
+      return std::nullopt;
+    if (nestedPaths.size() == 1)
+      return nestedPaths.front();
+
+    return BuildPathForGeneratedState(rootInvocation, *generatedState);
+  }
+
+  /// Initialize per-formal tuple slices for the first generated callee.
+  ///
+  /// `RootTupleSliceDeriver` has already proven that every actual of the first
+  /// generated callee is exactly one top-level element of the unique root tuple
+  /// formal.  This method reshapes that proof into a formal-indexed state so a
+  /// generated callee body such as `f t` can be followed when `f` itself names a
+  /// generated function-like macro and `t` supplies that macro's tuple actuals.
+  std::optional<GeneratedTupleFormalState> MakeGeneratedTupleFormalState(
+      const TerminalGeneratedCalleeEdge &edge,
+      const RootTupleSliceDerivation &derivation) const {
+    if (!edge.terminalInvocation || !edge.terminalDefinition ||
+        !edge.terminalDefinition->functionLike)
+      return std::nullopt;
+    if (edge.terminalDefinition->defParams.empty() ||
+        edge.terminalDefinition->defParams.size() >
+            std::numeric_limits<uint32_t>::max())
+      return std::nullopt;
+
+    const uint32_t formalCount =
+        static_cast<uint32_t>(edge.terminalDefinition->defParams.size());
+    GeneratedTupleFormalState state;
+    state.invocation = edge.terminalInvocation;
+    state.definition = edge.terminalDefinition;
+    state.rootCalleeFormalIndex = edge.rootCalleeFormalIndex;
+    state.rootTupleFormalIndex = derivation.rootTupleFormalIndex;
+    state.rootTupleSliceByLocalFormal.assign(formalCount, std::nullopt);
+    state.actualSlices.assign(derivation.actualSlices.begin(),
+                              derivation.actualSlices.end());
+
+    for (const RootTupleSliceBinding &slice : derivation.actualSlices) {
+      if (slice.generatedFormalIndex >= formalCount ||
+          slice.rootTupleFormalIndex != derivation.rootTupleFormalIndex)
+        return std::nullopt;
+      if (state.rootTupleSliceByLocalFormal[slice.generatedFormalIndex])
+        return std::nullopt;
+      state.rootTupleSliceByLocalFormal[slice.generatedFormalIndex] = slice;
+    }
+
+    for (const std::optional<RootTupleSliceBinding> &slice :
+         state.rootTupleSliceByLocalFormal) {
+      if (!slice)
+        return std::nullopt;
+    }
+    return state;
+  }
+
+  /// Follow generated-callee descendants that are selected by tuple elements.
+  ///
+  /// The first generated-callee edge may be only an intermediate higher-order
+  /// forwarder.  In `ADD(f, t) -> f t`, the `ADD` invocation's first actual
+  /// selects the next generated callee and its second actual supplies the tuple
+  /// consumed by that callee.  This traversal follows only producer-recorded
+  /// `caller_param` children and requires each descendant actual to carry exact
+  /// `arg_tuple_refs` back to a currently proven generated formal slice.
+  bool CollectNestedGeneratedCalleePaths(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      const RefoldModel::MacroInvocation &rootInvocation,
+      const GeneratedTupleFormalState &state, unsigned depth,
+      llvm::SmallVectorImpl<ComposedGeneratedCalleePath> &paths) const {
+    if (!state.invocation || !state.definition ||
+        depth >= RecursiveTupleForwardingDepthLimit)
+      return false;
+
+    bool sawGeneratedCalleeChild = false;
+    for (const RefoldModel::MacroInvocation *child :
+         graph_.ChildrenOf(state.invocation->id)) {
+      if (!child)
+        return false;
+
+      switch (child->calleeOrigin.kind) {
+      case MacroCalleeOriginKind::LiteralMacroName:
+        continue;
+      case MacroCalleeOriginKind::Paste:
+      case MacroCalleeOriginKind::Opaque:
+        return false;
+      case MacroCalleeOriginKind::CallerParam:
+        break;
+      }
+
+      sawGeneratedCalleeChild = true;
+      std::optional<GeneratedTupleFormalState> childState =
+          TryComposeNestedGeneratedCalleeState(request, state, *child);
+      if (!childState)
+        return false;
+
+      llvm::SmallVector<ComposedGeneratedCalleePath, 2> descendantPaths;
+      if (!CollectNestedGeneratedCalleePaths(request, rootInvocation,
+                                            *childState, depth + 1,
+                                            descendantPaths))
+        return false;
+      if (descendantPaths.empty()) {
+        std::optional<ComposedGeneratedCalleePath> leafPath =
+            BuildPathForGeneratedState(rootInvocation, *childState);
+        if (!leafPath)
+          return false;
+        paths.push_back(*leafPath);
+      } else {
+        paths.append(descendantPaths.begin(), descendantPaths.end());
+      }
+
+      if (paths.size() > 1)
+        return true;
+    }
+
+    (void)sawGeneratedCalleeChild;
+    return true;
+  }
+
+  /// Compose one generated-callee child through exact tuple-element refs.
+  std::optional<GeneratedTupleFormalState> TryComposeNestedGeneratedCalleeState(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      const GeneratedTupleFormalState &parentState,
+      const RefoldModel::MacroInvocation &child) const {
+    if (!parentState.invocation || !child.callerMacroId ||
+        *child.callerMacroId != parentState.invocation->id)
+      return std::nullopt;
+    if (child.calleeOrigin.kind != MacroCalleeOriginKind::CallerParam ||
+        child.calleeOrigin.callerParamIndices.size() != 1)
+      return std::nullopt;
+
+    const uint32_t calleeFormalIndex =
+        child.calleeOrigin.callerParamIndices.front();
+    if (calleeFormalIndex >= parentState.rootTupleSliceByLocalFormal.size() ||
+        !parentState.rootTupleSliceByLocalFormal[calleeFormalIndex])
+      return std::nullopt;
+
+    const RefoldModel::MacroDirective *childDefinition =
+        graph_.DefinitionFor(child);
+    if (!childDefinition || !childDefinition->functionLike ||
+        macroDefinitionHasVariadicFormal(*childDefinition))
+      return std::nullopt;
+    if (childDefinition->defParams.empty() ||
+        childDefinition->defParams.size() >
+            std::numeric_limits<uint32_t>::max())
+      return std::nullopt;
+
+    const uint32_t formalCount =
+        static_cast<uint32_t>(childDefinition->defParams.size());
+    if (child.invArgRanges.size() != formalCount ||
+        child.argTupleRefs.size() != formalCount)
+      return std::nullopt;
+
+    GeneratedTupleFormalState childState;
+    childState.invocation = &child;
+    childState.definition = childDefinition;
+    childState.rootCalleeFormalIndex = parentState.rootCalleeFormalIndex;
+    childState.rootTupleFormalIndex = parentState.rootTupleFormalIndex;
+    childState.rootTupleSliceByLocalFormal.assign(formalCount, std::nullopt);
+    childState.actualSlices.reserve(formalCount);
+
+    for (uint32_t formalIndex = 0; formalIndex < formalCount; ++formalIndex) {
+      const auto &refs = child.argTupleRefs[formalIndex];
+      if (refs.size() != 1)
+        return std::nullopt;
+
+      const RefoldModel::TupleArgRef &ref = refs.front();
+      if (ref.callerParamIndex >=
+              parentState.rootTupleSliceByLocalFormal.size() ||
+          !parentState.rootTupleSliceByLocalFormal[ref.callerParamIndex])
+        return std::nullopt;
+      if (ref.callerByteEnd <= ref.callerByteBegin)
+        return std::nullopt;
+
+      const RootTupleSliceBinding &parentSlice =
+          *parentState.rootTupleSliceByLocalFormal[ref.callerParamIndex];
+      if (parentSlice.rootTupleFormalIndex != parentState.rootTupleFormalIndex)
+        return std::nullopt;
+
+      const uint64_t parentByteWidth =
+          parentSlice.absoluteByteEnd - parentSlice.absoluteByteBegin;
+      if (ref.callerByteEnd > parentByteWidth)
+        return std::nullopt;
+
+      RootTupleSliceBinding binding;
+      binding.generatedActualIndex = formalIndex;
+      binding.generatedFormalIndex = formalIndex;
+      binding.rootTupleFormalIndex = parentState.rootTupleFormalIndex;
+      binding.rootTuplePayloadByteBegin =
+          parentSlice.rootTuplePayloadByteBegin + ref.callerByteBegin;
+      binding.rootTuplePayloadByteEnd =
+          parentSlice.rootTuplePayloadByteBegin + ref.callerByteEnd;
+      binding.absoluteByteBegin =
+          parentSlice.absoluteByteBegin + ref.callerByteBegin;
+      binding.absoluteByteEnd = parentSlice.absoluteByteBegin + ref.callerByteEnd;
+      if (binding.rootTuplePayloadByteEnd <=
+              binding.rootTuplePayloadByteBegin ||
+          binding.absoluteByteEnd <= binding.absoluteByteBegin ||
+          binding.rootTuplePayloadByteEnd > parentSlice.rootTuplePayloadByteEnd)
+        return std::nullopt;
+
+      std::optional<PhysicalInvocationActualRange> actualRange =
+          physicalInvocationActualRange(child, formalIndex);
+      if (!actualRange || actualRange->begin != binding.absoluteByteBegin ||
+          actualRange->end != binding.absoluteByteEnd ||
+          !request.rootInvocation.invFile ||
+          actualRange->file != *request.rootInvocation.invFile)
+        return std::nullopt;
+
+      for (const RootTupleSliceBinding &existing : childState.actualSlices) {
+        if (rangesOverlap(existing.rootTuplePayloadByteBegin,
+                          existing.rootTuplePayloadByteEnd,
+                          binding.rootTuplePayloadByteBegin,
+                          binding.rootTuplePayloadByteEnd))
+          return std::nullopt;
+      }
+
+      childState.rootTupleSliceByLocalFormal[formalIndex] = binding;
+      childState.actualSlices.push_back(binding);
+    }
+
+    return childState;
+  }
+
+  /// Convert a generated formal state into the public composed path carrier.
+  std::optional<ComposedGeneratedCalleePath> BuildPathForGeneratedState(
+      const RefoldModel::MacroInvocation &rootInvocation,
+      const GeneratedTupleFormalState &state) const {
+    if (!state.invocation || !state.definition || state.actualSlices.empty())
+      return std::nullopt;
+
     ComposedGeneratedCalleePath path;
     path.rootInvocation = &rootInvocation;
-    path.terminalInvocation = edge.terminalInvocation;
-    path.terminalDefinition = edge.terminalDefinition;
-    path.rootCalleeFormalIndex = edge.rootCalleeFormalIndex;
-    path.rootTupleFormalIndex = derivation->rootTupleFormalIndex;
-    path.actualSlices.assign(derivation->actualSlices.begin(),
-                             derivation->actualSlices.end());
-    if (!path.terminalInvocation || !path.terminalDefinition ||
-        path.actualSlices.empty())
-      return std::nullopt;
+    path.terminalInvocation = state.invocation;
+    path.terminalDefinition = state.definition;
+    path.rootCalleeFormalIndex = state.rootCalleeFormalIndex;
+    path.rootTupleFormalIndex = state.rootTupleFormalIndex;
+    path.actualSlices.assign(state.actualSlices.begin(),
+                             state.actualSlices.end());
     return path;
   }
 
@@ -1033,8 +1294,10 @@ std::optional<std::string> rootInvocationSourceSlice(
 class RecursiveTupleGeneratedReplaySolver {
 public:
   explicit RecursiveTupleGeneratedReplaySolver(
-      const RefoldMacroGeneratedCalleeReplayEngine &generatedCalleeReplayEngine)
-      : generatedCalleeReplayEngine_(generatedCalleeReplayEngine) {}
+      const RefoldMacroGeneratedCalleeReplayEngine &generatedCalleeReplayEngine,
+      const RefoldSourceMapper &sourceMapper)
+      : generatedCalleeReplayEngine_(generatedCalleeReplayEngine),
+        sourceMapper_(sourceMapper) {}
 
   /// Return the unique terminal replay solution for \p path, if provable.
   std::optional<RecursiveTupleGeneratedReplaySolution> Solve(
@@ -1075,11 +1338,21 @@ public:
       solution.oldActuals.push_back(std::move(*oldActualByFormal[formalIndex]));
     }
 
+    std::optional<std::pair<uint64_t, uint64_t>> replayATokens =
+        terminalReplayATokenRange(request, path);
+    if (!replayATokens)
+      return std::nullopt;
+
+    std::optional<std::pair<size_t, size_t>> replayBEnvelope =
+        mapReplayBTokenEnvelope(*replayATokens);
+    if (!replayBEnvelope)
+      return std::nullopt;
+
     TerminalGeneratedCalleeReplayRequest terminalRequest{
         *path.terminalDefinition,
         llvm::ArrayRef<std::string>(solution.oldActuals.data(),
                                     solution.oldActuals.size()),
-        request.wholeCoverATokens, request.bTokenEnvelope};
+        *replayATokens, *replayBEnvelope};
     std::optional<TerminalGeneratedCalleeReplaySolution> terminalSolution =
         generatedCalleeReplayEngine_.SolveTerminalGeneratedCalleeReplay(
             terminalRequest);
@@ -1099,7 +1372,52 @@ public:
   }
 
 private:
+  /// Return the exact A-token replay surface for the terminal generated callee.
+  ///
+  /// The recursive proof edits the source-spelled root tuple, but terminal
+  /// generated-callee inversion must be solved against the terminal callee's
+  /// own expansion surface.  In nested cases such as `ADD(f, t) -> ((f t)+10)`,
+  /// the root whole-cover surface contains literal wrapper tokens from `ADD`
+  /// that are not part of the terminal `SUB` replacement list.  Solving `SUB`
+  /// against the enclosing root cover would fail correctly and then allow a
+  /// lossy whole-cover fallback.  The producer-recorded terminal cover is the
+  /// deterministic replay surface for the terminal definition.
+  std::optional<std::pair<uint64_t, uint64_t>> terminalReplayATokenRange(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      const ComposedGeneratedCalleePath &path) const {
+    if (!path.terminalInvocation || !path.terminalInvocation->cover.IsValid())
+      return std::nullopt;
+
+    const uint64_t begin = path.terminalInvocation->cover.begin;
+    const uint64_t end = path.terminalInvocation->cover.end;
+    if (begin >= end || begin < request.wholeCoverATokens.first ||
+        end > request.wholeCoverATokens.second)
+      return std::nullopt;
+    return std::make_pair(begin, end);
+  }
+
+  /// Map the terminal A-token replay surface to the edited B-token surface.
+  ///
+  /// This mirrors the normal whole-cover mapping policy, including the
+  /// boundary-insertion preserving fallback, but applies it to the terminal
+  /// generated callee's own expansion surface rather than the enclosing root
+  /// invocation cover.
+  std::optional<std::pair<size_t, size_t>> mapReplayBTokenEnvelope(
+      const std::pair<uint64_t, uint64_t> &replayATokens) const {
+    std::optional<std::pair<size_t, size_t>> bEnvelope =
+        sourceMapper_.MapATokRangeAToBTokenEnvelope(
+            replayATokens.first, replayATokens.second);
+    if (!bEnvelope || bEnvelope->first >= bEnvelope->second)
+      bEnvelope = sourceMapper_
+                      .MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+                          replayATokens.first, replayATokens.second);
+    if (!bEnvelope || bEnvelope->first >= bEnvelope->second)
+      return std::nullopt;
+    return bEnvelope;
+  }
+
   const RefoldMacroGeneratedCalleeReplayEngine &generatedCalleeReplayEngine_;
+  const RefoldSourceMapper &sourceMapper_;
 };
 
 /// Applies solved terminal generated-callee replacements to the root tuple.
@@ -1296,7 +1614,7 @@ RefoldMacroRecursiveTupleGeneratedReplay::BuildCandidate(
     return std::nullopt;
 
   RecursiveTupleGeneratedReplaySolver replaySolver(
-      deps_.generatedCalleeReplayEngine);
+      deps_.generatedCalleeReplayEngine, deps_.sourceMapper);
   std::optional<RecursiveTupleGeneratedReplaySolution> replaySolution =
       replaySolver.Solve(request, *path);
   if (!replaySolution)
