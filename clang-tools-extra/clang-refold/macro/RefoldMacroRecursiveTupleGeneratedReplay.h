@@ -91,6 +91,16 @@ public:
 
   explicit RefoldMacroRecursiveTupleGeneratedReplay(Dependencies deps);
 
+  /// Try to construct a direct paste-derived tuple-generated-callee candidate.
+  ///
+  /// This covers non-recursive roots shaped like `a##b t`, where the generated
+  /// callee token is produced by token pasting over root actuals and the callee
+  /// arguments are supplied by one parenthesized tuple actual.  The method owns
+  /// only the tuple/generator theorem gate; terminal replay and root invocation
+  /// rebuilding stay delegated to the generated-callee engine.
+  std::optional<MacroPatch> BuildPasteTupleCandidate(
+      const RecursiveTupleGeneratedReplayRequest &request) const;
+
   /// Try to construct a recursive tuple-generated-callee replay candidate.
   ///
   /// The method emits a patch only after proving the unique forwarding path,

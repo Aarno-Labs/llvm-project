@@ -2051,6 +2051,56 @@ RefoldMacroRecursiveTupleGeneratedReplay::
     : deps_(deps) {}
 
 std::optional<MacroPatch>
+RefoldMacroRecursiveTupleGeneratedReplay::BuildPasteTupleCandidate(
+    const RecursiveTupleGeneratedReplayRequest &request) const {
+  const RefoldModel::MacroInvocation &rootInvocation =
+      request.rootInvocation;
+  if (!rootInvocation.definitionDirectiveId || !rootInvocation.invB ||
+      !rootInvocation.invE || !rootInvocation.stringifySpans.empty() ||
+      !rootInvocation.pasteSpans.empty())
+    return std::nullopt;
+
+  if (request.rootDefinition.subkind != "#define" ||
+      !request.rootDefinition.functionLike ||
+      request.rootDefinition.replacementTokens.size() < 4)
+    return std::nullopt;
+
+  const RefoldModel::MacroReplacementToken &tupleToken =
+      request.rootDefinition.replacementTokens.back();
+  if (tupleToken.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+      !tupleToken.paramIndex ||
+      *tupleToken.paramIndex >= request.invocationArgRanges.size())
+    return std::nullopt;
+
+  // The direct paste/tuple theorem is intentionally narrow: the root
+  // replacement tape must end in the tuple formal, and at least one earlier
+  // token must be the paste operator that constructs the generated callee
+  // spelling.  Richer tapes are rejected by the engine's parser, but this early
+  // gate keeps unrelated tuple-forwarding roots on the existing replay paths.
+  bool sawPasteOperator = false;
+  for (size_t i = 0;
+       i + 1 < request.rootDefinition.replacementTokens.size(); ++i) {
+    if (request.rootDefinition.replacementTokens[i].spelling == "##") {
+      sawPasteOperator = true;
+      break;
+    }
+  }
+  if (!sawPasteOperator)
+    return std::nullopt;
+
+  PasteTupleGeneratedCalleeReplayContext pasteTupleContext{
+      rootInvocation,
+      request.baseInvocationText,
+      request.invocationArgRanges,
+      request.wholeCoverATokens,
+      request.bTokenEnvelope,
+      request.rootDefinition,
+      *tupleToken.paramIndex};
+  return deps_.generatedCalleeReplayEngine
+      .BuildPasteTupleGeneratedCalleeReplayCandidate(pasteTupleContext);
+}
+
+std::optional<MacroPatch>
 RefoldMacroRecursiveTupleGeneratedReplay::BuildCandidate(
     const RecursiveTupleGeneratedReplayRequest &request) const {
   if (!recursiveTupleReplayRequestHasUsableRootEvidence(request))

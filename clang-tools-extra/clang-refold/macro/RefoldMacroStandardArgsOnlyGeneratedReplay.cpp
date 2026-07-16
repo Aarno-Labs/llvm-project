@@ -1907,6 +1907,10 @@ std::optional<MacroPatch> HigherOrderGeneratedReplayProbe::TryBuild(
           invocation, baseInvocationText, invocationArgRanges))
     return generatedCalleePatch;
 
+  if (auto pasteTupleGeneratedPatch = TryBuildPasteTupleGeneratedCalleeReplay(
+          invocation, baseInvocationText, invocationArgRanges))
+    return pasteTupleGeneratedPatch;
+
   if (auto tupleGeneratedPatch = TryBuildTupleGeneratedCalleeReplay(
           invocation, baseInvocationText, invocationArgRanges))
     return tupleGeneratedPatch;
@@ -2194,6 +2198,46 @@ HigherOrderGeneratedReplayProbe::TryBuildRecursiveTupleGeneratedCalleeReplay(
   return recursiveReplay.BuildCandidate(recursiveRequest);
 }
 
+
+/// Try the paste/tuple generated-callee theorem for roots such as `a##b t`.
+///
+/// This probe sits after ordinary generated-callee replay and before the
+/// direct tuple-generated bridge.  It only recognizes a root replacement tape
+/// whose final token is the tuple actual and whose preceding tape contains a
+/// paste expression that can deterministically synthesize the generated callee
+/// token.
+std::optional<MacroPatch>
+HigherOrderGeneratedReplayProbe::TryBuildPasteTupleGeneratedCalleeReplay(
+    const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
+  if (!invocation.definitionDirectiveId || !invocation.invB ||
+      !invocation.invE)
+    return std::nullopt;
+
+  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
+  if (!cover || cover->first >= cover->second)
+    return std::nullopt;
+
+  auto bEnv = MapWholeCoverBEnvelope(*cover);
+  if (!bEnv)
+    return std::nullopt;
+
+  const RefoldModel::MacroDirective *rootDefinition =
+      FindRootDefinition(invocation);
+  if (!rootDefinition || rootDefinition->subkind != "#define" ||
+      !rootDefinition->functionLike)
+    return std::nullopt;
+
+  RefoldMacroRecursiveTupleGeneratedReplay tupleReplay(
+      RefoldMacroRecursiveTupleGeneratedReplay::Dependencies{
+          deps_.model, deps_.sourceMapper, deps_.macroTopology,
+          deps_.generatedCalleeReplayEngine, deps_.proofCertifier,
+          deps_.lexLang});
+  RecursiveTupleGeneratedReplayRequest tupleRequest{
+      invocation, *rootDefinition, baseInvocationText, invocationArgRanges,
+      *cover, *bEnv};
+  return tupleReplay.BuildPasteTupleCandidate(tupleRequest);
+}
 
 std::optional<MacroPatch>
 HigherOrderGeneratedReplayProbe::TryBuildTupleGeneratedCalleeReplay(

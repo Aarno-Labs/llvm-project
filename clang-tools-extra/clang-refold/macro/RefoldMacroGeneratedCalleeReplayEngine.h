@@ -2,7 +2,7 @@
 //
 // Higher-order generated-callee replay engine for clang-refold.
 //
-// Owns the four predicates and builders that admit and construct
+// Owns the generated-callee predicates and builders that admit and construct
 // generated-callee chain candidates outside the leaf fallback path:
 //
 //   * `GeneratedCalleeReplayPreservesEnvelope` — trivial envelope guard.
@@ -13,6 +13,9 @@
 //   * `BuildTupleGeneratedCalleeReplayCandidate` — tuple-aware variant
 //     used when the caller forwards a tuple actual through a forwarder
 //     callee.
+//   * `BuildPasteTupleGeneratedCalleeReplayCandidate` — paste-derived
+//     callee variant used when the root macro forms the callee token with
+//     `##` and supplies the generated call arguments through one tuple actual.
 //
 // Owns generated-callee replay construction and admission so patch dispatch,
 // replay synthesis, and proof certification remain separate. Calls into
@@ -130,6 +133,32 @@ struct TupleGeneratedCalleeReplayContext {
   uint32_t &objectAliasHopCount;
 };
 
+/// Explicit root state for paste-derived tuple generated-callee replay.
+///
+/// This replay handles roots shaped like `a##b t`: the generated callee token
+/// is synthesized by a deterministic paste expression over root actuals, while
+/// the final callee arguments are supplied by one parenthesized tuple actual.
+/// The engine solves the old expansion against the old pasted callee, solves
+/// the edited expansion against exactly one visible replacement callee, then
+/// maps both the callee-token paste pieces and tuple elements back to root
+/// invocation arguments.
+struct PasteTupleGeneratedCalleeReplayContext {
+  /// Root invocation whose paste-derived generated callee is being replayed.
+  const RefoldModel::MacroInvocation &invocation;
+  /// Complete source spelling of the root invocation.
+  llvm::StringRef baseInvocationText;
+  /// Formal-content byte ranges inside `baseInvocationText`.
+  llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges;
+  /// Whole-cover A-token envelope for the root invocation.
+  const std::pair<uint64_t, uint64_t> &wholeCoverATokens;
+  /// B-token envelope being realized by paste/tuple replay.
+  const std::pair<size_t, size_t> &bTokenEnvelope;
+  /// Macro definition at the paste/tuple replay root.
+  const RefoldModel::MacroDirective &rootDefinition;
+  /// Root formal index containing the parenthesized tuple actual.
+  uint32_t tupleArgIdx = 0;
+};
+
 /// Request for solving one already-composed terminal generated callee.
 ///
 /// The recursive tuple-generated-callee resolver uses this narrow engine entry
@@ -226,6 +255,11 @@ public:
   /// nullopt for a non-terminal miss.
   std::optional<MacroPatch> BuildTupleGeneratedCalleeReplayCandidate(
       const TupleGeneratedCalleeReplayContext &ctx) const;
+
+  /// Build the paste-derived tuple generated-callee replay candidate. Returns
+  /// nullopt for a non-terminal miss.
+  std::optional<MacroPatch> BuildPasteTupleGeneratedCalleeReplayCandidate(
+      const PasteTupleGeneratedCalleeReplayContext &ctx) const;
 
   /// Solve an already-composed terminal generated-callee replay.
   ///
