@@ -145,6 +145,34 @@ void normalizeIntervals(SmallVectorImpl<TokenInterval> &spans) {
   spans.append(merged.begin(), merged.end());
 }
 
+/// Chooses the B-token envelope used by the args-only whole-envelope replay
+/// audit. Boundary pure insertions are excluded when the edge surface is fixed
+/// replacement-list body, because fixed macro body cannot own new edge text.
+/// When the edge surface is argument-dependent, keep the untrimmed edge: the
+/// changed actual/stringify/paste surface is allowed to supply new boundary
+/// spelling, even if the byte diff represents that spelling as an insertion at
+/// the whole expansion frontier.
+std::pair<size_t, size_t> chooseArgumentAwareReplayBEnvelope(
+    std::pair<size_t, size_t> wholeB,
+    const std::optional<std::pair<size_t, size_t>> &trimmedB,
+    ArrayRef<WholeEnvelopeReplayElem> elems) {
+  if (!trimmedB || wholeB.first > trimmedB->first ||
+      trimmedB->first > trimmedB->second || trimmedB->second > wholeB.second)
+    return wholeB;
+
+  std::pair<size_t, size_t> replayB = *trimmedB;
+  if (!elems.empty()) {
+    if (elems.front().isArgumentDependent)
+      replayB.first = wholeB.first;
+    if (elems.back().isArgumentDependent)
+      replayB.second = wholeB.second;
+  }
+
+  if (replayB.second < replayB.first)
+    replayB.second = replayB.first;
+  return replayB;
+}
+
 } // namespace
 
 RefoldMacroReplayStabilityValidator::RefoldMacroReplayStabilityValidator(
@@ -288,21 +316,14 @@ bool RefoldMacroReplayStabilityValidator::
 
   // The materialized whole-cover envelope intentionally preserves
   // zero-width insertions that are anchored exactly at either edge of the
-  // macro expansion.  Those boundary insertions are not part of the
-  // replacement-list replay obligation: they are emitted by the ordinary
-  // boundary edit path next to the preserved invocation.  Use the
-  // boundary-trimmed envelope for the literal body/formal/operator replay
-  // audit, while still requiring the candidate to have claimed the wider
-  // whole-cover envelope before this guard applies.
-  std::pair<size_t, size_t> replayB = *wholeB;
-  if (std::optional<std::pair<size_t, size_t>> trimmedB =
-          deps_.sourceMapper.MapATokRangeAToBTokenEnvelope(cover->first,
-                                                           cover->second)) {
-    if (wholeB->first <= trimmedB->first &&
-        trimmedB->first <= trimmedB->second &&
-        trimmedB->second <= wholeB->second)
-      replayB = *trimmedB;
-  }
+  // macro expansion.  Keep both views: the untrimmed envelope is the claimed
+  // materialized target, while the trimmed envelope is useful when an edge
+  // insertion would otherwise be misread as fixed replacement-list body.  The
+  // final replay cursor is selected after the replay elements are known, since
+  // argument-dependent edge surfaces may legitimately own new boundary text.
+  std::optional<std::pair<size_t, size_t>> trimmedReplayB =
+      deps_.sourceMapper.MapATokRangeAToBTokenEnvelope(cover->first,
+                                                       cover->second);
 
   // This guard is only about whole-envelope claims.  Narrow args-only
   // materializations are checked by their local formal/paste/stringify
@@ -421,6 +442,9 @@ bool RefoldMacroReplayStabilityValidator::
       return lhs.aEnd < rhs.aEnd;
     return lhs.isArgumentDependent < rhs.isArgumentDependent;
   });
+
+  const std::pair<size_t, size_t> replayB =
+      chooseArgumentAwareReplayBEnvelope(*wholeB, trimmedReplayB, elems);
 
   auto mapArgumentDependentSurfaceToReplayBEnvelope =
       [&](const ReplayElem &elem) -> std::optional<std::pair<size_t, size_t>> {
