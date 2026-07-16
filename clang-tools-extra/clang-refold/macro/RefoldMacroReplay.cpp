@@ -83,11 +83,18 @@ RefoldMacroOccurrenceReplay::GetOwnedPureInsertionBRangeForArgSpan(
   // Exact span-end ownership:
   //
   // If the gap is exactly at this occurrence's end, the raw inserted B range is
-  // owned by this occurrence, unless the same A-side position is also the comma
-  // separator immediately before some right-hand occurrence. In that case the
-  // right-hand separator owner takes precedence and this span must not claim
-  // the insertion.
+  // owned by this occurrence only when no right-hand occurrence begins at the
+  // same A-side frontier. Token-diff pure insertions are anchored before token
+  // `aPos`; when another occurrence begins at `aPos`, the insertion is a
+  // prefix edit of that right-hand half-open span rather than a suffix edit of
+  // this left-hand span. This prevents adjacent generated-callee/argument
+  // occurrences from both claiming one insertion.
   if (aPos == span.end) {
+    for (const auto &s : argSpans) {
+      if (s.begin == aPos)
+        return std::nullopt;
+    }
+
     if (isCommaSeparator) {
       for (const auto &s : argSpans) {
         if (s.begin == aPos + 1)

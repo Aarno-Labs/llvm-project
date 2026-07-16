@@ -92,12 +92,26 @@ RefoldSourceMapper::FindExactOwningArgSpanForPureInsertion(
     }
   }
 
-  // Finally allow an exact span-end owner when no containing occurrence or
-  // right-hand separator owner claimed the insertion first.
-  for (size_t i = 0; i < argSpans.size(); ++i) {
-    const auto &s = argSpans[i];
-    if (aPos == s.end)
-      return i;
+  // Finally allow an exact span-end owner when no containing occurrence,
+  // same-frontier right-hand occurrence, or right-hand separator owner claimed
+  // the insertion first. A pure insertion at A token index `aPos` is inserted
+  // before that token. Therefore, if an occurrence begins at exactly `aPos`,
+  // the insertion is owned by that right-hand half-open span, not by the
+  // preceding span whose end is also `aPos`.
+  bool hasSameFrontierRightOccurrence = false;
+  for (const auto &s : argSpans) {
+    if (s.begin == aPos) {
+      hasSameFrontierRightOccurrence = true;
+      break;
+    }
+  }
+
+  if (!hasSameFrontierRightOccurrence) {
+    for (size_t i = 0; i < argSpans.size(); ++i) {
+      const auto &s = argSpans[i];
+      if (aPos == s.end)
+        return i;
+    }
   }
 
   // No exact structural owner exists for this pure insertion.

@@ -112,8 +112,10 @@ public:
   ///
   /// Converts a pure insertion from the raw hunk-local B token range into the
   /// effective occurrence-owned B range used for argument derivation and
-  /// cross-occurrence verification.  For ordinary interior/begin/end ownership,
-  /// the owned range is the raw inserted B range.  For the exact
+  /// cross-occurrence verification.  For ordinary interior ownership and
+  /// unambiguous end ownership, the owned range is the raw inserted B range.
+  /// A shared frontier with a right-hand occurrence belongs to that right-hand
+  /// half-open span, not to the preceding span-end fallback.  For the exact
   /// separator-before-right-occurrence case, the owned range is shifted so that
   /// it excludes the shared leading separator and includes the separator that
   /// now precedes the original occurrence in B.
