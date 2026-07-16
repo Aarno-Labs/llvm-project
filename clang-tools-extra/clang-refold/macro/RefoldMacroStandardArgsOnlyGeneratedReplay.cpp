@@ -2261,6 +2261,10 @@ std::optional<MacroPatch> HigherOrderGeneratedReplayProbe::TryBuild(
           invocation, baseInvocationText, invocationArgRanges))
     return generatedCalleePatch;
 
+  if (auto pasteGeneratedPatch = TryBuildPasteGeneratedCalleeReplay(
+          invocation, baseInvocationText, invocationArgRanges))
+    return pasteGeneratedPatch;
+
   if (auto objectSelectorTupleGeneratedPatch =
           TryBuildObjectSelectorTupleGeneratedCalleeReplay(
               invocation, baseInvocationText, invocationArgRanges))
@@ -2557,6 +2561,43 @@ HigherOrderGeneratedReplayProbe::TryBuildRecursiveTupleGeneratedCalleeReplay(
   return recursiveReplay.BuildCandidate(recursiveRequest);
 }
 
+
+
+/// Try the paste/generated-callee theorem for roots such as `a##b(x)`.
+///
+/// This probe is separate from paste/tuple replay: the pasted token supplies the
+/// generated callee name, but the generated call actuals are ordinary
+/// replacement-list arguments rather than elements of one parenthesized tuple.
+/// It is ranked before tuple-specific replay and remains fail-closed when the
+/// root replacement tape is anything other than one paste-derived call.
+std::optional<MacroPatch>
+HigherOrderGeneratedReplayProbe::TryBuildPasteGeneratedCalleeReplay(
+    const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
+  if (!invocation.definitionDirectiveId || !invocation.invB ||
+      !invocation.invE)
+    return std::nullopt;
+
+  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
+  if (!cover || cover->first >= cover->second)
+    return std::nullopt;
+
+  auto bEnv = MapWholeCoverBEnvelope(*cover);
+  if (!bEnv)
+    return std::nullopt;
+
+  const RefoldModel::MacroDirective *rootDefinition =
+      FindRootDefinition(invocation);
+  if (!rootDefinition || rootDefinition->subkind != "#define" ||
+      !rootDefinition->functionLike)
+    return std::nullopt;
+
+  PasteGeneratedCalleeReplayContext pasteGeneratedContext{
+      invocation, baseInvocationText, invocationArgRanges, *cover, *bEnv,
+      *rootDefinition};
+  return deps_.generatedCalleeReplayEngine
+      .BuildPasteGeneratedCalleeReplayCandidate(pasteGeneratedContext);
+}
 
 /// Try the paste/tuple generated-callee theorem for roots such as `a##b t`.
 ///

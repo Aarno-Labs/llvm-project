@@ -1956,6 +1956,98 @@ bool parseRootPasteCalleePrefix(
   return sawPaste && !expectPiece && pieces.size() >= 2;
 }
 
+
+/// Converts a root replacement token into one paste-callee piece.
+///
+/// Unlike paste/tuple replay, the ordinary paste/generated-callee theorem does
+/// not reserve a tuple formal.  Any non-variadic root formal may contribute to
+/// the pasted callee token, and generated-call argument replay later proves
+/// whether that same formal also carries an editable actual.  Unsupported
+/// operators fail closed so only a real paste expression can name the callee.
+bool rootPasteGeneratedCalleePieceFromReplacementToken(
+    const RefoldModel::MacroReplacementToken &tok, size_t rootArgCount,
+    GeneratedPastePiece &piece) {
+  if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
+    if (!tok.paramIndex || *tok.paramIndex >= rootArgCount)
+      return false;
+    piece.isParam = true;
+    piece.paramIdx = *tok.paramIndex;
+    return true;
+  }
+  if (tok.spelling == "#" || tok.spelling == "##" ||
+      tok.spelling == "__VA_OPT__")
+    return false;
+  piece.isParam = false;
+  piece.literal = tok.spelling.str();
+  return true;
+}
+
+/// Root replacement-list shape for one pasted generated call.
+///
+/// `calleePieces` name the paste expression before the call paren, while
+/// `argumentRanges` name the replacement-token ranges inside the generated
+/// call.  The shape intentionally has no prefix or suffix literals: this proof
+/// is for roots whose complete replacement list is the generated call.
+struct RootPasteGeneratedCallShape {
+  SmallVector<GeneratedPastePiece, 8> calleePieces;
+  SmallVector<ReplacementTokenRange, 8> argumentRanges;
+};
+
+/// Parses a root replacement list shaped exactly as `paste-expr(args...)`.
+///
+/// The accepted prefix is an alternating paste chain and the matching close
+/// paren must be the final replacement token.  Richer surrounding context is
+/// left to existing whole-cover/leaf paths; accepting it here would make the
+/// pasted callee theorem responsible for unrelated body-owned tokens.
+bool parseRootPasteGeneratedCallShape(
+    const RefoldModel::MacroDirective &rootDefinition, size_t rootArgCount,
+    RootPasteGeneratedCallShape &shape) {
+  const auto &tokens = rootDefinition.replacementTokens;
+  if (tokens.size() < 5)
+    return false;
+
+  std::optional<size_t> callOpen;
+  std::optional<size_t> callClose;
+  for (size_t open = 1; open < tokens.size(); ++open) {
+    if (!isReplacementLiteralToken(tokens, open, "("))
+      continue;
+    auto close = findMatchingReplacementParen(tokens, open, tokens.size());
+    if (!close || *close + 1 != tokens.size())
+      continue;
+    if (callOpen)
+      return false;
+    callOpen = open;
+    callClose = *close;
+  }
+  if (!callOpen || !callClose || *callOpen == 0)
+    return false;
+
+  bool expectPiece = true;
+  bool sawPaste = false;
+  for (size_t i = 0; i < *callOpen; ++i) {
+    const RefoldModel::MacroReplacementToken &tok = tokens[i];
+    if (expectPiece) {
+      GeneratedPastePiece piece;
+      if (!rootPasteGeneratedCalleePieceFromReplacementToken(tok, rootArgCount,
+                                                             piece))
+        return false;
+      shape.calleePieces.push_back(std::move(piece));
+      expectPiece = false;
+      continue;
+    }
+    if (tok.spelling != "##")
+      return false;
+    sawPaste = true;
+    expectPiece = true;
+  }
+  if (!sawPaste || expectPiece || shape.calleePieces.size() < 2)
+    return false;
+
+  return collectTopLevelReplacementArgumentRanges(tokens, *callOpen,
+                                                  *callClose,
+                                                  shape.argumentRanges);
+}
+
 /// Materializes a paste expression from root actuals and verifies that the
 /// result is a single token.  A generated callee name must be one token; if the
 /// root actuals would produce whitespace or multiple tokens, this replay is not
@@ -2082,6 +2174,18 @@ struct PasteTupleGeneratedReplayCandidate {
   uint32_t objectAliasHopCount = 0;
   bool usesStringification = false;
   bool usesPaste = false;
+};
+
+
+/// Candidate produced by paste-derived generated-callee replay before the
+/// unique-candidate check commits to a patch.
+struct PasteGeneratedReplayCandidate {
+  llvm::DenseMap<uint32_t, std::string> replacementsByRootArgIdx;
+  const RefoldModel::MacroDirective *calleeDefinition = nullptr;
+  uint32_t objectAliasHopCount = 0;
+  bool usesStringification = false;
+  bool usesPaste = false;
+  bool usesVariadicForwarding = false;
 };
 
 /// Candidate produced by object-selector tuple generated-callee replay before
@@ -3125,6 +3229,247 @@ RefoldMacroGeneratedCalleeReplayEngine::BuildGeneratedCalleeReplayCandidate(
       generatedCalleeCtx, replayState, *finalSolution);
 }
 
+
+std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
+    BuildPasteGeneratedCalleeReplayCandidate(
+        const PasteGeneratedCalleeReplayContext &ctx) const {
+  if (ctx.wholeCoverATokens.first >= ctx.wholeCoverATokens.second ||
+      ctx.bTokenEnvelope.first >= ctx.bTokenEnvelope.second)
+    return std::nullopt;
+
+  SmallVector<std::string, 8> rootActuals;
+  SmallVector<GeneratedCalleeSourceSlot, 8> rootSlots;
+  rootActuals.reserve(ctx.invocationArgRanges.size());
+  rootSlots.reserve(ctx.invocationArgRanges.size());
+  for (uint32_t i = 0; i < ctx.invocationArgRanges.size(); ++i) {
+    const auto range = ctx.invocationArgRanges[i];
+    if (range.second < range.first ||
+        range.second > ctx.baseInvocationText.size())
+      return std::nullopt;
+    std::string text = ctx.baseInvocationText.slice(range.first, range.second)
+                           .trim()
+                           .str();
+    rootActuals.push_back(text);
+
+    GeneratedCalleeSourceSlot slot;
+    slot.text = text;
+    slot.rootSourceText = text;
+    slot.rootArgIdx = i;
+    rootSlots.push_back(std::move(slot));
+  }
+
+  RootPasteGeneratedCallShape rootShape;
+  if (!parseRootPasteGeneratedCallShape(ctx.rootDefinition, rootActuals.size(),
+                                        rootShape))
+    return std::nullopt;
+
+  std::optional<std::string> oldCalleeSpelling =
+      materializeSingleRootPasteToken(
+          ArrayRef<GeneratedPastePiece>(rootShape.calleePieces.data(),
+                                        rootShape.calleePieces.size()),
+          ArrayRef<std::string>(rootActuals.data(), rootActuals.size()),
+          deps_.lexLang);
+  if (!oldCalleeSpelling)
+    return std::nullopt;
+
+  uint32_t oldAliasHops = 0;
+  const RefoldModel::MacroDirective *oldCalleeDefinition =
+      deps_.resolveFunctionLikeMacroThroughAliasesWithHops(
+          StringRef(*oldCalleeSpelling), &oldAliasHops);
+  if (!oldCalleeDefinition || !oldCalleeDefinition->functionLike ||
+      oldCalleeDefinition->defParams.empty())
+    return std::nullopt;
+
+  bool rootArgsUseStringification = false;
+  bool rootArgsUsePaste = false;
+  bool rootArgsUseVariadicForwarding = false;
+  SmallVector<GeneratedCalleeSourceSlot, 8> generatedActualSlots;
+  for (const ReplacementTokenRange &argRange : rootShape.argumentRanges) {
+    if (!instantiateGeneratedArgument(
+            deps_, ctx.rootDefinition,
+            ArrayRef<GeneratedCalleeSourceSlot>(rootSlots.data(),
+                                                rootSlots.size()),
+            argRange.begin, argRange.end, rootArgsUseStringification,
+            rootArgsUsePaste, rootArgsUseVariadicForwarding,
+            generatedActualSlots))
+      return std::nullopt;
+  }
+
+  SmallVector<std::string, 8> oldGeneratedActuals;
+  oldGeneratedActuals.reserve(generatedActualSlots.size());
+  for (const GeneratedCalleeSourceSlot &slot : generatedActualSlots)
+    oldGeneratedActuals.push_back(StringRef(slot.text).trim().str());
+
+  if (!macroDefinitionAcceptsActualCount(*oldCalleeDefinition,
+                                         oldGeneratedActuals.size()))
+    return std::nullopt;
+
+  StringRef oldExpansion = deps_.sourceMapper
+                               .SliceASource(ctx.wholeCoverATokens.first,
+                                             ctx.wholeCoverATokens.second)
+                               .trim();
+  StringRef newExpansion = deps_.sourceMapper
+                               .SliceBSource(ctx.bTokenEnvelope.first,
+                                             ctx.bTokenEnvelope.second)
+                               .trim();
+
+  bool oldUsesStringification = false;
+  bool oldUsesPaste = false;
+  std::optional<GeneratedSolvedActuals> oldSolved = solveDefinitionExpansion(
+      *oldCalleeDefinition,
+      ArrayRef<std::string>(oldGeneratedActuals.data(),
+                            oldGeneratedActuals.size()),
+      oldExpansion, deps_.lexLang, oldUsesStringification, oldUsesPaste);
+  if (!oldSolved || oldSolved->size() != oldGeneratedActuals.size())
+    return std::nullopt;
+
+  std::optional<PasteGeneratedReplayCandidate> uniqueCandidate;
+  for (const RefoldModel::MacroDirective &candidateDefinition :
+       deps_.model.GetMacroDirectives()) {
+    if (candidateDefinition.subkind != "#define" ||
+        !candidateDefinition.functionLike ||
+        !macroDefinitionAcceptsActualCount(candidateDefinition,
+                                           oldGeneratedActuals.size()))
+      continue;
+
+    uint32_t candidateAliasHops = 0;
+    const RefoldModel::MacroDirective *visibleCandidate =
+        deps_.resolveFunctionLikeMacroThroughAliasesWithHops(
+            candidateDefinition.name, &candidateAliasHops);
+    if (!visibleCandidate || visibleCandidate->id != candidateDefinition.id)
+      continue;
+
+    bool candidateUsesStringification = false;
+    bool candidateUsesPaste = false;
+    std::optional<GeneratedSolvedActuals> newSolved = solveDefinitionExpansion(
+        candidateDefinition,
+        ArrayRef<std::string>(oldGeneratedActuals.data(),
+                              oldGeneratedActuals.size()),
+        newExpansion, deps_.lexLang, candidateUsesStringification,
+        candidateUsesPaste);
+    if (!newSolved || newSolved->size() != oldGeneratedActuals.size())
+      continue;
+
+    std::optional<GeneratedSolvedActuals> rootPasteSolved =
+        solveRootPasteActualsForCallee(
+            ArrayRef<GeneratedPastePiece>(rootShape.calleePieces.data(),
+                                          rootShape.calleePieces.size()),
+            candidateDefinition.name,
+            ArrayRef<std::string>(rootActuals.data(), rootActuals.size()),
+            deps_.lexLang);
+    if (!rootPasteSolved || rootPasteSolved->size() != rootActuals.size())
+      continue;
+
+    PasteGeneratedReplayCandidate candidate;
+    candidate.calleeDefinition = &candidateDefinition;
+    candidate.objectAliasHopCount = oldAliasHops + candidateAliasHops;
+    candidate.usesStringification = rootArgsUseStringification ||
+                                    oldUsesStringification ||
+                                    candidateUsesStringification;
+    // The root callee token is synthesized by `##`, so the accepted proof is
+    // paste-backed even when the final callee bodies do not themselves paste.
+    candidate.usesPaste = true;
+    candidate.usesVariadicForwarding = rootArgsUseVariadicForwarding;
+
+    llvm::DenseMap<uint32_t, std::string> workingRootTextByArgIdx;
+    for (size_t i = 0; i < rootActuals.size(); ++i) {
+      StringRef oldRoot = StringRef(rootActuals[i]).trim();
+      StringRef newRoot = StringRef((*rootPasteSolved)[i]).trim();
+      if (oldRoot == newRoot)
+        continue;
+      workingRootTextByArgIdx[static_cast<uint32_t>(i)] = newRoot.str();
+      candidate.replacementsByRootArgIdx[static_cast<uint32_t>(i)] =
+          newRoot.str();
+    }
+
+    for (uint32_t i = 0; i < newSolved->size(); ++i) {
+      if (i >= generatedActualSlots.size())
+        return std::nullopt;
+      const GeneratedCalleeSourceSlot &slot = generatedActualSlots[i];
+      const uint32_t rootIdx = slot.rootArgIdx;
+      if (rootIdx >= ctx.invocationArgRanges.size())
+        return std::nullopt;
+
+      StringRef oldActual = StringRef((*oldSolved)[i]).trim();
+      StringRef newActual = StringRef((*newSolved)[i]).trim();
+      if (generatedCalleeTextsTokenEquivalent(oldActual, newActual,
+                                               deps_.lexLang))
+        continue;
+      if (!isMacroInvocationVariadicFormal(ctx.invocation, rootIdx) &&
+          newActual.empty())
+        return std::nullopt;
+
+      StringRef originalRoot = StringRef(rootActuals[rootIdx]).trim();
+      auto workingIt = workingRootTextByArgIdx.find(rootIdx);
+      StringRef source = workingIt != workingRootTextByArgIdx.end()
+                             ? StringRef(workingIt->second)
+                             : StringRef(slot.rootSourceText).trim();
+
+      if (workingIt != workingRootTextByArgIdx.end()) {
+        std::optional<std::string> alreadySatisfied =
+            rewriteSourceActualFromSolvedExpansion(originalRoot, oldActual,
+                                                   newActual, deps_.lexLang);
+        if (alreadySatisfied &&
+            generatedCalleeTextsTokenEquivalent(StringRef(*alreadySatisfied),
+                                                source, deps_.lexLang))
+          continue;
+      }
+
+      std::optional<std::string> rewritten =
+          rewriteSourceActualFromSolvedExpansion(source, oldActual, newActual,
+                                                 deps_.lexLang);
+      if (!rewritten)
+        return std::nullopt;
+      if (!isMacroInvocationVariadicFormal(ctx.invocation, rootIdx) &&
+          replacementIntroducesTopLevelComma(*rewritten, deps_.lexLang))
+        return std::nullopt;
+
+      workingRootTextByArgIdx[rootIdx] = std::move(*rewritten);
+      StringRef finalRoot = StringRef(workingRootTextByArgIdx[rootIdx]).trim();
+      if (finalRoot != originalRoot)
+        candidate.replacementsByRootArgIdx[rootIdx] = finalRoot.str();
+      else
+        candidate.replacementsByRootArgIdx.erase(rootIdx);
+    }
+
+    if (candidate.replacementsByRootArgIdx.empty())
+      continue;
+
+    if (uniqueCandidate)
+      return std::nullopt;
+    uniqueCandidate = std::move(candidate);
+  }
+
+  if (!uniqueCandidate || !uniqueCandidate->calleeDefinition)
+    return std::nullopt;
+
+  InvocationActualRecoveryContext actualRecoveryCtx{
+      ctx.invocation, ctx.baseInvocationText, ctx.invocationArgRanges};
+  std::optional<InvocationRewriteWithRange> rewrite =
+      deps_.buildInvocationRewriteWithRange(
+          actualRecoveryCtx, uniqueCandidate->replacementsByRootArgIdx,
+          /*materializedRangeByArgIdx=*/nullptr);
+  if (!rewrite)
+    return std::nullopt;
+
+  MacroPatch patch{*ctx.invocation.invB, *ctx.invocation.invE,
+                   std::move(rewrite->text), ctx.invocation.id};
+  deps_.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
+      patch, rewrite->materializedOutputByteStart,
+      rewrite->materializedOutputByteEnd);
+  certifyMacroPatchMaterializedBTokenRange(
+      patch, static_cast<uint64_t>(ctx.bTokenEnvelope.first),
+      static_cast<uint64_t>(ctx.bTokenEnvelope.second));
+  deps_.proofCertifier.SetArgsOnlyStandardProof(
+      patch, ctx.invocation, /*wholeEnvelopeReplayValidated=*/true);
+  deps_.proofCertifier.CertifyGeneratedCalleeReplayProof(
+      patch, ctx.invocation, uniqueCandidate->calleeDefinition->id,
+      /*generatedCallDepth=*/1, uniqueCandidate->objectAliasHopCount,
+      uniqueCandidate->usesStringification, uniqueCandidate->usesPaste,
+      uniqueCandidate->usesVariadicForwarding,
+      /*decodedStringLiteralEvidenceOnly=*/uniqueCandidate->usesStringification);
+  return patch;
+}
 
 std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
     BuildPasteTupleGeneratedCalleeReplayCandidate(

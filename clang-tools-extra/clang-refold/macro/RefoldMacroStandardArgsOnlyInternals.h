@@ -372,6 +372,11 @@ private:
       llvm::StringRef baseInvocationText,
       llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
 
+  std::optional<MacroPatch> TryBuildPasteGeneratedCalleeReplay(
+      const RefoldModel::MacroInvocation &invocation,
+      llvm::StringRef baseInvocationText,
+      llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
+
   std::optional<MacroPatch> TryBuildObjectSelectorTupleGeneratedCalleeReplay(
       const RefoldModel::MacroInvocation &invocation,
       llvm::StringRef baseInvocationText,
