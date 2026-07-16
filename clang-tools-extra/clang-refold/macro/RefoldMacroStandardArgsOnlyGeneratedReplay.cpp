@@ -810,11 +810,11 @@ private:
 /// tapes, resolves only deterministic object-like alias chains, replays the
 /// generated callee through the existing parser/matcher/unique-solver helpers,
 /// and mutates only the returned `outNewArg` when every observed occurrence
-/// agrees on the same solved actuals.  Unsupported or malformed
-/// stringification, paste, and `__VA_OPT__` forms, ambiguous macro definitions,
-/// conflicting occurrence solutions, or non-unique replay solutions reject this
-/// bridge and leave the caller's later tuple-forwarding/fallback policy
-/// unchanged.
+  /// agrees on the same solved actuals.  Stringification is supported only when
+  /// it has an exact inverse back to one tuple element; unsupported or malformed
+  /// paste and `__VA_OPT__` forms, ambiguous macro definitions, conflicting
+  /// occurrence solutions, or non-unique replay solutions reject this bridge and
+  /// leave the caller's later tuple-forwarding/fallback policy unchanged.
 class ParentTupleGeneratedCalleeRewriteResolver {
 public:
   ParentTupleGeneratedCalleeRewriteResolver(
@@ -893,9 +893,8 @@ public:
       return false;
 
     const auto &forwarderToks = forwarderDefinition->replacementTokens;
-    if (forwarderToks.size() < 4)
-      return false;
-    if (forwarderToks[0].kind !=
+    if (forwarderToks.empty() ||
+        forwarderToks[0].kind !=
             RefoldModel::MacroReplacementTokenKind::ParamRef ||
         !forwarderToks[0].paramIndex)
       return false;
@@ -903,37 +902,62 @@ public:
     if (calleeForwarderParam >= forwarderDefinition->defParams.size() ||
         calleeForwarderParam >= tupleElems.size())
       return false;
-    if (forwarderToks[1].kind !=
-            RefoldModel::MacroReplacementTokenKind::Literal ||
-        forwarderToks[1].spelling != "(" ||
-        forwarderToks.back().kind !=
-            RefoldModel::MacroReplacementTokenKind::Literal ||
-        forwarderToks.back().spelling != ")")
+
+    const bool explicitParenGeneratedCall =
+        forwarderToks.size() >= 4 &&
+        forwarderToks[1].kind ==
+            RefoldModel::MacroReplacementTokenKind::Literal &&
+        forwarderToks[1].spelling == "(" &&
+        forwarderToks.back().kind ==
+            RefoldModel::MacroReplacementTokenKind::Literal &&
+        forwarderToks.back().spelling == ")";
+
+    const bool adjacencyGeneratedCall =
+        forwarderToks.size() == 2 &&
+        forwarderToks[1].kind ==
+            RefoldModel::MacroReplacementTokenKind::ParamRef &&
+        forwarderToks[1].paramIndex &&
+        *forwarderToks[1].paramIndex != calleeForwarderParam;
+
+    if (!explicitParenGeneratedCall && !adjacencyGeneratedCall)
       return false;
 
-    // Accept only a direct generated-call replacement list:
+    // Accept either a direct generated-call replacement list:
     //   calleeFormal '(' generatedActualFormals... ')'
+    // or the narrower adjacency stringifier shape:
+    //   calleeFormal parenthesizedPayloadFormal
     // The callee formal itself is not rewritten here; it is resolved to a
     // function-like macro definition below, while the remaining formals become
     // positional tuple-edit targets.
     SmallVector<GeneratedTupleCalleeArgRef, 8> &generatedArgs =
         state.generatedArgs;
-    for (size_t i = 2, e = forwarderToks.size() - 1; i < e; ++i) {
-      const auto &tok = forwarderToks[i];
-      if (tok.spelling == "#" || tok.spelling == "##" ||
-          tok.spelling == "__VA_OPT__")
-        return false;
-      if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef)
-        continue;
-      if (!tok.paramIndex ||
-          *tok.paramIndex >= forwarderDefinition->defParams.size())
-        return false;
-      if (*tok.paramIndex == calleeForwarderParam)
+    if (explicitParenGeneratedCall) {
+      for (size_t i = 2, e = forwarderToks.size() - 1; i < e; ++i) {
+        const auto &tok = forwarderToks[i];
+        if (tok.spelling == "#" || tok.spelling == "##" ||
+            tok.spelling == "__VA_OPT__")
+          return false;
+        if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef)
+          continue;
+        if (!tok.paramIndex ||
+            *tok.paramIndex >= forwarderDefinition->defParams.size())
+          return false;
+        if (*tok.paramIndex == calleeForwarderParam)
+          return false;
+        GeneratedTupleCalleeArgRef ref;
+        ref.forwarderParamIdx = *tok.paramIndex;
+        ref.variadicPack =
+            forwarderDefinition->defParams[*tok.paramIndex].variadic;
+        generatedArgs.push_back(ref);
+      }
+    } else {
+      const uint32_t payloadForwarderParam = *forwarderToks[1].paramIndex;
+      if (payloadForwarderParam >= forwarderDefinition->defParams.size())
         return false;
       GeneratedTupleCalleeArgRef ref;
-      ref.forwarderParamIdx = *tok.paramIndex;
+      ref.forwarderParamIdx = payloadForwarderParam;
       ref.variadicPack =
-          forwarderDefinition->defParams[*tok.paramIndex].variadic;
+          forwarderDefinition->defParams[payloadForwarderParam].variadic;
       generatedArgs.push_back(ref);
     }
     if (generatedArgs.empty())
@@ -945,6 +969,9 @@ public:
     const RefoldModel::MacroDirective *calleeDefinition =
         ResolveFunctionLikeCallee(calleeSourceText);
     if (!calleeDefinition || calleeDefinition->defParams.empty())
+      return false;
+
+    if (adjacencyGeneratedCall && !IsSingleFormalStringifier(*calleeDefinition))
       return false;
 
     // Read the generated actuals from the original tuple spelling.  This is
@@ -984,8 +1011,17 @@ public:
     // performed after solving the new expansion.
     SmallVector<std::string, 8> &oldActuals = state.oldActuals;
     oldActuals.reserve(calleeDefinition->defParams.size());
-    for (size_t i = 0; i < fixedCalleeActuals; ++i)
+    for (size_t i = 0; i < fixedCalleeActuals; ++i) {
+      if (adjacencyGeneratedCall) {
+        std::optional<StringRef> actual =
+            GetSingleParenthesizedAdjacencyActual(oldGeneratedActualPieces[i]);
+        if (!actual)
+          return false;
+        oldActuals.push_back(actual->str());
+        continue;
+      }
       oldActuals.push_back(oldGeneratedActualPieces[i].str());
+    }
     if (calleeHasVariadic) {
       std::string variadicText;
       raw_string_ostream os(variadicText);
@@ -1035,10 +1071,37 @@ public:
     std::optional<SmallVector<std::string, 8>> &mergedSolvedActuals =
         state.mergedSolvedActuals;
     for (const OccObservation &obs : occObservations) {
-      if (!MatchOldExpansion(oldExpansionMatcher, StringRef(obs.oldText)))
+      const bool singleStringifyPattern =
+          calleePattern.size() == 1 &&
+          calleePattern.front().kind ==
+              StandardArgsGeneratedCalleeReplayKind::Stringify;
+      const uint32_t stringifyParamIdx =
+          singleStringifyPattern ? calleePattern.front().paramIdx : 0;
+
+      bool matchedOldExpansion =
+          MatchOldExpansion(oldExpansionMatcher, StringRef(obs.oldText));
+      if (!matchedOldExpansion && singleStringifyPattern &&
+          stringifyParamIdx < oldActuals.size()) {
+        StringRef oldActual = StringRef(oldActuals[stringifyParamIdx]).trim();
+        StringRef observedOldText = StringRef(obs.oldText).trim();
+        matchedOldExpansion =
+            oldActual == observedOldText ||
+            findUniqueTrimmedSubstring(oldActual, observedOldText).has_value();
+      }
+      if (!matchedOldExpansion)
         continue;
+
       auto solved = SolveStringifyOrPasteNewExpansion(
           calleePattern, *calleeDefinition, oldActuals, obs.newText);
+      if (!solved && singleStringifyPattern &&
+          stringifyParamIdx < calleeDefinition->defParams.size()) {
+        SmallVector<std::string, 8> actuals;
+        actuals.resize(calleeDefinition->defParams.size());
+        for (size_t i = 0; i < oldActuals.size(); ++i)
+          actuals[i] = oldActuals[i];
+        actuals[stringifyParamIdx] = StringRef(obs.newText).trim().str();
+        solved = std::move(actuals);
+      }
       if (!solved)
         solved = newExpansionSolver.Solve(obs.newText);
       if (!solved || solved->size() != calleeDefinition->defParams.size())
@@ -1073,6 +1136,15 @@ public:
       const uint32_t paramIdx = calleePattern.front().paramIdx;
       if (paramIdx < oldGeneratedPiecesForRewrite.size()) {
         for (const OccObservation &obs : occObservations) {
+          StringRef observedOldText = StringRef(obs.oldText).trim();
+          StringRef sourcePiece =
+              StringRef(oldGeneratedPiecesForRewrite[paramIdx]);
+          if (sourcePiece == observedOldText ||
+              findUniqueTrimmedSubstring(sourcePiece, observedOldText)) {
+            oldGeneratedPiecesForRewrite[paramIdx] = observedOldText.str();
+            break;
+          }
+
           std::optional<std::string> token =
               SingleTokenSpelling(StringRef(obs.oldText));
           if (!token)
@@ -1081,8 +1153,6 @@ public:
               decodeSimpleStringLiteralToken(*token);
           if (!content)
             continue;
-          StringRef sourcePiece =
-              StringRef(oldGeneratedPiecesForRewrite[paramIdx]);
           if (sourcePiece == StringRef(*content) ||
               findUniqueTrimmedSubstring(sourcePiece, StringRef(*content))) {
             oldGeneratedPiecesForRewrite[paramIdx] = std::move(*content);
@@ -1259,6 +1329,50 @@ private:
                                     size_t elemIdx) {
     const TupleElementSlice &elem = tupleElems[elemIdx];
     return tuplePayload.slice(elem.trimBegin, elem.trimEnd).trim();
+  }
+
+  /// Return the sole macro actual inside a parenthesized adjacency payload.
+  ///
+  /// A forwarding definition such as `CALL(f, t) f t` forms a generated macro
+  /// invocation only when the tuple element bound to `t` supplies the call
+  /// parentheses, for example `CALL(STR, (alpha + beta))`.  The source tuple
+  /// element that must be preserved is `(alpha + beta)`, but the actual consumed
+  /// by the generated one-argument callee is the payload inside those parens.
+  /// This helper accepts only that fully proved one-argument shape: a balanced
+  /// outer parenthesized spelling whose top-level payload does not split into
+  /// multiple macro arguments.
+  std::optional<StringRef> GetSingleParenthesizedAdjacencyActual(
+      StringRef sourceTupleElement) const {
+    StringRef trimmed = sourceTupleElement.trim();
+    if (!trimmed.starts_with("(") || !trimmed.ends_with(")") ||
+        trimmed.size() < 2)
+      return std::nullopt;
+
+    StringRef payload = trimmed.drop_front().drop_back();
+    SmallVector<TupleElementSlice, 2> pieces;
+    if (!splitTopLevelTupleElementsWithLexer(payload, deps_.lexLang, pieces) ||
+        pieces.size() != 1)
+      return std::nullopt;
+    return TupleElementText(payload, pieces, 0);
+  }
+
+  /// Return whether `definition` is exactly `#` applied to its only formal.
+  ///
+  /// The adjacency-generated path below is intentionally limited to this
+  /// single-argument stringification shape.  General `f t` replay for ordinary
+  /// parameter substitution would need to invert the callee's macro-argument
+  /// parser and map edits back into one tuple element, so unsupported callees
+  /// continue to fail closed rather than guessing.
+  static bool IsSingleFormalStringifier(
+      const RefoldModel::MacroDirective &definition) {
+    return definition.functionLike && definition.defParams.size() == 1 &&
+           !definition.defParams.front().variadic &&
+           definition.replacementTokens.size() == 2 &&
+           definition.replacementTokens[0].spelling == "#" &&
+           definition.replacementTokens[1].kind ==
+               RefoldModel::MacroReplacementTokenKind::ParamRef &&
+           definition.replacementTokens[1].paramIndex &&
+           *definition.replacementTokens[1].paramIndex == 0;
   }
 
   /// Returns a single replay-token spelling, rejecting multi-token text.
