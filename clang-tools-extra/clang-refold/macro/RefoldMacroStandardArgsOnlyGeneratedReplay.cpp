@@ -1515,6 +1515,18 @@ public:
         !childDefinition->functionLike)
       return true;
 
+    // First replay the child replacement list itself.  Some tuple forwarders do
+    // not create a generated callee invocation at all: `CALL(f, t) f t` fed with
+    // `(STR, pair(1, 2))` expands to the adjacent token run
+    // `STR pair(1, 2)`, where `STR` is inert because it is not followed by a
+    // macro-call parenthesis.  In that shape the generic old-text map contains
+    // only the whole adjacent run, so preserving the parent tuple requires a
+    // positional replay proof that derives the changed tuple element from the
+    // child replacement tape.
+    if (!DeriveDirectReplacementListRewrites(*childDefinition, childArgs,
+                                             occObservations, newTextByOld))
+      return false;
+
     // The accepted forwarding shape is a replacement list of the form
     //   <callee-param> '(' <argument-param/literal tape> ')'
     // with the callee and each argument coming from direct tuple refs. This is a
@@ -1635,6 +1647,234 @@ public:
   }
 
 private:
+  /// Add tuple-element rewrites by replaying the child replacement list itself.
+  ///
+  /// This proof is intentionally separate from generated-callee replay.  It
+  /// handles direct tuple-ref forwarding such as `f t`, where the expansion is a
+  /// concatenation of forwarded tuple elements rather than the body of a second
+  /// macro.  New text is solved by allowing exactly one forwarded formal to
+  /// change while every other forwarded formal and literal token remains an
+  /// old-spelling anchor.  If more than one anchored solution exists, the proof
+  /// rejects so ordinary fallback behavior remains responsible for the edit.
+  bool DeriveDirectReplacementListRewrites(
+      const RefoldModel::MacroDirective &childDefinition,
+      ArrayRef<std::pair<uint32_t, StringRef>> childArgs,
+      ArrayRef<OccObservation> occObservations,
+      StringMap<std::string> &newTextByOld) const {
+    if (childArgs.empty() || childDefinition.replacementTokens.empty())
+      return true;
+
+    SmallVector<ForwardedGeneratedCalleeReplayElem, 8> replayPattern;
+    SmallVector<std::string, 4> oldActuals;
+    DenseMap<uint32_t, uint32_t> childArgToCompactParam;
+
+    for (const RefoldModel::MacroReplacementToken &tok :
+         childDefinition.replacementTokens) {
+      if (tok.spelling == "#" || tok.spelling == "##" ||
+          tok.spelling == "__VA_OPT__")
+        return true;
+
+      ForwardedGeneratedCalleeReplayElem elem;
+      if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef) {
+        elem.literal = tok.spelling.str();
+        replayPattern.push_back(std::move(elem));
+        continue;
+      }
+
+      if (!tok.paramIndex)
+        return true;
+      std::optional<StringRef> oldText = ChildArgText(childArgs, *tok.paramIndex);
+      if (!oldText)
+        return true;
+
+      auto compactIt = childArgToCompactParam.find(*tok.paramIndex);
+      uint32_t compactParam = 0;
+      if (compactIt == childArgToCompactParam.end()) {
+        compactParam = static_cast<uint32_t>(oldActuals.size());
+        childArgToCompactParam[*tok.paramIndex] = compactParam;
+        oldActuals.push_back(oldText->trim().str());
+      } else {
+        compactParam = compactIt->second;
+      }
+
+      elem.isParam = true;
+      elem.paramIdx = compactParam;
+      replayPattern.push_back(std::move(elem));
+    }
+
+    if (oldActuals.empty())
+      return true;
+
+    SmallVector<SmallVector<std::string, 8>, 4> oldActualTokSpellings;
+    for (const std::string &actual : oldActuals)
+      oldActualTokSpellings.push_back(
+          tokenSpellingsForReplayText<8>(actual, deps_.lexLang));
+
+    ForwardedGeneratedCalleeReplaySolver oldReplayMatcher(
+        ArrayRef<ForwardedGeneratedCalleeReplayElem>(replayPattern.data(),
+                                                     replayPattern.size()),
+        ArrayRef<SmallVector<std::string, 8>>(oldActualTokSpellings.data(),
+                                              oldActualTokSpellings.size()),
+        oldActuals.size(), deps_.lexLang);
+
+    for (const OccObservation &obs : occObservations) {
+      if (!oldReplayMatcher.MatchOldExpansion(StringRef(obs.oldText)))
+        continue;
+
+      std::optional<SmallVector<std::string, 4>> solvedActuals =
+          SolveSingleChangedDirectReplay(
+              ArrayRef<ForwardedGeneratedCalleeReplayElem>(
+                  replayPattern.data(), replayPattern.size()),
+              ArrayRef<SmallVector<std::string, 8>>(
+                  oldActualTokSpellings.data(), oldActualTokSpellings.size()),
+              ArrayRef<std::string>(oldActuals.data(), oldActuals.size()),
+              obs.newText);
+      if (!solvedActuals)
+        return false;
+      if (solvedActuals->size() != oldActuals.size())
+        return false;
+
+      for (size_t i = 0; i < solvedActuals->size(); ++i) {
+        StringRef oldKey = StringRef(oldActuals[i]).trim();
+        StringRef newValue = StringRef((*solvedActuals)[i]).trim();
+        if (oldKey == newValue)
+          continue;
+
+        auto it = newTextByOld.find(oldKey);
+        if (it == newTextByOld.end()) {
+          newTextByOld[oldKey] = newValue.str();
+          continue;
+        }
+        if (StringRef(it->second).trim() != newValue)
+          return false;
+      }
+    }
+
+    return true;
+  }
+
+  /// Solve a direct child replacement replay where exactly one forwarded formal
+  /// is allowed to change and all other formals remain old-spelling anchors.
+  std::optional<SmallVector<std::string, 4>> SolveSingleChangedDirectReplay(
+      ArrayRef<ForwardedGeneratedCalleeReplayElem> replayPattern,
+      ArrayRef<SmallVector<std::string, 8>> oldActualTokSpellings,
+      ArrayRef<std::string> oldActuals, StringRef newExpansion) const {
+    SmallVector<ParentTupleCalleeReplayTok, 16> toks;
+    lexReplayTokens(newExpansion, deps_.lexLang, toks);
+
+    SmallVector<SmallVector<std::string, 4>, 4> solutions;
+    for (size_t changedParam = 0; changedParam < oldActuals.size();
+         ++changedParam) {
+      std::optional<std::pair<size_t, size_t>> assignedChangedRange;
+      SolveDirectReplayDfs(replayPattern, oldActualTokSpellings, oldActuals,
+                           newExpansion, toks, changedParam, 0, 0,
+                           assignedChangedRange, solutions);
+      if (solutions.size() > 1)
+        return std::nullopt;
+    }
+
+    if (solutions.size() != 1)
+      return std::nullopt;
+    return solutions.front();
+  }
+
+  /// DFS used by `SolveSingleChangedDirectReplay`.  Unchanged formals are fixed
+  /// anchors; the candidate changed formal is the only variable-width slice.
+  void SolveDirectReplayDfs(
+      ArrayRef<ForwardedGeneratedCalleeReplayElem> replayPattern,
+      ArrayRef<SmallVector<std::string, 8>> oldActualTokSpellings,
+      ArrayRef<std::string> oldActuals, StringRef newExpansion,
+      ArrayRef<ParentTupleCalleeReplayTok> toks, size_t changedParam,
+      size_t elemIdx, size_t tokPos,
+      std::optional<std::pair<size_t, size_t>> &assignedChangedRange,
+      SmallVectorImpl<SmallVector<std::string, 4>> &solutions) const {
+    if (solutions.size() > 1)
+      return;
+
+    if (elemIdx == replayPattern.size()) {
+      if (tokPos != toks.size() || !assignedChangedRange)
+        return;
+      SmallVector<std::string, 4> actuals;
+      actuals.reserve(oldActuals.size());
+      for (size_t i = 0; i < oldActuals.size(); ++i) {
+        if (i != changedParam) {
+          actuals.push_back(oldActuals[i]);
+          continue;
+        }
+        const size_t beginTok = assignedChangedRange->first;
+        const size_t endTok = assignedChangedRange->second;
+        if (beginTok == endTok) {
+          actuals.push_back(std::string());
+          continue;
+        }
+        const size_t byteBegin = toks[beginTok].begin;
+        const size_t byteEnd = toks[endTok - 1].end;
+        actuals.push_back(newExpansion.slice(byteBegin, byteEnd).str());
+      }
+      if (StringRef(actuals[changedParam]).trim() !=
+          StringRef(oldActuals[changedParam]).trim())
+        solutions.push_back(std::move(actuals));
+      return;
+    }
+
+    const ForwardedGeneratedCalleeReplayElem &elem = replayPattern[elemIdx];
+    if (!elem.isParam) {
+      if (tokPos < toks.size() && toks[tokPos].spelling == elem.literal)
+        SolveDirectReplayDfs(replayPattern, oldActualTokSpellings, oldActuals,
+                             newExpansion, toks, changedParam, elemIdx + 1,
+                             tokPos + 1, assignedChangedRange, solutions);
+      return;
+    }
+
+    if (elem.paramIdx >= oldActuals.size())
+      return;
+
+    if (elem.paramIdx != changedParam) {
+      const SmallVector<std::string, 8> &expected =
+          oldActualTokSpellings[elem.paramIdx];
+      if (replayTokenRangeSpellingsEqual(toks, tokPos, expected))
+        SolveDirectReplayDfs(replayPattern, oldActualTokSpellings, oldActuals,
+                             newExpansion, toks, changedParam, elemIdx + 1,
+                             tokPos + expected.size(), assignedChangedRange,
+                             solutions);
+      return;
+    }
+
+    if (assignedChangedRange) {
+      const size_t width = assignedChangedRange->second -
+                           assignedChangedRange->first;
+      if (tokPos + width <= toks.size() &&
+          TokenRangesHaveSameSpellings(toks, assignedChangedRange->first,
+                                       tokPos, width))
+        SolveDirectReplayDfs(replayPattern, oldActualTokSpellings, oldActuals,
+                             newExpansion, toks, changedParam, elemIdx + 1,
+                             tokPos + width, assignedChangedRange, solutions);
+      return;
+    }
+
+    for (size_t endTok = tokPos; endTok <= toks.size(); ++endTok) {
+      assignedChangedRange = std::make_pair(tokPos, endTok);
+      SolveDirectReplayDfs(replayPattern, oldActualTokSpellings, oldActuals,
+                           newExpansion, toks, changedParam, elemIdx + 1,
+                           endTok, assignedChangedRange, solutions);
+      assignedChangedRange.reset();
+      if (solutions.size() > 1)
+        return;
+    }
+  }
+
+  /// Compare two token ranges inside one replay token vector by spelling.
+  static bool TokenRangesHaveSameSpellings(
+      ArrayRef<ParentTupleCalleeReplayTok> toks, size_t lhsBegin,
+      size_t rhsBegin, size_t width) {
+    if (lhsBegin + width > toks.size() || rhsBegin + width > toks.size())
+      return false;
+    for (size_t i = 0; i < width; ++i)
+      if (toks[lhsBegin + i].spelling != toks[rhsBegin + i].spelling)
+        return false;
+    return true;
+  }
+
   struct FunctionLikeCalleeResolution {
     const RefoldModel::MacroDirective *definition = nullptr;
     bool ambiguous = false;
