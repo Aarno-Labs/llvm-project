@@ -320,9 +320,10 @@ private:
 /// Probes generated replay candidates before ordinary occurrence collection.
 ///
 /// The probe owns the higher-order ranking sequence used before ordinary
-/// occurrence collection: direct generated-callee replay, direct
-/// tuple-generated-callee replay, recursive tuple-generated-callee replay, and
-/// finally generated-leaf fallback.  A miss remains non-terminal and returns
+/// occurrence collection: direct generated-callee replay, object-selector
+/// tuple replay, paste-derived tuple replay, direct tuple-generated-callee
+/// replay, recursive tuple-generated-callee replay, and finally generated-leaf
+/// fallback.  A miss remains non-terminal and returns
 /// nullopt; ambiguity, unsupported shapes, and unprovable B envelopes continue
 /// to fail closed through the delegated replay engines rather than introducing a
 /// fallback candidate.
@@ -367,6 +368,11 @@ private:
       llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
 
   std::optional<MacroPatch> TryBuildPasteTupleGeneratedCalleeReplay(
+      const RefoldModel::MacroInvocation &invocation,
+      llvm::StringRef baseInvocationText,
+      llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
+
+  std::optional<MacroPatch> TryBuildObjectSelectorTupleGeneratedCalleeReplay(
       const RefoldModel::MacroInvocation &invocation,
       llvm::StringRef baseInvocationText,
       llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;

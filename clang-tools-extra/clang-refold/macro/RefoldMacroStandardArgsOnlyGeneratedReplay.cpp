@@ -1907,6 +1907,11 @@ std::optional<MacroPatch> HigherOrderGeneratedReplayProbe::TryBuild(
           invocation, baseInvocationText, invocationArgRanges))
     return generatedCalleePatch;
 
+  if (auto objectSelectorTupleGeneratedPatch =
+          TryBuildObjectSelectorTupleGeneratedCalleeReplay(
+              invocation, baseInvocationText, invocationArgRanges))
+    return objectSelectorTupleGeneratedPatch;
+
   if (auto pasteTupleGeneratedPatch = TryBuildPasteTupleGeneratedCalleeReplay(
           invocation, baseInvocationText, invocationArgRanges))
     return pasteTupleGeneratedPatch;
@@ -2237,6 +2242,46 @@ HigherOrderGeneratedReplayProbe::TryBuildPasteTupleGeneratedCalleeReplay(
       invocation, *rootDefinition, baseInvocationText, invocationArgRanges,
       *cover, *bEnv};
   return tupleReplay.BuildPasteTupleCandidate(tupleRequest);
+}
+
+/// Try the object-selector/tuple generated-callee theorem for roots such as
+/// `f t` where `f` is an object-like selector actual.
+///
+/// This probe sits before paste/tuple and ordinary tuple-generated replay.  It
+/// is intentionally limited to the source-level `f t` shape so ordinary
+/// args-only and existing generated-callee proofs keep owning simpler direct
+/// cases.
+std::optional<MacroPatch>
+HigherOrderGeneratedReplayProbe::TryBuildObjectSelectorTupleGeneratedCalleeReplay(
+    const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
+  if (!invocation.definitionDirectiveId || !invocation.invB ||
+      !invocation.invE)
+    return std::nullopt;
+
+  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
+  if (!cover || cover->first >= cover->second)
+    return std::nullopt;
+
+  auto bEnv = MapWholeCoverBEnvelope(*cover);
+  if (!bEnv)
+    return std::nullopt;
+
+  const RefoldModel::MacroDirective *rootDefinition =
+      FindRootDefinition(invocation);
+  if (!rootDefinition || rootDefinition->subkind != "#define" ||
+      !rootDefinition->functionLike)
+    return std::nullopt;
+
+  RefoldMacroRecursiveTupleGeneratedReplay tupleReplay(
+      RefoldMacroRecursiveTupleGeneratedReplay::Dependencies{
+          deps_.model, deps_.sourceMapper, deps_.macroTopology,
+          deps_.generatedCalleeReplayEngine, deps_.proofCertifier,
+          deps_.lexLang});
+  RecursiveTupleGeneratedReplayRequest tupleRequest{
+      invocation, *rootDefinition, baseInvocationText, invocationArgRanges,
+      *cover, *bEnv};
+  return tupleReplay.BuildObjectSelectorTupleCandidate(tupleRequest);
 }
 
 std::optional<MacroPatch>

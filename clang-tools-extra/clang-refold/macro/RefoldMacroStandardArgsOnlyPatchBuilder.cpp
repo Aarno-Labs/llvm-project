@@ -36,6 +36,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <algorithm>
@@ -97,6 +98,178 @@ makeOriginalDefinitionReplayedStandardArgSpanRepair(
   DefinitionReplayedStandardArgSpanRepair result;
   result.argSpans = m.argSpans;
   return result;
+}
+
+
+/// Return true when `definition` is the direct selector/tuple forwarder shape
+/// whose replacement list is exactly two distinct formals: a generated-callee
+/// selector followed by one tuple actual.  This helper is deliberately limited
+/// to the same source-level shape as object-selector tuple replay, so ordinary
+/// standard args-only replay is not restricted for unrelated macros.
+bool isDirectSelectorTupleForwarder(
+    const RefoldModel::MacroDirective &definition, uint32_t &selectorArgIdx,
+    uint32_t &tupleArgIdx) {
+  if (definition.subkind != "#define" || !definition.functionLike ||
+      definition.replacementTokens.size() != 2)
+    return false;
+
+  const RefoldModel::MacroReplacementToken &selectorToken =
+      definition.replacementTokens.front();
+  const RefoldModel::MacroReplacementToken &tupleToken =
+      definition.replacementTokens.back();
+  if (selectorToken.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+      tupleToken.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+      !selectorToken.paramIndex || !tupleToken.paramIndex ||
+      *selectorToken.paramIndex == *tupleToken.paramIndex)
+    return false;
+
+  selectorArgIdx = *selectorToken.paramIndex;
+  tupleArgIdx = *tupleToken.paramIndex;
+  return true;
+}
+
+/// Return a trimmed invocation argument slice from an already parsed invocation
+/// layout.  The byte ranges are relative to `baseInvocationText`.
+std::optional<StringRef> sliceInvocationArgumentText(
+    StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges,
+    uint32_t argIdx) {
+  if (argIdx >= invocationArgRanges.size())
+    return std::nullopt;
+  const auto range = invocationArgRanges[argIdx];
+  if (range.second < range.first || range.second > baseInvocationText.size())
+    return std::nullopt;
+  return baseInvocationText.slice(range.first, range.second).trim();
+}
+
+/// Return true when `child` is the generated function-like callee that consumes
+/// the root selector formal and obtains its terminal actuals from the root tuple
+/// formal.  Object-selector replay has already had first right of refusal; this
+/// predicate only identifies the situation where ordinary args-only replay would
+/// otherwise preserve a stale selector after an unhandled generated-callee body
+/// edit.
+bool isSelectorTupleGeneratedCalleeChild(
+    const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
+    const RefoldModel::MacroInvocation &child, uint32_t selectorArgIdx,
+    uint32_t tupleArgIdx) {
+  if (child.subkind != "func" ||
+      child.calleeOrigin.kind != MacroCalleeOriginKind::CallerParam ||
+      !llvm::is_contained(child.calleeOrigin.callerParamIndices,
+                          selectorArgIdx) ||
+      child.argTupleRefs.empty())
+    return false;
+
+  const RefoldModel::MacroDirective *definition =
+      getDefinitionDirectiveForInvocation(deps.model, child);
+  if (!definition || !definition->functionLike)
+    return false;
+
+  bool sawTupleActualRef = false;
+  for (ArrayRef<RefoldModel::TupleArgRef> refs : child.argTupleRefs) {
+    if (refs.empty())
+      return false;
+    for (const RefoldModel::TupleArgRef &ref : refs) {
+      if (ref.callerParamIndex != tupleArgIdx)
+        return false;
+      sawTupleActualRef = true;
+    }
+  }
+  return sawTupleActualRef;
+}
+
+/// Return true if a token hunk inside the root whole-cover is outside the
+/// tuple-formal occurrences that ordinary args-only replay can update.
+///
+/// For `f t` generated-callee roots, such a hunk is a callee-body or callee
+/// identity effect, not a tuple payload edit.  If object-selector tuple replay
+/// has already failed to prove a replacement selector for that effect, allowing
+/// ordinary args-only replay to continue would preserve the old selector and
+/// silently emit a source spelling that preprocesses to the wrong stream.
+bool hasWholeCoverHunkOutsideTupleArgument(
+    const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
+    const RefoldModel::MacroInvocation &invocation, uint32_t tupleArgIdx,
+    ArrayRef<RefoldModel::PPArgSpan> standardArgSpans) {
+  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
+  if (!cover || cover->first >= cover->second)
+    return false;
+
+  SmallVector<RefoldModel::PPArgSpan, 8> tupleSpans;
+  for (const RefoldModel::PPArgSpan &span : standardArgSpans) {
+    if (span.kind == PPArgSpanKind::Standard && span.argIdx == tupleArgIdx)
+      tupleSpans.push_back(span);
+  }
+  if (tupleSpans.empty())
+    return false;
+
+  for (const diffutils::Hunk &hunk : deps.abTokHunks) {
+    if (hunk.aStart < cover->first || hunk.aEnd > cover->second)
+      continue;
+
+    SmallVector<char, 8> touched(tupleSpans.size(), 0);
+    if (!deps.sourceMapper.HunkFullyWithinArgSpans(
+            hunk, ArrayRef<RefoldModel::PPArgSpan>(tupleSpans.data(),
+                                                   tupleSpans.size()),
+            MutableArrayRef<char>(touched.data(), touched.size())))
+      return true;
+  }
+  return false;
+}
+
+/// After higher-order selector/tuple replay declines, reject ordinary
+/// args-only replay for selector-generated callees when the edited whole-cover
+/// still contains a non-tuple hunk.
+///
+/// This is a narrow fail-closed soundness gate, not the broad hunk-coverage
+/// guard that previously regressed unrelated tests.  It applies only to roots
+/// shaped like `f t`, where `f` resolves to a generated function-like callee and
+/// the child callee records tuple-element provenance from `t`.  In that shape,
+/// an unhandled non-tuple hunk means no visible selector macro could reproduce
+/// the edited generated-callee body.  The only sound result is therefore to let
+/// the existing whole-cover fallback materialize the expansion.
+bool shouldRejectOrdinaryArgsOnlyAfterSelectorTupleReplayMiss(
+    const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
+    const RefoldModel::MacroInvocation &invocation,
+    const RefoldModel::MacroDirective &rootDefinition,
+    StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges,
+    ArrayRef<RefoldModel::PPArgSpan> standardArgSpans) {
+  uint32_t selectorArgIdx = 0;
+  uint32_t tupleArgIdx = 0;
+  if (!isDirectSelectorTupleForwarder(rootDefinition, selectorArgIdx,
+                                      tupleArgIdx) ||
+      selectorArgIdx >= invocationArgRanges.size() ||
+      tupleArgIdx >= invocationArgRanges.size())
+    return false;
+
+  std::optional<StringRef> selectorText = sliceInvocationArgumentText(
+      baseInvocationText, invocationArgRanges, selectorArgIdx);
+  std::optional<StringRef> tupleText = sliceInvocationArgumentText(
+      baseInvocationText, invocationArgRanges, tupleArgIdx);
+  if (!selectorText || selectorText->empty() || !tupleText ||
+      !tupleText->starts_with("(") || !tupleText->ends_with(")"))
+    return false;
+
+  uint32_t selectorAliasHops = 0;
+  const RefoldModel::MacroDirective *oldCallee =
+      deps.resolveFunctionLikeMacroThroughAliasesWithHops(*selectorText,
+                                                          &selectorAliasHops);
+  if (!oldCallee || !oldCallee->functionLike)
+    return false;
+
+  bool sawSelectorTupleGeneratedCallee = false;
+  for (const RefoldModel::MacroInvocation *child :
+       deps.macroTopology.MacroChildrenOf(invocation.id)) {
+    if (child && isSelectorTupleGeneratedCalleeChild(
+                     deps, *child, selectorArgIdx, tupleArgIdx)) {
+      sawSelectorTupleGeneratedCallee = true;
+      break;
+    }
+  }
+  if (!sawSelectorTupleGeneratedCallee)
+    return false;
+
+  return hasWholeCoverHunkOutsideTupleArgument(deps, invocation, tupleArgIdx,
+                                               standardArgSpans);
 }
 
 /// Repairs recorded standard arg-span formal indices through the immutable
@@ -274,6 +447,14 @@ RefoldMacroStandardArgsOnlyPatchBuilder::BuildStandardArgsOnlyPatch(
           HigherOrderGeneratedReplayProbe(deps_).TryBuild(m, h, baseInvText,
                                                           invArgRanges))
     return higherOrderGeneratedPatch;
+
+  if (const RefoldModel::MacroDirective *rootDefinition =
+          getDefinitionDirectiveForInvocation(deps_.model, m)) {
+    if (shouldRejectOrdinaryArgsOnlyAfterSelectorTupleReplayMiss(
+            deps_, m, *rootDefinition, baseInvText, invArgRanges,
+            standardArgSpans))
+      return std::nullopt;
+  }
 
   RefoldMacroOccurrenceReplay occurrenceReplay = OccurrenceReplay();
   std::optional<TouchedFormalHunkCollection> collectedTouchedFormalHunks =

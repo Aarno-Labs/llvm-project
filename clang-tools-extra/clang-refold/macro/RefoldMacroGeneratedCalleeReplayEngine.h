@@ -16,6 +16,9 @@
 //   * `BuildPasteTupleGeneratedCalleeReplayCandidate` — paste-derived
 //     callee variant used when the root macro forms the callee token with
 //     `##` and supplies the generated call arguments through one tuple actual.
+//   * `BuildObjectSelectorTupleGeneratedCalleeReplayCandidate` — object-selector
+//     variant used when a root `f t` macro changes both selector alias and
+//     tuple actuals.
 //
 // Owns generated-callee replay construction and admission so patch dispatch,
 // replay synthesis, and proof certification remain separate. Calls into
@@ -159,6 +162,33 @@ struct PasteTupleGeneratedCalleeReplayContext {
   uint32_t tupleArgIdx = 0;
 };
 
+/// Explicit root state for object-selector tuple generated-callee replay.
+///
+/// This replay handles roots shaped like `f t` when `f` is a source-spelled
+/// object-like selector macro that resolves to the function-like generated
+/// callee and `t` is one parenthesized tuple actual.  Unlike the paste-derived
+/// variant, the selector rewrite preserves the object-selector abstraction:
+/// an old object alias such as `SELECT_ADD` may be rewritten only to another
+/// object alias that resolves to the uniquely solved edited callee.
+struct ObjectSelectorTupleGeneratedCalleeReplayContext {
+  /// Root invocation whose object-selector generated callee is replayed.
+  const RefoldModel::MacroInvocation &invocation;
+  /// Complete source spelling of the root invocation.
+  llvm::StringRef baseInvocationText;
+  /// Formal-content byte ranges inside `baseInvocationText`.
+  llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges;
+  /// Whole-cover A-token envelope for the root invocation.
+  const std::pair<uint64_t, uint64_t> &wholeCoverATokens;
+  /// B-token envelope being realized by object-selector/tuple replay.
+  const std::pair<size_t, size_t> &bTokenEnvelope;
+  /// Macro definition at the object-selector/tuple replay root.
+  const RefoldModel::MacroDirective &rootDefinition;
+  /// Root formal index containing the selector actual.
+  uint32_t selectorArgIdx = 0;
+  /// Root formal index containing the parenthesized tuple actual.
+  uint32_t tupleArgIdx = 0;
+};
+
 /// Request for solving one already-composed terminal generated callee.
 ///
 /// The recursive tuple-generated-callee resolver uses this narrow engine entry
@@ -260,6 +290,12 @@ public:
   /// nullopt for a non-terminal miss.
   std::optional<MacroPatch> BuildPasteTupleGeneratedCalleeReplayCandidate(
       const PasteTupleGeneratedCalleeReplayContext &ctx) const;
+
+  /// Build the object-selector tuple generated-callee replay candidate. Returns
+  /// nullopt for a non-terminal miss.
+  std::optional<MacroPatch>
+  BuildObjectSelectorTupleGeneratedCalleeReplayCandidate(
+      const ObjectSelectorTupleGeneratedCalleeReplayContext &ctx) const;
 
   /// Solve an already-composed terminal generated-callee replay.
   ///

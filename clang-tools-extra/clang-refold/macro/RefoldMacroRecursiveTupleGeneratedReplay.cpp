@@ -2101,6 +2101,46 @@ RefoldMacroRecursiveTupleGeneratedReplay::BuildPasteTupleCandidate(
 }
 
 std::optional<MacroPatch>
+RefoldMacroRecursiveTupleGeneratedReplay::BuildObjectSelectorTupleCandidate(
+    const RecursiveTupleGeneratedReplayRequest &request) const {
+  const RefoldModel::MacroInvocation &rootInvocation = request.rootInvocation;
+  if (!rootInvocation.definitionDirectiveId || !rootInvocation.invB ||
+      !rootInvocation.invE || !rootInvocation.stringifySpans.empty() ||
+      !rootInvocation.pasteSpans.empty())
+    return std::nullopt;
+
+  if (request.rootDefinition.subkind != "#define" ||
+      !request.rootDefinition.functionLike ||
+      request.rootDefinition.replacementTokens.size() != 2)
+    return std::nullopt;
+
+  const RefoldModel::MacroReplacementToken &selectorToken =
+      request.rootDefinition.replacementTokens.front();
+  const RefoldModel::MacroReplacementToken &tupleToken =
+      request.rootDefinition.replacementTokens.back();
+  if (selectorToken.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+      tupleToken.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+      !selectorToken.paramIndex || !tupleToken.paramIndex ||
+      *selectorToken.paramIndex == *tupleToken.paramIndex ||
+      *selectorToken.paramIndex >= request.invocationArgRanges.size() ||
+      *tupleToken.paramIndex >= request.invocationArgRanges.size())
+    return std::nullopt;
+
+  ObjectSelectorTupleGeneratedCalleeReplayContext objectSelectorContext{
+      rootInvocation,
+      request.baseInvocationText,
+      request.invocationArgRanges,
+      request.wholeCoverATokens,
+      request.bTokenEnvelope,
+      request.rootDefinition,
+      *selectorToken.paramIndex,
+      *tupleToken.paramIndex};
+  return deps_.generatedCalleeReplayEngine
+      .BuildObjectSelectorTupleGeneratedCalleeReplayCandidate(
+          objectSelectorContext);
+}
+
+std::optional<MacroPatch>
 RefoldMacroRecursiveTupleGeneratedReplay::BuildCandidate(
     const RecursiveTupleGeneratedReplayRequest &request) const {
   if (!recursiveTupleReplayRequestHasUsableRootEvidence(request))

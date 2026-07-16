@@ -2084,6 +2084,127 @@ struct PasteTupleGeneratedReplayCandidate {
   bool usesPaste = false;
 };
 
+/// Candidate produced by object-selector tuple generated-callee replay before
+/// the unique-candidate check commits to a patch.
+struct ObjectSelectorTupleGeneratedReplayCandidate {
+  llvm::DenseMap<uint32_t, std::string> replacementsByRootArgIdx;
+  const RefoldModel::MacroDirective *calleeDefinition = nullptr;
+  uint32_t objectAliasHopCount = 0;
+  bool usesStringification = false;
+  bool usesPaste = false;
+};
+
+/// Return whether a directive is a one-token object-like alias.
+///
+/// Object-selector tuple replay preserves a source-spelled selector abstraction
+/// only through this producer-recorded alias shape.  Function-like directives,
+/// empty replacement lists, and multi-token object macros are not selector
+/// spellings for this theorem.
+bool isSingleTokenObjectSelectorAlias(
+    const RefoldModel::MacroDirective &directive) {
+  return directive.subkind == "#define" && !directive.functionLike &&
+         directive.replacementTokens.size() == 1 &&
+         directive.replacementTokens[0].kind ==
+             RefoldModel::MacroReplacementTokenKind::Literal &&
+         !directive.name.empty() &&
+         !directive.replacementTokens[0].spelling.empty();
+}
+
+/// Return whether a source selector actual is itself an object-like alias name.
+///
+/// The check is intentionally syntactic over the producer macro-state model.
+/// Alias resolution is performed separately by the planner callback so this
+/// helper does not conflate direct function-like callees with object-selector
+/// callsite spellings.
+bool selectorSpellingNamesObjectAlias(const RefoldModel &model,
+                                      StringRef selectorSpelling) {
+  StringRef trimmedSelector = selectorSpelling.trim();
+  if (trimmedSelector.empty())
+    return false;
+
+  for (const RefoldModel::MacroDirective &directive :
+       model.GetMacroDirectives()) {
+    if (directive.name == trimmedSelector &&
+        isSingleTokenObjectSelectorAlias(directive))
+      return true;
+  }
+  return false;
+}
+
+/// Return whether `candidateSelector` is an object selector for `definition`.
+///
+/// The candidate must resolve through the same number of object-like alias hops
+/// as the old selector and must land on the exact candidate function-like
+/// definition.  This keeps `SELECT_ADD -> SELECT_SUB` source-preserving while
+/// rejecting ambiguous rewrites to raw callee names when the original callsite
+/// used an object selector.
+bool objectSelectorResolvesToDefinitionWithSameDepth(
+    const RefoldMacroGeneratedCalleeReplayEngine::Dependencies &deps,
+    StringRef candidateSelector, uint32_t requiredAliasHops,
+    const RefoldModel::MacroDirective &definition, uint32_t &candidateHops) {
+  candidateHops = 0;
+  if (candidateSelector.empty() || requiredAliasHops == 0)
+    return false;
+
+  const RefoldModel::MacroDirective *resolved =
+      deps.resolveFunctionLikeMacroThroughAliasesWithHops(candidateSelector,
+                                                          &candidateHops);
+  return resolved && resolved->id == definition.id &&
+         candidateHops == requiredAliasHops;
+}
+
+/// Add the selector actual rewrite required by one object-selector candidate.
+///
+/// Direct function-like selector callsites (`ADD`) are allowed to rewrite to the
+/// direct candidate definition name.  Object-like selector callsites
+/// (`SELECT_ADD`) must rewrite only to another object-like selector with the
+/// same alias depth; this preserves the macro abstraction encoded by the source
+/// spelling and fails closed if no unique selector alias exists.
+bool addObjectSelectorReplacement(
+    const ObjectSelectorTupleGeneratedCalleeReplayContext &ctx,
+    const RefoldMacroGeneratedCalleeReplayEngine::Dependencies &deps,
+    StringRef oldSelector, uint32_t oldAliasHops,
+    const RefoldModel::MacroDirective &candidateDefinition,
+    ObjectSelectorTupleGeneratedReplayCandidate &candidate) {
+  if (oldAliasHops == 0) {
+    if (oldSelector.trim() == candidateDefinition.name)
+      return true;
+    candidate.replacementsByRootArgIdx[ctx.selectorArgIdx] =
+        candidateDefinition.name.str();
+    return true;
+  }
+
+  if (!selectorSpellingNamesObjectAlias(deps.model, oldSelector))
+    return false;
+
+  std::optional<std::string> uniqueSelector;
+  uint32_t uniqueAliasHops = 0;
+  for (const RefoldModel::MacroDirective &directive :
+       deps.model.GetMacroDirectives()) {
+    if (!isSingleTokenObjectSelectorAlias(directive) ||
+        directive.name == oldSelector.trim())
+      continue;
+
+    uint32_t candidateHops = 0;
+    if (!objectSelectorResolvesToDefinitionWithSameDepth(
+            deps, directive.name, oldAliasHops, candidateDefinition,
+            candidateHops))
+      continue;
+
+    if (uniqueSelector && *uniqueSelector != directive.name)
+      return false;
+    uniqueSelector = directive.name.str();
+    uniqueAliasHops = candidateHops;
+  }
+
+  if (!uniqueSelector)
+    return false;
+  candidate.objectAliasHopCount += uniqueAliasHops;
+  candidate.replacementsByRootArgIdx[ctx.selectorArgIdx] =
+      std::move(*uniqueSelector);
+  return true;
+}
+
 /// Classifies one token-level element in a tuple generated-callee replay pattern.
 enum class TupleCalleeReplayKind {
   /// Literal replacement text.
@@ -3152,6 +3273,175 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
         candidate.replacementsByRootArgIdx[static_cast<uint32_t>(i)] =
             newRoot.str();
     }
+
+    if (tupleArgText.trim() != StringRef(*rewrittenTupleArg).trim()) {
+      candidate.replacementsByRootArgIdx[ctx.tupleArgIdx] =
+          StringRef(*rewrittenTupleArg).trim().str();
+    }
+
+    if (candidate.replacementsByRootArgIdx.empty())
+      continue;
+
+    if (uniqueCandidate)
+      return std::nullopt;
+    uniqueCandidate = std::move(candidate);
+  }
+
+  if (!uniqueCandidate || !uniqueCandidate->calleeDefinition)
+    return std::nullopt;
+
+  InvocationActualRecoveryContext actualRecoveryCtx{
+      ctx.invocation, ctx.baseInvocationText, ctx.invocationArgRanges};
+  std::optional<InvocationRewriteWithRange> rewrite =
+      deps_.buildInvocationRewriteWithRange(
+          actualRecoveryCtx, uniqueCandidate->replacementsByRootArgIdx,
+          /*materializedRangeByArgIdx=*/nullptr);
+  if (!rewrite)
+    return std::nullopt;
+
+  MacroPatch patch{*ctx.invocation.invB, *ctx.invocation.invE,
+                   std::move(rewrite->text), ctx.invocation.id};
+  deps_.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
+      patch, rewrite->materializedOutputByteStart,
+      rewrite->materializedOutputByteEnd);
+  certifyMacroPatchMaterializedBTokenRange(
+      patch, static_cast<uint64_t>(ctx.bTokenEnvelope.first),
+      static_cast<uint64_t>(ctx.bTokenEnvelope.second));
+  deps_.proofCertifier.SetArgsOnlyStandardProof(
+      patch, ctx.invocation, /*wholeEnvelopeReplayValidated=*/true);
+  deps_.proofCertifier.CertifyGeneratedCalleeReplayProof(
+      patch, ctx.invocation, uniqueCandidate->calleeDefinition->id,
+      /*generatedCallDepth=*/1, uniqueCandidate->objectAliasHopCount,
+      uniqueCandidate->usesStringification, uniqueCandidate->usesPaste,
+      /*usesVariadicForwarding=*/false,
+      /*decodedStringLiteralEvidenceOnly=*/uniqueCandidate->usesStringification);
+  return patch;
+}
+
+std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
+    BuildObjectSelectorTupleGeneratedCalleeReplayCandidate(
+        const ObjectSelectorTupleGeneratedCalleeReplayContext &ctx) const {
+  if (ctx.wholeCoverATokens.first >= ctx.wholeCoverATokens.second ||
+      ctx.bTokenEnvelope.first >= ctx.bTokenEnvelope.second ||
+      ctx.selectorArgIdx >= ctx.invocationArgRanges.size() ||
+      ctx.tupleArgIdx >= ctx.invocationArgRanges.size() ||
+      ctx.selectorArgIdx == ctx.tupleArgIdx)
+    return std::nullopt;
+
+  SmallVector<std::string, 8> rootActuals;
+  rootActuals.reserve(ctx.invocationArgRanges.size());
+  for (const auto &range : ctx.invocationArgRanges) {
+    if (range.second < range.first ||
+        range.second > ctx.baseInvocationText.size())
+      return std::nullopt;
+    rootActuals.push_back(
+        ctx.baseInvocationText.slice(range.first, range.second).trim().str());
+  }
+
+  StringRef oldSelector = StringRef(rootActuals[ctx.selectorArgIdx]).trim();
+  if (oldSelector.empty())
+    return std::nullopt;
+
+  uint32_t oldAliasHops = 0;
+  const RefoldModel::MacroDirective *oldCalleeDefinition =
+      deps_.resolveFunctionLikeMacroThroughAliasesWithHops(oldSelector,
+                                                           &oldAliasHops);
+  if (!oldCalleeDefinition || !oldCalleeDefinition->functionLike ||
+      oldCalleeDefinition->defParams.empty())
+    return std::nullopt;
+
+  const auto tupleRange = ctx.invocationArgRanges[ctx.tupleArgIdx];
+  StringRef tupleArgText = ctx.baseInvocationText
+                               .slice(tupleRange.first, tupleRange.second)
+                               .trim();
+  if (!tupleArgText.starts_with("(") || !tupleArgText.ends_with(")") ||
+      tupleArgText.size() < 2)
+    return std::nullopt;
+
+  StringRef tuplePayload = tupleArgText.drop_front().drop_back();
+  SmallVector<TupleElementSlice, 8> tupleElements;
+  if (!splitTopLevelTupleElementsWithLexer(tuplePayload, deps_.lexLang,
+                                           tupleElements) ||
+      tupleElements.empty())
+    return std::nullopt;
+
+  SmallVector<std::string, 8> oldTupleActuals;
+  oldTupleActuals.reserve(tupleElements.size());
+  for (const TupleElementSlice &elem : tupleElements) {
+    oldTupleActuals.push_back(
+        tuplePayload.slice(elem.trimBegin, elem.trimEnd).trim().str());
+  }
+
+  if (!macroDefinitionAcceptsActualCount(*oldCalleeDefinition,
+                                         oldTupleActuals.size()) ||
+      oldCalleeDefinition->defParams.size() != oldTupleActuals.size())
+    return std::nullopt;
+
+  StringRef oldExpansion = deps_.sourceMapper
+                               .SliceASource(ctx.wholeCoverATokens.first,
+                                             ctx.wholeCoverATokens.second)
+                               .trim();
+  StringRef newExpansion = deps_.sourceMapper
+                               .SliceBSource(ctx.bTokenEnvelope.first,
+                                             ctx.bTokenEnvelope.second)
+                               .trim();
+
+  bool oldUsesStringification = false;
+  bool oldUsesPaste = false;
+  std::optional<GeneratedSolvedActuals> oldSolved = solveDefinitionExpansion(
+      *oldCalleeDefinition,
+      ArrayRef<std::string>(oldTupleActuals.data(), oldTupleActuals.size()),
+      oldExpansion, deps_.lexLang, oldUsesStringification, oldUsesPaste);
+  if (!oldSolved || oldSolved->size() != oldTupleActuals.size())
+    return std::nullopt;
+
+  std::optional<ObjectSelectorTupleGeneratedReplayCandidate> uniqueCandidate;
+  for (const RefoldModel::MacroDirective &candidateDefinition :
+       deps_.model.GetMacroDirectives()) {
+    if (candidateDefinition.subkind != "#define" ||
+        !candidateDefinition.functionLike ||
+        candidateDefinition.defParams.size() != oldTupleActuals.size() ||
+        !macroDefinitionAcceptsActualCount(candidateDefinition,
+                                           oldTupleActuals.size()))
+      continue;
+
+    uint32_t directCandidateAliasHops = 0;
+    const RefoldModel::MacroDirective *visibleCandidate =
+        deps_.resolveFunctionLikeMacroThroughAliasesWithHops(
+            candidateDefinition.name, &directCandidateAliasHops);
+    if (!visibleCandidate || visibleCandidate->id != candidateDefinition.id ||
+        directCandidateAliasHops != 0)
+      continue;
+
+    bool candidateUsesStringification = false;
+    bool candidateUsesPaste = false;
+    std::optional<GeneratedSolvedActuals> newSolved = solveDefinitionExpansion(
+        candidateDefinition,
+        ArrayRef<std::string>(oldTupleActuals.data(), oldTupleActuals.size()),
+        newExpansion, deps_.lexLang, candidateUsesStringification,
+        candidateUsesPaste);
+    if (!newSolved || newSolved->size() != oldTupleActuals.size())
+      continue;
+
+    std::optional<std::string> rewrittenTupleArg = rebuildPasteTupleArgument(
+        tupleArgText, ArrayRef<TupleElementSlice>(tupleElements.data(),
+                                                  tupleElements.size()),
+        ArrayRef<std::string>(oldSolved->data(), oldSolved->size()),
+        ArrayRef<std::string>(newSolved->data(), newSolved->size()),
+        deps_.lexLang);
+    if (!rewrittenTupleArg)
+      continue;
+
+    ObjectSelectorTupleGeneratedReplayCandidate candidate;
+    candidate.calleeDefinition = &candidateDefinition;
+    candidate.objectAliasHopCount = oldAliasHops;
+    candidate.usesStringification = oldUsesStringification ||
+                                    candidateUsesStringification;
+    candidate.usesPaste = oldUsesPaste || candidateUsesPaste;
+
+    if (!addObjectSelectorReplacement(ctx, deps_, oldSelector, oldAliasHops,
+                                      candidateDefinition, candidate))
+      continue;
 
     if (tupleArgText.trim() != StringRef(*rewrittenTupleArg).trim()) {
       candidate.replacementsByRootArgIdx[ctx.tupleArgIdx] =

@@ -101,6 +101,17 @@ public:
   std::optional<MacroPatch> BuildPasteTupleCandidate(
       const RecursiveTupleGeneratedReplayRequest &request) const;
 
+  /// Try to construct a direct object-selector tuple-generated-callee candidate.
+  ///
+  /// This covers non-recursive roots shaped like `f t`, where `f` is a
+  /// source-spelled selector actual that resolves through object-like aliases to
+  /// the generated function-like callee and `t` is one parenthesized tuple
+  /// actual.  The method owns the tuple/generator theorem gate and delegates
+  /// replay solving plus root invocation rebuilding to the generated-callee
+  /// engine.
+  std::optional<MacroPatch> BuildObjectSelectorTupleCandidate(
+      const RecursiveTupleGeneratedReplayRequest &request) const;
+
   /// Try to construct a recursive tuple-generated-callee replay candidate.
   ///
   /// The method emits a patch only after proving the unique forwarding path,
