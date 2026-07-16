@@ -1857,15 +1857,18 @@ struct GeneratedActualRootTupleSlice {
 /// \brief Durable proof carrier for recursive tuple-generated-callee replay.
 ///
 /// This witness is deliberately narrower than ordinary generated-callee replay.
-/// It certifies that a root invocation forwards a selector formal and a tuple
-/// formal through producer-recorded `caller_macro_id` / `arg_refs` edges until a
-/// single terminal generated function-like macro consumes exact elements of
-/// that root tuple.  Builders must set the uniqueness and validation bits only
-/// after separately proving the named obligation; the classifier rejects the
-/// proof kind unless those obligations are all recorded here.
+/// It certifies that a root invocation forwards selector formals and a tuple
+/// formal through producer-recorded `caller_macro_id` / `arg_refs` edges until
+/// generated function-like terminals consume exact elements of that root tuple.
+/// `terminalGeneratedInvocationId` is the canonical terminal anchor for the
+/// proof identity; builders may additionally verify repeated or sibling
+/// terminals internally, but they may set the uniqueness and validation bits
+/// only after every such replay target proves the same tuple edit obligation.
 struct RecursiveTupleGeneratedCalleeReplayWitness {
   uint64_t rootInvocationId = 0;
+  /// Canonical terminal invocation used as the durable proof anchor.
   uint64_t terminalGeneratedInvocationId = 0;
+  /// Definition directive for the canonical terminal invocation.
   uint64_t terminalCalleeDefinitionDirectiveId = 0;
 
   uint32_t rootCalleeFormalIndex = 0;

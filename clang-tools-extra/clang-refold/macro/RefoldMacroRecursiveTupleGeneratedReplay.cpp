@@ -240,7 +240,22 @@ struct RootTupleSliceDerivation {
   llvm::SmallVector<RootTupleSliceBinding, 8> actualSlices;
 };
 
-/// Complete proof path from a root invocation to one terminal generated callee.
+/// One physical terminal generated-callee replay target.
+///
+/// A single root tuple can feed more than one generated terminal, for example
+/// `f t + g t`.  The tuple edit obligation is shared, but each terminal must be
+/// replayed with its own definition (`ADD` and `SUB` are not interchangeable).
+/// Keeping the invocation and definition together prevents the multi-terminal
+/// theorem from accidentally solving every replay surface through the first
+/// terminal's replacement list.
+struct TerminalReplayTarget {
+  /// Physical generated invocation whose replay surface must agree.
+  const RefoldModel::MacroInvocation *invocation = nullptr;
+  /// Exact definition directive used by `invocation`.
+  const RefoldModel::MacroDirective *definition = nullptr;
+};
+
+/// Complete proof path from a root invocation to terminal generated callees.
 ///
 /// The carrier deliberately stores only evidence already proven by earlier
 /// private theorem layers: producer ancestry, exact whole-formal composition,
@@ -260,13 +275,15 @@ struct ComposedGeneratedCalleePath {
   uint32_t rootTupleFormalIndex = 0;
   /// Exact terminal-actual-to-root-tuple element slice bindings.
   llvm::SmallVector<RootTupleSliceBinding, 8> actualSlices;
-  /// Physical generated invocations that express the same tuple-edit obligation.
+  /// Physical generated targets that express the same tuple-edit obligation.
   ///
-  /// Repeated uses such as `((f t) + (f t))` legitimately create more than one
-  /// terminal generated invocation.  They are accepted only after every replay
-  /// surface solves to the same edited actuals, so they are tracked separately
-  /// from the canonical terminal invocation recorded in the proof witness.
-  llvm::SmallVector<const RefoldModel::MacroInvocation *, 4> replayInvocations;
+  /// Repeated uses such as `((f t) + (f t))` and sibling terminals such as
+  /// `f t + g t` legitimately create more than one generated invocation.  They
+  /// are accepted only after every replay target solves to the same edited
+  /// tuple actuals.  The canonical `terminalInvocation` / `terminalDefinition`
+  /// fields remain the durable witness anchor; this vector drives replay solving
+  /// with the correct definition for each physical terminal.
+  llvm::SmallVector<TerminalReplayTarget, 4> replayTargets;
 };
 
 
@@ -1035,17 +1052,14 @@ private:
   /// Return whether two terminal paths express the same root tuple edit.
   ///
   /// Multiple physical generated-callee invocations are not ambiguous when they
-  /// are repeated uses of the same proven tuple-forwarding obligation.  The
-  /// replay solver will still check every physical replay surface and reject if
-  /// any occurrence solves to different edited actuals.  This comparison only
-  /// establishes that the root-side edit coordinates and terminal definition are
-  /// identical enough to be considered one candidate path.
+  /// consume the same root tuple formal through the same exact element slices.
+  /// Their callee selector formals and terminal definitions may differ (`f t +
+  /// g t`), but replay solving will still require every physical terminal to
+  /// produce the same old/new tuple actuals before a root edit is emitted.
   static bool PathsHaveSameTupleEditObligation(
       const ComposedGeneratedCalleePath &lhs,
       const ComposedGeneratedCalleePath &rhs) {
     if (lhs.rootInvocation != rhs.rootInvocation ||
-        lhs.terminalDefinition != rhs.terminalDefinition ||
-        lhs.rootCalleeFormalIndex != rhs.rootCalleeFormalIndex ||
         lhs.rootTupleFormalIndex != rhs.rootTupleFormalIndex ||
         lhs.actualSlices.size() != rhs.actualSlices.size())
       return false;
@@ -1077,20 +1091,25 @@ private:
       return std::nullopt;
 
     ComposedGeneratedCalleePath collapsed = paths.front();
-    if (collapsed.replayInvocations.empty() && collapsed.terminalInvocation)
-      collapsed.replayInvocations.push_back(collapsed.terminalInvocation);
+    if (collapsed.replayTargets.empty()) {
+      if (!collapsed.terminalInvocation || !collapsed.terminalDefinition)
+        return std::nullopt;
+      collapsed.replayTargets.push_back(
+          {collapsed.terminalInvocation, collapsed.terminalDefinition});
+    }
 
     for (const ComposedGeneratedCalleePath &path : paths.drop_front()) {
       if (!PathsHaveSameTupleEditObligation(collapsed, path))
         return std::nullopt;
-      if (path.replayInvocations.empty()) {
-        if (!path.terminalInvocation)
+      if (path.replayTargets.empty()) {
+        if (!path.terminalInvocation || !path.terminalDefinition)
           return std::nullopt;
-        collapsed.replayInvocations.push_back(path.terminalInvocation);
+        collapsed.replayTargets.push_back(
+            {path.terminalInvocation, path.terminalDefinition});
         continue;
       }
-      collapsed.replayInvocations.append(path.replayInvocations.begin(),
-                                         path.replayInvocations.end());
+      collapsed.replayTargets.append(path.replayTargets.begin(),
+                                     path.replayTargets.end());
     }
 
     return collapsed;
@@ -1575,7 +1594,7 @@ private:
     path.rootTupleFormalIndex = state.rootTupleFormalIndex;
     path.actualSlices.assign(state.actualSlices.begin(),
                              state.actualSlices.end());
-    path.replayInvocations.push_back(state.invocation);
+    path.replayTargets.push_back({state.invocation, state.definition});
     return path;
   }
 
@@ -1668,35 +1687,55 @@ public:
       solution.oldActuals.push_back(std::move(*oldActualByFormal[formalIndex]));
     }
 
-    llvm::ArrayRef<const RefoldModel::MacroInvocation *> replayInvocations =
-        path.replayInvocations;
-    if (replayInvocations.empty()) {
-      if (!path.terminalInvocation)
+    llvm::ArrayRef<TerminalReplayTarget> replayTargets = path.replayTargets;
+    TerminalReplayTarget fallbackTarget;
+    if (replayTargets.empty()) {
+      if (!path.terminalInvocation || !path.terminalDefinition)
         return std::nullopt;
-      replayInvocations = llvm::ArrayRef<const RefoldModel::MacroInvocation *>(
-          &path.terminalInvocation, 1);
+      fallbackTarget.invocation = path.terminalInvocation;
+      fallbackTarget.definition = path.terminalDefinition;
+      replayTargets = llvm::ArrayRef<TerminalReplayTarget>(&fallbackTarget, 1);
     }
 
     bool haveReferenceReplay = false;
-    llvm::SmallVector<std::pair<uint64_t, uint64_t>, 4> solvedReplaySurfaces;
-    for (const RefoldModel::MacroInvocation *replayInvocation :
-         replayInvocations) {
+    llvm::SmallVector<std::tuple<uint64_t, uint64_t, uint64_t>, 4>
+        solvedReplaySurfaces;
+    for (const TerminalReplayTarget &replayTarget : replayTargets) {
+      if (!replayTarget.invocation || !replayTarget.definition ||
+          !replayTarget.definition->functionLike ||
+          replayTarget.definition->defParams.size() !=
+              solution.oldActuals.size())
+        return std::nullopt;
+
       llvm::SmallVector<std::pair<uint64_t, uint64_t>, 4> replaySurfaces;
-      if (!appendTerminalReplayATokenRanges(request, *replayInvocation,
+      if (!appendTerminalReplayATokenRanges(request, *replayTarget.invocation,
                                            replaySurfaces))
         return std::nullopt;
 
+      bool targetSolved = false;
       for (const std::pair<uint64_t, uint64_t> &replaySurface :
            replaySurfaces) {
-        if (llvm::is_contained(solvedReplaySurfaces, replaySurface))
+        const auto solvedKey = std::make_tuple(
+            replayTarget.invocation->id, replaySurface.first,
+            replaySurface.second);
+        if (llvm::is_contained(solvedReplaySurfaces, solvedKey))
           continue;
-        solvedReplaySurfaces.push_back(replaySurface);
 
+        // Some producer maps give the first generated terminal a conservative
+        // cover that also contains later sibling terminal surfaces.  Attempt the
+        // surface with this target's own definition, but treat a replay miss as
+        // evidence that the component belongs to a sibling target rather than as
+        // immediate ambiguity.  The target as a whole must still solve at least
+        // one surface, and all solved surfaces must agree on the tuple edit.
         std::optional<TerminalGeneratedCalleeReplaySolution> terminalSolution =
-            SolveOneReplaySurface(request, path, replaySurface,
-                                  solution.oldActuals);
-        if (!terminalSolution ||
-            terminalSolution->oldSolvedActuals.size() !=
+            SolveOneReplaySurface(request, *replayTarget.definition,
+                                  replaySurface, solution.oldActuals);
+        if (!terminalSolution)
+          continue;
+        solvedReplaySurfaces.push_back(solvedKey);
+        targetSolved = true;
+
+        if (terminalSolution->oldSolvedActuals.size() !=
                 solution.oldActuals.size() ||
             terminalSolution->newSolvedActuals.size() !=
                 solution.oldActuals.size())
@@ -1725,6 +1764,9 @@ public:
         solution.usesStringification |= terminalSolution->usesStringification;
         solution.usesPaste |= terminalSolution->usesPaste;
       }
+
+      if (!targetSolved)
+        return std::nullopt;
     }
 
     if (!haveReferenceReplay)
@@ -1736,10 +1778,10 @@ private:
   /// Solve one physical generated-callee replay surface.
   std::optional<TerminalGeneratedCalleeReplaySolution> SolveOneReplaySurface(
       const RecursiveTupleGeneratedReplayRequest &request,
-      const ComposedGeneratedCalleePath &path,
+      const RefoldModel::MacroDirective &terminalDefinition,
       const std::pair<uint64_t, uint64_t> &replayATokens,
       llvm::ArrayRef<std::string> oldActuals) const {
-    if (!path.terminalDefinition)
+    if (!terminalDefinition.functionLike)
       return std::nullopt;
     if (replayATokens.first >= replayATokens.second ||
         replayATokens.first < request.wholeCoverATokens.first ||
@@ -1752,7 +1794,7 @@ private:
       return std::nullopt;
 
     TerminalGeneratedCalleeReplayRequest terminalRequest{
-        *path.terminalDefinition, oldActuals, replayATokens, *replayBEnvelope};
+        terminalDefinition, oldActuals, replayATokens, *replayBEnvelope};
     return generatedCalleeReplayEngine_.SolveTerminalGeneratedCalleeReplay(
         terminalRequest);
   }
