@@ -260,6 +260,13 @@ struct ComposedGeneratedCalleePath {
   uint32_t rootTupleFormalIndex = 0;
   /// Exact terminal-actual-to-root-tuple element slice bindings.
   llvm::SmallVector<RootTupleSliceBinding, 8> actualSlices;
+  /// Physical generated invocations that express the same tuple-edit obligation.
+  ///
+  /// Repeated uses such as `((f t) + (f t))` legitimately create more than one
+  /// terminal generated invocation.  They are accepted only after every replay
+  /// surface solves to the same edited actuals, so they are tracked separately
+  /// from the canonical terminal invocation recorded in the proof witness.
+  llvm::SmallVector<const RefoldModel::MacroInvocation *, 4> replayInvocations;
 };
 
 
@@ -287,6 +294,12 @@ struct GeneratedTupleFormalState {
       rootTupleSliceByLocalFormal;
   /// Exact actual slices for `invocation`, in generated formal order.
   llvm::SmallVector<RootTupleSliceBinding, 8> actualSlices;
+  /// True when this invocation's callee token was selected by caller-param evidence.
+  ///
+  /// Literal generated forwarders can carry tuple-slice state to a later
+  /// generated callee, but they are not themselves terminal generated-callee
+  /// replay targets for this theorem.
+  bool calleeWasSelectedByCallerParam = false;
 };
 
 /// Unique terminal generated-callee replay result for the composed path.
@@ -610,6 +623,11 @@ std::optional<RootInvocationActualText> rootInvocationActualText(
                                       static_cast<size_t>(textEnd));
   return out;
 }
+
+/// Slice an absolute physical range from the root invocation spelling.
+std::optional<std::string> rootInvocationSourceSlice(
+    const RefoldModel::MacroInvocation &rootInvocation, uint64_t absoluteBegin,
+    uint64_t absoluteEnd);
 
 /// Return whether two half-open ranges overlap.
 bool rangesOverlap(uint64_t lhsBegin, uint64_t lhsEnd, uint64_t rhsBegin,
@@ -949,7 +967,8 @@ public:
   MacroForwardingPathComposer(const MacroForwardingGraph &graph,
                               const clang::LangOptions &lexLang)
       : graph_(graph), forwardingComposer_(graph),
-        terminalRecognizer_(graph), tupleSliceDeriver_(lexLang) {}
+        terminalRecognizer_(graph), lexLang_(lexLang),
+        tupleSliceDeriver_(lexLang) {}
 
   /// Compose exactly one complete path from \p request's root invocation.
   std::optional<ComposedGeneratedCalleePath> ComposeUniquePath(
@@ -983,13 +1002,9 @@ public:
       if (!path)
         continue;
       paths.push_back(*path);
-      if (paths.size() > 1)
-        return std::nullopt;
     }
 
-    if (paths.size() != 1)
-      return std::nullopt;
-    return paths.front();
+    return CollapseEquivalentPaths(paths);
   }
 
 private:
@@ -1011,12 +1026,74 @@ private:
     if (!CollectNestedGeneratedCalleePaths(request, rootInvocation,
                                           *generatedState, 0, nestedPaths))
       return std::nullopt;
-    if (nestedPaths.size() > 1)
-      return std::nullopt;
-    if (nestedPaths.size() == 1)
-      return nestedPaths.front();
+    if (!nestedPaths.empty())
+      return CollapseEquivalentPaths(nestedPaths);
 
     return BuildPathForGeneratedState(rootInvocation, *generatedState);
+  }
+
+  /// Return whether two terminal paths express the same root tuple edit.
+  ///
+  /// Multiple physical generated-callee invocations are not ambiguous when they
+  /// are repeated uses of the same proven tuple-forwarding obligation.  The
+  /// replay solver will still check every physical replay surface and reject if
+  /// any occurrence solves to different edited actuals.  This comparison only
+  /// establishes that the root-side edit coordinates and terminal definition are
+  /// identical enough to be considered one candidate path.
+  static bool PathsHaveSameTupleEditObligation(
+      const ComposedGeneratedCalleePath &lhs,
+      const ComposedGeneratedCalleePath &rhs) {
+    if (lhs.rootInvocation != rhs.rootInvocation ||
+        lhs.terminalDefinition != rhs.terminalDefinition ||
+        lhs.rootCalleeFormalIndex != rhs.rootCalleeFormalIndex ||
+        lhs.rootTupleFormalIndex != rhs.rootTupleFormalIndex ||
+        lhs.actualSlices.size() != rhs.actualSlices.size())
+      return false;
+
+    for (size_t index = 0; index < lhs.actualSlices.size(); ++index) {
+      const RootTupleSliceBinding &a = lhs.actualSlices[index];
+      const RootTupleSliceBinding &b = rhs.actualSlices[index];
+      if (a.generatedActualIndex != b.generatedActualIndex ||
+          a.generatedFormalIndex != b.generatedFormalIndex ||
+          a.rootTupleFormalIndex != b.rootTupleFormalIndex ||
+          a.rootTuplePayloadByteBegin != b.rootTuplePayloadByteBegin ||
+          a.rootTuplePayloadByteEnd != b.rootTuplePayloadByteEnd ||
+          a.absoluteByteBegin != b.absoluteByteBegin ||
+          a.absoluteByteEnd != b.absoluteByteEnd)
+        return false;
+    }
+
+    return true;
+  }
+
+  /// Collapse repeated equivalent terminal paths into one replay plan.
+  ///
+  /// This preserves fail-closed uniqueness for truly different paths while
+  /// allowing deterministic repeated terminal occurrences to share one tuple
+  /// edit after replay has proven all physical occurrences agree.
+  static std::optional<ComposedGeneratedCalleePath> CollapseEquivalentPaths(
+      llvm::ArrayRef<ComposedGeneratedCalleePath> paths) {
+    if (paths.empty())
+      return std::nullopt;
+
+    ComposedGeneratedCalleePath collapsed = paths.front();
+    if (collapsed.replayInvocations.empty() && collapsed.terminalInvocation)
+      collapsed.replayInvocations.push_back(collapsed.terminalInvocation);
+
+    for (const ComposedGeneratedCalleePath &path : paths.drop_front()) {
+      if (!PathsHaveSameTupleEditObligation(collapsed, path))
+        return std::nullopt;
+      if (path.replayInvocations.empty()) {
+        if (!path.terminalInvocation)
+          return std::nullopt;
+        collapsed.replayInvocations.push_back(path.terminalInvocation);
+        continue;
+      }
+      collapsed.replayInvocations.append(path.replayInvocations.begin(),
+                                         path.replayInvocations.end());
+    }
+
+    return collapsed;
   }
 
   /// Initialize per-formal tuple slices for the first generated callee.
@@ -1044,6 +1121,7 @@ private:
     state.definition = edge.terminalDefinition;
     state.rootCalleeFormalIndex = edge.rootCalleeFormalIndex;
     state.rootTupleFormalIndex = derivation.rootTupleFormalIndex;
+    state.calleeWasSelectedByCallerParam = true;
     state.rootTupleSliceByLocalFormal.assign(formalCount, std::nullopt);
     state.actualSlices.assign(derivation.actualSlices.begin(),
                               derivation.actualSlices.end());
@@ -1065,14 +1143,15 @@ private:
     return state;
   }
 
-  /// Follow generated-callee descendants that are selected by tuple elements.
+  /// Follow generated-callee descendants proven below a generated invocation.
   ///
   /// The first generated-callee edge may be only an intermediate higher-order
   /// forwarder.  In `ADD(f, t) -> f t`, the `ADD` invocation's first actual
   /// selects the next generated callee and its second actual supplies the tuple
-  /// consumed by that callee.  This traversal follows only producer-recorded
-  /// `caller_param` children and requires each descendant actual to carry exact
-  /// `arg_tuple_refs` back to a currently proven generated formal slice.
+  /// consumed by that callee.  Literal generated forwarders are composed only by
+  /// exact whole-formal `arg_refs`; caller-param generated callees then prove
+  /// their actuals either through `arg_tuple_refs` or through exact source-range
+  /// identity with elements of one already-composed tuple slice.
   bool CollectNestedGeneratedCalleePaths(
       const RecursiveTupleGeneratedReplayRequest &request,
       const RefoldModel::MacroInvocation &rootInvocation,
@@ -1090,6 +1169,22 @@ private:
 
       switch (child->calleeOrigin.kind) {
       case MacroCalleeOriginKind::LiteralMacroName:
+        if (std::optional<GeneratedTupleFormalState> childState =
+                TryComposeNestedLiteralForwardingState(state, *child)) {
+          llvm::SmallVector<ComposedGeneratedCalleePath, 2> descendantPaths;
+          if (!CollectNestedGeneratedCalleePaths(request, rootInvocation,
+                                                *childState, depth + 1,
+                                                descendantPaths))
+            return false;
+          if (descendantPaths.empty()) {
+            // A literal generated forwarder is only an intermediate carrier for
+            // tuple-slice provenance.  If no caller-param generated callee is
+            // reachable beneath it, this child is out of the recursive theorem.
+            continue;
+          }
+          paths.append(descendantPaths.begin(), descendantPaths.end());
+          continue;
+        }
         continue;
       case MacroCalleeOriginKind::Paste:
       case MacroCalleeOriginKind::Opaque:
@@ -1118,13 +1213,83 @@ private:
       } else {
         paths.append(descendantPaths.begin(), descendantPaths.end());
       }
-
-      if (paths.size() > 1)
-        return true;
     }
 
     (void)sawGeneratedCalleeChild;
     return true;
+  }
+
+  /// Compose one literal generated forwarder through exact whole-formal refs.
+  std::optional<GeneratedTupleFormalState> TryComposeNestedLiteralForwardingState(
+      const GeneratedTupleFormalState &parentState,
+      const RefoldModel::MacroInvocation &child) const {
+    if (!parentState.invocation || !child.callerMacroId ||
+        *child.callerMacroId != parentState.invocation->id)
+      return std::nullopt;
+    if (child.calleeOrigin.kind != MacroCalleeOriginKind::LiteralMacroName)
+      return std::nullopt;
+    if (!child.stringifySpans.empty() || !child.pasteSpans.empty() ||
+        !child.pasteTokens.empty())
+      return std::nullopt;
+
+    const RefoldModel::MacroDirective *childDefinition =
+        graph_.DefinitionFor(child);
+    if (!childDefinition || !childDefinition->functionLike ||
+        macroDefinitionHasVariadicFormal(*childDefinition))
+      return std::nullopt;
+    if (childDefinition->defParams.empty() ||
+        childDefinition->defParams.size() >
+            std::numeric_limits<uint32_t>::max())
+      return std::nullopt;
+
+    const uint32_t formalCount =
+        static_cast<uint32_t>(childDefinition->defParams.size());
+    if (child.invArgRanges.size() != formalCount ||
+        child.argRefs.size() != formalCount)
+      return std::nullopt;
+    if (!child.argTupleRefs.empty() && child.argTupleRefs.size() != formalCount)
+      return std::nullopt;
+
+    GeneratedTupleFormalState childState;
+    childState.invocation = &child;
+    childState.definition = childDefinition;
+    childState.rootCalleeFormalIndex = parentState.rootCalleeFormalIndex;
+    childState.rootTupleFormalIndex = parentState.rootTupleFormalIndex;
+    childState.rootTupleSliceByLocalFormal.assign(formalCount, std::nullopt);
+    childState.actualSlices.reserve(formalCount);
+    childState.calleeWasSelectedByCallerParam = false;
+
+    for (uint32_t formalIndex = 0; formalIndex < formalCount; ++formalIndex) {
+      const auto &refs = child.argRefs[formalIndex];
+      if (refs.size() != 1)
+        return std::nullopt;
+      if (formalIndex < child.argTupleRefs.size() &&
+          !child.argTupleRefs[formalIndex].empty())
+        return std::nullopt;
+
+      std::optional<std::pair<uint32_t, uint32_t>> trimmedBounds =
+          trimmedInvocationActualBounds(child, formalIndex);
+      if (!trimmedBounds)
+        return std::nullopt;
+
+      const RefoldModel::InvArgRef &ref = refs.front();
+      if (ref.byteBegin != trimmedBounds->first ||
+          ref.byteEnd != trimmedBounds->second)
+        return std::nullopt;
+      if (ref.callerParamIndex >=
+              parentState.rootTupleSliceByLocalFormal.size() ||
+          !parentState.rootTupleSliceByLocalFormal[ref.callerParamIndex])
+        return std::nullopt;
+
+      const RootTupleSliceBinding &binding =
+          *parentState.rootTupleSliceByLocalFormal[ref.callerParamIndex];
+      if (binding.rootTupleFormalIndex != parentState.rootTupleFormalIndex)
+        return std::nullopt;
+      childState.rootTupleSliceByLocalFormal[formalIndex] = binding;
+      childState.actualSlices.push_back(binding);
+    }
+
+    return childState;
   }
 
   /// Compose one generated-callee child through exact tuple-element refs.
@@ -1157,17 +1322,37 @@ private:
 
     const uint32_t formalCount =
         static_cast<uint32_t>(childDefinition->defParams.size());
-    if (child.invArgRanges.size() != formalCount ||
-        child.argTupleRefs.size() != formalCount)
+    if (child.invArgRanges.size() != formalCount)
       return std::nullopt;
 
+    if (child.argTupleRefs.size() == formalCount) {
+      if (std::optional<GeneratedTupleFormalState> byTupleRefs =
+              TryComposeNestedGeneratedCalleeStateFromTupleRefs(
+                  request, parentState, child, *childDefinition, formalCount))
+        return byTupleRefs;
+    }
+
+    return TryComposeNestedGeneratedCalleeStateFromSourceRanges(
+        request, parentState, child, *childDefinition, formalCount,
+        calleeFormalIndex);
+  }
+
+  /// Compose a nested generated-callee child using producer tuple refs.
+  std::optional<GeneratedTupleFormalState>
+  TryComposeNestedGeneratedCalleeStateFromTupleRefs(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      const GeneratedTupleFormalState &parentState,
+      const RefoldModel::MacroInvocation &child,
+      const RefoldModel::MacroDirective &childDefinition,
+      uint32_t formalCount) const {
     GeneratedTupleFormalState childState;
     childState.invocation = &child;
-    childState.definition = childDefinition;
+    childState.definition = &childDefinition;
     childState.rootCalleeFormalIndex = parentState.rootCalleeFormalIndex;
     childState.rootTupleFormalIndex = parentState.rootTupleFormalIndex;
     childState.rootTupleSliceByLocalFormal.assign(formalCount, std::nullopt);
     childState.actualSlices.reserve(formalCount);
+    childState.calleeWasSelectedByCallerParam = true;
 
     for (uint32_t formalIndex = 0; formalIndex < formalCount; ++formalIndex) {
       const auto &refs = child.argTupleRefs[formalIndex];
@@ -1203,27 +1388,14 @@ private:
       binding.absoluteByteBegin =
           parentSlice.absoluteByteBegin + ref.callerByteBegin;
       binding.absoluteByteEnd = parentSlice.absoluteByteBegin + ref.callerByteEnd;
-      if (binding.rootTuplePayloadByteEnd <=
-              binding.rootTuplePayloadByteBegin ||
-          binding.absoluteByteEnd <= binding.absoluteByteBegin ||
-          binding.rootTuplePayloadByteEnd > parentSlice.rootTuplePayloadByteEnd)
+      if (binding.rootTuplePayloadByteEnd >
+              parentSlice.rootTuplePayloadByteEnd ||
+          binding.absoluteByteEnd > parentSlice.absoluteByteEnd)
         return std::nullopt;
-
-      std::optional<PhysicalInvocationActualRange> actualRange =
-          physicalInvocationActualRange(child, formalIndex);
-      if (!actualRange || actualRange->begin != binding.absoluteByteBegin ||
-          actualRange->end != binding.absoluteByteEnd ||
-          !request.rootInvocation.invFile ||
-          actualRange->file != *request.rootInvocation.invFile)
+      if (!BindingMatchesChildActual(request, child, formalIndex, binding))
         return std::nullopt;
-
-      for (const RootTupleSliceBinding &existing : childState.actualSlices) {
-        if (rangesOverlap(existing.rootTuplePayloadByteBegin,
-                          existing.rootTuplePayloadByteEnd,
-                          binding.rootTuplePayloadByteBegin,
-                          binding.rootTuplePayloadByteEnd))
-          return std::nullopt;
-      }
+      if (BindingOverlapsExisting(childState.actualSlices, binding))
+        return std::nullopt;
 
       childState.rootTupleSliceByLocalFormal[formalIndex] = binding;
       childState.actualSlices.push_back(binding);
@@ -1232,11 +1404,167 @@ private:
     return childState;
   }
 
+  /// Compose a nested generated-callee child by exact source-range tuple proof.
+  ///
+  /// Some producer maps do not attach `arg_tuple_refs` after one or more
+  /// literal generated forwarders.  The theorem can still be proven without a
+  /// heuristic: find exactly one currently composed parent formal whose source
+  /// spelling parses as a tuple and whose element ranges byte-match the child
+  /// actual ranges.  The caller-param callee edge still proves the callee token;
+  /// source ranges are used only for actual-to-tuple-element identity.
+  std::optional<GeneratedTupleFormalState>
+  TryComposeNestedGeneratedCalleeStateFromSourceRanges(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      const GeneratedTupleFormalState &parentState,
+      const RefoldModel::MacroInvocation &child,
+      const RefoldModel::MacroDirective &childDefinition,
+      uint32_t formalCount, uint32_t calleeFormalIndex) const {
+    llvm::SmallVector<GeneratedTupleFormalState, 2> matches;
+
+    for (uint32_t parentFormalIndex = 0;
+         parentFormalIndex < parentState.rootTupleSliceByLocalFormal.size();
+         ++parentFormalIndex) {
+      if (parentFormalIndex == calleeFormalIndex)
+        continue;
+      if (!parentState.rootTupleSliceByLocalFormal[parentFormalIndex])
+        continue;
+
+      std::optional<GeneratedTupleFormalState> state =
+          TryComposeNestedGeneratedCalleeStateFromParentTupleSlice(
+              request, parentState, child, childDefinition, formalCount,
+              *parentState.rootTupleSliceByLocalFormal[parentFormalIndex]);
+      if (state)
+        matches.push_back(*state);
+      if (matches.size() > 1)
+        return std::nullopt;
+    }
+
+    if (matches.size() != 1)
+      return std::nullopt;
+    return matches.front();
+  }
+
+  /// Try to match child actual ranges against elements of one parent tuple slice.
+  std::optional<GeneratedTupleFormalState>
+  TryComposeNestedGeneratedCalleeStateFromParentTupleSlice(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      const GeneratedTupleFormalState &parentState,
+      const RefoldModel::MacroInvocation &child,
+      const RefoldModel::MacroDirective &childDefinition,
+      uint32_t formalCount,
+      const RootTupleSliceBinding &parentSlice) const {
+    if (parentSlice.rootTupleFormalIndex != parentState.rootTupleFormalIndex)
+      return std::nullopt;
+
+    std::optional<std::string> parentSliceText = rootInvocationSourceSlice(
+        request.rootInvocation, parentSlice.absoluteByteBegin,
+        parentSlice.absoluteByteEnd);
+    if (!parentSliceText)
+      return std::nullopt;
+
+    llvm::StringRef parentText(*parentSliceText);
+    size_t trimmedBegin = 0;
+    size_t trimmedEnd = parentText.size();
+    std::tie(trimmedBegin, trimmedEnd) =
+        stringutils::trimWsRange(parentText, 0, parentText.size());
+    if (trimmedEnd <= trimmedBegin + 2)
+      return std::nullopt;
+
+    llvm::StringRef trimmedTuple = parentText.slice(trimmedBegin, trimmedEnd);
+    if (!trimmedTuple.starts_with("(") || !trimmedTuple.ends_with(")"))
+      return std::nullopt;
+
+    llvm::SmallVector<TupleElementSlice, 8> tupleElements;
+    if (!splitTopLevelTupleElementsWithLexer(trimmedTuple.drop_front().drop_back(),
+                                             lexLang_, tupleElements))
+      return std::nullopt;
+    if (tupleElements.size() != formalCount)
+      return std::nullopt;
+
+    const uint64_t payloadOffset = static_cast<uint64_t>(trimmedBegin) + 1;
+    GeneratedTupleFormalState childState;
+    childState.invocation = &child;
+    childState.definition = &childDefinition;
+    childState.rootCalleeFormalIndex = parentState.rootCalleeFormalIndex;
+    childState.rootTupleFormalIndex = parentState.rootTupleFormalIndex;
+    childState.rootTupleSliceByLocalFormal.assign(formalCount, std::nullopt);
+    childState.actualSlices.reserve(formalCount);
+    childState.calleeWasSelectedByCallerParam = true;
+
+    for (uint32_t formalIndex = 0; formalIndex < formalCount; ++formalIndex) {
+      const TupleElementSlice &element = tupleElements[formalIndex];
+      if (element.trimEnd <= element.trimBegin)
+        return std::nullopt;
+
+      RootTupleSliceBinding binding;
+      binding.generatedActualIndex = formalIndex;
+      binding.generatedFormalIndex = formalIndex;
+      binding.rootTupleFormalIndex = parentState.rootTupleFormalIndex;
+      binding.rootTuplePayloadByteBegin = parentSlice.rootTuplePayloadByteBegin +
+                                          payloadOffset + element.trimBegin;
+      binding.rootTuplePayloadByteEnd = parentSlice.rootTuplePayloadByteBegin +
+                                        payloadOffset + element.trimEnd;
+      binding.absoluteByteBegin =
+          parentSlice.absoluteByteBegin + payloadOffset + element.trimBegin;
+      binding.absoluteByteEnd =
+          parentSlice.absoluteByteBegin + payloadOffset + element.trimEnd;
+      if (binding.rootTuplePayloadByteEnd >
+              parentSlice.rootTuplePayloadByteEnd ||
+          binding.absoluteByteEnd > parentSlice.absoluteByteEnd)
+        return std::nullopt;
+
+      if (!BindingMatchesChildActual(request, child, formalIndex, binding))
+        return std::nullopt;
+      if (BindingOverlapsExisting(childState.actualSlices, binding))
+        return std::nullopt;
+
+      childState.rootTupleSliceByLocalFormal[formalIndex] = binding;
+      childState.actualSlices.push_back(binding);
+    }
+
+    return childState;
+  }
+
+  /// Verify one composed binding is exactly the child's physical actual range.
+  static bool BindingMatchesChildActual(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      const RefoldModel::MacroInvocation &child, uint32_t formalIndex,
+      const RootTupleSliceBinding &binding) {
+    if (binding.rootTuplePayloadByteEnd <=
+            binding.rootTuplePayloadByteBegin ||
+        binding.absoluteByteEnd <= binding.absoluteByteBegin)
+      return false;
+
+    std::optional<PhysicalInvocationActualRange> actualRange =
+        physicalInvocationActualRange(child, formalIndex);
+    if (!actualRange || actualRange->begin != binding.absoluteByteBegin ||
+        actualRange->end != binding.absoluteByteEnd ||
+        !request.rootInvocation.invFile ||
+        actualRange->file != *request.rootInvocation.invFile)
+      return false;
+    return true;
+  }
+
+  /// Return whether a binding overlaps any existing child actual binding.
+  static bool BindingOverlapsExisting(
+      llvm::ArrayRef<RootTupleSliceBinding> existingBindings,
+      const RootTupleSliceBinding &binding) {
+    for (const RootTupleSliceBinding &existing : existingBindings) {
+      if (rangesOverlap(existing.rootTuplePayloadByteBegin,
+                        existing.rootTuplePayloadByteEnd,
+                        binding.rootTuplePayloadByteBegin,
+                        binding.rootTuplePayloadByteEnd))
+        return true;
+    }
+    return false;
+  }
+
   /// Convert a generated formal state into the public composed path carrier.
   std::optional<ComposedGeneratedCalleePath> BuildPathForGeneratedState(
       const RefoldModel::MacroInvocation &rootInvocation,
       const GeneratedTupleFormalState &state) const {
-    if (!state.invocation || !state.definition || state.actualSlices.empty())
+    if (!state.invocation || !state.definition || state.actualSlices.empty() ||
+        !state.calleeWasSelectedByCallerParam)
       return std::nullopt;
 
     ComposedGeneratedCalleePath path;
@@ -1247,12 +1575,14 @@ private:
     path.rootTupleFormalIndex = state.rootTupleFormalIndex;
     path.actualSlices.assign(state.actualSlices.begin(),
                              state.actualSlices.end());
+    path.replayInvocations.push_back(state.invocation);
     return path;
   }
 
   const MacroForwardingGraph &graph_;
   WholeFormalForwardingComposer forwardingComposer_;
   TerminalGeneratedCalleeEdgeRecognizer terminalRecognizer_;
+  const clang::LangOptions &lexLang_;
   RootTupleSliceDeriver tupleSliceDeriver_;
 };
 
@@ -1338,62 +1668,189 @@ public:
       solution.oldActuals.push_back(std::move(*oldActualByFormal[formalIndex]));
     }
 
-    std::optional<std::pair<uint64_t, uint64_t>> replayATokens =
-        terminalReplayATokenRange(request, path);
-    if (!replayATokens)
-      return std::nullopt;
+    llvm::ArrayRef<const RefoldModel::MacroInvocation *> replayInvocations =
+        path.replayInvocations;
+    if (replayInvocations.empty()) {
+      if (!path.terminalInvocation)
+        return std::nullopt;
+      replayInvocations = llvm::ArrayRef<const RefoldModel::MacroInvocation *>(
+          &path.terminalInvocation, 1);
+    }
 
-    std::optional<std::pair<size_t, size_t>> replayBEnvelope =
-        mapReplayBTokenEnvelope(*replayATokens);
-    if (!replayBEnvelope)
-      return std::nullopt;
+    bool haveReferenceReplay = false;
+    llvm::SmallVector<std::pair<uint64_t, uint64_t>, 4> solvedReplaySurfaces;
+    for (const RefoldModel::MacroInvocation *replayInvocation :
+         replayInvocations) {
+      llvm::SmallVector<std::pair<uint64_t, uint64_t>, 4> replaySurfaces;
+      if (!appendTerminalReplayATokenRanges(request, *replayInvocation,
+                                           replaySurfaces))
+        return std::nullopt;
 
-    TerminalGeneratedCalleeReplayRequest terminalRequest{
-        *path.terminalDefinition,
-        llvm::ArrayRef<std::string>(solution.oldActuals.data(),
-                                    solution.oldActuals.size()),
-        *replayATokens, *replayBEnvelope};
-    std::optional<TerminalGeneratedCalleeReplaySolution> terminalSolution =
-        generatedCalleeReplayEngine_.SolveTerminalGeneratedCalleeReplay(
-            terminalRequest);
-    if (!terminalSolution ||
-        terminalSolution->oldSolvedActuals.size() !=
-            solution.oldActuals.size() ||
-        terminalSolution->newSolvedActuals.size() != solution.oldActuals.size())
-      return std::nullopt;
+      for (const std::pair<uint64_t, uint64_t> &replaySurface :
+           replaySurfaces) {
+        if (llvm::is_contained(solvedReplaySurfaces, replaySurface))
+          continue;
+        solvedReplaySurfaces.push_back(replaySurface);
 
-    solution.oldSolvedActuals.assign(terminalSolution->oldSolvedActuals.begin(),
-                                     terminalSolution->oldSolvedActuals.end());
-    solution.newSolvedActuals.assign(terminalSolution->newSolvedActuals.begin(),
-                                     terminalSolution->newSolvedActuals.end());
-    solution.usesStringification = terminalSolution->usesStringification;
-    solution.usesPaste = terminalSolution->usesPaste;
+        std::optional<TerminalGeneratedCalleeReplaySolution> terminalSolution =
+            SolveOneReplaySurface(request, path, replaySurface,
+                                  solution.oldActuals);
+        if (!terminalSolution ||
+            terminalSolution->oldSolvedActuals.size() !=
+                solution.oldActuals.size() ||
+            terminalSolution->newSolvedActuals.size() !=
+                solution.oldActuals.size())
+          return std::nullopt;
+
+        if (!haveReferenceReplay) {
+          solution.oldSolvedActuals.assign(
+              terminalSolution->oldSolvedActuals.begin(),
+              terminalSolution->oldSolvedActuals.end());
+          solution.newSolvedActuals.assign(
+              terminalSolution->newSolvedActuals.begin(),
+              terminalSolution->newSolvedActuals.end());
+          solution.usesStringification = terminalSolution->usesStringification;
+          solution.usesPaste = terminalSolution->usesPaste;
+          haveReferenceReplay = true;
+          continue;
+        }
+
+        if (!std::equal(solution.oldSolvedActuals.begin(),
+                        solution.oldSolvedActuals.end(),
+                        terminalSolution->oldSolvedActuals.begin()) ||
+            !std::equal(solution.newSolvedActuals.begin(),
+                        solution.newSolvedActuals.end(),
+                        terminalSolution->newSolvedActuals.begin()))
+          return std::nullopt;
+        solution.usesStringification |= terminalSolution->usesStringification;
+        solution.usesPaste |= terminalSolution->usesPaste;
+      }
+    }
+
+    if (!haveReferenceReplay)
+      return std::nullopt;
     return solution;
   }
 
 private:
-  /// Return the exact A-token replay surface for the terminal generated callee.
-  ///
-  /// The recursive proof edits the source-spelled root tuple, but terminal
-  /// generated-callee inversion must be solved against the terminal callee's
-  /// own expansion surface.  In nested cases such as `ADD(f, t) -> ((f t)+10)`,
-  /// the root whole-cover surface contains literal wrapper tokens from `ADD`
-  /// that are not part of the terminal `SUB` replacement list.  Solving `SUB`
-  /// against the enclosing root cover would fail correctly and then allow a
-  /// lossy whole-cover fallback.  The producer-recorded terminal cover is the
-  /// deterministic replay surface for the terminal definition.
-  std::optional<std::pair<uint64_t, uint64_t>> terminalReplayATokenRange(
+  /// Solve one physical generated-callee replay surface.
+  std::optional<TerminalGeneratedCalleeReplaySolution> SolveOneReplaySurface(
       const RecursiveTupleGeneratedReplayRequest &request,
-      const ComposedGeneratedCalleePath &path) const {
-    if (!path.terminalInvocation || !path.terminalInvocation->cover.IsValid())
+      const ComposedGeneratedCalleePath &path,
+      const std::pair<uint64_t, uint64_t> &replayATokens,
+      llvm::ArrayRef<std::string> oldActuals) const {
+    if (!path.terminalDefinition)
+      return std::nullopt;
+    if (replayATokens.first >= replayATokens.second ||
+        replayATokens.first < request.wholeCoverATokens.first ||
+        replayATokens.second > request.wholeCoverATokens.second)
       return std::nullopt;
 
-    const uint64_t begin = path.terminalInvocation->cover.begin;
-    const uint64_t end = path.terminalInvocation->cover.end;
-    if (begin >= end || begin < request.wholeCoverATokens.first ||
-        end > request.wholeCoverATokens.second)
+    std::optional<std::pair<size_t, size_t>> replayBEnvelope =
+        mapReplayBTokenEnvelope(replayATokens);
+    if (!replayBEnvelope)
       return std::nullopt;
-    return std::make_pair(begin, end);
+
+    TerminalGeneratedCalleeReplayRequest terminalRequest{
+        *path.terminalDefinition, oldActuals, replayATokens, *replayBEnvelope};
+    return generatedCalleeReplayEngine_.SolveTerminalGeneratedCalleeReplay(
+        terminalRequest);
+  }
+
+  /// Append exact A-token replay surfaces for one generated-callee invocation.
+  ///
+  /// Most generated invocations have one producer cover, but repeated uses such
+  /// as `((f t) + (f t))` can give the first repeated terminal invocation a
+  /// conservative cover that also spans the caller's literal separator and the
+  /// second terminal expansion.  The terminal replay theorem must solve each
+  /// physical terminal expansion, not the enclosing repeated-caller surface.
+  /// Therefore, when detailed terminal body/argument spans are available, split
+  /// them into contiguous components.  Gaps are tokens owned by the enclosing
+  /// generated macro and are not part of the terminal callee's replay surface.
+  /// If the producer supplied no detailed terminal spans, fall back to the
+  /// ordinary invocation cover.
+  bool appendTerminalReplayATokenRanges(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      const RefoldModel::MacroInvocation &replayInvocation,
+      llvm::SmallVectorImpl<std::pair<uint64_t, uint64_t>> &ranges) const {
+    llvm::SmallVector<std::pair<uint64_t, uint64_t>, 8> detailedSpans;
+    appendReplayDetailSpans(replayInvocation, detailedSpans);
+
+    if (detailedSpans.empty()) {
+      if (!replayInvocation.cover.IsValid())
+        return false;
+      return appendReplaySurfaceIfValid(request,
+                                        {replayInvocation.cover.begin,
+                                         replayInvocation.cover.end},
+                                        ranges);
+    }
+
+    llvm::sort(detailedSpans);
+    uint64_t componentBegin = 0;
+    uint64_t componentEnd = 0;
+    bool haveComponent = false;
+
+    for (const std::pair<uint64_t, uint64_t> &span : detailedSpans) {
+      if (span.first >= span.second)
+        return false;
+      if (!replayInvocation.cover.Covers(span.first, span.second))
+        return false;
+      if (!haveComponent) {
+        componentBegin = span.first;
+        componentEnd = span.second;
+        haveComponent = true;
+        continue;
+      }
+
+      if (span.first <= componentEnd) {
+        componentEnd = std::max(componentEnd, span.second);
+        continue;
+      }
+
+      if (!appendReplaySurfaceIfValid(request, {componentBegin, componentEnd},
+                                      ranges))
+        return false;
+      componentBegin = span.first;
+      componentEnd = span.second;
+    }
+
+    if (!haveComponent)
+      return false;
+    return appendReplaySurfaceIfValid(request, {componentBegin, componentEnd},
+                                      ranges);
+  }
+
+  /// Collect detailed terminal-owned spans used to split repeated surfaces.
+  static void appendReplayDetailSpans(
+      const RefoldModel::MacroInvocation &invocation,
+      llvm::SmallVectorImpl<std::pair<uint64_t, uint64_t>> &spans) {
+    auto appendSpan = [&](const RefoldModel::PPSpan &span) {
+      if (span.IsValid())
+        spans.push_back({span.begin, span.end});
+    };
+
+    for (const RefoldModel::PPArgSpan &span : invocation.argSpans)
+      appendSpan(span);
+    for (const RefoldModel::PPArgSpan &span : invocation.stringifySpans)
+      appendSpan(span);
+    for (const RefoldModel::PPArgSpan &span : invocation.pasteSpans)
+      appendSpan(span);
+    for (const RefoldModel::PPSpan &span : invocation.bodySpans)
+      appendSpan(span);
+  }
+
+  /// Append one replay surface after validating root-envelope containment.
+  static bool appendReplaySurfaceIfValid(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      const std::pair<uint64_t, uint64_t> &surface,
+      llvm::SmallVectorImpl<std::pair<uint64_t, uint64_t>> &ranges) {
+    if (surface.first >= surface.second ||
+        surface.first < request.wholeCoverATokens.first ||
+        surface.second > request.wholeCoverATokens.second)
+      return false;
+    if (!llvm::is_contained(ranges, surface))
+      ranges.push_back(surface);
+    return true;
   }
 
   /// Map the terminal A-token replay surface to the edited B-token surface.
