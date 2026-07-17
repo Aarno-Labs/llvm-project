@@ -507,6 +507,195 @@ std::optional<std::string> rewriteSourceActualFromSolvedExpansion(
   return std::nullopt;
 }
 
+
+/// Returns true for ordinary ASCII whitespace in invocation spelling.
+///
+/// Generated-callee replay uses this only to inspect the separator trivia around
+/// a final variadic actual.  Keeping the predicate local avoids changing lexer
+/// behavior in the shared invocation rewrite helper.
+bool isInvocationSeparatorWhitespace(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' ||
+         c == '\v';
+}
+
+/// Finds the comma separator immediately before a final variadic actual.
+///
+/// `BuildInvocationRewriteWithRange` replaces only actual-content ranges.  That
+/// is correct for ordinary argument edits, but when a generated-callee proof
+/// deactivates a final variadic pack the source-preserving spelling is the
+/// omitted-tail form, e.g. `CALL(LOG)` rather than `CALL(LOG, )`.  This helper
+/// accepts only the deterministic separator surface between the previous actual
+/// and the final variadic actual: exactly one comma plus whitespace.  Comments
+/// or any other tokens fail closed so the proof cannot guess how to reattach
+/// separator trivia.
+std::optional<size_t> findFinalVariadicSeparatorComma(
+    StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges,
+    uint32_t variadicArgIdx) {
+  if (variadicArgIdx == 0 ||
+      static_cast<size_t>(variadicArgIdx) >= invocationArgRanges.size())
+    return std::nullopt;
+
+  const size_t separatorBegin = invocationArgRanges[variadicArgIdx - 1].second;
+  const size_t separatorEnd = invocationArgRanges[variadicArgIdx].first;
+  if (separatorBegin > separatorEnd || separatorEnd > baseInvocationText.size())
+    return std::nullopt;
+
+  std::optional<size_t> commaOffset;
+  for (size_t i = separatorBegin; i < separatorEnd; ++i) {
+    const char c = baseInvocationText[i];
+    if (c == ',') {
+      if (commaOffset)
+        return std::nullopt;
+      commaOffset = i;
+      continue;
+    }
+    if (!isInvocationSeparatorWhitespace(c))
+      return std::nullopt;
+  }
+  return commaOffset;
+}
+
+/// Extends a final-variadic deletion through whitespace before the close paren.
+///
+/// The actual-content range usually ends before any trivia that precedes the
+/// invocation close paren.  When the final variadic actual is omitted, that
+/// trivia belongs to the removed separator rather than to a surviving actual.
+/// The extension is accepted only when the whitespace is immediately followed by
+/// the close paren, preserving fail-closed behavior for unusual call surfaces.
+size_t extendFinalVariadicDeletionEnd(StringRef baseInvocationText,
+                                      size_t deletionEnd) {
+  size_t cursor = deletionEnd;
+  while (cursor < baseInvocationText.size() &&
+         isInvocationSeparatorWhitespace(baseInvocationText[cursor]))
+    ++cursor;
+  if (cursor < baseInvocationText.size() && baseInvocationText[cursor] == ')')
+    return cursor;
+  return deletionEnd;
+}
+
+/// Returns the final variadic actual erased by a generated-callee replay proof.
+///
+/// The engine uses this predicate only for the root invocation whose generated
+/// callee proof solved a non-empty variadic pack on the A side and an empty pack
+/// on the B side.  Other empty replacements continue through the ordinary
+/// content-range rewrite path; this keeps the canonical `CALL(f)` spelling
+/// limited to omitted final variadic tails.
+std::optional<uint32_t> findErasedFinalVariadicRootActual(
+    const RefoldModel::MacroInvocation &invocation,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges,
+    const DenseMap<uint32_t, std::string> &replacementsByRootArgIdx) {
+  if (invocation.defParams.empty() || invocationArgRanges.empty())
+    return std::nullopt;
+
+  const uint32_t finalFormalIdx =
+      static_cast<uint32_t>(invocation.defParams.size() - 1);
+  if (!isMacroInvocationVariadicFormal(invocation, finalFormalIdx) ||
+      static_cast<size_t>(finalFormalIdx) + 1 != invocationArgRanges.size())
+    return std::nullopt;
+
+  auto replacementIt = replacementsByRootArgIdx.find(finalFormalIdx);
+  if (replacementIt == replacementsByRootArgIdx.end() ||
+      !StringRef(replacementIt->second).trim().empty())
+    return std::nullopt;
+  return finalFormalIdx;
+}
+
+/// Source edit used while rebuilding a root invocation spelling.
+///
+/// Generated-callee replay normally delegates this representation to the planner,
+/// but final-variadic erasure has to widen one actual-content edit to include
+/// its separator comma.  Naming the local edit carrier keeps that widening
+/// auditable and lets the deterministic source-order comparator remain a normal
+/// helper instead of an inline callback.
+struct InvocationSourceEdit {
+  size_t begin = 0;
+  size_t end = 0;
+  std::string text;
+};
+
+/// Deterministic ascending order for invocation source edits.
+bool invocationSourceEditLess(const InvocationSourceEdit &lhs,
+                              const InvocationSourceEdit &rhs) {
+  if (lhs.begin != rhs.begin)
+    return lhs.begin < rhs.begin;
+  return lhs.end < rhs.end;
+}
+
+/// Rebuilds an invocation while omitting an erased final variadic actual.
+///
+/// This is the generated-callee counterpart to `BuildInvocationRewriteWithRange`.
+/// It preserves that helper's right-to-left source replacement semantics, but
+/// widens the empty final variadic edit to include the separator comma.  Without
+/// this special case, deactivating a `__VA_OPT__`-controlled variadic tail would
+/// produce `CALL(LOG, )`; the canonical source-preserving form is `CALL(LOG)`.
+std::optional<InvocationRewriteWithRange>
+buildInvocationRewriteOmittingErasedFinalVariadicActual(
+    const InvocationActualRecoveryContext &ctx,
+    const DenseMap<uint32_t, std::string> &replacementsByRootArgIdx,
+    uint32_t variadicArgIdx) {
+  const ArrayRef<std::pair<size_t, size_t>> invocationArgRanges =
+      ctx.invocationArgRanges;
+  StringRef baseInvocationText = ctx.baseInvocationText;
+
+  std::optional<size_t> commaOffset = findFinalVariadicSeparatorComma(
+      baseInvocationText, invocationArgRanges, variadicArgIdx);
+  if (!commaOffset)
+    return std::nullopt;
+
+  SmallVector<InvocationSourceEdit, 8> edits;
+  edits.reserve(replacementsByRootArgIdx.size());
+  for (const auto &entry : replacementsByRootArgIdx) {
+    if (static_cast<size_t>(entry.first) >= invocationArgRanges.size())
+      return std::nullopt;
+
+    const auto rawRange = invocationArgRanges[entry.first];
+    if (rawRange.second < rawRange.first ||
+        rawRange.second > baseInvocationText.size())
+      return std::nullopt;
+
+    if (entry.first == variadicArgIdx) {
+      const size_t deletionEnd =
+          extendFinalVariadicDeletionEnd(baseInvocationText, rawRange.second);
+      edits.push_back(InvocationSourceEdit{*commaOffset, deletionEnd, ""});
+      continue;
+    }
+
+    edits.push_back(
+        InvocationSourceEdit{rawRange.first, rawRange.second, entry.second});
+  }
+
+  llvm::sort(edits, invocationSourceEditLess);
+
+  InvocationRewriteWithRange out;
+  out.text.reserve(baseInvocationText.size());
+  size_t cursor = 0;
+  std::optional<uint64_t> mappedBegin;
+  std::optional<uint64_t> mappedEnd;
+  for (const InvocationSourceEdit &edit : edits) {
+    if (edit.end < edit.begin || edit.begin < cursor ||
+        edit.end > baseInvocationText.size())
+      return std::nullopt;
+
+    out.text += baseInvocationText.slice(cursor, edit.begin).str();
+    const uint64_t replacementBegin = static_cast<uint64_t>(out.text.size());
+    out.text.append(edit.text);
+    const uint64_t replacementEnd = static_cast<uint64_t>(out.text.size());
+    mappedBegin = mappedBegin ? std::min(*mappedBegin, replacementBegin)
+                              : replacementBegin;
+    mappedEnd = mappedEnd ? std::max(*mappedEnd, replacementEnd)
+                          : replacementEnd;
+    cursor = edit.end;
+  }
+
+  out.text += baseInvocationText.substr(cursor).str();
+  if (!mappedBegin || !mappedEnd)
+    return std::nullopt;
+  out.materializedOutputByteStart = *mappedBegin;
+  out.materializedOutputByteEnd = *mappedEnd;
+  return out;
+}
+
 /// Rewrites one tuple element from a solved tuple-generated expansion.
 ///
 /// Tuple-generated replay shares the token-position replacement proof with root
@@ -2204,10 +2393,19 @@ public:
         m, generatedCalleeCtx.baseInvocationText,
         generatedCalleeCtx.invocationArgRanges};
 
-    std::optional<InvocationRewriteWithRange> rewrite =
-        deps_.buildInvocationRewriteWithRange(
-            actualRecoveryCtx, finalSolution.replacementsByRootArgIdx,
-            /*materializedRangeByArgIdx=*/nullptr);
+    std::optional<InvocationRewriteWithRange> rewrite;
+    if (std::optional<uint32_t> erasedVariadicArgIdx =
+            findErasedFinalVariadicRootActual(
+                m, generatedCalleeCtx.invocationArgRanges,
+                finalSolution.replacementsByRootArgIdx)) {
+      rewrite = buildInvocationRewriteOmittingErasedFinalVariadicActual(
+          actualRecoveryCtx, finalSolution.replacementsByRootArgIdx,
+          *erasedVariadicArgIdx);
+    } else {
+      rewrite = deps_.buildInvocationRewriteWithRange(
+          actualRecoveryCtx, finalSolution.replacementsByRootArgIdx,
+          /*materializedRangeByArgIdx=*/nullptr);
+    }
     if (!rewrite)
       return std::nullopt;
 
