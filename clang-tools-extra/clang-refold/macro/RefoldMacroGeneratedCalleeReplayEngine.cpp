@@ -3044,7 +3044,10 @@ public:
       : replayPattern_(replayPattern), oldActuals_(oldActuals),
         variadicParamByIdx_(variadicParamByIdx.begin(),
                             variadicParamByIdx.end()),
-        lexLang_(lexLang) {}
+        lexLang_(lexLang) {
+    nonPasteParamReferences_.assign(oldActuals_.size(), false);
+    MarkNonPasteParamReferences(replayPattern_);
+  }
 
   /// Solves the tuple replay pattern against `expansion`, if unique.
   ///
@@ -3101,10 +3104,51 @@ private:
                                                lexLang_);
   }
 
+  /// Records formal uses outside paste replay elements.
+  ///
+  /// Unanchored paste such as `x##y` has no delimiter that can determine a new
+  /// split by itself.  It becomes replay-safe when some paste formal is also
+  /// constrained by an independent non-paste occurrence in the same generated
+  /// callee, for example `x##y + x`.  These facts are gathered once from the
+  /// accepted replay pattern and used only to decide whether the paste split may
+  /// be enumerated and later discharged by that independent occurrence.
+  void MarkNonPasteParamReferences(ArrayRef<TupleCalleeReplayElem> elems) {
+    for (const TupleCalleeReplayElem &elem : elems) {
+      switch (elem.kind) {
+      case TupleCalleeReplayKind::Param:
+      case TupleCalleeReplayKind::Stringify:
+        if (elem.paramIdx < nonPasteParamReferences_.size())
+          nonPasteParamReferences_[elem.paramIdx] = true;
+        break;
+      case TupleCalleeReplayKind::VaOpt:
+        MarkNonPasteParamReferences(ArrayRef<TupleCalleeReplayElem>(
+            elem.children.data(), elem.children.size()));
+        break;
+      case TupleCalleeReplayKind::Literal:
+      case TupleCalleeReplayKind::Paste:
+        break;
+      }
+    }
+  }
+
+  /// Returns whether an unanchored paste has an independent formal constraint.
+  bool PasteHasNonLocalFormalConstraint(
+      ArrayRef<TupleCalleePastePiece> pieces) const {
+    for (const TupleCalleePastePiece &piece : pieces)
+      if (piece.isParam && piece.paramIdx < nonPasteParamReferences_.size() &&
+          nonPasteParamReferences_[piece.paramIdx])
+        return true;
+    return false;
+  }
+
   /// Enumerates replay-safe assignments for one tuple pasted token.
   ///
   /// Literal-anchored paste forms use DFS over candidate slices.  Paste forms
-  /// without a literal anchor keep the deterministic old-width inverse.
+  /// without a literal anchor keep the deterministic old-width inverse unless a
+  /// pasted formal is independently constrained elsewhere in the same generated
+  /// callee.  In that constrained case enumeration is still deterministic and
+  /// fail-closed because `SolveExpansion` accepts only one final solution after
+  /// all later occurrences have replayed.
   SmallVector<TupleSolvedActuals, 4>
   SolvePasteToken(ArrayRef<TupleCalleePastePiece> pieces, StringRef spelling,
                   const TupleSolvedActuals &seed) const {
@@ -3114,10 +3158,13 @@ private:
         llvm::any_of(pieces, [](const TupleCalleePastePiece &piece) {
           return !piece.isParam && !piece.literal.empty();
         });
+    const bool hasNonLocalFormalConstraint =
+        PasteHasNonLocalFormalConstraint(pieces);
 
-    // Without a fixed literal anchor, preserve the tuple solver's prior
-    // deterministic inverse: original actual widths, not arbitrary cuts.
-    if (!hasLiteralAnchor) {
+    // Without a fixed literal anchor or a later independent occurrence, preserve
+    // the tuple solver's prior deterministic inverse: original actual widths,
+    // not arbitrary cuts.
+    if (!hasLiteralAnchor && !hasNonLocalFormalConstraint) {
       TupleSolvedActuals cur = seed;
       size_t cursor = 0;
       for (const TupleCalleePastePiece &piece : pieces) {
@@ -3147,18 +3194,24 @@ private:
     }
 
     TupleSolvedActuals start = seed;
-    DfsPaste(pieces, spelling, 0, 0, start, solutions);
+    DfsPaste(pieces, spelling, 0, 0, start, solutions,
+             /*stopAfterSecondSolution=*/!hasNonLocalFormalConstraint);
     return solutions;
   }
 
   /// DFSes tuple paste pieces in left-to-right order.
   ///
   /// Literal pieces consume fixed text.  Parameter pieces enumerate slices in
-  /// increasing end-offset order.  Search stops after two solutions.
+  /// increasing end-offset order.  Locally anchored paste may stop after a
+  /// second local solution because ambiguity is already proven.  For unanchored
+  /// paste discharged by a later formal occurrence, all local splits must be
+  /// streamed to the outer replay DFS so the independent occurrence can reject
+  /// the wrong splits before the global uniqueness check runs.
   void DfsPaste(ArrayRef<TupleCalleePastePiece> pieces, StringRef spelling,
                 size_t pieceIdx, size_t cursor, TupleSolvedActuals &cur,
-                SmallVectorImpl<TupleSolvedActuals> &solutions) const {
-    if (solutions.size() > 1)
+                SmallVectorImpl<TupleSolvedActuals> &solutions,
+                bool stopAfterSecondSolution) const {
+    if (stopAfterSecondSolution && solutions.size() > 1)
       return;
 
     if (pieceIdx == pieces.size()) {
@@ -3173,19 +3226,23 @@ private:
       // split points.
       if (spelling.substr(cursor).starts_with(piece.literal))
         DfsPaste(pieces, spelling, pieceIdx + 1,
-                 cursor + piece.literal.size(), cur, solutions);
+                 cursor + piece.literal.size(), cur, solutions,
+                 stopAfterSecondSolution);
       return;
     }
 
-    // Parameter slices are tried in deterministic increasing-end order.
-    // Retaining at most two solutions preserves the ambiguity cutoff.
+    // Parameter slices are tried in deterministic increasing-end order.  The
+    // caller chooses whether local ambiguity is enough to stop immediately or
+    // whether a later non-paste formal occurrence must be allowed to discharge
+    // the split first.
     for (size_t end = cursor; end <= spelling.size(); ++end) {
       StringRef slice = spelling.slice(cursor, end);
       TupleSolvedActuals next = cur;
       if (!AssignSolvedActual(next, piece.paramIdx, slice))
         continue;
-      DfsPaste(pieces, spelling, pieceIdx + 1, end, next, solutions);
-      if (solutions.size() > 1)
+      DfsPaste(pieces, spelling, pieceIdx + 1, end, next, solutions,
+               stopAfterSecondSolution);
+      if (stopAfterSecondSolution && solutions.size() > 1)
         return;
     }
   }
@@ -3389,6 +3446,7 @@ private:
   ArrayRef<TupleCalleeReplayElem> replayPattern_;
   ArrayRef<std::string> oldActuals_;
   SmallVector<bool, 8> variadicParamByIdx_;
+  SmallVector<bool, 8> nonPasteParamReferences_;
   const clang::LangOptions &lexLang_;
 };
 
