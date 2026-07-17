@@ -4107,8 +4107,13 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
 
   StringRef tuplePayload = tupleArgText.drop_front().drop_back();
   SmallVector<TupleElementSlice, 8> tupleElements;
-  if (!splitTopLevelTupleElementsWithLexer(tuplePayload, deps_.lexLang,
-                                           tupleElements) ||
+  // This parenthesized source slot supplies the generated callee's macro
+  // actual list, not an ordinary structural caller tuple.  Empty actuals are
+  // therefore meaningful positional slots, as in SECOND(, 1), and must be
+  // preserved so generated-callee replay keeps the callee's formal indices
+  // aligned.
+  if (!splitTopLevelMacroActualsWithLexer(tuplePayload, deps_.lexLang,
+                                          tupleElements) ||
       tupleElements.empty())
     return std::nullopt;
 
@@ -4291,8 +4296,13 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
 
   StringRef tuplePayload = tupleArgText.drop_front().drop_back();
   SmallVector<TupleElementSlice, 8> tupleElements;
-  if (!splitTopLevelTupleElementsWithLexer(tuplePayload, deps_.lexLang,
-                                           tupleElements) ||
+  // This parenthesized source slot supplies the generated callee's macro
+  // actual list, not an ordinary structural caller tuple.  Empty actuals are
+  // therefore meaningful positional slots, as in SECOND(, 1), and must be
+  // preserved so generated-callee replay keeps the callee's formal indices
+  // aligned.
+  if (!splitTopLevelMacroActualsWithLexer(tuplePayload, deps_.lexLang,
+                                          tupleElements) ||
       tupleElements.empty())
     return std::nullopt;
 

@@ -664,7 +664,7 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
   // declines such a body-owned hunk, so whole-cover planning must still give
   // the same exact generated-callee theorem one chance before expansion can
   // realize the whole cover.
-  if (!argsOnlyCandidate && m.subkind == "func") {
+  if (m.subkind == "func") {
     // Whole-cover orchestration must not reach into planner-private actual
     // recovery carriers.  The public content-range primitive is sufficient
     // here because the higher-order theorem only needs the formal argument
@@ -692,6 +692,15 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
           patchReusePhase_.MergeCurrentRootWithExistingCallsitePatch(
               planningCtx, *higherOrderPatch);
           if (!conflictingConcreteSubtreeWitnessForcesWholeCover) {
+            // A successful higher-order generated-callee replay is a stronger
+            // owner-level proof than ordinary args-only assignment: it explains
+            // the edited descendant expansion through the root replacement-list
+            // grammar and keeps the generated callee/actual structure intact.
+            // Keep it as the root replay candidate and suppress the generic
+            // direct args-only candidate so zero-token formal assignment cannot
+            // collapse the selector argument, e.g. CALL(SECOND, (, 1)) ->
+            // CALL(, 2).
+            argsOnlyCandidate.reset();
             dagRootCandidate = std::move(*higherOrderPatch);
             reuseExistingCallsitePatch = false;
           }
