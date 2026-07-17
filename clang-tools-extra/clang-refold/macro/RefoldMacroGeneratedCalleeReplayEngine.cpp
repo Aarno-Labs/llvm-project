@@ -1151,7 +1151,9 @@ enum class GeneratedReplayKind {
   /// Stringification of a formal parameter.
   Stringify,
   /// Token-paste expression.
-  Paste
+  Paste,
+  /// `__VA_OPT__` payload replay.
+  VaOpt
 };
 
 /// One literal or parameter piece inside a generated token-paste expression.
@@ -1177,6 +1179,9 @@ struct GeneratedReplayElem {
   /// Formal parameter index for parameter or stringification elements.
   uint32_t paramIdx = 0;
 
+  /// Ordered nested replay elements for `__VA_OPT__` payloads.
+  std::vector<GeneratedReplayElem> children;
+
   /// Ordered paste pieces for token-paste replay elements.
   std::vector<GeneratedPastePiece> pastePieces;
 };
@@ -1188,7 +1193,8 @@ using GeneratedSolvedActuals = SmallVector<std::string, 8>;
 /// The caller trusts the current macro definition and the recovered old actual
 /// slots.  The parser owns the syntactic rejection obligations for unsupported
 /// token forms: malformed stringification, malformed paste chains,
-/// out-of-range formal references, and `__VA_OPT__` all fail closed.  The
+/// out-of-range formal references, and malformed `__VA_OPT__` payloads all
+/// fail closed.  The
 /// stringification and paste proof facts are meaningful only after a successful
 /// parse, and are raised only for replay elements that are emitted into the
 /// accepted pattern.
@@ -1273,10 +1279,22 @@ public:
         continue;
       }
 
-      // Standalone paste, standalone stringification handled above, and
-      // __VA_OPT__ are not part of this generated-callee replay language.
-      if (tok.spelling == "##" || tok.spelling == "__VA_OPT__")
+      // Standalone paste is not accepted in this generated-callee replay
+      // parser.  It remains fail-closed rather than being approximated.
+      if (tok.spelling == "##")
         return false;
+      if (tok.spelling == "__VA_OPT__") {
+        std::optional<size_t> close = FindVaOptPayloadClose(i, end);
+        if (!close)
+          return false;
+        GeneratedReplayElem elem;
+        elem.kind = GeneratedReplayKind::VaOpt;
+        if (!Parse(i + 2, *close, elem.children))
+          return false;
+        out.push_back(std::move(elem));
+        i = *close + 1;
+        continue;
+      }
       GeneratedReplayElem elem;
       elem.kind = GeneratedReplayKind::Literal;
       elem.literal = tok.spelling.str();
@@ -1308,6 +1326,37 @@ private:
     piece.isParam = false;
     piece.literal = tok.spelling.str();
     return true;
+  }
+
+  /// Finds the close parenthesis for a canonical `__VA_OPT__(...)` payload.
+  ///
+  /// Generated-callee replay accepts `__VA_OPT__` only as the ordinary
+  /// replacement-list operator recorded by the producer.  The payload is parsed
+  /// recursively by `Parse`, so malformed payload parentheses or unterminated
+  /// payloads reject the generated-callee proof instead of falling through to a
+  /// whole-cover expansion.
+  std::optional<size_t> FindVaOptPayloadClose(size_t vaOptIdx,
+                                              size_t end) const {
+    if (vaOptIdx + 1 >= end ||
+        definition_.replacementTokens[vaOptIdx + 1].kind !=
+            RefoldModel::MacroReplacementTokenKind::Literal ||
+        definition_.replacementTokens[vaOptIdx + 1].spelling != "(")
+      return std::nullopt;
+
+    unsigned depth = 1;
+    size_t close = vaOptIdx + 2;
+    for (; close < end; ++close) {
+      const auto &inner = definition_.replacementTokens[close];
+      if (inner.kind != RefoldModel::MacroReplacementTokenKind::Literal)
+        continue;
+      if (inner.spelling == "(") {
+        ++depth;
+        continue;
+      }
+      if (inner.spelling == ")" && --depth == 0)
+        return close;
+    }
+    return std::nullopt;
   }
 
   const RefoldModel::MacroDirective &definition_;
@@ -1466,8 +1515,11 @@ class FormalActualConstraintSolver {
 public:
   FormalActualConstraintSolver(ArrayRef<GeneratedReplayElem> replayPattern,
                                ArrayRef<std::string> oldActuals,
+                               ArrayRef<bool> variadicParamByIdx,
                                const clang::LangOptions &lexLang)
       : replayPattern_(replayPattern), oldActuals_(oldActuals),
+        variadicParamByIdx_(variadicParamByIdx.begin(),
+                            variadicParamByIdx.end()),
         lexLang_(lexLang), pasteSolver_(oldActuals, lexLang) {}
 
   /// Solves the replay pattern against `expansion`, if the solution is unique.
@@ -1484,7 +1536,8 @@ public:
     for (const std::string &actual : oldActuals_)
       seed.push_back(actual);
 
-    Dfs(expansion, toks, replayPattern_, 0, seed, solutions);
+    Dfs(expansion, toks, replayPattern_, 0, seed,
+        /*vaOptPayloadPresent=*/std::nullopt, solutions);
     if (solutions.size() != 1)
       return std::nullopt;
     return solutions.front();
@@ -1499,15 +1552,17 @@ private:
   /// after two solutions because only a unique assignment is admissible.
   void Dfs(StringRef expansion, ArrayRef<ReplayTok> toks,
            ArrayRef<GeneratedReplayElem> elems, size_t tokPos,
-           GeneratedSolvedActuals &cur,
+           GeneratedSolvedActuals &cur, std::optional<bool> vaOptPayloadPresent,
            SmallVectorImpl<GeneratedSolvedActuals> &solutions) const {
     if (solutions.size() > 1)
       return;
 
     // Reaching the end of the replay pattern is successful only if the B-side
-    // token stream was consumed exactly.
+    // token stream was consumed exactly and the observed `__VA_OPT__` branch
+    // choice agrees with the solved variadic actuals.
     if (elems.empty()) {
-      if (tokPos == toks.size())
+      if (tokPos == toks.size() &&
+          VaOptPayloadStateMatchesSolvedVariadic(cur, vaOptPayloadPresent))
         solutions.push_back(cur);
       return;
     }
@@ -1519,7 +1574,8 @@ private:
       // Literal replay elements are fixed anchors: they match exactly one
       // expansion token and introduce no alternate bindings.
       if (tokPos < toks.size() && toks[tokPos].spelling == elem.literal)
-        Dfs(expansion, toks, rest, tokPos + 1, cur, solutions);
+        Dfs(expansion, toks, rest, tokPos + 1, cur, vaOptPayloadPresent,
+            solutions);
       return;
 
     case GeneratedReplayKind::Param: {
@@ -1538,7 +1594,7 @@ private:
         if (!pasteSolver_.AssignSolvedActual(next, elem.paramIdx, value))
           continue;
 
-        Dfs(expansion, toks, rest, end, next, solutions);
+        Dfs(expansion, toks, rest, end, next, vaOptPayloadPresent, solutions);
         if (solutions.size() > 1)
           return;
       }
@@ -1560,7 +1616,8 @@ private:
                                            StringRef(*content)))
         return;
 
-      Dfs(expansion, toks, rest, tokPos + 1, next, solutions);
+      Dfs(expansion, toks, rest, tokPos + 1, next, vaOptPayloadPresent,
+          solutions);
       return;
     }
 
@@ -1576,21 +1633,147 @@ private:
               toks[tokPos].spelling, cur);
 
       for (GeneratedSolvedActuals &pasteSol : pasteSolutions) {
-        Dfs(expansion, toks, rest, tokPos + 1, pasteSol, solutions);
+        Dfs(expansion, toks, rest, tokPos + 1, pasteSol,
+            vaOptPayloadPresent, solutions);
         if (solutions.size() > 1)
           return;
+      }
+      return;
+    }
+
+    case GeneratedReplayKind::VaOpt: {
+      if (!vaOptPayloadPresent || !*vaOptPayloadPresent) {
+        std::optional<bool> erasedPayload = false;
+        Dfs(expansion, toks, rest, tokPos, cur, erasedPayload, solutions);
+      }
+      if (!vaOptPayloadPresent || *vaOptPayloadPresent) {
+        GeneratedSolvedActuals withPayload = cur;
+        std::optional<bool> presentPayload = true;
+        DfsVaOptChildren(expansion, toks,
+                         ArrayRef<GeneratedReplayElem>(elem.children.data(),
+                                                       elem.children.size()),
+                         rest, tokPos, tokPos, withPayload, presentPayload,
+                         solutions);
       }
       return;
     }
     }
   }
 
+  /// DFSes one `__VA_OPT__` payload and then resumes the parent suffix.
+  ///
+  /// Generated-callee replay admits literal and ordinary formal references
+  /// inside the payload.  Stringification, paste, and nested `__VA_OPT__`
+  /// remain outside this local theorem and therefore fail closed.  The
+  /// payload-present branch must consume at least one token before resuming the
+  /// parent replay.
+  void DfsVaOptChildren(
+      StringRef expansion, ArrayRef<ReplayTok> toks,
+      ArrayRef<GeneratedReplayElem> childElems,
+      ArrayRef<GeneratedReplayElem> parentRest, size_t parentTokPos,
+      size_t childTokPos, GeneratedSolvedActuals &childAssigned,
+      std::optional<bool> vaOptPayloadPresent,
+      SmallVectorImpl<GeneratedSolvedActuals> &solutions) const {
+    if (solutions.size() > 1)
+      return;
+
+    if (childElems.empty()) {
+      if (childTokPos != parentTokPos)
+        Dfs(expansion, toks, parentRest, childTokPos, childAssigned,
+            vaOptPayloadPresent, solutions);
+      return;
+    }
+
+    const GeneratedReplayElem &child = childElems.front();
+    ArrayRef<GeneratedReplayElem> childRest = childElems.drop_front();
+    switch (child.kind) {
+    case GeneratedReplayKind::Literal:
+      if (childTokPos < toks.size() &&
+          toks[childTokPos].spelling == child.literal)
+        DfsVaOptChildren(expansion, toks, childRest, parentRest, parentTokPos,
+                         childTokPos + 1, childAssigned, vaOptPayloadPresent,
+                         solutions);
+      return;
+    case GeneratedReplayKind::Param:
+      DfsVaOptParam(expansion, toks, childRest, parentRest, parentTokPos,
+                    child.paramIdx, childTokPos, childAssigned,
+                    vaOptPayloadPresent, solutions);
+      return;
+    case GeneratedReplayKind::Stringify:
+    case GeneratedReplayKind::Paste:
+    case GeneratedReplayKind::VaOpt:
+      return;
+    }
+  }
+
+  /// Enumerates a parameter binding inside a `__VA_OPT__` payload.
+  void DfsVaOptParam(
+      StringRef expansion, ArrayRef<ReplayTok> toks,
+      ArrayRef<GeneratedReplayElem> childRest,
+      ArrayRef<GeneratedReplayElem> parentRest, size_t parentTokPos,
+      uint32_t paramIdx, size_t childTokPos,
+      GeneratedSolvedActuals &childAssigned,
+      std::optional<bool> vaOptPayloadPresent,
+      SmallVectorImpl<GeneratedSolvedActuals> &solutions) const {
+    if (paramIdx >= childAssigned.size())
+      return;
+
+    for (size_t end = childTokPos; end <= toks.size(); ++end) {
+      StringRef value;
+      if (end > childTokPos) {
+        const size_t byteBegin = toks[childTokPos].begin;
+        const size_t byteEnd = toks[end - 1].end;
+        value = expansion.slice(byteBegin, byteEnd);
+      }
+      GeneratedSolvedActuals next = childAssigned;
+      if (!pasteSolver_.AssignSolvedActual(next, paramIdx, value))
+        continue;
+      DfsVaOptChildren(expansion, toks, childRest, parentRest, parentTokPos,
+                       end, next, vaOptPayloadPresent, solutions);
+      if (solutions.size() > 1)
+        return;
+    }
+  }
+
+  /// Checks the chosen `__VA_OPT__` branch against solved variadic formals.
+  bool VaOptPayloadStateMatchesSolvedVariadic(
+      const GeneratedSolvedActuals &actuals,
+      std::optional<bool> vaOptPayloadPresent) const {
+    if (!vaOptPayloadPresent)
+      return true;
+
+    bool hasVariadicTokens = false;
+    for (size_t i = 0; i < actuals.size() && i < variadicParamByIdx_.size();
+         ++i) {
+      if (variadicParamByIdx_[i] && !StringRef(actuals[i]).trim().empty()) {
+        hasVariadicTokens = true;
+        break;
+      }
+    }
+    return hasVariadicTokens == *vaOptPayloadPresent;
+  }
+
   ArrayRef<GeneratedReplayElem> replayPattern_;
   ArrayRef<std::string> oldActuals_;
+  SmallVector<bool, 8> variadicParamByIdx_;
   const clang::LangOptions &lexLang_;
   GeneratedCalleePasteActualSolver pasteSolver_;
 };
 
+
+/// Builds the per-formal variadic mask consumed by replay solvers that support
+/// `__VA_OPT__`.  Keeping the mask next to the generated-callee solver avoids
+/// guessing from actual spellings; branch activation is checked against the
+/// producer definition's formal metadata.
+SmallVector<bool, 8>
+buildGeneratedReplayVariadicParamMask(
+    const RefoldModel::MacroDirective &definition) {
+  SmallVector<bool, 8> variadicParamByIdx;
+  variadicParamByIdx.reserve(definition.defParams.size());
+  for (const auto &param : definition.defParams)
+    variadicParamByIdx.push_back(param.variadic);
+  return variadicParamByIdx;
+}
 
 /// Resolves the final generated-callee actual solution back to root arguments.
 ///
@@ -1688,11 +1871,14 @@ public:
       }
     }
 
+    SmallVector<bool, 8> variadicParamByIdx =
+        buildGeneratedReplayVariadicParamMask(*replayState.currentDefinition);
     const FormalActualConstraintSolver formalSolver(
         ArrayRef<GeneratedReplayElem>(replayPattern.data(),
                                       replayPattern.size()),
         ArrayRef<std::string>(solution.oldActuals.data(),
                               solution.oldActuals.size()),
+        ArrayRef<bool>(variadicParamByIdx.data(), variadicParamByIdx.size()),
         deps_.lexLang);
 
     StringRef oldExpansion = deps_.sourceMapper
@@ -2177,8 +2363,11 @@ std::optional<GeneratedSolvedActuals> solveDefinitionExpansion(
       pattern.empty())
     return std::nullopt;
 
+  SmallVector<bool, 8> variadicParamByIdx =
+      buildGeneratedReplayVariadicParamMask(definition);
   const FormalActualConstraintSolver solver(
       ArrayRef<GeneratedReplayElem>(pattern.data(), pattern.size()), oldActuals,
+      ArrayRef<bool>(variadicParamByIdx.data(), variadicParamByIdx.size()),
       lexLang);
   return solver.SolveExpansion(expansion);
 }
@@ -3746,10 +3935,14 @@ RefoldMacroGeneratedCalleeReplayEngine::SolveTerminalGeneratedCalleeReplay(
       replayPattern.empty())
     return std::nullopt;
 
+  SmallVector<bool, 8> variadicParamByIdx =
+      buildGeneratedReplayVariadicParamMask(ctx.terminalDefinition);
   const FormalActualConstraintSolver formalSolver(
       ArrayRef<GeneratedReplayElem>(replayPattern.data(),
                                     replayPattern.size()),
-      ctx.oldActuals, deps_.lexLang);
+      ctx.oldActuals,
+      ArrayRef<bool>(variadicParamByIdx.data(), variadicParamByIdx.size()),
+      deps_.lexLang);
 
   StringRef oldExpansion = deps_.sourceMapper
                                .SliceASource(ctx.wholeCoverATokens.first,
