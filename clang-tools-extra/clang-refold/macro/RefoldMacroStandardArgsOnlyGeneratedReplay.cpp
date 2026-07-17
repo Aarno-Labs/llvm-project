@@ -2759,24 +2759,28 @@ HigherOrderGeneratedReplayProbe::TryBuildTupleGeneratedCalleeReplay(
     const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
     ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
   if (!invocation.definitionDirectiveId || !invocation.invB ||
-      !invocation.invE || !invocation.stringifySpans.empty())
+      !invocation.invE)
     return std::nullopt;
 
-  // Do not reject merely because the root invocation reports paste spans.  The
-  // producer records descendant paste uses on the forwarding root when a tuple
-  // element selects a pasted generated callee, for example
+  // Do not reject merely because the root invocation reports stringify or paste
+  // spans.  The producer records descendant semantic uses on the forwarding root
+  // when a tuple element selects a generated callee, for example:
   //
+  //   #define DECLPAIR(x) const char *x##_s = #x
   //   #define CATUSE(x) x##Tail + x
   //   #define CALL(f, t) f t
   //   #define WRAP(p) CALL p
   //
+  //   WRAP((DECLPAIR, (foo)))
   //   WRAP((CATUSE, (foo)))
   //
-  // In that shape the root replacement list is still the ordinary tuple
-  // forwarder `CALL p`; the paste belongs to the terminal generated callee and
-  // is replayed by `BuildTupleGeneratedCalleeReplayCandidate`.  The structural
-  // root-definition checks below still fail closed for roots whose own
-  // replacement list is not the narrow literal-forwarder shape.
+  // In these shapes the root replacement list is still the ordinary tuple
+  // forwarder `CALL p`; the stringify/paste operation belongs to the terminal
+  // generated callee and is replayed by
+  // `BuildTupleGeneratedCalleeReplayCandidate`.  The structural root-definition
+  // checks below still fail closed for roots whose own replacement list is not
+  // the narrow literal-forwarder shape, so removing this early metadata gate does
+  // not admit direct root stringify/paste replay.
 
   auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
   if (!cover || cover->first >= cover->second)
