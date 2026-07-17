@@ -434,6 +434,18 @@ private:
       llvm::StringRef headerText, const RefoldModel::CondGroup &group,
       uint64_t materialBeginA, uint64_t materialEndA) const;
 
+  /// Returns whether a candidate source envelope lies wholly inside one
+  /// producer-selected arm of a header conditional group.
+  ///
+  /// This distinguishes an enclosing conditional wrapper from a source
+  /// envelope that actually crosses conditional-control structure. The
+  /// caller must still prove every inter-piece source gap before committing
+  /// the widened edit.
+  bool HeaderSourceEnvelopeIsInsideSelectedConditionalArm(
+      const RefoldModel::IncludeItem &currentInclude, llvm::StringRef file,
+      const RefoldModel::CondGroup &group, uint64_t sourceBegin,
+      uint64_t sourceEnd) const;
+
   /// Returns whether selected material from a header conditional group overlaps
   /// a hunk's A-side material interval.
   bool HeaderConditionalGroupSelectedMaterialOverlaps(

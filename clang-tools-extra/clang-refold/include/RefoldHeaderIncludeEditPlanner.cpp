@@ -589,6 +589,34 @@ bool RefoldHeaderIncludeEditPlanner::
 }
 
 bool RefoldHeaderIncludeEditPlanner::
+    HeaderSourceEnvelopeIsInsideSelectedConditionalArm(
+        const RefoldModel::IncludeItem &currentInclude, StringRef file,
+        const RefoldModel::CondGroup &group, uint64_t sourceBegin,
+        uint64_t sourceEnd) const {
+  if (!paths_.PathsEqual(group.file, file))
+    return false;
+  if (!group.parentIncludeId || *group.parentIncludeId != currentInclude.id)
+    return false;
+  if (group.groupB >= group.groupE || sourceBegin >= sourceEnd ||
+      sourceBegin < group.groupB || sourceEnd > group.groupE)
+    return false;
+
+  // Selected-material overlap does not by itself mean that a widened source
+  // edit crosses conditional-control structure.  A candidate inside one
+  // selected arm may retain the surrounding wrapper unchanged.  The caller's
+  // normal source-envelope gap proof still rejects any conditional directive or
+  // other stateful source structure crossed between candidate pieces.
+  for (const RefoldModel::CondArm &arm : group.arms) {
+    if (!arm.selected || arm.bodyB > arm.bodyE ||
+        arm.bodyB < group.groupB || arm.bodyE > group.groupE)
+      continue;
+    if (arm.bodyB <= sourceBegin && sourceEnd <= arm.bodyE)
+      return true;
+  }
+  return false;
+}
+
+bool RefoldHeaderIncludeEditPlanner::
     HeaderConditionalGroupSelectedMaterialOverlaps(
         const RefoldModel::IncludeItem &currentInclude, StringRef file,
         const RefoldModel::CondGroup &group, uint64_t materialBeginA,
@@ -1211,6 +1239,23 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
     hasPartialMacroInvocationOverlap = true;
   }
 
+  // Classify incomplete conditional overlap against the candidate source
+  // envelope formed before adding conditional wrappers.  This lets an outer
+  // selected arm remain in place around an interior cross-declaration edit,
+  // while malformed or non-contiguous candidates continue to fail closed.
+  std::optional<SourceEnvelopeInterval> preConditionalSourceEnvelope;
+  {
+    SmallVector<HeaderSourceEnvelopePiece, 8> sourcePieces = hunkSourcePieces;
+    if (sourcePieces.size() >= 2 &&
+        normalizeSourceEnvelopePieces(sourcePieces,
+                                      HeaderSourceEnvelopePieceKindPrecedes,
+                                      HeaderSourceEnvelopePieceContains)) {
+      preConditionalSourceEnvelope = {
+          sourceEnvelopePieceBegin(sourcePieces.front()),
+          sourceEnvelopePieceEnd(sourcePieces.back())};
+    }
+  }
+
   for (const auto &group : model_.GetConds()) {
     if (!HeaderConditionalGroupSelectedMaterialOverlaps(
             state.include, state.file, group, fullLo, fullHi))
@@ -1224,9 +1269,19 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
       continue;
     }
 
-    // The hunk touches selected conditional output but does not consume the
-    // selected arm. Do not widen across the directive wrapper unless a
-    // coalesced patch can prove the whole group is replaced.
+    // A conditional group that merely encloses the candidate is not source
+    // structure crossed by the edit.  Keep its directives untouched and let
+    // the ordinary source-envelope gap proof certify every byte between the
+    // mapped pieces.  If no normalized candidate exists, or the candidate is
+    // not wholly inside one selected arm, preserve the existing fail-closed
+    // whole-include realization path.
+    if (preConditionalSourceEnvelope &&
+        HeaderSourceEnvelopeIsInsideSelectedConditionalArm(
+            state.include, state.file, group,
+            preConditionalSourceEnvelope->begin,
+            preConditionalSourceEnvelope->end))
+      continue;
+
     hasPartialConditionalGroupOverlap = true;
   }
 
