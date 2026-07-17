@@ -2759,9 +2759,24 @@ HigherOrderGeneratedReplayProbe::TryBuildTupleGeneratedCalleeReplay(
     const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
     ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
   if (!invocation.definitionDirectiveId || !invocation.invB ||
-      !invocation.invE || !invocation.stringifySpans.empty() ||
-      !invocation.pasteSpans.empty())
+      !invocation.invE || !invocation.stringifySpans.empty())
     return std::nullopt;
+
+  // Do not reject merely because the root invocation reports paste spans.  The
+  // producer records descendant paste uses on the forwarding root when a tuple
+  // element selects a pasted generated callee, for example
+  //
+  //   #define CATUSE(x) x##Tail + x
+  //   #define CALL(f, t) f t
+  //   #define WRAP(p) CALL p
+  //
+  //   WRAP((CATUSE, (foo)))
+  //
+  // In that shape the root replacement list is still the ordinary tuple
+  // forwarder `CALL p`; the paste belongs to the terminal generated callee and
+  // is replayed by `BuildTupleGeneratedCalleeReplayCandidate`.  The structural
+  // root-definition checks below still fail closed for roots whose own
+  // replacement list is not the narrow literal-forwarder shape.
 
   auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
   if (!cover || cover->first >= cover->second)
