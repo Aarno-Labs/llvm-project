@@ -382,6 +382,11 @@ private:
       llvm::StringRef baseInvocationText,
       llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
 
+  std::optional<MacroPatch> TryBuildFunctionSelectorTupleGeneratedCalleeReplay(
+      const RefoldModel::MacroInvocation &invocation,
+      llvm::StringRef baseInvocationText,
+      llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
+
   const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps_;
 };
 

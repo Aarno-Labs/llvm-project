@@ -2360,6 +2360,11 @@ std::optional<MacroPatch> HigherOrderGeneratedReplayProbe::TryBuild(
               invocation, baseInvocationText, invocationArgRanges))
     return objectSelectorTupleGeneratedPatch;
 
+  if (auto functionSelectorTupleGeneratedPatch =
+          TryBuildFunctionSelectorTupleGeneratedCalleeReplay(
+              invocation, baseInvocationText, invocationArgRanges))
+    return functionSelectorTupleGeneratedPatch;
+
   if (auto pasteTupleGeneratedPatch = TryBuildPasteTupleGeneratedCalleeReplay(
           invocation, baseInvocationText, invocationArgRanges))
     return pasteTupleGeneratedPatch;
@@ -2695,6 +2700,40 @@ HigherOrderGeneratedReplayProbe::TryBuildPasteGeneratedCalleeReplay(
       *rootDefinition};
   return deps_.generatedCalleeReplayEngine
       .BuildPasteGeneratedCalleeReplayCandidate(pasteGeneratedContext);
+}
+
+
+/// Try the function-selector/tuple generated-callee theorem for roots such as
+/// `sel(ADD, SUB) t`, where the source selector actual is itself a
+/// function-like selector macro (`SELECT_LEFT`, `SELECT_RIGHT`, etc.).
+std::optional<MacroPatch>
+HigherOrderGeneratedReplayProbe::TryBuildFunctionSelectorTupleGeneratedCalleeReplay(
+    const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
+  if (!invocation.definitionDirectiveId || !invocation.invB ||
+      !invocation.invE)
+    return std::nullopt;
+
+  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
+  if (!cover || cover->first >= cover->second)
+    return std::nullopt;
+
+  auto bEnv = MapWholeCoverBEnvelope(*cover);
+  if (!bEnv)
+    return std::nullopt;
+
+  const RefoldModel::MacroDirective *rootDefinition =
+      FindRootDefinition(invocation);
+  if (!rootDefinition || rootDefinition->subkind != "#define" ||
+      !rootDefinition->functionLike)
+    return std::nullopt;
+
+  FunctionSelectorTupleGeneratedCalleeReplayContext selectorTupleContext{
+      invocation, baseInvocationText, invocationArgRanges, *cover, *bEnv,
+      *rootDefinition};
+  return deps_.generatedCalleeReplayEngine
+      .BuildFunctionSelectorTupleGeneratedCalleeReplayCandidate(
+          selectorTupleContext);
 }
 
 /// Try the paste/tuple generated-callee theorem for roots such as `a##b t`.

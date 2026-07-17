@@ -213,6 +213,29 @@ struct PasteGeneratedCalleeReplayContext {
   const RefoldModel::MacroDirective &rootDefinition;
 };
 
+
+/// Explicit root state for function-selector tuple generated-callee replay.
+///
+/// This replay handles roots shaped like `selector(A, B, ...) tuple`, where
+/// the source selector actual is itself a function-like selector macro such as
+/// `SELECT_LEFT` or `SELECT_RIGHT`.  The selector is replayed through
+/// producer replacement-list facts to choose one literal callee name, and the
+/// tuple actual supplies the selected callee's macro actuals.
+struct FunctionSelectorTupleGeneratedCalleeReplayContext {
+  /// Root invocation whose function-selector generated callee is replayed.
+  const RefoldModel::MacroInvocation &invocation;
+  /// Complete source spelling of the root invocation.
+  llvm::StringRef baseInvocationText;
+  /// Formal-content byte ranges inside `baseInvocationText`.
+  llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges;
+  /// Whole-cover A-token envelope for the root invocation.
+  const std::pair<uint64_t, uint64_t> &wholeCoverATokens;
+  /// B-token envelope being realized by function-selector/tuple replay.
+  const std::pair<size_t, size_t> &bTokenEnvelope;
+  /// Macro definition at the function-selector/tuple replay root.
+  const RefoldModel::MacroDirective &rootDefinition;
+};
+
 /// Explicit root state for object-selector tuple generated-callee replay.
 ///
 /// This replay handles roots shaped like `f t` when `f` is a source-spelled
@@ -351,6 +374,12 @@ public:
   /// for a non-terminal miss.
   std::optional<MacroPatch> BuildPasteGeneratedCalleeReplayCandidate(
       const PasteGeneratedCalleeReplayContext &ctx) const;
+
+  /// Build the function-selector tuple generated-callee replay candidate.
+  /// Returns nullopt for a non-terminal miss.
+  std::optional<MacroPatch>
+  BuildFunctionSelectorTupleGeneratedCalleeReplayCandidate(
+      const FunctionSelectorTupleGeneratedCalleeReplayContext &ctx) const;
 
   /// Build the object-selector tuple generated-callee replay candidate. Returns
   /// nullopt for a non-terminal miss.
