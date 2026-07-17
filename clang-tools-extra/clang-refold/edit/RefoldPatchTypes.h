@@ -152,6 +152,22 @@ struct WholeCoverCertificate {
   uint64_t bAdjHi = 0;
 };
 
+/// Supplemental TU byte edit that is semantically attached to a macro patch.
+///
+/// These edits are intentionally narrow and rare: they let a certified macro
+/// proof preserve a callsite while also changing a macro-state selector that
+/// the preserved callsite observes.  The edit is staged as an ordinary TU text
+/// edit during final emission, while the owning MacroPatch still carries the
+/// B-surface materialization witness.
+struct SupplementalMacroTUEdit {
+  /// Half-open TU source-byte range replaced by this auxiliary edit.
+  uint64_t start = 0;
+  /// Exclusive end of the replaced TU source-byte range.
+  uint64_t end = 0;
+  /// Replacement bytes to splice at `[start, end)`.
+  std::string text;
+};
+
 /// Candidate macro-owned source replacement before final emission.
 struct MacroPatch {
   /// A-side token interval for the physical macro invocation being patched.
@@ -203,6 +219,12 @@ struct MacroPatch {
 
   /// Owner/conditional-arm certificate for the patch surface, when proven.
   OwnerCertificate ownerCert = {};
+
+  /// Additional TU edits that must be emitted with this macro patch to preserve
+  /// the macro-state selector proven by the patch.  These edits must not
+  /// overlap the primary invocation replacement; final emission validates that
+  /// at staging time.
+  std::vector<SupplementalMacroTUEdit> supplementalTUEdits = {};
 };
 
 /// Candidate include-owned source replacement before materialization/emission.

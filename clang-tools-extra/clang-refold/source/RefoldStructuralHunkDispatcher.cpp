@@ -197,6 +197,24 @@ void RefoldStructuralHunkDispatcher::MergeMaterializedBTokenRangeFromSlot(
     }
   }
 
+  if (slot.existingPatch) {
+    for (const SupplementalMacroTUEdit &existingEdit :
+         slot.existingPatch->supplementalTUEdits) {
+      bool alreadyPresent = false;
+      for (const SupplementalMacroTUEdit &patchEdit :
+           patch.supplementalTUEdits) {
+        if (patchEdit.start == existingEdit.start &&
+            patchEdit.end == existingEdit.end &&
+            patchEdit.text == existingEdit.text) {
+          alreadyPresent = true;
+          break;
+        }
+      }
+      if (!alreadyPresent)
+        patch.supplementalTUEdits.push_back(existingEdit);
+    }
+  }
+
   if (!patch.materialized.hasBTokenRange) {
     patch.materialized.hasBTokenRange = true;
     patch.materialized.bTokStart = hunk.bStart;
