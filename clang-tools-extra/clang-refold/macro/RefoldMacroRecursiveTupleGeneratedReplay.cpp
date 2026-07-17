@@ -30,6 +30,7 @@
 #include "llvm/Support/ErrorHandling.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -40,13 +41,19 @@ namespace clang {
 namespace refold {
 namespace {
 
-/// Maximum recursive tuple-forwarding ancestry depth accepted from a map.
+/// Return an acyclic traversal bound derived from the producer graph size.
 ///
-/// The bound protects the consumer from malformed producer graphs while staying
-/// well above normal macro-forwarding chains.  A path that reaches the bound is
-/// rejected rather than truncated, because skipping part of the ancestry would
-/// weaken the recursive generated-callee theorem.
-constexpr unsigned RecursiveTupleForwardingDepthLimit = 64;
+/// Recursive tuple replay still needs a finite traversal bound, but a fixed
+/// small constant is not part of the theorem: an exact forwarding chain can be
+/// arbitrarily long in valid source.  The graph already rejects active-stack
+/// cycles, so the remaining deterministic bound is the number of unique
+/// producer-recorded macro invocations.  Any acyclic path longer than that would
+/// necessarily repeat an invocation and is therefore malformed.
+static unsigned maxAcyclicTraversalDepth(size_t invocationCount) {
+  if (invocationCount > std::numeric_limits<unsigned>::max())
+    return std::numeric_limits<unsigned>::max();
+  return static_cast<unsigned>(invocationCount);
+}
 
 /// Deterministic graph view over producer-recorded macro invocation ancestry.
 ///
@@ -133,20 +140,25 @@ public:
   ///
   /// This helper performs the graph-level rejection required before later
   /// theorem composition.  Revisiting an invocation ID on the active DFS stack
-  /// rejects the candidate path outright; exceeding the hard depth limit is
-  /// also treated as a malformed graph rather than an invitation to continue
-  /// with partial evidence.
+  /// rejects the candidate path outright; exceeding the graph-derived acyclic
+  /// depth bound is also malformed because it would require an invocation to
+  /// appear twice on one producer ancestry path.
   bool HasAcyclicBoundedDescendants(
       const RefoldModel::MacroInvocation &root) const {
     llvm::DenseSet<uint64_t> active;
     return HasAcyclicBoundedDescendants(root, 0, active);
   }
 
+  /// Maximum depth of any acyclic invocation path in this producer graph.
+  unsigned MaxAcyclicTraversalDepth() const {
+    return maxAcyclicTraversalDepth(invocationsById_.size());
+  }
+
 private:
   bool HasAcyclicBoundedDescendants(
       const RefoldModel::MacroInvocation &invocation, unsigned depth,
       llvm::DenseSet<uint64_t> &active) const {
-    if (depth >= RecursiveTupleForwardingDepthLimit ||
+    if (depth >= MaxAcyclicTraversalDepth() ||
         duplicateInvocationIds_.count(invocation.id))
       return false;
     if (!active.insert(invocation.id).second)
@@ -476,7 +488,7 @@ private:
       const ComposedFormalState &state, unsigned depth,
       llvm::DenseSet<uint64_t> &active,
       llvm::SmallVectorImpl<ComposedFormalState> &states) const {
-    if (!state.invocation || depth >= RecursiveTupleForwardingDepthLimit)
+    if (!state.invocation || depth >= graph_.MaxAcyclicTraversalDepth())
       return false;
     if (!active.insert(state.invocation->id).second)
       return false;
@@ -1177,7 +1189,7 @@ private:
       const GeneratedTupleFormalState &state, unsigned depth,
       llvm::SmallVectorImpl<ComposedGeneratedCalleePath> &paths) const {
     if (!state.invocation || !state.definition ||
-        depth >= RecursiveTupleForwardingDepthLimit)
+        depth >= graph_.MaxAcyclicTraversalDepth())
       return false;
 
     bool sawGeneratedCalleeChild = false;
