@@ -1423,7 +1423,7 @@ private:
 
     StringRef payload = trimmed.drop_front().drop_back();
     SmallVector<TupleElementSlice, 8> pieces;
-    if (!splitTopLevelTupleElementsWithLexer(payload, deps_.lexLang, pieces))
+    if (!splitTopLevelMacroActualsWithLexer(payload, deps_.lexLang, pieces))
       return false;
     for (size_t i = 0; i < pieces.size(); ++i)
       out.push_back(TupleElementText(payload, pieces, i));

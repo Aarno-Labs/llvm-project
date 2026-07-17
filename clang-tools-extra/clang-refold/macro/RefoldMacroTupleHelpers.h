@@ -42,6 +42,15 @@ bool splitTopLevelTupleElementsWithLexer(
     llvm::StringRef text, const clang::LangOptions &lang,
     llvm::SmallVectorImpl<TupleElementSlice> &out);
 
+/// Split a parenthesized macro-call actual payload into top-level actuals.
+///
+/// Unlike caller tuple elements, macro actual slots may be intentionally empty,
+/// as in `F(, x)`.  This helper therefore preserves empty trimmed ranges while
+/// retaining the same lexer-aware top-level comma handling used for tuples.
+bool splitTopLevelMacroActualsWithLexer(
+    llvm::StringRef text, const clang::LangOptions &lang,
+    llvm::SmallVectorImpl<TupleElementSlice> &out);
+
 } // namespace refold
 } // namespace clang
 

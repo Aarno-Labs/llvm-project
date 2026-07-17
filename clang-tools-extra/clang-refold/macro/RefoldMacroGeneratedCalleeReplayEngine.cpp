@@ -1922,7 +1922,7 @@ bool collectParenthesizedTupleGeneratedActuals(
 
   StringRef payload = trimmed.drop_front().drop_back();
   SmallVector<TupleElementSlice, 8> pieces;
-  if (!splitTopLevelTupleElementsWithLexer(payload, lexLang, pieces))
+  if (!splitTopLevelMacroActualsWithLexer(payload, lexLang, pieces))
     return false;
   for (const TupleElementSlice &piece : pieces)
     out.push_back(payload.slice(piece.trimBegin, piece.trimEnd).trim().str());

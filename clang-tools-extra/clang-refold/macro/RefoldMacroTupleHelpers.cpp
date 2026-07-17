@@ -21,27 +21,32 @@ namespace refold {
 
 namespace {
 
-/// Build a tuple-element slice and reject elements whose trimmed payload is
-/// empty.  Empty elements would make old/new tuple matching ambiguous.
-bool computeTrimmedTupleElement(StringRef text, size_t begin, size_t end,
-                                TupleElementSlice &out) {
+/// Build one comma-separated element slice and optionally accept an empty
+/// trimmed payload.
+///
+/// Caller tuple elements reject empty payloads because an empty tuple slot does
+/// not identify a source-edit obligation by itself.  Macro-call actual lists are
+/// different: an empty actual is a real positional argument, as in `F(, x)`, and
+/// must be preserved so the callee's formal slots remain aligned.
+bool computeTrimmedCommaElement(StringRef text, size_t begin, size_t end,
+                                bool allowEmpty, TupleElementSlice &out) {
   out.begin = begin;
   out.end = end;
   out.trimBegin = begin;
   out.trimEnd = end;
   std::tie(out.trimBegin, out.trimEnd) =
       stringutils::trimWsRange(text, begin, end);
-  return out.trimBegin != out.trimEnd;
+  return allowEmpty || out.trimBegin != out.trimEnd;
 }
 
-} // namespace
-
-bool splitTopLevelTupleElementsWithLexer(
-    StringRef text, const LangOptions &lang,
+/// Lexer-aware top-level comma splitter shared by tuple and macro-actual
+/// parsing.  `allowEmpty` is the only policy difference between the two uses.
+bool splitTopLevelCommaSeparatedElements(
+    StringRef text, const LangOptions &lang, bool allowEmpty,
     SmallVectorImpl<TupleElementSlice> &out) {
   out.clear();
 
-  if (text.empty())
+  if (text.empty() && !allowEmpty)
     return false;
 
   const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
@@ -95,7 +100,8 @@ bool splitTopLevelTupleElementsWithLexer(
     case tok::comma:
       if (parenDepth == 0 && bracketDepth == 0 && braceDepth == 0) {
         TupleElementSlice elem;
-        if (!computeTrimmedTupleElement(text, elementBegin, tokBegin, elem))
+        if (!computeTrimmedCommaElement(text, elementBegin, tokBegin,
+                                        allowEmpty, elem))
           return false;
         out.push_back(elem);
 
@@ -108,11 +114,28 @@ bool splitTopLevelTupleElementsWithLexer(
   }
 
   TupleElementSlice elem;
-  if (!computeTrimmedTupleElement(text, elementBegin, text.size(), elem))
+  if (!computeTrimmedCommaElement(text, elementBegin, text.size(), allowEmpty,
+                                  elem))
     return false;
   out.push_back(elem);
 
   return true;
+}
+
+} // namespace
+
+bool splitTopLevelTupleElementsWithLexer(
+    StringRef text, const LangOptions &lang,
+    SmallVectorImpl<TupleElementSlice> &out) {
+  return splitTopLevelCommaSeparatedElements(text, lang, /*allowEmpty=*/false,
+                                             out);
+}
+
+bool splitTopLevelMacroActualsWithLexer(
+    StringRef text, const LangOptions &lang,
+    SmallVectorImpl<TupleElementSlice> &out) {
+  return splitTopLevelCommaSeparatedElements(text, lang, /*allowEmpty=*/true,
+                                             out);
 }
 
 } // namespace refold
