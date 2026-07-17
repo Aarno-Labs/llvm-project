@@ -655,6 +655,32 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
       planningCtx.rootHasDirectArgLikeSurface ? 1 : 0,
       planningCtx.directRootPreservationInadmissible ? 1 : 0);
 
+  // Literal sibling terminal tuple replay is more specific than ordinary
+  // args-only assignment.  A root such as `BOTH(t) -> DECL t NAME t` can have
+  // one terminal proving a tuple element through paste and another proving the
+  // same element through stringification.  Ordinary args-only may update only a
+  // later standard occurrence and leave the shared tuple selector stale, so try
+  // the producer-backed sibling theorem before final selection can commit the
+  // partial root rewrite.
+  if (m.subkind == "func") {
+    if (std::optional<MacroPatch> siblingTerminalPatch =
+            planner_->TryBuildTupleSiblingTerminalReplayPatch(m, h,
+                                                              baseInvText)) {
+      REFOLD_LOG_TRACE(
+          "macro/whole-cover",
+          "sibling-tuple-terminal-accepted inv id={0} name={1} replacement='{2}'",
+          m.id, m.name,
+          stringutils::showWsWithClip(siblingTerminalPatch->replacement, 220));
+      patchReusePhase_.MergeCurrentRootWithExistingCallsitePatch(
+          planningCtx, *siblingTerminalPatch);
+      if (!conflictingConcreteSubtreeWitnessForcesWholeCover) {
+        argsOnlyCandidate.reset();
+        dagRootCandidate = std::move(*siblingTerminalPatch);
+        reuseExistingCallsitePatch = false;
+      }
+    }
+  }
+
   // Higher-order generated-callee replay normally lives inside the standard
   // args-only ranking slot because many generated-callee edits are observed
   // through root actuals.  Some generated-callee selectors are body-owned at

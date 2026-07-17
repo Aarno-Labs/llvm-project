@@ -370,6 +370,30 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
       return false;
     };
 
+    // A complete same-root owner proof is stronger than a later local
+    // args-only repair that does not carry its own complete-envelope witness.
+    // In multi-terminal tuple cases the first pass may already prove the
+    // entire invocation, including sibling paste/stringify effects.  A later
+    // ordinary standard-argument hunk can be rebuilt from the original
+    // invocation spelling and would otherwise merge over the existing patch,
+    // regressing tuple elements outside the local hunk.  Keep the complete
+    // existing proof before attempting text merge; the merge helper only
+    // reasons about source bytes, not about whether the fresh candidate was
+    // derived from stale root spelling.
+    const bool existingPatchHasCompleteEnvelope =
+        existingPatch->materialized.hasBTokenRange &&
+        existingPatch->materialized.bTokStart <= h.bStart &&
+        h.bEnd <= existingPatch->materialized.bTokEnd &&
+        existingPatch->proof.wholeEnvelopeReplay &&
+        existingPatch->proof.wholeEnvelopeReplay->replayValidated;
+    const bool directPatchHasCompleteEnvelope =
+        argsOnlyCandidate->proof.wholeEnvelopeReplay &&
+        argsOnlyCandidate->proof.wholeEnvelopeReplay->replayValidated;
+    if (existingPatchHasCompleteEnvelope && !directPatchHasCompleteEnvelope) {
+      argsOnlyCandidate.reset();
+      reuseExistingCallsitePatch = true;
+    } else {
+
     // If an earlier structure-preserving patch already materializes a B-token
     // envelope that covers this hunk, do not automatically freeze it.  The
     // covered-envelope fact proves that both patches talk about the same B
@@ -417,32 +441,58 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
         reuseExistingCallsitePatch = false;
         existingCallsitePatchAbsorbedByDirectCandidate = true;
       } else {
-        // If the patches cannot be merged, check whether the direct candidate
-        // is independently valid. An invalid direct replay is discarded so
-        // the existing callsite patch remains available to the final
-        // selector.
-        const bool directValid =
-            deps_.patchReusePhase.ValidateMergedDirectAndDagRootReplacement(
-                m, baseInvText, StringRef(argsOnlyCandidate->replacement));
-        if (!directValid) {
+        // If the older same-root callsite patch carries a complete
+        // whole-envelope replay that already covers this B hunk, keep that
+        // stronger proof ahead of a fresh local args-only repair.  This is the
+        // sibling-terminal tuple case: the first pass can prove the complete
+        // tuple rewrite from paste/stringify sibling evidence, while a later
+        // ordinary standard-argument hunk can rebuild the same invocation from
+        // the original tuple spelling and accidentally revert an earlier tuple
+        // element.  Prefer the existing patch only when it has the stronger
+        // whole-envelope witness and the fresh candidate does not; two
+        // competing complete-envelope proofs still fall through to the normal
+        // lattice comparison below.
+        const bool existingHasCompleteEnvelope =
+            existingPatch->materialized.hasBTokenRange &&
+            existingPatch->materialized.bTokStart <= h.bStart &&
+            h.bEnd <= existingPatch->materialized.bTokEnd &&
+            existingPatch->proof.wholeEnvelopeReplay &&
+            existingPatch->proof.wholeEnvelopeReplay->replayValidated;
+        const bool directHasCompleteEnvelope =
+            argsOnlyCandidate->proof.wholeEnvelopeReplay &&
+            argsOnlyCandidate->proof.wholeEnvelopeReplay->replayValidated;
+        if (existingHasCompleteEnvelope && !directHasCompleteEnvelope) {
           argsOnlyCandidate.reset();
           reuseExistingCallsitePatch = true;
         } else {
-          // Both candidates are individually viable but not merge-compatible.
-          // Defer to the proof lattice rather than letting the direct replay
-          // win merely because it was produced in this local path.
-          const bool preferDirect =
-              deps_.proofLattice.AcceptedResultRanker().LatticePrefers(
-                  argsOnlyCandidate->proofSummary, existingPatch->proofSummary);
-          const bool preferExisting =
-              deps_.proofLattice.AcceptedResultRanker().LatticePrefers(
-                  existingPatch->proofSummary, argsOnlyCandidate->proofSummary);
-          if (preferExisting && !preferDirect) {
+          // If the patches cannot be merged, check whether the direct candidate
+          // is independently valid. An invalid direct replay is discarded so
+          // the existing callsite patch remains available to the final
+          // selector.
+          const bool directValid =
+              deps_.patchReusePhase.ValidateMergedDirectAndDagRootReplacement(
+                  m, baseInvText, StringRef(argsOnlyCandidate->replacement));
+          if (!directValid) {
             argsOnlyCandidate.reset();
             reuseExistingCallsitePatch = true;
+          } else {
+            // Both candidates are individually viable but not merge-compatible.
+            // Defer to the proof lattice rather than letting the direct replay
+            // win merely because it was produced in this local path.
+            const bool preferDirect =
+                deps_.proofLattice.AcceptedResultRanker().LatticePrefers(
+                    argsOnlyCandidate->proofSummary, existingPatch->proofSummary);
+            const bool preferExisting =
+                deps_.proofLattice.AcceptedResultRanker().LatticePrefers(
+                    existingPatch->proofSummary, argsOnlyCandidate->proofSummary);
+            if (preferExisting && !preferDirect) {
+              argsOnlyCandidate.reset();
+              reuseExistingCallsitePatch = true;
+            }
           }
         }
       }
+    }
     }
   }
 

@@ -215,6 +215,244 @@ RefoldMacroPatchPlanner::DefinitionTapeSolver() const {
        deps_.proofLattice, deps_.lexLang, deps_.strict});
 }
 
+
+namespace {
+
+/// One proven replacement for an exact byte slice inside a root tuple actual.
+///
+/// The byte coordinates are relative to the complete source-spelled root actual
+/// including its outer parentheses.  Multiple terminal children may prove the
+/// same slice; they must agree byte-for-byte, and overlapping distinct slices
+/// are rejected so tuple reconstruction never chooses an arbitrary owner.
+struct TupleSiblingTerminalConstraint {
+  uint32_t rootArgIdx = 0;
+  uint32_t byteBegin = 0;
+  uint32_t byteEnd = 0;
+  std::string replacement;
+};
+
+/// Cached replay facts for one literal terminal child of a tuple-forwarding
+/// root.  The sibling-terminal theorem needs to compare root-level forwarded
+/// argument spans with child tuple references; keeping the recovered child
+/// actuals next to the child definition avoids recomputing them and lets root
+/// standard spans be resolved through the same producer tuple facts as paste
+/// and stringification spans.
+struct TupleSiblingTerminalChildInfo {
+  const RefoldModel::MacroInvocation *child = nullptr;
+  const RefoldModel::MacroDirective *definition = nullptr;
+  SmallVector<std::string, 8> oldActuals;
+};
+
+bool spanCoversHunk(const RefoldModel::PPSpan &span,
+                    const diffutils::Hunk &hunk) {
+  return span.begin <= hunk.aStart && hunk.aEnd <= span.end;
+}
+
+bool addTupleSiblingTerminalConstraint(
+    llvm::SmallVectorImpl<TupleSiblingTerminalConstraint> &constraints,
+    uint32_t rootArgIdx, uint32_t byteBegin, uint32_t byteEnd,
+    llvm::StringRef replacement) {
+  if (byteEnd < byteBegin)
+    return false;
+
+  for (const TupleSiblingTerminalConstraint &existing : constraints) {
+    if (existing.rootArgIdx != rootArgIdx)
+      continue;
+    const bool overlaps = byteBegin < existing.byteEnd &&
+                          existing.byteBegin < byteEnd;
+    if (!overlaps)
+      continue;
+
+    // Repeated terminals are allowed to prove the exact same tuple element,
+    // but they must agree on the replacement spelling.  Partial overlaps would
+    // require a nested edit composition theorem and therefore fail closed here.
+    if (existing.byteBegin != byteBegin || existing.byteEnd != byteEnd ||
+        existing.replacement != replacement)
+      return false;
+    return true;
+  }
+
+  constraints.push_back(TupleSiblingTerminalConstraint{
+      rootArgIdx, byteBegin, byteEnd, replacement.trim().str()});
+  return true;
+}
+
+const RefoldModel::MacroDirective *findDefinitionDirectiveById(
+    const RefoldModel &model, uint64_t directiveId) {
+  for (const RefoldModel::MacroDirective &directive :
+       model.GetMacroDirectives())
+    if (directive.id == directiveId && directive.subkind == "#define")
+      return &directive;
+  return nullptr;
+}
+
+std::optional<std::string> recoverNormalizedChildActual(
+    const RefoldModel::MacroInvocation &child, uint32_t argIdx) {
+  if (!child.normalizedInvText || argIdx >= child.normalizedInvArgTextRanges.size())
+    return std::nullopt;
+
+  const auto &range = child.normalizedInvArgTextRanges[argIdx];
+  if (!range.first || !range.second || *range.second < *range.first ||
+      *range.second > child.normalizedInvText->size())
+    return std::nullopt;
+
+  return child.normalizedInvText
+      ->slice(static_cast<size_t>(*range.first),
+              static_cast<size_t>(*range.second))
+      .trim()
+      .str();
+}
+
+std::optional<RefoldModel::TupleArgRef> recoverUniqueTupleRefForChildFormal(
+    const RefoldModel::MacroInvocation &child, uint32_t argIdx) {
+  if (argIdx >= child.argTupleRefs.size() ||
+      child.argTupleRefs[argIdx].size() != 1)
+    return std::nullopt;
+  return child.argTupleRefs[argIdx].front();
+}
+
+bool tupleRefMatchesOldActual(llvm::StringRef rootActualText,
+                              const RefoldModel::TupleArgRef &tupleRef,
+                              llvm::StringRef oldActual) {
+  if (tupleRef.callerByteEnd < tupleRef.callerByteBegin ||
+      tupleRef.callerByteEnd > rootActualText.size())
+    return false;
+  return rootActualText
+             .slice(tupleRef.callerByteBegin, tupleRef.callerByteEnd)
+             .trim() == oldActual.trim();
+}
+
+bool tupleSiblingTerminalConstraintReverseLess(
+    const TupleSiblingTerminalConstraint &lhs,
+    const TupleSiblingTerminalConstraint &rhs) {
+  if (lhs.byteBegin != rhs.byteBegin)
+    return lhs.byteBegin > rhs.byteBegin;
+  return lhs.byteEnd > rhs.byteEnd;
+}
+
+bool addChildTupleSiblingTerminalConstraint(
+    llvm::SmallVectorImpl<TupleSiblingTerminalConstraint> &constraints,
+    const RefoldModel::MacroInvocation &child,
+    const RefoldModel::MacroDirective &childDefinition,
+    llvm::ArrayRef<std::string> oldChildActuals,
+    llvm::ArrayRef<std::pair<size_t, size_t>> rootArgRanges,
+    llvm::StringRef baseInvocationText, uint32_t argIdx,
+    llvm::StringRef replacement, const clang::LangOptions &lexLang) {
+  if (argIdx >= oldChildActuals.size() ||
+      argIdx >= childDefinition.defParams.size())
+    return false;
+
+  std::optional<RefoldModel::TupleArgRef> tupleRef =
+      recoverUniqueTupleRefForChildFormal(child, argIdx);
+  if (!tupleRef || tupleRef->callerParamIndex >= rootArgRanges.size())
+    return false;
+
+  const auto rootRange = rootArgRanges[tupleRef->callerParamIndex];
+  if (rootRange.second < rootRange.first ||
+      rootRange.second > baseInvocationText.size())
+    return false;
+  llvm::StringRef rootActualText =
+      baseInvocationText.slice(rootRange.first, rootRange.second);
+  if (!tupleRefMatchesOldActual(rootActualText, *tupleRef,
+                                oldChildActuals[argIdx]))
+    return false;
+
+  if (!childDefinition.defParams[argIdx].variadic &&
+      replacementIntroducesTopLevelComma(replacement, lexLang))
+    return false;
+
+  return addTupleSiblingTerminalConstraint(
+      constraints, tupleRef->callerParamIndex, tupleRef->callerByteBegin,
+      tupleRef->callerByteEnd, replacement);
+}
+
+
+bool tupleSiblingConstraintSameSlice(
+    const TupleSiblingTerminalConstraint &lhs,
+    const TupleSiblingTerminalConstraint &rhs) {
+  return lhs.rootArgIdx == rhs.rootArgIdx && lhs.byteBegin == rhs.byteBegin &&
+         lhs.byteEnd == rhs.byteEnd;
+}
+
+bool addRootForwardedTupleSiblingTerminalConstraint(
+    llvm::SmallVectorImpl<TupleSiblingTerminalConstraint> &constraints,
+    llvm::ArrayRef<TupleSiblingTerminalChildInfo> childInfos,
+    llvm::ArrayRef<std::pair<size_t, size_t>> rootArgRanges,
+    llvm::StringRef baseInvocationText,
+    const RefoldModel::PPArgSpan &rootSpan, llvm::StringRef oldContribution,
+    llvm::StringRef replacement, const clang::LangOptions &lexLang) {
+  if (rootSpan.argIdx >= rootArgRanges.size())
+    return false;
+
+  SmallVector<TupleSiblingTerminalConstraint, 4> candidates;
+  for (const TupleSiblingTerminalChildInfo &childInfo : childInfos) {
+    if (!childInfo.child || !childInfo.definition)
+      return false;
+    for (uint32_t argIdx = 0; argIdx < childInfo.oldActuals.size(); ++argIdx) {
+      std::optional<RefoldModel::TupleArgRef> tupleRef =
+          recoverUniqueTupleRefForChildFormal(*childInfo.child, argIdx);
+      if (!tupleRef || tupleRef->callerParamIndex != rootSpan.argIdx ||
+          tupleRef->callerParamIndex >= rootArgRanges.size())
+        continue;
+
+      const auto rootRange = rootArgRanges[tupleRef->callerParamIndex];
+      if (rootRange.second < rootRange.first ||
+          rootRange.second > baseInvocationText.size())
+        return false;
+      llvm::StringRef rootActualText =
+          baseInvocationText.slice(rootRange.first, rootRange.second);
+      if (!tupleRefMatchesOldActual(rootActualText, *tupleRef,
+                                    childInfo.oldActuals[argIdx]))
+        continue;
+      if (oldContribution.trim() !=
+          llvm::StringRef(childInfo.oldActuals[argIdx]).trim())
+        continue;
+
+      if (argIdx >= childInfo.definition->defParams.size())
+        return false;
+      if (!childInfo.definition->defParams[argIdx].variadic &&
+          replacementIntroducesTopLevelComma(replacement, lexLang))
+        return false;
+
+      TupleSiblingTerminalConstraint candidate;
+      candidate.rootArgIdx = tupleRef->callerParamIndex;
+      candidate.byteBegin = tupleRef->callerByteBegin;
+      candidate.byteEnd = tupleRef->callerByteEnd;
+      candidate.replacement = replacement.trim().str();
+
+      bool duplicate = false;
+      for (const TupleSiblingTerminalConstraint &existing : candidates) {
+        if (!tupleSiblingConstraintSameSlice(existing, candidate))
+          continue;
+        if (existing.replacement != candidate.replacement)
+          return false;
+        duplicate = true;
+        break;
+      }
+      if (!duplicate)
+        candidates.push_back(std::move(candidate));
+    }
+  }
+
+  if (candidates.empty())
+    return false;
+
+  // A root-level standard span on a forwarded tuple formal does not identify a
+  // tuple element by itself.  It becomes safe only when the child tuple refs
+  // identify exactly one distinct source slice.  Repeated terminal children may
+  // prove the same slice; different matching slices would be ambiguous and must
+  // not be guessed from token spelling.
+  if (candidates.size() != 1)
+    return false;
+
+  const TupleSiblingTerminalConstraint &candidate = candidates.front();
+  return addTupleSiblingTerminalConstraint(
+      constraints, candidate.rootArgIdx, candidate.byteBegin,
+      candidate.byteEnd, candidate.replacement);
+}
+
+} // namespace
+
 RefoldMacroArgsOnlyTemplateSolver
 RefoldMacroPatchPlanner::TemplateSolver() const {
   return RefoldMacroArgsOnlyTemplateSolver(
@@ -969,6 +1207,284 @@ RefoldMacroPatchPlanner::BuildPasteAwareArgsOnlyPatch(
   // fall through to the standard (non-paste) args-only policy below.
 
   return ArgsOnlyPatchAttempt::ContinueSearchResult();
+}
+
+
+std::optional<MacroPatch>
+RefoldMacroPatchPlanner::TryBuildTupleSiblingTerminalReplayPatch(
+    const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
+    StringRef baseInvText) const {
+  (void)h;
+  if (m.subkind != "func" || !m.invB || !m.invE || !deps_.abTokHunks)
+    return std::nullopt;
+
+  std::optional<InvocationActualLayout> actualLayout =
+      RecoverInvocationActuals(m, baseInvText);
+  if (!actualLayout)
+    return std::nullopt;
+  ArrayRef<std::pair<size_t, size_t>> invArgRanges =
+      actualLayout->rangePairs();
+  if (invArgRanges.empty())
+    return std::nullopt;
+
+  SmallVector<diffutils::Hunk, 8> coverHunks;
+  for (const diffutils::Hunk &candidateHunk : *deps_.abTokHunks) {
+    if (m.Covers(candidateHunk.aStart, candidateHunk.aEnd))
+      coverHunks.push_back(candidateHunk);
+  }
+  if (coverHunks.empty())
+    return std::nullopt;
+
+  SmallVector<TupleSiblingTerminalChildInfo, 8> childInfos;
+  for (const RefoldModel::MacroInvocation &candidateChild :
+       deps_.model->GetMacroInvocations()) {
+    if (!candidateChild.callerMacroId || *candidateChild.callerMacroId != m.id)
+      continue;
+    if (candidateChild.subkind != "func" ||
+        !candidateChild.definitionDirectiveId ||
+        candidateChild.calleeOrigin.kind != MacroCalleeOriginKind::LiteralMacroName)
+      return std::nullopt;
+
+    const RefoldModel::MacroDirective *childDefinition =
+        findDefinitionDirectiveById(*deps_.model,
+                                    *candidateChild.definitionDirectiveId);
+    if (!childDefinition || !childDefinition->functionLike ||
+        childDefinition->defParams.size() != candidateChild.defParams.size())
+      return std::nullopt;
+
+    TupleSiblingTerminalChildInfo childInfo;
+    childInfo.child = &candidateChild;
+    childInfo.definition = childDefinition;
+    childInfo.oldActuals.reserve(childDefinition->defParams.size());
+    for (uint32_t argIdx = 0; argIdx < childDefinition->defParams.size();
+         ++argIdx) {
+      std::optional<std::string> oldActual =
+          recoverNormalizedChildActual(candidateChild, argIdx);
+      if (!oldActual)
+        return std::nullopt;
+      childInfo.oldActuals.push_back(std::move(*oldActual));
+    }
+    childInfos.push_back(std::move(childInfo));
+  }
+  if (childInfos.size() < 2)
+    return std::nullopt;
+
+  SmallVector<TupleSiblingTerminalConstraint, 8> constraints;
+  SmallVector<bool, 8> explainedHunks(coverHunks.size(), false);
+  bool usedPasteOrStringifyEvidence = false;
+
+  // A root argument span on a tuple-forwarding macro can represent a standard
+  // occurrence inside one of the literal sibling terminals.  Producers may not
+  // duplicate that standard span on the child invocation when the child was
+  // materialized from a tuple formal (`DECL t`).  Resolve such spans through the
+  // child arg_tuple_refs, and accept only if those refs identify one exact tuple
+  // slice; token spelling alone is never enough to choose among repeated tuple
+  // elements.
+  for (const RefoldModel::PPArgSpan &span : m.argSpans) {
+    for (size_t hunkIdx = 0; hunkIdx < coverHunks.size(); ++hunkIdx) {
+      const diffutils::Hunk &coverHunk = coverHunks[hunkIdx];
+      if (!spanCoversHunk(span, coverHunk))
+        continue;
+      std::optional<std::pair<size_t, size_t>> bEnv =
+          deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(span);
+      if (!bEnv || bEnv->second <= bEnv->first)
+        return std::nullopt;
+      StringRef oldContribution =
+          deps_.sourceMapper->SliceASource(span.begin, span.end).trim();
+      StringRef newContribution =
+          deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
+      if (!addRootForwardedTupleSiblingTerminalConstraint(
+              constraints, childInfos, invArgRanges, baseInvText, span,
+              oldContribution, newContribution, *deps_.lexLang))
+        return std::nullopt;
+      explainedHunks[hunkIdx] = true;
+    }
+  }
+
+  for (const TupleSiblingTerminalChildInfo &childInfo : childInfos) {
+    const RefoldModel::MacroInvocation &child = *childInfo.child;
+    const RefoldModel::MacroDirective &childDefinition = *childInfo.definition;
+    ArrayRef<std::string> oldChildActuals(childInfo.oldActuals);
+
+    for (const RefoldModel::PPArgSpan &span : child.argSpans) {
+      for (size_t hunkIdx = 0; hunkIdx < coverHunks.size(); ++hunkIdx) {
+        const diffutils::Hunk &coverHunk = coverHunks[hunkIdx];
+        if (!spanCoversHunk(span, coverHunk))
+          continue;
+        if (span.argIdx >= oldChildActuals.size())
+          return std::nullopt;
+        std::optional<std::pair<size_t, size_t>> bEnv =
+            deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(span);
+        if (!bEnv || bEnv->second <= bEnv->first)
+          return std::nullopt;
+        StringRef oldContribution =
+            deps_.sourceMapper->SliceASource(span.begin, span.end).trim();
+        if (oldContribution != StringRef(oldChildActuals[span.argIdx]).trim())
+          return std::nullopt;
+        StringRef newContribution =
+            deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
+        if (!addChildTupleSiblingTerminalConstraint(
+                constraints, child, childDefinition, oldChildActuals,
+                invArgRanges, baseInvText, span.argIdx, newContribution,
+                *deps_.lexLang))
+          return std::nullopt;
+        explainedHunks[hunkIdx] = true;
+      }
+    }
+
+    for (const RefoldModel::PPArgSpan &span : child.stringifySpans) {
+      for (size_t hunkIdx = 0; hunkIdx < coverHunks.size(); ++hunkIdx) {
+        const diffutils::Hunk &coverHunk = coverHunks[hunkIdx];
+        if (!spanCoversHunk(span, coverHunk))
+          continue;
+        std::optional<std::pair<size_t, size_t>> bEnv =
+            deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(span);
+        if (!bEnv || bEnv->second <= bEnv->first ||
+            bEnv->second - bEnv->first != 1)
+          return std::nullopt;
+        StringRef bString =
+            deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
+        std::optional<std::string> decoded =
+            deps_.argTextRecovery->UnstringifyLiteralToArgText(
+                bString, /*allowTopLevelComma=*/true);
+        if (!decoded)
+          return std::nullopt;
+        std::optional<std::string> canonical =
+            stringutils::canonicalizeStringifyInversePayload(*decoded);
+        if (!canonical || !addChildTupleSiblingTerminalConstraint(
+                constraints, child, childDefinition, oldChildActuals,
+                invArgRanges, baseInvText, span.argIdx, *canonical,
+                *deps_.lexLang))
+          return std::nullopt;
+        usedPasteOrStringifyEvidence = true;
+        explainedHunks[hunkIdx] = true;
+      }
+    }
+
+    for (size_t hunkIdx = 0; hunkIdx < coverHunks.size(); ++hunkIdx) {
+      const diffutils::Hunk &coverHunk = coverHunks[hunkIdx];
+      bool explainedByPaste = false;
+      std::optional<std::vector<PasteArgEdit>> pasteEdits =
+          PasteArgumentBuilder().DerivePasteArgEdits(child, coverHunk);
+      if (pasteEdits) {
+        for (const PasteArgEdit &edit : *pasteEdits) {
+          if (edit.argIdx >= oldChildActuals.size())
+            return std::nullopt;
+          StringRef baseArg = oldChildActuals[edit.argIdx];
+          std::string newArg =
+              (edit.argByteBegin && edit.argByteEnd)
+                  ? RefoldMacroPasteSpelling::
+                        SplicePasteSegmentIntoSpellingArgExact(
+                            baseArg, *edit.argByteBegin, *edit.argByteEnd,
+                            edit.oldSeg, edit.newSeg)
+                  : RefoldMacroPasteSpelling::SplicePasteSegmentIntoSpellingArg(
+                        baseArg, edit.oldSeg, edit.newSeg);
+          if (!addChildTupleSiblingTerminalConstraint(
+                  constraints, child, childDefinition, oldChildActuals,
+                  invArgRanges, baseInvText, edit.argIdx, newArg,
+                  *deps_.lexLang))
+            return std::nullopt;
+          explainedByPaste = true;
+        }
+      }
+
+      std::optional<PasteArgEdit> pasteEdit =
+          PasteArgumentBuilder().DerivePasteArgEdit(child, coverHunk);
+      if (pasteEdit) {
+        if (pasteEdit->argIdx >= oldChildActuals.size())
+          return std::nullopt;
+        StringRef baseArg = oldChildActuals[pasteEdit->argIdx];
+        std::string newArg =
+            (pasteEdit->argByteBegin && pasteEdit->argByteEnd)
+                ? RefoldMacroPasteSpelling::SplicePasteSegmentIntoSpellingArgExact(
+                      baseArg, *pasteEdit->argByteBegin, *pasteEdit->argByteEnd,
+                      pasteEdit->oldSeg, pasteEdit->newSeg)
+                : RefoldMacroPasteSpelling::SplicePasteSegmentIntoSpellingArg(
+                      baseArg, pasteEdit->oldSeg, pasteEdit->newSeg);
+        if (!addChildTupleSiblingTerminalConstraint(
+                constraints, child, childDefinition, oldChildActuals,
+                invArgRanges, baseInvText, pasteEdit->argIdx, newArg,
+                *deps_.lexLang))
+          return std::nullopt;
+        explainedByPaste = true;
+      }
+
+      if (explainedByPaste) {
+        usedPasteOrStringifyEvidence = true;
+        explainedHunks[hunkIdx] = true;
+      }
+    }
+  }
+
+  for (bool explained : explainedHunks)
+    if (!explained)
+      return std::nullopt;
+
+  if (constraints.empty() || !usedPasteOrStringifyEvidence)
+    return std::nullopt;
+
+  DenseMap<uint32_t, SmallVector<TupleSiblingTerminalConstraint, 4>>
+      constraintsByRootArg;
+  for (const TupleSiblingTerminalConstraint &constraint : constraints)
+    constraintsByRootArg[constraint.rootArgIdx].push_back(constraint);
+
+  DenseMap<uint32_t, std::string> replacementByRootArg;
+  for (auto &entry : constraintsByRootArg) {
+    const uint32_t rootArgIdx = entry.first;
+    if (rootArgIdx >= invArgRanges.size())
+      return std::nullopt;
+    const auto rootRange = invArgRanges[rootArgIdx];
+    if (rootRange.second < rootRange.first ||
+        rootRange.second > baseInvText.size())
+      return std::nullopt;
+
+    std::string rewrittenRootArg =
+        baseInvText.slice(rootRange.first, rootRange.second).str();
+    llvm::SmallVectorImpl<TupleSiblingTerminalConstraint> &rootConstraints =
+        entry.second;
+    llvm::sort(rootConstraints, tupleSiblingTerminalConstraintReverseLess);
+
+    uint32_t previousBegin = std::numeric_limits<uint32_t>::max();
+    for (const TupleSiblingTerminalConstraint &constraint : rootConstraints) {
+      if (constraint.byteEnd < constraint.byteBegin ||
+          constraint.byteEnd > rewrittenRootArg.size())
+        return std::nullopt;
+      if (previousBegin != std::numeric_limits<uint32_t>::max() &&
+          constraint.byteEnd > previousBegin)
+        return std::nullopt;
+      previousBegin = constraint.byteBegin;
+      rewrittenRootArg = stringutils::replaceRange(
+          rewrittenRootArg, constraint.byteBegin, constraint.byteEnd,
+          constraint.replacement);
+    }
+
+    if (StringRef(rewrittenRootArg).trim() !=
+        baseInvText.slice(rootRange.first, rootRange.second).trim())
+      replacementByRootArg[rootArgIdx] = std::move(rewrittenRootArg);
+  }
+
+  if (replacementByRootArg.empty())
+    return std::nullopt;
+
+  InvocationActualRecoveryContext actualRecoveryCtx{m, baseInvText,
+                                                    invArgRanges};
+  std::optional<InvocationRewriteWithRange> rewrite =
+      BuildInvocationRewriteWithRange(actualRecoveryCtx, replacementByRootArg,
+                                      /*materializedRangeByArgIdx=*/nullptr);
+  if (!rewrite)
+    return std::nullopt;
+
+  MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
+  proofCertifier_.CertifyInvocationRewriteMaterializedOutputRange(
+      patch, rewrite->materializedOutputByteStart,
+      rewrite->materializedOutputByteEnd);
+  CertifyMacroPatchWholeExpansionBRange(m, patch);
+  proofCertifier_.SetArgsOnlyStandardProof(
+      patch, m, /*wholeEnvelopeReplayValidated=*/true,
+      /*definitionTapeReplayValidated=*/false);
+  GetProofLattice().MacroPatchProofClassifier().SyncMacroPatchProofSummary(
+      patch);
+  return patch;
 }
 
 std::optional<MacroPatch>

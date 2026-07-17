@@ -196,6 +196,16 @@ public:
     return standardArgsOnlyPatchBuilder_;
   }
 
+  /// Build a structure-preserving tuple-terminal patch for roots that forward
+  /// one tuple formal into multiple literal child invocations.  This theorem is
+  /// narrower than ordinary args-only replay: every edited token in the root
+  /// expansion must be explained by producer-recorded child argument,
+  /// stringification, or paste evidence that maps back to exact slices of the
+  /// same source-spelled root tuple.
+  std::optional<MacroPatch> TryBuildTupleSiblingTerminalReplayPatch(
+      const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
+      llvm::StringRef baseInvocationText) const;
+
   /// Build a structure-preserving invocation patch by rewriting only the
   /// callsite arguments when all touched macro occurrences replay consistently.
   std::optional<MacroPatch>
