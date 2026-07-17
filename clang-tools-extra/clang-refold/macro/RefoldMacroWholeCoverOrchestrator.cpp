@@ -60,6 +60,65 @@ namespace refold {
 /// path rather than truncating producer ancestry.
 constexpr unsigned RecursiveTupleAncestorDepthLimit = 64;
 
+/// Return the physical source end consumed by an object-like macro whose
+/// replacement names a function-like macro that immediately consumes the
+/// call-suffix group following the object invocation.
+///
+/// The producer represents this preprocessing shape as an object invocation
+/// with a direct function-like child whose `inv_text` is absent: the child is
+/// not a separately spelled source callsite, because its callee came from the
+/// parent replacement list.  The child's preprocessed invocation envelope is
+/// therefore identical to the parent's, while its `inv_e` records the end of
+/// the source-supplied argument group.  Whole-cover realization must replace
+/// that complete physical envelope; replacing only the object token would
+/// append the untouched source arguments to an already materialized call.
+///
+/// Every structural fact is required exactly and a unique child must certify
+/// the parsed suffix endpoint.  Missing, conflicting, or ambiguous metadata
+/// leaves the ordinary invocation endpoint unchanged.
+static uint64_t resolveGeneratedFunctionCallSourceEnd(
+    const RefoldMacroPatchPlanner &planner,
+    const RefoldModel::MacroInvocation &invocation, uint64_t invocationEnd) {
+  if (invocation.subkind != "obj" || !invocation.invFile ||
+      !invocation.invPPByteBegin || !invocation.invPPByteEnd)
+    return invocationEnd;
+
+  const RefoldModel::MacroInvocation *generatedFunctionChild = nullptr;
+  for (const RefoldModel::MacroInvocation &candidate :
+       planner.Deps().model->GetMacroInvocations()) {
+    if (!candidate.callerMacroId ||
+        *candidate.callerMacroId != invocation.id ||
+        candidate.subkind != "func" || candidate.invText || !candidate.invE ||
+        candidate.invPPByteBegin != invocation.invPPByteBegin ||
+        candidate.invPPByteEnd != invocation.invPPByteEnd)
+      continue;
+
+    if (generatedFunctionChild)
+      return invocationEnd;
+    generatedFunctionChild = &candidate;
+  }
+
+  if (!generatedFunctionChild || *generatedFunctionChild->invE <= invocationEnd)
+    return invocationEnd;
+
+  const std::string invocationPath =
+      planner.Deps().lineDirs->ToAbsolutePath(*invocation.invFile);
+  auto bufferOrError = MemoryBuffer::getFile(invocationPath);
+  if (!bufferOrError)
+    return invocationEnd;
+
+  const StringRef invocationFileText = (*bufferOrError)->getBuffer();
+  if (invocationEnd > invocationFileText.size())
+    return invocationEnd;
+
+  const uint64_t parsedSuffixEnd = stringutils::extendChainedCallEnd(
+      invocationFileText, invocationEnd, StringRef());
+  if (parsedSuffixEnd != *generatedFunctionChild->invE)
+    return invocationEnd;
+
+  return parsedSuffixEnd;
+}
+
 // Small token-spelling / PP-span helpers shared across the DAG phase
 // services live in `macro/RefoldMacroDAGSharedHelpers.h`
 // (`tokenSpellingVectorsEqual`, `hunkWithinPPSpans`,
@@ -573,6 +632,14 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
           TryCounterLiteralWholeCoverPatch(m, h, *invStart, *invEnd))
     return counterPatch;
 
+  // Object-like aliases can generate a function-like macro invocation whose
+  // arguments are supplied by the immediately following source suffix.  In
+  // that producer shape, whole-cover realization owns both the alias token and
+  // the consumed suffix; use the uniquely certified physical endpoint so the
+  // untouched source arguments are not appended to the materialized call.
+  const uint64_t effectiveInvEnd =
+      resolveGeneratedFunctionCallSourceEnd(*planner_, m, *invEnd);
+
   // Bundle the per-call planning state into a named carrier
   // (`RefoldMacroWholeCoverPlanningContext`) so each phase service takes a
   // single argument instead of re-expanding the parameter list.  The
@@ -605,7 +672,8 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
 
   MacroPatchReuseAdmissionContext reuseAdmissionCtx =
       planner_->RecoverWholeCoverReuseContext(
-          m, currentPatchOwner, *invStart, *invEnd, patchMap, existingContext);
+          m, currentPatchOwner, *invStart, effectiveInvEnd, patchMap,
+          existingContext);
   SmallVector<RefoldModel::PPArgSpan, 16> argLikeSpans;
   argLikeSpans.append(m.argSpans.begin(), m.argSpans.end());
   argLikeSpans.append(m.stringifySpans.begin(), m.stringifySpans.end());
@@ -620,7 +688,7 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
       /*existingContext=*/existingContext,
       /*currentPatchOwner=*/currentPatchOwner,
       /*invStart=*/*invStart,
-      /*invEnd=*/*invEnd,
+      /*invEnd=*/effectiveInvEnd,
       /*argLikeSpans=*/argLikeSpans,
       /*reuseAdmissionCtx=*/reuseAdmissionCtx,
       /*argsOnlyCandidate=*/std::nullopt,
