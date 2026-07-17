@@ -132,6 +132,11 @@ RefoldMacroPatchProofClassifier::ClassifyMacroPatchProof(
     // Paired pure insertion is only valid on non-paste direct arg/stringify
     // surfaces. The builder already enforces that; the proof record makes the
     // requirement explicit.
+  case MacroPatchProofKind::DirectCalleeSubstitution:
+    // Direct callee substitution is structure-preserving: the emitted edit
+    // rewrites only the root invocation's callee token after exact replay proves
+    // that an active alternate definition explains the edited B expansion under
+    // the same recovered actual arguments.
   case MacroPatchProofKind::PasteDerivedCalleeSelector:
     // Paste-derived callee selector substitution is structure-preserving: the
     // emitted edit rewrites only a root invocation argument, after proving that
@@ -405,6 +410,14 @@ RefoldMacroPatchProofClassifier::ValidateInvocationPreservingProofImpl(
     discharge.Require(root && root->pasteSpans.empty(),
                       ProofObligationKind::MacroPasteFreeSurfaceTracked,
                       ProofFailureReason::UnexpectedPasteSurface);
+    break;
+
+  case MacroPatchProofKind::DirectCalleeSubstitution:
+    // The direct-callee builder validates the hard semantic witness before
+    // certifying the patch: original callee replays A, one active alternate
+    // callee replays B under the same actuals, and the emitted source edit
+    // rewrites only the invocation callee token.  The common obligations above
+    // keep the patch rooted at one top-level invocation.
     break;
 
   case MacroPatchProofKind::PasteDerivedCalleeSelector:

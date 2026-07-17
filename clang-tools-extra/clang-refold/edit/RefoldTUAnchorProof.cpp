@@ -68,6 +68,7 @@ buildTUAnchorAcceptancePathInventory(AcceptedPathKind currentPath) {
   case AcceptedPathKind::MacroArgsOnlyPasteMulti:
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
   case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
   case AcceptedPathKind::MacroDagSubtreeRoot:
@@ -160,6 +161,7 @@ validateTUAnchorProof(AcceptedPathKind currentPath,
   case AcceptedPathKind::MacroArgsOnlyPasteMulti:
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
   case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
   case AcceptedPathKind::MacroDagSubtreeRoot:
@@ -213,6 +215,7 @@ buildTUAnchorSelectionLattice(const ProofSummary &summary) {
   case AcceptedPathKind::MacroArgsOnlyPasteMulti:
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
   case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
   case AcceptedPathKind::MacroDagSubtreeRoot:
@@ -360,6 +363,7 @@ ProofSummary buildAcceptedTUAnchorProofSummary(AcceptedPathKind currentPath,
   case AcceptedPathKind::MacroArgsOnlyPasteMulti:
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
   case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
   case AcceptedPathKind::MacroDagSubtreeRoot:

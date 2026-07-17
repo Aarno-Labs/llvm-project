@@ -18,6 +18,7 @@
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
 #include "proof/RefoldAcceptedResultRanker.h"
 #include "proof/RefoldProofLattice.h"
+#include "util/StringUtils.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -46,6 +47,26 @@ enum class FinalMacroCandidateOrigin : uint8_t {
   ReuseExistingExpanded,
   WholeCoverRealization,
 };
+
+/// Stable trace spelling for final candidate origins.
+StringRef finalMacroCandidateOriginName(FinalMacroCandidateOrigin origin) {
+  switch (origin) {
+  case FinalMacroCandidateOrigin::DirectArgsOnly:
+    return "DirectArgsOnly";
+  case FinalMacroCandidateOrigin::DagRootReplay:
+    return "DagRootReplay";
+  case FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp:
+    return "ReuseExistingCallsiteNoOp";
+  case FinalMacroCandidateOrigin::ReuseExistingCallsiteSkipWholeCover:
+    return "ReuseExistingCallsiteSkipWholeCover";
+  case FinalMacroCandidateOrigin::ReuseExistingExpanded:
+    return "ReuseExistingExpanded";
+  case FinalMacroCandidateOrigin::WholeCoverRealization:
+    return "WholeCoverRealization";
+  }
+  llvm_unreachable("invalid final macro candidate origin");
+}
+
 
 /// Pair the concrete macro patch with its theorem-lattice selection
 /// candidate and the origin path that produced it.
@@ -113,20 +134,54 @@ void noteFinalMacroCandidateOrigin(FinalMacroCandidateAdmissionContext &ctx,
 /// gate passes.  Structure-preserving replay candidates can be produced by
 /// several proof paths, but they all share this same gate so unstable
 /// callsite replay cannot suppress realization.
-void addFinalMacroCandidate(
+bool addFinalMacroCandidate(
     const RefoldMacroReplayStabilityValidator &replayStabilityValidator,
     RefoldProofLattice &lattice, FinalMacroCandidateAdmissionContext &ctx,
     FinalMacroCandidate candidate) {
-  if (!ctx.replayStabilityCtx ||
-      !replayStabilityValidator.MacroCandidateReplayIsStableForFinalSelection(
-          *ctx.replayStabilityCtx, candidate.patch))
-    return;
+  REFOLD_LOG_TRACE(
+      "macro/final-candidate",
+      "consider inv id={0} name={1} origin={2} proof={3} preserves={4} "
+      "root={5} replacement='{6}' BRange={7} B=[{8},{9})",
+      ctx.invocation.id, ctx.invocation.name,
+      finalMacroCandidateOriginName(candidate.origin),
+      toString(candidate.patch.proof.kind),
+      candidate.patch.proof.preservesInvocationStructure ? 1 : 0,
+      candidate.patch.proof.proofRootMacroId,
+      stringutils::showWsWithClip(candidate.patch.replacement, 220),
+      candidate.patch.materialized.hasBTokenRange ? 1 : 0,
+      candidate.patch.materialized.bTokStart,
+      candidate.patch.materialized.bTokEnd);
+
+  if (!ctx.replayStabilityCtx) {
+    REFOLD_LOG_TRACE("macro/final-candidate",
+                     "reject inv id={0} name={1} origin={2} reason=no-replay-stability-context",
+                     ctx.invocation.id, ctx.invocation.name,
+                     finalMacroCandidateOriginName(candidate.origin));
+    return false;
+  }
+  if (!replayStabilityValidator.MacroCandidateReplayIsStableForFinalSelection(
+          *ctx.replayStabilityCtx, candidate.patch)) {
+    REFOLD_LOG_TRACE("macro/final-candidate",
+                     "reject inv id={0} name={1} origin={2} reason=replay-stability-failed proof={3} replacement='{4}'",
+                     ctx.invocation.id, ctx.invocation.name,
+                     finalMacroCandidateOriginName(candidate.origin),
+                     toString(candidate.patch.proof.kind),
+                     stringutils::showWsWithClip(candidate.patch.replacement, 220));
+    return false;
+  }
 
   candidate.selectionCandidate =
       lattice.AcceptedCandidateBuilder().BuildMacroSelectionCandidate(
           candidate.patch, ctx.allowNonTopLevelMacroSelectorFailure);
   ctx.candidates.push_back(std::move(candidate));
   noteFinalMacroCandidateOrigin(ctx, ctx.candidates.back().origin);
+  REFOLD_LOG_TRACE(
+      "macro/final-candidate",
+      "admit inv id={0} name={1} origin={2} candidateIndex={3} proof={4}",
+      ctx.invocation.id, ctx.invocation.name,
+      finalMacroCandidateOriginName(ctx.candidates.back().origin),
+      ctx.candidates.size() - 1, toString(ctx.candidates.back().patch.proof.kind));
+  return true;
 }
 
 /// Return whether an already-admitted structure-preserving candidate
@@ -226,6 +281,19 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
   // arbitration path.
   const bool funcLikeWithLiteralCalleeOrigin =
       m.subkind == "func" && hasLiteralMacroCalleeOrigin(m);
+
+  REFOLD_LOG_TRACE(
+      "macro/final-candidate",
+      "enter inv id={0} name={1} hEffA=[{2},{3}) hEffB=[{4},{5}) "
+      "funcLikeLiteral={6} argsOnly={7} dagRoot={8} reuseCallsite={9} "
+      "existingPatch={10} existingExpanded={11} existingIsCallsite={12} "
+      "baseText='{13}'",
+      m.id, m.name, hEff.aStart, hEff.aEnd, hEff.bStart, hEff.bEnd,
+      funcLikeWithLiteralCalleeOrigin ? 1 : 0, argsOnlyCandidate ? 1 : 0,
+      dagRootCandidate ? 1 : 0, reuseExistingCallsitePatch ? 1 : 0,
+      existingPatch ? 1 : 0, existingExpandedPatch ? 1 : 0,
+      existingIsCallsite ? 1 : 0,
+      stringutils::showWsWithClip(baseInvText, 220));
 
   if (funcLikeWithLiteralCalleeOrigin &&
       planningCtx.directRootPreservationInadmissible) {
@@ -465,30 +533,22 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
       &finalSubtreeValidationCtx,
       allowNonTopLevelMacroSelectorFailure};
 
-  if (argsOnlyCandidate &&
-      deps_.replayStabilityValidator
-          .MacroCandidateReplayIsStableForFinalSelection(
-              finalSubtreeValidationCtx, *argsOnlyCandidate)) {
+
+  if (argsOnlyCandidate) {
     addFinalMacroCandidate(
         deps_.replayStabilityValidator, deps_.proofLattice, finalAdmissionCtx,
         FinalMacroCandidate{*argsOnlyCandidate, MacroSelectionCandidate{},
                             FinalMacroCandidateOrigin::DirectArgsOnly});
   }
 
-  if (dagRootCandidate &&
-      deps_.replayStabilityValidator
-          .MacroCandidateReplayIsStableForFinalSelection(
-              finalSubtreeValidationCtx, *dagRootCandidate)) {
+  if (dagRootCandidate) {
     addFinalMacroCandidate(
         deps_.replayStabilityValidator, deps_.proofLattice, finalAdmissionCtx,
         FinalMacroCandidate{*dagRootCandidate, MacroSelectionCandidate{},
                             FinalMacroCandidateOrigin::DagRootReplay});
   }
 
-  if (canReuseExistingCallsiteNoOp && existingPatch &&
-      deps_.replayStabilityValidator
-          .MacroCandidateReplayIsStableForFinalSelection(
-              finalSubtreeValidationCtx, *existingPatch)) {
+  if (canReuseExistingCallsiteNoOp && existingPatch) {
     addFinalMacroCandidate(
         deps_.replayStabilityValidator, deps_.proofLattice, finalAdmissionCtx,
         FinalMacroCandidate{
@@ -496,10 +556,7 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
             FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp});
   }
 
-  if (canReuseExistingCallsiteSkipWholeCover && existingPatch &&
-      deps_.replayStabilityValidator
-          .MacroCandidateReplayIsStableForFinalSelection(
-              finalSubtreeValidationCtx, *existingPatch)) {
+  if (canReuseExistingCallsiteSkipWholeCover && existingPatch) {
     addFinalMacroCandidate(
         deps_.replayStabilityValidator, deps_.proofLattice, finalAdmissionCtx,
         FinalMacroCandidate{
@@ -531,6 +588,23 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
             invocationText, m);
   }
 
+  // Log the final slot state after whole-cover source eligibility is known.
+  // This keeps instrumentation-only diagnostics in the same scope as every
+  // value reported by the trace record and avoids changing candidate ranking.
+  REFOLD_LOG_TRACE(
+      "macro/final-candidate",
+      "slot-state inv id={0} name={1} argsOnly={2} dagRoot={3} "
+      "reuseNoOp={4} reuseSkipWhole={5} reuseExpanded={6} wholeCoverPlan={7} "
+      "wholeCoverCanReplaceSource={8} conflictForcesWhole={9} "
+      "absorbedExisting={10}",
+      m.id, m.name, argsOnlyCandidate ? 1 : 0, dagRootCandidate ? 1 : 0,
+      canReuseExistingCallsiteNoOp ? 1 : 0,
+      canReuseExistingCallsiteSkipWholeCover ? 1 : 0,
+      canReuseExistingExpanded ? 1 : 0, wholeCoverPlan ? 1 : 0,
+      wholeCoverCanReplaceInvocationSource ? 1 : 0,
+      conflictingConcreteSubtreeWitnessForcesWholeCover ? 1 : 0,
+      existingCallsitePatchAbsorbedByDirectCandidate ? 1 : 0);
+
   if (wholeCoverPlan && wholeCoverCanReplaceInvocationSource) {
     // Whole-cover realization is added as another final candidate unless
     // a selectable structure-preserving candidate for the same root
@@ -542,8 +616,15 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
                                                   *wholeCoverPlan};
     MacroPatch patch =
         materializeWholeCoverPatch(deps_.proofCertifier, wholeCoverCandidate);
-    if (!theoremLatticeStructureCandidateDominatesRealization(
-            deps_.proofLattice, finalAdmissionCtx, patch))
+    const bool structureCandidateDominatesWholeCover =
+        theoremLatticeStructureCandidateDominatesRealization(
+            deps_.proofLattice, finalAdmissionCtx, patch);
+    REFOLD_LOG_TRACE(
+        "macro/final-candidate",
+        "whole-cover-candidate inv id={0} name={1} dominatedByStructure={2} replacement='{3}'",
+        m.id, m.name, structureCandidateDominatesWholeCover ? 1 : 0,
+        stringutils::showWsWithClip(patch.replacement, 220));
+    if (!structureCandidateDominatesWholeCover)
       addFinalMacroCandidate(
           deps_.replayStabilityValidator, deps_.proofLattice, finalAdmissionCtx,
           FinalMacroCandidate{
@@ -551,8 +632,15 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
               FinalMacroCandidateOrigin::WholeCoverRealization});
   }
 
-  if (finalAdmissionCtx.candidates.empty())
+  if (finalAdmissionCtx.candidates.empty()) {
+    REFOLD_LOG_TRACE("macro/final-candidate",
+                     "no-admitted-candidates inv id={0} name={1}", m.id,
+                     m.name);
     return std::nullopt;
+  }
+  REFOLD_LOG_TRACE("macro/final-candidate",
+                   "admitted-count inv id={0} name={1} count={2}", m.id,
+                   m.name, finalAdmissionCtx.candidates.size());
 
   // The macro selector ranks MacroSelectionCandidate objects, not emitted
   // AcceptedResultCandidate objects.  This keeps selector-only nested
@@ -573,6 +661,13 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
 
   const FinalMacroCandidate &selected =
       finalAdmissionCtx.candidates[selectedCandidate->index];
+  REFOLD_LOG_TRACE(
+      "macro/final-candidate",
+      "selected inv id={0} name={1} index={2} origin={3} proof={4} replacement='{5}'",
+      m.id, m.name, selectedCandidate->index,
+      finalMacroCandidateOriginName(selected.origin),
+      toString(selected.patch.proof.kind),
+      stringutils::showWsWithClip(selected.patch.replacement, 220));
 
   switch (selected.origin) {
   case FinalMacroCandidateOrigin::DirectArgsOnly:

@@ -134,7 +134,8 @@ RefoldMacroWholeCoverOrchestrator::RefoldMacroWholeCoverOrchestrator(
       selectorSubstitutionPhase_(
           RefoldMacroSelectorSubstitutionPhase::Dependencies{
               *planner_->Deps().model, *planner_->Deps().sourceMapper,
-              planner_->Deps().aToks, *planner_->Deps().proofLattice,
+              planner_->Deps().aToks, planner_->Deps().bToks,
+              *planner_->Deps().proofLattice,
               [planner](const RefoldModel::MacroInvocation &m,
                         llvm::StringRef invText)
                   -> std::optional<std::vector<std::pair<size_t, size_t>>> {
@@ -550,8 +551,22 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
   // The invocation byte span in the owning file must be known.
   const auto invStart = m.invB;
   const auto invEnd = m.invE;
-  if (!invStart || !invEnd || *invEnd < *invStart)
+  if (!invStart || !invEnd || *invEnd < *invStart) {
+    REFOLD_LOG_TRACE(
+        "macro/whole-cover",
+        "reject inv id={0} name={1} reason=missing-or-invalid-invocation-range invB={2} invE={3}",
+        m.id, m.name, invStart ? std::to_string(*invStart) : std::string("<none>"),
+        invEnd ? std::to_string(*invEnd) : std::string("<none>"));
     return std::nullopt;
+  }
+
+  REFOLD_LOG_TRACE(
+      "macro/whole-cover",
+      "enter inv id={0} name={1} subkind={2} hA=[{3},{4}) hB=[{5},{6}) "
+      "invBytes=[{7},{8}) baseTextBytes={9} baseText='{10}'",
+      m.id, m.name, m.subkind, h.aStart, h.aEnd, h.bStart, h.bEnd,
+      *invStart, *invEnd, baseInvText.size(),
+      stringutils::showWsWithClip(baseInvText, 220));
 
   // Special-case: __COUNTER__.
   if (auto counterPatch =
@@ -578,9 +593,8 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
   // bytes with an expanded expression.
   if (m.subkind == "func") {
     StringRef invocationText =
-        !baseInvText.empty()
-            ? baseInvText
-            : (m.invText ? StringRef(*m.invText) : StringRef(""));
+        !baseInvText.empty() ? baseInvText
+                             : (m.invText ? StringRef(*m.invText) : StringRef());
     if (!RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
             invocationText, m)) {
       if (std::optional<MacroPatch> ancestorPatch =
@@ -632,6 +646,14 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
   // `reuseExistingCallsitePatch`, and `rootHasDirectArgLikeSurface` back into
   // that context.
   argsOnlyPhase_.Run(planningCtx);
+  REFOLD_LOG_TRACE(
+      "macro/whole-cover",
+      "after-args-only inv id={0} name={1} argsOnly={2} reuseCallsite={3} "
+      "rootHasDirectArgLikeSurface={4} directRootInadmissible={5}",
+      m.id, m.name, argsOnlyCandidate ? 1 : 0,
+      reuseExistingCallsitePatch ? 1 : 0,
+      planningCtx.rootHasDirectArgLikeSurface ? 1 : 0,
+      planningCtx.directRootPreservationInadmissible ? 1 : 0);
 
   // 1b) Conservative DAG chaining: if the edited A-span lies within this
   //     invocation's cover but not within one of its direct argument-like
@@ -804,6 +826,9 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
     // selector, where it can still compete against whole-cover realization and
     // any reusable already-tracked callsite patch.
     auto dag = tryDAGChainedArgsOnly();
+    REFOLD_LOG_TRACE("macro/whole-cover",
+                     "after-dag-probe inv id={0} name={1} dag={2} argsOnly={3}",
+                     m.id, m.name, dag ? 1 : 0, argsOnlyCandidate ? 1 : 0);
     if (dag) {
       bool preferDirectRootCandidate = false;
       if (argsOnlyCandidate &&
@@ -869,15 +894,41 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
     // candidate path as other DAG-root proofs so existing conflict handling and
     // lattice selection remain authoritative.
     if (!dagRootCandidate) {
+      REFOLD_LOG_TRACE("macro/whole-cover",
+                       "selector-probe-start inv id={0} name={1}", m.id,
+                       m.name);
       if (std::optional<MacroPatch> selectorPatch =
               selectorSubstitutionPhase_.Run(planningCtx)) {
+        REFOLD_LOG_TRACE(
+            "macro/whole-cover",
+            "selector-probe-accepted inv id={0} name={1} proof={2} replacement='{3}'",
+            m.id, m.name, toString(selectorPatch->proof.kind),
+            stringutils::showWsWithClip(selectorPatch->replacement, 220));
         patchReusePhase_.MergeCurrentRootWithExistingCallsitePatch(
             planningCtx, *selectorPatch);
+        REFOLD_LOG_TRACE(
+            "macro/whole-cover",
+            "selector-after-merge inv id={0} name={1} conflictForcesWhole={2} reuseCallsite={3}",
+            m.id, m.name,
+            conflictingConcreteSubtreeWitnessForcesWholeCover ? 1 : 0,
+            reuseExistingCallsitePatch ? 1 : 0);
         if (!conflictingConcreteSubtreeWitnessForcesWholeCover) {
           dagRootCandidate = std::move(*selectorPatch);
           argsOnlyCandidate.reset();
+          REFOLD_LOG_TRACE(
+              "macro/whole-cover",
+              "selector-staged-as-dag-root inv id={0} name={1}", m.id,
+              m.name);
         }
+      } else {
+        REFOLD_LOG_TRACE("macro/whole-cover",
+                         "selector-probe-declined inv id={0} name={1}",
+                         m.id, m.name);
       }
+    } else {
+      REFOLD_LOG_TRACE("macro/whole-cover",
+                       "selector-probe-skipped inv id={0} name={1} reason=dag-root-already-present",
+                       m.id, m.name);
     }
   }
 
@@ -885,7 +936,21 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
   // whole-cover plan computation, and proof-lattice ranking — is owned by
   // `RefoldMacroFinalCandidateSelector`.  The selector reads the planning
   // context's candidate slots and conflict flags directly.
-  return finalCandidateSelector_.Run(planningCtx);
+  REFOLD_LOG_TRACE(
+      "macro/whole-cover",
+      "before-final-selector inv id={0} name={1} argsOnly={2} dagRoot={3} "
+      "reuseCallsite={4} conflictForcesWhole={5}",
+      m.id, m.name, argsOnlyCandidate ? 1 : 0, dagRootCandidate ? 1 : 0,
+      reuseExistingCallsitePatch ? 1 : 0,
+      conflictingConcreteSubtreeWitnessForcesWholeCover ? 1 : 0);
+  std::optional<MacroPatch> selectedPatch = finalCandidateSelector_.Run(planningCtx);
+  REFOLD_LOG_TRACE(
+      "macro/whole-cover",
+      "after-final-selector inv id={0} name={1} selected={2} replacement='{3}'",
+      m.id, m.name, selectedPatch ? 1 : 0,
+      selectedPatch ? stringutils::showWsWithClip(selectedPatch->replacement, 220)
+                    : std::string(""));
+  return selectedPatch;
 }
 
 } // namespace refold

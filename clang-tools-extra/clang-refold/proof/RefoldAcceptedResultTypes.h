@@ -310,6 +310,7 @@ inline StringRef toString(TheoremSelectionTieBreakerKind value) {
   REFOLD_X(MacroArgsOnlyPasteMulti)                                            \
   REFOLD_X(MacroArgsOnlyPurePasteOnly)                                         \
   REFOLD_X(MacroArgsOnlyPairedPureInsertion)                                   \
+  REFOLD_X(MacroDirectCalleeSubstitution)                                      \
   REFOLD_X(MacroPasteDerivedCalleeSelector)                                    \
   REFOLD_X(MacroRecursiveTupleGeneratedCalleeReplay)                           \
   REFOLD_X(MacroDagSubtreeRoot)                                                \
@@ -488,6 +489,7 @@ inline StringRef toString(AcceptanceSupportKind value) {
   REFOLD_X(MacroPasteMultiFixedAnchor, "MacroPasteMultiFixedAnchor")           \
   REFOLD_X(MacroPurePasteOnly, "MacroPurePasteOnly")                           \
   REFOLD_X(MacroPairedPureInsertion, "MacroPairedPureInsertion")               \
+  REFOLD_X(MacroDirectCalleeSubstitution, "MacroDirectCalleeSubstitution")     \
   REFOLD_X(MacroPasteDerivedCalleeSelector, "MacroPasteDerivedCalleeSelector") \
   REFOLD_X(MacroRecursiveTupleGeneratedCalleeReplay,                           \
            "MacroRecursiveTupleGeneratedCalleeReplay")                         \
@@ -1733,6 +1735,7 @@ struct SelectedMacroSelectionCandidate {
   REFOLD_X(ArgsOnlyPurePasteOnly)                                              \
   REFOLD_X(ArgsOnlyStandard)                                                   \
   REFOLD_X(ArgsOnlyPairedPureInsertion)                                        \
+  REFOLD_X(DirectCalleeSubstitution)                                           \
   REFOLD_X(PasteDerivedCalleeSelector)                                         \
   REFOLD_X(RecursiveTupleGeneratedCalleeReplay)                                \
   REFOLD_X(DagSubtreeRoot)                                                     \

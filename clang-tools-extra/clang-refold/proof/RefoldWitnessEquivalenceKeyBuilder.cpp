@@ -288,6 +288,7 @@ bool pathIsMacroRepairReplayStateNeutralCandidate(AcceptedPathKind path) {
   case AcceptedPathKind::MacroArgsOnlyStandard:
   case AcceptedPathKind::MacroDagSubtreeRoot:
   case AcceptedPathKind::MacroCallChainSuffix:
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
   case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
     return true;

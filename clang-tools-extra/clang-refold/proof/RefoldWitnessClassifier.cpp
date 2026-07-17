@@ -18,6 +18,7 @@ witnessFamilyForAcceptedPath(AcceptedPathKind path) {
   switch (path) {
   case AcceptedPathKind::MacroArgsOnlyStandard:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
     return WitnessProofFamily::MacroActualRepair;
   case AcceptedPathKind::MacroArgsOnlyPasteSingle:
   case AcceptedPathKind::MacroArgsOnlyPasteMulti:
@@ -64,6 +65,7 @@ witnessProducerKindForAcceptedPath(AcceptedPathKind path) {
   switch (path) {
   case AcceptedPathKind::MacroArgsOnlyStandard:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
     return WitnessProducerKind::Forward;
   case AcceptedPathKind::MacroArgsOnlyPasteSingle:
   case AcceptedPathKind::MacroArgsOnlyPasteMulti:

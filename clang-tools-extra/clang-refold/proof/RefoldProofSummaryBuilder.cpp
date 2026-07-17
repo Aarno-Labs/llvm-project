@@ -68,6 +68,7 @@ bool RefoldProofSummaryBuilder::ProofSummaryRequiresOwnerRealizationWitness(
   case AcceptedPathKind::MacroArgsOnlyPasteMulti:
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
   case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
   case AcceptedPathKind::MacroDagSubtreeRoot:
@@ -378,6 +379,7 @@ RefoldProofSummaryBuilder::BuildGlobalSelectionLattice(
   case AcceptedPathKind::MacroArgsOnlyPasteMulti:
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
   case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
   case AcceptedPathKind::MacroDagSubtreeRoot:

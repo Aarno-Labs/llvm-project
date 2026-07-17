@@ -190,7 +190,10 @@ bool RefoldMacroReplayStabilityValidator::
     return true;
   if (m.subkind != "func")
     return true;
-  if (!RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
+  const bool directCalleeSubstitution =
+      patch.proof.kind == MacroPatchProofKind::DirectCalleeSubstitution;
+  if (!directCalleeSubstitution &&
+      !RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
           patch.replacement, m)) {
     REFOLD_LOG_TRACE("macro/proof",
                      "suppress structure-preserving macro replay: inv id={0} "
@@ -269,6 +272,7 @@ bool RefoldMacroReplayStabilityValidator::
     case MacroPatchProofKind::ArgsOnlyPurePasteOnly:
     case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
       return true;
+    case MacroPatchProofKind::DirectCalleeSubstitution:
     case MacroPatchProofKind::PasteDerivedCalleeSelector:
     case MacroPatchProofKind::RecursiveTupleGeneratedCalleeReplay:
     case MacroPatchProofKind::DagSubtreeRoot:
@@ -812,13 +816,51 @@ bool RefoldMacroReplayStabilityValidator::
         const MacroSubtreeReplayValidationContext &ctx,
         const MacroPatch &patch) const {
   const RefoldModel::MacroInvocation &m = ctx.rootInvocation;
-  return StructurePreservingCallsiteHasStableFormalSyntax(patch, m) &&
-         ArgsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay(ctx, patch) &&
-         RootPreservingCandidateHasLiteralFixedRootBodyReplay(
-             m, ctx.rootInvocationText, patch) &&
-         deps_.subtreeReplayValidator.ClaimedWholeEnvelopeIsReplaySafe(ctx,
-                                                                       patch) &&
-         !CallsiteReplayObservesActiveHeaderMacroState(m, patch);
+  REFOLD_LOG_TRACE(
+      "macro/replay-stability",
+      "enter inv id={0} name={1} proof={2} preserves={3} root={4} replacement='{5}'",
+      m.id, m.name, toString(patch.proof.kind),
+      patch.proof.preservesInvocationStructure ? 1 : 0,
+      patch.proof.proofRootMacroId,
+      stringutils::showWsWithClip(patch.replacement, 220));
+
+  if (!StructurePreservingCallsiteHasStableFormalSyntax(patch, m)) {
+    REFOLD_LOG_TRACE("macro/replay-stability",
+                     "reject inv id={0} name={1} proof={2} reason=formal-syntax-unstable",
+                     m.id, m.name, toString(patch.proof.kind));
+    return false;
+  }
+  if (!ArgsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay(ctx, patch)) {
+    REFOLD_LOG_TRACE("macro/replay-stability",
+                     "reject inv id={0} name={1} proof={2} reason=args-only-whole-envelope-literal-body-failed",
+                     m.id, m.name, toString(patch.proof.kind));
+    return false;
+  }
+  if (!RootPreservingCandidateHasLiteralFixedRootBodyReplay(
+          m, ctx.rootInvocationText, patch)) {
+    REFOLD_LOG_TRACE("macro/replay-stability",
+                     "reject inv id={0} name={1} proof={2} reason=fixed-root-body-replay-failed",
+                     m.id, m.name, toString(patch.proof.kind));
+    return false;
+  }
+  if (!deps_.subtreeReplayValidator.ClaimedWholeEnvelopeIsReplaySafe(ctx,
+                                                                     patch)) {
+    REFOLD_LOG_TRACE("macro/replay-stability",
+                     "reject inv id={0} name={1} proof={2} reason=subtree-whole-envelope-replay-unsafe",
+                     m.id, m.name, toString(patch.proof.kind));
+    return false;
+  }
+  if (CallsiteReplayObservesActiveHeaderMacroState(m, patch)) {
+    REFOLD_LOG_TRACE("macro/replay-stability",
+                     "reject inv id={0} name={1} proof={2} reason=active-header-macro-state-observed",
+                     m.id, m.name, toString(patch.proof.kind));
+    return false;
+  }
+
+  REFOLD_LOG_TRACE("macro/replay-stability",
+                   "accept inv id={0} name={1} proof={2}", m.id, m.name,
+                   toString(patch.proof.kind));
+  return true;
 }
 
 } // namespace refold

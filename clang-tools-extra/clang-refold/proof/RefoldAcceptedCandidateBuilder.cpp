@@ -466,6 +466,7 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedMacroCandidate(
     case MacroPatchProofKind::ArgsOnlyStandard:
     case MacroPatchProofKind::DagSubtreeRoot:
     case MacroPatchProofKind::CallChainSuffix:
+    case MacroPatchProofKind::DirectCalleeSubstitution:
     case MacroPatchProofKind::PasteDerivedCalleeSelector:
     case MacroPatchProofKind::RecursiveTupleGeneratedCalleeReplay:
       return true;

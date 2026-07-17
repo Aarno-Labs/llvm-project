@@ -327,6 +327,7 @@ RefoldProofLattice::ValidateIncludePreservingProof(
   case AcceptedPathKind::MacroCallChainSuffix:
   case AcceptedPathKind::MacroCounterLiteral:
   case AcceptedPathKind::MacroWholeCoverRealization:
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
   case AcceptedPathKind::TUExactSlotBoundary:
   case AcceptedPathKind::TUProvableInsertionAnchor:

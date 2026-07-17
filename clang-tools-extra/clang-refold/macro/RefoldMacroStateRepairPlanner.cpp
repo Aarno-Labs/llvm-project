@@ -244,6 +244,11 @@ private:
   bool ReplacementSuffixBoundaryAllowsDirectiveLine(const TextEdit &edit) const;
   /// Returns whether an edit already carries a macro patch surface in B-state.
   bool EditHasMacroPatchSurfaceInBMacroState(const TextEdit &edit) const;
+  /// Returns whether a direct-callee macro patch intentionally depends on a
+  /// definition remaining before the rewritten invocation.
+  bool DirectCalleePatchRequiresDefinitionBeforeReplacement(
+      const TextEdit &edit, const RefoldModel::MacroDirective &definition,
+      StringRef macroName) const;
 
   /// Builds the owner-state boundary immediately after a macro directive.
   OwnerStateBoundary MacroDirectiveSuffixBoundary(
@@ -814,6 +819,36 @@ bool MacroStateRepairContext::EditHasMacroPatchSurfaceInBMacroState(
             SurfaceDisposition::RealizeWholeCoverMacros)
       return true;
   }
+  return false;
+}
+
+bool MacroStateRepairContext::
+    DirectCalleePatchRequiresDefinitionBeforeReplacement(
+        const TextEdit &edit, const RefoldModel::MacroDirective &definition,
+        StringRef macroName) const {
+  if (definition.subkind != "#define")
+    return false;
+  if (!ReplacementObservesPreservedDefinition(edit, definition, macroName))
+    return false;
+
+  for (const auto &carrier : edit.acceptedResults) {
+    if (!carrier || carrier->kind != AcceptedResultCandidateKind::MacroPatch)
+      continue;
+
+    const ProofSummary &summary = carrier->proofSummary;
+    if (summary.inventory.currentPath !=
+        AcceptedPathKind::MacroDirectCalleeSubstitution)
+      continue;
+
+    // A direct-callee substitution is not a B-surface realization whose
+    // observing macro definitions should be delayed past the replacement.  Its
+    // proof says that the emitted invocation must be preprocessed under the
+    // ordinary source macro state available at the original callsite.  Moving
+    // an observed gap definition after the rewritten call would invalidate the
+    // alternate-callee replay witness, as in ADD(...) -> SUB(...).
+    return true;
+  }
+
   return false;
 }
 
@@ -1495,6 +1530,9 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
         continue;
       if (!ReplacementObservesPreservedDefinition(edit, directiveLocal,
                                                   ref.name))
+        continue;
+      if (DirectCalleePatchRequiresDefinitionBeforeReplacement(
+              edit, directiveLocal, ref.name))
         continue;
 
       std::optional<uint64_t> boundary = DelayedTransitionBoundaryAfterEdit(

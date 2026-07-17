@@ -53,6 +53,9 @@ RefoldAcceptancePathClassifier::InventoryMacroPatchProofAcceptancePath(
     // requirement explicit.
     return BuildAcceptancePathInventory(
         AcceptedPathKind::MacroArgsOnlyPairedPureInsertion);
+  case MacroPatchProofKind::DirectCalleeSubstitution:
+    return BuildAcceptancePathInventory(
+        AcceptedPathKind::MacroDirectCalleeSubstitution);
   case MacroPatchProofKind::PasteDerivedCalleeSelector:
     return BuildAcceptancePathInventory(
         AcceptedPathKind::MacroPasteDerivedCalleeSelector);
@@ -114,6 +117,10 @@ RefoldAcceptancePathClassifier::BuildAcceptancePathInventory(
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
     inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::MacroPairedPureInsertion;
+    break;
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
+    inventory.futureTarget = FutureProofTarget::MacroDirectCalleeSubstitution;
     break;
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
     inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
@@ -250,6 +257,7 @@ RefoldAcceptancePathClassifier::BuildTheoremProofClassForAcceptedPath(
   case AcceptedPathKind::MacroArgsOnlyPasteMulti:
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
   case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
   case AcceptedPathKind::MacroDagSubtreeRoot:
@@ -446,6 +454,7 @@ RefoldAcceptancePathClassifier::BuildAcceptedPathProofSummary(
   case AcceptedPathKind::MacroArgsOnlyPasteMulti:
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
   case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
   case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
   case AcceptedPathKind::MacroDagSubtreeRoot:
