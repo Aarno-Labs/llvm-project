@@ -142,6 +142,225 @@ std::optional<StringRef> sliceInvocationArgumentText(
   return baseInvocationText.slice(range.first, range.second).trim();
 }
 
+
+/// Direct conditional-token-paste shape proved from a definition replacement
+/// list.  This covers the restricted `base ## __VA_OPT__(__VA_ARGS__)` family
+/// where the paste result is one PP token and the changed suffix/prefix belongs
+/// to the variadic formal.
+struct DirectVaOptPasteTokenShape {
+  /// Formal whose source spelling is the stable non-variadic side of the paste.
+  uint32_t fixedArgIdx = 0;
+  /// Variadic formal contributed only when the `__VA_OPT__` branch is active.
+  uint32_t variadicArgIdx = 0;
+  /// True for `fixed ## __VA_OPT__(variadic)`, false for the reverse order.
+  bool fixedBeforeVariadic = true;
+};
+
+/// Return true when `text` trims to exactly one raw lexer token with the same
+/// spelling.  The conditional-paste bridge uses this to avoid inventing source
+/// spellings for multi-token actuals or relying on maximal-munch-adjacent text
+/// that would not be a stable macro actual segment.
+bool textIsSingleTokenSpelling(StringRef text, const LangOptions &lexLang) {
+  text = text.trim();
+  if (text.empty())
+    return false;
+
+  SmallVector<RefoldLexBoundaryToken, 4> tokens;
+  refoldLexBoundaryTokens(text, lexLang, tokens);
+  return tokens.size() == 1 && tokens.front().begin == 0 &&
+         tokens.front().end == text.size() && tokens.front().spelling == text;
+}
+
+/// Recognize the direct conditional paste shape that the producer currently
+/// records with `paste_tokens` but without `paste_spans`.
+///
+/// The accepted grammar is intentionally tiny:
+///
+///   fixed ## __VA_OPT__(variadic)
+///   __VA_OPT__(variadic) ## fixed
+///
+/// where `fixed` is a non-variadic parameter reference and `variadic` is the
+/// invocation's variadic formal.  General token-paste replay remains owned by
+/// the existing paste-span path; this helper only fills the missing proof edge
+/// for a conditional paste whose edited token can be derived uniquely from the
+/// call-site actual text.
+std::optional<DirectVaOptPasteTokenShape>
+matchDirectVaOptPasteTokenShape(const RefoldModel::MacroDirective &definition) {
+  if (definition.subkind != "#define" || !definition.functionLike ||
+      definition.replacementTokens.size() != 6)
+    return std::nullopt;
+
+  auto paramIndexAt = [&](size_t index) -> std::optional<uint32_t> {
+    const RefoldModel::MacroReplacementToken &token =
+        definition.replacementTokens[index];
+    if (token.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+        !token.paramIndex || *token.paramIndex >= definition.defParams.size())
+      return std::nullopt;
+    return *token.paramIndex;
+  };
+
+  auto literalAt = [&](size_t index, StringRef spelling) -> bool {
+    const RefoldModel::MacroReplacementToken &token =
+        definition.replacementTokens[index];
+    return token.kind == RefoldModel::MacroReplacementTokenKind::Literal &&
+           token.spelling == spelling;
+  };
+
+  auto buildShape = [&](uint32_t fixedArgIdx, uint32_t variadicArgIdx,
+                        bool fixedBeforeVariadic)
+      -> std::optional<DirectVaOptPasteTokenShape> {
+    if (fixedArgIdx == variadicArgIdx ||
+        fixedArgIdx >= definition.defParams.size() ||
+        variadicArgIdx >= definition.defParams.size() ||
+        definition.defParams[fixedArgIdx].variadic ||
+        !definition.defParams[variadicArgIdx].variadic)
+      return std::nullopt;
+
+    DirectVaOptPasteTokenShape shape;
+    shape.fixedArgIdx = fixedArgIdx;
+    shape.variadicArgIdx = variadicArgIdx;
+    shape.fixedBeforeVariadic = fixedBeforeVariadic;
+    return shape;
+  };
+
+  if (auto fixedArgIdx = paramIndexAt(0)) {
+    if (literalAt(1, "##") && literalAt(2, "__VA_OPT__") &&
+        literalAt(3, "(") && literalAt(5, ")")) {
+      if (auto variadicArgIdx = paramIndexAt(4))
+        return buildShape(*fixedArgIdx, *variadicArgIdx,
+                          /*fixedBeforeVariadic=*/true);
+    }
+  }
+
+  if (literalAt(0, "__VA_OPT__") && literalAt(1, "(") &&
+      literalAt(3, ")") && literalAt(4, "##")) {
+    if (auto variadicArgIdx = paramIndexAt(2)) {
+      if (auto fixedArgIdx = paramIndexAt(5))
+        return buildShape(*fixedArgIdx, *variadicArgIdx,
+                          /*fixedBeforeVariadic=*/false);
+    }
+  }
+
+  return std::nullopt;
+}
+
+/// Build an invocation-preserving patch for the direct conditional paste case
+/// where the producer has a paste-token witness but no paste-span interval.
+///
+/// Proof obligation: the old invocation actuals must concatenate to the single
+/// A-side pasted token, and the edited B token must differ only in the
+/// variadic contribution while preserving the fixed contribution.  The new
+/// variadic contribution must itself be exactly one lexer token so the rewrite
+/// does not invent a multi-token paste payload or change call-site arity.
+std::optional<MacroPatch> tryBuildDirectVaOptPasteTokenPatch(
+    const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
+    const RefoldModel::MacroInvocation &invocation, const diffutils::Hunk &hunk,
+    StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges,
+    const InvocationActualRecoveryContext &actualCtx) {
+  if (!invocation.pasteSpans.empty() || invocation.pasteTokens.empty() ||
+      !invocation.argSpans.empty() || !invocation.stringifySpans.empty())
+    return std::nullopt;
+
+  const RefoldModel::MacroDirective *definition =
+      getDefinitionDirectiveForInvocation(deps.model, invocation);
+  if (!definition || definition->name != invocation.name ||
+      definition->defParams.size() != invocation.defParams.size())
+    return std::nullopt;
+
+  std::optional<DirectVaOptPasteTokenShape> shape =
+      matchDirectVaOptPasteTokenShape(*definition);
+  if (!shape)
+    return std::nullopt;
+
+  std::optional<std::pair<uint64_t, uint64_t>> cover =
+      RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
+  if (!cover || cover->second != cover->first + 1 ||
+      hunk.aStart != cover->first || hunk.aEnd != cover->second ||
+      hunk.bEnd != hunk.bStart + 1 || hunk.aStart >= deps.aToks.size() ||
+      hunk.bStart >= deps.bToks.size())
+    return std::nullopt;
+
+  std::optional<StringRef> fixedActual = sliceInvocationArgumentText(
+      baseInvocationText, invocationArgRanges, shape->fixedArgIdx);
+  std::optional<StringRef> oldVariadicActual = sliceInvocationArgumentText(
+      baseInvocationText, invocationArgRanges, shape->variadicArgIdx);
+  if (!fixedActual || !oldVariadicActual || fixedActual->empty() ||
+      oldVariadicActual->empty() ||
+      !textIsSingleTokenSpelling(*fixedActual, deps.lexLang) ||
+      !textIsSingleTokenSpelling(*oldVariadicActual, deps.lexLang))
+    return std::nullopt;
+
+  StringRef aToken = deps.aToks[static_cast<size_t>(hunk.aStart)].spelling;
+  StringRef bToken = deps.bToks[static_cast<size_t>(hunk.bStart)].spelling;
+  std::string expectedA;
+  if (shape->fixedBeforeVariadic) {
+    expectedA = fixedActual->str();
+    expectedA += oldVariadicActual->str();
+  } else {
+    expectedA = oldVariadicActual->str();
+    expectedA += fixedActual->str();
+  }
+  if (aToken != expectedA)
+    return std::nullopt;
+
+  std::string newVariadicActual;
+  if (shape->fixedBeforeVariadic) {
+    if (!bToken.starts_with(*fixedActual))
+      return std::nullopt;
+    newVariadicActual = bToken.drop_front(fixedActual->size()).str();
+  } else {
+    if (!bToken.ends_with(*fixedActual))
+      return std::nullopt;
+    newVariadicActual = bToken.drop_back(fixedActual->size()).str();
+  }
+
+  if (newVariadicActual.empty() ||
+      StringRef(newVariadicActual) == *oldVariadicActual ||
+      !textIsSingleTokenSpelling(newVariadicActual, deps.lexLang) ||
+      replacementIntroducesTopLevelComma(newVariadicActual, deps.lexLang))
+    return std::nullopt;
+
+  if (!invocation.invB || !invocation.invE)
+    return std::nullopt;
+
+  DenseMap<uint32_t, std::string> replacementByArgIdx;
+  replacementByArgIdx[shape->variadicArgIdx] = std::move(newVariadicActual);
+
+  std::optional<InvocationRewriteWithRange> rewrite =
+      deps.buildInvocationRewriteWithRange(
+          actualCtx, replacementByArgIdx,
+          /*materializedRangeByArgIdx=*/nullptr);
+  if (!rewrite || StringRef(rewrite->text).trim() == baseInvocationText.trim())
+    return std::nullopt;
+
+  MacroPatch patch{*invocation.invB, *invocation.invE, std::move(rewrite->text),
+                   invocation.id};
+  deps.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
+      patch, rewrite->materializedOutputByteStart,
+      rewrite->materializedOutputByteEnd);
+  deps.certifyMacroPatchWholeExpansionBRange(invocation, patch);
+
+  MacroPatchProof proof = deps.proofLattice.MakeMacroPatchProof(
+      MacroPatchProofKind::ArgsOnlyStandard,
+      /*preservesInvocationStructure=*/true, invocation.id);
+  WholeEnvelopeReplayWitness wholeEnvelopeWitness;
+  wholeEnvelopeWitness.rootMacroId = invocation.id;
+  wholeEnvelopeWitness.replayValidated = true;
+  wholeEnvelopeWitness.definitionTapeReplayValidated = true;
+  proof.wholeEnvelopeReplay = wholeEnvelopeWitness;
+  deps.proofLattice.SetMacroPatchProof(patch, std::move(proof));
+
+  // The producer did not provide a paste-span interval for the VA_OPT paste
+  // token, so this path carries its own replay proof.  Mark the patch after the
+  // primary proof is installed and resync so the canonical paste witness is
+  // derived from this completed carrier.
+  patch.pasteReplayValidated = true;
+  deps.proofLattice.MacroPatchProofClassifier().SyncMacroPatchProofSummary(
+      patch);
+  return patch;
+}
+
 /// Return true when `child` is the generated function-like callee that consumes
 /// the root selector formal and obtains its terminal actuals from the root tuple
 /// formal.  Object-selector replay has already had first right of refusal; this
@@ -437,6 +656,12 @@ RefoldMacroStandardArgsOnlyPatchBuilder::BuildStandardArgsOnlyPatch(
   if (occs.empty() && !m.pasteSpans.empty()) {
     return PurePasteOnlyArgsOnlyCandidateBuilder(deps_, PasteArgumentBuilder())
         .TryBuild(m, hArgs, baseInvText, invArgRanges, actualRecoveryCtx);
+  }
+
+  if (occs.empty() && m.pasteSpans.empty() && !m.pasteTokens.empty()) {
+    if (auto directVaOptPasteTokenPatch = tryBuildDirectVaOptPasteTokenPatch(
+            deps_, m, hArgs, baseInvText, invArgRanges, actualRecoveryCtx))
+      return directVaOptPasteTokenPatch;
   }
 
   // Higher-order generated replay remains in its historical ranking position
