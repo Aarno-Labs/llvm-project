@@ -1900,6 +1900,75 @@ bool tupleGeneratedEditReverseLess(const TupleGeneratedEdit &lhs,
   return lhs.end > rhs.end;
 }
 
+/// Splits the parenthesized generated-callee actual list carried by one tuple
+/// element in an adjacency forwarder.
+///
+/// A forwarding macro such as `CALL(f, t) f t` does not spell the generated
+/// call parentheses in its replacement list.  Instead, the tuple element bound
+/// to `t` supplies the whole actual-list spelling, for example `("x")` in
+/// `OUTER((LOG, ("x")))`.  The tuple element is edited as one source slot, but
+/// replay must reason over the generated callee's individual actuals, including
+/// an empty variadic tail.  This helper performs only the deterministic
+/// top-level split; callee arity and variadic admission are checked by the
+/// caller.
+bool collectParenthesizedTupleGeneratedActuals(
+    StringRef sourceTupleElement, const clang::LangOptions &lexLang,
+    SmallVectorImpl<std::string> &out) {
+  out.clear();
+  StringRef trimmed = sourceTupleElement.trim();
+  if (!trimmed.starts_with("(") || !trimmed.ends_with(")") ||
+      trimmed.size() < 2)
+    return false;
+
+  StringRef payload = trimmed.drop_front().drop_back();
+  SmallVector<TupleElementSlice, 8> pieces;
+  if (!splitTopLevelTupleElementsWithLexer(payload, lexLang, pieces))
+    return false;
+  for (const TupleElementSlice &piece : pieces)
+    out.push_back(payload.slice(piece.trimBegin, piece.trimEnd).trim().str());
+  return !out.empty();
+}
+
+/// Rebuilds the single tuple element that supplies adjacency-call parentheses.
+///
+/// The tuple-generated solver has already produced the generated callee's fixed
+/// and variadic actual spellings.  The source-preserving obligation here is only
+/// to place those spellings back into the one parenthesized tuple slot consumed
+/// by `f t`, so the parent tuple shape survives instead of being collapsed into
+/// the generated expansion text.
+std::string buildParenthesizedTupleGeneratedActualList(
+    ArrayRef<std::string> actualPieces) {
+  std::string text;
+  raw_string_ostream os(text);
+  os << '(';
+  for (size_t i = 0; i < actualPieces.size(); ++i) {
+    if (i)
+      os << ", ";
+    os << StringRef(actualPieces[i]).trim();
+  }
+  os << ')';
+  os.flush();
+  return text;
+}
+
+/// Returns whether replay text contains a comma at macro-argument depth zero.
+///
+/// A solved non-variadic formal cannot be emitted as one macro actual if its
+/// replay text contains an unprotected top-level comma.  This check prevents a
+/// failed `__VA_OPT__` erased branch from accepting `fmt = "x", A, B` while the
+/// variadic formal remains empty.  Nested commas, such as `pair(1, 2)` or
+/// `(A, B)`, remain one argument and are accepted by the lexer-backed splitter.
+bool containsTopLevelMacroArgumentComma(StringRef text,
+                                        const clang::LangOptions &lexLang) {
+  StringRef trimmed = text.trim();
+  if (trimmed.empty())
+    return false;
+  SmallVector<TupleElementSlice, 4> pieces;
+  if (!splitTopLevelTupleElementsWithLexer(trimmed, lexLang, pieces))
+    return true;
+  return pieces.size() > 1;
+}
+
 /// Converts a root replacement token into one paste piece for the generated
 /// callee spelling.  The tuple actual that supplies generated-call arguments is
 /// deliberately rejected here: in this proof, callee-token bytes and tuple
@@ -2361,10 +2430,10 @@ using TupleSolvedActuals = SmallVector<std::string, 8>;
 /// The caller trusts the tuple forwarder proof and the recovered old tuple-slot
 /// actuals.  This parser owns the tuple replay syntactic gates: malformed
 /// stringification, malformed paste chains, out-of-range formal references,
-/// and unsupported `__VA_OPT__` all fail closed.  It preserves replacement-token
-/// order.  Tuple-specific stringification and paste facts are meaningful only
-/// after a successful parse, and are raised only for replay elements emitted
-/// into the accepted tuple pattern.
+/// and malformed `__VA_OPT__` payloads all fail closed.  It preserves
+/// replacement-token order.  Tuple-specific stringification and paste facts are
+/// meaningful only after a successful parse, and are raised only for replay
+/// elements emitted into the accepted tuple pattern.
 class TupleGeneratedCalleeReplayPatternParser {
 public:
   TupleGeneratedCalleeReplayPatternParser(
@@ -2449,12 +2518,22 @@ public:
         continue;
       }
 
-      // Standalone paste and __VA_OPT__ are not accepted in this tuple replay
-      // parser.  They remain fail-closed rather than being approximated.
+      // Standalone paste is not accepted in this tuple replay parser.  It
+      // remains fail-closed rather than being approximated.
       if (tok.spelling == "##")
         return false;
-      if (tok.spelling == "__VA_OPT__")
-        return false;
+      if (tok.spelling == "__VA_OPT__") {
+        std::optional<size_t> close = FindVaOptPayloadClose(i, end);
+        if (!close)
+          return false;
+        TupleCalleeReplayElem elem;
+        elem.kind = TupleCalleeReplayKind::VaOpt;
+        if (!Parse(i + 2, *close, elem.children))
+          return false;
+        out.push_back(std::move(elem));
+        i = *close + 1;
+        continue;
+      }
 
       TupleCalleeReplayElem elem;
       elem.kind = TupleCalleeReplayKind::Literal;
@@ -2491,6 +2570,37 @@ private:
     return true;
   }
 
+  /// Finds the close parenthesis for a canonical `__VA_OPT__(...)` payload.
+  ///
+  /// Tuple replay permits `__VA_OPT__` only as the ordinary replacement-list
+  /// operator recorded by the producer.  The payload is parsed recursively by
+  /// `Parse`, so malformed payload parentheses or unterminated payloads reject
+  /// the tuple-generated proof rather than falling through to whole-cover
+  /// preservation.
+  std::optional<size_t> FindVaOptPayloadClose(size_t vaOptIdx,
+                                              size_t end) const {
+    if (vaOptIdx + 1 >= end ||
+        definition_.replacementTokens[vaOptIdx + 1].kind !=
+            RefoldModel::MacroReplacementTokenKind::Literal ||
+        definition_.replacementTokens[vaOptIdx + 1].spelling != "(")
+      return std::nullopt;
+
+    unsigned depth = 1;
+    size_t close = vaOptIdx + 2;
+    for (; close < end; ++close) {
+      const auto &inner = definition_.replacementTokens[close];
+      if (inner.kind != RefoldModel::MacroReplacementTokenKind::Literal)
+        continue;
+      if (inner.spelling == "(") {
+        ++depth;
+        continue;
+      }
+      if (inner.spelling == ")" && --depth == 0)
+        return close;
+    }
+    return std::nullopt;
+  }
+
   const RefoldModel::MacroDirective &definition_;
   ArrayRef<std::string> oldActuals_;
   bool &usesStringification_;
@@ -2509,8 +2619,11 @@ class TupleGeneratedCalleeReplayResolver {
 public:
   TupleGeneratedCalleeReplayResolver(
       ArrayRef<TupleCalleeReplayElem> replayPattern,
-      ArrayRef<std::string> oldActuals, const clang::LangOptions &lexLang)
+      ArrayRef<std::string> oldActuals, ArrayRef<bool> variadicParamByIdx,
+      const clang::LangOptions &lexLang)
       : replayPattern_(replayPattern), oldActuals_(oldActuals),
+        variadicParamByIdx_(variadicParamByIdx.begin(),
+                            variadicParamByIdx.end()),
         lexLang_(lexLang) {}
 
   /// Solves the tuple replay pattern against `expansion`, if unique.
@@ -2527,7 +2640,9 @@ public:
     for (const std::string &actual : oldActuals_)
       seed.push_back(actual);
 
-    Dfs(expansion, toks, replayPattern_, 0, seed, solutions);
+    std::optional<bool> vaOptPayloadPresent;
+    Dfs(expansion, toks, replayPattern_, 0, seed, vaOptPayloadPresent,
+        solutions);
     if (solutions.size() != 1)
       return std::nullopt;
     return solutions.front();
@@ -2541,6 +2656,11 @@ private:
   bool AssignSolvedActual(TupleSolvedActuals &actuals, uint32_t paramIdx,
                           StringRef value) const {
     if (paramIdx >= actuals.size())
+      return false;
+
+    if (paramIdx < variadicParamByIdx_.size() &&
+        !variadicParamByIdx_[paramIdx] &&
+        containsTopLevelMacroArgumentComma(value, lexLang_))
       return false;
 
     // Compare by token equivalence so harmless spelling differences do not
@@ -2654,18 +2774,23 @@ private:
   ///
   /// Literals and stringification consume one token.  Parameters enumerate token
   /// suffixes in increasing end order.  Paste consumes one token through the
-  /// tuple paste solver.  `VaOpt` remains unsupported and fails closed.
+  /// tuple paste solver.  `__VA_OPT__` records whether its payload branch was
+  /// consumed and validates that choice against the solved variadic actual at
+  /// the end of the replay.  Delaying that validation prevents the erased branch
+  /// from stealing the leading comma by binding it into `__VA_ARGS__`.
   void Dfs(StringRef expansion, ArrayRef<ReplayTok> toks,
            ArrayRef<TupleCalleeReplayElem> elems, size_t tokPos,
-           TupleSolvedActuals &cur,
+           TupleSolvedActuals &cur, std::optional<bool> vaOptPayloadPresent,
            SmallVectorImpl<TupleSolvedActuals> &solutions) const {
     if (solutions.size() > 1)
       return;
 
     // The replay pattern is successful only when it consumes the entire B-side
-    // token stream.
+    // token stream and any `__VA_OPT__` branch choice agrees with the final
+    // solved variadic actual.
     if (elems.empty()) {
-      if (tokPos == toks.size())
+      if (tokPos == toks.size() &&
+          VaOptPayloadStateMatchesSolvedVariadic(cur, vaOptPayloadPresent))
         solutions.push_back(cur);
       return;
     }
@@ -2676,7 +2801,8 @@ private:
     case TupleCalleeReplayKind::Literal:
       // Literal replay elements are fixed token anchors.
       if (tokPos < toks.size() && toks[tokPos].spelling == elem.literal)
-        Dfs(expansion, toks, rest, tokPos + 1, cur, solutions);
+        Dfs(expansion, toks, rest, tokPos + 1, cur, vaOptPayloadPresent,
+            solutions);
       return;
 
     case TupleCalleeReplayKind::Param: {
@@ -2692,7 +2818,7 @@ private:
         TupleSolvedActuals next = cur;
         if (!AssignSolvedActual(next, elem.paramIdx, value))
           continue;
-        Dfs(expansion, toks, rest, end, next, solutions);
+        Dfs(expansion, toks, rest, end, next, vaOptPayloadPresent, solutions);
         if (solutions.size() > 1)
           return;
       }
@@ -2710,7 +2836,8 @@ private:
       TupleSolvedActuals next = cur;
       if (!AssignSolvedActual(next, elem.paramIdx, StringRef(*content)))
         return;
-      Dfs(expansion, toks, rest, tokPos + 1, next, solutions);
+      Dfs(expansion, toks, rest, tokPos + 1, next, vaOptPayloadPresent,
+          solutions);
       return;
     }
 
@@ -2724,21 +2851,124 @@ private:
                                           elem.pastePieces.size()),
           toks[tokPos].spelling, cur);
       for (TupleSolvedActuals &pasteSol : pasteSolutions) {
-        Dfs(expansion, toks, rest, tokPos + 1, pasteSol, solutions);
+        Dfs(expansion, toks, rest, tokPos + 1, pasteSol, vaOptPayloadPresent,
+            solutions);
         if (solutions.size() > 1)
           return;
       }
       return;
     }
 
+    case TupleCalleeReplayKind::VaOpt: {
+      if (!vaOptPayloadPresent || !*vaOptPayloadPresent) {
+        std::optional<bool> erasedPayload = false;
+        Dfs(expansion, toks, rest, tokPos, cur, erasedPayload, solutions);
+      }
+      if (!vaOptPayloadPresent || *vaOptPayloadPresent) {
+        TupleSolvedActuals withPayload = cur;
+        std::optional<bool> presentPayload = true;
+        DfsVaOptChildren(expansion, toks, elem.children, rest, tokPos, tokPos,
+                         withPayload, presentPayload, solutions);
+      }
+      return;
+    }
+    }
+  }
+
+  /// DFSes one `__VA_OPT__` payload and then resumes the parent suffix.
+  ///
+  /// Tuple replay admits literal and ordinary formal references inside the
+  /// payload.  Stringification, paste, and nested `__VA_OPT__` remain outside
+  /// this local theorem and therefore fail closed.  The payload-present branch
+  /// must consume at least one token before resuming the parent replay.
+  void DfsVaOptChildren(
+      StringRef expansion, ArrayRef<ReplayTok> toks,
+      ArrayRef<TupleCalleeReplayElem> childElems,
+      ArrayRef<TupleCalleeReplayElem> parentRest, size_t parentTokPos,
+      size_t childTokPos, TupleSolvedActuals &childAssigned,
+      std::optional<bool> vaOptPayloadPresent,
+      SmallVectorImpl<TupleSolvedActuals> &solutions) const {
+    if (solutions.size() > 1)
+      return;
+
+    if (childElems.empty()) {
+      if (childTokPos != parentTokPos)
+        Dfs(expansion, toks, parentRest, childTokPos, childAssigned,
+            vaOptPayloadPresent, solutions);
+      return;
+    }
+
+    const TupleCalleeReplayElem &child = childElems.front();
+    ArrayRef<TupleCalleeReplayElem> childRest = childElems.drop_front();
+    switch (child.kind) {
+    case TupleCalleeReplayKind::Literal:
+      if (childTokPos < toks.size() &&
+          toks[childTokPos].spelling == child.literal)
+        DfsVaOptChildren(expansion, toks, childRest, parentRest, parentTokPos,
+                         childTokPos + 1, childAssigned, vaOptPayloadPresent,
+                         solutions);
+      return;
+    case TupleCalleeReplayKind::Param:
+      DfsVaOptParam(expansion, toks, childRest, parentRest, parentTokPos,
+                    child.paramIdx, childTokPos, childAssigned,
+                    vaOptPayloadPresent, solutions);
+      return;
+    case TupleCalleeReplayKind::Stringify:
+    case TupleCalleeReplayKind::Paste:
     case TupleCalleeReplayKind::VaOpt:
-      // Tuple generated-callee replay does not currently prove VA_OPT payloads.
       return;
     }
   }
 
+  /// Enumerates a parameter binding inside a `__VA_OPT__` payload.
+  void DfsVaOptParam(
+      StringRef expansion, ArrayRef<ReplayTok> toks,
+      ArrayRef<TupleCalleeReplayElem> childRest,
+      ArrayRef<TupleCalleeReplayElem> parentRest, size_t parentTokPos,
+      uint32_t paramIdx, size_t childTokPos, TupleSolvedActuals &childAssigned,
+      std::optional<bool> vaOptPayloadPresent,
+      SmallVectorImpl<TupleSolvedActuals> &solutions) const {
+    if (paramIdx >= childAssigned.size())
+      return;
+
+    for (size_t end = childTokPos; end <= toks.size(); ++end) {
+      StringRef value;
+      if (end > childTokPos) {
+        const size_t byteBegin = toks[childTokPos].begin;
+        const size_t byteEnd = toks[end - 1].end;
+        value = expansion.slice(byteBegin, byteEnd);
+      }
+      TupleSolvedActuals next = childAssigned;
+      if (!AssignSolvedActual(next, paramIdx, value))
+        continue;
+      DfsVaOptChildren(expansion, toks, childRest, parentRest, parentTokPos,
+                       end, next, vaOptPayloadPresent, solutions);
+      if (solutions.size() > 1)
+        return;
+    }
+  }
+
+  /// Checks the chosen `__VA_OPT__` branch against solved variadic formals.
+  bool VaOptPayloadStateMatchesSolvedVariadic(
+      const TupleSolvedActuals &actuals,
+      std::optional<bool> vaOptPayloadPresent) const {
+    if (!vaOptPayloadPresent)
+      return true;
+
+    bool hasVariadicTokens = false;
+    for (size_t i = 0; i < actuals.size() && i < variadicParamByIdx_.size();
+         ++i) {
+      if (variadicParamByIdx_[i] && !StringRef(actuals[i]).trim().empty()) {
+        hasVariadicTokens = true;
+        break;
+      }
+    }
+    return hasVariadicTokens == *vaOptPayloadPresent;
+  }
+
   ArrayRef<TupleCalleeReplayElem> replayPattern_;
   ArrayRef<std::string> oldActuals_;
+  SmallVector<bool, 8> variadicParamByIdx_;
   const clang::LangOptions &lexLang_;
 };
 
@@ -2801,18 +3031,23 @@ public:
     const auto &forwarderToks = ctx.forwarderDefinition.replacementTokens;
 
     // Recover the generated call inside the forwarding macro as a token-level
-    // context rather than requiring the whole replacement list to be exactly
-    // `F(X, ...)`.  This is the owner-level invariant for tuple-generated
-    // callees: fixed literal tokens before/after the generated call belong to
-    // the forwarding template, while the callee formal and generated actual
-    // formals still map positionally back to tuple slots.  Examples accepted by
-    // this proof include `F(X)`, `(F(X))`, and `F(X) "!"`; anything with
-    // operators such as #/## in the forwarding layer remains outside this proof.
+    // context.  Tuple replay accepts two explicit, deterministic shapes:
+    //
+    //   * `f(...)`, where the forwarder replacement list spells the generated
+    //     call parentheses; and
+    //   * `f t`, where tuple element `t` supplies the complete parenthesized
+    //     generated-callee actual list.
+    //
+    // The second form is required for nested tuple forwarders such as
+    // `OUTER((LOG, ("x")))`.  The tuple element remains one source edit target,
+    // but replay below splits its parenthesized payload into the generated
+    // callee's fixed and variadic actual slots.
     size_t generatedCallBegin = forwarderToks.size();
     size_t generatedCallOpen = forwarderToks.size();
     size_t generatedCallClose = forwarderToks.size();
     uint32_t calleeForwarderParam = 0;
     bool foundGeneratedCall = false;
+    bool adjacencyGeneratedCall = false;
     for (size_t i = 0; i + 1 < forwarderToks.size(); ++i) {
       const auto &calleeTok = forwarderToks[i];
       const auto &openTok = forwarderToks[i + 1];
@@ -2848,6 +3083,28 @@ public:
       generatedCallClose = close;
       calleeForwarderParam = *calleeTok.paramIndex;
     }
+
+    if (!foundGeneratedCall && forwarderToks.size() == 2 &&
+        forwarderToks[0].kind ==
+            RefoldModel::MacroReplacementTokenKind::ParamRef &&
+        forwarderToks[0].paramIndex &&
+        forwarderToks[1].kind ==
+            RefoldModel::MacroReplacementTokenKind::ParamRef &&
+        forwarderToks[1].paramIndex &&
+        *forwarderToks[0].paramIndex != *forwarderToks[1].paramIndex) {
+      foundGeneratedCall = true;
+      adjacencyGeneratedCall = true;
+      calleeForwarderParam = *forwarderToks[0].paramIndex;
+
+      TupleGeneratedArgRef ref;
+      ref.forwarderParamIdx = *forwarderToks[1].paramIndex;
+      if (ref.forwarderParamIdx >= ctx.forwarderDefinition.defParams.size())
+        return std::nullopt;
+      ref.variadicPack =
+          ctx.forwarderDefinition.defParams[ref.forwarderParamIdx].variadic;
+      tupleState.generatedArgRefs.push_back(ref);
+    }
+
     if (!foundGeneratedCall ||
         calleeForwarderParam >= ctx.forwarderDefinition.defParams.size() ||
         calleeForwarderParam >= tupleElems.size())
@@ -2855,33 +3112,36 @@ public:
 
     SmallVector<std::string, 8> forwarderPrefixLiterals;
     SmallVector<std::string, 8> forwarderSuffixLiterals;
-    if (!appendGeneratedReplayLiteralRange(forwarderToks, 0,
-                                           generatedCallBegin,
-                                           forwarderPrefixLiterals) ||
-        !appendGeneratedReplayLiteralRange(forwarderToks,
-                                           generatedCallClose + 1,
-                                           forwarderToks.size(),
-                                           forwarderSuffixLiterals)) {
+    if (!adjacencyGeneratedCall &&
+        (!appendGeneratedReplayLiteralRange(forwarderToks, 0,
+                                            generatedCallBegin,
+                                            forwarderPrefixLiterals) ||
+         !appendGeneratedReplayLiteralRange(forwarderToks,
+                                            generatedCallClose + 1,
+                                            forwarderToks.size(),
+                                            forwarderSuffixLiterals))) {
       return std::nullopt;
     }
 
-    for (size_t i = generatedCallOpen + 1; i < generatedCallClose; ++i) {
-      const auto &tok = forwarderToks[i];
-      if (tok.spelling == "#" || tok.spelling == "##" ||
-          tok.spelling == "__VA_OPT__")
-        return std::nullopt;
-      if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef)
-        continue;
-      if (!tok.paramIndex ||
-          *tok.paramIndex >= ctx.forwarderDefinition.defParams.size())
-        return std::nullopt;
-      if (*tok.paramIndex == calleeForwarderParam)
-        return std::nullopt;
-      TupleGeneratedArgRef ref;
-      ref.forwarderParamIdx = *tok.paramIndex;
-      ref.variadicPack = ctx.forwarderDefinition.defParams[*tok.paramIndex]
-                             .variadic;
-      tupleState.generatedArgRefs.push_back(ref);
+    if (!adjacencyGeneratedCall) {
+      for (size_t i = generatedCallOpen + 1; i < generatedCallClose; ++i) {
+        const auto &tok = forwarderToks[i];
+        if (tok.spelling == "#" || tok.spelling == "##" ||
+            tok.spelling == "__VA_OPT__")
+          return std::nullopt;
+        if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef)
+          continue;
+        if (!tok.paramIndex ||
+            *tok.paramIndex >= ctx.forwarderDefinition.defParams.size())
+          return std::nullopt;
+        if (*tok.paramIndex == calleeForwarderParam)
+          return std::nullopt;
+        TupleGeneratedArgRef ref;
+        ref.forwarderParamIdx = *tok.paramIndex;
+        ref.variadicPack = ctx.forwarderDefinition.defParams[*tok.paramIndex]
+                               .variadic;
+        tupleState.generatedArgRefs.push_back(ref);
+      }
     }
     if (tupleState.generatedArgRefs.empty())
       return std::nullopt;
@@ -2910,6 +3170,22 @@ public:
           tupleState.TupleElementText(ref.forwarderParamIdx).str());
     }
 
+    SmallVector<std::string, 8> oldCalleeActualPieces;
+    if (adjacencyGeneratedCall) {
+      // The source tuple slot consumed by `f t` is one parenthesized generated
+      // actual list, not one generated actual.  Split it for callee replay while
+      // keeping the original tuple slot as the only edit target.
+      if (tupleState.oldGeneratedPieces.size() != 1 ||
+          tupleState.generatedArgRefs.size() != 1 ||
+          !collectParenthesizedTupleGeneratedActuals(
+              tupleState.oldGeneratedPieces.front(), deps_.lexLang,
+              oldCalleeActualPieces))
+        return std::nullopt;
+    } else {
+      oldCalleeActualPieces.append(tupleState.oldGeneratedPieces.begin(),
+                                   tupleState.oldGeneratedPieces.end());
+    }
+
     const bool calleeHasVariadic = !calleeDefinition->defParams.empty() &&
                                    calleeDefinition->defParams.back().variadic;
     bool tupleReplayUsesStringification = false;
@@ -2921,23 +3197,21 @@ public:
                                           ? calleeDefinition->defParams.size() - 1
                                           : calleeDefinition->defParams.size();
     if ((!calleeHasVariadic &&
-         tupleState.oldGeneratedPieces.size() !=
-             calleeDefinition->defParams.size()) ||
-        (calleeHasVariadic &&
-         tupleState.oldGeneratedPieces.size() < fixedCalleeActuals))
+         oldCalleeActualPieces.size() != calleeDefinition->defParams.size()) ||
+        (calleeHasVariadic && oldCalleeActualPieces.size() < fixedCalleeActuals))
       return std::nullopt;
 
     tupleState.oldActuals.reserve(calleeDefinition->defParams.size());
     for (size_t i = 0; i < fixedCalleeActuals; ++i)
-      tupleState.oldActuals.push_back(tupleState.oldGeneratedPieces[i]);
+      tupleState.oldActuals.push_back(oldCalleeActualPieces[i]);
     if (calleeHasVariadic) {
       std::string variadicText;
       raw_string_ostream os(variadicText);
       for (size_t i = fixedCalleeActuals;
-           i < tupleState.oldGeneratedPieces.size(); ++i) {
+           i < oldCalleeActualPieces.size(); ++i) {
         if (i != fixedCalleeActuals)
           os << ", ";
-        os << StringRef(tupleState.oldGeneratedPieces[i]).trim();
+        os << StringRef(oldCalleeActualPieces[i]).trim();
       }
       os.flush();
       tupleState.oldActuals.push_back(std::move(variadicText));
@@ -2986,10 +3260,16 @@ public:
       replayPattern.push_back(std::move(elem));
     }
 
+    SmallVector<bool, 8> variadicParamByIdx;
+    variadicParamByIdx.reserve(calleeDefinition->defParams.size());
+    for (const auto &param : calleeDefinition->defParams)
+      variadicParamByIdx.push_back(param.variadic);
+
     const TupleGeneratedCalleeReplayResolver tupleReplayResolver(
         ArrayRef<TupleCalleeReplayElem>(replayPattern.data(), replayPattern.size()),
         ArrayRef<std::string>(tupleState.oldActuals.data(),
                               tupleState.oldActuals.size()),
+        ArrayRef<bool>(variadicParamByIdx.data(), variadicParamByIdx.size()),
         deps_.lexLang);
 
     std::optional<TupleSolvedActuals> oldSolved =
@@ -3026,53 +3306,75 @@ public:
     }
 
     size_t pieceCursor = 0;
-    for (const TupleGeneratedArgRef &ref : tupleState.generatedArgRefs) {
-      if (ref.variadicPack) {
-        if (ref.forwarderParamIdx >= tupleElems.size())
-          return std::nullopt;
-        std::string text;
-        raw_string_ostream os(text);
-        bool first = true;
-        while (pieceCursor < newGeneratedPieces.size()) {
-          if (!first)
-            os << ", ";
-          first = false;
-          os << StringRef(newGeneratedPieces[pieceCursor]).trim();
-          ++pieceCursor;
-        }
-        os.flush();
-        const TupleElementSlice &firstElem = tupleElems[ref.forwarderParamIdx];
-        const TupleElementSlice &lastElem = tupleElems.back();
-        tupleState.edits.push_back(TupleGeneratedEdit{firstElem.trimBegin,
-                                                      lastElem.trimEnd,
-                                                      std::move(text)});
-        continue;
-      }
-      if (pieceCursor >= newGeneratedPieces.size() ||
-          ref.forwarderParamIdx >= tupleElems.size())
+    if (adjacencyGeneratedCall) {
+      // `f t` consumes one tuple element as the full parenthesized actual list
+      // for the generated callee.  Rebuild that single element from the solved
+      // callee actuals instead of trying to map fixed and variadic slots to
+      // separate tuple elements.
+      if (tupleState.generatedArgRefs.size() != 1)
+        return std::nullopt;
+      const TupleGeneratedArgRef &ref = tupleState.generatedArgRefs.front();
+      if (ref.forwarderParamIdx >= tupleElems.size())
         return std::nullopt;
       const TupleElementSlice &elem = tupleElems[ref.forwarderParamIdx];
-      StringRef oldText = pieceCursor < oldSolved->size()
-                              ? StringRef((*oldSolved)[pieceCursor]).trim()
-                              : (pieceCursor < tupleState.oldActuals.size()
-                                     ? StringRef(
-                                           tupleState.oldActuals[pieceCursor])
-                                           .trim()
-                                     : StringRef(tupleState.oldGeneratedPieces[
-                                                     pieceCursor])
-                                           .trim());
-      StringRef newText = StringRef(newGeneratedPieces[pieceCursor]).trim();
-      if (newText != tuplePayload.slice(elem.trimBegin, elem.trimEnd).trim()) {
-        auto rewrittenElem = rewriteTupleElementFromSolvedExpansion(
-            tupleState.TupleElementText(ref.forwarderParamIdx), oldText, newText,
-            deps_.lexLang);
-        if (!rewrittenElem)
-          return std::nullopt;
+      std::string rebuiltElement =
+          buildParenthesizedTupleGeneratedActualList(newGeneratedPieces);
+      if (StringRef(rebuiltElement).trim() !=
+          tuplePayload.slice(elem.trimBegin, elem.trimEnd).trim()) {
         tupleState.edits.push_back(TupleGeneratedEdit{elem.trimBegin,
                                                       elem.trimEnd,
-                                                      std::move(*rewrittenElem)});
+                                                      std::move(rebuiltElement)});
       }
-      ++pieceCursor;
+      pieceCursor = newGeneratedPieces.size();
+    } else {
+      for (const TupleGeneratedArgRef &ref : tupleState.generatedArgRefs) {
+        if (ref.variadicPack) {
+          if (ref.forwarderParamIdx >= tupleElems.size())
+            return std::nullopt;
+          std::string text;
+          raw_string_ostream os(text);
+          bool first = true;
+          while (pieceCursor < newGeneratedPieces.size()) {
+            if (!first)
+              os << ", ";
+            first = false;
+            os << StringRef(newGeneratedPieces[pieceCursor]).trim();
+            ++pieceCursor;
+          }
+          os.flush();
+          const TupleElementSlice &firstElem = tupleElems[ref.forwarderParamIdx];
+          const TupleElementSlice &lastElem = tupleElems.back();
+          tupleState.edits.push_back(TupleGeneratedEdit{firstElem.trimBegin,
+                                                        lastElem.trimEnd,
+                                                        std::move(text)});
+          continue;
+        }
+        if (pieceCursor >= newGeneratedPieces.size() ||
+            ref.forwarderParamIdx >= tupleElems.size())
+          return std::nullopt;
+        const TupleElementSlice &elem = tupleElems[ref.forwarderParamIdx];
+        StringRef oldText = pieceCursor < oldSolved->size()
+                                ? StringRef((*oldSolved)[pieceCursor]).trim()
+                                : (pieceCursor < tupleState.oldActuals.size()
+                                       ? StringRef(
+                                             tupleState.oldActuals[pieceCursor])
+                                             .trim()
+                                       : StringRef(tupleState.oldGeneratedPieces[
+                                                       pieceCursor])
+                                             .trim());
+        StringRef newText = StringRef(newGeneratedPieces[pieceCursor]).trim();
+        if (newText != tuplePayload.slice(elem.trimBegin, elem.trimEnd).trim()) {
+          auto rewrittenElem = rewriteTupleElementFromSolvedExpansion(
+              tupleState.TupleElementText(ref.forwarderParamIdx), oldText,
+              newText, deps_.lexLang);
+          if (!rewrittenElem)
+            return std::nullopt;
+          tupleState.edits.push_back(TupleGeneratedEdit{elem.trimBegin,
+                                                        elem.trimEnd,
+                                                        std::move(*rewrittenElem)});
+        }
+        ++pieceCursor;
+      }
     }
     if (pieceCursor != newGeneratedPieces.size() || tupleState.edits.empty())
       return std::nullopt;
