@@ -82,6 +82,24 @@ bool replayTokenRangeSpellingsEqual(
   return true;
 }
 
+/// Return whether a macro replacement list contains an explicit `__VA_OPT__`
+/// operator.
+///
+/// The fixed-callee actual-list replay theorem is a VA_OPT-specific bridge for
+/// wrappers such as `WRAP(args) LOG args`, where the wrapper itself supplies a
+/// literal callee and the source actual supplies that callee's parenthesized
+/// actual list.  Do not run that theorem for ordinary shielded stringify
+/// wrappers such as `SHIELD_STR(x) STR x`: those may also be textually replayable
+/// through a literal callee, but they have different decoded-payload evidence and
+/// are intentionally left to the existing stringify/whole-cover policy.
+bool replacementTokensContainVaOpt(
+    const RefoldModel::MacroDirective &definition) {
+  for (const auto &tok : definition.replacementTokens)
+    if (tok.spelling == "__VA_OPT__")
+      return true;
+  return false;
+}
+
 enum class TupleRewriteMode {
   None,
   DirectTupleRefs,
@@ -2811,10 +2829,41 @@ HigherOrderGeneratedReplayProbe::TryBuildTupleGeneratedCalleeReplay(
   const RefoldModel::MacroDirective *forwarderDefinition =
       deps_.resolveFunctionLikeMacroThroughAliasesWithHops(
           rootTok0.spelling, &forwarderAliasHops);
-  tupleObjectAliasHopCount += forwarderAliasHops;
   if (!forwarderDefinition || forwarderDefinition->defParams.empty())
     return std::nullopt;
 
+  // A wrapper can fix the generated callee directly instead of forwarding a
+  // tuple element that names it:
+  //
+  //   #define LOG(fmt, ...) emit(fmt __VA_OPT__(,) __VA_ARGS__)
+  //   #define WRAP(args) LOG args
+  //
+  // This theorem is deliberately restricted to fixed callees that contain
+  // `__VA_OPT__`.  Non-VAOPT wrappers such as `SHIELD_STR(x) STR x` are also
+  // textually shaped like `CALLEE args`, but replaying them through this bridge
+  // would incorrectly outrank the existing stringify/whole-cover policy for
+  // decoded string payloads.  VAOPT is the proof-relevant feature that requires
+  // this extra actual-list bridge because activation/deactivation changes fixed
+  // replacement-list syntax together with the forwarded variadic actuals.
+  if (replacementTokensContainVaOpt(*forwarderDefinition)) {
+    uint32_t literalCalleeAliasHops = forwarderAliasHops;
+    LiteralCalleeTupleActualReplayContext literalCalleeCtx{
+        invocation,
+        baseInvocationText,
+        invocationArgRanges,
+        *cover,
+        *bEnv,
+        *rootDefinition,
+        *forwarderDefinition,
+        callerArgIdx,
+        literalCalleeAliasHops};
+    if (auto literalCalleePatch = deps_.generatedCalleeReplayEngine
+                                      .BuildLiteralCalleeTupleActualReplayCandidate(
+                                          literalCalleeCtx))
+      return literalCalleePatch;
+  }
+
+  tupleObjectAliasHopCount += forwarderAliasHops;
   TupleGeneratedCalleeReplayContext tupleGeneratedCtx{
       invocation,
       baseInvocationText,

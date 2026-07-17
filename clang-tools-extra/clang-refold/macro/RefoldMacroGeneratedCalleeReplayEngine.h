@@ -136,6 +136,34 @@ struct TupleGeneratedCalleeReplayContext {
   uint32_t &objectAliasHopCount;
 };
 
+/// Explicit root state for literal-callee tuple-actual replay.
+///
+/// This replay handles wrapper definitions shaped like `CALLEE args`, where the
+/// callee is fixed by the root replacement list and the single source actual
+/// supplies the complete parenthesized generated-callee actual list.  It is the
+/// direct analogue of tuple-generated `f t` replay, but without a source tuple
+/// element for the callee name.
+struct LiteralCalleeTupleActualReplayContext {
+  /// Root invocation whose tuple actual is being replayed.
+  const RefoldModel::MacroInvocation &invocation;
+  /// Complete source spelling of the root invocation.
+  llvm::StringRef baseInvocationText;
+  /// Formal-content byte ranges inside `baseInvocationText`.
+  llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges;
+  /// Whole-cover A-token envelope for the root invocation.
+  const std::pair<uint64_t, uint64_t> &wholeCoverATokens;
+  /// B-token envelope being realized by literal-callee replay.
+  const std::pair<size_t, size_t> &bTokenEnvelope;
+  /// Macro definition at the tuple replay root.
+  const RefoldModel::MacroDirective &rootDefinition;
+  /// Fixed function-like callee named by the root replacement list.
+  const RefoldModel::MacroDirective &calleeDefinition;
+  /// Caller formal index that contains the parenthesized actual list.
+  uint32_t callerArgIdx = 0;
+  /// Number of object-like alias hops consumed while resolving the callee.
+  uint32_t &objectAliasHopCount;
+};
+
 /// Explicit root state for paste-derived tuple generated-callee replay.
 ///
 /// This replay handles roots shaped like `a##b t`: the generated callee token
@@ -308,6 +336,11 @@ public:
   /// nullopt for a non-terminal miss.
   std::optional<MacroPatch> BuildTupleGeneratedCalleeReplayCandidate(
       const TupleGeneratedCalleeReplayContext &ctx) const;
+
+  /// Build a literal-callee tuple-actual replay candidate.  Returns nullopt for
+  /// a non-terminal miss.
+  std::optional<MacroPatch> BuildLiteralCalleeTupleActualReplayCandidate(
+      const LiteralCalleeTupleActualReplayContext &ctx) const;
 
   /// Build the paste-derived tuple generated-callee replay candidate. Returns
   /// nullopt for a non-terminal miss.

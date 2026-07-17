@@ -2973,6 +2973,170 @@ private:
 };
 
 
+
+/// Resolves fixed-callee tuple-actual replay before patch certification.
+///
+/// A wrapper such as `#define WRAP(args) LOG args` does not have a tuple element
+/// that names the generated callee.  The root replacement list already fixes
+/// the callee (`LOG`), and the root actual supplies the parenthesized generated
+/// actual list.  This resolver proves that direct shape without routing it
+/// through the `CALL(f, t)` tuple-callee theorem, which would incorrectly look
+/// for a callee element inside the source actual.
+class LiteralCalleeTupleActualReplayResolver {
+public:
+  explicit LiteralCalleeTupleActualReplayResolver(
+      const RefoldMacroGeneratedCalleeReplayEngine::Dependencies &deps)
+      : deps_(deps) {}
+
+  /// Builds the rewritten invocation for a fixed-callee tuple-actual wrapper.
+  ///
+  /// The proof is fail-closed: the source actual must be a parenthesized macro
+  /// actual list, the fixed callee must replay both the old and edited whole
+  /// covers uniquely, and the accepted edit may replace only the root formal
+  /// that supplies the generated callee's actual-list spelling.
+  std::optional<MacroPatch>
+  Build(const LiteralCalleeTupleActualReplayContext &ctx) const {
+    if (ctx.callerArgIdx >= ctx.invocationArgRanges.size() ||
+        !ctx.invocation.invB || !ctx.invocation.invE)
+      return std::nullopt;
+
+    const auto argRange = ctx.invocationArgRanges[ctx.callerArgIdx];
+    if (argRange.second < argRange.first ||
+        argRange.second > ctx.baseInvocationText.size())
+      return std::nullopt;
+
+    StringRef sourceActual =
+        ctx.baseInvocationText.slice(argRange.first, argRange.second).trim();
+
+    SmallVector<std::string, 8> oldCalleeActualPieces;
+    if (!collectParenthesizedTupleGeneratedActuals(sourceActual, deps_.lexLang,
+                                                   oldCalleeActualPieces))
+      return std::nullopt;
+    if (!macroDefinitionAcceptsActualCount(ctx.calleeDefinition,
+                                           oldCalleeActualPieces.size()))
+      return std::nullopt;
+
+    const bool calleeHasVariadic = !ctx.calleeDefinition.defParams.empty() &&
+                                   ctx.calleeDefinition.defParams.back().variadic;
+    const size_t fixedCalleeActuals = calleeHasVariadic
+                                          ? ctx.calleeDefinition.defParams.size() - 1
+                                          : ctx.calleeDefinition.defParams.size();
+    if ((!calleeHasVariadic &&
+         oldCalleeActualPieces.size() != ctx.calleeDefinition.defParams.size()) ||
+        (calleeHasVariadic && oldCalleeActualPieces.size() < fixedCalleeActuals))
+      return std::nullopt;
+
+    SmallVector<std::string, 8> oldActuals;
+    oldActuals.reserve(ctx.calleeDefinition.defParams.size());
+    for (size_t i = 0; i < fixedCalleeActuals; ++i)
+      oldActuals.push_back(oldCalleeActualPieces[i]);
+    if (calleeHasVariadic) {
+      std::string variadicText;
+      raw_string_ostream os(variadicText);
+      for (size_t i = fixedCalleeActuals; i < oldCalleeActualPieces.size();
+           ++i) {
+        if (i != fixedCalleeActuals)
+          os << ", ";
+        os << StringRef(oldCalleeActualPieces[i]).trim();
+      }
+      os.flush();
+      oldActuals.push_back(std::move(variadicText));
+    }
+    if (oldActuals.size() != ctx.calleeDefinition.defParams.size())
+      return std::nullopt;
+
+    bool usesStringification = false;
+    bool usesPaste = false;
+    std::vector<TupleCalleeReplayElem> replayPattern;
+    const TupleGeneratedCalleeReplayPatternParser parser(
+        ctx.calleeDefinition,
+        ArrayRef<std::string>(oldActuals.data(), oldActuals.size()),
+        usesStringification, usesPaste);
+    if (!parser.Parse(0, ctx.calleeDefinition.replacementTokens.size(),
+                      replayPattern) ||
+        replayPattern.empty())
+      return std::nullopt;
+
+    SmallVector<bool, 8> variadicParamByIdx;
+    variadicParamByIdx.reserve(ctx.calleeDefinition.defParams.size());
+    for (const auto &param : ctx.calleeDefinition.defParams)
+      variadicParamByIdx.push_back(param.variadic);
+
+    const TupleGeneratedCalleeReplayResolver replayResolver(
+        ArrayRef<TupleCalleeReplayElem>(replayPattern.data(),
+                                        replayPattern.size()),
+        ArrayRef<std::string>(oldActuals.data(), oldActuals.size()),
+        ArrayRef<bool>(variadicParamByIdx.data(), variadicParamByIdx.size()),
+        deps_.lexLang);
+
+    StringRef oldExpansion = deps_.sourceMapper
+                                 .SliceASource(ctx.wholeCoverATokens.first,
+                                               ctx.wholeCoverATokens.second)
+                                 .trim();
+    StringRef newExpansion = deps_.sourceMapper
+                                 .SliceBSource(ctx.bTokenEnvelope.first,
+                                               ctx.bTokenEnvelope.second)
+                                 .trim();
+
+    std::optional<TupleSolvedActuals> oldSolved =
+        replayResolver.SolveExpansion(oldExpansion);
+    if (!oldSolved || oldSolved->size() != oldActuals.size())
+      return std::nullopt;
+
+    std::optional<TupleSolvedActuals> newSolved =
+        replayResolver.SolveExpansion(newExpansion);
+    if (!newSolved || newSolved->size() != oldActuals.size())
+      return std::nullopt;
+
+    SmallVector<std::string, 8> newPieces;
+    for (size_t i = 0; i < fixedCalleeActuals; ++i)
+      newPieces.push_back(StringRef((*newSolved)[i]).trim().str());
+    if (calleeHasVariadic) {
+      StringRef tail = StringRef(newSolved->back()).trim();
+      if (!tail.empty())
+        newPieces.push_back(tail.str());
+    }
+
+    std::string rewrittenActual =
+        buildParenthesizedTupleGeneratedActualList(newPieces);
+    if (StringRef(rewrittenActual).trim() == sourceActual)
+      return std::nullopt;
+
+    llvm::DenseMap<uint32_t, std::string> replacementsByArgIdx;
+    replacementsByArgIdx[ctx.callerArgIdx] = std::move(rewrittenActual);
+
+    InvocationActualRecoveryContext actualRecoveryCtx{
+        ctx.invocation, ctx.baseInvocationText, ctx.invocationArgRanges};
+    std::optional<InvocationRewriteWithRange> rewrite =
+        deps_.buildInvocationRewriteWithRange(
+            actualRecoveryCtx, replacementsByArgIdx,
+            /*materializedRangeByArgIdx=*/nullptr);
+    if (!rewrite)
+      return std::nullopt;
+
+    MacroPatch patch{*ctx.invocation.invB, *ctx.invocation.invE,
+                     std::move(rewrite->text), ctx.invocation.id};
+    deps_.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
+        patch, rewrite->materializedOutputByteStart,
+        rewrite->materializedOutputByteEnd);
+    certifyMacroPatchMaterializedBTokenRange(
+        patch, static_cast<uint64_t>(ctx.bTokenEnvelope.first),
+        static_cast<uint64_t>(ctx.bTokenEnvelope.second));
+    deps_.proofCertifier.SetArgsOnlyStandardProof(
+        patch, ctx.invocation, /*wholeEnvelopeReplayValidated=*/true);
+    deps_.proofCertifier.CertifyGeneratedCalleeReplayProof(
+        patch, ctx.invocation, ctx.calleeDefinition.id,
+        /*generatedCallDepth=*/1, ctx.objectAliasHopCount,
+        usesStringification, usesPaste,
+        /*usesVariadicForwarding=*/calleeHasVariadic,
+        /*decodedStringLiteralEvidenceOnly=*/usesStringification);
+    return patch;
+  }
+
+private:
+  const RefoldMacroGeneratedCalleeReplayEngine::Dependencies &deps_;
+};
+
 /// Resolves the tuple-generated replay proof before patch certification.
 ///
 /// The resolver owns the tuple-side algorithm that was formerly inline in
@@ -4132,6 +4296,12 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
       /*usesVariadicForwarding=*/false,
       /*decodedStringLiteralEvidenceOnly=*/uniqueCandidate->usesStringification);
   return patch;
+}
+
+std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
+    BuildLiteralCalleeTupleActualReplayCandidate(
+        const LiteralCalleeTupleActualReplayContext &literalCtx) const {
+  return LiteralCalleeTupleActualReplayResolver(deps_).Build(literalCtx);
 }
 
 std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
