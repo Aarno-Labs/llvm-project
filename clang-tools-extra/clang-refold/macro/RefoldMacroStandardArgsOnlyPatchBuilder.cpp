@@ -171,6 +171,73 @@ bool textIsSingleTokenSpelling(StringRef text, const LangOptions &lexLang) {
          tokens.front().end == text.size() && tokens.front().spelling == text;
 }
 
+/// Return whether an invocation delimiter slice contains exactly one comma and
+/// otherwise only whitespace.
+///
+/// Variadic deactivation rewrites remove the final variadic actual rather than
+/// replacing its content with an empty string.  This helper gives that deletion
+/// a small fail-closed boundary: the bytes between the previous argument and the
+/// variadic argument must be only the call-site delimiter we are allowed to
+/// remove.
+bool invocationDelimiterIsSingleComma(StringRef delimiterText) {
+  bool sawComma = false;
+  for (char c : delimiterText) {
+    if (c == ',') {
+      if (sawComma)
+        return false;
+      sawComma = true;
+      continue;
+    }
+    if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\f' &&
+        c != '\v')
+      return false;
+  }
+  return sawComma;
+}
+
+/// Rebuild an invocation after deleting its final variadic actual and the
+/// delimiter that introduced it.
+///
+/// This is intentionally not folded into `BuildInvocationRewriteWithRange`:
+/// that service replaces formal-content ranges and must not learn how to delete
+/// call-site delimiters.  Conditional `__VA_OPT__` paste deactivation is the one
+/// args-only proof here that needs delimiter deletion, because the source form
+/// changes from `MAKE(foo, bar)` to `MAKE(foo)` when the variadic pack becomes
+/// empty.
+std::optional<InvocationRewriteWithRange> buildInvocationRewriteDroppingFinalArg(
+    StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges,
+    uint32_t argIdx, uint32_t materializedArgIdx) {
+  if (argIdx == 0 || argIdx + 1 != invocationArgRanges.size() ||
+      materializedArgIdx >= invocationArgRanges.size())
+    return std::nullopt;
+
+  const auto previousRange = invocationArgRanges[argIdx - 1];
+  const auto droppedRange = invocationArgRanges[argIdx];
+  const auto materializedRange = invocationArgRanges[materializedArgIdx];
+  if (previousRange.second < previousRange.first ||
+      droppedRange.second < droppedRange.first ||
+      materializedRange.second < materializedRange.first ||
+      previousRange.second > baseInvocationText.size() ||
+      droppedRange.second > baseInvocationText.size() ||
+      materializedRange.second > baseInvocationText.size() ||
+      previousRange.second > droppedRange.first ||
+      materializedRange.first >= droppedRange.second)
+    return std::nullopt;
+
+  StringRef delimiterText =
+      baseInvocationText.slice(previousRange.second, droppedRange.first);
+  if (!invocationDelimiterIsSingleComma(delimiterText))
+    return std::nullopt;
+
+  InvocationRewriteWithRange out;
+  out.text = baseInvocationText.slice(0, previousRange.second).str();
+  out.text += baseInvocationText.substr(droppedRange.second).str();
+  out.materializedOutputByteStart = materializedRange.first;
+  out.materializedOutputByteEnd = materializedRange.second;
+  return out;
+}
+
 /// Recognize the direct conditional paste shape that the producer currently
 /// records with `paste_tokens` but without `paste_spans`.
 ///
@@ -249,9 +316,11 @@ matchDirectVaOptPasteTokenShape(const RefoldModel::MacroDirective &definition) {
 ///
 /// Proof obligation: the old invocation actuals must concatenate to the single
 /// A-side pasted token, and the edited B token must differ only in the
-/// variadic contribution while preserving the fixed contribution.  The new
-/// variadic contribution must itself be exactly one lexer token so the rewrite
-/// does not invent a multi-token paste payload or change call-site arity.
+/// variadic contribution while preserving the fixed contribution.  A non-empty
+/// new variadic contribution must itself be exactly one lexer token so the
+/// rewrite does not invent a multi-token paste payload.  An empty new
+/// contribution is admitted only as `__VA_OPT__` deactivation and is emitted by
+/// deleting the final variadic argument plus its comma delimiter.
 std::optional<MacroPatch> tryBuildDirectVaOptPasteTokenPatch(
     const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
     const RefoldModel::MacroInvocation &invocation, const diffutils::Hunk &hunk,
@@ -315,22 +384,28 @@ std::optional<MacroPatch> tryBuildDirectVaOptPasteTokenPatch(
     newVariadicActual = bToken.drop_back(fixedActual->size()).str();
   }
 
-  if (newVariadicActual.empty() ||
-      StringRef(newVariadicActual) == *oldVariadicActual ||
-      !textIsSingleTokenSpelling(newVariadicActual, deps.lexLang) ||
-      replacementIntroducesTopLevelComma(newVariadicActual, deps.lexLang))
+  const bool deactivatesVaOpt = newVariadicActual.empty();
+  if ((!deactivatesVaOpt &&
+       (!textIsSingleTokenSpelling(newVariadicActual, deps.lexLang) ||
+        replacementIntroducesTopLevelComma(newVariadicActual, deps.lexLang))) ||
+      StringRef(newVariadicActual) == *oldVariadicActual)
     return std::nullopt;
 
   if (!invocation.invB || !invocation.invE)
     return std::nullopt;
 
-  DenseMap<uint32_t, std::string> replacementByArgIdx;
-  replacementByArgIdx[shape->variadicArgIdx] = std::move(newVariadicActual);
-
-  std::optional<InvocationRewriteWithRange> rewrite =
-      deps.buildInvocationRewriteWithRange(
-          actualCtx, replacementByArgIdx,
-          /*materializedRangeByArgIdx=*/nullptr);
+  std::optional<InvocationRewriteWithRange> rewrite;
+  if (deactivatesVaOpt) {
+    rewrite = buildInvocationRewriteDroppingFinalArg(
+        baseInvocationText, invocationArgRanges, shape->variadicArgIdx,
+        shape->fixedArgIdx);
+  } else {
+    DenseMap<uint32_t, std::string> replacementByArgIdx;
+    replacementByArgIdx[shape->variadicArgIdx] = std::move(newVariadicActual);
+    rewrite = deps.buildInvocationRewriteWithRange(
+        actualCtx, replacementByArgIdx,
+        /*materializedRangeByArgIdx=*/nullptr);
+  }
   if (!rewrite || StringRef(rewrite->text).trim() == baseInvocationText.trim())
     return std::nullopt;
 
