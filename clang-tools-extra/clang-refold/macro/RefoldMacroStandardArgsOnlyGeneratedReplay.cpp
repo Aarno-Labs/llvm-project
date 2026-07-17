@@ -2350,14 +2350,11 @@ std::optional<MacroPatch> HigherOrderGeneratedReplayProbe::TryBuild(
     const RefoldModel::MacroInvocation &invocation, const diffutils::Hunk &hunk,
     StringRef baseInvocationText,
     ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
-  if (auto generatedCalleePatch = TryBuildGeneratedCalleeReplay(
-          invocation, baseInvocationText, invocationArgRanges))
-    return generatedCalleePatch;
-
-  if (auto pasteGeneratedPatch = TryBuildPasteGeneratedCalleeReplay(
-          invocation, baseInvocationText, invocationArgRanges))
-    return pasteGeneratedPatch;
-
+  // Tuple-generated replay is more specific than ordinary generated-callee
+  // replay: it proves that a source tuple element names the terminal generated
+  // callee and that later tuple elements supply its actuals.  Try these proofs
+  // before the ordinary chain solver so wrappers such as `WRAP((LOG, A))` do
+  // not collapse the selector to the terminal replacement-list literal `emit`.
   if (auto objectSelectorTupleGeneratedPatch =
           TryBuildObjectSelectorTupleGeneratedCalleeReplay(
               invocation, baseInvocationText, invocationArgRanges))
@@ -2375,6 +2372,14 @@ std::optional<MacroPatch> HigherOrderGeneratedReplayProbe::TryBuild(
           TryBuildRecursiveTupleGeneratedCalleeReplay(
               invocation, baseInvocationText, invocationArgRanges))
     return recursiveTupleGeneratedPatch;
+
+  if (auto generatedCalleePatch = TryBuildGeneratedCalleeReplay(
+          invocation, baseInvocationText, invocationArgRanges))
+    return generatedCalleePatch;
+
+  if (auto pasteGeneratedPatch = TryBuildPasteGeneratedCalleeReplay(
+          invocation, baseInvocationText, invocationArgRanges))
+    return pasteGeneratedPatch;
 
   return TryBuildGeneratedLeafReplay(invocation, hunk, baseInvocationText,
                                      invocationArgRanges);
@@ -2832,19 +2837,33 @@ HigherOrderGeneratedReplayProbe::TryBuildTupleGeneratedCalleeReplay(
   if (!forwarderDefinition || forwarderDefinition->defParams.empty())
     return std::nullopt;
 
+  tupleObjectAliasHopCount += forwarderAliasHops;
+  TupleGeneratedCalleeReplayContext tupleGeneratedCtx{
+      invocation,
+      baseInvocationText,
+      invocationArgRanges,
+      *cover,
+      *bEnv,
+      *rootDefinition,
+      *forwarderDefinition,
+      callerArgIdx,
+      tupleObjectAliasHopCount};
+  if (auto tupleGeneratedPatch = deps_.generatedCalleeReplayEngine
+                                     .BuildTupleGeneratedCalleeReplayCandidate(
+                                         tupleGeneratedCtx))
+    return tupleGeneratedPatch;
+
   // A wrapper can fix the generated callee directly instead of forwarding a
   // tuple element that names it:
   //
   //   #define LOG(fmt, ...) emit(fmt __VA_OPT__(,) __VA_ARGS__)
   //   #define WRAP(args) LOG args
   //
-  // This theorem is deliberately restricted to fixed callees that contain
-  // `__VA_OPT__`.  Non-VAOPT wrappers such as `SHIELD_STR(x) STR x` are also
-  // textually shaped like `CALLEE args`, but replaying them through this bridge
-  // would incorrectly outrank the existing stringify/whole-cover policy for
-  // decoded string payloads.  VAOPT is the proof-relevant feature that requires
-  // this extra actual-list bridge because activation/deactivation changes fixed
-  // replacement-list syntax together with the forwarded variadic actuals.
+  // Try this after the tuple-selector theorem.  In shapes like
+  // `#define WRAP(pair) CALL pair`, the literal `CALL` is only a forwarding
+  // macro and the first tuple element still names the terminal generated
+  // callee.  Let that more specific proof preserve the tuple selector before
+  // falling back to the fixed-callee bridge.
   if (replacementTokensContainVaOpt(*forwarderDefinition)) {
     uint32_t literalCalleeAliasHops = forwarderAliasHops;
     LiteralCalleeTupleActualReplayContext literalCalleeCtx{
@@ -2863,19 +2882,7 @@ HigherOrderGeneratedReplayProbe::TryBuildTupleGeneratedCalleeReplay(
       return literalCalleePatch;
   }
 
-  tupleObjectAliasHopCount += forwarderAliasHops;
-  TupleGeneratedCalleeReplayContext tupleGeneratedCtx{
-      invocation,
-      baseInvocationText,
-      invocationArgRanges,
-      *cover,
-      *bEnv,
-      *rootDefinition,
-      *forwarderDefinition,
-      callerArgIdx,
-      tupleObjectAliasHopCount};
-  return deps_.generatedCalleeReplayEngine
-      .BuildTupleGeneratedCalleeReplayCandidate(tupleGeneratedCtx);
+  return std::nullopt;
 }
 
 } // namespace refold

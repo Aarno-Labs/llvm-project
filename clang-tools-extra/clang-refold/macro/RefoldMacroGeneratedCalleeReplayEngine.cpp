@@ -202,6 +202,13 @@ struct TupleGeneratedForwarderState {
   llvm::SmallVector<std::string, 8> tupleElementTexts;
   /// Forwarder-formal references recovered from the generated call actuals.
   llvm::SmallVector<TupleGeneratedArgRef, 8> generatedArgRefs;
+  /// Leading generated-callee actuals supplied by literal forwarder tokens.
+  ///
+  /// These pieces have no caller-tuple edit target.  They are replay evidence
+  /// for fixed generated-callee formals such as the literal head in
+  /// `f("tag" __VA_OPT__(,) __VA_ARGS__)`; solved edits must start after
+  /// these fixed pieces when rebuilding the source tuple.
+  size_t literalGeneratedPieceCount = 0;
   /// Source tuple pieces used as old generated-callee actual evidence.
   llvm::SmallVector<std::string, 8> oldGeneratedPieces;
   /// Final callee actuals in callee formal order before solving.
@@ -216,6 +223,110 @@ struct TupleGeneratedForwarderState {
     return tupleElementTexts[elemIdx];
   }
 };
+
+/// Materializes one fixed generated-callee actual from literal replacement
+/// tokens.
+///
+/// Tuple-generated replay uses this only for actual-list elements that have no
+/// caller source owner.  Parameter references and preprocessing replay
+/// operators are rejected so fixed literal actuals cannot steal edits that
+/// should be assigned to tuple elements.
+bool materializeTupleGeneratedLiteralActual(
+    ArrayRef<RefoldModel::MacroReplacementToken> tokens, size_t begin,
+    size_t end, std::string &out) {
+  if (begin >= end)
+    return false;
+
+  std::string text;
+  for (size_t i = begin; i < end; ++i) {
+    const RefoldModel::MacroReplacementToken &tok = tokens[i];
+    if (tok.kind != RefoldModel::MacroReplacementTokenKind::Literal)
+      return false;
+    if (tok.spelling == "#" || tok.spelling == "##" ||
+        tok.spelling == "__VA_OPT__")
+      return false;
+    text += tok.spelling.str();
+  }
+
+  out = std::move(text);
+  return !out.empty();
+}
+
+/// Collects one explicit generated-call actual range for tuple replay.
+///
+/// The ordinary tuple path already handles actuals that are direct forwarder
+/// formal references.  This helper adds the replay-safe literal-head variadic
+/// form used by wrappers such as:
+///
+///   f("tag" __VA_OPT__(,) __VA_ARGS__)
+///
+/// The literal head is fixed evidence for the terminal generated callee's first
+/// formal, while the variadic formal still maps back to caller tuple elements.
+/// Richer mixtures remain fail-closed rather than guessing source ownership.
+bool collectTupleGeneratedExplicitActualRange(
+    const RefoldModel::MacroDirective &forwarderDefinition,
+    ArrayRef<RefoldModel::MacroReplacementToken> tokens, size_t begin,
+    size_t end, TupleGeneratedForwarderState &tupleState) {
+  if (begin >= end)
+    return false;
+
+  if (end == begin + 1 &&
+      tokens[begin].kind == RefoldModel::MacroReplacementTokenKind::ParamRef &&
+      tokens[begin].paramIndex &&
+      *tokens[begin].paramIndex < forwarderDefinition.defParams.size()) {
+    TupleGeneratedArgRef ref;
+    ref.forwarderParamIdx = *tokens[begin].paramIndex;
+    ref.variadicPack =
+        forwarderDefinition.defParams[ref.forwarderParamIdx].variadic;
+    tupleState.generatedArgRefs.push_back(ref);
+    return true;
+  }
+
+  std::optional<size_t> vaOptIndex;
+  for (size_t i = begin; i < end; ++i) {
+    if (tokens[i].spelling != "__VA_OPT__")
+      continue;
+    if (vaOptIndex)
+      return false;
+    vaOptIndex = i;
+  }
+
+  if (!vaOptIndex) {
+    std::string literalActual;
+    if (!materializeTupleGeneratedLiteralActual(tokens, begin, end,
+                                                literalActual))
+      return false;
+    tupleState.oldGeneratedPieces.push_back(std::move(literalActual));
+    ++tupleState.literalGeneratedPieceCount;
+    return true;
+  }
+
+  const size_t vaOpt = *vaOptIndex;
+  if (vaOpt == begin || vaOpt + 5 != end || tokens[vaOpt + 1].spelling != "(" ||
+      tokens[vaOpt + 2].spelling != "," ||
+      tokens[vaOpt + 3].spelling != ")" ||
+      tokens[vaOpt + 4].kind !=
+          RefoldModel::MacroReplacementTokenKind::ParamRef ||
+      !tokens[vaOpt + 4].paramIndex ||
+      *tokens[vaOpt + 4].paramIndex >=
+          forwarderDefinition.defParams.size() ||
+      !forwarderDefinition.defParams[*tokens[vaOpt + 4].paramIndex]
+           .variadic)
+    return false;
+
+  std::string literalActual;
+  if (!materializeTupleGeneratedLiteralActual(tokens, begin, vaOpt,
+                                              literalActual))
+    return false;
+  tupleState.oldGeneratedPieces.push_back(std::move(literalActual));
+  ++tupleState.literalGeneratedPieceCount;
+
+  TupleGeneratedArgRef ref;
+  ref.forwarderParamIdx = *tokens[vaOpt + 4].paramIndex;
+  ref.variadicPack = true;
+  tupleState.generatedArgRefs.push_back(ref);
+  return true;
+}
 
 /// Solved tuple-generated replay result before proof certification.
 ///
@@ -3597,24 +3708,22 @@ public:
     }
 
     if (!adjacencyGeneratedCall) {
-      for (size_t i = generatedCallOpen + 1; i < generatedCallClose; ++i) {
-        const auto &tok = forwarderToks[i];
-        if (tok.spelling == "#" || tok.spelling == "##" ||
-            tok.spelling == "__VA_OPT__")
+      SmallVector<ReplacementTokenRange, 8> generatedActualRanges;
+      if (!collectTopLevelReplacementArgumentRanges(
+              forwarderToks, generatedCallOpen, generatedCallClose,
+              generatedActualRanges))
+        return std::nullopt;
+
+      for (const ReplacementTokenRange &range : generatedActualRanges) {
+        if (!collectTupleGeneratedExplicitActualRange(
+                ctx.forwarderDefinition, forwarderToks, range.begin,
+                range.end, tupleState))
           return std::nullopt;
-        if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef)
-          continue;
-        if (!tok.paramIndex ||
-            *tok.paramIndex >= ctx.forwarderDefinition.defParams.size())
-          return std::nullopt;
-        if (*tok.paramIndex == calleeForwarderParam)
-          return std::nullopt;
-        TupleGeneratedArgRef ref;
-        ref.forwarderParamIdx = *tok.paramIndex;
-        ref.variadicPack = ctx.forwarderDefinition.defParams[*tok.paramIndex]
-                               .variadic;
-        tupleState.generatedArgRefs.push_back(ref);
       }
+
+      for (const TupleGeneratedArgRef &ref : tupleState.generatedArgRefs)
+        if (ref.forwarderParamIdx == calleeForwarderParam)
+          return std::nullopt;
     }
     if (tupleState.generatedArgRefs.empty())
       return std::nullopt;
@@ -3778,7 +3887,9 @@ public:
         newGeneratedPieces.push_back(tail.str());
     }
 
-    size_t pieceCursor = 0;
+    size_t pieceCursor = adjacencyGeneratedCall
+                             ? 0
+                             : tupleState.literalGeneratedPieceCount;
     if (adjacencyGeneratedCall) {
       // `f t` consumes one tuple element as the full parenthesized actual list
       // for the generated callee.  Rebuild that single element from the solved
