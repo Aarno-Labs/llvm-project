@@ -436,6 +436,197 @@ std::optional<MacroPatch> tryBuildDirectVaOptPasteTokenPatch(
   return patch;
 }
 
+
+/// Direct `__VA_OPT__` stringify deactivation shape proved from a definition
+/// replacement list.  This covers the restricted
+/// `fixed __VA_OPT__(, #variadic)` family where the edited stream deletes the
+/// comma and stringified variadic payload, leaving only the fixed formal.
+struct DirectVaOptStringifyDeactivationShape {
+  /// Formal that remains visible after `__VA_OPT__` deactivation.
+  uint32_t fixedArgIdx = 0;
+  /// Variadic formal stringified inside the active `__VA_OPT__` payload.
+  uint32_t variadicArgIdx = 0;
+};
+
+/// Recognize the direct conditional stringify shape:
+///
+///   fixed __VA_OPT__(, #variadic)
+///
+/// This intentionally does not try to solve arbitrary `__VA_OPT__` payloads.
+/// The caller still has to prove the observed A-side token layout and the
+/// exact source-level deletion of the final variadic actual.
+std::optional<DirectVaOptStringifyDeactivationShape>
+matchDirectVaOptStringifyDeactivationShape(
+    const RefoldModel::MacroDirective &definition) {
+  if (definition.subkind != "#define" || !definition.functionLike ||
+      definition.replacementTokens.size() != 7)
+    return std::nullopt;
+
+  auto literalAt = [&](size_t idx, StringRef spelling) {
+    return idx < definition.replacementTokens.size() &&
+           definition.replacementTokens[idx].kind ==
+               RefoldModel::MacroReplacementTokenKind::Literal &&
+           definition.replacementTokens[idx].spelling == spelling;
+  };
+  auto paramIndexAt = [&](size_t idx) -> std::optional<uint32_t> {
+    if (idx >= definition.replacementTokens.size())
+      return std::nullopt;
+    const RefoldModel::MacroReplacementToken &token =
+        definition.replacementTokens[idx];
+    if (token.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+        !token.paramIndex || *token.paramIndex >= definition.defParams.size())
+      return std::nullopt;
+    return *token.paramIndex;
+  };
+
+  std::optional<uint32_t> fixedArgIdx = paramIndexAt(0);
+  std::optional<uint32_t> variadicArgIdx = paramIndexAt(5);
+  if (!fixedArgIdx || !variadicArgIdx || *fixedArgIdx == *variadicArgIdx ||
+      !literalAt(1, "__VA_OPT__") || !literalAt(2, "(") ||
+      !literalAt(3, ",") || !literalAt(4, "#") || !literalAt(6, ")"))
+    return std::nullopt;
+
+  if (!definition.defParams[*variadicArgIdx].variadic)
+    return std::nullopt;
+
+  DirectVaOptStringifyDeactivationShape shape;
+  shape.fixedArgIdx = *fixedArgIdx;
+  shape.variadicArgIdx = *variadicArgIdx;
+  return shape;
+}
+
+/// Return the unique producer span for `argIdx` when it exists.
+///
+/// Direct VA_OPT-stringify deactivation is intentionally limited to one fixed
+/// occurrence and one stringified variadic occurrence.  Multiple occurrences
+/// would require cross-occurrence agreement and should remain on the ordinary
+/// args-only/stringify path instead of this delimiter-deletion bridge.
+std::optional<RefoldModel::PPArgSpan> findUniqueArgSpanByKind(
+    ArrayRef<RefoldModel::PPArgSpan> spans, uint32_t argIdx,
+    PPArgSpanKind kind) {
+  std::optional<RefoldModel::PPArgSpan> result;
+  for (const RefoldModel::PPArgSpan &span : spans) {
+    if (span.argIdx != argIdx || span.kind != kind)
+      continue;
+    if (result)
+      return std::nullopt;
+    result = span;
+  }
+  return result;
+}
+
+/// Build an invocation-preserving patch for deactivating
+/// `fixed __VA_OPT__(, #variadic)`.
+///
+/// Ordinary stringify replay owns only the string literal span.  In this shape,
+/// however, the source edit deletes both that span and the fixed comma inside
+/// the `__VA_OPT__` payload.  Since the comma is replacement-list syntax, the
+/// normal occurrence collector correctly refuses the hunk.  This bridge accepts
+/// only the direct deactivation theorem: the fixed formal remains unchanged,
+/// the stringified variadic span is deleted with its immediately preceding
+/// comma token, and the source rewrite removes the final variadic actual plus
+/// its call-site comma delimiter.
+std::optional<MacroPatch> tryBuildDirectVaOptStringifyDeactivationPatch(
+    const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
+    const RefoldModel::MacroInvocation &invocation, const diffutils::Hunk &hunk,
+    StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) {
+  if (!invocation.pasteSpans.empty() || !invocation.pasteTokens.empty() ||
+      invocation.stringifySpans.empty() || invocation.argSpans.empty())
+    return std::nullopt;
+
+  const RefoldModel::MacroDirective *definition =
+      getDefinitionDirectiveForInvocation(deps.model, invocation);
+  if (!definition || definition->name != invocation.name ||
+      definition->defParams.size() != invocation.defParams.size())
+    return std::nullopt;
+
+  std::optional<DirectVaOptStringifyDeactivationShape> shape =
+      matchDirectVaOptStringifyDeactivationShape(*definition);
+  if (!shape)
+    return std::nullopt;
+
+  if (shape->fixedArgIdx >= invocationArgRanges.size() ||
+      shape->variadicArgIdx >= invocationArgRanges.size())
+    return std::nullopt;
+
+  std::optional<RefoldModel::PPArgSpan> fixedSpan = findUniqueArgSpanByKind(
+      invocation.argSpans, shape->fixedArgIdx, PPArgSpanKind::Standard);
+  std::optional<RefoldModel::PPArgSpan> stringifySpan = findUniqueArgSpanByKind(
+      invocation.stringifySpans, shape->variadicArgIdx,
+      PPArgSpanKind::Stringify);
+  if (!fixedSpan || !stringifySpan || fixedSpan->begin >= fixedSpan->end ||
+      stringifySpan->begin + 1 != stringifySpan->end ||
+      fixedSpan->end > stringifySpan->begin ||
+      stringifySpan->end > deps.aToks.size())
+    return std::nullopt;
+
+  std::optional<std::pair<uint64_t, uint64_t>> cover =
+      RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
+  if (!cover || cover->first != fixedSpan->begin ||
+      cover->second != stringifySpan->end || hunk.aStart != fixedSpan->end ||
+      hunk.aEnd != stringifySpan->end || hunk.bStart != hunk.bEnd)
+    return std::nullopt;
+
+  // The token immediately before the stringified variadic payload must be the
+  // comma literal inside the VA_OPT payload.  The definition shape proves that
+  // the comma exists; this token-level check proves the observed A expansion
+  // surface matches that shape exactly.
+  if (stringifySpan->begin == 0 ||
+      deps.aToks[static_cast<size_t>(stringifySpan->begin - 1)].spelling != ",")
+    return std::nullopt;
+
+  std::optional<StringRef> oldVariadicActual = sliceInvocationArgumentText(
+      baseInvocationText, invocationArgRanges, shape->variadicArgIdx);
+  if (!oldVariadicActual || oldVariadicActual->empty())
+    return std::nullopt;
+
+  StringRef oldStringifiedToken =
+      deps.aToks[static_cast<size_t>(stringifySpan->begin)].spelling;
+  std::optional<std::string> unstringifiedOld =
+      deps.argTextRecovery.UnstringifyLiteralToArgText(oldStringifiedToken,
+                                                       /*allowTopLevelComma=*/true);
+  if (!unstringifiedOld)
+    return std::nullopt;
+
+  std::optional<std::string> canonicalOld =
+      stringutils::canonicalizeStringifyInversePayload(*unstringifiedOld);
+  if (!canonicalOld || StringRef(*canonicalOld).trim() !=
+                           StringRef(*unstringifiedOld).trim() ||
+      StringRef(*canonicalOld).trim() != oldVariadicActual->trim())
+    return std::nullopt;
+
+  if (!invocation.invB || !invocation.invE)
+    return std::nullopt;
+
+  std::optional<InvocationRewriteWithRange> rewrite =
+      buildInvocationRewriteDroppingFinalArg(
+          baseInvocationText, invocationArgRanges, shape->variadicArgIdx,
+          shape->fixedArgIdx);
+  if (!rewrite || StringRef(rewrite->text).trim() == baseInvocationText.trim())
+    return std::nullopt;
+
+  MacroPatch patch{*invocation.invB, *invocation.invE, std::move(rewrite->text),
+                   invocation.id};
+  deps.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
+      patch, rewrite->materializedOutputByteStart,
+      rewrite->materializedOutputByteEnd);
+  deps.certifyMacroPatchWholeExpansionBRange(invocation, patch);
+
+  MacroPatchProof proof = deps.proofLattice.MakeMacroPatchProof(
+      MacroPatchProofKind::ArgsOnlyStandard,
+      /*preservesInvocationStructure=*/true, invocation.id);
+  WholeEnvelopeReplayWitness wholeEnvelopeWitness;
+  wholeEnvelopeWitness.rootMacroId = invocation.id;
+  wholeEnvelopeWitness.replayValidated = true;
+  wholeEnvelopeWitness.definitionTapeReplayValidated = true;
+  proof.wholeEnvelopeReplay = wholeEnvelopeWitness;
+  deps.proofLattice.SetMacroPatchProof(patch, std::move(proof));
+  deps.proofLattice.MacroPatchProofClassifier().SyncMacroPatchProofSummary(
+      patch);
+  return patch;
+}
+
 /// Return true when `child` is the generated function-like callee that consumes
 /// the root selector formal and obtains its terminal actuals from the root tuple
 /// formal.  Object-selector replay has already had first right of refusal; this
@@ -738,6 +929,11 @@ RefoldMacroStandardArgsOnlyPatchBuilder::BuildStandardArgsOnlyPatch(
             deps_, m, hArgs, baseInvText, invArgRanges, actualRecoveryCtx))
       return directVaOptPasteTokenPatch;
   }
+
+  if (auto directVaOptStringifyDeactivationPatch =
+          tryBuildDirectVaOptStringifyDeactivationPatch(
+              deps_, m, hArgs, baseInvText, invArgRanges))
+    return directVaOptStringifyDeactivationPatch;
 
   // Higher-order generated replay remains in its historical ranking position
   // before ordinary occurrence collection.  The private probe owns only the
