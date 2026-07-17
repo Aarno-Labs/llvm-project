@@ -1877,6 +1877,12 @@ struct RecursiveTupleGeneratedCalleeReplayWitness {
   uint32_t rootCalleeFormalIndex = 0;
   uint32_t rootTupleFormalIndex = 0;
 
+  /// True when the terminal callee selector is itself an exact element of the
+  /// same root tuple that supplies the generated actuals.  In that proof shape
+  /// there is no separate root selector formal, so `rootCalleeFormalIndex` and
+  /// `rootTupleFormalIndex` intentionally name the same root formal.
+  bool calleeSelectedFromRootTupleSlice = false;
+
   std::vector<GeneratedActualRootTupleSlice> actualSlices;
 
   bool uniquePath = false;

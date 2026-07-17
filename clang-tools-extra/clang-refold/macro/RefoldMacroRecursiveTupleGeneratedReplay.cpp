@@ -287,6 +287,12 @@ struct ComposedGeneratedCalleePath {
   uint32_t rootTupleFormalIndex = 0;
   /// Exact terminal-actual-to-root-tuple element slice bindings.
   llvm::SmallVector<RootTupleSliceBinding, 8> actualSlices;
+  /// True when the terminal callee selector is proven by an exact tuple element
+  /// of the same root formal that owns the generated actual slices.  This is
+  /// different from the older theorem shape where one root formal selects the
+  /// callee and a distinct root formal supplies the tuple payload.
+  bool calleeSelectedFromRootTupleSlice = false;
+
   /// Physical generated targets that express the same tuple-edit obligation.
   ///
   /// Repeated uses such as `((f t) + (f t))` and sibling terminals such as
@@ -323,12 +329,19 @@ struct GeneratedTupleFormalState {
       rootTupleSliceByLocalFormal;
   /// Exact actual slices for `invocation`, in generated formal order.
   llvm::SmallVector<RootTupleSliceBinding, 8> actualSlices;
-  /// True when this invocation's callee token was selected by caller-param evidence.
+  /// True when this invocation's callee token was selected by caller-param
+  /// evidence or by an exact tuple-element selector carried through a literal
+  /// tuple splitter.
   ///
   /// Literal generated forwarders can carry tuple-slice state to a later
   /// generated callee, but they are not themselves terminal generated-callee
   /// replay targets for this theorem.
   bool calleeWasSelectedByCallerParam = false;
+
+  /// True when `calleeWasSelectedByCallerParam` was discharged by proving that
+  /// the selector token is an exact root tuple element rather than by composing
+  /// a distinct root selector formal.
+  bool calleeSelectedFromRootTupleSlice = false;
 };
 
 /// Unique terminal generated-callee replay result for the composed path.
@@ -1033,10 +1046,54 @@ public:
       paths.push_back(*path);
     }
 
+    if (!CollectLiteralTupleSplitPaths(request, *rootInvocation,
+                                       forwardingStates, paths))
+      return std::nullopt;
+
     return CollapseEquivalentPaths(paths);
   }
 
 private:
+  /// Collect paths through literal tuple splitters below composed states.
+  ///
+  /// The ordinary recursive path starts at a caller-param generated callee.  A
+  /// root can also first expand one tuple actual into several local formals via
+  /// a literal macro, e.g. `OUTER(p) -> BOTH p`, and only then emit generated
+  /// terminals such as `f t + g t`.  This collector composes that literal split
+  /// using producer `arg_tuple_refs`, then reuses the existing nested
+  /// generated-callee traversal so any number of terminal users can share one
+  /// proven root tuple edit.
+  bool CollectLiteralTupleSplitPaths(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      const RefoldModel::MacroInvocation &rootInvocation,
+      llvm::ArrayRef<ComposedFormalState> forwardingStates,
+      llvm::SmallVectorImpl<ComposedGeneratedCalleePath> &paths) const {
+    for (const ComposedFormalState &state : forwardingStates) {
+      if (!state.invocation)
+        return false;
+
+      for (const RefoldModel::MacroInvocation *child :
+           graph_.ChildrenOf(state.invocation->id)) {
+        if (!child)
+          return false;
+
+        std::optional<GeneratedTupleFormalState> tupleSplitState =
+            TryComposeLiteralTupleSplitState(request, state, *child);
+        if (!tupleSplitState)
+          continue;
+
+        llvm::SmallVector<ComposedGeneratedCalleePath, 4> nestedPaths;
+        if (!CollectNestedGeneratedCalleePaths(request, rootInvocation,
+                                              *tupleSplitState, 0,
+                                              nestedPaths))
+          return false;
+        paths.append(nestedPaths.begin(), nestedPaths.end());
+      }
+    }
+
+    return true;
+  }
+
   std::optional<ComposedGeneratedCalleePath> TryCompletePath(
       const RecursiveTupleGeneratedReplayRequest &request,
       const RefoldModel::MacroInvocation &rootInvocation,
@@ -1073,6 +1130,8 @@ private:
       const ComposedGeneratedCalleePath &rhs) {
     if (lhs.rootInvocation != rhs.rootInvocation ||
         lhs.rootTupleFormalIndex != rhs.rootTupleFormalIndex ||
+        lhs.calleeSelectedFromRootTupleSlice !=
+            rhs.calleeSelectedFromRootTupleSlice ||
         lhs.actualSlices.size() != rhs.actualSlices.size())
       return false;
 
@@ -1218,8 +1277,30 @@ private:
         }
         continue;
       case MacroCalleeOriginKind::Paste:
-      case MacroCalleeOriginKind::Opaque:
         return false;
+      case MacroCalleeOriginKind::Opaque: {
+        sawGeneratedCalleeChild = true;
+        std::optional<GeneratedTupleFormalState> childState =
+            TryComposeNestedOpaqueGeneratedCalleeState(request, state, *child);
+        if (!childState)
+          return false;
+
+        llvm::SmallVector<ComposedGeneratedCalleePath, 2> descendantPaths;
+        if (!CollectNestedGeneratedCalleePaths(request, rootInvocation,
+                                              *childState, depth + 1,
+                                              descendantPaths))
+          return false;
+        if (descendantPaths.empty()) {
+          std::optional<ComposedGeneratedCalleePath> leafPath =
+              BuildPathForGeneratedState(rootInvocation, *childState);
+          if (!leafPath)
+            return false;
+          paths.push_back(*leafPath);
+        } else {
+          paths.append(descendantPaths.begin(), descendantPaths.end());
+        }
+        continue;
+      }
       case MacroCalleeOriginKind::CallerParam:
         break;
       }
@@ -1323,6 +1404,146 @@ private:
     return childState;
   }
 
+  /// Compose a literal child that splits one already-composed tuple formal.
+  ///
+  /// This covers nested tuple forwarders such as `OUTER(p) -> BOTH p` where
+  /// `BOTH(f, g, t)` receives every local formal from a distinct top-level
+  /// element of the single caller tuple.  The producer `arg_tuple_refs` are the
+  /// proof source; this helper only checks that those ranges are exactly the
+  /// parsed top-level tuple elements in the root invocation spelling.
+  std::optional<GeneratedTupleFormalState> TryComposeLiteralTupleSplitState(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      const ComposedFormalState &parentState,
+      const RefoldModel::MacroInvocation &child) const {
+    if (!parentState.invocation || !child.callerMacroId ||
+        *child.callerMacroId != parentState.invocation->id)
+      return std::nullopt;
+    if (child.calleeOrigin.kind != MacroCalleeOriginKind::LiteralMacroName)
+      return std::nullopt;
+    if (!child.stringifySpans.empty() || !child.pasteSpans.empty() ||
+        !child.pasteTokens.empty())
+      return std::nullopt;
+
+    const RefoldModel::MacroDirective *childDefinition =
+        graph_.DefinitionFor(child);
+    if (!childDefinition || !childDefinition->functionLike ||
+        macroDefinitionHasVariadicFormal(*childDefinition))
+      return std::nullopt;
+    if (childDefinition->defParams.empty() ||
+        childDefinition->defParams.size() >
+            std::numeric_limits<uint32_t>::max())
+      return std::nullopt;
+
+    const uint32_t formalCount =
+        static_cast<uint32_t>(childDefinition->defParams.size());
+    if (child.argTupleRefs.size() != formalCount)
+      return std::nullopt;
+    if (!child.argRefs.empty()) {
+      if (child.argRefs.size() != formalCount)
+        return std::nullopt;
+      for (const auto &refs : child.argRefs) {
+        if (!refs.empty())
+          return std::nullopt;
+      }
+    }
+
+    std::optional<uint32_t> rootTupleFormalIndex;
+    llvm::SmallVector<const RefoldModel::TupleArgRef *, 8> refsByFormal;
+    refsByFormal.reserve(formalCount);
+    for (uint32_t formalIndex = 0; formalIndex < formalCount; ++formalIndex) {
+      const auto &refs = child.argTupleRefs[formalIndex];
+      if (refs.size() != 1)
+        return std::nullopt;
+
+      const RefoldModel::TupleArgRef &ref = refs.front();
+      if (ref.callerParamIndex >= parentState.rootFormalByLocalFormal.size())
+        return std::nullopt;
+      RootFormalBinding mappedRootFormal =
+          parentState.rootFormalByLocalFormal[ref.callerParamIndex];
+      if (!mappedRootFormal)
+        return std::nullopt;
+      if (rootTupleFormalIndex && *rootTupleFormalIndex != *mappedRootFormal)
+        return std::nullopt;
+      rootTupleFormalIndex = *mappedRootFormal;
+      refsByFormal.push_back(&ref);
+    }
+    if (!rootTupleFormalIndex)
+      return std::nullopt;
+
+    std::optional<RootInvocationActualText> rootActual =
+        rootInvocationActualText(request.rootInvocation, *rootTupleFormalIndex);
+    if (!rootActual)
+      return std::nullopt;
+
+    size_t trimmedBegin = 0;
+    size_t trimmedEnd = rootActual->text.size();
+    std::tie(trimmedBegin, trimmedEnd) =
+        stringutils::trimWsRange(rootActual->text, 0, rootActual->text.size());
+    if (trimmedEnd <= trimmedBegin + 2)
+      return std::nullopt;
+
+    llvm::StringRef trimmedTuple =
+        rootActual->text.slice(trimmedBegin, trimmedEnd);
+    if (!trimmedTuple.starts_with("(") || !trimmedTuple.ends_with(")"))
+      return std::nullopt;
+
+    llvm::SmallVector<TupleElementSlice, 8> tupleElements;
+    if (!splitTopLevelTupleElementsWithLexer(trimmedTuple.drop_front().drop_back(),
+                                             lexLang_, tupleElements))
+      return std::nullopt;
+    if (tupleElements.size() != formalCount)
+      return std::nullopt;
+
+    const uint64_t payloadAbsoluteBegin =
+        rootActual->absoluteBegin + static_cast<uint64_t>(trimmedBegin) + 1;
+    const uint64_t payloadByteBeginInActual =
+        static_cast<uint64_t>(trimmedBegin) + 1;
+
+    GeneratedTupleFormalState childState;
+    childState.invocation = &child;
+    childState.definition = childDefinition;
+    childState.rootCalleeFormalIndex = *rootTupleFormalIndex;
+    childState.rootTupleFormalIndex = *rootTupleFormalIndex;
+    childState.rootTupleSliceByLocalFormal.assign(formalCount, std::nullopt);
+    childState.actualSlices.reserve(formalCount);
+    childState.calleeWasSelectedByCallerParam = false;
+
+    for (uint32_t formalIndex = 0; formalIndex < formalCount; ++formalIndex) {
+      const RefoldModel::TupleArgRef &ref = *refsByFormal[formalIndex];
+      const TupleElementSlice &element = tupleElements[formalIndex];
+      if (element.trimEnd <= element.trimBegin)
+        return std::nullopt;
+
+      const uint64_t expectedBegin =
+          payloadByteBeginInActual + static_cast<uint64_t>(element.trimBegin);
+      const uint64_t expectedEnd =
+          payloadByteBeginInActual + static_cast<uint64_t>(element.trimEnd);
+      if (ref.callerByteBegin != expectedBegin ||
+          ref.callerByteEnd != expectedEnd)
+        return std::nullopt;
+
+      RootTupleSliceBinding binding;
+      binding.generatedActualIndex = formalIndex;
+      binding.generatedFormalIndex = formalIndex;
+      binding.rootTupleFormalIndex = *rootTupleFormalIndex;
+      binding.rootTuplePayloadByteBegin =
+          static_cast<uint64_t>(element.trimBegin);
+      binding.rootTuplePayloadByteEnd =
+          static_cast<uint64_t>(element.trimEnd);
+      binding.absoluteByteBegin =
+          payloadAbsoluteBegin + static_cast<uint64_t>(element.trimBegin);
+      binding.absoluteByteEnd =
+          payloadAbsoluteBegin + static_cast<uint64_t>(element.trimEnd);
+      if (BindingOverlapsExisting(childState.actualSlices, binding))
+        return std::nullopt;
+
+      childState.rootTupleSliceByLocalFormal[formalIndex] = binding;
+      childState.actualSlices.push_back(binding);
+    }
+
+    return childState;
+  }
+
   /// Compose one generated-callee child through exact tuple-element refs.
   std::optional<GeneratedTupleFormalState> TryComposeNestedGeneratedCalleeState(
       const RecursiveTupleGeneratedReplayRequest &request,
@@ -1363,9 +1584,80 @@ private:
         return byTupleRefs;
     }
 
-    return TryComposeNestedGeneratedCalleeStateFromSourceRanges(
-        request, parentState, child, *childDefinition, formalCount,
-        calleeFormalIndex);
+    std::optional<GeneratedTupleFormalState> childState =
+        TryComposeNestedGeneratedCalleeStateFromSourceRanges(
+            request, parentState, child, *childDefinition, formalCount,
+            calleeFormalIndex);
+    if (!childState)
+      return std::nullopt;
+
+    if (parentState.rootTupleSliceByLocalFormal[calleeFormalIndex])
+      childState->calleeSelectedFromRootTupleSlice = true;
+    return childState;
+  }
+
+  /// Compose an opaque terminal whose callee token is a proven tuple slice.
+  ///
+  /// Some producer records cannot spell a generated terminal as
+  /// `caller_param`, but the literal tuple-split parent still proves the callee
+  /// selector by exact source slice.  This helper accepts only when exactly one
+  /// current local formal's root tuple slice is byte-for-byte the terminal
+  /// definition name, and another composed tuple slice uniquely supplies the
+  /// terminal actuals by exact source-range identity.
+  std::optional<GeneratedTupleFormalState>
+  TryComposeNestedOpaqueGeneratedCalleeState(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      const GeneratedTupleFormalState &parentState,
+      const RefoldModel::MacroInvocation &child) const {
+    if (!parentState.invocation || !child.callerMacroId ||
+        *child.callerMacroId != parentState.invocation->id)
+      return std::nullopt;
+    if (child.calleeOrigin.kind != MacroCalleeOriginKind::Opaque)
+      return std::nullopt;
+
+    const RefoldModel::MacroDirective *childDefinition =
+        graph_.DefinitionFor(child);
+    if (!childDefinition || !childDefinition->functionLike ||
+        macroDefinitionHasVariadicFormal(*childDefinition))
+      return std::nullopt;
+    if (childDefinition->defParams.empty() ||
+        childDefinition->defParams.size() >
+            std::numeric_limits<uint32_t>::max())
+      return std::nullopt;
+
+    const uint32_t formalCount =
+        static_cast<uint32_t>(childDefinition->defParams.size());
+    if (child.invArgRanges.size() != formalCount)
+      return std::nullopt;
+
+    llvm::SmallVector<uint32_t, 2> matchingCalleeFormals;
+    for (uint32_t formalIndex = 0;
+         formalIndex < parentState.rootTupleSliceByLocalFormal.size();
+         ++formalIndex) {
+      if (!parentState.rootTupleSliceByLocalFormal[formalIndex])
+        continue;
+      const RootTupleSliceBinding &binding =
+          *parentState.rootTupleSliceByLocalFormal[formalIndex];
+      std::optional<std::string> selectorText = rootInvocationSourceSlice(
+          request.rootInvocation, binding.absoluteByteBegin,
+          binding.absoluteByteEnd);
+      if (!selectorText)
+        return std::nullopt;
+      if (llvm::StringRef(*selectorText).trim() == childDefinition->name)
+        matchingCalleeFormals.push_back(formalIndex);
+    }
+    if (matchingCalleeFormals.size() != 1)
+      return std::nullopt;
+
+    std::optional<GeneratedTupleFormalState> childState =
+        TryComposeNestedGeneratedCalleeStateFromSourceRanges(
+            request, parentState, child, *childDefinition, formalCount,
+            matchingCalleeFormals.front());
+    if (!childState)
+      return std::nullopt;
+
+    childState->calleeSelectedFromRootTupleSlice = true;
+    return childState;
   }
 
   /// Compose a nested generated-callee child using producer tuple refs.
@@ -1384,6 +1676,8 @@ private:
     childState.rootTupleSliceByLocalFormal.assign(formalCount, std::nullopt);
     childState.actualSlices.reserve(formalCount);
     childState.calleeWasSelectedByCallerParam = true;
+    childState.calleeSelectedFromRootTupleSlice =
+        parentState.calleeSelectedFromRootTupleSlice;
 
     for (uint32_t formalIndex = 0; formalIndex < formalCount; ++formalIndex) {
       const auto &refs = child.argTupleRefs[formalIndex];
@@ -1521,6 +1815,8 @@ private:
     childState.rootTupleSliceByLocalFormal.assign(formalCount, std::nullopt);
     childState.actualSlices.reserve(formalCount);
     childState.calleeWasSelectedByCallerParam = true;
+    childState.calleeSelectedFromRootTupleSlice =
+        parentState.calleeSelectedFromRootTupleSlice;
 
     for (uint32_t formalIndex = 0; formalIndex < formalCount; ++formalIndex) {
       const TupleElementSlice &element = tupleElements[formalIndex];
@@ -1604,6 +1900,8 @@ private:
     path.terminalDefinition = state.definition;
     path.rootCalleeFormalIndex = state.rootCalleeFormalIndex;
     path.rootTupleFormalIndex = state.rootTupleFormalIndex;
+    path.calleeSelectedFromRootTupleSlice =
+        state.calleeSelectedFromRootTupleSlice;
     path.actualSlices.assign(state.actualSlices.begin(),
                              state.actualSlices.end());
     path.replayTargets.push_back({state.invocation, state.definition});
@@ -2251,6 +2549,8 @@ RefoldMacroRecursiveTupleGeneratedReplay::BuildCandidate(
   witness.terminalCalleeDefinitionDirectiveId = path->terminalDefinition->id;
   witness.rootCalleeFormalIndex = path->rootCalleeFormalIndex;
   witness.rootTupleFormalIndex = path->rootTupleFormalIndex;
+  witness.calleeSelectedFromRootTupleSlice =
+      path->calleeSelectedFromRootTupleSlice;
   witness.uniquePath = true;
   witness.uniqueTupleFormal = true;
   witness.uniqueReplaySolution = true;

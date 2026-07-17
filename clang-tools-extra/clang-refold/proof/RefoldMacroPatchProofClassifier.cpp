@@ -82,12 +82,18 @@ bool recursiveTupleGeneratedCalleeReplayWitnessIsWellFormed(
 
   const RecursiveTupleGeneratedCalleeReplayWitness &witness =
       *proof.recursiveTupleGeneratedCalleeReplay;
+  const bool hasDistinctRootSelectorFormal =
+      witness.rootCalleeFormalIndex != witness.rootTupleFormalIndex;
+  const bool hasTupleElementSelector =
+      witness.calleeSelectedFromRootTupleSlice &&
+      witness.rootCalleeFormalIndex == witness.rootTupleFormalIndex;
+
   return witness.rootInvocationId != 0 &&
          witness.rootInvocationId == proof.proofRootMacroId &&
          witness.terminalGeneratedInvocationId != 0 &&
          witness.terminalCalleeDefinitionDirectiveId != 0 &&
          witness.terminalGeneratedInvocationId != witness.rootInvocationId &&
-         witness.rootCalleeFormalIndex != witness.rootTupleFormalIndex &&
+         (hasDistinctRootSelectorFormal || hasTupleElementSelector) &&
          witness.uniquePath && witness.uniqueTupleFormal &&
          witness.uniqueReplaySolution &&
          recursiveTupleGeneratedCalleeReplaySlicesAreWellFormed(witness);
