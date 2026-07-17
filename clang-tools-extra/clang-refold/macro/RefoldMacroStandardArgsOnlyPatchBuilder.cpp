@@ -627,6 +627,208 @@ std::optional<MacroPatch> tryBuildDirectVaOptStringifyDeactivationPatch(
   return patch;
 }
 
+
+/// Restricted generated-callee shape for activating a stringified `__VA_OPT__`
+/// payload through a variadic forwarding root.
+struct GeneratedVaOptStringifyPayloadActivationShape {
+  uint32_t rootCalleeArgIdx = 0;
+  uint32_t rootVariadicArgIdx = 0;
+  uint32_t fixedFinalArgIdx = 0;
+  uint32_t variadicFinalArgIdx = 0;
+};
+
+/// Recognize `callee(__VA_ARGS__)` at the root and
+/// `fixed __VA_OPT__(# variadic)` at the reached callee.
+///
+/// The bridge intentionally accepts only the canonical two-level shape needed
+/// to distinguish a stable fixed generated actual from an activated
+/// stringified variadic payload.  More complex generated-call grammars remain
+/// owned by the general generated-callee replay engine.
+std::optional<GeneratedVaOptStringifyPayloadActivationShape>
+matchGeneratedVaOptStringifyPayloadActivationShape(
+    const RefoldModel::MacroDirective &rootDefinition,
+    const RefoldModel::MacroDirective &calleeDefinition) {
+  if (rootDefinition.subkind != "#define" || !rootDefinition.functionLike ||
+      calleeDefinition.subkind != "#define" || !calleeDefinition.functionLike ||
+      rootDefinition.replacementTokens.size() != 4 ||
+      calleeDefinition.replacementTokens.size() != 6 ||
+      rootDefinition.defParams.size() < 2 ||
+      calleeDefinition.defParams.size() != 2 ||
+      !rootDefinition.defParams.back().variadic ||
+      !calleeDefinition.defParams.back().variadic)
+    return std::nullopt;
+
+  auto rootParamAt = [&](size_t idx) -> std::optional<uint32_t> {
+    const RefoldModel::MacroReplacementToken &tok =
+        rootDefinition.replacementTokens[idx];
+    if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+        !tok.paramIndex || *tok.paramIndex >= rootDefinition.defParams.size())
+      return std::nullopt;
+    return *tok.paramIndex;
+  };
+  auto rootLiteralAt = [&](size_t idx, StringRef spelling) {
+    const RefoldModel::MacroReplacementToken &tok =
+        rootDefinition.replacementTokens[idx];
+    return tok.kind == RefoldModel::MacroReplacementTokenKind::Literal &&
+           tok.spelling == spelling;
+  };
+
+  std::optional<uint32_t> rootCalleeArgIdx = rootParamAt(0);
+  std::optional<uint32_t> rootVariadicArgIdx = rootParamAt(2);
+  if (!rootCalleeArgIdx || !rootVariadicArgIdx ||
+      *rootCalleeArgIdx == *rootVariadicArgIdx ||
+      !rootLiteralAt(1, "(") || !rootLiteralAt(3, ")") ||
+      rootDefinition.defParams[*rootCalleeArgIdx].variadic ||
+      !rootDefinition.defParams[*rootVariadicArgIdx].variadic)
+    return std::nullopt;
+
+  auto calleeParamAt = [&](size_t idx) -> std::optional<uint32_t> {
+    const RefoldModel::MacroReplacementToken &tok =
+        calleeDefinition.replacementTokens[idx];
+    if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+        !tok.paramIndex || *tok.paramIndex >= calleeDefinition.defParams.size())
+      return std::nullopt;
+    return *tok.paramIndex;
+  };
+  auto calleeLiteralAt = [&](size_t idx, StringRef spelling) {
+    const RefoldModel::MacroReplacementToken &tok =
+        calleeDefinition.replacementTokens[idx];
+    return tok.kind == RefoldModel::MacroReplacementTokenKind::Literal &&
+           tok.spelling == spelling;
+  };
+
+  std::optional<uint32_t> fixedFinalArgIdx = calleeParamAt(0);
+  std::optional<uint32_t> variadicFinalArgIdx = calleeParamAt(4);
+  if (!fixedFinalArgIdx || !variadicFinalArgIdx ||
+      *fixedFinalArgIdx == *variadicFinalArgIdx ||
+      calleeDefinition.defParams[*fixedFinalArgIdx].variadic ||
+      !calleeDefinition.defParams[*variadicFinalArgIdx].variadic ||
+      !calleeLiteralAt(1, "__VA_OPT__") || !calleeLiteralAt(2, "(") ||
+      !calleeLiteralAt(3, "#") || !calleeLiteralAt(5, ")"))
+    return std::nullopt;
+
+  GeneratedVaOptStringifyPayloadActivationShape shape;
+  shape.rootCalleeArgIdx = *rootCalleeArgIdx;
+  shape.rootVariadicArgIdx = *rootVariadicArgIdx;
+  shape.fixedFinalArgIdx = *fixedFinalArgIdx;
+  shape.variadicFinalArgIdx = *variadicFinalArgIdx;
+  return shape;
+}
+
+/// Build an invocation-preserving patch for generated `__VA_OPT__`
+/// stringification activation through a forwarding root.
+///
+/// The accepted example is:
+///
+///   CALL(S, "p")
+///   #define CALL(f, ...) f(__VA_ARGS__)
+///   #define S(prefix, ...) prefix __VA_OPT__(# __VA_ARGS__)
+///
+/// When the B-side expansion is `"p" "alpha"`, the fixed generated actual
+/// `prefix = "p"` is still present and is therefore anchored.  The inserted
+/// string literal is then decoded as the activated variadic payload.  The proof
+/// fails closed unless the old expansion is exactly that fixed actual and the
+/// new expansion is that same token followed by one decodable string literal.
+std::optional<MacroPatch> tryBuildGeneratedVaOptStringifyPayloadActivationPatch(
+    const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
+    const RefoldModel::MacroInvocation &invocation, const diffutils::Hunk &hunk,
+    StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) {
+  if (!invocation.invB || !invocation.invE)
+    return std::nullopt;
+
+  const RefoldModel::MacroDirective *rootDefinition =
+      getDefinitionDirectiveForInvocation(deps.model, invocation);
+  if (!rootDefinition || !rootDefinition->functionLike)
+    return std::nullopt;
+
+  std::optional<StringRef> calleeName =
+      sliceInvocationArgumentText(baseInvocationText, invocationArgRanges, 0);
+  if (!calleeName || calleeName->empty())
+    return std::nullopt;
+
+  uint32_t objectAliasHops = 0;
+  const RefoldModel::MacroDirective *calleeDefinition =
+      deps.resolveFunctionLikeMacroThroughAliasesWithHops(*calleeName,
+                                                          &objectAliasHops);
+  if (!calleeDefinition || !calleeDefinition->functionLike)
+    return std::nullopt;
+
+  std::optional<GeneratedVaOptStringifyPayloadActivationShape> shape =
+      matchGeneratedVaOptStringifyPayloadActivationShape(*rootDefinition,
+                                                         *calleeDefinition);
+  if (!shape)
+    return std::nullopt;
+  if (shape->rootCalleeArgIdx >= invocationArgRanges.size() ||
+      shape->rootVariadicArgIdx >= invocationArgRanges.size())
+    return std::nullopt;
+
+  // The root is a variadic forwarding call whose old pack supplies only the
+  // fixed generated actual.  If the old root pack is already comma-separated,
+  // this direct activation theorem would have to compose existing tail slots;
+  // leave that to the general replay engine instead.
+  std::optional<StringRef> fixedRootActual = sliceInvocationArgumentText(
+      baseInvocationText, invocationArgRanges, shape->rootVariadicArgIdx);
+  if (!fixedRootActual || fixedRootActual->empty() ||
+      replacementIntroducesTopLevelComma(*fixedRootActual, deps.lexLang))
+    return std::nullopt;
+
+  std::optional<std::pair<uint64_t, uint64_t>> cover =
+      RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
+  if (!cover || cover->second != cover->first + 1 ||
+      hunk.aStart != cover->second || hunk.aEnd != cover->second ||
+      hunk.bEnd != hunk.bStart + 1 || cover->first >= deps.aToks.size() ||
+      hunk.bStart == 0 || hunk.bStart >= deps.bToks.size())
+    return std::nullopt;
+
+  const PPTok &oldPrefixTok = deps.aToks[static_cast<size_t>(cover->first)];
+  const PPTok &bPrefixTok = deps.bToks[static_cast<size_t>(hunk.bStart - 1)];
+  const PPTok &insertedTok = deps.bToks[static_cast<size_t>(hunk.bStart)];
+  if (oldPrefixTok.spelling != bPrefixTok.spelling ||
+      oldPrefixTok.spelling != fixedRootActual->trim() ||
+      insertedTok.kind != "string_literal")
+    return std::nullopt;
+
+  std::optional<std::string> decodedPayload =
+      decodeSimpleStringLiteralToken(insertedTok.spelling);
+  if (!decodedPayload)
+    return std::nullopt;
+  std::optional<std::string> canonicalPayload =
+      stringutils::canonicalizeStringifyInversePayload(*decodedPayload);
+  if (!canonicalPayload || StringRef(*canonicalPayload).trim().empty())
+    return std::nullopt;
+
+  DenseMap<uint32_t, std::string> replacements;
+  std::string rewrittenRootActual = fixedRootActual->trim().str();
+  rewrittenRootActual += ", ";
+  rewrittenRootActual += StringRef(*canonicalPayload).trim().str();
+  replacements[shape->rootVariadicArgIdx] = std::move(rewrittenRootActual);
+
+  InvocationActualRecoveryContext actualCtx{invocation, baseInvocationText,
+                                            invocationArgRanges};
+  std::optional<InvocationRewriteWithRange> rewrite =
+      deps.buildInvocationRewriteWithRange(actualCtx, replacements,
+                                           /*materializedRangeByArgIdx=*/nullptr);
+  if (!rewrite || StringRef(rewrite->text).trim() == baseInvocationText.trim())
+    return std::nullopt;
+
+  MacroPatch patch{*invocation.invB, *invocation.invE, std::move(rewrite->text),
+                   invocation.id};
+  deps.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
+      patch, rewrite->materializedOutputByteStart,
+      rewrite->materializedOutputByteEnd);
+  deps.certifyMacroPatchWholeExpansionBRange(invocation, patch);
+  deps.proofCertifier.SetArgsOnlyStandardProof(
+      patch, invocation, /*wholeEnvelopeReplayValidated=*/true,
+      /*definitionTapeReplayValidated=*/true);
+  deps.proofCertifier.CertifyGeneratedCalleeReplayProof(
+      patch, invocation, calleeDefinition->id, /*generatedCallDepth=*/1,
+      objectAliasHops, /*usesStringification=*/true, /*usesPaste=*/false,
+      /*usesVariadicForwarding=*/true,
+      /*decodedStringLiteralEvidenceOnly=*/true);
+  return patch;
+}
+
 /// Return true when `child` is the generated function-like callee that consumes
 /// the root selector formal and obtains its terminal actuals from the root tuple
 /// formal.  Object-selector replay has already had first right of refusal; this
@@ -944,6 +1146,11 @@ RefoldMacroStandardArgsOnlyPatchBuilder::BuildStandardArgsOnlyPatch(
           tryBuildDirectVaOptStringifyDeactivationPatch(
               deps_, m, hArgs, baseInvText, invArgRanges))
     return directVaOptStringifyDeactivationPatch;
+
+  if (auto generatedVaOptStringifyPayloadPatch =
+          tryBuildGeneratedVaOptStringifyPayloadActivationPatch(
+              deps_, m, hArgs, baseInvText, invArgRanges))
+    return generatedVaOptStringifyPayloadPatch;
 
   // Higher-order generated replay remains in its historical ranking position
   // before ordinary occurrence collection.  The private probe owns only the

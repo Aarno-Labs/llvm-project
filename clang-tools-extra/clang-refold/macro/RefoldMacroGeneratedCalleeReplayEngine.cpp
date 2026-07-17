@@ -159,6 +159,15 @@ struct FinalGeneratedCalleeSolution {
   llvm::DenseMap<uint32_t, std::string> replacementsByRootArgIdx;
   /// Working text for root actuals that receive multiple solved obligations.
   llvm::DenseMap<uint32_t, std::string> workingRootTextByArgIdx;
+  /// True for final-callee variadic formals that had no written generated actual.
+  ///
+  /// This occurs when a variadic forwarding macro supplies a fixed generated
+  /// actual from the root variadic pack and the reached callee's own variadic
+  /// tail is empty on the A side, for example `CALL(MAKE, foo)` producing
+  /// `MAKE(foo)`.  The empty tail is still owned by the same root variadic
+  /// actual, so an activation such as `foo -> foobar` must append to the root
+  /// pack (`foo, bar`) rather than index a nonexistent generated actual.
+  llvm::SmallVector<bool, 8> syntheticEmptyVariadicTailByFinalParam;
 };
 
 /// One generated forwarder argument reference in tuple replay.
@@ -1960,6 +1969,31 @@ private:
       // Parameter replay elements may cover any token suffix beginning at the
       // current position, including the empty slice.  Increasing end order is
       // part of the deterministic replay proof and must be preserved.
+      //
+      // When a stable non-variadic actual is immediately followed by a
+      // `__VA_OPT__` payload, anchor that old actual first if it still appears
+      // verbatim at the current B-side position.  Otherwise the generic suffix
+      // enumeration can absorb newly activated payload tokens into the fixed
+      // formal, e.g. solving `prefix __VA_OPT__(# __VA_ARGS__)` as
+      // `prefix = "p" "alpha"` instead of preserving `prefix = "p"` and
+      // assigning the inserted string literal to the variadic tail.
+      if (std::optional<size_t> anchoredEnd =
+              FixedActualAnchorEndBeforeVaOpt(elem.paramIdx, toks, tokPos,
+                                              rest)) {
+        StringRef value;
+        if (*anchoredEnd > tokPos) {
+          const size_t byteBegin = toks[tokPos].begin;
+          const size_t byteEnd = toks[*anchoredEnd - 1].end;
+          value = expansion.slice(byteBegin, byteEnd);
+        }
+
+        GeneratedSolvedActuals next = cur;
+        if (pasteSolver_.AssignSolvedActual(next, elem.paramIdx, value))
+          Dfs(expansion, toks, rest, *anchoredEnd, next,
+              vaOptPayloadPresent, solutions);
+        return;
+      }
+
       for (size_t end = tokPos; end <= toks.size(); ++end) {
         StringRef value;
         if (end > tokPos) {
@@ -2038,13 +2072,44 @@ private:
     }
   }
 
+  /// Return the end token for an unchanged fixed actual before `__VA_OPT__`.
+  ///
+  /// The generated-callee solver uses this only as a producer-backed anchor:
+  /// the formal must be non-variadic, the next replay element must be a
+  /// `__VA_OPT__` payload, and the old actual must still appear token-for-token
+  /// at the current expansion position.  Failure to prove that exact prefix
+  /// falls back to ordinary enumeration rather than guessing a split.
+  std::optional<size_t> FixedActualAnchorEndBeforeVaOpt(
+      uint32_t paramIdx, ArrayRef<ReplayTok> toks, size_t tokPos,
+      ArrayRef<GeneratedReplayElem> rest) const {
+    if (paramIdx >= oldActuals_.size() ||
+        paramIdx >= variadicParamByIdx_.size() ||
+        variadicParamByIdx_[paramIdx] || rest.empty() ||
+        rest.front().kind != GeneratedReplayKind::VaOpt)
+      return std::nullopt;
+
+    SmallVector<ReplayTok, 8> oldActualTokens;
+    lexGeneratedCalleeReplayTokens(StringRef(oldActuals_[paramIdx]).trim(),
+                                   lexLang_, oldActualTokens);
+    if (oldActualTokens.empty() ||
+        tokPos + oldActualTokens.size() > toks.size())
+      return std::nullopt;
+
+    for (size_t i = 0; i < oldActualTokens.size(); ++i)
+      if (toks[tokPos + i].spelling != oldActualTokens[i].spelling)
+        return std::nullopt;
+    return tokPos + oldActualTokens.size();
+  }
+
   /// DFSes one `__VA_OPT__` payload and then resumes the parent suffix.
   ///
-  /// Generated-callee replay admits literal and ordinary formal references
-  /// inside the payload.  Stringification, paste, and nested `__VA_OPT__`
-  /// remain outside this local theorem and therefore fail closed.  The
-  /// payload-present branch must consume at least one token before resuming the
-  /// parent replay.
+  /// Generated-callee replay admits literal, ordinary formal, and simple
+  /// stringification references inside the payload.  Stringification support is
+  /// limited to one decoded string-literal token, which is exactly the C macro
+  /// surface produced by `# __VA_ARGS__` in an activated `__VA_OPT__` payload.
+  /// Paste and nested `__VA_OPT__` remain outside this local theorem and
+  /// therefore fail closed.  The payload-present branch must consume at least
+  /// one token before resuming the parent replay.
   void DfsVaOptChildren(
       StringRef expansion, ArrayRef<ReplayTok> toks,
       ArrayRef<GeneratedReplayElem> childElems,
@@ -2077,7 +2142,22 @@ private:
                     child.paramIdx, childTokPos, childAssigned,
                     vaOptPayloadPresent, solutions);
       return;
-    case GeneratedReplayKind::Stringify:
+    case GeneratedReplayKind::Stringify: {
+      if (childTokPos >= toks.size())
+        return;
+      std::optional<std::string> content =
+          decodeSimpleStringLiteralToken(toks[childTokPos].spelling);
+      if (!content)
+        return;
+
+      GeneratedSolvedActuals next = childAssigned;
+      if (!pasteSolver_.AssignSolvedActual(next, child.paramIdx,
+                                           StringRef(*content)))
+        return;
+      DfsVaOptChildren(expansion, toks, childRest, parentRest, parentTokPos,
+                       childTokPos + 1, next, vaOptPayloadPresent, solutions);
+      return;
+    }
     case GeneratedReplayKind::Paste:
     case GeneratedReplayKind::VaOpt:
       return;
@@ -2189,6 +2269,9 @@ public:
             ? replayState.currentDefinition->defParams.size() - 1
             : replayState.currentDefinition->defParams.size();
 
+    if (replayState.currentActuals.size() < finalFixed)
+      return std::nullopt;
+
     FinalGeneratedCalleeSolution solution;
     for (size_t i = 0; i < finalFixed; ++i) {
       solution.oldActuals.push_back(replayState.currentActuals[i].text);
@@ -2196,6 +2279,7 @@ public:
           replayState.currentActuals[i].rootArgIdx);
       solution.rootSourceByFinalParam.push_back(
           replayState.currentActuals[i].rootSourceText);
+      solution.syntheticEmptyVariadicTailByFinalParam.push_back(false);
     }
     if (finalHasVariadic) {
       std::string variadicText;
@@ -2207,15 +2291,38 @@ public:
       }
       os.flush();
       solution.oldActuals.push_back(std::move(variadicText));
-      solution.rootSlotByFinalParam.push_back(
-          replayState.currentActuals[finalFixed].rootArgIdx);
-      solution.rootSourceByFinalParam.push_back(
-          replayState.currentActuals[finalFixed].rootSourceText);
+
+      if (replayState.currentActuals.size() > finalFixed) {
+        solution.rootSlotByFinalParam.push_back(
+            replayState.currentActuals[finalFixed].rootArgIdx);
+        solution.rootSourceByFinalParam.push_back(
+            replayState.currentActuals[finalFixed].rootSourceText);
+        solution.syntheticEmptyVariadicTailByFinalParam.push_back(false);
+      } else {
+        // The final variadic formal is empty in the generated call.  It still
+        // has a source owner only when the preceding generated actual came from
+        // the root invocation's variadic formal, as in `CALL(MAKE, foo)` where
+        // `foo` becomes MAKE's fixed `prefix` actual and MAKE's variadic tail is
+        // absent.  Reusing that root owner lets a later solved activation append
+        // to the same root pack; all other shapes remain fail-closed.
+        if (finalFixed == 0)
+          return std::nullopt;
+        const GeneratedCalleeSourceSlot &owner =
+            replayState.currentActuals[finalFixed - 1];
+        if (!isMacroInvocationVariadicFormal(m, owner.rootArgIdx))
+          return std::nullopt;
+        solution.rootSlotByFinalParam.push_back(owner.rootArgIdx);
+        solution.rootSourceByFinalParam.push_back(
+            StringRef(owner.rootSourceText).trim().str());
+        solution.syntheticEmptyVariadicTailByFinalParam.push_back(true);
+      }
     }
     if (solution.oldActuals.size() !=
             replayState.currentDefinition->defParams.size() ||
         solution.rootSlotByFinalParam.size() != solution.oldActuals.size() ||
-        solution.rootSourceByFinalParam.size() != solution.oldActuals.size())
+        solution.rootSourceByFinalParam.size() != solution.oldActuals.size() ||
+        solution.syntheticEmptyVariadicTailByFinalParam.size() !=
+            solution.oldActuals.size())
       return std::nullopt;
 
     std::vector<GeneratedReplayElem> finalPattern;
@@ -2309,6 +2416,34 @@ public:
                                     ? StringRef(
                                           solution.rootSourceByFinalParam[i])
                                     : StringRef(solution.oldActuals[i]));
+
+      if (i < solution.syntheticEmptyVariadicTailByFinalParam.size() &&
+          solution.syntheticEmptyVariadicTailByFinalParam[i]) {
+        if (!StringRef((*oldSolved)[i]).trim().empty() ||
+            !isMacroInvocationVariadicFormal(m, rootIdx))
+          return std::nullopt;
+        StringRef newTail = StringRef((*newSolved)[i]).trim();
+        if (newTail.empty())
+          continue;
+
+        StringRef existingRoot = workingIt != solution.workingRootTextByArgIdx.end()
+                                     ? StringRef(workingIt->second).trim()
+                                     : originalRoot;
+        if (existingRoot.empty())
+          return std::nullopt;
+
+        std::string rewritten = existingRoot.str();
+        rewritten += ", ";
+        rewritten += newTail.str();
+        solution.workingRootTextByArgIdx[rootIdx] = std::move(rewritten);
+        StringRef finalRoot =
+            StringRef(solution.workingRootTextByArgIdx[rootIdx]).trim();
+        if (finalRoot != originalRoot)
+          solution.replacementsByRootArgIdx[rootIdx] = finalRoot.str();
+        else
+          solution.replacementsByRootArgIdx.erase(rootIdx);
+        continue;
+      }
 
       if (workingIt != solution.workingRootTextByArgIdx.end()) {
         // Multiple final-callee parameters can impose the same edit on one
