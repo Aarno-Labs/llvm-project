@@ -410,8 +410,13 @@ GeneratedLeafReplayResolver::TryGeneratedSelectorActualRewrite(
         deps_.resolveFunctionLikeMacroForReplay(selectorText);
     if (!oldSelectorDef || oldSelectorDef->defParams.empty())
       continue;
-    if (selectorIdx + oldSelectorDef->defParams.size() >=
-        invArgRanges.size() + 1)
+    // The selector consumes its own root actual, and each generated-callee
+    // formal would have to consume one following root actual in this narrow
+    // selector-inversion theorem. A generated call may also provide fixed
+    // replacement-list actuals, so an insufficient root-actual tail is a miss
+    // here, not an ArrayRef index past the invocation's recovered argument
+    // ranges.
+    if (selectorIdx + oldSelectorDef->defParams.size() >= invArgRanges.size())
       continue;
 
     SmallVector<StringRef, 8> actuals;

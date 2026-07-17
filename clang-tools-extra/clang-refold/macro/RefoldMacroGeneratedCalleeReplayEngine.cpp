@@ -947,6 +947,60 @@ bool appendActualsForParam(const RefoldModel::MacroDirective &definition,
   return true;
 }
 
+/// Append one fixed generated actual that has no editable root source owner.
+///
+/// Literal head arguments in generated calls, for example
+/// `f("tag" __VA_OPT__(,) __VA_ARGS__)`, become ordinary fixed actuals of the
+/// terminal generated callee. They must participate in old/new replay solving,
+/// but they cannot themselves produce a source rewrite. Use any valid root
+/// owner only as a fail-closed placeholder: unchanged literal actuals are
+/// skipped before source rewriting, while an attempted edit to the literal fails
+/// because the solved old literal is not found in that root argument.
+bool appendFixedGeneratedLiteralActual(
+    ArrayRef<GeneratedCalleeSourceSlot> actuals, StringRef literal,
+    SmallVectorImpl<GeneratedCalleeSourceSlot> &out) {
+  if (actuals.empty())
+    return false;
+  GeneratedCalleeSourceSlot slot;
+  slot.text = literal.trim().str();
+  slot.rootSourceText = slot.text;
+  slot.rootArgIdx = actuals.front().rootArgIdx;
+  out.push_back(std::move(slot));
+  return true;
+}
+
+/// Append the narrow literal-head plus `__VA_OPT__` variadic-tail generated
+/// actual list.
+///
+/// This covers the canonical forwarding shape:
+///
+///   f("tag" __VA_OPT__(,) __VA_ARGS__)
+///
+/// The literal head supplies a fixed actual to the generated callee, while the
+/// variadic formal supplies the editable tail. Richer payloads remain outside
+/// this theorem and fail closed through the caller's ordinary generated-argument
+/// checks.
+bool appendLiteralHeadVaOptVariadicGeneratedActuals(
+    const RefoldModel::MacroDirective &definition,
+    ArrayRef<GeneratedCalleeSourceSlot> actuals, size_t begin, size_t end,
+    const clang::LangOptions &lexLang, bool &usesVariadicForwarding,
+    SmallVectorImpl<GeneratedCalleeSourceSlot> &out) {
+  const auto &toks = definition.replacementTokens;
+  if (begin + 6 != end ||
+      toks[begin].kind != RefoldModel::MacroReplacementTokenKind::Literal ||
+      toks[begin + 1].spelling != "__VA_OPT__" ||
+      toks[begin + 2].spelling != "(" || toks[begin + 3].spelling != "," ||
+      toks[begin + 4].spelling != ")" ||
+      toks[begin + 5].kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+      !toks[begin + 5].paramIndex ||
+      !isMacroDirectiveVariadicParam(definition, *toks[begin + 5].paramIndex))
+    return false;
+  if (!appendFixedGeneratedLiteralActual(actuals, toks[begin].spelling, out))
+    return false;
+  return appendActualsForParam(definition, actuals, *toks[begin + 5].paramIndex,
+                               lexLang, usesVariadicForwarding, out);
+}
+
 
 /// Finds the single root source slot edited by one generated-call argument.
 ///
@@ -1022,6 +1076,11 @@ bool instantiateGeneratedArgument(
       isMacroDirectiveVariadicParam(definition, *toks[begin].paramIndex))
     return appendActualsForParam(definition, actuals, *toks[begin].paramIndex,
                                  deps.lexLang, usesVariadicForwarding, out);
+
+  if (appendLiteralHeadVaOptVariadicGeneratedActuals(
+          definition, actuals, begin, end, deps.lexLang, usesVariadicForwarding,
+          out))
+    return true;
 
   // Active `__VA_OPT__(, __VA_ARGS__)` in a generated-call argument list
   // contributes additional positional arguments rather than bytes inside the
@@ -1487,8 +1546,12 @@ private:
 class GeneratedCalleePasteActualSolver {
 public:
   GeneratedCalleePasteActualSolver(ArrayRef<std::string> oldActuals,
+                                   ArrayRef<bool> variadicParamByIdx,
                                    const clang::LangOptions &lexLang)
-      : oldActuals_(oldActuals), lexLang_(lexLang) {}
+      : oldActuals_(oldActuals),
+        variadicParamByIdx_(variadicParamByIdx.begin(),
+                            variadicParamByIdx.end()),
+        lexLang_(lexLang) {}
 
   /// Assigns one solved actual while preserving existing compatible bindings.
   ///
@@ -1498,6 +1561,19 @@ public:
   bool AssignSolvedActual(GeneratedSolvedActuals &actuals, uint32_t paramIdx,
                           StringRef value) const {
     if (paramIdx >= actuals.size())
+      return false;
+
+    // A solved non-variadic formal is one macro actual.  Do not let it absorb a
+    // top-level comma while inverting a replacement list that also contains a
+    // variadic tail.  Without this guard, patterns such as
+    // `fmt __VA_OPT__(,) __VA_ARGS__` have two apparent solutions for
+    // `emit("tag", A)`: either `fmt = "tag", __VA_ARGS__ = A` or
+    // `fmt = "tag", A, __VA_ARGS__ = <empty>`.  The latter is not a
+    // replay-safe source actual for a fixed formal and would make the generated
+    // callee proof ambiguous, forcing whole-cover expansion.
+    if (paramIdx < variadicParamByIdx_.size() &&
+        !variadicParamByIdx_[paramIdx] &&
+        replacementIntroducesTopLevelComma(value, lexLang_))
       return false;
 
     // Existing assignments are compared by token equivalence, not raw spelling,
@@ -1610,6 +1686,7 @@ private:
   }
 
   ArrayRef<std::string> oldActuals_;
+  SmallVector<bool, 8> variadicParamByIdx_;
   const clang::LangOptions &lexLang_;
 };
 
@@ -1631,7 +1708,8 @@ public:
       : replayPattern_(replayPattern), oldActuals_(oldActuals),
         variadicParamByIdx_(variadicParamByIdx.begin(),
                             variadicParamByIdx.end()),
-        lexLang_(lexLang), pasteSolver_(oldActuals, lexLang) {}
+        lexLang_(lexLang),
+        pasteSolver_(oldActuals, variadicParamByIdx, lexLang) {}
 
   /// Solves the replay pattern against `expansion`, if the solution is unique.
   ///
@@ -2452,7 +2530,12 @@ std::optional<GeneratedSolvedActuals> solveRootPasteActualsForCallee(
   for (const std::string &actual : oldRootActuals)
     seed.push_back(StringRef(actual).trim().str());
 
-  GeneratedCalleePasteActualSolver solver(oldRootActuals, lexLang);
+  SmallVector<bool, 8> variadicParamByIdx;
+  variadicParamByIdx.resize(oldRootActuals.size(), false);
+  GeneratedCalleePasteActualSolver solver(
+      oldRootActuals, ArrayRef<bool>(variadicParamByIdx.data(),
+                                     variadicParamByIdx.size()),
+      lexLang);
   SmallVector<GeneratedSolvedActuals, 4> solutions =
       solver.Solve(pieces, calleeSpelling, seed);
   if (solutions.size() != 1)
