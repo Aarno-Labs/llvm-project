@@ -125,6 +125,15 @@ public:
   std::optional<MacroPatch>
   BuildStandardArgsOnlyPatch(const ArgsOnlyPlanningContext &ctx) const;
 
+  /// Try the higher-order generated-callee replay theorem independently of
+  /// args-only hunk admission.  Whole-cover planning uses this when the edited
+  /// token is body-owned by the root expansion, but the producer graph still
+  /// proves a source-preserving generated-callee rewrite.
+  std::optional<MacroPatch> TryBuildHigherOrderGeneratedReplay(
+      const RefoldModel::MacroInvocation &invocation,
+      const diffutils::Hunk &hunk, llvm::StringRef baseInvocationText,
+      llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
+
 private:
   /// On-demand constructors for the short-lived macro-domain helper services
   /// that the standard args-only body queries.

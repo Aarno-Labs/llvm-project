@@ -863,6 +863,16 @@ DefinitionReplayedStandardArgSpanRepair getDefinitionReplayedStandardArgSpans(
 } // namespace
 
 
+
+std::optional<MacroPatch>
+RefoldMacroStandardArgsOnlyPatchBuilder::TryBuildHigherOrderGeneratedReplay(
+    const RefoldModel::MacroInvocation &invocation, const diffutils::Hunk &hunk,
+    StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
+  return HigherOrderGeneratedReplayProbe(deps_).TryBuild(
+      invocation, hunk, baseInvocationText, invocationArgRanges);
+}
+
 std::optional<MacroPatch>
 RefoldMacroStandardArgsOnlyPatchBuilder::BuildStandardArgsOnlyPatch(
     const ArgsOnlyPlanningContext &ctx) const {

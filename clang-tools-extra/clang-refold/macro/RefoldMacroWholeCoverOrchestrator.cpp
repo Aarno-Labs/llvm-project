@@ -655,6 +655,51 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
       planningCtx.rootHasDirectArgLikeSurface ? 1 : 0,
       planningCtx.directRootPreservationInadmissible ? 1 : 0);
 
+  // Higher-order generated-callee replay normally lives inside the standard
+  // args-only ranking slot because many generated-callee edits are observed
+  // through root actuals.  Some generated-callee selectors are body-owned at
+  // the root, however: for example `#define APPLY(f, t) f t` with source
+  // `APPLY(OP, (9, 4))` materializes the selected `ADD`/`SUB` body even though
+  // the root callsite arguments are unchanged.  The args-only phase correctly
+  // declines such a body-owned hunk, so whole-cover planning must still give
+  // the same exact generated-callee theorem one chance before expansion can
+  // realize the whole cover.
+  if (!argsOnlyCandidate && m.subkind == "func") {
+    // Whole-cover orchestration must not reach into planner-private actual
+    // recovery carriers.  The public content-range primitive is sufficient
+    // here because the higher-order theorem only needs the formal argument
+    // byte intervals in the original invocation spelling.
+    if (std::optional<std::vector<std::pair<size_t, size_t>>>
+            higherOrderArgRanges = planner_->GetMacroInvocationFormalArgContentRanges(
+                m, baseInvText)) {
+      if (std::optional<MacroPatch> higherOrderPatch =
+              planner_->StandardArgsOnlyPatchBuilder()
+                  .TryBuildHigherOrderGeneratedReplay(
+                      m, h, baseInvText, *higherOrderArgRanges)) {
+        // This whole-cover-side hook is only for generated-callee theorems that
+        // preserve the root invocation abstraction.  Non-preserving generated
+        // leaf materialization still belongs to the ordinary whole-cover
+        // realization path below.
+        if (!higherOrderPatch->proof.preservesInvocationStructure)
+          higherOrderPatch.reset();
+
+        if (higherOrderPatch) {
+          REFOLD_LOG_TRACE(
+              "macro/whole-cover",
+              "higher-order-generated-accepted inv id={0} name={1} proof={2} replacement='{3}'",
+              m.id, m.name, toString(higherOrderPatch->proof.kind),
+              stringutils::showWsWithClip(higherOrderPatch->replacement, 220));
+          patchReusePhase_.MergeCurrentRootWithExistingCallsitePatch(
+              planningCtx, *higherOrderPatch);
+          if (!conflictingConcreteSubtreeWitnessForcesWholeCover) {
+            dagRootCandidate = std::move(*higherOrderPatch);
+            reuseExistingCallsitePatch = false;
+          }
+        }
+      }
+    }
+  }
+
   // 1b) Conservative DAG chaining: if the edited A-span lies within this
   //     invocation's cover but not within one of its direct argument-like
   //     spans, attempt to lift the edit from a nested callee invocation back
@@ -667,7 +712,8 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
   //   * If the inverse is ambiguous, unsupported, or does not match the
   //     observed text, lifting fails and we conservatively keep the subtree
   //     expanded.
-  if (m.subkind == "func" && hasLiteralMacroCalleeOrigin(m)) {
+  if (!dagRootCandidate && m.subkind == "func" &&
+      hasLiteralMacroCalleeOrigin(m)) {
     auto tryDAGChainedArgsOnly = [&]() -> std::optional<MacroPatch> {
       // The DAG chain runs in two phase services.  Discovery computes the
       // leaf candidate set, the split-insertion root candidates, and the

@@ -4394,14 +4394,26 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
   if (!uniqueCandidate || !uniqueCandidate->calleeDefinition)
     return std::nullopt;
 
-  InvocationActualRecoveryContext actualRecoveryCtx{
-      ctx.invocation, ctx.baseInvocationText, ctx.invocationArgRanges};
-  std::optional<InvocationRewriteWithRange> rewrite =
-      deps_.buildInvocationRewriteWithRange(
-          actualRecoveryCtx, uniqueCandidate->replacementsByRootArgIdx,
-          /*materializedRangeByArgIdx=*/nullptr);
-  if (!rewrite)
-    return std::nullopt;
+  std::optional<InvocationRewriteWithRange> rewrite;
+  if (!uniqueCandidate->replacementsByRootArgIdx.empty()) {
+    InvocationActualRecoveryContext actualRecoveryCtx{
+        ctx.invocation, ctx.baseInvocationText, ctx.invocationArgRanges};
+    rewrite = deps_.buildInvocationRewriteWithRange(
+        actualRecoveryCtx, uniqueCandidate->replacementsByRootArgIdx,
+        /*materializedRangeByArgIdx=*/nullptr);
+    if (!rewrite)
+      return std::nullopt;
+  } else {
+    // The selected object-selector definition can be the only source edit
+    // required by this theorem.  In that shape the root invocation spelling is
+    // intentionally preserved byte-for-byte, so the ordinary invocation rewrite
+    // helper would reject the empty argument-replacement map even though the
+    // proof has a non-empty supplemental selector-definition edit.
+    if (uniqueCandidate->supplementalTUEdits.empty())
+      return std::nullopt;
+    rewrite = InvocationRewriteWithRange{ctx.baseInvocationText.str(), 0,
+                                         ctx.baseInvocationText.size()};
+  }
 
   MacroPatch patch{*ctx.invocation.invB, *ctx.invocation.invE,
                    std::move(rewrite->text), ctx.invocation.id};
