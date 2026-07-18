@@ -70,19 +70,6 @@ private:
       const MacroPatch &patch, uint64_t patchEnd,
       llvm::ArrayRef<std::pair<uint64_t, uint64_t>> acceptedRanges) const;
 
-  /// Stages auxiliary TU edits attached to an accepted macro patch.
-  void StageSupplementalTUEditsForMacroPatch(const MacroPatch &patch);
-
-  /// Creates a concrete TU text edit for one macro-patch auxiliary source edit.
-  ///
-  /// Supplemental edits are not independent terminal rewrites: they are source
-  /// surfaces needed by the owning macro patch's proof.  They therefore inherit
-  /// the owning patch's certified B-side materialization envelope for edit-map
-  /// emission instead of pretending to own a separate raw B hunk.
-  TextEdit BuildSupplementalTUEdit(
-      const MacroPatch &patch,
-      const SupplementalMacroTUEdit &supplementalEdit) const;
-
   /// Creates the concrete TU text edit for one accepted TU macro patch.
   TextEdit BuildTUMacroPatchEdit(const MacroPatch &patch,
                                  uint64_t patchEnd) const;
@@ -184,7 +171,6 @@ void FinalTUEmissionContext::StageTUMacroPatchEdits() {
       continue;
 
     accepted.push_back({patch.invRange.begin, patchEnd});
-    StageSupplementalTUEditsForMacroPatch(patch);
     structuralHunkDispatcher_.AddTUEdit(BuildTUMacroPatchEdit(patch, patchEnd));
   }
 }
@@ -208,74 +194,6 @@ bool FinalTUEmissionContext::MacroPatchIsShadowedByAccepted(
     }
   }
   return false;
-}
-
-void FinalTUEmissionContext::StageSupplementalTUEditsForMacroPatch(
-    const MacroPatch &patch) {
-  for (const SupplementalMacroTUEdit &supplementalEdit :
-       patch.supplementalTUEdits) {
-    if (supplementalEdit.start > supplementalEdit.end ||
-        supplementalEdit.end > request_.tuBytes.size()) {
-      REFOLD_LOG_FATAL("macro/tu",
-                       "invalid supplemental TU edit for macro patch #{0}: "
-                       "[{1},{2}) size={3}",
-                       patch.macroId, supplementalEdit.start,
-                       supplementalEdit.end, request_.tuBytes.size());
-    }
-    if (supplementalEdit.start < patch.invRange.end &&
-        patch.invRange.begin < supplementalEdit.end) {
-      REFOLD_LOG_FATAL("macro/tu",
-                       "supplemental TU edit overlaps macro invocation: "
-                       "macro=#{0} supplemental=[{1},{2}) invocation=[{3},{4})",
-                       patch.macroId, supplementalEdit.start,
-                       supplementalEdit.end, patch.invRange.begin,
-                       patch.invRange.end);
-    }
-    structuralHunkDispatcher_.AddTUEdit(
-        BuildSupplementalTUEdit(patch, supplementalEdit));
-  }
-}
-
-TextEdit FinalTUEmissionContext::BuildSupplementalTUEdit(
-    const MacroPatch &patch,
-    const SupplementalMacroTUEdit &supplementalEdit) const {
-  ResyncOutcome resync = textEditAssembler_.ApplyResyncOrPend(
-      request_.tuBytes, supplementalEdit.start, supplementalEdit.end,
-      supplementalEdit.text, request_.tuPath);
-
-  TextEdit edit{supplementalEdit.start,
-                supplementalEdit.end,
-                std::move(resync.text),
-                std::move(resync.pending),
-                std::nullopt,
-                {},
-                {},
-                {}};
-  edit.lineControlPruneCandidates =
-      std::move(resync.lineControlPruneCandidates);
-  edit.directTUFinalStart = edit.start;
-  edit.directTUFinalEnd = edit.end;
-
-  // The supplemental edit is semantically part of the macro patch that selected
-  // it.  For example, an object-selector tuple replay may preserve
-  // `APPLY(OP, ...)` while rewriting the active one-token selector definition
-  // from `#define OP ADD` to `#define OP SUB`.  That directive edit has no
-  // independent B-side token range of its own; the deterministic materialized
-  // B envelope is the same expansion envelope certified by the owning macro
-  // patch.  Propagating that envelope keeps the optional edit map proof-backed
-  // and avoids treating the selector edit as an unproven terminal artifact.
-  if (auto bRange = textEditAssembler_.MacroPatchMaterializedBByteRange(patch))
-    textEditAssembler_.CertifyTextEditMaterializedBByteRange(
-        edit, bRange->first, bRange->second);
-  textEditAssembler_.CertifyTextEditMaterializedOutputTextRange(
-      edit, /*begin=*/0, static_cast<uint64_t>(edit.text.size()));
-
-  textEditAssembler_.AttachAcceptedResultCarrier(
-      edit, deps_.proofLattice->AcceptedCandidateBuilder()
-                .BuildAcceptedTUTextEditCandidate(
-                    AcceptedPathKind::TUByteSpanConservativeEdit, edit.start,
-                    edit.end, StringRef(edit.text)));
-  return edit;
 }
 
 TextEdit

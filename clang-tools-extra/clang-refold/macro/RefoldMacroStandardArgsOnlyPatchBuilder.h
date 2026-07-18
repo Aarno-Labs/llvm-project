@@ -9,8 +9,9 @@
 // occurrences) for the touched hunk, requires hunk coverage by those spans,
 // and derives per-arg replacements from the B-side slices.  Higher-order
 // generated-callee, generated-leaf, tuple-forwarded, and pure paste-only paths
-// remain private implementation details reached through the references
-// supplied in `Dependencies`.
+// remain implementation details reached through the references supplied in
+// `Dependencies`; whole-cover orchestration may invoke the higher-order probe
+// through the narrow competition hook declared below.
 //
 // The builder has no back-reference to `RefoldMacroPatchPlanner`.
 // Planner-side helpers that stay on the planner are reached through
@@ -125,10 +126,15 @@ public:
   std::optional<MacroPatch>
   BuildStandardArgsOnlyPatch(const ArgsOnlyPlanningContext &ctx) const;
 
-  /// Try the higher-order generated-callee replay theorem independently of
-  /// args-only hunk admission.  Whole-cover planning uses this when the edited
-  /// token is body-owned by the root expansion, but the producer graph still
-  /// proves a source-preserving generated-callee rewrite.
+  /// Try the existing higher-order generated replay theorem after another
+  /// args-only path has already admitted a candidate.
+  ///
+  /// Definition-tape replay intentionally precedes the standard args-only
+  /// builder and can therefore return before the builder's private higher-order
+  /// probe runs.  Whole-cover orchestration uses this narrow hook only to let an
+  /// invocation-preserving generated-callee proof compete with that earlier
+  /// direct candidate.  A miss is non-terminal and does not alter ordinary
+  /// args-only or whole-cover fallback behavior.
   std::optional<MacroPatch> TryBuildHigherOrderGeneratedReplay(
       const RefoldModel::MacroInvocation &invocation,
       const diffutils::Hunk &hunk, llvm::StringRef baseInvocationText,

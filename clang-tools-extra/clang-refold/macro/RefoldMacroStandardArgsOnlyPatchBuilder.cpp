@@ -1064,13 +1064,15 @@ DefinitionReplayedStandardArgSpanRepair getDefinitionReplayedStandardArgSpans(
 
 } // namespace
 
-
-
 std::optional<MacroPatch>
 RefoldMacroStandardArgsOnlyPatchBuilder::TryBuildHigherOrderGeneratedReplay(
-    const RefoldModel::MacroInvocation &invocation, const diffutils::Hunk &hunk,
-    StringRef baseInvocationText,
+    const RefoldModel::MacroInvocation &invocation,
+    const diffutils::Hunk &hunk, StringRef baseInvocationText,
     ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
+  // Reuse the exact theorem ordering and fail-closed behavior of the private
+  // higher-order probe.  This wrapper adds no alternate solver or fallback; it
+  // only exposes the already-existing proof sequence to whole-cover candidate
+  // arbitration after an earlier args-only path returned first.
   return HigherOrderGeneratedReplayProbe(deps_).TryBuild(
       invocation, hunk, baseInvocationText, invocationArgRanges);
 }

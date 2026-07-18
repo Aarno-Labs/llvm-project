@@ -2977,7 +2977,6 @@ struct PasteGeneratedReplayCandidate {
 /// the unique-candidate check commits to a patch.
 struct ObjectSelectorTupleGeneratedReplayCandidate {
   llvm::DenseMap<uint32_t, std::string> replacementsByRootArgIdx;
-  std::vector<SupplementalMacroTUEdit> supplementalTUEdits;
   const RefoldModel::MacroDirective *calleeDefinition = nullptr;
   uint32_t objectAliasHopCount = 0;
   bool usesStringification = false;
@@ -3019,125 +3018,6 @@ bool selectorSpellingNamesObjectAlias(const RefoldModel &model,
       return true;
   }
   return false;
-}
-
-/// Resolve the active one-token object-like alias definition before a macro
-/// invocation item.  Undefs close the state, so a selector whose active binding
-/// is missing or no longer a single literal token is outside the theorem.
-const RefoldModel::MacroDirective *activeObjectSelectorAliasBefore(
-    const RefoldModel &model, uint64_t beforeItemId, StringRef selectorName) {
-  StringRef trimmedSelector = selectorName.trim();
-  if (trimmedSelector.empty())
-    return nullptr;
-
-  const RefoldModel::MacroDirective *active = nullptr;
-  for (const RefoldModel::MacroDirective &directive :
-       model.GetMacroDirectives()) {
-    if (directive.id >= beforeItemId)
-      continue;
-    if (directive.subkind != "#define" && directive.subkind != "#undef")
-      continue;
-    if (directive.name != trimmedSelector)
-      continue;
-    if (!active || directive.id > active->id)
-      active = &directive;
-  }
-
-  if (!active || !isSingleTokenObjectSelectorAlias(*active))
-    return nullptr;
-  return active;
-}
-
-/// Physical source-byte range of the single replacement token in an
-/// object-like alias definition.  MacroDirective::siteB points at the macro
-/// name, while MacroDirective::text is the complete directive spelling.  The
-/// helper therefore derives the directive-line base from `siteE - text.size()`
-/// and then accepts only the simple producer shape `#define NAME TOKEN` with
-/// no unmodelled trailing replacement tokens.
-std::optional<std::pair<uint64_t, uint64_t>>
-objectSelectorAliasReplacementByteRange(
-    const RefoldModel::MacroDirective &aliasDirective) {
-  if (!isSingleTokenObjectSelectorAlias(aliasDirective) ||
-      aliasDirective.text.empty() || aliasDirective.siteE < aliasDirective.siteB)
-    return std::nullopt;
-
-  StringRef directiveText = aliasDirective.text;
-  if (aliasDirective.siteE < directiveText.size())
-    return std::nullopt;
-  const uint64_t directiveBegin =
-      aliasDirective.siteE - static_cast<uint64_t>(directiveText.size());
-  if (aliasDirective.siteB < directiveBegin)
-    return std::nullopt;
-
-  const uint64_t nameOffset = aliasDirective.siteB - directiveBegin;
-  if (nameOffset + aliasDirective.name.size() > directiveText.size() ||
-      directiveText.slice(static_cast<size_t>(nameOffset),
-                          static_cast<size_t>(nameOffset +
-                                              aliasDirective.name.size())) !=
-          aliasDirective.name)
-    return std::nullopt;
-
-  const StringRef replacementSpelling =
-      aliasDirective.replacementTokens.front().spelling;
-  size_t cursor = static_cast<size_t>(nameOffset + aliasDirective.name.size());
-  while (cursor < directiveText.size() && stringutils::isWs(directiveText[cursor]))
-    ++cursor;
-  if (cursor + replacementSpelling.size() > directiveText.size())
-    return std::nullopt;
-  if (directiveText.slice(cursor, cursor + replacementSpelling.size()) !=
-      replacementSpelling)
-    return std::nullopt;
-
-  const size_t tokenEnd = cursor + replacementSpelling.size();
-  if (cursor > 0 && stringutils::isIdentPart(directiveText[cursor - 1]))
-    return std::nullopt;
-  if (tokenEnd < directiveText.size() &&
-      stringutils::isIdentPart(directiveText[tokenEnd]))
-    return std::nullopt;
-
-  for (size_t i = tokenEnd; i < directiveText.size(); ++i) {
-    if (!stringutils::isWs(directiveText[i]))
-      return std::nullopt;
-  }
-
-  return std::make_pair(directiveBegin + static_cast<uint64_t>(cursor),
-                        directiveBegin + static_cast<uint64_t>(tokenEnd));
-}
-
-/// Add the selected-definition rewrite for an object-selector actual when no
-/// source-level alternate selector spelling exists.  This is deliberately
-/// limited to a single alias hop (`#define OP ADD`): changing that selected
-/// definition to `SUB` preserves the root invocation spelling `APPLY(OP, ...)`
-/// while making the callsite observe the unique alternate callee.  Longer alias
-/// chains would require a separate proof that chooses which link in the chain
-/// may be mutated, so they remain fail-closed here.
-bool addObjectSelectorDefinitionReplacement(
-    const ObjectSelectorTupleGeneratedCalleeReplayContext &ctx,
-    const RefoldMacroGeneratedCalleeReplayEngine::Dependencies &deps,
-    StringRef oldSelector, uint32_t oldAliasHops,
-    const RefoldModel::MacroDirective &oldCalleeDefinition,
-    const RefoldModel::MacroDirective &candidateDefinition,
-    ObjectSelectorTupleGeneratedReplayCandidate &candidate) {
-  if (oldAliasHops != 1)
-    return false;
-
-  const RefoldModel::MacroDirective *aliasDirective =
-      activeObjectSelectorAliasBefore(deps.model, ctx.invocation.id,
-                                      oldSelector);
-  if (!aliasDirective || aliasDirective->replacementTokens.empty() ||
-      aliasDirective->replacementTokens.front().spelling !=
-          oldCalleeDefinition.name)
-    return false;
-
-  std::optional<std::pair<uint64_t, uint64_t>> replacementRange =
-      objectSelectorAliasReplacementByteRange(*aliasDirective);
-  if (!replacementRange)
-    return false;
-
-  candidate.supplementalTUEdits.push_back(SupplementalMacroTUEdit{
-      replacementRange->first, replacementRange->second,
-      candidateDefinition.name.str()});
-  return true;
 }
 
 /// Return whether `candidateSelector` is an object selector for `definition`.
@@ -5878,10 +5758,7 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
     candidate.usesPaste = oldUsesPaste || candidateUsesPaste;
 
     if (!addObjectSelectorReplacement(ctx, deps_, oldSelector, oldAliasHops,
-                                      candidateDefinition, candidate) &&
-        !addObjectSelectorDefinitionReplacement(
-            ctx, deps_, oldSelector, oldAliasHops, *oldCalleeDefinition,
-            candidateDefinition, candidate))
+                                      candidateDefinition, candidate))
       continue;
 
     if (tupleArgText.trim() != StringRef(*rewrittenTupleArg).trim()) {
@@ -5889,8 +5766,7 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
           StringRef(*rewrittenTupleArg).trim().str();
     }
 
-    if (candidate.replacementsByRootArgIdx.empty() &&
-        candidate.supplementalTUEdits.empty())
+    if (candidate.replacementsByRootArgIdx.empty())
       continue;
 
     if (uniqueCandidate)
@@ -5901,31 +5777,17 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
   if (!uniqueCandidate || !uniqueCandidate->calleeDefinition)
     return std::nullopt;
 
-  std::optional<InvocationRewriteWithRange> rewrite;
-  if (!uniqueCandidate->replacementsByRootArgIdx.empty()) {
-    InvocationActualRecoveryContext actualRecoveryCtx{
-        ctx.invocation, ctx.baseInvocationText, ctx.invocationArgRanges};
-    rewrite = deps_.buildInvocationRewriteWithRange(
-        actualRecoveryCtx, uniqueCandidate->replacementsByRootArgIdx,
-        /*materializedRangeByArgIdx=*/nullptr);
-    if (!rewrite)
-      return std::nullopt;
-  } else {
-    // The selected object-selector definition can be the only source edit
-    // required by this theorem.  In that shape the root invocation spelling is
-    // intentionally preserved byte-for-byte, so the ordinary invocation rewrite
-    // helper would reject the empty argument-replacement map even though the
-    // proof has a non-empty supplemental selector-definition edit.
-    if (uniqueCandidate->supplementalTUEdits.empty())
-      return std::nullopt;
-    rewrite = InvocationRewriteWithRange{ctx.baseInvocationText.str(), 0,
-                                         ctx.baseInvocationText.size()};
-  }
+  InvocationActualRecoveryContext actualRecoveryCtx{
+      ctx.invocation, ctx.baseInvocationText, ctx.invocationArgRanges};
+  std::optional<InvocationRewriteWithRange> rewrite =
+      deps_.buildInvocationRewriteWithRange(
+          actualRecoveryCtx, uniqueCandidate->replacementsByRootArgIdx,
+          /*materializedRangeByArgIdx=*/nullptr);
+  if (!rewrite)
+    return std::nullopt;
 
   MacroPatch patch{*ctx.invocation.invB, *ctx.invocation.invE,
                    std::move(rewrite->text), ctx.invocation.id};
-  patch.supplementalTUEdits =
-      std::move(uniqueCandidate->supplementalTUEdits);
   deps_.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
       patch, rewrite->materializedOutputByteStart,
       rewrite->materializedOutputByteEnd);

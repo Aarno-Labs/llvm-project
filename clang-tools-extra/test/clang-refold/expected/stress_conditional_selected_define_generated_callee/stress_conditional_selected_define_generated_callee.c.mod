@@ -1,6 +1,6 @@
 // RUN: %clang-refold-tester-with-lines stress_conditional_selected_define_generated_callee
 #if 1
-#define OP SUB
+#define OP ADD
 #else
 #define OP SUB
 #endif
@@ -8,4 +8,4 @@
 #define ADD(a, b) ((a) + (b))
 #define SUB(a, b) ((a) - (b))
 
-int x = APPLY(OP, (9, 4));
+int x = ((9) - (4));

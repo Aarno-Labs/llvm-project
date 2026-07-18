@@ -723,6 +723,53 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
       planningCtx.rootHasDirectArgLikeSurface ? 1 : 0,
       planningCtx.directRootPreservationInadmissible ? 1 : 0);
 
+  // Definition-tape replay is intentionally ranked before the standard
+  // args-only builder.  It can therefore admit a zero-token formal assignment
+  // before the builder's higher-order generated-callee probe runs.  Give that
+  // exact probe one competing chance only when an earlier direct args-only
+  // candidate already exists.  This preserves the ordinary body-owned
+  // whole-cover policy while allowing a stronger generated-callee proof to keep
+  // the selector and generated actual-list structure intact.
+  if (argsOnlyCandidate && m.subkind == "func") {
+    // The higher-order theorem needs only the recovered formal-content ranges;
+    // it reuses the same producer graph, old/new expansion solvers, uniqueness
+    // checks, invocation rewrite builder, and proof certification as the
+    // standard args-only path.  Missing or ambiguous recovery fails closed and
+    // leaves the original args-only candidate unchanged.
+    if (std::optional<std::vector<std::pair<size_t, size_t>>>
+            higherOrderArgRanges =
+                planner_->GetMacroInvocationFormalArgContentRanges(
+                    m, baseInvText)) {
+      if (std::optional<MacroPatch> higherOrderPatch =
+              planner_->StandardArgsOnlyPatchBuilder()
+                  .TryBuildHigherOrderGeneratedReplay(
+                      m, h, baseInvText, *higherOrderArgRanges)) {
+        // Only invocation-preserving generated replay can dominate an admitted
+        // args-only candidate.  Generated-leaf materialization remains on the
+        // existing whole-cover realization path.
+        if (higherOrderPatch->proof.preservesInvocationStructure) {
+          REFOLD_LOG_TRACE(
+              "macro/whole-cover",
+              "higher-order-generated-competitor-accepted inv id={0} "
+              "name={1} proof={2} replacement='{3}'",
+              m.id, m.name, toString(higherOrderPatch->proof.kind),
+              stringutils::showWsWithClip(higherOrderPatch->replacement, 220));
+          patchReusePhase_.MergeCurrentRootWithExistingCallsitePatch(
+              planningCtx, *higherOrderPatch);
+          if (!conflictingConcreteSubtreeWitnessForcesWholeCover) {
+            // Generated-callee replay proves the edited descendant through the
+            // root replacement-list grammar.  It is therefore stronger than a
+            // generic zero-token args-only assignment that can erase the
+            // selector formal, e.g. `CALL(SECOND, (, 1))` -> `CALL(, 2)`.
+            argsOnlyCandidate.reset();
+            dagRootCandidate = std::move(*higherOrderPatch);
+            reuseExistingCallsitePatch = false;
+          }
+        }
+      }
+    }
+  }
+
   // Literal sibling terminal tuple replay is more specific than ordinary
   // args-only assignment.  A root such as `BOTH(t) -> DECL t NAME t` can have
   // one terminal proving a tuple element through paste and another proving the
@@ -745,60 +792,6 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
         argsOnlyCandidate.reset();
         dagRootCandidate = std::move(*siblingTerminalPatch);
         reuseExistingCallsitePatch = false;
-      }
-    }
-  }
-
-  // Higher-order generated-callee replay normally lives inside the standard
-  // args-only ranking slot because many generated-callee edits are observed
-  // through root actuals.  Some generated-callee selectors are body-owned at
-  // the root, however: for example `#define APPLY(f, t) f t` with source
-  // `APPLY(OP, (9, 4))` materializes the selected `ADD`/`SUB` body even though
-  // the root callsite arguments are unchanged.  The args-only phase correctly
-  // declines such a body-owned hunk, so whole-cover planning must still give
-  // the same exact generated-callee theorem one chance before expansion can
-  // realize the whole cover.
-  if (m.subkind == "func") {
-    // Whole-cover orchestration must not reach into planner-private actual
-    // recovery carriers.  The public content-range primitive is sufficient
-    // here because the higher-order theorem only needs the formal argument
-    // byte intervals in the original invocation spelling.
-    if (std::optional<std::vector<std::pair<size_t, size_t>>>
-            higherOrderArgRanges = planner_->GetMacroInvocationFormalArgContentRanges(
-                m, baseInvText)) {
-      if (std::optional<MacroPatch> higherOrderPatch =
-              planner_->StandardArgsOnlyPatchBuilder()
-                  .TryBuildHigherOrderGeneratedReplay(
-                      m, h, baseInvText, *higherOrderArgRanges)) {
-        // This whole-cover-side hook is only for generated-callee theorems that
-        // preserve the root invocation abstraction.  Non-preserving generated
-        // leaf materialization still belongs to the ordinary whole-cover
-        // realization path below.
-        if (!higherOrderPatch->proof.preservesInvocationStructure)
-          higherOrderPatch.reset();
-
-        if (higherOrderPatch) {
-          REFOLD_LOG_TRACE(
-              "macro/whole-cover",
-              "higher-order-generated-accepted inv id={0} name={1} proof={2} replacement='{3}'",
-              m.id, m.name, toString(higherOrderPatch->proof.kind),
-              stringutils::showWsWithClip(higherOrderPatch->replacement, 220));
-          patchReusePhase_.MergeCurrentRootWithExistingCallsitePatch(
-              planningCtx, *higherOrderPatch);
-          if (!conflictingConcreteSubtreeWitnessForcesWholeCover) {
-            // A successful higher-order generated-callee replay is a stronger
-            // owner-level proof than ordinary args-only assignment: it explains
-            // the edited descendant expansion through the root replacement-list
-            // grammar and keeps the generated callee/actual structure intact.
-            // Keep it as the root replay candidate and suppress the generic
-            // direct args-only candidate so zero-token formal assignment cannot
-            // collapse the selector argument, e.g. CALL(SECOND, (, 1)) ->
-            // CALL(, 2).
-            argsOnlyCandidate.reset();
-            dagRootCandidate = std::move(*higherOrderPatch);
-            reuseExistingCallsitePatch = false;
-          }
-        }
       }
     }
   }

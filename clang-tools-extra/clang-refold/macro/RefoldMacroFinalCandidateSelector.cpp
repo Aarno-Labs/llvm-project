@@ -632,7 +632,7 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
     StringRef invocationText =
         !baseInvText.empty()
             ? baseInvText
-            : (m.invText ? StringRef(*m.invText) : StringRef());
+            : (m.invText ? StringRef(*m.invText) : StringRef(""));
     wholeCoverCanReplaceInvocationSource =
         RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
             invocationText, m);
