@@ -40,6 +40,22 @@ namespace refold {
 /// anchors or widen ownership when producer source facts are missing.
 class RefoldSourceMapper {
 public:
+  /// Lower/upper B-token projections for one exact A-token boundary.
+  ///
+  /// A structural replacement may split at `aBoundary` only when both
+  /// projections identify the same B-token boundary.  Keeping both values in
+  /// the result makes ambiguity explicit: callers must test `IsUnique()` and
+  /// must not choose either side by iteration order, textual proximity, or a
+  /// preferred fragment.
+  struct ATokenBoundaryProjection {
+    uint64_t aBoundary = 0;
+    uint64_t lowerBTokenBoundary = 0;
+    uint64_t upperBTokenBoundary = 0;
+
+    bool IsUnique() const {
+      return lowerBTokenBoundary == upperBTokenBoundary;
+    }
+  };
   RefoldSourceMapper(const RefoldModel &model, const RefoldPathIdentity &paths,
                      llvm::StringRef aSource, llvm::StringRef bSource,
                      llvm::ArrayRef<PPTok> aToks, llvm::ArrayRef<PPTok> bToks,
@@ -253,6 +269,24 @@ public:
   std::optional<std::pair<size_t, size_t>>
   MapATokRangeAToBTokenEnvelopeWholeCover(uint64_t beginTok,
                                           uint64_t endTok) const;
+
+  /// Project one exact A-token boundary to lower/upper B-token boundaries.
+  ///
+  /// The projection is the set of B frontiers crossed by all maximum-length
+  /// local token alignments of the complete parent replacement. `lower` and
+  /// `upper` are respectively the minimum and maximum such frontiers. This
+  /// deliberately excludes owner-depth or surface-placement tie-breaks from
+  /// proof authority: repeated tokens and an inseparable B expression retain
+  /// distinct bounds, while only `lower == upper` proves one exact split of the
+  /// complete parent B envelope. The calculation is exact and uses linear
+  /// auxiliary storage; it never assigns payload by textual distance or a
+  /// preferred side.
+  std::optional<ATokenBoundaryProjection>
+  ProjectATokenBoundaryToBTokenBounds(uint64_t parentAStart,
+                                      uint64_t parentAEnd,
+                                      uint64_t parentBStart,
+                                      uint64_t parentBEnd,
+                                      uint64_t aBoundary) const;
 
   /// Map an A-token cover and trim edge pure insertions from the B envelope.
   ///

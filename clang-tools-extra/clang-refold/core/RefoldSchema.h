@@ -661,7 +661,7 @@ static constexpr const char *RefoldSchema = R"json(
         "group_b": {
           "type": "integer",
           "minimum": 0,
-          "description": "Byte of '#' starting the #if/ifdef/ifndef line"
+          "description": "Exact logical-line-prefix or directive-introducer byte for #if/ifdef/ifndef"
         },
         "group_e": {
           "type": "integer",

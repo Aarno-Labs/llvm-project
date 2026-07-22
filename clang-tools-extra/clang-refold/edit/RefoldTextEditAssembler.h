@@ -15,6 +15,7 @@
 
 #include "edit/RefoldEditTypes.h"
 #include "edit/RefoldPatchTypes.h"
+#include "edit/RefoldTUEditPlanner.h"
 #include "line-control/RefoldLineControlProof.h"
 #include "macro/RefoldMacroTopology.h"
 #include "proof/RefoldAcceptedResultTypes.h"
@@ -35,10 +36,16 @@
 #include <vector>
 
 namespace clang {
+
+class LangOptions;
+
 namespace refold {
 
 class LineDirectiveInserter;
+class RefoldMacroStateProof;
 class RefoldOwnerStateProof;
+class RefoldPathIdentity;
+class RefoldPreprocessingStructureIndex;
 class RefoldProofLattice;
 class RefoldSourceMapper;
 class RefoldTUEditPlanner;
@@ -106,6 +113,10 @@ public:
       const std::vector<int64_t> &abTokMapA2B,
       const std::vector<int64_t> &abTokMapB2A,
       const RefoldSourceMapper &sourceMapper,
+      const RefoldPathIdentity &pathIdentity,
+      const RefoldMacroStateProof &macroStateProof,
+      const clang::LangOptions &lexLang,
+      const RefoldPreprocessingStructureIndex &tuPreprocessingStructureIndex,
       const RefoldProofLattice &proofLattice,
       const RefoldOwnerStateProof &ownerStateProof,
       const RefoldMacroTopology &macroTopology,
@@ -115,16 +126,21 @@ public:
       const RefoldTUEditPlanner &tuEdits,
       const RefoldTheoremAudit &theoremAuditService,
       const std::vector<SidebandPragmaEdit> &sidebandPragmaEdits,
+      const std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses,
       TheoremAuditStats &theoremAudit, Hooks hooks)
       : model_(model), bSource_(bSource), aToks_(aToks), bToks_(bToks),
         bTokOff_(bTokOff), abTokHunks_(abTokHunks), abTokMapA2B_(abTokMapA2B),
         abTokMapB2A_(abTokMapB2A), sourceMapper_(sourceMapper),
+        pathIdentity_(pathIdentity), macroStateProof_(macroStateProof),
+        lexLang_(lexLang),
+        tuPreprocessingStructureIndex_(tuPreprocessingStructureIndex),
         proofLattice_(proofLattice), ownerStateProof_(ownerStateProof),
         macroTopology_(macroTopology), lineControlProof_(lineControlProof),
         lineDirs_(lineDirs), terminalSink_(terminalSink), tuEdits_(tuEdits),
         theoremAuditService_(theoremAuditService),
-        sidebandPragmaEdits_(sidebandPragmaEdits), theoremAudit_(theoremAudit),
-        hooks_(std::move(hooks)) {}
+        sidebandPragmaEdits_(sidebandPragmaEdits),
+        mixedOwnerTilingWitnesses_(mixedOwnerTilingWitnesses),
+        theoremAudit_(theoremAudit), hooks_(std::move(hooks)) {}
 
   /// \brief Compute how to preserve __LINE__ after applying replacement to
   /// [start,end) in originalFileText.
@@ -159,15 +175,87 @@ public:
   AttachAcceptedResultCarrier(TextEdit &edit,
                               const AcceptedResultCandidate &candidate) const;
 
+  /// Authorize every complete protected interval touched by `[begin,end)` for
+  /// one named specialized directive operation.
+  ///
+  /// The interval census is rebuilt in the exact physical source-owner domain
+  /// that will later be assembled.  A narrow specialized operation must contain
+  /// the scanner-proven directive spelling for every touched interval; a
+  /// source-closure operation must contain the complete lexical interval.  The
+  /// final capability is bound to exact physical kind/range identity. Producer
+  /// metadata is carried and rechecked whenever the physical census can bind
+  /// it, but a missing producer binding does not invalidate an already-proved
+  /// physical operation.
+  /// Failure returns false; callers must not emit the specialized edit without
+  /// this capability.  Candidate planners may set `requestTerminalOnFailure`
+  /// to false so their ordinary fallback lattice remains reachable.  The final
+  /// emission audit always treats an authorization failure as terminal.
+  bool AuthorizeProtectedSourceIntervals(
+      TextEdit &edit, ProtectedSourceEditAuthorityKind authority,
+      llvm::StringRef sourcePath, std::optional<uint64_t> ownerIncludeId,
+      llvm::StringRef sourceBytes, uint64_t begin, uint64_t end,
+      llvm::ArrayRef<PreprocessingStructureKind> allowedKinds,
+      bool requireProtectedInterval = true,
+      bool requestTerminalOnFailure = true) const;
+
+  /// Authorize one exact protected interval already identified by a
+  /// specialized semantic proof.
+  ///
+  /// Unlike `AuthorizeProtectedSourceIntervals`, this routine does not grant
+  /// authority to every protected construct touched by the surrounding edit.
+  /// It locates exactly one indexed interval matching the supplied physical
+  /// transition range, verifies the named authority/kind pair, and records a
+  /// capability for only that interval.  This is required by include-owned
+  /// macro-state repair: the planner may move the one TU include that embodies
+  /// a proved header `#define` or `#undef`, while any unrelated directive in
+  /// the widened edit must remain unauthorized and therefore fail closed.
+  bool AuthorizeExactProtectedSourceInterval(
+      TextEdit &edit, ProtectedSourceEditAuthorityKind authority,
+      llvm::StringRef sourcePath, std::optional<uint64_t> ownerIncludeId,
+      llvm::StringRef sourceBytes, uint64_t intervalBegin,
+      uint64_t intervalEnd,
+      llvm::ArrayRef<PreprocessingStructureKind> allowedKinds,
+      bool requestTerminalOnFailure = true) const;
+
+  /// Authorize a complete source-closure operation after its independent
+  /// source-gap theorem has proved the entire physical byte envelope.
+  ///
+  /// Only the two named closure authorities are accepted.  The method expands
+  /// their closed domain to every indexed preprocessing kind and records one
+  /// exact capability per interval; it does not itself prove source closure.
+  bool AuthorizeCompleteProtectedSourceClosure(
+      TextEdit &edit, ProtectedSourceEditAuthorityKind authority,
+      llvm::StringRef sourcePath, std::optional<uint64_t> ownerIncludeId,
+      llvm::StringRef sourceBytes, uint64_t begin, uint64_t end,
+      bool requireProtectedInterval = false,
+      bool requestTerminalOnFailure = true) const;
+
+  /// Return whether an ordinary token-derived edit avoids every protected
+  /// preprocessing interval in its exact physical source-owner domain.
+  ///
+  /// This is the candidate-level form of the final global firewall. It grants
+  /// no capability and never interprets an accepted path name as directive
+  /// authority. Candidate planners may keep their fallback lattice reachable
+  /// by leaving `requestTerminalOnFailure` false.
+  bool OrdinaryEditAvoidsProtectedPreprocessingStructure(
+      const TextEdit &edit, llvm::StringRef sourcePath,
+      std::optional<uint64_t> ownerIncludeId, llvm::StringRef sourceBytes,
+      bool requestTerminalOnFailure = false) const;
+
   /// \brief Audit the complete accepted-proof surface before bytes are emitted.
   ///
   /// This is the last accepted-proof gate before the applicator splices
   /// replacement text into a source file. The audit checks every normalized
   /// edit, every carrier attached to each edit, and the composition law for
-  /// multi-carrier edits.
+  /// multi-carrier edits. `originalFileText` supplies the final physical bytes
+  /// needed to distinguish a newline-terminated directive from an end-of-file
+  /// directive when auditing a zero-width insertion at the interval end.
   bool AuditAcceptedEditProofs(
       llvm::ArrayRef<TextEdit> edits, llvm::StringRef emissionStage,
-      llvm::StringRef emissionOwner = llvm::StringRef()) const;
+      llvm::StringRef emissionOwner = llvm::StringRef(),
+      std::optional<uint64_t> ownerIncludeId = std::nullopt,
+      llvm::ArrayRef<TextEdit> plannedEdits = {},
+      llvm::StringRef originalFileText = llvm::StringRef()) const;
 
   /// \brief Return whether an emitted non-terminal byte edit is backed only by
   /// emission-discharged normalized accepted-result carriers.
@@ -181,6 +269,33 @@ public:
   bool EmittedTextEditHasDischargedAcceptedResults(
       const TextEdit &edit, llvm::StringRef emissionStage,
       llvm::StringRef emissionOwner = llvm::StringRef()) const;
+
+  /// Verify the preserved-gap theorem against the normalized physical edit set
+  /// rather than only against the planner's token carriers.
+  ///
+  /// The pre-normalization edit set must contain every token segment belonging
+  /// to the current physical source owner, the final edit set must retain those
+  /// exact segment carriers, and no normalized `TextEdit` may interfere with a
+  /// gap recorded as `PreservedInPlace`. A zero-width insertion at the beginning
+  /// or inside such an interval can extend or disable the logical directive
+  /// without deleting one of its original bytes. An insertion at the physical
+  /// end is also rejected when the preserved directive reaches end-of-file
+  /// without a terminating newline, because that insertion extends the same
+  /// logical directive line. Comparing both edit sets closes
+  /// widening, merging, and conservative-closure paths that occur after token
+  /// tiling and could otherwise erase the witness they invalidate.  Replacement
+  /// witnesses additionally retain the Patch 3.1 unique A-to-B boundary
+  /// projection proof through this final emission audit.
+  bool PreservedStructuralGapsRemainOutsideEmittedEdits(
+      llvm::ArrayRef<TextEdit> plannedEdits,
+      llvm::ArrayRef<TextEdit> emittedEdits, llvm::StringRef emissionStage,
+      llvm::StringRef emissionOwner,
+      std::optional<uint64_t> ownerIncludeId,
+      llvm::StringRef originalFileText) const;
+
+  /// Reject a preserved-gap audit at the common theorem/fallback boundary.
+  bool RejectPreservedStructuralGapAudit(llvm::StringRef emissionStage,
+                                         llvm::StringRef detail) const;
 
   /// \brief Verify that multiple carriers on one edit compose in source order.
   ///
@@ -310,16 +425,40 @@ public:
   ///
   /// This service is the single home for assembling proof-certified direct TU
   /// hunk edits; orchestration sites just supply the hunk + span + payload
-  /// inputs and consume the resulting `TextEdit`.
-  TextEdit BuildDirectTUHunkTextEdit(
+  /// inputs and consume the resulting `TextEdit`.  A failed final TU-span
+  /// revalidation returns `std::nullopt` so orchestration can continue to its
+  /// declared fallback path.
+  std::optional<TextEdit> BuildDirectTUHunkTextEdit(
       const diffutils::Hunk &h, uint64_t hunkIndex,
       const std::pair<uint64_t, uint64_t> &span, ResyncOutcome resync,
       llvm::StringRef acceptedPayload, uint64_t rawTUStart, uint64_t rawTUEnd,
       std::optional<uint64_t> materializedBByteBegin,
       std::optional<uint64_t> materializedBByteEnd,
-      AcceptedPathKind acceptedPath) const;
+      AcceptedPathKind acceptedPath,
+      std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment =
+          std::nullopt) const;
 
 private:
+  /// Build the immutable protected-structure census for the physical source
+  /// owner being assembled, reusing the run-wide TU index when possible.
+  RefoldPreprocessingStructureIndex BuildEmissionStructureIndex(
+      llvm::StringRef emissionOwner,
+      std::optional<uint64_t> ownerIncludeId,
+      llvm::StringRef originalFileText) const;
+
+  /// Final global firewall for ordinary and specialized source edits.
+  ///
+  /// Path-specific planners remain the primary proof of token/source
+  /// ownership.  This independent audit rechecks that direct-TU lexical
+  /// widening contains only trivia plus exact capabilities and that no edit
+  /// interferes with protected preprocessing structure without one exact,
+  /// compatible specialized-operation authorization.
+  bool AuditGlobalSourceEditInvariant(
+      llvm::ArrayRef<TextEdit> edits, llvm::StringRef emissionStage,
+      llvm::StringRef emissionOwner,
+      std::optional<uint64_t> ownerIncludeId,
+      llvm::StringRef originalFileText) const;
+
   const RefoldModel &model_;
   llvm::StringRef bSource_;
   llvm::ArrayRef<PPTok> aToks_;
@@ -329,6 +468,10 @@ private:
   const std::vector<int64_t> &abTokMapA2B_;
   const std::vector<int64_t> &abTokMapB2A_;
   const RefoldSourceMapper &sourceMapper_;
+  const RefoldPathIdentity &pathIdentity_;
+  const RefoldMacroStateProof &macroStateProof_;
+  const clang::LangOptions &lexLang_;
+  const RefoldPreprocessingStructureIndex &tuPreprocessingStructureIndex_;
   const RefoldProofLattice &proofLattice_;
   const RefoldOwnerStateProof &ownerStateProof_;
   const RefoldMacroTopology &macroTopology_;
@@ -338,6 +481,9 @@ private:
   const RefoldTUEditPlanner &tuEdits_;
   const RefoldTheoremAudit &theoremAuditService_;
   const std::vector<SidebandPragmaEdit> &sidebandPragmaEdits_;
+  /// Durable structural partitions used to resolve Patch 1.4 TU carrier keys
+  /// after later edit normalization has discarded path-local bindings.
+  const std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses_;
   TheoremAuditStats &theoremAudit_;
   Hooks hooks_;
 };

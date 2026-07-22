@@ -16,8 +16,10 @@
 #include "proof/RefoldAcceptedResultTypes.h"
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldToken.h"
+#include "source/RefoldPreprocessingStructureIndex.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
@@ -88,6 +90,26 @@ struct TUInsertionAnchor {
       : ppGap(ppGap), tuByteOffset(tuByteOffset), witness(std::move(witness)) {}
 };
 
+/// Proven adjustment applied to a pure-insertion source anchor.
+enum class TUInsertionAnchorAdjustmentKind : uint8_t {
+  Unknown,
+  SourceLineControlPrefix,
+};
+
+/// Typed proof input for moving a pure insertion across preserved source
+/// structure without consuming that structure.
+struct TUInsertionAnchorAdjustment {
+  TUInsertionAnchorAdjustmentKind kind =
+      TUInsertionAnchorAdjustmentKind::Unknown;
+  uint64_t originalTUByteOffset = 0;
+  uint64_t adjustedTUByteOffset = 0;
+
+  bool IsValid() const {
+    return kind != TUInsertionAnchorAdjustmentKind::Unknown &&
+           originalTUByteOffset <= adjustedTUByteOffset;
+  }
+};
+
 /// Planned TU byte span for a token hunk.
 ///
 /// The span is half-open in TU byte coordinates.  A pure insertion is
@@ -104,20 +126,81 @@ struct TUByteSpanPlan {
   uint64_t tuByteEnd = 0;
   /// Exact insertion anchor for pure insertions, when one was proven.
   std::optional<TUInsertionAnchor> insertionAnchor;
+  /// Producer-bound #define/#undef intervals deferred to mandatory macro-state
+  /// repair. An empty vector means the span consumes no preprocessing state.
+  std::vector<DirectTUMacroStateAuthorization> macroStateAuthorizations;
+  /// Optional typed proof for moving a pure insertion past preserved source
+  /// line-control structure while leaving that structure outside the edit.
+  std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment;
 
   TUByteSpanPlan() = default;
 
   TUByteSpanPlan(
       uint64_t aTokenBegin, uint64_t aTokenEnd, uint64_t tuByteBegin,
       uint64_t tuByteEnd,
-      std::optional<TUInsertionAnchor> insertionAnchor = std::nullopt)
+      std::optional<TUInsertionAnchor> insertionAnchor = std::nullopt,
+      std::vector<DirectTUMacroStateAuthorization>
+          macroStateAuthorizations = {},
+      std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment =
+          std::nullopt)
       : aTokenBegin(aTokenBegin), aTokenEnd(aTokenEnd),
         tuByteBegin(tuByteBegin), tuByteEnd(tuByteEnd),
-        insertionAnchor(std::move(insertionAnchor)) {}
+        insertionAnchor(std::move(insertionAnchor)),
+        macroStateAuthorizations(std::move(macroStateAuthorizations)),
+        insertionAnchorAdjustment(std::move(insertionAnchorAdjustment)) {}
 
   bool isPureInsertion() const { return aTokenBegin == aTokenEnd; }
   std::pair<uint64_t, uint64_t> byteRange() const {
     return {tuByteBegin, tuByteEnd};
+  }
+};
+
+/// Durable binding from one structurally split token hunk back to the proof
+/// that protected preprocessing structure remains outside the emitted edit.
+///
+/// This value type exists before same-owner structural splitting is enabled,
+/// so ordinary direct TU spans normally pass no binding. Structural tiling may
+/// populate the record only after it has proved a complete original-hunk
+/// partition, exact segment identity, exact source-byte
+/// ownership, and preservation of every protected interval outside this
+/// segment's emitted byte range. A bare witness id or a best-effort split is
+/// deliberately insufficient.
+struct StructuralHunkSegmentBinding {
+  /// Original unsplit A-token envelope.
+  uint64_t originalAStart = 0;
+  uint64_t originalAEnd = 0;
+  /// Original unsplit B-token envelope.
+  uint64_t originalBStart = 0;
+  uint64_t originalBEnd = 0;
+  /// Exact emitted segment A-token envelope.
+  uint64_t segmentAStart = 0;
+  uint64_t segmentAEnd = 0;
+  /// Exact emitted segment B-token envelope.
+  uint64_t segmentBStart = 0;
+  uint64_t segmentBEnd = 0;
+  /// Exact emitted segment TU byte interval.
+  uint64_t sourceBegin = 0;
+  uint64_t sourceEnd = 0;
+  /// Stable identity of the durable structural-tiling witness.
+  uint64_t witnessId = 0;
+  /// Stable segment ordinal within that witness.
+  uint32_t segmentIndex = 0;
+  /// The witness proved complete source-byte coverage for the original hunk.
+  bool sourceByteCoverComplete = false;
+  /// Every protected preprocessing interval lies outside this segment edit.
+  bool protectedStructurePreservedOutsideSegment = false;
+
+  /// Return whether the record is internally well formed.
+  bool IsWellFormed() const {
+    const bool isProperSegment =
+        originalAStart != segmentAStart || originalAEnd != segmentAEnd ||
+        originalBStart != segmentBStart || originalBEnd != segmentBEnd;
+    return originalAStart <= segmentAStart && segmentAEnd <= originalAEnd &&
+           originalBStart <= segmentBStart && segmentBEnd <= originalBEnd &&
+           segmentAStart <= segmentAEnd && segmentBStart <= segmentBEnd &&
+           sourceBegin <= sourceEnd && isProperSegment && witnessId != 0 &&
+           sourceByteCoverComplete &&
+           protectedStructurePreservedOutsideSegment;
   }
 };
 
@@ -249,8 +332,14 @@ public:
     const RefoldTUAnchorProof &tuAnchorProof;
     /// Logical line directive model for exact slot boundary queries.
     const LineDirectiveInserter &lineDirs;
+    /// Exact preprocessing-structure census for the physical translation unit.
+    const RefoldPreprocessingStructureIndex &preprocessingStructureIndex;
+    /// Exact physical bytes indexed by `preprocessingStructureIndex`.
+    llvm::StringRef tuSourceBytes;
     /// A-token stream for owner-depth and suffix checks.
     llvm::ArrayRef<PPTok> aTokens;
+    /// Number of edited-preprocessed B tokens available to direct hunks.
+    uint64_t bTokenCount = 0;
     /// A-to-B token map from the token diff planner.
     const std::vector<int64_t> &abTokenMapA2B;
     /// A-side PP-gap owner-depth profile from the token diff planner.
@@ -340,6 +429,17 @@ public:
   std::optional<TUInsertionAnchor>
   FindProvableTUInsertionAnchor(const TUEditPlanningContext &ctx) const;
 
+  /// Project the TU-owned subset of an A-token interval to its legacy physical
+  /// min/max envelope for owner topology only.
+  ///
+  /// This method does not authorize an edit.  It preserves the historical
+  /// owner-classification projection used to locate include/conditional slot
+  /// surfaces without coupling ownership to the stronger direct-realization
+  /// theorem implemented by `PlanTUByteSpan()`.
+  std::optional<TUByteSpanPlan>
+  ProjectTUByteEnvelopeForOwnership(uint64_t a0, uint64_t a1,
+                                    llvm::StringRef tuPath) const;
+
   /// \brief Compute the TU byte span \c [b,e) corresponding to an A-side
   /// PP-token interval \c [a0,a1).
   ///
@@ -348,6 +448,14 @@ public:
   /// conservative: if the interval cannot be proven to touch the TU, or cannot
   /// be safely anchored into the TU for a pure insertion, the method returns
   /// \c std::nullopt rather than "snapping" across ownership boundaries.
+  ///
+  /// A nonempty interval is admitted only when every consumed A token has one
+  /// exact in-bounds TU mapping, those mappings are source-monotone and
+  /// nonoverlapping, and every internal physical gap is covered by exact lexer
+  /// trivia or complete producer-bound `#define`/`#undef` intervals.  The latter
+  /// are carried as explicit deferred obligations for the mandatory macro-state
+  /// repair planner.  Every other preprocessing construct or unknown byte
+  /// rejects the span until structural tiling can leave it outside the edit.
   ///
   /// For pure insertions, the planner first tries an exact producer-recorded TU
   /// slot boundary at the same PP gap. If no exact slot exists, it defers to
@@ -360,6 +468,31 @@ public:
   /// Context-shaped overload using the hunk stored in the planning context.
   std::optional<TUByteSpanPlan>
   PlanTUByteSpan(const TUEditPlanningContext &ctx) const;
+
+  /// Revalidate the concrete carrier used by a direct TU owner realization.
+  ///
+  /// This is intentionally stronger than owner classification. The supplied
+  /// hunk must match the span's A envelope exactly, the hunk's B envelope must
+  /// be a real edited-token interval, the final physical byte interval must
+  /// contain the independently re-derived base span, and no protected
+  /// preprocessing structure may be consumed except exact #define/#undef
+  /// obligations already deferred to mandatory macro-state repair. An
+  /// optional structural binding is accepted only when it names this exact
+  /// segment and proves that all protected structure remains outside the edit.
+  bool ValidateTUOwnerRealizationCarrier(
+      const diffutils::Hunk &hunk, const TUByteSpanPlan &span,
+      const StructuralHunkSegmentBinding *structuralBinding = nullptr) const;
+
+  /// Validate the actual final byte envelope for a proved direct TU span.
+  ///
+  /// The envelope may contain the span's explicit producer-bound macro-state
+  /// obligations and may widen over lexer trivia, but it may not introduce any
+  /// new directive, pragma operator, partial lexical construct, or unbound
+  /// preprocessing state.
+  bool ValidateDirectTUEnvelope(llvm::StringRef tuPath, uint64_t begin,
+                                uint64_t end,
+                                llvm::ArrayRef<DirectTUMacroStateAuthorization>
+                                    authorizations) const;
 
   /// \brief Determine whether an insertion hunk lands exactly on an include PP
   /// boundary and, if so, return the include level that should own the boundary
@@ -387,16 +520,20 @@ public:
   /// Build the direct-TU hunk edit plan for an already-proved TU byte span.
   ///
   /// This method deliberately returns a plan, not an applied or globally
-  /// ordered edit.  The caller remains responsible for converting the plan into
-  /// the final TextEdit carrier so proof-certifying and final edit assembly
-  /// continue to flow through the existing assembler/audit boundary.
-  DirectTUHunkEditPlan BuildDirectTUHunkEditPlan(
+  /// ordered edit.  It re-proves every nonempty raw A-token carrier and the
+  /// actual final source envelope; failure returns `std::nullopt`.  The caller
+  /// remains responsible for converting an accepted plan into the final
+  /// TextEdit carrier so proof-certifying and final edit assembly continue to
+  /// flow through the existing assembler/audit boundary.
+  std::optional<DirectTUHunkEditPlan> BuildDirectTUHunkEditPlan(
       const diffutils::Hunk &h, uint64_t hunkIndex,
       const std::pair<uint64_t, uint64_t> &span, ResyncOutcome resync,
       llvm::StringRef acceptedPayload, uint64_t rawTUStart, uint64_t rawTUEnd,
       std::optional<uint64_t> materializedBByteBegin,
       std::optional<uint64_t> materializedBByteEnd,
-      AcceptedPathKind acceptedPath) const;
+      AcceptedPathKind acceptedPath,
+      std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment =
+          std::nullopt) const;
 
   /// Context-shaped overload for call sites that already carry the A/B token
   /// hunk and TU source-byte span planning records together.
@@ -407,7 +544,9 @@ public:
                             uint64_t rawTUStart, uint64_t rawTUEnd,
                             std::optional<uint64_t> materializedBByteBegin,
                             std::optional<uint64_t> materializedBByteEnd,
-                            AcceptedPathKind acceptedPath) const;
+                            AcceptedPathKind acceptedPath,
+                            std::optional<TUInsertionAnchorAdjustment>
+                                insertionAnchorAdjustment = std::nullopt) const;
 
   /// Check whether the TU byte suffix [oldEnd, extEnd) is closed over the
   /// corresponding B-token interval.  This is a token-closure proof for a
@@ -453,6 +592,11 @@ private:
   /// zero-width TU insertion from being proved through a PP gap that lies
   /// inside an include expansion.
   std::optional<uint64_t> IncludeIdCoveringPPIndex(uint64_t pp) const;
+
+  /// A-token coordinates that occur more than once in the producer tokmap.
+  /// Duplicate entries make the physical spelling ambiguous even when the
+  /// model's DenseMap retained one deterministic last writer.
+  llvm::DenseSet<uint64_t> duplicateTokmapPP_;
 
   Deps deps_;
 };

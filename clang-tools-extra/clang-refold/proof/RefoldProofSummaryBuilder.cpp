@@ -10,18 +10,31 @@
 
 #include "proof/RefoldAcceptedResultTypes.h"
 #include "proof/RefoldProofVocabulary.h"
+#include "proof/RefoldStructuralHunkTilingProof.h"
 #include "proof/RefoldTheoremAudit.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
 
 #include <cstdint>
 #include <optional>
+#include <set>
+#include <string>
 #include <utility>
 
 using namespace llvm;
 
 namespace clang {
 namespace refold {
+namespace {
+
+/// Return whether one owner-state witness is the forbidden widening form for
+/// ordinary direct TU byte-span evidence.
+bool isClosureWideningWitness(const SuffixStabilityWitness &witness) {
+  return witness.kind == SuffixStabilityWitnessKind::ClosureWidening;
+}
+
+} // namespace
 
 RefoldProofSummaryBuilder::RefoldProofSummaryBuilder(Dependencies deps)
     : deps_(std::move(deps)) {}
@@ -239,31 +252,47 @@ RefoldProofSummaryBuilder::BuildCanonicalEmittedProofFromSummary(
 
   switch (summary.theoremClass) {
   case TheoremProofClass::MixedOwnerTilingProof: {
-    if (!summary.hasMixedOwnerTilingWitness)
+    if (!summary.hasMixedOwnerTilingWitness ||
+        !summary.hasMixedOwnerTilingSegmentSelection)
       return std::nullopt;
     const MixedOwnerTilingWitness &witness = summary.mixedOwnerTilingWitness;
-    if (!witness.stateSummariesComposed || !witness.ownerBoundariesComposed ||
+    if (!witness.uniquePartition || !witness.stateSummariesComposed ||
+        !witness.stateTransitionsComposed ||
+        !witness.ownerBoundariesComposed ||
         !witness.targetTokenStreamComposed || !witness.compositionEdgesProven ||
-        witness.tokenSegmentCount == 0 || witness.segments.empty() ||
+        witness.reason == StructuralTilingReason::Unknown ||
+        witness.tokenSegmentCount == 0 || witness.edges.empty() ||
         witness.globalTargetPPTokenSignature.empty() ||
         witness.globalCompositionSignature.empty() ||
         witness.originalAEnd < witness.originalAStart ||
         witness.originalBEnd < witness.originalBStart ||
-        witness.originalBEnd > deps_.bToks.size()) {
+        witness.originalBEnd > deps_.bToks.size() ||
+        summary.mixedOwnerTilingSegmentIndex >= witness.edges.size()) {
       return std::nullopt;
     }
 
+    const bool deleteOnlyWitness =
+        witness.originalBStart == witness.originalBEnd;
     uint64_t expectedA = witness.originalAStart;
     uint64_t expectedB = witness.originalBStart;
     uint32_t tokenSegmentCount = 0;
     uint32_t stateGapCount = 0;
-    for (size_t i = 0; i < witness.segments.size(); ++i) {
-      const MixedOwnerTilingSegmentWitness &segment = witness.segments[i];
+    uint32_t protectedStructureGapCount = 0;
+    uint32_t preservedInPlaceGapCount = 0;
+    std::set<std::string> distinctRealizerSignatures;
+    bool allTokenSegmentsPreserveProtectedStructure = true;
+    uint32_t emptyBTokenSegmentCount = 0;
+    for (size_t i = 0; i < witness.edges.size(); ++i) {
+      const MixedOwnerTilingSegmentWitness &segment = witness.edges[i];
       if (segment.parentTilingWitnessId != witness.witnessId ||
-          segment.segmentIndex != i || !segment.ownerClosureComplete ||
+          segment.segmentIndex != i || segment.sourceOrderPosition != i ||
+          !segment.ownerClosureComplete || !segment.ownerIdentityKnown ||
+          segment.ownerIdentity.kind == OwnerKind::Unknown ||
           segment.ownerSignature.empty() || segment.sourceSignature.empty() ||
           segment.producerPathSignature.empty() ||
           segment.targetPPTokenSignature.empty() ||
+          !segment.sourceByteRangeKnown || segment.sourcePath.empty() ||
+          segment.sourceEnd < segment.sourceBegin ||
           segment.aEnd < segment.aStart || segment.bEnd < segment.bStart ||
           segment.bEnd > deps_.bToks.size()) {
         return std::nullopt;
@@ -273,11 +302,32 @@ RefoldProofSummaryBuilder::BuildCanonicalEmittedProofFromSummary(
       case MixedOwnerTilingEdgeKind::TokenSegment:
         if (segment.zeroTokenStateGap || segment.aStart != expectedA ||
             segment.bStart != expectedB || segment.aEnd <= segment.aStart ||
-            (!segment.allowEmptyBEnvelope && segment.bEnd <= segment.bStart)) {
+            segment.protectedPreprocessingStructure ||
+            segment.protectedStructureIdentityRecorded ||
+            segment.protectedStructureKind !=
+                StructuralProtectedStructureKind::Unknown ||
+            segment.producerIdentityKind !=
+                StructuralProducerIdentityKind::None ||
+            segment.producerItemId || segment.producerConditionalGroupId ||
+            segment.producerConditionalArmId ||
+            segment.sourceBytesPreservedUnchanged ||
+            segment.gapDisposition != StructuralGapDisposition::Unknown ||
+            (!segment.allowEmptyBEnvelope && segment.bEnd <= segment.bStart) ||
+            (segment.allowEmptyBEnvelope &&
+             (segment.bStart != segment.bEnd ||
+              (deleteOnlyWitness &&
+               segment.bStart != witness.originalBStart) ||
+              (!deleteOnlyWitness &&
+               !witness.uniqueBoundaryProjectionProven)))) {
           return std::nullopt;
         }
         expectedA = segment.aEnd;
         expectedB = segment.bEnd;
+        distinctRealizerSignatures.insert(segment.producerPathSignature);
+        allTokenSegmentsPreserveProtectedStructure &=
+            segment.protectedStructurePreservedOutsideSegment;
+        if (segment.allowEmptyBEnvelope)
+          ++emptyBTokenSegmentCount;
         ++tokenSegmentCount;
         break;
 
@@ -287,6 +337,57 @@ RefoldProofSummaryBuilder::BuildCanonicalEmittedProofFromSummary(
             segment.bEnd != expectedB) {
           return std::nullopt;
         }
+        // Patch 2.2 produces only physically preserved state gaps.  The other
+        // disposition values reserve future specialized materialization and
+        // repair theorems; accepting them here without their own durable
+        // witness would manufacture authority.  `Unknown` is likewise a
+        // fail-closed proof omission.
+        if (segment.gapDisposition !=
+                StructuralGapDisposition::PreservedInPlace ||
+            !segment.sourceBytesPreservedUnchanged ||
+            !segment.sourceByteRangeKnown ||
+            segment.sourceEnd <= segment.sourceBegin) {
+          return std::nullopt;
+        }
+        if (segment.protectedPreprocessingStructure) {
+          if (!segment.protectedStructureIdentityRecorded ||
+              segment.protectedStructureKind ==
+                  StructuralProtectedStructureKind::Unknown)
+            return std::nullopt;
+          switch (segment.producerIdentityKind) {
+          case StructuralProducerIdentityKind::None:
+            if (segment.producerItemId ||
+                segment.producerConditionalGroupId ||
+                segment.producerConditionalArmId)
+              return std::nullopt;
+            break;
+          case StructuralProducerIdentityKind::ConditionalDirective:
+            if (!segment.producerConditionalGroupId || segment.producerItemId)
+              return std::nullopt;
+            break;
+          case StructuralProducerIdentityKind::MacroDirective:
+          case StructuralProducerIdentityKind::IncludeDirective:
+          case StructuralProducerIdentityKind::PragmaDirective:
+          case StructuralProducerIdentityKind::LineControlEvent:
+            if (!segment.producerItemId ||
+                segment.producerConditionalGroupId)
+              return std::nullopt;
+            break;
+          }
+        } else if (segment.protectedStructureIdentityRecorded ||
+                   segment.protectedStructureKind !=
+                       StructuralProtectedStructureKind::Unknown ||
+                   segment.producerIdentityKind !=
+                       StructuralProducerIdentityKind::None ||
+                   segment.producerItemId ||
+                   segment.producerConditionalGroupId ||
+                   segment.producerConditionalArmId) {
+          return std::nullopt;
+        }
+        ++preservedInPlaceGapCount;
+        if (segment.protectedPreprocessingStructure) {
+          ++protectedStructureGapCount;
+        }
         ++stateGapCount;
         break;
 
@@ -295,20 +396,160 @@ RefoldProofSummaryBuilder::BuildCanonicalEmittedProofFromSummary(
       }
     }
 
+    const MixedOwnerTilingSegmentWitness &selectedSegment =
+        witness.edges[summary.mixedOwnerTilingSegmentIndex];
+    if (selectedSegment.kind != MixedOwnerTilingEdgeKind::TokenSegment ||
+        selectedSegment.zeroTokenStateGap)
+      return std::nullopt;
+
+    if (deleteOnlyWitness) {
+      if (!witness.sharedEmptyBEnvelopeProven ||
+          witness.sharedEmptyBBoundary != witness.originalBStart ||
+          emptyBTokenSegmentCount != tokenSegmentCount ||
+          !witness.preservedStateChainComposed)
+        return std::nullopt;
+    } else if (witness.sharedEmptyBEnvelopeProven ||
+               witness.preservedStateChainComposed) {
+      return std::nullopt;
+    }
+
     if (expectedA != witness.originalAEnd ||
         expectedB != witness.originalBEnd ||
         tokenSegmentCount != witness.tokenSegmentCount ||
-        stateGapCount != witness.stateGapCount) {
+        stateGapCount != witness.stateGapCount ||
+        protectedStructureGapCount != witness.protectedStructureGapCount ||
+        preservedInPlaceGapCount != witness.preservedInPlaceGapCount ||
+        preservedInPlaceGapCount != stateGapCount ||
+        witness.preservedGapsDisjointFromEdits !=
+            (preservedInPlaceGapCount == 0 ||
+             witness.preservedGapsDisjointFromTokenSegments) ||
+        static_cast<uint32_t>(distinctRealizerSignatures.size()) !=
+            witness.distinctRealizerCount) {
+      return std::nullopt;
+    }
+
+    const bool preservesPreprocessingStructure =
+        witness.reason ==
+            StructuralTilingReason::PreservedPreprocessingStructure ||
+        witness.reason == StructuralTilingReason::
+                              MixedRealizersAndPreservedStructure;
+    if (preservesPreprocessingStructure &&
+        !structuralPreservedSourceTopologyIsComplete(witness)) {
+      return std::nullopt;
+    }
+
+    // Patch 3.1/3.2 is mandatory for every structural replacement that preserves
+    // preprocessing structure.  A mixed-realizer path cannot bypass ambiguous
+    // B ownership merely because its adjacent token segments have different
+    // owners.  Historical mixed-realizer partitions with no protected source
+    // seam retain their original theorem and carry no projection facts.
+    const bool requiresBoundaryProjectionTheorem =
+        structuralReplacementRequiresBoundaryProjection(witness);
+    if (deleteOnlyWitness) {
+      if (witness.uniqueBoundaryProjectionProven ||
+          witness.boundaryProjectionCount != 0 ||
+          !witness.boundaryProjections.empty()) {
+        return std::nullopt;
+      }
+    } else if (requiresBoundaryProjectionTheorem) {
+      if (!structuralReplacementBoundaryProjectionIsComplete(witness))
+        return std::nullopt;
+    } else if (witness.uniqueBoundaryProjectionProven ||
+               witness.boundaryProjectionCount != 0 ||
+               !witness.boundaryProjections.empty()) {
+      return std::nullopt;
+    }
+
+    switch (witness.reason) {
+    case StructuralTilingReason::MixedRealizers:
+      if (witness.distinctRealizerCount < 2 ||
+          witness.protectedStructureGapCount != 0 ||
+          witness.physicalSourceRunCount != 0 ||
+          witness.physicalSourceRunsProven ||
+          witness.uniqueMinimumFragmentPartition ||
+          witness.uniqueBoundaryProjectionProven ||
+          witness.boundaryProjectionCount != 0 ||
+          !witness.boundaryProjections.empty())
+        return std::nullopt;
+      if (witness.preservedInPlaceGapCount != 0 &&
+          (!witness.preservedGapSourceOrderProven ||
+           !witness.preservedGapsDisjointFromTokenSegments ||
+           !witness.preservedGapsDisjointFromEdits)) {
+        return std::nullopt;
+      }
+      break;
+
+    case StructuralTilingReason::PreservedPreprocessingStructure:
+      if (witness.distinctRealizerCount != 1 ||
+          witness.protectedStructureGapCount == 0 ||
+          witness.preservedInPlaceGapCount <
+              witness.protectedStructureGapCount ||
+          witness.physicalSourceRunCount < 2 ||
+          witness.physicalSourceRunCount != witness.tokenSegmentCount ||
+          !witness.physicalSourceRunsProven ||
+          !witness.uniqueMinimumFragmentPartition ||
+          !witness.sourceByteCoverComplete ||
+          !witness.preservedGapSourceOrderProven ||
+          !witness.preservedGapsDisjointFromTokenSegments ||
+          !witness.preservedGapsDisjointFromEdits ||
+          !allTokenSegmentsPreserveProtectedStructure)
+        return std::nullopt;
+      break;
+
+    case StructuralTilingReason::MixedRealizersAndPreservedStructure:
+      if (witness.distinctRealizerCount < 2 ||
+          witness.protectedStructureGapCount == 0 ||
+          witness.preservedInPlaceGapCount <
+              witness.protectedStructureGapCount ||
+          !witness.preservedGapSourceOrderProven ||
+          !witness.preservedGapsDisjointFromTokenSegments ||
+          !witness.preservedGapsDisjointFromEdits)
+        return std::nullopt;
+      if (witness.sourceByteCoverComplete &&
+          !allTokenSegmentsPreserveProtectedStructure)
+        return std::nullopt;
+      break;
+
+    case StructuralTilingReason::Unknown:
       return std::nullopt;
     }
 
     return BuildEmittedProofFromSummary(summary.theoremClass, summary);
   }
 
-  case TheoremProofClass::OwnerRealizationProof:
+  case TheoremProofClass::OwnerRealizationProof: {
     if (!summary.hasOwnerRealizationWitness)
       return std::nullopt;
+
+    const OwnerRealizationWitness &owner = summary.ownerRealizationWitness;
+    if (owner.evidence == OwnerRealizationEvidenceKind::TUByteSpan) {
+      // Ordinary direct TU evidence is valid only when the exact hunk/span
+      // carrier was re-proved. ClosureWidening is intentionally excluded: it
+      // describes an obligation to cover an observer, not authority to consume
+      // a preprocessing directive or manufacture token envelopes.
+      if (!owner.hasTUCarrierWitness ||
+          !owner.tuCarrierWitness.IsComplete() ||
+          !owner.closure.owner.IsTU() ||
+          llvm::any_of(owner.stateWitnesses, isClosureWideningWitness)) {
+        return std::nullopt;
+      }
+    } else if (owner.evidence ==
+               OwnerRealizationEvidenceKind::TUSpecializedRealization) {
+      // Specialized state/directive planners use a separate TU evidence class.
+      // They may not inherit the ordinary direct-span carrier or use closure
+      // widening as substitute authority for their planner-specific theorem.
+      if (owner.hasTUCarrierWitness || !owner.closure.owner.IsTU() ||
+          llvm::any_of(owner.stateWitnesses, isClosureWideningWitness)) {
+        return std::nullopt;
+      }
+    } else if (owner.hasTUCarrierWitness) {
+      // The stronger direct-span witness may not be attached to macro or
+      // include realization evidence.
+      return std::nullopt;
+    }
+
     return BuildEmittedProofFromSummary(summary.theoremClass, summary);
+  }
 
   case TheoremProofClass::IdentityPreservingProof:
     // Identity preservation needs no additional owner witness once the summary

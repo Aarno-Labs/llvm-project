@@ -8,7 +8,9 @@
 
 #include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
+#include "edit/RefoldTUEditPlanner.h"
 #include "proof/RefoldOwnerStateProof.h"
+#include "proof/RefoldStructuralHunkTilingProof.h"
 #include "proof/RefoldWitnessTrace.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -26,6 +28,47 @@ using namespace llvm;
 
 namespace clang {
 namespace refold {
+namespace {
+
+/// Return whether one typed state witness is the legacy closure-widening form.
+bool isClosureWideningWitness(const SuffixStabilityWitness &witness) {
+  return witness.kind == SuffixStabilityWitnessKind::ClosureWidening;
+}
+
+/// Build the canonical fail-closed result for an invalid direct TU carrier.
+///
+/// This helper takes the closure by value so callers may safely reject both
+/// before and after the shared realization gate moves its local closure into an
+/// `OwnerRealizationResult`.  It never manufactures state or token authority.
+OwnerRealizationResult buildRejectedDirectTUCarrier(
+    OwnerClosure closure, StringRef detail,
+    TerminalFallbackObligationKind obligation,
+    TerminalFallbackFailureReason reason) {
+  OwnerRealizationResult result;
+  result.witness.evidence = OwnerRealizationEvidenceKind::TUByteSpan;
+  result.witness.closure = std::move(closure);
+  result.witness.detail = detail.str();
+  result.detail = detail.str();
+
+  TerminalFallbackFailureContext context;
+  context.owner = toString(result.witness.closure.owner.kind).str();
+  context.sourcePath = result.witness.closure.source.path;
+  context.sourceBegin = result.witness.closure.source.begin;
+  context.sourceEnd = result.witness.closure.source.end;
+  context.aTokenBegin = result.witness.closure.aTokens.begin;
+  context.aTokenEnd = result.witness.closure.aTokens.end;
+  context.bTokenBegin = result.witness.closure.bTokens.begin;
+  context.bTokenEnd = result.witness.closure.bTokens.end;
+  result.failure = MakeTerminalFallbackProofFailure(
+      obligation, reason, std::move(context));
+  REFOLD_LOG_TRACE(
+      "proof/owner-realization",
+      "reject direct TU owner carrier: {0} detail='{1}'", result.failure,
+      result.detail);
+  return result;
+}
+
+} // namespace
 
 RefoldOwnerRealizationProofBuilder::RefoldOwnerRealizationProofBuilder(
     Dependencies deps)
@@ -153,11 +196,13 @@ void RefoldOwnerRealizationProofBuilder::AttachLineControlObserverWitness(
 
   if (summary.hasMixedOwnerTilingWitness) {
     const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
-    for (const MixedOwnerTilingSegmentWitness &segment : tiling.segments) {
-      collectDelta(segment.ownerTransitionProof.before, "mixed.segment.before");
-      collectDelta(segment.ownerTransitionProof.after, "mixed.segment.after");
+    for (const MixedOwnerTilingSegmentWitness &segment : tiling.edges) {
+      collectDelta(segment.canonicalStateTransition.before,
+                   "mixed.segment.before");
+      collectDelta(segment.canonicalStateTransition.after,
+                   "mixed.segment.after");
       for (const SuffixStabilityWitness &suffix :
-           segment.ownerTransitionProof.suffixWitnesses) {
+           segment.canonicalStateTransition.suffixWitnesses) {
         const OwnerStateComponent component =
             deps_.ownerStateProof.ComponentNamedBySuffixStabilityWitness(
                 suffix);
@@ -381,15 +426,15 @@ void RefoldOwnerRealizationProofBuilder::AttachCounterStateWitness(
 
   if (summary.hasMixedOwnerTilingWitness) {
     const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
-    for (const MixedOwnerTilingSegmentWitness &segment : tiling.segments) {
+    for (const MixedOwnerTilingSegmentWitness &segment : tiling.edges) {
       collectDelta(
-          segment.ownerTransitionProof.before,
+          segment.canonicalStateTransition.before,
           llvm::formatv("mixed.segment{0}.before", segment.segmentIndex).str());
       collectDelta(
-          segment.ownerTransitionProof.after,
+          segment.canonicalStateTransition.after,
           llvm::formatv("mixed.segment{0}.after", segment.segmentIndex).str());
       for (const SuffixStabilityWitness &suffix :
-           segment.ownerTransitionProof.suffixWitnesses)
+           segment.canonicalStateTransition.suffixWitnesses)
         recordSuffixWitness(suffix, llvm::formatv("mixed.segment{0}.suffix",
                                                   segment.segmentIndex)
                                         .str());
@@ -474,11 +519,11 @@ void RefoldOwnerRealizationProofBuilder::
     const MixedOwnerTilingWitness &witness =
         deps_.mixedOwnerTilingWitnesses[binding.witnessIndex];
     if (witness.witnessId != binding.parentTilingWitnessId ||
-        binding.segmentIndex >= witness.segments.size())
+        binding.segmentIndex >= witness.edges.size())
       continue;
 
     const MixedOwnerTilingSegmentWitness &segment =
-        witness.segments[binding.segmentIndex];
+        witness.edges[binding.segmentIndex];
     if (segment.parentTilingWitnessId != witness.witnessId ||
         segment.segmentIndex != binding.segmentIndex ||
         segment.kind != MixedOwnerTilingEdgeKind::TokenSegment ||
@@ -489,6 +534,8 @@ void RefoldOwnerRealizationProofBuilder::
     ProofSummary candidate = summary;
     candidate.hasMixedOwnerTilingWitness = true;
     candidate.mixedOwnerTilingWitness = witness;
+    candidate.hasMixedOwnerTilingSegmentSelection = true;
+    candidate.mixedOwnerTilingSegmentIndex = binding.segmentIndex;
     candidate.theoremClass = TheoremProofClass::MixedOwnerTilingProof;
     candidate.primaryProofClassExplicit = true;
     deps_.proofSummaryBuilder.FinalizeProofSummary(candidate);
@@ -509,10 +556,21 @@ void RefoldOwnerRealizationProofBuilder::
 RefoldOwnerRealizationProofBuilder::TryBuildOwnerRealization(
     OwnerRealizationEvidenceKind evidence, OwnerClosure closure,
     StringRef detail) const {
+  return TryBuildOwnerRealizationImpl(evidence, std::move(closure), detail,
+                                      /*attachCanonicalStateSummary=*/true);
+}
+
+::clang::refold::OwnerRealizationResult
+RefoldOwnerRealizationProofBuilder::TryBuildOwnerRealizationImpl(
+    OwnerRealizationEvidenceKind evidence, OwnerClosure closure,
+    StringRef detail, bool attachCanonicalStateSummary) const {
   OwnerRealizationResult result;
   result.witness.evidence = evidence;
   result.witness.closure =
-      deps_.ownerStateProof.AttachCanonicalStateSummary(std::move(closure));
+      attachCanonicalStateSummary
+          ? deps_.ownerStateProof.AttachCanonicalStateSummary(
+                std::move(closure))
+          : std::move(closure);
   result.witness.detail = detail.str();
   result.detail = detail.str();
 
@@ -545,19 +603,27 @@ RefoldOwnerRealizationProofBuilder::TryBuildOwnerRealization(
            result.witness.closure.stateOut))
     addUniqueComponent(mutatedComponents, component);
 
-  // Owner realization proves stateful closures by widening the realized owner
-  // through each component it mutates.  Keep those proofs as typed witnesses
-  // instead of projecting the result through a coarse aggregate discharge enum.
-  const OwnerStateBoundary stateBoundary =
-      OwnerStateBoundary::FromSourceAndATokens(result.witness.closure.source,
-                                               result.witness.closure.aTokens);
-  for (OwnerStateComponent component : mutatedComponents) {
-    ClosureWideningWitness stateWitness;
-    stateWitness.component = component;
-    stateWitness.boundary = stateBoundary;
-    stateWitness.detail = detail.str();
-    result.witness.stateWitnesses.push_back(
-        SuffixStabilityWitness::From(std::move(stateWitness)));
+  // Legacy macro/include owner realizations still project their canonical
+  // owner-state mutations into widening obligations. Direct and specialized TU
+  // source carriers deliberately do not: widening is not authority to consume
+  // a preprocessing directive. Ordinary TUByteSpan evidence is authorized by
+  // the exact hunk/span theorem; specialized TU evidence is authorized by the
+  // directive/state-specific planner that called its separate factory.
+  const bool isTURealization =
+      evidence == OwnerRealizationEvidenceKind::TUByteSpan ||
+      evidence == OwnerRealizationEvidenceKind::TUSpecializedRealization;
+  if (!isTURealization) {
+    const OwnerStateBoundary stateBoundary =
+        OwnerStateBoundary::FromSourceAndATokens(
+            result.witness.closure.source, result.witness.closure.aTokens);
+    for (OwnerStateComponent component : mutatedComponents) {
+      ClosureWideningWitness stateWitness;
+      stateWitness.component = component;
+      stateWitness.boundary = stateBoundary;
+      stateWitness.detail = detail.str();
+      result.witness.stateWitnesses.push_back(
+          SuffixStabilityWitness::From(std::move(stateWitness)));
+    }
   }
   auto reject = [&](TerminalFallbackObligationKind obligation,
                     TerminalFallbackFailureReason reason) {
@@ -608,10 +674,12 @@ RefoldOwnerRealizationProofBuilder::TryBuildOwnerRealization(
           result.witness.closure.stateIn) ||
       deps_.ownerStateProof.OwnerStateDeltaMutatesAnyState(
           result.witness.closure.stateOut);
-  if (mutatesOrCarriesUnmodeledState && result.witness.stateWitnesses.empty())
+  if (mutatesOrCarriesUnmodeledState && result.witness.stateWitnesses.empty() &&
+      evidence != OwnerRealizationEvidenceKind::TUSpecializedRealization) {
     return reject(
         TerminalFallbackObligationKind::StateTransitionClosure,
         TerminalFallbackFailureReason::StateTransitionConsumedAndObserved);
+  }
 
   result.accepted = true;
   REFOLD_LOG_TRACE(
@@ -775,20 +843,283 @@ RefoldOwnerRealizationProofBuilder::BuildIncludeOwnerRealization(
   return TryBuildOwnerRealization(evidence, std::move(closure), detail);
 }
 
+bool RefoldOwnerRealizationProofBuilder::
+    ValidateDurableStructuralSegmentBinding(
+        const diffutils::Hunk &hunk, const TUByteSpanPlan &spanPlan,
+        const StructuralHunkSegmentBinding &structuralBinding) const {
+  // The local binding is only an index key. Resolve it through the persisted
+  // tiling ledger before treating it as authority that preprocessing structure
+  // was kept outside this segment's emitted source interval.
+  if (!structuralBinding.IsWellFormed() ||
+      structuralBinding.segmentAStart != hunk.aStart ||
+      structuralBinding.segmentAEnd != hunk.aEnd ||
+      structuralBinding.segmentBStart != hunk.bStart ||
+      structuralBinding.segmentBEnd != hunk.bEnd ||
+      structuralBinding.sourceBegin != spanPlan.tuByteBegin ||
+      structuralBinding.sourceEnd != spanPlan.tuByteEnd) {
+    return false;
+  }
+
+  bool foundUniqueBinding = false;
+  for (const MixedOwnerTilingSegmentBinding &binding :
+       deps_.mixedOwnerTilingSegmentBindings) {
+    if (binding.aStart != hunk.aStart || binding.aEnd != hunk.aEnd ||
+        binding.bStart != hunk.bStart || binding.bEnd != hunk.bEnd ||
+        binding.parentTilingWitnessId != structuralBinding.witnessId ||
+        binding.segmentIndex != structuralBinding.segmentIndex) {
+      continue;
+    }
+
+    // Two durable ledger entries for the same structural segment are
+    // ambiguous authority. Reject rather than relying on vector order.
+    if (foundUniqueBinding ||
+        binding.witnessIndex >= deps_.mixedOwnerTilingWitnesses.size()) {
+      return false;
+    }
+
+    const MixedOwnerTilingWitness &witness =
+        deps_.mixedOwnerTilingWitnesses[binding.witnessIndex];
+    if (witness.witnessId != structuralBinding.witnessId ||
+        witness.originalAStart != structuralBinding.originalAStart ||
+        witness.originalAEnd != structuralBinding.originalAEnd ||
+        witness.originalBStart != structuralBinding.originalBStart ||
+        witness.originalBEnd != structuralBinding.originalBEnd ||
+        (witness.reason !=
+             StructuralTilingReason::PreservedPreprocessingStructure &&
+         witness.reason != StructuralTilingReason::
+                               MixedRealizersAndPreservedStructure) ||
+        witness.stateGapCount == 0 ||
+        witness.protectedStructureGapCount == 0 ||
+        witness.preservedInPlaceGapCount != witness.stateGapCount ||
+        witness.preservedInPlaceGapCount <
+            witness.protectedStructureGapCount ||
+        !witness.uniquePartition || !witness.stateSummariesComposed ||
+        !witness.stateTransitionsComposed ||
+        !witness.ownerBoundariesComposed ||
+        !witness.targetTokenStreamComposed ||
+        !witness.compositionEdgesProven ||
+        !witness.sourceByteCoverComplete ||
+        !witness.preservedGapSourceOrderProven ||
+        !witness.preservedGapsDisjointFromTokenSegments ||
+        !witness.preservedGapsDisjointFromEdits ||
+        structuralBinding.segmentIndex >= witness.edges.size()) {
+      return false;
+    }
+
+    if (!structuralPreservedSourceTopologyIsComplete(witness))
+      return false;
+
+    const bool deleteOnlyWitness =
+        witness.originalBStart == witness.originalBEnd;
+    if ((deleteOnlyWitness &&
+         (!witness.sharedEmptyBEnvelopeProven ||
+          witness.sharedEmptyBBoundary != witness.originalBStart ||
+          !witness.preservedStateChainComposed)) ||
+        (!deleteOnlyWitness &&
+         (witness.sharedEmptyBEnvelopeProven ||
+          witness.preservedStateChainComposed))) {
+      return false;
+    }
+
+    const bool requiresCanonicalPhysicalRunProof =
+        witness.reason ==
+            StructuralTilingReason::PreservedPreprocessingStructure ||
+        structuralReplacementRequiresBoundaryProjection(witness);
+    if (requiresCanonicalPhysicalRunProof &&
+        (witness.physicalSourceRunCount < 2 ||
+         !witness.physicalSourceRunsProven)) {
+      return false;
+    }
+    if (witness.reason ==
+            StructuralTilingReason::PreservedPreprocessingStructure &&
+        (witness.physicalSourceRunCount != witness.tokenSegmentCount ||
+         !witness.uniqueMinimumFragmentPartition)) {
+      return false;
+    }
+
+    if (deleteOnlyWitness) {
+      if (witness.uniqueBoundaryProjectionProven ||
+          witness.boundaryProjectionCount != 0 ||
+          !witness.boundaryProjections.empty()) {
+        return false;
+      }
+    } else if (requiresCanonicalPhysicalRunProof) {
+      if (!structuralReplacementBoundaryProjectionIsComplete(witness))
+        return false;
+    } else if (witness.uniqueBoundaryProjectionProven ||
+               witness.boundaryProjectionCount != 0 ||
+               !witness.boundaryProjections.empty()) {
+      return false;
+    }
+
+    for (const MixedOwnerTilingSegmentWitness &witnessSegment :
+         witness.edges) {
+      if (witnessSegment.kind == MixedOwnerTilingEdgeKind::TokenSegment) {
+        if (witnessSegment.gapDisposition !=
+            StructuralGapDisposition::Unknown) {
+          return false;
+        }
+        continue;
+      }
+
+      if (witnessSegment.kind != MixedOwnerTilingEdgeKind::StateGap ||
+          witnessSegment.gapDisposition !=
+              StructuralGapDisposition::PreservedInPlace ||
+          !witnessSegment.sourceBytesPreservedUnchanged ||
+          !witnessSegment.ownerIdentityKnown ||
+          witnessSegment.ownerIdentity.kind == OwnerKind::Unknown ||
+          !witnessSegment.sourceByteRangeKnown ||
+          witnessSegment.sourcePath.empty() ||
+          witnessSegment.sourceEnd <= witnessSegment.sourceBegin ||
+          (witnessSegment.protectedPreprocessingStructure &&
+           (!witnessSegment.protectedStructureIdentityRecorded ||
+            witnessSegment.protectedStructureKind ==
+                StructuralProtectedStructureKind::Unknown))) {
+        return false;
+      }
+    }
+
+    const MixedOwnerTilingSegmentWitness &segment =
+        witness.edges[structuralBinding.segmentIndex];
+    if (segment.parentTilingWitnessId != witness.witnessId ||
+        segment.segmentIndex != structuralBinding.segmentIndex ||
+        segment.sourceOrderPosition != structuralBinding.segmentIndex ||
+        segment.kind != MixedOwnerTilingEdgeKind::TokenSegment ||
+        segment.gapDisposition != StructuralGapDisposition::Unknown ||
+        segment.aStart != hunk.aStart || segment.aEnd != hunk.aEnd ||
+        segment.bStart != hunk.bStart || segment.bEnd != hunk.bEnd ||
+        (deleteOnlyWitness &&
+         (!segment.allowEmptyBEnvelope ||
+          segment.bStart != witness.sharedEmptyBBoundary ||
+          segment.bEnd != witness.sharedEmptyBBoundary)) ||
+        (!deleteOnlyWitness &&
+         ((segment.bStart == segment.bEnd) != segment.allowEmptyBEnvelope ||
+          (segment.allowEmptyBEnvelope &&
+           !witness.uniqueBoundaryProjectionProven))) ||
+        !segment.ownerClosureComplete || !segment.ownerIdentityKnown ||
+        segment.ownerIdentity.kind == OwnerKind::Unknown ||
+        segment.sourceBytesPreservedUnchanged ||
+        segment.protectedStructureIdentityRecorded ||
+        segment.protectedStructureKind !=
+            StructuralProtectedStructureKind::Unknown ||
+        !segment.sourceByteRangeKnown ||
+        segment.sourcePath.empty() ||
+        segment.sourceBegin != spanPlan.tuByteBegin ||
+        segment.sourceEnd != spanPlan.tuByteEnd ||
+        !segment.protectedStructurePreservedOutsideSegment) {
+      return false;
+    }
+
+    foundUniqueBinding = true;
+  }
+
+  return foundUniqueBinding;
+}
+
 ::clang::refold::OwnerRealizationResult
 RefoldOwnerRealizationProofBuilder::BuildTUOwnerRealization(
+    AcceptedPathKind currentPath, const diffutils::Hunk &hunk,
+    const TUByteSpanPlan &spanPlan,
+    const StructuralHunkSegmentBinding *structuralBinding) const {
+  OwnerClosure closure = OwnerClosure::From(
+      Owner::TU(),
+      OwnerSourceRange::From(deps_.model.GetSourcePath(),
+                             spanPlan.tuByteBegin, spanPlan.tuByteEnd),
+      OwnerTokenRange::From(hunk.aStart, hunk.aEnd),
+      OwnerTokenRange::From(hunk.bStart, hunk.bEnd));
+
+  const std::string detail =
+      formatv("tu-byte-edit path={0} A=[{1},{2}) B=[{3},{4}) "
+              "source=[{5},{6}) structuralBinding={7}",
+              currentPath, hunk.aStart, hunk.aEnd, hunk.bStart, hunk.bEnd,
+              spanPlan.tuByteBegin, spanPlan.tuByteEnd,
+              structuralBinding ? "present" : "absent")
+          .str();
+
+  // Only ordinary direct-span paths may claim TUByteSpan evidence. Specialized
+  // state-repair and source-closure planners use the separate source-only
+  // evidence path below and cannot impersonate a concrete token hunk.
+  if ((currentPath != AcceptedPathKind::TUByteSpanMappedEdit &&
+       currentPath != AcceptedPathKind::TUByteSpanConservativeEdit) ||
+      hunk.bEnd > deps_.bTokenCount ||
+      !deps_.tuEdits.ValidateTUOwnerRealizationCarrier(
+          hunk, spanPlan, structuralBinding) ||
+      (structuralBinding &&
+       !ValidateDurableStructuralSegmentBinding(hunk, spanPlan,
+                                                *structuralBinding))) {
+    return buildRejectedDirectTUCarrier(
+        closure, detail, TerminalFallbackObligationKind::OwnerClosedCover,
+        TerminalFallbackFailureReason::NoOwnerClosedCover);
+  }
+
+  if (spanPlan.macroStateAuthorizations.size() >
+      std::numeric_limits<uint32_t>::max()) {
+    return buildRejectedDirectTUCarrier(
+        closure, detail, TerminalFallbackObligationKind::ProducerFactsAvailable,
+        TerminalFallbackFailureReason::MissingProducerFacts);
+  }
+
+  OwnerRealizationResult result = TryBuildOwnerRealizationImpl(
+      OwnerRealizationEvidenceKind::TUByteSpan, std::move(closure), detail,
+      /*attachCanonicalStateSummary=*/false);
+  if (!result.accepted)
+    return result;
+
+  result.witness.hasTUCarrierWitness = true;
+  result.witness.tuCarrierWitness.exactHunkAndSpanValidated = true;
+  result.witness.tuCarrierWitness.protectedStructureExcludedOrAuthorized =
+      true;
+  result.witness.tuCarrierWitness.deferredMacroStateAuthorizationCount =
+      static_cast<uint32_t>(spanPlan.macroStateAuthorizations.size());
+  if (structuralBinding) {
+    result.witness.tuCarrierWitness.hasStructuralSegmentBinding = true;
+    result.witness.tuCarrierWitness.structuralSegmentBindingValidated = true;
+    result.witness.tuCarrierWitness.structuralWitnessId =
+        structuralBinding->witnessId;
+    result.witness.tuCarrierWitness.structuralSegmentIndex =
+        structuralBinding->segmentIndex;
+  }
+
+  // A direct source carrier is never certified by closure widening. The span
+  // theorem and optional structural binding are the only source authorities;
+  // widening remains an obligation for owner-specific state proofs.
+  if (llvm::any_of(result.witness.stateWitnesses,
+                   isClosureWideningWitness)) {
+    // Reject from the already-materialized closure.  The original local
+    // closure was moved into the shared gate and must not be read again.
+    return buildRejectedDirectTUCarrier(
+        result.witness.closure, detail,
+        TerminalFallbackObligationKind::StateTransitionClosure,
+        TerminalFallbackFailureReason::StateTransitionConsumedAndObserved);
+  }
+
+  return result;
+}
+
+::clang::refold::OwnerRealizationResult
+RefoldOwnerRealizationProofBuilder::BuildSpecializedTUOwnerRealization(
     AcceptedPathKind currentPath, uint64_t begin, uint64_t end) const {
   OwnerClosure closure = OwnerClosure::From(
       Owner::TU(),
       OwnerSourceRange::From(deps_.model.GetSourcePath(), begin, end),
+      // Specialized sideband/repair edits may not correspond to one ordinary
+      // token hunk. Their empty envelope is explicitly classified by the
+      // distinct evidence kind below; it is not presented as TUByteSpan proof.
       OwnerTokenRange::From(0, 0), OwnerTokenRange::From(0, 0));
 
-  // Direct TU byte-span realization has already had its concrete byte spelling
-  // selected before this helper is called.  The shared proof gate records only
-  // that the TU owner and byte interval have a closed realization carrier.
-  return TryBuildOwnerRealization(
-      OwnerRealizationEvidenceKind::TUByteSpan, std::move(closure),
-      formatv("tu-byte-edit path={0}", currentPath).str());
+  if (currentPath != AcceptedPathKind::TUByteSpanConservativeEdit &&
+      currentPath != AcceptedPathKind::TUIncludeClosureEdit) {
+    return TryBuildOwnerRealizationImpl(
+        OwnerRealizationEvidenceKind::Unknown, std::move(closure),
+        formatv("invalid specialized TU path={0}", currentPath).str(),
+        /*attachCanonicalStateSummary=*/false);
+  }
+
+  return TryBuildOwnerRealizationImpl(
+      OwnerRealizationEvidenceKind::TUSpecializedRealization,
+      std::move(closure),
+      formatv("specialized-tu-edit path={0}", currentPath).str(),
+      /*attachCanonicalStateSummary=*/true);
 }
 
 ::clang::refold::ProofSummary

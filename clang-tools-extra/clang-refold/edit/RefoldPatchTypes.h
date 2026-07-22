@@ -205,6 +205,18 @@ struct MacroPatch {
   OwnerCertificate ownerCert = {};
 };
 
+/// Specialized authority carried by an exact direct-header byte patch.
+///
+/// `None` denotes an ordinary token-derived header edit and grants no right to
+/// touch preprocessing structure.  The other values are assigned only by the
+/// planner that proved the corresponding exact directive operation; the final
+/// header edit planner translates them into emission-boundary capabilities.
+enum class DirectHeaderByteEditAuthorityKind : uint8_t {
+  None,
+  LineControlRepair,
+  IncludeDirectiveRewrite,
+};
+
 /// Candidate include-owned source replacement before materialization/emission.
 struct IncludePatch {
   /// Include instance that owns the candidate patch.
@@ -236,6 +248,10 @@ struct IncludePatch {
   uint64_t directHeaderByteBegin = 0;
   /// Exclusive direct header source-byte replacement offset.
   uint64_t directHeaderByteEnd = 0;
+  /// Named specialized operation that proved this direct byte range, or None
+  /// when the range is an ordinary token-derived edit.
+  DirectHeaderByteEditAuthorityKind directHeaderByteAuthority =
+      DirectHeaderByteEditAuthorityKind::None;
 
   std::string ToString() const {
     llvm::StringRef path;

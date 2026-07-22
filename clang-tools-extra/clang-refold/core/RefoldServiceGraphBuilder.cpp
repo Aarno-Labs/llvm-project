@@ -13,6 +13,7 @@
 
 #include "core/RefoldEngine.h"
 
+#include "core/RefoldLog.h"
 #include "core/RefoldOwnerClassifier.h"
 #include "edit/RefoldBInsertionLedger.h"
 #include "edit/RefoldExpansionFallbackPlanner.h"
@@ -30,7 +31,11 @@
 #include "proof/RefoldProofLattice.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldMixedOwnerTilingPlanner.h"
+#include "source/RefoldPreprocessingStructureIndex.h"
 #include "source/RefoldTokenDiffPlanner.h"
+
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MemoryBuffer.h"
 
 #include <cassert>
 #include <memory>
@@ -123,26 +128,77 @@ void RefoldEngine::InitializeTokenDiffPlanner() {
 }
 
 void RefoldEngine::InitializeMixedOwnerTilingPlanner() {
-  // Mixed-owner tiling borrows the owner/proof services it needs to prove
-  // deterministic token-hunk partitions.  The planner writes the existing
-  // token-hunk cache and mixed-owner witness ledgers directly, so later proof
-  // consumers see the same normalized state without engine callbacks.
+  assert(preprocessingStructureIndex_ &&
+         "preprocessing-structure index must precede structural tiling");
+
+  // Structural tiling borrows the owner/proof services and exact preprocessing
+  // census needed to prove deterministic token-hunk partitions.  The planner
+  // retains its historical type name while atomically publishing the normalized
+  // token-hunk cache and durable witness ledgers.  PlanTokenDiff() validates
+  // that publication before insertion provenance or owner dispatch can observe
+  // hunk indices.
   mixedOwnerTilingPlanner_ = std::make_unique<RefoldMixedOwnerTilingPlanner>(
       RefoldMixedOwnerTilingPlanner::Dependencies{
           model_, model_.GetSourcePath(), pathIdentity_, lineDirs_, lexLang_,
           macroTopology_, sourceMapper_, OwnerClassifier(), OwnerStateProof(),
-          abTokHunks_, mixedOwnerTilingWitnesses_,
-          mixedOwnerTilingSegmentBindings_});
+          MacroStateProof(), *preprocessingStructureIndex_, abTokHunks_,
+          mixedOwnerTilingWitnesses_, mixedOwnerTilingSegmentBindings_});
 }
 
 void RefoldEngine::InitializeTUEditPlanner() {
+  assert(preprocessingStructureIndex_ &&
+         "preprocessing-structure index must precede TU edit planning");
+
   // TU edit planning has a real owner.  The planner receives only read-only
   // services and token-map state; final TextEdit assembly intentionally remains
   // outside this service.
   tuEditPlanner_ =
       std::make_unique<RefoldTUEditPlanner>(RefoldTUEditPlanner::Deps{
           model_, pathIdentity_, macroTopology_, TUAnchorProof(), lineDirs_,
-          aToks_, abTokMapA2B_, ownerDepthGap_, strict_});
+          *preprocessingStructureIndex_, tuSourceBytes_, aToks_,
+          static_cast<uint64_t>(bToks_.size()), abTokMapA2B_, ownerDepthGap_,
+          strict_});
+}
+
+void RefoldEngine::InitializePreprocessingStructureIndex() {
+  const std::string absoluteTUPath =
+      lineDirs_.ToAbsolutePath(model_.GetSourcePath());
+  auto bufferOrError = MemoryBuffer::getFile(absoluteTUPath);
+  if (!bufferOrError) {
+    tuSourceLoadError_ =
+        llvm::formatv("unable to read translation unit '{0}': {1}",
+                      absoluteTUPath, bufferOrError.getError().message())
+            .str();
+    tuSourceBytes_.clear();
+    REFOLD_LOG_WARN("tu/structure-index",
+                    "{0}; direct TU spans will fail closed",
+                    *tuSourceLoadError_);
+  } else {
+    tuSourceLoadError_.reset();
+    tuSourceBytes_ = bufferOrError.get()->getBuffer().str();
+  }
+
+  preprocessingStructureIndex_ =
+      std::make_unique<RefoldPreprocessingStructureIndex>(
+          RefoldPreprocessingStructureIndex::Build(
+              RefoldPreprocessingStructureIndex::Dependencies{
+                  model_, pathIdentity_, MacroStateProof(), lexLang_},
+              model_.GetSourcePath(), tuSourceBytes_, std::nullopt));
+
+  // Protection diagnostics invalidate the whole physical census and therefore
+  // reject every direct TU byte span.  Ordinary producer-binding diagnostics
+  // are local: the scanned interval remains protected, but an unrelated
+  // mismatch elsewhere in the file must not change owner classification or
+  // macro replay ranking.
+  for (StringRef diagnostic :
+       preprocessingStructureIndex_->GetDirectTUProtectionDiagnostics()) {
+    REFOLD_LOG_WARN("tu/structure-index",
+                    "incomplete direct-TU protection census: {0}", diagnostic);
+  }
+  for (StringRef diagnostic : preprocessingStructureIndex_->GetDiagnostics()) {
+    REFOLD_LOG_DEBUG("tu/structure-index", "index diagnostic: {0}",
+                     diagnostic);
+  }
 }
 
 RefoldTUEditPlanner &RefoldEngine::TUEditPlanner() {
@@ -380,10 +436,11 @@ void RefoldEngine::InitializeTextEditAssembler() {
 
   textEditAssembler_ = std::make_unique<RefoldTextEditAssembler>(
       model_, bSource_, aToks_, bToks_, bTokOff_, abTokHunks_, abTokMapA2B_,
-      abTokMapB2A_, sourceMapper_, ProofLattice(), OwnerStateProof(),
+      abTokMapB2A_, sourceMapper_, pathIdentity_, MacroStateProof(), lexLang_,
+      *preprocessingStructureIndex_, ProofLattice(), OwnerStateProof(),
       macroTopology_, lineControlProof_, lineDirs_, terminalSink_,
-      TUEditPlanner(), TheoremAudit(), sidebandPragmaEdits_, lastTheoremAudit_,
-      std::move(hooks));
+      TUEditPlanner(), TheoremAudit(), sidebandPragmaEdits_,
+      mixedOwnerTilingWitnesses_, lastTheoremAudit_, std::move(hooks));
 }
 
 //===----------------------------------------------------------------------===//
@@ -414,6 +471,8 @@ void RefoldEngine::InitializeIncludeMaterializer() {
 // decisions.
 
 void RefoldEngine::InitializeExpansionFallbackPlanner() {
+  assert(preprocessingStructureIndex_ &&
+         "preprocessing-structure index must precede expansion fallback");
   RefoldExpansionFallbackPlanner::Hooks hooks;
   // Non-audit emission/orchestration hooks.  These callbacks route directly to
   // the assembler service; the hook bundle stays limited to the cycle-breaking
@@ -435,6 +494,15 @@ void RefoldEngine::InitializeExpansionFallbackPlanner() {
       [this](TextEdit &edit, const AcceptedResultCandidate &candidate) {
         textEditAssembler_->AttachAcceptedResultCarrier(edit, candidate);
       };
+  hooks.authorizeTUIncludeClosure =
+      [this](TextEdit &edit, StringRef sourcePath, StringRef sourceBytes,
+             uint64_t begin, uint64_t end) {
+        return textEditAssembler_->AuthorizeCompleteProtectedSourceClosure(
+            edit, ProtectedSourceEditAuthorityKind::TUIncludeClosure,
+            sourcePath, std::nullopt, sourceBytes, begin, end,
+            /*requireProtectedInterval=*/true,
+            /*requestTerminalOnFailure=*/false);
+      };
   hooks.resetAttemptStats = [this]() {
     resetRefoldAttemptStats(lastStats_, model_);
   };
@@ -442,7 +510,8 @@ void RefoldEngine::InitializeExpansionFallbackPlanner() {
   expansionFallbackPlanner_ = std::make_unique<RefoldExpansionFallbackPlanner>(
       model_, bSource_, aToks_, abTokHunks_, abTokMapB2A_, lineDirs_,
       sourceMapper_, pathIdentity_, macroTopology_, lineControlProof_,
-      MacroStateProof(), terminalSink_, lexLang_, IncludeInsertionPlanner(),
+      MacroStateProof(), *preprocessingStructureIndex_, terminalSink_,
+      lexLang_, IncludeInsertionPlanner(),
       ProofLattice(), TheoremAudit(), lastStats_, materializedEditMappings_,
       std::move(hooks));
 }

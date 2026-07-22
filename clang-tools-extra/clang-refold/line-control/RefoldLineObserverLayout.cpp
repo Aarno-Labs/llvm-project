@@ -742,11 +742,19 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
 
     TextEdit edit{editBegin,    editEnd, replacement, std::nullopt,
                   std::nullopt, {},      {},          {}};
+    const PreprocessingStructureKind lineControlKinds[] = {
+        PreprocessingStructureKind::LineControl};
+    if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
+            edit, ProtectedSourceEditAuthorityKind::LineControlRepair, tuPath,
+            std::nullopt, tuBytes, editBegin, editEnd, lineControlKinds,
+            /*requireProtectedInterval=*/false,
+            /*requestTerminalOnFailure=*/false))
+      return false;
     textEditAssembler_.CertifyTextEditMaterializedBByteRange(edit, prevBEnd,
                                                              initialBEnd);
     textEditAssembler_.AttachAcceptedResultCarrier(
         edit, proofLattice_.AcceptedCandidateBuilder()
-                  .BuildAcceptedTUTextEditCandidate(
+                  .BuildAcceptedSpecializedTUTextEditCandidate(
                       AcceptedPathKind::TUByteSpanConservativeEdit, editBegin,
                       editEnd, replacement));
     tuEdits.push_back(std::move(edit));
@@ -854,11 +862,19 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
 
     TextEdit edit{editBegin,    editEnd, replacement, std::nullopt,
                   std::nullopt, {},      {},          {}};
+    const PreprocessingStructureKind lineControlKinds[] = {
+        PreprocessingStructureKind::LineControl};
+    if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
+            edit, ProtectedSourceEditAuthorityKind::LineControlRepair, tuPath,
+            std::nullopt, tuBytes, editBegin, editEnd, lineControlKinds,
+            /*requireProtectedInterval=*/false,
+            /*requestTerminalOnFailure=*/false))
+      return false;
     textEditAssembler_.CertifyTextEditMaterializedBByteRange(
         edit, collapsedGap->leftBEnd, firstObserverBBegin);
     textEditAssembler_.AttachAcceptedResultCarrier(
         edit, proofLattice_.AcceptedCandidateBuilder()
-                  .BuildAcceptedTUTextEditCandidate(
+                  .BuildAcceptedSpecializedTUTextEditCandidate(
                       AcceptedPathKind::TUByteSpanConservativeEdit, editBegin,
                       editEnd, replacement));
     tuEdits.push_back(std::move(edit));
@@ -975,6 +991,8 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
     patch.hasDirectHeaderByteRange = true;
     patch.directHeaderByteBegin = prevEntry.e;
     patch.directHeaderByteEnd = ownLineClosure.sourceEnd;
+    patch.directHeaderByteAuthority =
+        DirectHeaderByteEditAuthorityKind::LineControlRepair;
 
     auto [it, _] = perInclude.try_emplace(include->id, include);
     it->second.Add(std::move(patch));
@@ -1108,6 +1126,8 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
     patch.hasDirectHeaderByteRange = true;
     patch.directHeaderByteBegin = leftEntry.e;
     patch.directHeaderByteEnd = closure->sourceEnd;
+    patch.directHeaderByteAuthority =
+        DirectHeaderByteEditAuthorityKind::LineControlRepair;
 
     auto [it, _] = perInclude.try_emplace(include->id, include);
     it->second.Add(std::move(patch));

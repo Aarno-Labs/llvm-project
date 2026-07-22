@@ -1589,35 +1589,35 @@ RefoldHeaderIncludeEditPlanner::BuildCarriedHeaderMacroStateRewrite(
                                       std::move(carriedReplacement)};
 }
 
-void RefoldHeaderIncludeEditPlanner::TryCarryHeaderMacroStateAfterReplacement(
+bool RefoldHeaderIncludeEditPlanner::TryCarryHeaderMacroStateAfterReplacement(
     const HeaderMacroStateCarryState &state) const {
   if (!state.startByte || !state.endByte || *state.startByte > *state.endByte ||
       state.replacement.empty())
-    return;
+    return false;
   if (!ReplacementHeaderSuffixBoundaryAllowsDirectiveLine(
           state.headerText, StringRef(state.replacement), *state.endByte))
-    return;
+    return false;
 
   SmallVector<HeaderMacroStateCarryCandidate, 4> carryCandidates;
   CollectHeaderMacroStateCarryCandidates(state, carryCandidates);
   if (carryCandidates.empty())
-    return;
+    return false;
 
   llvm::sort(carryCandidates, HeaderMacroStateCarryCandidatePrecedes);
   if (!HeaderMacroStateCarryCandidatesCanCross(state, carryCandidates))
-    return;
+    return false;
 
   const uint64_t replacementTailEnd =
       HeaderMacroStateCarryReplacementTailEnd(state.headerText, *state.endByte);
   if (!HeaderMacroStateCarryTailIsNonObserving(state, carryCandidates,
                                                replacementTailEnd))
-    return;
+    return false;
 
   std::optional<HeaderMacroStateCarryRewrite> rewrite =
       BuildCarriedHeaderMacroStateRewrite(state, carryCandidates,
                                           replacementTailEnd);
   if (!rewrite)
-    return;
+    return false;
 
   *state.startByte = rewrite->startByte;
   *state.endByte = rewrite->endByte;
@@ -1625,6 +1625,7 @@ void RefoldHeaderIncludeEditPlanner::TryCarryHeaderMacroStateAfterReplacement(
   state.mappedHeaderWitness.hasByteRange = true;
   state.mappedHeaderWitness.startByte = *state.startByte;
   state.mappedHeaderWitness.endByte = *state.endByte;
+  return true;
 }
 
 void RefoldHeaderIncludeEditPlanner::
@@ -1765,7 +1766,7 @@ RefoldHeaderIncludeEditPlanner::SelectBestInsertCandidate(
   return result;
 }
 
-void RefoldHeaderIncludeEditPlanner::CommitInsertCandidate(
+bool RefoldHeaderIncludeEditPlanner::CommitInsertCandidate(
     const HeaderInsertionPlanningState &state,
     const SelectedInsertAnchorCandidate &selected) const {
   const InsertAnchorCandidate &candidate = selected.anchor;
@@ -1789,8 +1790,20 @@ void RefoldHeaderIncludeEditPlanner::CommitInsertCandidate(
                                               {},
                                               {},
                                               {}};
+  if (!textEditAssembler_.OrdinaryEditAvoidsProtectedPreprocessingStructure(
+          edit, state.file, state.include.id, state.headerText,
+          /*requestTerminalOnFailure=*/false)) {
+    state.plan.requiresIncludeRealization = true;
+    state.plan.realizationReason =
+        llvm::formatv("INSERT: chosen header anchor at byte {0} interferes "
+                      "with protected preprocessing structure in {1}",
+                      candidate.anchorByte, state.file)
+            .str();
+    return false;
+  }
   textEditAssembler_.AttachAcceptedResultCarrier(edit, selected.accepted);
   state.plan.edits.push_back(std::move(edit));
+  return true;
 }
 
 bool RefoldHeaderIncludeEditPlanner::HasCopiedHeaderSuffix(
@@ -2067,8 +2080,7 @@ bool RefoldHeaderIncludeEditPlanner::PlanPureInsertionPatch(
 
   if (auto selected =
           SelectBestInsertCandidate(topTierCandidates, state.patch)) {
-    CommitInsertCandidate(state, *selected);
-    return true;
+    return CommitInsertCandidate(state, *selected);
   }
 
   // If no structural boundary anchor won, look for the nearest mapped PP token
@@ -2077,8 +2089,7 @@ bool RefoldHeaderIncludeEditPlanner::PlanPureInsertionPatch(
   if (!AppendRightNeighborAnchor(state, rightCandidates))
     return false;
   if (auto selected = SelectBestInsertCandidate(rightCandidates, state.patch)) {
-    CommitInsertCandidate(state, *selected);
-    return true;
+    return CommitInsertCandidate(state, *selected);
   }
 
   // Right-neighbor anchoring is preferred because it naturally inserts before
@@ -2090,8 +2101,7 @@ bool RefoldHeaderIncludeEditPlanner::PlanPureInsertionPatch(
     return false;
   if (auto selected =
           SelectBestInsertCandidate(secondaryCandidates, state.patch)) {
-    CommitInsertCandidate(state, *selected);
-    return true;
+    return CommitInsertCandidate(state, *selected);
   }
 
   // No include-preserving insertion anchor discharged. Switch to the explicit
@@ -2192,6 +2202,50 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
                     {},
                     {},
                     {}};
+      bool sourceAuthorityAccepted = false;
+      switch (p.directHeaderByteAuthority) {
+      case DirectHeaderByteEditAuthorityKind::None:
+        sourceAuthorityAccepted =
+            textEditAssembler_
+                .OrdinaryEditAvoidsProtectedPreprocessingStructure(
+                    edit, file, ie.include->id, headerText,
+                    /*requestTerminalOnFailure=*/false);
+        break;
+      case DirectHeaderByteEditAuthorityKind::LineControlRepair: {
+        const PreprocessingStructureKind lineControlKinds[] = {
+            PreprocessingStructureKind::LineControl};
+        sourceAuthorityAccepted =
+            textEditAssembler_.AuthorizeProtectedSourceIntervals(
+                edit, ProtectedSourceEditAuthorityKind::LineControlRepair,
+                file, ie.include->id, headerText, p.directHeaderByteBegin,
+                p.directHeaderByteEnd, lineControlKinds,
+                /*requireProtectedInterval=*/false,
+                /*requestTerminalOnFailure=*/false);
+        break;
+      }
+      case DirectHeaderByteEditAuthorityKind::IncludeDirectiveRewrite: {
+        const PreprocessingStructureKind includeKinds[] = {
+            PreprocessingStructureKind::Include,
+            PreprocessingStructureKind::IncludeNext,
+            PreprocessingStructureKind::Import};
+        sourceAuthorityAccepted =
+            textEditAssembler_.AuthorizeProtectedSourceIntervals(
+                edit,
+                ProtectedSourceEditAuthorityKind::IncludeDirectiveRewrite,
+                file, ie.include->id, headerText, p.directHeaderByteBegin,
+                p.directHeaderByteEnd, includeKinds,
+                /*requireProtectedInterval=*/true,
+                /*requestTerminalOnFailure=*/false);
+        break;
+      }
+      }
+      if (!sourceAuthorityAccepted) {
+        plan.requiresIncludeRealization = true;
+        plan.realizationReason =
+            "direct mapped-header edit failed global protected-source "
+            "authorization";
+        return plan;
+      }
       textEditAssembler_.AttachAcceptedResultCarrier(
           edit,
           proofLattice_.AcceptedCandidateBuilder()
@@ -2430,11 +2484,13 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
     // B-derived patch payload carried by the IncludePatch.
     std::string replacement = isDelete ? "" : materialInsertBytes;
 
+    bool carriedHeaderMacroState = false;
     if (isReplace) {
       HeaderMacroStateCarryState carryState{
           *ie.include, plan,    file,        StringRef(headerText),
           startByte,   endByte, replacement, mappedHeaderWitness};
-      TryCarryHeaderMacroStateAfterReplacement(carryState);
+      carriedHeaderMacroState =
+          TryCarryHeaderMacroStateAfterReplacement(carryState);
     }
 
     if (!headerGapPreservations.empty()) {
@@ -2521,6 +2577,58 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
                               file, ie.include->id);
     if (emitsHeaderSourceLineDirectiveResume)
       edit.lineControlPruneCandidates = std::move(sourceLineResumeCandidates);
+    bool sourceAuthorityAccepted = true;
+    if (usedFullHeaderEnvelope) {
+      // The full-envelope path has already proved every crossed source gap by
+      // exact structure pieces plus lexical trivia.  Translate that independent
+      // closure theorem into exact per-interval emission capabilities; the path
+      // name alone is not authority.
+      sourceAuthorityAccepted =
+          textEditAssembler_.AuthorizeCompleteProtectedSourceClosure(
+              edit,
+              ProtectedSourceEditAuthorityKind::
+                  IncludePreservingSourceClosure,
+              file, ie.include->id, headerText, *startByte, *endByte,
+              /*requireProtectedInterval=*/false,
+              /*requestTerminalOnFailure=*/false);
+    }
+
+    if (sourceAuthorityAccepted && carriedHeaderMacroState) {
+      // Header-local macro-state carry is a specialized directive operation,
+      // not an ordinary mapped-token edit. The carry proof above establishes
+      // that each moved active definition may cross the replacement and its
+      // physical line tail without changing any observer. Bind that theorem to
+      // every exact #define/#undef interval touched by the final widened edit.
+      // Any unrelated protected construct still makes authorization fail
+      // closed unless a prior full-envelope proof independently authorized it.
+      const PreprocessingStructureKind macroStateKinds[] = {
+          PreprocessingStructureKind::MacroDefine,
+          PreprocessingStructureKind::MacroUndef};
+      sourceAuthorityAccepted =
+          textEditAssembler_.AuthorizeProtectedSourceIntervals(
+              edit, ProtectedSourceEditAuthorityKind::MacroStateRepair, file,
+              ie.include->id, headerText, *startByte, *endByte,
+              macroStateKinds,
+              /*requireProtectedInterval=*/true,
+              /*requestTerminalOnFailure=*/false);
+    }
+
+    if (sourceAuthorityAccepted && !usedFullHeaderEnvelope &&
+        !carriedHeaderMacroState) {
+      // A local mapped-token edit has no source-closure theorem.  It must avoid
+      // every protected interval and fall back to include realization if the
+      // mapped byte envelope crosses even one directive-looking construct.
+      sourceAuthorityAccepted =
+          textEditAssembler_.OrdinaryEditAvoidsProtectedPreprocessingStructure(
+              edit, file, ie.include->id, headerText,
+              /*requestTerminalOnFailure=*/false);
+    }
+    if (!sourceAuthorityAccepted) {
+      plan.requiresIncludeRealization = true;
+      plan.realizationReason =
+          "mapped-header edit failed global protected-source authorization";
+      return plan;
+    }
     textEditAssembler_.AttachAcceptedResultCarrier(
         edit,
         proofLattice_.AcceptedCandidateBuilder().BuildAcceptedIncludeCandidate(

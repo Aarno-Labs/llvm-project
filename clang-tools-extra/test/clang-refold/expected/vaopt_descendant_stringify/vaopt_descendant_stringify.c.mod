@@ -19,7 +19,7 @@ int main() {
   int z = 30;
 
   // 1. Multiple variables
-  PRINT_VARS(a, y, z)
+  PRINT_VARS(a, b, c)
   // Output: x = 10; y = 20; z = 30
 
   printf("\n");

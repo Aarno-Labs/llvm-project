@@ -14,9 +14,10 @@
 // The structural proof algorithms (templates and their lexical helpers) are
 // implementation details owned entirely by RefoldNeutralityProof.cpp; they
 // are not part of this header's contract.  Generic source-envelope tiling
-// helpers (edit/RefoldSourceEnvelopeTiling.h) live in their own header
-// because they are caller-policy gap-discharge mechanics, not a neutrality
-// proof.
+// helpers (edit/RefoldSourceEnvelopeTiling.h) remain caller-policy envelope
+// mechanics.  Exact preprocessing inventory and physical byte coverage are
+// centralized separately in source/RefoldSourceGapProof.h so every consumer
+// discharges that common theorem identically.
 //
 //===----------------------------------------------------------------------===//
 

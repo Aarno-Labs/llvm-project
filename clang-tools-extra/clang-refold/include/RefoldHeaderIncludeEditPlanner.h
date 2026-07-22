@@ -616,8 +616,11 @@ private:
       uint64_t replacementTailEnd) const;
 
   /// Carries active header #defines after a replacement when proof permits it.
-  /// On success, the edit range, replacement text, and witness are widened.
-  void TryCarryHeaderMacroStateAfterReplacement(
+  /// On success, the edit range, replacement text, and witness are widened and
+  /// true is returned so the final physical edit can receive explicit
+  /// macro-state-repair authority. Returning false means that no carry rewrite
+  /// was performed; it does not by itself reject the ordinary mapped edit.
+  bool TryCarryHeaderMacroStateAfterReplacement(
       const HeaderMacroStateCarryState &state) const;
 
   /// Checks owner-state proof obligations for a synthetic header #line resume.
@@ -651,9 +654,9 @@ private:
   /// Commits a selected pure-insertion anchor into the output plan.
   /// Boundary padding, local line resync, and accepted-result certification are
   /// applied in the same operation.
-  void
-  CommitInsertCandidate(const HeaderInsertionPlanningState &state,
-                        const SelectedInsertAnchorCandidate &selected) const;
+  bool CommitInsertCandidate(
+      const HeaderInsertionPlanningState &state,
+      const SelectedInsertAnchorCandidate &selected) const;
 
   /// Returns whether copied header bytes survive after an insertion anchor.
   /// Whitespace-only suffixes do not need local line-state resync.

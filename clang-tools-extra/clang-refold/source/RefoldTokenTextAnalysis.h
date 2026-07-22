@@ -76,7 +76,7 @@ public:
   /// True iff \p text contains a `__COUNTER__` observer/consumer token.
   bool TextMentionsCounterObserver(llvm::StringRef text) const;
 
-  /// Return true when `text` contains a physical preprocessor directive line.
+  /// Return true when `text` contains an exact preprocessing directive line.
   ///
   /// Macro-state transitions may cross ordinary source bytes only when those
   /// bytes cannot observe the moved transition.  Crossing a directive line is

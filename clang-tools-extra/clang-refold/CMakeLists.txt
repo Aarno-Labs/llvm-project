@@ -28,6 +28,9 @@ add_clang_tool(clang-refold
   source/RefoldToken.cpp
   source/RefoldTokenDiffPlanner.cpp
   source/RefoldMixedOwnerTilingPlanner.cpp
+  source/RefoldPreprocessingDirectiveScanner.cpp
+  source/RefoldPreprocessingStructureIndex.cpp
+  source/RefoldSourceGapProof.cpp
   source/RefoldStructuralHunkDispatcher.cpp
   macro/RefoldMacroTopology.cpp
   macro/RefoldMacroReplay.cpp
@@ -76,6 +79,7 @@ add_clang_tool(clang-refold
   proof/RefoldOwnerRealizationProofBuilder.cpp
   proof/RefoldProofLattice.cpp
   proof/RefoldProofSummaryBuilder.cpp
+  proof/RefoldStructuralHunkTilingProof.cpp
   proof/RefoldWitnessClassifier.cpp
   proof/RefoldWitnessEquivalenceKeyBuilder.cpp
   proof/RefoldWitnessResolver.cpp

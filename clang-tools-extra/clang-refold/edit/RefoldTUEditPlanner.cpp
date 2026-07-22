@@ -17,6 +17,7 @@
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlProof.h"
 #include "macro/RefoldMacroTopology.h"
+#include "source/RefoldPreprocessingStructureIndex.h"
 #include "util/RefoldPathIdentity.h"
 #include "util/StringUtils.h"
 
@@ -38,7 +39,80 @@ using namespace llvm;
 namespace clang {
 namespace refold {
 
-RefoldTUEditPlanner::RefoldTUEditPlanner(Deps deps) : deps_(std::move(deps)) {}
+namespace {
+
+/// Return the source-level directive spelling used by direct-TU rejection
+/// diagnostics.  The stable enum name is logged separately; this spelling
+/// makes a protected boundary recognizable without consulting the producer
+/// schema.
+StringRef directTUDiagnosticDirectiveSpelling(
+    PreprocessingStructureKind kind) {
+  switch (kind) {
+  case PreprocessingStructureKind::ConditionalIf:
+    return "#if";
+  case PreprocessingStructureKind::ConditionalIfdef:
+    return "#ifdef";
+  case PreprocessingStructureKind::ConditionalIfndef:
+    return "#ifndef";
+  case PreprocessingStructureKind::ConditionalElif:
+    return "#elif";
+  case PreprocessingStructureKind::ConditionalElifdef:
+    return "#elifdef";
+  case PreprocessingStructureKind::ConditionalElifndef:
+    return "#elifndef";
+  case PreprocessingStructureKind::ConditionalElse:
+    return "#else";
+  case PreprocessingStructureKind::ConditionalEndif:
+    return "#endif";
+  case PreprocessingStructureKind::MacroDefine:
+    return "#define";
+  case PreprocessingStructureKind::MacroUndef:
+    return "#undef";
+  case PreprocessingStructureKind::Include:
+    return "#include";
+  case PreprocessingStructureKind::IncludeNext:
+    return "#include_next";
+  case PreprocessingStructureKind::Import:
+    return "#import";
+  case PreprocessingStructureKind::Pragma:
+    return "#pragma";
+  case PreprocessingStructureKind::PragmaOperator:
+    return "_Pragma/__pragma";
+  case PreprocessingStructureKind::LineControl:
+    return "#line/linemarker";
+  case PreprocessingStructureKind::ErrorDirective:
+    return "#error";
+  case PreprocessingStructureKind::WarningDirective:
+    return "#warning";
+  case PreprocessingStructureKind::OtherDirective:
+    return "#directive";
+  }
+  llvm_unreachable("invalid preprocessing-structure kind");
+}
+
+} // namespace
+
+RefoldTUEditPlanner::RefoldTUEditPlanner(Deps deps) : deps_(std::move(deps)) {
+  DenseSet<uint64_t> seenPP;
+  for (const RefoldModel::TokMapEntry &entry : deps_.model.GetTokmap()) {
+    if (!seenPP.insert(entry.pp).second)
+      duplicateTokmapPP_.insert(entry.pp);
+  }
+}
+
+bool RefoldTUEditPlanner::ValidateDirectTUEnvelope(
+    StringRef tuPath, uint64_t begin, uint64_t end,
+    ArrayRef<DirectTUMacroStateAuthorization> authorizations) const {
+  if (end < begin || end > deps_.tuSourceBytes.size() ||
+      deps_.preprocessingStructureIndex.GetOwnerIncludeId() ||
+      !deps_.pathIdentity.PathsEqual(tuPath, deps_.model.GetSourcePath()) ||
+      !deps_.pathIdentity.PathsEqual(
+          deps_.preprocessingStructureIndex.GetSourcePath(), tuPath)) {
+    return false;
+  }
+  return deps_.preprocessingStructureIndex.ValidateDirectTUEnvelope(
+      begin, end, authorizations);
+}
 
 bool RefoldTUEditPlanner::IsPPGapAtSelectedConditionalArmExit(
     uint64_t ppGap) const {
@@ -748,6 +822,43 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
 }
 
 std::optional<TUByteSpanPlan>
+RefoldTUEditPlanner::ProjectTUByteEnvelopeForOwnership(
+    uint64_t a0, uint64_t a1, StringRef tuPath) const {
+  if (a0 > a1)
+    std::swap(a0, a1);
+
+  if (a0 == a1) {
+    if (auto anchor = FindProvableTUInsertionAnchor(a0, tuPath))
+      return TUByteSpanPlan(a0, a1, anchor->tuByteOffset,
+                            anchor->tuByteOffset, std::move(anchor));
+    return std::nullopt;
+  }
+
+  // This is a topology projection only.  It deliberately preserves the legacy
+  // min/max TU-owned subset behavior used by owner classification and does not
+  // authorize a source edit.  Concrete direct realization must call
+  // PlanTUByteSpan(), whose theorem is strictly stronger.
+  uint64_t minimumBegin = std::numeric_limits<uint64_t>::max();
+  uint64_t maximumEnd = 0;
+  bool foundTUToken = false;
+  const auto &tokmapByPP = deps_.model.GetTokmapByPP();
+  for (uint64_t pp = a0; pp < a1; ++pp) {
+    auto entryIt = tokmapByPP.find(pp);
+    if (entryIt == tokmapByPP.end())
+      continue;
+    const RefoldModel::TokMapEntry &entry = entryIt->second;
+    if (!deps_.pathIdentity.PathsEqual(entry.file, tuPath))
+      continue;
+    minimumBegin = std::min(minimumBegin, entry.b);
+    maximumEnd = std::max(maximumEnd, entry.e);
+    foundTUToken = true;
+  }
+  if (!foundTUToken)
+    return std::nullopt;
+  return TUByteSpanPlan(a0, a1, minimumBegin, maximumEnd);
+}
+
+std::optional<TUByteSpanPlan>
 RefoldTUEditPlanner::PlanTUByteSpan(uint64_t a0, uint64_t a1,
                                     StringRef tuPath) const {
   if (a0 > a1)
@@ -756,44 +867,158 @@ RefoldTUEditPlanner::PlanTUByteSpan(uint64_t a0, uint64_t a1,
   const bool isEmpty = (a0 == a1);
   const auto &tokmapByPP = deps_.model.GetTokmapByPP();
 
-  // For pure insertions, use the same conservative TU-anchor proof used by
-  // HunkMapsToTU so classification and concrete TU realization cannot diverge.
+  // Emit one deterministic rejection block at the exact direct-TU proof
+  // boundary.  The diagnostic projection below is evidence-only: it reuses the
+  // legacy min/max TU ownership envelope solely to explain what a rejected edit
+  // would have consumed.  It never participates in admission.  In particular,
+  // listing a protected interval does not manufacture structural-tiling
+  // authority; the generalized tiler must still prove an exact partition.
+  auto reject = [&](StringRef reason,
+                    StringRef requiredAction) -> std::optional<TUByteSpanPlan> {
+    if (!inTraceMode())
+      return std::nullopt;
+
+    REFOLD_LOG_TRACE("tu/direct-span", "direct TU span rejected:");
+    REFOLD_LOG_TRACE("tu/direct-span", "A=[{0},{1})", a0, a1);
+    REFOLD_LOG_TRACE("tu/direct-span", "reason={0}", reason);
+
+    bool listedProtectedStructure = false;
+    if (!isEmpty) {
+      std::optional<TUByteSpanPlan> candidate =
+          ProjectTUByteEnvelopeForOwnership(a0, a1, tuPath);
+      if (candidate) {
+        REFOLD_LOG_TRACE("tu/direct-span", "candidate source=[{0},{1})",
+                         candidate->tuByteBegin, candidate->tuByteEnd);
+        for (const PreprocessingStructureInterval *interval :
+             deps_.preprocessingStructureIndex.FindOverlapping(
+                 candidate->tuByteBegin, candidate->tuByteEnd)) {
+          listedProtectedStructure = true;
+          REFOLD_LOG_TRACE(
+              "tu/direct-span",
+              "protected structure=[{0},{1}) {2} kind={3} model={4} "
+              "modelItem={5} conditionalGroup={6} conditionalArm={7} "
+              "ownerArm={8}",
+              interval->begin, interval->end,
+              directTUDiagnosticDirectiveSpelling(interval->kind),
+              interval->kind, interval->modelKind,
+              interval->modelItemId, interval->conditionalGroupId,
+              interval->conditionalArmId, interval->ownerConditionalArmId);
+        }
+      } else {
+        REFOLD_LOG_TRACE("tu/direct-span", "candidate source=<unavailable>");
+      }
+    } else {
+      REFOLD_LOG_TRACE("tu/direct-span",
+                       "candidate source=<zero-width insertion anchor>");
+    }
+
+    if (!listedProtectedStructure)
+      REFOLD_LOG_TRACE("tu/direct-span", "protected structure=<none listed>");
+    REFOLD_LOG_TRACE("tu/direct-span", "required action={0}",
+                     requiredAction);
+    return std::nullopt;
+  };
+
   if (isEmpty) {
     if (auto anchor = FindProvableTUInsertionAnchor(a0, tuPath))
-      return TUByteSpanPlan(a0, a1, anchor->tuByteOffset, anchor->tuByteOffset,
-                            std::move(anchor));
+      return TUByteSpanPlan(a0, a1, anchor->tuByteOffset,
+                            anchor->tuByteOffset, std::move(anchor));
+    return reject("no provable TU insertion anchor",
+                  "ordinary insertion owner/fallback path");
   }
 
-  // Non-empty: compute min/max over TU-mapped subset only.
-  uint64_t minB = std::numeric_limits<uint64_t>::max();
-  uint64_t maxE = 0;
-  bool foundTuToken = false;
-
-  // Compute the minimal TU byte envelope covered by the mapped A-side tokens in
-  // this hunk, ignoring unmapped PP bytes and tokens that belong to other
-  // files.
-  for (uint64_t i = a0; i < a1; ++i) {
-    auto it = tokmapByPP.find(i);
-    if (it == tokmapByPP.end())
-      continue;
-
-    const auto &ent = it->second;
-    if (!deps_.pathIdentity.PathsEqual(ent.file, tuPath))
-      continue;
-
-    if (ent.b < minB)
-      minB = ent.b;
-    if (ent.e > maxE)
-      maxE = ent.e;
-    foundTuToken = true;
+  // A nonempty direct-TU realization is a one-owner physical-source theorem,
+  // not a best-effort min/max projection.  Every consumed A token must have one
+  // unambiguous, complete, in-bounds TU spelling.  Producer binding failures
+  // elsewhere in the file do not poison this local proof: lexically discovered
+  // unbound directives remain protected intervals and reject only overlapping
+  // spans.  A protection-census failure does poison the proof because some
+  // conditional or pragma state then lacks a complete physical boundary.
+  if (a1 > deps_.model.GetTokensCountA() ||
+      a1 > static_cast<uint64_t>(deps_.aTokens.size())) {
+    return reject("A-token envelope is outside the producer/token stream",
+                  "safe owner/fallback path");
+  }
+  if (!deps_.pathIdentity.PathsEqual(tuPath, deps_.model.GetSourcePath()) ||
+      !deps_.pathIdentity.PathsEqual(
+          tuPath, deps_.preprocessingStructureIndex.GetSourcePath()) ||
+      deps_.preprocessingStructureIndex.GetOwnerIncludeId()) {
+    return reject("requested source owner is not the direct translation unit",
+                  "owner-specific realization/fallback path");
+  }
+  if (!deps_.preprocessingStructureIndex
+           .IsDirectTUProtectionCensusComplete()) {
+    return reject("direct-TU preprocessing protection census is incomplete",
+                  "safe fallback after structure-census repair");
   }
 
-  if (foundTuToken)
-    return TUByteSpanPlan(a0, a1, minB, maxE);
+  uint64_t spanBegin = 0;
+  uint64_t spanEnd = 0;
+  uint64_t previousBegin = 0;
+  uint64_t previousEnd = 0;
+  bool havePrevious = false;
+  std::vector<DirectTUMacroStateAuthorization> authorizations;
 
-  // No TU byte span: either this is an empty hunk with no safe TU insertion
-  // anchor, or a non-empty hunk with no TU-owned mapped tokens.
-  return std::nullopt;
+  for (uint64_t pp = a0; pp < a1; ++pp) {
+    if (duplicateTokmapPP_.count(pp) != 0) {
+      return reject("duplicate producer token mapping inside A envelope",
+                    "safe owner/fallback path");
+    }
+
+    auto entryIt = tokmapByPP.find(pp);
+    if (entryIt == tokmapByPP.end()) {
+      return reject("missing producer token mapping inside A envelope",
+                    "safe owner/fallback path");
+    }
+
+    const RefoldModel::TokMapEntry &entry = entryIt->second;
+    if (entry.pp != pp ||
+        !deps_.pathIdentity.PathsEqual(entry.file, tuPath) ||
+        entry.b >= entry.e || entry.e > deps_.tuSourceBytes.size() ||
+        !deps_.preprocessingStructureIndex.IsExactTokenSpellingInterval(
+            entry.b, entry.e)) {
+      return reject("A token lacks one exact in-bounds TU spelling",
+                    "owner-specific realization/fallback path");
+    }
+
+    if (!havePrevious) {
+      spanBegin = entry.b;
+      spanEnd = entry.e;
+      previousBegin = entry.b;
+      previousEnd = entry.e;
+      havePrevious = true;
+      continue;
+    }
+
+    if (entry.b < previousBegin || entry.b < previousEnd) {
+      return reject("mapped TU token spellings are nonmonotone or overlap",
+                    "safe owner/fallback path");
+    }
+
+    if (previousEnd < entry.b &&
+        !deps_.preprocessingStructureIndex.ProveDirectTUInternalGap(
+            previousEnd, entry.b, authorizations)) {
+      return reject("internal source gap is not authorized direct-TU trivia or "
+                    "macro-state repair",
+                    "structural hunk tiling");
+    }
+
+    previousBegin = entry.b;
+    previousEnd = entry.e;
+    spanEnd = entry.e;
+  }
+
+  if (!havePrevious) {
+    return reject("A envelope contains no directly mapped TU token",
+                  "safe owner/fallback path");
+  }
+  if (!ValidateDirectTUEnvelope(tuPath, spanBegin, spanEnd, authorizations)) {
+    return reject("candidate TU envelope contains unproved protected source",
+                  "structural hunk tiling or directive-specific fallback");
+  }
+
+  return TUByteSpanPlan(a0, a1, spanBegin, spanEnd, std::nullopt,
+                        std::move(authorizations));
 }
 
 std::optional<TUByteSpanPlan>
@@ -801,6 +1026,119 @@ RefoldTUEditPlanner::PlanTUByteSpan(const TUEditPlanningContext &ctx) const {
   if (!ctx.hunk)
     return std::nullopt;
   return PlanTUByteSpan(ctx.hunk->aStart, ctx.hunk->aEnd, ctx.tuPath);
+}
+
+bool RefoldTUEditPlanner::ValidateTUOwnerRealizationCarrier(
+    const diffutils::Hunk &hunk, const TUByteSpanPlan &span,
+    const StructuralHunkSegmentBinding *structuralBinding) const {
+  // A direct owner carrier must describe the exact token hunk that produced
+  // the edit.  In particular, a valid zero-width A range is a pure insertion,
+  // not permission to replace an arbitrary source interval with manufactured
+  // A=[0,0) / B=[0,0) proof coordinates.
+  if (hunk.aEnd < hunk.aStart || hunk.bEnd < hunk.bStart ||
+      hunk.aEnd > static_cast<uint64_t>(deps_.aTokens.size()) ||
+      hunk.aEnd > deps_.model.GetTokensCountA() ||
+      hunk.bEnd > deps_.bTokenCount ||
+      (hunk.aStart == hunk.aEnd && hunk.bStart == hunk.bEnd) ||
+      span.aTokenBegin != hunk.aStart || span.aTokenEnd != hunk.aEnd ||
+      span.tuByteEnd < span.tuByteBegin) {
+    return false;
+  }
+
+  if (structuralBinding) {
+    // Structural authority is segment-specific.  It may explain why an
+    // original hunk was split, but it may not widen this segment's source or
+    // token envelopes, and it may not be represented by a bare witness id.
+    if (!structuralBinding->IsWellFormed() ||
+        structuralBinding->segmentAStart != hunk.aStart ||
+        structuralBinding->segmentAEnd != hunk.aEnd ||
+        structuralBinding->segmentBStart != hunk.bStart ||
+        structuralBinding->segmentBEnd != hunk.bEnd ||
+        structuralBinding->sourceBegin != span.tuByteBegin ||
+        structuralBinding->sourceEnd != span.tuByteEnd) {
+      return false;
+    }
+  }
+
+  const StringRef tuPath = deps_.model.GetSourcePath();
+  std::optional<TUByteSpanPlan> baseSpan =
+      PlanTUByteSpan(hunk.aStart, hunk.aEnd, tuPath);
+  if (!baseSpan)
+    return false;
+
+  if (hunk.isInsertOnly()) {
+    // A pure insertion retains the exact producer/provenance anchor even when
+    // a separate theorem consumes adjacent trivia or moves the insertion past
+    // a preserved source #line prefix.  The base anchor therefore remains the
+    // carrier identity; the final physical edit must either contain that anchor
+    // or carry the typed line-control adjustment proved below.
+    if (!span.insertionAnchor || !baseSpan->insertionAnchor ||
+        span.insertionAnchor->ppGap != hunk.aStart ||
+        baseSpan->insertionAnchor->ppGap != hunk.aStart ||
+        span.insertionAnchor->tuByteOffset != baseSpan->tuByteBegin ||
+        baseSpan->insertionAnchor->tuByteOffset != baseSpan->tuByteBegin ||
+        !span.macroStateAuthorizations.empty() ||
+        !ValidateDirectTUEnvelope(tuPath, span.tuByteBegin, span.tuByteEnd,
+                                  {})) {
+      return false;
+    }
+
+    const uint64_t baseAnchor = baseSpan->tuByteBegin;
+    if (!span.insertionAnchorAdjustment) {
+      return span.tuByteBegin <= baseAnchor &&
+             baseAnchor <= span.tuByteEnd;
+    }
+
+    const TUInsertionAnchorAdjustment &adjustment =
+        *span.insertionAnchorAdjustment;
+    if (!adjustment.IsValid() ||
+        adjustment.kind !=
+            TUInsertionAnchorAdjustmentKind::SourceLineControlPrefix ||
+        adjustment.originalTUByteOffset != baseAnchor ||
+        adjustment.adjustedTUByteOffset != span.tuByteBegin ||
+        span.tuByteBegin != span.tuByteEnd) {
+      return false;
+    }
+
+    // The adjustment theorem leaves the skipped #line structure physically in
+    // place.  Revalidate that the complete byte interval between the original
+    // and adjusted anchors consists only of exact producer-bound line-control
+    // directives and lexer trivia; no other preprocessing state may be crossed.
+    uint64_t cursor = adjustment.originalTUByteOffset;
+    for (const PreprocessingStructureInterval *interval :
+         deps_.preprocessingStructureIndex.FindOverlapping(
+             adjustment.originalTUByteOffset,
+             adjustment.adjustedTUByteOffset)) {
+      if (interval->begin < adjustment.originalTUByteOffset ||
+          adjustment.adjustedTUByteOffset < interval->end ||
+          interval->kind != PreprocessingStructureKind::LineControl ||
+          interval->modelKind !=
+              PreprocessingStructureModelKind::LineControlEvent ||
+          !interval->modelItemId || interval->begin < cursor ||
+          !deps_.preprocessingStructureIndex.IsRangeLexicallyIgnorable(
+              cursor, interval->begin)) {
+        return false;
+      }
+      cursor = interval->end;
+    }
+    return cursor > adjustment.originalTUByteOffset &&
+           deps_.preprocessingStructureIndex.IsRangeLexicallyIgnorable(
+               cursor, adjustment.adjustedTUByteOffset);
+  }
+
+  // Boundary widening performed by a separate suffix/separator theorem may
+  // make the emitted source interval larger than the base token carrier.  It
+  // still has to contain that independently re-derived carrier and retain
+  // exactly the same producer-bound macro-state obligations.
+  if (span.tuByteBegin > baseSpan->tuByteBegin ||
+      baseSpan->tuByteEnd > span.tuByteEnd ||
+      span.macroStateAuthorizations !=
+          baseSpan->macroStateAuthorizations) {
+    return false;
+  }
+
+  return ValidateDirectTUEnvelope(tuPath, span.tuByteBegin, span.tuByteEnd,
+                                  span.macroStateAuthorizations);
 }
 
 std::optional<BoundaryParentIncludePlan>
@@ -954,7 +1292,8 @@ RefoldTUEditPlanner::MaybeExtendTUSpanOverClosedTrailingCallSuffix(
   const bool closed =
       extEnd != oldEnd && TUReplacementExtensionIsBTokenClosed(
                               h.aEnd, oldEnd, extEnd, h.bStart, h.bEnd, tuPath);
-  if (!closed)
+  if (!closed ||
+      !ValidateDirectTUEnvelope(tuPath, oldEnd, extEnd, {}))
     return std::nullopt;
 
   return TUTrailingCallSuffixExtension(h.aEnd, h.aEnd, oldEnd, extEnd, h.bStart,
@@ -981,18 +1320,39 @@ void RefoldTUEditPlanner::MaybeExtendTUSpanOverClosedTrailingCallSuffix(
     span.second = extension->extendedTUByteEnd;
 }
 
-DirectTUHunkEditPlan RefoldTUEditPlanner::BuildDirectTUHunkEditPlan(
+std::optional<DirectTUHunkEditPlan>
+RefoldTUEditPlanner::BuildDirectTUHunkEditPlan(
     const diffutils::Hunk &h, uint64_t hunkIndex,
     const std::pair<uint64_t, uint64_t> &span, ResyncOutcome resync,
     StringRef acceptedPayload, uint64_t rawTUStart, uint64_t rawTUEnd,
     std::optional<uint64_t> materializedBByteBegin,
     std::optional<uint64_t> materializedBByteEnd,
-    AcceptedPathKind acceptedPath) const {
+    AcceptedPathKind acceptedPath,
+    std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment) const {
+  // Re-prove the original A-token carrier at the last direct-plan
+  // construction boundary. Callers may legitimately widen the already-proved
+  // raw range through a specialized suffix/separator theorem, but they may not
+  // manufacture a different raw carrier or let the final physical edit cross
+  // preprocessing structure. Pure insertions retain their exact base anchor;
+  // movement past source #line prefixes requires the typed adjustment witness.
+  std::optional<TUByteSpanPlan> rawSpan = PlanTUByteSpan(
+      h.aStart, h.aEnd, deps_.model.GetSourcePath());
+  if (!rawSpan || rawSpan->tuByteBegin != rawTUStart ||
+      rawSpan->tuByteEnd != rawTUEnd || span.second < span.first) {
+    return std::nullopt;
+  }
+
+  TUByteSpanPlan spanPlan(
+      h.aStart, h.aEnd, span.first, span.second, rawSpan->insertionAnchor,
+      std::move(rawSpan->macroStateAuthorizations),
+      std::move(insertionAnchorAdjustment));
+  if (!ValidateTUOwnerRealizationCarrier(h, spanPlan))
+    return std::nullopt;
+
   // Direct-TU hunk planning records the already-proved TU byte range and all
-  // hunk-local attribution needed by the eventual TextEdit.  It intentionally
+  // hunk-local attribution needed by the eventual TextEdit. It intentionally
   // does not certify accepted-result carriers or participate in final edit
   // ordering; those remain the assembler/audit boundary's responsibility.
-  TUByteSpanPlan spanPlan(h.aStart, h.aEnd, span.first, span.second);
   return DirectTUHunkEditPlan(h, hunkIndex, std::move(spanPlan),
                               std::optional<ResyncOutcome>(std::move(resync)),
                               acceptedPayload.str(), rawTUStart, rawTUEnd,
@@ -1006,15 +1366,16 @@ RefoldTUEditPlanner::BuildDirectTUHunkEditPlan(
     ResyncOutcome resync, StringRef acceptedPayload, uint64_t rawTUStart,
     uint64_t rawTUEnd, std::optional<uint64_t> materializedBByteBegin,
     std::optional<uint64_t> materializedBByteEnd,
-    AcceptedPathKind acceptedPath) const {
+    AcceptedPathKind acceptedPath,
+    std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment) const {
   if (!ctx.hunk)
     return std::nullopt;
 
-  return DirectTUHunkEditPlan(*ctx.hunk, ctx.hunkIndex, span,
-                              std::optional<ResyncOutcome>(std::move(resync)),
-                              acceptedPayload.str(), rawTUStart, rawTUEnd,
-                              materializedBByteBegin, materializedBByteEnd,
-                              acceptedPath);
+  return BuildDirectTUHunkEditPlan(
+      *ctx.hunk, ctx.hunkIndex, span.byteRange(), std::move(resync),
+      acceptedPayload, rawTUStart, rawTUEnd, materializedBByteBegin,
+      materializedBByteEnd, acceptedPath,
+      std::move(insertionAnchorAdjustment));
 }
 
 bool maybeAdvanceTUInsertionPastSourceLineControlPrefix(

@@ -94,6 +94,7 @@
 #include "proof/RefoldProofLattice.h"
 #include "sideband/RefoldSidebandPragmaEdits.h"
 #include "source/RefoldMixedOwnerTilingPlanner.h"
+#include "source/RefoldPreprocessingStructureIndex.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
 #include "source/RefoldTokenDiffPlanner.h"
 #include "source/TokenTextHelpers.h"
@@ -150,6 +151,117 @@ using namespace llvm;
 namespace clang {
 namespace refold {
 
+namespace {
+
+/// Verify that every durable structural segment binding names one exact
+/// normalized hunk and the matching token edge in its parent witness.
+///
+/// The tiler lowers proof-rich structural partitions back into ordinary
+/// `diffutils::Hunk` values.  Insertion provenance and owner dispatch index
+/// those lowered hunks by position, so accepting a stale binding from an
+/// intermediate normalization would silently attach the wrong proof carrier.
+/// This check is deliberately independent of owner classification: it proves
+/// only that the normalization transaction published one coherent hunk/ledger
+/// snapshot before downstream planning begins.
+bool structuralTilingLedgersMatchNormalizedHunks(
+    ArrayRef<diffutils::Hunk> hunks,
+    ArrayRef<MixedOwnerTilingWitness> witnesses,
+    ArrayRef<MixedOwnerTilingSegmentBinding> bindings, std::string &failure) {
+  for (const MixedOwnerTilingSegmentBinding &binding : bindings) {
+    if (binding.witnessIndex >= witnesses.size()) {
+      failure = llvm::formatv(
+                    "binding witness index {0} is outside ledger size {1}",
+                    binding.witnessIndex, witnesses.size())
+                    .str();
+      return false;
+    }
+
+    const MixedOwnerTilingWitness &witness =
+        witnesses[binding.witnessIndex];
+    if (witness.witnessId != binding.parentTilingWitnessId) {
+      failure = llvm::formatv(
+                    "binding witness id {0} does not match ledger id {1}",
+                    binding.parentTilingWitnessId, witness.witnessId)
+                    .str();
+      return false;
+    }
+    if (binding.segmentIndex >= witness.edges.size()) {
+      failure = llvm::formatv(
+                    "binding segment index {0} is outside witness edge count "
+                    "{1}",
+                    binding.segmentIndex, witness.edges.size())
+                    .str();
+      return false;
+    }
+
+    const MixedOwnerTilingSegmentWitness &edge =
+        witness.edges[binding.segmentIndex];
+    if (edge.kind != MixedOwnerTilingEdgeKind::TokenSegment ||
+        edge.aStart != binding.aStart || edge.aEnd != binding.aEnd ||
+        edge.bStart != binding.bStart || edge.bEnd != binding.bEnd) {
+      failure = llvm::formatv(
+                    "binding A=[{0},{1}) B=[{2},{3}) does not match token "
+                    "edge #{4} of witness {5}",
+                    binding.aStart, binding.aEnd, binding.bStart, binding.bEnd,
+                    binding.segmentIndex, binding.parentTilingWitnessId)
+                    .str();
+      return false;
+    }
+
+    size_t matchingHunkCount = 0;
+    for (const diffutils::Hunk &hunk : hunks) {
+      if (hunk.aStart == binding.aStart && hunk.aEnd == binding.aEnd &&
+          hunk.bStart == binding.bStart && hunk.bEnd == binding.bEnd) {
+        ++matchingHunkCount;
+      }
+    }
+    if (matchingHunkCount != 1) {
+      failure = llvm::formatv(
+                    "binding A=[{0},{1}) B=[{2},{3}) matches {4} normalized "
+                    "hunks instead of exactly one",
+                    binding.aStart, binding.aEnd, binding.bStart, binding.bEnd,
+                    matchingHunkCount)
+                    .str();
+      return false;
+    }
+  }
+
+  // Every emitted token edge must also have exactly one reverse binding.  The
+  // forward check above rejects stale bindings; this reverse check rejects a
+  // partially published witness whose segment would reach owner dispatch
+  // without the structural authority that justified its split.
+  for (size_t witnessIndex = 0; witnessIndex < witnesses.size();
+       ++witnessIndex) {
+    const MixedOwnerTilingWitness &witness = witnesses[witnessIndex];
+    for (size_t edgeIndex = 0; edgeIndex < witness.edges.size(); ++edgeIndex) {
+      const MixedOwnerTilingSegmentWitness &edge = witness.edges[edgeIndex];
+      if (edge.kind != MixedOwnerTilingEdgeKind::TokenSegment)
+        continue;
+
+      size_t matchingBindingCount = 0;
+      for (const MixedOwnerTilingSegmentBinding &binding : bindings) {
+        if (binding.witnessIndex == witnessIndex &&
+            binding.parentTilingWitnessId == witness.witnessId &&
+            binding.segmentIndex == edgeIndex) {
+          ++matchingBindingCount;
+        }
+      }
+      if (matchingBindingCount != 1) {
+        failure = llvm::formatv(
+                      "token edge #{0} of witness {1} has {2} reverse "
+                      "bindings instead of exactly one",
+                      edgeIndex, witness.witnessId, matchingBindingCount)
+                      .str();
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+} // namespace
+
 RefoldEngine::RefoldEngine(
     RefoldModel model, StringRef aSource, ArrayRef<PPTok> aToks,
     ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
@@ -199,6 +311,7 @@ RefoldEngine::RefoldEngine(
   InitializeTheoremAudit();
   InitializeOwnerStateProof();
   InitializeMacroStateProof();
+  InitializePreprocessingStructureIndex();
   InitializeTokenDiffPlanner();
   InitializeTUAnchorProof();
   InitializeTUEditPlanner();
@@ -354,25 +467,32 @@ bool RefoldEngine::ValidateTokenCount() {
 
 std::unique_ptr<llvm::MemoryBuffer>
 RefoldEngine::LoadTUSource(StringRef tuPath) {
-  // Read in the translation unit file / C source.
-  std::unique_ptr<llvm::MemoryBuffer> tuBuffer;
-  {
-    const auto fullTuPath = lineDirs_.ToAbsolutePath(tuPath);
-    auto bufOrErr = MemoryBuffer::getFile(fullTuPath);
-    if (!bufOrErr) {
-      // Fatal and stop: unreachable past this point.
-      REFOLD_LOG_FATAL("src/load", "failed to read C source: {0} ({1})",
-                       fullTuPath, bufOrErr.getError().message());
-    }
+  if (tuSourceLoadError_)
+    REFOLD_LOG_FATAL("src/load", "{0}", *tuSourceLoadError_);
 
-    // Don't need a copy of the bytes here due to lifetime reasoning.
-    tuBuffer = std::move(*bufOrErr);
-  }
-  return tuBuffer;
+  // Reuse the exact byte snapshot indexed during service-graph construction.
+  // Re-reading the file here would permit a filesystem race in which
+  // PlanTUByteSpan() proves ranges against one version of the TU while final
+  // edit assembly applies them to another.  A private MemoryBuffer copy keeps
+  // the existing caller lifetime contract while preserving byte identity with
+  // the preprocessing-structure census.
+  return MemoryBuffer::getMemBufferCopy(tuSourceBytes_, tuPath);
 }
 
 std::vector<diffutils::Hunk>
 RefoldEngine::PlanTokenDiff(StringRef tuPath, StringRef tuBytes) {
+  // PlanTokenDiff is the only phase boundary allowed to expose structural
+  // hunks.  Re-entry would permit an insertion ledger or owner classifier to
+  // retain indices into a stale normalization, so reject it as an internal
+  // pipeline violation rather than trying to rebuild partially consumed state.
+  if (structuralHunkPlanningPhase_ !=
+      StructuralHunkPlanningPhase::NotStarted) {
+    REFOLD_LOG_FATAL(
+        "plan/order",
+        "token-diff planning entered from invalid structural phase {0}",
+        static_cast<unsigned>(structuralHunkPlanningPhase_));
+  }
+
   // 1) Build the initial A/B token diff and refresh the per-run diff caches.
   //
   // RefoldTokenDiffPlanner owns lexeme mapping, LCS provenance construction,
@@ -382,6 +502,8 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath, StringRef tuBytes) {
   assert(tokenDiffPlanner_ && "token diff planner service not initialized");
   RefoldTokenDiffPlanner::TokenDiffPlan diffPlan = tokenDiffPlanner_->Plan();
   std::vector<diffutils::Hunk> hunks = std::move(diffPlan.hunks);
+  structuralHunkPlanningPhase_ =
+      StructuralHunkPlanningPhase::InitialTokenDiffBuilt;
 
   REFOLD_LOG_DEBUG(
       "plan",
@@ -390,15 +512,45 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath, StringRef tuBytes) {
       tuPath, model_.GetIncludes().size(), model_.GetMacroInvocations().size(),
       model_.GetTokmapByPP().size());
 
-  // The token-diff planner caches the pre-tiling token hunks for A->B envelope
-  // projection.  Mixed-owner tiling may replace this vector with split hunks
-  // after it proves a deterministic owner partition.
-
+  // 2) Normalize the initial hunk sequence before any owner-sensitive state is
+  // built.  The generalized tiler may lower one structural deletion to several
+  // ordinary token hunks, but downstream services continue to consume only the
+  // normalized vector and its durable segment bindings.
   assert(mixedOwnerTilingPlanner_ &&
-         "mixed-owner tiling planner service not initialized");
-  RefoldMixedOwnerTilingPlanner::MixedOwnerTilingPlan mixedOwnerPlan =
+         "structural tiling planner service not initialized");
+  RefoldMixedOwnerTilingPlanner::MixedOwnerTilingPlan structuralTilingPlan =
       mixedOwnerTilingPlanner_->Plan(std::move(hunks), tuBytes);
-  hunks = std::move(mixedOwnerPlan.hunks);
+  hunks = std::move(structuralTilingPlan.hunks);
+
+  // The planner writes the shared token-hunk cache and durable ledgers as part
+  // of the same normalization transaction.  Validate that transaction before
+  // insertion provenance records hunk indices; after that point a mismatch
+  // could redirect claims or owner dispatch to the wrong segment.
+  std::string structuralLedgerFailure;
+  const bool structuralLedgersAgree =
+      structuralTilingLedgersMatchNormalizedHunks(
+          hunks, mixedOwnerTilingWitnesses_,
+          mixedOwnerTilingSegmentBindings_, structuralLedgerFailure);
+  if (abTokHunks_ != hunks ||
+      structuralTilingPlan.mixedOwnerWitnessCount !=
+          mixedOwnerTilingWitnesses_.size() ||
+      structuralTilingPlan.segmentBindingCount !=
+          mixedOwnerTilingSegmentBindings_.size() ||
+      !structuralLedgersAgree) {
+    REFOLD_LOG_FATAL(
+        "plan/order",
+        "structural tiling did not atomically publish its normalized hunks "
+        "and ledgers: returnedHunks={0} cachedHunks={1} "
+        "reportedWitnesses={2} durableWitnesses={3} "
+        "reportedBindings={4} durableBindings={5} detail={6}",
+        hunks.size(), abTokHunks_.size(),
+        structuralTilingPlan.mixedOwnerWitnessCount,
+        mixedOwnerTilingWitnesses_.size(),
+        structuralTilingPlan.segmentBindingCount,
+        mixedOwnerTilingSegmentBindings_.size(), structuralLedgerFailure);
+  }
+  structuralHunkPlanningPhase_ =
+      StructuralHunkPlanningPhase::StructuralTilingComplete;
 
   if (inDebugMode()) {
     size_t insertOnlyHunks = 0;
@@ -415,17 +567,24 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath, StringRef tuBytes) {
     }
     debug("diff",
           "token diff normalized: hunks={0} replacements={1} insertions={2} "
-          "deletions={3} mixedOwnerWitnesses={4}",
+          "deletions={3} structuralTilingWitnesses={4}",
           hunks.size(), replaceHunks, insertOnlyHunks, deleteOnlyHunks,
           mixedOwnerTilingWitnesses_.size());
   }
 
-  // Build provenance for token-level pure insertions (B-only hunks) and
-  // pre-claim standalone insertions before macro patching so whole-cover
-  // replacements can deterministically avoid double-emitting insertion
-  // payloads.
+  // 3) Build provenance from the normalized sequence only.  In particular, a
+  // structural deletion lowered to A=[a0,a1), B=[q,q) segments must not leave
+  // insertion or claim indices referring to the original unsplit hunk.
+  if (structuralHunkPlanningPhase_ !=
+      StructuralHunkPlanningPhase::StructuralTilingComplete) {
+    REFOLD_LOG_FATAL("plan/order",
+                     "insertion provenance requested before structural "
+                     "tiling completed");
+  }
   BInsertionLedger().BuildProvenance(hunks);
   BInsertionLedger().PreclaimStandaloneInsertions(tuPath, hunks);
+  structuralHunkPlanningPhase_ =
+      StructuralHunkPlanningPhase::InsertionLedgerReady;
   return hunks;
 }
 
@@ -499,6 +658,24 @@ bool RefoldEngine::StageSidebandEdits(
 bool RefoldEngine::DispatchStructuralHunks(
     StringRef tuPath, StringRef tuBytes, ArrayRef<diffutils::Hunk> hunks,
     RefoldStructuralHunkDispatcher &structuralHunkDispatcher) {
+  // Owner classification, direct TU planning, and macro/include selection must
+  // all observe exactly the hunk sequence used to build insertion provenance.
+  // This guard prevents a future orchestration change from dispatching the
+  // initial pre-tiling diff or from bypassing insertion-ledger construction.
+  const bool dispatchMatchesNormalizedCache =
+      hunks.size() == abTokHunks_.size() &&
+      std::equal(hunks.begin(), hunks.end(), abTokHunks_.begin());
+  if (structuralHunkPlanningPhase_ !=
+          StructuralHunkPlanningPhase::InsertionLedgerReady ||
+      !dispatchMatchesNormalizedCache) {
+    REFOLD_LOG_FATAL(
+        "plan/order",
+        "structural owner dispatch observed an uncommitted hunk plan: "
+        "phase={0} dispatchedHunks={1} cachedHunks={2}",
+        static_cast<unsigned>(structuralHunkPlanningPhase_), hunks.size(),
+        abTokHunks_.size());
+  }
+
   // Local lexical predicate used by the theorem-lattice tie-breaker below.
   // A top-level comma in replacement text would split the original invocation
   // argument list, so the otherwise-equivalent TU edit must stay behind the
@@ -669,8 +846,8 @@ bool RefoldEngine::DispatchStructuralHunks(
         ProofLattice()
             .AcceptedCandidateBuilder()
             .BuildAcceptedTUTextEditCandidate(
-                AcceptedPathKind::TUByteSpanMappedEdit, span.first, span.second,
-                replacement);
+                AcceptedPathKind::TUByteSpanMappedEdit, hunk, *spanPlan,
+                /*structuralBinding=*/nullptr, replacement);
     tuCandidate.proofSummary.selectionTieBreaker =
         TheoremSelectionTieBreakerKind::
             ExactTUArgumentEditOverEquivalentMacroArgsOnly;
@@ -933,6 +1110,12 @@ bool RefoldEngine::DispatchStructuralHunks(
         bool advancedOverSourceLineControlPrefix =
             maybeAdvanceTUInsertionPastSourceLineControlPrefix(
                 TUEditPlanner(), lineControlProof_, h, tuPath, tuBytes, span);
+        std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment;
+        if (advancedOverSourceLineControlPrefix) {
+          insertionAnchorAdjustment = TUInsertionAnchorAdjustment{
+              TUInsertionAnchorAdjustmentKind::SourceLineControlPrefix,
+              rawTUStart, span.first};
+        }
 
         // Is this span replacing a TU "gap" (bytes that are all whitespace)?
         std::string original;
@@ -980,12 +1163,15 @@ bool RefoldEngine::DispatchStructuralHunks(
                 ? ResyncOutcome(padded, std::nullopt)
                 : textEditAssembler_->ApplyResyncOrPend(
                       tuBytes, span.first, span.second, padded, tuPath);
-        structuralHunkDispatcher.AddTUEdit(
-            textEditAssembler_->BuildDirectTUHunkTextEdit(
-                h, i, span, std::move(ro), StringRef(padded), rawTUStart,
-                rawTUEnd, materializedBByteBegin, materializedBByteEnd,
-                AcceptedPathKind::TUByteSpanMappedEdit));
-        continue;
+        if (std::optional<TextEdit> directEdit =
+                textEditAssembler_->BuildDirectTUHunkTextEdit(
+                    h, i, span, std::move(ro), StringRef(padded), rawTUStart,
+                    rawTUEnd, materializedBByteBegin, materializedBByteEnd,
+                    AcceptedPathKind::TUByteSpanMappedEdit,
+                    std::move(insertionAnchorAdjustment))) {
+          structuralHunkDispatcher.AddTUEdit(std::move(*directEdit));
+          continue;
+        }
       }
     }
 
@@ -1131,6 +1317,12 @@ bool RefoldEngine::DispatchStructuralHunks(
       bool advancedOverSourceLineControlPrefix =
           maybeAdvanceTUInsertionPastSourceLineControlPrefix(
               TUEditPlanner(), lineControlProof_, h, tuPath, tuBytes, span);
+      std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment;
+      if (advancedOverSourceLineControlPrefix) {
+        insertionAnchorAdjustment = TUInsertionAnchorAdjustment{
+            TUInsertionAnchorAdjustmentKind::SourceLineControlPrefix,
+            rawTUStart, span.first};
+      }
 
       // If we are replacing whitespace-only text in the TU, we prefer to
       // preserve the existing TU gap whitespace rather than introducing new
@@ -1177,12 +1369,15 @@ bool RefoldEngine::DispatchStructuralHunks(
               ? ResyncOutcome(padded, std::nullopt)
               : textEditAssembler_->ApplyResyncOrPend(
                     tuBytes, span.first, span.second, padded, tuPath);
-      structuralHunkDispatcher.AddTUEdit(
-          textEditAssembler_->BuildDirectTUHunkTextEdit(
-              h, i, span, std::move(ro), StringRef(padded), rawTUStart,
-              rawTUEnd, materializedBByteBegin, materializedBByteEnd,
-              AcceptedPathKind::TUByteSpanConservativeEdit));
-      continue;
+      if (std::optional<TextEdit> directEdit =
+              textEditAssembler_->BuildDirectTUHunkTextEdit(
+                  h, i, span, std::move(ro), StringRef(padded), rawTUStart,
+                  rawTUEnd, materializedBByteBegin, materializedBByteEnd,
+                  AcceptedPathKind::TUByteSpanConservativeEdit,
+                  std::move(insertionAnchorAdjustment))) {
+        structuralHunkDispatcher.AddTUEdit(std::move(*directEdit));
+        continue;
+      }
     }
 
     // Before we escalate to the explicit terminal out-of-domain carrier, try
@@ -1519,8 +1714,11 @@ std::string RefoldEngine::RunRefoldPass() {
       "ppModTokens={4}",
       tuPath, aSource_.size(), bSource_.size(), aToks_.size(), bToks_.size());
 
-  // Reset run-local token diff caches before any stage repopulates them for
-  // this structural pass.
+  // Reset the structural planning phase and run-local token diff caches before
+  // any stage repopulates them for this pass.  PlanTokenDiff() advances the
+  // phase monotonically through initial diff, tiling, and insertion-ledger
+  // publication before DispatchStructuralHunks() is allowed to run.
+  structuralHunkPlanningPhase_ = StructuralHunkPlanningPhase::NotStarted;
   abTokHunks_.clear();
   abTokMapA2B_.clear();
   abTokMapB2A_.clear();

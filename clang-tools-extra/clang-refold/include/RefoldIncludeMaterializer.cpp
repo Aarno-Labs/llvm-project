@@ -607,6 +607,17 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
                   {},
                   {}};
     edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
+    const PreprocessingStructureKind pragmaKinds[] = {
+        PreprocessingStructureKind::Pragma,
+        PreprocessingStructureKind::PragmaOperator};
+    if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
+            edit, ProtectedSourceEditAuthorityKind::SidebandPragmaEdit,
+            headerPath, includeId, bytes, sourceRange.first,
+            sourceRange.second, pragmaKinds,
+            /*requireProtectedInterval=*/false)) {
+      includeExpansion[includeId] = std::string();
+      return;
+    }
     textEditAssembler_.AttachAcceptedResultCarrier(
         edit, proofLattice_.AcceptedCandidateBuilder()
                   .BuildAcceptedIncludeRealizationCandidate(
@@ -673,6 +684,18 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
           {}};
       edit.lineControlPruneCandidates =
           std::move(ro.lineControlPruneCandidates);
+      if (editStart != mp.invRange.begin || editEnd != mpEnd) {
+        const PreprocessingStructureKind macroStateKinds[] = {
+            PreprocessingStructureKind::MacroDefine,
+            PreprocessingStructureKind::MacroUndef};
+        if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
+                edit, ProtectedSourceEditAuthorityKind::MacroStateRepair,
+                headerPath, includeId, bytes, editStart, editEnd,
+                macroStateKinds)) {
+          includeExpansion[includeId] = std::string();
+          return;
+        }
+      }
       textEditAssembler_.AttachAcceptedResultCarrier(
           edit, proofLattice_.AcceptedCandidateBuilder()
                     .BuildAcceptedEmittedMacroCandidate(mp));
@@ -880,6 +903,19 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
                           child->id))
             textEditAssembler_.CertifyTextEditMaterializedBByteRange(
                 edit, sidebandBRange->first, sidebandBRange->second);
+        }
+
+        const PreprocessingStructureKind includeKinds[] = {
+            PreprocessingStructureKind::Include,
+            PreprocessingStructureKind::IncludeNext,
+            PreprocessingStructureKind::Import};
+        if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
+                edit,
+                ProtectedSourceEditAuthorityKind::IncludeMaterialization,
+                headerPath, includeId, bytes, siteStart, siteEnd,
+                includeKinds)) {
+          includeExpansion[includeId] = std::string();
+          return;
         }
 
         // Preserve the child's accepted-result carrier if the child was
@@ -1203,6 +1239,8 @@ RefoldIncludeMaterializer::MakeCleanChildIncludeOperandRewriteEdit(
   patch.hasDirectHeaderByteRange = true;
   patch.directHeaderByteBegin = siteStart;
   patch.directHeaderByteEnd = siteEnd;
+  patch.directHeaderByteAuthority =
+      DirectHeaderByteEditAuthorityKind::IncludeDirectiveRewrite;
 
   IncludeAnchorWitness witness;
   witness.evidence = IncludeAnchorEvidenceKind::MappedHeaderTokens;
@@ -1216,6 +1254,16 @@ RefoldIncludeMaterializer::MakeCleanChildIncludeOperandRewriteEdit(
 
   TextEdit edit{siteStart,    siteEnd, replacement, std::nullopt,
                 std::nullopt, {},      {},          {}};
+  const PreprocessingStructureKind includeKinds[] = {
+      PreprocessingStructureKind::Include,
+      PreprocessingStructureKind::IncludeNext,
+      PreprocessingStructureKind::Import};
+  if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
+          edit, ProtectedSourceEditAuthorityKind::IncludeDirectiveRewrite,
+          child.sitePath, child.parent, ownerBytes, siteStart, siteEnd,
+          includeKinds, /*requireProtectedInterval=*/true,
+          /*requestTerminalOnFailure=*/false))
+    return std::nullopt;
   textEditAssembler_.AttachAcceptedResultCarrier(
       edit,
       proofLattice_.AcceptedCandidateBuilder().BuildAcceptedIncludeCandidate(

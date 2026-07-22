@@ -7,207 +7,12 @@
 #include "include/RefoldSourceGraphProof.h"
 
 #include "include/IncludeSpellingHelpers.h"
-#include "util/StringUtils.h"
-
-#include <cctype>
-#include <cstddef>
+#include "core/RefoldLangOptions.h"
+#include "source/RefoldPreprocessingDirectiveScanner.h"
 
 namespace clang {
 namespace refold {
 namespace source_graph {
-
-namespace {
-
-static bool isDirectiveHorizontalWhitespace(char c) {
-  return c == '\r' || stringutils::isNonNewlineWs(c);
-}
-
-static bool consumeDirectiveScannerNewline(llvm::StringRef text, size_t &pos) {
-  if (pos >= text.size())
-    return false;
-  if (text[pos] == '\r') {
-    ++pos;
-    if (pos < text.size() && text[pos] == '\n')
-      ++pos;
-    return true;
-  }
-  if (text[pos] == '\n') {
-    ++pos;
-    return true;
-  }
-  return false;
-}
-
-static bool consumeDirectiveScannerEscapedNewline(llvm::StringRef text,
-                                                  size_t &pos) {
-  if (pos >= text.size() || text[pos] != '\\')
-    return false;
-
-  size_t afterBackslash = pos + 1;
-  while (afterBackslash < text.size() &&
-         isDirectiveHorizontalWhitespace(text[afterBackslash]))
-    ++afterBackslash;
-  if (!consumeDirectiveScannerNewline(text, afterBackslash))
-    return false;
-
-  // Escaped-newline deletion removes the backslash-newline pair before
-  // directive recognition.  Clang also accepts horizontal whitespace before the
-  // newline as an extension, so the directive scanner consumes the same
-  // spelling that source-range extension treats as a splice.
-  pos = afterBackslash;
-  return true;
-}
-
-/// Return the byte offset of the next preprocessing directive introducer.
-///
-/// This is intentionally a tiny preprocessing-aware scanner rather than a raw
-/// physical-line test.  Clang recognizes directives after deleting escaped
-/// newlines and after replacing comments with whitespace.  In particular,
-/// `#\\\ninclude` is `#include`, and a complete block comment may span a
-/// physical newline before the `#` that starts the directive.
-///
-/// Line comments are different: after escaped-newline deletion they consume the
-/// rest of the logical line, so a `#` inside `// ...` is not a directive
-/// introducer.  An unterminated block comment simply prevents later bytes from
-/// being observed as directives by this scanner; callers that need stronger
-/// recovery already fail closed at the proof site.
-static std::optional<size_t>
-findPreprocessingDirectiveIntroducer(llvm::StringRef text, size_t start = 0) {
-  bool onlyTriviaOnLogicalLine = true;
-  bool inBlockComment = false;
-  bool blockCommentStartedInDirectivePrefix = false;
-  size_t pos = start;
-
-  while (pos < text.size()) {
-    if (consumeDirectiveScannerEscapedNewline(text, pos))
-      continue;
-
-    if (inBlockComment) {
-      if (pos + 1 < text.size() && text[pos] == '*' && text[pos + 1] == '/') {
-        // A complete block comment is preprocessing whitespace.  Once the
-        // terminator is consumed, directive-prefix scanning must resume in the
-        // surrounding logical line; otherwise a real directive such as
-        // `/*\n*/#include` is hidden from macro-state and include-replay
-        // proofs.
-        pos += 2;
-        inBlockComment = false;
-        continue;
-      }
-      if (consumeDirectiveScannerNewline(text, pos)) {
-        // A newline inside a leading block comment still leaves the eventual
-        // comment replacement in directive-prefix trivia.  A newline inside a
-        // block comment that began after real source code does not
-        // retroactively make the following bytes directive-prefix trivia.
-        onlyTriviaOnLogicalLine = blockCommentStartedInDirectivePrefix;
-        continue;
-      }
-      ++pos;
-      continue;
-    }
-
-    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
-      blockCommentStartedInDirectivePrefix = onlyTriviaOnLogicalLine;
-      pos += 2;
-      inBlockComment = true;
-      continue;
-    }
-
-    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '/') {
-      pos += 2;
-      while (pos < text.size()) {
-        if (consumeDirectiveScannerEscapedNewline(text, pos))
-          continue;
-        if (consumeDirectiveScannerNewline(text, pos))
-          break;
-        ++pos;
-      }
-      onlyTriviaOnLogicalLine = true;
-      continue;
-    }
-
-    if (consumeDirectiveScannerNewline(text, pos)) {
-      onlyTriviaOnLogicalLine = true;
-      continue;
-    }
-
-    if (!onlyTriviaOnLogicalLine) {
-      ++pos;
-      continue;
-    }
-
-    if (isDirectiveHorizontalWhitespace(text[pos])) {
-      ++pos;
-      continue;
-    }
-
-    if (text[pos] == '#')
-      return pos;
-
-    onlyTriviaOnLogicalLine = false;
-    ++pos;
-  }
-
-  return std::nullopt;
-}
-
-/// Skip preprocessing whitespace after a directive introducer or keyword.
-/// Escaped newlines are ignored because preprocessing removes them before
-/// directive recognition.  Complete block comments are skipped as whitespace,
-/// including comments that span physical lines; Clang accepts constructs such
-/// as `#/*\n*/include` for the same reason.  Line comments are not skipped
-/// because they terminate the directive logical line.
-static bool skipDirectiveLogicalWhitespace(llvm::StringRef text, size_t &pos) {
-  while (pos < text.size()) {
-    if (isDirectiveHorizontalWhitespace(text[pos])) {
-      ++pos;
-      continue;
-    }
-    if (consumeDirectiveScannerEscapedNewline(text, pos))
-      continue;
-    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
-      pos += 2;
-      while (pos + 1 < text.size() &&
-             !(text[pos] == '*' && text[pos + 1] == '/')) {
-        if (consumeDirectiveScannerEscapedNewline(text, pos))
-          continue;
-        ++pos;
-      }
-      if (pos + 1 >= text.size())
-        return false;
-      pos += 2;
-      continue;
-    }
-    break;
-  }
-  return true;
-}
-
-static bool readDirectiveIdentifier(llvm::StringRef text, size_t &pos,
-                                    std::string &identifier) {
-  identifier.clear();
-  while (pos < text.size()) {
-    if (consumeDirectiveScannerEscapedNewline(text, pos))
-      continue;
-    const unsigned char c = static_cast<unsigned char>(text[pos]);
-    if (std::isalpha(c) || text[pos] == '_')
-      break;
-    return false;
-  }
-
-  while (pos < text.size()) {
-    if (consumeDirectiveScannerEscapedNewline(text, pos))
-      continue;
-    const unsigned char c = static_cast<unsigned char>(text[pos]);
-    if (!(std::isalnum(c) || text[pos] == '_'))
-      break;
-    identifier.push_back(text[pos]);
-    ++pos;
-  }
-
-  return !identifier.empty();
-}
-
-} // namespace
 
 std::optional<std::string>
 safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &include) {
@@ -225,51 +30,41 @@ safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &include) {
   return path.str();
 }
 
-bool lineHasPreprocessingDirectiveIntroducer(llvm::StringRef text) {
-  return findPreprocessingDirectiveIntroducer(text).has_value();
+bool lineHasPreprocessingDirectiveIntroducer(
+    llvm::StringRef text, const clang::LangOptions &lexLang) {
+  PreprocessingDirectiveScanResult scan =
+      scanPreprocessingDirectives(text, lexLang);
+
+  // Scanner inconsistency is itself unsafe for callers that use this predicate
+  // as a macro-state neutrality proof.  Returning true preserves the previous
+  // fail-closed contract even when no exact directive interval was recovered.
+  return !scan.directives.empty() || !scan.diagnostics.empty();
 }
 
-MaterializedIncludeReplayAlias
-classifyMaterializedIncludeReplayAlias(llvm::StringRef materializedText,
-                                       llvm::StringRef sourceGraphPath) {
-  size_t searchPos = 0;
-  while (std::optional<size_t> hash = findPreprocessingDirectiveIntroducer(
-             materializedText, searchPos)) {
-    size_t pos = *hash + 1;
-    searchPos = pos;
+MaterializedIncludeReplayAlias classifyMaterializedIncludeReplayAlias(
+    llvm::StringRef materializedText, llvm::StringRef sourceGraphPath,
+    const clang::LangOptions &lexLang) {
+  PreprocessingDirectiveScanResult scan =
+      scanPreprocessingDirectives(materializedText, lexLang);
+  if (!scan.IsComplete())
+    return MaterializedIncludeReplayAlias::UnprovenInclude;
 
-    if (!skipDirectiveLogicalWhitespace(materializedText, pos))
-      return MaterializedIncludeReplayAlias::UnprovenInclude;
-
-    std::string keyword;
-    if (!readDirectiveIdentifier(materializedText, pos, keyword))
-      continue;
-    if (keyword != "include")
+  for (const PreprocessingDirectiveLine &directive : scan.directives) {
+    if (directive.headKind != PreprocessingDirectiveHeadKind::Identifier ||
+        directive.keyword != "include")
       continue;
 
-    if (!skipDirectiveLogicalWhitespace(materializedText, pos))
+    // A macro-derived, angled, malformed, or otherwise non-simple operand can
+    // name the generated sidecar after preprocessing.  Without evaluating that
+    // directive in its original state, alias safety must reject it.
+    if (directive.includeOperandKind !=
+            PreprocessingIncludeOperandKind::SimpleQuotedHeader ||
+        !directive.simpleQuotedIncludePath) {
       return MaterializedIncludeReplayAlias::UnprovenInclude;
-
-    if (pos >= materializedText.size() || materializedText[pos] != '"')
-      return MaterializedIncludeReplayAlias::UnprovenInclude;
-
-    const size_t pathBegin = ++pos;
-    while (pos < materializedText.size() && materializedText[pos] != '"') {
-      // Keep this classifier conservative.  A quoted include whose operand
-      // itself uses a splice or reaches an unescaped newline is not a simple
-      // path-level equality proof, so source-graph replay must fail closed.
-      if (materializedText[pos] == '\\' || materializedText[pos] == '\n' ||
-          materializedText[pos] == '\r')
-        return MaterializedIncludeReplayAlias::UnprovenInclude;
-      ++pos;
     }
-    if (pos >= materializedText.size())
-      return MaterializedIncludeReplayAlias::UnprovenInclude;
 
-    if (materializedText.slice(pathBegin, pos) == sourceGraphPath)
+    if (llvm::StringRef(*directive.simpleQuotedIncludePath) == sourceGraphPath)
       return MaterializedIncludeReplayAlias::SamePath;
-
-    searchPos = pos + 1;
   }
 
   return MaterializedIncludeReplayAlias::None;
@@ -279,6 +74,13 @@ bool sourceGraphIncludePathIsUnaliasedOrCoherent(
     const SourceGraphProofInputs &inputs,
     const RefoldModel::IncludeItem &include, llvm::StringRef sourceGraphPath,
     llvm::StringRef candidateBytes, const SourceGraphProofServices &services) {
+  // Materialized include bytes must be scanned under the producer language
+  // mode.  Construct the mode once for this complete alias proof so digraph,
+  // trigraph, comment, and literal recognition agrees with the main refold run
+  // without adding another scheduler dependency.
+  const clang::LangOptions lexLang =
+      makeRefoldLexLangOptions(inputs.model.GetPPLang());
+
   // A source-graph output written under an original quoted include path is a
   // path-level edit, not an include-site-local edit: every surviving
   // `#include "that/path.h"` in the emitted TU will read the generated bytes.
@@ -326,8 +128,8 @@ bool sourceGraphIncludePathIsUnaliasedOrCoherent(
       continue;
 
     const MaterializedIncludeReplayAlias replayAlias =
-        classifyMaterializedIncludeReplayAlias(otherExpansionIt->second,
-                                               sourceGraphPath);
+        classifyMaterializedIncludeReplayAlias(
+            otherExpansionIt->second, sourceGraphPath, lexLang);
     if (replayAlias == MaterializedIncludeReplayAlias::SamePath)
       return false;
     if (replayAlias == MaterializedIncludeReplayAlias::UnprovenInclude)
@@ -335,7 +137,8 @@ bool sourceGraphIncludePathIsUnaliasedOrCoherent(
   }
 
   const MaterializedIncludeReplayAlias candidateReplayAlias =
-      classifyMaterializedIncludeReplayAlias(candidateBytes, sourceGraphPath);
+      classifyMaterializedIncludeReplayAlias(candidateBytes, sourceGraphPath,
+                                               lexLang);
   if (candidateReplayAlias == MaterializedIncludeReplayAlias::SamePath)
     return false;
   if (candidateReplayAlias == MaterializedIncludeReplayAlias::UnprovenInclude)

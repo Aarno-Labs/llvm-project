@@ -43,6 +43,7 @@ namespace refold {
 class LineDirectiveInserter;
 class RefoldProofLattice;
 class RefoldIncludeInsertionPlanner;
+class RefoldPreprocessingStructureIndex;
 class RefoldTheoremAudit;
 
 /// Plans explicit expansion fallback when no declared structural proof owns a
@@ -67,6 +68,9 @@ public:
         certifyTextEditMaterializedBTokenRange;
     std::function<void(TextEdit &, const AcceptedResultCandidate &)>
         attachAcceptedResultCarrier;
+    std::function<bool(TextEdit &, llvm::StringRef, llvm::StringRef, uint64_t,
+                       uint64_t)>
+        authorizeTUIncludeClosure;
     std::function<void()> resetAttemptStats;
   };
 
@@ -80,6 +84,7 @@ public:
       const RefoldMacroTopology &macroTopology,
       const RefoldLineControlProof &lineControlProof,
       const RefoldMacroStateProof &macroStateProof,
+      const RefoldPreprocessingStructureIndex &preprocessingStructureIndex,
       const RefoldTerminalProofSink &terminalSink,
       const clang::LangOptions &lexLang,
       const RefoldIncludeInsertionPlanner &includeInsertionPlanner,
@@ -91,7 +96,9 @@ public:
         abTokHunks_(abTokHunks), abTokMapB2A_(abTokMapB2A), lineDirs_(lineDirs),
         sourceMapper_(sourceMapper), paths_(paths),
         macroTopology_(macroTopology), lineControlProof_(lineControlProof),
-        macroStateProof_(macroStateProof), terminalSink_(terminalSink),
+        macroStateProof_(macroStateProof),
+        preprocessingStructureIndex_(preprocessingStructureIndex),
+        terminalSink_(terminalSink),
         lexLang_(lexLang), includeInsertionPlanner_(includeInsertionPlanner),
         proofLattice_(proofLattice), theoremAuditService_(theoremAuditService),
         lastStats_(lastStats),
@@ -126,6 +133,8 @@ private:
   const RefoldMacroTopology &macroTopology_;
   const RefoldLineControlProof &lineControlProof_;
   const RefoldMacroStateProof &macroStateProof_;
+  /// Shared exact TU preprocessing census used by every source-gap theorem.
+  const RefoldPreprocessingStructureIndex &preprocessingStructureIndex_;
   const RefoldTerminalProofSink &terminalSink_;
   const clang::LangOptions &lexLang_;
   const RefoldIncludeInsertionPlanner &includeInsertionPlanner_;

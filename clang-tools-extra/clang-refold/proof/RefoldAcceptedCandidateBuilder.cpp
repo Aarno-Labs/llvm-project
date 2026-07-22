@@ -8,6 +8,7 @@
 
 #include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
+#include "edit/RefoldTUEditPlanner.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroTopology.h"
 #include "proof/RefoldAcceptedResultPredicates.h"
@@ -789,11 +790,41 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedIncludeRealizationCandidate(
 
 ::clang::refold::AcceptedResultCandidate
 RefoldAcceptedCandidateBuilder::BuildAcceptedTUTextEditCandidate(
+    AcceptedPathKind currentPath, const diffutils::Hunk &hunk,
+    const TUByteSpanPlan &spanPlan,
+    const StructuralHunkSegmentBinding *structuralBinding,
+    StringRef payloadPreview) const {
+  const OwnerRealizationResult ownerRealization =
+      deps_.ownerRealizationProofBuilder.BuildTUOwnerRealization(
+          currentPath, hunk, spanPlan, structuralBinding);
+  AcceptedResultCandidate candidate;
+  candidate.kind = AcceptedResultCandidateKind::TUTextEdit;
+  candidate.proofSummary =
+      deps_.ownerRealizationProofBuilder.BuildOwnerRealizationProofSummary(
+          currentPath, ownerRealization);
+  candidate.begin = spanPlan.tuByteBegin;
+  candidate.end = spanPlan.tuByteEnd;
+  candidate.hasPayloadPreview = true;
+  candidate.payloadPreview = payloadPreview.str();
+  deps_.ownerRealizationProofBuilder.AttachLineControlObserverWitness(
+      candidate);
+  deps_.ownerRealizationProofBuilder.AttachCounterStateWitness(candidate);
+  RefreshAcceptedCandidateEmissionPathInventory(candidate);
+  deps_.theoremAudit.AuditAcceptedResultCandidateForLegacyAuthority(
+      candidate, "BuildAcceptedTUTextEditCandidate");
+  deps_.witnessTrace.TraceWitnessEmitted(
+      deps_.witnessResolver.BuildRefoldWitness(
+          candidate, "BuildAcceptedTUTextEditCandidate"));
+  return candidate;
+}
+
+::clang::refold::AcceptedResultCandidate
+RefoldAcceptedCandidateBuilder::BuildAcceptedSpecializedTUTextEditCandidate(
     AcceptedPathKind currentPath, uint64_t begin, uint64_t end,
     StringRef payloadPreview) const {
   const OwnerRealizationResult ownerRealization =
-      deps_.ownerRealizationProofBuilder.BuildTUOwnerRealization(currentPath,
-                                                                 begin, end);
+      deps_.ownerRealizationProofBuilder.BuildSpecializedTUOwnerRealization(
+          currentPath, begin, end);
   AcceptedResultCandidate candidate;
   candidate.kind = AcceptedResultCandidateKind::TUTextEdit;
   candidate.proofSummary =
@@ -808,10 +839,10 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedTUTextEditCandidate(
   deps_.ownerRealizationProofBuilder.AttachCounterStateWitness(candidate);
   RefreshAcceptedCandidateEmissionPathInventory(candidate);
   deps_.theoremAudit.AuditAcceptedResultCandidateForLegacyAuthority(
-      candidate, "BuildAcceptedTUTextEditCandidate");
+      candidate, "BuildAcceptedSpecializedTUTextEditCandidate");
   deps_.witnessTrace.TraceWitnessEmitted(
       deps_.witnessResolver.BuildRefoldWitness(
-          candidate, "BuildAcceptedTUTextEditCandidate"));
+          candidate, "BuildAcceptedSpecializedTUTextEditCandidate"));
   return candidate;
 }
 

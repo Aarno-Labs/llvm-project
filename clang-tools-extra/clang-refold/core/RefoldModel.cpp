@@ -1434,6 +1434,17 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           // repeated-header disambiguator for zero-token pragma owners.
           pd.ownerIncludeId = asOptUInt64(*obj, "owner_include_id");
 
+          // Preserve producer-owned `_Pragma` source provenance in the typed
+          // model.  Sideband replay already consumes these fields directly
+          // from JSON; the preprocessing-structure census also needs them so a
+          // mid-line pragma operator cannot disappear behind an ordinary token
+          // byte envelope.  Missing or partial ranges remain unbound and are
+          // rejected by the interval index rather than guessed here.
+          pd.viaPragmaOperator =
+              obj->getBoolean("via_pragma_operator").value_or(false);
+          pd.operatorB = asOptUInt64(*obj, "operator_b");
+          pd.operatorE = asOptUInt64(*obj, "operator_e");
+
           model.pragmas_.push_back(std::move(pd));
         } else {
           return createStringError(

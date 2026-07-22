@@ -64,6 +64,13 @@
 namespace clang {
 namespace refold {
 
+struct StructuralHunkSegmentBinding;
+struct TUByteSpanPlan;
+
+namespace diffutils {
+struct Hunk;
+} // namespace diffutils
+
 class RefoldArgTextRecovery;
 class RefoldMacroTopology;
 class RefoldSourceMapper;
@@ -211,15 +218,25 @@ public:
       std::optional<IncludeRealizationBTokenEnvelope> bTokenEnvelope =
           std::nullopt) const;
 
-  /// Build an accepted-result candidate for a direct TU byte-span edit.
+  /// Build an accepted-result candidate for an ordinary direct TU span.
   ///
-  /// Represents a theorem-facing TU text edit whose source byte range is
-  /// already known. The optional payload preview is diagnostic/audit metadata
-  /// only; the candidate identity is the accepted path plus byte span.
-  AcceptedResultCandidate
-  BuildAcceptedTUTextEditCandidate(AcceptedPathKind currentPath, uint64_t begin,
-                                   uint64_t end,
-                                   llvm::StringRef payloadPreview) const;
+  /// The exact token hunk and final span plan are proof inputs. They are routed
+  /// through `BuildTUOwnerRealization()` so the resulting OwnerClosure carries
+  /// real A/B ranges and the owner gate cannot manufacture byte-span authority.
+  AcceptedResultCandidate BuildAcceptedTUTextEditCandidate(
+      AcceptedPathKind currentPath, const diffutils::Hunk &hunk,
+      const TUByteSpanPlan &spanPlan,
+      const StructuralHunkSegmentBinding *structuralBinding,
+      llvm::StringRef payloadPreview) const;
+
+  /// Build an accepted-result carrier for an explicitly specialized TU edit.
+  ///
+  /// These callers already own directive/state-specific proof machinery and do
+  /// not claim ordinary `TUByteSpan` evidence. Keeping the factory separate
+  /// prevents future direct callers from dropping their hunk/span proof inputs.
+  AcceptedResultCandidate BuildAcceptedSpecializedTUTextEditCandidate(
+      AcceptedPathKind currentPath, uint64_t begin, uint64_t end,
+      llvm::StringRef payloadPreview) const;
 
   /// Build an accepted-result candidate for terminal fallback.
   ///

@@ -55,7 +55,8 @@ RefoldProofLattice::RefoldProofLattice(
           }}),
       ownerRealizationProofBuilder_(
           RefoldOwnerRealizationProofBuilder::Dependencies{
-              model, ownerStateProof, proofSummaryBuilder_,
+              model, ownerStateProof, tuEdits,
+              static_cast<uint64_t>(bToks.size()), proofSummaryBuilder_,
               acceptedResultRanker_, mixedOwnerTilingSegmentBindings,
               mixedOwnerTilingWitnesses,
               // The starter-summary callback is called only from

@@ -15,6 +15,7 @@
 
 #include "line-control/FinalLineControlModel.h"
 #include "proof/RefoldAcceptedResultTypes.h"
+#include "source/RefoldPreprocessingStructureIndex.h"
 
 #include "llvm/ADT/StringRef.h"
 
@@ -120,6 +121,80 @@ struct ResyncOutcome {
         lineControlPruneCandidates(std::move(candidates)) {}
 };
 
+/// Named proof authority for deliberately changing protected preprocessing
+/// structure.
+///
+/// Ordinary token-derived edits carry no authority.  The exceptional values
+/// enumerate the closed set of planners whose own theorem permits consuming or
+/// rewriting one exact protected interval. The final emission audit validates
+/// the authority class and exact physical source identity below, together with
+/// producer metadata whenever the census can bind it; a path name by itself is
+/// never sufficient.
+enum class ProtectedSourceEditAuthorityKind : uint8_t {
+  Unknown,
+  DirectTUMacroStateRepair,
+  MacroStateRepair,
+  /// Moves a TU-visible include directive whose included subtree owns the
+  /// macro-state transition being repaired.  This authority is narrower than
+  /// general include materialization: it may be minted only from the exact
+  /// owning-include transition already proved by the macro-state planner.
+  IncludeOwnedMacroStateRepair,
+  SidebandPragmaEdit,
+  IncludeMaterialization,
+  IncludeDirectiveRewrite,
+  IncludePreservingSourceClosure,
+  TUIncludeClosure,
+  LineControlRepair,
+};
+
+/// Exact protected preprocessing interval authorized for one emitted edit.
+///
+/// This is an emission-boundary capability, not a reconstruction hint.  It is
+/// created only after a specialized planner has discharged its own semantic
+/// proof. The final assembler requires an exact kind/range match with the
+/// immutable preprocessing-structure index for the current physical source
+/// owner. Producer metadata is retained and rechecked when the physical census
+/// can bind it, but the capability does not require such a binding:
+/// macro-computed include operands, comments in include operands, and repeated
+/// zero-token header occurrences can all have physical spellings or occurrence
+/// ownership that intentionally differ from one producer record. Stale or
+/// unused capabilities are rejected.
+struct ProtectedSourceEditAuthorization {
+  ProtectedSourceEditAuthorityKind authority =
+      ProtectedSourceEditAuthorityKind::Unknown;
+  PreprocessingStructureKind structureKind =
+      PreprocessingStructureKind::OtherDirective;
+  PreprocessingStructureModelKind modelKind =
+      PreprocessingStructureModelKind::None;
+  std::optional<uint64_t> modelItemId;
+  std::optional<uint64_t> ownerConditionalArmId;
+  std::optional<uint64_t> conditionalGroupId;
+  std::optional<uint64_t> conditionalArmId;
+  uint64_t begin = 0;
+  uint64_t end = 0;
+
+  bool IsWellFormed() const {
+    // Exact physical owner/kind/range identity is the mandatory capability.
+    // Producer metadata is strengthening evidence when available, but it is
+    // legitimately absent for scanner-recovered repeated zero-token header
+    // occurrences and for physical directive spellings normalized by the
+    // producer model.
+    if (authority == ProtectedSourceEditAuthorityKind::Unknown || begin >= end)
+      return false;
+    return true;
+  }
+
+  bool operator==(const ProtectedSourceEditAuthorization &other) const {
+    return authority == other.authority &&
+           structureKind == other.structureKind &&
+           modelKind == other.modelKind && modelItemId == other.modelItemId &&
+           ownerConditionalArmId == other.ownerConditionalArmId &&
+           conditionalGroupId == other.conditionalGroupId &&
+           conditionalArmId == other.conditionalArmId && begin == other.begin &&
+           end == other.end;
+  }
+};
+
 /// One byte edit selected for final source emission.
 struct TextEdit {
   /// Half-open TU source-byte range replaced by this edit.
@@ -139,6 +214,14 @@ struct TextEdit {
   /// of each emitted artifact explicit at the byte-edit boundary so a later
   /// universal proof gate can reason over the actual emitted surface.
   std::vector<std::shared_ptr<const AcceptedResultCandidate>> acceptedResults;
+
+  /// Exact capabilities for protected preprocessing intervals intentionally
+  /// changed by a specialized directive operation.  Ordinary token-derived
+  /// edits leave this vector empty.  Capabilities are preserved and
+  /// de-duplicated through edit normalization, then consumed by the final
+  /// global emission audit.
+  std::vector<ProtectedSourceEditAuthorization>
+      protectedSourceAuthorizations;
 
   /// Final-output line-control pruning candidates carried by this edit, using
   /// byte offsets relative to this edit's replacement `text`. Only synthetic

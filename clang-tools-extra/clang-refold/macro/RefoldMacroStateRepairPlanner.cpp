@@ -313,8 +313,9 @@ private:
 
   /// Restages a conservative TU edit after a repair changes its byte range or
   /// replacement text.
-  void RestageConservativeTUEdit(TextEdit &edit, uint64_t start, uint64_t end,
-                                 StringRef replacement);
+  void RestageConservativeTUEdit(
+      TextEdit &edit, uint64_t start, uint64_t end, StringRef replacement,
+      ArrayRef<MacroStateSourceTransition> includeOwnedTransitions = {});
   /// Attaches conservative TU proof carrier metadata to a repaired edit.
   void AttachConservativeTUCarrier(TextEdit &edit);
 
@@ -937,15 +938,14 @@ void MacroStateRepairContext::AttachConservativeTUCarrier(TextEdit &edit) {
   TextEditAssembler().AttachAcceptedResultCarrier(
       edit, ProofLattice()
                 .AcceptedCandidateBuilder()
-                .BuildAcceptedTUTextEditCandidate(
+                .BuildAcceptedSpecializedTUTextEditCandidate(
                     AcceptedPathKind::TUByteSpanConservativeEdit, edit.start,
                     edit.end, StringRef(edit.text)));
 }
 
-void MacroStateRepairContext::RestageConservativeTUEdit(TextEdit &edit,
-                                                        uint64_t start,
-                                                        uint64_t end,
-                                                        StringRef replacement) {
+void MacroStateRepairContext::RestageConservativeTUEdit(
+    TextEdit &edit, uint64_t start, uint64_t end, StringRef replacement,
+    ArrayRef<MacroStateSourceTransition> includeOwnedTransitions) {
   ResyncOutcome resync = TextEditAssembler().ApplyResyncOrPend(
       tuBytes_, start, end, replacement, tuPath_);
   edit.start = start;
@@ -967,6 +967,46 @@ void MacroStateRepairContext::RestageConservativeTUEdit(TextEdit &edit,
   edit.directTURawEnd.reset();
   edit.directTUFinalStart = edit.start;
   edit.directTUFinalEnd = edit.end;
+
+  // Restaging replaces the original direct-hunk carrier with a macro-state
+  // repair surface.  Rebuild the protected-source capabilities from the final
+  // physical interval so stale direct-TU authorizations cannot survive a move
+  // or widening, and so any unrelated directive in the widened interval makes
+  // the repair fail closed at this exact authority boundary.
+  llvm::erase_if(
+      edit.protectedSourceAuthorizations,
+      [&](const ProtectedSourceEditAuthorization &authorization) {
+        return authorization.authority ==
+                   ProtectedSourceEditAuthorityKind::
+                       DirectTUMacroStateRepair ||
+               authorization.begin < start || end < authorization.end;
+      });
+  // A macro transition owned by a header is represented in the TU by the
+  // exact include directive that introduces that header.  Moving the
+  // transition therefore moves that one include directive.  Mint a capability
+  // only for each producer-proved owning-include interval supplied by the
+  // caller; do not authorize every include merely because it lies inside the
+  // widened repair envelope.
+  const PreprocessingStructureKind includeKinds[] = {
+      PreprocessingStructureKind::Include,
+      PreprocessingStructureKind::IncludeNext,
+      PreprocessingStructureKind::Import};
+  for (const MacroStateSourceTransition &transition :
+       includeOwnedTransitions) {
+    (void)TextEditAssembler().AuthorizeExactProtectedSourceInterval(
+        edit,
+        ProtectedSourceEditAuthorityKind::IncludeOwnedMacroStateRepair,
+        tuPath_, std::nullopt, tuBytes_, transition.interval.begin,
+        transition.interval.end, includeKinds);
+  }
+
+  const PreprocessingStructureKind macroStateKinds[] = {
+      PreprocessingStructureKind::MacroDefine,
+      PreprocessingStructureKind::MacroUndef};
+  (void)TextEditAssembler().AuthorizeProtectedSourceIntervals(
+      edit, ProtectedSourceEditAuthorityKind::MacroStateRepair, tuPath_,
+      std::nullopt, tuBytes_, start, end, macroStateKinds,
+      /*requireProtectedInterval=*/false);
   AttachConservativeTUCarrier(edit);
 }
 
@@ -1112,8 +1152,12 @@ void MacroStateRepairContext::
 
       const uint64_t oldStart = edit.start;
       const uint64_t oldEnd = edit.end;
-      RestageConservativeTUEdit(edit, lineStart, undefTransition->interval.end,
-                                replacement);
+      SmallVector<MacroStateSourceTransition, 1> includeOwnedTransitions;
+      if (OwningIncludeSiteInTU(undefDirective))
+        includeOwnedTransitions.push_back(*undefTransition);
+      RestageConservativeTUEdit(edit, lineStart,
+                                undefTransition->interval.end, replacement,
+                                includeOwnedTransitions);
 
       (void)CheckMacroStateRepaired(
           undefDirective, StateMutationKind::MovedEarlier,
@@ -1637,9 +1681,19 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
     for (const MacroStateGapCarryCandidate &candidate : candidates)
       replacement += candidate.preservationText;
 
+    SmallVector<MacroStateSourceTransition, 4> includeOwnedTransitions;
+    for (const MacroStateGapCarryCandidate &candidate : candidates) {
+      if (!OwningIncludeSiteInTU(*candidate.directive))
+        continue;
+      includeOwnedTransitions.push_back(
+          MacroStateSourceTransition{candidate.interval,
+                                     candidate.preservationText});
+    }
+
     const uint64_t oldStart = edit.start;
     const uint64_t oldEnd = edit.end;
-    RestageConservativeTUEdit(edit, newStart, *delayedBoundary, replacement);
+    RestageConservativeTUEdit(edit, newStart, *delayedBoundary, replacement,
+                              includeOwnedTransitions);
 
     for (const MacroStateGapCarryCandidate &candidate : candidates) {
       (void)CheckMacroStateRepaired(

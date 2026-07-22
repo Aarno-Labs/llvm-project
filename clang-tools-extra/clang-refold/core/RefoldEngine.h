@@ -154,6 +154,7 @@ class RefoldMacroStateRepairPlanner;
 class RefoldMacroStateProof;
 class RefoldOwnerClassifier;
 class RefoldOwnerStateProof;
+class RefoldPreprocessingStructureIndex;
 class RefoldProofLattice;
 class RefoldStructuralHunkDispatcher;
 class RefoldTextEditAssembler;
@@ -310,6 +311,32 @@ private:
   ProofAuditMode proofAuditMode_;
   LangOptions lexLang_;
 
+  /// Exact physical bytes of the producer-recorded translation unit.
+  ///
+  /// Direct TU byte-span planning must validate every mapped token interval and
+  /// every internal source gap against the original physical file rather than
+  /// against preprocessed stream A.  The bytes are loaded once and retained for
+  /// the lifetime of all planning/proof services.
+  std::string tuSourceBytes_;
+
+  /// Deferred physical-source load failure, if the initial snapshot was
+  /// unavailable.
+  ///
+  /// Service construction retains an incomplete fail-closed index so an
+  /// already-detected A/model inconsistency can still take the existing raw-B
+  /// terminal path without requiring the TU file.  Normal structural refolding
+  /// reports this error when it first requires the physical source buffer.
+  std::optional<std::string> tuSourceLoadError_;
+
+  /// Exact lexical inventory of preprocessing structure in `tuSourceBytes_`.
+  ///
+  /// This index is built before TU edit planning and is shared by every direct
+  /// TU byte-span query.  Protection-census incompleteness rejects every direct
+  /// span; ordinary producer-binding diagnostics remain local because their
+  /// lexical intervals still reject any overlapping realization.
+  std::unique_ptr<RefoldPreprocessingStructureIndex>
+      preprocessingStructureIndex_;
+
   /// Macro-argument text recovery service.
   ///
   /// This owns inverse stringification and fallback invocation-actual lexing.
@@ -366,17 +393,36 @@ private:
   /// Computed once per refold run and reused to bound best-effort snapping.
   std::vector<uint32_t> ownerDepthGap_;
 
+  /// Ordered planning phase for the structural token-hunk pipeline.
+  ///
+  /// Structural tiling must finish before insertion provenance or owner
+  /// dispatch observes the hunk sequence.  Keeping this phase explicit turns
+  /// that ordering from a call-site convention into a checked engine
+  /// invariant: no downstream service may accidentally consume the initial,
+  /// pre-tiling token diff.
+  enum class StructuralHunkPlanningPhase : uint8_t {
+    NotStarted,
+    InitialTokenDiffBuilt,
+    StructuralTilingComplete,
+    InsertionLedgerReady,
+  };
+
+  StructuralHunkPlanningPhase structuralHunkPlanningPhase_ =
+      StructuralHunkPlanningPhase::NotStarted;
+
   /// Cached token-level hunks for the current refold invocation.
   ///
-  /// These hunks are used to deterministically disambiguate A→B token envelope
+  /// After `PlanTokenDiff()` returns, this cache is required to equal the
+  /// normalized hunk vector returned to structural dispatch.  These hunks are
+  /// used to deterministically disambiguate A→B token envelope
   /// mapping at *span boundaries* when there are adjacent pure-insertion hunks
   /// (A-span is empty) that should not be absorbed into a larger mapped
   /// envelope (e.g., macro whole-cover replacement).
   std::vector<diffutils::Hunk> abTokHunks_;
 
-  /// Persisted mixed-owner tiling witnesses for the current run.
+  /// Persisted structural-hunk tiling witnesses for the current run.
   ///
-  /// The mixed-owner normalizer still lowers a proved tiling to ordinary token
+  /// The structural normalizer still lowers a proved tiling to ordinary token
   /// hunks so existing macro/include/TU classifiers can operate unchanged.
   /// These side tables preserve the theorem proof that created those hunks and
   /// map each emitted token segment back to the full ordered tiling path.
@@ -489,11 +535,12 @@ private:
   /// longer borrows RefoldEngine or requires friend access.
   std::unique_ptr<RefoldOwnerStateProof> ownerStateProof_;
 
-  /// Mixed-owner token-hunk tiling service owned by the engine graph.
+  /// Structural token-hunk tiling service owned by the engine graph.
   ///
-  /// The planner owns the deterministic DP normalization that may split a
-  /// replacement/deletion hunk across provable TU/include/macro owner
-  /// boundaries while refreshing the mixed-owner witness ledgers.
+  /// The planner owns deterministic normalization that may split a hunk across
+  /// provable owner boundaries or, for delete-only hunks, around exact
+  /// preprocessing structure preserved in place.  It refreshes the durable
+  /// structural witness ledgers before any owner-sensitive service executes.
   std::unique_ptr<RefoldMixedOwnerTilingPlanner> mixedOwnerTilingPlanner_;
 
   /// Macro-state proof service owned by the engine.
@@ -620,8 +667,8 @@ private:
   /// Allocate the initial A/B token-diff planning service.
   void InitializeTokenDiffPlanner();
 
-  /// Allocate the mixed-owner tiling planner that normalizes token hunks after
-  /// the initial token-diff pass.
+  /// Allocate the generalized structural tiler that normalizes token hunks
+  /// after the initial token-diff pass.
   void InitializeMixedOwnerTilingPlanner();
 
   /// Allocate and access the translation-unit edit planning service.
@@ -632,6 +679,10 @@ private:
   void InitializeTUEditPlanner();
   RefoldTUEditPlanner &TUEditPlanner();
   const RefoldTUEditPlanner &TUEditPlanner() const;
+
+  /// Load the physical TU bytes and build the exact preprocessing-structure
+  /// census consumed by direct TU byte-span planning.
+  void InitializePreprocessingStructureIndex();
 
   /// Allocate and access the macro patch planner after the proof lattice
   /// exists. Macro-planning orchestration calls this service directly.
@@ -727,8 +778,10 @@ private:
   /// Build and normalize the A/B token diff used by structural hunk dispatch.
   ///
   /// This stage refreshes the token-diff planner's run-local caches, applies
-  /// mixed-owner tiling, and records pure-insertion provenance before any
-  /// macro/include/TU edit planner can consume the hunk sequence.
+  /// generalized structural tiling, verifies that the normalized hunk cache and
+  /// durable segment ledgers agree, and only then records pure-insertion
+  /// provenance.  No macro/include/TU owner dispatch may consume the sequence
+  /// before this method completes.
   std::vector<diffutils::Hunk> PlanTokenDiff(StringRef tuPath,
                                              StringRef tuBytes);
 

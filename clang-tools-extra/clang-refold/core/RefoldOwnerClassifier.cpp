@@ -123,7 +123,7 @@ Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
   // belongs to a header, we still anchor via the TU span because segments for
   // includes and conditional arms in that header are projected into the TU
   // through slots.
-  auto span = deps_.tuEdits.PlanTUByteSpan(a0, a1, tuPath); // [b, e)
+  auto span = deps_.tuEdits.ProjectTUByteEnvelopeForOwnership(a0, a1, tuPath); // [b, e)
 
   // No truthful TU byte anchor exists for this PP segment, so choose its owner
   // using only preprocessed-token structure. This happens when the segment has
@@ -261,27 +261,28 @@ bool RefoldOwnerClassifier::HunkMapsToTU(uint64_t a0, uint64_t a1,
   bool sawAnyTU = false;
   const auto &tokmapByPP = deps_.model.GetTokmapByPP();
 
-  // Walk the A-side PP byte range and require every mapped byte to belong to
-  // the translation unit itself. Unmapped bytes (whitespace/separators) are
-  // ignored; the hunk ceases to be TU-owned as soon as any mapped byte resolves
-  // to a different file.
+  // Ownership is a provenance/topology question, not an edit-realization
+  // theorem.  Require every mapped A token in the interval to belong to the TU,
+  // while leaving exact physical mapping, source order, gap coverage, and
+  // preprocessing-state authorization to PlanTUByteSpan().  Coupling these two
+  // questions would make an unrelated producer-binding diagnostic change macro
+  // candidate ranking and force terminal expansion before the specialized
+  // realization paths can run.
   for (uint64_t pp = a0; pp < a1; ++pp) {
-    auto it = tokmapByPP.find(pp);
-    if (it == tokmapByPP.end())
-      continue; // ignore unmapped (spaces/tabs/newlines)
-    const auto &t = it->second;
-    if (!deps_.pathIdentity.PathsEqual(t.file, tuPath))
-      return false; // spans a non-TU mapping
+    auto entryIt = tokmapByPP.find(pp);
+    if (entryIt == tokmapByPP.end())
+      continue;
+    const RefoldModel::TokMapEntry &entry = entryIt->second;
+    if (!deps_.pathIdentity.PathsEqual(entry.file, tuPath))
+      return false;
     sawAnyTU = true;
   }
 
-  // Non-empty range: if we only saw TU mappings (or nothing but whitespace),
-  // then the hunk maps to the TU. Otherwise it mapped to some header above.
   if (a0 != a1)
     return sawAnyTU;
 
-  // INSERTION (A gap): classify TU ownership only when we can derive a truthful
-  // TU insertion anchor at that exact PP gap.
+  // A pure insertion is TU-owned only when the exact PP gap has the same
+  // conservative insertion-anchor proof used by concrete realization.
   return deps_.tuEdits.FindProvableTUInsertionAnchor(a0, tuPath).has_value();
 }
 

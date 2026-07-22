@@ -485,12 +485,12 @@ bool transitionHasStableCounterWitness(const StateTransitionProof &proof) {
 /// the tiling immediately disqualify the tiling.
 bool mixedOwnerTilingHasKnownCounterState(
     const MixedOwnerTilingWitness &tiling) {
-  if (!tiling.stateSummariesComposed || tiling.segments.empty())
+  if (!tiling.stateSummariesComposed || tiling.edges.empty())
     return false;
 
   bool sawCounterObligation = false;
-  for (const MixedOwnerTilingSegmentWitness &segment : tiling.segments) {
-    const StateTransitionProof &proof = segment.ownerTransitionProof;
+  for (const MixedOwnerTilingSegmentWitness &segment : tiling.edges) {
+    const StateTransitionProof &proof = segment.canonicalStateTransition;
     if (deltaHasMissingCounterProof(proof.before) ||
         deltaHasMissingCounterProof(proof.after))
       return false;
@@ -632,6 +632,21 @@ std::string ownerStateDeltaSignature(const OwnerRealizationWitness &owner) {
   if (owner.closure.bTokens.IsValid())
     os << ":B=[" << owner.closure.bTokens.begin << ','
        << owner.closure.bTokens.end << ')';
+  if (owner.hasTUCarrierWitness) {
+    const TUOwnerRealizationCarrierWitness &carrier = owner.tuCarrierWitness;
+    os << ":tu_carrier={exact="
+       << (carrier.exactHunkAndSpanValidated ? 1 : 0)
+       << ",structure="
+       << (carrier.protectedStructureExcludedOrAuthorized ? 1 : 0)
+       << ",structural="
+       << (carrier.hasStructuralSegmentBinding ? 1 : 0)
+       << ",structural_valid="
+       << (carrier.structuralSegmentBindingValidated ? 1 : 0)
+       << ",structural_id=" << carrier.structuralWitnessId
+       << ",structural_segment=" << carrier.structuralSegmentIndex
+       << ",macro_auth="
+       << carrier.deferredMacroStateAuthorizationCount << '}';
+  }
   appendStateDeltaSignature(os, "in", owner.closure.stateIn);
   appendStateDeltaSignature(os, "out", owner.closure.stateOut);
   for (const SuffixStabilityWitness &suffix : owner.stateWitnesses)
@@ -650,33 +665,138 @@ std::string ownerStateDeltaSignature(const OwnerRealizationWitness &owner) {
 std::string mixedOwnerTilingSignature(const MixedOwnerTilingWitness &tiling) {
   std::string storage;
   llvm::raw_string_ostream os(storage);
-  os << "tiling=" << tiling.witnessId << ":A=[" << tiling.originalAStart << ','
+  os << "tiling=" << tiling.witnessId
+     << ":reason=" << toString(tiling.reason) << ":A=["
+     << tiling.originalAStart << ','
      << tiling.originalAEnd << ")"
      << ":B=[" << tiling.originalBStart << ',' << tiling.originalBEnd
-     << "):tokens=" << tiling.tokenSegmentCount
+     << "):unique_partition=" << (tiling.uniquePartition ? 1 : 0)
+     << ":tokens=" << tiling.tokenSegmentCount
      << ":state_gaps=" << tiling.stateGapCount
+     << ":distinct_realizers=" << tiling.distinctRealizerCount
+     << ":protected_gaps=" << tiling.protectedStructureGapCount
+     << ":preserved_in_place_gaps=" << tiling.preservedInPlaceGapCount
+     << ":physical_runs=" << tiling.physicalSourceRunCount
+     << ":physical_runs_proven="
+     << (tiling.physicalSourceRunsProven ? 1 : 0)
+     << ":minimum_fragments="
+     << (tiling.uniqueMinimumFragmentPartition ? 1 : 0)
+     << ":unique_boundary_projection="
+     << (tiling.uniqueBoundaryProjectionProven ? 1 : 0)
+     << ":boundary_projection_count=" << tiling.boundaryProjectionCount
+     << ":shared_empty_b="
+     << (tiling.sharedEmptyBEnvelopeProven ? 1 : 0)
+     << ":shared_empty_b_boundary=" << tiling.sharedEmptyBBoundary
+     << ":preserved_state_chain="
+     << (tiling.preservedStateChainComposed ? 1 : 0)
      << ":state_composed=" << (tiling.stateSummariesComposed ? 1 : 0)
+     << ":state_transitions_composed="
+     << (tiling.stateTransitionsComposed ? 1 : 0)
      << ":owners_composed=" << (tiling.ownerBoundariesComposed ? 1 : 0)
      << ":target_composed=" << (tiling.targetTokenStreamComposed ? 1 : 0)
      << ":edges_proven=" << (tiling.compositionEdgesProven ? 1 : 0)
+     << ":source_cover=" << (tiling.sourceByteCoverComplete ? 1 : 0)
+     << ":preserved_gap_order="
+     << (tiling.preservedGapSourceOrderProven ? 1 : 0)
+     << ":preserved_gap_disjoint="
+     << (tiling.preservedGapsDisjointFromTokenSegments ? 1 : 0)
+     << ":preserved_gap_disjoint_from_edits="
+     << (tiling.preservedGapsDisjointFromEdits ? 1 : 0)
      << ":target=" << tiling.globalTargetPPTokenSignature
      << ":composition=" << tiling.globalCompositionSignature;
-  for (const MixedOwnerTilingSegmentWitness &segment : tiling.segments) {
-    os << ";segment" << segment.segmentIndex
-       << "{kind=" << toString(segment.kind) << ":A=[" << segment.aStart << ','
+  for (const StructuralBoundaryProjectionWitness &projection :
+       tiling.boundaryProjections) {
+    os << ";boundary_projection{A=" << projection.aTokenBoundary
+       << ":lower_B=" << projection.lowerBTokenBoundary
+       << ":upper_B=" << projection.upperBTokenBoundary
+       << ":B=" << projection.bTokenBoundary
+       << ":unique=" << (projection.uniqueProjection ? 1 : 0) << '}';
+  }
+  for (const MixedOwnerTilingSegmentWitness &segment : tiling.edges) {
+    os << ";edge" << segment.segmentIndex
+       << "{source_order=" << segment.sourceOrderPosition
+       << ":kind=" << toString(segment.kind) << ":A=[" << segment.aStart << ','
        << segment.aEnd << "):B=[" << segment.bStart << ',' << segment.bEnd
        << "):zero_gap=" << (segment.zeroTokenStateGap ? 1 : 0)
+       << ":gap_disposition=" << toString(segment.gapDisposition)
+       << ":protected_gap="
+       << (segment.protectedPreprocessingStructure ? 1 : 0)
        << ":empty_b=" << (segment.allowEmptyBEnvelope ? 1 : 0)
        << ":closure=" << (segment.ownerClosureComplete ? 1 : 0)
+       << ":owner_identity_known=" << (segment.ownerIdentityKnown ? 1 : 0)
+       << ":owner_kind=" << toString(segment.ownerIdentity.kind)
+       << ":owner_include="
+       << (segment.ownerIdentity.includeId
+               ? llvm::formatv("{0}", *segment.ownerIdentity.includeId).str()
+               : std::string("none"))
+       << ":owner_macro="
+       << (segment.ownerIdentity.macroInvocationId
+               ? llvm::formatv("{0}",
+                               *segment.ownerIdentity.macroInvocationId)
+                     .str()
+               : std::string("none"))
+       << ":owner_macro_directive="
+       << (segment.ownerIdentity.macroDirectiveId
+               ? llvm::formatv("{0}", *segment.ownerIdentity.macroDirectiveId)
+                     .str()
+               : std::string("none"))
+       << ":owner_line="
+       << (segment.ownerIdentity.lineControlId
+               ? llvm::formatv("{0}", *segment.ownerIdentity.lineControlId)
+                     .str()
+               : std::string("none"))
+       << ":owner_pragma="
+       << (segment.ownerIdentity.pragmaId
+               ? llvm::formatv("{0}", *segment.ownerIdentity.pragmaId).str()
+               : std::string("none"))
+       << ":owner_cond_group="
+       << (segment.ownerIdentity.condGroupId
+               ? llvm::formatv("{0}", *segment.ownerIdentity.condGroupId).str()
+               : std::string("none"))
+       << ":owner_cond_arm="
+       << (segment.ownerIdentity.condArmId
+               ? llvm::formatv("{0}", *segment.ownerIdentity.condArmId).str()
+               : std::string("none"))
+       << ":source_range_known=" << (segment.sourceByteRangeKnown ? 1 : 0)
+       << ":source_path=" << segment.sourcePath
+       << ":source_include="
+       << (segment.sourceIncludeId
+               ? llvm::formatv("{0}", *segment.sourceIncludeId).str()
+               : std::string("none"))
+       << ":source_range=[" << segment.sourceBegin << ',' << segment.sourceEnd
+       << ")"
+       << ":structure_identity="
+       << (segment.protectedStructureIdentityRecorded ? 1 : 0)
+       << ":structure_kind=" << toString(segment.protectedStructureKind)
+       << ":producer_kind=" << toString(segment.producerIdentityKind)
+       << ":producer_item="
+       << (segment.producerItemId
+               ? llvm::formatv("{0}", *segment.producerItemId).str()
+               : std::string("none"))
+       << ":producer_cond_group="
+       << (segment.producerConditionalGroupId
+               ? llvm::formatv("{0}",
+                               *segment.producerConditionalGroupId)
+                     .str()
+               : std::string("none"))
+       << ":producer_cond_arm="
+       << (segment.producerConditionalArmId
+               ? llvm::formatv("{0}", *segment.producerConditionalArmId).str()
+               : std::string("none"))
+       << ":bytes_unchanged="
+       << (segment.sourceBytesPreservedUnchanged ? 1 : 0)
+       << ":protected_outside="
+       << (segment.protectedStructurePreservedOutsideSegment ? 1 : 0)
        << ":owner=" << segment.ownerSignature
        << ":source=" << segment.sourceSignature
        << ":producer=" << segment.producerPathSignature
        << ":target=" << segment.targetPPTokenSignature;
     appendStateDeltaSignature(os, "before",
-                              segment.ownerTransitionProof.before);
-    appendStateDeltaSignature(os, "after", segment.ownerTransitionProof.after);
+                              segment.canonicalStateTransition.before);
+    appendStateDeltaSignature(os, "after",
+                              segment.canonicalStateTransition.after);
     for (const SuffixStabilityWitness &suffix :
-         segment.ownerTransitionProof.suffixWitnesses) {
+         segment.canonicalStateTransition.suffixWitnesses) {
       os << "suffix{" << toString(suffix.kind) << ':'
          << toString(
                 RefoldOwnerStateProof::ComponentNamedBySuffixStabilityWitness(

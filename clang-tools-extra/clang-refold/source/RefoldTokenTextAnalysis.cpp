@@ -154,7 +154,8 @@ bool RefoldTokenTextAnalysis::TextMentionsCounterObserver(
 }
 
 bool RefoldTokenTextAnalysis::TextContainsDirectiveLine(StringRef text) const {
-  return source_graph::lineHasPreprocessingDirectiveIntroducer(text);
+  return source_graph::lineHasPreprocessingDirectiveIntroducer(text,
+                                                              lexLang_);
 }
 
 } // namespace refold

@@ -12,8 +12,10 @@
 //     caller-specific `Build*OwnerRealization` funnels into.
 //   * `BuildMacroWholeCoverOwnerRealization` /
 //     `BuildIncludeOwnerRealization` /
-//     `BuildTUOwnerRealization` — caller-specific closures onto the
-//     shared gate.
+//     `BuildTUOwnerRealization` — exact ordinary TU hunk/span closures onto
+//     the shared gate.
+//   * `BuildSpecializedTUOwnerRealization` — source-only carriers for explicit
+//     state/directive repair and TU-closure planners.
 //   * `ApplyOwnerRealizationResultToProofSummary` — apply the gate's
 //     verdict to a `ProofSummary` (discharge status, witness, finalize).
 //   * `BuildOwnerRealizationProofSummary` — one-call convenience that
@@ -55,6 +57,13 @@ namespace clang {
 namespace refold {
 
 class RefoldOwnerStateProof;
+class RefoldTUEditPlanner;
+struct StructuralHunkSegmentBinding;
+struct TUByteSpanPlan;
+
+namespace diffutils {
+struct Hunk;
+} // namespace diffutils
 
 /// Owner-realization proof builder.
 ///
@@ -67,6 +76,8 @@ public:
   struct Dependencies {
     const RefoldModel &model;
     const RefoldOwnerStateProof &ownerStateProof;
+    const RefoldTUEditPlanner &tuEdits;
+    uint64_t bTokenCount = 0;
     const RefoldProofSummaryBuilder &proofSummaryBuilder;
     const RefoldAcceptedResultRanker &acceptedResultRanker;
     const std::vector<MixedOwnerTilingSegmentBinding>
@@ -150,14 +161,27 @@ public:
       IncludeRealizationEvidenceKind evidenceKind,
       std::optional<IncludeRealizationBTokenEnvelope> bTokenEnvelope) const;
 
-  /// Build an owner-realization result for a direct TU realization path.
+  /// Build an owner-realization result for an ordinary direct TU span.
   ///
-  /// The helper does not construct the byte edit; it only builds the TU closure
-  /// and delegates the common owner-realization obligations to
-  /// `TryBuildOwnerRealization()`.
-  OwnerRealizationResult BuildTUOwnerRealization(AcceptedPathKind currentPath,
-                                                 uint64_t begin,
-                                                 uint64_t end) const;
+  /// The hunk and `TUByteSpanPlan` are theorem inputs, not diagnostics. The
+  /// helper revalidates their exact concrete carrier, records their real A/B
+  /// token ranges in `OwnerClosure`, and accepts an optional structural binding
+  /// only when it proves that protected preprocessing structure remains outside
+  /// this exact segment edit.
+  OwnerRealizationResult BuildTUOwnerRealization(
+      AcceptedPathKind currentPath, const diffutils::Hunk &hunk,
+      const TUByteSpanPlan &spanPlan,
+      const StructuralHunkSegmentBinding *structuralBinding) const;
+
+  /// Build a source-only TU realization for a specialized repair/closure path.
+  ///
+  /// Line-control repair, macro-state repair, pragma sideband repair, and the
+  /// explicit TU-include closure theorem do not claim ordinary `TUByteSpan`
+  /// evidence. Their caller-specific planners have already discharged the
+  /// structure/state obligations, so this distinct evidence class prevents
+  /// those paths from manufacturing a direct hunk carrier.
+  OwnerRealizationResult BuildSpecializedTUOwnerRealization(
+      AcceptedPathKind currentPath, uint64_t begin, uint64_t end) const;
 
   /// Build the generic proof summary for realized include/TU/macro output.
   ///
@@ -171,6 +195,31 @@ public:
       const OwnerRealizationResult &ownerRealization) const;
 
 private:
+  /// Internal common gate with an explicit state-summary policy.
+  ///
+  /// Ordinary direct TU spans pass `false`: their exact local hunk/span theorem
+  /// must not import unrelated directives from the translation-unit-wide owner
+  /// summary. Specialized state/directive planners retain the canonical summary
+  /// for observer bookkeeping, but their distinct evidence kind is exempt from
+  /// widening construction and cannot claim ordinary `TUByteSpan` authority.
+  /// Macro/include owners retain the legacy canonical-summary policy through
+  /// the public `TryBuildOwnerRealization()` entry point.
+  OwnerRealizationResult TryBuildOwnerRealizationImpl(
+      OwnerRealizationEvidenceKind evidence, OwnerClosure closure,
+      llvm::StringRef detail, bool attachCanonicalStateSummary) const;
+
+  /// Verify that a structural segment binding resolves to the persisted tiling
+  /// ledger and names the exact token segment used by this TU realization.
+  ///
+  /// The binding's local preservation flags are not accepted as self-authenticating
+  /// booleans.  Its witness id and segment ordinal must resolve through the
+  /// engine-owned durable mixed-owner/structural-tiling records, and both the
+  /// original and segment token envelopes must agree byte-for-byte with the
+  /// concrete carrier supplied by the caller.
+  bool ValidateDurableStructuralSegmentBinding(
+      const diffutils::Hunk &hunk, const TUByteSpanPlan &spanPlan,
+      const StructuralHunkSegmentBinding &structuralBinding) const;
+
   Dependencies deps_;
 };
 

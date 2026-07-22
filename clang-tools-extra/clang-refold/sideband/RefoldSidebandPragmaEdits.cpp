@@ -2414,6 +2414,20 @@ bool appendSidebandPragmaSourceEdits(
                   {}};
     edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
 
+    // Sideband replay is the one TU operation authorized to rewrite an exact
+    // source-authored pragma line or pragma operator.  Record that capability
+    // explicitly so the final global emission firewall does not infer it from
+    // the generic conservative-TU accepted path used by the replay carrier.
+    const PreprocessingStructureKind pragmaKinds[] = {
+        PreprocessingStructureKind::Pragma,
+        PreprocessingStructureKind::PragmaOperator};
+    if (!textEditAssembler.AuthorizeProtectedSourceIntervals(
+            edit, ProtectedSourceEditAuthorityKind::SidebandPragmaEdit,
+            tuPath, std::nullopt, tuBytes, sourceRange.first,
+            sourceRange.second, pragmaKinds,
+            /*requireProtectedInterval=*/false))
+      return false;
+
     const bool folded =
         StringRef(foldedReplacement) != sideband.ReplacementText();
     if (!folded) {
@@ -2435,7 +2449,7 @@ bool appendSidebandPragmaSourceEdits(
     textEditAssembler.AttachAcceptedResultCarrier(
         edit,
         proofLattice.AcceptedCandidateBuilder()
-            .BuildAcceptedTUTextEditCandidate(
+            .BuildAcceptedSpecializedTUTextEditCandidate(
                 AcceptedPathKind::TUByteSpanConservativeEdit, sourceRange.first,
                 sourceRange.second, foldedReplacement));
     structuralHunkDispatcher.AddTUEdit(std::move(edit));

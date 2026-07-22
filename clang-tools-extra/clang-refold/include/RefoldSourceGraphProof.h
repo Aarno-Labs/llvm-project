@@ -25,6 +25,9 @@
 #include <string>
 
 namespace clang {
+
+class LangOptions;
+
 namespace refold {
 
 /// One modified include owner emitted next to the refolded TU.
@@ -139,14 +142,15 @@ struct SourceGraphOwnerPreservationOutputPlan {
 std::optional<std::string>
 safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &include);
 
-/// True when `text` contains a preprocessing directive introducer after applying
-/// the small amount of preprocessing needed for directive recognition by this
-/// proof layer: escaped-newline deletion and comment-as-whitespace treatment.
+/// True when `text` contains a preprocessing directive recognized by the shared
+/// Clang-raw-lexer logical-line scanner under `lexLang`.
 ///
-/// This helper recognizes the directive introducer only; it does not parse or
-/// validate the directive body.  Source-graph alias proof uses it to find
-/// include-looking directives inside already-materialized owner bytes.
-bool lineHasPreprocessingDirectiveIntroducer(llvm::StringRef text);
+/// The scanner applies escaped-newline deletion and comment-as-whitespace
+/// treatment, honors the active digraph/trigraph language mode, and excludes
+/// `#` spellings inside comments and literals.  A scanner inconsistency returns
+/// true so neutrality proofs remain fail-closed.
+bool lineHasPreprocessingDirectiveIntroducer(
+    llvm::StringRef text, const clang::LangOptions &lexLang);
 
 /// Classify whether materialized include-owner bytes contain a surviving
 /// preprocessing include directive that could observe a generated source-graph
@@ -160,12 +164,13 @@ bool lineHasPreprocessingDirectiveIntroducer(llvm::StringRef text);
 /// sidecar.  Non-literal include operands cannot be proven not to name the
 /// sidecar, so the proof fails closed for them as well.
 MaterializedIncludeReplayAlias
-classifyMaterializedIncludeReplayAlias(llvm::StringRef materializedText,
-                                       llvm::StringRef sourceGraphPath);
+classifyMaterializedIncludeReplayAlias(
+    llvm::StringRef materializedText, llvm::StringRef sourceGraphPath,
+    const clang::LangOptions &lexLang);
 
 /// Return true when preserving `include` as a source-graph sidecar under
-/// `sourceGraphPath` cannot conflict with another top-level same-path include or
-/// with a surviving include directive inside materialized owner bytes.
+/// `sourceGraphPath` cannot conflict with another top-level same-path include
+/// or with a surviving include directive inside materialized owner bytes.
 ///
 /// This is an alias-safety proof, not a path-normalization heuristic.  It must
 /// reject preservation whenever a same-spelling top-level include names a

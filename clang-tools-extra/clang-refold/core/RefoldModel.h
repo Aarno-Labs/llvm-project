@@ -777,7 +777,12 @@ public:
   struct PragmaDirective {
     /// Stable producer id for this pragma directive.
     uint64_t id;
-    /// Full source pragma directive line text.
+    /// Producer-recorded pragma text.
+    ///
+    /// Ordinary directives carry the full source `#pragma` line.  For an
+    /// operator-spelled pragma this can be the replayed directive spelling;
+    /// `operatorB/operatorE`, not this field, identify the exact physical
+    /// `_Pragma("...")` expression.
     StringRef text;
     /// Physical source file containing the directive site.
     StringRef sitePath;
@@ -790,6 +795,13 @@ public:
     /// the owner from slot/segment facts or reject repeated-header ambiguity
     /// instead of binding the pragma by physical path alone.
     std::optional<uint64_t> ownerIncludeId;
+    /// True when the pragma was spelled as `_Pragma("...")` rather than as a
+    /// preprocessing directive line.
+    bool viaPragmaOperator = false;
+    /// Inclusive byte offset of the exact `_Pragma("...")` expression.
+    std::optional<uint64_t> operatorB;
+    /// Exclusive byte offset of the exact `_Pragma("...")` expression.
+    std::optional<uint64_t> operatorE;
   };
 
   /// Producer record for one physical file's emitted A-token contribution.

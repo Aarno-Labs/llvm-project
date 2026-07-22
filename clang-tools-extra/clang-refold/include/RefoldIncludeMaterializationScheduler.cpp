@@ -687,6 +687,16 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
       std::move(wrapped.lineControlPruneCandidates);
   edit.lineControlSourceMappings = std::move(wrapped.lineControlSourceMappings);
 
+  const PreprocessingStructureKind includeKinds[] = {
+      PreprocessingStructureKind::Include,
+      PreprocessingStructureKind::IncludeNext,
+      PreprocessingStructureKind::Import};
+  if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
+          edit, ProtectedSourceEditAuthorityKind::IncludeMaterialization,
+          request_.tuPath, std::nullopt, request_.tuBytes, siteBegin, siteEnd,
+          includeKinds))
+    return false;
+
   // Certify the materialized-B extent carried by the edit. Prefer the full
   // include realization envelope, but allow sideband-only materializations to
   // certify the narrower sideband pragma replay range.

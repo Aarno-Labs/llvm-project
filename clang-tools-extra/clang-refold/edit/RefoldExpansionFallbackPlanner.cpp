@@ -27,6 +27,8 @@
 #include "proof/RefoldProofLattice.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
+#include "source/RefoldPreprocessingStructureIndex.h"
+#include "source/RefoldSourceGapProof.h"
 #include "source/TokenTextHelpers.h"
 #include "util/RefoldDenseMapInfo.h"
 
@@ -441,6 +443,47 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
           ExpansionFallbackBranchKind::TUIncludeClosureEdit);
   theoremAuditService_.AuditExpansionFallbackBranchClassification(
       fallbackBranch, "BuildTUIncludeClosureEditForUnresolvedHunk");
+
+  // Expansion fallback and structural hunk tiling must reason over the same
+  // exact physical preprocessing census.  A mismatched source surface would
+  // let the two paths classify identical bytes differently, so this closure
+  // proof is unavailable unless the engine-owned TU index names this exact
+  // source owner and byte extent.
+  if (!paths_.PathsEqual(preprocessingStructureIndex_.GetSourcePath(),
+                         tuPath) ||
+      preprocessingStructureIndex_.GetOwnerIncludeId() ||
+      preprocessingStructureIndex_.GetSourceSize() != tuBytes.size()) {
+    REFOLD_LOG_TRACE(
+        "fallback",
+        "TU include-closure rejected: shared preprocessing index does not "
+        "match TU path='{0}' bytes={1}",
+        tuPath, tuBytes.size());
+    return std::nullopt;
+  }
+
+  // Exact lexical trivia and literal conditional-control preservation are
+  // submitted through the shared source-gap theorem.  The old text predicates
+  // remain narrow semantic policies, but they no longer maintain a second
+  // preprocessing inventory or byte-cover implementation beside structural
+  // hunk tiling.
+  auto gapIsIndexedLexerTrivia = [&](uint64_t begin, uint64_t end) {
+    return proveSourceGapWithIndexedTrivia(
+               preprocessingStructureIndex_, begin, end,
+               ArrayRef<SourceGapProofPiece>())
+        .has_value();
+  };
+  auto gapIsIndexedPreservableIncludeClosureTrivia =
+      [&](uint64_t begin, uint64_t end) {
+        return proveSourceGapWithPolicy(
+                   preprocessingStructureIndex_, begin, end,
+                   ArrayRef<SourceGapProofPiece>(),
+                   [&](uint64_t neutralBegin, uint64_t neutralEnd) {
+                     return isPreservableIncludeClosureGapTrivia(
+                         tuBytes.slice(neutralBegin, neutralEnd));
+                   },
+                   [](size_t) {}, sourceGapConditionalDirectiveKindMask())
+            .has_value();
+      };
 
   // This source-closure path is the declared TUIncludeClosureEdit proof class:
   // one closed TU source interval may replace top-level include directives plus
@@ -883,39 +926,53 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     };
 
     SmallVector<ConditionalPiece, 8> pieces;
-    for (const auto &group : model_.GetConds())
-      if (conditionalGroupIsPreservableIncludeClosureGap(group, gapBegin,
-                                                         gapEnd))
-        pieces.push_back({group.groupB, group.groupE, group.id});
+    for (const auto &group : model_.GetConds()) {
+      if (!conditionalGroupIsPreservableIncludeClosureGap(
+              group, gapBegin, gapEnd)) {
+        continue;
+      }
+      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+          findSourceGapConditionalGroupRange(preprocessingStructureIndex_,
+                                             group.id);
+      if (!exactRange || exactRange->first < gapBegin ||
+          exactRange->second > gapEnd) {
+        continue;
+      }
+      pieces.push_back({exactRange->first, exactRange->second, group.id});
+    }
 
     if (pieces.empty())
       return false;
 
-    if (!proveSourceEnvelopeGap(
-            pieces, gapBegin, gapEnd,
-            [](const ConditionalPiece &, const ConditionalPiece &) {
-              return false;
-            },
-            [](const ConditionalPiece &outer, const ConditionalPiece &piece) {
-              if (outer.begin <= piece.begin && piece.end <= outer.end) {
-                // Nested conditional groups are represented by the producer as
-                // separate records.  Once the outer complete group is
-                // preserved verbatim, nested conditional records inside its
-                // bytes are not independent gap pieces.
-                return true;
-              }
-              return false;
-            },
-            [&](uint64_t begin, uint64_t end) {
-              return isWsOrCompleteCommentTrivia(tuBytes.slice(begin, end));
-            },
-            [](const ConditionalPiece &) {}))
+    SmallVector<SourceGapProofPiece, 8> proofPieces;
+    proofPieces.reserve(pieces.size());
+    for (size_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
+      const ConditionalPiece &piece = pieces[pieceIndex];
+      proofPieces.push_back(SourceGapProofPiece{
+          piece.begin, piece.end, piece.id,
+          /*kindOrder=*/0, /*nestingClass=*/0,
+          /*absorbedNestingClasses=*/uint64_t{1}, pieceIndex});
+    }
+
+    std::string gapReason;
+    std::optional<SourceGapProofResult> gapProof =
+        proveSourceGapWithIndexedTrivia(preprocessingStructureIndex_,
+                                        gapBegin, gapEnd, proofPieces,
+                                        &gapReason);
+    if (!gapProof) {
+      REFOLD_LOG_TRACE(
+          "fallback",
+          "TU include-closure rejected recorded conditional gap "
+          "source=[{0},{1}): {2}",
+          gapBegin, gapEnd, gapReason);
       return false;
+    }
 
     REFOLD_LOG_TRACE("fallback",
                      "TU include-closure preserving recorded conditional gap "
                      "source=[{0},{1}) conditionalGroups={2}",
-                     gapBegin, gapEnd, pieces.size());
+                     gapBegin, gapEnd,
+                     gapProof->outerPiecePayloadIndices.size());
     return true;
   };
 
@@ -981,8 +1038,15 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
         continue;
       if (inc.cover.IsValid() || includeHasRecordedSideEffects(inc))
         continue;
-      if (gapBegin <= inc.siteB && inc.siteE <= gapEnd && inc.siteB < inc.siteE)
-        pieces.push_back({inc.siteB, inc.siteE, inc.id, "include"});
+      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+          findSourceGapProducerInterval(
+              preprocessingStructureIndex_,
+              PreprocessingStructureModelKind::IncludeDirective, inc.id);
+      if (exactRange && gapBegin <= exactRange->first &&
+          exactRange->second <= gapEnd) {
+        pieces.push_back(
+            {exactRange->first, exactRange->second, inc.id, "include"});
+      }
     }
 
     for (const auto &m : model_.GetMacroInvocations())
@@ -997,9 +1061,17 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     if (allowTUConditionalControl)
       for (const auto &group : model_.GetConds())
-        if (conditionalGroupIsConsumableZeroTokenGap(group, gapBegin, gapEnd))
-          pieces.push_back(
-              {group.groupB, group.groupE, group.id, "conditional"});
+        if (conditionalGroupIsConsumableZeroTokenGap(group, gapBegin,
+                                                       gapEnd)) {
+          std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+              findSourceGapConditionalGroupRange(
+                  preprocessingStructureIndex_, group.id);
+          if (exactRange && gapBegin <= exactRange->first &&
+              exactRange->second <= gapEnd) {
+            pieces.push_back({exactRange->first, exactRange->second, group.id,
+                              "conditional"});
+          }
+        }
 
     uint64_t scanCursor = gapBegin;
     uint64_t includeCount = 0;
@@ -1109,57 +1181,72 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     if (pieces.empty())
       return false;
 
-    if (!proveSourceEnvelopeGap(
-            pieces, gapBegin, gapEnd,
-            [](const GapPiece &lhs, const GapPiece &rhs) {
-              return lhs.kind < rhs.kind;
-            },
-            [](const GapPiece &outer, const GapPiece &piece) {
-              if (outer.kind == "macro" && piece.kind == "macro") {
-                // A function-like zero-token macro such as FORWARD(EMPTY)
-                // records both the outer callsite and the nested EMPTY callsite
-                // in the same TU gap. Once the outer macro has been proved
-                // source-neutral, the nested callsite is part of that proof,
-                // not a second independent gap piece.
-                return true;
-              }
+    enum : uint32_t {
+      ConditionalPieceClass = 0,
+      IncludePieceClass = 1,
+      MacroPieceClass = 2,
+      MacroDirectivePieceClass = 3,
+    };
 
-              if (outer.kind == "conditional" && piece.kind == "conditional") {
-                // A complete inactive conditional group may contain nested
-                // conditional groups that the producer also recorded. The outer
-                // zero-token group proof owns all bytes in the inactive island,
-                // so nested conditional records are not separate top-level gap
-                // pieces.
-                return true;
-              }
+    SmallVector<SourceGapProofPiece, 8> proofPieces;
+    proofPieces.reserve(pieces.size());
+    for (size_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
+      const GapPiece &piece = pieces[pieceIndex];
+      uint32_t pieceClass = MacroDirectivePieceClass;
+      uint64_t absorbedClasses = 0;
+      if (piece.kind == "conditional") {
+        pieceClass = ConditionalPieceClass;
+        absorbedClasses = uint64_t{1} << ConditionalPieceClass;
+      } else if (piece.kind == "include") {
+        pieceClass = IncludePieceClass;
+      } else if (piece.kind == "macro") {
+        pieceClass = MacroPieceClass;
+        absorbedClasses = uint64_t{1} << MacroPieceClass;
+      }
+      proofPieces.push_back(SourceGapProofPiece{
+          piece.begin, piece.end, piece.id, pieceClass, pieceClass,
+          absorbedClasses, pieceIndex});
+    }
 
-              // Any other overlap would make the source tiling ambiguous:
-              // includes, directives, and unrelated macro calls must remain
-              // disjoint at this level of the closure proof.
-              return false;
-            },
-            [&](uint64_t begin, uint64_t end) {
-              return scanNeutralControlTrivia(begin, end);
-            },
-            [&](const GapPiece &piece) {
-              // The artifact itself has already been independently proved
-              // zero-token and complete. Consume it as one opaque
-              // source-neutral piece, then continue scanning surrounding
-              // control/trivia bytes at the same conditional depth.
-              StringRef pieceBytes = tuBytes.slice(piece.begin, piece.end);
-              atLineStart =
-                  pieceBytes.ends_with("\n") || pieceBytes.ends_with("\r");
-              if (piece.kind == "include")
-                ++includeCount;
-              else if (piece.kind == "macro")
-                ++macroCount;
-              else if (piece.kind == "macro-directive")
-                ++macroDirectiveCount;
-              else
-                ++conditionalGroupCount;
-            }) ||
-        conditionalDepth != 0)
+    const uint64_t uncoveredConditionalKinds =
+        allowTUConditionalControl ? sourceGapConditionalDirectiveKindMask() : 0;
+
+    std::string gapReason;
+    std::optional<SourceGapProofResult> gapProof = proveSourceGapWithPolicy(
+        preprocessingStructureIndex_, gapBegin, gapEnd, proofPieces,
+        [&](uint64_t begin, uint64_t end) {
+          return scanNeutralControlTrivia(begin, end);
+        },
+        [&](size_t payloadIndex) {
+          const GapPiece &piece = pieces[payloadIndex];
+
+          // The artifact itself has already been independently proved
+          // zero-token and complete. Consume it as one opaque source-neutral
+          // piece, then continue scanning surrounding control/trivia bytes at
+          // the same conditional depth.
+          StringRef pieceBytes = tuBytes.slice(piece.begin, piece.end);
+          atLineStart =
+              pieceBytes.ends_with("\n") || pieceBytes.ends_with("\r");
+          if (piece.kind == "include")
+            ++includeCount;
+          else if (piece.kind == "macro")
+            ++macroCount;
+          else if (piece.kind == "macro-directive")
+            ++macroDirectiveCount;
+          else
+            ++conditionalGroupCount;
+        },
+        uncoveredConditionalKinds, &gapReason);
+    if (!gapProof || conditionalDepth != 0) {
+      REFOLD_LOG_TRACE(
+          "fallback",
+          "TU/include closure rejected zero-token source gap "
+          "source=[{0},{1}): {2}",
+          gapBegin, gapEnd,
+          gapProof ? StringRef("unbalanced literal conditional controls")
+                   : StringRef(gapReason));
       return false;
+    }
 
     REFOLD_LOG_TRACE(
         "fallback",
@@ -1213,9 +1300,15 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     for (const auto &group : model_.GetConds()) {
       if (conditionalGroupIsConsumableZeroTokenGap(group, gapBegin, gapEnd)) {
-        pieces.push_back(
-            {group.groupB, group.groupE, group.id,
-             TUPreservedGapPiece::Kind::ZeroTokenConditionalGroup});
+        std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+            findSourceGapConditionalGroupRange(preprocessingStructureIndex_,
+                                               group.id);
+        if (exactRange && gapBegin <= exactRange->first &&
+            exactRange->second <= gapEnd) {
+          pieces.push_back(
+              {exactRange->first, exactRange->second, group.id,
+               TUPreservedGapPiece::Kind::ZeroTokenConditionalGroup});
+        }
       }
     }
 
@@ -1240,46 +1333,55 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     if (pieces.empty())
       return false;
 
-    SmallVector<TUPreservedGapPiece, 8> accepted;
-    if (!proveSourceEnvelopeGap(
-            pieces, gapBegin, gapEnd,
-            [](const GapPiece &lhs, const GapPiece &rhs) {
-              return lhs.kind < rhs.kind;
-            },
-            [](const GapPiece &outer, const GapPiece &piece) {
-              if (outer.begin <= piece.begin && piece.end <= outer.end) {
-                if (outer.kind ==
-                        TUPreservedGapPiece::Kind::ZeroTokenMacroInvocation &&
-                    piece.kind ==
-                        TUPreservedGapPiece::Kind::ZeroTokenMacroInvocation) {
-                  // Nested zero-token macro invocations are already part of
-                  // the outer invocation's source-neutral proof. Preserve only
-                  // the outer callsite text so the refolded source does not
-                  // duplicate the same gap structure.
-                  return true;
-                }
+    SmallVector<SourceGapProofPiece, 8> proofPieces;
+    proofPieces.reserve(pieces.size());
+    for (size_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
+      const GapPiece &piece = pieces[pieceIndex];
+      const uint32_t pieceClass = static_cast<uint32_t>(piece.kind);
+      uint64_t absorbedClasses = 0;
+      if (piece.kind ==
+          TUPreservedGapPiece::Kind::ZeroTokenMacroInvocation) {
+        absorbedClasses = uint64_t{1} << pieceClass;
+      } else if (piece.kind ==
+                 TUPreservedGapPiece::Kind::ZeroTokenConditionalGroup) {
+        // The independently proved complete conditional island owns nested
+        // macro invocations, nested conditional records, and balanced pragma
+        // islands in its source bytes.
+        absorbedClasses =
+            (uint64_t{1}
+             << static_cast<uint32_t>(
+                    TUPreservedGapPiece::Kind::ZeroTokenMacroInvocation)) |
+            (uint64_t{1}
+             << static_cast<uint32_t>(
+                    TUPreservedGapPiece::Kind::ZeroTokenConditionalGroup)) |
+            (uint64_t{1}
+             << static_cast<uint32_t>(
+                    TUPreservedGapPiece::Kind::BalancedPragmaStateIsland));
+      }
+      proofPieces.push_back(SourceGapProofPiece{
+          piece.begin, piece.end, piece.id, pieceClass, pieceClass,
+          absorbedClasses, pieceIndex});
+    }
 
-                if (outer.kind ==
-                    TUPreservedGapPiece::Kind::ZeroTokenConditionalGroup) {
-                  // A preserved complete conditional group owns everything in
-                  // its source island, including control-line macro uses,
-                  // nested inactive conditional records, and any balanced
-                  // pragma-state island that the shared conditional proof has
-                  // already accepted as boundary-neutral.  Those inner records
-                  // are not independently emitted as gap pieces.
-                  return true;
-                }
-              }
-              return false;
-            },
-            [&](uint64_t begin, uint64_t end) {
-              return isWsOrCompleteCommentTrivia(tuBytes.slice(begin, end));
-            },
-            [&](const GapPiece &piece) {
-              accepted.push_back(
-                  {piece.kind, piece.begin, piece.end, piece.id});
-            }))
+    std::string gapReason;
+    std::optional<SourceGapProofResult> gapProof =
+        proveSourceGapWithIndexedTrivia(preprocessingStructureIndex_,
+                                        gapBegin, gapEnd, proofPieces,
+                                        &gapReason);
+    if (!gapProof) {
+      REFOLD_LOG_TRACE(
+          "fallback",
+          "TU/include closure rejected preserved zero-token gap "
+          "source=[{0},{1}): {2}",
+          gapBegin, gapEnd, gapReason);
       return false;
+    }
+
+    SmallVector<TUPreservedGapPiece, 8> accepted;
+    for (size_t payloadIndex : gapProof->outerPiecePayloadIndices) {
+      const GapPiece &piece = pieces[payloadIndex];
+      accepted.push_back({piece.kind, piece.begin, piece.end, piece.id});
+    }
 
     out.append(accepted.begin(), accepted.end());
     REFOLD_LOG_TRACE("fallback",
@@ -1653,57 +1755,47 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       for (const auto &group : model_.GetConds()) {
         if (!paths_.PathsEqual(group.file, tuPath) || group.parentIncludeId)
           continue;
-        if (group.groupB < gapBegin && gapBegin < group.groupE &&
-            gapEnd == group.groupE) {
-          owningGroup = &group;
-          break;
+        std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+            findSourceGapConditionalGroupRange(preprocessingStructureIndex_,
+                                               group.id);
+        if (!exactRange || exactRange->first >= gapBegin ||
+            gapBegin >= exactRange->second || gapEnd != exactRange->second) {
+          continue;
         }
+        if (owningGroup)
+          return false;
+        owningGroup = &group;
       }
       if (!owningGroup)
         return false;
 
-      StringRef text = tuBytes.slice(gapBegin, gapEnd);
-      size_t cursor = 0;
-      bool sawEndif = false;
-      bool atLineStart = stringutils::beginsLineAfterWs(tuBytes, gapBegin);
-      while (cursor < text.size()) {
-        char ch = text[cursor];
-        if (stringutils::isWs(ch)) {
-          atLineStart = ch == '\n' || ch == '\r';
-          ++cursor;
-          continue;
+      // This legacy delete-only repair preserves a suffix made solely of
+      // closing conditional controls.  Use the shared source-gap theorem to
+      // prove exact directive/trivia byte coverage, then retain only the
+      // path-specific semantic restriction that every indexed structure is a
+      // producer-bound #endif.  No independent line parser or source-offset
+      // search remains in the fallback planner.
+      std::string gapReason;
+      std::optional<SourceGapProofResult> gapProof =
+          proveSourceGapWithIndexedStructureAndTrivia(
+              preprocessingStructureIndex_, gapBegin, gapEnd, &gapReason);
+      if (!gapProof || gapProof->protectedIntervals.empty())
+        return false;
+
+      bool sawOwningEndif = false;
+      for (const PreprocessingStructureInterval *interval :
+           gapProof->protectedIntervals) {
+        if (!interval ||
+            interval->kind != PreprocessingStructureKind::ConditionalEndif ||
+            interval->modelKind !=
+                PreprocessingStructureModelKind::ConditionalDirective ||
+            !interval->conditionalGroupId) {
+          return false;
         }
-        if (ch != '#' || !atLineStart)
-          return false;
-
-        size_t lineEnd = cursor;
-        while (lineEnd < text.size() && text[lineEnd] != '\n')
-          ++lineEnd;
-        const bool hasNewline = lineEnd < text.size();
-        if (hasNewline)
-          ++lineEnd;
-
-        StringRef line = text.slice(cursor, lineEnd);
-        if (line.ends_with("\n"))
-          line = line.drop_back();
-        if (line.ends_with("\r"))
-          line = line.drop_back();
-        StringRef rest = line.ltrim(" \t\v\f");
-        if (!rest.consume_front("#"))
-          return false;
-        rest = rest.ltrim(" \t\v\f");
-        if (!rest.consume_front("endif"))
-          return false;
-        rest = rest.trim(" \t\v\f");
-        if (!rest.empty())
-          return false;
-
-        sawEndif = true;
-        cursor = lineEnd;
-        atLineStart = true;
+        if (*interval->conditionalGroupId == owningGroup->id)
+          sawOwningEndif = true;
       }
-
-      if (!sawEndif)
+      if (!sawOwningEndif)
         return false;
 
       REFOLD_LOG_TRACE("fallback",
@@ -1893,7 +1985,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
                                                           gap.end());
             return true;
           }
-          if (isPreservableIncludeClosureGapTrivia(gap))
+          if (gapIsIndexedPreservableIncludeClosureTrivia(gapBegin,
+                                                            gapEnd))
             return true;
 
           SmallVector<TUPreservedGapPiece, 4> preservedZeroTokenPieces;
@@ -2080,7 +2173,19 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     // them here would incorrectly require a pure contiguous-include closure.
     if (!mixedTUIncludeClosure && inc->siteB > sourceCursor) {
       StringRef gap = tuBytes.slice(sourceCursor, inc->siteB);
-      if (!gap.empty() && !stringutils::isWs(gap)) {
+      if (!gap.empty() && stringutils::isWs(gap)) {
+        // Retain the historical policy of consuming whitespace-only gaps, but
+        // submit their physical byte coverage to the same exact lexical census
+        // used by every other source-gap path.
+        if (!gapIsIndexedLexerTrivia(sourceCursor, inc->siteB)) {
+          REFOLD_LOG_TRACE(
+              "fallback",
+              "TU include-closure rejected: whitespace gap before inc#{0} "
+              "is not an exact indexed trivia interval source=[{1},{2})",
+              inc->id, sourceCursor, inc->siteB);
+          return std::nullopt;
+        }
+      } else if (!gap.empty()) {
         if (gapIsConsumableZeroTokenSourceClosure(
                 sourceCursor, inc->siteB,
                 /*allowTUConditionalControl=*/false)) {
@@ -2089,7 +2194,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
               "TU include-closure consuming zero-token source gap before "
               "inc#{0} gap='{1}'",
               inc->id, stringutils::showWsWithClip(gap, 120));
-        } else if (!isPreservableIncludeClosureGapTrivia(gap) &&
+        } else if (!gapIsIndexedPreservableIncludeClosureTrivia(
+                       sourceCursor, inc->siteB) &&
                    !gapIsPreservableRecordedConditionalIncludeClosure(
                        sourceCursor, inc->siteB)) {
           REFOLD_LOG_TRACE(
@@ -2602,7 +2708,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       // preserved source between the deleted entering include and the skipped
       // include can observe the header macro state at the old position.
       StringRef gap = tuBytes.slice(closureSourceEnd, next->siteB);
-      if (!isWsOrCompleteCommentTrivia(gap)) {
+      if (!gapIsIndexedLexerTrivia(closureSourceEnd, next->siteB)) {
         REFOLD_LOG_TRACE(
             "fallback",
             "TU include-closure rejected: consuming earlier #pragma once "
@@ -2664,6 +2770,10 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
                                      : std::move(ro.lineControlPruneCandidates);
   hooks_.certifyTextEditMaterializedBTokenRange(edit, bEnvelope->first,
                                                 bEnvelope->second);
+  if (!hooks_.authorizeTUIncludeClosure ||
+      !hooks_.authorizeTUIncludeClosure(edit, tuPath, tuBytes, sourceBegin,
+                                        closureSourceEnd))
+    return std::nullopt;
 
   // Emit a first-class TU include-closure carrier instead of hiding this hybrid
   // proof behind the ordinary conservative TU byte-span class.  The local
@@ -2672,9 +2782,10 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   // repair, and pragma-once/include-guard reactivation safety all had to be
   // discharged before this edit was created.
   AcceptedResultCandidate acceptedClosure =
-      proofLattice_.AcceptedCandidateBuilder().BuildAcceptedTUTextEditCandidate(
-          AcceptedPathKind::TUIncludeClosureEdit, sourceBegin, closureSourceEnd,
-          StringRef(rawReplacement));
+      proofLattice_.AcceptedCandidateBuilder()
+          .BuildAcceptedSpecializedTUTextEditCandidate(
+              AcceptedPathKind::TUIncludeClosureEdit, sourceBegin,
+              closureSourceEnd, StringRef(rawReplacement));
   theoremAuditService_.AuditExpansionFallbackAcceptedCandidate(
       fallbackBranch, acceptedClosure,
       "BuildTUIncludeClosureEditForUnresolvedHunk/accepted");

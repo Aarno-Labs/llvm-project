@@ -7,11 +7,11 @@
 // deterministic non-overlapping envelope and drive gap tiling with a
 // caller-specific neutral-range check.  Consumers are
 // `include/RefoldIncludeMaterializer` and
-// `edit/RefoldExpansionFallbackPlanner`.  This is caller-policy gap-
-// discharge mechanics, not owner-state transition logic and not a
-// theorem-proof service — hence the `edit/` location and the
-// `SourceEnvelopeInterval` naming (a byte interval, not a discharge
-// witness).
+// `edit/RefoldExpansionFallbackPlanner`.  This remains caller-policy envelope
+// mechanics, not owner-state transition logic.  Exact preprocessing-structure
+// inventory and physical source-gap byte coverage live in the shared
+// `source/RefoldSourceGapProof` theorem service; this header only orders and
+// iterates already-authorized envelope pieces.
 //
 //===----------------------------------------------------------------------===//
 
