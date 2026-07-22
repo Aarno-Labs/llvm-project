@@ -1005,39 +1005,9 @@ bool RefoldHeaderIncludeEditPlanner::HeaderSourceEnvelopePieceContains(
   return false;
 }
 
-bool RefoldHeaderIncludeEditPlanner::HeaderPreservedGapPieceKindPrecedes(
-    const HeaderPreservedGapPiece &lhs, const HeaderPreservedGapPiece &rhs) {
-  return static_cast<unsigned>(lhs.kind) < static_cast<unsigned>(rhs.kind);
-}
-
-bool RefoldHeaderIncludeEditPlanner::HeaderPreservedGapPieceContains(
-    const HeaderPreservedGapPiece &outer,
-    const HeaderPreservedGapPiece &piece) {
-  if (outer.kind == HeaderPreservedGapPiece::Kind::ZeroTokenMacroInvocation &&
-      piece.kind == HeaderPreservedGapPiece::Kind::ZeroTokenMacroInvocation) {
-    // Nested zero-token macro invocations are already part of the outer
-    // invocation's source-neutral proof. Preserve only the outer callsite text
-    // so the refolded header does not duplicate the same gap structure.
-    return true;
-  }
-
-  if (outer.kind == HeaderPreservedGapPiece::Kind::ZeroTokenConditionalGroup) {
-    // A preserved complete conditional group owns every artifact inside its
-    // source island after the shared conditional-island proof has discharged
-    // those artifacts.
-    return true;
-  }
-
-  return false;
-}
-
-bool RefoldHeaderIncludeEditPlanner::HeaderGapRangeIsTrivia(
-    StringRef headerText, uint64_t begin, uint64_t end) {
-  return isWsOrCompleteCommentTrivia(headerText.slice(begin, end));
-}
-
 bool RefoldHeaderIncludeEditPlanner::ProveHeaderSourceEnvelopeGap(
     const HeaderSourceEnvelopePlanningState &state,
+    const RefoldPreprocessingStructureIndex &structureIndex,
     const SourceEnvelopeInterval &sourceEnvelope, uint64_t gapBegin,
     uint64_t gapEnd,
     SmallVectorImpl<HeaderPreservedGapPiece> &preservedPieces) const {
@@ -1062,7 +1032,40 @@ bool RefoldHeaderIncludeEditPlanner::ProveHeaderSourceEnvelopeGap(
     // Header full-envelope widening uses the same owner-piece gap proof as
     // TU/include closure. A source-spelled line-control gap is not disposable
     // trivia, but it is preservable by carrying its net line state forward to
-    // the untouched header suffix.
+    // the untouched header suffix.  Submit the exact indexed line-control
+    // intervals to the common source-gap theorem so this specialized state
+    // proof does not bypass protected-structure inventory or byte coverage.
+    SmallVector<SourceGapProofPiece, 4> lineControlPieces;
+    for (const PreprocessingStructureInterval *interval :
+         structureIndex.FindOverlapping(gapBegin, gapEnd)) {
+      if (!interval ||
+          interval->kind != PreprocessingStructureKind::LineControl)
+        continue;
+      lineControlPieces.push_back(SourceGapProofPiece{
+          interval->begin, interval->end,
+          interval->modelItemId.value_or(lineControlPieces.size()),
+          static_cast<uint32_t>(PreprocessingStructureKind::LineControl),
+          /*nestingClass=*/0, /*absorbedNestingClasses=*/0,
+          lineControlPieces.size()});
+    }
+
+    std::string gapReason;
+    std::optional<SourceGapProofResult> lineControlGapProof;
+    if (!lineControlPieces.empty()) {
+      lineControlGapProof = proveSourceGapWithIndexedTrivia(
+          structureIndex, gapBegin, gapEnd, lineControlPieces, &gapReason);
+    }
+    if (!lineControlGapProof) {
+      REFOLD_LOG_TRACE(
+          "include",
+          "header source-envelope rejected line-control gap "
+          "source=[{0},{1}): {2}",
+          gapBegin, gapEnd,
+          gapReason.empty() ? "no exact indexed line-control cover"
+                            : gapReason);
+      return false;
+    }
+
     state.headerSourceLineDirectiveResume = std::move(lineResume);
     return true;
   }
@@ -1149,16 +1152,125 @@ bool RefoldHeaderIncludeEditPlanner::ProveHeaderSourceEnvelopeGap(
     gapPieces.push_back(std::move(piece));
   }
 
-  if (!proveSourceEnvelopeGap(
-          gapPieces, gapBegin, gapEnd, HeaderPreservedGapPieceKindPrecedes,
-          HeaderPreservedGapPieceContains,
-          [&](uint64_t begin, uint64_t end) {
-            return HeaderGapRangeIsTrivia(state.headerText, begin, end);
-          },
-          [](const HeaderPreservedGapPiece &) {}))
-    return false;
+  enum : uint32_t {
+    MacroStateDirectiveClass = 0,
+    ConditionalGroupClass = 1,
+    MacroInvocationClass = 2,
+    ChildIncludeClass = 3,
+    PragmaStateIslandClass = 4,
+  };
+  constexpr uint64_t AllHeaderGapPieceClasses =
+      (uint64_t{1} << (PragmaStateIslandClass + 1)) - 1;
 
-  preservedPieces.append(gapPieces.begin(), gapPieces.end());
+  SmallVector<SourceGapProofPiece, 8> proofPieces;
+  proofPieces.reserve(gapPieces.size());
+  for (size_t pieceIndex = 0; pieceIndex < gapPieces.size(); ++pieceIndex) {
+    const HeaderPreservedGapPiece &piece = gapPieces[pieceIndex];
+    uint64_t proofBegin = piece.begin;
+    uint64_t proofEnd = piece.end;
+    uint32_t pieceClass = MacroStateDirectiveClass;
+    uint64_t absorbedClasses = 0;
+
+    switch (piece.kind) {
+    case HeaderPreservedGapPiece::Kind::MacroStateDirective: {
+      if (!piece.directive)
+        return false;
+      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+          findSourceGapProducerInterval(
+              structureIndex,
+              PreprocessingStructureModelKind::MacroDirective, piece.id);
+      if (!exactRange)
+        return false;
+      proofBegin = exactRange->first;
+      proofEnd = exactRange->second;
+      pieceClass = MacroStateDirectiveClass;
+      break;
+    }
+    case HeaderPreservedGapPiece::Kind::ZeroTokenConditionalGroup: {
+      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+          findSourceGapConditionalGroupRange(structureIndex, piece.id);
+      if (!exactRange)
+        return false;
+      proofBegin = exactRange->first;
+      proofEnd = exactRange->second;
+      pieceClass = ConditionalGroupClass;
+
+      // A complete conditional-island proof owns every independently proved
+      // header gap artifact nested in that island.  This reproduces the former
+      // header-specific containment rule inside the shared normalizer.
+      absorbedClasses = AllHeaderGapPieceClasses;
+      break;
+    }
+    case HeaderPreservedGapPiece::Kind::ZeroTokenMacroInvocation:
+      pieceClass = MacroInvocationClass;
+
+      // Nested zero-token macro calls are already part of the outer callsite's
+      // source-neutrality witness.  Preserve only the outer invocation bytes.
+      absorbedClasses = uint64_t{1} << MacroInvocationClass;
+      break;
+    case HeaderPreservedGapPiece::Kind::ZeroTokenChildInclude: {
+      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+          findSourceGapProducerInterval(
+              structureIndex,
+              PreprocessingStructureModelKind::IncludeDirective, piece.id);
+      if (!exactRange)
+        return false;
+      proofBegin = exactRange->first;
+      proofEnd = exactRange->second;
+      pieceClass = ChildIncludeClass;
+      break;
+    }
+    case HeaderPreservedGapPiece::Kind::BalancedPragmaStateIsland: {
+      pieceClass = PragmaStateIslandClass;
+
+      // The semantic island is expressed in producer pragma-text coordinates,
+      // while ordinary edit protection uses complete lexical directive lines.
+      // Expand only to the exact indexed pragma intervals whose scanner-proven
+      // spellings are contained by the already-proved island.  This authorizes
+      // leading logical-line trivia and terminating newlines without allowing
+      // an unrelated directive to enlarge the island.
+      bool sawIndexedPragma = false;
+      for (const PreprocessingStructureInterval *interval :
+           structureIndex.FindOverlapping(piece.begin, piece.end)) {
+        if (!interval ||
+            (interval->kind != PreprocessingStructureKind::Pragma &&
+             interval->kind !=
+                 PreprocessingStructureKind::PragmaOperator) ||
+            interval->structureSpellingBegin < piece.begin ||
+            interval->structureSpellingEnd > piece.end)
+          continue;
+        proofBegin = std::min(proofBegin, interval->begin);
+        proofEnd = std::max(proofEnd, interval->end);
+        sawIndexedPragma = true;
+      }
+      if (!sawIndexedPragma)
+        return false;
+      break;
+    }
+    }
+
+    proofPieces.push_back(SourceGapProofPiece{
+        proofBegin, proofEnd, piece.id, pieceClass, pieceClass,
+        absorbedClasses, pieceIndex});
+  }
+
+  std::string gapReason;
+  std::optional<SourceGapProofResult> gapProof =
+      proveSourceGapWithIndexedTrivia(structureIndex, gapBegin, gapEnd,
+                                      proofPieces, &gapReason);
+  if (!gapProof) {
+    REFOLD_LOG_TRACE("include",
+                     "header source-envelope rejected preserved gap "
+                     "source=[{0},{1}): {2}",
+                     gapBegin, gapEnd, gapReason);
+    return false;
+  }
+
+  for (size_t payloadIndex : gapProof->outerPiecePayloadIndices) {
+    if (payloadIndex >= gapPieces.size())
+      return false;
+    preservedPieces.push_back(gapPieces[payloadIndex]);
+  }
   return true;
 }
 
@@ -1179,6 +1291,16 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
   bool hasPartialChildIncludeOverlap = false;
   const uint64_t fullLo = std::max(state.materialAStart, state.coverBegin);
   const uint64_t fullHi = std::min(state.materialAEnd, state.coverEnd);
+
+  // Build one immutable occurrence-local structure inventory for every source
+  // theorem in this candidate.  Conditional-wrapper classification and all
+  // inter-piece gap proofs must observe the same raw-lexer census; rebuilding
+  // or maintaining a separate header-only directive inventory would re-create
+  // the exact duplication this path is intended to remove.
+  const RefoldPreprocessingStructureIndex sourceStructureIndex =
+      RefoldPreprocessingStructureIndex::Build(
+          {model_, paths_, macroStateProof_, lexLang_}, state.file,
+          state.headerText, std::optional<uint64_t>(state.include.id));
 
   const auto &tokmapByPP = model_.GetTokmapByPP();
   for (uint64_t pp = fullLo; pp < fullHi; ++pp) {
@@ -1263,8 +1385,6 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
           sourceEnvelopePieceEnd(sourcePieces.back())};
     }
   }
-  std::optional<RefoldPreprocessingStructureIndex> conditionalStructureIndex;
-
   for (const auto &group : model_.GetConds()) {
     if (!HeaderConditionalGroupSelectedMaterialOverlaps(
             state.include, state.file, group, fullLo, fullHi))
@@ -1285,13 +1405,8 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
     // source-envelope gap proof remains mandatory and independently rejects
     // every unproved directive or nontrivia byte between mapped pieces.
     if (preConditionalSourceEnvelope) {
-      if (!conditionalStructureIndex) {
-        conditionalStructureIndex = RefoldPreprocessingStructureIndex::Build(
-            {model_, paths_, macroStateProof_, lexLang_}, state.file,
-            state.headerText, std::optional<uint64_t>(state.include.id));
-      }
       if (HeaderSourceEnvelopeLeavesConditionalControlsUntouched(
-              *conditionalStructureIndex, group,
+              sourceStructureIndex, group,
               preConditionalSourceEnvelope->begin,
               preConditionalSourceEnvelope->end))
         continue;
@@ -1341,8 +1456,9 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
     if (sourceEnvelope &&
         !proveSourceEnvelopeGaps(hunkSourcePieces, [&](uint64_t gapBegin,
                                                        uint64_t gapEnd) {
-          return ProveHeaderSourceEnvelopeGap(state, *sourceEnvelope, gapBegin,
-                                              gapEnd, preservedPieces);
+          return ProveHeaderSourceEnvelopeGap(
+              state, sourceStructureIndex, *sourceEnvelope, gapBegin, gapEnd,
+              preservedPieces);
         }))
       sourceEnvelope.reset();
 

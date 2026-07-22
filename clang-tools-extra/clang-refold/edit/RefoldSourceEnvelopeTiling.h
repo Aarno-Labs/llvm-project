@@ -5,13 +5,12 @@
 //
 // These utilities normalize caller-supplied source pieces into a
 // deterministic non-overlapping envelope and drive gap tiling with a
-// caller-specific neutral-range check.  Consumers are
-// `include/RefoldIncludeMaterializer` and
-// `edit/RefoldExpansionFallbackPlanner`.  This remains caller-policy envelope
-// mechanics, not owner-state transition logic.  Exact preprocessing-structure
-// inventory and physical source-gap byte coverage live in the shared
-// `source/RefoldSourceGapProof` theorem service; this header only orders and
-// iterates already-authorized envelope pieces.
+// caller-specific gap theorem.  Consumers are the header include planner and
+// expansion fallback.  This remains caller-policy envelope mechanics, not
+// owner-state transition logic.  Exact preprocessing-structure inventory,
+// physical source-gap normalization, and byte coverage live in the shared
+// `source/RefoldSourceGapProof` theorem service; this header only orders outer
+// envelope pieces and enumerates the gaps between them.
 //
 //===----------------------------------------------------------------------===//
 
@@ -129,32 +128,6 @@ bool proveSourceEnvelopeGaps(const llvm::SmallVectorImpl<PieceT> &pieces,
   }
 
   return true;
-}
-
-/// Normalize and tile one physical source-byte gap with caller-specific
-/// neutral-gap and piece-consumption proofs.
-template <typename PieceT, typename KindLess, typename NestedCovered,
-          typename NeutralRange, typename ConsumePiece>
-bool proveSourceEnvelopeGap(llvm::SmallVectorImpl<PieceT> &pieces,
-                            uint64_t gapBegin, uint64_t gapEnd,
-                            KindLess kindLess, NestedCovered nestedCovered,
-                            NeutralRange neutralRange,
-                            ConsumePiece consumePiece) {
-  if (!normalizeSourceEnvelopePieces(pieces, kindLess, nestedCovered))
-    return false;
-
-  uint64_t cursor = gapBegin;
-  for (const PieceT &piece : pieces) {
-    const uint64_t pieceBegin = sourceEnvelopePieceBegin(piece);
-    const uint64_t pieceEnd = sourceEnvelopePieceEnd(piece);
-    if (pieceBegin < cursor)
-      return false;
-    if (!neutralRange(cursor, pieceBegin))
-      return false;
-    consumePiece(piece);
-    cursor = pieceEnd;
-  }
-  return neutralRange(cursor, gapEnd);
 }
 
 } // namespace refold

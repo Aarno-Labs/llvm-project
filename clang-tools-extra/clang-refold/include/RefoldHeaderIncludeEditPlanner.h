@@ -531,30 +531,15 @@ private:
   HeaderSourceEnvelopePieceContains(const HeaderSourceEnvelopePiece &outer,
                                     const HeaderSourceEnvelopePiece &piece);
 
-  /// Orders preserved gap pieces by preservation category.
-  /// This matches the former source-envelope gap tiling callback.
-  static bool
-  HeaderPreservedGapPieceKindPrecedes(const HeaderPreservedGapPiece &lhs,
-                                      const HeaderPreservedGapPiece &rhs);
-
-  /// Returns whether one preserved gap piece owns another proven piece.
-  /// Nested zero-token macro calls and complete conditional islands absorb
-  /// already-proved child pieces.
-  static bool
-  HeaderPreservedGapPieceContains(const HeaderPreservedGapPiece &outer,
-                                  const HeaderPreservedGapPiece &piece);
-
-  /// Returns whether an uncovered header gap range is trivia.
-  /// Only whitespace and complete comments may be accepted without a proof
-  /// piece.
-  static bool HeaderGapRangeIsTrivia(llvm::StringRef headerText, uint64_t begin,
-                                     uint64_t end);
-
   /// Proves one physical gap between full-envelope source pieces.
-  /// The method appends any preserved gap pieces and records source-line resume
-  /// state on the planning carrier.
+  /// Header-specific code decides which source artifacts are semantically
+  /// preservable; the shared source-gap theorem then owns exact interval
+  /// normalization, protected-structure coverage, and lexer-trivia proof. The
+  /// method appends only the surviving outer preservation pieces and records
+  /// source-line resume state on the planning carrier.
   bool ProveHeaderSourceEnvelopeGap(
       const HeaderSourceEnvelopePlanningState &state,
+      const RefoldPreprocessingStructureIndex &structureIndex,
       const SourceEnvelopeInterval &sourceEnvelope, uint64_t gapBegin,
       uint64_t gapEnd,
       llvm::SmallVectorImpl<HeaderPreservedGapPiece> &preservedPieces) const;
