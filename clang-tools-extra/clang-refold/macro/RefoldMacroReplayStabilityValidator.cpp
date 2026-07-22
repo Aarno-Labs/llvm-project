@@ -127,6 +127,45 @@ bool appendFixedPiecesOutsideExcludedSurfaces(
   return true;
 }
 
+/// Append each non-empty token span clipped to `cover`.
+///
+/// The span range must carry exact producer surfaces rather than a bounding
+/// cover.  Clipping is required because a validated descendant may begin or end
+/// outside the root invocation currently being audited.
+template <typename SpanRange>
+void appendClippedTokenIntervals(SmallVectorImpl<TokenInterval> &out,
+                                 const SpanRange &spans,
+                                 std::pair<uint64_t, uint64_t> cover) {
+  for (const auto &span : spans) {
+    const uint64_t begin = std::max<uint64_t>(span.begin, cover.first);
+    const uint64_t end = std::min<uint64_t>(span.end, cover.second);
+    addNonEmptyTokenInterval(out, begin, end);
+  }
+}
+
+/// Append the exact A-token surfaces produced by one validated descendant.
+///
+/// A descendant's `PPCover` is only the convex hull of its producer spans.  It
+/// is suitable for containment and ranking, but it is not an ownership proof:
+/// sparse child output can leave parent-owned fixed-body tokens inside that
+/// hull.  Excluding the hull from a root literal-body audit would therefore
+/// hide edits that the preserved root callsite cannot reproduce.
+///
+/// Only the producer's exact body and argument-dependent surfaces are safe to
+/// delegate to descendant replay.  Generic `spans` are deliberately omitted;
+/// they may carry the same conservative ancestry envelope that widened the
+/// cover.  Missing exact surfaces remain fail-closed and are audited as root
+/// fixed body instead of being inferred from a bounding interval.
+void appendExactDescendantReplaySurfaces(
+    SmallVectorImpl<TokenInterval> &out,
+    const RefoldModel::MacroInvocation &descendant,
+    std::pair<uint64_t, uint64_t> rootCover) {
+  appendClippedTokenIntervals(out, descendant.bodySpans, rootCover);
+  appendClippedTokenIntervals(out, descendant.argSpans, rootCover);
+  appendClippedTokenIntervals(out, descendant.stringifySpans, rootCover);
+  appendClippedTokenIntervals(out, descendant.pasteSpans, rootCover);
+}
+
 /// Merge overlapping/adjacent intervals in place.  Used by
 /// `RootPreservingCandidateHasLiteralFixedRootBodyReplay` only.
 void normalizeIntervals(SmallVectorImpl<TokenInterval> &spans) {
@@ -360,13 +399,14 @@ bool RefoldMacroReplayStabilityValidator::
   for (const auto &span : m.pasteSpans)
     addArgumentDependentInterval(span.begin, span.end);
 
-  // A root producer body span may contain output emitted by nested macro
-  // invocations.  That output is not fixed root replacement-list text: the
-  // subtree replay validator owns its semantic replay obligation.  Exclude
-  // each proven descendant cover from this local literal-body audit while
-  // retaining exact A/B envelope tiling below.  Membership is established
-  // solely from recorded caller ancestry, so malformed or unrelated producer
-  // nodes remain fail-closed and continue to be checked as fixed root body.
+  // A root producer body span may contain exact output surfaces emitted by
+  // nested macro invocations.  The subtree replay validator owns those
+  // surfaces, so exclude them from this local literal-body audit while
+  // retaining exact A/B envelope tiling below.  Never exclude the descendant
+  // PPCover: that interval is only a convex hull and can contain intervening
+  // parent-owned body tokens.  Membership is established solely from recorded
+  // caller ancestry, so malformed or unrelated producer nodes remain
+  // fail-closed and continue to be checked as fixed root body.
   RefoldMacroOccurrenceProofValidator occurrenceProofValidator(
       RefoldMacroOccurrenceProofValidator::Dependencies{&deps_.model,
                                                         &deps_.macroTopology});
@@ -377,11 +417,8 @@ bool RefoldMacroReplayStabilityValidator::
             ctx, candidate))
       continue;
 
-    const uint64_t begin =
-        std::max<uint64_t>(candidate.cover.begin, cover->first);
-    const uint64_t end =
-        std::min<uint64_t>(candidate.cover.end, cover->second);
-    addArgumentDependentInterval(begin, end);
+    appendExactDescendantReplaySurfaces(argumentDependentIntervals, candidate,
+                                        *cover);
   }
 
   llvm::sort(argumentDependentIntervals, tokenIntervalLess);
@@ -608,12 +645,13 @@ bool RefoldMacroReplayStabilityValidator::
   for (const auto &span : m.pasteSpans)
     addNonEmptyTokenInterval(excludedA, span.begin, span.end);
 
-  // Producer body spans on a root invocation can include tokens emitted
-  // by nested/generated macro calls.  Those tokens are not fixed root
-  // body: they are discharged by the descendant proof that the root
-  // candidate rewrites or by whole-cover realization.  Exclude every
-  // descendant cover before asking whether the remaining root-owned body
-  // text is still literal.
+  // Producer body spans on a root invocation can include exact surfaces
+  // emitted by nested/generated macro calls.  Those surfaces are not fixed
+  // root body: they are discharged by the descendant proof that the root
+  // candidate rewrites or by whole-cover realization.  Exclude only those
+  // exact producer surfaces before auditing the remaining root-owned body.
+  // A descendant PPCover is merely a convex hull and must not hide
+  // intervening parent-owned fixed-body tokens.
   DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invById;
   for (const auto &candidate : deps_.model.GetMacroInvocations())
     invById[candidate.id] = &candidate;
@@ -630,10 +668,7 @@ bool RefoldMacroReplayStabilityValidator::
         !occurrenceProofValidator.CandidateBelongsToValidatedSubtree(
             rootBodyReplaySubtreeCtx, candidate))
       continue;
-    const uint64_t begin =
-        std::max<uint64_t>(candidate.cover.begin, cover->first);
-    const uint64_t end = std::min<uint64_t>(candidate.cover.end, cover->second);
-    addNonEmptyTokenInterval(excludedA, begin, end);
+    appendExactDescendantReplaySurfaces(excludedA, candidate, *cover);
   }
 
   normalizeIntervals(excludedA);
