@@ -26,6 +26,7 @@
 #include "proof/RefoldProofLattice.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
+#include "source/RefoldSourceGapProof.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
 #include "util/RefoldDenseMapInfo.h"
@@ -589,31 +590,38 @@ bool RefoldHeaderIncludeEditPlanner::
 }
 
 bool RefoldHeaderIncludeEditPlanner::
-    HeaderSourceEnvelopeIsInsideSelectedConditionalArm(
-        const RefoldModel::IncludeItem &currentInclude, StringRef file,
+    HeaderSourceEnvelopeLeavesConditionalControlsUntouched(
+        const RefoldPreprocessingStructureIndex &structureIndex,
         const RefoldModel::CondGroup &group, uint64_t sourceBegin,
         uint64_t sourceEnd) const {
-  if (!paths_.PathsEqual(group.file, file))
-    return false;
-  if (!group.parentIncludeId || *group.parentIncludeId != currentInclude.id)
-    return false;
-  if (group.groupB >= group.groupE || sourceBegin >= sourceEnd ||
-      sourceBegin < group.groupB || sourceEnd > group.groupE)
+  if (sourceBegin >= sourceEnd)
     return false;
 
-  // Selected-material overlap does not by itself mean that a widened source
-  // edit crosses conditional-control structure.  A candidate inside one
-  // selected arm may retain the surrounding wrapper unchanged.  The caller's
-  // normal source-envelope gap proof still rejects any conditional directive or
-  // other stateful source structure crossed between candidate pieces.
-  for (const RefoldModel::CondArm &arm : group.arms) {
-    if (!arm.selected || arm.bodyB > arm.bodyE ||
-        arm.bodyB < group.groupB || arm.bodyE > group.groupE)
-      continue;
-    if (arm.bodyB <= sourceBegin && sourceEnd <= arm.bodyE)
-      return true;
+  // Use the shared lexical/producer binding rather than interpreting arm body
+  // bounds as directive intervals.  The group range is available only when the
+  // scanner found one complete #if...#endif topology and bound it uniquely to
+  // this producer group in the current include occurrence.
+  std::optional<std::pair<uint64_t, uint64_t>> groupRange =
+      findSourceGapConditionalGroupRange(structureIndex, group.id);
+  if (!groupRange || sourceBegin < groupRange->first ||
+      sourceEnd > groupRange->second)
+    return false;
+
+  // A selected arm's PP material can overlap a replacement even though the
+  // concrete source envelope lies strictly between its control directives.
+  // Such an enclosing wrapper is not source structure consumed by the edit.
+  // Conversely, touching any control interval belonging to this exact group
+  // is a real conditional-state obligation and must retain the existing
+  // fail-closed whole-include realization path.
+  for (const PreprocessingStructureInterval *interval :
+       structureIndex.FindOverlapping(sourceBegin, sourceEnd)) {
+    if (interval->modelKind ==
+            PreprocessingStructureModelKind::ConditionalDirective &&
+        interval->conditionalGroupId == group.id)
+      return false;
   }
-  return false;
+
+  return true;
 }
 
 bool RefoldHeaderIncludeEditPlanner::
@@ -1239,10 +1247,10 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
     hasPartialMacroInvocationOverlap = true;
   }
 
-  // Classify incomplete conditional overlap against the candidate source
-  // envelope formed before adding conditional wrappers.  This lets an outer
-  // selected arm remain in place around an interior cross-declaration edit,
-  // while malformed or non-contiguous candidates continue to fail closed.
+  // Classify incomplete conditional overlap against the concrete source
+  // envelope before adding any conditional wrapper as a source piece.  PP
+  // overlap alone proves only that the hunk consumes selected-arm output; it
+  // does not prove that the byte edit crosses a conditional-control line.
   std::optional<SourceEnvelopeInterval> preConditionalSourceEnvelope;
   {
     SmallVector<HeaderSourceEnvelopePiece, 8> sourcePieces = hunkSourcePieces;
@@ -1255,6 +1263,7 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
           sourceEnvelopePieceEnd(sourcePieces.back())};
     }
   }
+  std::optional<RefoldPreprocessingStructureIndex> conditionalStructureIndex;
 
   for (const auto &group : model_.GetConds()) {
     if (!HeaderConditionalGroupSelectedMaterialOverlaps(
@@ -1269,18 +1278,24 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
       continue;
     }
 
-    // A conditional group that merely encloses the candidate is not source
-    // structure crossed by the edit.  Keep its directives untouched and let
-    // the ordinary source-envelope gap proof certify every byte between the
-    // mapped pieces.  If no normalized candidate exists, or the candidate is
-    // not wholly inside one selected arm, preserve the existing fail-closed
-    // whole-include realization path.
-    if (preConditionalSourceEnvelope &&
-        HeaderSourceEnvelopeIsInsideSelectedConditionalArm(
-            state.include, state.file, group,
-            preConditionalSourceEnvelope->begin,
-            preConditionalSourceEnvelope->end))
-      continue;
+    // A conditional group that merely encloses the source envelope is not
+    // structure consumed by the edit.  Bind the wrapper through the shared
+    // preprocessing-structure index and require that the candidate overlap no
+    // #if/#elif/#else/#endif interval from this exact group.  The subsequent
+    // source-envelope gap proof remains mandatory and independently rejects
+    // every unproved directive or nontrivia byte between mapped pieces.
+    if (preConditionalSourceEnvelope) {
+      if (!conditionalStructureIndex) {
+        conditionalStructureIndex = RefoldPreprocessingStructureIndex::Build(
+            {model_, paths_, macroStateProof_, lexLang_}, state.file,
+            state.headerText, std::optional<uint64_t>(state.include.id));
+      }
+      if (HeaderSourceEnvelopeLeavesConditionalControlsUntouched(
+              *conditionalStructureIndex, group,
+              preConditionalSourceEnvelope->begin,
+              preConditionalSourceEnvelope->end))
+        continue;
+    }
 
     hasPartialConditionalGroupOverlap = true;
   }

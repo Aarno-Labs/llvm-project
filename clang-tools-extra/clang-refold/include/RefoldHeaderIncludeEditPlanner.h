@@ -41,6 +41,7 @@ class LineDirectiveInserter;
 class RefoldLineControlProof;
 class RefoldMacroStateProof;
 class RefoldOwnerStateProof;
+class RefoldPreprocessingStructureIndex;
 class RefoldProofLattice;
 class RefoldSourceMapper;
 class RefoldTerminalProofSink;
@@ -434,15 +435,16 @@ private:
       llvm::StringRef headerText, const RefoldModel::CondGroup &group,
       uint64_t materialBeginA, uint64_t materialEndA) const;
 
-  /// Returns whether a candidate source envelope lies wholly inside one
-  /// producer-selected arm of a header conditional group.
+  /// Returns whether an exact candidate source envelope leaves every control
+  /// directive of one enclosing conditional group physically untouched.
   ///
-  /// This distinguishes an enclosing conditional wrapper from a source
-  /// envelope that actually crosses conditional-control structure. The
-  /// caller must still prove every inter-piece source gap before committing
-  /// the widened edit.
-  bool HeaderSourceEnvelopeIsInsideSelectedConditionalArm(
-      const RefoldModel::IncludeItem &currentInclude, llvm::StringRef file,
+  /// The shared preprocessing-structure index must bind the complete lexical
+  /// group uniquely to `group`.  Mere selected-arm PP overlap is not enough to
+  /// reject the edit: only an actual overlap with one of that group's control
+  /// intervals creates a conditional-state obligation.  The caller must still
+  /// prove every inter-piece source gap before committing the widened edit.
+  bool HeaderSourceEnvelopeLeavesConditionalControlsUntouched(
+      const RefoldPreprocessingStructureIndex &structureIndex,
       const RefoldModel::CondGroup &group, uint64_t sourceBegin,
       uint64_t sourceEnd) const;
 
