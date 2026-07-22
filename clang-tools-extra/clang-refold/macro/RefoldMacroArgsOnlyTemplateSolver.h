@@ -60,6 +60,19 @@ struct CurrentLevelTemplateSurface {
   uint64_t coverEnd = 0;
 };
 
+/// Exact B-side realization of a current-level standard-argument template.
+///
+/// `surface` is the exact A-side body/formal partition.  `bExpansionByFormal`
+/// contains one edited expansion spelling per parsed callsite formal.  The
+/// realization comes either from a producer-byte projection that itself tiles
+/// the complete literal-body template, or from a complete template solve whose
+/// admissible assignments all agree on the per-formal text.
+struct CurrentLevelStandardArgReplay {
+  CurrentLevelTemplateSurface surface;
+  std::vector<std::string> bExpansionByFormal;
+  std::pair<size_t, size_t> bEnvelope = {0, 0};
+};
+
 /// Explicit state bundle for args-only template replay.
 ///
 /// Template replay needs the current invocation, its source spelling, and the
@@ -110,6 +123,19 @@ public:
   /// Convenience wrapper used when only rebased standard spans are needed.
   std::optional<std::vector<RefoldModel::PPArgSpan>>
   GetCurrentLevelStandardArgSpansForInvocation(
+      const RefoldModel::MacroInvocation &invocation,
+      llvm::ArrayRef<std::pair<size_t, size_t>> formalRanges) const;
+
+  /// Resolve every current-level standard formal against the invocation's
+  /// complete edited expansion envelope.
+  ///
+  /// Fixed replacement-list tokens are matched literally and formal slots are
+  /// the only variables.  An existing producer-byte projection is retained
+  /// only when it exactly tiles that complete template.  Otherwise, multiple
+  /// token partitions are accepted only when they all recover identical
+  /// per-formal B text; divergent realizations fail closed.
+  std::optional<CurrentLevelStandardArgReplay>
+  ResolveCurrentLevelStandardArgReplay(
       const RefoldModel::MacroInvocation &invocation,
       llvm::ArrayRef<std::pair<size_t, size_t>> formalRanges) const;
 

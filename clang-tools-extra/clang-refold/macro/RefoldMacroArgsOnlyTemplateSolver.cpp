@@ -427,16 +427,72 @@ private:
       return std::nullopt;
     const auto &formalRanges = *formalRangesOpt;
 
+    // Prefer the complete fixed-body template proof introduced for boundary
+    // insertion recovery.  It is the only authority allowed to widen a
+    // producer argument span beyond its ordinary byte projection.
+    if (auto replay =
+            solver_.ResolveCurrentLevelStandardArgReplay(inv, formalRanges)) {
+      if (auto rewritten = BuildFromReplay(
+              inv, formalRanges, replay->surface.standardSpans,
+              replay->bExpansionByFormal, depth))
+        return rewritten;
+    }
+
+    // Preserve the established projection-backed current-level replay as a
+    // fallback.  Some nested-call surfaces are not uniquely segmentable from
+    // fixed replacement-list tokens alone: repeated body punctuation can admit
+    // several complete B partitions even though child invocation provenance
+    // reconstructs one exact source spelling.  The fallback does not widen any
+    // span.  It uses the producer byte projection exactly as before and is
+    // admitted only after `BuildFromReplay` proves the old/new child expansion
+    // bridge and validates that the rebuilt text changes producer callsite
+    // syntax solely inside formal slots.
     auto standardSpansOpt =
         solver_.GetCurrentLevelStandardArgSpansForInvocation(inv, formalRanges);
-    if (!standardSpansOpt)
+    if (!standardSpansOpt ||
+        standardSpansOpt->size() != formalRanges.size())
       return std::nullopt;
-    const auto &standardSpans = *standardSpansOpt;
-    if (standardSpans.size() != formalRanges.size())
+
+    std::vector<std::string> projectedExpansionByFormal(formalRanges.size());
+    for (size_t i = 0; i < standardSpansOpt->size(); ++i) {
+      auto bEnvelope = (*deps_.sourceMapper)
+                           .MapAToBTokenEnvelopeByPPArgSpan(
+                               (*standardSpansOpt)[i]);
+      if (!bEnvelope || bEnvelope->first >= bEnvelope->second)
+        return std::nullopt;
+      std::string expansion =
+          (*deps_.sourceMapper)
+              .SliceBSource(bEnvelope->first, bEnvelope->second)
+              .trim()
+              .str();
+      if (expansion.empty())
+        return std::nullopt;
+      projectedExpansionByFormal[i] = std::move(expansion);
+    }
+
+    return BuildFromReplay(inv, formalRanges, *standardSpansOpt,
+                           projectedExpansionByFormal, depth);
+  }
+
+  /// Rebuild one invocation from a proven per-formal B expansion assignment.
+  ///
+  /// This routine owns the source-syntax inversion shared by the complete
+  /// template and projection-backed authorities.  Direct textual inversions,
+  /// unique substring replacement, and recursive child-expansion bridges are
+  /// accepted exactly as before; the final producer-slot transport check makes
+  /// the resulting source spelling a complete function-like invocation rather
+  /// than merely a token partition of its expansion.
+  std::optional<std::string> BuildFromReplay(
+      const RefoldModel::MacroInvocation &inv,
+      ArrayRef<std::pair<size_t, size_t>> formalRanges,
+      ArrayRef<RefoldModel::PPArgSpan> standardSpans,
+      ArrayRef<std::string> bExpansionByFormal, unsigned depth) const {
+    if (standardSpans.size() != formalRanges.size() ||
+        bExpansionByFormal.size() != formalRanges.size())
       return std::nullopt;
 
     // Accumulate replacements by parsed formal slot.  Each replacement is
-    // derived from one standard span's old expansion and its mapped B-side
+    // derived from one standard span's old expansion and its proven B-side
     // expansion, then later applied directly to the invocation spelling.
     DenseMap<uint32_t, std::string> replByFormal;
     for (size_t i = 0; i < standardSpans.size(); ++i) {
@@ -459,11 +515,7 @@ private:
 
       StringRef oldExpansion =
           (*deps_.sourceMapper).SliceASource(sp.begin, sp.end).trim();
-      auto bEnv = (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(sp);
-      if (!bEnv)
-        return std::nullopt;
-      StringRef newExpansion =
-          (*deps_.sourceMapper).SliceBSource(bEnv->first, bEnv->second).trim();
+      StringRef newExpansion = bExpansionByFormal[i];
       if (oldExpansion.empty() || newExpansion.empty())
         return std::nullopt;
 
@@ -616,6 +668,24 @@ private:
       rewritten =
           stringutils::replaceRange(rewritten, edit.begin, edit.end, edit.repl);
     }
+
+    // A complete expansion-template partition is not, by itself, proof that
+    // the recovered variable interval is a valid source-level macro actual.
+    // Runs of identical replacement-list punctuation can otherwise let a
+    // fixed token match the wrong B-side occurrence and leave the inferred
+    // formal text containing an unmatched delimiter.  Reparse the rebuilt
+    // callsite through the producer-aware actual-layout service.  For rewritten
+    // text, that service accepts only when the producer's fixed callsite text
+    // plus the newly parsed formal slots reconstructs the entire spelling
+    // exactly.  Therefore no prefix/suffix text may escape the invocation and
+    // no token outside a formal slot may be reassigned to an argument.
+    auto rewrittenFormalRanges =
+        RefoldMacroActualLayout({deps_.lexLang})
+            .GetMacroInvocationFormalArgContentRanges(inv, rewritten);
+    if (!rewrittenFormalRanges ||
+        rewrittenFormalRanges->size() != formalRanges.size())
+      return std::nullopt;
+
     return StringRef(rewritten).trim().str();
   }
 
@@ -818,6 +888,173 @@ RefoldMacroArgsOnlyTemplateSolver::GetCurrentLevelStandardArgSpansForInvocation(
   if (!surface)
     return std::nullopt;
   return std::move(surface->standardSpans);
+}
+
+std::optional<CurrentLevelStandardArgReplay>
+RefoldMacroArgsOnlyTemplateSolver::ResolveCurrentLevelStandardArgReplay(
+    const RefoldModel::MacroInvocation &invocation,
+    ArrayRef<std::pair<size_t, size_t>> formalRanges) const {
+  auto surface =
+      GetCurrentLevelTemplateSurfaceForInvocation(invocation, formalRanges);
+  if (!surface || surface->coverBegin >= surface->coverEnd ||
+      surface->standardSpans.size() != formalRanges.size())
+    return std::nullopt;
+
+  // Build the exact current-level template.  Body spans are fixed terminals;
+  // the maximal standard spans are the only variable B intervals.
+  SmallVector<ArgsOnlyTemplateElem, 32> elems;
+  for (const auto &bodySpan : invocation.bodySpans) {
+    if (bodySpan.begin < bodySpan.end)
+      elems.push_back({false, bodySpan.begin, bodySpan.end, 0, 0});
+  }
+
+  size_t occurrenceCount = 0;
+  for (const RefoldModel::PPArgSpan &span : surface->standardSpans) {
+    if (span.kind != PPArgSpanKind::Standard || span.begin >= span.end ||
+        static_cast<size_t>(span.argIdx) >= formalRanges.size())
+      return std::nullopt;
+    elems.push_back(
+        {true, span.begin, span.end, span.argIdx, occurrenceCount++});
+  }
+
+  if (occurrenceCount != formalRanges.size() || elems.empty())
+    return std::nullopt;
+
+  llvm::sort(elems,
+             [](const ArgsOnlyTemplateElem &lhs,
+                const ArgsOnlyTemplateElem &rhs) {
+               if (lhs.aBegin != rhs.aBegin)
+                 return lhs.aBegin < rhs.aBegin;
+               if (lhs.aEnd != rhs.aEnd)
+                 return lhs.aEnd < rhs.aEnd;
+               return lhs.isArg < rhs.isArg;
+             });
+
+  // A missing, overlapping, or duplicated surface would leave some expansion
+  // token unexplained.  Reject rather than recovering a formal from an
+  // approximate byte boundary.
+  uint64_t aCursor = surface->coverBegin;
+  for (const ArgsOnlyTemplateElem &elem : elems) {
+    if (elem.aBegin != aCursor || elem.aEnd <= elem.aBegin ||
+        elem.aEnd > surface->coverEnd)
+      return std::nullopt;
+    aCursor = elem.aEnd;
+  }
+  if (aCursor != surface->coverEnd)
+    return std::nullopt;
+
+  auto bEnvelope =
+      (*deps_.sourceMapper)
+          .MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+              surface->coverBegin, surface->coverEnd);
+  if (!bEnvelope || bEnvelope->first >= bEnvelope->second ||
+      bEnvelope->second > deps_.bToks.size())
+    return std::nullopt;
+
+  // Preserve the existing producer-byte projection whenever it already
+  // constitutes an exact replay of the complete current-level template.  This
+  // is not a fallback to approximate slicing: the whole-envelope validator
+  // requires every projected body/formal element to be contiguous, requires
+  // every fixed body token to match literally, and requires the partition to
+  // consume the complete B envelope.  The failing bracket cases do not pass
+  // this test because their trimmed standard span leaves an unexplained B
+  // token between the formal and the following fixed body span.
+  if (ArgsOnlyTemplateReplayPreservesEnvelope(invocation, *surface)) {
+    std::vector<std::string> projectedExpansionByFormal(formalRanges.size());
+    for (size_t i = 0; i < surface->standardSpans.size(); ++i) {
+      auto projected = (*deps_.sourceMapper)
+                           .MapAToBTokenEnvelopeByPPArgSpan(
+                               surface->standardSpans[i]);
+      if (!projected || projected->first >= projected->second ||
+          projected->second > bEnvelope->second)
+        return std::nullopt;
+      std::string expansion =
+          (*deps_.sourceMapper)
+              .SliceBSource(projected->first, projected->second)
+              .trim()
+              .str();
+      if (expansion.empty())
+        return std::nullopt;
+      projectedExpansionByFormal[i] = std::move(expansion);
+    }
+
+    CurrentLevelStandardArgReplay replay;
+    replay.surface = std::move(*surface);
+    replay.bExpansionByFormal = std::move(projectedExpansionByFormal);
+    replay.bEnvelope = *bEnvelope;
+    return replay;
+  }
+
+  // If producer-byte projection does not tile the complete envelope, solve the
+  // exact fixed-body template instead.  Match the bounds already used by the
+  // complete template solver so current-level recovery remains deterministic
+  // and pathological covers cannot trigger an unbounded segmentation search.
+  if (elems.size() > 64 ||
+      (bEnvelope->second - bEnvelope->first) > 256 ||
+      occurrenceCount > 32)
+    return std::nullopt;
+
+  TemplateAssignmentEnumerator assignmentEnumerator(
+      ArrayRef<ArgsOnlyTemplateElem>(elems.data(), elems.size()), *bEnvelope,
+      deps_);
+  std::vector<TemplateAssignmentEnumerator::Assignment> solutions =
+      assignmentEnumerator.Enumerate(occurrenceCount);
+  if (solutions.empty() || solutions.size() > 16)
+    return std::nullopt;
+
+  std::optional<std::vector<std::string>> uniqueExpansionByFormal;
+  for (const TemplateAssignmentEnumerator::Assignment &solution : solutions) {
+    if (solution.size() != occurrenceCount)
+      return std::nullopt;
+
+    std::vector<std::string> expansionByFormal(formalRanges.size());
+    for (const ArgsOnlyTemplateElem &elem : elems) {
+      if (!elem.isArg)
+        continue;
+      if (elem.occurrenceOrdinal >= solution.size() ||
+          static_cast<size_t>(elem.argIdx) >= expansionByFormal.size())
+        return std::nullopt;
+
+      const auto &range = solution[elem.occurrenceOrdinal];
+      if (range.first >= range.second || range.second > bEnvelope->second)
+        return std::nullopt;
+      std::string expansion =
+          (*deps_.sourceMapper)
+              .SliceBSource(range.first, range.second)
+              .trim()
+              .str();
+      if (expansion.empty())
+        return std::nullopt;
+      expansionByFormal[elem.argIdx] = std::move(expansion);
+    }
+
+    for (const std::string &expansion : expansionByFormal) {
+      if (expansion.empty())
+        return std::nullopt;
+    }
+
+    if (!uniqueExpansionByFormal) {
+      uniqueExpansionByFormal = std::move(expansionByFormal);
+      continue;
+    }
+    if (*uniqueExpansionByFormal != expansionByFormal) {
+      REFOLD_LOG_TRACE(
+          "macro/template",
+          "reject current-level standard replay: inv id={0} name={1} "
+          "complete fixed-body template has divergent formal assignments",
+          invocation.id, invocation.name);
+      return std::nullopt;
+    }
+  }
+
+  if (!uniqueExpansionByFormal)
+    return std::nullopt;
+
+  CurrentLevelStandardArgReplay replay;
+  replay.surface = std::move(*surface);
+  replay.bExpansionByFormal = std::move(*uniqueExpansionByFormal);
+  replay.bEnvelope = *bEnvelope;
+  return replay;
 }
 
 std::optional<std::pair<std::string, std::string>>
