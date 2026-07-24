@@ -11,10 +11,13 @@
 #include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
 #include "macro/RefoldMacroTopology.h"
+#include "source/RefoldPreprocessingStructureIndex.h"
 #include "source/RefoldSourceMapper.h"
+#include "util/RefoldPathIdentity.h"
 #include "util/StringUtils.h"
 
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <algorithm>
@@ -22,6 +25,8 @@
 #include <cstddef>
 #include <limits>
 #include <optional>
+#include <set>
+#include <string>
 #include <utility>
 
 using namespace llvm;
@@ -38,24 +43,94 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
 
   deps_.ownerDepthGap = ComputeOwnerDepthGapsForPP();
 
-  std::vector<diffutils::LcsAGapProvenance> gapProvenance =
-      ComputeLcsAGapProvenanceForPP(deps_.ownerDepthGap);
-  std::vector<diffutils::LcsBGapProvenance> bGapProvenance =
-      ComputeLcsBGapProvenanceForPP();
-  std::vector<int64_t> a2b =
-      diffutils::lcsMapAB(aSeq, bSeq, gapProvenance, bGapProvenance);
+  diffutils::CertifiedLcsResult alignment;
+  if (deps_.alignmentOverride) {
+    alignment.completeCertification = true;
+    alignment.selectedMap = deps_.alignmentOverride->selectedMap;
+    alignment.selectedAnchorProofs =
+        deps_.alignmentOverride->selectedAnchorProofs;
+    alignment.forcedMap.assign(alignment.selectedMap.size(), -1);
+    for (size_t aToken = 0; aToken < alignment.selectedMap.size(); ++aToken) {
+      if (alignment.selectedMap[aToken] < 0 ||
+          aToken >= alignment.selectedAnchorProofs.size())
+        continue;
+      if (alignment.selectedAnchorProofs[aToken].kind ==
+          diffutils::LcsAnchorProofKind::CoreOptimalPathForced)
+        alignment.forcedMap[aToken] = alignment.selectedMap[aToken];
+    }
+  } else {
+    std::vector<diffutils::LcsAGapProvenance> gapProvenance =
+        ComputeLcsAGapProvenanceForPP(deps_.ownerDepthGap);
+    alignment = diffutils::certifiedLcsMapAB(aSeq, bSeq, gapProvenance);
+    // The permanent ambiguity census is evidence-only and may inspect every
+    // admissible repeated-token pair. Do not pay that cost when trace output is
+    // disabled.
+    if (inTraceMode())
+      TraceAlignmentAmbiguityWindows(aSeq, bSeq, alignment);
+    if (deps_.semanticAlignmentResolver) {
+      // The historical boundary policy is reconstructed only as a proposal.
+      // Its B-gap surface ranks never grant authority: every proposed
+      // non-forced anchor must subsequently pass the semantic resolver's
+      // complete counterfactual and realization-equivalence theorems.
+      std::vector<diffutils::LcsBGapProvenance> bGapProvenance =
+          ComputeLcsBGapProvenanceForPP();
+      deps_.semanticAlignmentResolver(aSeq, bSeq, gapProvenance,
+                                      bGapProvenance, alignment);
+    }
+  }
+  const std::vector<int64_t> &a2b = alignment.selectedMap;
+
+  // An incomplete structured result is not an alignment certificate. The
+  // diff layer deliberately publishes no anchors in that case, causing the
+  // downstream owner/structure planners to see one conservative edit island.
+  // Keep this assertion at the refolding boundary so a future compatibility
+  // fallback cannot silently reintroduce uncertified provenance.
+  if (!alignment.completeCertification &&
+      std::any_of(a2b.begin(), a2b.end(),
+                  [](int64_t bToken) { return bToken >= 0; })) {
+    REFOLD_LOG_FATAL(
+        "lcs/map",
+        "incomplete structured LCS result exposed an uncertified token anchor");
+  }
+
+  if (a2b.size() != aSeq.size() ||
+      alignment.selectedAnchorProofs.size() != aSeq.size()) {
+    REFOLD_LOG_FATAL(
+        "lcs/map",
+        "selected alignment/proof surface has the wrong A-token cardinality");
+  }
 
   int64_t last = -1;
   for (size_t i = 0; i < a2b.size(); ++i) {
     const int64_t j = a2b[i];
-    if (j < 0)
+    const diffutils::LcsAnchorProof &proof =
+        alignment.selectedAnchorProofs[i];
+    if (j < 0) {
+      if (proof.kind != diffutils::LcsAnchorProofKind::None ||
+          proof.semanticWitnessId != 0)
+        REFOLD_LOG_FATAL("lcs/map",
+                         "unmapped A token carries an anchor theorem");
       continue;
-    if (j < last) {
+    }
+    if (!proof.IsAuthorized())
+      REFOLD_LOG_FATAL("lcs/map",
+                       "mapped A token has no authorized anchor theorem");
+    if (static_cast<size_t>(j) >= bSeq.size() || aSeq[i] != bSeq[j])
+      REFOLD_LOG_FATAL("lcs/map",
+                       "selected anchor does not identify equal A/B lexemes");
+    if (j <= last) {
       REFOLD_LOG_FATAL("lcs/map", "non-monotone map at A[{0}]={1} after {2}", i,
                        j, last);
     }
+    if (proof.kind == diffutils::LcsAnchorProofKind::CoreOptimalPathForced &&
+        (i >= alignment.forcedMap.size() || alignment.forcedMap[i] != j)) {
+      REFOLD_LOG_FATAL(
+          "lcs/map",
+          "core-forced anchor theorem does not match the exact forced map");
+    }
     last = j;
   }
+  deps_.abTokAnchorProofs = alignment.selectedAnchorProofs;
 
   std::vector<diffutils::Hunk> hunks =
       diffutils::hunksFromMap(a2b, aSeq.size(), bSeq.size());
@@ -74,9 +149,10 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
     if (!h.isInsertOnly())
       continue;
 
-    // Insert-only hunks should contain only unmatched B tokens. Under
-    // ambiguous token-LCS tie-breaks, matched context tokens can appear on a
-    // hunk edge; trim them away before downstream owner classification.
+    // Insert-only hunks should contain only unmatched B tokens.  A
+    // theorem-authorized semantic representative may retain matched context
+    // at a hunk edge, so trim that context before downstream owner
+    // classification without changing the selected anchor proof.
     while (h.bStart < h.bEnd && static_cast<size_t>(h.bStart) < b2a.size() &&
            b2a[static_cast<size_t>(h.bStart)] >= 0) {
       ++h.bStart;
@@ -114,7 +190,314 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
   // inputs as the token hunk plan.
   deps_.abByteHunks = deps_.sourceMapper.BuildByteHunksFromRawText();
   deps_.sourceMapper.BuildByteHunkPrefixDeltaCache();
-  return TokenDiffPlan{std::move(hunks)};
+  return TokenDiffPlan{std::move(hunks), std::move(alignment)};
+}
+
+namespace {
+
+struct ForcedAlignmentAnchor {
+  int64_t aToken = -1;
+  int64_t bToken = -1;
+};
+
+static std::string formatTokenFrontiers(ArrayRef<uint64_t> frontiers) {
+  std::string text;
+  raw_string_ostream os(text);
+  os << '[';
+  for (size_t i = 0; i < frontiers.size(); ++i) {
+    if (i != 0)
+      os << ',';
+    os << frontiers[i];
+  }
+  os << ']';
+  os.flush();
+  return text;
+}
+
+static std::string formatForcedAnchor(const ForcedAlignmentAnchor &anchor,
+                                      bool isLeftSentinel,
+                                      bool isRightSentinel) {
+  if (isLeftSentinel)
+    return "<begin>";
+  if (isRightSentinel)
+    return "<end>";
+  return formatv("A[{0}]->B[{1}]", anchor.aToken, anchor.bToken).str();
+}
+
+static bool sourceIntervalPrecedes(const RefoldModel::TokMapEntry &entry,
+                                   uint64_t sourceBegin) {
+  return entry.e <= sourceBegin;
+}
+
+static bool sourceIntervalFollows(const RefoldModel::TokMapEntry &entry,
+                                  uint64_t sourceEnd) {
+  return entry.b >= sourceEnd;
+}
+
+} // namespace
+
+void RefoldTokenDiffPlanner::TraceAlignmentAmbiguityWindows(
+    ArrayRef<StringRef> aSeq, ArrayRef<StringRef> bSeq,
+    const diffutils::CertifiedLcsResult &alignment) const {
+  if (!inTraceMode())
+    return;
+
+  const uint64_t aTokenCount = static_cast<uint64_t>(aSeq.size());
+  const uint64_t bTokenCount = static_cast<uint64_t>(bSeq.size());
+
+  // Project exact protected physical intervals to A-token boundaries.  This is
+  // diagnostic evidence only: failure to find one exact boundary is recorded
+  // and never replaced by a nearest-token or source-distance approximation.
+  std::set<uint64_t> protectedABoundaries;
+  size_t unmappedProtectedIntervals = 0;
+  const StringRef indexedPath =
+      deps_.preprocessingStructureIndex.GetSourcePath();
+
+  auto addBoundIncludeSeams = [&](const PreprocessingStructureInterval &interval)
+      -> bool {
+    if (interval.modelKind !=
+            PreprocessingStructureModelKind::IncludeDirective ||
+        !interval.modelItemId)
+      return false;
+
+    for (const RefoldModel::IncludeItem &include : deps_.model.GetIncludes()) {
+      if (include.id != *interval.modelItemId || !include.cover.IsValid())
+        continue;
+      if (include.cover.end > aTokenCount)
+        return false;
+      if (!deps_.pathIdentity.PathsEqual(include.sitePath, indexedPath) ||
+          include.parent !=
+              deps_.preprocessingStructureIndex.GetOwnerIncludeId())
+        return false;
+      protectedABoundaries.insert(include.cover.begin);
+      protectedABoundaries.insert(include.cover.end);
+      return true;
+    }
+    return false;
+  };
+
+  auto projectTokenlessInterval =
+      [&](const PreprocessingStructureInterval &interval)
+      -> std::optional<uint64_t> {
+    uint64_t lowerBoundary = 0;
+    uint64_t upperBoundary = aTokenCount;
+    bool overlapsMappedToken = false;
+
+    for (const RefoldModel::TokMapEntry &entry : deps_.model.GetTokmap()) {
+      if (entry.pp >= aTokenCount ||
+          !deps_.pathIdentity.PathsEqual(entry.file, indexedPath))
+        continue;
+      if (sourceIntervalPrecedes(entry, interval.begin)) {
+        lowerBoundary = std::max(lowerBoundary, entry.pp + 1);
+      } else if (sourceIntervalFollows(entry, interval.end)) {
+        upperBoundary = std::min(upperBoundary, entry.pp);
+      } else {
+        overlapsMappedToken = true;
+      }
+    }
+
+    // A top-level include contributes tokens whose tokmap entries name the
+    // included file rather than this TU.  Its producer cover is nevertheless
+    // exact A-token evidence, so include covers before/after the directive are
+    // part of the physical-order projection.
+    for (const RefoldModel::IncludeItem &include : deps_.model.GetIncludes()) {
+      if (include.parent !=
+              deps_.preprocessingStructureIndex.GetOwnerIncludeId() ||
+          !include.cover.IsValid() || include.cover.end > aTokenCount ||
+          !deps_.pathIdentity.PathsEqual(include.sitePath, indexedPath))
+        continue;
+      if (include.siteE <= interval.begin) {
+        lowerBoundary = std::max(lowerBoundary, include.cover.end);
+      } else if (include.siteB >= interval.end) {
+        upperBoundary = std::min(upperBoundary, include.cover.begin);
+      }
+    }
+
+    if (overlapsMappedToken || lowerBoundary != upperBoundary)
+      return std::nullopt;
+    return lowerBoundary;
+  };
+
+  for (const PreprocessingStructureInterval &interval :
+       deps_.preprocessingStructureIndex.GetIntervals()) {
+    if (addBoundIncludeSeams(interval))
+      continue;
+    std::optional<uint64_t> boundary = projectTokenlessInterval(interval);
+    if (!boundary) {
+      ++unmappedProtectedIntervals;
+      continue;
+    }
+    protectedABoundaries.insert(*boundary);
+  }
+
+  auto traceWindowHeader = [&](uint64_t aBegin, uint64_t aEnd,
+                               uint64_t bBegin, uint64_t bEnd,
+                               const ForcedAlignmentAnchor &left,
+                               const ForcedAlignmentAnchor &right,
+                               bool leftSentinel, bool rightSentinel,
+                               const diffutils::LcsObjective &objective) {
+    REFOLD_LOG_TRACE("lcs/ambiguity", "alignment ambiguity window:");
+    REFOLD_LOG_TRACE("lcs/ambiguity", "A window=[{0},{1})", aBegin,
+                     aEnd);
+    REFOLD_LOG_TRACE("lcs/ambiguity", "B window=[{0},{1})", bBegin,
+                     bEnd);
+    REFOLD_LOG_TRACE(
+        "lcs/ambiguity", "forced left anchor={0}",
+        formatForcedAnchor(left, leftSentinel, /*isRightSentinel=*/false));
+    REFOLD_LOG_TRACE(
+        "lcs/ambiguity", "forced right anchor={0}",
+        formatForcedAnchor(right, /*isLeftSentinel=*/false, rightSentinel));
+    REFOLD_LOG_TRACE(
+        "lcs/ambiguity",
+        "core objective matchedTokens={0} ownerDepthCost={1}",
+        objective.matchedTokenCount, objective.ownerDepthCost);
+  };
+
+  if (!alignment.completeCertification ||
+      !alignment.oracle.HasCompleteCertification()) {
+    const ForcedAlignmentAnchor beginSentinel;
+    const ForcedAlignmentAnchor endSentinel{
+        static_cast<int64_t>(aTokenCount),
+        static_cast<int64_t>(bTokenCount)};
+    traceWindowHeader(0, aTokenCount, 0, bTokenCount, beginSentinel,
+                      endSentinel, /*leftSentinel=*/true,
+                      /*rightSentinel=*/true, alignment.globalObjective);
+    REFOLD_LOG_TRACE("lcs/ambiguity",
+                     "admissible repeated-token pairs=<unavailable>");
+    for (uint64_t aBoundary : protectedABoundaries) {
+      REFOLD_LOG_TRACE(
+          "lcs/ambiguity",
+          "possible B frontiers protectedA={0} frontiers=<incomplete>",
+          aBoundary);
+    }
+    REFOLD_LOG_TRACE("lcs/ambiguity",
+                     "unmapped protected intervals={0}",
+                     unmappedProtectedIntervals);
+    REFOLD_LOG_TRACE("lcs/ambiguity",
+                     "certification completeness=false");
+    return;
+  }
+
+  std::vector<ForcedAlignmentAnchor> anchors;
+  anchors.reserve(alignment.forcedMap.size() + 2);
+  anchors.push_back(ForcedAlignmentAnchor{});
+  for (size_t aToken = 0; aToken < alignment.forcedMap.size(); ++aToken) {
+    const int64_t bToken = alignment.forcedMap[aToken];
+    if (bToken < 0)
+      continue;
+    anchors.push_back(ForcedAlignmentAnchor{
+        static_cast<int64_t>(aToken), bToken});
+  }
+  anchors.push_back(ForcedAlignmentAnchor{
+      static_cast<int64_t>(aTokenCount),
+      static_cast<int64_t>(bTokenCount)});
+
+  for (size_t anchorIndex = 0; anchorIndex + 1 < anchors.size();
+       ++anchorIndex) {
+    const ForcedAlignmentAnchor &left = anchors[anchorIndex];
+    const ForcedAlignmentAnchor &right = anchors[anchorIndex + 1];
+    const bool leftSentinel = anchorIndex == 0;
+    const bool rightSentinel = anchorIndex + 2 == anchors.size();
+    const uint64_t aBegin =
+        leftSentinel ? 0 : static_cast<uint64_t>(left.aToken + 1);
+    const uint64_t bBegin =
+        leftSentinel ? 0 : static_cast<uint64_t>(left.bToken + 1);
+    const uint64_t aEnd = static_cast<uint64_t>(right.aToken);
+    const uint64_t bEnd = static_cast<uint64_t>(right.bToken);
+    if (aBegin > aEnd || bBegin > bEnd)
+      continue;
+
+    StringMap<uint32_t> aSpellingCount;
+    StringMap<uint32_t> bSpellingCount;
+    StringMap<std::vector<uint64_t>> bTokensBySpelling;
+    for (uint64_t aToken = aBegin; aToken < aEnd; ++aToken)
+      ++aSpellingCount[aSeq[static_cast<size_t>(aToken)]];
+    for (uint64_t bToken = bBegin; bToken < bEnd; ++bToken) {
+      const StringRef spelling = bSeq[static_cast<size_t>(bToken)];
+      ++bSpellingCount[spelling];
+      bTokensBySpelling[spelling].push_back(bToken);
+    }
+
+    struct AdmissiblePair {
+      uint64_t aToken = 0;
+      uint64_t bToken = 0;
+      StringRef spelling;
+    };
+    // A match edge can exist only between equal lexemes. Indexing the B side
+    // preserves the original A-major/B-minor diagnostic order while avoiding a
+    // Cartesian scan over provably unequal pairs.
+    bool hasOptionalPair = false;
+    std::vector<AdmissiblePair> repeatedPairs;
+    for (uint64_t aToken = aBegin; aToken < aEnd; ++aToken) {
+      const StringRef spelling = aSeq[static_cast<size_t>(aToken)];
+      const auto positions = bTokensBySpelling.find(spelling);
+      if (positions == bTokensBySpelling.end())
+        continue;
+      const bool repeated = aSpellingCount.lookup(spelling) > 1 ||
+                            bSpellingCount.lookup(spelling) > 1;
+      for (uint64_t bToken : positions->second) {
+        if (!alignment.oracle.PairOccursOnOptimalPath(aToken, bToken) ||
+            alignment.oracle.PairIsForced(aToken, bToken))
+          continue;
+        hasOptionalPair = true;
+        if (repeated)
+          repeatedPairs.push_back(
+              AdmissiblePair{aToken, bToken, spelling});
+      }
+    }
+
+    std::vector<std::pair<uint64_t, std::vector<uint64_t>>>
+        protectedFrontiers;
+    bool ambiguousProtectedFrontier = false;
+    for (uint64_t aBoundary : protectedABoundaries) {
+      if (aBoundary < aBegin || aBoundary > aEnd)
+        continue;
+      std::vector<uint64_t> frontiers =
+          alignment.oracle.ProjectATokenBoundaryToOptimalBFrontiers(
+              aBegin, aEnd, bBegin, bEnd, aBoundary);
+      if (frontiers.size() != 1)
+        ambiguousProtectedFrontier = true;
+      protectedFrontiers.emplace_back(aBoundary, std::move(frontiers));
+    }
+
+    // An ambiguity window exists when at least one non-forced match edge can
+    // participate in an optimal path, or an exact protected A boundary has
+    // multiple/no certified B frontiers. Pure insertion/deletion regions with
+    // no optional anchors do not create token-alignment ambiguity.
+    if (!hasOptionalPair && !ambiguousProtectedFrontier)
+      continue;
+
+    const diffutils::LcsObjective objective =
+        alignment.oracle.ObjectiveForWindow(aBegin, aEnd, bBegin, bEnd);
+    traceWindowHeader(aBegin, aEnd, bBegin, bEnd, left, right, leftSentinel,
+                      rightSentinel, objective);
+
+    std::string repeatedPairsText;
+    raw_string_ostream repeatedPairsStream(repeatedPairsText);
+    repeatedPairsStream << '[';
+    bool firstRepeatedPair = true;
+    for (const AdmissiblePair &pair : repeatedPairs) {
+      if (!firstRepeatedPair)
+        repeatedPairsStream << ", ";
+      firstRepeatedPair = false;
+      repeatedPairsStream << "A[" << pair.aToken << "]->B[" << pair.bToken
+                          << "] '" << pair.spelling << "'";
+    }
+    repeatedPairsStream << ']';
+    repeatedPairsStream.flush();
+    REFOLD_LOG_TRACE("lcs/ambiguity",
+                     "admissible repeated-token pairs={0}",
+                     repeatedPairsText);
+
+    for (const auto &entry : protectedFrontiers) {
+      REFOLD_LOG_TRACE(
+          "lcs/ambiguity", "possible B frontiers protectedA={0} frontiers={1}",
+          entry.first, formatTokenFrontiers(entry.second));
+    }
+    REFOLD_LOG_TRACE("lcs/ambiguity", "unmapped protected intervals={0}",
+                     unmappedProtectedIntervals);
+    REFOLD_LOG_TRACE("lcs/ambiguity", "certification completeness=true");
+  }
 }
 
 std::vector<StringRef>
@@ -402,14 +785,16 @@ RefoldTokenDiffPlanner::ComputeLcsAGapProvenanceForPP(
   return profiles;
 }
 
+
 std::vector<diffutils::LcsBGapProvenance>
 RefoldTokenDiffPlanner::ComputeLcsBGapProvenanceForPP() const {
   using diffutils::LcsBGapProvenance;
 
-  // B-side tokens have no producer ownership graph, so this records only source
-  // surface facts around each edited token gap. The LCS certificate may use
-  // these facts to break otherwise equivalent pure-insertion frontiers without
-  // reintroducing the removed neighboring-token spelling heuristic.
+  // B-side tokens have no producer ownership graph, so this records only
+  // source-surface facts around each edited token gap.  The evidence-only
+  // Patch 6 shadow reconstruction consumes the profile to reproduce the last
+  // known regression-passing frontier policy exactly.  Production alignment
+  // certification and semantic class construction never consult these facts.
 
   const size_t n = deps_.bToks.size();
   std::vector<LcsBGapProvenance> profiles(n + 1);
@@ -458,10 +843,10 @@ RefoldTokenDiffPlanner::ComputeLcsBGapProvenanceForPP() const {
     profile.gapBeginByte = static_cast<uint64_t>(gapBegin);
     profile.gapEndByte = static_cast<uint64_t>(gapEnd);
 
-    // Record whitespace/newline shape of the gap itself. These facts distin-
-    // guish distinguish ordinary intra-line spacing from line-boundary or
-    // blank-line frontiers, while staying purely structural. They are not
-    // lexical-neighbor heuristics.
+    // Record whitespace/newline shape of the gap itself. These facts
+    // distinguish ordinary intra-line spacing from line-boundary or blank-line
+    // frontiers. They are retained only to reconstruct the historical policy
+    // faithfully; they are not production proof facts.
     profile.gapContainsNewline =
         stringutils::rangeContainsNewline(deps_.bSource, gapBegin, gapEnd);
     profile.gapContainsOnlyWs =
@@ -471,9 +856,8 @@ RefoldTokenDiffPlanner::ComputeLcsBGapProvenanceForPP() const {
     profile.gapAtLineEnd = stringutils::endsLineBeforeWs(deps_.bSource, gapEnd);
 
     // If there is a token to the left, record its byte extent and whether that
-    // token itself touches a logical line boundary. Later ranking can then
-    // prefer anchors/frontiers that preserve existing line structure without
-    // re-lexing the source.
+    // token itself touches a logical line boundary. The shadow reconstruction
+    // can then reproduce the historical rank without re-lexing the source.
     if (profile.hasLeftToken) {
       const size_t leftBegin = tokenBegin(gap - 1);
       const size_t leftEnd = tokenEnd(gap - 1);
@@ -499,9 +883,8 @@ RefoldTokenDiffPlanner::ComputeLcsBGapProvenanceForPP() const {
           stringutils::endsLineBeforeWs(deps_.bSource, rightEnd);
     }
 
-    // Store the completed B-gap profile. LCS tie resolution and edit-frontier
-    // construction consume these precomputed facts so they can remain
-    // deterministic and provenance/surface driven.
+    // Store the completed B-gap profile for the trace-only historical shadow.
+    // No production LCS or edit-frontier decision consumes this profile.
     profiles[gap] = profile;
   }
 

@@ -1721,7 +1721,9 @@ RefoldHeaderIncludeEditPlanner::BuildCarriedHeaderMacroStateRewrite(
 }
 
 bool RefoldHeaderIncludeEditPlanner::TryCarryHeaderMacroStateAfterReplacement(
-    const HeaderMacroStateCarryState &state) const {
+    const HeaderMacroStateCarryState &state,
+    SmallVectorImpl<HeaderMacroStateCarryCandidate> &carriedTransitions) const {
+  carriedTransitions.clear();
   if (!state.startByte || !state.endByte || *state.startByte > *state.endByte ||
       state.replacement.empty())
     return false;
@@ -1750,12 +1752,43 @@ bool RefoldHeaderIncludeEditPlanner::TryCarryHeaderMacroStateAfterReplacement(
   if (!rewrite)
     return false;
 
+  // The lexical non-observation checks above establish why each exact
+  // definition can move.  Record the same transition through the shared owner
+  // state gateway before mutating the output plan, so authority and theorem
+  // admission cannot become detached.  The final position is named by the
+  // widened source carrier plus the deterministic append order in `rewrite`.
+  for (const HeaderMacroStateCarryCandidate &candidate : carryCandidates) {
+    const OwnerStateBoundary originalBoundary =
+        OwnerStateBoundary::FromSource(OwnerSourceRange::From(
+            state.file, candidate.begin, candidate.end,
+            std::optional<uint64_t>(state.include.id)));
+    const std::string detail =
+        llvm::formatv("header include #{0} moves #define #{1} for '{2}' "
+                      "from [{3},{4}) after replacement carrier [{5},{6})",
+                      state.include.id, candidate.directive->id, candidate.name,
+                      candidate.begin, candidate.end, rewrite->startByte,
+                      rewrite->endByte)
+            .str();
+    StateTransitionProof proof =
+        ownerStateProof_.CheckStateTransitionAcrossEditBoundary(
+            originalBoundary, OwnerStateComponent::MacroState,
+            StateMutationKind::MovedLater,
+            ownerStateProof_.BuildStateTransitionWitness(
+                SuffixStabilityWitnessKind::ClosureWidening,
+                OwnerStateComponent::MacroState, originalBoundary, detail),
+            "include/header-macro-state-carry", detail,
+            /*requireKnownObserver=*/false);
+    if (proof.failure)
+      return false;
+  }
+
   *state.startByte = rewrite->startByte;
   *state.endByte = rewrite->endByte;
   state.replacement = std::move(rewrite->replacement);
   state.mappedHeaderWitness.hasByteRange = true;
   state.mappedHeaderWitness.startByte = *state.startByte;
   state.mappedHeaderWitness.endByte = *state.endByte;
+  carriedTransitions.append(carryCandidates.begin(), carryCandidates.end());
   return true;
 }
 
@@ -2615,13 +2648,15 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
     // B-derived patch payload carried by the IncludePatch.
     std::string replacement = isDelete ? "" : materialInsertBytes;
 
+    SmallVector<HeaderMacroStateCarryCandidate, 4>
+        carriedHeaderMacroStateTransitions;
     bool carriedHeaderMacroState = false;
     if (isReplace) {
       HeaderMacroStateCarryState carryState{
           *ie.include, plan,    file,        StringRef(headerText),
           startByte,   endByte, replacement, mappedHeaderWitness};
-      carriedHeaderMacroState =
-          TryCarryHeaderMacroStateAfterReplacement(carryState);
+      carriedHeaderMacroState = TryCarryHeaderMacroStateAfterReplacement(
+          carryState, carriedHeaderMacroStateTransitions);
     }
 
     if (!headerGapPreservations.empty()) {
@@ -2725,23 +2760,25 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
     }
 
     if (sourceAuthorityAccepted && carriedHeaderMacroState) {
-      // Header-local macro-state carry is a specialized directive operation,
-      // not an ordinary mapped-token edit. The carry proof above establishes
-      // that each moved active definition may cross the replacement and its
-      // physical line tail without changing any observer. Bind that theorem to
-      // every exact #define/#undef interval touched by the final widened edit.
-      // Any unrelated protected construct still makes authorization fail
-      // closed unless a prior full-envelope proof independently authorized it.
+      // Header-local carry proves individual producer transitions, not every
+      // macro directive incidentally enclosed by the widened source carrier.
+      // Mint one exact capability per proved transition so unrelated protected
+      // structure remains unauthorized and therefore fails closed.
       const PreprocessingStructureKind macroStateKinds[] = {
           PreprocessingStructureKind::MacroDefine,
           PreprocessingStructureKind::MacroUndef};
-      sourceAuthorityAccepted =
-          textEditAssembler_.AuthorizeProtectedSourceIntervals(
-              edit, ProtectedSourceEditAuthorityKind::MacroStateRepair, file,
-              ie.include->id, headerText, *startByte, *endByte,
-              macroStateKinds,
-              /*requireProtectedInterval=*/true,
-              /*requestTerminalOnFailure=*/false);
+      for (const HeaderMacroStateCarryCandidate &transition :
+           carriedHeaderMacroStateTransitions) {
+        if (textEditAssembler_.AuthorizeExactProtectedSourceInterval(
+                edit, ProtectedSourceEditAuthorityKind::MacroStateRepair, file,
+                ie.include->id, headerText, transition.begin, transition.end,
+                macroStateKinds, {},
+                /*requestTerminalOnFailure=*/false)) {
+          continue;
+        }
+        sourceAuthorityAccepted = false;
+        break;
+      }
     }
 
     if (sourceAuthorityAccepted && !usedFullHeaderEnvelope &&

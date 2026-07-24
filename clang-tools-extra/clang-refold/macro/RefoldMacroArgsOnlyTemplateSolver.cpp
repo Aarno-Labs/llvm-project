@@ -403,15 +403,21 @@ public:
       : solver_(solver), deps_(deps) {}
 
   /// Rebuilds `inv` as source syntax when every changed formal is provable.
+  /// `completeEnvelopeReplayValidated` reports whether the complete-template
+  /// resolver, rather than the legacy projection fallback, supplied the
+  /// formal expansions used to construct the spelling.
   std::optional<std::string>
-  Build(const RefoldModel::MacroInvocation &inv) const {
-    return Build(inv, 0);
+  Build(const RefoldModel::MacroInvocation &inv,
+        bool &completeEnvelopeReplayValidated) const {
+    completeEnvelopeReplayValidated = false;
+    return Build(inv, 0, &completeEnvelopeReplayValidated);
   }
 
 private:
   /// Recursively rebuilds `inv`, preserving child traversal and depth bounds.
-  std::optional<std::string> Build(const RefoldModel::MacroInvocation &inv,
-                                   unsigned depth) const {
+  std::optional<std::string>
+  Build(const RefoldModel::MacroInvocation &inv, unsigned depth,
+        bool *completeEnvelopeReplayValidated = nullptr) const {
     // The recursion follows recorded child invocation edges.  A path deeper
     // than the number of recorded invocations implies a cycle or stale
     // metadata, so use that structural bound instead of a fixed depth cap.
@@ -434,8 +440,11 @@ private:
             solver_.ResolveCurrentLevelStandardArgReplay(inv, formalRanges)) {
       if (auto rewritten = BuildFromReplay(
               inv, formalRanges, replay->surface.standardSpans,
-              replay->bExpansionByFormal, depth))
+              replay->bExpansionByFormal, depth)) {
+        if (completeEnvelopeReplayValidated)
+          *completeEnvelopeReplayValidated = true;
         return rewritten;
+      }
     }
 
     // Preserve the established projection-backed current-level replay as a
@@ -1203,20 +1212,20 @@ RefoldMacroArgsOnlyTemplateSolver::TryTemplateSolvedArgsOnlyPatch(
   // Prefer the current-level template proof when it can rewrite the whole
   // invocation. It captures brace/bracket comma-split cases before a narrower
   // hunk-local proof can accept a partial patch.
-  if (auto currentLevelRewrite =
-          currentLevelSyntaxBuilder.Build(templateInvocation)) {
+  bool completeEnvelopeReplayValidated = false;
+  if (auto currentLevelRewrite = currentLevelSyntaxBuilder.Build(
+          templateInvocation, completeEnvelopeReplayValidated)) {
     if (StringRef(*currentLevelRewrite).trim() !=
         templateBaseInvocationText.trim()) {
-      bool counterWholeEnvelopeReplayValidated = false;
-      if (currentLevelSubtreeContainsCounterInvocation(
-              *deps_.macroTopology, deps_.model, templateInvocation.id)) {
-        auto currentLevelSurface = GetCurrentLevelTemplateSurfaceForInvocation(
-            templateInvocation, templateInvocationArgRanges);
-        counterWholeEnvelopeReplayValidated =
-            currentLevelSurface &&
-            ArgsOnlyTemplateReplayPreservesEnvelope(templateInvocation,
-                                                    *currentLevelSurface);
-      }
+      // Preserve the authority used to construct the spelling.  Re-running the
+      // boundary-preserving byte projection here is both redundant and weaker:
+      // a token replacement at a formal boundary can be absorbed into the
+      // adjacent body envelope even after the complete token-template solver
+      // has uniquely assigned that token to the formal slot.
+      const bool counterWholeEnvelopeReplayValidated =
+          completeEnvelopeReplayValidated &&
+          currentLevelSubtreeContainsCounterInvocation(
+              *deps_.macroTopology, deps_.model, templateInvocation.id);
 
       MacroPatch patch{*templateInvocation.invB, *templateInvocation.invE,
                        std::move(*currentLevelRewrite), templateInvocation.id};

@@ -18,10 +18,12 @@ namespace {
 
 /// Return whether the durable partition preserves a macro-state directive.
 ///
-/// Producer-bound #define/#undef lines are owned by the direct-TU macro-state
-/// repair theorem.  A Patch 3.1 boundary witness does not compose with that
-/// theorem merely because its B boundaries are unique, so such a witness must
-/// fail independently at every later proof boundary as well as in the planner.
+/// Producer-bound #define/#undef lines are owned by the specialized macro-state
+/// repair theorem. Direct-TU span planning may discover those lines as evidence
+/// but grants no protected-source authority. A Patch 3.1 boundary witness does
+/// not compose with the repair theorem merely because its B boundaries are
+/// unique, so such a witness must fail independently at every later proof
+/// boundary as well as in the planner.
 bool replacementPreservesMacroStateDirective(
     const StructuralHunkTilingWitness &witness) {
   return llvm::any_of(

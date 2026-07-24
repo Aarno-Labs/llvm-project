@@ -113,6 +113,7 @@
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "source/DiffAlgorithms.h"
+#include "source/RefoldAlignmentSemanticResolver.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/RefoldTokenTextAnalysis.h"
 #include "util/RefoldDenseMapInfo.h"
@@ -298,6 +299,8 @@ private:
   StringRef aSource_, bSource_;
   ArrayRef<PPTok> aToks_, bToks_;
   ArrayRef<size_t> aTokOff_, bTokOff_;
+  bool noLines_ = false;
+  std::string finalOutputPath_;
   LineDirectiveInserter lineDirs_;
 
   /// Path identity service shared by the engine and proof/planning services.
@@ -392,6 +395,39 @@ private:
   /// Per-gap ownership depth for insertion before PP token k (k in [0..N]).
   /// Computed once per refold run and reused to bound best-effort snapping.
   std::vector<uint32_t> ownerDepthGap_;
+
+  /// Theorem authority parallel to the selected production A-to-B token map.
+  std::vector<diffutils::LcsAnchorProof> abTokAnchorProofs_;
+
+  /// Durable semantic-equivalence witnesses emitted by the alignment resolver.
+  std::vector<AlignmentSemanticResolutionWitness>
+      alignmentSemanticResolutionWitnesses_;
+
+  /// Internal exact alignment override used by an isolated semantic simulation.
+  std::optional<AlignmentSelectionOverride> alignmentSelectionOverride_;
+
+  /// False only for isolated simulations, preventing recursive resolution.
+  bool alignmentSemanticResolverEnabled_ = true;
+
+  /// Dynamic theorem boundary for semantic alignment. Isolated candidates set
+  /// this from their alignment override; the production engine sets it only
+  /// after one complete semantic equivalence class is committed. Proof/audit
+  /// services borrow this flag so candidate and production realization use the
+  /// same strict witness domain without changing unrelated planner policy.
+  bool alignmentSemanticTheoremActive_ = false;
+
+  /// Exact outer-run TU byte snapshot supplied to isolated simulations.
+  /// Production engines leave this empty and load the physical source once;
+  /// simulations reuse that immutable snapshot instead of rereading the file.
+  std::optional<llvm::StringRef> tuSourceBytesOverride_;
+
+  /// Canonical staged source-edit topology captured after final-emission
+  /// lowering and repair have completed.
+  std::string alignmentSimulationStagedTopologyKey_;
+  bool alignmentSimulationStagedTopologyComplete_ = true;
+  std::string alignmentSimulationStagedTopologyFailure_;
+  AlignmentSemanticPreservationFootprint
+      alignmentSimulationPreservationFootprint_;
 
   /// Ordered planning phase for the structural token-hunk pipeline.
   ///
@@ -746,7 +782,11 @@ private:
       std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr,
       FinalLineControlValidationCallback finalLineControlValidationCallback =
           FinalLineControlValidationCallback(),
-      std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr);
+      std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr,
+      std::optional<AlignmentSelectionOverride> alignmentSelectionOverride =
+          std::nullopt,
+      bool alignmentSemanticResolverEnabled = true,
+      std::optional<llvm::StringRef> tuSourceBytesOverride = std::nullopt);
 
   ~RefoldEngine();
 
@@ -782,6 +822,23 @@ private:
   /// durable segment ledgers agree, and only then records pure-insertion
   /// provenance.  No macro/include/TU owner dispatch may consume the sequence
   /// before this method completes.
+  /// Resolve non-forced core-optimal anchors through isolated full structural
+  /// simulations and one exact semantic equivalence class.
+  void ResolveSemanticAlignment(
+      llvm::ArrayRef<llvm::StringRef> aLexemes,
+      llvm::ArrayRef<llvm::StringRef> bLexemes,
+      llvm::ArrayRef<diffutils::LcsAGapProvenance> aGapProvenance,
+      llvm::ArrayRef<diffutils::LcsBGapProvenance> bGapProvenance,
+      diffutils::CertifiedLcsResult &alignment);
+
+  /// Run one candidate map through a fresh, non-recursive structural engine.
+  AlignmentSemanticSimulationResult SimulateSemanticAlignmentCandidate(
+      const AlignmentSelectionOverride &selection) const;
+
+
+  /// Reject an isolated run whose durable structural witnesses are incomplete.
+  bool AlignmentSimulationProofComplete(std::string &failure) const;
+
   std::vector<diffutils::Hunk> PlanTokenDiff(StringRef tuPath,
                                              StringRef tuBytes);
 

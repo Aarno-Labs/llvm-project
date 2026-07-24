@@ -25,15 +25,17 @@ namespace refold {
 
 RefoldTheoremAudit::RefoldTheoremAudit(
     TheoremAuditStats &audit, const RefoldTerminalProofSink &terminalSink,
-    bool strict, Hooks hooks)
+    bool strict, const bool &alignmentSemanticTheoremActive, Hooks hooks)
     : audit_(audit), terminalSink_(terminalSink), strict_(strict),
+      alignmentSemanticTheoremActive_(alignmentSemanticTheoremActive),
       hooks_(std::move(hooks)) {}
 
 bool RefoldTheoremAudit::IsNoLegacyAuditEnabled() const {
-  // The no-legacy audit is a regular strict/theorem invariant. Non-strict
-  // runs do not emit diagnostic-only audit noise, and strict runs fail closed
-  // whenever a legacy-authority seam reaches a theorem boundary.
-  return strict_;
+  // The no-legacy audit is active for an explicitly strict run and for the
+  // narrower semantic-alignment theorem boundary. Ordinary non-strict runs do
+  // not emit diagnostic-only audit noise; a run that authorizes non-forced
+  // alignment anchors must nevertheless fail closed on every legacy seam.
+  return strict_ || alignmentSemanticTheoremActive_;
 }
 
 LegacyAuditEvidence
@@ -95,7 +97,8 @@ void RefoldTheoremAudit::ReportNoLegacyAuditFinding(
 }
 
 void RefoldTheoremAudit::EnforceTheoremAuditInvariants() const {
-  // The theorem audit is authoritative in strict mode: any emitted
+  // The theorem audit is authoritative in strict mode and while the semantic
+  // alignment theorem boundary is active: any emitted
   // non-terminal result that is not declared, explicit-proof-backed, locally
   // discharged, lattice-resolved, and in-domain violates the declared
   // theorem domain and therefore forces terminal fallback in strict mode.
@@ -178,7 +181,8 @@ void RefoldTheoremAudit::EnforceTheoremAuditInvariants() const {
             .str());
   }
 
-  if (!strict_ || terminalSink_.HasRequest() || audit_.theoremSatisfied)
+  if ((!strict_ && !alignmentSemanticTheoremActive_) ||
+      terminalSink_.HasRequest() || audit_.theoremSatisfied)
     return;
 
   terminalSink_.RequestTerminalFallback(

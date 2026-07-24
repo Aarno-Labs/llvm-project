@@ -28,14 +28,18 @@
 #include "util/RefoldPathIdentity.h"
 #include "util/StringUtils.h"
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,9 +73,96 @@ struct MacroStatePreservation {
   size_t replacementOffset = 0;
 };
 
+/// Exact physical source surface that embodies one macro-state transition.
+///
+/// This record is private to the specialized repair planner. It is deliberately
+/// separate from `TUByteSpanPlan`: direct token-span planning may prove that an
+/// exact transition exists, but only this planner may decide whether the final
+/// edit preserves, replays, or moves that transition and mint the corresponding
+/// protected-source capability.
+enum class MacroStateTransitionSurface {
+  DirectTUMacroDirective,
+  OwningTUIncludeDirective,
+};
+
 struct MacroStateSourceTransition {
+  const RefoldModel::MacroDirective *directive = nullptr;
   MacroDirectiveSourceInterval interval;
   std::string text;
+  MacroStateTransitionSurface surface =
+      MacroStateTransitionSurface::DirectTUMacroDirective;
+};
+
+/// Semantic disposition proved for one consumed physical transition.
+///
+/// The enum names why the original protected interval may be consumed.  It is
+/// intentionally independent of source-envelope shape: two edits may cover the
+/// same bytes while having different state semantics, and only the disposition
+/// proved by this planner is allowed to mint macro-state authority.
+enum class MacroStateTransitionDisposition : uint8_t {
+  Unknown,
+  ReplayedBeforeReplacement,
+  ReplayedInsideReplacement,
+  ReplayedAfterReplacement,
+  MovedEarlier,
+  MovedLater,
+  Materialized,
+};
+
+StringRef macroStateTransitionDispositionName(
+    MacroStateTransitionDisposition disposition) {
+  switch (disposition) {
+  case MacroStateTransitionDisposition::Unknown:
+    return "unknown";
+  case MacroStateTransitionDisposition::ReplayedBeforeReplacement:
+    return "replayed-before-replacement";
+  case MacroStateTransitionDisposition::ReplayedInsideReplacement:
+    return "replayed-inside-replacement";
+  case MacroStateTransitionDisposition::ReplayedAfterReplacement:
+    return "replayed-after-replacement";
+  case MacroStateTransitionDisposition::MovedEarlier:
+    return "moved-earlier";
+  case MacroStateTransitionDisposition::MovedLater:
+    return "moved-later";
+  case MacroStateTransitionDisposition::Materialized:
+    return "materialized";
+  }
+  llvm_unreachable("invalid macro-state transition disposition");
+}
+
+/// Complete theorem record authorizing one exact macro-state source interval.
+///
+/// This private record is the boundary between macro-state proof and source
+/// capability.  It names the producer directive, its exact physical interval,
+/// original and final state boundaries, mutation, complete suffix-observer
+/// census, and the reason for the disposition.  `TUByteSpanPlan` never carries
+/// this record and ordinary direct-TU planning cannot construct it.
+struct ProvenMacroStateSourceTransition {
+  MacroStateSourceTransition source;
+  OwnerStateBoundary originalBoundary;
+  OwnerStateBoundary finalBoundary;
+  StateMutationKind mutation = StateMutationKind::Unknown;
+  MacroStateTransitionDisposition disposition =
+      MacroStateTransitionDisposition::Unknown;
+  /// Replacement-local byte boundary when the transition is replayed inside
+  /// the source carrier.  Together with `finalBoundary`, this distinguishes
+  /// before/inside/after placements that share the same original source span.
+  std::optional<size_t> finalReplacementOffset = std::nullopt;
+  SuffixObserverQueryResult relevantObservers;
+  StateTransitionProof proof;
+  std::string reason;
+
+  bool IsComplete() const {
+    return source.directive && source.interval.begin < source.interval.end &&
+           originalBoundary.hasSourceBoundary &&
+           originalBoundary.source.IsComplete() &&
+           finalBoundary.hasSourceBoundary &&
+           finalBoundary.source.IsComplete() &&
+           mutation != StateMutationKind::Unknown &&
+           disposition != MacroStateTransitionDisposition::Unknown &&
+           !proof.failure && !proof.suffixWitnesses.empty() &&
+           !reason.empty();
+  }
 };
 
 struct MacroStateGapCarryCandidate {
@@ -212,6 +303,23 @@ private:
   /// Reconstructs the macro-state transition represented by a source directive.
   std::optional<MacroStateSourceTransition> MacroStateSourceTransitionFor(
       const RefoldModel::MacroDirective &directive) const;
+  /// Return a point boundary in the final TU source carrier.
+  OwnerStateBoundary FinalTUStateBoundary(uint64_t sourceOffset) const;
+  /// Prove one complete macro-state disposition before any source capability is
+  /// minted for the consumed transition.
+  std::optional<ProvenMacroStateSourceTransition>
+  ProveMacroStateSourceTransition(
+      const RefoldModel::MacroDirective &directive, StateMutationKind mutation,
+      MacroStateTransitionDisposition disposition,
+      const OwnerStateBoundary &finalBoundary,
+      std::optional<size_t> finalReplacementOffset,
+      SuffixStabilityWitnessKind witnessKind, StringRef stage, StringRef reason,
+      bool requireKnownObserver = false) const;
+  /// Mint the exact protected-source capability carried by one already-proved
+  /// transition.  Raw source intervals are deliberately not accepted.
+  bool AuthorizeMacroStateSourceTransition(
+      TextEdit &edit,
+      const ProvenMacroStateSourceTransition &transition) const;
   /// Finds the active definition for a macro name at a physical source offset.
   const RefoldModel::MacroDirective *
   ActiveDefinitionAtSourceOffset(StringRef macroName, uint64_t offset) const;
@@ -222,6 +330,17 @@ private:
   /// Returns whether a definition is already available before a source offset.
   bool MacroStateDefinitionAvailableBeforeSourceOffset(
       const RefoldModel::MacroDirective &definition, uint64_t offset) const;
+
+  /// Resolve an expansion-chain node to its outermost physical invocation.
+  const RefoldModel::MacroInvocation *PhysicalRootInvocation(
+      const RefoldModel::MacroInvocation &invocation) const;
+  /// Return whether an accepted patch or complete owner edit materializes the
+  /// physical callsite and therefore removes its definition dependency.
+  bool PhysicalCallsiteIsMaterialized(
+      const RefoldModel::MacroInvocation &invocation) const;
+  /// Authorize a consumed definition only when every producer-linked physical
+  /// callsite has an accepted materialized disposition.
+  bool AuthorizeMaterializedDefinitionTransitions();
 
   /// Finds the first replacement-text observation of a preserved definition.
   std::optional<size_t> FirstReplacementObservationOffset(
@@ -266,12 +385,6 @@ private:
                           StateMutationKind mutation, StringRef stage,
                           StringRef detail,
                           bool requireKnownObserver = false) const;
-  /// Validates proof evidence for a materialized macro-state transition.
-  StateTransitionProof
-  CheckMacroStateMaterialized(const RefoldModel::MacroDirective &directive,
-                              StateMutationKind mutation, StringRef stage,
-                              StringRef detail,
-                              bool requireKnownObserver = false) const;
   /// Validates terminal fallback evidence for a macro-state transition.
   StateTransitionProof
   CheckMacroStateTerminal(const RefoldModel::MacroDirective &directive,
@@ -311,11 +424,16 @@ private:
       StringRef macroName,
       const RefoldModel::MacroDirective *observedDefinition);
 
+  /// Promote a repaired edit from ordinary direct-TU provenance to the
+  /// specialized macro-state repair carrier.  Ordinary TUByteSpan carriers are
+  /// removed rather than retained beside the new authority, so final emission
+  /// cannot repurpose their weaker theorem after edit normalization.
+  void PromoteToSpecializedMacroStateRepairCarrier(TextEdit &edit);
   /// Restages a conservative TU edit after a repair changes its byte range or
   /// replacement text.
   void RestageConservativeTUEdit(
       TextEdit &edit, uint64_t start, uint64_t end, StringRef replacement,
-      ArrayRef<MacroStateSourceTransition> includeOwnedTransitions = {});
+      ArrayRef<ProvenMacroStateSourceTransition> repairedTransitions = {});
   /// Attaches conservative TU proof carrier metadata to a repaired edit.
   void AttachConservativeTUCarrier(TextEdit &edit);
 
@@ -330,15 +448,13 @@ private:
   /// Preserves consumed undef directives that remain semantically required and
   /// returns the number of applied repairs.
   size_t PreserveConsumedUndefs();
-  /// Applies queued macro-state preservation edits in deterministic edit order.
-  void ApplyQueuedMacroStatePreservations();
+  /// Applies queued macro-state preservations and authorizes only the exact
+  /// transitions discharged by those repairs.
+  bool ApplyQueuedMacroStatePreservations();
 
   /// Returns whether a definition directive is consumed or altered by TU edits.
   bool DefinitionDirectiveTouchedByTUEdit(
       const RefoldModel::MacroDirective &directive) const;
-  /// Returns whether a physical macro invocation callsite already has a patch.
-  bool PhysicalCallsiteAlreadyHasPatch(
-      const RefoldModel::MacroInvocation &invocation) const;
   /// Finds the TU-visible include site that owns a macro invocation, if any.
   const RefoldModel::IncludeItem *OwningIncludeSiteForInvocationInTU(
       const RefoldModel::MacroInvocation &invocation) const;
@@ -631,8 +747,9 @@ MacroStateRepairContext::MacroStateSourceTransitionFor(
         MacroDirectiveFullSourceInterval(directive);
     if (!intervalLocal)
       return std::nullopt;
-    return MacroStateSourceTransition{*intervalLocal,
-                                      DirectiveTextForPreservation(directive)};
+    return MacroStateSourceTransition{
+        &directive, *intervalLocal, DirectiveTextForPreservation(directive),
+        MacroStateTransitionSurface::DirectTUMacroDirective};
   }
 
   const RefoldModel::IncludeItem *inc = OwningIncludeSiteInTU(directive);
@@ -647,7 +764,155 @@ MacroStateRepairContext::MacroStateSourceTransitionFor(
   MacroDirectiveSourceInterval interval;
   interval.begin = inc->siteB;
   interval.end = inc->siteE;
-  return MacroStateSourceTransition{interval, std::move(spelling)};
+  return MacroStateSourceTransition{
+      &directive, interval, std::move(spelling),
+      MacroStateTransitionSurface::OwningTUIncludeDirective};
+}
+
+OwnerStateBoundary
+MacroStateRepairContext::FinalTUStateBoundary(uint64_t sourceOffset) const {
+  return OwnerStateBoundary::FromSource(
+      OwnerSourceRange::From(tuPath_, sourceOffset, sourceOffset));
+}
+
+std::optional<ProvenMacroStateSourceTransition>
+MacroStateRepairContext::ProveMacroStateSourceTransition(
+    const RefoldModel::MacroDirective &directive, StateMutationKind mutation,
+    MacroStateTransitionDisposition disposition,
+    const OwnerStateBoundary &finalBoundary,
+    std::optional<size_t> finalReplacementOffset,
+    SuffixStabilityWitnessKind witnessKind, StringRef stage, StringRef reason,
+    bool requireKnownObserver) const {
+  std::optional<MacroStateSourceTransition> source =
+      MacroStateSourceTransitionFor(directive);
+  if (!source || mutation == StateMutationKind::Unknown ||
+      disposition == MacroStateTransitionDisposition::Unknown ||
+      !finalBoundary.hasSourceBoundary || !finalBoundary.source.IsValid() ||
+      reason.empty()) {
+    TerminalSink().RequestTerminalFallback(
+        MakeTerminalFallbackProofFailure(
+            TerminalFallbackObligationKind::EmissionEditSetComposable,
+            TerminalFallbackFailureReason::UncomposableEmissionEditSet),
+        stage,
+        llvm::formatv("incomplete specialized macro-state transition proof: "
+                      "directive=#{0} mutation={1} reason={2}",
+                      directive.id, mutation, reason)
+            .str());
+    return std::nullopt;
+  }
+
+  const OwnerStateBoundary originalBoundary =
+      MacroDirectiveSuffixBoundary(directive);
+  SuffixStabilityWitness witness =
+      OwnerStateProof().BuildStateTransitionWitness(
+          witnessKind, OwnerStateComponent::MacroState, originalBoundary,
+          reason);
+  StateTransitionProof proof = CheckMacroStateWithWitness(
+      originalBoundary, mutation, std::move(witness), stage, reason,
+      requireKnownObserver);
+  if (proof.failure)
+    return std::nullopt;
+
+  ProvenMacroStateSourceTransition transition;
+  transition.source = std::move(*source);
+  transition.originalBoundary = originalBoundary;
+  transition.finalBoundary = finalBoundary;
+  transition.mutation = mutation;
+  transition.disposition = disposition;
+  transition.finalReplacementOffset = finalReplacementOffset;
+  transition.relevantObservers = OwnerStateProof().FindSuffixObservers(
+      originalBoundary, OwnerStateComponent::MacroState);
+  transition.proof = std::move(proof);
+  transition.reason = reason.str();
+  if (!transition.IsComplete()) {
+    TerminalSink().RequestTerminalFallback(
+        MakeTerminalFallbackProofFailure(
+            TerminalFallbackObligationKind::EmissionEditSetComposable,
+            TerminalFallbackFailureReason::UncomposableEmissionEditSet),
+        stage,
+        llvm::formatv("specialized macro-state transition proof remained "
+                      "incomplete after gateway discharge: directive=#{0}",
+                      directive.id)
+            .str());
+    return std::nullopt;
+  }
+  return transition;
+}
+
+bool MacroStateRepairContext::AuthorizeMacroStateSourceTransition(
+    TextEdit &edit,
+    const ProvenMacroStateSourceTransition &transition) const {
+  if (!transition.IsComplete() ||
+      transition.source.interval.begin < edit.start ||
+      edit.end < transition.source.interval.end ||
+      !PathIdentity().PathsEqual(transition.finalBoundary.source.path,
+                                 tuPath_) ||
+      transition.finalBoundary.source.begin !=
+          transition.finalBoundary.source.end ||
+      transition.finalBoundary.source.begin < edit.start ||
+      edit.end < transition.finalBoundary.source.end ||
+      (transition.finalReplacementOffset &&
+       *transition.finalReplacementOffset > edit.text.size())) {
+    TerminalSink().RequestTerminalFallback(
+        MakeTerminalFallbackProofFailure(
+            TerminalFallbackObligationKind::EmissionEditSetComposable,
+            TerminalFallbackFailureReason::UncomposableEmissionEditSet),
+        "macro/state-repair",
+        "specialized macro-state transition did not match its final edit "
+        "carrier");
+    return false;
+  }
+
+  const PreprocessingStructureKind macroStateKinds[] = {
+      PreprocessingStructureKind::MacroDefine,
+      PreprocessingStructureKind::MacroUndef};
+  const PreprocessingStructureKind includeKinds[] = {
+      PreprocessingStructureKind::Include,
+      PreprocessingStructureKind::IncludeNext,
+      PreprocessingStructureKind::Import};
+  const PreprocessingStructureKind nestedMacroKinds[] = {
+      PreprocessingStructureKind::PragmaOperator};
+
+  const bool includeOwned =
+      transition.source.surface ==
+      MacroStateTransitionSurface::OwningTUIncludeDirective;
+  const ArrayRef<PreprocessingStructureKind> allowedKinds =
+      includeOwned ? ArrayRef<PreprocessingStructureKind>(includeKinds)
+                   : ArrayRef<PreprocessingStructureKind>(macroStateKinds);
+  const ArrayRef<PreprocessingStructureKind> allowedNestedKinds =
+      includeOwned ? ArrayRef<PreprocessingStructureKind>()
+                   : ArrayRef<PreprocessingStructureKind>(nestedMacroKinds);
+  const bool authorized =
+      TextEditAssembler().AuthorizeExactProtectedSourceInterval(
+          edit,
+          includeOwned
+              ? ProtectedSourceEditAuthorityKind::IncludeOwnedMacroStateRepair
+              : ProtectedSourceEditAuthorityKind::MacroStateRepair,
+          tuPath_, std::nullopt, tuBytes_, transition.source.interval.begin,
+          transition.source.interval.end, allowedKinds, allowedNestedKinds);
+  if (authorized) {
+    REFOLD_LOG_TRACE(
+        "macro/state-repair",
+        "authorized specialized macro-state transition: directive=#{0} "
+        "source=[{1},{2}) originalBoundary={3}:{4} finalBoundary={5}:{6} "
+        "replacementOffset={7} mutation={8} disposition={9} "
+        "orderedObservers={10} incomparableObservers={11} reason={12}",
+        transition.source.directive->id, transition.source.interval.begin,
+        transition.source.interval.end,
+        transition.originalBoundary.source.begin,
+        transition.originalBoundary.source.end,
+        transition.finalBoundary.source.begin,
+        transition.finalBoundary.source.end,
+        transition.finalReplacementOffset
+            ? std::to_string(*transition.finalReplacementOffset)
+            : std::string("none"),
+        transition.mutation,
+        macroStateTransitionDispositionName(transition.disposition),
+        transition.relevantObservers.orderedObservers.size(),
+        transition.relevantObservers.incomparableResults.size(),
+        transition.reason);
+  }
+  return authorized;
 }
 
 const RefoldModel::MacroDirective *
@@ -708,6 +973,145 @@ bool MacroStateRepairContext::MacroStateDefinitionAvailableBeforeSourceOffset(
 
   const RefoldModel::IncludeItem *inc = OwningIncludeSiteInTU(definition);
   return inc && inc->siteE <= offset;
+}
+
+const RefoldModel::MacroInvocation *
+MacroStateRepairContext::PhysicalRootInvocation(
+    const RefoldModel::MacroInvocation &invocation) const {
+  const uint64_t rootId = MacroTopology().GetRootMacroId(invocation.id);
+  return MacroTopology().FindMacroInvocationById(rootId);
+}
+
+bool MacroStateRepairContext::PhysicalCallsiteIsMaterialized(
+    const RefoldModel::MacroInvocation &invocation) const {
+  if (!invocation.invFile || !invocation.invB || !invocation.invE ||
+      *invocation.invE < *invocation.invB) {
+    return false;
+  }
+
+  RefoldStructuralHunkDispatcher::MacroPatchStagingSlot slot =
+      dispatcher_.PrepareMacroPatchStagingSlot(invocation);
+  if (slot.existingPatch && !slot.existingIsCallsite)
+    return true;
+
+  if (PathIdentity().PathsEqual(*invocation.invFile, tuPath_)) {
+    return FinalTUEditContainingInterval(*invocation.invB, *invocation.invE)
+        .has_value();
+  }
+
+  const RefoldModel::IncludeItem *inc =
+      OwningIncludeSiteForInvocationInTU(invocation);
+  return inc && FinalTUEditContainingInterval(inc->siteB, inc->siteE);
+}
+
+
+bool MacroStateRepairContext::AuthorizeMaterializedDefinitionTransitions() {
+  struct DefinitionMaterializationState {
+    const RefoldModel::MacroDirective *definition = nullptr;
+    bool sawPhysicalCallsite = false;
+    bool allPhysicalCallsitesMaterialized = true;
+  };
+
+  std::map<uint64_t, DefinitionMaterializationState> states;
+  std::set<std::pair<uint64_t, uint64_t>> processedDefinitionRootPairs;
+
+  // A consumed definition is not authorized merely because its source line is
+  // covered by an ordinary TU edit. Instead, collect every producer-linked
+  // physical root that depends on that exact definition and require each root
+  // to have an accepted materialized disposition. Folding nested expansion
+  // nodes to the physical root prevents one callsite from being counted as
+  // several independent proofs, while the pair key preserves distinct
+  // definition dependencies at the same root.
+  for (const RefoldModel::MacroInvocation &invocation :
+       Model().GetMacroInvocations()) {
+    const RefoldModel::MacroDirective *definition =
+        ActiveDefinitionForInvocation(invocation);
+    if (!definition || definition->subkind != "#define" ||
+        !DefinitionDirectiveTouchedByTUEdit(*definition)) {
+      continue;
+    }
+
+    const RefoldModel::MacroInvocation *root =
+        PhysicalRootInvocation(invocation);
+    if (!root) {
+      TerminalSink().RequestTerminalFallback(
+          MakeTerminalFallbackProofFailure(
+              TerminalFallbackObligationKind::EmissionEditSetComposable,
+              TerminalFallbackFailureReason::UncomposableEmissionEditSet),
+          "macro/state-repair",
+          llvm::formatv("producer-linked invocation #{0} of consumed "
+                        "definition #{1} has no exact physical root",
+                        invocation.id, definition->id)
+              .str());
+      return false;
+    }
+
+    if (!processedDefinitionRootPairs
+             .insert(std::make_pair(definition->id, root->id))
+             .second) {
+      continue;
+    }
+
+    DefinitionMaterializationState &state = states[definition->id];
+    state.definition = definition;
+    state.sawPhysicalCallsite = true;
+    state.allPhysicalCallsitesMaterialized &=
+        PhysicalCallsiteIsMaterialized(*root);
+  }
+
+  for (const auto &entry : states) {
+    const DefinitionMaterializationState &state = entry.second;
+    if (!state.definition || !state.sawPhysicalCallsite ||
+        !state.allPhysicalCallsitesMaterialized ||
+        plan_.preservedDefinitionDirectiveIds.contains(entry.first)) {
+      continue;
+    }
+
+    std::optional<MacroStateSourceTransition> source =
+        MacroStateSourceTransitionFor(*state.definition);
+    std::optional<size_t> editIndex;
+    if (source) {
+      editIndex = FinalTUEditContainingInterval(source->interval.begin,
+                                                source->interval.end);
+    }
+    if (!source || !editIndex || *editIndex >= tuEdits_.size()) {
+      TerminalSink().RequestTerminalFallback(
+          MakeTerminalFallbackProofFailure(
+              TerminalFallbackObligationKind::EmissionEditSetComposable,
+              TerminalFallbackFailureReason::UncomposableEmissionEditSet),
+          "macro-definition-materialization",
+          "materialized definition transition has no exact containing final "
+          "TU edit");
+      return false;
+    }
+
+    const std::string reason =
+        llvm::formatv("every producer-linked physical callsite of consumed "
+                      "definition #{0} has an accepted materialized "
+                      "disposition",
+                      state.definition->id)
+            .str();
+    std::optional<ProvenMacroStateSourceTransition> transition =
+        ProveMacroStateSourceTransition(
+            *state.definition, StateMutationKind::Materialized,
+            MacroStateTransitionDisposition::Materialized,
+            FinalTUStateBoundary(tuEdits_[*editIndex].end), std::nullopt,
+            SuffixStabilityWitnessKind::OwnerMaterialization,
+            "macro-definition-materialization", reason,
+            // The materialized physical roots above are the concrete
+            // observation facts. Once all of them are removed, a suffix
+            // observer is not required merely to manufacture authority for the
+            // source transition. Any observer that remains is still recorded
+            // by the state gateway and the complete observer census below.
+            /*RequireKnownObserver=*/false);
+    if (!transition || !AuthorizeMacroStateSourceTransition(
+                           tuEdits_[*editIndex], *transition)) {
+      return false;
+    }
+    PromoteToSpecializedMacroStateRepairCarrier(tuEdits_[*editIndex]);
+  }
+
+  return !TerminalSink().HasRequest();
 }
 
 std::optional<size_t>
@@ -881,18 +1285,6 @@ StateTransitionProof MacroStateRepairContext::CheckMacroStateRepaired(
       stage, detail, requireKnownObserver);
 }
 
-StateTransitionProof MacroStateRepairContext::CheckMacroStateMaterialized(
-    const RefoldModel::MacroDirective &directive, StateMutationKind mutation,
-    StringRef stage, StringRef detail, bool requireKnownObserver) const {
-  const OwnerStateBoundary boundary = MacroDirectiveSuffixBoundary(directive);
-  return CheckMacroStateWithWitness(
-      boundary, mutation,
-      OwnerStateProof().BuildStateTransitionWitness(
-          SuffixStabilityWitnessKind::OwnerMaterialization,
-          OwnerStateComponent::MacroState, boundary, detail),
-      stage, detail, requireKnownObserver);
-}
-
 StateTransitionProof MacroStateRepairContext::CheckMacroStateTerminal(
     const RefoldModel::MacroDirective &directive, StateMutationKind mutation,
     StringRef stage, StringRef detail, bool requireKnownObserver) const {
@@ -943,9 +1335,60 @@ void MacroStateRepairContext::AttachConservativeTUCarrier(TextEdit &edit) {
                     edit.end, StringRef(edit.text)));
 }
 
+void MacroStateRepairContext::PromoteToSpecializedMacroStateRepairCarrier(
+    TextEdit &edit) {
+  // A repaired source surface is no longer justified by the ordinary token
+  // hunk theorem.  Remove only carriers whose canonical owner-realization
+  // evidence is TUByteSpan; independently discharged macro/include carriers
+  // remain attached when the repair composes with them.
+  llvm::erase_if(
+      edit.acceptedResults,
+      [&](const std::shared_ptr<const AcceptedResultCandidate> &candidate) {
+        if (!candidate ||
+            candidate->kind != AcceptedResultCandidateKind::TUTextEdit)
+          return false;
+        if (AcceptedResultIsOrdinaryDirectTUCarrier(*candidate))
+          return true;
+        return AcceptedResultIsSpecializedTUCarrier(
+                   *candidate,
+                   AcceptedPathKind::TUByteSpanConservativeEdit) &&
+               (candidate->begin != edit.start || candidate->end != edit.end ||
+                !candidate->hasPayloadPreview ||
+                candidate->payloadPreview != edit.text);
+      });
+
+  // Direct-hunk coordinates are implementation provenance for the ordinary
+  // carrier.  Once macro-state proof changes or authorizes the source surface,
+  // retaining them would let the final assembler mistake this specialized edit
+  // for a raw direct span.
+  edit.isDirectTUHunkEdit = false;
+  edit.directTUHunkIndex.reset();
+  edit.directTUHunkAStart.reset();
+  edit.directTUHunkAEnd.reset();
+  edit.directTUHunkBStart.reset();
+  edit.directTUHunkBEnd.reset();
+  edit.directTURawStart.reset();
+  edit.directTURawEnd.reset();
+  edit.directTUFinalStart.reset();
+  edit.directTUFinalEnd.reset();
+
+  const bool alreadySpecialized = llvm::any_of(
+      edit.acceptedResults,
+      [&](const std::shared_ptr<const AcceptedResultCandidate> &candidate) {
+        if (!candidate ||
+            candidate->kind != AcceptedResultCandidateKind::TUTextEdit ||
+            candidate->begin != edit.start || candidate->end != edit.end)
+          return false;
+        return AcceptedResultIsSpecializedTUCarrier(
+            *candidate, AcceptedPathKind::TUByteSpanConservativeEdit);
+      });
+  if (!alreadySpecialized)
+    AttachConservativeTUCarrier(edit);
+}
+
 void MacroStateRepairContext::RestageConservativeTUEdit(
     TextEdit &edit, uint64_t start, uint64_t end, StringRef replacement,
-    ArrayRef<MacroStateSourceTransition> includeOwnedTransitions) {
+    ArrayRef<ProvenMacroStateSourceTransition> repairedTransitions) {
   ResyncOutcome resync = TextEditAssembler().ApplyResyncOrPend(
       tuBytes_, start, end, replacement, tuPath_);
   edit.start = start;
@@ -955,59 +1398,22 @@ void MacroStateRepairContext::RestageConservativeTUEdit(
   edit.lineControlPruneCandidates =
       std::move(resync.lineControlPruneCandidates);
 
-  // A repair edit is no longer the original direct TU hunk edit. It now carries
-  // macro-state transition bytes around the original replacement.
-  edit.isDirectTUHunkEdit = false;
-  edit.directTUHunkIndex.reset();
-  edit.directTUHunkAStart.reset();
-  edit.directTUHunkAEnd.reset();
-  edit.directTUHunkBStart.reset();
-  edit.directTUHunkBEnd.reset();
-  edit.directTURawStart.reset();
-  edit.directTURawEnd.reset();
-  edit.directTUFinalStart = edit.start;
-  edit.directTUFinalEnd = edit.end;
-
-  // Restaging replaces the original direct-hunk carrier with a macro-state
-  // repair surface.  Rebuild the protected-source capabilities from the final
-  // physical interval so stale direct-TU authorizations cannot survive a move
-  // or widening, and so any unrelated directive in the widened interval makes
-  // the repair fail closed at this exact authority boundary.
+  // Restaging replaces the original direct-hunk carrier with a specialized
+  // macro-state repair surface. Preserve independently discharged specialized
+  // capabilities that remain inside the widened edit, discard capabilities
+  // that no longer fit, and add only the exact transitions proved by this
+  // repair. No capability is inferred merely from source containment.
   llvm::erase_if(
       edit.protectedSourceAuthorizations,
       [&](const ProtectedSourceEditAuthorization &authorization) {
-        return authorization.authority ==
-                   ProtectedSourceEditAuthorityKind::
-                       DirectTUMacroStateRepair ||
-               authorization.begin < start || end < authorization.end;
+        return authorization.begin < start || end < authorization.end;
       });
-  // A macro transition owned by a header is represented in the TU by the
-  // exact include directive that introduces that header.  Moving the
-  // transition therefore moves that one include directive.  Mint a capability
-  // only for each producer-proved owning-include interval supplied by the
-  // caller; do not authorize every include merely because it lies inside the
-  // widened repair envelope.
-  const PreprocessingStructureKind includeKinds[] = {
-      PreprocessingStructureKind::Include,
-      PreprocessingStructureKind::IncludeNext,
-      PreprocessingStructureKind::Import};
-  for (const MacroStateSourceTransition &transition :
-       includeOwnedTransitions) {
-    (void)TextEditAssembler().AuthorizeExactProtectedSourceInterval(
-        edit,
-        ProtectedSourceEditAuthorityKind::IncludeOwnedMacroStateRepair,
-        tuPath_, std::nullopt, tuBytes_, transition.interval.begin,
-        transition.interval.end, includeKinds);
+  for (const ProvenMacroStateSourceTransition &transition :
+       repairedTransitions) {
+    if (!AuthorizeMacroStateSourceTransition(edit, transition))
+      return;
   }
-
-  const PreprocessingStructureKind macroStateKinds[] = {
-      PreprocessingStructureKind::MacroDefine,
-      PreprocessingStructureKind::MacroUndef};
-  (void)TextEditAssembler().AuthorizeProtectedSourceIntervals(
-      edit, ProtectedSourceEditAuthorityKind::MacroStateRepair, tuPath_,
-      std::nullopt, tuBytes_, start, end, macroStateKinds,
-      /*requireProtectedInterval=*/false);
-  AttachConservativeTUCarrier(edit);
+  PromoteToSpecializedMacroStateRepairCarrier(edit);
 }
 
 std::optional<uint64_t>
@@ -1152,20 +1558,25 @@ void MacroStateRepairContext::
 
       const uint64_t oldStart = edit.start;
       const uint64_t oldEnd = edit.end;
-      SmallVector<MacroStateSourceTransition, 1> includeOwnedTransitions;
-      if (OwningIncludeSiteInTU(undefDirective))
-        includeOwnedTransitions.push_back(*undefTransition);
-      RestageConservativeTUEdit(edit, lineStart,
-                                undefTransition->interval.end, replacement,
-                                includeOwnedTransitions);
-
-      (void)CheckMacroStateRepaired(
-          undefDirective, StateMutationKind::MovedEarlier,
-          "macro-undef-liveness",
+      const std::string reason =
           llvm::formatv("advanced preserved #undef directive #{0} for macro "
                         "'{1}' before observing replacement [{2},{3})",
                         undefDirective.id, undefRef.name, oldStart, oldEnd)
-              .str());
+              .str();
+      std::optional<ProvenMacroStateSourceTransition> provedTransition =
+          ProveMacroStateSourceTransition(
+              undefDirective, StateMutationKind::MovedEarlier,
+              MacroStateTransitionDisposition::MovedEarlier,
+              FinalTUStateBoundary(lineStart), size_t{0},
+              SuffixStabilityWitnessKind::StateRepair,
+              "macro-undef-liveness", reason);
+      if (!provedTransition)
+        return;
+      SmallVector<ProvenMacroStateSourceTransition, 1> repairedTransitions;
+      repairedTransitions.push_back(std::move(*provedTransition));
+      RestageConservativeTUEdit(edit, lineStart,
+                                undefTransition->interval.end, replacement,
+                                repairedTransitions);
 
       advancedDirectiveIds.insert(undefDirective.id);
       ++advancedCount;
@@ -1240,8 +1651,30 @@ MacroStateRepairContext::TryAdvanceConsumedUndefBeforeObservedReplacement(
   replacement.append(crossedPrefix.begin(), crossedPrefix.end());
   replacement.append(ReplacementText.begin(), ReplacementText.end());
 
+  std::optional<MacroStateSourceTransition> undefTransition =
+      MacroStateSourceTransitionFor(undefDirective);
+  if (!undefTransition)
+    return std::nullopt;
+
   const uint64_t oldStart = edit.start;
-  RestageConservativeTUEdit(edit, lineStart, edit.end, replacement);
+  const std::string reason =
+      llvm::formatv("advanced consumed #undef directive #{0} for macro '{1}' "
+                    "before replacement observing prior definition #{2}",
+                    undefDirective.id, macroName, previousDefinition.id)
+          .str();
+  std::optional<ProvenMacroStateSourceTransition> provedTransition =
+      ProveMacroStateSourceTransition(
+          undefDirective, StateMutationKind::MovedEarlier,
+          MacroStateTransitionDisposition::MovedEarlier,
+          FinalTUStateBoundary(lineStart), size_t{0},
+          SuffixStabilityWitnessKind::StateRepair, "macro-undef-liveness",
+          reason);
+  if (!provedTransition)
+    return std::nullopt;
+  SmallVector<ProvenMacroStateSourceTransition, 1> repairedTransitions;
+  repairedTransitions.push_back(std::move(*provedTransition));
+  RestageConservativeTUEdit(edit, lineStart, edit.end, replacement,
+                            repairedTransitions);
 
   REFOLD_LOG_WARN("macro/liveness",
                   "advancing consumed #undef before observed replacement: "
@@ -1678,33 +2111,35 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
       continue;
     if (!replacement.empty() && replacement.back() != '\n')
       replacement.push_back('\n');
-    for (const MacroStateGapCarryCandidate &candidate : candidates)
-      replacement += candidate.preservationText;
-
-    SmallVector<MacroStateSourceTransition, 4> includeOwnedTransitions;
-    for (const MacroStateGapCarryCandidate &candidate : candidates) {
-      if (!OwningIncludeSiteInTU(*candidate.directive))
-        continue;
-      includeOwnedTransitions.push_back(
-          MacroStateSourceTransition{candidate.interval,
-                                     candidate.preservationText});
-    }
 
     const uint64_t oldStart = edit.start;
     const uint64_t oldEnd = edit.end;
-    RestageConservativeTUEdit(edit, newStart, *delayedBoundary, replacement,
-                              includeOwnedTransitions);
-
+    SmallVector<ProvenMacroStateSourceTransition, 4> repairedTransitions;
     for (const MacroStateGapCarryCandidate &candidate : candidates) {
-      (void)CheckMacroStateRepaired(
-          *candidate.directive, StateMutationKind::MovedLater,
-          "macro-gap-definition-carry",
+      const size_t finalReplacementOffset = replacement.size();
+      replacement += candidate.preservationText;
+      const std::string reason =
           llvm::formatv("carried observed gap #define directive #{0} for "
                         "macro '{1}' after TU replacement [{2},{3})",
                         candidate.directive->id, candidate.name, oldStart,
                         oldEnd)
-              .str());
+              .str();
+      std::optional<ProvenMacroStateSourceTransition> transition =
+          ProveMacroStateSourceTransition(
+              *candidate.directive, StateMutationKind::MovedLater,
+              MacroStateTransitionDisposition::MovedLater,
+              FinalTUStateBoundary(*delayedBoundary), finalReplacementOffset,
+              SuffixStabilityWitnessKind::StateRepair,
+              "macro-gap-definition-carry", reason);
+      if (!transition)
+        return;
+      repairedTransitions.push_back(std::move(*transition));
+    }
 
+    RestageConservativeTUEdit(edit, newStart, *delayedBoundary, replacement,
+                              repairedTransitions);
+
+    for (const MacroStateGapCarryCandidate &candidate : candidates) {
       carriedDirectiveIds.insert(candidate.directive->id);
       ++carriedCount;
       REFOLD_LOG_WARN("macro/liveness",
@@ -1729,13 +2164,6 @@ bool MacroStateRepairContext::DefinitionDirectiveTouchedByTUEdit(
   if (directive.subkind != "#define")
     return false;
   return MacroDirectiveTouchedByTUEdit(directive);
-}
-
-bool MacroStateRepairContext::PhysicalCallsiteAlreadyHasPatch(
-    const RefoldModel::MacroInvocation &invocation) const {
-  if (!invocation.invB || !invocation.invE)
-    return true;
-  return dispatcher_.HasMacroPatchForInvocation(invocation);
 }
 
 const RefoldModel::IncludeItem *
@@ -1846,7 +2274,7 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
     if (!definition || !DefinitionDirectiveTouchedByTUEdit(*definition))
       continue;
 
-    if (PhysicalCallsiteAlreadyHasPatch(invocation))
+    if (PhysicalCallsiteIsMaterialized(invocation))
       continue;
 
     bool preservedDefinition = false;
@@ -1886,12 +2314,10 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
     }
 
     if (preservedDefinition) {
-      (void)CheckMacroStateRepaired(
-          *definition, StateMutationKind::Replayed, "macro-definition-liveness",
-          llvm::formatv("preserved consumed definition #{0} for surviving "
-                        "invocation #{1} of macro '{2}'",
-                        definition->id, invocation.id, invocation.name)
-              .str());
+      // The queued preservation is proved and authorized atomically after all
+      // replacement-local insertion offsets are finalized.  Performing a
+      // detached gateway check here would create proof evidence unrelated to
+      // the exact transition capability eventually minted for the edit.
       continue;
     }
 
@@ -1926,14 +2352,6 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
           /*RequireKnownObserver=*/true);
       continue;
     }
-
-    (void)CheckMacroStateMaterialized(
-        *definition, StateMutationKind::Materialized,
-        "macro-definition-liveness",
-        llvm::formatv("materialized surviving invocation #{0} of macro '{1}' "
-                      "after consuming active definition #{2}",
-                      invocation.id, invocation.name, definition->id)
-            .str());
 
     MacroPatch patch{*invocation.invB, *invocation.invE, wholePlan->clippedText,
                      invocation.id};
@@ -2036,16 +2454,6 @@ size_t MacroStateRepairContext::PreserveConsumedUndefs() {
       continue;
     }
 
-    (void)CheckMacroStateRepaired(
-        undefDirective, MutationForMacroStatePreservationPlacement(*placement),
-        "macro-undef-liveness",
-        llvm::formatv(
-            "preserved consumed #undef directive #{0} for macro '{1}' "
-            "using {2} placement",
-            undefDirective.id, ref.name,
-            MacroStatePreservationPlacementName(*placement))
-            .str());
-
     ++undefLivenessHazards;
     REFOLD_LOG_WARN(
         "macro/liveness",
@@ -2060,72 +2468,159 @@ size_t MacroStateRepairContext::PreserveConsumedUndefs() {
   return undefLivenessHazards;
 }
 
-void MacroStateRepairContext::ApplyQueuedMacroStatePreservations() {
+bool MacroStateRepairContext::ApplyQueuedMacroStatePreservations() {
+  struct PreservationEmission {
+    const MacroStatePreservation *preservation = nullptr;
+    size_t replacementOffset = 0;
+  };
+
   for (auto &entry : macroStatePreservationsByEdit_) {
+    if (entry.first >= tuEdits_.size()) {
+      TerminalSink().RequestTerminalFallback(
+          MakeTerminalFallbackProofFailure(
+              TerminalFallbackObligationKind::EmissionEditSetComposable,
+              TerminalFallbackFailureReason::UncomposableEmissionEditSet),
+          "macro/state-repair",
+          "queued macro-state preservation references a missing TU edit");
+      return false;
+    }
+
     TextEdit &edit = tuEdits_[entry.first];
-    SmallVector<MacroStatePreservation, 8> Preservations(entry.second.begin(),
+    SmallVector<MacroStatePreservation, 8> preservations(entry.second.begin(),
                                                          entry.second.end());
-    llvm::sort(Preservations, [](const MacroStatePreservation &lhs,
+    llvm::sort(preservations, [](const MacroStatePreservation &lhs,
                                  const MacroStatePreservation &rhs) {
       if (lhs.placement != rhs.placement)
         return lhs.placement < rhs.placement;
+      if (lhs.replacementOffset != rhs.replacementOffset)
+        return lhs.replacementOffset < rhs.replacementOffset;
       if (lhs.directive->siteB != rhs.directive->siteB)
         return lhs.directive->siteB < rhs.directive->siteB;
       return lhs.directive->id < rhs.directive->id;
     });
 
-    std::string prefix;
-    std::string suffix;
-    std::map<size_t, std::string> interiorInsertions;
-    for (const MacroStatePreservation &preservation : Preservations) {
-      if (!preservation.directive)
-        continue;
-      if (preservation.placement ==
-          MacroStatePreservationPlacement::BeforeReplacement) {
-        prefix += DirectiveTextForPreservation(*preservation.directive);
-        continue;
-      }
+    // Emit the repaired replacement once while recording the exact final
+    // replacement-local boundary of every replayed directive.  This avoids a
+    // second text search and keeps the state proof tied to the bytes that will
+    // actually be emitted.
+    const std::string originalReplacement = edit.text;
+    std::string repairedReplacement;
+    SmallVector<PreservationEmission, 8> emissions;
+    DenseSet<uint64_t> emittedDirectiveIds;
 
-      if (preservation.placement ==
-          MacroStatePreservationPlacement::AdvancedBeforeReplacement) {
-        // Advanced-before-replacement repairs widen and rewrite the owning edit
-        // immediately because they move the directive to a source byte boundary
-        // outside the original edit start, not to a replacement-local offset.
-        continue;
-      }
+    auto appendPreservation = [&](const MacroStatePreservation &preservation) {
+      if (!preservation.directive ||
+          !emittedDirectiveIds.insert(preservation.directive->id).second)
+        return;
+      emissions.push_back(
+          PreservationEmission{&preservation, repairedReplacement.size()});
+      repairedReplacement +=
+          DirectiveTextForPreservation(*preservation.directive);
+    };
 
+    for (const MacroStatePreservation &preservation : preservations) {
       if (preservation.placement ==
-          MacroStatePreservationPlacement::InsideReplacement) {
-        interiorInsertions[preservation.replacementOffset] +=
-            DirectiveTextForPreservation(*preservation.directive);
-        continue;
-      }
-
-      if (suffix.empty() && !edit.text.empty() && edit.text.back() != '\n')
-        suffix.push_back('\n');
-      suffix += DirectiveTextForPreservation(*preservation.directive);
+          MacroStatePreservationPlacement::BeforeReplacement)
+        appendPreservation(preservation);
     }
 
-    if (!interiorInsertions.empty()) {
-      std::string replacementWithInteriorPreservations;
-      size_t cursor = 0;
-      for (const auto &insertion : interiorInsertions) {
-        const size_t offset = std::min(insertion.first, edit.text.size());
-        replacementWithInteriorPreservations.append(edit.text.begin() + cursor,
-                                                    edit.text.begin() + offset);
-        replacementWithInteriorPreservations += insertion.second;
-        cursor = offset;
+    size_t cursor = 0;
+    for (const MacroStatePreservation &preservation : preservations) {
+      if (preservation.placement !=
+          MacroStatePreservationPlacement::InsideReplacement)
+        continue;
+      const size_t offset =
+          std::min(preservation.replacementOffset, originalReplacement.size());
+      if (offset < cursor) {
+        TerminalSink().RequestTerminalFallback(
+            MakeTerminalFallbackProofFailure(
+                TerminalFallbackObligationKind::EmissionEditSetComposable,
+                TerminalFallbackFailureReason::UncomposableEmissionEditSet),
+            "macro/state-repair",
+            "queued macro-state preservation offsets are non-monotone");
+        return false;
       }
-      replacementWithInteriorPreservations.append(edit.text.begin() + cursor,
-                                                  edit.text.end());
-      edit.text = std::move(replacementWithInteriorPreservations);
+      repairedReplacement.append(originalReplacement.begin() + cursor,
+                                 originalReplacement.begin() + offset);
+      cursor = offset;
+      appendPreservation(preservation);
     }
-    if (!prefix.empty())
-      edit.text.insert(0, prefix);
-    if (!suffix.empty())
-      edit.text.append(suffix);
-    AttachConservativeTUCarrier(edit);
+    repairedReplacement.append(originalReplacement.begin() + cursor,
+                               originalReplacement.end());
+
+    bool appendedAfterReplacementSeparator = false;
+    for (const MacroStatePreservation &preservation : preservations) {
+      if (preservation.placement !=
+          MacroStatePreservationPlacement::AfterReplacement)
+        continue;
+      if (!appendedAfterReplacementSeparator) {
+        if (!repairedReplacement.empty() && repairedReplacement.back() != '\n')
+          repairedReplacement.push_back('\n');
+        appendedAfterReplacementSeparator = true;
+      }
+      appendPreservation(preservation);
+    }
+
+    SmallVector<ProvenMacroStateSourceTransition, 8> provedTransitions;
+    provedTransitions.reserve(emissions.size());
+    for (const PreservationEmission &emission : emissions) {
+      const MacroStatePreservation &preservation = *emission.preservation;
+      const RefoldModel::MacroDirective &directive = *preservation.directive;
+
+      MacroStateTransitionDisposition disposition =
+          MacroStateTransitionDisposition::Unknown;
+      uint64_t finalSourceOffset = edit.start;
+      switch (preservation.placement) {
+      case MacroStatePreservationPlacement::BeforeReplacement:
+        disposition =
+            MacroStateTransitionDisposition::ReplayedBeforeReplacement;
+        break;
+      case MacroStatePreservationPlacement::InsideReplacement:
+        disposition =
+            MacroStateTransitionDisposition::ReplayedInsideReplacement;
+        break;
+      case MacroStatePreservationPlacement::AfterReplacement:
+        disposition =
+            MacroStateTransitionDisposition::ReplayedAfterReplacement;
+        finalSourceOffset = edit.end;
+        break;
+      case MacroStatePreservationPlacement::AdvancedBeforeReplacement:
+        // Advanced repairs were proved, restaged, and authorized at the source
+        // boundary where the edit was widened. They intentionally contribute
+        // no second replay surface here.
+        continue;
+      }
+
+      const std::string reason =
+          llvm::formatv("preserved consumed {0} directive #{1} for macro "
+                        "'{2}' using {3} placement",
+                        directive.subkind, directive.id, directive.name,
+                        MacroStatePreservationPlacementName(
+                            preservation.placement))
+              .str();
+      std::optional<ProvenMacroStateSourceTransition> transition =
+          ProveMacroStateSourceTransition(
+              directive,
+              MutationForMacroStatePreservationPlacement(
+                  preservation.placement),
+              disposition, FinalTUStateBoundary(finalSourceOffset),
+              emission.replacementOffset,
+              SuffixStabilityWitnessKind::StateRepair,
+              "macro-state-preservation", reason);
+      if (!transition)
+        return false;
+      provedTransitions.push_back(std::move(*transition));
+    }
+
+    edit.text = std::move(repairedReplacement);
+    for (const ProvenMacroStateSourceTransition &transition :
+         provedTransitions) {
+      if (!AuthorizeMacroStateSourceTransition(edit, transition))
+        return false;
+    }
+    PromoteToSpecializedMacroStateRepairCarrier(edit);
   }
+  return true;
 }
 
 bool MacroStateRepairContext::RunInitialRepair() {
@@ -2145,6 +2640,18 @@ bool MacroStateRepairContext::RunInitialRepair() {
     return false;
   }
 
+  // Direct span planning contributes no macro-state authority. Authorize an
+  // unreplayed consumed definition only after the specialized planner proves
+  // that every producer-linked physical callsite has been materialized by an
+  // accepted TU edit or macro patch.
+  if (!AuthorizeMaterializedDefinitionTransitions()) {
+    REFOLD_LOG_DEBUG("fallback",
+                     "single-pass refold aborted while authorizing "
+                     "materialized macro definitions; terminal fallback will "
+                     "be emitted");
+    return false;
+  }
+
   const size_t undefLivenessHazards = PreserveConsumedUndefs();
   if (TerminalSink().HasRequest()) {
     REFOLD_LOG_DEBUG("fallback",
@@ -2153,7 +2660,13 @@ bool MacroStateRepairContext::RunInitialRepair() {
     return false;
   }
 
-  ApplyQueuedMacroStatePreservations();
+  if (!ApplyQueuedMacroStatePreservations() || TerminalSink().HasRequest()) {
+    REFOLD_LOG_DEBUG("fallback",
+                     "single-pass refold aborted while authorizing exact "
+                     "macro-state repair transitions; terminal fallback will "
+                     "be emitted");
+    return false;
+  }
 
   if (undefLivenessHazards != 0) {
     REFOLD_LOG_INFO("macro/liveness",
@@ -2226,7 +2739,7 @@ bool MacroStateRepairContext::MaterializedIncludeNeedsDefinitionAfterward(
     if (invocation.callerMacroId ||
         MacroTopology().IsInvocationInsideDefineDirective(invocation))
       continue;
-    if (PhysicalCallsiteAlreadyHasPatch(invocation))
+    if (PhysicalCallsiteIsMaterialized(invocation))
       continue;
     const RefoldModel::MacroDirective *active =
         ActiveDefinitionForInvocation(invocation);

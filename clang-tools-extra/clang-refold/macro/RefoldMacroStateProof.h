@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace clang {
 namespace refold {
@@ -105,6 +106,13 @@ struct StabilizedMaterializedHeaderMacroPatch {
   uint64_t start = 0;
   uint64_t end = 0;
   std::string replacement;
+
+  /// Exact producer-bound directives moved by the stabilization proof.
+  ///
+  /// Consumers must authorize only these transitions.  The widened edit range
+  /// may contain unrelated preprocessing structure, so range-wide macro-state
+  /// authority would exceed the theorem proved by the stabilizer.
+  std::vector<MacroStateDirectiveLineInterval> movedTransitions;
 };
 
 /// Read-only macro-state proof service.

@@ -19,6 +19,7 @@
 
 #include "edit/RefoldEditTypes.h"
 #include "edit/RefoldPatchTypes.h"
+#include "source/RefoldAlignmentSemanticEvidence.h"
 #include "util/RefoldDenseMapInfo.h"
 #include "clang/Basic/LangOptions.h"
 #include "llvm/ADT/DenseMap.h"
@@ -45,6 +46,18 @@ class RefoldMacroTopology;
 class RefoldModel;
 class RefoldPathIdentity;
 class RefoldProofLattice;
+class RefoldWitnessEquivalenceKeyBuilder;
+
+/// Exact staged-topology serialization used by the semantic alignment
+/// resolver. `complete` is false when any emitted accepted carrier lacks a
+/// complete witness-equivalence key, in which case `failure` names the first
+/// missing proof dimension and the key cannot become production authority.
+struct AlignmentSemanticTopologyKeyResult {
+  bool complete = true;
+  std::string key;
+  std::string failure;
+  AlignmentSemanticPreservationFootprint preservationFootprint;
+};
 
 /// Mutable staging area for one structural hunk-dispatch pass.
 class RefoldStructuralHunkDispatcher {
@@ -180,6 +193,21 @@ public:
 
   /// Return the number of root macro ids recorded for emitted expansions.
   size_t ExpandedMacroRootCount() const;
+
+  /// Return the exact root macro ids recorded for emitted expansions.
+  ///
+  /// This read-only view is consumed by isolated semantic-alignment theorem
+  /// simulations. It cannot change statistics attribution or emission order.
+  const llvm::DenseSet<uint64_t> &ExpandedMacroRootIds() const;
+
+  /// Serialize the complete staged source-edit topology for alignment witness
+  /// equivalence. `tuSourceBytes` supplies immutable original bytes for exact
+  /// TU-carrier transformation evidence. The serialization is deterministic
+  /// and length-delimited; constructing it never mutates staging order or proof
+  /// state.
+  AlignmentSemanticTopologyKeyResult BuildAlignmentSemanticTopologyKey(
+      const RefoldWitnessEquivalenceKeyBuilder &equivalenceKeyBuilder,
+      llvm::StringRef tuSourceBytes) const;
 
 private:
   IncludeEdits &EnsureIncludeEdits(const RefoldModel::IncludeItem *include);

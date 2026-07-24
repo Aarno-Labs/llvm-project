@@ -180,30 +180,6 @@ struct PreprocessingStructureInterval {
   }
 };
 
-/// Producer-bound macro-state directive authorized inside a direct TU span.
-///
-/// A generic TU edit is never independently entitled to consume preprocessing
-/// state.  The only exception exposed by this index is an exact `#define` or
-/// `#undef` interval already owned by the mandatory macro-state repair planner.
-/// Carrying the concrete producer id, enclosing conditional-arm identity, and
-/// physical range makes that deferred obligation explicit; it is not a blanket
-/// authorization for other directive kinds or for an unbound directive-looking
-/// line.
-struct DirectTUMacroStateAuthorization {
-  uint64_t directiveId = 0;
-  PreprocessingStructureKind kind =
-      PreprocessingStructureKind::OtherDirective;
-  std::optional<uint64_t> ownerConditionalArmId;
-  uint64_t begin = 0;
-  uint64_t end = 0;
-
-  bool operator==(const DirectTUMacroStateAuthorization &other) const {
-    return directiveId == other.directiveId && kind == other.kind &&
-           ownerConditionalArmId == other.ownerConditionalArmId &&
-           begin == other.begin && end == other.end;
-  }
-};
-
 /// Immutable exact preprocessing-structure inventory for one physical source
 /// owner occurrence.
 ///
@@ -327,29 +303,26 @@ public:
   /// comment, or physical CRLF spelling.
   bool IsExactLexicalBoundary(uint64_t offset) const;
 
-  /// Prove one internal direct-TU source gap.
+  /// Prove one ordinary internal direct-TU source gap.
   ///
-  /// The complete range must be covered by exact lexer trivia and/or complete,
-  /// producer-bound `#define`/`#undef` intervals.  Those two directive kinds are
-  /// admitted only as explicit deferred obligations because final TU emission
-  /// always invokes `RefoldMacroStateRepairPlanner` and fails closed if their
-  /// state cannot be preserved.  Every conditional, include, pragma,
-  /// line-control, unknown, unbound, or partially intersected directive rejects
-  /// the gap.
-  bool ProveDirectTUInternalGap(
-      uint64_t begin, uint64_t end,
-      std::vector<DirectTUMacroStateAuthorization> &authorizations) const;
+  /// Empty ranges are accepted.  A nonempty range must be covered completely
+  /// by exact lexer trivia without cutting an indivisible trivia component, and
+  /// it must overlap no protected preprocessing-structure interval.  In
+  /// particular, an exact producer-bound `#define` or `#undef` remains
+  /// preprocessing state and is never ordinary trivia authority.
+  bool ProveOrdinaryDirectTUInternalGap(uint64_t begin, uint64_t end) const;
 
-  /// Validate a complete direct-TU edit envelope against a previously proved
-  /// authorization set.
+  /// Collect exact producer-bound macro-state directives inside a byte range.
   ///
-  /// Boundary widening may absorb additional lexer trivia, but it may not
-  /// introduce a new preprocessing-state obligation.  Every protected interval
-  /// inside the final range must exactly match one authorization produced while
-  /// planning the A-token span.
-  bool ValidateDirectTUEnvelope(
+  /// This is an evidence-only query.  It reports complete `#define` and
+  /// `#undef` intervals wholly contained in `[begin,end)`, but does not prove
+  /// that any edit may consume them.  Other overlapping structure is ignored
+  /// by this query and must be handled independently by the caller.  A false
+  /// return denotes an invalid query, incomplete protection census, nonlexical
+  /// boundary, or a partially intersected macro-state interval.
+  bool CollectExactMacroStateIntervals(
       uint64_t begin, uint64_t end,
-      llvm::ArrayRef<DirectTUMacroStateAuthorization> authorizations) const;
+      std::vector<const PreprocessingStructureInterval *> &intervals) const;
 
 private:
   std::string sourcePath_;

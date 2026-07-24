@@ -1267,187 +1267,60 @@ bool RefoldPreprocessingStructureIndex::IsExactLexicalBoundary(
 
 namespace {
 
-/// Return whether one protected interval can be deferred to the mandatory
-/// macro-state repair planner.
-static bool isDirectTUMacroStateInterval(
+/// Return whether one protected interval is exact producer-bound macro-state
+/// evidence for a specialized repair theorem.
+static bool isExactProducerBoundMacroStateInterval(
     const PreprocessingStructureInterval &interval) {
   if (interval.kind != PreprocessingStructureKind::MacroDefine &&
       interval.kind != PreprocessingStructureKind::MacroUndef) {
     return false;
   }
-  return interval.modelKind ==
+  return interval.IsValid() &&
+         interval.modelKind ==
              PreprocessingStructureModelKind::MacroDirective &&
-         interval.modelItemId.has_value();
-}
-
-/// Return whether `authorization` names exactly `interval`.
-static bool authorizationMatchesInterval(
-    const DirectTUMacroStateAuthorization &authorization,
-    const PreprocessingStructureInterval &interval) {
-  return interval.modelItemId &&
-         authorization.directiveId == *interval.modelItemId &&
-         authorization.kind == interval.kind &&
-         authorization.ownerConditionalArmId ==
-             interval.ownerConditionalArmId &&
-         authorization.begin == interval.begin &&
-         authorization.end == interval.end;
-}
-
-/// Append one authorization unless the exact record is already present.
-static void appendUniqueAuthorization(
-    const DirectTUMacroStateAuthorization &authorization,
-    std::vector<DirectTUMacroStateAuthorization> &authorizations) {
-  if (llvm::find(authorizations, authorization) == authorizations.end())
-    authorizations.push_back(authorization);
-}
-
-/// Deterministic source ordering for gap-coverage components.
-static bool sourceCoverageIntervalLess(
-    const std::pair<uint64_t, uint64_t> &lhs,
-    const std::pair<uint64_t, uint64_t> &rhs) {
-  if (lhs.first != rhs.first)
-    return lhs.first < rhs.first;
-  return lhs.second < rhs.second;
+         interval.IsProducerBound();
 }
 
 } // namespace
 
-bool RefoldPreprocessingStructureIndex::ProveDirectTUInternalGap(
-    uint64_t begin, uint64_t end,
-    std::vector<DirectTUMacroStateAuthorization> &authorizations) const {
-  if (end < begin || end > sourceSize_ || !IsDirectTUProtectionCensusComplete() ||
+bool RefoldPreprocessingStructureIndex::ProveOrdinaryDirectTUInternalGap(
+    uint64_t begin, uint64_t end) const {
+  if (end < begin || end > sourceSize_ ||
+      !IsDirectTUProtectionCensusComplete() ||
       !IsExactLexicalBoundary(begin) || !IsExactLexicalBoundary(end)) {
     return false;
   }
   if (begin == end)
     return true;
-  if (IsRangeLexicallyIgnorable(begin, end))
-    return true;
 
-  std::vector<std::pair<uint64_t, uint64_t>> coverage;
+  // Lexer trivia cannot become ordinary edit authority merely because the same
+  // physical bytes also belong to a directive logical line.  Consult the exact
+  // structure census independently before accepting the trivia theorem.
+  if (!FindOverlapping(begin, end).empty())
+    return false;
 
-  // Trivia can surround, separate, or lie within directive logical lines.  Use
-  // intersections so a maximal whole-source trivia range can contribute only
-  // the bytes that belong to the queried gap.
-  for (const PreprocessingTriviaInterval &trivia : triviaIntervals_) {
-    if (trivia.end <= begin)
-      continue;
-    if (trivia.begin >= end)
-      break;
-    coverage.emplace_back(std::max(begin, trivia.begin),
-                          std::min(end, trivia.end));
-  }
-
-  std::vector<const PreprocessingStructureInterval *> overlaps =
-      FindOverlapping(begin, end);
-  std::vector<const PreprocessingStructureInterval *> macroIntervals;
-  for (const PreprocessingStructureInterval *interval : overlaps) {
-    if (interval->begin < begin || end < interval->end)
-      return false;
-    if (!isDirectTUMacroStateInterval(*interval))
-      continue;
-
-    macroIntervals.push_back(interval);
-    coverage.emplace_back(interval->begin, interval->end);
-    appendUniqueAuthorization(
-        DirectTUMacroStateAuthorization{
-            *interval->modelItemId, interval->kind,
-            interval->ownerConditionalArmId, interval->begin, interval->end},
-        authorizations);
-  }
-
-  for (const PreprocessingStructureInterval *interval : overlaps) {
-    if (isDirectTUMacroStateInterval(*interval))
-      continue;
-
-    // A pragma operator spelled inside the replacement list of an authorized
-    // macro directive is preserved as part of that exact directive text.  It
-    // does not constitute an independently consumed state transition.  No
-    // other overlapping construct is admitted unless its complete interval is
-    // similarly enclosed by the same producer-bound directive obligation.
-    if (interval->kind != PreprocessingStructureKind::PragmaOperator)
-      return false;
-
-    bool enclosedByAuthorizedMacro = false;
-    for (const PreprocessingStructureInterval *macroInterval :
-         macroIntervals) {
-      if (macroInterval->begin <= interval->begin &&
-          interval->end <= macroInterval->end) {
-        enclosedByAuthorizedMacro = true;
-        break;
-      }
-    }
-    if (!enclosedByAuthorizedMacro)
-      return false;
-  }
-
-  llvm::sort(coverage, sourceCoverageIntervalLess);
-
-  uint64_t coveredEnd = begin;
-  for (const auto &component : coverage) {
-    if (component.second <= coveredEnd)
-      continue;
-    if (component.first > coveredEnd)
-      return false;
-    coveredEnd = component.second;
-    if (coveredEnd >= end)
-      return true;
-  }
-  return false;
+  return IsRangeLexicallyIgnorable(begin, end);
 }
 
-bool RefoldPreprocessingStructureIndex::ValidateDirectTUEnvelope(
+bool RefoldPreprocessingStructureIndex::CollectExactMacroStateIntervals(
     uint64_t begin, uint64_t end,
-    ArrayRef<DirectTUMacroStateAuthorization> authorizations) const {
-  if (end < begin || end > sourceSize_ || !IsDirectTUProtectionCensusComplete() ||
+    std::vector<const PreprocessingStructureInterval *> &intervals) const {
+  intervals.clear();
+  if (end < begin || end > sourceSize_ ||
+      !IsDirectTUProtectionCensusComplete() ||
       !IsExactLexicalBoundary(begin) || !IsExactLexicalBoundary(end)) {
     return false;
   }
 
-  std::vector<const PreprocessingStructureInterval *> overlaps =
-      FindOverlapping(begin, end);
-  for (const PreprocessingStructureInterval *interval : overlaps) {
-    if (interval->begin < begin || end < interval->end)
+  for (const PreprocessingStructureInterval *interval :
+       FindOverlapping(begin, end)) {
+    if (!isExactProducerBoundMacroStateInterval(*interval))
+      continue;
+    if (interval->begin < begin || end < interval->end) {
+      intervals.clear();
       return false;
-
-    bool matched = false;
-    for (const DirectTUMacroStateAuthorization &authorization :
-         authorizations) {
-      if (authorizationMatchesInterval(authorization, *interval)) {
-        matched = true;
-        break;
-      }
-      if (interval->kind == PreprocessingStructureKind::PragmaOperator &&
-          authorization.begin <= interval->begin &&
-          interval->end <= authorization.end) {
-        // `_Pragma` in a replacement list is preserved by carrying the complete
-        // authorized macro directive; no other nested structure is admitted.
-        matched = true;
-        break;
-      }
     }
-    if (!matched)
-      return false;
-  }
-
-  // Every deferred obligation must remain inside the final edit and retain an
-  // exact producer-bound interval.  This prevents a later recomposition path
-  // from silently dropping or inventing macro-state authority.
-  for (const DirectTUMacroStateAuthorization &authorization :
-       authorizations) {
-    if (authorization.begin < begin || end < authorization.end)
-      return false;
-
-    bool matched = false;
-    for (const PreprocessingStructureInterval *interval :
-         FindOverlapping(authorization.begin, authorization.end)) {
-      if (authorizationMatchesInterval(authorization, *interval)) {
-        matched = true;
-        break;
-      }
-    }
-    if (!matched)
-      return false;
+    intervals.push_back(interval);
   }
   return true;
 }

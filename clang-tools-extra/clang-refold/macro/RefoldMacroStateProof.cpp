@@ -546,6 +546,7 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
   stabilized.start = newStart;
   stabilized.end = newEnd;
   stabilized.replacement = std::move(replacement);
+  stabilized.movedTransitions.assign(candidates.begin(), candidates.end());
   return stabilized;
 }
 

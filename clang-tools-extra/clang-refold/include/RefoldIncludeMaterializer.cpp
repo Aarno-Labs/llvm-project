@@ -648,6 +648,7 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
       uint64_t editStart = mp.invRange.begin;
       uint64_t editEnd = mpEnd;
       std::string editReplacement = mp.replacement;
+      std::vector<MacroStateDirectiveLineInterval> movedMacroStateTransitions;
       if (std::optional<StabilizedMaterializedHeaderMacroPatch> stabilized =
               macroStateProof_.StabilizeMaterializedHeaderMacroPatchReplay(
                   MacroStatePatchReplayInput{mp.invRange.begin, mp.invRange.end,
@@ -665,6 +666,8 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
         editStart = stabilized->start;
         editEnd = stabilized->end;
         editReplacement = std::move(stabilized->replacement);
+        movedMacroStateTransitions =
+            std::move(stabilized->movedTransitions);
       }
 
       // Apply local line-resync policy before staging the edit, and carry the
@@ -684,14 +687,18 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
           {}};
       edit.lineControlPruneCandidates =
           std::move(ro.lineControlPruneCandidates);
-      if (editStart != mp.invRange.begin || editEnd != mpEnd) {
+      if (!movedMacroStateTransitions.empty()) {
         const PreprocessingStructureKind macroStateKinds[] = {
             PreprocessingStructureKind::MacroDefine,
             PreprocessingStructureKind::MacroUndef};
-        if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
-                edit, ProtectedSourceEditAuthorityKind::MacroStateRepair,
-                headerPath, includeId, bytes, editStart, editEnd,
-                macroStateKinds)) {
+        for (const MacroStateDirectiveLineInterval &transition :
+             movedMacroStateTransitions) {
+          if (textEditAssembler_.AuthorizeExactProtectedSourceInterval(
+                  edit, ProtectedSourceEditAuthorityKind::MacroStateRepair,
+                  headerPath, includeId, bytes, transition.begin,
+                  transition.end, macroStateKinds)) {
+            continue;
+          }
           includeExpansion[includeId] = std::string();
           return;
         }

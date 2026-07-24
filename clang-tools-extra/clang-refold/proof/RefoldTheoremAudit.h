@@ -64,6 +64,7 @@ public:
 
   RefoldTheoremAudit(TheoremAuditStats &audit,
                      const RefoldTerminalProofSink &terminalSink, bool strict,
+                     const bool &alignmentSemanticTheoremActive,
                      Hooks hooks);
 
   /// Return whether semantic no-legacy auditing is active for this run.
@@ -222,6 +223,7 @@ private:
   TheoremAuditStats &audit_;
   const RefoldTerminalProofSink &terminalSink_;
   bool strict_ = false;
+  const bool &alignmentSemanticTheoremActive_;
   Hooks hooks_;
 };
 

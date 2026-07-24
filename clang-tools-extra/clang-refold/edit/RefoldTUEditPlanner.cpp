@@ -100,18 +100,147 @@ RefoldTUEditPlanner::RefoldTUEditPlanner(Deps deps) : deps_(std::move(deps)) {
   }
 }
 
-bool RefoldTUEditPlanner::ValidateDirectTUEnvelope(
-    StringRef tuPath, uint64_t begin, uint64_t end,
-    ArrayRef<DirectTUMacroStateAuthorization> authorizations) const {
-  if (end < begin || end > deps_.tuSourceBytes.size() ||
-      deps_.preprocessingStructureIndex.GetOwnerIncludeId() ||
-      !deps_.pathIdentity.PathsEqual(tuPath, deps_.model.GetSourcePath()) ||
-      !deps_.pathIdentity.PathsEqual(
-          deps_.preprocessingStructureIndex.GetSourcePath(), tuPath)) {
+bool RefoldTUEditPlanner::CollectDirectTUMacroRepairEvidence(
+    uint64_t begin, uint64_t end,
+    std::vector<const PreprocessingStructureInterval *> &intervals) const {
+  const RefoldPreprocessingStructureIndex &structure =
+      deps_.preprocessingStructureIndex;
+  if (!structure.CollectExactMacroStateIntervals(begin, end, intervals) ||
+      intervals.empty()) {
     return false;
   }
-  return deps_.preprocessingStructureIndex.ValidateDirectTUEnvelope(
-      begin, end, authorizations);
+
+  llvm::sort(intervals,
+             [](const PreprocessingStructureInterval *lhs,
+                const PreprocessingStructureInterval *rhs) {
+               if (lhs->begin != rhs->begin)
+                 return lhs->begin < rhs->begin;
+               if (lhs->end != rhs->end)
+                 return lhs->end < rhs->end;
+               if (lhs->kind != rhs->kind)
+                 return lhs->kind < rhs->kind;
+               return lhs->modelItemId < rhs->modelItemId;
+             });
+
+  // The structure-index query intentionally reports macro evidence without
+  // interpreting other overlapping intervals. Recheck the complete overlap
+  // set here so a provisional direct carrier cannot use one exact macro line to
+  // absorb a conditional, include, pragma, line-control, or unknown directive.
+  // A `_Pragma` token wholly nested in the replacement list is part of that
+  // exact physical macro transition and is the sole admitted nested interval.
+  for (const PreprocessingStructureInterval *interval :
+       structure.FindOverlapping(begin, end)) {
+    if (llvm::is_contained(intervals, interval))
+      continue;
+
+    const bool nestedPragmaOperator =
+        interval->kind == PreprocessingStructureKind::PragmaOperator &&
+        llvm::any_of(intervals,
+                     [&](const PreprocessingStructureInterval *macro) {
+                       return macro->begin <= interval->begin &&
+                              interval->end <= macro->end;
+                     });
+    if (!nestedPragmaOperator) {
+      intervals.clear();
+      return false;
+    }
+  }
+  return true;
+}
+
+bool RefoldTUEditPlanner::CollectDirectTUMacroRepairEvidenceOrEmpty(
+    uint64_t begin, uint64_t end,
+    std::vector<const PreprocessingStructureInterval *> &intervals) const {
+  intervals.clear();
+  if (deps_.preprocessingStructureIndex.FindOverlapping(begin, end).empty())
+    return true;
+  return CollectDirectTUMacroRepairEvidence(begin, end, intervals);
+}
+
+bool RefoldTUEditPlanner::ValidateOrdinaryDirectTUEnvelope(
+    StringRef tuPath, uint64_t begin, uint64_t end) const {
+  const RefoldPreprocessingStructureIndex &structure =
+      deps_.preprocessingStructureIndex;
+  if (end < begin || end > deps_.tuSourceBytes.size() ||
+      structure.GetOwnerIncludeId() ||
+      !deps_.pathIdentity.PathsEqual(tuPath, deps_.model.GetSourcePath()) ||
+      !deps_.pathIdentity.PathsEqual(structure.GetSourcePath(), tuPath) ||
+      !structure.IsDirectTUProtectionCensusComplete() ||
+      !structure.IsExactLexicalBoundary(begin) ||
+      !structure.IsExactLexicalBoundary(end)) {
+    return false;
+  }
+  return structure.FindOverlapping(begin, end).empty();
+}
+
+bool RefoldTUEditPlanner::DirectTUEnvelopeRetainsMacroRepairEvidence(
+    StringRef tuPath, uint64_t baseBegin, uint64_t baseEnd,
+    uint64_t widenedBegin, uint64_t widenedEnd) const {
+  if (widenedBegin > baseBegin || baseEnd > widenedEnd ||
+      !ValidateDirectTUEnvelope(tuPath, baseBegin, baseEnd) ||
+      !ValidateDirectTUEnvelope(tuPath, widenedBegin, widenedEnd)) {
+    return false;
+  }
+
+  std::vector<const PreprocessingStructureInterval *> baseEvidence;
+  std::vector<const PreprocessingStructureInterval *> widenedEvidence;
+  if (!CollectDirectTUMacroRepairEvidenceOrEmpty(baseBegin, baseEnd,
+                                                 baseEvidence) ||
+      !CollectDirectTUMacroRepairEvidenceOrEmpty(widenedBegin, widenedEnd,
+                                                 widenedEvidence)) {
+    return false;
+  }
+  return baseEvidence == widenedEvidence;
+}
+
+bool RefoldTUEditPlanner::ProveDirectTUGapWithMacroRepairEvidence(
+    uint64_t begin, uint64_t end) const {
+  const RefoldPreprocessingStructureIndex &structure =
+      deps_.preprocessingStructureIndex;
+  if (structure.ProveOrdinaryDirectTUInternalGap(begin, end))
+    return true;
+
+  std::vector<const PreprocessingStructureInterval *> macroIntervals;
+  if (!CollectDirectTUMacroRepairEvidence(begin, end, macroIntervals))
+    return false;
+
+  uint64_t coveredEnd = begin;
+  for (const PreprocessingStructureInterval *interval : macroIntervals) {
+    if (interval->end <= coveredEnd)
+      continue;
+    if (interval->begin < coveredEnd ||
+        (coveredEnd < interval->begin &&
+         !structure.ProveOrdinaryDirectTUInternalGap(coveredEnd,
+                                                     interval->begin))) {
+      return false;
+    }
+    coveredEnd = interval->end;
+  }
+
+  return coveredEnd == end ||
+         (coveredEnd < end &&
+          structure.ProveOrdinaryDirectTUInternalGap(coveredEnd, end));
+}
+
+bool RefoldTUEditPlanner::ValidateDirectTUEnvelope(
+    StringRef tuPath, uint64_t begin, uint64_t end) const {
+  const RefoldPreprocessingStructureIndex &structure =
+      deps_.preprocessingStructureIndex;
+  if (end < begin || end > deps_.tuSourceBytes.size() ||
+      structure.GetOwnerIncludeId() ||
+      !deps_.pathIdentity.PathsEqual(tuPath, deps_.model.GetSourcePath()) ||
+      !deps_.pathIdentity.PathsEqual(structure.GetSourcePath(), tuPath) ||
+      !structure.IsDirectTUProtectionCensusComplete() ||
+      !structure.IsExactLexicalBoundary(begin) ||
+      !structure.IsExactLexicalBoundary(end)) {
+    return false;
+  }
+
+  if (structure.FindOverlapping(begin, end).empty())
+    return true;
+
+  std::vector<const PreprocessingStructureInterval *> macroIntervals;
+  return CollectDirectTUMacroRepairEvidence(begin, end, macroIntervals);
 }
 
 bool RefoldTUEditPlanner::IsPPGapAtSelectedConditionalArmExit(
@@ -957,7 +1086,6 @@ RefoldTUEditPlanner::PlanTUByteSpan(uint64_t a0, uint64_t a1,
   uint64_t previousBegin = 0;
   uint64_t previousEnd = 0;
   bool havePrevious = false;
-  std::vector<DirectTUMacroStateAuthorization> authorizations;
 
   for (uint64_t pp = a0; pp < a1; ++pp) {
     if (duplicateTokmapPP_.count(pp) != 0) {
@@ -996,10 +1124,9 @@ RefoldTUEditPlanner::PlanTUByteSpan(uint64_t a0, uint64_t a1,
     }
 
     if (previousEnd < entry.b &&
-        !deps_.preprocessingStructureIndex.ProveDirectTUInternalGap(
-            previousEnd, entry.b, authorizations)) {
-      return reject("internal source gap is not authorized direct-TU trivia or "
-                    "macro-state repair",
+        !ProveDirectTUGapWithMacroRepairEvidence(previousEnd, entry.b)) {
+      return reject("internal source gap is neither exact ordinary direct-TU "
+                    "trivia nor complete macro-state repair evidence",
                     "structural hunk tiling");
     }
 
@@ -1012,13 +1139,12 @@ RefoldTUEditPlanner::PlanTUByteSpan(uint64_t a0, uint64_t a1,
     return reject("A envelope contains no directly mapped TU token",
                   "safe owner/fallback path");
   }
-  if (!ValidateDirectTUEnvelope(tuPath, spanBegin, spanEnd, authorizations)) {
+  if (!ValidateDirectTUEnvelope(tuPath, spanBegin, spanEnd)) {
     return reject("candidate TU envelope contains unproved protected source",
                   "structural hunk tiling or directive-specific fallback");
   }
 
-  return TUByteSpanPlan(a0, a1, spanBegin, spanEnd, std::nullopt,
-                        std::move(authorizations));
+  return TUByteSpanPlan(a0, a1, spanBegin, spanEnd);
 }
 
 std::optional<TUByteSpanPlan>
@@ -1077,9 +1203,8 @@ bool RefoldTUEditPlanner::ValidateTUOwnerRealizationCarrier(
         baseSpan->insertionAnchor->ppGap != hunk.aStart ||
         span.insertionAnchor->tuByteOffset != baseSpan->tuByteBegin ||
         baseSpan->insertionAnchor->tuByteOffset != baseSpan->tuByteBegin ||
-        !span.macroStateAuthorizations.empty() ||
-        !ValidateDirectTUEnvelope(tuPath, span.tuByteBegin, span.tuByteEnd,
-                                  {})) {
+        !ValidateOrdinaryDirectTUEnvelope(tuPath, span.tuByteBegin,
+                                          span.tuByteEnd)) {
       return false;
     }
 
@@ -1127,18 +1252,18 @@ bool RefoldTUEditPlanner::ValidateTUOwnerRealizationCarrier(
   }
 
   // Boundary widening performed by a separate suffix/separator theorem may
-  // make the emitted source interval larger than the base token carrier.  It
-  // still has to contain that independently re-derived carrier and retain
-  // exactly the same producer-bound macro-state obligations.
+  // make the emitted source interval larger than the base token carrier. It
+  // still has to contain that independently re-derived carrier. Any macro
+  // transition in the wider envelope remains provisional evidence only and
+  // must later be discharged by the specialized repair planner.
   if (span.tuByteBegin > baseSpan->tuByteBegin ||
-      baseSpan->tuByteEnd > span.tuByteEnd ||
-      span.macroStateAuthorizations !=
-          baseSpan->macroStateAuthorizations) {
+      baseSpan->tuByteEnd > span.tuByteEnd) {
     return false;
   }
 
-  return ValidateDirectTUEnvelope(tuPath, span.tuByteBegin, span.tuByteEnd,
-                                  span.macroStateAuthorizations);
+  return DirectTUEnvelopeRetainsMacroRepairEvidence(
+      tuPath, baseSpan->tuByteBegin, baseSpan->tuByteEnd, span.tuByteBegin,
+      span.tuByteEnd);
 }
 
 std::optional<BoundaryParentIncludePlan>
@@ -1293,7 +1418,7 @@ RefoldTUEditPlanner::MaybeExtendTUSpanOverClosedTrailingCallSuffix(
       extEnd != oldEnd && TUReplacementExtensionIsBTokenClosed(
                               h.aEnd, oldEnd, extEnd, h.bStart, h.bEnd, tuPath);
   if (!closed ||
-      !ValidateDirectTUEnvelope(tuPath, oldEnd, extEnd, {}))
+      !ValidateOrdinaryDirectTUEnvelope(tuPath, oldEnd, extEnd))
     return std::nullopt;
 
   return TUTrailingCallSuffixExtension(h.aEnd, h.aEnd, oldEnd, extEnd, h.bStart,
@@ -1342,10 +1467,9 @@ RefoldTUEditPlanner::BuildDirectTUHunkEditPlan(
     return std::nullopt;
   }
 
-  TUByteSpanPlan spanPlan(
-      h.aStart, h.aEnd, span.first, span.second, rawSpan->insertionAnchor,
-      std::move(rawSpan->macroStateAuthorizations),
-      std::move(insertionAnchorAdjustment));
+  TUByteSpanPlan spanPlan(h.aStart, h.aEnd, span.first, span.second,
+                          rawSpan->insertionAnchor,
+                          std::move(insertionAnchorAdjustment));
   if (!ValidateTUOwnerRealizationCarrier(h, spanPlan))
     return std::nullopt;
 

@@ -2289,6 +2289,37 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
   return model;
 }
 
+RefoldModel RefoldModel::CloneForReadOnlyConsumer() const {
+  RefoldModel clone;
+  clone.root_ = root_;
+  clone.version_ = version_;
+  clone.sourcePath_ = sourcePath_;
+  clone.ppCwd_ = ppCwd_;
+  clone.ppLang_ = ppLang_;
+  clone.ppArgv_ = ppArgv_;
+  clone.includeSearchChain_ = includeSearchChain_;
+  clone.tokensCountA_ = tokensCountA_;
+  clone.tokPPByteBeginA_ = tokPPByteBeginA_;
+  clone.tokPPByteEndA_ = tokPPByteEndA_;
+  clone.tokmapByPP_ = tokmapByPP_;
+  clone.tokmap_ = tokmap_;
+  clone.includes_ = includes_;
+  clone.macroInvs_ = macroInvs_;
+  clone.macroDirs_ = macroDirs_;
+  clone.pragmas_ = pragmas_;
+  clone.fileItems_ = fileItems_;
+  clone.slots_ = slots_;
+  clone.conds_ = conds_;
+  clone.lineControls_ = lineControls_;
+
+  // Rebuild all pointer-bearing and ordering-sensitive derived state against
+  // the clone's own vectors.  The producer-backed StringRefs intentionally
+  // continue to refer to the immutable JSON root, whose lifetime already
+  // dominates every RefoldEngine created from this model.
+  clone.BuildIndicesAndSort();
+  return clone;
+}
+
 void RefoldModel::CompleteIncludeNextDerivedProvenance() {
   // The producer schema stores #include_next provenance in normalized form:
   //   * include_next.containing_file_include_id names the containing edge;

@@ -126,9 +126,6 @@ struct TUByteSpanPlan {
   uint64_t tuByteEnd = 0;
   /// Exact insertion anchor for pure insertions, when one was proven.
   std::optional<TUInsertionAnchor> insertionAnchor;
-  /// Producer-bound #define/#undef intervals deferred to mandatory macro-state
-  /// repair. An empty vector means the span consumes no preprocessing state.
-  std::vector<DirectTUMacroStateAuthorization> macroStateAuthorizations;
   /// Optional typed proof for moving a pure insertion past preserved source
   /// line-control structure while leaving that structure outside the edit.
   std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment;
@@ -139,14 +136,11 @@ struct TUByteSpanPlan {
       uint64_t aTokenBegin, uint64_t aTokenEnd, uint64_t tuByteBegin,
       uint64_t tuByteEnd,
       std::optional<TUInsertionAnchor> insertionAnchor = std::nullopt,
-      std::vector<DirectTUMacroStateAuthorization>
-          macroStateAuthorizations = {},
       std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment =
           std::nullopt)
       : aTokenBegin(aTokenBegin), aTokenEnd(aTokenEnd),
         tuByteBegin(tuByteBegin), tuByteEnd(tuByteEnd),
         insertionAnchor(std::move(insertionAnchor)),
-        macroStateAuthorizations(std::move(macroStateAuthorizations)),
         insertionAnchorAdjustment(std::move(insertionAnchorAdjustment)) {}
 
   bool isPureInsertion() const { return aTokenBegin == aTokenEnd; }
@@ -450,12 +444,13 @@ public:
   /// \c std::nullopt rather than "snapping" across ownership boundaries.
   ///
   /// A nonempty interval is admitted only when every consumed A token has one
-  /// exact in-bounds TU mapping, those mappings are source-monotone and
-  /// nonoverlapping, and every internal physical gap is covered by exact lexer
-  /// trivia or complete producer-bound `#define`/`#undef` intervals.  The latter
-  /// are carried as explicit deferred obligations for the mandatory macro-state
-  /// repair planner.  Every other preprocessing construct or unknown byte
-  /// rejects the span until structural tiling can leave it outside the edit.
+  /// exact in-bounds TU mapping and those mappings are source-monotone and
+  /// nonoverlapping.  Each internal physical gap is then discharged in one of
+  /// two separate proof domains: ordinary lexer trivia with no overlapping
+  /// protected structure, or complete producer-bound `#define`/`#undef`
+  /// evidence converted into explicit obligations for mandatory macro-state
+  /// repair.  Every other preprocessing construct or unknown byte rejects the
+  /// span until structural tiling can leave it outside the edit.
   ///
   /// For pure insertions, the planner first tries an exact producer-recorded TU
   /// slot boundary at the same PP gap. If no exact slot exists, it defers to
@@ -474,25 +469,25 @@ public:
   /// This is intentionally stronger than owner classification. The supplied
   /// hunk must match the span's A envelope exactly, the hunk's B envelope must
   /// be a real edited-token interval, the final physical byte interval must
-  /// contain the independently re-derived base span, and no protected
-  /// preprocessing structure may be consumed except exact #define/#undef
-  /// obligations already deferred to mandatory macro-state repair. An
-  /// optional structural binding is accepted only when it names this exact
-  /// segment and proves that all protected structure remains outside the edit.
+  /// contain the independently re-derived base span, and protected structure
+  /// may appear in the provisional carrier only as complete producer-bound
+  /// `#define`/`#undef` evidence deferred to mandatory macro-state repair. This
+  /// validation grants no authority to consume those intervals. An optional
+  /// structural binding is accepted only when it names this exact segment and
+  /// proves that all protected structure remains outside the edit.
   bool ValidateTUOwnerRealizationCarrier(
       const diffutils::Hunk &hunk, const TUByteSpanPlan &span,
       const StructuralHunkSegmentBinding *structuralBinding = nullptr) const;
 
-  /// Validate the actual final byte envelope for a proved direct TU span.
+  /// Validate a provisional direct-TU source envelope.
   ///
-  /// The envelope may contain the span's explicit producer-bound macro-state
-  /// obligations and may widen over lexer trivia, but it may not introduce any
-  /// new directive, pragma operator, partial lexical construct, or unbound
-  /// preprocessing state.
+  /// Complete producer-bound `#define`/`#undef` intervals may be recognized
+  /// only as evidence that the specialized macro-state repair planner has an
+  /// exact transition to inspect.  This theorem creates no protected-source
+  /// authority, and the final edit remains inadmissible until that specialized
+  /// planner has discharged every consumed transition.
   bool ValidateDirectTUEnvelope(llvm::StringRef tuPath, uint64_t begin,
-                                uint64_t end,
-                                llvm::ArrayRef<DirectTUMacroStateAuthorization>
-                                    authorizations) const;
+                                uint64_t end) const;
 
   /// \brief Determine whether an insertion hunk lands exactly on an include PP
   /// boundary and, if so, return the include level that should own the boundary
@@ -586,6 +581,46 @@ public:
       llvm::StringRef replacement, std::pair<uint64_t, uint64_t> &span) const;
 
 private:
+  /// Collect the exact macro transitions a direct-TU envelope defers to the
+  /// specialized repair planner.
+  ///
+  /// The returned intervals are evidence only. The query rejects partial
+  /// macro lines and every unrelated protected construct; a `_Pragma` token
+  /// nested wholly inside one collected macro replacement is the only nested
+  /// interval admitted by the same physical transition.
+  bool CollectDirectTUMacroRepairEvidence(
+      uint64_t begin, uint64_t end,
+      std::vector<const PreprocessingStructureInterval *> &intervals) const;
+
+  /// Collect the exact macro-repair evidence in an envelope, accepting an
+  /// empty evidence set when the envelope contains no protected structure.
+  bool CollectDirectTUMacroRepairEvidenceOrEmpty(
+      uint64_t begin, uint64_t end,
+      std::vector<const PreprocessingStructureInterval *> &intervals) const;
+
+  /// Validate a direct-TU envelope that may contain only ordinary source.
+  ///
+  /// This stricter form is used by independent widening theorems that have no
+  /// pre-existing macro transition to defer to specialized repair.
+  bool ValidateOrdinaryDirectTUEnvelope(llvm::StringRef tuPath,
+                                        uint64_t begin, uint64_t end) const;
+
+  /// Return whether widening preserves exactly the macro-transition evidence
+  /// already present in the independently re-derived base carrier.
+  bool DirectTUEnvelopeRetainsMacroRepairEvidence(
+      llvm::StringRef tuPath, uint64_t baseBegin, uint64_t baseEnd,
+      uint64_t widenedBegin, uint64_t widenedEnd) const;
+
+  /// Prove a direct-TU gap that is eligible for specialized macro repair.
+  ///
+  /// Ordinary bytes are discharged exclusively by
+  /// `ProveOrdinaryDirectTUInternalGap()`. Complete producer-bound
+  /// `#define`/`#undef` intervals may complete the gap only as evidence for the
+  /// later macro-state repair planner. No authorization record is returned or
+  /// stored by the direct-span theorem.
+  bool ProveDirectTUGapWithMacroRepairEvidence(uint64_t begin,
+                                               uint64_t end) const;
+
   /// Return the narrowest include id covering a PP index, if any.
   ///
   /// This is a TU-anchor guard, not general owner classification: it prevents a

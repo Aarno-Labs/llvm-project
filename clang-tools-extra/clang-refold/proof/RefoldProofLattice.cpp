@@ -34,12 +34,13 @@ RefoldProofLattice::RefoldProofLattice(
     const RefoldTUEditPlanner &tuEdits, const RefoldTheoremAudit &theoremAudit,
     TheoremAuditStats &lastTheoremAudit, bool strict,
     ProofAuditMode &proofAuditMode,
+    const bool &alignmentSemanticTheoremActive,
     std::vector<MixedOwnerTilingSegmentBinding>
         &mixedOwnerTilingSegmentBindings,
     std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses,
     Hooks hooks)
     : hooks_(std::move(hooks)), model_(model), bSource_(bSource), bToks_(bToks),
-      witnessTrace_(strict, proofAuditMode),
+      witnessTrace_(strict, proofAuditMode, alignmentSemanticTheoremActive),
       equivalenceKeyBuilder_(RefoldWitnessEquivalenceKeyBuilder::Dependencies{
           sourceMapper, bSource, bToks}),
       proofSummaryBuilder_(RefoldProofSummaryBuilder::Dependencies{bToks}),

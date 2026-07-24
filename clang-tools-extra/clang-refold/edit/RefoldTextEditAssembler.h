@@ -209,12 +209,17 @@ public:
   /// macro-state repair: the planner may move the one TU include that embodies
   /// a proved header `#define` or `#undef`, while any unrelated directive in
   /// the widened edit must remain unauthorized and therefore fail closed.
+  /// `allowedNestedKinds` names the closed set of independently indexed
+  /// constructs that are physically contained by that exact transition and
+  /// semantically inseparable from it. The current macro-state theorem uses
+  /// this only for `_Pragma` operators inside a complete macro replacement.
   bool AuthorizeExactProtectedSourceInterval(
       TextEdit &edit, ProtectedSourceEditAuthorityKind authority,
       llvm::StringRef sourcePath, std::optional<uint64_t> ownerIncludeId,
       llvm::StringRef sourceBytes, uint64_t intervalBegin,
       uint64_t intervalEnd,
       llvm::ArrayRef<PreprocessingStructureKind> allowedKinds,
+      llvm::ArrayRef<PreprocessingStructureKind> allowedNestedKinds = {},
       bool requestTerminalOnFailure = true) const;
 
   /// Authorize a complete source-closure operation after its independent

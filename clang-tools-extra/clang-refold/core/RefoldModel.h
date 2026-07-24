@@ -997,6 +997,17 @@ public:
   /// \see RefoldSchema.h
   static Expected<RefoldModel> FromJson(const json::Object &root);
 
+  /// Return an independent read-only consumer copy of this model.
+  ///
+  /// The model's public records are value types, but several private lookup
+  /// tables retain pointers into the owning vectors.  A compiler-generated
+  /// copy would preserve those pointers and therefore make the copy borrow
+  /// the original model's storage.  Isolated proof simulations require a
+  /// genuinely independent model, so this helper copies only the stored
+  /// producer records and then rebuilds every derived index against the
+  /// cloned vectors.
+  RefoldModel CloneForReadOnlyConsumer() const;
+
   // ============================== Basic getters ==============================
 
   /// Return the producer map version string.

@@ -957,16 +957,17 @@ inline StringRef toString(OwnerRealizationEvidenceKind value) {
 /// owner-realization boundary using the exact hunk and final `TUByteSpanPlan`.
 /// It deliberately does not treat closure widening as source authority. Any
 /// protected preprocessing structure was either absent from the emitted span,
-/// covered by an exact deferred #define/#undef repair obligation, or proven to
-/// remain outside the edit by a durable structural-segment binding.
+/// recognized only as exact macro-transition evidence deferred to the
+/// specialized repair planner, or proven to remain outside the edit by a
+/// durable structural-segment binding. This witness never grants emission
+/// authority to an ordinary direct-TU carrier.
 struct TUOwnerRealizationCarrierWitness {
   bool exactHunkAndSpanValidated = false;
-  bool protectedStructureExcludedOrAuthorized = false;
+  bool protectedStructureExcludedOrDeferred = false;
   bool hasStructuralSegmentBinding = false;
   bool structuralSegmentBindingValidated = false;
   uint64_t structuralWitnessId = 0;
   uint32_t structuralSegmentIndex = 0;
-  uint32_t deferredMacroStateAuthorizationCount = 0;
 
   bool IsComplete() const {
     const bool structuralBindingConsistent =
@@ -975,7 +976,7 @@ struct TUOwnerRealizationCarrierWitness {
             : !structuralSegmentBindingValidated && structuralWitnessId == 0 &&
                   structuralSegmentIndex == 0;
     return exactHunkAndSpanValidated &&
-           protectedStructureExcludedOrAuthorized &&
+           protectedStructureExcludedOrDeferred &&
            structuralBindingConsistent;
   }
 };
@@ -2120,6 +2121,51 @@ struct AcceptedResultCandidate {
   bool hasCounterStateWitness = false;
   CounterStateWitness counterStateWitness;
 };
+
+/// Return the theorem-facing owner-realization evidence carried by one
+/// accepted result, when present.
+inline std::optional<OwnerRealizationEvidenceKind>
+AcceptedResultOwnerRealizationEvidence(
+    const AcceptedResultCandidate &candidate) {
+  const std::optional<EmittedProof> &emittedProof =
+      candidate.proofSummary.emittedProof;
+  if (!emittedProof || !emittedProof->ownerRealization)
+    return std::nullopt;
+  return emittedProof->ownerRealization->evidence;
+}
+
+/// Return whether one accepted result is an ordinary token-derived direct-TU
+/// carrier.
+///
+/// The path name alone is insufficient because specialized repair and
+/// sideband surfaces reuse the conservative TU path. The canonical
+/// owner-realization evidence distinguishes `TUByteSpan` from
+/// `TUSpecializedRealization` without adding a parallel path enum.
+inline bool
+AcceptedResultIsOrdinaryDirectTUCarrier(
+    const AcceptedResultCandidate &candidate) {
+  const AcceptedPathKind path =
+      candidate.proofSummary.inventory.currentPath;
+  const std::optional<OwnerRealizationEvidenceKind> evidence =
+      AcceptedResultOwnerRealizationEvidence(candidate);
+  return candidate.kind == AcceptedResultCandidateKind::TUTextEdit &&
+         (path == AcceptedPathKind::TUByteSpanMappedEdit ||
+          path == AcceptedPathKind::TUByteSpanConservativeEdit) &&
+         evidence && *evidence == OwnerRealizationEvidenceKind::TUByteSpan;
+}
+
+/// Return whether one accepted result is an explicit specialized TU
+/// realization on the requested construction path.
+inline bool AcceptedResultIsSpecializedTUCarrier(
+    const AcceptedResultCandidate &candidate, AcceptedPathKind requiredPath) {
+  const std::optional<OwnerRealizationEvidenceKind> evidence =
+      AcceptedResultOwnerRealizationEvidence(candidate);
+  return candidate.kind == AcceptedResultCandidateKind::TUTextEdit &&
+         candidate.proofSummary.inventory.currentPath == requiredPath &&
+         evidence &&
+         *evidence ==
+             OwnerRealizationEvidenceKind::TUSpecializedRealization;
+}
 
 /// \brief Result returned by the accepted-result selector.
 ///

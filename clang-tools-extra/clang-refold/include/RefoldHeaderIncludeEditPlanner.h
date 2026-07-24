@@ -605,10 +605,15 @@ private:
   /// Carries active header #defines after a replacement when proof permits it.
   /// On success, the edit range, replacement text, and witness are widened and
   /// true is returned so the final physical edit can receive explicit
-  /// macro-state-repair authority. Returning false means that no carry rewrite
-  /// was performed; it does not by itself reject the ordinary mapped edit.
+  /// macro-state-repair authority. `carriedTransitions` receives only the exact
+  /// producer-bound directives discharged by this proof; the caller must not
+  /// authorize every macro directive incidentally covered by the widened edit.
+  /// Returning false means that no carry rewrite was performed; it does not by
+  /// itself reject the ordinary mapped edit.
   bool TryCarryHeaderMacroStateAfterReplacement(
-      const HeaderMacroStateCarryState &state) const;
+      const HeaderMacroStateCarryState &state,
+      llvm::SmallVectorImpl<HeaderMacroStateCarryCandidate>
+          &carriedTransitions) const;
 
   /// Checks owner-state proof obligations for a synthetic header #line resume.
   /// The resume must preserve line number, file state, and filename state at

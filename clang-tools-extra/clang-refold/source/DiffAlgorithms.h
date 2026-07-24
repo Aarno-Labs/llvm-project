@@ -18,8 +18,8 @@
 // ----------------
 //   • lcsMapAB: compute a one-sided mapping from indices in A to matching
 //     indices in B (or -1 if unmatched). The structured overload first solves
-//     the owner-aware LCS objective and then suppresses/restores ambiguous
-//     anchors using provenance certificates.
+//     the owner-aware LCS objective and exposes only every-optimal-path
+//     forced anchors until a separate semantic resolver proves equivalence.
 //   • hunksFromMap: convert an A→B map into ordered edit hunks between anchors.
 //   • diff / coalesce: produce SES steps (EQUAL/INSERT/DELETE) and merge
 //     adjacent non-EQUAL runs into hunks.
@@ -29,7 +29,7 @@
 //   • Algorithms are deterministic. The refolder-facing LCS overload avoids
 //     lexical neighbor tie heuristics by keeping only certified anchors.
 //   • Large-input guard: LCS switches to Hirschberg recursion (exact) when
-//     the full DP table would exceed a configured cell budget.
+//     the checked aggregate allocation would exceed a configured byte budget.
 //   • Utilities are side-effect free and operate on caller-owned sequences.
 //
 // Complexity
@@ -76,10 +76,13 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace llvm;
@@ -88,8 +91,13 @@ namespace clang {
 namespace refold {
 namespace diffutils {
 
-// Default to ~4GB budget.
-constexpr unsigned long long DEFAULT_MAX_CELLS = 1ULL << 28;
+/// Aggregate heap-payload budget for one quadratic LCS proof/realization.
+///
+/// The previous limit counted DP cells and therefore understated the real
+/// allocation by several simultaneously live tables. One GiB is intentionally
+/// below the multi-gigabyte range while remaining large enough for ordinary
+/// translation-unit alignments.
+constexpr unsigned long long DEFAULT_MAX_BYTES = 1ULL << 30;
 
 // ===== Myers shortest edit script (SES) =====
 
@@ -245,12 +253,188 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 
 // ========================== LCS alignment utilities ==========================
 
+/// Exact value of the core weighted-LCS objective.
+///
+/// The objective has only two components, evaluated lexicographically:
+/// maximize `matchedTokenCount`, then minimize `ownerDepthCost`. Structural
+/// boundary profiles may certify or suppress individual anchors after this
+/// objective is solved, but they never alter the objective itself.
+struct LcsObjective {
+  uint32_t matchedTokenCount = 0;
+  uint64_t ownerDepthCost = 0;
+
+  bool operator==(const LcsObjective &other) const {
+    return matchedTokenCount == other.matchedTokenCount &&
+           ownerDepthCost == other.ownerDepthCost;
+  }
+
+  bool operator!=(const LcsObjective &other) const {
+    return !(*this == other);
+  }
+};
+
+/// Theorem that authorizes one A-to-B token anchor in the production map.
+enum class LcsAnchorProofKind : uint8_t {
+  /// No theorem authorizes an anchor at this A-token position.
+  None,
+  /// Every globally core-optimal weighted-LCS path uses this exact match edge.
+  CoreOptimalPathForced,
+  /// A semantic alignment resolver proved that every remaining globally
+  /// core-optimal explanation produces one equivalent normalized owner/edit
+  /// realization.
+  EquivalentNormalizedHunkAndOwner,
+};
+
+inline StringRef toString(LcsAnchorProofKind kind) {
+  switch (kind) {
+  case LcsAnchorProofKind::None:
+    return "None";
+  case LcsAnchorProofKind::CoreOptimalPathForced:
+    return "CoreOptimalPathForced";
+  case LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner:
+    return "EquivalentNormalizedHunkAndOwner";
+  }
+  llvm_unreachable("invalid LCS anchor proof kind");
+}
+
+/// Durable theorem reference for one selected production anchor.
+struct LcsAnchorProof {
+  LcsAnchorProofKind kind = LcsAnchorProofKind::None;
+  /// Nonzero only for `EquivalentNormalizedHunkAndOwner`; identifies the
+  /// semantic resolver witness that discharged the ambiguity.
+  uint64_t semanticWitnessId = 0;
+
+  bool IsAuthorized() const {
+    if (kind == LcsAnchorProofKind::CoreOptimalPathForced)
+      return semanticWitnessId == 0;
+    if (kind == LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner)
+      return semanticWitnessId != 0;
+    return false;
+  }
+};
+
+/// Complete set of distinct match maps for one conditioned optimal window.
+///
+/// Distinct DP paths that differ only in insertion/deletion interleaving but
+/// carry the same ordered match edges collapse to one map. `complete` is false
+/// when the exact set exceeds the caller's proof budget; in that case `maps` is
+/// empty and no partial enumeration may be used as authority.
+struct OptimalLcsMapEnumeration {
+  std::vector<std::vector<int64_t>> maps;
+  bool complete = false;
+};
+
+/// Immutable all-optimal state for one certified weighted-LCS problem.
+///
+/// Its internal storage retains the exact core DP facts and admissible-pair
+/// relation needed by pair, window-objective, and boundary-frontier queries.
+/// Callers cannot mutate those facts or manufacture a completed
+/// certification.
+class OptimalTokenAlignmentOracle {
+public:
+  struct Storage;
+
+  OptimalTokenAlignmentOracle() = default;
+  explicit OptimalTokenAlignmentOracle(std::shared_ptr<const Storage> storage)
+      : storage_(std::move(storage)) {}
+
+  /// Return true when the complete all-optimal state was materialized.
+  bool HasCompleteCertification() const;
+  /// Number of A-side tokens represented by this oracle.
+  size_t GetATokenCount() const;
+  /// Number of B-side tokens represented by this oracle.
+  size_t GetBTokenCount() const;
+
+  /// Return true when the equal-token pair occurs on at least one globally
+  /// optimal path for the unchanged weighted-LCS objective.
+  ///
+  /// A false result means either that the pair is not globally admissible or
+  /// that this oracle has incomplete certification. Callers that need to
+  /// distinguish those cases must first check `HasCompleteCertification()`.
+  bool PairOccursOnOptimalPath(uint64_t aToken, uint64_t bToken) const;
+
+  /// Return true when every globally optimal path uses this exact match edge.
+  ///
+  /// This is stronger than having a unique individually admissible partner:
+  /// two crossing one-partner pairs may each occur on an optimal path while
+  /// neither is present on every optimal path. The oracle therefore derives
+  /// forcedness from the complete optimal-path DAG rather than partner counts.
+  bool PairIsForced(uint64_t aToken, uint64_t bToken) const;
+
+  /// Compute the exact weighted-LCS objective inside one half-open A/B window.
+  ///
+  /// The query uses the same absolute A-gap costs as the global problem. It is
+  /// a local optimum and does not by itself assert that the window endpoints
+  /// occur together on a globally optimal path. Invalid bounds or incomplete
+  /// certification return the default objective; callers should validate the
+  /// oracle and bounds before issuing the query.
+  LcsObjective ObjectiveForWindow(uint64_t aBegin, uint64_t aEnd,
+                                  uint64_t bBegin, uint64_t bEnd) const;
+
+  /// Return true when a globally optimal path passes through both window
+  /// endpoints in order.
+  ///
+  /// This companion query distinguishes an inadmissible window from an empty
+  /// frontier result without weakening the required vector-returning API.
+  bool WindowOccursOnOptimalPath(uint64_t aBegin, uint64_t aEnd,
+                                 uint64_t bBegin, uint64_t bEnd) const;
+
+  /// Project an A-token boundary to every exact B frontier admitted by the
+  /// globally conditioned weighted-LCS window.
+  ///
+  /// The returned vector is sorted and contains only frontiers that occur on
+  /// an optimal path from `(aWindowBegin,bWindowBegin)` to
+  /// `(aWindowEnd,bWindowEnd)` while that complete window remains admissible
+  /// in the global problem. Noncontiguous frontier sets remain noncontiguous;
+  /// no min/max range approximation is performed. An empty vector means that
+  /// certification is incomplete, the bounds are invalid, or the window is
+  /// not globally admissible. `HasCompleteCertification()` and
+  /// `WindowOccursOnOptimalPath()` distinguish those cases.
+  std::vector<uint64_t> ProjectATokenBoundaryToOptimalBFrontiers(
+      uint64_t aWindowBegin, uint64_t aWindowEnd, uint64_t bWindowBegin,
+      uint64_t bWindowEnd, uint64_t aBoundary) const;
+
+  /// Enumerate every distinct core-optimal match map inside one conditioned
+  /// forced-anchor window.
+  ///
+  /// The enumeration is exact and deduplicates insertion/deletion interleavings
+  /// that induce the same ordered set of match edges. If the number of distinct
+  /// maps exceeds `maxUniqueMaps`, the result is incomplete and contains no
+  /// maps; callers must retain only already-forced anchors.
+  OptimalLcsMapEnumeration EnumerateOptimalMapsForWindow(
+      uint64_t aWindowBegin, uint64_t aWindowEnd, uint64_t bWindowBegin,
+      uint64_t bWindowEnd, size_t maxUniqueMaps) const;
+
+private:
+  std::shared_ptr<const Storage> storage_;
+};
+
+/// Structured result of the provenance-certified weighted LCS.
+///
+/// `forcedMap` contains only anchors forced by the unchanged core objective.
+/// The core certifier initializes `selectedMap` from that exact surface. A
+/// later semantic alignment resolver may add non-forced anchors only after it
+/// records one durable `EquivalentNormalizedHunkAndOwner` witness. Every mapped
+/// A token has a parallel `selectedAnchorProofs` entry naming its authority.
+///
+/// When `completeCertification` is false, both maps and all proofs contain no
+/// anchors. The exact global objective is still returned, but no single
+/// linear-space LCS realization is exposed as though it certified ambiguity.
+struct CertifiedLcsResult {
+  std::vector<int64_t> forcedMap;
+  std::vector<int64_t> selectedMap;
+  std::vector<LcsAnchorProof> selectedAnchorProofs;
+  OptimalTokenAlignmentOracle oracle;
+  LcsObjective globalObjective;
+  bool completeCertification = false;
+};
+
 /// \brief Structured provenance for one A-side token gap used by LCS.
 ///
 /// `ownerDepthGap` intentionally collapses nested ownership into one scalar.
 /// The scalar remains the primary cost for the core LCS objective, while the
-/// identity-bearing fields below are used to certify boundary-preserving
-/// ambiguous-edge restoration without looking at neighboring token spellings.
+/// identity-bearing fields below remain available to downstream owner and
+/// structural proofs; they do not select non-forced alignment anchors.
 struct LcsAGapProvenance {
   static constexpr uint64_t noId = std::numeric_limits<uint64_t>::max();
 
@@ -299,9 +483,8 @@ struct LcsBGapProvenance {
   bool rightTokenStartsLine = false;
   bool rightTokenEndsLine = false;
 
-  // Byte coordinates in the edited preprocessed stream. The production ranking
-  // uses the boolean line/whitespace shape above; absolute offsets are retained
-  // for trace output and postmortem diagnostics, not as proof inputs.
+  // Byte coordinates in the edited preprocessed stream. All fields are retained
+  // only for compatibility and trace output; none is an anchor-selection proof.
   uint64_t gapBeginByte = noOffset;
   uint64_t gapEndByte = noOffset;
   uint64_t leftTokenBeginByte = noOffset;
@@ -331,11 +514,10 @@ struct LcsBGapProvenance {
 ///
 /// ### Performance & Scaling
 ///
-/// - **DP Path:** Used for small-to-medium sequences where the product of
-///   lengths is less than \p maxCells. Employs a cost-model-augmented
+/// - **DP Path:** Used for small-to-medium sequences when the checked aggregate
+///   allocation fits within \p maxBytes. Employs a cost-model-augmented
 ///   Dynamic Programming approach.
-/// - **Hirschberg Fallback:** If \p maxCells is exceeded, the algorithm
-/// switches
+/// - **Hirschberg Fallback:** If \p maxBytes is exceeded, the algorithm switches
 ///   to Hirschberg recursion (exact) using O(N+M) space.
 ///
 /// ### Complexity
@@ -348,31 +530,60 @@ struct LcsBGapProvenance {
 /// \param b The edited (Source B) sequence of tokens/strings.
 /// \param ownerDepthGap A gap array of size `a.size() + 1` giving the
 ///        ownership/boundary cost at each A-side token gap.
-/// \param maxCells The threshold for the DP table size (N*M) before switching
-///        to Hirschberg recursion.
+/// \param maxBytes Maximum aggregate heap payload admitted for the quadratic
+///        path before switching to Hirschberg recursion.
 /// \returns A vector mapping each index in \p a to its corresponding index
 ///          in \p b, or -1 if the token was deleted or moved.
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                               ArrayRef<uint32_t> ownerDepthGap,
-                              unsigned long long maxCells = DEFAULT_MAX_CELLS);
+                              unsigned long long maxBytes = DEFAULT_MAX_BYTES);
+
+/// Build the structured provenance-certified weighted-LCS result.
+///
+/// The returned oracle and `globalObjective` describe only the unchanged core
+/// objective: maximize matched-token count, then minimize owner-depth cost.
+/// `selectedMap` initially equals the exact every-optimal-path `forcedMap`.
+/// Non-forced production anchors belong to the separate semantic alignment
+/// resolver and therefore cannot contaminate the all-optimal oracle. If the
+/// all-optimal tables exceed the proof budget, both maps are returned fully
+/// suppressed and `completeCertification` is false.
+CertifiedLcsResult
+certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                  ArrayRef<LcsAGapProvenance> gapProvenance,
+                  unsigned long long maxBytes = DEFAULT_MAX_BYTES);
+
+/// Compatibility overload accepting edited-side B-gap surface profiles.
+///
+/// The core certifier deliberately ignores these profiles: line/whitespace
+/// shape is diagnostic evidence, not an anchor-selection theorem. `selectedMap`
+/// remains identical to `forcedMap` until the semantic resolver proves one
+/// downstream equivalence class.
+CertifiedLcsResult
+certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                  ArrayRef<LcsAGapProvenance> gapProvenance,
+                  ArrayRef<LcsBGapProvenance> bGapProvenance,
+                  unsigned long long maxBytes = DEFAULT_MAX_BYTES);
 
 /// \brief Compute the provenance-certified owner-aware LCS map.
 ///
 /// This overload derives the scalar owner-depth array from `gapProvenance` and
-/// then builds a certified partial map: only core-LCS-forced anchors are kept,
-/// and ambiguous equal-token edge anchors are restored only when the structured
-/// boundary profile proves a unique pure-insertion frontier.
+/// then builds a certified partial map containing only core-LCS-forced
+/// anchors. Ambiguous equal-token anchors remain suppressed until the separate
+/// semantic resolver proves that every optimal explanation induces one
+/// equivalent normalized owner/edit realization. If complete certification
+/// exceeds the configured proof budget, the returned map is fully suppressed
+/// rather than selecting one uncertified weighted LCS.
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                               ArrayRef<LcsAGapProvenance> gapProvenance,
-                              unsigned long long maxCells = DEFAULT_MAX_CELLS);
+                              unsigned long long maxBytes = DEFAULT_MAX_BYTES);
 
-/// \brief Same as the structured-provenance overload, with edited-side B-gap
-/// surface profiles used as the final structural discriminator for otherwise
-/// equivalent pure-insertion frontiers.
+/// \brief Compatibility overload carrying edited-side B-gap diagnostics.
+///
+/// B-gap surface profiles do not participate in production anchor selection.
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                               ArrayRef<LcsAGapProvenance> gapProvenance,
                               ArrayRef<LcsBGapProvenance> bGapProvenance,
-                              unsigned long long maxCells = DEFAULT_MAX_CELLS);
+                              unsigned long long maxBytes = DEFAULT_MAX_BYTES);
 
 /// \brief Compute a plain deterministic one-sided LCS backmap from A to B.
 ///
@@ -386,7 +597,7 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 ///
 /// ### Large-input guard
 ///
-/// If the full DP table would exceed the configured cell budget,
+/// If the checked quadratic allocation would exceed the configured byte budget,
 /// the algorithm switches to Hirschberg recursion (exact) using O(N+M) space.
 ///
 /// ### Complexity
@@ -396,11 +607,10 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 ///
 /// \param a Left sequence.
 /// \param b Right sequence.
-/// \param maxCells Maximum number of DP cells before switching to Hirschberg
-/// recursion. \returns A vector mapping a-indices to b-indices (or -1 if
-/// unmatched).
+/// \param maxBytes Maximum aggregate heap payload for the quadratic path.
+/// \returns A vector mapping a-indices to b-indices (or -1 if unmatched).
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                              unsigned long long maxCells = DEFAULT_MAX_CELLS);
+                              unsigned long long maxBytes = DEFAULT_MAX_BYTES);
 
 /// \brief Convert an A→B alignment map into a list of edit hunks.
 ///

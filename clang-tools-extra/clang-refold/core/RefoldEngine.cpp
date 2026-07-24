@@ -270,9 +270,13 @@ RefoldEngine::RefoldEngine(
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     std::vector<MaterializedEditMapping> *materializedEditMappings,
     FinalLineControlValidationCallback finalLineControlValidationCallback,
-    std::vector<SourceGraphOutput> *sourceGraphOutputs)
+    std::vector<SourceGraphOutput> *sourceGraphOutputs,
+    std::optional<AlignmentSelectionOverride> alignmentSelectionOverride,
+    bool alignmentSemanticResolverEnabled,
+    std::optional<StringRef> tuSourceBytesOverride)
     : model_(std::move(model)), aSource_(aSource), bSource_(bSource),
       aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff),
+      noLines_(noLines), finalOutputPath_(finalOutputPath.str()),
       lineDirs_(!noLines, model_.GetPPCwd()),
       pathIdentity_(model_, model_.GetPPCwd(), /*emitAbsPaths=*/false),
       strict_(strict), proofAuditMode_(proofAuditMode),
@@ -305,6 +309,11 @@ RefoldEngine::RefoldEngine(
       lineControlProof_(model_, sourceMapper_, pathIdentity_,
                         tokenTextAnalysis_, macroTopology_, lineDirs_, aToks_,
                         bToks_, abTokMapA2B_, abTokMapB2A_) {
+  alignmentSelectionOverride_ = std::move(alignmentSelectionOverride);
+  alignmentSemanticResolverEnabled_ = alignmentSemanticResolverEnabled;
+  alignmentSemanticTheoremActive_ = alignmentSelectionOverride_.has_value();
+  tuSourceBytesOverride_ = std::move(tuSourceBytesOverride);
+
   // Build the object graph in dependency order.  Each service receives
   // explicit inputs/services and, where orchestration remains engine-owned, a
   // narrow hook bundle; no service stores RefoldEngine itself.
@@ -501,6 +510,97 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath, StringRef tuBytes) {
   // deterministic token-diff plan below.
   assert(tokenDiffPlanner_ && "token diff planner service not initialized");
   RefoldTokenDiffPlanner::TokenDiffPlan diffPlan = tokenDiffPlanner_->Plan();
+
+  // Production non-forced anchors must resolve to one durable semantic
+  // witness retained by this engine run. Isolated candidate simulations carry
+  // a temporary theorem-bearing override and are validated by the outer
+  // resolver instead.
+  if (!alignmentSelectionOverride_) {
+    std::set<uint64_t> semanticWitnessIds;
+    for (const AlignmentSemanticResolutionWitness &witness :
+         alignmentSemanticResolutionWitnesses_) {
+      if (witness.witnessId == 0 ||
+          !semanticWitnessIds.insert(witness.witnessId).second) {
+        REFOLD_LOG_FATAL(
+            "lcs/semantic-resolver",
+            "alignment semantic witness ledger has an invalid duplicate id");
+      }
+      if (!witness.completeEnumeration || witness.enumeratedMapCount == 0 ||
+          witness.acceptedMapCount == 0 ||
+          witness.acceptedMapCount + witness.rejectedMapCount !=
+              witness.enumeratedMapCount ||
+          witness.equivalenceKey.empty() ||
+          witness.representativeMap.size() != abTokMapA2B_.size()) {
+        REFOLD_LOG_FATAL(
+            "lcs/semantic-resolver",
+            "alignment semantic witness {0} is incomplete or malformed",
+            witness.witnessId);
+      }
+
+      std::set<std::pair<uint64_t, uint64_t>> anchorEvidence;
+      for (const AlignmentSemanticAnchorEvidence &evidence :
+           witness.anchorEvidence) {
+        if (evidence.aToken >= witness.representativeMap.size() ||
+            witness.representativeMap[evidence.aToken] !=
+                static_cast<int64_t>(evidence.bToken) ||
+            !anchorEvidence.insert({evidence.aToken, evidence.bToken}).second) {
+          REFOLD_LOG_FATAL(
+              "lcs/semantic-resolver",
+              "alignment semantic witness {0} has malformed anchor evidence",
+              witness.witnessId);
+        }
+      }
+      for (size_t aToken = 0; aToken < witness.representativeMap.size();
+           ++aToken) {
+        const int64_t bToken = witness.representativeMap[aToken];
+        if (bToken < 0 ||
+            (aToken < abTokAnchorProofs_.size() &&
+             abTokAnchorProofs_[aToken].kind ==
+                 diffutils::LcsAnchorProofKind::CoreOptimalPathForced))
+          continue;
+        if (!anchorEvidence.count(
+                {aToken, static_cast<uint64_t>(bToken)})) {
+          REFOLD_LOG_FATAL(
+              "lcs/semantic-resolver",
+              "alignment semantic witness {0} lacks evidence for A-token {1}",
+              witness.witnessId, aToken);
+        }
+      }
+    }
+    for (size_t aToken = 0; aToken < abTokAnchorProofs_.size(); ++aToken) {
+      const diffutils::LcsAnchorProof &proof = abTokAnchorProofs_[aToken];
+      if (proof.kind !=
+          diffutils::LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner)
+        continue;
+      if (!alignmentSemanticTheoremActive_) {
+        REFOLD_LOG_FATAL(
+            "lcs/semantic-resolver",
+            "A-token anchor {0} has semantic authority while the theorem "
+            "boundary is inactive",
+            aToken);
+      }
+      if (!semanticWitnessIds.count(proof.semanticWitnessId)) {
+        REFOLD_LOG_FATAL(
+            "lcs/semantic-resolver",
+            "A-token anchor {0} names missing semantic witness {1}", aToken,
+            proof.semanticWitnessId);
+      }
+      const auto witnessIt = llvm::find_if(
+          alignmentSemanticResolutionWitnesses_,
+          [&](const AlignmentSemanticResolutionWitness &witness) {
+            return witness.witnessId == proof.semanticWitnessId;
+          });
+      if (witnessIt == alignmentSemanticResolutionWitnesses_.end() ||
+          aToken >= witnessIt->representativeMap.size() ||
+          witnessIt->representativeMap[aToken] != abTokMapA2B_[aToken]) {
+        REFOLD_LOG_FATAL(
+            "lcs/semantic-resolver",
+            "A-token anchor {0} disagrees with semantic witness {1}", aToken,
+            proof.semanticWitnessId);
+      }
+    }
+  }
+
   std::vector<diffutils::Hunk> hunks = std::move(diffPlan.hunks);
   structuralHunkPlanningPhase_ =
       StructuralHunkPlanningPhase::InitialTokenDiffBuilt;
@@ -1699,6 +1799,27 @@ std::string RefoldEngine::FinalizeStructuralResult(
   if (!finalEmission.success)
     return std::string();
 
+  // Capture the exact final staged TU/include/macro topology after every
+  // final-emission lowering and repair has been applied. This is evidence-only
+  // and is consumed only by isolated alignment simulations.
+  AlignmentSemanticTopologyKeyResult topologyKey =
+      structuralHunkDispatcher.BuildAlignmentSemanticTopologyKey(
+          ProofLattice().EquivalenceKeyBuilder(), tuBytes);
+  for (uint64_t includeId :
+       includeMaterializationScheduler.ExpandedIncludeIds())
+    topologyKey.preservationFootprint.expandedIncludeIds.push_back(includeId);
+  for (uint64_t macroRootId :
+       structuralHunkDispatcher.ExpandedMacroRootIds())
+    topologyKey.preservationFootprint.expandedMacroRootIds.push_back(
+        macroRootId);
+  llvm::sort(topologyKey.preservationFootprint.expandedIncludeIds);
+  llvm::sort(topologyKey.preservationFootprint.expandedMacroRootIds);
+  alignmentSimulationStagedTopologyComplete_ = topologyKey.complete;
+  alignmentSimulationStagedTopologyFailure_ = std::move(topologyKey.failure);
+  alignmentSimulationStagedTopologyKey_ = std::move(topologyKey.key);
+  alignmentSimulationPreservationFootprint_ =
+      std::move(topologyKey.preservationFootprint);
+
   lastStats_.expandedMacros = finalEmission.expandedMacroCount;
   return std::move(finalEmission.tuText);
 }
@@ -1722,6 +1843,14 @@ std::string RefoldEngine::RunRefoldPass() {
   abTokHunks_.clear();
   abTokMapA2B_.clear();
   abTokMapB2A_.clear();
+  abTokAnchorProofs_.clear();
+  alignmentSemanticResolutionWitnesses_.clear();
+  alignmentSimulationStagedTopologyKey_.clear();
+  alignmentSimulationStagedTopologyComplete_ = true;
+  alignmentSimulationStagedTopologyFailure_.clear();
+  alignmentSimulationPreservationFootprint_ =
+      AlignmentSemanticPreservationFootprint{};
+  alignmentSemanticTheoremActive_ = alignmentSelectionOverride_.has_value();
 
   std::unique_ptr<llvm::MemoryBuffer> tuBuffer = LoadTUSource(tuPath);
   StringRef tuBytes = tuBuffer->getBuffer();

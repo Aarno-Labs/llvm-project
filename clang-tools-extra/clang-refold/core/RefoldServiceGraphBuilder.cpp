@@ -38,6 +38,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 
 #include <cassert>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -122,9 +123,33 @@ void RefoldEngine::InitializeTokenDiffPlanner() {
   // lifetime on the engine object graph.
   tokenDiffPlanner_ = std::make_unique<RefoldTokenDiffPlanner>(
       RefoldTokenDiffPlanner::Dependencies{
-          model_, bSource_, aToks_, bToks_, aTokOff_, bTokOff_, macroTopology_,
-          sourceMapper_, ownerDepthGap_, abTokHunks_, abByteHunks_,
-          abTokMapA2B_, abTokMapB2A_});
+          model_, pathIdentity_, *preprocessingStructureIndex_, bSource_,
+          aToks_, bToks_, aTokOff_, bTokOff_, macroTopology_, sourceMapper_,
+          ownerDepthGap_, abTokHunks_, abByteHunks_, abTokMapA2B_,
+          abTokMapB2A_, abTokAnchorProofs_,
+          alignmentSelectionOverride_ ? &*alignmentSelectionOverride_ : nullptr,
+          alignmentSemanticResolverEnabled_
+              ? std::function<void(
+                    ArrayRef<StringRef>, ArrayRef<StringRef>,
+                    ArrayRef<diffutils::LcsAGapProvenance>,
+                    ArrayRef<diffutils::LcsBGapProvenance>,
+                    diffutils::CertifiedLcsResult &)>(
+                    [this](ArrayRef<StringRef> aLexemes,
+                           ArrayRef<StringRef> bLexemes,
+                           ArrayRef<diffutils::LcsAGapProvenance>
+                               aGapProvenance,
+                           ArrayRef<diffutils::LcsBGapProvenance>
+                               bGapProvenance,
+                           diffutils::CertifiedLcsResult &alignment) {
+                      ResolveSemanticAlignment(aLexemes, bLexemes,
+                                               aGapProvenance, bGapProvenance,
+                                               alignment);
+                    })
+              : std::function<void(
+                    ArrayRef<StringRef>, ArrayRef<StringRef>,
+                    ArrayRef<diffutils::LcsAGapProvenance>,
+                    ArrayRef<diffutils::LcsBGapProvenance>,
+                    diffutils::CertifiedLcsResult &)>()});
 }
 
 void RefoldEngine::InitializeMixedOwnerTilingPlanner() {
@@ -161,21 +186,26 @@ void RefoldEngine::InitializeTUEditPlanner() {
 }
 
 void RefoldEngine::InitializePreprocessingStructureIndex() {
-  const std::string absoluteTUPath =
-      lineDirs_.ToAbsolutePath(model_.GetSourcePath());
-  auto bufferOrError = MemoryBuffer::getFile(absoluteTUPath);
-  if (!bufferOrError) {
-    tuSourceLoadError_ =
-        llvm::formatv("unable to read translation unit '{0}': {1}",
-                      absoluteTUPath, bufferOrError.getError().message())
-            .str();
-    tuSourceBytes_.clear();
-    REFOLD_LOG_WARN("tu/structure-index",
-                    "{0}; direct TU spans will fail closed",
-                    *tuSourceLoadError_);
-  } else {
+  if (tuSourceBytesOverride_) {
     tuSourceLoadError_.reset();
-    tuSourceBytes_ = bufferOrError.get()->getBuffer().str();
+    tuSourceBytes_ = *tuSourceBytesOverride_;
+  } else {
+    const std::string absoluteTUPath =
+        lineDirs_.ToAbsolutePath(model_.GetSourcePath());
+    auto bufferOrError = MemoryBuffer::getFile(absoluteTUPath);
+    if (!bufferOrError) {
+      tuSourceLoadError_ =
+          llvm::formatv("unable to read translation unit '{0}': {1}",
+                        absoluteTUPath, bufferOrError.getError().message())
+              .str();
+      tuSourceBytes_.clear();
+      REFOLD_LOG_WARN("tu/structure-index",
+                      "{0}; direct TU spans will fail closed",
+                      *tuSourceLoadError_);
+    } else {
+      tuSourceLoadError_.reset();
+      tuSourceBytes_ = bufferOrError.get()->getBuffer().str();
+    }
   }
 
   preprocessingStructureIndex_ =
@@ -293,7 +323,8 @@ void RefoldEngine::InitializeTheoremAudit() {
       };
 
   theoremAudit_ = std::make_unique<RefoldTheoremAudit>(
-      lastTheoremAudit_, terminalSink_, strict_, std::move(hooks));
+      lastTheoremAudit_, terminalSink_, strict_,
+      alignmentSemanticTheoremActive_, std::move(hooks));
 }
 
 RefoldTheoremAudit &RefoldEngine::TheoremAudit() const {
@@ -332,7 +363,8 @@ void RefoldEngine::InitializeProofLattice() {
       model_, bSource_, bToks_, sourceMapper_, tokenTextAnalysis_,
       argTextRecovery_, macroTopology_, OwnerStateProof(), terminalSink_,
       TUEditPlanner(), TheoremAudit(), lastTheoremAudit_, strict_,
-      proofAuditMode_, mixedOwnerTilingSegmentBindings_,
+      proofAuditMode_, alignmentSemanticTheoremActive_,
+      mixedOwnerTilingSegmentBindings_,
       mixedOwnerTilingWitnesses_, std::move(hooks));
 }
 

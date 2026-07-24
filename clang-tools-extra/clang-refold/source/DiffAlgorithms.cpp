@@ -18,8 +18,8 @@
 // ----------------
 //   • lcsMapAB: compute a one-sided mapping from indices in A to matching
 //     indices in B (or -1 if unmatched). The structured overload first solves
-//     the owner-aware LCS objective and then suppresses/restores ambiguous
-//     anchors using provenance certificates.
+//     the owner-aware LCS objective and exposes only every-optimal-path
+//     forced anchors until a separate semantic resolver proves equivalence.
 //   • hunksFromMap: convert an A→B map into ordered edit hunks between anchors.
 //   • diff / coalesce: produce SES steps (EQUAL/INSERT/DELETE) and merge
 //     adjacent non-EQUAL runs into hunks.
@@ -29,7 +29,7 @@
 //   • Algorithms are deterministic. The refolder-facing LCS overload avoids
 //     lexical neighbor tie heuristics by keeping only certified anchors.
 //   • Large-input guard: LCS switches to Hirschberg recursion (exact) when
-//     the full DP table would exceed a configured cell budget.
+//     the checked aggregate allocation would exceed a configured byte budget.
 //   • Utilities are side-effect free and operate on caller-owned sequences.
 //
 // Complexity
@@ -74,7 +74,9 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace clang {
@@ -83,55 +85,731 @@ namespace diffutils {
 
 constexpr size_t MAX = static_cast<size_t>(std::numeric_limits<int64_t>::max());
 
+/// Compact structure-of-arrays storage for one weighted-LCS objective table.
+///
+/// `LcsObjective` is a convenient public value type, but its natural alignment
+/// gives each vector element four bytes of padding on 64-bit targets.  The
+/// certifier retains two quadratic objective tables, so that padding alone can
+/// consume hundreds of MiB on otherwise moderate translation units.  Keeping
+/// the 32-bit match count and 64-bit owner cost in parallel arrays preserves
+/// the exact objective while using the actual twelve payload bytes per state.
+class ObjectiveTable {
+public:
+  void Assign(size_t count) {
+    matchedTokenCounts_.assign(count, 0);
+    ownerDepthCosts_.assign(count, 0);
+  }
+
+  bool Empty() const {
+    return matchedTokenCounts_.empty() && ownerDepthCosts_.empty();
+  }
+
+  size_t Size() const {
+    assert(matchedTokenCounts_.size() == ownerDepthCosts_.size());
+    return matchedTokenCounts_.size();
+  }
+
+  LcsObjective Get(size_t index) const {
+    assert(index < Size());
+    return LcsObjective{matchedTokenCounts_[index], ownerDepthCosts_[index]};
+  }
+
+  void Set(size_t index, const LcsObjective &objective) {
+    assert(index < Size());
+    matchedTokenCounts_[index] = objective.matchedTokenCount;
+    ownerDepthCosts_[index] = objective.ownerDepthCost;
+  }
+
+private:
+  std::vector<uint32_t> matchedTokenCounts_;
+  std::vector<uint64_t> ownerDepthCosts_;
+};
+
+/// Retained exact state for `OptimalTokenAlignmentOracle`.
+///
+/// Pair facts use bit 0 for exact token equality, bit 1 for occurrence on at
+/// least one globally optimal core path, and bit 2 for occurrence on every
+/// globally optimal path. The complete forward/suffix objective tables are
+/// retained so conditioned window and frontier queries can be answered without
+/// recomputing or approximating the global alignment problem.
+struct OptimalTokenAlignmentOracle::Storage {
+  size_t aTokenCount = 0;
+  size_t bTokenCount = 0;
+  size_t stride = 0;
+  LcsObjective globalObjective;
+  std::vector<uint32_t> ownerDepthGap;
+  ObjectiveTable forwardObjectives;
+  ObjectiveTable suffixObjectives;
+  std::vector<uint8_t> pairFacts;
+  uint64_t maxAllocationBytes = 0;
+  uint64_t retainedAllocationBytes = 0;
+};
+
 namespace {
-/// Return true when the exact full DP table would exceed the configured cell or
-/// allocation budget and the caller must use the exact linear-space Hirschberg
-/// path. Despite the conservative helper name, the fallback is not greedy.
-bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
-                             unsigned long long maxCells) {
-  if (n >= std::numeric_limits<unsigned long long>::max() - 1ULL ||
-      m >= std::numeric_limits<unsigned long long>::max() - 1ULL) {
-    REFOLD_LOG_WARN(
-        "lcs/map",
-        "hirschberg fallback: (n+1) or (m+1) would overflow unsigned long long"
-        " (n={0}, m={1})",
-        n, m);
-    return true; // (n+1) or (m+1) would overflow ULL anyway
-  } else {
-    const unsigned long long n1 = n + 1ULL;
-    const unsigned long long m1 = m + 1ULL;
 
-    // Product check via division to avoid overflow: n1 * m1 > maxCells ?
-    const unsigned long long maxN1 = maxCells / m1; // m1 >= 1 always
-    if (n1 > maxN1) {
-      REFOLD_LOG_WARN(
-          "lcs/map",
-          "hirschberg fallback: DP cell budget exceeded: (n+1)*(m+1) > "
-          "maxCells "
-          "(n={0}, m={1}, n1={2}, m1={3}, maxCells={4}, maxAllowedN1ForM1={5})",
-          n, m, n1, m1, maxCells, maxN1);
-      return true;
-    } else {
-      // Safe to multiply here: n1 <= maxCells/m1 implies n1*m1 <= maxCells (no
-      // ULL overflow).
-      const unsigned long long cells = n1 * m1;
+constexpr uint8_t TokensEqualFact = 1U << 0;
+constexpr uint8_t PairOccursOnOptimalPathFact = 1U << 1;
+constexpr uint8_t PairIsForcedFact = 1U << 2;
 
-      // Allocation guard: cells * sizeof(unsigned) must fit in size_t
-      const unsigned long long cellLimit = static_cast<unsigned long long>(
-          std::numeric_limits<size_t>::max() / sizeof(unsigned));
+/// Checked heap-payload plan for the complete certified weighted-LCS path.
+///
+/// `retainedBytes` remains live after certification and is therefore charged
+/// against later oracle queries. `constructionPeakBytes` additionally includes
+/// the immediate-dominator and dominates-sink arrays used only while forced
+/// pairs are certified. The plan is computed before any quadratic allocation.
+struct CertifiedLcsAllocationPlan {
+  size_t stateCount = 0;
+  size_t pairCount = 0;
+  uint64_t retainedBytes = 0;
+  uint64_t constructionPeakBytes = 0;
+};
 
-      if (cells > cellLimit) {
-        REFOLD_LOG_WARN(
-            "lcs/map",
-            "hirschberg fallback: DP allocation would overflow size_t for "
-            "unsigned table "
-            "(cells={0} > size_t/sizeof(unsigned)={1}; n={2}, m={3})",
-            cells, cellLimit, n, m);
-        return true;
+static bool multiplySizeChecked(size_t lhs, size_t rhs, size_t &out) {
+  if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs)
+    return false;
+  out = lhs * rhs;
+  return true;
+}
+
+static bool addBytesChecked(uint64_t value, uint64_t &total) {
+  if (total > std::numeric_limits<uint64_t>::max() - value)
+    return false;
+  total += value;
+  return true;
+}
+
+template <typename T>
+static bool arrayBytesChecked(size_t count, uint64_t &bytes) {
+  static_assert(sizeof(size_t) <= sizeof(uint64_t),
+                "LCS byte accounting requires size_t to fit in uint64_t");
+  if (count > std::vector<T>().max_size() ||
+      count > std::numeric_limits<uint64_t>::max() / sizeof(T))
+    return false;
+  bytes = static_cast<uint64_t>(count) * sizeof(T);
+  return true;
+}
+
+template <typename T>
+static bool addArrayBytesChecked(size_t count, uint64_t &total) {
+  uint64_t bytes = 0;
+  return arrayBytesChecked<T>(count, bytes) && addBytesChecked(bytes, total);
+}
+
+/// Add the exact payload of one compact objective table.
+static bool addObjectiveTableBytesChecked(size_t count, uint64_t &total) {
+  return addArrayBytesChecked<uint32_t>(count, total) &&
+         addArrayBytesChecked<uint64_t>(count, total);
+}
+
+static bool gridStateCountChecked(size_t aWidth, size_t bWidth,
+                                  size_t &stateCount) {
+  if (aWidth == std::numeric_limits<size_t>::max() ||
+      bWidth == std::numeric_limits<size_t>::max())
+    return false;
+  return multiplySizeChecked(aWidth + 1, bWidth + 1, stateCount);
+}
+
+static bool buildCertifiedLcsAllocationPlan(
+    size_t aTokenCount, size_t bTokenCount,
+    CertifiedLcsAllocationPlan &plan) {
+  plan = CertifiedLcsAllocationPlan{};
+  if (!gridStateCountChecked(aTokenCount, bTokenCount, plan.stateCount) ||
+      !multiplySizeChecked(aTokenCount, bTokenCount, plan.pairCount))
+    return false;
+
+  uint64_t retainedBytes = 0;
+  if (!addObjectiveTableBytesChecked(plan.stateCount, retainedBytes) ||
+      !addObjectiveTableBytesChecked(plan.stateCount, retainedBytes) ||
+      !addArrayBytesChecked<uint8_t>(plan.pairCount, retainedBytes) ||
+      !addArrayBytesChecked<uint32_t>(aTokenCount + 1, retainedBytes) ||
+      !addArrayBytesChecked<uint32_t>(aTokenCount + 1, retainedBytes) ||
+      !addArrayBytesChecked<int64_t>(aTokenCount, retainedBytes) ||
+      !addArrayBytesChecked<int64_t>(aTokenCount, retainedBytes) ||
+      !addArrayBytesChecked<LcsAnchorProof>(aTokenCount, retainedBytes))
+    return false;
+  plan.retainedBytes = retainedBytes;
+
+  // The compact certifier stores flattened dominator predecessors in 32 bits.
+  // Under the default one-GiB budget this bound is automatic; callers that
+  // raise the budget still fail closed rather than silently truncating an
+  // index. Forced match edges are recovered by walking the sink's immediate-
+  // dominator chain directly, so no separate state-membership bitset is
+  // allocated.
+  if (plan.stateCount > std::numeric_limits<uint32_t>::max())
+    return false;
+
+  uint64_t constructionPeakBytes = retainedBytes;
+  if (!addArrayBytesChecked<uint32_t>(plan.stateCount,
+                                      constructionPeakBytes))
+    return false;
+  plan.constructionPeakBytes = constructionPeakBytes;
+  return true;
+}
+
+/// Return true when one oracle query's retained and temporary arrays fit.
+///
+/// This helper is deliberately allocation-only. It does not alter the sparse
+/// first-match cache or enumeration traversal used by the fixed6 baseline.
+static bool oracleQueryFitsByteBudget(
+    const OptimalTokenAlignmentOracle::Storage &storage, size_t aWidth,
+    size_t bWidth, uint64_t additionalBytes = 0) {
+  size_t stateCount = 0;
+  uint64_t requiredBytes = storage.retainedAllocationBytes;
+  return gridStateCountChecked(aWidth, bWidth, stateCount) &&
+         addObjectiveTableBytesChecked(stateCount, requiredBytes) &&
+         addObjectiveTableBytesChecked(stateCount, requiredBytes) &&
+         addBytesChecked(additionalBytes, requiredBytes) &&
+         requiredBytes <= storage.maxAllocationBytes;
+}
+
+inline bool isCoreBetter(unsigned candLen, uint64_t candCost,
+                         unsigned bestLen, uint64_t bestCost);
+static bool addCostChecked(uint64_t base, uint32_t extra, uint64_t &out);
+
+/// Add two weighted-LCS objective fragments without allowing either component
+/// to wrap. The core objective is additive across concatenated path segments:
+/// matched-token counts add, as do owner-gap costs.
+static bool addObjectivesChecked(const LcsObjective &lhs,
+                                 const LcsObjective &rhs,
+                                 LcsObjective &out) {
+  if (lhs.matchedTokenCount >
+      std::numeric_limits<uint32_t>::max() - rhs.matchedTokenCount)
+    return false;
+  if (lhs.ownerDepthCost >
+      std::numeric_limits<uint64_t>::max() - rhs.ownerDepthCost)
+    return false;
+  out.matchedTokenCount = lhs.matchedTokenCount + rhs.matchedTokenCount;
+  out.ownerDepthCost = lhs.ownerDepthCost + rhs.ownerDepthCost;
+  return true;
+}
+
+/// Return true when the exact sum of two objective fragments equals `target`.
+static bool objectiveSumEquals(const LcsObjective &lhs,
+                               const LcsObjective &rhs,
+                               const LcsObjective &target) {
+  LcsObjective sum;
+  return addObjectivesChecked(lhs, rhs, sum) && sum == target;
+}
+
+/// Return true when the exact sum of three objective fragments equals
+/// `target`.
+static bool objectiveSumEquals(const LcsObjective &first,
+                               const LcsObjective &second,
+                               const LcsObjective &third,
+                               const LcsObjective &target) {
+  LcsObjective prefix;
+  return addObjectivesChecked(first, second, prefix) &&
+         objectiveSumEquals(prefix, third, target);
+}
+
+/// Exact dynamic-programming state for one oracle window.
+struct OracleWindowDp {
+  size_t aWidth = 0;
+  size_t bWidth = 0;
+  size_t stride = 0;
+  ObjectiveTable forward;
+  ObjectiveTable suffix;
+};
+
+/// Build the same weighted-LCS objective used by the global certifier, but for
+/// one absolute A/B subwindow. `tokensEqual` is queried with absolute token
+/// indices, and owner-gap charges retain their original absolute A positions.
+template <typename TokensEqualFn>
+static bool buildWeightedWindowDp(size_t aBegin, size_t aEnd, size_t bBegin,
+                                  size_t bEnd,
+                                  ArrayRef<uint32_t> ownerDepthGap,
+                                  TokensEqualFn tokensEqual,
+                                  OracleWindowDp &out) {
+  if (aBegin > aEnd || bBegin > bEnd || aEnd >= ownerDepthGap.size())
+    return false;
+
+  const size_t n = aEnd - aBegin;
+  const size_t m = bEnd - bBegin;
+  out = OracleWindowDp{};
+  out.aWidth = n;
+  out.bWidth = m;
+  if (m == std::numeric_limits<size_t>::max())
+    return false;
+  out.stride = m + 1;
+  size_t stateCount = 0;
+  uint64_t ignoredBytes = 0;
+  if (!gridStateCountChecked(n, m, stateCount) ||
+      !addObjectiveTableBytesChecked(stateCount, ignoredBytes))
+    return false;
+  out.forward.Assign(stateCount);
+  out.suffix.Assign(stateCount);
+
+  auto idx = [&](size_t i, size_t j) -> size_t {
+    return i * out.stride + j;
+  };
+  auto better = [](const LcsObjective &candidate,
+                   const LcsObjective &best) {
+    return isCoreBetter(candidate.matchedTokenCount,
+                        candidate.ownerDepthCost, best.matchedTokenCount,
+                        best.ownerDepthCost);
+  };
+
+  for (size_t i = 0; i <= n; ++i) {
+    for (size_t j = 0; j <= m; ++j) {
+      if (i == 0 && j == 0)
+        continue;
+
+      LcsObjective best{0, std::numeric_limits<uint64_t>::max()};
+      if (i > 0 && j > 0 &&
+          tokensEqual(aBegin + i - 1, bBegin + j - 1)) {
+        LcsObjective candidate = out.forward.Get(idx(i - 1, j - 1));
+        ++candidate.matchedTokenCount;
+        if (better(candidate, best))
+          best = candidate;
       }
+      if (i > 0) {
+        LcsObjective candidate = out.forward.Get(idx(i - 1, j));
+        if (addCostChecked(candidate.ownerDepthCost,
+                           ownerDepthGap[aBegin + i],
+                           candidate.ownerDepthCost) &&
+            better(candidate, best))
+          best = candidate;
+      }
+      if (j > 0) {
+        LcsObjective candidate = out.forward.Get(idx(i, j - 1));
+        if (addCostChecked(candidate.ownerDepthCost,
+                           ownerDepthGap[aBegin + i],
+                           candidate.ownerDepthCost) &&
+            better(candidate, best))
+          best = candidate;
+      }
+      out.forward.Set(idx(i, j), best);
     }
   }
-  return false;
+
+  for (size_t ii = n + 1; ii > 0; --ii) {
+    const size_t i = ii - 1;
+    for (size_t jj = m + 1; jj > 0; --jj) {
+      const size_t j = jj - 1;
+      if (i == n && j == m)
+        continue;
+
+      LcsObjective best{0, std::numeric_limits<uint64_t>::max()};
+      if (i < n && j < m && tokensEqual(aBegin + i, bBegin + j)) {
+        LcsObjective candidate = out.suffix.Get(idx(i + 1, j + 1));
+        ++candidate.matchedTokenCount;
+        if (better(candidate, best))
+          best = candidate;
+      }
+      if (i < n) {
+        LcsObjective candidate = out.suffix.Get(idx(i + 1, j));
+        if (addCostChecked(candidate.ownerDepthCost,
+                           ownerDepthGap[aBegin + i + 1],
+                           candidate.ownerDepthCost) &&
+            better(candidate, best))
+          best = candidate;
+      }
+      if (j < m) {
+        LcsObjective candidate = out.suffix.Get(idx(i, j + 1));
+        if (addCostChecked(candidate.ownerDepthCost,
+                           ownerDepthGap[aBegin + i],
+                           candidate.ownerDepthCost) &&
+            better(candidate, best))
+          best = candidate;
+      }
+      out.suffix.Set(idx(i, j), best);
+    }
+  }
+
+  return true;
+}
+
+static bool oracleBoundsAreValid(
+    const OptimalTokenAlignmentOracle::Storage &storage, uint64_t aBegin,
+    uint64_t aEnd, uint64_t bBegin, uint64_t bEnd) {
+  return aBegin <= aEnd && bBegin <= bEnd &&
+         aEnd <= storage.aTokenCount && bEnd <= storage.bTokenCount;
+}
+
+static bool oracleTokensEqual(
+    const OptimalTokenAlignmentOracle::Storage &storage, size_t aToken,
+    size_t bToken) {
+  if (aToken >= storage.aTokenCount || bToken >= storage.bTokenCount)
+    return false;
+  return (storage.pairFacts[aToken * storage.bTokenCount + bToken] &
+          TokensEqualFact) != 0;
+}
+
+static bool buildOracleWindowDp(
+    const OptimalTokenAlignmentOracle::Storage &storage, uint64_t aBegin,
+    uint64_t aEnd, uint64_t bBegin, uint64_t bEnd, OracleWindowDp &out,
+    uint64_t additionalBytes = 0) {
+  if (!oracleBoundsAreValid(storage, aBegin, aEnd, bBegin, bEnd))
+    return false;
+  const size_t aWidth = static_cast<size_t>(aEnd - aBegin);
+  const size_t bWidth = static_cast<size_t>(bEnd - bBegin);
+  if (!oracleQueryFitsByteBudget(storage, aWidth, bWidth, additionalBytes)) {
+    REFOLD_LOG_WARN(
+        "lcs/oracle",
+        "oracle query unavailable: checked aggregate allocation exceeds the "
+        "byte budget (aWidth={0}, bWidth={1}, maxBytes={2})",
+        aWidth, bWidth, storage.maxAllocationBytes);
+    return false;
+  }
+  return buildWeightedWindowDp(
+      static_cast<size_t>(aBegin), static_cast<size_t>(aEnd),
+      static_cast<size_t>(bBegin), static_cast<size_t>(bEnd),
+      storage.ownerDepthGap,
+      [&](size_t aToken, size_t bToken) {
+        return oracleTokensEqual(storage, aToken, bToken);
+      },
+      out);
+}
+
+static bool oracleWindowOccursOnOptimalPath(
+    const OptimalTokenAlignmentOracle::Storage &storage, uint64_t aBegin,
+    uint64_t aEnd, uint64_t bBegin, uint64_t bEnd,
+    const OracleWindowDp &window) {
+  if (storage.forwardObjectives.Empty() || storage.suffixObjectives.Empty())
+    return false;
+  const size_t start = static_cast<size_t>(aBegin) * storage.stride +
+                       static_cast<size_t>(bBegin);
+  const size_t end = static_cast<size_t>(aEnd) * storage.stride +
+                     static_cast<size_t>(bEnd);
+  const LcsObjective windowObjective =
+      window.forward.Get(window.aWidth * window.stride + window.bWidth);
+  return objectiveSumEquals(storage.forwardObjectives.Get(start),
+                            windowObjective,
+                            storage.suffixObjectives.Get(end),
+                            storage.globalObjective);
+}
+
+} // namespace
+
+bool OptimalTokenAlignmentOracle::HasCompleteCertification() const {
+  return static_cast<bool>(storage_);
+}
+
+size_t OptimalTokenAlignmentOracle::GetATokenCount() const {
+  return storage_ ? storage_->aTokenCount : 0;
+}
+
+size_t OptimalTokenAlignmentOracle::GetBTokenCount() const {
+  return storage_ ? storage_->bTokenCount : 0;
+}
+
+bool OptimalTokenAlignmentOracle::PairOccursOnOptimalPath(
+    uint64_t aToken, uint64_t bToken) const {
+  if (!storage_ || aToken >= storage_->aTokenCount ||
+      bToken >= storage_->bTokenCount)
+    return false;
+  return (storage_->pairFacts[static_cast<size_t>(aToken) *
+                                  storage_->bTokenCount +
+                              static_cast<size_t>(bToken)] &
+          PairOccursOnOptimalPathFact) != 0;
+}
+
+bool OptimalTokenAlignmentOracle::PairIsForced(uint64_t aToken,
+                                                uint64_t bToken) const {
+  if (!storage_ || aToken >= storage_->aTokenCount ||
+      bToken >= storage_->bTokenCount)
+    return false;
+  return (storage_->pairFacts[static_cast<size_t>(aToken) *
+                                  storage_->bTokenCount +
+                              static_cast<size_t>(bToken)] &
+          PairIsForcedFact) != 0;
+}
+
+LcsObjective OptimalTokenAlignmentOracle::ObjectiveForWindow(
+    uint64_t aBegin, uint64_t aEnd, uint64_t bBegin, uint64_t bEnd) const {
+  OracleWindowDp window;
+  if (!storage_ ||
+      !buildOracleWindowDp(*storage_, aBegin, aEnd, bBegin, bEnd, window))
+    return LcsObjective{};
+  return window.forward.Get(window.aWidth * window.stride + window.bWidth);
+}
+
+bool OptimalTokenAlignmentOracle::WindowOccursOnOptimalPath(
+    uint64_t aBegin, uint64_t aEnd, uint64_t bBegin, uint64_t bEnd) const {
+  OracleWindowDp window;
+  if (!storage_ ||
+      !buildOracleWindowDp(*storage_, aBegin, aEnd, bBegin, bEnd, window))
+    return false;
+  return oracleWindowOccursOnOptimalPath(*storage_, aBegin, aEnd, bBegin,
+                                         bEnd, window);
+}
+
+std::vector<uint64_t>
+OptimalTokenAlignmentOracle::ProjectATokenBoundaryToOptimalBFrontiers(
+    uint64_t aWindowBegin, uint64_t aWindowEnd, uint64_t bWindowBegin,
+    uint64_t bWindowEnd, uint64_t aBoundary) const {
+  std::vector<uint64_t> frontiers;
+  if (!storage_ || aBoundary < aWindowBegin || aBoundary > aWindowEnd ||
+      !oracleBoundsAreValid(*storage_, aWindowBegin, aWindowEnd, bWindowBegin,
+                            bWindowEnd))
+    return frontiers;
+
+  const size_t bWidth = static_cast<size_t>(bWindowEnd - bWindowBegin);
+  if (bWidth == std::numeric_limits<size_t>::max())
+    return frontiers;
+  const size_t frontierCount = bWidth + 1;
+  uint64_t frontierBytes = 0;
+  if (!arrayBytesChecked<uint64_t>(frontierCount, frontierBytes))
+    return frontiers;
+
+  OracleWindowDp window;
+  if (!buildOracleWindowDp(*storage_, aWindowBegin, aWindowEnd, bWindowBegin,
+                           bWindowEnd, window, frontierBytes) ||
+      !oracleWindowOccursOnOptimalPath(*storage_, aWindowBegin, aWindowEnd,
+                                       bWindowBegin, bWindowEnd, window))
+    return frontiers;
+
+  const size_t localA = static_cast<size_t>(aBoundary - aWindowBegin);
+  const LcsObjective windowObjective =
+      window.forward.Get(window.aWidth * window.stride + window.bWidth);
+  frontiers.reserve(frontierCount);
+  for (size_t localB = 0; localB <= window.bWidth; ++localB) {
+    const size_t state = localA * window.stride + localB;
+    if (objectiveSumEquals(window.forward.Get(state), window.suffix.Get(state),
+                           windowObjective))
+      frontiers.push_back(bWindowBegin + localB);
+  }
+  return frontiers;
+}
+
+
+OptimalLcsMapEnumeration
+OptimalTokenAlignmentOracle::EnumerateOptimalMapsForWindow(
+    uint64_t aWindowBegin, uint64_t aWindowEnd, uint64_t bWindowBegin,
+    uint64_t bWindowEnd, size_t maxUniqueMaps) const {
+  OptimalLcsMapEnumeration result;
+  if (!storage_ || maxUniqueMaps == 0 ||
+      !oracleBoundsAreValid(*storage_, aWindowBegin, aWindowEnd, bWindowBegin,
+                            bWindowEnd))
+    return result;
+
+  using MatchEdge = std::pair<uint64_t, uint64_t>;
+  using MatchSequence = std::vector<MatchEdge>;
+  struct EnumerationFrame {
+    size_t localA = 0;
+    size_t localB = 0;
+    const std::vector<MatchEdge> *nextMatches = nullptr;
+    size_t nextMatchIndex = 0;
+    bool ownsIncomingMatch = false;
+  };
+
+  const size_t aWidth = static_cast<size_t>(aWindowEnd - aWindowBegin);
+  const size_t bWidth = static_cast<size_t>(bWindowEnd - bWindowBegin);
+  const size_t maxMatchCount = std::min(aWidth, bWidth);
+  size_t stateCount = 0;
+  size_t sequenceEdgeLimit = 0;
+  size_t resultMapElementLimit = 0;
+  uint64_t additionalBytes = 0;
+  if (!gridStateCountChecked(aWidth, bWidth, stateCount) ||
+      maxUniqueMaps == std::numeric_limits<size_t>::max() ||
+      !multiplySizeChecked(maxUniqueMaps + 1, maxMatchCount,
+                           sequenceEdgeLimit) ||
+      !multiplySizeChecked(maxUniqueMaps, aWidth, resultMapElementLimit) ||
+      !addArrayBytesChecked<uint32_t>(stateCount, additionalBytes) ||
+      !addArrayBytesChecked<std::pair<size_t, size_t>>(stateCount,
+                                                       additionalBytes) ||
+      !addArrayBytesChecked<EnumerationFrame>(maxMatchCount + 1,
+                                              additionalBytes) ||
+      !addArrayBytesChecked<MatchEdge>(maxMatchCount, additionalBytes) ||
+      !addArrayBytesChecked<MatchSequence>(maxUniqueMaps + 1,
+                                           additionalBytes) ||
+      !addArrayBytesChecked<MatchEdge>(sequenceEdgeLimit, additionalBytes) ||
+      !addArrayBytesChecked<std::vector<int64_t>>(maxUniqueMaps,
+                                                  additionalBytes) ||
+      !addArrayBytesChecked<int64_t>(resultMapElementLimit,
+                                     additionalBytes))
+    return result;
+
+  OracleWindowDp window;
+  if (!buildOracleWindowDp(*storage_, aWindowBegin, aWindowEnd, bWindowBegin,
+                           bWindowEnd, window, additionalBytes) ||
+      !oracleWindowOccursOnOptimalPath(*storage_, aWindowBegin, aWindowEnd,
+                                       bWindowBegin, bWindowEnd, window))
+    return result;
+
+  auto idx = [&](size_t localA, size_t localB) {
+    return localA * window.stride + localB;
+  };
+
+  // A zero-match optimum has exactly one distinct match map regardless of how
+  // many insertion/deletion interleavings realize it.  Handle it directly so
+  // very long pure gaps never consume traversal stack or proof budget.
+  if (window.suffix.Get(0).matchedTokenCount == 0) {
+    result.maps.emplace_back(window.aWidth, -1);
+    result.complete = true;
+    return result;
+  }
+
+  // Return every match edge that can be the first match of an optimal suffix
+  // beginning at `start`.  Gap-only optimal transitions are traversed
+  // iteratively and collapsed, so different insertion/deletion interleavings
+  // reaching the same match edge do not manufacture duplicate match maps.
+  std::map<size_t, std::vector<MatchEdge>> firstMatchCache;
+  std::vector<uint32_t> visitEpoch(stateCount, 0);
+  uint32_t nextEpoch = 0;
+  std::vector<std::pair<size_t, size_t>> gapStack;
+
+  auto firstOptimalMatches = [&](size_t startA, size_t startB)
+      -> const std::vector<MatchEdge> & {
+    const size_t startState = idx(startA, startB);
+    auto cacheIt = firstMatchCache.find(startState);
+    if (cacheIt != firstMatchCache.end())
+      return cacheIt->second;
+
+    if (++nextEpoch == 0) {
+      std::fill(visitEpoch.begin(), visitEpoch.end(), 0);
+      nextEpoch = 1;
+    }
+    gapStack.clear();
+    gapStack.emplace_back(startA, startB);
+    visitEpoch[startState] = nextEpoch;
+
+    std::vector<MatchEdge> matches;
+    while (!gapStack.empty()) {
+      const auto state = gapStack.back();
+      gapStack.pop_back();
+      const size_t localA = state.first;
+      const size_t localB = state.second;
+      const LcsObjective current = window.suffix.Get(idx(localA, localB));
+
+      if (localA < window.aWidth && localB < window.bWidth &&
+          oracleTokensEqual(*storage_, aWindowBegin + localA,
+                            bWindowBegin + localB)) {
+        const LcsObjective edge{1, 0};
+        const LcsObjective tail =
+            window.suffix.Get(idx(localA + 1, localB + 1));
+        if (objectiveSumEquals(edge, tail, current)) {
+          matches.emplace_back(aWindowBegin + localA,
+                               bWindowBegin + localB);
+        }
+      }
+
+      auto addGapSuccessor = [&](size_t nextA, size_t nextB,
+                                 uint32_t gapCost) {
+        const size_t nextState = idx(nextA, nextB);
+        if (visitEpoch[nextState] == nextEpoch)
+          return;
+        const LcsObjective edge{0, gapCost};
+        if (!objectiveSumEquals(edge, window.suffix.Get(nextState), current))
+          return;
+        visitEpoch[nextState] = nextEpoch;
+        gapStack.emplace_back(nextA, nextB);
+      };
+
+      if (localA < window.aWidth) {
+        addGapSuccessor(
+            localA + 1, localB,
+            storage_->ownerDepthGap[aWindowBegin + localA + 1]);
+      }
+      if (localB < window.bWidth) {
+        addGapSuccessor(localA, localB + 1,
+                        storage_->ownerDepthGap[aWindowBegin + localA]);
+      }
+    }
+
+    std::sort(matches.begin(), matches.end());
+    matches.erase(std::unique(matches.begin(), matches.end()), matches.end());
+    return firstMatchCache.emplace(startState, std::move(matches))
+        .first->second;
+  };
+
+  std::vector<EnumerationFrame> frames;
+  MatchSequence sequence;
+  auto pushFrame = [&](size_t localA, size_t localB,
+                       bool ownsIncomingMatch) -> bool {
+    const LcsObjective remaining = window.suffix.Get(idx(localA, localB));
+    const std::vector<MatchEdge> *nextMatches = nullptr;
+    if (remaining.matchedTokenCount != 0) {
+      const std::vector<MatchEdge> &matches =
+          firstOptimalMatches(localA, localB);
+      if (matches.empty())
+        return false;
+      nextMatches = &matches;
+    }
+    frames.push_back(EnumerationFrame{localA, localB, nextMatches, 0,
+                                      ownsIncomingMatch});
+    return true;
+  };
+  auto popFrame = [&]() {
+    const bool ownsIncomingMatch = frames.back().ownsIncomingMatch;
+    frames.pop_back();
+    if (ownsIncomingMatch)
+      sequence.pop_back();
+  };
+
+  if (!pushFrame(0, 0, /*ownsIncomingMatch=*/false))
+    return result;
+
+  std::vector<MatchSequence> sequences;
+  while (!frames.empty()) {
+    EnumerationFrame &frame = frames.back();
+    if (!frame.nextMatches) {
+      sequences.push_back(sequence);
+      if (sequences.size() > maxUniqueMaps)
+        return result;
+      popFrame();
+      continue;
+    }
+
+    if (frame.nextMatchIndex >= frame.nextMatches->size()) {
+      popFrame();
+      continue;
+    }
+
+    const MatchEdge edge = (*frame.nextMatches)[frame.nextMatchIndex++];
+    const size_t edgeLocalA =
+        static_cast<size_t>(edge.first - aWindowBegin);
+    const size_t edgeLocalB =
+        static_cast<size_t>(edge.second - bWindowBegin);
+    sequence.push_back(edge);
+    if (!pushFrame(edgeLocalA + 1, edgeLocalB + 1,
+                   /*ownsIncomingMatch=*/true))
+      return result;
+  }
+
+  result.maps.reserve(sequences.size());
+  for (const MatchSequence &matchSequence : sequences) {
+    std::vector<int64_t> map(window.aWidth, -1);
+    for (const MatchEdge &edge : matchSequence) {
+      const size_t localA = static_cast<size_t>(edge.first - aWindowBegin);
+      map[localA] = static_cast<int64_t>(edge.second);
+    }
+    result.maps.push_back(std::move(map));
+  }
+  result.complete = true;
+  return result;
+}
+
+namespace {
+/// Quadratic table family selected by one public LCS overload.
+enum class QuadraticLcsAllocationKind { WeightedMap, PlainMap };
+
+/// Return true when the exact quadratic implementation would exceed the
+/// configured aggregate byte budget and the caller must use exact Hirschberg.
+static bool shouldUseLinearSpace(size_t n, size_t m, uint64_t maxBytes,
+                                 QuadraticLcsAllocationKind kind) {
+  size_t stateCount = 0;
+  uint64_t requiredBytes = 0;
+  const bool dimensionsValid = gridStateCountChecked(n, m, stateCount);
+  const bool allocationValid =
+      dimensionsValid &&
+      (kind == QuadraticLcsAllocationKind::WeightedMap
+           ? addArrayBytesChecked<uint32_t>(stateCount, requiredBytes) &&
+                 addArrayBytesChecked<uint64_t>(stateCount, requiredBytes)
+           : addArrayBytesChecked<unsigned>(stateCount, requiredBytes)) &&
+      addArrayBytesChecked<int64_t>(n, requiredBytes);
+  if (allocationValid && requiredBytes <= maxBytes)
+    return false;
+
+  REFOLD_LOG_WARN(
+      "lcs/map",
+      "hirschberg fallback: checked quadratic allocation exceeds the byte "
+      "budget (kind={0}, n={1}, m={2}, states={3}, requiredBytes={4}, "
+      "maxBytes={5})",
+      kind == QuadraticLcsAllocationKind::WeightedMap ? "weighted" : "plain",
+      n, m, dimensionsValid ? stateCount : 0,
+      allocationValid ? requiredBytes : 0, maxBytes);
+  return true;
 }
 
 /// Compare structural-LCS candidates: longer subsequence first, then lower
@@ -143,11 +821,6 @@ inline bool isCoreBetter(unsigned candLen, std::uint64_t candCost,
   return candCost < bestCost;
 }
 
-/// Return the width of a hunk on the A side.
-static uint64_t hunkAWidth(const Hunk &h) { return h.aEnd - h.aStart; }
-/// Return the width of a hunk on the B side.
-static uint64_t hunkBWidth(const Hunk &h) { return h.bEnd - h.bStart; }
-
 /// Add \p extra to \p base without allowing unsigned wraparound.
 static bool addCostChecked(uint64_t base, uint32_t extra, uint64_t &out) {
   if (base > std::numeric_limits<uint64_t>::max() - extra)
@@ -156,16 +829,8 @@ static bool addCostChecked(uint64_t base, uint32_t extra, uint64_t &out) {
   return true;
 }
 
-/// DP cell for the heuristic-free structural LCS objective.
-///
-/// This models only the proof-relevant core objective: maximize LCS length,
-/// then minimize ownerDepthGap cost.  Neighbor-coherence is deliberately
-/// outside this certified core objective, so the forward/suffix tables can
-/// prove whether a token pair is admissible in any optimal core solution.
-struct CoreLcsCell {
-  uint32_t len = 0;
-  uint64_t cost = 0;
-};
+/// The compact internal table stores the public objective's two exact scalar
+/// components without per-element alignment padding.
 
 /// Compute forward and suffix DP tables for the structural LCS core objective.
 ///
@@ -176,626 +841,241 @@ struct CoreLcsCell {
 /// the production map.
 static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                                  ArrayRef<uint32_t> ownerDepthGap,
-                                 unsigned long long maxCells,
-                                 std::vector<CoreLcsCell> &forward,
-                                 std::vector<CoreLcsCell> &suffix,
+                                 ObjectiveTable &forward,
+                                 ObjectiveTable &suffix,
                                  size_t &stride) {
-  const size_t n = a.size();
-  const size_t m = b.size();
-  const unsigned long long nu = static_cast<unsigned long long>(n);
-  const unsigned long long mu = static_cast<unsigned long long>(m);
-
-  // Refuse to build quadratic DP tables when the configured cell budget says
-  // this input must fall back to the exact linear-space Hirschberg path.
-  if (shouldUseGreedyApproach(nu, mu, maxCells))
+  OracleWindowDp window;
+  if (!buildWeightedWindowDp(
+          0, a.size(), 0, b.size(), ownerDepthGap,
+          [&](size_t aToken, size_t bToken) {
+            return a[aToken] == b[bToken];
+          },
+          window))
     return false;
 
-  stride = m + 1;
-  const size_t cells = (n + 1) * (m + 1);
-  forward.assign(cells, CoreLcsCell{});
-  suffix.assign(cells, CoreLcsCell{});
-
-  auto idx = [&](size_t i, size_t j) -> size_t { return i * stride + j; };
-  auto better = [](const CoreLcsCell &cand, const CoreLcsCell &best) {
-    return isCoreBetter(cand.len, cand.cost, best.len, best.cost);
-  };
-
-  // Forward DP over prefixes A[0..i) and B[0..j). Each cell stores the best
-  // objective value reachable for that prefix pair: maximize kept length, then
-  // minimize structural gap cost.
-  for (size_t i = 0; i <= n; ++i) {
-    for (size_t j = 0; j <= m; ++j) {
-      if (i == 0 && j == 0)
-        continue;
-
-      CoreLcsCell best{0, std::numeric_limits<uint64_t>::max()};
-
-      // Keep a matching token pair. Matching increases the LCS length and does
-      // not pay an owner-depth gap cost.
-      if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
-        CoreLcsCell cand = forward[idx(i - 1, j - 1)];
-        ++cand.len;
-        if (better(cand, best))
-          best = cand;
-      }
-
-      // Delete A[i - 1]. In prefix coordinates, this deletion crosses the gap
-      // after that A token, represented by ownerDepthGap[i].
-      if (i > 0) {
-        CoreLcsCell cand = forward[idx(i - 1, j)];
-        if (addCostChecked(cand.cost, ownerDepthGap[i], cand.cost) &&
-            better(cand, best))
-          best = cand;
-      }
-
-      // Insert B[j - 1] at the current A prefix boundary. This insertion is
-      // charged to the same A gap ownerDepthGap[i].
-      if (j > 0) {
-        CoreLcsCell cand = forward[idx(i, j - 1)];
-        if (addCostChecked(cand.cost, ownerDepthGap[i], cand.cost) &&
-            better(cand, best))
-          best = cand;
-      }
-
-      forward[idx(i, j)] = best;
-    }
-  }
-
-  // Suffix DP over suffixes A[i..n) and B[j..m). This table answers the same
-  // objective as `forward`, but from the opposite direction so later
-  // admissibility checks can prove that a proposed split still lies on an
-  // optimal full solution.
-  for (size_t ii = n + 1; ii > 0; --ii) {
-    const size_t i = ii - 1;
-    for (size_t jj = m + 1; jj > 0; --jj) {
-      const size_t j = jj - 1;
-      if (i == n && j == m)
-        continue;
-
-      CoreLcsCell best{0, std::numeric_limits<uint64_t>::max()};
-
-      // Keep a matching token pair at the start of both suffixes.
-      if (i < n && j < m && a[i] == b[j]) {
-        CoreLcsCell cand = suffix[idx(i + 1, j + 1)];
-        ++cand.len;
-        if (better(cand, best))
-          best = cand;
-      }
-
-      // Delete A[i]. In suffix coordinates, deleting this token advances to
-      // A[i + 1..), so the crossed gap is ownerDepthGap[i + 1].
-      if (i < n) {
-        CoreLcsCell cand = suffix[idx(i + 1, j)];
-        if (addCostChecked(cand.cost, ownerDepthGap[i + 1], cand.cost) &&
-            better(cand, best))
-          best = cand;
-      }
-
-      // Insert B[j] at the current A suffix boundary. This mirrors the forward
-      // insertion rule and charges ownerDepthGap[i].
-      if (j < m) {
-        CoreLcsCell cand = suffix[idx(i, j + 1)];
-        if (addCostChecked(cand.cost, ownerDepthGap[i], cand.cost) &&
-            better(cand, best))
-          best = cand;
-      }
-
-      suffix[idx(i, j)] = best;
-    }
-  }
-
+  stride = window.stride;
+  forward = std::move(window.forward);
+  suffix = std::move(window.suffix);
   return true;
 }
 
-/// Return true iff a provenance id is present rather than the sentinel zero.
-static bool hasProvenanceId(uint64_t value) {
-  return value != LcsAGapProvenance::noId;
-}
-
-/// Rank the amount of original-side structural boundary retained at an
-/// insertion gap.
+/// Mark exact match edges that occur on every globally optimal path.
 ///
-/// This is not a lexical-neighbor preference. It uses only the provenance facts
-/// that the refolder's boundary policy already reasons about: include depth and
-/// identity, conditional group/arm identity, and macro root/leaf identity. A
-/// larger rank means the gap preserves a more specific owner boundary.
-static uint64_t aBoundaryRetentionRank(ArrayRef<LcsAGapProvenance> profiles,
-                                       uint64_t gap) {
-  if (gap >= profiles.size())
-    return 0;
+/// The optimal transitions form a monotone DAG over DP states `(i,j)`. A match
+/// edge is forced exactly when every source-to-sink path reaches its source
+/// state and that state has no other globally optimal outgoing transition.
+/// The first condition is computed with exact DAG dominators; the second
+/// excludes paths that pass through the same state but choose deletion or
+/// insertion instead of the match. This avoids the incorrect shortcut that a
+/// pair is forced merely because each token has one individually admissible
+/// partner.
+static void markForcedOptimalPairs(
+    size_t n, size_t m, size_t stride, ArrayRef<uint32_t> ownerDepthGap,
+    const ObjectiveTable &forward, const ObjectiveTable &suffix,
+    const LcsObjective &total, std::vector<uint8_t> &pairFacts,
+    std::vector<int64_t> &forcedMap) {
+  const size_t stateCount = (n + 1) * (m + 1);
+  assert(stateCount <= std::numeric_limits<uint32_t>::max() &&
+         "certified allocation preflight must bound dominator indices");
+  const uint32_t invalid = std::numeric_limits<uint32_t>::max();
+  auto idx = [&](size_t i, size_t j) -> size_t { return i * stride + j; };
 
-  const LcsAGapProvenance &profile = profiles[static_cast<size_t>(gap)];
+  auto transitionOccursOnOptimalPath =
+      [&](size_t fromI, size_t fromJ, size_t toI, size_t toJ,
+          uint32_t matchedTokenCount, uint64_t ownerDepthCost) {
+        return objectiveSumEquals(
+            forward.Get(idx(fromI, fromJ)),
+            LcsObjective{matchedTokenCount, ownerDepthCost},
+            suffix.Get(idx(toI, toJ)), total);
+      };
 
-  // Depth carries the coarse owner-boundary strength; identity fields then add
-  // small tie-breaking increments without introducing token-spelling bias.
-  uint64_t rank = profile.ownerDepth;
-  rank += static_cast<uint64_t>(profile.includeDepth) * 8;
-  rank += static_cast<uint64_t>(profile.conditionalDepth) * 8;
-  rank += static_cast<uint64_t>(profile.macroDepth) * 8;
-  rank += hasProvenanceId(profile.leftIncludeId) ? 1 : 0;
-  rank += hasProvenanceId(profile.rightIncludeId) ? 1 : 0;
-  rank += hasProvenanceId(profile.lcaIncludeId) ? 1 : 0;
-  rank += hasProvenanceId(profile.leftCondGroupId) ? 1 : 0;
-  rank += hasProvenanceId(profile.leftCondArmId) ? 1 : 0;
-  rank += hasProvenanceId(profile.rightCondGroupId) ? 1 : 0;
-  rank += hasProvenanceId(profile.rightCondArmId) ? 1 : 0;
-  rank += hasProvenanceId(profile.leftMacroRootId) ? 1 : 0;
-  rank += hasProvenanceId(profile.leftMacroLeafId) ? 1 : 0;
-  rank += hasProvenanceId(profile.rightMacroRootId) ? 1 : 0;
-  rank += hasProvenanceId(profile.rightMacroLeafId) ? 1 : 0;
-  rank += profile.leftMacroRoleMask ? 1 : 0;
-  rank += profile.rightMacroRoleMask ? 1 : 0;
-  return rank;
-}
+  // Row-major DP-state order is topological: every insertion, deletion, and
+  // match strictly increases the flattened state index. Immediate dominators
+  // can therefore be computed in one pass by intersecting already-complete
+  // predecessor dominator chains.
+  std::vector<uint32_t> immediateDominator(stateCount, invalid);
+  immediateDominator[0] = 0;
+  auto intersectDominators = [&](uint32_t lhs, uint32_t rhs) {
+    while (lhs != rhs) {
+      while (lhs > rhs)
+        lhs = immediateDominator[lhs];
+      while (rhs > lhs)
+        rhs = immediateDominator[rhs];
+    }
+    return lhs;
+  };
 
-/// True when two B gaps expose the same line-boundary shape.
-static bool sameBLineShape(const LcsBGapProvenance &lhs,
-                           const LcsBGapProvenance &rhs) {
-  return lhs.hasLeftToken == rhs.hasLeftToken &&
-         lhs.hasRightToken == rhs.hasRightToken &&
-         lhs.gapContainsNewline == rhs.gapContainsNewline &&
-         lhs.gapContainsOnlyWs == rhs.gapContainsOnlyWs &&
-         lhs.gapAtLineStart == rhs.gapAtLineStart &&
-         lhs.gapAtLineEnd == rhs.gapAtLineEnd &&
-         lhs.leftTokenStartsLine == rhs.leftTokenStartsLine &&
-         lhs.leftTokenEndsLine == rhs.leftTokenEndsLine &&
-         lhs.rightTokenStartsLine == rhs.rightTokenStartsLine &&
-         lhs.rightTokenEndsLine == rhs.rightTokenEndsLine;
-}
+  for (size_t i = 0; i <= n; ++i) {
+    for (size_t j = 0; j <= m; ++j) {
+      const size_t state = idx(i, j);
+      if (state == 0)
+        continue;
 
-/// Rank the edited-side line/gap surface around one B-side gap.
-///
-/// This is intentionally structural rather than lexical: it never looks at the
-/// neighboring token spellings. It is used only after A-side owner-boundary
-/// specificity, to separate candidates that preserve the same core LCS proof.
-static uint64_t bGapSurfaceRank(ArrayRef<LcsBGapProvenance> profiles,
-                                uint64_t gap) {
-  if (gap >= profiles.size())
-    return 0;
+      // States outside the globally optimal source-to-sink DAG cannot
+      // dominate the sink and receive no predecessor in the original
+      // formulation below. Reject them with one exact prefix/suffix test
+      // instead of evaluating all three candidate transitions. This preserves
+      // the same dominator graph while avoiding most transition work for the
+      // common narrow-optimal-corridor case.
+      if (!objectiveSumEquals(forward.Get(state), suffix.Get(state), total))
+        continue;
 
-  const LcsBGapProvenance &profile = profiles[static_cast<size_t>(gap)];
-  uint64_t rank = 0;
-  rank += profile.hasLeftToken ? 1 : 0;
-  rank += profile.hasRightToken ? 1 : 0;
-  rank += profile.gapContainsOnlyWs ? 1 : 0;
-  rank += !profile.gapContainsNewline ? 4 : 0;
-  rank += !profile.gapAtLineStart ? 2 : 0;
-  rank += !profile.gapAtLineEnd ? 2 : 0;
-  rank += profile.leftTokenEndsLine == profile.rightTokenEndsLine ? 1 : 0;
-  rank += profile.leftTokenStartsLine == profile.rightTokenStartsLine ? 1 : 0;
-  return rank;
-}
+      uint32_t dominator = invalid;
+      auto addPredecessor = [&](size_t predecessorIndex) {
+        const uint32_t predecessor = static_cast<uint32_t>(predecessorIndex);
+        if (immediateDominator[predecessor] == invalid)
+          return;
+        dominator = dominator == invalid
+                        ? predecessor
+                        : intersectDominators(dominator, predecessor);
+      };
 
-/// Rank a matched B-token pair using the surrounding B-gap surfaces.
-static uint64_t bPairSurfaceRank(ArrayRef<LcsBGapProvenance> profiles,
-                                 uint64_t bStart, uint64_t bEnd) {
-  uint64_t rank =
-      bGapSurfaceRank(profiles, bStart) + bGapSurfaceRank(profiles, bEnd);
-  if (bStart < profiles.size() && bEnd < profiles.size() &&
-      sameBLineShape(profiles[static_cast<size_t>(bStart)],
-                     profiles[static_cast<size_t>(bEnd)])) {
-    rank += 8;
-  }
-  return rank;
-}
+      if (i > 0 && j > 0 &&
+          (pairFacts[(i - 1) * m + (j - 1)] &
+           PairOccursOnOptimalPathFact) != 0)
+        addPredecessor(idx(i - 1, j - 1));
+      if (i > 0 && transitionOccursOnOptimalPath(
+                       i - 1, j, i, j, 0, ownerDepthGap[i]))
+        addPredecessor(idx(i - 1, j));
+      if (j > 0 && transitionOccursOnOptimalPath(
+                       i, j - 1, i, j, 0, ownerDepthGap[i]))
+        addPredecessor(idx(i, j - 1));
 
-/// Remove individually admissible anchors that are not mutually order-
-/// compatible.
-///
-/// The core admissibility pass reasons about one candidate anchor at a time: an
-/// A/B token pair may occur in some optimal owner-aware LCS path. In highly
-/// repetitive regions, two such individually valid anchors can still be
-/// mutually exclusive because they cross in B order. Returning both violates
-/// the A->B map contract and later hunk construction is undefined.
-///
-/// This cleanup is deliberately conservative. It does not pick a longest
-/// increasing subsequence, because that would select one of several equally
-/// valid repeated-token explanations. Instead, an anchor is retained only if
-/// it is order-compatible with every other currently retained anchor: all
-/// mapped anchors to its left must map to smaller B indices, and all mapped
-/// anchors to its right must map to larger B indices. Any anchor involved in a
-/// crossing is suppressed, widening the surrounding edit island and preserving
-/// fail-closed behavior.
-static size_t suppressOrderConflictingAnchors(std::vector<int64_t> &map) {
-  const size_t n = map.size();
-  if (n == 0)
-    return 0;
-
-  // Prefix scan: for each A index, remember the largest retained B index to
-  // its left. A valid anchor must be strictly greater than this value.
-  std::vector<int64_t> maxLeft(n, -1);
-  int64_t leftMax = -1;
-  for (size_t i = 0; i < n; ++i) {
-    maxLeft[i] = leftMax;
-    if (map[i] >= 0)
-      leftMax = std::max(leftMax, map[i]);
-  }
-
-  // Suffix scan: symmetrically remember the smallest retained B index to the
-  // right. A valid anchor must be strictly smaller than this value.
-  std::vector<int64_t> minRight(n, std::numeric_limits<int64_t>::max());
-  int64_t rightMin = std::numeric_limits<int64_t>::max();
-  for (size_t i = n; i-- > 0;) {
-    minRight[i] = rightMin;
-    if (map[i] >= 0)
-      rightMin = std::min(rightMin, map[i]);
-  }
-
-  // Drop any anchor that crosses either side. This deliberately widens hunks
-  // instead of choosing one arbitrary explanation for repeated tokens.
-  size_t suppressed = 0;
-  for (size_t i = 0; i < n; ++i) {
-    const int64_t bj = map[i];
-    if (bj < 0)
-      continue;
-    if (maxLeft[i] >= bj || minRight[i] <= bj) {
-      map[i] = -1;
-      ++suppressed;
+      immediateDominator[state] = dominator;
     }
   }
-  return suppressed;
+
+  // Nodes on the sink's immediate-dominator chain occur on every globally
+  // optimal path. The earlier implementation first copied that chain into a
+  // state-count bitset and then rescanned every A/B token pair to find the few
+  // chain states that can own a forced match. Walking the chain directly is
+  // exactly equivalent: the old final scan accepted a pair iff its source
+  // state was on this same chain and its match was the only optimal outgoing
+  // transition. The direct walk removes one full O(n*m) pass and the redundant
+  // bitset without changing the theorem or iteration-dependent selection.
+  const uint32_t sink = static_cast<uint32_t>(idx(n, m));
+  if (immediateDominator[sink] == invalid)
+    return;
+
+  for (uint32_t state = sink;; state = immediateDominator[state]) {
+    const size_t stateIndex = static_cast<size_t>(state);
+    const size_t ai = stateIndex / stride;
+    const size_t bj = stateIndex % stride;
+
+    if (ai < n && bj < m) {
+      uint8_t &facts = pairFacts[ai * m + bj];
+      if ((facts & PairOccursOnOptimalPathFact) != 0) {
+        uint32_t optimalOutgoingCount = 1; // This pair's match edge.
+        if (transitionOccursOnOptimalPath(ai, bj, ai + 1, bj, 0,
+                                          ownerDepthGap[ai + 1]))
+          ++optimalOutgoingCount;
+        if (transitionOccursOnOptimalPath(ai, bj, ai, bj + 1, 0,
+                                          ownerDepthGap[ai]))
+          ++optimalOutgoingCount;
+        if (optimalOutgoingCount == 1) {
+          facts |= PairIsForcedFact;
+          assert(forcedMap[ai] < 0 &&
+                 "one A token cannot have two forced optimal partners");
+          forcedMap[ai] = static_cast<int64_t>(bj);
+        }
+      }
+    }
+
+    if (state == 0)
+      break;
+  }
 }
 
-/// Build the heuristic-free provenance-certified LCS map used by refolding.
+/// Build the exact core-certified LCS result used by refolding.
 ///
-/// The algorithm separates optimality from certification:
-///  * compute the core owner-aware LCS objective with no neighbor-spelling tie:
-///    maximize length, then minimize ownerDepthGap cost;
-///  * retain only anchors forced by that core objective, meaning both sides
-///    have exactly one admissible partner;
-///  * restore ambiguous equal-token edge anchors only when they create a unique
-///    best pure-insertion frontier under structural boundary ranks.
-///
-/// If a hunk still has no unique boundary-preserving pure-insertion candidate,
-/// the ambiguous anchors remain suppressed. That is fail-closed: downstream
-/// code sees a wider edit island instead of an arbitrary repeated punctuation
-/// anchor.
-static bool buildBoundaryPureCertifiedMap(
+/// The certifier has one production authority: every selected anchor must occur
+/// on every globally optimal path for the unchanged weighted-LCS objective.
+/// Ambiguous equal-token pairs remain suppressed. A separate semantic resolver
+/// may later restore a representative map only after proving that every
+/// remaining optimal explanation induces one equivalent normalized owner/edit
+/// realization.
+static bool buildForcedCertifiedResult(
     ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-    ArrayRef<uint32_t> ownerDepthGap, ArrayRef<LcsAGapProvenance> gapProvenance,
-    ArrayRef<LcsBGapProvenance> bGapProvenance, unsigned long long maxCells,
-    std::vector<int64_t> &outMap) {
+    ArrayRef<uint32_t> ownerDepthGap, unsigned long long maxBytes,
+    CertifiedLcsResult &outResult) {
   const size_t n = a.size();
   const size_t m = b.size();
-  outMap.assign(n, -1);
-  if (n == 0 || m == 0)
-    return true;
-  if (ownerDepthGap.size() != n + 1 || gapProvenance.size() != n + 1)
+  outResult = CertifiedLcsResult{};
+  if (ownerDepthGap.size() != n + 1)
     return false;
 
-  // The forward/suffix tables let us ask whether any proposed A/B equal-token
-  // pair participates in at least one globally optimal core LCS solution.
-  std::vector<CoreLcsCell> forward;
-  std::vector<CoreLcsCell> suffix;
+  CertifiedLcsAllocationPlan allocationPlan;
+  if (!buildCertifiedLcsAllocationPlan(n, m, allocationPlan) ||
+      allocationPlan.constructionPeakBytes > maxBytes) {
+    REFOLD_LOG_WARN(
+        "lcs/map",
+        "all-optimal certification unavailable: checked aggregate "
+        "allocation exceeds the byte budget (aTokens={0}, bTokens={1}, "
+        "requiredBytes={2}, maxBytes={3})",
+        n, m,
+        allocationPlan.constructionPeakBytes,
+        maxBytes);
+    return false;
+  }
+
+  outResult.forcedMap.assign(n, -1);
+  outResult.selectedMap.assign(n, -1);
+  outResult.selectedAnchorProofs.assign(n, LcsAnchorProof{});
+
+  auto storage = std::make_shared<OptimalTokenAlignmentOracle::Storage>();
+  storage->aTokenCount = n;
+  storage->bTokenCount = m;
+  storage->maxAllocationBytes = maxBytes;
+  storage->retainedAllocationBytes = allocationPlan.retainedBytes;
+  storage->ownerDepthGap.assign(ownerDepthGap.begin(), ownerDepthGap.end());
+
+  ObjectiveTable forward;
+  ObjectiveTable suffix;
   size_t stride = 0;
-  if (!buildCoreLcsDpTables(a, b, ownerDepthGap, maxCells, forward, suffix,
-                            stride))
+  if (!buildCoreLcsDpTables(a, b, ownerDepthGap, forward, suffix, stride))
     return false;
 
   auto idx = [&](size_t i, size_t j) -> size_t { return i * stride + j; };
-  const CoreLcsCell total = forward[idx(n, m)];
+  const LcsObjective total = forward.Get(idx(n, m));
+  outResult.globalObjective = total;
+  storage->stride = stride;
+  storage->globalObjective = total;
+  storage->pairFacts.assign(allocationPlan.pairCount, 0);
 
-  auto isCoreAdmissible = [&](size_t ai, size_t bj) -> bool {
-    // Splice prefix + this match + suffix. The candidate is admissible only if
-    // it preserves both the optimal LCS length and the optimal owner-depth
-    // cost.
-    if (ai >= n || bj >= m || a[ai] != b[bj])
+  auto isCoreAdmissible = [&](size_t aToken, size_t bToken) {
+    if (aToken >= n || bToken >= m || a[aToken] != b[bToken])
       return false;
-    const CoreLcsCell &prefix = forward[idx(ai, bj)];
-    const CoreLcsCell &tail = suffix[idx(ai + 1, bj + 1)];
-    if (prefix.len + 1U + tail.len != total.len)
-      return false;
-    if (prefix.cost > std::numeric_limits<uint64_t>::max() - tail.cost)
-      return false;
-    return prefix.cost + tail.cost == total.cost;
+    const LcsObjective prefix = forward.Get(idx(aToken, bToken));
+    const LcsObjective edge{1, 0};
+    const LcsObjective tail = suffix.Get(idx(aToken + 1, bToken + 1));
+    return objectiveSumEquals(prefix, edge, tail, total);
   };
 
-  // Count every individually admissible partner in the optimal core objective.
-  // An anchor is forced only when both directions are unique: A[i] can match
-  // one B token, and that B token can match only this A token.
-  std::vector<uint32_t> aPartnerCount(n, 0);
-  std::vector<uint32_t> bPartnerCount(m, 0);
-  std::vector<int64_t> firstBPartner(n, -1);
-  for (size_t ai = 0; ai < n; ++ai) {
-    for (size_t bj = 0; bj < m; ++bj) {
-      if (!isCoreAdmissible(ai, bj))
+  for (size_t aToken = 0; aToken < n; ++aToken) {
+    for (size_t bToken = 0; bToken < m; ++bToken) {
+      uint8_t &facts = storage->pairFacts[aToken * m + bToken];
+      if (a[aToken] != b[bToken])
         continue;
-      if (aPartnerCount[ai] == 0)
-        firstBPartner[ai] = static_cast<int64_t>(bj);
-      ++aPartnerCount[ai];
-      ++bPartnerCount[bj];
+      facts |= TokensEqualFact;
+      if (isCoreAdmissible(aToken, bToken))
+        facts |= PairOccursOnOptimalPathFact;
     }
   }
 
-  // Seed the map with only forced anchors. Repeated punctuation/literals that
-  // have several optimal explanations remain unmatched until a later boundary
-  // proof restores them at an edit edge.
-  for (size_t ai = 0; ai < n; ++ai) {
-    if (aPartnerCount[ai] != 1)
+  markForcedOptimalPairs(n, m, stride, ownerDepthGap, forward, suffix, total,
+                         storage->pairFacts, outResult.forcedMap);
+  outResult.selectedMap = outResult.forcedMap;
+  for (size_t aToken = 0; aToken < n; ++aToken) {
+    if (outResult.selectedMap[aToken] < 0)
       continue;
-    const int64_t bj = firstBPartner[ai];
-    if (bj >= 0 && bj < static_cast<int64_t>(m) &&
-        bPartnerCount[static_cast<size_t>(bj)] == 1)
-      outMap[ai] = bj;
+    outResult.selectedAnchorProofs[aToken] =
+        LcsAnchorProof{LcsAnchorProofKind::CoreOptimalPathForced, 0};
   }
 
-  // Defensive monotonicity cleanup: individual admissibility is local to a
-  // token pair, so suppress any rare crossing anchors before hunk construction.
-  suppressOrderConflictingAnchors(outMap);
-
-  // Return true when a matching A/B token pair can serve as an ambiguous edge
-  // anchor: it must be core-admissible, but not already a unique one-to-one
-  // match that would be handled by the ordinary anchor path.
-  auto canUseAmbiguousEdgeAnchor = [&](uint64_t ai64, uint64_t bj64) -> bool {
-    if (ai64 >= n || bj64 >= m)
-      return false;
-    const size_t ai = static_cast<size_t>(ai64);
-    const size_t bj = static_cast<size_t>(bj64);
-    if (a[ai] != b[bj])
-      return false;
-    if (!isCoreAdmissible(ai, bj))
-      return false;
-    return !(aPartnerCount[ai] == 1 && bPartnerCount[bj] == 1);
-  };
-
-  struct BoundaryPureCandidate {
-    uint64_t left = 0;
-    uint64_t right = 0;
-    uint64_t balance = 0;
-    uint64_t boundaryRank = 0;
-    uint64_t bPairRank = 0;
-  };
-
-  struct SuffixInsertionCandidate {
-    uint64_t left = 0;
-    uint64_t right = 0;
-    uint64_t anchorA = 0;
-    uint64_t anchorB = 0;
-    uint64_t boundaryRank = 0;
-    uint64_t bPairRank = 0;
-    uint64_t restoredAnchors = 0;
-  };
-
-  // Order boundary-pure candidates by the deterministic preference used for
-  // anchor selection: best balance first, then stronger boundary evidence, then
-  // stronger B-side pair evidence.
-  auto betterCandidate = [](const BoundaryPureCandidate &cand,
-                            const BoundaryPureCandidate &best) {
-    if (cand.balance != best.balance)
-      return cand.balance < best.balance;
-    if (cand.boundaryRank != best.boundaryRank)
-      return cand.boundaryRank > best.boundaryRank;
-    return cand.bPairRank > best.bPairRank;
-  };
-
-  // Order suffix-insertion candidates by deterministic recovery strength:
-  // prefer stronger boundary evidence, stronger B-side pair evidence, more
-  // restored anchors, then the rightmost compatible insertion window.
-  auto betterSuffixInsertionCandidate =
-      [](const SuffixInsertionCandidate &cand,
-         const SuffixInsertionCandidate &best) {
-        if (cand.boundaryRank != best.boundaryRank)
-          return cand.boundaryRank > best.boundaryRank;
-        if (cand.bPairRank != best.bPairRank)
-          return cand.bPairRank > best.bPairRank;
-        if (cand.restoredAnchors != best.restoredAnchors)
-          return cand.restoredAnchors > best.restoredAnchors;
-        if (cand.right != best.right)
-          return cand.right > best.right;
-        return cand.left > best.left;
-      };
-
-  // Each forced hunk is a conservative edit island. Try to shrink only its
-  // edges by restoring ambiguous equal-token anchors when the resulting
-  // frontier is uniquely certified as a boundary-preserving pure insertion.
-  const std::vector<Hunk> forcedHunks = hunksFromMap(outMap, n, m);
-  for (const Hunk &forced : forcedHunks) {
-    const uint64_t maxSharedWidth =
-        std::min(hunkAWidth(forced), hunkBWidth(forced));
-    if (maxSharedWidth == 0)
-      continue;
-
-    // Compute the maximal ambiguous equal-token edge runs. These are candidates
-    // for restoration; interior ambiguous anchors are intentionally ignored.
-    uint64_t maxPrefix = 0;
-    while (maxPrefix < maxSharedWidth &&
-           canUseAmbiguousEdgeAnchor(forced.aStart + maxPrefix,
-                                     forced.bStart + maxPrefix))
-      ++maxPrefix;
-
-    uint64_t maxSuffix = 0;
-    while (maxSuffix < maxSharedWidth &&
-           canUseAmbiguousEdgeAnchor(forced.aEnd - maxSuffix - 1,
-                                     forced.bEnd - maxSuffix - 1))
-      ++maxSuffix;
-
-    // First handle the symmetric case: restore some left and/or right edge
-    // anchors so the remaining hunk is exactly A-empty/B-nonempty.
-    bool haveBest = false;
-    BoundaryPureCandidate best;
-    size_t bestCount = 0;
-    for (uint64_t left = 0; left <= maxPrefix; ++left) {
-      for (uint64_t right = 0; right <= maxSuffix; ++right) {
-        if (left + right > maxSharedWidth)
-          continue;
-        const uint64_t aStart = forced.aStart + left;
-        const uint64_t aEnd = forced.aEnd - right;
-        const uint64_t bStart = forced.bStart + left;
-        const uint64_t bEnd = forced.bEnd - right;
-        if (aStart > aEnd || bStart > bEnd)
-          continue;
-        if (!(aStart == aEnd && bStart < bEnd))
-          continue;
-
-        BoundaryPureCandidate cand;
-        cand.left = left;
-        cand.right = right;
-        cand.balance = left > right ? left - right : right - left;
-        cand.boundaryRank = aBoundaryRetentionRank(gapProvenance, aStart);
-        cand.bPairRank = bPairSurfaceRank(bGapProvenance, bStart, bEnd);
-        if (!haveBest || betterCandidate(cand, best)) {
-          best = cand;
-          haveBest = true;
-          bestCount = 1;
-        } else if (cand.balance == best.balance &&
-                   cand.boundaryRank == best.boundaryRank &&
-                   cand.bPairRank == best.bPairRank) {
-          ++bestCount;
-        }
-      }
-    }
-
-    if (!haveBest) {
-      // A boundary-pure insertion can also be hidden behind an unchanged token
-      // immediately to the left of the insertion frontier. This occurs when a
-      // line-local macro expansion is edited and a B-only after-boundary
-      // payload is appended before the next unchanged token. Equal-offset edge
-      // restoration cannot prove that shape because the delimiter token is no
-      // longer at the same relative B offset, but the shape is still fully
-      // certifiable:
-      //
-      //   [left edit]  anchor  [B-only suffix insertion]  [right edge anchors]
-      //
-      // The restored internal anchor must be core-LCS-admissible, the suffix
-      // insertion must be bounded by at least one restored right-edge anchor,
-      // and the selected frontier must be unique under structural A-gap and
-      // B-gap ranks. No neighboring token spelling is consulted to choose the
-      // frontier; spellings are used only for ordinary LCS anchor equality.
-      bool haveSuffixBest = false;
-      SuffixInsertionCandidate suffixBest;
-      size_t suffixBestCount = 0;
-
-      // Enumerate possible right-edge restorations first. `right` gives the
-      // number of unchanged trailing anchors that bound the B-only suffix
-      // insertion from the right.
-      for (uint64_t right = 1; right <= maxSuffix; ++right) {
-        const uint64_t aPureGap = forced.aEnd - right;
-        const uint64_t bPureEnd = forced.bEnd - right;
-        if (aPureGap == 0 || aPureGap <= forced.aStart ||
-            bPureEnd <= forced.bStart)
-          continue;
-
-        // The insertion frontier is immediately after this restored internal
-        // anchor. The anchor is allowed to move on the B side, unlike the
-        // equal-offset edge anchors handled by the earlier path.
-        const uint64_t anchorA = aPureGap - 1;
-        for (uint64_t left = 0; left <= maxPrefix; ++left) {
-          if (left + right + 1 > maxSharedWidth)
-            continue;
-          const uint64_t leftA = forced.aStart + left;
-          const uint64_t leftB = forced.bStart + left;
-          if (anchorA < leftA)
-            continue;
-
-          for (uint64_t anchorB = leftB; anchorB < bPureEnd; ++anchorB) {
-            if (!canUseAmbiguousEdgeAnchor(anchorA, anchorB))
-              continue;
-
-            const uint64_t insertionBegin = anchorB + 1;
-            if (insertionBegin >= bPureEnd)
-              continue;
-
-            // Rank the candidate by the structural boundary it preserves and
-            // by the B-only surface that would be inserted. The comparator
-            // below uses only these proof ranks plus deterministic tie-breaks.
-            SuffixInsertionCandidate cand;
-            cand.left = left;
-            cand.right = right;
-            cand.anchorA = anchorA;
-            cand.anchorB = anchorB;
-            cand.boundaryRank = aBoundaryRetentionRank(gapProvenance, aPureGap);
-            cand.bPairRank =
-                bPairSurfaceRank(bGapProvenance, insertionBegin, bPureEnd);
-            cand.restoredAnchors = left + right + 1;
-
-            if (!haveSuffixBest ||
-                betterSuffixInsertionCandidate(cand, suffixBest)) {
-              suffixBest = cand;
-              haveSuffixBest = true;
-              suffixBestCount = 1;
-            } else if (cand.boundaryRank == suffixBest.boundaryRank &&
-                       cand.bPairRank == suffixBest.bPairRank &&
-                       cand.restoredAnchors == suffixBest.restoredAnchors &&
-                       cand.right == suffixBest.right &&
-                       cand.left == suffixBest.left) {
-              ++suffixBestCount;
-            }
-          }
-        }
-      }
-
-      if (!haveSuffixBest)
-        continue;
-      if (suffixBestCount != 1) {
-        continue;
-      }
-
-      // Commit only the anchors proven by the suffix-insertion certificate:
-      // unchanged prefix anchors, the moved internal anchor, and unchanged
-      // suffix anchors. The B-only interval between anchorB and the right edge
-      // intentionally remains unmapped.
-      for (uint64_t off = 0; off < suffixBest.left; ++off) {
-        outMap[static_cast<size_t>(forced.aStart + off)] =
-            static_cast<int64_t>(forced.bStart + off);
-      }
-      outMap[static_cast<size_t>(suffixBest.anchorA)] =
-          static_cast<int64_t>(suffixBest.anchorB);
-      for (uint64_t off = 0; off < suffixBest.right; ++off) {
-        outMap[static_cast<size_t>(forced.aEnd - suffixBest.right + off)] =
-            static_cast<int64_t>(forced.bEnd - suffixBest.right + off);
-      }
-
-      continue;
-    }
-
-    if (bestCount != 1) {
-      continue;
-    }
-
-    // Restore only the uniquely certified equal-token edge runs. The middle of
-    // the hunk remains B-only, which downstream code can treat as an insertion.
-    for (uint64_t off = 0; off < best.left; ++off) {
-      outMap[static_cast<size_t>(forced.aStart + off)] =
-          static_cast<int64_t>(forced.bStart + off);
-    }
-    for (uint64_t off = 0; off < best.right; ++off) {
-      outMap[static_cast<size_t>(forced.aEnd - best.right + off)] =
-          static_cast<int64_t>(forced.bEnd - best.right + off);
-    }
-  }
-
-  // The final map must remain a strict A→B monotone alignment. If an edge
-  // restoration unexpectedly crosses another anchor, discard restored ambiguous
-  // edges and return to the fail-closed forced-anchor map.
-  int64_t previousB = -1;
-  for (size_t ai = 0; ai < outMap.size(); ++ai) {
-    const int64_t bj = outMap[ai];
-    if (bj < 0)
-      continue;
-    if (bj <= previousB) {
-
-      // Rebuild the fallback map from only unique one-to-one token partners.
-      // This intentionally drops every ambiguity-restored edge and keeps only
-      // anchors that are independently forced by both A-side and B-side
-      // uniqueness.
-      outMap.assign(n, -1);
-      for (size_t forcedAi = 0; forcedAi < n; ++forcedAi) {
-        if (aPartnerCount[forcedAi] != 1)
-          continue;
-        const int64_t forcedBj = firstBPartner[forcedAi];
-        if (forcedBj >= 0 && forcedBj < static_cast<int64_t>(m) &&
-            bPartnerCount[static_cast<size_t>(forcedBj)] == 1)
-          outMap[forcedAi] = forcedBj;
-      }
-
-      // Even the unique-partner fallback must be order-clean before it leaves
-      // this function.
-      suppressOrderConflictingAnchors(outMap);
-      return true;
-    }
-    previousB = bj;
-  }
-
+  storage->forwardObjectives = std::move(forward);
+  storage->suffixObjectives = std::move(suffix);
+  outResult.oracle = OptimalTokenAlignmentOracle(std::move(storage));
+  outResult.completeCertification = true;
   return true;
 }
 
@@ -913,9 +1193,9 @@ static std::vector<Score> computeRowWeighted(const SpanView &aV,
 
 /// Solve a small weighted-LCS box with the full DP table and append anchors in
 /// forward order.
-static void solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
-                                 const GapView &gapV,
-                                 std::vector<int64_t> &outMap) {
+static Score solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
+                                  const GapView &gapV,
+                                  std::vector<int64_t> &outMap) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (gapV.size() != n + 1)
@@ -971,6 +1251,8 @@ static void solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
     }
   }
 
+  const Score objective{len(n, m), cost(n, m)};
+
   // Backtrack (diag, then up, then left)
   size_t i = n;
   size_t j = m;
@@ -1010,6 +1292,7 @@ static void solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
     if (!moved)
       break;
   }
+  return objective;
 }
 
 /// Recursively solve weighted LCS with Hirschberg splitting.
@@ -1020,21 +1303,19 @@ static void solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
 /// objective, and recursively solving the two induced subproblems. The
 /// objective is the same one used by the exact weighted DP path: maximize LCS
 /// length, then minimize owner-depth gap cost.
-static void hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
-                                  const GapView &gapV,
-                                  std::vector<int64_t> &outMap) {
+static Score hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
+                                   const GapView &gapV,
+                                   std::vector<int64_t> &outMap) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (n == 0 || m == 0)
-    return;
+    return Score{};
 
   // Small exact DP base case.
   const unsigned long long cells = static_cast<unsigned long long>(n + 1ULL) *
                                    static_cast<unsigned long long>(m + 1ULL);
-  if (cells <= (1ULL << 20)) {
-    solveSmallWeightedDP(aV, bV, gapV, outMap);
-    return;
-  }
+  if (cells <= (1ULL << 20))
+    return solveSmallWeightedDP(aV, bV, gapV, outMap);
 
   // Split A in half. The gap view is split with one extra element on each side
   // because A-side gap costs are indexed at token boundaries, so an A span of
@@ -1081,18 +1362,51 @@ static void hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
 
   hirschbergWeightedRec(aLeft, bLeft, gapLeft, outMap);
   hirschbergWeightedRec(aRight, bRight, gapRight, outMap);
+  return best;
 }
 
+struct WeightedLcsSelection {
+  std::vector<int64_t> map;
+  LcsObjective objective;
+};
+
 /// Entry point for the linear-space weighted LCS fallback.
-static std::vector<int64_t>
+static WeightedLcsSelection
 lcsMapABHirschbergWeighted(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                            ArrayRef<uint32_t> ownerDepthGap) {
-  std::vector<int64_t> out(a.size(), -1);
+  WeightedLcsSelection selection;
+  selection.map.assign(a.size(), -1);
   const SpanView aV{a, 0, a.size(), false};
   const SpanView bV{b, 0, b.size(), false};
   const GapView gV{ownerDepthGap, 0, ownerDepthGap.size(), false};
-  hirschbergWeightedRec(aV, bV, gV, out);
-  return out;
+  const Score objective =
+      hirschbergWeightedRec(aV, bV, gV, selection.map);
+  selection.objective =
+      LcsObjective{objective.len, objective.cost};
+  return selection;
+}
+
+/// Compute only the exact weighted-LCS objective in linear space.
+///
+/// The structured refolding path uses this helper when the quadratic
+/// all-optimal tables exceed the proof budget. Computing the objective remains
+/// useful for diagnostics and later resource accounting, but deliberately no
+/// concrete alignment is reconstructed: one selected Hirschberg path cannot
+/// certify which repeated-token anchors occur on all optimal paths.
+static LcsObjective
+lcsObjectiveLinearSpaceWeighted(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                                ArrayRef<uint32_t> ownerDepthGap) {
+  if (ownerDepthGap.size() != a.size() + 1)
+    REFOLD_LOG_FATAL("lcs/map",
+                     "internal: ownerDepthGap length must be A.size()+1");
+
+  const SpanView aV{a, 0, a.size(), false};
+  const SpanView bV{b, 0, b.size(), false};
+  const GapView gV{ownerDepthGap, 0, ownerDepthGap.size(), false};
+  const std::vector<Score> finalRow = computeRowWeighted(aV, bV, gV);
+  assert(!finalRow.empty() && "weighted-LCS row always contains B boundary 0");
+  const Score &objective = finalRow.back();
+  return LcsObjective{objective.len, objective.cost};
 }
 
 /// Compute one unweighted Hirschberg LCS length row.
@@ -1243,7 +1557,7 @@ static std::vector<int64_t> lcsMapABHirschberg(ArrayRef<StringRef> a,
 
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                               ArrayRef<uint32_t> ownerDepthGap,
-                              unsigned long long maxCells) {
+                              unsigned long long maxBytes) {
   using namespace clang::refold;
 
   const size_t n = a.size(), m = b.size();
@@ -1266,12 +1580,10 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 
   // DP table guard: if the full (n+1)*(m+1) table is too large, use Hirschberg
   // to remain exact while using only O(n+m) memory.
-  const unsigned long long nu = static_cast<unsigned long long>(n);
-  const unsigned long long mu = static_cast<unsigned long long>(m);
-  const bool useHirschberg = shouldUseGreedyApproach(nu, mu, maxCells);
+  const bool useHirschberg = shouldUseLinearSpace(
+      n, m, maxBytes, QuadraticLcsAllocationKind::WeightedMap);
   if (useHirschberg) {
-    std::vector<int64_t> map = lcsMapABHirschbergWeighted(a, b, ownerDepthGap);
-    return map;
+    return lcsMapABHirschbergWeighted(a, b, ownerDepthGap).map;
   }
 
   // ---------------- DP path: (n+1) x (m+1) tables, row-major -----------------
@@ -1385,65 +1697,96 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   return map;
 }
 
-std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                              ArrayRef<LcsAGapProvenance> gapProvenance,
-                              unsigned long long maxCells) {
+CertifiedLcsResult
+certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                  ArrayRef<LcsAGapProvenance> gapProvenance,
+                  unsigned long long maxBytes) {
   if (gapProvenance.size() != a.size() + 1)
     REFOLD_LOG_FATAL("lcs/map", "gapProvenance length must be A.size() + 1");
+  if (b.size() > MAX)
+    REFOLD_LOG_FATAL("lcs/map", "B.size() exceeds int64_t index range");
 
   std::vector<uint32_t> ownerDepthGap;
   ownerDepthGap.reserve(gapProvenance.size());
   for (const LcsAGapProvenance &profile : gapProvenance)
     ownerDepthGap.push_back(profile.ownerDepth);
 
-  // A caller without edited-side gap profiles still receives the certified
-  // ambiguity-suppressed map. The B-side ranks collapse to zero, so ambiguous
-  // edge anchors are restored only when A-side provenance alone proves a unique
-  // frontier.
-  std::vector<LcsBGapProvenance> emptyBGapProvenance(b.size() + 1);
-  std::vector<int64_t> map;
-  if (buildBoundaryPureCertifiedMap(a, b, ownerDepthGap, gapProvenance,
-                                    emptyBGapProvenance, maxCells, map)) {
-    return map;
-  }
+  CertifiedLcsResult result;
+  if (buildForcedCertifiedResult(a, b, ownerDepthGap, maxBytes, result))
+    return result;
 
-  // If the full admissibility tables exceed the configured DP budget, fall back
-  // to the exact weighted Hirschberg/core-DP implementation. This path uses
-  // the same core objective without the removed neighbor-coherence heuristic;
-  // it merely lacks the full ambiguity-certification table.
-  return lcsMapAB(a, b, ArrayRef<uint32_t>(ownerDepthGap), maxCells);
+  result.forcedMap.assign(a.size(), -1);
+  result.selectedMap.assign(a.size(), -1);
+  result.selectedAnchorProofs.assign(a.size(), LcsAnchorProof{});
+  result.globalObjective =
+      lcsObjectiveLinearSpaceWeighted(a, b, ownerDepthGap);
+  result.completeCertification = false;
+  REFOLD_LOG_WARN(
+      "lcs/map",
+      "all-optimal certification unavailable: suppressing all structured "
+      "token anchors (aTokens={0}, bTokens={1}, maxBytes={2})",
+      a.size(), b.size(), maxBytes);
+  return result;
+}
+
+CertifiedLcsResult
+certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                  ArrayRef<LcsAGapProvenance> gapProvenance,
+                  ArrayRef<LcsBGapProvenance> bGapProvenance,
+                  unsigned long long maxBytes) {
+  if (bGapProvenance.size() != b.size() + 1)
+    REFOLD_LOG_FATAL("lcs/map", "bGapProvenance length must be B.size() + 1");
+  if (gapProvenance.size() != a.size() + 1)
+    REFOLD_LOG_FATAL("lcs/map", "gapProvenance length must be A.size() + 1");
+  if (b.size() > MAX)
+    REFOLD_LOG_FATAL("lcs/map", "B.size() exceeds int64_t index range");
+
+  std::vector<uint32_t> ownerDepthGap;
+  ownerDepthGap.reserve(gapProvenance.size());
+  for (const LcsAGapProvenance &profile : gapProvenance)
+    ownerDepthGap.push_back(profile.ownerDepth);
+
+  (void)bGapProvenance;
+  CertifiedLcsResult result;
+  if (buildForcedCertifiedResult(a, b, ownerDepthGap, maxBytes, result))
+    return result;
+
+  // The exact linear-space solver can still recover the global weighted
+  // objective, but it selects only one optimal path and therefore proves
+  // nothing about ambiguity. Keep both public maps fully suppressed so the
+  // refolding path forms one conservative edit island and fails closed rather
+  // than treating a resource-driven path choice as provenance.
+  result.forcedMap.assign(a.size(), -1);
+  result.selectedMap.assign(a.size(), -1);
+  result.selectedAnchorProofs.assign(a.size(), LcsAnchorProof{});
+  result.globalObjective =
+      lcsObjectiveLinearSpaceWeighted(a, b, ownerDepthGap);
+  result.completeCertification = false;
+  REFOLD_LOG_WARN(
+      "lcs/map",
+      "all-optimal certification unavailable: suppressing all structured "
+      "token anchors (aTokens={0}, bTokens={1}, maxBytes={2})",
+      a.size(), b.size(), maxBytes);
+  return result;
+}
+
+std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                              ArrayRef<LcsAGapProvenance> gapProvenance,
+                              unsigned long long maxBytes) {
+  return certifiedLcsMapAB(a, b, gapProvenance, maxBytes).selectedMap;
 }
 
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                               ArrayRef<LcsAGapProvenance> gapProvenance,
                               ArrayRef<LcsBGapProvenance> bGapProvenance,
-                              unsigned long long maxCells) {
-  if (bGapProvenance.size() != b.size() + 1)
-    REFOLD_LOG_FATAL("lcs/map", "bGapProvenance length must be B.size() + 1");
-
-  if (gapProvenance.size() != a.size() + 1)
-    REFOLD_LOG_FATAL("lcs/map", "gapProvenance length must be A.size() + 1");
-
-  std::vector<uint32_t> ownerDepthGap;
-  ownerDepthGap.reserve(gapProvenance.size());
-  for (const LcsAGapProvenance &profile : gapProvenance)
-    ownerDepthGap.push_back(profile.ownerDepth);
-
-  std::vector<int64_t> map;
-  if (buildBoundaryPureCertifiedMap(a, b, ownerDepthGap, gapProvenance,
-                                    bGapProvenance, maxCells, map)) {
-    return map;
-  }
-
-  // See the A-only overload above: this is the exact certified-core fallback;
-  // it keeps neighbor-coherence outside the objective rather than using it as a
-  // hidden tie-breaker.
-  return lcsMapAB(a, b, ArrayRef<uint32_t>(ownerDepthGap), maxCells);
+                              unsigned long long maxBytes) {
+  return certifiedLcsMapAB(a, b, gapProvenance, bGapProvenance, maxBytes)
+      .selectedMap;
 }
 
 [[maybe_unused]]
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                              unsigned long long maxCells) {
+                              unsigned long long maxBytes) {
   const size_t n = a.size(), m = b.size();
 
   // Early outs for empties
@@ -1459,9 +1802,8 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 
   // DP table guard: if the full table is too large, use Hirschberg (exact,
   // linear space).
-  const unsigned long long nu = static_cast<unsigned long long>(n);
-  const unsigned long long mu = static_cast<unsigned long long>(m);
-  const bool useHirschberg = shouldUseGreedyApproach(nu, mu, maxCells);
+  const bool useHirschberg = shouldUseLinearSpace(
+      n, m, maxBytes, QuadraticLcsAllocationKind::PlainMap);
   if (useHirschberg)
     return lcsMapABHirschberg(a, b);
 

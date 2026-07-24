@@ -633,10 +633,10 @@ bool protectedSourceAuthorityAcceptsKind(
     ProtectedSourceEditAuthorityKind authority,
     PreprocessingStructureKind kind) {
   switch (authority) {
-  case ProtectedSourceEditAuthorityKind::DirectTUMacroStateRepair:
   case ProtectedSourceEditAuthorityKind::MacroStateRepair:
     return kind == PreprocessingStructureKind::MacroDefine ||
-           kind == PreprocessingStructureKind::MacroUndef;
+           kind == PreprocessingStructureKind::MacroUndef ||
+           kind == PreprocessingStructureKind::PragmaOperator;
   case ProtectedSourceEditAuthorityKind::IncludeOwnedMacroStateRepair:
     return kind == PreprocessingStructureKind::Include ||
            kind == PreprocessingStructureKind::IncludeNext ||
@@ -801,6 +801,58 @@ bool sourceEditInterferesWithProtectedInterval(
       sourceBytes.take_front(interval.end), edit.text, lexLang);
 }
 
+/// Return whether one accepted theorem carrier is compatible with a protected
+/// source capability.
+///
+/// Exact interval identity is checked separately.  This closed table prevents
+/// a capability from surviving normalization beside an unrelated carrier: in
+/// particular, ordinary `TUByteSpan` results never support any protected-source
+/// authority, even when an equivalent specialized edit was merged later.
+bool acceptedResultSupportsProtectedSourceAuthority(
+    const AcceptedResultCandidate &candidate,
+    ProtectedSourceEditAuthorityKind authority) {
+  const AcceptedPathKind path =
+      candidate.proofSummary.inventory.currentPath;
+  switch (authority) {
+  case ProtectedSourceEditAuthorityKind::MacroStateRepair:
+    return AcceptedResultIsSpecializedTUCarrier(
+               candidate, AcceptedPathKind::TUByteSpanConservativeEdit) ||
+           candidate.kind == AcceptedResultCandidateKind::MacroPatch ||
+           (candidate.kind == AcceptedResultCandidateKind::IncludePatch &&
+            path ==
+                AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens);
+  case ProtectedSourceEditAuthorityKind::IncludeOwnedMacroStateRepair:
+    return AcceptedResultIsSpecializedTUCarrier(
+        candidate, AcceptedPathKind::TUByteSpanConservativeEdit);
+  case ProtectedSourceEditAuthorityKind::SidebandPragmaEdit:
+    return AcceptedResultIsSpecializedTUCarrier(
+               candidate, AcceptedPathKind::TUByteSpanConservativeEdit) ||
+           (candidate.kind == AcceptedResultCandidateKind::IncludePatch &&
+            (path == AcceptedPathKind::IncludeMaterializedExpansion ||
+             path == AcceptedPathKind::IncludeRealizationInlineFromB));
+  case ProtectedSourceEditAuthorityKind::LineControlRepair:
+    return AcceptedResultIsSpecializedTUCarrier(
+               candidate, AcceptedPathKind::TUByteSpanConservativeEdit) ||
+           (candidate.kind == AcceptedResultCandidateKind::IncludePatch &&
+            path ==
+                AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens);
+  case ProtectedSourceEditAuthorityKind::IncludeMaterialization:
+    return candidate.kind == AcceptedResultCandidateKind::IncludePatch &&
+           (path == AcceptedPathKind::IncludeMaterializedExpansion ||
+            path == AcceptedPathKind::IncludeRealizationInlineFromB);
+  case ProtectedSourceEditAuthorityKind::IncludeDirectiveRewrite:
+  case ProtectedSourceEditAuthorityKind::IncludePreservingSourceClosure:
+    return candidate.kind == AcceptedResultCandidateKind::IncludePatch &&
+           path == AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens;
+  case ProtectedSourceEditAuthorityKind::TUIncludeClosure:
+    return AcceptedResultIsSpecializedTUCarrier(candidate,
+                                  AcceptedPathKind::TUIncludeClosureEdit);
+  case ProtectedSourceEditAuthorityKind::Unknown:
+    return false;
+  }
+  return false;
+}
+
 void appendUniqueProtectedSourceAuthorization(
     TextEdit &edit, ProtectedSourceEditAuthorization authorization) {
   if (llvm::is_contained(edit.protectedSourceAuthorizations, authorization))
@@ -938,6 +990,7 @@ bool RefoldTextEditAssembler::AuthorizeExactProtectedSourceInterval(
     StringRef sourcePath, std::optional<uint64_t> ownerIncludeId,
     StringRef sourceBytes, uint64_t intervalBegin, uint64_t intervalEnd,
     ArrayRef<PreprocessingStructureKind> allowedKinds,
+    ArrayRef<PreprocessingStructureKind> allowedNestedKinds,
     bool requestTerminalOnFailure) const {
   auto reject = [&](StringRef detail) {
     if (requestTerminalOnFailure) {
@@ -967,16 +1020,32 @@ bool RefoldTextEditAssembler::AuthorizeExactProtectedSourceInterval(
   const PreprocessingStructureInterval *matched = nullptr;
   for (const PreprocessingStructureInterval &interval :
        structure.GetIntervals()) {
-    // Producer transitions commonly identify the scanner spelling itself,
-    // while source-closure records identify the complete lexical interval.
-    // Accept either exact representation, but never containment or proximity.
+    // Specialized planners may identify one physical directive through any of
+    // the structure index's three exact coordinate systems:
+    //
+    //  * `[begin,end)` is the complete lexical logical-line interval;
+    //  * `[structureSpellingBegin,structureSpellingEnd)` is the scanner-proven
+    //    directive spelling without leading trivia or the final newline; and
+    //  * `[producerTextBegin,producerTextEnd)` is the exact source slice bound
+    //    to the producer record.  Macro producer text commonly includes the
+    //    terminating newline while omitting leading indentation, so it is not
+    //    necessarily equal to either of the first two ranges.
+    //
+    // Accept only equality with one recorded range.  In particular, do not
+    // infer authority from containment, adjacency, or textual similarity.
     const bool exactLexicalRange = interval.begin == intervalBegin &&
                                    interval.end == intervalEnd;
     const bool exactSpellingRange =
         interval.structureSpellingBegin == intervalBegin &&
         interval.structureSpellingEnd == intervalEnd;
-    if (!exactLexicalRange && !exactSpellingRange)
+    const bool exactProducerTextRange =
+        interval.HasExactProducerTextRange() &&
+        *interval.producerTextBegin == intervalBegin &&
+        *interval.producerTextEnd == intervalEnd;
+    if (!exactLexicalRange && !exactSpellingRange &&
+        !exactProducerTextRange) {
       continue;
+    }
     if (matched)
       return reject("exact protected-source authorization matched more than "
                     "one indexed preprocessing interval");
@@ -1013,7 +1082,62 @@ bool RefoldTextEditAssembler::AuthorizeExactProtectedSourceInterval(
   authorization.conditionalArmId = matched->conditionalArmId;
   authorization.begin = matched->begin;
   authorization.end = matched->end;
-  appendUniqueProtectedSourceAuthorization(edit, std::move(authorization));
+  SmallVector<ProtectedSourceEditAuthorization, 2> newAuthorizations;
+  newAuthorizations.push_back(std::move(authorization));
+
+  // A complete macro definition may contain a separately indexed `_Pragma`
+  // operator in its replacement list. That operator is physically and
+  // semantically part of the exact macro transition, but the final audit still
+  // requires one capability per indexed interval. Authorize only explicitly
+  // admitted nested kinds and reject any other protected construct enclosed by
+  // the transition; containment alone never broadens the theorem domain.
+  for (const PreprocessingStructureInterval &nested :
+       structure.GetIntervals()) {
+    if (&nested == matched || nested.begin < matched->begin ||
+        matched->end < nested.end ||
+        !sourceEditInterferesWithProtectedInterval(edit, nested, sourceBytes,
+                                                    lexLang_)) {
+      continue;
+    }
+
+    if (!llvm::is_contained(allowedNestedKinds, nested.kind) ||
+        !protectedSourceAuthorityAcceptsKind(authority, nested.kind)) {
+      return reject(llvm::formatv(
+                        "exact protected-source transition contains "
+                        "unadmitted nested {0} interval [{1},{2})",
+                        toString(nested.kind), nested.begin, nested.end)
+                        .str());
+    }
+
+    std::optional<std::pair<uint64_t, uint64_t>> nestedCoverage =
+        requiredProtectedCoverage(authority, nested);
+    if (!nestedCoverage || edit.start > nestedCoverage->first ||
+        nestedCoverage->second > edit.end) {
+      return reject("nested protected-source authorization is not fully "
+                    "covered by the emitted edit");
+    }
+
+    ProtectedSourceEditAuthorization nestedAuthorization;
+    nestedAuthorization.authority = authority;
+    nestedAuthorization.structureKind = nested.kind;
+    nestedAuthorization.modelKind = nested.modelKind;
+    nestedAuthorization.modelItemId = nested.modelItemId;
+    nestedAuthorization.ownerConditionalArmId = nested.ownerConditionalArmId;
+    nestedAuthorization.conditionalGroupId = nested.conditionalGroupId;
+    nestedAuthorization.conditionalArmId = nested.conditionalArmId;
+    nestedAuthorization.begin = nested.begin;
+    nestedAuthorization.end = nested.end;
+    newAuthorizations.push_back(std::move(nestedAuthorization));
+  }
+
+  // Commit transactionally only after the exact transition and every admitted
+  // nested interval have passed validation. A rejected specialized theorem
+  // must not leave a partial capability on a caller-owned edit.
+  for (ProtectedSourceEditAuthorization &newAuthorization :
+       newAuthorizations) {
+    appendUniqueProtectedSourceAuthorization(edit,
+                                             std::move(newAuthorization));
+  }
   return true;
 }
 
@@ -1114,6 +1238,94 @@ bool RefoldTextEditAssembler::AuditGlobalSourceEditInvariant(
     if (edit.start > edit.end || edit.end > originalFileText.size())
       return reject("global source-edit audit found an out-of-bounds edit");
 
+    bool hasOrdinaryDirectTUCarrier = false;
+    for (const std::shared_ptr<const AcceptedResultCandidate> &candidatePtr :
+         edit.acceptedResults) {
+      if (!candidatePtr || !AcceptedResultIsOrdinaryDirectTUCarrier(*candidatePtr))
+        continue;
+      hasOrdinaryDirectTUCarrier = true;
+
+      // Audit the carrier's own proven source surface rather than only the
+      // normalized TextEdit. Equivalent-edit merging may retain several
+      // carriers with different original spans; no specialized capability on
+      // the merged edit may retroactively authorize any one of them.
+      const AcceptedResultCandidate &candidate = *candidatePtr;
+      if (candidate.begin > candidate.end ||
+          candidate.end > originalFileText.size() ||
+          !candidate.hasPayloadPreview) {
+        return reject("ordinary direct-TU carrier has malformed source "
+                      "provenance");
+      }
+      TextEdit carrierSurface{candidate.begin,
+                              candidate.end,
+                              candidate.payloadPreview,
+                              std::nullopt,
+                              std::nullopt,
+                              {},
+                              {},
+                              {}};
+      for (const PreprocessingStructureInterval &interval :
+           structure.GetIntervals()) {
+        if (!sourceEditInterferesWithProtectedInterval(
+                carrierSurface, interval, originalFileText, lexLang_))
+          continue;
+        if (inTraceMode()) {
+          REFOLD_LOG_TRACE("tu/direct-span", "direct TU span rejected:");
+          REFOLD_LOG_TRACE("tu/direct-span", "source=[{0},{1})",
+                           candidate.begin, candidate.end);
+          const bool macroState =
+              interval.kind == PreprocessingStructureKind::MacroDefine ||
+              interval.kind == PreprocessingStructureKind::MacroUndef;
+          REFOLD_LOG_TRACE(
+              "tu/direct-span", "reason={0}",
+              macroState
+                  ? "internal source gap contains protected macro state"
+                  : "raw direct carrier contains protected preprocessing "
+                    "structure");
+          REFOLD_LOG_TRACE("tu/direct-span",
+                           "protected structure=[{0},{1}) kind={2}",
+                           interval.begin, interval.end, interval.kind);
+          REFOLD_LOG_TRACE("tu/direct-span",
+                           "required action=specialized structural repair or "
+                           "terminal fallback");
+        }
+        return reject(llvm::formatv(
+                          "ordinary direct-TU carrier [{0},{1}) interferes "
+                          "with protected {2} interval [{3},{4})",
+                          candidate.begin, candidate.end,
+                          toString(interval.kind), interval.begin, interval.end)
+                          .str());
+      }
+    }
+
+    if (hasOrdinaryDirectTUCarrier &&
+        !edit.protectedSourceAuthorizations.empty()) {
+      return reject("ordinary direct-TU accepted carrier retained protected-"
+                    "source authority after normalization");
+    }
+    if (edit.isDirectTUHunkEdit &&
+        !edit.protectedSourceAuthorizations.empty()) {
+      return reject("raw direct-TU edit provenance retained protected-source "
+                    "authority");
+    }
+
+    for (const ProtectedSourceEditAuthorization &authorization :
+         edit.protectedSourceAuthorizations) {
+      const bool hasCompatibleCarrier = llvm::any_of(
+          edit.acceptedResults,
+          [&](const std::shared_ptr<const AcceptedResultCandidate> &candidate) {
+            return candidate && acceptedResultSupportsProtectedSourceAuthority(
+                                    *candidate, authorization.authority);
+          });
+      if (!hasCompatibleCarrier) {
+        return reject(llvm::formatv(
+                          "protected-source authority kind {0} has no "
+                          "compatible specialized accepted carrier",
+                          static_cast<unsigned>(authorization.authority))
+                          .str());
+      }
+    }
+
     std::vector<bool> used(edit.protectedSourceAuthorizations.size(), false);
     for (const PreprocessingStructureInterval &interval :
          structure.GetIntervals()) {
@@ -1157,12 +1369,28 @@ bool RefoldTextEditAssembler::AuditGlobalSourceEditInvariant(
       }
     }
 
-    // Direct TU span planning already proves the raw token-derived carrier.
-    // Recheck only the later lexical widening here: each added byte must be
-    // lexer trivia or part of an exact protected interval authorized above.
-    if (edit.isDirectTUHunkEdit && edit.directTURawStart &&
-        edit.directTURawEnd && edit.directTUFinalStart &&
-        edit.directTUFinalEnd) {
+    const bool hasAnyDirectTUProvenance =
+        edit.directTUHunkIndex || edit.directTUHunkAStart ||
+        edit.directTUHunkAEnd || edit.directTUHunkBStart ||
+        edit.directTUHunkBEnd || edit.directTURawStart ||
+        edit.directTURawEnd || edit.directTUFinalStart ||
+        edit.directTUFinalEnd;
+    if (!edit.isDirectTUHunkEdit && hasAnyDirectTUProvenance) {
+      return reject("non-direct edit retained stale direct-TU provenance");
+    }
+
+    // Direct TU span planning proves the raw token-derived carrier. Recheck the
+    // complete provenance tuple and later lexical widening independently at
+    // final emission; missing fields are not treated as permission to skip the
+    // firewall.
+    if (edit.isDirectTUHunkEdit) {
+      if (!edit.directTUHunkIndex || !edit.directTUHunkAStart ||
+          !edit.directTUHunkAEnd || !edit.directTUHunkBStart ||
+          !edit.directTUHunkBEnd || !edit.directTURawStart ||
+          !edit.directTURawEnd || !edit.directTUFinalStart ||
+          !edit.directTUFinalEnd) {
+        return reject("direct TU edit carries incomplete raw/final provenance");
+      }
       const uint64_t rawBegin = *edit.directTURawStart;
       const uint64_t rawEnd = *edit.directTURawEnd;
       const uint64_t finalBegin = *edit.directTUFinalStart;
@@ -1189,25 +1417,11 @@ bool RefoldTextEditAssembler::AuditGlobalSourceEditInvariant(
 
       // Revalidate the original token-derived carrier against the immutable
       // source index instead of trusting that normalization preserved the
-      // planner's earlier result.  Only exact direct-TU macro-state
-      // capabilities participate in this theorem; later specialized
-      // authorizations cannot retroactively make the raw carrier valid.
-      std::vector<DirectTUMacroStateAuthorization> rawAuthorizations;
-      for (const ProtectedSourceEditAuthorization &authorization :
-           edit.protectedSourceAuthorizations) {
-        if (authorization.authority !=
-                ProtectedSourceEditAuthorityKind::DirectTUMacroStateRepair ||
-            authorization.modelKind !=
-                PreprocessingStructureModelKind::MacroDirective ||
-            !authorization.modelItemId)
-          continue;
-        rawAuthorizations.push_back(DirectTUMacroStateAuthorization{
-            *authorization.modelItemId, authorization.structureKind,
-            authorization.ownerConditionalArmId, authorization.begin,
-            authorization.end});
-      }
-      if (!structure.ValidateDirectTUEnvelope(rawBegin, rawEnd,
-                                              rawAuthorizations)) {
+      // planner's earlier result. Provisional macro-transition evidence is
+      // useful only before specialized repair; an ordinary direct carrier that
+      // reaches final emission may not intersect any protected interval.
+      if (!tuEdits_.ValidateDirectTUEnvelope(emissionOwner, rawBegin,
+                                             rawEnd)) {
         return reject("direct TU raw carrier failed final exact source-envelope "
                       "revalidation");
       }
@@ -1242,46 +1456,24 @@ bool RefoldTextEditAssembler::AuditGlobalSourceEditInvariant(
         continue;
       }
 
-      auto wideningIsAuthorized = [&](uint64_t begin, uint64_t end) {
-        if (begin == end || structure.IsRangeLexicallyIgnorable(begin, end))
-          return true;
-        uint64_t cursor = begin;
-        for (const PreprocessingStructureInterval &interval :
-             structure.GetIntervals()) {
-          if (interval.end <= cursor || interval.begin >= end)
-            continue;
-          if (cursor < interval.begin &&
-              !structure.IsRangeLexicallyIgnorable(cursor, interval.begin))
-            return false;
-          std::optional<std::pair<uint64_t, uint64_t>> authorizedCoverage;
-          for (const ProtectedSourceEditAuthorization &authorization :
-               edit.protectedSourceAuthorizations) {
-            if (!protectedSourceAuthorizationCoversEdit(authorization,
-                                                        interval, edit))
-              continue;
-            authorizedCoverage =
-                requiredProtectedCoverage(authorization.authority, interval);
-            if (authorizedCoverage)
-              break;
-          }
-          if (!authorizedCoverage || authorizedCoverage->first < cursor ||
-              authorizedCoverage->second > end)
-            return false;
-          if (cursor < authorizedCoverage->first &&
-              !structure.IsRangeLexicallyIgnorable(
-                  cursor, authorizedCoverage->first))
-            return false;
-          cursor = authorizedCoverage->second;
-        }
-        return cursor == end ||
-               structure.IsRangeLexicallyIgnorable(cursor, end);
-      };
+      TextEdit rawCarrier{rawBegin, rawEnd, edit.text, std::nullopt,
+                          std::nullopt, {}, {}, {}};
+      for (const PreprocessingStructureInterval &interval :
+           structure.GetIntervals()) {
+        if (!sourceEditInterferesWithProtectedInterval(
+                rawCarrier, interval, originalFileText, lexLang_))
+          continue;
+        return reject("ordinary direct TU raw carrier intersects protected "
+                      "preprocessing structure at final emission");
+      }
 
-      if (!wideningIsAuthorized(finalBegin, rawBegin) ||
-          !wideningIsAuthorized(rawEnd, finalEnd)) {
-        return reject("direct TU lexical widening contains bytes that are "
-                      "neither proven trivia nor exactly authorized "
-                      "preprocessing structure");
+      // Ordinary lexical widening has no exceptional capability. Every added
+      // byte must therefore be exact lexer trivia; a specialized planner must
+      // clear direct-hunk provenance and attach its own carrier before any
+      // protected interval can be consumed.
+      if (!structure.IsRangeLexicallyIgnorable(finalBegin, rawBegin) ||
+          !structure.IsRangeLexicallyIgnorable(rawEnd, finalEnd)) {
+        return reject("direct TU lexical widening contains non-trivia bytes");
       }
     }
   }
@@ -2284,13 +2476,11 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
         }
 
         // Merging still recreates one larger physical source edit. Re-run the
-        // preprocessing-state firewall over that actual envelope.  Only the
-        // producer-bound macro-state obligations proved for the combined token
-        // run may survive; no new directive or pragma operator can be absorbed
-        // merely because the diff produced adjacent direct-hunk fragments.
-        if (!tuEdits_.ValidateDirectTUEnvelope(
-                emissionOwner, s, t,
-                combinedBaseSpan->macroStateAuthorizations)) {
+        // preprocessing-state firewall over that actual envelope. Complete
+        // producer-bound macro transitions may remain only as provisional
+        // evidence for the later repair planner; this merge creates no source
+        // authority and may absorb no other directive or pragma operator.
+        if (!tuEdits_.ValidateDirectTUEnvelope(emissionOwner, s, t)) {
           return std::nullopt;
         }
 
@@ -2336,14 +2526,13 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
         // proof gate can reason about this replacement as one conservative TU
         // edit. The synthetic hunk is not manufactured proof: its A/B envelopes
         // are the already-validated contiguous fragment union, and the final
-        // span retains the authorizations re-derived for that complete union.
+        // span retains only specialized capabilities already discharged by the
+        // absorbed fragments; direct span planning contributes none.
         const diffutils::Hunk mergedHunk{
             *fragments.front()->directTUHunkAStart,
             *fragments.back()->directTUHunkAEnd, bBegin, bEnd};
-        TUByteSpanPlan mergedSpan(
-            mergedHunk.aStart, mergedHunk.aEnd, s, t,
-            combinedBaseSpan->insertionAnchor,
-            combinedBaseSpan->macroStateAuthorizations);
+        TUByteSpanPlan mergedSpan(mergedHunk.aStart, mergedHunk.aEnd, s,
+                                  t, combinedBaseSpan->insertionAnchor);
         AttachAcceptedResultCarrier(
             merged, proofLattice_.AcceptedCandidateBuilder()
                         .BuildAcceptedTUTextEditCandidate(
@@ -2530,7 +2719,6 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     uint64_t bBegin = 0;
     uint64_t bEnd = 0;
     std::optional<TUInsertionAnchor> insertionAnchor;
-    std::vector<DirectTUMacroStateAuthorization> macroStateAuthorizations;
     SmallVector<size_t, 16> editIndices;
   };
 
@@ -2612,17 +2800,15 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     candidate.aBegin = firstHunkRecord.aStart;
     candidate.aEnd = lastHunkRecord.aEnd;
     candidate.insertionAnchor = combinedBaseSpan->insertionAnchor;
-    candidate.macroStateAuthorizations =
-        combinedBaseSpan->macroStateAuthorizations;
 
     // This path deliberately synthesizes a wider direct TU edit from several
     // already-planned fragments. Its ordinary-token closure checks below do
-    // not authorize preprocessing state.  Validate the actual envelope against
-    // exactly the macro-state obligations proved for the combined token run;
-    // any additional or unbound structure rejects the candidate.
+    // not authorize preprocessing state. Validate the actual envelope so it
+    // contains at most complete producer-bound macro-transition evidence for
+    // the later repair planner; any additional or unbound structure rejects
+    // the candidate.
     if (!tuEdits_.ValidateDirectTUEnvelope(
-            emissionOwner, candidate.sourceBegin, candidate.sourceEnd,
-            combinedBaseSpan->macroStateAuthorizations)) {
+            emissionOwner, candidate.sourceBegin, candidate.sourceEnd)) {
       return false;
     }
 
@@ -2813,25 +2999,11 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     CertifyTextEditMaterializedBTokenRange(closure, best->bBegin, best->bEnd);
     const diffutils::Hunk closedHunk{best->aBegin, best->aEnd, best->bBegin,
                                       best->bEnd};
-    TUByteSpanPlan closedSpan(
-        best->aBegin, best->aEnd, best->sourceBegin, best->sourceEnd,
-        best->insertionAnchor, best->macroStateAuthorizations);
+    TUByteSpanPlan closedSpan(best->aBegin, best->aEnd,
+                              best->sourceBegin, best->sourceEnd,
+                              best->insertionAnchor);
     for (size_t editIndex : best->editIndices)
       appendUniqueProtectedSourceAuthorizations(closure, norm[editIndex]);
-    for (const DirectTUMacroStateAuthorization &macroAuthorization :
-         best->macroStateAuthorizations) {
-      ProtectedSourceEditAuthorization authorization;
-      authorization.authority =
-          ProtectedSourceEditAuthorityKind::DirectTUMacroStateRepair;
-      authorization.structureKind = macroAuthorization.kind;
-      authorization.modelKind =
-          PreprocessingStructureModelKind::MacroDirective;
-      authorization.modelItemId = macroAuthorization.directiveId;
-      authorization.begin = macroAuthorization.begin;
-      authorization.end = macroAuthorization.end;
-      appendUniqueProtectedSourceAuthorization(closure,
-                                               std::move(authorization));
-    }
     AttachAcceptedResultCarrier(
         closure, proofLattice_.AcceptedCandidateBuilder()
                      .BuildAcceptedTUTextEditCandidate(
@@ -3627,26 +3799,10 @@ RefoldTextEditAssembler::BuildDirectTUHunkTextEdit(
   edit.directTUFinalStart = spanBytes.first;
   edit.directTUFinalEnd = spanBytes.second;
 
-  // Direct TU span planning exposes only exact producer-bound #define/#undef
-  // obligations that the mandatory macro-state repair path owns.  Preserve
-  // those concrete capabilities on the emitted edit; the final global audit
-  // will reject any protected interval that was introduced by later widening
-  // or was not part of this original authorization set.
-  for (const DirectTUMacroStateAuthorization &macroAuthorization :
-       plan->span.macroStateAuthorizations) {
-    ProtectedSourceEditAuthorization authorization;
-    authorization.authority =
-        ProtectedSourceEditAuthorityKind::DirectTUMacroStateRepair;
-    authorization.structureKind = macroAuthorization.kind;
-    authorization.modelKind =
-        PreprocessingStructureModelKind::MacroDirective;
-    authorization.modelItemId = macroAuthorization.directiveId;
-    authorization.ownerConditionalArmId =
-        macroAuthorization.ownerConditionalArmId;
-    authorization.begin = macroAuthorization.begin;
-    authorization.end = macroAuthorization.end;
-    appendUniqueProtectedSourceAuthorization(edit, std::move(authorization));
-  }
+  // An ordinary direct-TU edit carries no protected-source authority. Exact
+  // macro transitions inside the provisional carrier are rediscovered and
+  // discharged only by RefoldMacroStateRepairPlanner; this assembly boundary
+  // deliberately has no conversion from planning evidence to capability.
 
   if (plan->materializedBByteBegin && plan->materializedBByteEnd)
     CertifyTextEditMaterializedBByteRange(edit, *plan->materializedBByteBegin,

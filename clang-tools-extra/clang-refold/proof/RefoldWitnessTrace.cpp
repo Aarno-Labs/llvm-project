@@ -63,11 +63,13 @@ template <typename FormatObject> void logProofLine(const FormatObject &line) {
 } // namespace
 
 RefoldWitnessTrace::RefoldWitnessTrace(bool strict,
-                                       const ProofAuditMode &proofAuditMode)
-    : strict_(strict), proofAuditMode_(proofAuditMode) {}
+                                       const ProofAuditMode &proofAuditMode,
+                                       const bool &alignmentSemanticTheoremActive)
+    : strict_(strict), proofAuditMode_(proofAuditMode),
+      alignmentSemanticTheoremActive_(alignmentSemanticTheoremActive) {}
 
 WitnessResolverMode RefoldWitnessTrace::GetWitnessResolverMode() const {
-  if (strict_)
+  if (strict_ || alignmentSemanticTheoremActive_)
     return WitnessResolverMode::Strict;
 
   switch (proofAuditMode_) {

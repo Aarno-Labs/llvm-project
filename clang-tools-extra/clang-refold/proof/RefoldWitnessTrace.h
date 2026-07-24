@@ -30,7 +30,8 @@ namespace refold {
 /// enabled.
 class RefoldWitnessTrace {
 public:
-  RefoldWitnessTrace(bool strict, const ProofAuditMode &proofAuditMode);
+  RefoldWitnessTrace(bool strict, const ProofAuditMode &proofAuditMode,
+                     const bool &alignmentSemanticTheoremActive);
 
   /// Compute the active witness resolver mode from the configured strict flag
   /// and proof-audit mode.  This is the single source of truth that gates
@@ -81,6 +82,7 @@ public:
 private:
   bool strict_;
   const ProofAuditMode &proofAuditMode_;
+  const bool &alignmentSemanticTheoremActive_;
 };
 
 } // namespace refold

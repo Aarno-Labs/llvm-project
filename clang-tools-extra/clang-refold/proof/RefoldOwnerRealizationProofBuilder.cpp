@@ -1052,13 +1052,6 @@ RefoldOwnerRealizationProofBuilder::BuildTUOwnerRealization(
         TerminalFallbackFailureReason::NoOwnerClosedCover);
   }
 
-  if (spanPlan.macroStateAuthorizations.size() >
-      std::numeric_limits<uint32_t>::max()) {
-    return buildRejectedDirectTUCarrier(
-        closure, detail, TerminalFallbackObligationKind::ProducerFactsAvailable,
-        TerminalFallbackFailureReason::MissingProducerFacts);
-  }
-
   OwnerRealizationResult result = TryBuildOwnerRealizationImpl(
       OwnerRealizationEvidenceKind::TUByteSpan, std::move(closure), detail,
       /*attachCanonicalStateSummary=*/false);
@@ -1067,10 +1060,8 @@ RefoldOwnerRealizationProofBuilder::BuildTUOwnerRealization(
 
   result.witness.hasTUCarrierWitness = true;
   result.witness.tuCarrierWitness.exactHunkAndSpanValidated = true;
-  result.witness.tuCarrierWitness.protectedStructureExcludedOrAuthorized =
+  result.witness.tuCarrierWitness.protectedStructureExcludedOrDeferred =
       true;
-  result.witness.tuCarrierWitness.deferredMacroStateAuthorizationCount =
-      static_cast<uint32_t>(spanPlan.macroStateAuthorizations.size());
   if (structuralBinding) {
     result.witness.tuCarrierWitness.hasStructuralSegmentBinding = true;
     result.witness.tuCarrierWitness.structuralSegmentBindingValidated = true;

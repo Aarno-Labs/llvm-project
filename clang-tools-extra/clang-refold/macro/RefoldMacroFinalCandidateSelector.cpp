@@ -370,105 +370,103 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
       return false;
     };
 
-    // A complete same-root owner proof is stronger than a later local
-    // args-only repair that does not carry its own complete-envelope witness.
-    // In multi-terminal tuple cases the first pass may already prove the
-    // entire invocation, including sibling paste/stringify effects.  A later
-    // ordinary standard-argument hunk can be rebuilt from the original
-    // invocation spelling and would otherwise merge over the existing patch,
-    // regressing tuple elements outside the local hunk.  Keep the complete
-    // existing proof before attempting text merge; the merge helper only
-    // reasons about source bytes, not about whether the fresh candidate was
-    // derived from stale root spelling.
-    const bool existingPatchHasCompleteEnvelope =
-        existingPatch->materialized.hasBTokenRange &&
-        existingPatch->materialized.bTokStart <= h.bStart &&
-        h.bEnd <= existingPatch->materialized.bTokEnd &&
-        existingPatch->proof.wholeEnvelopeReplay &&
-        existingPatch->proof.wholeEnvelopeReplay->replayValidated;
-    const bool directPatchHasCompleteEnvelope =
-        argsOnlyCandidate->proof.wholeEnvelopeReplay &&
-        argsOnlyCandidate->proof.wholeEnvelopeReplay->replayValidated;
-    if (existingPatchHasCompleteEnvelope && !directPatchHasCompleteEnvelope) {
-      argsOnlyCandidate.reset();
-      reuseExistingCallsitePatch = true;
-    } else {
+    // A complete same-root owner proof can make a later local args-only
+    // repair redundant. In multi-terminal and zero-token cases the first pass
+    // may already replay the entire invocation, including sibling or
+    // empty-formal effects. Test that exact condition before attempting text
+    // merge; the merge helper reasons only about source bytes and cannot prove
+    // that an original A-domain hunk remains applicable to staged source.
+    auto patchHasValidatedWholeEnvelope =
+        [&](const MacroPatch &patch) -> bool {
+      return patch.materialized.hasBTokenRange &&
+             patch.materialized.bTokStart <= h.bStart &&
+             h.bEnd <= patch.materialized.bTokEnd &&
+             patch.proof.wholeEnvelopeReplay &&
+             patch.proof.wholeEnvelopeReplay->replayValidated &&
+             patch.proof.wholeEnvelopeReplay->rootMacroId == m.id;
+    };
 
-    // If an earlier structure-preserving patch already materializes a B-token
-    // envelope that covers this hunk, do not automatically freeze it.  The
-    // covered-envelope fact proves that both patches talk about the same B
-    // surface, but it does not prove that the older patch has already updated
-    // every source-level formal affected by this hunk.  Direct stringify and
-    // paste repairs such as `FOO(billy, bob) -> FOO(billy, corgan)` must
-    // still be allowed to replace a stale same-root patch.
+    const bool existingHasCompleteEnvelope =
+        patchHasValidatedWholeEnvelope(*existingPatch);
+    const bool directHasCompleteEnvelope =
+        patchHasValidatedWholeEnvelope(*argsOnlyCandidate);
+    const auto &existingEnvelopeReplay =
+        existingPatch->proof.wholeEnvelopeReplay;
+    const bool existingPatchAlreadyRealizesTarget =
+        existingHasCompleteEnvelope && existingEnvelopeReplay &&
+        existingEnvelopeReplay->definitionTapeReplayValidated &&
+        StringRef(existingPatch->replacement) == baseInvText;
+
+    // Two independently proved dominance cases make a fresh local repair
+    // redundant before text merging:
     //
-    // The one case where the older patch really is the stronger owner proof
-    // is the tuple/generated-callee collapse we introduced this guard for:
-    // the original argument is a parenthesized tuple, the existing patch
-    // preserves that tuple, and the later direct args-only candidate replaces
-    // the tuple formal with its generated expansion text.  In that situation
-    // merging or selecting the direct candidate would lose source structure
-    // that has already been proved by the tuple owner.
-    if (existingPatch->materialized.hasBTokenRange &&
-        existingPatch->materialized.bTokStart <= h.bStart &&
-        h.bEnd <= existingPatch->materialized.bTokEnd &&
-        replacementCollapsesParenthesizedTupleFormal(*existingPatch,
-                                                     *argsOnlyCandidate)) {
+    //  * a staged definition-tape replay is exactly the current invocation and
+    //    already realizes the complete edited B envelope; or
+    //  * the existing patch has a validated whole-envelope proof while the
+    //    fresh local candidate does not.
+    //
+    // The first case prevents stale A-domain coordinates from moving tokens
+    // across an originally empty formal. The second preserves sibling
+    // paste/stringify tuple edits that a later local hunk, rebuilt from the
+    // original invocation, cannot prove complete. Neither rule compares
+    // spelling preference: both are strict proof-containment relations.
+    if (existingPatchAlreadyRealizesTarget ||
+        (existingHasCompleteEnvelope && !directHasCompleteEnvelope)) {
       argsOnlyCandidate.reset();
       reuseExistingCallsitePatch = true;
     } else {
-      // First try ordinary compatible text merging. Even when the two patches
-      // touch the same root span, the merge is accepted only if the resulting
-      // replacement still preserves the root invocation envelope.
-      SmallVector<StringRef, 2> repls;
-      repls.push_back(StringRef(argsOnlyCandidate->replacement));
-      repls.push_back(StringRef(existingPatch->replacement));
-      auto merged = mergeCompatibleStringReplacements(
-          baseInvText, ArrayRef<StringRef>(repls));
-      if (merged &&
-          deps_.patchReusePhase.ValidateMergedDirectAndDagRootReplacement(
-              m, baseInvText, StringRef(*merged))) {
-        argsOnlyCandidate->replacement = std::move(*merged);
-        argsOnlyCandidate->materialized.hasOutputByteRange = false;
-        if (!argsOnlyCandidate->macroId)
-          argsOnlyCandidate->macroId = existingPatch->macroId;
-
-        // The merged direct replay is the unique source-level candidate for
-        // this callsite after it absorbs the existing same-root patch.
-        // Keeping the stale pre-merge patch in the final selector would
-        // manufacture a second, non-equivalent witness class for bytes that
-        // are already covered by the merged invocation repair.
-        reuseExistingCallsitePatch = false;
-        existingCallsitePatchAbsorbedByDirectCandidate = true;
+      // If an earlier structure-preserving patch already materializes a B-token
+      // envelope that covers this hunk, do not automatically freeze it. The
+      // covered-envelope fact proves that both patches talk about the same B
+      // surface, but it does not prove that the older patch has already updated
+      // every source-level formal affected by this hunk. Direct stringify and
+      // paste repairs such as `FOO(billy, bob) -> FOO(billy, corgan)` must
+      // still be allowed to replace a stale same-root patch.
+      //
+      // The one case where the older patch really is the stronger owner proof
+      // is the tuple/generated-callee collapse we introduced this guard for:
+      // the original argument is a parenthesized tuple, the existing patch
+      // preserves that tuple, and the later direct args-only candidate replaces
+      // the tuple formal with its generated expansion text. In that situation
+      // merging or selecting the direct candidate would lose source structure
+      // that has already been proved by the tuple owner.
+      if (existingPatch->materialized.hasBTokenRange &&
+          existingPatch->materialized.bTokStart <= h.bStart &&
+          h.bEnd <= existingPatch->materialized.bTokEnd &&
+          replacementCollapsesParenthesizedTupleFormal(*existingPatch,
+                                                       *argsOnlyCandidate)) {
+        argsOnlyCandidate.reset();
+        reuseExistingCallsitePatch = true;
       } else {
-        // If the older same-root callsite patch carries a complete
-        // whole-envelope replay that already covers this B hunk, keep that
-        // stronger proof ahead of a fresh local args-only repair.  This is the
-        // sibling-terminal tuple case: the first pass can prove the complete
-        // tuple rewrite from paste/stringify sibling evidence, while a later
-        // ordinary standard-argument hunk can rebuild the same invocation from
-        // the original tuple spelling and accidentally revert an earlier tuple
-        // element.  Prefer the existing patch only when it has the stronger
-        // whole-envelope witness and the fresh candidate does not; two
-        // competing complete-envelope proofs still fall through to the normal
-        // lattice comparison below.
-        const bool existingHasCompleteEnvelope =
-            existingPatch->materialized.hasBTokenRange &&
-            existingPatch->materialized.bTokStart <= h.bStart &&
-            h.bEnd <= existingPatch->materialized.bTokEnd &&
-            existingPatch->proof.wholeEnvelopeReplay &&
-            existingPatch->proof.wholeEnvelopeReplay->replayValidated;
-        const bool directHasCompleteEnvelope =
-            argsOnlyCandidate->proof.wholeEnvelopeReplay &&
-            argsOnlyCandidate->proof.wholeEnvelopeReplay->replayValidated;
-        if (existingHasCompleteEnvelope && !directHasCompleteEnvelope) {
-          argsOnlyCandidate.reset();
-          reuseExistingCallsitePatch = true;
+        // First try ordinary compatible text merging. Even when the two patches
+        // touch the same root span, the merge is accepted only if the resulting
+        // replacement still preserves the root invocation envelope.
+        SmallVector<StringRef, 2> repls;
+        repls.push_back(StringRef(argsOnlyCandidate->replacement));
+        repls.push_back(StringRef(existingPatch->replacement));
+        auto merged = mergeCompatibleStringReplacements(
+            baseInvText, ArrayRef<StringRef>(repls));
+        if (merged &&
+            deps_.patchReusePhase.ValidateMergedDirectAndDagRootReplacement(
+                m, baseInvText, StringRef(*merged))) {
+          argsOnlyCandidate->replacement = std::move(*merged);
+          argsOnlyCandidate->materialized.hasOutputByteRange = false;
+          if (!argsOnlyCandidate->macroId)
+            argsOnlyCandidate->macroId = existingPatch->macroId;
+
+          // The merged direct replay is the unique source-level candidate for
+          // this callsite after it absorbs the existing same-root patch.
+          // Keeping the stale pre-merge patch in the final selector would
+          // manufacture a second, non-equivalent witness class for bytes that
+          // are already covered by the merged invocation repair.
+          reuseExistingCallsitePatch = false;
+          existingCallsitePatchAbsorbedByDirectCandidate = true;
         } else {
           // If the patches cannot be merged, check whether the direct candidate
           // is independently valid. An invalid direct replay is discarded so
           // the existing callsite patch remains available to the final
-          // selector.
+          // selector. Whole-envelope dominance was already discharged before
+          // the merge attempt, so no duplicate proof comparison is needed here.
           const bool directValid =
               deps_.patchReusePhase.ValidateMergedDirectAndDagRootReplacement(
                   m, baseInvText, StringRef(argsOnlyCandidate->replacement));
@@ -481,10 +479,12 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
             // win merely because it was produced in this local path.
             const bool preferDirect =
                 deps_.proofLattice.AcceptedResultRanker().LatticePrefers(
-                    argsOnlyCandidate->proofSummary, existingPatch->proofSummary);
+                    argsOnlyCandidate->proofSummary,
+                    existingPatch->proofSummary);
             const bool preferExisting =
                 deps_.proofLattice.AcceptedResultRanker().LatticePrefers(
-                    existingPatch->proofSummary, argsOnlyCandidate->proofSummary);
+                    existingPatch->proofSummary,
+                    argsOnlyCandidate->proofSummary);
             if (preferExisting && !preferDirect) {
               argsOnlyCandidate.reset();
               reuseExistingCallsitePatch = true;
@@ -492,7 +492,6 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
           }
         }
       }
-    }
     }
   }
 

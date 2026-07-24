@@ -4,6 +4,8 @@ add_clang_tool(clang-refold
   clang-refold.cpp
   sideband/RefoldSidebandPragmaEdits.cpp
   source/DiffAlgorithms.cpp
+  source/RefoldAlignmentSemanticResolver.cpp
+  source/RefoldLegacyAlignmentDiagnostic.cpp
   line-control/FinalLineControlModel.cpp
   line-control/LineDirectiveInserter.cpp
   line-control/RefoldLineControlFilename.cpp
@@ -12,6 +14,7 @@ add_clang_tool(clang-refold
   edit/RefoldExpansionFallbackPlanner.cpp
   edit/RefoldBInsertionLedger.cpp
   core/RefoldEngine.cpp
+  core/RefoldAlignmentSemanticIntegration.cpp
   core/RefoldLangOptions.cpp
   core/RefoldPreprocessRecheck.cpp
   core/RefoldServiceGraphBuilder.cpp

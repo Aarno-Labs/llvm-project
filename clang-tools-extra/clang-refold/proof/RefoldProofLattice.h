@@ -186,6 +186,7 @@ public:
       const RefoldTheoremAudit &theoremAudit,
       TheoremAuditStats &lastTheoremAudit, bool strict,
       ProofAuditMode &proofAuditMode,
+      const bool &alignmentSemanticTheoremActive,
       std::vector<MixedOwnerTilingSegmentBinding>
           &mixedOwnerTilingSegmentBindings,
       std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses,

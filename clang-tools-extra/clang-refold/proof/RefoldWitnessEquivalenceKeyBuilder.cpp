@@ -637,15 +637,13 @@ std::string ownerStateDeltaSignature(const OwnerRealizationWitness &owner) {
     os << ":tu_carrier={exact="
        << (carrier.exactHunkAndSpanValidated ? 1 : 0)
        << ",structure="
-       << (carrier.protectedStructureExcludedOrAuthorized ? 1 : 0)
+       << (carrier.protectedStructureExcludedOrDeferred ? 1 : 0)
        << ",structural="
        << (carrier.hasStructuralSegmentBinding ? 1 : 0)
        << ",structural_valid="
        << (carrier.structuralSegmentBindingValidated ? 1 : 0)
        << ",structural_id=" << carrier.structuralWitnessId
-       << ",structural_segment=" << carrier.structuralSegmentIndex
-       << ",macro_auth="
-       << carrier.deferredMacroStateAuthorizationCount << '}';
+       << ",structural_segment=" << carrier.structuralSegmentIndex << '}';
   }
   appendStateDeltaSignature(os, "in", owner.closure.stateIn);
   appendStateDeltaSignature(os, "out", owner.closure.stateOut);

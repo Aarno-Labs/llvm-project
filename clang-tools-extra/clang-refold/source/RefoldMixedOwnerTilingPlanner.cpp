@@ -2444,6 +2444,27 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
                   deps_.sourceMapper.ProjectATokenBoundaryToBTokenBounds(
                       h.aStart, h.aEnd, h.bStart, h.bEnd, aBoundary);
           if (!projection || !projection->IsUnique()) {
+            if (inTraceMode()) {
+              REFOLD_LOG_TRACE("tiling/structural",
+                               "structural replacement rejected:");
+              REFOLD_LOG_TRACE("tiling/structural",
+                               "original A=[{0},{1}) B=[{2},{3})",
+                               h.aStart, h.aEnd, h.bStart, h.bEnd);
+              REFOLD_LOG_TRACE("tiling/structural",
+                               "reason=non-unique B partition");
+              if (projection) {
+                REFOLD_LOG_TRACE(
+                    "tiling/structural",
+                    "ambiguous boundary A={0} lowerB={1} upperB={2}",
+                    aBoundary, projection->lowerBTokenBoundary,
+                    projection->upperBTokenBoundary);
+              } else {
+                REFOLD_LOG_TRACE("tiling/structural",
+                                 "ambiguous boundary A={0} projection="
+                                 "<incomplete>",
+                                 aBoundary);
+              }
+            }
             projectionsComplete = false;
             break;
           }

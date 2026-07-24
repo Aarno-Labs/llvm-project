@@ -132,7 +132,6 @@ struct ResyncOutcome {
 /// never sufficient.
 enum class ProtectedSourceEditAuthorityKind : uint8_t {
   Unknown,
-  DirectTUMacroStateRepair,
   MacroStateRepair,
   /// Moves a TU-visible include directive whose included subtree owns the
   /// macro-state transition being repaired.  This authority is narrower than
