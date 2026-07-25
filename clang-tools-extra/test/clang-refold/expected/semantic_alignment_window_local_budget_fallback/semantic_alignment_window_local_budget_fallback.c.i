@@ -1,0 +1,15 @@
+int prefix_0 = 10;
+int prefix_1 = 11;
+int prefix_2 = 12;
+int prefix_3 = 13;
+int prefix_4 = 14;
+int prefix_5 = 15;
+int prefix_6 = 16;
+int prefix_7 = 17;
+int left_window_marker = 7001;
+;;;;;;;;;;
+int right_window_marker = 7002;
+int suffix_0 = 20;
+int suffix_1 = 21;
+int suffix_2 = 22;
+int suffix_3 = 23;

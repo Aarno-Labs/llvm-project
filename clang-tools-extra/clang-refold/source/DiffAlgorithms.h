@@ -44,8 +44,9 @@
 //       A[i] -> B[j] (j >= 0) or -1; owner-aware/provenance-certified when
 //       structured gap profiles are supplied.
 //   • std::vector<Hunk> hunksFromMap(ArrayRef<int64_t> map,
+//                                    ArrayRef<LcsCertifiedBoundary> seams,
 //                                    size_t nA, size_t nB):
-//       contiguous edit regions between anchors, half-open indices.
+//       contiguous edit regions between anchors, split at exact DP seams.
 //   • std::vector<Step> diff(ArrayRef<StringRef> A, ArrayRef<StringRef> B):
 //       shortest edit script (EQUAL/INSERT/DELETE).
 //   • std::vector<Hunk> coalesce(ArrayRef<Step> steps):
@@ -71,6 +72,7 @@
 #include "core/RefoldFormatProviders.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FormatAdapters.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -277,11 +279,11 @@ struct LcsObjective {
 enum class LcsAnchorProofKind : uint8_t {
   /// No theorem authorizes an anchor at this A-token position.
   None,
-  /// Every globally core-optimal weighted-LCS path uses this exact match edge.
+  /// Every core-optimal weighted-LCS path through the anchor's certified
+  /// window uses this exact match edge.
   CoreOptimalPathForced,
-  /// A semantic alignment resolver proved that every remaining globally
-  /// core-optimal explanation produces one equivalent normalized owner/edit
-  /// realization.
+  /// A semantic alignment resolver proved that every remaining admissible
+  /// explanation produces one equivalent normalized owner/edit realization.
   EquivalentNormalizedHunkAndOwner,
 };
 
@@ -310,6 +312,89 @@ struct LcsAnchorProof {
     if (kind == LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner)
       return semanticWitnessId != 0;
     return false;
+  }
+};
+
+/// Theorem that authorizes one exact A/B dynamic-programming boundary.
+enum class LcsBoundaryProofKind : uint8_t {
+  /// No theorem authorizes this boundary.
+  None,
+  /// Every core-optimal weighted-LCS path through the enclosing window
+  /// crosses this exact DP state.
+  EveryOptimalPathCrossesState,
+  /// A producer-backed theorem proved that every remaining admissible
+  /// frontier induces the same downstream normalized result.
+  EquivalentDownstreamResult,
+};
+
+inline StringRef toString(LcsBoundaryProofKind kind) {
+  switch (kind) {
+  case LcsBoundaryProofKind::None:
+    return "None";
+  case LcsBoundaryProofKind::EveryOptimalPathCrossesState:
+    return "EveryOptimalPathCrossesState";
+  case LcsBoundaryProofKind::EquivalentDownstreamResult:
+    return "EquivalentDownstreamResult";
+  }
+  llvm_unreachable("invalid LCS boundary proof kind");
+}
+
+/// Certification disposition for one half-open A/B alignment rectangle.
+enum class LcsWindowCertificationStatus : uint8_t {
+  /// Complete all-optimal state was materialized for this window.
+  Certified,
+  /// The checked local allocation exceeded the configured proof budget.
+  BudgetExceeded,
+  /// The window could not be certified for a non-budget proof reason.
+  PartitionUnresolved,
+};
+
+inline StringRef toString(LcsWindowCertificationStatus status) {
+  switch (status) {
+  case LcsWindowCertificationStatus::Certified:
+    return "Certified";
+  case LcsWindowCertificationStatus::BudgetExceeded:
+    return "BudgetExceeded";
+  case LcsWindowCertificationStatus::PartitionUnresolved:
+    return "PartitionUnresolved";
+  }
+  llvm_unreachable("invalid LCS window certification status");
+}
+
+/// Exact certified seam between two independently alignable A/B regions.
+struct LcsCertifiedBoundary {
+  uint64_t aBoundary = 0;
+  uint64_t bBoundary = 0;
+  LcsBoundaryProofKind proofKind = LcsBoundaryProofKind::None;
+
+  bool IsAuthorized() const {
+    return proofKind != LcsBoundaryProofKind::None;
+  }
+};
+
+/// Certification record for one half-open A/B token window.
+struct LcsCertificationWindow {
+  uint64_t aBegin = 0;
+  uint64_t aEnd = 0;
+  uint64_t bBegin = 0;
+  uint64_t bEnd = 0;
+
+  LcsWindowCertificationStatus status =
+      LcsWindowCertificationStatus::PartitionUnresolved;
+  /// Checked peak heap payload required by the local all-optimal certifier.
+  uint64_t requiredBytes = 0;
+  /// Proof byte budget applied to this local certification attempt.
+  uint64_t proofBudgetBytes = 0;
+
+  bool IsCertified() const {
+    return status == LcsWindowCertificationStatus::Certified;
+  }
+
+  /// Return true when this certified rectangle contains the complete match
+  /// edge from `(aToken,bToken)` to `(aToken+1,bToken+1)`.
+  bool ContainsAnchor(uint64_t aToken, uint64_t bToken) const {
+    return IsCertified() && aBegin <= aToken && aToken < aEnd &&
+           bBegin <= bToken && bToken < bEnd;
   }
 };
 
@@ -409,6 +494,77 @@ private:
   std::shared_ptr<const Storage> storage_;
 };
 
+/// Exact result of certifying one conditioned A/B alignment window.
+///
+/// The vectors are indexed relative to `window.aBegin`, but every nonnegative
+/// B value is an absolute index in the caller's complete B token stream. This
+/// representation keeps the result proportional to the local A width while
+/// making independently certified windows directly mergeable into one global
+/// map without another coordinate-conversion theorem.
+///
+/// The core window certifier initializes `selectedMap` from `forcedMap`; it
+/// does not perform semantic restoration. Quadratic all-optimal state is
+/// deliberately not retained here, so it is released when
+/// `certifyLcsWindow()` returns. The complete-stream compatibility path may
+/// retain that state separately in its `OptimalTokenAlignmentOracle` to
+/// preserve existing behavior.
+struct LcsWindowCertificationResult {
+  LcsCertificationWindow window;
+  LcsObjective objective;
+  bool objectiveIsExact = false;
+  std::vector<int64_t> forcedMap;
+  std::vector<int64_t> selectedMap;
+  std::vector<LcsAnchorProof> selectedAnchorProofs;
+
+  bool IsCertified() const { return window.IsCertified(); }
+};
+
+/// Exact linear-space projection of one A boundary into an enclosing B range.
+///
+/// `admissibleBFrontiers` contains every B-side DP frontier at which the
+/// enclosing window's complete weighted objective decomposes exactly into its
+/// left and right subobjectives. The vector is sorted and absolute. A singleton
+/// vector therefore proves that every optimal path crosses one exact DP state;
+/// no selected Hirschberg split or boundary-ranking policy contributes to the
+/// result.
+struct LcsBoundaryFrontierProjection {
+  uint64_t aBoundary = 0;
+  LcsObjective windowObjective;
+  bool objectiveIsExact = false;
+  std::vector<uint64_t> admissibleBFrontiers;
+
+  bool ProvesUniqueBoundary() const {
+    return objectiveIsExact && admissibleBFrontiers.size() == 1;
+  }
+};
+
+/// Exact state-seam partition produced without a quadratic DP table.
+///
+/// Every boundary carries an `EveryOptimalPathCrossesState` theorem. The
+/// resulting windows cover the requested rectangle in source order and remain
+/// `PartitionUnresolved` until the local quadratic certifier processes them.
+/// This separation keeps seam proof linear-space and lets callers decide when
+/// to spend quadratic proof memory on each independent window.
+struct LcsWindowPartitionResult {
+  LcsObjective objective;
+  bool objectiveIsExact = false;
+  llvm::SmallVector<LcsCertifiedBoundary, 8> certifiedBoundaries;
+  llvm::SmallVector<LcsCertificationWindow, 8> windows;
+};
+
+/// Optional evidence ledger for permanent certification diagnostics.
+///
+/// This record is populated only when a caller explicitly supplies it. Keeping
+/// frontier vectors outside `CertifiedLcsResult` prevents diagnostic retention
+/// from increasing ordinary production memory or changing the proof result.
+struct LcsCertificationDiagnosticEvidence {
+  /// Sorted unique A boundaries nominated for the exact frontier theorem.
+  llvm::SmallVector<uint64_t, 8> candidateABoundaries;
+  /// Exact admissible B-frontier sets for every boundary actually tested.
+  llvm::SmallVector<LcsBoundaryFrontierProjection, 8>
+      boundaryFrontierProjections;
+};
+
 /// Structured result of the provenance-certified weighted LCS.
 ///
 /// `forcedMap` contains only anchors forced by the unchanged core objective.
@@ -417,17 +573,81 @@ private:
 /// records one durable `EquivalentNormalizedHunkAndOwner` witness. Every mapped
 /// A token has a parallel `selectedAnchorProofs` entry naming its authority.
 ///
-/// When `completeCertification` is false, both maps and all proofs contain no
-/// anchors. The exact global objective is still returned, but no single
-/// linear-space LCS realization is exposed as though it certified ambiguity.
+/// Certification is window-local. A failed window contributes no anchors, but
+/// anchors already proved in independent certified windows remain valid. The
+/// current implementation initially represents the complete stream as one
+/// window; later partitioning patches may populate certified and uncertified
+/// windows simultaneously without changing this authority contract.
 struct CertifiedLcsResult {
   std::vector<int64_t> forcedMap;
   std::vector<int64_t> selectedMap;
   std::vector<LcsAnchorProof> selectedAnchorProofs;
   OptimalTokenAlignmentOracle oracle;
+  /// Exact optimum for the complete A/B token streams when the companion
+  /// exactness flag is true, even if one or more windows are uncertified.
   LcsObjective globalObjective;
-  bool completeCertification = false;
+  bool globalObjectiveIsExact = false;
+  /// Aggregate convenience bit; partition validation requires it to equal the
+  /// conjunction of every window's `Certified` status.
+  bool allWindowsCertified = false;
+  /// Keep the initial full-stream window inline so this structural patch does
+  /// not change the existing proof-budget threshold. Later partitioning may
+  /// grow these ledgers without changing their ordered semantics.
+  llvm::SmallVector<LcsCertifiedBoundary, 1> certifiedBoundaries;
+  llvm::SmallVector<LcsCertificationWindow, 1> certificationWindows;
+
+  /// Return true when an A/B match edge lies wholly inside a certified window.
+  bool AnchorBelongsToCertifiedWindow(uint64_t aToken,
+                                      uint64_t bToken) const;
+
+  /// Validate the ordered window partition and its aggregate status.
+  ///
+  /// Empty-sided insertion/deletion windows are valid. A window with no A or B
+  /// progress is valid only for the single empty-stream partition.
+  bool CertificationPartitionIsWellFormed(uint64_t aTokenCount,
+                                          uint64_t bTokenCount) const;
+
+  /// Return true when the retained oracle certifies one complete-stream
+  /// window. Low-level consumers of complete global pair facts should use this
+  /// query rather than inferring authority from an aggregate Boolean; semantic
+  /// restoration should use `HasCompleteSemanticOracleForWindow()` so its
+  /// per-window availability remains explicit.
+  bool HasCompleteGlobalOracle() const;
+
+  /// Return true when semantic restoration may enumerate every optimal map in
+  /// one certification window.
+  ///
+  /// A `Certified` status proves core-forced anchors, but it does not imply
+  /// that the quadratic pair facts needed by semantic equivalence remain
+  /// available. The current conservative implementation retains those facts
+  /// only for the single complete-stream compatibility window. Partitioned
+  /// results therefore return false even when every local window certified;
+  /// a later compositional theorem may extend this query without weakening the
+  /// fail-closed contract.
+  bool HasCompleteSemanticOracleForWindow(size_t windowIndex) const;
+
+  /// Discard every semantic-restored selection while preserving all
+  /// independently certified core anchors.
+  ///
+  /// This operation is the conservative boundary used when semantic
+  /// restoration lacks complete explanations for one or more windows. It does
+  /// not alter `forcedMap`, certification windows, seams, or the exact global
+  /// objective.
+  void RetainOnlyCoreForcedAnchors();
 };
+
+/// Format one stable evidence-only certification transcript.
+///
+/// The returned lines describe the complete global objective, every tested
+/// partition boundary and admissible frontier set, accepted seams, local
+/// certification windows, retained proof kinds, and exact failed rectangles.
+/// Formatting reads only the finished result and cannot affect candidate order,
+/// map publication, or any proof decision.
+std::vector<std::string>
+describeLcsCertificationRun(
+    const CertifiedLcsResult &result,
+    const LcsCertificationDiagnosticEvidence &diagnosticEvidence,
+    uint64_t aTokenCount, uint64_t bTokenCount);
 
 /// \brief Structured provenance for one A-side token gap used by LCS.
 ///
@@ -460,6 +680,161 @@ struct LcsAGapProvenance {
   uint32_t leftMacroRoleMask = 0;
   uint32_t rightMacroRoleMask = 0;
 };
+
+/// Certify one exact half-open A/B token window.
+///
+/// The local dynamic program is conditioned on entering at
+/// `(aBegin,bBegin)` and leaving at `(aEnd,bEnd)`. It uses the unchanged
+/// weighted-LCS objective and the same all-optimal-path dominator theorem as
+/// `certifiedLcsMapAB()`. No selected Hirschberg path is published.
+///
+/// On success, the returned maps have length `aEnd-aBegin`; mapped B indices
+/// are absolute. On a proof-budget failure, the result records
+/// `BudgetExceeded`, the checked local byte requirement, and the exact local
+/// objective while keeping both maps fully suppressed. Invalid bounds or an
+/// unrepresentable local state space produce `PartitionUnresolved`.
+///
+/// Quadratic tables, pair facts, and dominator state are local to this call and
+/// are destroyed before it returns. This permits callers to certify windows
+/// sequentially with peak quadratic storage determined by the largest window.
+bool certifyLcsWindow(
+    ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
+    ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    unsigned long long maxBytes, LcsWindowCertificationResult &result);
+
+/// Compute the exact checked heap-payload requirement for one certification
+/// rectangle without running dynamic programming or allocating its tables.
+///
+/// `retainCompleteOracle` must be true for the historical complete-stream path
+/// and false for an isolated local window. The distinction accounts for the
+/// additional retained owner-gap copy in the complete oracle. False means the
+/// rectangle or compact dominator index is not representable.
+bool getLcsCertificationRequiredBytes(uint64_t aTokenCount,
+                                      uint64_t bTokenCount,
+                                      bool retainCompleteOracle,
+                                      uint64_t &requiredBytes);
+
+/// Project one A boundary to every exact optimal B frontier in linear space.
+///
+/// The complete weighted objective is used: matched-token count is maximized
+/// first and owner-depth cost is minimized second. The routine retains only a
+/// constant number of B-width rows and never reconstructs one selected path.
+/// Invalid bounds or malformed provenance return false and leave an incomplete
+/// result.
+bool projectLcsBoundaryToOptimalBFrontiers(
+    ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
+    ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
+    uint64_t aBoundary, ArrayRef<LcsAGapProvenance> gapProvenance,
+    LcsBoundaryFrontierProjection &result);
+
+/// Nominate deterministic, identity-bearing A partition boundaries.
+///
+/// The returned vector is sorted and unique. It contains exact provenance
+/// transitions, including stream endpoints when independently nominated, the
+/// endpoints of maximal runs of already-forced token edges,
+/// and any caller-supplied producer/protected-structure boundaries. Candidate
+/// nomination grants no B-side authority; `partitionLcsWindowsLinearSpace()`
+/// must still prove a singleton optimal frontier.
+std::vector<uint64_t> nominateLcsPartitionBoundaries(
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    ArrayRef<int64_t> forcedMap = {},
+    ArrayRef<uint64_t> additionalABoundaries = {});
+
+/// Partition one A/B rectangle at exact state seams.
+///
+/// Candidate order is normalized before proof, so input order cannot affect
+/// the result. Every candidate is tested against the complete enclosing-window
+/// objective using exact forward and suffix rows. All singleton frontiers are
+/// accepted together. A candidate with zero or multiple frontiers is never
+/// selected by rank, proximity, balance, or Hirschberg traversal order.
+///
+/// Callers should supply the bounded structural set returned by
+/// `nominateLcsPartitionBoundaries()` plus any exact producer/protected
+/// boundaries. The routine does not impose a lossy count cap or scan every A
+/// token boundary implicitly.
+///
+/// This exhaustive evidence API computes one complete forward/suffix
+/// projection per supplied candidate. It is appropriate for focused proof
+/// queries and tests, but production certification of large streams must use
+/// `certifyLcsWindowsWithinBudget()`, whose balanced recursion has a geometric
+/// work bound independent of the total nomination count.
+///
+/// The result contains only partition evidence; all windows remain
+/// `PartitionUnresolved` and publish no anchors.
+bool partitionLcsWindowsLinearSpace(
+    ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
+    ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    ArrayRef<uint64_t> candidateABoundaries,
+    LcsWindowPartitionResult &result,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence = nullptr);
+
+/// Partition the complete streams and certify each resulting window locally.
+///
+/// Nonempty candidate A boundaries are first proved with
+/// `partitionLcsWindowsLinearSpace()`. Every resulting window is then passed,
+/// in source order, to the existing bounded all-optimal certifier. Certified
+/// anchors are translated into the complete-stream maps; an uncertified window
+/// contributes no anchors but does not revoke anchors or exact seams proved in
+/// independent windows.
+///
+/// `maxBytes` is a per-window proof budget. Each window records its own checked
+/// `requiredBytes`, applied `proofBudgetBytes`, and final status. Quadratic
+/// state is local to one `certifyLcsWindow()` call and is destroyed before the
+/// next window is processed, so peak quadratic storage is determined by the
+/// largest individual window rather than the complete A/B grid. When no
+/// interior seam is proved, the established one-window compatibility path is
+/// reused, including its retained complete-stream oracle and historical byte
+/// threshold.
+///
+/// The function returns false only when the inputs or composed proof result are
+/// malformed. Local `BudgetExceeded` and `PartitionUnresolved` statuses are
+/// successful fail-closed outcomes represented in `result`; callers must
+/// inspect `allWindowsCertified` rather than interpreting the return value as
+/// aggregate certification.
+///
+/// Callers that supply nonempty nominations must pass the resulting
+/// `certifiedBoundaries` to seam-aware hunk construction so independently
+/// certified regions cannot be recombined. Supplying a diagnostic-evidence
+/// pointer records frontier sets but does not alter proof or map results.
+bool certifyLcsWindowsIndependently(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    ArrayRef<uint64_t> candidateABoundaries,
+    unsigned long long maxBytes, CertifiedLcsResult &result,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence = nullptr);
+
+/// Partition only oversized windows, using exact balanced state-seam proofs.
+///
+/// This is the production scalability path. A complete-stream theorem that
+/// exceeds `maxBytes` is divided recursively. Each oversized window tests its
+/// arithmetic A midpoint first, then at most one nearest producer-nominated A
+/// boundary from the middle half of the window if the midpoint has multiple
+/// admissible B frontiers. A split is accepted only when the complete weighted
+/// objective proves one unique B frontier; A-boundary scheduling never selects
+/// B-side authority.
+///
+/// An accepted midpoint halves the A width; an accepted producer fallback
+/// leaves each child with at most three quarters of the parent A width. The sum
+/// of child-grid areas therefore decreases geometrically, independent of the
+/// proved B frontier. Consequently recursive partitioning performs only a
+/// bounded constant multiple of one complete-grid linear-space pass instead of
+/// one complete pass per structural candidate.
+/// Windows that already fit the local proof budget are not projected again.
+/// An oversized window for which neither tested A boundary proves a unique
+/// frontier remains one fail-closed window.
+///
+/// Producer nominations are normalized and used only as deterministic fallback
+/// A coordinates. They never nominate or rank a B frontier. Diagnostic
+/// evidence records every boundary actually tested and cannot affect proof
+/// order or results.
+bool certifyLcsWindowsWithinBudget(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    ArrayRef<uint64_t> candidateABoundaries,
+    unsigned long long maxBytes, CertifiedLcsResult &result,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence = nullptr);
 
 /// \brief Edited-side structural surface for one B-side token gap.
 ///
@@ -545,8 +920,8 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 /// `selectedMap` initially equals the exact every-optimal-path `forcedMap`.
 /// Non-forced production anchors belong to the separate semantic alignment
 /// resolver and therefore cannot contaminate the all-optimal oracle. If the
-/// all-optimal tables exceed the proof budget, both maps are returned fully
-/// suppressed and `completeCertification` is false.
+/// all-optimal tables exceed the proof budget, the single full-stream window
+/// is marked `BudgetExceeded` and both maps remain fully suppressed.
 CertifiedLcsResult
 certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                   ArrayRef<LcsAGapProvenance> gapProvenance,
@@ -570,9 +945,10 @@ certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 /// then builds a certified partial map containing only core-LCS-forced
 /// anchors. Ambiguous equal-token anchors remain suppressed until the separate
 /// semantic resolver proves that every optimal explanation induces one
-/// equivalent normalized owner/edit realization. If complete certification
-/// exceeds the configured proof budget, the returned map is fully suppressed
-/// rather than selecting one uncertified weighted LCS.
+/// equivalent normalized owner/edit realization. A failed certification
+/// window contributes no anchors; in the current one-window implementation,
+/// that conservatively suppresses the complete returned map rather than
+/// selecting one uncertified weighted LCS.
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                               ArrayRef<LcsAGapProvenance> gapProvenance,
                               unsigned long long maxBytes = DEFAULT_MAX_BYTES);
@@ -624,9 +1000,12 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 ///   (one-sided LCS-style alignment).
 /// * `map[i] = -1` → `A[i]` is unmatched.
 ///
-/// The function walks the aligned pairs in order and emits a `Hunk` for
-/// every region between consecutive anchors, including the leading region
-/// before the first match and the trailing region after the last match.
+/// The function walks each A/B rectangle delimited by `certifiedBoundaries`
+/// independently. Within one rectangle it emits a `Hunk` for every region
+/// between consecutive token anchors, including the leading and trailing
+/// regions. A certified boundary is therefore a hard edit-region cut even
+/// when no matched token crosses that DP state. The seam itself is never
+/// represented as an equal token or synthetic anchor.
 ///
 /// Each hunk describes the half-open intervals `A[aStart,aEnd)` and
 /// `B[bStart,bEnd)` that differ:
@@ -634,16 +1013,30 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 /// * **DELETE:** `aStart < aEnd && bStart == bEnd`
 /// * **REPLACE:** `aStart < aEnd && bStart < bEnd`
 ///
+/// Authorized seams must be ordered, monotone, interior DP states within the
+/// complete A/B rectangle. Every mapped edge must remain inside exactly one
+/// seam-delimited rectangle. Malformed proof input is rejected rather than
+/// being interpreted as an alignment hint.
+///
 /// **Determinism:**
-/// Output depends only on `map`, `nA`, and `nB`; no heuristics or
-/// look-ahead are used. Complexity is *O(nA)* with *O(1)* extra space.
+/// Output depends only on `map`, the exact certified seam sequence, `nA`, and
+/// `nB`; no heuristic or selected-path information is used. Complexity is
+/// *O(nA + certifiedBoundaries.size())* with *O(1)* auxiliary state beyond
+/// the returned hunk vector.
 ///
 /// \param map One-sided alignment from A indices to B indices (`-1` for
 ///            unmatched A positions).
+/// \param certifiedBoundaries Exact DP-state seams that must split hunks.
 /// \param nA  Size of sequence A.
 /// \param nB  Size of sequence B.
-/// \returns   List of `Hunk` objects, one per contiguous edit region
-///            between anchors.
+/// \returns   List of `Hunk` objects, one per contiguous edit region inside
+///            one seam-delimited rectangle.
+std::vector<Hunk>
+hunksFromMap(ArrayRef<int64_t> map,
+             ArrayRef<LcsCertifiedBoundary> certifiedBoundaries, size_t nA,
+             size_t nB);
+
+/// Backward-compatible hunk construction for callers with no certified seams.
 std::vector<Hunk> hunksFromMap(ArrayRef<int64_t> map, size_t nA, size_t nB);
 
 } // namespace diffutils

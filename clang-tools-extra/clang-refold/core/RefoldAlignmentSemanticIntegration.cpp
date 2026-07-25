@@ -702,9 +702,23 @@ void RefoldEngine::ResolveSemanticAlignment(
     ArrayRef<diffutils::LcsBGapProvenance> bGapProvenance,
     diffutils::CertifiedLcsResult &alignment) {
   alignmentSemanticResolutionWitnesses_.clear();
-  if (!alignmentSemanticResolverEnabled_ || alignmentSelectionOverride_ ||
-      !alignment.completeCertification)
+  if (!alignmentSemanticResolverEnabled_ || alignmentSelectionOverride_)
     return;
+
+  // The current semantic theorem enumerates complete global optimal maps and
+  // compares their full planner realizations. A certified local window without
+  // retained pair facts is sufficient for core anchors, but not for that
+  // cross-window theorem. Fail closed to the union of independently certified
+  // core anchors rather than revoking anchors from neighboring windows or
+  // consulting incomplete alignment explanations.
+  if (!alignment.HasCompleteSemanticOracleForWindow(/*windowIndex=*/0)) {
+    alignment.RetainOnlyCoreForcedAnchors();
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "semantic restoration unavailable for the complete certification "
+        "partition; retaining independently certified core anchors");
+    return;
+  }
 
   RefoldAlignmentSemanticResolver resolver(
       RefoldAlignmentSemanticResolver::Dependencies{
@@ -714,6 +728,13 @@ void RefoldEngine::ResolveSemanticAlignment(
           }});
   RefoldAlignmentSemanticResolver::ResolutionResult resolution =
       resolver.Resolve();
+  if (!resolution.committedEquivalentClass) {
+    // Enumeration failure, proof-budget exhaustion, or multiple inequivalent
+    // realizations grants no rank-selected authority. Preserve the exact core
+    // map directly rather than relying on a resolver fallback payload.
+    alignment.RetainOnlyCoreForcedAnchors();
+    return;
+  }
   alignment.selectedMap = std::move(resolution.selectedMap);
   alignment.selectedAnchorProofs =
       std::move(resolution.selectedAnchorProofs);

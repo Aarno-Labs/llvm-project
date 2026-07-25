@@ -165,8 +165,7 @@ bool addObjectiveChecked(diffutils::LcsObjective &total,
 bool mapCanOccurOnOneOptimalPath(
     ArrayRef<int64_t> map, const diffutils::CertifiedLcsResult &alignment,
     std::string &failure) {
-  if (!alignment.completeCertification ||
-      !alignment.oracle.HasCompleteCertification()) {
+  if (!alignment.HasCompleteSemanticOracleForWindow(/*windowIndex=*/0)) {
     failure = "core all-optimal oracle is incomplete";
     return false;
   }
@@ -289,8 +288,8 @@ LegacyAlignmentDiagnosticResult reconstructLegacyBoundaryProposal(
   result.selectedMap.assign(aCount, -1);
   result.anchorOrigins.assign(aCount, LegacyAlignmentAnchorOrigin::None);
 
-  if (!coreAlignment.completeCertification ||
-      !coreAlignment.oracle.HasCompleteCertification()) {
+  if (!coreAlignment.HasCompleteSemanticOracleForWindow(
+          /*windowIndex=*/0)) {
     result.constructionFailure = "core all-optimal certification is incomplete";
     return result;
   }
@@ -353,8 +352,8 @@ LegacyAlignmentDiagnosticResult reconstructLegacyBoundaryProposal(
              bPartnerCount[static_cast<size_t>(bToken)] == 1);
   };
 
-  const std::vector<diffutils::Hunk> seedHunks =
-      diffutils::hunksFromMap(result.selectedMap, aCount, bCount);
+  const std::vector<diffutils::Hunk> seedHunks = diffutils::hunksFromMap(
+      result.selectedMap, coreAlignment.certifiedBoundaries, aCount, bCount);
   for (const diffutils::Hunk &seedHunk : seedHunks) {
     const uint64_t aWidth = seedHunk.aEnd - seedHunk.aStart;
     const uint64_t bWidth = seedHunk.bEnd - seedHunk.bStart;
@@ -565,8 +564,8 @@ LegacyAlignmentDiagnosticResult reconstructLegacyBoundaryProposal(
         !result.monotone ? "legacy shadow map is non-monotone"
                          : "legacy shadow map does not preserve token equality";
   }
-  result.hunks =
-      diffutils::hunksFromMap(result.selectedMap, aCount, bCount);
+  result.hunks = diffutils::hunksFromMap(
+      result.selectedMap, coreAlignment.certifiedBoundaries, aCount, bCount);
   result.complete = true;
   return result;
 }

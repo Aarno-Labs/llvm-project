@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstddef>
 #include <limits>
 #include <optional>
@@ -34,6 +35,33 @@ using namespace llvm;
 namespace clang {
 namespace refold {
 
+namespace {
+
+constexpr StringLiteral TestOnlyCertificationBudgetEnvironment =
+    "CLANG_REFOLD_TEST_ONLY_LCS_CERTIFICATION_BYTE_BUDGET";
+
+/// Return the production proof budget unless a test explicitly injects one.
+///
+/// The environment hook is intentionally test-only and has no default effect.
+/// It lets llvm-lit exercise exact local threshold behavior without requesting
+/// large real allocations or adding a user-facing policy option.
+static uint64_t getLcsCertificationByteBudget() {
+  const char *injected =
+      std::getenv(TestOnlyCertificationBudgetEnvironment.data());
+  if (injected == nullptr)
+    return diffutils::DEFAULT_MAX_BYTES;
+
+  uint64_t parsed = 0;
+  if (StringRef(injected).getAsInteger(10, parsed)) {
+    REFOLD_LOG_FATAL(
+        "lcs/certification",
+        "invalid test-only LCS certification byte budget '{0}'", injected);
+  }
+  return parsed;
+}
+
+} // namespace
+
 RefoldTokenDiffPlanner::RefoldTokenDiffPlanner(Dependencies deps)
     : deps_(deps) {}
 
@@ -45,10 +73,18 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
 
   diffutils::CertifiedLcsResult alignment;
   if (deps_.alignmentOverride) {
-    alignment.completeCertification = true;
     alignment.selectedMap = deps_.alignmentOverride->selectedMap;
     alignment.selectedAnchorProofs =
         deps_.alignmentOverride->selectedAnchorProofs;
+    alignment.globalObjective = deps_.alignmentOverride->globalObjective;
+    alignment.globalObjectiveIsExact =
+        deps_.alignmentOverride->globalObjectiveIsExact;
+    alignment.allWindowsCertified =
+        deps_.alignmentOverride->allWindowsCertified;
+    alignment.certifiedBoundaries =
+        deps_.alignmentOverride->certifiedBoundaries;
+    alignment.certificationWindows =
+        deps_.alignmentOverride->certificationWindows;
     alignment.forcedMap.assign(alignment.selectedMap.size(), -1);
     for (size_t aToken = 0; aToken < alignment.selectedMap.size(); ++aToken) {
       if (alignment.selectedMap[aToken] < 0 ||
@@ -61,12 +97,58 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
   } else {
     std::vector<diffutils::LcsAGapProvenance> gapProvenance =
         ComputeLcsAGapProvenanceForPP(deps_.ownerDepthGap);
-    alignment = diffutils::certifiedLcsMapAB(aSeq, bSeq, gapProvenance);
-    // The permanent ambiguity census is evidence-only and may inspect every
-    // admissible repeated-token pair. Do not pay that cost when trace output is
-    // disabled.
-    if (inTraceMode())
-      TraceAlignmentAmbiguityWindows(aSeq, bSeq, alignment);
+    const uint64_t certificationByteBudget =
+        getLcsCertificationByteBudget();
+    uint64_t completeStreamRequiredBytes = 0;
+    const bool completeStreamIsRepresentable =
+        diffutils::getLcsCertificationRequiredBytes(
+            aSeq.size(), bSeq.size(), /*retainCompleteOracle=*/true,
+            completeStreamRequiredBytes);
+
+    size_t unmappedProtectedIntervals = 0;
+    std::vector<uint64_t> protectedABoundaries;
+    std::vector<uint64_t> candidateABoundaries;
+    diffutils::LcsCertificationDiagnosticEvidence diagnosticEvidence;
+    diffutils::LcsCertificationDiagnosticEvidence *diagnosticEvidenceOut =
+        inTraceMode() ? &diagnosticEvidence : nullptr;
+
+    if (completeStreamIsRepresentable &&
+        completeStreamRequiredBytes <= certificationByteBudget) {
+      // A fitting complete-stream theorem is already exact and retains the
+      // semantic oracle. Ordinary runs therefore avoid both partition-frontier
+      // DP and protected-boundary collection. Trace runs still collect the
+      // nominations needed by the permanent evidence transcript.
+      alignment = diffutils::certifiedLcsMapAB(
+          aSeq, bSeq, gapProvenance, certificationByteBudget);
+      if (diagnosticEvidenceOut) {
+        protectedABoundaries =
+            CollectProtectedAlignmentABoundaries(unmappedProtectedIntervals);
+        candidateABoundaries = diffutils::nominateLcsPartitionBoundaries(
+            gapProvenance, /*forcedMap=*/{}, protectedABoundaries);
+        diagnosticEvidence.candidateABoundaries.assign(
+            candidateABoundaries.begin(), candidateABoundaries.end());
+      }
+    } else {
+      protectedABoundaries =
+          CollectProtectedAlignmentABoundaries(unmappedProtectedIntervals);
+      candidateABoundaries = diffutils::nominateLcsPartitionBoundaries(
+          gapProvenance, /*forcedMap=*/{}, protectedABoundaries);
+      if (!diffutils::certifyLcsWindowsWithinBudget(
+              aSeq, bSeq, gapProvenance, candidateABoundaries,
+              certificationByteBudget, alignment, diagnosticEvidenceOut)) {
+        REFOLD_LOG_FATAL("lcs/map",
+                         "window-local LCS certification failed");
+      }
+    }
+    // The ambiguity census is evidence-only and may enumerate complete pair
+    // facts, so prepare it only for trace runs. The final certification
+    // transcript is emitted after semantic restoration so its retained-anchor
+    // proof counts describe the surface that production actually consumes.
+    if (inTraceMode()) {
+      TraceAlignmentAmbiguityWindows(
+          aSeq, bSeq, protectedABoundaries, unmappedProtectedIntervals,
+          alignment);
+    }
     if (deps_.semanticAlignmentResolver) {
       // The historical boundary policy is reconstructed only as a proposal.
       // Its B-gap surface ranks never grant authority: every proposed
@@ -77,27 +159,55 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
       deps_.semanticAlignmentResolver(aSeq, bSeq, gapProvenance,
                                       bGapProvenance, alignment);
     }
+    if (inTraceMode())
+      TraceAlignmentCertificationRun(alignment, diagnosticEvidence,
+                                     aSeq.size(), bSeq.size());
   }
   const std::vector<int64_t> &a2b = alignment.selectedMap;
 
-  // An incomplete structured result is not an alignment certificate. The
-  // diff layer deliberately publishes no anchors in that case, causing the
-  // downstream owner/structure planners to see one conservative edit island.
-  // Keep this assertion at the refolding boundary so a future compatibility
-  // fallback cannot silently reintroduce uncertified provenance.
-  if (!alignment.completeCertification &&
-      std::any_of(a2b.begin(), a2b.end(),
-                  [](int64_t bToken) { return bToken >= 0; })) {
-    REFOLD_LOG_FATAL(
-        "lcs/map",
-        "incomplete structured LCS result exposed an uncertified token anchor");
+  if (!alignment.globalObjectiveIsExact)
+    REFOLD_LOG_FATAL("lcs/map", "global LCS objective is not exact");
+  if (!alignment.CertificationPartitionIsWellFormed(aSeq.size(),
+                                                     bSeq.size())) {
+    REFOLD_LOG_FATAL("lcs/map",
+                     "alignment certification windows do not form one "
+                     "well-formed A/B partition");
   }
-
   if (a2b.size() != aSeq.size() ||
+      alignment.forcedMap.size() != aSeq.size() ||
       alignment.selectedAnchorProofs.size() != aSeq.size()) {
     REFOLD_LOG_FATAL(
         "lcs/map",
-        "selected alignment/proof surface has the wrong A-token cardinality");
+        "alignment/proof surfaces have the wrong A-token cardinality");
+  }
+
+  int64_t lastForced = -1;
+  for (size_t i = 0; i < alignment.forcedMap.size(); ++i) {
+    const int64_t j = alignment.forcedMap[i];
+    if (j < 0)
+      continue;
+    if (static_cast<size_t>(j) >= bSeq.size() || aSeq[i] != bSeq[j])
+      REFOLD_LOG_FATAL("lcs/map",
+                       "forced anchor does not identify equal A/B lexemes");
+    if (j <= lastForced)
+      REFOLD_LOG_FATAL("lcs/map",
+                       "non-monotone forced map at A[{0}]={1} after {2}", i,
+                       j, lastForced);
+    if (!alignment.AnchorBelongsToCertifiedWindow(i,
+                                                   static_cast<uint64_t>(j))) {
+      REFOLD_LOG_FATAL(
+          "lcs/map",
+          "forced anchor lies outside every certified alignment window");
+    }
+    if (a2b[i] != j ||
+        alignment.selectedAnchorProofs[i].kind !=
+            diffutils::LcsAnchorProofKind::CoreOptimalPathForced ||
+        alignment.selectedAnchorProofs[i].semanticWitnessId != 0) {
+      REFOLD_LOG_FATAL(
+          "lcs/map",
+          "forced anchor is missing its exact selected-map theorem");
+    }
+    lastForced = j;
   }
 
   int64_t last = -1;
@@ -115,6 +225,12 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
     if (!proof.IsAuthorized())
       REFOLD_LOG_FATAL("lcs/map",
                        "mapped A token has no authorized anchor theorem");
+    if (!alignment.AnchorBelongsToCertifiedWindow(i,
+                                                   static_cast<uint64_t>(j))) {
+      REFOLD_LOG_FATAL(
+          "lcs/map",
+          "selected anchor lies outside every certified alignment window");
+    }
     if (static_cast<size_t>(j) >= bSeq.size() || aSeq[i] != bSeq[j])
       REFOLD_LOG_FATAL("lcs/map",
                        "selected anchor does not identify equal A/B lexemes");
@@ -123,7 +239,7 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
                        j, last);
     }
     if (proof.kind == diffutils::LcsAnchorProofKind::CoreOptimalPathForced &&
-        (i >= alignment.forcedMap.size() || alignment.forcedMap[i] != j)) {
+        alignment.forcedMap[i] != j) {
       REFOLD_LOG_FATAL(
           "lcs/map",
           "core-forced anchor theorem does not match the exact forced map");
@@ -132,8 +248,8 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
   }
   deps_.abTokAnchorProofs = alignment.selectedAnchorProofs;
 
-  std::vector<diffutils::Hunk> hunks =
-      diffutils::hunksFromMap(a2b, aSeq.size(), bSeq.size());
+  std::vector<diffutils::Hunk> hunks = diffutils::hunksFromMap(
+      a2b, alignment.certifiedBoundaries, aSeq.size(), bSeq.size());
 
   std::vector<int64_t> b2a(bSeq.size(), -1);
   for (size_t ai = 0; ai < a2b.size(); ++ai) {
@@ -161,26 +277,6 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
            b2a[static_cast<size_t>(h.bEnd - 1)] >= 0) {
       --h.bEnd;
     }
-  }
-
-  if (hunks.size() > 1) {
-    std::vector<diffutils::Hunk> merged;
-    merged.reserve(hunks.size());
-    for (const diffutils::Hunk &h : hunks) {
-      const bool isIns = h.isInsertOnly();
-      if (!merged.empty()) {
-        diffutils::Hunk &prev = merged.back();
-        const bool prevIns = prev.isInsertOnly();
-        if (isIns && prevIns && prev.aStart == h.aStart &&
-            prev.aEnd == h.aEnd && prev.bEnd == h.bStart) {
-          prev.bEnd = h.bEnd;
-          continue;
-        }
-      }
-      merged.push_back(h);
-    }
-    if (merged.size() != hunks.size())
-      hunks = std::move(merged);
   }
 
   deps_.abTokHunks = hunks;
@@ -236,20 +332,12 @@ static bool sourceIntervalFollows(const RefoldModel::TokMapEntry &entry,
 
 } // namespace
 
-void RefoldTokenDiffPlanner::TraceAlignmentAmbiguityWindows(
-    ArrayRef<StringRef> aSeq, ArrayRef<StringRef> bSeq,
-    const diffutils::CertifiedLcsResult &alignment) const {
-  if (!inTraceMode())
-    return;
-
-  const uint64_t aTokenCount = static_cast<uint64_t>(aSeq.size());
-  const uint64_t bTokenCount = static_cast<uint64_t>(bSeq.size());
-
-  // Project exact protected physical intervals to A-token boundaries.  This is
-  // diagnostic evidence only: failure to find one exact boundary is recorded
-  // and never replaced by a nearest-token or source-distance approximation.
+std::vector<uint64_t>
+RefoldTokenDiffPlanner::CollectProtectedAlignmentABoundaries(
+    size_t &unmappedIntervalCount) const {
+  unmappedIntervalCount = 0;
+  const uint64_t aTokenCount = static_cast<uint64_t>(deps_.aToks.size());
   std::set<uint64_t> protectedABoundaries;
-  size_t unmappedProtectedIntervals = 0;
   const StringRef indexedPath =
       deps_.preprocessingStructureIndex.GetSourcePath();
 
@@ -296,10 +384,9 @@ void RefoldTokenDiffPlanner::TraceAlignmentAmbiguityWindows(
       }
     }
 
-    // A top-level include contributes tokens whose tokmap entries name the
-    // included file rather than this TU.  Its producer cover is nevertheless
-    // exact A-token evidence, so include covers before/after the directive are
-    // part of the physical-order projection.
+    // Included tokens name the included file in tokmap.  Exact include covers
+    // nevertheless preserve their position relative to a tokenless directive
+    // in the owning source file.
     for (const RefoldModel::IncludeItem &include : deps_.model.GetIncludes()) {
       if (include.parent !=
               deps_.preprocessingStructureIndex.GetOwnerIncludeId() ||
@@ -322,13 +409,41 @@ void RefoldTokenDiffPlanner::TraceAlignmentAmbiguityWindows(
        deps_.preprocessingStructureIndex.GetIntervals()) {
     if (addBoundIncludeSeams(interval))
       continue;
-    std::optional<uint64_t> boundary = projectTokenlessInterval(interval);
+    const std::optional<uint64_t> boundary =
+        projectTokenlessInterval(interval);
     if (!boundary) {
-      ++unmappedProtectedIntervals;
+      ++unmappedIntervalCount;
       continue;
     }
     protectedABoundaries.insert(*boundary);
   }
+
+  return std::vector<uint64_t>(protectedABoundaries.begin(),
+                               protectedABoundaries.end());
+}
+
+void RefoldTokenDiffPlanner::TraceAlignmentCertificationRun(
+    const diffutils::CertifiedLcsResult &alignment,
+    const diffutils::LcsCertificationDiagnosticEvidence &diagnosticEvidence,
+    uint64_t aTokenCount, uint64_t bTokenCount) const {
+  if (!inTraceMode())
+    return;
+  for (const std::string &line : diffutils::describeLcsCertificationRun(
+           alignment, diagnosticEvidence, aTokenCount, bTokenCount)) {
+    REFOLD_LOG_TRACE("lcs/certification", "{0}", line);
+  }
+}
+
+void RefoldTokenDiffPlanner::TraceAlignmentAmbiguityWindows(
+    ArrayRef<StringRef> aSeq, ArrayRef<StringRef> bSeq,
+    ArrayRef<uint64_t> protectedABoundaries,
+    size_t unmappedProtectedIntervals,
+    const diffutils::CertifiedLcsResult &alignment) const {
+  if (!inTraceMode())
+    return;
+
+  const uint64_t aTokenCount = static_cast<uint64_t>(aSeq.size());
+  const uint64_t bTokenCount = static_cast<uint64_t>(bSeq.size());
 
   auto traceWindowHeader = [&](uint64_t aBegin, uint64_t aEnd,
                                uint64_t bBegin, uint64_t bEnd,
@@ -353,8 +468,7 @@ void RefoldTokenDiffPlanner::TraceAlignmentAmbiguityWindows(
         objective.matchedTokenCount, objective.ownerDepthCost);
   };
 
-  if (!alignment.completeCertification ||
-      !alignment.oracle.HasCompleteCertification()) {
+  if (!alignment.HasCompleteGlobalOracle()) {
     const ForcedAlignmentAnchor beginSentinel;
     const ForcedAlignmentAnchor endSentinel{
         static_cast<int64_t>(aTokenCount),

@@ -44,8 +44,9 @@
 //       A[i] -> B[j] (j >= 0) or -1; owner-aware/provenance-certified when
 //       structured gap profiles are supplied.
 //   • std::vector<Hunk> hunksFromMap(ArrayRef<int64_t> map,
+//                                    ArrayRef<LcsCertifiedBoundary> seams,
 //                                    size_t nA, size_t nB):
-//       contiguous edit regions between anchors, half-open indices.
+//       contiguous edit regions between anchors, split at exact DP seams.
 //   • std::vector<Step> diff(ArrayRef<StringRef> A, ArrayRef<StringRef> B):
 //       shortest edit script (EQUAL/INSERT/DELETE).
 //   • std::vector<Hunk> coalesce(ArrayRef<Step> steps):
@@ -75,6 +76,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -209,9 +211,14 @@ static bool gridStateCountChecked(size_t aWidth, size_t bWidth,
   return multiplySizeChecked(aWidth + 1, bWidth + 1, stateCount);
 }
 
+static bool hasBoundaryVectorSize(size_t tokenCount, size_t boundaryCount) {
+  return tokenCount != std::numeric_limits<size_t>::max() &&
+         boundaryCount == tokenCount + 1;
+}
+
 static bool buildCertifiedLcsAllocationPlan(
     size_t aTokenCount, size_t bTokenCount,
-    CertifiedLcsAllocationPlan &plan) {
+    size_t ownerDepthGapCopyCount, CertifiedLcsAllocationPlan &plan) {
   plan = CertifiedLcsAllocationPlan{};
   if (!gridStateCountChecked(aTokenCount, bTokenCount, plan.stateCount) ||
       !multiplySizeChecked(aTokenCount, bTokenCount, plan.pairCount))
@@ -221,12 +228,14 @@ static bool buildCertifiedLcsAllocationPlan(
   if (!addObjectiveTableBytesChecked(plan.stateCount, retainedBytes) ||
       !addObjectiveTableBytesChecked(plan.stateCount, retainedBytes) ||
       !addArrayBytesChecked<uint8_t>(plan.pairCount, retainedBytes) ||
-      !addArrayBytesChecked<uint32_t>(aTokenCount + 1, retainedBytes) ||
-      !addArrayBytesChecked<uint32_t>(aTokenCount + 1, retainedBytes) ||
       !addArrayBytesChecked<int64_t>(aTokenCount, retainedBytes) ||
       !addArrayBytesChecked<int64_t>(aTokenCount, retainedBytes) ||
       !addArrayBytesChecked<LcsAnchorProof>(aTokenCount, retainedBytes))
     return false;
+  for (size_t copy = 0; copy < ownerDepthGapCopyCount; ++copy) {
+    if (!addArrayBytesChecked<uint32_t>(aTokenCount + 1, retainedBytes))
+      return false;
+  }
   plan.retainedBytes = retainedBytes;
 
   // The compact certifier stores flattened dominator predecessors in 32 bits.
@@ -491,6 +500,210 @@ size_t OptimalTokenAlignmentOracle::GetATokenCount() const {
 
 size_t OptimalTokenAlignmentOracle::GetBTokenCount() const {
   return storage_ ? storage_->bTokenCount : 0;
+}
+
+bool CertifiedLcsResult::AnchorBelongsToCertifiedWindow(
+    uint64_t aToken, uint64_t bToken) const {
+  return std::any_of(
+      certificationWindows.begin(), certificationWindows.end(),
+      [&](const LcsCertificationWindow &window) {
+        return window.ContainsAnchor(aToken, bToken);
+      });
+}
+
+bool CertifiedLcsResult::CertificationPartitionIsWellFormed(
+    uint64_t aTokenCount, uint64_t bTokenCount) const {
+  if (certificationWindows.empty())
+    return false;
+  if (certifiedBoundaries.size() != certificationWindows.size() - 1)
+    return false;
+
+  uint64_t expectedABegin = 0;
+  uint64_t expectedBBegin = 0;
+  bool everyWindowCertified = true;
+  for (size_t windowIndex = 0;
+       windowIndex < certificationWindows.size(); ++windowIndex) {
+    const LcsCertificationWindow &window =
+        certificationWindows[windowIndex];
+    if (window.aBegin != expectedABegin || window.bBegin != expectedBBegin ||
+        window.aBegin > window.aEnd || window.bBegin > window.bEnd ||
+        window.aEnd > aTokenCount || window.bEnd > bTokenCount)
+      return false;
+
+    const bool makesProgress = window.aBegin != window.aEnd ||
+                               window.bBegin != window.bEnd;
+    const bool isSingleEmptyStreamWindow =
+        certificationWindows.size() == 1 && aTokenCount == 0 &&
+        bTokenCount == 0;
+    if (!makesProgress && !isSingleEmptyStreamWindow)
+      return false;
+
+    everyWindowCertified &= window.IsCertified();
+    expectedABegin = window.aEnd;
+    expectedBBegin = window.bEnd;
+
+    if (windowIndex + 1 == certificationWindows.size())
+      continue;
+    const LcsCertifiedBoundary &boundary =
+        certifiedBoundaries[windowIndex];
+    if (!boundary.IsAuthorized() || boundary.aBoundary != window.aEnd ||
+        boundary.bBoundary != window.bEnd)
+      return false;
+  }
+
+  return expectedABegin == aTokenCount && expectedBBegin == bTokenCount &&
+         allWindowsCertified == everyWindowCertified;
+}
+
+bool CertifiedLcsResult::HasCompleteGlobalOracle() const {
+  if (!globalObjectiveIsExact || !allWindowsCertified ||
+      !oracle.HasCompleteCertification() || certificationWindows.size() != 1)
+    return false;
+
+  const uint64_t aTokenCount = oracle.GetATokenCount();
+  const uint64_t bTokenCount = oracle.GetBTokenCount();
+  if (forcedMap.size() != aTokenCount || selectedMap.size() != aTokenCount ||
+      selectedAnchorProofs.size() != aTokenCount ||
+      !CertificationPartitionIsWellFormed(aTokenCount, bTokenCount))
+    return false;
+
+  const LcsCertificationWindow &window = certificationWindows.front();
+  return window.IsCertified() && window.aBegin == 0 &&
+         window.aEnd == aTokenCount && window.bBegin == 0 &&
+         window.bEnd == bTokenCount;
+}
+
+bool CertifiedLcsResult::HasCompleteSemanticOracleForWindow(
+    size_t windowIndex) const {
+  // The retained all-optimal oracle currently represents only the historical
+  // complete-stream problem. A certified local window without retained pair
+  // facts authorizes its core-forced anchors, but it cannot support semantic
+  // map enumeration. Keep that distinction explicit so no caller can read
+  // pair facts from an uncertified or non-retained window by accident.
+  return windowIndex == 0 && certificationWindows.size() == 1 &&
+         HasCompleteGlobalOracle();
+}
+
+void CertifiedLcsResult::RetainOnlyCoreForcedAnchors() {
+  selectedMap = forcedMap;
+  selectedAnchorProofs.assign(forcedMap.size(), LcsAnchorProof{});
+  for (size_t aToken = 0; aToken < forcedMap.size(); ++aToken) {
+    if (forcedMap[aToken] < 0)
+      continue;
+    selectedAnchorProofs[aToken] =
+        LcsAnchorProof{LcsAnchorProofKind::CoreOptimalPathForced, 0};
+  }
+}
+
+std::vector<std::string>
+describeLcsCertificationRun(
+    const CertifiedLcsResult &result,
+    const LcsCertificationDiagnosticEvidence &diagnosticEvidence,
+    uint64_t aTokenCount, uint64_t bTokenCount) {
+  auto boolText = [](bool value) -> StringRef {
+    return value ? "true" : "false";
+  };
+  auto formatBoundaries = [](ArrayRef<uint64_t> boundaries) {
+    std::string text;
+    raw_string_ostream stream(text);
+    stream << '[';
+    for (size_t index = 0; index < boundaries.size(); ++index) {
+      if (index != 0)
+        stream << ',';
+      stream << boundaries[index];
+    }
+    stream << ']';
+    stream.flush();
+    return text;
+  };
+
+  std::vector<std::string> lines;
+  lines.reserve(4 + diagnosticEvidence.boundaryFrontierProjections.size() +
+                result.certifiedBoundaries.size() +
+                result.certificationWindows.size() * 2);
+
+  lines.push_back(
+      formatv("global A=[0,{0}) B=[0,{1})", aTokenCount, bTokenCount).str());
+  lines.push_back(
+      formatv("global objective exact={0} matchedTokens={1} "
+              "ownerDepthCost={2}",
+              boolText(result.globalObjectiveIsExact),
+              result.globalObjective.matchedTokenCount,
+              result.globalObjective.ownerDepthCost)
+          .str());
+  lines.push_back(
+      formatv("candidate A boundaries={0}",
+              formatBoundaries(diagnosticEvidence.candidateABoundaries))
+          .str());
+
+  for (const LcsBoundaryFrontierProjection &projection :
+       diagnosticEvidence.boundaryFrontierProjections) {
+    lines.push_back(
+        formatv("boundary A={0} objectiveExact={1} frontiers={2}",
+                projection.aBoundary, boolText(projection.objectiveIsExact),
+                formatBoundaries(projection.admissibleBFrontiers))
+            .str());
+  }
+
+  for (size_t index = 0; index < result.certifiedBoundaries.size(); ++index) {
+    const LcsCertifiedBoundary &boundary = result.certifiedBoundaries[index];
+    lines.push_back(
+        formatv("seam index={0} A={1} B={2} proof={3}", index,
+                boundary.aBoundary, boundary.bBoundary,
+                toString(boundary.proofKind))
+            .str());
+  }
+
+  uint64_t retainedAnchors = 0;
+  uint64_t coreForcedAnchors = 0;
+  uint64_t semanticAnchors = 0;
+  for (size_t aToken = 0; aToken < result.selectedMap.size(); ++aToken) {
+    if (result.selectedMap[aToken] < 0)
+      continue;
+    ++retainedAnchors;
+    if (aToken >= result.selectedAnchorProofs.size())
+      continue;
+    switch (result.selectedAnchorProofs[aToken].kind) {
+    case LcsAnchorProofKind::None:
+      break;
+    case LcsAnchorProofKind::CoreOptimalPathForced:
+      ++coreForcedAnchors;
+      break;
+    case LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner:
+      ++semanticAnchors;
+      break;
+    }
+  }
+  lines.push_back(
+      formatv("retained anchors total={0} CoreOptimalPathForced={1} "
+              "EquivalentNormalizedHunkAndOwner={2}",
+              retainedAnchors, coreForcedAnchors, semanticAnchors)
+          .str());
+
+  for (size_t index = 0; index < result.certificationWindows.size(); ++index) {
+    const LcsCertificationWindow &window = result.certificationWindows[index];
+    lines.push_back(
+        formatv("window index={0} A=[{1},{2}) B=[{3},{4}) "
+                "requiredBytes={5} proofBudgetBytes={6} status={7}",
+                index, window.aBegin, window.aEnd, window.bBegin, window.bEnd,
+                window.requiredBytes, window.proofBudgetBytes,
+                toString(window.status))
+            .str());
+    if (!window.IsCertified()) {
+      lines.push_back(
+          formatv("failed rectangle index={0} A=[{1},{2}) B=[{3},{4}) "
+                  "requiredBytes={5} proofBudgetBytes={6} status={7}",
+                  index, window.aBegin, window.aEnd, window.bBegin,
+                  window.bEnd, window.requiredBytes, window.proofBudgetBytes,
+                  toString(window.status))
+              .str());
+    }
+  }
+  lines.push_back(
+      formatv("all windows certified={0}",
+              boolText(result.allWindowsCertified))
+          .str());
+  return lines;
 }
 
 bool OptimalTokenAlignmentOracle::PairOccursOnOptimalPath(
@@ -859,7 +1072,7 @@ static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   return true;
 }
 
-/// Mark exact match edges that occur on every globally optimal path.
+/// Mark exact match edges that occur on every optimal path through one DP box.
 ///
 /// The optimal transitions form a monotone DAG over DP states `(i,j)`. A match
 /// edge is forced exactly when every source-to-sink path reaches its source
@@ -873,7 +1086,7 @@ static void markForcedOptimalPairs(
     size_t n, size_t m, size_t stride, ArrayRef<uint32_t> ownerDepthGap,
     const ObjectiveTable &forward, const ObjectiveTable &suffix,
     const LcsObjective &total, std::vector<uint8_t> &pairFacts,
-    std::vector<int64_t> &forcedMap) {
+    uint64_t bTokenOffset, std::vector<int64_t> &forcedMap) {
   const size_t stateCount = (n + 1) * (m + 1);
   assert(stateCount <= std::numeric_limits<uint32_t>::max() &&
          "certified allocation preflight must bound dominator indices");
@@ -911,7 +1124,7 @@ static void markForcedOptimalPairs(
       if (state == 0)
         continue;
 
-      // States outside the globally optimal source-to-sink DAG cannot
+      // States outside the conditioned optimal source-to-sink DAG cannot
       // dominate the sink and receive no predecessor in the original
       // formulation below. Reject them with one exact prefix/suffix test
       // instead of evaluating all three candidate transitions. This preserves
@@ -945,7 +1158,7 @@ static void markForcedOptimalPairs(
     }
   }
 
-  // Nodes on the sink's immediate-dominator chain occur on every globally
+  // Nodes on the sink's immediate-dominator chain occur on every conditioned
   // optimal path. The earlier implementation first copied that chain into a
   // state-count bitset and then rescanned every A/B token pair to find the few
   // chain states that can own a forced match. Walking the chain directly is
@@ -976,7 +1189,8 @@ static void markForcedOptimalPairs(
           facts |= PairIsForcedFact;
           assert(forcedMap[ai] < 0 &&
                  "one A token cannot have two forced optimal partners");
-          forcedMap[ai] = static_cast<int64_t>(bj);
+          forcedMap[ai] =
+              static_cast<int64_t>(bTokenOffset + static_cast<uint64_t>(bj));
         }
       }
     }
@@ -989,61 +1203,154 @@ static void markForcedOptimalPairs(
 /// Build the exact core-certified LCS result used by refolding.
 ///
 /// The certifier has one production authority: every selected anchor must occur
-/// on every globally optimal path for the unchanged weighted-LCS objective.
-/// Ambiguous equal-token pairs remain suppressed. A separate semantic resolver
-/// may later restore a representative map only after proving that every
-/// remaining optimal explanation induces one equivalent normalized owner/edit
-/// realization.
-static bool buildForcedCertifiedResult(
-    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-    ArrayRef<uint32_t> ownerDepthGap, unsigned long long maxBytes,
-    CertifiedLcsResult &outResult) {
-  const size_t n = a.size();
-  const size_t m = b.size();
-  outResult = CertifiedLcsResult{};
-  if (ownerDepthGap.size() != n + 1)
+/// on every optimal path through the conditioned weighted-LCS window. Ambiguous
+/// equal-token pairs remain suppressed. A separate semantic resolver may later
+/// restore a representative map only after proving that every remaining
+/// explanation induces one equivalent normalized owner/edit realization.
+static LcsObjective
+lcsObjectiveLinearSpaceWeighted(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                                ArrayRef<uint32_t> ownerDepthGap);
+
+static void initializeWindowCertificationResult(
+    uint64_t aBegin, uint64_t aEnd, uint64_t bBegin, uint64_t bEnd,
+    unsigned long long maxBytes, LcsWindowCertificationResult &result) {
+  result = LcsWindowCertificationResult{};
+  result.window = LcsCertificationWindow{
+      aBegin, aEnd, bBegin, bEnd,
+      LcsWindowCertificationStatus::PartitionUnresolved,
+      /*requiredBytes=*/0, static_cast<uint64_t>(maxBytes)};
+
+  const size_t aWidth = static_cast<size_t>(aEnd - aBegin);
+  result.forcedMap.assign(aWidth, -1);
+  result.selectedMap.assign(aWidth, -1);
+  result.selectedAnchorProofs.assign(aWidth, LcsAnchorProof{});
+}
+
+/// Complete a failed local proof without selecting one optimal path.
+///
+/// Hirschberg's linear-space objective is exact, but it does not materialize
+/// the all-optimal relation. The maps therefore remain suppressed while the
+/// caller still receives the exact conditioned objective and failure rectangle.
+static void finishWindowObjectiveLinearSpace(
+    ArrayRef<StringRef> aWindow, ArrayRef<StringRef> bWindow,
+    ArrayRef<uint32_t> ownerDepthGap,
+    LcsWindowCertificationResult &result) {
+  result.objective =
+      lcsObjectiveLinearSpaceWeighted(aWindow, bWindow, ownerDepthGap);
+  result.objectiveIsExact = true;
+}
+
+/// Copy the scalar owner-depth objective for one inclusive A-gap range.
+static std::vector<uint32_t>
+copyOwnerDepthGaps(ArrayRef<LcsAGapProvenance> gapProvenance,
+                   size_t aBegin, size_t aEnd) {
+  assert(aBegin <= aEnd && aEnd < gapProvenance.size());
+  std::vector<uint32_t> ownerDepthGap;
+  ownerDepthGap.reserve(aEnd - aBegin + 1);
+  for (const LcsAGapProvenance &profile :
+       gapProvenance.slice(aBegin, aEnd - aBegin + 1))
+    ownerDepthGap.push_back(profile.ownerDepth);
+  return ownerDepthGap;
+}
+
+/// Run the existing all-optimal theorem on one local coordinate rectangle.
+///
+/// `aWindow` and `bWindow` begin at local DP state `(0,0)`. Nonnegative map
+/// values are translated by `absoluteBBegin` before publication. When
+/// `retainedOracleStorage` is non-null, this must be the complete-stream window;
+/// its quadratic state is moved into the compatibility oracle instead of being
+/// released at return. All ordinary subwindow calls pass null and retain only
+/// linear-size maps and proof records.
+static bool certifyLcsWindowCore(
+    ArrayRef<StringRef> aWindow, ArrayRef<StringRef> bWindow,
+    ArrayRef<uint32_t> ownerDepthGap, uint64_t absoluteABegin,
+    uint64_t absoluteBBegin, unsigned long long maxBytes,
+    size_t ownerDepthGapCopyCount, LcsWindowCertificationResult &outResult,
+    std::shared_ptr<OptimalTokenAlignmentOracle::Storage>
+        *retainedOracleStorage) {
+  const size_t n = aWindow.size();
+  const size_t m = bWindow.size();
+  if (!hasBoundaryVectorSize(n, ownerDepthGap.size()) ||
+      absoluteABegin > std::numeric_limits<uint64_t>::max() - n ||
+      absoluteBBegin > std::numeric_limits<uint64_t>::max() - m ||
+      absoluteBBegin + m > MAX ||
+      (retainedOracleStorage &&
+       (absoluteABegin != 0 || absoluteBBegin != 0)))
     return false;
 
+  const uint64_t absoluteAEnd = absoluteABegin + n;
+  const uint64_t absoluteBEnd = absoluteBBegin + m;
+  initializeWindowCertificationResult(
+      absoluteABegin, absoluteAEnd, absoluteBBegin, absoluteBEnd, maxBytes,
+      outResult);
+  if (retainedOracleStorage)
+    retainedOracleStorage->reset();
+
   CertifiedLcsAllocationPlan allocationPlan;
-  if (!buildCertifiedLcsAllocationPlan(n, m, allocationPlan) ||
-      allocationPlan.constructionPeakBytes > maxBytes) {
+  if (!buildCertifiedLcsAllocationPlan(n, m, ownerDepthGapCopyCount,
+                                       allocationPlan)) {
+    // Checked arithmetic or the compact dominator index could not represent
+    // this rectangle. This is a non-budget proof limitation, so do not publish
+    // a fabricated byte requirement or misclassify it as BudgetExceeded.
+    finishWindowObjectiveLinearSpace(aWindow, bWindow, ownerDepthGap,
+                                     outResult);
     REFOLD_LOG_WARN(
         "lcs/map",
-        "all-optimal certification unavailable: checked aggregate "
-        "allocation exceeds the byte budget (aTokens={0}, bTokens={1}, "
-        "requiredBytes={2}, maxBytes={3})",
-        n, m,
-        allocationPlan.constructionPeakBytes,
+        "all-optimal window certification unavailable: checked allocation "
+        "or state index is not representable (A=[{0},{1}), B=[{2},{3}), "
+        "aTokens={4}, bTokens={5}, maxBytes={6})",
+        absoluteABegin, absoluteAEnd, absoluteBBegin, absoluteBEnd, n, m,
         maxBytes);
     return false;
   }
 
-  outResult.forcedMap.assign(n, -1);
-  outResult.selectedMap.assign(n, -1);
-  outResult.selectedAnchorProofs.assign(n, LcsAnchorProof{});
+  outResult.window.requiredBytes = allocationPlan.constructionPeakBytes;
+  if (allocationPlan.constructionPeakBytes > maxBytes) {
+    outResult.window.status = LcsWindowCertificationStatus::BudgetExceeded;
+    finishWindowObjectiveLinearSpace(aWindow, bWindow, ownerDepthGap,
+                                     outResult);
+    REFOLD_LOG_WARN(
+        "lcs/map",
+        "all-optimal window certification unavailable: checked aggregate "
+        "allocation exceeds the byte budget (A=[{0},{1}), B=[{2},{3}), "
+        "aTokens={4}, bTokens={5}, requiredBytes={6}, maxBytes={7})",
+        absoluteABegin, absoluteAEnd, absoluteBBegin, absoluteBEnd, n, m,
+        allocationPlan.constructionPeakBytes, maxBytes);
+    return false;
+  }
 
-  auto storage = std::make_shared<OptimalTokenAlignmentOracle::Storage>();
-  storage->aTokenCount = n;
-  storage->bTokenCount = m;
-  storage->maxAllocationBytes = maxBytes;
-  storage->retainedAllocationBytes = allocationPlan.retainedBytes;
-  storage->ownerDepthGap.assign(ownerDepthGap.begin(), ownerDepthGap.end());
+  std::shared_ptr<OptimalTokenAlignmentOracle::Storage> storage;
+  std::vector<uint8_t> localPairFacts;
+  std::vector<uint8_t> *pairFacts = &localPairFacts;
+  if (retainedOracleStorage) {
+    storage = std::make_shared<OptimalTokenAlignmentOracle::Storage>();
+    storage->aTokenCount = n;
+    storage->bTokenCount = m;
+    storage->maxAllocationBytes = maxBytes;
+    storage->retainedAllocationBytes = allocationPlan.retainedBytes;
+    storage->ownerDepthGap.assign(ownerDepthGap.begin(), ownerDepthGap.end());
+    pairFacts = &storage->pairFacts;
+  }
 
   ObjectiveTable forward;
   ObjectiveTable suffix;
   size_t stride = 0;
-  if (!buildCoreLcsDpTables(a, b, ownerDepthGap, forward, suffix, stride))
+  if (!buildCoreLcsDpTables(aWindow, bWindow, ownerDepthGap, forward, suffix,
+                            stride)) {
+    finishWindowObjectiveLinearSpace(aWindow, bWindow, ownerDepthGap,
+                                     outResult);
     return false;
+  }
 
   auto idx = [&](size_t i, size_t j) -> size_t { return i * stride + j; };
   const LcsObjective total = forward.Get(idx(n, m));
-  outResult.globalObjective = total;
-  storage->stride = stride;
-  storage->globalObjective = total;
-  storage->pairFacts.assign(allocationPlan.pairCount, 0);
+  outResult.objective = total;
+  outResult.objectiveIsExact = true;
+  pairFacts->assign(allocationPlan.pairCount, 0);
 
   auto isCoreAdmissible = [&](size_t aToken, size_t bToken) {
-    if (aToken >= n || bToken >= m || a[aToken] != b[bToken])
+    if (aToken >= n || bToken >= m ||
+        aWindow[aToken] != bWindow[bToken])
       return false;
     const LcsObjective prefix = forward.Get(idx(aToken, bToken));
     const LcsObjective edge{1, 0};
@@ -1053,8 +1360,8 @@ static bool buildForcedCertifiedResult(
 
   for (size_t aToken = 0; aToken < n; ++aToken) {
     for (size_t bToken = 0; bToken < m; ++bToken) {
-      uint8_t &facts = storage->pairFacts[aToken * m + bToken];
-      if (a[aToken] != b[bToken])
+      uint8_t &facts = (*pairFacts)[aToken * m + bToken];
+      if (aWindow[aToken] != bWindow[bToken])
         continue;
       facts |= TokensEqualFact;
       if (isCoreAdmissible(aToken, bToken))
@@ -1063,7 +1370,7 @@ static bool buildForcedCertifiedResult(
   }
 
   markForcedOptimalPairs(n, m, stride, ownerDepthGap, forward, suffix, total,
-                         storage->pairFacts, outResult.forcedMap);
+                         *pairFacts, absoluteBBegin, outResult.forcedMap);
   outResult.selectedMap = outResult.forcedMap;
   for (size_t aToken = 0; aToken < n; ++aToken) {
     if (outResult.selectedMap[aToken] < 0)
@@ -1072,11 +1379,88 @@ static bool buildForcedCertifiedResult(
         LcsAnchorProof{LcsAnchorProofKind::CoreOptimalPathForced, 0};
   }
 
-  storage->forwardObjectives = std::move(forward);
-  storage->suffixObjectives = std::move(suffix);
-  outResult.oracle = OptimalTokenAlignmentOracle(std::move(storage));
-  outResult.completeCertification = true;
+  if (storage) {
+    storage->stride = stride;
+    storage->globalObjective = total;
+    storage->forwardObjectives = std::move(forward);
+    storage->suffixObjectives = std::move(suffix);
+    *retainedOracleStorage = std::move(storage);
+  }
+
+  outResult.window.status = LcsWindowCertificationStatus::Certified;
   return true;
+}
+
+static void adoptFullStreamWindowResult(
+    LcsWindowCertificationResult &&windowResult,
+    std::shared_ptr<OptimalTokenAlignmentOracle::Storage> oracleStorage,
+    CertifiedLcsResult &outResult) {
+  outResult = CertifiedLcsResult{};
+  outResult.forcedMap = std::move(windowResult.forcedMap);
+  outResult.selectedMap = std::move(windowResult.selectedMap);
+  outResult.selectedAnchorProofs =
+      std::move(windowResult.selectedAnchorProofs);
+  outResult.globalObjective = windowResult.objective;
+  outResult.globalObjectiveIsExact = windowResult.objectiveIsExact;
+  outResult.allWindowsCertified = windowResult.window.IsCertified();
+  outResult.certificationWindows.push_back(windowResult.window);
+  if (oracleStorage)
+    outResult.oracle = OptimalTokenAlignmentOracle(std::move(oracleStorage));
+}
+
+/// Finish the current one-window fallback without publishing a selected path.
+static void finalizeUncertifiedFullStreamResult(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<uint32_t> ownerDepthGap, unsigned long long maxBytes,
+    CertifiedLcsResult &result) {
+  if (!result.globalObjectiveIsExact) {
+    result.globalObjective =
+        lcsObjectiveLinearSpaceWeighted(a, b, ownerDepthGap);
+    result.globalObjectiveIsExact = true;
+  }
+  result.allWindowsCertified = false;
+  REFOLD_LOG_WARN(
+      "lcs/map",
+      "all-optimal certification unavailable: suppressing all structured "
+      "token anchors (aTokens={0}, bTokens={1}, maxBytes={2})",
+      a.size(), b.size(), maxBytes);
+}
+
+static bool buildForcedCertifiedResult(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<uint32_t> ownerDepthGap, unsigned long long maxBytes,
+    CertifiedLcsResult &outResult) {
+  if (!hasBoundaryVectorSize(a.size(), ownerDepthGap.size()))
+    return false;
+
+  LcsWindowCertificationResult windowResult;
+  std::shared_ptr<OptimalTokenAlignmentOracle::Storage> oracleStorage;
+  // The complete-stream compatibility path has two live owner-gap payloads:
+  // the caller's derived vector and the oracle's retained copy. Counting both
+  // preserves the existing byte threshold exactly while the public subwindow
+  // API counts only its one local derived vector.
+  const bool certified = certifyLcsWindowCore(
+      a, b, ownerDepthGap, /*absoluteABegin=*/0, /*absoluteBBegin=*/0,
+      maxBytes, /*ownerDepthGapCopyCount=*/2, windowResult, &oracleStorage);
+  if (windowResult.window.aEnd != a.size() ||
+      windowResult.window.bEnd != b.size())
+    return false;
+
+  adoptFullStreamWindowResult(std::move(windowResult),
+                              std::move(oracleStorage), outResult);
+  return certified;
+}
+
+/// Preserve the current one-window production contract through the generalized
+/// local certifier. A failed proof retains the exact objective but publishes no
+/// path-selected anchors.
+static CertifiedLcsResult certifyFullStream(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<uint32_t> ownerDepthGap, unsigned long long maxBytes) {
+  CertifiedLcsResult result;
+  if (!buildForcedCertifiedResult(a, b, ownerDepthGap, maxBytes, result))
+    finalizeUncertifiedFullStreamResult(a, b, ownerDepthGap, maxBytes, result);
+  return result;
 }
 
 // ===================== Hirschberg (exact, linear space) ======================
@@ -1118,13 +1502,10 @@ struct GapView {
   ArrayRef<uint32_t> base;
   size_t off = 0;
   size_t len = 0; // boundaries, so len == A.len + 1 for the corresponding span
-  bool rev = false;
 
   size_t size() const { return len; }
 
-  uint32_t at(size_t i) const {
-    return rev ? base[off + (len - 1 - i)] : base[off + i];
-  }
+  uint32_t at(size_t i) const { return base[off + i]; }
 };
 
 /// Compute one weighted Hirschberg LCS DP row for the given span views.
@@ -1189,6 +1570,81 @@ static std::vector<Score> computeRowWeighted(const SpanView &aV,
   }
 
   return dp;
+}
+
+/// Compute exact weighted suffix objectives for every B frontier.
+///
+/// The returned row stores, at index `j`, the optimum for all of `aV` against
+/// `bV[j..m)`. This must be computed directly from right to left: the weighted
+/// objective is asymmetric at an A token, because deleting `A[i]` pays gap
+/// `i+1`, while inserting B at state `(i,j)` pays gap `i`. Reversing A, B, and
+/// the gap vector cannot preserve both transition charges simultaneously.
+static std::vector<Score> computeSuffixRowWeighted(const SpanView &aV,
+                                                   const SpanView &bV,
+                                                   const GapView &gapV) {
+  const size_t n = aV.size();
+  const size_t m = bV.size();
+  if (gapV.size() != n + 1)
+    REFOLD_LOG_FATAL("lcs/map", "internal: gap view length must be A.len+1");
+
+  std::vector<Score> next(m + 1);
+  std::vector<Score> current(m + 1);
+
+  // S[n][j]: only B insertions remain, all charged at the terminal A gap.
+  next[m] = Score{0, 0};
+  for (size_t jj = m; jj > 0; --jj) {
+    const size_t j = jj - 1;
+    next[j] = next[j + 1];
+    next[j].cost += static_cast<uint64_t>(gapV.at(n));
+  }
+
+  for (size_t ii = n; ii > 0; --ii) {
+    const size_t i = ii - 1;
+    current[m] = next[m];
+    current[m].cost += static_cast<uint64_t>(gapV.at(i + 1));
+
+    for (size_t jj = m; jj > 0; --jj) {
+      const size_t j = jj - 1;
+      Score best{0, std::numeric_limits<uint64_t>::max()};
+
+      if (aV.at(i) == bV.at(j)) {
+        Score candidate = next[j + 1];
+        ++candidate.len;
+        best = candidate;
+      }
+
+      Score deleteA = next[j];
+      deleteA.cost += static_cast<uint64_t>(gapV.at(i + 1));
+      if (isCoreBetter(deleteA.len, deleteA.cost, best.len, best.cost))
+        best = deleteA;
+
+      Score insertB = current[j + 1];
+      insertB.cost += static_cast<uint64_t>(gapV.at(i));
+      if (isCoreBetter(insertB.len, insertB.cost, best.len, best.cost))
+        best = insertB;
+
+      current[j] = best;
+    }
+    next.swap(current);
+  }
+  return next;
+}
+
+/// Compute `S[aBoundary][j]` for an ordinary contiguous A/B window.
+static std::vector<Score> computeSuffixRowWeighted(
+    ArrayRef<StringRef> aWindow, ArrayRef<StringRef> bWindow,
+    ArrayRef<uint32_t> ownerDepthGap, size_t aBoundary) {
+  if (!hasBoundaryVectorSize(aWindow.size(), ownerDepthGap.size()) ||
+      aBoundary > aWindow.size())
+    REFOLD_LOG_FATAL("lcs/map",
+                     "internal: invalid weighted-LCS suffix row bounds");
+
+  const SpanView aSuffix{aWindow, aBoundary, aWindow.size() - aBoundary,
+                         false};
+  const SpanView bFull{bWindow, 0, bWindow.size(), false};
+  const GapView gapSuffix{ownerDepthGap, aBoundary,
+                          aWindow.size() - aBoundary + 1};
+  return computeSuffixRowWeighted(aSuffix, bFull, gapSuffix);
 }
 
 /// Solve a small weighted-LCS box with the full DP table and append anchors in
@@ -1323,31 +1779,27 @@ static Score hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
   const size_t mid = n / 2;
 
   const SpanView aLeft{aV.base, aV.off, mid, aV.rev};
-  const GapView gapLeft{gapV.base, gapV.off, mid + 1, gapV.rev};
+  const GapView gapLeft{gapV.base, gapV.off, mid + 1};
 
   const SpanView aRight{aV.base, aV.off + mid, n - mid, aV.rev};
-  const GapView gapRight{gapV.base, gapV.off + mid, (n - mid) + 1, gapV.rev};
+  const GapView gapRight{gapV.base, gapV.off + mid, (n - mid) + 1};
 
   // Compute the best weighted LCS objective for every possible B split after
   // solving the left half of A against each prefix of B.
   const std::vector<Score> leftRow = computeRowWeighted(aLeft, bV, gapLeft);
 
-  // Compute the corresponding suffix objectives by solving the right half of A
-  // and B in reverse. rightRowRev[m - j] is the score for A[mid..n) against
-  // B[j..m).
-  const SpanView aRightRev{aV.base, aV.off + mid, n - mid, true};
-  const GapView gapRightRev{gapV.base, gapV.off + mid, (n - mid) + 1, true};
-  const SpanView bRev{bV.base, bV.off, m, true};
-
-  const std::vector<Score> rightRowRev =
-      computeRowWeighted(aRightRev, bRev, gapRightRev);
+  // Compute the exact objective for the right half of A against every suffix
+  // of B. A direct backward recurrence is required because reversing the gap
+  // vector does not preserve the asymmetric delete/insert charges.
+  const std::vector<Score> rightRow =
+      computeSuffixRowWeighted(aRight, bV, gapRight);
 
   // Choose split j maximizing the core objective (length, then inverse cost).
   // On exact equality, prefer the smallest j for determinism.
   size_t bestJ = 0;
-  Score best = leftRow[0] + rightRowRev[m];
+  Score best = leftRow[0] + rightRow[0];
   for (size_t j = 1; j <= m; ++j) {
-    Score cand = leftRow[j] + rightRowRev[m - j];
+    Score cand = leftRow[j] + rightRow[j];
     if (isCoreBetter(cand.len, cand.cost, best.len, best.cost) ||
         (cand == best && j < bestJ)) {
       bestJ = j;
@@ -1378,7 +1830,7 @@ lcsMapABHirschbergWeighted(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   selection.map.assign(a.size(), -1);
   const SpanView aV{a, 0, a.size(), false};
   const SpanView bV{b, 0, b.size(), false};
-  const GapView gV{ownerDepthGap, 0, ownerDepthGap.size(), false};
+  const GapView gV{ownerDepthGap, 0, ownerDepthGap.size()};
   const Score objective =
       hirschbergWeightedRec(aV, bV, gV, selection.map);
   selection.objective =
@@ -1402,11 +1854,79 @@ lcsObjectiveLinearSpaceWeighted(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 
   const SpanView aV{a, 0, a.size(), false};
   const SpanView bV{b, 0, b.size(), false};
-  const GapView gV{ownerDepthGap, 0, ownerDepthGap.size(), false};
+  const GapView gV{ownerDepthGap, 0, ownerDepthGap.size()};
   const std::vector<Score> finalRow = computeRowWeighted(aV, bV, gV);
   assert(!finalRow.empty() && "weighted-LCS row always contains B boundary 0");
   const Score &objective = finalRow.back();
   return LcsObjective{objective.len, objective.cost};
+}
+
+/// Convert one linear-space row score to the public objective value.
+static LcsObjective objectiveFromScore(const Score &score) {
+  return LcsObjective{score.len, score.cost};
+}
+
+/// Project one local A boundary through the complete weighted objective.
+///
+/// Every monotone source-to-sink path crosses the requested A row at some B
+/// frontier. The exact enclosing objective is therefore the best additive
+/// combination of the left-prefix and right-suffix rows. Retaining every
+/// frontier that attains that objective proves uniqueness without selecting a
+/// Hirschberg split.
+static bool projectBoundaryWithOwnerDepth(
+    ArrayRef<StringRef> aWindow, ArrayRef<StringRef> bWindow,
+    ArrayRef<uint32_t> ownerDepthGap, uint64_t absoluteABegin,
+    uint64_t absoluteBBegin, size_t localABoundary,
+    LcsBoundaryFrontierProjection &result) {
+  result = LcsBoundaryFrontierProjection{};
+  if (!hasBoundaryVectorSize(aWindow.size(), ownerDepthGap.size()) ||
+      localABoundary > aWindow.size() ||
+      absoluteABegin > std::numeric_limits<uint64_t>::max() -
+                           localABoundary ||
+      absoluteBBegin > std::numeric_limits<uint64_t>::max() -
+                           bWindow.size())
+    return false;
+
+  result.aBoundary = absoluteABegin + localABoundary;
+  const size_t bWidth = bWindow.size();
+  const SpanView aLeft{aWindow, 0, localABoundary, false};
+  const SpanView bForward{bWindow, 0, bWidth, false};
+  const GapView gapLeft{ownerDepthGap, 0, localABoundary + 1};
+  const std::vector<Score> forward =
+      computeRowWeighted(aLeft, bForward, gapLeft);
+  const std::vector<Score> suffix = computeSuffixRowWeighted(
+      aWindow, bWindow, ownerDepthGap, localABoundary);
+
+  assert(forward.size() == bWidth + 1 && suffix.size() == bWidth + 1 &&
+         "linear-space frontier rows must cover every B boundary");
+
+  bool haveObjective = false;
+  LcsObjective best;
+  for (size_t localB = 0; localB <= bWidth; ++localB) {
+    LcsObjective combined;
+    if (!addObjectivesChecked(objectiveFromScore(forward[localB]),
+                              objectiveFromScore(suffix[localB]),
+                              combined))
+      return false;
+
+    if (!haveObjective ||
+        isCoreBetter(combined.matchedTokenCount, combined.ownerDepthCost,
+                     best.matchedTokenCount, best.ownerDepthCost)) {
+      haveObjective = true;
+      best = combined;
+      result.admissibleBFrontiers.clear();
+      result.admissibleBFrontiers.push_back(absoluteBBegin + localB);
+      continue;
+    }
+    if (combined == best)
+      result.admissibleBFrontiers.push_back(absoluteBBegin + localB);
+  }
+
+  if (!haveObjective)
+    return false;
+  result.windowObjective = best;
+  result.objectiveIsExact = true;
+  return true;
 }
 
 /// Compute one unweighted Hirschberg LCS length row.
@@ -1555,6 +2075,674 @@ static std::vector<int64_t> lcsMapABHirschberg(ArrayRef<StringRef> a,
 
 // ================ Weighted LCS (DP with Hirschberg fallback) =================
 
+bool getLcsCertificationRequiredBytes(uint64_t aTokenCount,
+                                      uint64_t bTokenCount,
+                                      bool retainCompleteOracle,
+                                      uint64_t &requiredBytes) {
+  requiredBytes = 0;
+  if (aTokenCount > std::numeric_limits<size_t>::max() ||
+      bTokenCount > std::numeric_limits<size_t>::max())
+    return false;
+
+  CertifiedLcsAllocationPlan plan;
+  const size_t ownerDepthGapCopyCount = retainCompleteOracle ? 2 : 1;
+  if (!buildCertifiedLcsAllocationPlan(
+          static_cast<size_t>(aTokenCount),
+          static_cast<size_t>(bTokenCount), ownerDepthGapCopyCount, plan))
+    return false;
+  requiredBytes = plan.constructionPeakBytes;
+  return true;
+}
+
+bool certifyLcsWindow(
+    ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
+    ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    unsigned long long maxBytes, LcsWindowCertificationResult &result) {
+  result = LcsWindowCertificationResult{};
+  result.window = LcsCertificationWindow{
+      aBegin, aEnd, bBegin, bEnd,
+      LcsWindowCertificationStatus::PartitionUnresolved,
+      /*requiredBytes=*/0, static_cast<uint64_t>(maxBytes)};
+
+  if (!hasBoundaryVectorSize(a.size(), gapProvenance.size()) ||
+      aBegin > aEnd ||
+      bBegin > bEnd || aEnd > a.size() || bEnd > b.size() || bEnd > MAX) {
+    REFOLD_LOG_WARN(
+        "lcs/map",
+        "all-optimal window certification unavailable: invalid bounds or "
+        "A-gap provenance (A=[{0},{1}), B=[{2},{3}), aTokens={4}, "
+        "bTokens={5}, aGapCount={6})",
+        aBegin, aEnd, bBegin, bEnd, a.size(), b.size(),
+        gapProvenance.size());
+    return false;
+  }
+
+  const size_t absoluteABegin = static_cast<size_t>(aBegin);
+  const size_t absoluteBBegin = static_cast<size_t>(bBegin);
+  const size_t aWidth = static_cast<size_t>(aEnd - aBegin);
+  const size_t bWidth = static_cast<size_t>(bEnd - bBegin);
+
+  // Materialize only the A-gap profile needed by this conditioned window.
+  // The resulting k+1 vector is part of the checked local allocation payload;
+  // no complete-stream owner vector is copied for an isolated certification.
+  std::vector<uint32_t> ownerDepthGap =
+      copyOwnerDepthGaps(gapProvenance, absoluteABegin,
+                         absoluteABegin + aWidth);
+
+  return certifyLcsWindowCore(
+      a.slice(absoluteABegin, aWidth),
+      b.slice(absoluteBBegin, bWidth), ownerDepthGap, aBegin, bBegin,
+      maxBytes, /*ownerDepthGapCopyCount=*/1, result,
+      /*retainedOracleStorage=*/nullptr);
+}
+
+bool projectLcsBoundaryToOptimalBFrontiers(
+    ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
+    ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
+    uint64_t aBoundary, ArrayRef<LcsAGapProvenance> gapProvenance,
+    LcsBoundaryFrontierProjection &result) {
+  result = LcsBoundaryFrontierProjection{};
+  result.aBoundary = aBoundary;
+  if (!hasBoundaryVectorSize(a.size(), gapProvenance.size()) ||
+      aBegin > aBoundary || aBoundary > aEnd || aEnd > a.size() ||
+      bBegin > bEnd || bEnd > b.size() || bEnd > MAX)
+    return false;
+
+  const size_t absoluteABegin = static_cast<size_t>(aBegin);
+  const size_t absoluteBBegin = static_cast<size_t>(bBegin);
+  const size_t aWidth = static_cast<size_t>(aEnd - aBegin);
+  const size_t bWidth = static_cast<size_t>(bEnd - bBegin);
+  std::vector<uint32_t> ownerDepthGap =
+      copyOwnerDepthGaps(gapProvenance, absoluteABegin,
+                         absoluteABegin + aWidth);
+  return projectBoundaryWithOwnerDepth(
+      a.slice(absoluteABegin, aWidth),
+      b.slice(absoluteBBegin, bWidth), ownerDepthGap, aBegin, bBegin,
+      static_cast<size_t>(aBoundary - aBegin), result);
+}
+
+std::vector<uint64_t> nominateLcsPartitionBoundaries(
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    ArrayRef<int64_t> forcedMap,
+    ArrayRef<uint64_t> additionalABoundaries) {
+  std::vector<uint64_t> candidates;
+  if (gapProvenance.empty())
+    return candidates;
+
+  const size_t aTokenCount = gapProvenance.size() - 1;
+  auto addBoundary = [&](uint64_t boundary) {
+    if (boundary <= aTokenCount)
+      candidates.push_back(boundary);
+  };
+
+  // Identity changes across one exact A gap nominate include/file, selected
+  // conditional-arm, macro-invocation, and macro-role transitions. Scalar
+  // owner depth alone is intentionally insufficient: every interior token in
+  // one nested owner may share that depth, so treating depth as a transition
+  // would degenerate into testing every token boundary.
+  for (size_t boundary = 1; boundary < aTokenCount; ++boundary) {
+    const LcsAGapProvenance &profile = gapProvenance[boundary];
+    const bool identityChanges =
+        profile.leftIncludeId != profile.rightIncludeId ||
+        profile.leftCondGroupId != profile.rightCondGroupId ||
+        profile.leftCondArmId != profile.rightCondArmId ||
+        profile.leftMacroRootId != profile.rightMacroRootId ||
+        profile.leftMacroLeafId != profile.rightMacroLeafId ||
+        profile.leftMacroRoleMask != profile.rightMacroRoleMask;
+    if (identityChanges)
+      candidates.push_back(static_cast<uint64_t>(boundary));
+  }
+
+  // Consecutive forced token edges already prove every state along the run.
+  // Only the two run endpoints are useful as partition nominations; retaining
+  // every interior state would add no independence and could turn unchanged
+  // stretches back into an all-token candidate set.
+  if (!forcedMap.empty()) {
+    if (forcedMap.size() != aTokenCount) {
+      REFOLD_LOG_WARN(
+          "lcs/partition",
+          "ignoring forced-anchor boundary nominations with wrong A-token "
+          "cardinality (mapSize={0}, aTokens={1})",
+          forcedMap.size(), aTokenCount);
+    } else {
+      size_t aToken = 0;
+      while (aToken < forcedMap.size()) {
+        if (forcedMap[aToken] < 0) {
+          ++aToken;
+          continue;
+        }
+        const size_t runBegin = aToken;
+        size_t runEnd = aToken;
+        while (runEnd + 1 < forcedMap.size() &&
+               forcedMap[runEnd + 1] >= 0 &&
+               forcedMap[runEnd] < std::numeric_limits<int64_t>::max() &&
+               forcedMap[runEnd + 1] == forcedMap[runEnd] + 1)
+          ++runEnd;
+        addBoundary(static_cast<uint64_t>(runBegin));
+        addBoundary(static_cast<uint64_t>(runEnd + 1));
+        aToken = runEnd + 1;
+      }
+    }
+  }
+
+  for (uint64_t boundary : additionalABoundaries)
+    addBoundary(boundary);
+
+  std::sort(candidates.begin(), candidates.end());
+  candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                   candidates.end());
+  return candidates;
+}
+
+bool partitionLcsWindowsLinearSpace(
+    ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
+    ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    ArrayRef<uint64_t> candidateABoundaries,
+    LcsWindowPartitionResult &result,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+  result = LcsWindowPartitionResult{};
+  if (diagnosticEvidence)
+    *diagnosticEvidence = LcsCertificationDiagnosticEvidence{};
+  if (!hasBoundaryVectorSize(a.size(), gapProvenance.size()) ||
+      aBegin > aEnd || aEnd > a.size() || bBegin > bEnd ||
+      bEnd > b.size() || bEnd > MAX)
+    return false;
+
+  std::vector<uint64_t> candidates;
+  candidates.reserve(candidateABoundaries.size());
+  for (uint64_t boundary : candidateABoundaries) {
+    if (boundary >= aBegin && boundary <= aEnd)
+      candidates.push_back(boundary);
+  }
+  std::sort(candidates.begin(), candidates.end());
+  candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                   candidates.end());
+  if (diagnosticEvidence)
+    diagnosticEvidence->candidateABoundaries.assign(candidates.begin(),
+                                                     candidates.end());
+
+  const size_t absoluteABegin = static_cast<size_t>(aBegin);
+  const size_t absoluteBBegin = static_cast<size_t>(bBegin);
+  const size_t aWidth = static_cast<size_t>(aEnd - aBegin);
+  const size_t bWidth = static_cast<size_t>(bEnd - bBegin);
+  std::vector<uint32_t> ownerDepthGap =
+      copyOwnerDepthGaps(gapProvenance, absoluteABegin,
+                         absoluteABegin + aWidth);
+  const ArrayRef<StringRef> aWindow = a.slice(absoluteABegin, aWidth);
+  const ArrayRef<StringRef> bWindow = b.slice(absoluteBBegin, bWidth);
+
+  // An accepted seam lies on every enclosing optimal path. Conditioning on
+  // such a seam cannot make another candidate's non-singleton frontier set
+  // become singleton: every optimal child path composes with the common
+  // optimal remainder. One enclosing-window pass is therefore complete for
+  // this candidate set and avoids redundant recursive row computations.
+  //
+  // The first projection already computes the exact enclosing objective.
+  // Adopt that objective instead of running a separate full-row pass before
+  // testing candidates. Endpoint nominations remain meaningful because a
+  // unique non-endpoint B frontier can isolate leading or trailing insertion.
+  for (uint64_t aBoundary : candidates) {
+    LcsBoundaryFrontierProjection projection;
+    if (!projectBoundaryWithOwnerDepth(
+            aWindow, bWindow, ownerDepthGap, aBegin, bBegin,
+            static_cast<size_t>(aBoundary - aBegin), projection) ||
+        !projection.objectiveIsExact) {
+      result = LcsWindowPartitionResult{};
+      return false;
+    }
+    if (!result.objectiveIsExact) {
+      result.objective = projection.windowObjective;
+      result.objectiveIsExact = true;
+    } else if (projection.windowObjective != result.objective) {
+      result = LcsWindowPartitionResult{};
+      return false;
+    }
+    if (diagnosticEvidence)
+      diagnosticEvidence->boundaryFrontierProjections.push_back(projection);
+    if (!projection.ProvesUniqueBoundary())
+      continue;
+    const uint64_t bBoundary = projection.admissibleBFrontiers.front();
+    if ((aBoundary == aBegin && bBoundary == bBegin) ||
+        (aBoundary == aEnd && bBoundary == bEnd))
+      continue;
+    result.certifiedBoundaries.push_back(LcsCertifiedBoundary{
+        aBoundary, bBoundary,
+        LcsBoundaryProofKind::EveryOptimalPathCrossesState});
+  }
+
+  if (!result.objectiveIsExact) {
+    result.objective =
+        lcsObjectiveLinearSpaceWeighted(aWindow, bWindow, ownerDepthGap);
+    result.objectiveIsExact = true;
+  }
+
+  uint64_t windowABegin = aBegin;
+  uint64_t windowBBegin = bBegin;
+  for (const LcsCertifiedBoundary &boundary : result.certifiedBoundaries) {
+    const bool makesStateProgress = boundary.aBoundary != windowABegin ||
+                                    boundary.bBoundary != windowBBegin;
+    if (!boundary.IsAuthorized() || !makesStateProgress ||
+        boundary.aBoundary < windowABegin || boundary.aBoundary > aEnd ||
+        boundary.bBoundary < windowBBegin || boundary.bBoundary > bEnd) {
+      result = LcsWindowPartitionResult{};
+      return false;
+    }
+    result.windows.push_back(LcsCertificationWindow{
+        windowABegin, boundary.aBoundary, windowBBegin,
+        boundary.bBoundary,
+        LcsWindowCertificationStatus::PartitionUnresolved,
+        /*requiredBytes=*/0, /*proofBudgetBytes=*/0});
+    windowABegin = boundary.aBoundary;
+    windowBBegin = boundary.bBoundary;
+  }
+  result.windows.push_back(LcsCertificationWindow{
+      windowABegin, aEnd, windowBBegin, bEnd,
+      LcsWindowCertificationStatus::PartitionUnresolved,
+      /*requiredBytes=*/0, /*proofBudgetBytes=*/0});
+
+  // Endpoint A seams may isolate leading or trailing insertion-only windows;
+  // every emitted child must nevertheless make progress in at least one axis.
+  if (result.windows.size() == 1 && aBegin == aEnd && bBegin == bEnd)
+    return true;
+  for (const LcsCertificationWindow &window : result.windows) {
+    if (window.aBegin == window.aEnd && window.bBegin == window.bEnd) {
+      result = LcsWindowPartitionResult{};
+      return false;
+    }
+  }
+  return true;
+}
+
+/// Preserve the established one-window result from provenance input.
+///
+/// A partition that proves no interior seam is semantically the original
+/// complete-stream problem. Reusing the compatibility path avoids changing its
+/// retained oracle or byte threshold merely because callers nominated
+/// boundaries that were correctly rejected.
+static bool certifyFullStreamFromProvenance(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    unsigned long long maxBytes, CertifiedLcsResult &result) {
+  std::vector<uint32_t> ownerDepthGap =
+      copyOwnerDepthGaps(gapProvenance, 0, a.size());
+  result = certifyFullStream(a, b, ownerDepthGap, maxBytes);
+  return result.globalObjectiveIsExact &&
+         result.CertificationPartitionIsWellFormed(a.size(), b.size());
+}
+
+/// Merge one local theorem into complete-stream proof surfaces.
+///
+/// Uncertified windows are required to remain completely suppressed. A
+/// certified local map carries absolute B indices, so only its A coordinate
+/// needs translation. Every accepted edge is revalidated against the local
+/// rectangle, global monotonicity, and its durable core-forced proof before
+/// publication.
+static bool mergeLocalWindowCertification(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    const LcsCertificationWindow &partitionWindow,
+    const LcsWindowCertificationResult &localResult,
+    CertifiedLcsResult &result, int64_t &lastPublishedB) {
+  const LcsCertificationWindow &window = localResult.window;
+  if (window.aBegin != partitionWindow.aBegin ||
+      window.aEnd != partitionWindow.aEnd ||
+      window.bBegin != partitionWindow.bBegin ||
+      window.bEnd != partitionWindow.bEnd)
+    return false;
+
+  const size_t aWidth = static_cast<size_t>(window.aEnd - window.aBegin);
+  if (!localResult.objectiveIsExact || localResult.forcedMap.size() != aWidth ||
+      localResult.selectedMap.size() != aWidth ||
+      localResult.selectedAnchorProofs.size() != aWidth)
+    return false;
+
+  for (size_t localA = 0; localA < aWidth; ++localA) {
+    const int64_t forcedB = localResult.forcedMap[localA];
+    const int64_t selectedB = localResult.selectedMap[localA];
+    const LcsAnchorProof &proof = localResult.selectedAnchorProofs[localA];
+    const size_t absoluteA = static_cast<size_t>(window.aBegin) + localA;
+
+    if (!window.IsCertified()) {
+      if (forcedB >= 0 || selectedB >= 0 || proof.IsAuthorized() ||
+          proof.semanticWitnessId != 0)
+        return false;
+      continue;
+    }
+
+    if (forcedB < 0 || selectedB < 0) {
+      if (forcedB != selectedB || proof.IsAuthorized() ||
+          proof.semanticWitnessId != 0)
+        return false;
+      continue;
+    }
+
+    if (forcedB != selectedB || forcedB <= lastPublishedB ||
+        proof.kind != LcsAnchorProofKind::CoreOptimalPathForced ||
+        proof.semanticWitnessId != 0)
+      return false;
+    const uint64_t absoluteB = static_cast<uint64_t>(forcedB);
+    if (!window.ContainsAnchor(absoluteA, absoluteB) ||
+        absoluteA >= a.size() || absoluteB >= b.size() ||
+        a[absoluteA] != b[static_cast<size_t>(absoluteB)] ||
+        result.forcedMap[absoluteA] >= 0 ||
+        result.selectedMap[absoluteA] >= 0 ||
+        result.selectedAnchorProofs[absoluteA].IsAuthorized())
+      return false;
+
+    result.forcedMap[absoluteA] = forcedB;
+    result.selectedMap[absoluteA] = selectedB;
+    result.selectedAnchorProofs[absoluteA] = proof;
+    lastPublishedB = forcedB;
+  }
+  return true;
+}
+
+/// Certify one already-proved ordered window partition.
+///
+/// Both the exhaustive diagnostic partitioner and the budget-driven production
+/// partitioner terminate here. Keeping publication in one routine prevents the
+/// two scheduling policies from drifting in byte accounting, objective
+/// composition, or anchor authority.
+static bool certifyPartitionWindows(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    ArrayRef<LcsCertifiedBoundary> certifiedBoundaries,
+    ArrayRef<LcsCertificationWindow> partitionWindows,
+    unsigned long long maxBytes, CertifiedLcsResult &result) {
+  if (partitionWindows.empty() ||
+      certifiedBoundaries.size() + 1 != partitionWindows.size())
+    return false;
+
+  result = CertifiedLcsResult{};
+  result.forcedMap.assign(a.size(), -1);
+  result.selectedMap.assign(a.size(), -1);
+  result.selectedAnchorProofs.assign(a.size(), LcsAnchorProof{});
+  result.globalObjectiveIsExact = true;
+  result.allWindowsCertified = true;
+  result.certifiedBoundaries.assign(certifiedBoundaries.begin(),
+                                    certifiedBoundaries.end());
+  result.certificationWindows.clear();
+  result.certificationWindows.reserve(partitionWindows.size());
+
+  LcsObjective composedObjective;
+  int64_t lastPublishedB = -1;
+  for (const LcsCertificationWindow &partitionWindow : partitionWindows) {
+    // The local result is deliberately scoped to one iteration. Its quadratic
+    // tables, pair facts, and dominator state have already been destroyed when
+    // `certifyLcsWindow()` returns; its remaining linear maps are released at
+    // the end of this iteration after publication.
+    LcsWindowCertificationResult localResult;
+    (void)certifyLcsWindow(
+        a, partitionWindow.aBegin, partitionWindow.aEnd, b,
+        partitionWindow.bBegin, partitionWindow.bEnd, gapProvenance, maxBytes,
+        localResult);
+    LcsObjective nextComposedObjective;
+    if (!localResult.objectiveIsExact ||
+        !addObjectivesChecked(composedObjective, localResult.objective,
+                              nextComposedObjective) ||
+        !mergeLocalWindowCertification(a, b, partitionWindow, localResult,
+                                       result, lastPublishedB)) {
+      result = CertifiedLcsResult{};
+      return false;
+    }
+    composedObjective = nextComposedObjective;
+    result.allWindowsCertified &= localResult.window.IsCertified();
+    result.certificationWindows.push_back(localResult.window);
+  }
+
+  result.globalObjective = composedObjective;
+  if (!result.CertificationPartitionIsWellFormed(a.size(), b.size())) {
+    result = CertifiedLcsResult{};
+    return false;
+  }
+  return true;
+}
+
+struct LcsBudgetPartitionPlan {
+  SmallVector<LcsCertifiedBoundary, 8> certifiedBoundaries;
+  SmallVector<LcsCertificationWindow, 8> windows;
+};
+
+/// Insert one evidence-only candidate while retaining normalized order.
+static void recordDiagnosticCandidate(
+    uint64_t boundary,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+  if (!diagnosticEvidence)
+    return;
+  auto &candidates = diagnosticEvidence->candidateABoundaries;
+  const auto insertion =
+      std::lower_bound(candidates.begin(), candidates.end(), boundary);
+  if (insertion == candidates.end() || *insertion != boundary)
+    candidates.insert(insertion, boundary);
+}
+
+/// Return the producer nomination nearest one window's arithmetic midpoint.
+///
+/// This coordinate is only a fallback proof schedule after the exact midpoint
+/// has failed. The selected A coordinate never determines or ranks a B
+/// frontier. Ties prefer the smaller A boundary for stable source order.
+static std::optional<uint64_t> nearestInteriorCandidate(
+    ArrayRef<uint64_t> normalizedCandidates, uint64_t aBegin, uint64_t aEnd,
+    uint64_t midpoint) {
+  const uint64_t aWidth = aEnd - aBegin;
+  const uint64_t quarterWidth = aWidth / 4;
+  const uint64_t balancedBegin = aBegin + quarterWidth;
+  const uint64_t balancedEnd = aEnd - quarterWidth;
+  const auto begin = std::upper_bound(normalizedCandidates.begin(),
+                                      normalizedCandidates.end(),
+                                      balancedBegin);
+  const auto end = std::lower_bound(normalizedCandidates.begin(),
+                                    normalizedCandidates.end(), balancedEnd);
+  if (begin == end)
+    return std::nullopt;
+
+  const auto upper = std::lower_bound(begin, end, midpoint);
+  if (upper == begin)
+    return *upper;
+  if (upper == end)
+    return *(end - 1);
+
+  const uint64_t lowerBoundary = *(upper - 1);
+  const uint64_t upperBoundary = *upper;
+  const uint64_t lowerDistance = midpoint - lowerBoundary;
+  const uint64_t upperDistance = upperBoundary - midpoint;
+  return lowerDistance <= upperDistance ? lowerBoundary : upperBoundary;
+}
+
+/// Recursively split one oversized rectangle at exact balanced state seams.
+///
+/// At most two boundaries are projected per oversized node: its arithmetic A
+/// midpoint and, only if necessary, one producer nomination in the middle half
+/// of the A range. An accepted midpoint leaves children with at most half the
+/// parent's A width; an accepted producer fallback leaves children with at
+/// most three quarters. Thus the sum of child grid areas decreases
+/// geometrically regardless of the unique B frontier. This hard work bound is
+/// the wall-time property missing from the former one-full-pass-per-candidate
+/// implementation.
+static bool appendBudgetPartition(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    ArrayRef<uint64_t> normalizedCandidates, uint64_t aBegin, uint64_t aEnd,
+    uint64_t bBegin, uint64_t bEnd, unsigned long long maxBytes,
+    LcsBudgetPartitionPlan &plan,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+  if (aBegin > aEnd || bBegin > bEnd || aEnd > a.size() || bEnd > b.size())
+    return false;
+
+  const uint64_t aWidth = aEnd - aBegin;
+  const uint64_t bWidth = bEnd - bBegin;
+  uint64_t requiredBytes = 0;
+  if (getLcsCertificationRequiredBytes(
+          aWidth, bWidth, /*retainCompleteOracle=*/false, requiredBytes) &&
+      requiredBytes <= maxBytes) {
+    plan.windows.push_back(LcsCertificationWindow{
+        aBegin, aEnd, bBegin, bEnd,
+        LcsWindowCertificationStatus::PartitionUnresolved,
+        /*requiredBytes=*/0, /*proofBudgetBytes=*/0});
+    return true;
+  }
+
+  // There is no interior A row to project. Preserve the exact rectangle as a
+  // local fail-closed window; its certifier will record BudgetExceeded or the
+  // checked non-representability status and compute its exact objective.
+  if (aWidth < 2) {
+    plan.windows.push_back(LcsCertificationWindow{
+        aBegin, aEnd, bBegin, bEnd,
+        LcsWindowCertificationStatus::PartitionUnresolved,
+        /*requiredBytes=*/0, /*proofBudgetBytes=*/0});
+    return true;
+  }
+
+  const uint64_t midpoint = aBegin + aWidth / 2;
+  SmallVector<uint64_t, 2> scheduledBoundaries;
+  scheduledBoundaries.push_back(midpoint);
+  const std::optional<uint64_t> producerBoundary = nearestInteriorCandidate(
+      normalizedCandidates, aBegin, aEnd, midpoint);
+  if (producerBoundary && *producerBoundary != midpoint)
+    scheduledBoundaries.push_back(*producerBoundary);
+
+  for (uint64_t aBoundary : scheduledBoundaries) {
+    recordDiagnosticCandidate(aBoundary, diagnosticEvidence);
+    LcsBoundaryFrontierProjection projection;
+    if (!projectLcsBoundaryToOptimalBFrontiers(
+            a, aBegin, aEnd, b, bBegin, bEnd, aBoundary, gapProvenance,
+            projection) ||
+        !projection.objectiveIsExact)
+      return false;
+    if (diagnosticEvidence)
+      diagnosticEvidence->boundaryFrontierProjections.push_back(projection);
+    if (!projection.ProvesUniqueBoundary())
+      continue;
+
+    const uint64_t bBoundary = projection.admissibleBFrontiers.front();
+    if (bBoundary < bBegin || bBoundary > bEnd)
+      return false;
+
+    if (!appendBudgetPartition(a, b, gapProvenance, normalizedCandidates,
+                               aBegin, aBoundary, bBegin, bBoundary, maxBytes,
+                               plan, diagnosticEvidence))
+      return false;
+    plan.certifiedBoundaries.push_back(LcsCertifiedBoundary{
+        aBoundary, bBoundary,
+        LcsBoundaryProofKind::EveryOptimalPathCrossesState});
+    return appendBudgetPartition(
+        a, b, gapProvenance, normalizedCandidates, aBoundary, aEnd, bBoundary,
+        bEnd, maxBytes, plan, diagnosticEvidence);
+  }
+
+  // Neither exact projection proved a singleton frontier. Do not search an
+  // unbounded number of alternative rows: that was the catastrophic
+  // O(candidateCount*N*M) behavior this path is designed to eliminate. The
+  // unresolved rectangle remains fail closed and contributes no anchors.
+  plan.windows.push_back(LcsCertificationWindow{
+      aBegin, aEnd, bBegin, bEnd,
+      LcsWindowCertificationStatus::PartitionUnresolved,
+      /*requiredBytes=*/0, /*proofBudgetBytes=*/0});
+  return true;
+}
+
+bool certifyLcsWindowsIndependently(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    ArrayRef<uint64_t> candidateABoundaries,
+    unsigned long long maxBytes, CertifiedLcsResult &result,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+  result = CertifiedLcsResult{};
+  if (diagnosticEvidence)
+    *diagnosticEvidence = LcsCertificationDiagnosticEvidence{};
+  if (!hasBoundaryVectorSize(a.size(), gapProvenance.size()) ||
+      b.size() > MAX)
+    return false;
+
+  // Preserve the established one-window path when no partition nominations
+  // are supplied. Besides avoiding a redundant linear-space pass, this retains
+  // the complete-stream oracle and its exact historical byte accounting.
+  if (candidateABoundaries.empty())
+    return certifyFullStreamFromProvenance(a, b, gapProvenance, maxBytes,
+                                           result);
+
+  LcsWindowPartitionResult partition;
+  if (!partitionLcsWindowsLinearSpace(
+          a, /*aBegin=*/0, static_cast<uint64_t>(a.size()), b,
+          /*bBegin=*/0, static_cast<uint64_t>(b.size()), gapProvenance,
+          candidateABoundaries, partition, diagnosticEvidence) ||
+      !partition.objectiveIsExact || partition.windows.empty() ||
+      partition.certifiedBoundaries.size() + 1 != partition.windows.size())
+    return false;
+
+  if (partition.certifiedBoundaries.empty()) {
+    if (!certifyFullStreamFromProvenance(a, b, gapProvenance, maxBytes,
+                                         result) ||
+        result.globalObjective != partition.objective) {
+      result = CertifiedLcsResult{};
+      return false;
+    }
+    return true;
+  }
+
+  if (!certifyPartitionWindows(
+          a, b, gapProvenance, partition.certifiedBoundaries,
+          partition.windows, maxBytes, result) ||
+      result.globalObjective != partition.objective) {
+    result = CertifiedLcsResult{};
+    return false;
+  }
+  return true;
+}
+
+bool certifyLcsWindowsWithinBudget(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    ArrayRef<uint64_t> candidateABoundaries,
+    unsigned long long maxBytes, CertifiedLcsResult &result,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+  result = CertifiedLcsResult{};
+  if (diagnosticEvidence)
+    *diagnosticEvidence = LcsCertificationDiagnosticEvidence{};
+  if (!hasBoundaryVectorSize(a.size(), gapProvenance.size()) ||
+      b.size() > MAX)
+    return false;
+
+  std::vector<uint64_t> normalizedCandidates;
+  normalizedCandidates.reserve(candidateABoundaries.size());
+  for (uint64_t boundary : candidateABoundaries) {
+    if (boundary <= a.size())
+      normalizedCandidates.push_back(boundary);
+  }
+  std::sort(normalizedCandidates.begin(), normalizedCandidates.end());
+  normalizedCandidates.erase(
+      std::unique(normalizedCandidates.begin(), normalizedCandidates.end()),
+      normalizedCandidates.end());
+  if (diagnosticEvidence) {
+    diagnosticEvidence->candidateABoundaries.assign(
+        normalizedCandidates.begin(), normalizedCandidates.end());
+  }
+
+  LcsBudgetPartitionPlan plan;
+  if (!appendBudgetPartition(
+          a, b, gapProvenance, normalizedCandidates, /*aBegin=*/0,
+          static_cast<uint64_t>(a.size()), /*bBegin=*/0,
+          static_cast<uint64_t>(b.size()), maxBytes, plan,
+          diagnosticEvidence) ||
+      plan.windows.empty() ||
+      plan.certifiedBoundaries.size() + 1 != plan.windows.size())
+    return false;
+
+  // Preserve the historical complete-stream byte threshold when no exact
+  // seam was proved. The complete compatibility theorem retains one extra
+  // owner-gap copy for its oracle, and existing budget tests intentionally
+  // account for that payload. A genuinely partitioned result uses the smaller
+  // local-window accounting because no complete oracle is retained.
+  if (plan.certifiedBoundaries.empty() && plan.windows.size() == 1)
+    return certifyFullStreamFromProvenance(a, b, gapProvenance, maxBytes,
+                                           result);
+
+  return certifyPartitionWindows(a, b, gapProvenance,
+                                 plan.certifiedBoundaries, plan.windows,
+                                 maxBytes, result);
+}
+
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                               ArrayRef<uint32_t> ownerDepthGap,
                               unsigned long long maxBytes) {
@@ -1701,31 +2889,16 @@ CertifiedLcsResult
 certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                   ArrayRef<LcsAGapProvenance> gapProvenance,
                   unsigned long long maxBytes) {
-  if (gapProvenance.size() != a.size() + 1)
+  if (!hasBoundaryVectorSize(a.size(), gapProvenance.size()))
     REFOLD_LOG_FATAL("lcs/map", "gapProvenance length must be A.size() + 1");
   if (b.size() > MAX)
     REFOLD_LOG_FATAL("lcs/map", "B.size() exceeds int64_t index range");
 
-  std::vector<uint32_t> ownerDepthGap;
-  ownerDepthGap.reserve(gapProvenance.size());
-  for (const LcsAGapProvenance &profile : gapProvenance)
-    ownerDepthGap.push_back(profile.ownerDepth);
-
   CertifiedLcsResult result;
-  if (buildForcedCertifiedResult(a, b, ownerDepthGap, maxBytes, result))
-    return result;
-
-  result.forcedMap.assign(a.size(), -1);
-  result.selectedMap.assign(a.size(), -1);
-  result.selectedAnchorProofs.assign(a.size(), LcsAnchorProof{});
-  result.globalObjective =
-      lcsObjectiveLinearSpaceWeighted(a, b, ownerDepthGap);
-  result.completeCertification = false;
-  REFOLD_LOG_WARN(
-      "lcs/map",
-      "all-optimal certification unavailable: suppressing all structured "
-      "token anchors (aTokens={0}, bTokens={1}, maxBytes={2})",
-      a.size(), b.size(), maxBytes);
+  if (!certifyLcsWindowsIndependently(
+          a, b, gapProvenance, /*candidateABoundaries=*/{}, maxBytes,
+          result))
+    REFOLD_LOG_FATAL("lcs/map", "full-stream LCS certification failed");
   return result;
 }
 
@@ -1736,37 +2909,17 @@ certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                   unsigned long long maxBytes) {
   if (bGapProvenance.size() != b.size() + 1)
     REFOLD_LOG_FATAL("lcs/map", "bGapProvenance length must be B.size() + 1");
-  if (gapProvenance.size() != a.size() + 1)
+  if (!hasBoundaryVectorSize(a.size(), gapProvenance.size()))
     REFOLD_LOG_FATAL("lcs/map", "gapProvenance length must be A.size() + 1");
   if (b.size() > MAX)
     REFOLD_LOG_FATAL("lcs/map", "B.size() exceeds int64_t index range");
 
-  std::vector<uint32_t> ownerDepthGap;
-  ownerDepthGap.reserve(gapProvenance.size());
-  for (const LcsAGapProvenance &profile : gapProvenance)
-    ownerDepthGap.push_back(profile.ownerDepth);
-
   (void)bGapProvenance;
   CertifiedLcsResult result;
-  if (buildForcedCertifiedResult(a, b, ownerDepthGap, maxBytes, result))
-    return result;
-
-  // The exact linear-space solver can still recover the global weighted
-  // objective, but it selects only one optimal path and therefore proves
-  // nothing about ambiguity. Keep both public maps fully suppressed so the
-  // refolding path forms one conservative edit island and fails closed rather
-  // than treating a resource-driven path choice as provenance.
-  result.forcedMap.assign(a.size(), -1);
-  result.selectedMap.assign(a.size(), -1);
-  result.selectedAnchorProofs.assign(a.size(), LcsAnchorProof{});
-  result.globalObjective =
-      lcsObjectiveLinearSpaceWeighted(a, b, ownerDepthGap);
-  result.completeCertification = false;
-  REFOLD_LOG_WARN(
-      "lcs/map",
-      "all-optimal certification unavailable: suppressing all structured "
-      "token anchors (aTokens={0}, bTokens={1}, maxBytes={2})",
-      a.size(), b.size(), maxBytes);
+  if (!certifyLcsWindowsIndependently(
+          a, b, gapProvenance, /*candidateABoundaries=*/{}, maxBytes,
+          result))
+    REFOLD_LOG_FATAL("lcs/map", "full-stream LCS certification failed");
   return result;
 }
 
@@ -1842,38 +2995,102 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   return map;
 }
 
-std::vector<Hunk> hunksFromMap(ArrayRef<int64_t> map, size_t nA, size_t nB) {
-  std::vector<Hunk> hunks;
+namespace {
 
+/// Append edit hunks from one exact seam-delimited A/B rectangle.
+///
+/// Token anchors remain ordinary match edges inside the rectangle. The
+/// rectangle endpoints are only DP-state conditions, so the trailing edit on
+/// the left side and the leading edit on the right side remain distinct even
+/// when no matched token occurs at the shared seam.
+static bool appendHunksForAlignmentWindow(ArrayRef<int64_t> map,
+                                          uint64_t aBegin, uint64_t aEnd,
+                                          uint64_t bBegin, uint64_t bEnd,
+                                          std::vector<Hunk> &hunks) {
+  uint64_t nextA = aBegin;
+  uint64_t nextB = bBegin;
+  const uint64_t mappedAEnd =
+      std::min<uint64_t>(aEnd, static_cast<uint64_t>(map.size()));
+
+  for (uint64_t aToken = aBegin; aToken < mappedAEnd; ++aToken) {
+    const int64_t matchedB = map[static_cast<size_t>(aToken)];
+    if (matchedB < 0)
+      continue;
+
+    const uint64_t bToken = static_cast<uint64_t>(matchedB);
+    if (bToken < bBegin || bToken >= bEnd || bToken < nextB)
+      return false;
+
+    if (aToken > nextA || bToken > nextB)
+      hunks.push_back(Hunk{nextA, aToken, nextB, bToken});
+
+    nextA = aToken + 1;
+    nextB = bToken + 1;
+  }
+
+  if (nextA < aEnd || nextB < bEnd)
+    hunks.push_back(Hunk{nextA, aEnd, nextB, bEnd});
+  return true;
+}
+
+/// Validate that exact seams form an ordered interior partition.
+static bool hunkBoundariesFormMonotonePartition(
+    ArrayRef<LcsCertifiedBoundary> certifiedBoundaries, uint64_t limitA,
+    uint64_t limitB) {
+  uint64_t previousA = 0;
+  uint64_t previousB = 0;
+  for (const LcsCertifiedBoundary &boundary : certifiedBoundaries) {
+    if (!boundary.IsAuthorized() || boundary.aBoundary > limitA ||
+        boundary.bBoundary > limitB || boundary.aBoundary < previousA ||
+        boundary.bBoundary < previousB ||
+        (boundary.aBoundary == previousA &&
+         boundary.bBoundary == previousB) ||
+        (boundary.aBoundary == limitA && boundary.bBoundary == limitB))
+      return false;
+    previousA = boundary.aBoundary;
+    previousB = boundary.bBoundary;
+  }
+  return true;
+}
+
+} // namespace
+
+std::vector<Hunk>
+hunksFromMap(ArrayRef<int64_t> map,
+             ArrayRef<LcsCertifiedBoundary> certifiedBoundaries, size_t nA,
+             size_t nB) {
   const uint64_t limitA = static_cast<uint64_t>(nA);
   const uint64_t limitB = static_cast<uint64_t>(nB);
+  if (!hunkBoundariesFormMonotonePartition(certifiedBoundaries, limitA,
+                                            limitB)) {
+    REFOLD_LOG_FATAL("lcs/hunks",
+                     "certified boundaries do not form a monotone interior "
+                     "A/B partition");
+  }
 
-  // Track the 'next expected' index to identify gaps.
-  uint64_t nextA = 0;
-  uint64_t nextB = 0;
-  for (uint64_t i = 0; i < nA; ++i) {
-    const int64_t matchedJ = (i < map.size() ? map[i] : -1);
-    if (matchedJ < 0)
-      continue; // Skip unmatched tokens
-
-    const uint64_t j = static_cast<uint64_t>(matchedJ);
-
-    // If there's a gap in A or B since the last match, we have a Hunk
-    if (i > nextA || j > nextB) {
-      hunks.push_back(Hunk{nextA, i, nextB, j});
+  std::vector<Hunk> hunks;
+  uint64_t aBegin = 0;
+  uint64_t bBegin = 0;
+  for (const LcsCertifiedBoundary &boundary : certifiedBoundaries) {
+    if (!appendHunksForAlignmentWindow(map, aBegin, boundary.aBoundary,
+                                       bBegin, boundary.bBoundary, hunks)) {
+      REFOLD_LOG_FATAL("lcs/hunks",
+                       "token anchor crosses a certified A/B state seam");
     }
-
-    // After a match, the next possible Hunk starts at i+1, j+1
-    nextA = i + 1;
-    nextB = j + 1;
+    aBegin = boundary.aBoundary;
+    bBegin = boundary.bBoundary;
   }
 
-  // Handle the tail region
-  if (nextA < limitA || nextB < limitB) {
-    hunks.push_back(Hunk{nextA, limitA, nextB, limitB});
+  if (!appendHunksForAlignmentWindow(map, aBegin, limitA, bBegin, limitB,
+                                     hunks)) {
+    REFOLD_LOG_FATAL("lcs/hunks",
+                     "token anchor lies outside its certified A/B window");
   }
-
   return hunks;
+}
+
+std::vector<Hunk> hunksFromMap(ArrayRef<int64_t> map, size_t nA, size_t nB) {
+  return hunksFromMap(map, /*certifiedBoundaries=*/{}, nA, nB);
 }
 
 // ===================== Myers linear-space O((N+M)*D) diff ====================

@@ -106,6 +106,11 @@ AlignmentSelectionOverride buildSimulationSelection(
   selection.selectedMap.assign(map.begin(), map.end());
   selection.selectedAnchorProofs.assign(map.size(),
                                          diffutils::LcsAnchorProof{});
+  selection.globalObjective = coreAlignment.globalObjective;
+  selection.globalObjectiveIsExact = coreAlignment.globalObjectiveIsExact;
+  selection.allWindowsCertified = coreAlignment.allWindowsCertified;
+  selection.certifiedBoundaries = coreAlignment.certifiedBoundaries;
+  selection.certificationWindows = coreAlignment.certificationWindows;
   for (size_t aToken = 0; aToken < map.size(); ++aToken) {
     const int64_t bToken = map[aToken];
     if (bToken < 0)
@@ -395,8 +400,9 @@ RefoldAlignmentSemanticResolver::Resolve() const {
 
   const diffutils::OptimalTokenAlignmentOracle &oracle =
       deps_.coreAlignment.oracle;
-  if (!deps_.coreAlignment.completeCertification ||
-      !oracle.HasCompleteCertification() || !deps_.simulate ||
+  if (!deps_.coreAlignment.HasCompleteSemanticOracleForWindow(
+          /*windowIndex=*/0) ||
+      !deps_.simulate ||
       deps_.coreAlignment.forcedMap.size() != deps_.aLexemes.size() ||
       oracle.GetATokenCount() != deps_.aLexemes.size() ||
       oracle.GetBTokenCount() != deps_.bLexemes.size())

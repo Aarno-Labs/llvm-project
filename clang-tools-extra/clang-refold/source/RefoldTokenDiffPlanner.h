@@ -102,7 +102,8 @@ public:
     std::vector<diffutils::Hunk> hunks;
     /// Structured core-optimal alignment result retained for later semantic
     /// resolution. `alignment.selectedMap` is the certified map used to derive
-    /// `hunks`; it is fully suppressed when certification is incomplete.
+    /// `hunks`; each retained anchor belongs to a certified window even when
+    /// another independent window is uncertified.
     diffutils::CertifiedLcsResult alignment;
   };
 
@@ -158,6 +159,15 @@ private:
   std::vector<diffutils::LcsBGapProvenance>
   ComputeLcsBGapProvenanceForPP() const;
 
+  /// Collect exact protected preprocessing-structure A-token boundaries.
+  ///
+  /// Include covers and tokenless directive intervals are projected only when
+  /// producer token/source facts identify one exact A frontier.  Unmappable
+  /// intervals are counted for diagnostics and never replaced by a nearest
+  /// token approximation.
+  std::vector<uint64_t>
+  CollectProtectedAlignmentABoundaries(size_t &unmappedIntervalCount) const;
+
   /// Emit permanent evidence-only diagnostics for every certified ambiguity
   /// window.
   ///
@@ -170,7 +180,15 @@ private:
   void TraceAlignmentAmbiguityWindows(
       llvm::ArrayRef<llvm::StringRef> aSeq,
       llvm::ArrayRef<llvm::StringRef> bSeq,
+      llvm::ArrayRef<uint64_t> protectedABoundaries,
+      size_t unmappedProtectedIntervals,
       const diffutils::CertifiedLcsResult &alignment) const;
+
+  /// Emit the stable evidence-only transcript retained by the certifier.
+  void TraceAlignmentCertificationRun(
+      const diffutils::CertifiedLcsResult &alignment,
+      const diffutils::LcsCertificationDiagnosticEvidence &diagnosticEvidence,
+      uint64_t aTokenCount, uint64_t bTokenCount) const;
 
   /// Borrowed construction-time service graph for token-diff planning.
   Dependencies deps_;

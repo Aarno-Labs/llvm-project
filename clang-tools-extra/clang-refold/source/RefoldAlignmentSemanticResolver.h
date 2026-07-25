@@ -33,6 +33,14 @@ namespace refold {
 struct AlignmentSelectionOverride {
   std::vector<int64_t> selectedMap;
   std::vector<diffutils::LcsAnchorProof> selectedAnchorProofs;
+  /// Preserve the parent certification envelope so isolated simulations pass
+  /// the same per-window authority checks as the production planner.
+  diffutils::LcsObjective globalObjective;
+  bool globalObjectiveIsExact = false;
+  bool allWindowsCertified = false;
+  llvm::SmallVector<diffutils::LcsCertifiedBoundary, 1> certifiedBoundaries;
+  llvm::SmallVector<diffutils::LcsCertificationWindow, 1>
+      certificationWindows;
 };
 
 /// Diagnostic classification of one isolated alignment simulation.
@@ -154,6 +162,11 @@ public:
 
   /// Resolve non-forced core-optimal maps through exact source-preservation,
   /// realized-source equivalence, and counterfactual theorems.
+  ///
+  /// The current theorem requires one retained complete-stream oracle. A
+  /// partitioned or partially certified result therefore returns the
+  /// independently certified core map without inspecting unavailable pair
+  /// facts; future compositional restoration may relax that gate per window.
   ///
   /// Enumeration budgets are proof budgets only: exceeding one returns the
   /// forced-only map and cannot authorize a partial class or ranked winner.
