@@ -2788,6 +2788,8 @@ void RefoldModel::BuildIndicesAndSort() {
   condGroupById_.clear();
   armById_.clear();
   segmentsByFile_.clear();
+  macroDirById_.clear();
+  macroDirsByName_.clear();
 
   // Some producer paths emit include items with an empty `spans` array even
   // though the slot stream already carries exact file_begin/file_end ownership
@@ -2872,6 +2874,17 @@ void RefoldModel::BuildIndicesAndSort() {
           "producer resume index {2}",
           inc.id, *inc.lookup->searchChainIndex,
           *inc.includeNext->resumeSearchChainIndex);
+  }
+
+  // macro-directive id and macro-state-key indices.  `macroDirs_` is never
+  // reordered, so walking it in producer record order gives every name bucket
+  // the same relative directive order a filtered linear scan would observe.
+  macroDirById_.reserve(macroDirs_.size());
+  for (const auto &directive : macroDirs_) {
+    // `try_emplace` keeps the first record for a repeated id, which is exactly
+    // what the linear `directive.id == wanted` scans this index replaces did.
+    macroDirById_.try_emplace(directive.id, &directive);
+    macroDirsByName_[directive.name].push_back(&directive);
   }
 
   // condsByFile / condsByFileByOwner

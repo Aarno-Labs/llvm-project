@@ -869,8 +869,10 @@ void appendUniqueProtectedSourceAuthorizations(TextEdit &destination,
 
 } // namespace
 
-RefoldPreprocessingStructureIndex
-RefoldTextEditAssembler::BuildEmissionStructureIndex(
+RefoldTextEditAssembler::~RefoldTextEditAssembler() = default;
+
+const RefoldPreprocessingStructureIndex &
+RefoldTextEditAssembler::GetEmissionStructureIndex(
     StringRef emissionOwner, std::optional<uint64_t> ownerIncludeId,
     StringRef originalFileText) const {
   if (pathIdentity_.PathsEqual(
@@ -881,10 +883,22 @@ RefoldTextEditAssembler::BuildEmissionStructureIndex(
     return tuPreprocessingStructureIndex_;
   }
 
-  return RefoldPreprocessingStructureIndex::Build(
-      RefoldPreprocessingStructureIndex::Dependencies{
-          model_, pathIdentity_, macroStateProof_, lexLang_},
-      emissionOwner, originalFileText, ownerIncludeId);
+  // A cached census is reused only for the same source owner occurrence at the
+  // same source extent, which is the exact discriminator the run-wide TU reuse
+  // check above applies.  A different extent rebuilds and replaces the entry
+  // rather than answering from a census of other bytes.
+  EmissionStructureIndexCacheEntry &entry =
+      emissionStructureIndexCache_[{emissionOwner.str(), ownerIncludeId}];
+  if (entry.index && entry.sourceSize == originalFileText.size())
+    return *entry.index;
+
+  entry.index = std::make_unique<RefoldPreprocessingStructureIndex>(
+      RefoldPreprocessingStructureIndex::Build(
+          RefoldPreprocessingStructureIndex::Dependencies{
+              model_, pathIdentity_, macroStateProof_, lexLang_},
+          emissionOwner, originalFileText, ownerIncludeId));
+  entry.sourceSize = originalFileText.size();
+  return *entry.index;
 }
 
 bool RefoldTextEditAssembler::AuthorizeProtectedSourceIntervals(
@@ -911,7 +925,7 @@ bool RefoldTextEditAssembler::AuthorizeProtectedSourceIntervals(
     return reject("malformed protected-source authorization request");
   }
 
-  RefoldPreprocessingStructureIndex structure = BuildEmissionStructureIndex(
+  const RefoldPreprocessingStructureIndex &structure = GetEmissionStructureIndex(
       sourcePath, ownerIncludeId, sourceBytes);
   if (!structure.IsProtectionCensusComplete())
     return reject("protected-source authorization has an incomplete physical "
@@ -1011,7 +1025,7 @@ bool RefoldTextEditAssembler::AuthorizeExactProtectedSourceInterval(
     return reject("malformed exact protected-source authorization request");
   }
 
-  RefoldPreprocessingStructureIndex structure = BuildEmissionStructureIndex(
+  const RefoldPreprocessingStructureIndex &structure = GetEmissionStructureIndex(
       sourcePath, ownerIncludeId, sourceBytes);
   if (!structure.IsProtectionCensusComplete())
     return reject("exact protected-source authorization has an incomplete "
@@ -1187,7 +1201,7 @@ bool RefoldTextEditAssembler::OrdinaryEditAvoidsProtectedPreprocessingStructure(
   if (edit.start > edit.end || edit.end > sourceBytes.size())
     return reject("ordinary source edit has an invalid physical byte range");
 
-  RefoldPreprocessingStructureIndex structure = BuildEmissionStructureIndex(
+  const RefoldPreprocessingStructureIndex &structure = GetEmissionStructureIndex(
       sourcePath, ownerIncludeId, sourceBytes);
   if (!structure.IsProtectionCensusComplete())
     return reject("ordinary source edit has an incomplete physical "
@@ -1228,7 +1242,7 @@ bool RefoldTextEditAssembler::AuditGlobalSourceEditInvariant(
   if (emissionOwner.empty())
     return reject("global source-edit audit has no physical emission owner");
 
-  RefoldPreprocessingStructureIndex structure = BuildEmissionStructureIndex(
+  const RefoldPreprocessingStructureIndex &structure = GetEmissionStructureIndex(
       emissionOwner, ownerIncludeId, originalFileText);
   if (!structure.IsProtectionCensusComplete())
     return reject("global source-edit audit has an incomplete physical "

@@ -19,6 +19,8 @@
 #include "source/RefoldSourceMapper.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -49,12 +51,12 @@ namespace {
 
 /// Render an optional unsigned 64-bit value as decimal or the literal "none".
 std::string formatOptionalU64(std::optional<uint64_t> value) {
-  return value ? llvm::formatv("{0}", *value).str() : std::string("none");
+  return value ? llvm::utostr(*value) : std::string("none");
 }
 
 /// Render an optional unsigned 32-bit value as decimal or the literal "none".
 std::string formatOptionalU32(std::optional<uint32_t> value) {
-  return value ? llvm::formatv("{0}", *value).str() : std::string("none");
+  return value ? llvm::utostr(*value) : std::string("none");
 }
 
 /// Render an optional std::string verbatim or the literal "none".
@@ -72,7 +74,7 @@ std::string formatOptionalString(const std::optional<std::string> &value) {
 
 /// Append a macro identity record: name, define/undef directive ids, arity,
 /// variadic flag, and replacement-token hash.
-void appendMacroIdentity(llvm::raw_ostream &os, llvm::StringRef label,
+void appendMacroIdentity(llvm::raw_ostream &os, const llvm::Twine &label,
                          const MacroStateIdentity &identity) {
   os << label << "{name=" << identity.macroName
      << ":def=" << formatOptionalU64(identity.definitionDirectiveId)
@@ -86,7 +88,7 @@ void appendMacroIdentity(llvm::raw_ostream &os, llvm::StringRef label,
 }
 
 /// Append a macro observation record (kind + identity).
-void appendMacroObservation(llvm::raw_ostream &os, llvm::StringRef label,
+void appendMacroObservation(llvm::raw_ostream &os, const llvm::Twine &label,
                             const MacroStateObservation &observation) {
   os << label << "{kind=" << toString(observation.kind) << ':';
   appendMacroIdentity(os, "identity=", observation.identity);
@@ -95,28 +97,29 @@ void appendMacroObservation(llvm::raw_ostream &os, llvm::StringRef label,
 
 /// Append every macro observation/requirement bucket carried by `facts` under
 /// the shared prefix `bucket`.
-void appendMacroObservationBucket(llvm::raw_ostream &os, llvm::StringRef bucket,
+void appendMacroObservationBucket(llvm::raw_ostream &os,
+                                  const llvm::Twine &bucket,
                                   const OwnerStateFacts &facts) {
   for (const MacroStateIdentity &identity : facts.macroRequirements)
-    appendMacroIdentity(os, llvm::formatv("{0}.requirement=", bucket).str(),
+    appendMacroIdentity(os, bucket + ".requirement=",
                         identity);
   for (const MacroStateObservation &observation :
        facts.macroExpansionObservations)
-    appendMacroObservation(os, llvm::formatv("{0}.expansion=", bucket).str(),
+    appendMacroObservation(os, bucket + ".expansion=",
                            observation);
   for (const MacroStateObservation &observation :
        facts.definedOperatorObservations)
-    appendMacroObservation(os, llvm::formatv("{0}.defined=", bucket).str(),
+    appendMacroObservation(os, bucket + ".defined=",
                            observation);
   for (const MacroStateObservation &observation :
        facts.conditionalMacroObservations)
-    appendMacroObservation(os, llvm::formatv("{0}.conditional=", bucket).str(),
+    appendMacroObservation(os, bucket + ".conditional=",
                            observation);
 }
 
 /// Append an include identity record: directive kind, site, target, resolved
 /// path, angled-ness, parent include id, and materialization flag.
-void appendIncludeIdentity(llvm::raw_ostream &os, llvm::StringRef label,
+void appendIncludeIdentity(llvm::raw_ostream &os, const llvm::Twine &label,
                            const IncludeStateIdentity &identity) {
   os << label << "{id=" << identity.includeId
      << ":kind=" << identity.directiveKind << ":site=" << identity.sitePath
@@ -129,7 +132,8 @@ void appendIncludeIdentity(llvm::raw_ostream &os, llvm::StringRef label,
 }
 
 /// Append an include-guard identity record.
-void appendIncludeGuardIdentity(llvm::raw_ostream &os, llvm::StringRef label,
+void appendIncludeGuardIdentity(llvm::raw_ostream &os,
+                                const llvm::Twine &label,
                                 const IncludeGuardStateIdentity &identity) {
   os << label << "{kind=" << toString(identity.kind)
      << ":include=" << identity.includeId << ":header=" << identity.headerPath
@@ -140,7 +144,8 @@ void appendIncludeGuardIdentity(llvm::raw_ostream &os, llvm::StringRef label,
 
 /// Append a line-control identity record (file, site, logical line/file
 /// after, owner include, operand provenance).
-void appendLineControlIdentity(llvm::raw_ostream &os, llvm::StringRef label,
+void appendLineControlIdentity(llvm::raw_ostream &os,
+                               const llvm::Twine &label,
                                const LineControlStateIdentity &identity) {
   os << label << "{id=" << identity.eventId << ":file=" << identity.physicalFile
      << ":site=[" << formatOptionalU64(identity.siteBegin) << ','
@@ -155,7 +160,7 @@ void appendLineControlIdentity(llvm::raw_ostream &os, llvm::StringRef label,
 
 /// Append a builtin-location observation record.
 void appendBuiltinLocationObservation(
-    llvm::raw_ostream &os, llvm::StringRef label,
+    llvm::raw_ostream &os, const llvm::Twine &label,
     const BuiltinLocationObservation &observation) {
   os << label << "{kind=" << toString(observation.kind)
      << ":owner_include=" << formatOptionalU64(observation.ownerIncludeId)
@@ -166,7 +171,7 @@ void appendBuiltinLocationObservation(
 }
 
 /// Append a counter event identity record.
-void appendCounterIdentity(llvm::raw_ostream &os, llvm::StringRef label,
+void appendCounterIdentity(llvm::raw_ostream &os, const llvm::Twine &label,
                            const CounterEventIdentity &identity) {
   os << label << "{macro=" << identity.macroInvocationId
      << ":ordinal=" << identity.occurrenceOrdinal
@@ -185,7 +190,7 @@ void appendCounterIdentity(llvm::raw_ostream &os, llvm::StringRef label,
 }
 
 /// Append a pragma identity record.
-void appendPragmaIdentity(llvm::raw_ostream &os, llvm::StringRef label,
+void appendPragmaIdentity(llvm::raw_ostream &os, const llvm::Twine &label,
                           const PragmaStateIdentity &identity) {
   os << label << "{id=" << identity.pragmaId << ":site=" << identity.sitePath
      << '[' << identity.siteBegin << ',' << identity.siteEnd << ')'
@@ -198,7 +203,8 @@ void appendPragmaIdentity(llvm::raw_ostream &os, llvm::StringRef label,
 
 /// Append a conditional identity record (role, group, arm, parent, selection,
 /// producer-truth, reverse-solved flag).
-void appendConditionalIdentity(llvm::raw_ostream &os, llvm::StringRef label,
+void appendConditionalIdentity(llvm::raw_ostream &os,
+                               const llvm::Twine &label,
                                const ConditionalStateIdentity &identity) {
   os << label << "{role=" << toString(identity.role)
      << ":group=" << identity.groupId
@@ -218,7 +224,7 @@ void appendConditionalIdentity(llvm::raw_ostream &os, llvm::StringRef label,
 }
 
 /// Append a missing-state-fact record.
-void appendMissingFact(llvm::raw_ostream &os, llvm::StringRef label,
+void appendMissingFact(llvm::raw_ostream &os, const llvm::Twine &label,
                        const MissingStateFact &fact) {
   os << label << "{kind=" << toString(fact.kind)
      << ":detail=" << RefoldWitnessTrace::FormatWitnessTraceHash(fact.detail)
@@ -228,53 +234,53 @@ void appendMissingFact(llvm::raw_ostream &os, llvm::StringRef label,
 /// Append every identity bucket carried by `facts` under the shared prefix
 /// `bucket` (macros, line-control, builtins, counters, pragmas, includes,
 /// include-guards, conditionals, and missing facts).
-void appendFullStateFacts(llvm::raw_ostream &os, llvm::StringRef bucket,
+void appendFullStateFacts(llvm::raw_ostream &os, const llvm::Twine &bucket,
                           const OwnerStateFacts &facts) {
   for (const MacroStateIdentity &identity : facts.macroDefinitions)
-    appendMacroIdentity(os, llvm::formatv("{0}.macro_define=", bucket).str(),
+    appendMacroIdentity(os, bucket + ".macro_define=",
                         identity);
   for (const MacroStateIdentity &identity : facts.macroUndefinitions)
-    appendMacroIdentity(os, llvm::formatv("{0}.macro_undef=", bucket).str(),
+    appendMacroIdentity(os, bucket + ".macro_undef=",
                         identity);
   appendMacroObservationBucket(os, bucket, facts);
   for (const LineControlStateIdentity &identity : facts.lineControlEvents)
     appendLineControlIdentity(
-        os, llvm::formatv("{0}.line_control=", bucket).str(), identity);
+        os, bucket + ".line_control=", identity);
   for (const BuiltinLocationObservation &observation :
        facts.builtinLocationObservations)
     appendBuiltinLocationObservation(
-        os, llvm::formatv("{0}.builtin=", bucket).str(), observation);
+        os, bucket + ".builtin=", observation);
   for (const CounterEventIdentity &identity : facts.counterEvents)
-    appendCounterIdentity(os, llvm::formatv("{0}.counter=", bucket).str(),
+    appendCounterIdentity(os, bucket + ".counter=",
                           identity);
   for (const PragmaStateIdentity &identity : facts.pragmaStateEvents)
-    appendPragmaIdentity(os, llvm::formatv("{0}.pragma=", bucket).str(),
+    appendPragmaIdentity(os, bucket + ".pragma=",
                          identity);
   for (const IncludeStateIdentity &identity : facts.includeStateEvents)
-    appendIncludeIdentity(os, llvm::formatv("{0}.include=", bucket).str(),
+    appendIncludeIdentity(os, bucket + ".include=",
                           identity);
   for (const IncludeGuardStateIdentity &identity :
        facts.includeGuardStateEvents)
     appendIncludeGuardIdentity(
-        os, llvm::formatv("{0}.include_guard=", bucket).str(), identity);
+        os, bucket + ".include_guard=", identity);
   for (const ConditionalStateIdentity &identity : facts.conditionalStateEvents)
     appendConditionalIdentity(
-        os, llvm::formatv("{0}.conditional=", bucket).str(), identity);
+        os, bucket + ".conditional=", identity);
   for (const MissingStateFact &fact : facts.missingStateFacts)
-    appendMissingFact(os, llvm::formatv("{0}.missing=", bucket).str(), fact);
+    appendMissingFact(os, bucket + ".missing=", fact);
 }
 
 /// Append the four-bucket delta signature (entry / observes / mutates / exit)
 /// under the shared prefix `prefix`.
-void appendStateDeltaSignature(llvm::raw_ostream &os, llvm::StringRef prefix,
+void appendStateDeltaSignature(llvm::raw_ostream &os, const llvm::Twine &prefix,
                                const OwnerStateDelta &delta) {
-  appendFullStateFacts(os, llvm::formatv("{0}.entry", prefix).str(),
+  appendFullStateFacts(os, prefix + ".entry",
                        delta.entry);
-  appendFullStateFacts(os, llvm::formatv("{0}.observes", prefix).str(),
+  appendFullStateFacts(os, prefix + ".observes",
                        delta.observes);
-  appendFullStateFacts(os, llvm::formatv("{0}.mutates", prefix).str(),
+  appendFullStateFacts(os, prefix + ".mutates",
                        delta.mutates);
-  appendFullStateFacts(os, llvm::formatv("{0}.exit", prefix).str(), delta.exit);
+  appendFullStateFacts(os, prefix + ".exit", delta.exit);
 }
 
 // --- pure path/fact predicates --------------------------------------------

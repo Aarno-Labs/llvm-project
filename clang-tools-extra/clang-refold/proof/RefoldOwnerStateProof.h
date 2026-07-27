@@ -25,6 +25,11 @@
 
 #include "clang/Basic/LangOptions.h"
 
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <tuple>
+
 namespace clang {
 namespace refold {
 
@@ -141,8 +146,37 @@ public:
   static uint64_t OwnerIncludeBucketKey(std::optional<uint64_t> includeId);
   /// Source-owner bucket used for TU/include-local fact scans.
   static std::optional<uint64_t> OwnerSourceBucketKey(const Owner &owner);
-  /// Stable cache key for canonical owner-state deltas.
-  static std::string OwnerStateDeltaCacheKey(const Owner &owner);
+  /// Stable, allocation-free cache key for canonical owner-state deltas.
+  ///
+  /// Every field is the corresponding `Owner` field with `std::nullopt`
+  /// projected onto the reserved sentinel `kNoId`.  Two owners share a key
+  /// exactly when all eight identity fields agree, which is the same identity
+  /// the previous formatted string key expressed.
+  struct OwnerStateDeltaCacheKey {
+    static constexpr uint64_t kNoId = std::numeric_limits<uint64_t>::max();
+
+    unsigned kind = 0;
+    uint64_t includeId = kNoId;
+    uint64_t macroInvocationId = kNoId;
+    uint64_t macroDirectiveId = kNoId;
+    uint64_t lineControlId = kNoId;
+    uint64_t pragmaId = kNoId;
+    uint64_t condGroupId = kNoId;
+    uint64_t condArmId = kNoId;
+
+    /// Total order over the eight identity fields, in the same field order the
+    /// previous formatted key concatenated them.
+    bool operator<(const OwnerStateDeltaCacheKey &other) const {
+      return std::tie(kind, includeId, macroInvocationId, macroDirectiveId,
+                      lineControlId, pragmaId, condGroupId, condArmId) <
+             std::tie(other.kind, other.includeId, other.macroInvocationId,
+                      other.macroDirectiveId, other.lineControlId,
+                      other.pragmaId, other.condGroupId, other.condArmId);
+    }
+  };
+
+  /// Project an owner onto its canonical delta cache key.
+  static OwnerStateDeltaCacheKey MakeOwnerStateDeltaCacheKey(const Owner &owner);
 
   /// Build the conservative state summary for a concrete owner.
   ///
@@ -359,7 +393,8 @@ private:
   /// delta, and suffix-observer queries.
   mutable std::optional<OwnerStateFactIndex> ownerStateFactIndexCache_;
   mutable std::optional<OwnerStateGraph> ownerStateGraphCache_;
-  mutable llvm::StringMap<OwnerStateDelta> ownerStateDeltaCache_;
+  mutable std::map<OwnerStateDeltaCacheKey, OwnerStateDelta>
+      ownerStateDeltaCache_;
 };
 
 /// Diagnostic pragma state action admitted by the owner-state proof.

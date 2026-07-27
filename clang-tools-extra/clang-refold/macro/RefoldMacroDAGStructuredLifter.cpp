@@ -55,6 +55,17 @@ RefoldMacroDAGStructuredLifter::RefoldMacroDAGStructuredLifter(
 
 namespace {
 
+/// Return whether \p values already holds the exact spelling \p candidate.
+///
+/// Probing through StringRef keeps the comparison byte-for-byte identical to a
+/// std::string comparison while avoiding a temporary std::string per probe.
+static bool containsSpelling(ArrayRef<std::string> values,
+                             StringRef candidate) {
+  return llvm::any_of(values, [&](const std::string &value) {
+    return StringRef(value) == candidate;
+  });
+}
+
 /// Resolves the unique inverse split of a rewritten pasted-token core.
 ///
 /// The resolver is deliberately local to this translation unit because it owns
@@ -1196,7 +1207,7 @@ RefoldMacroDAGStructuredLifter::TryBuildExactSiblingRerootLift(
               deps_.textPrimitives.GetInvocationArgText(parent, parentFormal)) {
         StringRef parentArgTrim = parentArg->trim();
         if (!parentArgTrim.empty() &&
-            !llvm::is_contained(parentActuals, parentArgTrim.str()))
+            !containsSpelling(parentActuals, parentArgTrim))
           parentActuals.push_back(parentArgTrim.str());
       }
     }
@@ -1214,7 +1225,7 @@ RefoldMacroDAGStructuredLifter::TryBuildExactSiblingRerootLift(
         continue;
       StringRef exemplarOldTrim = exemplarOldArg->trim();
       if (exemplarOldTrim.empty() ||
-          !llvm::is_contained(parentActuals, exemplarOldTrim.str()))
+          !containsSpelling(parentActuals, exemplarOldTrim))
         continue;
 
       // Use another invocation of the same sibling macro as a concrete
@@ -1231,7 +1242,7 @@ RefoldMacroDAGStructuredLifter::TryBuildExactSiblingRerootLift(
         projected = projected.trim();
         if (projected.empty() || projected == exemplarOldTrim)
           continue;
-        if (!llvm::is_contained(projectedConcreteNews, projected.str()))
+        if (!containsSpelling(projectedConcreteNews, projected))
           projectedConcreteNews.push_back(projected.str());
       }
       if (projectedConcreteNews.size() != 1)

@@ -1337,14 +1337,8 @@ std::optional<std::string> simpleLineControlMacroReplacementText(
       sourceLineDirectiveMacroHasMaterializedPPTokens(macro))
     return std::nullopt;
 
-  const RefoldModel::MacroDirective *definition = nullptr;
-  for (const RefoldModel::MacroDirective &directive :
-       model.GetMacroDirectives()) {
-    if (directive.id == *macro.definitionDirectiveId) {
-      definition = &directive;
-      break;
-    }
-  }
+  const RefoldModel::MacroDirective *definition =
+      model.GetMacroDirectiveById(*macro.definitionDirectiveId);
   if (!definition || definition->subkind != "#define")
     return std::nullopt;
 

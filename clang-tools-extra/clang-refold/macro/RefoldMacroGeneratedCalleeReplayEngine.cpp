@@ -254,7 +254,7 @@ bool materializeTupleGeneratedLiteralActual(
     if (tok.spelling == "#" || tok.spelling == "##" ||
         tok.spelling == "__VA_OPT__")
       return false;
-    text += tok.spelling.str();
+    text += tok.spelling;
   }
 
   out = std::move(text);
@@ -686,7 +686,7 @@ buildInvocationRewriteOmittingErasedFinalVariadicActual(
         edit.end > baseInvocationText.size())
       return std::nullopt;
 
-    out.text += baseInvocationText.slice(cursor, edit.begin).str();
+    out.text += baseInvocationText.slice(cursor, edit.begin);
     const uint64_t replacementBegin = static_cast<uint64_t>(out.text.size());
     out.text.append(edit.text);
     const uint64_t replacementEnd = static_cast<uint64_t>(out.text.size());
@@ -697,7 +697,7 @@ buildInvocationRewriteOmittingErasedFinalVariadicActual(
     cursor = edit.end;
   }
 
-  out.text += baseInvocationText.substr(cursor).str();
+  out.text += baseInvocationText.substr(cursor);
   if (!mappedBegin || !mappedEnd)
     return std::nullopt;
   out.materializedOutputByteStart = *mappedBegin;
@@ -1347,7 +1347,7 @@ bool instantiateGeneratedArgument(
       text += actuals[*tok.paramIndex].text;
       continue;
     }
-    text += tok.spelling.str();
+    text += tok.spelling;
   }
 
   GeneratedCalleeSourceSlot slot;
@@ -2434,7 +2434,7 @@ public:
 
         std::string rewritten = existingRoot.str();
         rewritten += ", ";
-        rewritten += newTail.str();
+        rewritten += newTail;
         solution.workingRootTextByArgIdx[rootIdx] = std::move(rewritten);
         StringRef finalRoot =
             StringRef(solution.workingRootTextByArgIdx[rootIdx]).trim();
@@ -3011,10 +3011,9 @@ bool selectorSpellingNamesObjectAlias(const RefoldModel &model,
   if (trimmedSelector.empty())
     return false;
 
-  for (const RefoldModel::MacroDirective &directive :
-       model.GetMacroDirectives()) {
-    if (directive.name == trimmedSelector &&
-        isSingleTokenObjectSelectorAlias(directive))
+  for (const RefoldModel::MacroDirective *directive :
+       model.GetMacroDirectivesByName(trimmedSelector)) {
+    if (isSingleTokenObjectSelectorAlias(*directive))
       return true;
   }
   return false;
@@ -3066,12 +3065,16 @@ bool addObjectSelectorReplacement(
   if (!selectorSpellingNamesObjectAlias(deps.model, oldSelector))
     return false;
 
+  // The reverse search below has no name key, so it must consider every
+  // recorded selector alias.  Each probe now costs one alias walk rather than a
+  // second full directive scan.
+  const StringRef trimmedOldSelector = oldSelector.trim();
   std::optional<std::string> uniqueSelector;
   uint32_t uniqueAliasHops = 0;
   for (const RefoldModel::MacroDirective &directive :
        deps.model.GetMacroDirectives()) {
     if (!isSingleTokenObjectSelectorAlias(directive) ||
-        directive.name == oldSelector.trim())
+        directive.name == trimmedOldSelector)
       continue;
 
     uint32_t candidateHops = 0;
@@ -5028,7 +5031,7 @@ std::optional<std::string> replaySelectorToIdentifier(
       StringRef actual = StringRef(selectorActuals[*tok.paramIndex]).trim();
       if (!isReplayIdentifierSpelling(actual))
         return std::nullopt;
-      result += actual.str();
+      result += actual;
       continue;
     }
 
@@ -5043,7 +5046,7 @@ std::optional<std::string> replaySelectorToIdentifier(
       if (!stringutils::isIdentPart(c))
         return std::nullopt;
     }
-    result += tok.spelling.str();
+    result += tok.spelling;
   }
 
   if (result.empty() || !isReplayIdentifierSpelling(result))

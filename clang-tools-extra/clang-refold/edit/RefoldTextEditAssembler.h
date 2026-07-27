@@ -30,6 +30,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -141,6 +143,10 @@ public:
         sidebandPragmaEdits_(sidebandPragmaEdits),
         mixedOwnerTilingWitnesses_(mixedOwnerTilingWitnesses),
         theoremAudit_(theoremAudit), hooks_(std::move(hooks)) {}
+
+  /// Declared out of line so the emission structure-index cache can hold a
+  /// forward-declared RefoldPreprocessingStructureIndex.
+  ~RefoldTextEditAssembler();
 
   /// \brief Compute how to preserve __LINE__ after applying replacement to
   /// [start,end) in originalFileText.
@@ -444,9 +450,14 @@ public:
           std::nullopt) const;
 
 private:
-  /// Build the immutable protected-structure census for the physical source
+  /// Return the immutable protected-structure census for the physical source
   /// owner being assembled, reusing the run-wide TU index when possible.
-  RefoldPreprocessingStructureIndex BuildEmissionStructureIndex(
+  ///
+  /// The census is a pure function of the physical source owner, the owner
+  /// include occurrence, and the original file bytes, so the returned reference
+  /// names an assembler-owned immutable index that stays valid for the
+  /// assembler's lifetime.  Callers must not retain it beyond that.
+  const RefoldPreprocessingStructureIndex &GetEmissionStructureIndex(
       llvm::StringRef emissionOwner,
       std::optional<uint64_t> ownerIncludeId,
       llvm::StringRef originalFileText) const;
@@ -491,6 +502,24 @@ private:
   const std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses_;
   TheoremAuditStats &theoremAudit_;
   Hooks hooks_;
+
+  /// One built emission census plus the source extent it was built from.
+  struct EmissionStructureIndexCacheEntry {
+    std::unique_ptr<RefoldPreprocessingStructureIndex> index;
+    /// Byte size of the original file text the index was built from.  This is
+    /// the same discriminator the run-wide TU index reuse check applies, so a
+    /// cache hit never substitutes a census built from a different extent.
+    size_t sourceSize = 0;
+  };
+
+  /// Emission censuses keyed by `(physical source owner, owner include id)`.
+  ///
+  /// The census is immutable once built and is consulted by every per-edit and
+  /// per-interval authorization predicate, so it is built at most once per
+  /// source owner occurrence for the life of the assembler.
+  mutable std::map<std::pair<std::string, std::optional<uint64_t>>,
+                   EmissionStructureIndexCacheEntry>
+      emissionStructureIndexCache_;
 };
 
 } // namespace refold

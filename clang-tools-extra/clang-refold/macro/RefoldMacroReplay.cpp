@@ -957,12 +957,7 @@ RefoldMacroBoundarySelector::RightBoundaryVaOptActivationMacro(
       -> const RefoldModel::MacroDirective * {
     if (!inv.definitionDirectiveId)
       return nullptr;
-    for (const RefoldModel::MacroDirective &directive :
-         model_.GetMacroDirectives()) {
-      if (directive.id == *inv.definitionDirectiveId)
-        return &directive;
-    }
-    return nullptr;
+    return model_.GetMacroDirectiveById(*inv.definitionDirectiveId);
   };
 
   auto definitionContainsVaOpt =
@@ -1119,12 +1114,7 @@ RefoldMacroBoundarySelector::BoundaryDefinitionTapeReplayMacro(
       -> const RefoldModel::MacroDirective * {
     if (!macro.definitionDirectiveId)
       return nullptr;
-    for (const RefoldModel::MacroDirective &directive :
-         model_.GetMacroDirectives()) {
-      if (directive.id == *macro.definitionDirectiveId)
-        return &directive;
-    }
-    return nullptr;
+    return model_.GetMacroDirectiveById(*macro.definitionDirectiveId);
   };
 
   RefoldMacroActualLayout actualLayout({&lexLang_});

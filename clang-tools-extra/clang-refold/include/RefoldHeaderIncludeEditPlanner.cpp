@@ -216,6 +216,24 @@ RefoldHeaderIncludeEditPlanner::RefoldHeaderIncludeEditPlanner(
   (void)terminalSink;
 }
 
+RefoldHeaderIncludeEditPlanner::~RefoldHeaderIncludeEditPlanner() = default;
+
+const RefoldPreprocessingStructureIndex &
+RefoldHeaderIncludeEditPlanner::GetHeaderOccurrenceStructureIndex(
+    StringRef headerPath, uint64_t includeId, StringRef headerText) const {
+  HeaderStructureIndexCacheEntry &entry =
+      headerStructureIndexCache_[{headerPath.str(), includeId}];
+  if (entry.index && entry.headerSize == headerText.size())
+    return *entry.index;
+
+  entry.index = std::make_unique<RefoldPreprocessingStructureIndex>(
+      RefoldPreprocessingStructureIndex::Build(
+          {model_, paths_, macroStateProof_, lexLang_}, headerPath, headerText,
+          std::optional<uint64_t>(includeId)));
+  entry.headerSize = headerText.size();
+  return *entry.index;
+}
+
 RefoldHeaderIncludeEditPlanner::TextEdit
 RefoldHeaderIncludeEditPlanner::MakeTextEditWithResyncOrPending(
     StringRef original, uint64_t start, uint64_t end, StringRef replacement,
@@ -1297,10 +1315,9 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
   // inter-piece gap proofs must observe the same raw-lexer census; rebuilding
   // or maintaining a separate header-only directive inventory would re-create
   // the exact duplication this path is intended to remove.
-  const RefoldPreprocessingStructureIndex sourceStructureIndex =
-      RefoldPreprocessingStructureIndex::Build(
-          {model_, paths_, macroStateProof_, lexLang_}, state.file,
-          state.headerText, std::optional<uint64_t>(state.include.id));
+  const RefoldPreprocessingStructureIndex &sourceStructureIndex =
+      GetHeaderOccurrenceStructureIndex(state.file, state.include.id,
+                                        state.headerText);
 
   const auto &tokmapByPP = model_.GetTokmapByPP();
   for (uint64_t pp = fullLo; pp < fullHi; ++pp) {

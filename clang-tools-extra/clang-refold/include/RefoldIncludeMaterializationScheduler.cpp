@@ -136,12 +136,7 @@ void RefoldIncludeMaterializationScheduler::BuildChildrenIndex() {
 const RefoldModel::MacroDirective *
 RefoldIncludeMaterializationScheduler::FindMacroDirectiveById(
     uint64_t id) const {
-  for (const RefoldModel::MacroDirective &directive :
-       model_.GetMacroDirectives()) {
-    if (directive.id == id)
-      return &directive;
-  }
-  return nullptr;
+  return model_.GetMacroDirectiveById(id);
 }
 
 bool RefoldIncludeMaterializationScheduler::

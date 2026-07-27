@@ -54,19 +54,13 @@ bool matchLiteralAToken(ArrayRef<PPTok> aToks, uint64_t tok,
 }
 
 /// Definition directive for the invocation, or nullptr when the producer did
-/// not record a corresponding `#define` site.  The lookup remains O(N) in the
-/// model directive list since the model does not yet expose a directive index.
+/// not record a corresponding `#define` site.
 const RefoldModel::MacroDirective *
 getDefinitionDirectiveForInvocation(const RefoldModel *model,
                                     const RefoldModel::MacroInvocation &m) {
   if (!m.definitionDirectiveId)
     return nullptr;
-  for (const RefoldModel::MacroDirective &directive :
-       model->GetMacroDirectives()) {
-    if (directive.id == *m.definitionDirectiveId)
-      return &directive;
-  }
-  return nullptr;
+  return model->GetMacroDirectiveById(*m.definitionDirectiveId);
 }
 
 /// Normalized replacement-list node used by the definition-tape replay solver.
@@ -1165,7 +1159,7 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
     auto add = [&](StringRef name) {
       if (needComma)
         out += ",";
-      out += name.str();
+      out += name;
       needComma = true;
     };
     if (hasForward)

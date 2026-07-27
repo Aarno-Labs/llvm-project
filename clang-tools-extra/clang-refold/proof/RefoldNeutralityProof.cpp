@@ -823,12 +823,12 @@ canonicalDiagnosticPragmaStateDirectiveText(StringRef text,
 
   std::string out;
   out += "#pragma ";
-  out += parsed->namespaceName.str();
+  out += parsed->namespaceName;
   out += " diagnostic ";
-  out += parsed->actionName.str();
+  out += parsed->actionName;
   if (parsed->action == DiagnosticPragmaStateAction::Setting) {
     out += " ";
-    out += parsed->optionSpelling.str();
+    out += parsed->optionSpelling;
   }
   out += "\n";
   return out;

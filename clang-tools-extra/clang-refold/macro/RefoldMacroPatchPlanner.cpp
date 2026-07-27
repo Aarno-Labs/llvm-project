@@ -279,11 +279,11 @@ bool addTupleSiblingTerminalConstraint(
 
 const RefoldModel::MacroDirective *findDefinitionDirectiveById(
     const RefoldModel &model, uint64_t directiveId) {
-  for (const RefoldModel::MacroDirective &directive :
-       model.GetMacroDirectives())
-    if (directive.id == directiveId && directive.subkind == "#define")
-      return &directive;
-  return nullptr;
+  const RefoldModel::MacroDirective *directive =
+      model.GetMacroDirectiveById(directiveId);
+  if (!directive || directive->subkind != "#define")
+    return nullptr;
+  return directive;
 }
 
 std::optional<std::string> recoverNormalizedChildActual(
@@ -617,7 +617,7 @@ RefoldMacroPatchPlanner::BuildInvocationRewriteWithRange(
         r.begin < cursor)
       return std::nullopt;
 
-    out.text += baseInvocationText.slice(cursor, r.begin).str();
+    out.text += baseInvocationText.slice(cursor, r.begin);
 
     auto replIt = replByArgIdx.find(argIdx);
     if (replIt == replByArgIdx.end())
@@ -649,7 +649,7 @@ RefoldMacroPatchPlanner::BuildInvocationRewriteWithRange(
     cursor = r.end;
   }
 
-  out.text += baseInvocationText.substr(cursor).str();
+  out.text += baseInvocationText.substr(cursor);
   if (!mappedBegin || !mappedEnd)
     return std::nullopt;
 
@@ -790,48 +790,10 @@ bool RefoldMacroPatchPlanner::MatchLiteralAToken(
 const RefoldModel::MacroDirective *
 RefoldMacroPatchPlanner::ResolveFunctionLikeMacroThroughAliasesWithHops(
     llvm::StringRef startName, uint32_t *aliasHops) const {
-  if (aliasHops)
-    *aliasHops = 0;
-  if (startName.empty())
-    return nullptr;
-  SmallVector<std::string, 8> seen;
-  std::string current = startName.trim().str();
-  for (size_t depth = 0; depth <= (*deps_.model).GetMacroDirectives().size();
-       ++depth) {
-    if (llvm::is_contained(seen, current))
-      return nullptr;
-    seen.push_back(current);
-
-    const RefoldModel::MacroDirective *functionLike = nullptr;
-    const RefoldModel::MacroDirective *alias = nullptr;
-    for (const RefoldModel::MacroDirective &directive :
-         (*deps_.model).GetMacroDirectives()) {
-      if (directive.subkind != "#define" ||
-          directive.name != llvm::StringRef(current))
-        continue;
-      if (directive.functionLike) {
-        if (functionLike)
-          return nullptr;
-        functionLike = &directive;
-        continue;
-      }
-      if (directive.replacementTokens.size() == 1 &&
-          directive.replacementTokens[0].kind ==
-              RefoldModel::MacroReplacementTokenKind::Literal) {
-        if (alias)
-          return nullptr;
-        alias = &directive;
-      }
-    }
-    if (functionLike)
-      return functionLike;
-    if (!alias)
-      return nullptr;
-    if (aliasHops)
-      ++*aliasHops;
-    current = alias->replacementTokens[0].spelling.str();
-  }
-  return nullptr;
+  // The leading name may carry callsite whitespace; every later hop is already
+  // an exact producer replacement-token spelling.
+  return resolveFunctionLikeMacroThroughObjectAliases(
+      *deps_.model, startName.trim(), aliasHops);
 }
 
 const RefoldModel::MacroDirective *
@@ -842,17 +804,7 @@ RefoldMacroPatchPlanner::ResolveFunctionLikeMacroForReplay(
 
 bool RefoldMacroPatchPlanner::IsObjectLikeSingleTokenAlias(
     llvm::StringRef name) const {
-  for (const RefoldModel::MacroDirective &directive :
-       (*deps_.model).GetMacroDirectives()) {
-    if (directive.subkind != "#define" || directive.name != name ||
-        directive.functionLike)
-      continue;
-    if (directive.replacementTokens.size() == 1 &&
-        directive.replacementTokens[0].kind ==
-            RefoldModel::MacroReplacementTokenKind::Literal)
-      return true;
-  }
-  return false;
+  return isObjectLikeSingleTokenAliasName(*deps_.model, name);
 }
 
 bool RefoldMacroPatchPlanner::TokenSpellingsEqualToA(

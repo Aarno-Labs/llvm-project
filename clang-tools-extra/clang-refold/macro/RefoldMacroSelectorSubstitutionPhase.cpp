@@ -149,16 +149,14 @@ static std::optional<ProducerFunctionMacroDefinition>
 activeFunctionDefinitionBefore(const RefoldModel &model, uint64_t beforeItemId,
                                StringRef name) {
   const RefoldModel::MacroDirective *active = nullptr;
-  for (const RefoldModel::MacroDirective &directive :
-       model.GetMacroDirectives()) {
-    if (directive.id >= beforeItemId)
+  for (const RefoldModel::MacroDirective *directive :
+       model.GetMacroDirectivesByName(name)) {
+    if (directive->id >= beforeItemId)
       continue;
-    if (directive.subkind != "#define" && directive.subkind != "#undef")
+    if (directive->subkind != "#define" && directive->subkind != "#undef")
       continue;
-    if (directive.name != name)
-      continue;
-    if (!active || directive.id > active->id)
-      active = &directive;
+    if (!active || directive->id > active->id)
+      active = directive;
   }
   if (!active || active->subkind != "#define")
     return std::nullopt;

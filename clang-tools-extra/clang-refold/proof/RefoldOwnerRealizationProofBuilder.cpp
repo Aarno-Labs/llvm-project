@@ -85,7 +85,7 @@ void RefoldOwnerRealizationProofBuilder::AttachLineControlObserverWitness(
   auto appendSig = [](std::string &dst, llvm::StringRef part) {
     if (!dst.empty())
       dst += ";";
-    dst += part.str();
+    dst += part;
   };
 
   auto observeSummary = [&](const OwnerObserverSummary &observers,
@@ -313,7 +313,7 @@ void RefoldOwnerRealizationProofBuilder::AttachCounterStateWitness(
   auto appendSig = [](std::string &dst, llvm::StringRef part) {
     if (!dst.empty())
       dst += ";";
-    dst += part.str();
+    dst += part;
   };
 
   std::vector<CounterEventIdentity> orderedEvents;

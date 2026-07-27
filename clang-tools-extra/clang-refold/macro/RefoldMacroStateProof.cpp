@@ -185,12 +185,8 @@ RefoldMacroStateProof::RecoverMacroDefinitionReplacementListInterval(
   if (!invocation.definitionDirectiveId)
     return std::nullopt;
 
-  const RefoldModel::MacroDirective *definition = nullptr;
-  for (const auto &directive : model_.GetMacroDirectives())
-    if (directive.id == *invocation.definitionDirectiveId) {
-      definition = &directive;
-      break;
-    }
+  const RefoldModel::MacroDirective *definition =
+      model_.GetMacroDirectiveById(*invocation.definitionDirectiveId);
 
   if (!definition || definition->subkind != "#define")
     return std::nullopt;

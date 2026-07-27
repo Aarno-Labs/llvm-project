@@ -447,7 +447,7 @@ private:
       for (const StandardArgsGeneratedCalleePastePiece &piece :
            elem.pastePieces) {
         if (piece.isParam)
-          expected += StringRef(oldActuals_[piece.paramIdx]).trim().str();
+          expected += StringRef(oldActuals_[piece.paramIdx]).trim();
         else
           expected += piece.literal;
       }
@@ -900,14 +900,8 @@ public:
     if (!invocation_.definitionDirectiveId)
       return false;
 
-    const RefoldModel::MacroDirective *rootDefinition = nullptr;
-    for (const RefoldModel::MacroDirective &directive :
-         deps_.model.GetMacroDirectives()) {
-      if (directive.id == *invocation_.definitionDirectiveId) {
-        rootDefinition = &directive;
-        break;
-      }
-    }
+    const RefoldModel::MacroDirective *rootDefinition =
+        deps_.model.GetMacroDirectiveById(*invocation_.definitionDirectiveId);
     if (!rootDefinition || rootDefinition->subkind != "#define" ||
         !rootDefinition->functionLike)
       return false;
@@ -1365,46 +1359,8 @@ private:
   /// or ambiguous macro-state histories fail closed.
   const RefoldModel::MacroDirective *
   ResolveFunctionLikeMacroThroughObjectAliases(StringRef startName) const {
-    if (startName.empty())
-      return nullptr;
-
-    SmallVector<std::string, 8> seen;
-    std::string current = startName.str();
-    for (size_t depth = 0; depth <= deps_.model.GetMacroDirectives().size();
-         ++depth) {
-      if (llvm::is_contained(seen, current))
-        return nullptr;
-      seen.push_back(current);
-
-      const RefoldModel::MacroDirective *functionLike = nullptr;
-      const RefoldModel::MacroDirective *alias = nullptr;
-      for (const RefoldModel::MacroDirective &directive :
-           deps_.model.GetMacroDirectives()) {
-        if (directive.subkind != "#define" ||
-            directive.name != StringRef(current))
-          continue;
-        if (directive.functionLike) {
-          if (functionLike)
-            return nullptr;
-          functionLike = &directive;
-          continue;
-        }
-        if (directive.replacementTokens.size() == 1 &&
-            directive.replacementTokens[0].kind ==
-                RefoldModel::MacroReplacementTokenKind::Literal) {
-          if (alias)
-            return nullptr;
-          alias = &directive;
-        }
-      }
-
-      if (functionLike)
-        return functionLike;
-      if (!alias)
-        return nullptr;
-      current = alias->replacementTokens[0].spelling.str();
-    }
-    return nullptr;
+    return refold::resolveFunctionLikeMacroThroughObjectAliases(deps_.model,
+                                                                startName);
   }
 
   /// Resolves the tuple callee element through the same exact alias proof used
@@ -1596,14 +1552,8 @@ public:
     if (!tupleChild || !tupleChild->definitionDirectiveId)
       return true;
 
-    const RefoldModel::MacroDirective *childDefinition = nullptr;
-    for (const RefoldModel::MacroDirective &directive :
-         deps_.model.GetMacroDirectives()) {
-      if (directive.id == *tupleChild->definitionDirectiveId) {
-        childDefinition = &directive;
-        break;
-      }
-    }
+    const RefoldModel::MacroDirective *childDefinition =
+        deps_.model.GetMacroDirectiveById(*tupleChild->definitionDirectiveId);
     if (!childDefinition || childDefinition->subkind != "#define" ||
         !childDefinition->functionLike)
       return true;
@@ -1990,16 +1940,15 @@ private:
   FunctionLikeCalleeResolution
   ResolveUniqueFunctionLikeCallee(StringRef calleeName) const {
     FunctionLikeCalleeResolution result;
-    for (const RefoldModel::MacroDirective &directive :
-         deps_.model.GetMacroDirectives()) {
-      if (directive.subkind == "#define" && directive.functionLike &&
-          directive.name == calleeName) {
+    for (const RefoldModel::MacroDirective *directive :
+         deps_.model.GetMacroDirectivesByName(calleeName)) {
+      if (directive->subkind == "#define" && directive->functionLike) {
         if (result.definition) {
           result.ambiguous = true;
           result.definition = nullptr;
           return result;
         }
-        result.definition = &directive;
+        result.definition = directive;
       }
     }
     return result;
@@ -2399,12 +2348,7 @@ HigherOrderGeneratedReplayProbe::FindRootDefinition(
     const RefoldModel::MacroInvocation &invocation) const {
   if (!invocation.definitionDirectiveId)
     return nullptr;
-  for (const RefoldModel::MacroDirective &directive :
-       deps_.model.GetMacroDirectives()) {
-    if (directive.id == *invocation.definitionDirectiveId)
-      return &directive;
-  }
-  return nullptr;
+  return deps_.model.GetMacroDirectiveById(*invocation.definitionDirectiveId);
 }
 
 

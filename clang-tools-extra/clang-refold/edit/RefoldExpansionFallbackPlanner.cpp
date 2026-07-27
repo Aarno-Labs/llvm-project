@@ -84,6 +84,64 @@ namespace refold {
 
 namespace {
 
+/// Include-tree adjacency facts shared by the include-closure resolvers below.
+///
+/// `childrenByParent` is built by one walk over GetIncludes(), so each bucket
+/// lists an include's children in exactly the relative order the previous full
+/// scan visited them.
+///
+/// `parentGraphIsAcyclic` records whether every include's parent chain
+/// terminates.  The resolvers memoize a per-include answer only when it holds:
+/// with a cycle present, a walk's answer is cut at whichever node the walk
+/// happened to re-enter first, so it is a property of the entry point rather
+/// than of the include, and caching it would leak one entry's cut into another
+/// entry's proof.  A cyclic graph therefore falls back to the exact
+/// uncached traversal.
+struct IncludeTreeAdjacency {
+  DenseMap<uint64_t, SmallVector<const RefoldModel::IncludeItem *, 4>>
+      childrenByParent;
+  bool parentGraphIsAcyclic = true;
+};
+
+/// Build the include-tree adjacency facts for \p model.
+IncludeTreeAdjacency buildIncludeTreeAdjacency(const RefoldModel &model) {
+  IncludeTreeAdjacency adjacency;
+
+  for (const RefoldModel::IncludeItem &inc : model.GetIncludes()) {
+    if (inc.parent)
+      adjacency.childrenByParent[*inc.parent].push_back(&inc);
+  }
+
+  // Each include has at most one parent, so the parent relation is a functional
+  // graph and a single colored walk per include settles acyclicity in O(I).
+  enum class WalkState : uint8_t { Unvisited, OnPath, Settled };
+  DenseMap<uint64_t, WalkState> state;
+  SmallVector<uint64_t, 16> path;
+
+  for (const RefoldModel::IncludeItem &inc : model.GetIncludes()) {
+    path.clear();
+    std::optional<uint64_t> cur = inc.id;
+    while (cur) {
+      WalkState &curState = state[*cur];
+      if (curState == WalkState::Settled)
+        break;
+      if (curState == WalkState::OnPath) {
+        adjacency.parentGraphIsAcyclic = false;
+        break;
+      }
+      curState = WalkState::OnPath;
+      path.push_back(*cur);
+
+      const RefoldModel::IncludeItem *node = model.GetIncludeById(*cur);
+      cur = node ? node->parent : std::nullopt;
+    }
+    for (uint64_t settled : path)
+      state[settled] = WalkState::Settled;
+  }
+
+  return adjacency;
+}
+
 /// Resolves the transitive side-effect proof for a zero-token include closure.
 ///
 /// The trusted inputs are the immutable refold model, path-identity service, and
@@ -100,7 +158,8 @@ public:
           pragmaIsConsumableIncludeLocalState)
       : model_(model), paths_(paths),
         pragmaIsConsumableIncludeLocalState_(
-            pragmaIsConsumableIncludeLocalState) {}
+            pragmaIsConsumableIncludeLocalState),
+        adjacency_(buildIncludeTreeAdjacency(model)) {}
 
   /// Return the first recorded reason that prevents treating `inc` and its
   /// descendants as a consumable zero-token source gap, or std::nullopt when the
@@ -108,54 +167,96 @@ public:
   std::optional<std::string>
   FindReason(const RefoldModel::IncludeItem &inc) const {
     DenseSet<uint64_t> visiting;
-    return FindReasonImpl(inc, visiting);
+    return FindReasonImpl(inc, visiting, /*wantReason=*/true);
+  }
+
+  /// Return whether any recorded reason prevents the same closure.
+  ///
+  /// This runs the identical traversal as FindReason but skips diagnostic
+  /// spelling, so a boolean query never pays for reason construction, and
+  /// caches the per-include answer when the include graph is acyclic.
+  bool HasReason(const RefoldModel::IncludeItem &inc) const {
+    DenseSet<uint64_t> visiting;
+    return FindReasonImpl(inc, visiting, /*wantReason=*/false).has_value();
   }
 
 private:
+  /// Build the rejection carrier for one walk.
+  ///
+  /// A predicate-only walk skips the diagnostic spelling entirely; the empty
+  /// string then stands for "rejected, reason not requested".  Both walks run
+  /// the same traversal, so the predicate can never disagree with the reason a
+  /// diagnostic walk would report.
+  static std::optional<std::string>
+  Rejected(bool wantReason, llvm::function_ref<std::string()> buildReason) {
+    if (!wantReason)
+      return std::string();
+    return buildReason();
+  }
+
   std::optional<std::string>
   FindReasonImpl(const RefoldModel::IncludeItem &inc,
-                 DenseSet<uint64_t> &visiting) const {
+                 DenseSet<uint64_t> &visiting, bool wantReason) const {
+    // A cached answer is only consulted for the predicate walk, and only when
+    // the include graph is acyclic; see IncludeTreeAdjacency.  The lookup
+    // precedes the cycle guard below, which cannot fire in an acyclic graph.
+    const bool memoize = !wantReason && adjacency_.parentGraphIsAcyclic;
+    if (memoize) {
+      auto cached = rejectedCache_.find(inc.id);
+      if (cached != rejectedCache_.end())
+        return cached->second ? std::optional<std::string>(std::string())
+                              : std::nullopt;
+    }
+
     // A cycle would indicate malformed include-parent metadata.  Do not try to
     // prove closure through it; reject rather than deleting uncertain state.
     if (!visiting.insert(inc.id).second)
-      return llvm::formatv("include-parent cycle reaches include id={0}",
-                           inc.id)
-          .str();
+      return Rejected(wantReason, [&] {
+        return llvm::formatv("include-parent cycle reaches include id={0}",
+                             inc.id)
+            .str();
+      });
 
     auto finish = [&](std::optional<std::string> reason) {
       visiting.erase(inc.id);
+      if (memoize)
+        rejectedCache_[inc.id] = reason.has_value();
       return reason;
     };
 
     // Header declarations are semantic structure, even if this include did not
     // contribute tokens to the particular A-side hunk being refolded.
     if (!inc.decls.empty())
-      return finish(llvm::formatv("include id={0} path='{1}' has {2} "
-                                  "recorded header declaration(s)",
-                                  inc.id, IncludePathForDiagnostic(inc),
-                                  inc.decls.size())
-                        .str());
+      return finish(Rejected(wantReason, [&] {
+        return llvm::formatv("include id={0} path='{1}' has {2} "
+                             "recorded header declaration(s)",
+                             inc.id, IncludePathForDiagnostic(inc),
+                             inc.decls.size())
+            .str();
+      }));
 
     // A nested include is not inherently a side effect.  It is consumable when
     // its own expansion is empty and its descendants/directives are consumable
     // by the same zero-token include-gap proof.  Record which child blocked the
     // proof so the mixed-closure rejection points at the real source structure.
-    for (const auto &child : model_.GetIncludes()) {
-      if (!child.parent || *child.parent != inc.id)
-        continue;
-      if (child.cover.IsValid())
-        return finish(llvm::formatv("child include id={0} path='{1}' "
-                                    "materializes PP cover=[{2},{3})",
-                                    child.id, IncludePathForDiagnostic(child),
-                                    child.cover.begin, child.cover.end)
-                          .str());
+    for (const RefoldModel::IncludeItem *child : ChildrenOf(inc)) {
+      if (child->cover.IsValid())
+        return finish(Rejected(wantReason, [&] {
+          return llvm::formatv("child include id={0} path='{1}' "
+                               "materializes PP cover=[{2},{3})",
+                               child->id, IncludePathForDiagnostic(*child),
+                               child->cover.begin, child->cover.end)
+              .str();
+        }));
       if (std::optional<std::string> childReason =
-              FindReasonImpl(child, visiting))
-        return finish(llvm::formatv("child include id={0} path='{1}' rejected: "
-                                    "{2}",
-                                    child.id, IncludePathForDiagnostic(child),
-                                    *childReason)
-                          .str());
+              FindReasonImpl(*child, visiting, wantReason))
+        return finish(Rejected(wantReason, [&] {
+          return llvm::formatv("child include id={0} path='{1}' rejected: "
+                               "{2}",
+                               child->id, IncludePathForDiagnostic(*child),
+                               *childReason)
+              .str();
+        }));
     }
 
     // Include-owned #define/#undef directives are macro-state transitions, not
@@ -170,14 +271,15 @@ private:
     for (const auto &directive : model_.GetMacroDirectives()) {
       if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id &&
           directive.subkind != "#define" && directive.subkind != "#undef") {
-        return finish(
-            llvm::formatv("include id={0} path='{1}' owns "
-                          "non-consumable macro directive id={2} "
-                          "subkind='{3}' text='{4}'",
-                          inc.id, IncludePathForDiagnostic(inc), directive.id,
-                          directive.subkind,
-                          stringutils::showWsWithClip(directive.text, 120))
-                .str());
+        return finish(Rejected(wantReason, [&] {
+          return llvm::formatv("include id={0} path='{1}' owns "
+                               "non-consumable macro directive id={2} "
+                               "subkind='{3}' text='{4}'",
+                               inc.id, IncludePathForDiagnostic(inc),
+                               directive.id, directive.subkind,
+                               stringutils::showWsWithClip(directive.text, 120))
+              .str();
+        }));
       }
     }
 
@@ -197,13 +299,15 @@ private:
       for (const RefoldModel::CondArm &arm : group.arms) {
         if (arm.span && arm.span->IsValid() &&
             arm.span->begin < arm.span->end) {
-          return finish(llvm::formatv("include id={0} path='{1}' owns "
-                                      "conditional group id={2} arm id={3} "
-                                      "with materialized PP span=[{4},{5})",
-                                      inc.id, IncludePathForDiagnostic(inc),
-                                      group.id, arm.id, arm.span->begin,
-                                      arm.span->end)
-                            .str());
+          return finish(Rejected(wantReason, [&] {
+            return llvm::formatv("include id={0} path='{1}' owns "
+                                 "conditional group id={2} arm id={3} "
+                                 "with materialized PP span=[{4},{5})",
+                                 inc.id, IncludePathForDiagnostic(inc),
+                                 group.id, arm.id, arm.span->begin,
+                                 arm.span->end)
+                .str();
+          }));
         }
       }
     }
@@ -221,19 +325,23 @@ private:
         if (!paths_.PathsEqual(pragma.sitePath, *inc.resolvedPath))
           continue;
         if (!pragmaIsConsumableIncludeLocalState_(pragma)) {
-          return finish(
-              llvm::formatv("include id={0} path='{1}' contains "
-                            "non-consumable pragma id={2} text='{3}'",
-                            inc.id, IncludePathForDiagnostic(inc), pragma.id,
-                            stringutils::showWsWithClip(pragma.text, 120))
-                  .str());
+          return finish(Rejected(wantReason, [&] {
+            return llvm::formatv("include id={0} path='{1}' contains "
+                                 "non-consumable pragma id={2} text='{3}'",
+                                 inc.id, IncludePathForDiagnostic(inc),
+                                 pragma.id,
+                                 stringutils::showWsWithClip(pragma.text, 120))
+                .str();
+          }));
         }
         if (IncludeHasNonPragmaStructure(inc)) {
-          return finish(llvm::formatv("include id={0} path='{1}' contains "
-                                      "#pragma once with additional recorded "
-                                      "source structure",
-                                      inc.id, IncludePathForDiagnostic(inc))
-                            .str());
+          return finish(Rejected(wantReason, [&] {
+            return llvm::formatv("include id={0} path='{1}' contains "
+                                 "#pragma once with additional recorded "
+                                 "source structure",
+                                 inc.id, IncludePathForDiagnostic(inc))
+                .str();
+          }));
         }
       }
 
@@ -243,6 +351,15 @@ private:
   StringRef IncludePathForDiagnostic(
       const RefoldModel::IncludeItem &inc) const {
     return inc.resolvedPath ? *inc.resolvedPath : inc.target;
+  }
+
+  /// Return the direct children of \p inc in producer include order.
+  ArrayRef<const RefoldModel::IncludeItem *>
+  ChildrenOf(const RefoldModel::IncludeItem &inc) const {
+    auto it = adjacency_.childrenByParent.find(inc.id);
+    if (it == adjacency_.childrenByParent.end())
+      return {};
+    return it->second;
   }
 
   /// Return true iff the include has structure other than an explicitly
@@ -255,9 +372,8 @@ private:
     if (!inc.decls.empty())
       return true;
 
-    for (const auto &child : model_.GetIncludes())
-      if (child.parent && *child.parent == inc.id)
-        return true;
+    if (!ChildrenOf(inc).empty())
+      return true;
 
     for (const auto &directive : model_.GetMacroDirectives())
       if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id)
@@ -274,6 +390,11 @@ private:
   const RefoldPathIdentity &paths_;
   llvm::function_ref<bool(const RefoldModel::PragmaDirective &)>
       pragmaIsConsumableIncludeLocalState_;
+  IncludeTreeAdjacency adjacency_;
+
+  /// Predicate-walk results keyed by include id.  Only populated when the
+  /// include parent graph is acyclic; see IncludeTreeAdjacency.
+  mutable DenseMap<uint64_t, bool> rejectedCache_;
 };
 
 /// Resolves whether a complete include directive may be preserved inside a
@@ -297,7 +418,8 @@ public:
       : model_(model), paths_(paths), macroStateProof_(macroStateProof),
         sourceMapper_(sourceMapper), h_(h),
         pragmaIsConsumableIncludeLocalState_(
-            pragmaIsConsumableIncludeLocalState) {}
+            pragmaIsConsumableIncludeLocalState),
+        adjacency_(buildIncludeTreeAdjacency(model)) {}
 
   /// Return true iff the include's directive can remain in the preserved
   /// conditional island without requiring a new raw-B fallback authority.
@@ -311,36 +433,39 @@ private:
                          DenseSet<uint64_t> &visiting) const {
     if (inc.cover.IsValid())
       return false;
+
+    // A cached answer is only consulted when the include graph is acyclic; see
+    // IncludeTreeAdjacency.  The lookup precedes the cycle guard below, which
+    // cannot fire in an acyclic graph.
+    const bool memoize = adjacency_.parentGraphIsAcyclic;
+    if (memoize) {
+      auto cached = preservableCache_.find(inc.id);
+      if (cached != preservableCache_.end())
+        return cached->second;
+    }
+
     if (!visiting.insert(inc.id).second)
       return false;
 
     auto finish = [&](bool result) {
       visiting.erase(inc.id);
+      if (memoize)
+        preservableCache_[inc.id] = result;
       return result;
     };
 
     if (!inc.decls.empty())
       return finish(false);
 
-    for (const auto &child : model_.GetIncludes()) {
-      if (!child.parent || *child.parent != inc.id)
-        continue;
-      if (!IsPreservableImpl(child, visiting))
+    for (const RefoldModel::IncludeItem *child : ChildrenOf(inc)) {
+      if (!IsPreservableImpl(*child, visiting))
         return finish(false);
     }
 
     for (const auto &directive : model_.GetMacroDirectives()) {
       if (!directive.ownerIncludeId)
         continue;
-      bool ownedByInclude = *directive.ownerIncludeId == inc.id;
-      if (!ownedByInclude)
-        for (const auto &child : model_.GetIncludes())
-          if (child.id == *directive.ownerIncludeId &&
-              IncludeIsDescendantOf(child, inc)) {
-            ownedByInclude = true;
-            break;
-          }
-      if (!ownedByInclude)
+      if (!IncludeOwnsOrContains(inc, *directive.ownerIncludeId))
         continue;
 
       if (HunkReplacementObservesMacroStateDirective(directive))
@@ -350,15 +475,7 @@ private:
     for (const auto &group : model_.GetConds()) {
       if (!group.parentIncludeId)
         continue;
-      bool ownedByInclude = *group.parentIncludeId == inc.id;
-      if (!ownedByInclude)
-        for (const auto &child : model_.GetIncludes())
-          if (child.id == *group.parentIncludeId &&
-              IncludeIsDescendantOf(child, inc)) {
-            ownedByInclude = true;
-            break;
-          }
-      if (!ownedByInclude)
+      if (!IncludeOwnsOrContains(inc, *group.parentIncludeId))
         continue;
       for (const RefoldModel::CondArm &arm : group.arms)
         if (arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end)
@@ -368,15 +485,7 @@ private:
     for (const auto &macro : model_.GetMacroInvocations()) {
       if (!macro.ownerIncludeId)
         continue;
-      bool ownedByInclude = *macro.ownerIncludeId == inc.id;
-      if (!ownedByInclude)
-        for (const auto &child : model_.GetIncludes())
-          if (child.id == *macro.ownerIncludeId &&
-              IncludeIsDescendantOf(child, inc)) {
-            ownedByInclude = true;
-            break;
-          }
-      if (!ownedByInclude)
+      if (!IncludeOwnsOrContains(inc, *macro.ownerIncludeId))
         continue;
       if (macro.cover.IsValid())
         return finish(false);
@@ -404,18 +513,38 @@ private:
         /*unprovenObserves=*/true);
   }
 
+  /// Return the direct children of \p inc in producer include order.
+  ArrayRef<const RefoldModel::IncludeItem *>
+  ChildrenOf(const RefoldModel::IncludeItem &inc) const {
+    auto it = adjacency_.childrenByParent.find(inc.id);
+    if (it == adjacency_.childrenByParent.end())
+      return {};
+    return it->second;
+  }
+
+  /// Return true iff \p ownerIncludeId names \p inc itself or a recorded
+  /// descendant of it.
+  ///
+  /// This is the exact ownership domain of the subtree proof: producer facts
+  /// attached to a nested include are attributed to the outer include whose
+  /// preservation is being decided.  An owner id the model does not name is not
+  /// in the domain, matching the previous scan that simply found no match.
+  bool IncludeOwnsOrContains(const RefoldModel::IncludeItem &inc,
+                             uint64_t ownerIncludeId) const {
+    if (ownerIncludeId == inc.id)
+      return true;
+    const RefoldModel::IncludeItem *owner =
+        model_.GetIncludeById(ownerIncludeId);
+    return owner && IncludeIsDescendantOf(*owner, inc);
+  }
+
   bool IncludeIsDescendantOf(const RefoldModel::IncludeItem &candidate,
                              const RefoldModel::IncludeItem &root) const {
     std::optional<uint64_t> cur = candidate.parent;
     while (cur) {
       if (*cur == root.id)
         return true;
-      const RefoldModel::IncludeItem *parent = nullptr;
-      for (const auto &inc : model_.GetIncludes())
-        if (inc.id == *cur) {
-          parent = &inc;
-          break;
-        }
+      const RefoldModel::IncludeItem *parent = model_.GetIncludeById(*cur);
       if (!parent)
         return false;
       cur = parent->parent;
@@ -430,6 +559,11 @@ private:
   const diffutils::Hunk &h_;
   llvm::function_ref<bool(const RefoldModel::PragmaDirective &)>
       pragmaIsConsumableIncludeLocalState_;
+  IncludeTreeAdjacency adjacency_;
+
+  /// Per-include preservation answers.  Only populated when the include parent
+  /// graph is acyclic; see IncludeTreeAdjacency.
+  mutable DenseMap<uint64_t, bool> preservableCache_;
 };
 
 } // namespace
@@ -757,7 +891,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   auto includeHasRecordedSideEffects =
       [&](const RefoldModel::IncludeItem &inc) -> bool {
-    return includeRecordedSideEffectReason(inc).has_value();
+    return recordedIncludeSideEffectResolver.HasReason(inc);
   };
 
   const ConditionalStateIncludePreservationResolver

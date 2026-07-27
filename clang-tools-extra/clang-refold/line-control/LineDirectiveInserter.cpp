@@ -123,7 +123,7 @@ parseMacroArguments(StringRef text, size_t openParen, size_t &afterClose) {
       size_t literalBegin = i;
       if (!stringutils::skipQuotedLiteral(text, i))
         return std::nullopt;
-      cur += text.slice(literalBegin, i).str();
+      cur += text.slice(literalBegin, i);
       --i;
       continue;
     }
@@ -180,7 +180,7 @@ parseBalancedParenthesizedContent(StringRef text, size_t openParen,
       size_t literalBegin = i;
       if (!stringutils::skipQuotedLiteral(text, i))
         return std::nullopt;
-      content += text.slice(literalBegin, i).str();
+      content += text.slice(literalBegin, i);
       --i;
       continue;
     }
@@ -1028,7 +1028,7 @@ static std::string expandSourceLineControlDirective(
 
   std::string expanded;
   expanded.reserve(line.size());
-  expanded += line.substr(0, operandBegin).str();
+  expanded += line.substr(0, operandBegin);
   expanded +=
       expandLineControlMacros(line.substr(operandBegin), macros,
                               logicalLineAtLineStart, activeFileSpelling);
@@ -1393,7 +1393,7 @@ static std::string insertLineDirectiveAt(StringRef replacement,
                                          StringRef directive, size_t offset) {
   std::string res = replacement.substr(0, offset).str();
   res += directive;
-  res += replacement.substr(offset).str();
+  res += replacement.substr(offset);
   return res;
 }
 

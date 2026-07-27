@@ -528,16 +528,19 @@ RefoldOwnerStateProof::OwnerSourceBucketKey(const Owner &owner) {
   return std::nullopt;
 }
 
-std::string RefoldOwnerStateProof::OwnerStateDeltaCacheKey(const Owner &owner) {
-  const uint64_t none = std::numeric_limits<uint64_t>::max();
-  return llvm::formatv(
-             "{0}:{1}:{2}:{3}:{4}:{5}:{6}:{7}",
-             static_cast<unsigned>(owner.kind), owner.includeId.value_or(none),
-             owner.macroInvocationId.value_or(none),
-             owner.macroDirectiveId.value_or(none),
-             owner.lineControlId.value_or(none), owner.pragmaId.value_or(none),
-             owner.condGroupId.value_or(none), owner.condArmId.value_or(none))
-      .str();
+RefoldOwnerStateProof::OwnerStateDeltaCacheKey
+RefoldOwnerStateProof::MakeOwnerStateDeltaCacheKey(const Owner &owner) {
+  constexpr uint64_t none = OwnerStateDeltaCacheKey::kNoId;
+  OwnerStateDeltaCacheKey key;
+  key.kind = static_cast<unsigned>(owner.kind);
+  key.includeId = owner.includeId.value_or(none);
+  key.macroInvocationId = owner.macroInvocationId.value_or(none);
+  key.macroDirectiveId = owner.macroDirectiveId.value_or(none);
+  key.lineControlId = owner.lineControlId.value_or(none);
+  key.pragmaId = owner.pragmaId.value_or(none);
+  key.condGroupId = owner.condGroupId.value_or(none);
+  key.condArmId = owner.condArmId.value_or(none);
+  return key;
 }
 
 bool RefoldOwnerStateProof::IsVirtualInitialMacroDirectiveSource(
@@ -629,22 +632,24 @@ RefoldOwnerStateProof::GetOwnerStateDelta(const Owner &owner) const {
   if (theoremAudit_.IsNoLegacyAuditEnabled())
     return BuildOwnerStateDelta(owner);
 
-  const std::string key = OwnerStateDeltaCacheKey(owner);
-  auto it = ownerStateDeltaCache_.find(key);
-  if (it != ownerStateDeltaCache_.end())
+  // One ordered probe answers both the hit and the miss: `lower_bound` locates
+  // the insertion position, which is then reused as the emplace hint.
+  const OwnerStateDeltaCacheKey key = MakeOwnerStateDeltaCacheKey(owner);
+  auto it = ownerStateDeltaCache_.lower_bound(key);
+  if (it != ownerStateDeltaCache_.end() && !(key < it->first))
     return it->second;
 
-  OwnerStateDelta delta = BuildOwnerStateDelta(owner);
-  ownerStateDeltaCache_[key] = delta;
-  return ownerStateDeltaCache_.find(key)->second;
+  return ownerStateDeltaCache_
+      .emplace_hint(it, key, BuildOwnerStateDelta(owner))
+      ->second;
 }
 
 OwnerClosure
 RefoldOwnerStateProof::AttachCanonicalStateSummary(OwnerClosure closure) const {
   OwnerStateDelta summary = GetOwnerStateDelta(closure.owner);
-  closure.stateIn = summary;
-  closure.stateOut = summary;
   closure.observers = OwnerStateDeltaToObserverSummary(summary);
+  closure.stateIn = summary;
+  closure.stateOut = std::move(summary);
   return closure;
 }
 

@@ -270,12 +270,97 @@ getDefinitionDirectiveForInvocation(const RefoldModel &model,
                                     const RefoldModel::MacroInvocation &m) {
   if (!m.definitionDirectiveId)
     return nullptr;
-  for (const RefoldModel::MacroDirective &directive :
-       model.GetMacroDirectives()) {
-    if (directive.id == *m.definitionDirectiveId)
-      return &directive;
+  return model.GetMacroDirectiveById(*m.definitionDirectiveId);
+}
+
+/// Resolve \p startName through a deterministic object-like alias chain to the
+/// unique function-like `#define` that it ultimately names.
+///
+/// Every hop must be a unique object-like `#define` whose replacement list is
+/// exactly one literal token, and the terminal definition must be the unique
+/// function-like `#define` for its name.  A name carrying two function-like
+/// definitions, or two single-literal object-like definitions, is ambiguous
+/// macro state and resolves to nullptr rather than to an arbitrary pick.  The
+/// walk is bounded both by an explicit visited-name set and by the directive
+/// table size, so alias cycles terminate without a result.
+///
+/// When \p aliasHops is non-null it receives the number of object-like hops
+/// taken before the function-like definition was reached.
+///
+/// Only the per-name directive bucket is scanned.  Bucket order matches the
+/// producer record order of GetMacroDirectives(), so the ambiguity decisions
+/// above observe exactly the candidate sequence a filtered full scan would.
+inline const RefoldModel::MacroDirective *
+resolveFunctionLikeMacroThroughObjectAliases(const RefoldModel &model,
+                                             llvm::StringRef startName,
+                                             uint32_t *aliasHops = nullptr) {
+  if (aliasHops)
+    *aliasHops = 0;
+  if (startName.empty())
+    return nullptr;
+
+  // Alias chains are short in practice; a linear probe over the visited names
+  // avoids both hashing and the per-hop string allocation the previous
+  // SmallVector<std::string> form paid.  Every name viewed here is either the
+  // caller's argument or a producer-owned replacement-token spelling, so the
+  // referenced bytes outlive this walk.
+  llvm::SmallVector<llvm::StringRef, 8> seen;
+  llvm::StringRef current = startName;
+  for (size_t depth = 0; depth <= model.GetMacroDirectives().size(); ++depth) {
+    if (llvm::is_contained(seen, current))
+      return nullptr;
+    seen.push_back(current);
+
+    const RefoldModel::MacroDirective *functionLike = nullptr;
+    const RefoldModel::MacroDirective *alias = nullptr;
+    for (const RefoldModel::MacroDirective *directive :
+         model.GetMacroDirectivesByName(current)) {
+      if (directive->subkind != "#define")
+        continue;
+      if (directive->functionLike) {
+        if (functionLike)
+          return nullptr;
+        functionLike = directive;
+        continue;
+      }
+      if (directive->replacementTokens.size() == 1 &&
+          directive->replacementTokens[0].kind ==
+              RefoldModel::MacroReplacementTokenKind::Literal) {
+        if (alias)
+          return nullptr;
+        alias = directive;
+      }
+    }
+
+    if (functionLike)
+      return functionLike;
+    if (!alias)
+      return nullptr;
+    if (aliasHops)
+      ++*aliasHops;
+    current = alias->replacementTokens[0].spelling;
   }
   return nullptr;
+}
+
+/// Return true when \p name has at least one object-like `#define` whose
+/// replacement list is exactly one literal token.
+///
+/// This is the admission test for a single hop of the alias chain walked by
+/// resolveFunctionLikeMacroThroughObjectAliases; it reports only that such a
+/// definition exists, not that the hop is unambiguous.
+inline bool isObjectLikeSingleTokenAliasName(const RefoldModel &model,
+                                             llvm::StringRef name) {
+  for (const RefoldModel::MacroDirective *directive :
+       model.GetMacroDirectivesByName(name)) {
+    if (directive->subkind != "#define" || directive->functionLike)
+      continue;
+    if (directive->replacementTokens.size() == 1 &&
+        directive->replacementTokens[0].kind ==
+            RefoldModel::MacroReplacementTokenKind::Literal)
+      return true;
+  }
+  return false;
 }
 
 /// Build the minimal token-edit envelope spanning two pure-insertion frontiers.

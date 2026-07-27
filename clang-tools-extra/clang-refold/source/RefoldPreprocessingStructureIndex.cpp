@@ -18,6 +18,7 @@
 
 #include "clang/Basic/LangOptions.h"
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -498,7 +499,21 @@ static void bindConditionalGroups(
     std::vector<ScannedDirective> &directives,
     ArrayRef<ScannedConditionalGroup> scannedGroups,
     std::vector<std::string> &diagnostics) {
-  std::vector<uint64_t> matchedProducerGroupIds;
+  // `file` and `parentIncludeId` are the same for every scanned group in this
+  // call, so the producer groups belonging to this exact source-owner domain are
+  // collected once instead of re-filtered per scanned group.  The collection
+  // walks GetConds() in order, so candidate enumeration, the ambiguity count,
+  // and the unmatched-group diagnostics below all observe the same sequence the
+  // previous per-group scans did.
+  std::vector<const RefoldModel::CondGroup *> ownerDomainGroups;
+  for (const RefoldModel::CondGroup &producerGroup : model.GetConds()) {
+    if (!paths.PathsEqual(producerGroup.file, sourcePath) ||
+        producerGroup.parentIncludeId != ownerIncludeId)
+      continue;
+    ownerDomainGroups.push_back(&producerGroup);
+  }
+
+  DenseSet<uint64_t> matchedProducerGroupIds;
 
   for (const ScannedConditionalGroup &scannedGroup : scannedGroups) {
     const ScannedDirective &openingDirective =
@@ -535,15 +550,13 @@ static void bindConditionalGroups(
     // body_b must equal its scanned control-line end. No nearest directive or
     // source-order fallback is permitted when any boundary disagrees.
     std::vector<const RefoldModel::CondGroup *> candidates;
-    for (const RefoldModel::CondGroup &producerGroup : model.GetConds()) {
-      if (!paths.PathsEqual(producerGroup.file, sourcePath) ||
-          producerGroup.parentIncludeId != ownerIncludeId ||
-          producerGroup.parentArmId != lexicalParentArmId)
+    for (const RefoldModel::CondGroup *producerGroup : ownerDomainGroups) {
+      if (producerGroup->parentArmId != lexicalParentArmId)
         continue;
-      if (producerGroupBeginMatchesOpeningDirective(
-              producerGroup, openingDirective) &&
-          producerGroup.groupE == ending.end) {
-        candidates.push_back(&producerGroup);
+      if (producerGroupBeginMatchesOpeningDirective(*producerGroup,
+                                                    openingDirective) &&
+          producerGroup->groupE == ending.end) {
+        candidates.push_back(producerGroup);
       }
     }
 
@@ -570,7 +583,7 @@ static void bindConditionalGroups(
     }
 
     const RefoldModel::CondGroup &producerGroup = *candidates.front();
-    if (llvm::is_contained(matchedProducerGroupIds, producerGroup.id)) {
+    if (matchedProducerGroupIds.contains(producerGroup.id)) {
       diagnostics.push_back(
           llvm::formatv("conditional group id={0} was selected by more than "
                         "one lexical source group",
@@ -626,24 +639,21 @@ static void bindConditionalGroups(
     scannedEndif.interval.modelKind =
         PreprocessingStructureModelKind::ConditionalDirective;
     scannedEndif.interval.conditionalGroupId = producerGroup.id;
-    matchedProducerGroupIds.push_back(producerGroup.id);
+    matchedProducerGroupIds.insert(producerGroup.id);
   }
 
   // A producer group in this exact source-owner domain must have one complete
   // lexical #if...#endif match.  Otherwise later state-aware reconstruction
   // cannot use the index as producer authority, even though each individually
   // scanned directive remains protected from generic edits.
-  for (const RefoldModel::CondGroup &producerGroup : model.GetConds()) {
-    if (!paths.PathsEqual(producerGroup.file, sourcePath) ||
-        producerGroup.parentIncludeId != ownerIncludeId)
-      continue;
-    if (llvm::is_contained(matchedProducerGroupIds, producerGroup.id))
+  for (const RefoldModel::CondGroup *producerGroup : ownerDomainGroups) {
+    if (matchedProducerGroupIds.contains(producerGroup->id))
       continue;
     diagnostics.push_back(
         llvm::formatv("producer conditional group id={0} range=[{1},{2}) has "
                       "no unique exact lexical binding",
-                      producerGroup.id, producerGroup.groupB,
-                      producerGroup.groupE)
+                      producerGroup->id, producerGroup->groupB,
+                      producerGroup->groupE)
             .str());
   }
 
@@ -1176,6 +1186,15 @@ bool RefoldPreprocessingStructureIndex::HasUnboundStructure() const {
   return false;
 }
 
+size_t RefoldPreprocessingStructureIndex::FirstPossibleOverlappingIndex(
+    uint64_t begin) const {
+  auto firstPossible = std::upper_bound(prefixMaximumIntervalEnds_.begin(),
+                                        prefixMaximumIntervalEnds_.end(),
+                                        begin);
+  return static_cast<size_t>(
+      std::distance(prefixMaximumIntervalEnds_.begin(), firstPossible));
+}
+
 std::vector<const PreprocessingStructureInterval *>
 RefoldPreprocessingStructureIndex::FindOverlapping(uint64_t begin,
                                                    uint64_t end) const {
@@ -1183,12 +1202,8 @@ RefoldPreprocessingStructureIndex::FindOverlapping(uint64_t begin,
   if (end <= begin)
     return result;
 
-  auto firstPossible = std::upper_bound(prefixMaximumIntervalEnds_.begin(),
-                                        prefixMaximumIntervalEnds_.end(),
-                                        begin);
-  size_t intervalIndex = static_cast<size_t>(
-      std::distance(prefixMaximumIntervalEnds_.begin(), firstPossible));
-  for (; intervalIndex < intervals_.size(); ++intervalIndex) {
+  for (size_t intervalIndex = FirstPossibleOverlappingIndex(begin);
+       intervalIndex < intervals_.size(); ++intervalIndex) {
     const PreprocessingStructureInterval &interval =
         intervals_[intervalIndex];
     if (interval.begin >= end)
@@ -1197,6 +1212,23 @@ RefoldPreprocessingStructureIndex::FindOverlapping(uint64_t begin,
       result.push_back(&interval);
   }
   return result;
+}
+
+bool RefoldPreprocessingStructureIndex::HasOverlapping(uint64_t begin,
+                                                       uint64_t end) const {
+  if (end <= begin)
+    return false;
+
+  for (size_t intervalIndex = FirstPossibleOverlappingIndex(begin);
+       intervalIndex < intervals_.size(); ++intervalIndex) {
+    const PreprocessingStructureInterval &interval =
+        intervals_[intervalIndex];
+    if (interval.begin >= end)
+      break;
+    if (interval.Overlaps(begin, end))
+      return true;
+  }
+  return false;
 }
 
 bool RefoldPreprocessingStructureIndex::IsRangeLexicallyIgnorable(
@@ -1296,7 +1328,7 @@ bool RefoldPreprocessingStructureIndex::ProveOrdinaryDirectTUInternalGap(
   // Lexer trivia cannot become ordinary edit authority merely because the same
   // physical bytes also belong to a directive logical line.  Consult the exact
   // structure census independently before accepting the trivia theorem.
-  if (!FindOverlapping(begin, end).empty())
+  if (HasOverlapping(begin, end))
     return false;
 
   return IsRangeLexicallyIgnorable(begin, end);

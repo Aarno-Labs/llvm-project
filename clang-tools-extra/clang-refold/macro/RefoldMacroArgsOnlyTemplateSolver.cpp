@@ -293,7 +293,7 @@ buildInvocationRewriteWithRangeLocal(
     if (rEnd < rBegin || rEnd > baseInvocationText.size() || rBegin < cursor)
       return std::nullopt;
 
-    out.text += baseInvocationText.slice(cursor, rBegin).str();
+    out.text += baseInvocationText.slice(cursor, rBegin);
 
     auto replIt = replByArgIdx.find(argIdx);
     if (replIt == replByArgIdx.end())
@@ -325,7 +325,7 @@ buildInvocationRewriteWithRangeLocal(
     cursor = rEnd;
   }
 
-  out.text += baseInvocationText.substr(cursor).str();
+  out.text += baseInvocationText.substr(cursor);
   if (!mappedBegin || !mappedEnd)
     return std::nullopt;
 

@@ -170,13 +170,13 @@ bool appendLeafReplayPastePiece(
   if (piece.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
     if (!piece.paramIndex || *piece.paramIndex >= actuals.size())
       return false;
-    pasted += actuals[*piece.paramIndex].trim().str();
+    pasted += actuals[*piece.paramIndex].trim();
     return true;
   }
   if (piece.spelling == "#" || piece.spelling == "##" ||
       piece.spelling == "__VA_OPT__")
     return false;
-  pasted += piece.spelling.str();
+  pasted += piece.spelling;
   return true;
 }
 
@@ -260,7 +260,7 @@ std::optional<std::string> rewriteSolvedLeafAsSource(
 
   std::string rewritten = source.slice(0, quote).str();
   rewritten += stringutils::quoteCStringLiteral(solved);
-  rewritten += source.substr(endQuote + 1).str();
+  rewritten += source.substr(endQuote + 1);
   return rewritten;
 }
 
@@ -553,7 +553,7 @@ GeneratedLeafReplayResolver::TryRemoveTrailingVariadicActual(
   // argument: start at the previous argument's end so the separating comma and
   // whitespace disappear together with the old variadic payload.
   std::string rewritten = baseInvText.slice(0, prev.second).str();
-  rewritten += baseInvText.substr(last.second).str();
+  rewritten += baseInvText.substr(last.second);
   MacroPatch patch{*m.invB, *m.invE, std::move(rewritten), m.id};
   patch.materialized.hasOutputByteRange = true;
   patch.materialized.outputByteStart = prev.second;
@@ -1020,7 +1020,7 @@ std::optional<MacroPatch> GeneratedLeafReplayResolver::TryBuild(
           if (!insertedActual.empty() && insertedActual.back() != ' ' &&
               insertedActual.back() != ',')
             insertedActual += " ";
-          insertedActual += spelling.str();
+          insertedActual += spelling;
         }
         sawInsertedData = true;
       }
@@ -1031,7 +1031,7 @@ std::optional<MacroPatch> GeneratedLeafReplayResolver::TryBuild(
         std::string rewritten = baseInvText.slice(0, close).str();
         rewritten += ", ";
         rewritten += StringRef(insertedActual).trim();
-        rewritten += baseInvText.substr(close).str();
+        rewritten += baseInvText.substr(close);
 
         MacroPatch patch{*m.invB, *m.invE, std::move(rewritten), m.id};
         patch.materialized.hasOutputByteRange = true;

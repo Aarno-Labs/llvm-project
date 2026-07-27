@@ -11,6 +11,7 @@
 #include "util/StringUtils.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <algorithm>
@@ -313,19 +314,21 @@ findPasteTokenWitnessForSpan(const RefoldModel::MacroInvocation &m,
   if (m.pasteTokens.empty())
     return nullptr;
 
-  SmallVector<std::pair<uint64_t, uint64_t>, 8> tokenOrder;
-  for (const auto &ps : m.pasteSpans) {
-    std::pair<uint64_t, uint64_t> key{ps.begin, ps.end};
-    if (llvm::find(tokenOrder, key) == tokenOrder.end())
-      tokenOrder.push_back(key);
-  }
+  // One pass assigns each distinct `(begin,end)` its producer token-order
+  // ordinal.  The map keeps the first ordinal for a repeated range, which is
+  // the same ordinal the previous append-if-absent list produced, but without
+  // rescanning the accumulated list per paste span.
+  SmallDenseMap<std::pair<uint64_t, uint64_t>, size_t, 8> ordinalByTokenRange;
+  for (const auto &ps : m.pasteSpans)
+    ordinalByTokenRange.try_emplace(
+        std::pair<uint64_t, uint64_t>{ps.begin, ps.end},
+        ordinalByTokenRange.size());
 
-  auto it = llvm::find(tokenOrder,
-                       std::pair<uint64_t, uint64_t>{span.begin, span.end});
-  if (it == tokenOrder.end())
+  auto it = ordinalByTokenRange.find(
+      std::pair<uint64_t, uint64_t>{span.begin, span.end});
+  if (it == ordinalByTokenRange.end())
     return nullptr;
-  const size_t index =
-      static_cast<size_t>(std::distance(tokenOrder.begin(), it));
+  const size_t index = it->second;
   if (index >= m.pasteTokens.size())
     return nullptr;
 

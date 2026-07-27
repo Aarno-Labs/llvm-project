@@ -696,24 +696,31 @@ RefoldMacroDAGSubtreeCertifier::BuildLeafFormalLiftGroups(
 
   // Group changed formals by the paste product they contribute to. The
   // key is the final pasted-token span, so all operands of the same paste
-  // result land in the same bucket.
-  StringMap<SmallVector<uint32_t, 4>> tokenArgs;
+  // result land in the same bucket.  Buckets stay in first-encounter producer
+  // order and are addressed by the exact `(begin,end)` span pair, so neither
+  // the grouping nor the adjacency below depends on hash-map iteration order or
+  // on a formatted key spelling.
+  SmallDenseMap<std::pair<uint64_t, uint64_t>, size_t, 8> tokenArgsBucket;
+  SmallVector<SmallVector<uint32_t, 4>, 8> tokenArgs;
   for (const auto &ps : leaf.pasteSpans) {
     auto it = leafFormals.find(ps.argIdx);
     if (it == leafFormals.end())
       continue;
 
-    std::string key = formatv("{0}:{1}", ps.begin, ps.end).str();
-    auto &args = tokenArgs[key];
-    if (llvm::find(args, ps.argIdx) == args.end())
+    auto bucket = tokenArgsBucket.try_emplace(
+        std::pair<uint64_t, uint64_t>{ps.begin, ps.end}, tokenArgs.size());
+    if (bucket.second)
+      tokenArgs.emplace_back();
+    SmallVectorImpl<uint32_t> &args = tokenArgs[bucket.first->second];
+    if (!llvm::is_contained(args, ps.argIdx))
       args.push_back(ps.argIdx);
   }
 
   // Add undirected edges between every pair of changed formals that share
   // a paste product. A connected component therefore represents the
   // smallest set of leaf formals that must be replayed together.
-  for (const auto &kvLocal : tokenArgs) {
-    ArrayRef<uint32_t> args = kvLocal.second;
+  for (const SmallVectorImpl<uint32_t> &argsBucket : tokenArgs) {
+    ArrayRef<uint32_t> args = argsBucket;
     if (args.size() < 2)
       continue;
     for (size_t i = 0; i < args.size(); ++i) {

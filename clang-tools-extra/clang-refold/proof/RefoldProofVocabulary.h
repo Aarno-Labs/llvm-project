@@ -704,7 +704,7 @@ struct WitnessProducerKindSet {
     for (size_t i = 0; i < kinds.size(); ++i) {
       if (i)
         out += ",";
-      out += toString(kinds[i]).str();
+      out += toString(kinds[i]);
     }
     out += "}";
     return out;
@@ -748,7 +748,7 @@ struct WitnessEquivalenceKey {
     auto append = [&](llvm::StringRef name) {
       if (!out.empty())
         out += ",";
-      out += name.str();
+      out += name;
     };
 
     if (!targetPPTokens.known)

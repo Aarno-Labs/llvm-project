@@ -232,7 +232,7 @@ std::optional<InvocationRewriteWithRange> buildInvocationRewriteDroppingFinalArg
 
   InvocationRewriteWithRange out;
   out.text = baseInvocationText.slice(0, previousRange.second).str();
-  out.text += baseInvocationText.substr(droppedRange.second).str();
+  out.text += baseInvocationText.substr(droppedRange.second);
   out.materializedOutputByteStart = materializedRange.first;
   out.materializedOutputByteEnd = materializedRange.second;
   return out;
@@ -801,7 +801,7 @@ std::optional<MacroPatch> tryBuildGeneratedVaOptStringifyPayloadActivationPatch(
   DenseMap<uint32_t, std::string> replacements;
   std::string rewrittenRootActual = fixedRootActual->trim().str();
   rewrittenRootActual += ", ";
-  rewrittenRootActual += StringRef(*canonicalPayload).trim().str();
+  rewrittenRootActual += StringRef(*canonicalPayload).trim();
   replacements[shape->rootVariadicArgIdx] = std::move(rewrittenRootActual);
 
   InvocationActualRecoveryContext actualCtx{invocation, baseInvocationText,

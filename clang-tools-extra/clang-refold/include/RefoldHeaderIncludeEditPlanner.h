@@ -30,8 +30,11 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace clang {
@@ -77,6 +80,10 @@ public:
       const RefoldTerminalProofSink &terminalSink,
       llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
       const clang::LangOptions &lexLang);
+
+  /// Declared out of line so the occurrence structure-index cache can hold a
+  /// forward-declared RefoldPreprocessingStructureIndex.
+  ~RefoldHeaderIncludeEditPlanner();
 
   /// Selects the recorded header declaration that best owns an include patch.
   /// This is a pure declaration-span chooser shared with the materializer
@@ -735,6 +742,28 @@ private:
   const RefoldTextEditAssembler &textEditAssembler_;
   llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits_;
   const clang::LangOptions &lexLang_;
+
+  /// Return the occurrence-local structure census for one header inclusion.
+  ///
+  /// The census is a pure function of the physical header path, the concrete
+  /// include occurrence, and the header bytes, so repeated candidates over the
+  /// same occurrence share one immutable inventory instead of re-lexing the
+  /// header per candidate.  A different header extent for the same occurrence
+  /// rebuilds rather than reusing a census of other bytes.
+  const RefoldPreprocessingStructureIndex &
+  GetHeaderOccurrenceStructureIndex(llvm::StringRef headerPath,
+                                    uint64_t includeId,
+                                    llvm::StringRef headerText) const;
+
+  /// One built occurrence census plus the header extent it was built from.
+  struct HeaderStructureIndexCacheEntry {
+    std::unique_ptr<RefoldPreprocessingStructureIndex> index;
+    size_t headerSize = 0;
+  };
+
+  mutable std::map<std::pair<std::string, uint64_t>,
+                   HeaderStructureIndexCacheEntry>
+      headerStructureIndexCache_;
 };
 
 } // namespace refold

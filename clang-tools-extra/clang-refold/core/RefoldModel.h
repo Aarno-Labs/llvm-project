@@ -30,6 +30,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Errc.h"
@@ -1072,6 +1073,28 @@ public:
     return it->second;
   }
 
+  /// Look up a producer macro-state directive by stable ID.
+  const MacroDirective *GetMacroDirectiveById(uint64_t id) const {
+    auto it = macroDirById_.find(id);
+    return it == macroDirById_.end() ? nullptr : it->second;
+  }
+
+  /// Return every macro-state directive recorded for macro-state key \p name,
+  /// in producer record order.
+  ///
+  /// The returned bucket preserves the exact relative order these directives
+  /// have in GetMacroDirectives(), so a scan over one bucket observes the same
+  /// candidate sequence a full linear scan filtered by name would observe.
+  /// Callers must never iterate the underlying name index itself; only these
+  /// per-name buckets carry a deterministic order.
+  ArrayRef<const MacroDirective *>
+  GetMacroDirectivesByName(StringRef name) const {
+    auto it = macroDirsByName_.find(name);
+    if (it == macroDirsByName_.end())
+      return {};
+    return it->second;
+  }
+
   // ========================= Helpers for the engine  =========================
 
   // --- Segments ---
@@ -1233,6 +1256,10 @@ private:
   DenseMap<uint64_t, const IncludeItem *> includeById_;
   DenseMap<uint64_t, const CondGroup *> condGroupById_;
   DenseMap<uint64_t, ArmRef> armById_;
+
+  // macro-state key -> directives in producer record order
+  DenseMap<uint64_t, const MacroDirective *> macroDirById_;
+  StringMap<SmallVector<const MacroDirective *, 2>> macroDirsByName_;
 
   // file -> groups (all owners)
   StringMap<std::vector<const CondGroup *>> condsByFile_;

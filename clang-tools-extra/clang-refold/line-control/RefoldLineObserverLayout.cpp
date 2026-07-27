@@ -416,7 +416,7 @@ static std::optional<LineObserverRightClosure> extendLineObserverRightClosure(
     if (!ownerBytes.slice(cursor, lineEnd).trim().empty())
       return std::nullopt;
 
-    closure.sourceSpelledExtension += bGap.str();
+    closure.sourceSpelledExtension += bGap;
     closure.sourceSpelledExtension +=
         ownerBytes.slice(nextEntry.b, lineEnd).str();
     closure.sourceEnd = lineEnd;
@@ -640,8 +640,8 @@ buildLineObserverSourceSpelledPrefix(
     if (bGap.contains('\n') || bGap.contains('\r'))
       return std::nullopt;
 
-    result.text += bGap.str();
-    result.text += ownerBytes.slice(constructBegin, constructEnd).str();
+    result.text += bGap;
+    result.text += ownerBytes.slice(constructBegin, constructEnd);
     result.sourceEnd = constructEnd;
     result.lastATok = constructLastATok;
     result.lastBTok = constructLastBTok;
@@ -656,7 +656,7 @@ buildLineObserverSourceSpelledPrefix(
     return std::nullopt;
   if (bLimit < bCursor || bLimit > bSource.size())
     return std::nullopt;
-  result.text += bSource.slice(bCursor, bLimit).str();
+  result.text += bSource.slice(bCursor, bLimit);
   return result;
 }
 
@@ -857,7 +857,7 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
     if (!loc.producerProven)
       continue;
     replacement += lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
-    replacement += tuBytes.slice(observerLineBegin, observerConstructEnd).str();
+    replacement += tuBytes.slice(observerLineBegin, observerConstructEnd);
     replacement += closure->sourceSpelledExtension;
 
     TextEdit edit{editBegin,    editEnd, replacement, std::nullopt,
@@ -1176,7 +1176,7 @@ RefoldLineObserverLayout::WrapIncludeExpansionForMaterialization(
 
   auto appendChildBody = [&]() {
     const uint64_t bodyBegin = static_cast<uint64_t>(wrapped.text.size());
-    wrapped.text += childBody.str();
+    wrapped.text += childBody;
     appendShiftedLineControlPruneCandidates(wrapped.lineControlPruneCandidates,
                                             childBodyLineControlCandidates,
                                             bodyBegin);

@@ -152,7 +152,7 @@ bool RefoldTUEditPlanner::CollectDirectTUMacroRepairEvidenceOrEmpty(
     uint64_t begin, uint64_t end,
     std::vector<const PreprocessingStructureInterval *> &intervals) const {
   intervals.clear();
-  if (deps_.preprocessingStructureIndex.FindOverlapping(begin, end).empty())
+  if (!deps_.preprocessingStructureIndex.HasOverlapping(begin, end))
     return true;
   return CollectDirectTUMacroRepairEvidence(begin, end, intervals);
 }
@@ -170,7 +170,7 @@ bool RefoldTUEditPlanner::ValidateOrdinaryDirectTUEnvelope(
       !structure.IsExactLexicalBoundary(end)) {
     return false;
   }
-  return structure.FindOverlapping(begin, end).empty();
+  return !structure.HasOverlapping(begin, end);
 }
 
 bool RefoldTUEditPlanner::DirectTUEnvelopeRetainsMacroRepairEvidence(
@@ -236,7 +236,7 @@ bool RefoldTUEditPlanner::ValidateDirectTUEnvelope(
     return false;
   }
 
-  if (structure.FindOverlapping(begin, end).empty())
+  if (!structure.HasOverlapping(begin, end))
     return true;
 
   std::vector<const PreprocessingStructureInterval *> macroIntervals;

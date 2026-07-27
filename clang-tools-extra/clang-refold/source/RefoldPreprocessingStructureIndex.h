@@ -286,6 +286,13 @@ public:
   std::vector<const PreprocessingStructureInterval *>
   FindOverlapping(uint64_t begin, uint64_t end) const;
 
+  /// Return whether any interval overlaps the requested half-open byte range.
+  ///
+  /// This answers the same question as `!FindOverlapping(begin, end).empty()`
+  /// from the same binary-search prologue, returning at the first overlap
+  /// instead of materializing the complete result list.
+  bool HasOverlapping(uint64_t begin, uint64_t end) const;
+
   /// Return whether `[begin,end)` is covered by one maximal exact lexical
   /// trivia interval discovered in the same whole-source scan as the directive
   /// census.
@@ -325,6 +332,13 @@ public:
       std::vector<const PreprocessingStructureInterval *> &intervals) const;
 
 private:
+  /// Return the first interval index that can still reach byte \p begin.
+  ///
+  /// Shared binary-search prologue of the overlap queries: every earlier
+  /// interval ends at or before \p begin, so none of them can overlap a range
+  /// starting there.
+  size_t FirstPossibleOverlappingIndex(uint64_t begin) const;
+
   std::string sourcePath_;
   uint64_t sourceSize_ = 0;
   std::optional<uint64_t> ownerIncludeId_;
