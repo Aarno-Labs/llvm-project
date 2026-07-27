@@ -95,6 +95,7 @@
 #include "sideband/RefoldSidebandPragmaEdits.h"
 #include "source/RefoldMixedOwnerTilingPlanner.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
+#include "source/RefoldPreprocessingStructureIndexProvider.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
 #include "source/RefoldTokenDiffPlanner.h"
 #include "source/TokenTextHelpers.h"
@@ -321,6 +322,7 @@ RefoldEngine::RefoldEngine(
   InitializeOwnerStateProof();
   InitializeMacroStateProof();
   InitializePreprocessingStructureIndex();
+  InitializePreprocessingStructureIndexProvider();
   InitializeTokenDiffPlanner();
   InitializeTUAnchorProof();
   InitializeTUEditPlanner();
@@ -489,7 +491,7 @@ RefoldEngine::LoadTUSource(StringRef tuPath) {
 }
 
 std::vector<diffutils::Hunk>
-RefoldEngine::PlanTokenDiff(StringRef tuPath, StringRef tuBytes) {
+RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   // PlanTokenDiff is the only phase boundary allowed to expose structural
   // hunks.  Re-entry would permit an insertion ledger or owner classifier to
   // retain indices into a stale normalization, so reject it as an internal
@@ -619,7 +621,7 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath, StringRef tuBytes) {
   assert(mixedOwnerTilingPlanner_ &&
          "structural tiling planner service not initialized");
   RefoldMixedOwnerTilingPlanner::MixedOwnerTilingPlan structuralTilingPlan =
-      mixedOwnerTilingPlanner_->Plan(std::move(hunks), tuBytes);
+      mixedOwnerTilingPlanner_->Plan(std::move(hunks));
   hunks = std::move(structuralTilingPlan.hunks);
 
   // The planner writes the shared token-hunk cache and durable ledgers as part
@@ -1855,7 +1857,7 @@ std::string RefoldEngine::RunRefoldPass() {
   std::unique_ptr<llvm::MemoryBuffer> tuBuffer = LoadTUSource(tuPath);
   StringRef tuBytes = tuBuffer->getBuffer();
 
-  std::vector<diffutils::Hunk> hunks = PlanTokenDiff(tuPath, tuBytes);
+  std::vector<diffutils::Hunk> hunks = PlanTokenDiff(tuPath);
   TraceStructuralHunkEnvelopes(hunks);
 
   RefoldStructuralHunkDispatcher structuralHunkDispatcher;

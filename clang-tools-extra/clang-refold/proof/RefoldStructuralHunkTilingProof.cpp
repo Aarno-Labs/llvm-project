@@ -20,7 +20,7 @@ namespace {
 ///
 /// Producer-bound #define/#undef lines are owned by the specialized macro-state
 /// repair theorem. Direct-TU span planning may discover those lines as evidence
-/// but grants no protected-source authority. A Patch 3.1 boundary witness does
+/// but grants no protected-source authority. A boundary-projection witness does
 /// not compose with the repair theorem merely because its B boundaries are
 /// unique, so such a witness must fail independently at every later proof
 /// boundary as well as in the planner.
@@ -272,7 +272,7 @@ bool structuralReplacementBoundaryProjectionIsComplete(
 
   // A pure preserved-structure partition has no owner boundary that could
   // require additional token segments inside one canonical physical run.  It
-  // must therefore retain the Patch 3.1 minimum-fragment theorem.  A combined
+  // must therefore retain the minimum-fragment theorem. A combined
   // mixed-realizer partition may legitimately contain more token segments than
   // physical runs; its unique lowest-cost DP path is recorded by
   // `uniquePartition` and the protected seams are still validated below.

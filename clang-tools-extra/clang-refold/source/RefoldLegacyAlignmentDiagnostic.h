@@ -2,11 +2,11 @@
 //
 // Boundary proposal reconstructed from the pre-semantic-resolver policy.
 //
-// This service reconstructs the last regression-passing Patch 6 partial map
-// from the exact all-optimal oracle. The historical ranks are proposal-only:
-// the semantic resolver must independently prove every non-forced anchor by
-// counterfactual planning or realized-source equivalence before it can become
-// production authority.
+// This service reconstructs the last regression-passing pre-semantic-resolver
+// partial map from the exact all-optimal oracle. The historical ranks are
+// proposal-only: the semantic resolver must independently prove every non-
+// forced anchor by counterfactual planning or realized-source equivalence
+// before it can become production authority.
 //
 //===----------------------------------------------------------------------===//
 
@@ -25,7 +25,7 @@
 namespace clang {
 namespace refold {
 
-/// Historical source of one Patch 6 shadow anchor.
+/// Historical source of one shadow alignment anchor.
 enum class LegacyAlignmentAnchorOrigin : uint8_t {
   None,
   CoreForced,
@@ -34,7 +34,7 @@ enum class LegacyAlignmentAnchorOrigin : uint8_t {
   SuffixInsertionRestoration,
 };
 
-/// Proposal reconstructed from the Patch 6 selected alignment policy.
+/// Proposal reconstructed from the legacy selected-alignment policy.
 struct LegacyAlignmentDiagnosticResult {
   std::vector<int64_t> selectedMap;
   std::vector<LegacyAlignmentAnchorOrigin> anchorOrigins;
@@ -52,14 +52,14 @@ struct LegacyAlignmentDiagnosticResult {
   bool lexemesAgree = false;
 
   /// True only when one globally optimal core path contains every selected
-  /// shadow anchor simultaneously.  Historical Patch 6 admitted anchors
+  /// shadow anchor simultaneously. The legacy policy admitted anchors
   /// individually, so this can be false even when every anchor occurs on some
   /// optimal path.
   bool jointlyCoreOptimal = false;
   std::string jointOptimalityFailure;
 };
 
-/// Reconstruct the exact Patch 6 boundary-restoration proposal.
+/// Reconstruct the exact legacy boundary-restoration proposal.
 ///
 /// The implementation intentionally preserves the historical ranking and
 /// tie-handling rules byte-for-byte in meaning. The returned map is not itself

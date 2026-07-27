@@ -156,6 +156,7 @@ class RefoldMacroStateProof;
 class RefoldOwnerClassifier;
 class RefoldOwnerStateProof;
 class RefoldPreprocessingStructureIndex;
+class RefoldPreprocessingStructureIndexProvider;
 class RefoldProofLattice;
 class RefoldStructuralHunkDispatcher;
 class RefoldTextEditAssembler;
@@ -339,6 +340,13 @@ private:
   /// lexical intervals still reject any overlapping realization.
   std::unique_ptr<RefoldPreprocessingStructureIndex>
       preprocessingStructureIndex_;
+
+  /// Shared exact structure-index provider for physical source occurrences.
+  ///
+  /// The provider returns `preprocessingStructureIndex_` for the TU and lazily
+  /// builds header indexes per canonical path and concrete include occurrence.
+  std::unique_ptr<RefoldPreprocessingStructureIndexProvider>
+      preprocessingStructureIndexProvider_;
 
   /// Macro-argument text recovery service.
   ///
@@ -720,6 +728,9 @@ private:
   /// census consumed by direct TU byte-span planning.
   void InitializePreprocessingStructureIndex();
 
+  /// Allocate the shared occurrence-local preprocessing-structure provider.
+  void InitializePreprocessingStructureIndexProvider();
+
   /// Allocate and access the macro patch planner after the proof lattice
   /// exists. Macro-planning orchestration calls this service directly.
   void InitializeMacroPatchPlanner();
@@ -839,8 +850,7 @@ private:
   /// Reject an isolated run whose durable structural witnesses are incomplete.
   bool AlignmentSimulationProofComplete(std::string &failure) const;
 
-  std::vector<diffutils::Hunk> PlanTokenDiff(StringRef tuPath,
-                                             StringRef tuBytes);
+  std::vector<diffutils::Hunk> PlanTokenDiff(StringRef tuPath);
 
   /// Emit trace diagnostics for each B-token envelope selected by the token
   /// diff and owner-aware tiling stages.

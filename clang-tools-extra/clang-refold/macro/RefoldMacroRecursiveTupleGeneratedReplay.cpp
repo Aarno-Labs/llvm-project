@@ -272,8 +272,8 @@ struct TerminalReplayTarget {
 /// The carrier deliberately stores only evidence already proven by earlier
 /// private theorem layers: producer ancestry, exact whole-formal composition,
 /// terminal caller-param callee origin, and exact terminal-actual-to-root-tuple
-/// byte-slice bindings.  Replay solving and tuple edit construction consume this
-/// path in later steps rather than re-deriving graph facts.
+/// byte-slice bindings. Replay solving and tuple edit construction consume this
+/// path directly rather than re-deriving graph facts.
 struct ComposedGeneratedCalleePath {
   /// Root invocation whose source tuple argument may eventually be edited.
   const RefoldModel::MacroInvocation *rootInvocation = nullptr;

@@ -337,8 +337,8 @@ RefoldProofSummaryBuilder::BuildCanonicalEmittedProofFromSummary(
             segment.bEnd != expectedB) {
           return std::nullopt;
         }
-        // Patch 2.2 produces only physically preserved state gaps.  The other
-        // disposition values reserve future specialized materialization and
+        // This planner path produces only physically preserved state gaps.
+        // Other disposition values reserve specialized materialization and
         // repair theorems; accepting them here without their own durable
         // witness would manufacture authority.  `Unknown` is likewise a
         // fail-closed proof omission.
@@ -438,9 +438,10 @@ RefoldProofSummaryBuilder::BuildCanonicalEmittedProofFromSummary(
       return std::nullopt;
     }
 
-    // Patch 3.1/3.2 is mandatory for every structural replacement that preserves
-    // preprocessing structure.  A mixed-realizer path cannot bypass ambiguous
-    // B ownership merely because its adjacent token segments have different
+    // The boundary-projection theorem is mandatory for every structural
+    // replacement that preserves preprocessing structure. A mixed-realizer
+    // path cannot bypass ambiguous B ownership merely because its adjacent
+    // token segments have different
     // owners.  Historical mixed-realizer partitions with no protected source
     // seam retain their original theorem and carry no projection facts.
     const bool requiresBoundaryProjectionTheorem =

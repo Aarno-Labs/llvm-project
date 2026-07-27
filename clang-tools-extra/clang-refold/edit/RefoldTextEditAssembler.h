@@ -289,7 +289,7 @@ public:
   /// logical directive line. Comparing both edit sets closes
   /// widening, merging, and conservative-closure paths that occur after token
   /// tiling and could otherwise erase the witness they invalidate.  Replacement
-  /// witnesses additionally retain the Patch 3.1 unique A-to-B boundary
+  /// witnesses additionally retain the unique A-to-B boundary
   /// projection proof through this final emission audit.
   bool PreservedStructuralGapsRemainOutsideEmittedEdits(
       llvm::ArrayRef<TextEdit> plannedEdits,
@@ -486,7 +486,7 @@ private:
   const RefoldTUEditPlanner &tuEdits_;
   const RefoldTheoremAudit &theoremAuditService_;
   const std::vector<SidebandPragmaEdit> &sidebandPragmaEdits_;
-  /// Durable structural partitions used to resolve Patch 1.4 TU carrier keys
+  /// Durable structural partitions used to resolve validated TU carrier keys
   /// after later edit normalization has discarded path-local bindings.
   const std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses_;
   TheoremAuditStats &theoremAudit_;

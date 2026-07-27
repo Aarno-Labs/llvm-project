@@ -24,34 +24,29 @@
 #include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
 #include "core/RefoldOwnerClassifier.h"
-#include "line-control/LineDirectiveInserter.h"
-#include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroTopology.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofLattice.h"
 #include "proof/RefoldStructuralHunkTilingProof.h"
 #include "proof/RefoldWitnessTrace.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
+#include "source/RefoldPreprocessingStructureIndexProvider.h"
 #include "source/RefoldSourceGapProof.h"
 #include "source/RefoldSourceMapper.h"
 #include "util/RefoldPathIdentity.h"
 
-#include "clang/Basic/LangOptions.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
-#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cassert>
 #include <limits>
 #include <map>
-#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -251,72 +246,23 @@ RefoldMixedOwnerTilingPlanner::RefoldMixedOwnerTilingPlanner(Dependencies deps)
     : deps_(deps) {}
 
 RefoldMixedOwnerTilingPlanner::MixedOwnerTilingPlan
-RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
-                                    StringRef tuBytes) {
-  // Source-gap classification needs read-only access to arbitrary source
-  // owners, not just the top-level TU. Cache buffers by model path so repeated
-  // include/gap proofs do not repeatedly hit the file system. Missing files
-  // make the gap proof non-applicable; the cache never synthesizes text.
-  llvm::StringMap<std::unique_ptr<llvm::MemoryBuffer>> sourceGapBufferCache;
-  auto getSourceBytesForGapPath =
-      [&](StringRef path) -> std::optional<StringRef> {
-    if (deps_.pathIdentity.PathsEqual(path, deps_.tuPath))
-      return tuBytes;
-
-    auto found = sourceGapBufferCache.find(path);
-    if (found != sourceGapBufferCache.end())
-      return found->second->getBuffer();
-
-    const std::string absolutePath = deps_.lineDirs.ToAbsolutePath(path);
-    auto bufOrErr = llvm::MemoryBuffer::getFile(absolutePath);
-    if (!bufOrErr)
-      return std::nullopt;
-
-    auto &cached = sourceGapBufferCache[path];
-    cached = std::move(*bufOrErr);
-    return cached->getBuffer();
+RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
+  // All structural proofs use the shared occurrence-local index provider. The
+  // provider returns the engine-owned TU index and lazily caches header indexes
+  // by canonical physical path plus concrete include owner. Missing source text
+  // remains explicit incomplete evidence and never creates an approximate index.
+  auto lookupStructureIndexForSource =
+      [&](const OwnerSourceRange &source)
+      -> RefoldPreprocessingStructureIndexProvider::LookupResult {
+    if (!source.IsComplete())
+      return {nullptr, {}, "source coordinates are incomplete"};
+    return deps_.preprocessingStructureIndexes.Get(source.path,
+                                                    source.includeId);
   };
-
-  // Same-realizer splitting must be justified by the same exact lexical
-  // protection census used by direct TU byte realization.  The TU index is
-  // already engine-owned; indexes for header/include occurrences are built
-  // lazily and cached by physical path plus concrete include owner.  Repeated
-  // header visits therefore never share producer bindings accidentally.
-  using StructureIndexCacheKey =
-      std::pair<std::string, std::optional<uint64_t>>;
-  std::map<StructureIndexCacheKey,
-           std::unique_ptr<RefoldPreprocessingStructureIndex>>
-      sourceStructureIndexCache;
   auto getStructureIndexForSource =
       [&](const OwnerSourceRange &source)
       -> const RefoldPreprocessingStructureIndex * {
-    if (!source.IsComplete())
-      return nullptr;
-
-    if (!source.includeId &&
-        deps_.pathIdentity.PathsEqual(source.path, deps_.tuPath)) {
-      return &deps_.tuPreprocessingStructureIndex;
-    }
-
-    StructureIndexCacheKey key{source.path, source.includeId};
-    auto found = sourceStructureIndexCache.find(key);
-    if (found != sourceStructureIndexCache.end())
-      return found->second.get();
-
-    std::optional<StringRef> sourceBytes =
-        getSourceBytesForGapPath(source.path);
-    if (!sourceBytes)
-      return nullptr;
-
-    auto index = std::make_unique<RefoldPreprocessingStructureIndex>(
-        RefoldPreprocessingStructureIndex::Build(
-            RefoldPreprocessingStructureIndex::Dependencies{
-                deps_.model, deps_.pathIdentity, deps_.macroStateProof,
-                deps_.lexLang},
-            source.path, *sourceBytes, source.includeId));
-    const RefoldPreprocessingStructureIndex *result = index.get();
-    sourceStructureIndexCache.emplace(std::move(key), std::move(index));
-    return result;
+    return lookupStructureIndexForSource(source).index;
   };
 
   // Structural witnesses are rebuilt from the current token diff and attached
@@ -520,9 +466,10 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
     /// leave the directive physically in place and emit independent edits on
     /// both sides.  Boundary projection proves only how B tokens are
     /// partitioned; it does not prove equivalence with that later macro-state
-    /// ordering theorem.  Therefore Patch 3.1 must defer such transitions to the
-    /// existing whole-hunk path until an explicit composition theorem connects
-    /// projected fragments with macro-state liveness repair.
+    /// ordering theorem. Therefore boundary-projected tiling must defer these
+    /// transitions to the existing whole-hunk path until an explicit
+    /// composition theorem connects projected fragments with macro-state
+    /// liveness repair.
     auto transitionContainsMacroStateDirective =
         [](const ClosedStateGapTransition &transition) {
           return llvm::any_of(
@@ -565,9 +512,9 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
       /// gaps outside the edits. A combined mixed-realizer partition may carry
       /// additional token segments inside a run and therefore leave this false.
       bool uniqueMinimumFragmentPartition = false;
-      /// Ordered Patch 3.1/3.2 proofs for every interior canonical source-run
-      /// boundary of a structure-preserving replacement. Delete-only partitions
-      /// use the shared empty-B theorem below instead.
+      /// Ordered unique-boundary projection proofs for each interior canonical
+      /// source-run boundary of a structure-preserving replacement. Delete-only
+      /// partitions use the shared empty-B theorem below instead.
       SmallVector<StructuralBoundaryProjectionWitness, 8> boundaryProjections;
       bool uniqueBoundaryProjectionProven = false;
       /// Every emitted token segment of a delete-only partition carries the
@@ -976,11 +923,16 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
         return false;
       }
 
+      const auto structureLookup =
+          lookupStructureIndexForSource(gapSource);
       const RefoldPreprocessingStructureIndex *structureIndex =
-          getStructureIndexForSource(gapSource);
+          structureLookup.index;
       if (!structureIndex) {
-        if (reason)
-          *reason = "source gap has no exact preprocessing-structure index";
+        if (reason) {
+          *reason = structureLookup.incompleteEvidenceReason.empty()
+                        ? "source gap has no exact preprocessing-structure index"
+                        : structureLookup.incompleteEvidenceReason.str();
+        }
         return false;
       }
 
@@ -1187,13 +1139,17 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
             uint64_t bBoundary,
             SmallVectorImpl<PartitionEdge> &gaps,
             std::string *reason) -> std::optional<bool> {
+      const auto structureLookup =
+          lookupStructureIndexForSource(gapSource);
       const RefoldPreprocessingStructureIndex *structureIndex =
-          getStructureIndexForSource(gapSource);
+          structureLookup.index;
       if (!structureIndex ||
           !structureIndex->IsDirectTUProtectionCensusComplete()) {
         if (reason) {
-          *reason =
-              "preprocessing-structure census is incomplete for source gap";
+          *reason = structureLookup.incompleteEvidenceReason.empty()
+                        ? "preprocessing-structure census is incomplete for "
+                          "source gap"
+                        : structureLookup.incompleteEvidenceReason.str();
         }
         return std::nullopt;
       }
@@ -1786,8 +1742,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
           (!hasPreservedInPlaceEdge ||
            (partition.preservedGapSourceOrderProven &&
             partition.preservedGapsDisjointFromTokenSegments));
-      // The durable edge set is the initial emitted edit topology. Patch 2.4's
-      // final assembler audit independently rechecks the same obligation after
+      // The durable edge set is the initial emitted edit topology. The final
+      // assembler audit independently rechecks the same obligation after
       // normalization, so a later widened closure cannot consume a preserved
       // gap merely because the original carriers disappeared.
       witness.preservedGapsDisjointFromEdits =
@@ -2417,11 +2373,12 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
       std::optional<PhysicalSourceRunPlan> physicalSourceRuns =
           buildPhysicalSourceRunPlan(h);
 
-      // Patch 3.1 binds every canonical physical source-run boundary to one
-      // exact B-token boundary before the DP may construct a replacement
-      // partition. Patch 3.2 makes disagreement terminal for this normalization
-      // attempt: retaining the physical plan only for same-realizer paths while
-      // allowing the historical mixed-realizer search to continue would let an
+      // The boundary-projection theorem binds every canonical physical
+      // source-run boundary to one exact B-token boundary before the DP may
+      // construct a replacement partition. Projection disagreement is terminal
+      // for this normalization attempt. Retaining the physical plan only for
+      // same-realizer paths while allowing the historical mixed-realizer search
+      // to continue would let an
       // alternate partition assign the same ambiguous payload indirectly.
       //
       // `ProjectATokenBoundaryToBTokenBounds()` now reports the minimum and
@@ -2669,7 +2626,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
                 // Every replacement transition across protected source bytes,
                 // including a transition between different realizers, needs the
                 // same canonical source-run and unique B-frontier authority.
-                // Otherwise a mixed-owner path could bypass the Patch 3.2
+                // Otherwise a mixed-owner path could bypass the required
                 // ambiguity rejection that applies to a same-owner path.
                 if (!physicalSourceRuns)
                   continue;
@@ -2736,7 +2693,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
                 }
                 protectedReplacementBoundaryProven = true;
               } else if (prevEdge->realizer == edge.realizer) {
-                // Delete-only same-realizer tiling retains the Patch 2 theorem:
+                // Delete-only same-realizer tiling retains the protected-gap
+                // theorem:
                 // both token edges must be the exact maximal runs surrounding
                 // the proved protected gap.  Mixed-realizer deletion behavior is
                 // intentionally unchanged.
@@ -2782,7 +2740,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
               // Adjacent equal realizers are never split merely because the
               // subrange search found two candidates.  Delete-only hunks require
               // one exact protected source gap.  Replacement hunks additionally
-              // require the Patch 3.1 theorem for that canonical run boundary:
+              // require the unique-boundary projection theorem for that
+              // canonical run boundary:
               // the independently derived lower and upper A-to-B projections
               // must agree with both neighboring edge envelopes.  This preserves
               // directive order without assigning replacement payload by
@@ -2972,9 +2931,10 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks,
         return std::nullopt;
 
       // A pure same-realizer preservation partition always requires the
-      // canonical physical-run theorem.  Patch 3.2 extends that requirement to
-      // every replacement containing a protected seam, including mixed-realizer
-      // paths: owner diversity cannot authorize a B split that the token
+      // canonical physical-run theorem. The ambiguity-rejection rule extends
+      // that requirement to every replacement containing a protected seam,
+      // including mixed-realizer paths: owner diversity cannot authorize a B
+      // split that the token
       // alignment itself leaves ambiguous.
       const bool requiresCanonicalPhysicalRunProof =
           reason == StructuralTilingReason::PreservedPreprocessingStructure ||

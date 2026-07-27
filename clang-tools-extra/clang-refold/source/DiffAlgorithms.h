@@ -83,6 +83,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -100,6 +101,16 @@ namespace diffutils {
 /// below the multi-gigabyte range while remaining large enough for ordinary
 /// translation-unit alignments.
 constexpr unsigned long long DEFAULT_MAX_BYTES = 1ULL << 30;
+
+/// Aggregate retained payload budget for optional admissible-pair diagnostics.
+///
+/// The production proof tables are governed separately by `DEFAULT_MAX_BYTES`.
+/// Trace mode may expose a quadratic number of non-forced optimal match pairs,
+/// so their owning vectors receive an independent bounded ledger. Sixty-four
+/// MiB retains substantial diagnostic evidence without allowing observability
+/// to add an unbounded quadratic payload after certification has succeeded.
+constexpr unsigned long long DEFAULT_MAX_DIAGNOSTIC_EVIDENCE_BYTES =
+    64ULL << 20;
 
 // ===== Myers shortest edit script (SES) =====
 
@@ -398,6 +409,113 @@ struct LcsCertificationWindow {
   }
 };
 
+/// Kind of endpoint delimiting one diagnostic ambiguity window.
+///
+/// A partition seam is an exact DP boundary rather than a matched token.
+/// Keeping it distinct from stream sentinels and forced edges lets local
+/// certification publish precise evidence without encoding boundaries as
+/// synthetic or negative token indices.
+enum class LcsDiagnosticWindowAnchorKind : uint8_t {
+  StreamBegin,
+  CertifiedBoundary,
+  ForcedToken,
+  StreamEnd,
+};
+
+/// One forced token, exact partition seam, or explicit stream endpoint.
+///
+/// For `ForcedToken`, the coordinates are zero-based token indices. For every
+/// other kind they are DP boundary coordinates. Stream begin is `(0,0)` and
+/// stream end is `(globalATokenCount,globalBTokenCount)`.
+struct LcsDiagnosticWindowAnchor {
+  LcsDiagnosticWindowAnchorKind kind =
+      LcsDiagnosticWindowAnchorKind::StreamBegin;
+  uint64_t aToken = 0;
+  uint64_t bToken = 0;
+
+  static constexpr LcsDiagnosticWindowAnchor StreamBegin() { return {}; }
+
+  static constexpr LcsDiagnosticWindowAnchor
+  CertifiedBoundary(uint64_t aBoundary, uint64_t bBoundary) {
+    return {LcsDiagnosticWindowAnchorKind::CertifiedBoundary, aBoundary,
+            bBoundary};
+  }
+
+  static constexpr LcsDiagnosticWindowAnchor ForcedToken(uint64_t aToken,
+                                                          uint64_t bToken) {
+    return {LcsDiagnosticWindowAnchorKind::ForcedToken, aToken, bToken};
+  }
+
+  static constexpr LcsDiagnosticWindowAnchor
+  StreamEnd(uint64_t aTokenCount, uint64_t bTokenCount) {
+    return {LcsDiagnosticWindowAnchorKind::StreamEnd, aTokenCount,
+            bTokenCount};
+  }
+};
+
+/// Evidence-only request for one physical protected-boundary identity.
+///
+/// The higher-level source model owns the identity metadata. The LCS layer
+/// needs only its stable diagnostic id and exact A projection. An absent
+/// boundary preserves an individually unmappable obligation without allowing
+/// it to participate in proof scheduling.
+struct LcsProtectedBoundaryDiagnosticIdentity {
+  uint64_t identityId = 0;
+  std::optional<uint64_t> aBoundary;
+};
+
+/// One non-forced match edge admitted by an optimal conditioned alignment.
+struct LcsDiagnosticAdmissiblePair {
+  uint64_t aToken = 0;
+  uint64_t bToken = 0;
+  bool repeatedInA = false;
+  bool repeatedInB = false;
+};
+
+/// Exact B-frontier evidence for one protected-boundary identity.
+struct LcsProtectedBoundaryDiagnosticProjection {
+  uint64_t boundaryIdentityId = 0;
+  std::optional<uint64_t> aBoundary;
+  std::vector<uint64_t> admissibleBFrontiers;
+  bool projectionComplete = false;
+};
+
+/// Owning evidence for one forced-anchor-delimited ambiguity window.
+///
+/// These records are materialized while the local quadratic theorem is live.
+/// They are diagnostics only: no field can authorize an anchor, choose a seam,
+/// or affect candidate order. An uncertified local rectangle produces one
+/// status-bearing record with no pair or B-frontier facts.
+struct LcsAmbiguityWindowDiagnosticRecord {
+  uint64_t aBegin = 0;
+  uint64_t aEnd = 0;
+  uint64_t bBegin = 0;
+  uint64_t bEnd = 0;
+
+  LcsDiagnosticWindowAnchor leftForcedAnchor =
+      LcsDiagnosticWindowAnchor::StreamBegin();
+  LcsDiagnosticWindowAnchor rightForcedAnchor =
+      LcsDiagnosticWindowAnchor::StreamEnd(0, 0);
+
+  LcsObjective objective;
+  std::vector<LcsDiagnosticAdmissiblePair> admissiblePairs;
+  std::vector<LcsProtectedBoundaryDiagnosticProjection>
+      protectedBoundaryProjections;
+
+  LcsWindowCertificationStatus certificationStatus =
+      LcsWindowCertificationStatus::PartitionUnresolved;
+  /// True only when the production all-optimal theorem certified this window.
+  ///
+  /// The two evidence flags below are deliberately independent. Diagnostic
+  /// retention or projection may be incomplete without weakening this proof
+  /// fact or any anchor authorized by it.
+  bool coreCertificationComplete = false;
+  /// True only when `admissiblePairs` is the complete non-forced pair set.
+  bool admissiblePairEnumerationComplete = false;
+  /// True only when every retained protected identity has an exact projection.
+  bool boundaryProjectionComplete = false;
+};
+
 /// Complete set of distinct match maps for one conditioned optimal window.
 ///
 /// Distinct DP paths that differ only in insertion/deletion interleaving but
@@ -558,11 +676,34 @@ struct LcsWindowPartitionResult {
 /// frontier vectors outside `CertifiedLcsResult` prevents diagnostic retention
 /// from increasing ordinary production memory or changing the proof result.
 struct LcsCertificationDiagnosticEvidence {
+  /// Maximum aggregate payload retained by all admissible-pair vectors.
+  ///
+  /// This is an evidence-only input. Certification routines preserve the
+  /// configured limit while resetting the generated byte charge for each run.
+  uint64_t admissiblePairByteBudget =
+      DEFAULT_MAX_DIAGNOSTIC_EVIDENCE_BYTES;
+  /// Checked aggregate payload currently retained in `ambiguityWindows`.
+  uint64_t retainedAdmissiblePairBytes = 0;
+  /// Canonically ordered physical identities requested by the caller.
+  ///
+  /// This is the only input portion of the ledger. Certification routines
+  /// clear and repopulate every output field while preserving these requests.
+  /// They are never consulted for partition scheduling or anchor authority.
+  llvm::SmallVector<LcsProtectedBoundaryDiagnosticIdentity, 8>
+      protectedBoundaryIdentities;
   /// Sorted unique A boundaries nominated for the exact frontier theorem.
   llvm::SmallVector<uint64_t, 8> candidateABoundaries;
   /// Exact admissible B-frontier sets for every boundary actually tested.
   llvm::SmallVector<LcsBoundaryFrontierProjection, 8>
       boundaryFrontierProjections;
+  /// Immutable ambiguity evidence captured before each local DP is released.
+  ///
+  /// Complete-stream and partitioned runs populate this same canonical ledger.
+  /// A certified local rectangle contributes its actual forced-anchor-delimited
+  /// ambiguity records; an uncertified rectangle contributes exactly one
+  /// status-only record matching that rectangle. A partitioned run therefore
+  /// never collapses to a synthetic full-stream incomplete record.
+  std::vector<LcsAmbiguityWindowDiagnosticRecord> ambiguityWindows;
 };
 
 /// Structured result of the provenance-certified weighted LCS.
@@ -701,7 +842,8 @@ bool certifyLcsWindow(
     ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
     ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
     ArrayRef<LcsAGapProvenance> gapProvenance,
-    unsigned long long maxBytes, LcsWindowCertificationResult &result);
+    unsigned long long maxBytes, LcsWindowCertificationResult &result,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence = nullptr);
 
 /// Compute the exact checked heap-payload requirement for one certification
 /// rectangle without running dynamic programming or allocating its tables.
@@ -761,7 +903,9 @@ std::vector<uint64_t> nominateLcsPartitionBoundaries(
 /// work bound independent of the total nomination count.
 ///
 /// The result contains only partition evidence; all windows remain
-/// `PartitionUnresolved` and publish no anchors.
+/// `PartitionUnresolved` and publish no anchors. When diagnostic evidence is
+/// supplied, generated output is reset while the caller's canonical protected-
+/// boundary identity request is preserved for subsequent local certification.
 bool partitionLcsWindowsLinearSpace(
     ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
     ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
@@ -783,10 +927,12 @@ bool partitionLcsWindowsLinearSpace(
 /// `requiredBytes`, applied `proofBudgetBytes`, and final status. Quadratic
 /// state is local to one `certifyLcsWindow()` call and is destroyed before the
 /// next window is processed, so peak quadratic storage is determined by the
-/// largest individual window rather than the complete A/B grid. When no
+/// largest individual window rather than the complete A/B grid. The optional
+/// diagnostic ledger is run-scoped and receives every local record in source
+/// order, including one status-only record for each failed rectangle. When no
 /// interior seam is proved, the established one-window compatibility path is
-/// reused, including its retained complete-stream oracle and historical byte
-/// threshold.
+/// reused through that same collector, including its retained complete-stream
+/// oracle and historical byte threshold.
 ///
 /// The function returns false only when the inputs or composed proof result are
 /// malformed. Local `BudgetExceeded` and `PartitionUnresolved` statuses are
@@ -826,8 +972,10 @@ bool certifyLcsWindowsIndependently(
 /// frontier remains one fail-closed window.
 ///
 /// Producer nominations are normalized and used only as deterministic fallback
-/// A coordinates. They never nominate or rank a B frontier. Diagnostic
-/// evidence records every boundary actually tested and cannot affect proof
+/// A coordinates. They never nominate or rank a B frontier. Complete-stream,
+/// partitioned, mixed, and wholly unresolved outcomes publish through one
+/// run-scoped diagnostic collector. Evidence records every boundary actually
+/// tested and every local ambiguity/failure record, but cannot affect proof
 /// order or results.
 bool certifyLcsWindowsWithinBudget(
     ArrayRef<StringRef> a, ArrayRef<StringRef> b,
@@ -925,7 +1073,9 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 CertifiedLcsResult
 certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                   ArrayRef<LcsAGapProvenance> gapProvenance,
-                  unsigned long long maxBytes = DEFAULT_MAX_BYTES);
+                  unsigned long long maxBytes = DEFAULT_MAX_BYTES,
+                  LcsCertificationDiagnosticEvidence *diagnosticEvidence =
+                      nullptr);
 
 /// Compatibility overload accepting edited-side B-gap surface profiles.
 ///
@@ -937,7 +1087,9 @@ CertifiedLcsResult
 certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                   ArrayRef<LcsAGapProvenance> gapProvenance,
                   ArrayRef<LcsBGapProvenance> bGapProvenance,
-                  unsigned long long maxBytes = DEFAULT_MAX_BYTES);
+                  unsigned long long maxBytes = DEFAULT_MAX_BYTES,
+                  LcsCertificationDiagnosticEvidence *diagnosticEvidence =
+                      nullptr);
 
 /// \brief Compute the provenance-certified owner-aware LCS map.
 ///

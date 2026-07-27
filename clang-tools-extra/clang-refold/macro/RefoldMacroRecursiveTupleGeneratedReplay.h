@@ -40,8 +40,8 @@ class RefoldSourceMapper;
 /// Request for one recursive tuple-generated-callee replay attempt.
 ///
 /// The request names the already-selected root invocation and its args-only
-/// replay envelope.  Later implementation steps will prove a unique
-/// caller_macro_id path from this root to one terminal generated callee and then
+/// replay envelope. The resolver proves a unique `caller_macro_id` path from
+/// this root to one terminal generated callee and then
 /// rewrite only exact slices of one source-spelled root tuple argument.
 struct RecursiveTupleGeneratedReplayRequest {
   /// Root macro invocation considered for source-preserving tuple repair.
@@ -71,14 +71,14 @@ struct RecursiveTupleGeneratedReplayRequest {
 /// tuple-forwarding case to the existing terminal generated-callee solver.
 /// Forwarding graph, exact whole-formal composition, terminal-edge
 /// recognition, and tuple-slice derivation are behavior-neutral.  Candidate
-/// construction is added by later replay/edit steps.
+/// construction is delegated to the replay/edit pipeline.
 class RefoldMacroRecursiveTupleGeneratedReplay {
 public:
   /// Borrowed services needed by the recursive replay resolver.
   ///
   /// All references must outlive the resolver.  Keeping the dependency set
-  /// explicit prevents hidden planner access and makes the later integration
-  /// point testable without introducing a new global service.
+  /// explicit prevents hidden planner access and makes the integration point
+  /// testable without introducing a new global service.
   struct Dependencies {
     const RefoldModel &model;
     const RefoldSourceMapper &sourceMapper;

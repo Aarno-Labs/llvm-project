@@ -41,6 +41,13 @@ public:
   /// comparison policy used by `PathsEqual()`.
   void CacheCanonicalPath(llvm::StringRef path) const;
 
+  /// Return the cached weakly-canonical spelling for one non-empty path.
+  ///
+  /// The returned view remains valid for the lifetime of this service. Empty
+  /// paths produce an empty view; canonicalization failures are fatal, matching
+  /// the physical-identity policy used by `PathsEqual()`.
+  llvm::StringRef GetCanonicalPath(llvm::StringRef path) const;
+
   /// Compare two paths for equality after weak canonicalization.
   ///
   /// Empty paths are compared by spelling.  Non-empty paths are canonicalized

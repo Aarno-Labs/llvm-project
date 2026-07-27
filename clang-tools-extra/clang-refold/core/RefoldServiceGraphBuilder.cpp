@@ -32,6 +32,7 @@
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldMixedOwnerTilingPlanner.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
+#include "source/RefoldPreprocessingStructureIndexProvider.h"
 #include "source/RefoldTokenDiffPlanner.h"
 
 #include "llvm/Support/FormatVariadic.h"
@@ -99,6 +100,16 @@ const RefoldBInsertionLedger &RefoldEngine::BInsertionLedger() const {
   return *bInsertionLedger_;
 }
 
+void RefoldEngine::InitializePreprocessingStructureIndexProvider() {
+  assert(preprocessingStructureIndex_ &&
+         "TU structure index must precede the shared provider");
+  preprocessingStructureIndexProvider_ =
+      std::make_unique<RefoldPreprocessingStructureIndexProvider>(
+          RefoldPreprocessingStructureIndexProvider::Dependencies{
+              model_, pathIdentity_, lineDirs_, MacroStateProof(), lexLang_},
+          model_.GetSourcePath(), *preprocessingStructureIndex_);
+}
+
 void RefoldEngine::InitializeTUAnchorProof() {
   // TU-anchor accepted-result construction is a narrow proof service.  Audit
   // flows through the shared theorem/audit service, while the anchor proof
@@ -117,13 +128,16 @@ const RefoldTUAnchorProof &RefoldEngine::TUAnchorProof() const {
 }
 
 void RefoldEngine::InitializeTokenDiffPlanner() {
+  assert(preprocessingStructureIndexProvider_ &&
+         "structure-index provider must precede token diff planning");
   // Token diff planning borrows the per-run source/token inputs and writes the
   // engine-owned diff caches later services observe.  The named service owns
   // lexeme/LCS provenance construction while preserving cache ownership and
   // lifetime on the engine object graph.
   tokenDiffPlanner_ = std::make_unique<RefoldTokenDiffPlanner>(
       RefoldTokenDiffPlanner::Dependencies{
-          model_, pathIdentity_, *preprocessingStructureIndex_, bSource_,
+          model_, pathIdentity_, *preprocessingStructureIndexProvider_,
+          bSource_,
           aToks_, bToks_, aTokOff_, bTokOff_, macroTopology_, sourceMapper_,
           ownerDepthGap_, abTokHunks_, abByteHunks_, abTokMapA2B_,
           abTokMapB2A_, abTokAnchorProofs_,
@@ -153,8 +167,8 @@ void RefoldEngine::InitializeTokenDiffPlanner() {
 }
 
 void RefoldEngine::InitializeMixedOwnerTilingPlanner() {
-  assert(preprocessingStructureIndex_ &&
-         "preprocessing-structure index must precede structural tiling");
+  assert(preprocessingStructureIndexProvider_ &&
+         "structure-index provider must precede structural tiling");
 
   // Structural tiling borrows the owner/proof services and exact preprocessing
   // census needed to prove deterministic token-hunk partitions.  The planner
@@ -164,9 +178,9 @@ void RefoldEngine::InitializeMixedOwnerTilingPlanner() {
   // hunk indices.
   mixedOwnerTilingPlanner_ = std::make_unique<RefoldMixedOwnerTilingPlanner>(
       RefoldMixedOwnerTilingPlanner::Dependencies{
-          model_, model_.GetSourcePath(), pathIdentity_, lineDirs_, lexLang_,
-          macroTopology_, sourceMapper_, OwnerClassifier(), OwnerStateProof(),
-          MacroStateProof(), *preprocessingStructureIndex_, abTokHunks_,
+          model_, model_.GetSourcePath(), pathIdentity_, macroTopology_,
+          sourceMapper_, OwnerClassifier(), OwnerStateProof(),
+          *preprocessingStructureIndexProvider_, abTokHunks_,
           mixedOwnerTilingWitnesses_, mixedOwnerTilingSegmentBindings_});
 }
 

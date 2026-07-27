@@ -12,8 +12,8 @@
 namespace clang {
 namespace refold {
 
-/// Return whether this nonempty replacement requires the Patch 3.1/3.2
-/// boundary-projection theorem.
+/// Return whether this nonempty replacement requires the boundary-projection
+/// theorem.
 ///
 /// The theorem is mandatory for every partition that preserves preprocessing
 /// structure, whether the adjacent token segments have the same or different
@@ -22,7 +22,7 @@ namespace refold {
 bool structuralReplacementRequiresBoundaryProjection(
     const StructuralHunkTilingWitness &witness);
 
-/// Validate the complete Patch 3.3 preserved-source topology theorem.
+/// Validate the complete preserved-source topology theorem.
 ///
 /// Every `PreservedInPlace` edge must be a zero-token, zero-target carrier for
 /// one exact nonempty source interval. Such edges must remain bracketed by the
@@ -34,7 +34,7 @@ bool structuralReplacementRequiresBoundaryProjection(
 bool structuralPreservedSourceTopologyIsComplete(
     const StructuralHunkTilingWitness &witness);
 
-/// Validate the complete Patch 3.1/3.2 boundary-projection theorem.
+/// Validate the complete boundary-projection theorem.
 ///
 /// The durable token segments must exactly and monotonically compose the
 /// original A and B envelopes.  Every protected interior A seam must have one

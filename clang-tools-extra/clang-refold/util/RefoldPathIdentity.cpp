@@ -45,15 +45,19 @@ void RefoldPathIdentity::CacheCanonicalPath(StringRef path) const {
   canonicalPathCache_.insert({path, canonical.string()});
 }
 
+StringRef RefoldPathIdentity::GetCanonicalPath(StringRef path) const {
+  if (path.empty())
+    return {};
+
+  CacheCanonicalPath(path);
+  return canonicalPathCache_.find(path)->getValue();
+}
+
 bool RefoldPathIdentity::PathsEqual(StringRef lhs, StringRef rhs) const {
   if (lhs.empty() || rhs.empty())
     return lhs == rhs;
 
-  CacheCanonicalPath(lhs);
-  CacheCanonicalPath(rhs);
-
-  return canonicalPathCache_.find(lhs)->getValue() ==
-         canonicalPathCache_.find(rhs)->getValue();
+  return GetCanonicalPath(lhs) == GetCanonicalPath(rhs);
 }
 
 std::optional<std::string> RefoldPathIdentity::ProducerPhysicalIncludePath(

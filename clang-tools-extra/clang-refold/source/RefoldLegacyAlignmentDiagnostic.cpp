@@ -1,4 +1,14 @@
-//===--- RefoldLegacyAlignmentDiagnostic.cpp -------------------------------===//
+//===--- RefoldLegacyAlignmentDiagnostic.cpp ------------------------------===//
+//
+// Boundary proposal reconstructed from the pre-semantic-resolver policy.
+//
+// This service reconstructs the last regression-passing pre-semantic-resolver
+// partial map from the exact all-optimal oracle. The historical ranks are
+// proposal-only: the semantic resolver must independently prove every non-
+// forced anchor by counterfactual planning or realized-source equivalence
+// before it can become production authority.
+//
+//===----------------------------------------------------------------------===//
 
 #include "source/RefoldLegacyAlignmentDiagnostic.h"
 

@@ -28,19 +28,14 @@
 #include <vector>
 
 namespace clang {
-
-class LangOptions;
-
 namespace refold {
 
-class LineDirectiveInserter;
-class RefoldMacroStateProof;
 class RefoldMacroTopology;
 class RefoldModel;
 class RefoldOwnerClassifier;
 class RefoldOwnerStateProof;
 class RefoldPathIdentity;
-class RefoldPreprocessingStructureIndex;
+class RefoldPreprocessingStructureIndexProvider;
 class RefoldSourceMapper;
 
 /// Normalizes token hunks whose A-side cover requires a structural split.
@@ -85,10 +80,6 @@ public:
     llvm::StringRef tuPath;
     /// Path identity service used when owner facts cross files.
     const RefoldPathIdentity &pathIdentity;
-    /// Logical line directive model used for source-state checks.
-    const LineDirectiveInserter &lineDirs;
-    /// Language options for raw lexer trivia checks.
-    const clang::LangOptions &lexLang;
     /// Macro topology service for macro-owned segment classification.
     const RefoldMacroTopology &macroTopology;
     /// Source mapper for A/B token and physical source-byte projection.
@@ -97,12 +88,9 @@ public:
     const RefoldOwnerClassifier &ownerClassifier;
     /// Owner-state proof service used to discharge zero-token state gaps.
     RefoldOwnerStateProof &ownerStateProof;
-    /// Macro-state proof service used when indexing non-TU source owners.
-    const RefoldMacroStateProof &macroStateProof;
-    /// Exact preprocessing-structure index for the translation-unit source.
-    /// Header/include-owner indexes are built lazily from the same shared
-    /// scanner when a candidate source gap belongs to another physical owner.
-    const RefoldPreprocessingStructureIndex &tuPreprocessingStructureIndex;
+    /// Shared exact structure-index provider for TU and header occurrences.
+    const RefoldPreprocessingStructureIndexProvider
+        &preprocessingStructureIndexes;
     /// Shared A/B token-hunk cache refreshed after tiling.
     std::vector<diffutils::Hunk> &abTokHunks;
     /// Durable structural-tiling witnesses produced during tiling.
@@ -127,8 +115,8 @@ public:
   ///
   /// The input vector is consumed by value so the caller can hand off the
   /// current token-diff plan without retaining a stale pre-normalization copy.
-  /// The TU bytes are supplied per run because the buffer is loaded inside
-  /// `RunRefoldPass`.  The planner refreshes the borrowed `ABTokHunks` cache,
+  /// Physical source bytes and occurrence-local structure indexes come from the
+  /// shared provider. The planner refreshes the borrowed `ABTokHunks` cache,
   /// durable structural-tiling witnesses, and emitted segment bindings as one
   /// deterministic normalization pass. `RefoldEngine::PlanTokenDiff()` commits
   /// and validates that complete result before insertion-ledger construction or
@@ -136,8 +124,7 @@ public:
   /// they are explained by modeled zero-token state owners or lexer-ignorable
   /// trivia; otherwise the original hunk remains unsplit for the normal
   /// owner/fallback path.
-  MixedOwnerTilingPlan Plan(std::vector<diffutils::Hunk> hunks,
-                            llvm::StringRef tuBytes);
+  MixedOwnerTilingPlan Plan(std::vector<diffutils::Hunk> hunks);
 
 private:
   /// Borrowed service graph and output ledgers for one refold engine instance.

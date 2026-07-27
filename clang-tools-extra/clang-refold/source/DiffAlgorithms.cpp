@@ -69,6 +69,7 @@
 #include "util/StringUtils.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringMap.h"
 
 #include <algorithm>
 #include <climits>
@@ -78,6 +79,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -289,6 +291,21 @@ static bool addObjectivesChecked(const LcsObjective &lhs,
     return false;
   out.matchedTokenCount = lhs.matchedTokenCount + rhs.matchedTokenCount;
   out.ownerDepthCost = lhs.ownerDepthCost + rhs.ownerDepthCost;
+  return true;
+}
+
+/// Subtract two already-disjoint path fragments from one exact total.
+static bool subtractObjectivesChecked(const LcsObjective &total,
+                                      const LcsObjective &prefix,
+                                      const LcsObjective &suffix,
+                                      LcsObjective &out) {
+  LcsObjective excluded;
+  if (!addObjectivesChecked(prefix, suffix, excluded) ||
+      excluded.matchedTokenCount > total.matchedTokenCount ||
+      excluded.ownerDepthCost > total.ownerDepthCost)
+    return false;
+  out.matchedTokenCount = total.matchedTokenCount - excluded.matchedTokenCount;
+  out.ownerDepthCost = total.ownerDepthCost - excluded.ownerDepthCost;
   return true;
 }
 
@@ -1253,6 +1270,509 @@ copyOwnerDepthGaps(ArrayRef<LcsAGapProvenance> gapProvenance,
   return ownerDepthGap;
 }
 
+/// Canonicalize the evidence-only physical identity request.
+static bool diagnosticIdentityLess(
+    const LcsProtectedBoundaryDiagnosticIdentity &lhs,
+    const LcsProtectedBoundaryDiagnosticIdentity &rhs) {
+  if (lhs.identityId != rhs.identityId)
+    return lhs.identityId < rhs.identityId;
+  return lhs.aBoundary < rhs.aBoundary;
+}
+
+/// Canonicalize the caller's evidence-only identity request.
+static void canonicalizeDiagnosticIdentityRequests(
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+  if (!diagnosticEvidence)
+    return;
+  std::sort(diagnosticEvidence->protectedBoundaryIdentities.begin(),
+            diagnosticEvidence->protectedBoundaryIdentities.end(),
+            diagnosticIdentityLess);
+}
+
+/// Clear generated evidence while preserving the caller's identity request.
+static void resetCertificationDiagnosticOutputs(
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+  if (!diagnosticEvidence)
+    return;
+  canonicalizeDiagnosticIdentityRequests(diagnosticEvidence);
+  diagnosticEvidence->retainedAdmissiblePairBytes = 0;
+  diagnosticEvidence->candidateABoundaries.clear();
+  diagnosticEvidence->boundaryFrontierProjections.clear();
+  diagnosticEvidence->ambiguityWindows.clear();
+}
+
+/// Charge one complete admissible-pair vector against the run-wide ledger.
+///
+/// The charge is computed before any pair payload is allocated. Failure leaves
+/// the ledger unchanged so the owning certified window can publish its exact
+/// proof facts with only pair enumeration marked incomplete.
+static bool tryChargeAdmissiblePairEvidence(
+    size_t pairCount, LcsCertificationDiagnosticEvidence &evidence,
+    uint64_t &requiredBytes) {
+  requiredBytes = 0;
+  if (!arrayBytesChecked<LcsDiagnosticAdmissiblePair>(pairCount,
+                                                       requiredBytes)) {
+    requiredBytes = std::numeric_limits<uint64_t>::max();
+    return false;
+  }
+
+  uint64_t chargedBytes = evidence.retainedAdmissiblePairBytes;
+  if (!addBytesChecked(requiredBytes, chargedBytes) ||
+      chargedBytes > evidence.admissiblePairByteBudget)
+    return false;
+  evidence.retainedAdmissiblePairBytes = chargedBytes;
+  return true;
+}
+
+/// Return true when one diagnostic record belongs to a certification window.
+static bool diagnosticRecordBelongsToWindow(
+    const LcsAmbiguityWindowDiagnosticRecord &record,
+    const LcsCertificationWindow &window) {
+  if (record.certificationStatus != LcsWindowCertificationStatus::Certified)
+    return record.aBegin == window.aBegin && record.aEnd == window.aEnd &&
+           record.bBegin == window.bBegin && record.bEnd == window.bEnd &&
+           record.certificationStatus == window.status;
+  if (!window.IsCertified() || window.aBegin > record.aBegin ||
+      record.aEnd > window.aEnd || window.bBegin > record.bBegin ||
+      record.bEnd > window.bEnd)
+    return false;
+
+  const LcsDiagnosticWindowAnchor &left = record.leftForcedAnchor;
+  const bool ownsLeft =
+      left.kind == LcsDiagnosticWindowAnchorKind::ForcedToken
+          ? window.ContainsAnchor(left.aToken, left.bToken)
+          : (left.kind == LcsDiagnosticWindowAnchorKind::StreamBegin ||
+             left.kind == LcsDiagnosticWindowAnchorKind::CertifiedBoundary) &&
+                window.aBegin == left.aToken &&
+                window.bBegin == left.bToken;
+  const LcsDiagnosticWindowAnchor &right = record.rightForcedAnchor;
+  const bool ownsRight =
+      right.kind == LcsDiagnosticWindowAnchorKind::ForcedToken
+          ? window.ContainsAnchor(right.aToken, right.bToken)
+          : (right.kind == LcsDiagnosticWindowAnchorKind::StreamEnd ||
+             right.kind ==
+                 LcsDiagnosticWindowAnchorKind::CertifiedBoundary) &&
+                window.aEnd == right.aToken && window.bEnd == right.bToken;
+  return ownsLeft && ownsRight;
+}
+
+/// Canonicalize and audit one complete diagnostic run.
+///
+/// The collector is observational: an invariant failure is reported and the
+/// malformed ambiguity transcript is suppressed, but the certified maps, seams,
+/// statuses, and candidate order are never changed. In particular, every failed
+/// local certification window must own exactly one status-only record. This
+/// rules out the former synthetic full-stream failure record for partitioned
+/// runs.
+static void finalizeCertificationAmbiguityDiagnostics(
+    const CertifiedLcsResult &result, uint64_t aTokenCount,
+    uint64_t bTokenCount,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+  if (!diagnosticEvidence)
+    return;
+
+  auto &records = diagnosticEvidence->ambiguityWindows;
+  std::stable_sort(
+      records.begin(), records.end(),
+      [](const LcsAmbiguityWindowDiagnosticRecord &lhs,
+         const LcsAmbiguityWindowDiagnosticRecord &rhs) {
+        return std::tie(lhs.aBegin, lhs.bBegin, lhs.aEnd, lhs.bEnd,
+                        lhs.certificationStatus) <
+               std::tie(rhs.aBegin, rhs.bBegin, rhs.aEnd, rhs.bEnd,
+                        rhs.certificationStatus);
+      });
+
+  bool wellFormed = result.CertificationPartitionIsWellFormed(
+      aTokenCount, bTokenCount);
+  uint64_t retainedPairBytes = 0;
+  std::vector<size_t> failedWindowRecordCounts(
+      result.certificationWindows.size(), 0);
+  for (const LcsAmbiguityWindowDiagnosticRecord &record : records) {
+    size_t owningWindow = result.certificationWindows.size();
+    for (size_t windowIndex = 0;
+         windowIndex < result.certificationWindows.size(); ++windowIndex) {
+      if (!diagnosticRecordBelongsToWindow(
+              record, result.certificationWindows[windowIndex]))
+        continue;
+      if (owningWindow != result.certificationWindows.size()) {
+        wellFormed = false;
+        break;
+      }
+      owningWindow = windowIndex;
+    }
+    if (owningWindow == result.certificationWindows.size()) {
+      wellFormed = false;
+      continue;
+    }
+
+    if (record.certificationStatus == LcsWindowCertificationStatus::Certified) {
+      // Core certification and optional evidence completeness are independent.
+      // An incomplete pair census or boundary projection is valid diagnostic
+      // output and must never invalidate the owning production window.
+      wellFormed &= record.coreCertificationComplete;
+      if (!record.admissiblePairEnumerationComplete)
+        wellFormed &= record.admissiblePairs.empty();
+      wellFormed &= addArrayBytesChecked<LcsDiagnosticAdmissiblePair>(
+          record.admissiblePairs.size(), retainedPairBytes);
+
+      bool everyProjectionComplete = true;
+      for (const LcsProtectedBoundaryDiagnosticProjection &projection :
+           record.protectedBoundaryProjections) {
+        everyProjectionComplete &= projection.projectionComplete;
+        if (!projection.projectionComplete)
+          wellFormed &= projection.admissibleBFrontiers.empty();
+      }
+      if (record.boundaryProjectionComplete)
+        wellFormed &= everyProjectionComplete;
+      continue;
+    }
+
+    ++failedWindowRecordCounts[owningWindow];
+    wellFormed &= !record.coreCertificationComplete &&
+                  !record.admissiblePairEnumerationComplete &&
+                  !record.boundaryProjectionComplete &&
+                  record.admissiblePairs.empty();
+    for (const LcsProtectedBoundaryDiagnosticProjection &projection :
+         record.protectedBoundaryProjections) {
+      wellFormed &= !projection.projectionComplete &&
+                    projection.admissibleBFrontiers.empty();
+    }
+  }
+
+  wellFormed &= retainedPairBytes ==
+                    diagnosticEvidence->retainedAdmissiblePairBytes &&
+                retainedPairBytes <=
+                    diagnosticEvidence->admissiblePairByteBudget;
+
+  for (size_t windowIndex = 0;
+       windowIndex < result.certificationWindows.size(); ++windowIndex) {
+    const size_t expected =
+        result.certificationWindows[windowIndex].IsCertified() ? 0 : 1;
+    wellFormed &= failedWindowRecordCounts[windowIndex] == expected;
+  }
+
+  if (wellFormed)
+    return;
+
+  REFOLD_LOG_WARN(
+      "lcs/diagnostic",
+      "discarding malformed ambiguity diagnostics without changing the "
+      "certified alignment result");
+  records.clear();
+  diagnosticEvidence->retainedAdmissiblePairBytes = 0;
+}
+
+/// Run-scoped owner of the optional ambiguity evidence ledger.
+///
+/// Complete-stream and partitioned certification construct this same wrapper,
+/// reset generated output exactly once, append every local record through the
+/// shared certifier, and finalize the canonical transcript against the completed
+/// certification partition. The wrapper allocates nothing when diagnostics are
+/// disabled.
+class LcsAmbiguityDiagnosticRun {
+public:
+  LcsAmbiguityDiagnosticRun(
+      uint64_t aTokenCount, uint64_t bTokenCount,
+      LcsCertificationDiagnosticEvidence *diagnosticEvidence)
+      : aTokenCount_(aTokenCount), bTokenCount_(bTokenCount),
+        diagnosticEvidence_(diagnosticEvidence) {
+    resetCertificationDiagnosticOutputs(diagnosticEvidence_);
+  }
+
+  LcsCertificationDiagnosticEvidence *Evidence() const {
+    return diagnosticEvidence_;
+  }
+
+  void Finalize(const CertifiedLcsResult &result) const {
+    finalizeCertificationAmbiguityDiagnostics(
+        result, aTokenCount_, bTokenCount_, diagnosticEvidence_);
+  }
+
+private:
+  uint64_t aTokenCount_ = 0;
+  uint64_t bTokenCount_ = 0;
+  LcsCertificationDiagnosticEvidence *diagnosticEvidence_ = nullptr;
+};
+
+/// Return the exact left endpoint kind for one local certification rectangle.
+static LcsDiagnosticWindowAnchor makeDiagnosticLeftBoundary(
+    uint64_t aBoundary, uint64_t bBoundary) {
+  if (aBoundary == 0 && bBoundary == 0)
+    return LcsDiagnosticWindowAnchor::StreamBegin();
+  return LcsDiagnosticWindowAnchor::CertifiedBoundary(aBoundary, bBoundary);
+}
+
+/// Return the exact right endpoint kind for one local certification rectangle.
+static LcsDiagnosticWindowAnchor makeDiagnosticRightBoundary(
+    uint64_t aBoundary, uint64_t bBoundary, uint64_t globalATokenCount,
+    uint64_t globalBTokenCount) {
+  if (aBoundary == globalATokenCount && bBoundary == globalBTokenCount)
+    return LcsDiagnosticWindowAnchor::StreamEnd(globalATokenCount,
+                                                globalBTokenCount);
+  return LcsDiagnosticWindowAnchor::CertifiedBoundary(aBoundary, bBoundary);
+}
+
+/// Append one physical obligation without manufacturing a B-frontier fact.
+static void appendIncompleteBoundaryProjection(
+    const LcsProtectedBoundaryDiagnosticIdentity &identity,
+    LcsAmbiguityWindowDiagnosticRecord &window) {
+  LcsProtectedBoundaryDiagnosticProjection projection;
+  projection.boundaryIdentityId = identity.identityId;
+  projection.aBoundary = identity.aBoundary;
+  window.protectedBoundaryProjections.push_back(std::move(projection));
+}
+
+/// Publish one uncertified local rectangle with no pair or frontier facts.
+static void appendUncertifiedAmbiguityDiagnostic(
+    uint64_t globalATokenCount, uint64_t globalBTokenCount,
+    const LcsWindowCertificationResult &result,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+  if (!diagnosticEvidence)
+    return;
+
+  const LcsCertificationWindow &rectangle = result.window;
+  LcsAmbiguityWindowDiagnosticRecord window;
+  window.aBegin = rectangle.aBegin;
+  window.aEnd = rectangle.aEnd;
+  window.bBegin = rectangle.bBegin;
+  window.bEnd = rectangle.bEnd;
+  window.leftForcedAnchor =
+      makeDiagnosticLeftBoundary(rectangle.aBegin, rectangle.bBegin);
+  window.rightForcedAnchor = makeDiagnosticRightBoundary(
+      rectangle.aEnd, rectangle.bEnd, globalATokenCount, globalBTokenCount);
+  window.objective = result.objective;
+  window.certificationStatus = rectangle.status;
+
+  for (const LcsProtectedBoundaryDiagnosticIdentity &identity :
+       diagnosticEvidence->protectedBoundaryIdentities) {
+    if (identity.aBoundary &&
+        (*identity.aBoundary < rectangle.aBegin ||
+         *identity.aBoundary > rectangle.aEnd))
+      continue;
+    appendIncompleteBoundaryProjection(identity, window);
+  }
+  diagnosticEvidence->ambiguityWindows.push_back(std::move(window));
+}
+
+/// Exact B-frontier facts for one unique protected A coordinate.
+struct LocalProtectedBoundaryFacts {
+  uint64_t aBoundary = 0;
+  std::vector<uint64_t> admissibleBFrontiers;
+  bool projectionComplete = false;
+};
+
+static bool localBoundaryFactsPrecede(
+    const LocalProtectedBoundaryFacts &candidate, uint64_t aBoundary) {
+  return candidate.aBoundary < aBoundary;
+}
+
+/// Return the facts for one sorted unique A boundary.
+static const LocalProtectedBoundaryFacts *findLocalBoundaryFacts(
+    ArrayRef<LocalProtectedBoundaryFacts> facts, uint64_t aBoundary) {
+  const auto position = std::lower_bound(
+      facts.begin(), facts.end(), aBoundary, localBoundaryFactsPrecede);
+  if (position == facts.end() || position->aBoundary != aBoundary)
+    return nullptr;
+  return &*position;
+}
+
+/// Capture exact ambiguity evidence from the already-live local theorem.
+///
+/// Forced token edges divide the certified rectangle into conditioned
+/// subwindows. Every optimal path crosses those edge endpoints and any
+/// enclosing certified seams, so the rectangle's forward/suffix tables are an
+/// equivalent exact view for each subwindow: pair admissibility, objectives,
+/// and protected-boundary frontiers require no second dynamic program.
+static void appendCertifiedAmbiguityDiagnostics(
+    ArrayRef<StringRef> aWindow, ArrayRef<StringRef> bWindow,
+    uint64_t absoluteABegin, uint64_t absoluteBBegin,
+    uint64_t globalATokenCount, uint64_t globalBTokenCount, size_t stride,
+    const ObjectiveTable &forward, const ObjectiveTable &suffix,
+    const LcsObjective &total, ArrayRef<uint8_t> pairFacts,
+    const LcsWindowCertificationResult &result,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+  if (!diagnosticEvidence)
+    return;
+
+  const uint64_t absoluteAEnd = absoluteABegin + aWindow.size();
+  const uint64_t absoluteBEnd = absoluteBBegin + bWindow.size();
+  std::vector<LcsDiagnosticWindowAnchor> anchors;
+  anchors.reserve(result.forcedMap.size() + 2);
+  anchors.push_back(
+      makeDiagnosticLeftBoundary(absoluteABegin, absoluteBBegin));
+  for (size_t localA = 0; localA < result.forcedMap.size(); ++localA) {
+    const int64_t absoluteB = result.forcedMap[localA];
+    if (absoluteB < 0)
+      continue;
+    anchors.push_back(LcsDiagnosticWindowAnchor::ForcedToken(
+        absoluteABegin + localA, static_cast<uint64_t>(absoluteB)));
+  }
+  anchors.push_back(makeDiagnosticRightBoundary(
+      absoluteAEnd, absoluteBEnd, globalATokenCount, globalBTokenCount));
+
+  for (size_t anchorIndex = 0; anchorIndex + 1 < anchors.size();
+       ++anchorIndex) {
+    const LcsDiagnosticWindowAnchor &left = anchors[anchorIndex];
+    const LcsDiagnosticWindowAnchor &right = anchors[anchorIndex + 1];
+    const bool leftIsForced =
+        left.kind == LcsDiagnosticWindowAnchorKind::ForcedToken;
+    const uint64_t aBegin = left.aToken + (leftIsForced ? 1 : 0);
+    const uint64_t bBegin = left.bToken + (leftIsForced ? 1 : 0);
+    const uint64_t aEnd = right.aToken;
+    const uint64_t bEnd = right.bToken;
+    if (aBegin > aEnd || bBegin > bEnd || aBegin < absoluteABegin ||
+        bBegin < absoluteBBegin || aEnd > absoluteAEnd ||
+        bEnd > absoluteBEnd)
+      continue;
+
+    const size_t localABegin = static_cast<size_t>(aBegin - absoluteABegin);
+    const size_t localAEnd = static_cast<size_t>(aEnd - absoluteABegin);
+    const size_t localBBegin = static_cast<size_t>(bBegin - absoluteBBegin);
+    const size_t localBEnd = static_cast<size_t>(bEnd - absoluteBBegin);
+    const size_t beginState = localABegin * stride + localBBegin;
+    const size_t endState = localAEnd * stride + localBEnd;
+
+    LcsAmbiguityWindowDiagnosticRecord window;
+    window.aBegin = aBegin;
+    window.aEnd = aEnd;
+    window.bBegin = bBegin;
+    window.bEnd = bEnd;
+    window.leftForcedAnchor = left;
+    window.rightForcedAnchor = right;
+    window.certificationStatus = LcsWindowCertificationStatus::Certified;
+    // The core theorem is already complete before optional evidence is copied.
+    // Any later diagnostic limitation may lower only the two evidence flags.
+    window.coreCertificationComplete = true;
+    window.admissiblePairEnumerationComplete = true;
+    window.boundaryProjectionComplete = true;
+    if (!subtractObjectivesChecked(total, forward.Get(beginState),
+                                   suffix.Get(endState), window.objective)) {
+      // A completed forced-anchor theorem guarantees this decomposition. Keep
+      // an impossible diagnostic inconsistency observational rather than
+      // allowing it to weaken the certified production map.
+      window.admissiblePairEnumerationComplete = false;
+      window.boundaryProjectionComplete = false;
+      diagnosticEvidence->ambiguityWindows.push_back(std::move(window));
+      continue;
+    }
+
+    size_t optionalPairCount = 0;
+    for (size_t localA = localABegin; localA < localAEnd; ++localA) {
+      const StringRef spelling = aWindow[localA];
+      for (size_t localB = localBBegin; localB < localBEnd; ++localB) {
+        if (spelling != bWindow[localB])
+          continue;
+        const uint8_t facts = pairFacts[localA * bWindow.size() + localB];
+        if ((facts & PairOccursOnOptimalPathFact) == 0 ||
+            (facts & PairIsForcedFact) != 0)
+          continue;
+        ++optionalPairCount;
+      }
+    }
+    const bool hasOptionalPair = optionalPairCount != 0;
+
+    std::vector<uint64_t> uniqueABoundaries;
+    for (const LcsProtectedBoundaryDiagnosticIdentity &identity :
+         diagnosticEvidence->protectedBoundaryIdentities) {
+      if (!identity.aBoundary || *identity.aBoundary < aBegin ||
+          *identity.aBoundary > aEnd)
+        continue;
+      uniqueABoundaries.push_back(*identity.aBoundary);
+    }
+    std::sort(uniqueABoundaries.begin(), uniqueABoundaries.end());
+    uniqueABoundaries.erase(
+        std::unique(uniqueABoundaries.begin(), uniqueABoundaries.end()),
+        uniqueABoundaries.end());
+
+    std::vector<LocalProtectedBoundaryFacts> boundaryFacts;
+    boundaryFacts.reserve(uniqueABoundaries.size());
+    bool hasAmbiguousProtectedFrontier = false;
+    for (uint64_t aBoundary : uniqueABoundaries) {
+      LocalProtectedBoundaryFacts facts;
+      facts.aBoundary = aBoundary;
+      const size_t localA =
+          static_cast<size_t>(aBoundary - absoluteABegin);
+      for (size_t localB = localBBegin; localB <= localBEnd; ++localB) {
+        const size_t state = localA * stride + localB;
+        if (objectiveSumEquals(forward.Get(state), suffix.Get(state), total))
+          facts.admissibleBFrontiers.push_back(absoluteBBegin + localB);
+      }
+      facts.projectionComplete = !facts.admissibleBFrontiers.empty();
+      hasAmbiguousProtectedFrontier |=
+          facts.admissibleBFrontiers.size() != 1;
+      boundaryFacts.push_back(std::move(facts));
+    }
+
+    if (!hasOptionalPair && !hasAmbiguousProtectedFrontier)
+      continue;
+
+    if (hasOptionalPair) {
+      uint64_t requiredPairBytes = 0;
+      if (!tryChargeAdmissiblePairEvidence(
+              optionalPairCount, *diagnosticEvidence, requiredPairBytes)) {
+        window.admissiblePairEnumerationComplete = false;
+        REFOLD_LOG_TRACE(
+            "lcs/diagnostic",
+            "admissible-pair evidence omitted: A=[{0},{1}) B=[{2},{3}) "
+            "pairs={4} requiredBytes={5} retainedBytes={6} maxBytes={7}",
+            aBegin, aEnd, bBegin, bEnd, optionalPairCount, requiredPairBytes,
+            diagnosticEvidence->retainedAdmissiblePairBytes,
+            diagnosticEvidence->admissiblePairByteBudget);
+      } else {
+        StringMap<uint32_t> aSpellingCounts;
+        StringMap<uint32_t> bSpellingCounts;
+        for (size_t localA = localABegin; localA < localAEnd; ++localA)
+          ++aSpellingCounts[aWindow[localA]];
+        for (size_t localB = localBBegin; localB < localBEnd; ++localB)
+          ++bSpellingCounts[bWindow[localB]];
+
+        window.admissiblePairs.reserve(optionalPairCount);
+        for (size_t localA = localABegin; localA < localAEnd; ++localA) {
+          const StringRef spelling = aWindow[localA];
+          for (size_t localB = localBBegin; localB < localBEnd; ++localB) {
+            if (spelling != bWindow[localB])
+              continue;
+            const uint8_t facts =
+                pairFacts[localA * bWindow.size() + localB];
+            if ((facts & PairOccursOnOptimalPathFact) == 0 ||
+                (facts & PairIsForcedFact) != 0)
+              continue;
+            window.admissiblePairs.push_back(LcsDiagnosticAdmissiblePair{
+                absoluteABegin + localA, absoluteBBegin + localB,
+                aSpellingCounts.lookup(spelling) > 1,
+                bSpellingCounts.lookup(spelling) > 1});
+          }
+        }
+        assert(window.admissiblePairs.size() == optionalPairCount);
+      }
+    }
+
+    for (const LcsProtectedBoundaryDiagnosticIdentity &identity :
+         diagnosticEvidence->protectedBoundaryIdentities) {
+      if (!identity.aBoundary) {
+        appendIncompleteBoundaryProjection(identity, window);
+        window.boundaryProjectionComplete = false;
+        continue;
+      }
+      if (*identity.aBoundary < aBegin || *identity.aBoundary > aEnd)
+        continue;
+
+      LcsProtectedBoundaryDiagnosticProjection projection;
+      projection.boundaryIdentityId = identity.identityId;
+      projection.aBoundary = identity.aBoundary;
+      const LocalProtectedBoundaryFacts *facts =
+          findLocalBoundaryFacts(boundaryFacts, *identity.aBoundary);
+      if (facts) {
+        projection.admissibleBFrontiers = facts->admissibleBFrontiers;
+        projection.projectionComplete = facts->projectionComplete;
+      }
+      window.boundaryProjectionComplete &= projection.projectionComplete;
+      window.protectedBoundaryProjections.push_back(std::move(projection));
+    }
+    diagnosticEvidence->ambiguityWindows.push_back(std::move(window));
+  }
+}
+
 /// Run the existing all-optimal theorem on one local coordinate rectangle.
 ///
 /// `aWindow` and `bWindow` begin at local DP state `(0,0)`. Nonnegative map
@@ -1264,8 +1784,10 @@ copyOwnerDepthGaps(ArrayRef<LcsAGapProvenance> gapProvenance,
 static bool certifyLcsWindowCore(
     ArrayRef<StringRef> aWindow, ArrayRef<StringRef> bWindow,
     ArrayRef<uint32_t> ownerDepthGap, uint64_t absoluteABegin,
-    uint64_t absoluteBBegin, unsigned long long maxBytes,
+    uint64_t absoluteBBegin, uint64_t globalATokenCount,
+    uint64_t globalBTokenCount, unsigned long long maxBytes,
     size_t ownerDepthGapCopyCount, LcsWindowCertificationResult &outResult,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence,
     std::shared_ptr<OptimalTokenAlignmentOracle::Storage>
         *retainedOracleStorage) {
   const size_t n = aWindow.size();
@@ -1294,6 +1816,8 @@ static bool certifyLcsWindowCore(
     // a fabricated byte requirement or misclassify it as BudgetExceeded.
     finishWindowObjectiveLinearSpace(aWindow, bWindow, ownerDepthGap,
                                      outResult);
+    appendUncertifiedAmbiguityDiagnostic(globalATokenCount, globalBTokenCount,
+                                         outResult, diagnosticEvidence);
     REFOLD_LOG_WARN(
         "lcs/map",
         "all-optimal window certification unavailable: checked allocation "
@@ -1309,6 +1833,8 @@ static bool certifyLcsWindowCore(
     outResult.window.status = LcsWindowCertificationStatus::BudgetExceeded;
     finishWindowObjectiveLinearSpace(aWindow, bWindow, ownerDepthGap,
                                      outResult);
+    appendUncertifiedAmbiguityDiagnostic(globalATokenCount, globalBTokenCount,
+                                         outResult, diagnosticEvidence);
     REFOLD_LOG_WARN(
         "lcs/map",
         "all-optimal window certification unavailable: checked aggregate "
@@ -1339,6 +1865,8 @@ static bool certifyLcsWindowCore(
                             stride)) {
     finishWindowObjectiveLinearSpace(aWindow, bWindow, ownerDepthGap,
                                      outResult);
+    appendUncertifiedAmbiguityDiagnostic(globalATokenCount, globalBTokenCount,
+                                         outResult, diagnosticEvidence);
     return false;
   }
 
@@ -1378,6 +1906,11 @@ static bool certifyLcsWindowCore(
     outResult.selectedAnchorProofs[aToken] =
         LcsAnchorProof{LcsAnchorProofKind::CoreOptimalPathForced, 0};
   }
+
+  appendCertifiedAmbiguityDiagnostics(
+      aWindow, bWindow, absoluteABegin, absoluteBBegin, globalATokenCount,
+      globalBTokenCount, stride, forward, suffix, total, *pairFacts, outResult,
+      diagnosticEvidence);
 
   if (storage) {
     storage->stride = stride;
@@ -1429,7 +1962,8 @@ static void finalizeUncertifiedFullStreamResult(
 static bool buildForcedCertifiedResult(
     ArrayRef<StringRef> a, ArrayRef<StringRef> b,
     ArrayRef<uint32_t> ownerDepthGap, unsigned long long maxBytes,
-    CertifiedLcsResult &outResult) {
+    CertifiedLcsResult &outResult,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
   if (!hasBoundaryVectorSize(a.size(), ownerDepthGap.size()))
     return false;
 
@@ -1441,7 +1975,9 @@ static bool buildForcedCertifiedResult(
   // API counts only its one local derived vector.
   const bool certified = certifyLcsWindowCore(
       a, b, ownerDepthGap, /*absoluteABegin=*/0, /*absoluteBBegin=*/0,
-      maxBytes, /*ownerDepthGapCopyCount=*/2, windowResult, &oracleStorage);
+      /*globalATokenCount=*/a.size(), /*globalBTokenCount=*/b.size(), maxBytes,
+      /*ownerDepthGapCopyCount=*/2, windowResult, diagnosticEvidence,
+      &oracleStorage);
   if (windowResult.window.aEnd != a.size() ||
       windowResult.window.bEnd != b.size())
     return false;
@@ -1456,9 +1992,11 @@ static bool buildForcedCertifiedResult(
 /// path-selected anchors.
 static CertifiedLcsResult certifyFullStream(
     ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-    ArrayRef<uint32_t> ownerDepthGap, unsigned long long maxBytes) {
+    ArrayRef<uint32_t> ownerDepthGap, unsigned long long maxBytes,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
   CertifiedLcsResult result;
-  if (!buildForcedCertifiedResult(a, b, ownerDepthGap, maxBytes, result))
+  if (!buildForcedCertifiedResult(a, b, ownerDepthGap, maxBytes, result,
+                                  diagnosticEvidence))
     finalizeUncertifiedFullStreamResult(a, b, ownerDepthGap, maxBytes, result);
   return result;
 }
@@ -2098,7 +2636,9 @@ bool certifyLcsWindow(
     ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
     ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
     ArrayRef<LcsAGapProvenance> gapProvenance,
-    unsigned long long maxBytes, LcsWindowCertificationResult &result) {
+    unsigned long long maxBytes, LcsWindowCertificationResult &result,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+  canonicalizeDiagnosticIdentityRequests(diagnosticEvidence);
   result = LcsWindowCertificationResult{};
   result.window = LcsCertificationWindow{
       aBegin, aEnd, bBegin, bEnd,
@@ -2133,7 +2673,8 @@ bool certifyLcsWindow(
   return certifyLcsWindowCore(
       a.slice(absoluteABegin, aWidth),
       b.slice(absoluteBBegin, bWidth), ownerDepthGap, aBegin, bBegin,
-      maxBytes, /*ownerDepthGapCopyCount=*/1, result,
+      /*globalATokenCount=*/a.size(), /*globalBTokenCount=*/b.size(), maxBytes,
+      /*ownerDepthGapCopyCount=*/1, result, diagnosticEvidence,
       /*retainedOracleStorage=*/nullptr);
 }
 
@@ -2235,16 +2776,24 @@ std::vector<uint64_t> nominateLcsPartitionBoundaries(
   return candidates;
 }
 
-bool partitionLcsWindowsLinearSpace(
+/// Build one exact seam partition, optionally joining an existing run ledger.
+///
+/// Standalone callers reset generated diagnostic output. Certification drivers
+/// pass `false` so candidate/frontier evidence and every later local ambiguity
+/// record remain in the same run-scoped ledger.
+static bool partitionLcsWindowsLinearSpaceImpl(
     ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
     ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
     ArrayRef<LcsAGapProvenance> gapProvenance,
     ArrayRef<uint64_t> candidateABoundaries,
     LcsWindowPartitionResult &result,
-    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence,
+    bool resetDiagnosticOutputs) {
   result = LcsWindowPartitionResult{};
-  if (diagnosticEvidence)
-    *diagnosticEvidence = LcsCertificationDiagnosticEvidence{};
+  if (resetDiagnosticOutputs)
+    resetCertificationDiagnosticOutputs(diagnosticEvidence);
+  else
+    canonicalizeDiagnosticIdentityRequests(diagnosticEvidence);
   if (!hasBoundaryVectorSize(a.size(), gapProvenance.size()) ||
       aBegin > aEnd || aEnd > a.size() || bBegin > bEnd ||
       bEnd > b.size() || bEnd > MAX)
@@ -2355,6 +2904,19 @@ bool partitionLcsWindowsLinearSpace(
   return true;
 }
 
+bool partitionLcsWindowsLinearSpace(
+    ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
+    ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
+    ArrayRef<LcsAGapProvenance> gapProvenance,
+    ArrayRef<uint64_t> candidateABoundaries,
+    LcsWindowPartitionResult &result,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+  return partitionLcsWindowsLinearSpaceImpl(
+      a, aBegin, aEnd, b, bBegin, bEnd, gapProvenance,
+      candidateABoundaries, result, diagnosticEvidence,
+      /*resetDiagnosticOutputs=*/true);
+}
+
 /// Preserve the established one-window result from provenance input.
 ///
 /// A partition that proves no interior seam is semantically the original
@@ -2364,10 +2926,12 @@ bool partitionLcsWindowsLinearSpace(
 static bool certifyFullStreamFromProvenance(
     ArrayRef<StringRef> a, ArrayRef<StringRef> b,
     ArrayRef<LcsAGapProvenance> gapProvenance,
-    unsigned long long maxBytes, CertifiedLcsResult &result) {
+    unsigned long long maxBytes, CertifiedLcsResult &result,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
   std::vector<uint32_t> ownerDepthGap =
       copyOwnerDepthGaps(gapProvenance, 0, a.size());
-  result = certifyFullStream(a, b, ownerDepthGap, maxBytes);
+  result = certifyFullStream(a, b, ownerDepthGap, maxBytes,
+                             diagnosticEvidence);
   return result.globalObjectiveIsExact &&
          result.CertificationPartitionIsWellFormed(a.size(), b.size());
 }
@@ -2449,7 +3013,8 @@ static bool certifyPartitionWindows(
     ArrayRef<LcsAGapProvenance> gapProvenance,
     ArrayRef<LcsCertifiedBoundary> certifiedBoundaries,
     ArrayRef<LcsCertificationWindow> partitionWindows,
-    unsigned long long maxBytes, CertifiedLcsResult &result) {
+    unsigned long long maxBytes, CertifiedLcsResult &result,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
   if (partitionWindows.empty() ||
       certifiedBoundaries.size() + 1 != partitionWindows.size())
     return false;
@@ -2476,7 +3041,7 @@ static bool certifyPartitionWindows(
     (void)certifyLcsWindow(
         a, partitionWindow.aBegin, partitionWindow.aEnd, b,
         partitionWindow.bBegin, partitionWindow.bEnd, gapProvenance, maxBytes,
-        localResult);
+        localResult, diagnosticEvidence);
     LcsObjective nextComposedObjective;
     if (!localResult.objectiveIsExact ||
         !addObjectivesChecked(composedObjective, localResult.objective,
@@ -2649,8 +3214,9 @@ bool certifyLcsWindowsIndependently(
     unsigned long long maxBytes, CertifiedLcsResult &result,
     LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
   result = CertifiedLcsResult{};
-  if (diagnosticEvidence)
-    *diagnosticEvidence = LcsCertificationDiagnosticEvidence{};
+  LcsAmbiguityDiagnosticRun diagnosticRun(a.size(), b.size(),
+                                           diagnosticEvidence);
+  LcsCertificationDiagnosticEvidence *runEvidence = diagnosticRun.Evidence();
   if (!hasBoundaryVectorSize(a.size(), gapProvenance.size()) ||
       b.size() > MAX)
     return false;
@@ -2658,36 +3224,43 @@ bool certifyLcsWindowsIndependently(
   // Preserve the established one-window path when no partition nominations
   // are supplied. Besides avoiding a redundant linear-space pass, this retains
   // the complete-stream oracle and its exact historical byte accounting.
-  if (candidateABoundaries.empty())
-    return certifyFullStreamFromProvenance(a, b, gapProvenance, maxBytes,
-                                           result);
+  if (candidateABoundaries.empty()) {
+    if (!certifyFullStreamFromProvenance(a, b, gapProvenance, maxBytes,
+                                         result, runEvidence))
+      return false;
+    diagnosticRun.Finalize(result);
+    return true;
+  }
 
   LcsWindowPartitionResult partition;
-  if (!partitionLcsWindowsLinearSpace(
+  if (!partitionLcsWindowsLinearSpaceImpl(
           a, /*aBegin=*/0, static_cast<uint64_t>(a.size()), b,
           /*bBegin=*/0, static_cast<uint64_t>(b.size()), gapProvenance,
-          candidateABoundaries, partition, diagnosticEvidence) ||
+          candidateABoundaries, partition, runEvidence,
+          /*resetDiagnosticOutputs=*/false) ||
       !partition.objectiveIsExact || partition.windows.empty() ||
       partition.certifiedBoundaries.size() + 1 != partition.windows.size())
     return false;
 
   if (partition.certifiedBoundaries.empty()) {
     if (!certifyFullStreamFromProvenance(a, b, gapProvenance, maxBytes,
-                                         result) ||
+                                         result, runEvidence) ||
         result.globalObjective != partition.objective) {
       result = CertifiedLcsResult{};
       return false;
     }
+    diagnosticRun.Finalize(result);
     return true;
   }
 
   if (!certifyPartitionWindows(
           a, b, gapProvenance, partition.certifiedBoundaries,
-          partition.windows, maxBytes, result) ||
+          partition.windows, maxBytes, result, runEvidence) ||
       result.globalObjective != partition.objective) {
     result = CertifiedLcsResult{};
     return false;
   }
+  diagnosticRun.Finalize(result);
   return true;
 }
 
@@ -2698,8 +3271,9 @@ bool certifyLcsWindowsWithinBudget(
     unsigned long long maxBytes, CertifiedLcsResult &result,
     LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
   result = CertifiedLcsResult{};
-  if (diagnosticEvidence)
-    *diagnosticEvidence = LcsCertificationDiagnosticEvidence{};
+  LcsAmbiguityDiagnosticRun diagnosticRun(a.size(), b.size(),
+                                           diagnosticEvidence);
+  LcsCertificationDiagnosticEvidence *runEvidence = diagnosticRun.Evidence();
   if (!hasBoundaryVectorSize(a.size(), gapProvenance.size()) ||
       b.size() > MAX)
     return false;
@@ -2714,8 +3288,8 @@ bool certifyLcsWindowsWithinBudget(
   normalizedCandidates.erase(
       std::unique(normalizedCandidates.begin(), normalizedCandidates.end()),
       normalizedCandidates.end());
-  if (diagnosticEvidence) {
-    diagnosticEvidence->candidateABoundaries.assign(
+  if (runEvidence) {
+    runEvidence->candidateABoundaries.assign(
         normalizedCandidates.begin(), normalizedCandidates.end());
   }
 
@@ -2724,7 +3298,7 @@ bool certifyLcsWindowsWithinBudget(
           a, b, gapProvenance, normalizedCandidates, /*aBegin=*/0,
           static_cast<uint64_t>(a.size()), /*bBegin=*/0,
           static_cast<uint64_t>(b.size()), maxBytes, plan,
-          diagnosticEvidence) ||
+          runEvidence) ||
       plan.windows.empty() ||
       plan.certifiedBoundaries.size() + 1 != plan.windows.size())
     return false;
@@ -2734,13 +3308,20 @@ bool certifyLcsWindowsWithinBudget(
   // owner-gap copy for its oracle, and existing budget tests intentionally
   // account for that payload. A genuinely partitioned result uses the smaller
   // local-window accounting because no complete oracle is retained.
-  if (plan.certifiedBoundaries.empty() && plan.windows.size() == 1)
-    return certifyFullStreamFromProvenance(a, b, gapProvenance, maxBytes,
-                                           result);
+  if (plan.certifiedBoundaries.empty() && plan.windows.size() == 1) {
+    if (!certifyFullStreamFromProvenance(a, b, gapProvenance, maxBytes,
+                                         result, runEvidence))
+      return false;
+    diagnosticRun.Finalize(result);
+    return true;
+  }
 
-  return certifyPartitionWindows(a, b, gapProvenance,
-                                 plan.certifiedBoundaries, plan.windows,
-                                 maxBytes, result);
+  if (!certifyPartitionWindows(a, b, gapProvenance,
+                               plan.certifiedBoundaries, plan.windows,
+                               maxBytes, result, runEvidence))
+    return false;
+  diagnosticRun.Finalize(result);
+  return true;
 }
 
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
@@ -2888,7 +3469,8 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 CertifiedLcsResult
 certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                   ArrayRef<LcsAGapProvenance> gapProvenance,
-                  unsigned long long maxBytes) {
+                  unsigned long long maxBytes,
+                  LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
   if (!hasBoundaryVectorSize(a.size(), gapProvenance.size()))
     REFOLD_LOG_FATAL("lcs/map", "gapProvenance length must be A.size() + 1");
   if (b.size() > MAX)
@@ -2897,7 +3479,7 @@ certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   CertifiedLcsResult result;
   if (!certifyLcsWindowsIndependently(
           a, b, gapProvenance, /*candidateABoundaries=*/{}, maxBytes,
-          result))
+          result, diagnosticEvidence))
     REFOLD_LOG_FATAL("lcs/map", "full-stream LCS certification failed");
   return result;
 }
@@ -2906,7 +3488,8 @@ CertifiedLcsResult
 certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                   ArrayRef<LcsAGapProvenance> gapProvenance,
                   ArrayRef<LcsBGapProvenance> bGapProvenance,
-                  unsigned long long maxBytes) {
+                  unsigned long long maxBytes,
+                  LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
   if (bGapProvenance.size() != b.size() + 1)
     REFOLD_LOG_FATAL("lcs/map", "bGapProvenance length must be B.size() + 1");
   if (!hasBoundaryVectorSize(a.size(), gapProvenance.size()))
@@ -2918,7 +3501,7 @@ certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   CertifiedLcsResult result;
   if (!certifyLcsWindowsIndependently(
           a, b, gapProvenance, /*candidateABoundaries=*/{}, maxBytes,
-          result))
+          result, diagnosticEvidence))
     REFOLD_LOG_FATAL("lcs/map", "full-stream LCS certification failed");
   return result;
 }

@@ -4,6 +4,7 @@ add_clang_tool(clang-refold
   clang-refold.cpp
   sideband/RefoldSidebandPragmaEdits.cpp
   source/DiffAlgorithms.cpp
+  source/RefoldAlignmentDiagnostic.cpp
   source/RefoldAlignmentSemanticResolver.cpp
   source/RefoldLegacyAlignmentDiagnostic.cpp
   line-control/FinalLineControlModel.cpp
@@ -33,6 +34,7 @@ add_clang_tool(clang-refold
   source/RefoldMixedOwnerTilingPlanner.cpp
   source/RefoldPreprocessingDirectiveScanner.cpp
   source/RefoldPreprocessingStructureIndex.cpp
+  source/RefoldPreprocessingStructureIndexProvider.cpp
   source/RefoldSourceGapProof.cpp
   source/RefoldStructuralHunkDispatcher.cpp
   macro/RefoldMacroTopology.cpp

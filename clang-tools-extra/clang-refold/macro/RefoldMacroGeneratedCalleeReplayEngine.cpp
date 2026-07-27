@@ -10,8 +10,8 @@
 //
 // The generated-callee replay implementation is intentionally split only after
 // each local proof obligation is made explicit.  The companion census document
-// records the remaining local composition blocks so future patches can move
-// deterministic helpers and private resolvers without changing solver order,
+// records the local composition blocks so deterministic helpers and private
+// resolvers can move without changing solver order,
 // ambiguity rejection, proof certification, or fallback behavior.
 //
 //===----------------------------------------------------------------------===//

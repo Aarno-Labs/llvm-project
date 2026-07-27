@@ -27,10 +27,11 @@ namespace {
 
 /// Compute `LCS(a,b[0,j))` for every B-token frontier `j`.
 ///
-/// The row is calculated with linear auxiliary storage. Patch 3.2 uses the
-/// complete row rather than one reconstructed LCS path because one deterministic
-/// path is not proof that a structural replacement boundary has unique target
-/// ownership. Every frontier that participates in any maximum-length local
+/// The row is calculated with linear auxiliary storage. Boundary uniqueness
+/// validation uses the complete row rather than one reconstructed LCS path
+/// because one deterministic path is not proof that a structural replacement
+/// boundary has unique target ownership. Every frontier that participates in
+/// any maximum-length local
 /// alignment must remain observable until ambiguity is rejected.
 std::vector<size_t> buildForwardLCSFrontierRow(ArrayRef<PPTok> a,
                                                ArrayRef<PPTok> b) {
@@ -358,9 +359,10 @@ std::optional<RefoldSourceMapper::ATokenBoundaryProjection>
 RefoldSourceMapper::ProjectATokenBoundaryToBTokenBounds(
     uint64_t parentAStart, uint64_t parentAEnd, uint64_t parentBStart,
     uint64_t parentBEnd, uint64_t aBoundary) const {
-  // Patch 3.1/3.2 projects only a strict interior boundary of one nonempty
-  // replacement.  Both A fragments must therefore remain nonempty, and the
-  // parent B envelope must itself be well formed and inside the token domains.
+  // Boundary uniqueness validation projects only a strict interior boundary
+  // of one nonempty replacement. Both A fragments must therefore remain
+  // nonempty, and the parent B envelope must itself be well formed and inside
+  // the token domains.
   if (parentAStart >= aBoundary || aBoundary >= parentAEnd ||
       parentAEnd > aToks_.size() || parentBStart > parentBEnd ||
       parentBEnd > bToks_.size()) {

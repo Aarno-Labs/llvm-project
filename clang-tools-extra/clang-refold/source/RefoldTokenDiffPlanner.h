@@ -31,10 +31,12 @@
 namespace clang {
 namespace refold {
 
+struct AlignmentProtectedBoundarySurfaces;
+struct AlignmentProtectedBoundaryIdentity;
 class RefoldMacroTopology;
 class RefoldModel;
 class RefoldPathIdentity;
-class RefoldPreprocessingStructureIndex;
+class RefoldPreprocessingStructureIndexProvider;
 class RefoldSourceMapper;
 
 /// Builds the deterministic A/B preprocessed-token diff plan.
@@ -52,9 +54,10 @@ public:
     const RefoldModel &model;
     /// Canonical path-equivalence service used by diagnostic source binding.
     const RefoldPathIdentity &pathIdentity;
-    /// Exact TU preprocessing-structure census used only to identify protected
-    /// A-token boundaries for evidence-only alignment diagnostics.
-    const RefoldPreprocessingStructureIndex &preprocessingStructureIndex;
+    /// Shared exact structure-index provider used by the alignment collector
+    /// for the TU and every represented concrete header occurrence.
+    const RefoldPreprocessingStructureIndexProvider
+        &preprocessingStructureIndexes;
     /// Edited preprocessed B source used for byte-hunk projection.
     llvm::StringRef bSource;
     /// Original preprocessed token stream A.
@@ -153,36 +156,43 @@ private:
 
   /// Compute edited-side B-gap line/surface provenance for shadow diagnostics.
   ///
-  /// This profile reconstructs the evidence consumed by the known-good Patch 6
-  /// boundary selector.  The semantic resolver uses it only in trace mode to
+  /// This profile reconstructs the evidence consumed by the known-good legacy
+  /// boundary selector. The semantic resolver uses it only in trace mode to
   /// explain historical output; it never participates in production admission.
   std::vector<diffutils::LcsBGapProvenance>
   ComputeLcsBGapProvenanceForPP() const;
 
-  /// Collect exact protected preprocessing-structure A-token boundaries.
+  /// Collect independent proof-scheduling and diagnostic boundary surfaces.
   ///
-  /// Include covers and tokenless directive intervals are projected only when
-  /// producer token/source facts identify one exact A frontier.  Unmappable
-  /// intervals are counted for diagnostics and never replaced by a nearest
-  /// token approximation.
-  std::vector<uint64_t>
-  CollectProtectedAlignmentABoundaries(size_t &unmappedIntervalCount) const;
+  /// The proof surface contains only the historical sorted, unique direct-TU
+  /// A frontiers. The diagnostic surface additionally walks every represented
+  /// concrete include occurrence, retaining one canonical identity per
+  /// physical construct and role even when several identities project to the
+  /// same frontier. Header identities never nominate a new production split.
+  /// Unmappable intervals retain an absent A frontier and incomplete projection
+  /// state; missing owner source is recorded explicitly rather than replaced
+  /// by an invented interval or nearest-token coordinate.
+  AlignmentProtectedBoundarySurfaces CollectProtectedAlignmentBoundarySurfaces(
+      bool retainDiagnosticIdentities) const;
 
-  /// Emit permanent evidence-only diagnostics for every certified ambiguity
-  /// window.
+  /// Emit the canonical physical identity census used by ambiguity records.
   ///
-  /// The routine reads the completed oracle and exact physical structure
-  /// census but never mutates an alignment map, hunk vector, or candidate
-  /// ordering.  Protected source intervals are projected to A-token boundaries
-  /// only when producer token/include facts establish one exact frontier; an
-  /// interval with no exact projection is reported as unmapped rather than
-  /// approximated.
+  /// This trace joins stable diagnostic ids back to source paths, concrete
+  /// include owners, physical ranges, and exact A projections. It is a pure
+  /// serializer and never contributes a boundary to proof scheduling.
+  void TraceProtectedAlignmentBoundaryIdentities(
+      llvm::ArrayRef<AlignmentProtectedBoundaryIdentity> identities) const;
+
+  /// Serialize completed evidence-only ambiguity-window records.
+  ///
+  /// This routine performs no theorem reconstruction: it never queries an
+  /// oracle, derives forced-anchor windows, enumerates admissible pairs, or
+  /// projects protected boundaries. Diagnostic collection is completed before
+  /// this serializer is called and cannot affect alignment authority.
   void TraceAlignmentAmbiguityWindows(
       llvm::ArrayRef<llvm::StringRef> aSeq,
-      llvm::ArrayRef<llvm::StringRef> bSeq,
-      llvm::ArrayRef<uint64_t> protectedABoundaries,
-      size_t unmappedProtectedIntervals,
-      const diffutils::CertifiedLcsResult &alignment) const;
+      llvm::ArrayRef<diffutils::LcsAmbiguityWindowDiagnosticRecord> windows,
+      llvm::ArrayRef<AlignmentProtectedBoundaryIdentity> identities) const;
 
   /// Emit the stable evidence-only transcript retained by the certifier.
   void TraceAlignmentCertificationRun(

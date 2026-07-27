@@ -305,7 +305,7 @@ PreservedStructuralTilingObservation *findOrCreateStructuralTilingObservation(
 /// token-segment index.
 ///
 /// Mixed-owner theorem carriers store the witness directly. Ordinary TU owner
-/// realizations instead store Patch 1.4's validated witness id/segment key in
+/// realizations instead store the validated witness id/segment key in
 /// `TUOwnerRealizationCarrierWitness`; resolve that key through the durable
 /// planner ledger so final edit normalization cannot hide direct TU segments
 /// merely by retaining their owner-realization proof class.
@@ -1529,8 +1529,8 @@ bool RefoldTextEditAssembler::PreservedStructuralGapsRemainOutsideEmittedEdits(
     std::optional<uint64_t> ownerIncludeId,
     StringRef originalFileText) const {
   // Token tiling happens before duplicate-edit merging, resync widening, and
-  // conservative TU closure.  Patch 2.4 therefore snapshots the structural
-  // segment obligations from the pre-normalization edit set and checks those
+  // conservative TU closure. The final audit snapshots structural segment
+  // obligations from the pre-normalization edit set and checks those
   // obligations against the final physical edit set.  Looking only at final
   // carriers would be unsound: a later closure can replace several structural
   // carriers with one new carrier and thereby erase the very witness whose
