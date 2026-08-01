@@ -155,6 +155,53 @@ namespace refold {
 
 namespace {
 
+/// Return the macro expansion an A-token position falls strictly inside, or
+/// null when the position is an expansion boundary or outside every expansion.
+///
+/// Boundaries are deliberately not interior: a hunk edge that coincides with a
+/// span edge already owns whole expansions on both sides.
+/// A hunk edge strictly inside an expansion is not by itself a problem: an edit
+/// confined to a macro argument has both edges inside the expansion and is
+/// realized by replaying the callsite, which owns the whole expansion.  The
+/// unrealizable shape is a *straddle*, where the hunk holds part of an
+/// expansion and the neighbouring untouched region holds the rest, so neither
+/// can reproduce it.  \p oppositeEdgeInsideSpan distinguishes the two: it is
+/// true when the hunk's other edge also lies within the span, meaning the hunk
+/// is contained rather than straddling.
+const RefoldModel::PPSpan *
+macroExpansionStraddledAtEdge(const RefoldModel &model, uint64_t edge,
+                              uint64_t oppositeEdge, bool edgeIsLeft) {
+  for (const RefoldModel::MacroInvocation &invocation :
+       model.GetMacroInvocations()) {
+    if (!invocation.invB || !invocation.invE)
+      continue;
+    for (const RefoldModel::PPSpan &span : invocation.spans) {
+      if (!(span.begin < edge && edge < span.end))
+        continue;
+      // Contained: the whole hunk lies within this expansion, so the callsite
+      // realizers own it and the edge is legitimate.
+      const bool containedInSpan = edgeIsLeft ? (oppositeEdge <= span.end)
+                                              : (span.begin <= oppositeEdge);
+      if (containedInSpan)
+        continue;
+      return &span;
+    }
+  }
+  return nullptr;
+}
+
+/// Return whether two A/B tokens are the same lexeme, so retracting a hunk edge
+/// across them restores a match rather than inventing one.
+bool aAndBTokensAreIdentical(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
+                             uint64_t aToken, uint64_t bToken) {
+  if (aToken >= aToks.size() || bToken >= bToks.size())
+    return false;
+  return aToks[static_cast<size_t>(aToken)].kind ==
+             bToks[static_cast<size_t>(bToken)].kind &&
+         aToks[static_cast<size_t>(aToken)].spelling ==
+             bToks[static_cast<size_t>(bToken)].spelling;
+}
+
 /// Verify that every durable structural segment binding names one exact
 /// normalized hunk and the matching token edge in its parent witness.
 ///
@@ -605,6 +652,7 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   }
 
   std::vector<diffutils::Hunk> hunks = std::move(diffPlan.hunks);
+  RetractHunkEdgesOutOfPartiallyOwnedMacroExpansions(hunks);
   structuralHunkPlanningPhase_ =
       StructuralHunkPlanningPhase::InitialTokenDiffBuilt;
 
@@ -756,6 +804,43 @@ bool RefoldEngine::StageSidebandEdits(
   return appendSidebandPragmaSourceEdits(
       sidebandPragmaEdits_, tuPath, tuBytes, pathIdentity_, *textEditAssembler_,
       ProofLattice(), terminalSink_, structuralHunkDispatcher);
+}
+
+void RefoldEngine::RetractHunkEdgesOutOfPartiallyOwnedMacroExpansions(
+    std::vector<diffutils::Hunk> &hunks) const {
+  for (diffutils::Hunk &hunk : hunks) {
+    if (hunk.aStart >= hunk.aEnd)
+      continue;
+
+    // Left edge: advance past the expansion it sits inside.  Each step gives
+    // one leading token back to the untouched region on the left, so the token
+    // must be identical on both sides for that region to reproduce it.
+    while (hunk.aStart < hunk.aEnd && hunk.bStart < hunk.bEnd) {
+      const RefoldModel::PPSpan *span = macroExpansionStraddledAtEdge(
+          model_, hunk.aStart, hunk.aEnd, /*edgeIsLeft=*/true);
+      if (!span)
+        break;
+      if (!aAndBTokensAreIdentical(aToks_, bToks_, hunk.aStart, hunk.bStart))
+        break;
+      ++hunk.aStart;
+      ++hunk.bStart;
+    }
+
+    // Right edge: retreat before the expansion, giving trailing tokens back to
+    // the untouched region on the right under the same identity requirement.
+    while (hunk.aStart < hunk.aEnd && hunk.bStart < hunk.bEnd) {
+      const RefoldModel::PPSpan *span = macroExpansionStraddledAtEdge(
+          model_, hunk.aEnd, hunk.aStart, /*edgeIsLeft=*/false);
+      if (!span)
+        break;
+      if (!aAndBTokensAreIdentical(aToks_, bToks_, hunk.aEnd - 1,
+                                   hunk.bEnd - 1)) {
+        break;
+      }
+      --hunk.aEnd;
+      --hunk.bEnd;
+    }
+  }
 }
 
 bool RefoldEngine::DispatchStructuralHunks(

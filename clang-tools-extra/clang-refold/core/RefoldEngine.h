@@ -776,6 +776,26 @@ private:
   /// layout, proof, and final text-edit services are available.  The
   /// materializer owns recursive include realization; RefoldEngine owns only
   /// construction order and final orchestration.
+  /// Retract hunk edges out of macro expansions the hunk only partially owns.
+  ///
+  /// A realizer reconstructs source by re-emitting a callsite, so an expansion
+  /// must be wholly inside a hunk or wholly outside it.  When an edge lands
+  /// strictly inside one, the source projection widens to the complete
+  /// invocation spelling while the replacement carries only the fragment of
+  /// expanded tokens inside the hunk, and the difference is dropped silently:
+  /// `return NULL;` became `return );` when an alignment boundary fell one
+  /// token inside `NULL`'s `((void*)0)` expansion.
+  ///
+  /// The edge is walked outward one token at a time, and only across tokens
+  /// that are identical on both sides -- restoring a match the certifier left
+  /// unforced because a repeated spelling made it ambiguous.  This keeps the
+  /// repair local: the expansion rejoins the untouched region beside the hunk
+  /// and every other hunk in the translation unit is unaffected.  An edge that
+  /// cannot be walked out is left alone for the ordinary realizer lattice
+  /// rather than escalating the whole translation unit to raw B.
+  void RetractHunkEdgesOutOfPartiallyOwnedMacroExpansions(
+      std::vector<diffutils::Hunk> &hunks) const;
+
   void InitializeIncludeMaterializer();
 
   /// Allocate and access the synthetic `#pragma once` guard rewriter.
