@@ -845,22 +845,39 @@ RefoldSourceMapper::MapAToBTokenEnvelopeByPPArgSpan(
     REFOLD_LOG_FATAL(
         "macro/pparg/span",
         "PPArgSpan missing producer ppByte span (kind='{0}' argIdx={1} "
-        "A=[{2},{3}) ppByte=[4},{5}]) - cannot map without snapping",
+        "A=[{2},{3}) ppByte=[{4},{5}]) - cannot map without snapping",
         sp.kind, sp.argIdx, sp.begin, sp.end, sp.ppByteBegin, sp.ppByteEnd);
     return std::nullopt;
   }
 
-  // Non-strict fallback: approximate the missing producer byte span from the
-  // consumer's A-token offset table, then reuse the ordinary A-byte -> B-token
-  // envelope mapper.
+  // Non-strict fallback.  The producer emits a preprocessed byte span for every
+  // non-empty, in-bounds arg-like surface, so a missing pp-byte span here means
+  // the span is either zero-length -- a zero-token contribution -- or out of
+  // bounds.  These are the only two cases, and they are not equivalent:
+  //
+  //   * A zero-length span has an *exact* consumer-side anchor.  The A-token
+  //     offset table gives the precise preprocessed byte at which the empty
+  //     contribution sits, so mapping that zero-width A-byte range to B is not
+  //     an approximation of a producer fact -- it is the fact.
+  //
+  //   * A non-empty span without a producer pp-byte span is out of bounds and
+  //     cannot be projected without snapping token offsets across unmodeled
+  //     material.  Fail closed rather than manufacturing a byte span, matching
+  //     the strict path above.
+  if (sp.begin != sp.end) {
+    REFOLD_LOG_TRACE(
+        "macro/pparg/span",
+        "PPArgSpan missing producer ppByte span for a non-empty surface "
+        "(kind='{0}' argIdx={1} A=[{2},{3})); failing closed rather than "
+        "snapping token offsets",
+        sp.kind, sp.argIdx, sp.begin, sp.end);
+    return std::nullopt;
+  }
+
   const uint64_t maxATok = static_cast<uint64_t>(aToks_.size());
-  uint64_t a0Idx = std::clamp(sp.begin, static_cast<uint64_t>(0), maxATok);
-  uint64_t a1Idx = std::clamp(sp.end, a0Idx, maxATok);
-
-  size_t a0 = aTokOff_[static_cast<size_t>(a0Idx)];
-  size_t a1 = aTokOff_[static_cast<size_t>(a1Idx)];
-
-  return MapAByteRangeToBTokenEnvelope(a0, a1);
+  const uint64_t aIdx = std::clamp(sp.begin, static_cast<uint64_t>(0), maxATok);
+  const size_t aByte = aTokOff_[static_cast<size_t>(aIdx)];
+  return MapAByteRangeToBTokenEnvelope(aByte, aByte);
 }
 
 bool RefoldSourceMapper::TrimPureBoundaryInsertionsFromTokenEnvelope(
