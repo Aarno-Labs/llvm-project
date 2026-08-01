@@ -486,6 +486,65 @@ bool RefoldMacroPatchPlanner::
           m, argIdx, baseArg, newArg, tokenHunks);
 }
 
+bool RefoldMacroPatchPlanner::DerivedReplacementsReproduceStringifiedOperands(
+    const RefoldModel::MacroInvocation &m,
+    const DenseMap<uint32_t, std::string> &replacementsByArgIdx) const {
+  if (m.stringifySpans.empty())
+    return true;
+  if (!deps_.sourceMapper || !deps_.argTextRecovery) {
+    // Without both services the stringified operand cannot be recovered from B,
+    // so agreement is unproven rather than true.
+    return false;
+  }
+
+  for (const RefoldModel::PPArgSpan &stringifySpan : m.stringifySpans) {
+    auto replacement = replacementsByArgIdx.find(stringifySpan.argIdx);
+    if (replacement == replacementsByArgIdx.end())
+      continue;
+
+    // The stringified operand is one B token: the literal the edited stream
+    // actually spells at this position.
+    auto bEnv =
+        deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(stringifySpan);
+    if (!bEnv || bEnv->second <= bEnv->first ||
+        bEnv->second - bEnv->first != 1) {
+      return false;
+    }
+
+    StringRef bStringifiedToken =
+        deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
+    std::optional<std::string> decoded =
+        deps_.argTextRecovery->UnstringifyLiteralToArgText(
+            bStringifiedToken, /*allowTopLevelComma=*/true);
+    if (!decoded)
+      return false;
+    std::optional<std::string> canonical =
+        stringutils::canonicalizeStringifyInversePayload(*decoded);
+    if (!canonical)
+      return false;
+
+    // Clang stringification collapses internal whitespace, so compare the
+    // canonicalized inverse payload rather than raw spellings.
+    std::optional<std::string> canonicalReplacement =
+        stringutils::canonicalizeStringifyInversePayload(replacement->second);
+    if (!canonicalReplacement)
+      return false;
+
+    if (StringRef(*canonical).trim() !=
+        StringRef(*canonicalReplacement).trim()) {
+      REFOLD_LOG_TRACE(
+          "macro/args-only",
+          "reject inv id={0} name={1} reason=stringify-operand-not-reproduced "
+          "argIdx={2} bStringified='{3}' derivedArg='{4}'",
+          m.id, m.name, stringifySpan.argIdx, bStringifiedToken,
+          replacement->second);
+      return false;
+    }
+  }
+
+  return true;
+}
+
 bool RefoldMacroPatchPlanner::
     MacroArgReplacementMatchesAllOccurrencesInBIgnorePasteSemanticProof(
         const RefoldModel::MacroInvocation &m, uint32_t argIdx,
@@ -1047,6 +1106,16 @@ RefoldMacroPatchPlanner::BuildPasteAwareArgsOnlyPatch(
               m, baseInvText, invArgRanges, replByArgIdx)) {
         return ArgsOnlyPatchAttempt::RejectResult();
       }
+
+      // The paste gate above proves only the pasted operands.  A parameter that
+      // is also stringified is constrained independently, and the per-argument
+      // check earlier sees only the hunk that produced the replacement -- an
+      // unchanged literal such as `"mime"` lies outside it and is never
+      // examined.  Prove the stringified operands too, so an argument derived
+      // purely from the paste cannot silently rewrite a string literal that B
+      // left alone.
+      if (!DerivedReplacementsReproduceStringifiedOperands(m, replByArgIdx))
+        return ArgsOnlyPatchAttempt::RejectResult();
 
       std::optional<InvocationRewriteWithRange> rewrite =
           BuildInvocationRewriteWithRange(actualRecoveryCtx, replByArgIdx);

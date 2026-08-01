@@ -331,6 +331,26 @@ private:
       llvm::StringRef baseArg, llvm::StringRef newArg,
       llvm::ArrayRef<diffutils::Hunk> tokenHunks) const;
 
+  /// Return whether derived argument replacements reproduce every stringified
+  /// operand exactly as the edited stream spells it.
+  ///
+  /// A parameter used through `#` and through `##` is constrained twice, and
+  /// the two constraints are independent.  When only the pasted product was
+  /// rewritten -- `parse_mime` becoming `parse_mime_xjtr_0` while the literal
+  /// `"mime"` is untouched -- the argument that satisfies the paste necessarily
+  /// changes the stringified literal as well.  No argument text reproduces both
+  /// operands, so the callsite is not refoldable and must fall back to the
+  /// expanded text instead of silently corrupting the string.
+  ///
+  /// Each stringified operand is checked by decoding what the edited stream
+  /// actually spells and comparing it against the derived replacement, so the
+  /// obligation is discharged against B rather than against the paste that
+  /// produced the replacement.  An operand whose B spelling cannot be recovered
+  /// exactly fails closed.
+  bool DerivedReplacementsReproduceStringifiedOperands(
+      const RefoldModel::MacroInvocation &m,
+      const llvm::DenseMap<uint32_t, std::string> &replacementsByArgIdx) const;
+
   /// Local aliases for namespace-scope macro-planning carrier types.
   ///
   /// The aliases keep planner internals readable while the actual carrier
