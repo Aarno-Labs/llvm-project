@@ -1103,7 +1103,6 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
       return arrOrErr.takeError();
     const json::Array *arr = *arrOrErr;
 
-    int autoPP = 0;
     model.tokmap_.reserve(arr->size());
     for (std::size_t i = 0; i < arr->size(); ++i) {
       const std::string ctxItem = (Twine("tokmap[") + Twine(i) + "]").str();
@@ -1131,13 +1130,15 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         return eOrErr.takeError();
       entry.e = *eOrErr;
 
-      // optional
-      entry.pp = autoPP;
-      if (auto ppVal = asOptUInt64(*obj, "pp")) {
-        entry.pp = *ppVal;
-      } else {
-        ++autoPP;
-      }
+      // `pp` (the A-token index this range maps to) is a required provenance
+      // fact.  It must be read from the producer, never synthesized from stream
+      // order: a positional index would fabricate provenance and could collide
+      // with an explicit `pp` from another entry, silently corrupting
+      // token->byte resolution.  Fail closed when it is absent.
+      auto ppOrErr = applyToField(asUInt64, *obj, "pp", ctxItem);
+      if (!ppOrErr)
+        return ppOrErr.takeError();
+      entry.pp = *ppOrErr;
 
       model.tokmap_.push_back(entry);
       model.tokmapByPP_[entry.pp] = entry;
