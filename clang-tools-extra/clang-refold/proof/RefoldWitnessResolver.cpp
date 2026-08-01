@@ -73,7 +73,7 @@ bool RefoldWitnessResolver::IsResolverAuthoritativeWitness(
   // until their own families are audited.
   if (witness.family != WitnessProofFamily::OwnerRealization)
     return false;
-  if (witness.sourceFamily != "MacroWholeCoverRealization")
+  if (witness.sourcePathKind != AcceptedPathKind::MacroWholeCoverRealization)
     return false;
   if (witness.key.boundaryClass != WitnessBoundaryClass::RootInvocation)
     return false;
@@ -152,6 +152,7 @@ RefoldWitnessResolver::BuildWitnessCanonicalCost(
         llvm::formatv("range=[{0},{1})", candidate.begin, candidate.end).str();
 
   witness.selector = role.str();
+  witness.sourcePathKind = candidate.proofSummary.inventory.currentPath;
   witness.sourceFamily =
       toString(candidate.proofSummary.inventory.currentPath).str();
   witness.candidateKind = toString(candidate.kind).str();
@@ -347,11 +348,11 @@ void addClosureLedgerEntriesForUnknownKeyDimensions(
 bool convertedInvocationRepairDominatesOwnerRealization(
     const RefoldWitness &candidate, llvm::StringRef role,
     llvm::ArrayRef<std::pair<size_t, RefoldWitness>> selectableWitnesses) {
-  if (role != "SelectPreferredMacroSelectionCandidate")
+  if (role != kSelectPreferredMacroSelectionRole)
     return false;
   if (candidate.family != WitnessProofFamily::OwnerRealization)
     return false;
-  if (candidate.sourceFamily != "MacroWholeCoverRealization")
+  if (candidate.sourcePathKind != AcceptedPathKind::MacroWholeCoverRealization)
     return false;
   if (candidate.key.HasUnknownDimensions())
     return false;

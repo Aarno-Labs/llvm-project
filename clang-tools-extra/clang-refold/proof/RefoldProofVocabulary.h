@@ -46,6 +46,13 @@ namespace refold {
 
 using llvm::StringRef;
 
+/// Opaque forward declaration of the accepted-path discriminator.  The full
+/// definition lives in RefoldAcceptedResultTypes.h, which includes this header,
+/// so it cannot be included back here without a cycle.  A fixed-underlying-type
+/// enum can be named by value, which is all `RefoldWitness` needs to carry the
+/// path kind as a typed discriminator alongside its trace-only spelling.
+enum class AcceptedPathKind : uint8_t;
+
 //===----------------------------------------------------------------------===//
 // Producer-include spelling helpers and small proof carriers.
 //===----------------------------------------------------------------------===//
@@ -855,6 +862,11 @@ struct RefoldWitness {
   std::string sourceFamily;
   std::string candidateKind;
   std::string theoremClass;
+  /// Typed discriminator behind `sourceFamily` (which is only its `toString`
+  /// spelling, kept for trace).  Resolver-authority decisions must compare this
+  /// enum, not the string, so a `toString` rename cannot silently change which
+  /// witnesses the resolver treats as authoritative.
+  AcceptedPathKind sourcePathKind{};
   WitnessEquivalenceKey key;
   WitnessCanonicalCost cost;
   std::string payloadPreview;

@@ -49,6 +49,15 @@ class RefoldTheoremAudit;
 class RefoldWitnessEquivalenceKeyBuilder;
 class RefoldWitnessTrace;
 
+/// Selection-role label for the macro-selection stage.  It is both the trace
+/// label the ranker emits and the key a resolver-authority gate keys on, so it
+/// is defined once here: the producer (RefoldAcceptedResultRanker) and the
+/// consumer (the dominance gate in RefoldWitnessResolver) reference the same
+/// constant, which makes a rename a single-point change instead of a silent
+/// drift between two hand-written string literals.
+inline constexpr llvm::StringLiteral kSelectPreferredMacroSelectionRole =
+    "SelectPreferredMacroSelectionCandidate";
+
 /// Resolves selectable accepted-result witnesses into one strict-domain
 /// decision.  The resolver partitions candidates by equivalence key, checks
 /// composition compatibility, records theorem-audit state, and traces the

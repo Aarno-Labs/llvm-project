@@ -301,12 +301,12 @@ RefoldAcceptedResultRanker::SelectPreferredMacroSelectionCandidate(
 
   WitnessResolverDecision resolverDecision =
       deps_.witnessResolver.ResolveWitnessesForSelection(
-          "SelectPreferredMacroSelectionCandidate", candidates.size(),
+          kSelectPreferredMacroSelectionRole, candidates.size(),
           isSelectable,
           [&](size_t idx) {
             return deps_.witnessResolver.BuildRefoldWitness(
                 candidates[idx].selectorCandidate,
-                "SelectPreferredMacroSelectionCandidate", idx);
+                kSelectPreferredMacroSelectionRole, idx);
           },
           prefers, legacyBestIdx);
 
@@ -323,7 +323,7 @@ RefoldAcceptedResultRanker::SelectPreferredMacroSelectionCandidate(
       deps_.witnessTrace.TraceWitnessRejected(
           deps_.witnessResolver.BuildRefoldWitness(
               candidates[i].selectorCandidate,
-              "SelectPreferredMacroSelectionCandidate", i),
+              kSelectPreferredMacroSelectionRole, i),
           WitnessRejectReason::SelectorOnlyNoEmittedCandidate,
           "selector-only macro witness has no emission-normalized carrier");
     }
@@ -343,7 +343,7 @@ RefoldAcceptedResultRanker::SelectPreferredMacroSelectionCandidate(
   deps_.witnessTrace.TraceWitnessChosen(
       deps_.witnessResolver.BuildRefoldWitness(
           selected.candidate.selectorCandidate,
-          "SelectPreferredMacroSelectionCandidate", *bestIdx),
+          kSelectPreferredMacroSelectionRole, *bestIdx),
       *bestIdx);
   return selected;
 }
