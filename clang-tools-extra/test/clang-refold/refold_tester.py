@@ -50,6 +50,27 @@ def run(cmd, output_file=None):
       sys.exit(e.returncode)
 
 
+def run_expecting_failure(cmd, output_file=None):
+  """Run a command that MUST fail (non-zero exit); error if it succeeds.
+
+  Used for negative assertions such as "the relaxed --check must reject this
+  refold" -- e.g. an independently edited stringified argument, which is not a
+  provably stale observer and so must not be tolerated.
+  """
+  print('RUN (expect failure):', cmd)
+  kwargs = {"shell": True, "check": False, "text": True}
+  if output_file:
+    with open(output_file, 'w') as f:
+      r = subprocess.run(cmd, stdout=f, stderr=f, **kwargs)
+  else:
+    r = subprocess.run(cmd, capture_output=True, **kwargs)
+  if r.returncode == 0:
+    print(f'\nEXPECTED FAILURE BUT COMMAND SUCCEEDED: {cmd}', file=sys.stderr)
+    if output_file:
+      print(f'Check logs in: {output_file}', file=sys.stderr)
+    sys.exit(1)
+
+
 def get_macos_sdk_flag():
   # Ask Xcode for the current macOS SDK path
   try:
@@ -130,6 +151,22 @@ def relativize_clang_flag_paths(flags, base_dir: str):
 def main():
   ap = argparse.ArgumentParser()
   ap.add_argument('--with-lines', action='store_true', required=False)
+  ap.add_argument(
+      '--relaxed', action='store_true', required=False,
+      help=('Run clang-refold WITHOUT --strict, exercising the relaxed '
+            '(default, non-strict) refold pipeline. Strict is the harness '
+            'default so soundness-trading branches would otherwise stay '
+            'regression-invisible. The re-preprocess check runs relaxed too, '
+            'so observer-only differences (e.g. a stale stringified argument '
+            'the relaxed pipeline folded) are tolerated while every other token '
+            'must still match exactly.'))
+  ap.add_argument(
+      '--expect-check-fail', action='store_true', required=False,
+      help=('Negative assertion: the refold must still succeed and match the '
+            'expected .c.mod, but the final re-preprocess check MUST reject it '
+            '(non-zero exit). Used to prove the relaxed check does not tolerate '
+            'an independently edited stringified argument (only a provably '
+            'stale one).'))
   ap.add_argument('--clang', required=True)
   ap.add_argument('--refolder', required=True)
   ap.add_argument('--headers', required=True)
@@ -233,8 +270,10 @@ def main():
 
   # 3) Run clang-refold
   line_flag = '' if args.with_lines else '--no-lines'
+  # Strict is the harness default; --relaxed opts into the non-strict pipeline.
+  strict_flag = '' if args.relaxed else '--strict'
   clang_refold_cmd = (
-      f'{shlex.quote(args.refolder)} {line_flag} --strict '
+      f'{shlex.quote(args.refolder)} {line_flag} {strict_flag} '
       f'--log-level={shlex.quote(args.log)} '
       f'--pp {shlex.quote(out_i)} '
       f'--pp-mod {shlex.quote(exp_i_mod)} '
@@ -248,16 +287,22 @@ def main():
   # 4) Compare final refolded output
   run(f'diff -u {shlex.quote(exp_mod)} {shlex.quote(out_mod)}')
 
-  # 5) Run the checker
+  # 5) Run the checker (re-preprocess the refolded source and compare to B).
+  # Pass the same strict flag as the refold step: a relaxed check tolerates
+  # observer-only differences (e.g. a stale stringified argument that the
+  # relaxed pipeline folded), while a strict check stays byte-exact.
   verify_out = os.path.join(tmp_out, f'{testname}.verify.out')
   clang_refold_checker_cmd = (
-      f'{shlex.quote(args.refolder)} {line_flag} '
+      f'{shlex.quote(args.refolder)} {line_flag} {strict_flag} '
       f'--log-level={shlex.quote(args.log)} '
       f'--check {shlex.quote(out_mod)} '
       f'--pp-mod {shlex.quote(exp_i_mod)} '
       f'--refold-map {shlex.quote(out_json)}'
   )
-  run(clang_refold_checker_cmd, verify_out)
+  if args.expect_check_fail:
+    run_expecting_failure(clang_refold_checker_cmd, verify_out)
+  else:
+    run(clang_refold_checker_cmd, verify_out)
 
 
 if __name__ == '__main__':

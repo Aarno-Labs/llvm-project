@@ -15,6 +15,8 @@
 #include "source/RefoldSourceMapper.h"
 #include "util/StringUtils.h"
 
+#include "clang/Lex/Lexer.h"
+
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
@@ -27,6 +29,85 @@
 
 using namespace llvm;
 using namespace clang::refold;
+
+namespace {
+
+/// Reproduce Clang's `#` (stringize) operator on a macro-argument spelling.
+///
+/// Per C 6.10.3.2 / [cpp.stringize], white space between the argument's
+/// preprocessing tokens collapses to a single space, leading and trailing white
+/// space is dropped, and a `\` is inserted before each `\` and `"` that is part
+/// of a string literal or character constant (including a string literal's
+/// delimiting `"`).  Every other preprocessing token keeps its original
+/// spelling, so a stray backslash is copied verbatim -- never doubled, unlike a
+/// blanket C-string escape such as `quoteCString`.  The raw lexer classifies the
+/// tokens (including prefixed and raw string literals), so the result matches
+/// Clang exactly rather than approximating.
+///
+/// Returns the full string-literal spelling with surrounding quotes, or nullopt
+/// when \p lang is unavailable (the caller then falls back to conservative
+/// behavior and fails the replay closed).
+std::optional<std::string>
+stringizeMacroArgumentLikeClang(StringRef argText,
+                                const clang::LangOptions *lang) {
+  if (!lang)
+    return std::nullopt;
+
+  const clang::SourceLocation baseLoc =
+      clang::SourceLocation::getFromRawEncoding(1);
+  std::string lexBuf = argText.str();
+  lexBuf.push_back('\0');
+  const char *bufStart = lexBuf.data();
+  const char *bufEnd = bufStart + argText.size();
+  clang::Lexer lexer(baseLoc, *lang, bufStart, bufStart, bufEnd);
+
+  std::string out = "\"";
+  bool first = true;
+  bool commentSpacePending = false;
+  clang::Token tok;
+  while (true) {
+    lexer.LexFromRawLexer(tok);
+    if (tok.is(clang::tok::eof))
+      break;
+    // A comment between tokens becomes a single inter-token space, exactly like
+    // ordinary white space, before `#` is applied.
+    if (tok.is(clang::tok::comment)) {
+      commentSpacePending = true;
+      continue;
+    }
+    if (!first && (tok.hasLeadingSpace() || commentSpacePending))
+      out.push_back(' ');
+    commentSpacePending = false;
+    first = false;
+
+    const unsigned offset =
+        tok.getLocation().getRawEncoding() - baseLoc.getRawEncoding();
+    StringRef spelling(bufStart + offset, tok.getLength());
+
+    const clang::tok::TokenKind kind = tok.getKind();
+    const bool escapeAsLiteral =
+        clang::tok::isStringLiteral(kind) ||
+        kind == clang::tok::char_constant ||
+        kind == clang::tok::wide_char_constant ||
+        kind == clang::tok::utf8_char_constant ||
+        kind == clang::tok::utf16_char_constant ||
+        kind == clang::tok::utf32_char_constant;
+    if (escapeAsLiteral) {
+      // Escape only the `\` and `"` that belong to the literal's spelling.
+      for (char c : spelling) {
+        if (c == '\\' || c == '"')
+          out.push_back('\\');
+        out.push_back(c);
+      }
+    } else {
+      out.append(spelling.begin(), spelling.end());
+    }
+  }
+  out.push_back('"');
+  return out;
+}
+
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // RefoldMacroOccurrenceReplay
@@ -355,8 +436,16 @@ bool RefoldMacroOccurrenceReplay::
           tok = tok.trim();
         }
 
-        std::string expect = stringutils::quoteCString(argTrim);
-        if (tok != expect) {
+        // Compare against Clang's exact `#` stringization of the recovered
+        // argument, not a blanket C-string escape.  `quoteCString` would double
+        // a stray backslash (e.g. `a\tb` -> `"a\\tb"`), but `#(a\tb)` yields
+        // `"a\tb"`, so the old model rejected valid stringified-argument folds
+        // whenever the edited value contained an escape sequence.
+        std::optional<std::string> expect =
+            deps_.lexLang
+                ? stringizeMacroArgumentLikeClang(argTrim, deps_.lexLang)
+                : std::optional<std::string>(stringutils::quoteCString(argTrim));
+        if (!expect || tok != *expect) {
           return false;
         }
       }

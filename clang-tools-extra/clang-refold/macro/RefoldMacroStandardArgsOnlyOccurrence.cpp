@@ -401,6 +401,14 @@ InvocationOccurrenceObservationCollector::Collect(const RefoldModel::MacroInvoca
         const diffutils::Hunk &primaryHunk) const {
   InvocationOccurrenceObservationSet result;
 
+  // Tracks whether the current `result.unifiedNewArg` was fixed by an evaluated
+  // (non-stringified) occurrence.  In relaxed mode an evaluated use is
+  // authoritative for the refolded argument, and a stringified occurrence whose
+  // spelling was not correspondingly edited is tolerated rather than forcing
+  // tuple forwarding: re-expanding the refolded invocation regenerates `#arg`
+  // from the new argument.  Strict mode still requires every occurrence to agree.
+  bool unifiedNewArgFromEvaluated = false;
+
   for (size_t i = 0; i < occurrences.size(); ++i) {
     const auto &sp = occurrences[i];
     if (sp.argIdx != argIdx)
@@ -588,10 +596,30 @@ InvocationOccurrenceObservationCollector::Collect(const RefoldModel::MacroInvoca
       result.unifiedMaterializedNewTextRange = *materializedNewTextRange;
     }
 
-    if (!result.unifiedNewArg)
+    const bool thisIsStringify =
+        i < occurrenceIsStringify.size() && occurrenceIsStringify[i] != 0;
+
+    if (!result.unifiedNewArg) {
       result.unifiedNewArg = newArg;
-    else if (*result.unifiedNewArg != newArg)
-      result.needTupleForwarding = true;
+      unifiedNewArgFromEvaluated = !thisIsStringify;
+    } else if (*result.unifiedNewArg != newArg) {
+      if (!deps_.strict && thisIsStringify && unifiedNewArgFromEvaluated) {
+        // Relaxed: an evaluated occurrence already fixed the argument; this
+        // stringified occurrence kept a stale spelling.  Tolerate it — the
+        // stringification is regenerated from the new argument on re-expansion.
+        // Strict mode falls through below and forces tuple forwarding.
+      } else if (!deps_.strict && !thisIsStringify &&
+                 !unifiedNewArgFromEvaluated) {
+        // Relaxed: an evaluated occurrence supersedes an argument previously
+        // inferred only from a stringified occurrence, regardless of order.
+        result.unifiedNewArg = newArg;
+        unifiedNewArgFromEvaluated = true;
+      } else {
+        // Strict mode, or a genuine disagreement between two authoritative
+        // (evaluated) occurrences, or between stringified-only occurrences.
+        result.needTupleForwarding = true;
+      }
+    }
   }
 
   return result;

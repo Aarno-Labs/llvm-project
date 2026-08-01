@@ -597,31 +597,60 @@ int main(int argc, char **argv) {
       aTokByteOff.push_back(aBytes.size());
   }
 
-  if (onlyCheck && NoLines) {
-    // Relax token comparison for location-sensitive predefined macros when
-    // verifying a refolding produced with --no-lines.
+  if (onlyCheck) {
     if (!checkCtx)
       REFOLD_LOG_FATAL("cli", "internal error: missing pp_ctx in --check mode");
-    auto maskOrErr = buildNoLinesIgnoreMask(rootJson, *checkCtx, bToks);
-    if (!maskOrErr) {
-      handleAllErrors(maskOrErr.takeError(), [&](const ErrorInfoBase &e) {
-        REFOLD_LOG_FATAL("check", "failed to build --no-lines ignore mask: {0}",
-                         e.message());
-      });
-    }
-    if (Error err = compareTokensNoLinesAware(aToks, bToks, *maskOrErr)) {
-      outs() << toString(std::move(err)) << "\n";
-      outs() << "FAILURE!\n";
-      return 1;
-    }
-    outs() << "SUCCESS!\n";
-    return 0;
-  }
 
-  if (onlyCheck) {
-    // Verification mode (normal comparison): compare preprocessed token streams
-    // directly. The --no-lines special-case is handled above.
-    if (Error err = compareTokens(aToks, bToks)) {
+    // Verification composes zero or more per-B-token relaxation masks and
+    // compares mask-aware; with no mask this is an exact token comparison.
+    std::vector<uint8_t> ignoreMask;
+    bool haveMask = false;
+
+    auto mergeMask = [&](std::vector<uint8_t> mask) {
+      if (!haveMask) {
+        ignoreMask = std::move(mask);
+        haveMask = true;
+      } else if (mask.size() == ignoreMask.size()) {
+        for (size_t i = 0; i < ignoreMask.size(); ++i)
+          ignoreMask[i] |= mask[i];
+      }
+    };
+
+    // Under --no-lines, relax comparison for location-sensitive predefined
+    // macros whose values legitimately differ once #line directives are pruned.
+    if (NoLines) {
+      auto maskOrErr = buildNoLinesIgnoreMask(rootJson, *checkCtx, bToks);
+      if (!maskOrErr) {
+        handleAllErrors(maskOrErr.takeError(), [&](const ErrorInfoBase &e) {
+          REFOLD_LOG_FATAL("check",
+                           "failed to build --no-lines ignore mask: {0}",
+                           e.message());
+        });
+      }
+      mergeMask(std::move(*maskOrErr));
+    }
+
+    // In relaxed (non-strict) mode, a folded argument edit may leave a
+    // stringified occurrence stale, so re-preprocessing the refolded source
+    // regenerates a different `#arg` than B carried.  Tolerate that difference
+    // only where B kept the original stringification.  Strict verification is
+    // byte-exact and skips this relaxation.
+    if (!StrictMode) {
+      auto maskOrErr =
+          buildRelaxedStringifyIgnoreMask(rootJson, *checkCtx, bToks);
+      if (!maskOrErr) {
+        handleAllErrors(maskOrErr.takeError(), [&](const ErrorInfoBase &e) {
+          REFOLD_LOG_FATAL(
+              "check", "failed to build relaxed stringify ignore mask: {0}",
+              e.message());
+        });
+      }
+      mergeMask(std::move(*maskOrErr));
+    }
+
+    Error err = haveMask ? compareTokensNoLinesAware(aToks, bToks, ignoreMask)
+                         : compareTokens(aToks, bToks);
+    if (err) {
       outs() << toString(std::move(err)) << "\n";
       outs() << "FAILURE!\n";
       return 1;

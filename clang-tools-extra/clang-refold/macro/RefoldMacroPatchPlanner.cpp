@@ -195,7 +195,7 @@ RefoldProofLattice &RefoldMacroPatchPlanner::GetProofLattice() const {
 RefoldMacroOccurrenceReplay RefoldMacroPatchPlanner::OccurrenceReplay() const {
   return RefoldMacroOccurrenceReplay({deps_.aToks, deps_.bTokOff,
                                       deps_.macroTopology, deps_.sourceMapper,
-                                      deps_.strict});
+                                      deps_.strict, deps_.lexLang});
 }
 
 RefoldMacroActualLayout RefoldMacroPatchPlanner::ActualLayout() const {

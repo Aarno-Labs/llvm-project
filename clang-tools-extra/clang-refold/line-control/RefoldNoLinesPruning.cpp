@@ -488,6 +488,42 @@ static void recoverZeroLengthNoLinesBuiltinSpans(
   }
 }
 
+/// Propagate per-A-token sensitivity to a per-B-token ignore mask.
+///
+/// Diffs the original preprocessed A tokens against the edited B tokens and
+/// marks a B index only when it is aligned to a sensitive A token by an EQUAL
+/// step -- i.e. B retained that exact original token.  A B token that was
+/// changed relative to A therefore never becomes ignorable, which is precisely
+/// the "the observer value was left stale" condition both the `--no-lines` and
+/// relaxed-stringify masks rely on.
+static std::vector<uint8_t>
+propagateSensitiveASpansToBMask(ArrayRef<PPTok> a0Toks,
+                                ArrayRef<uint8_t> a0Sensitive,
+                                ArrayRef<PPTok> bPPToks) {
+  SmallVector<StringRef, 0> aSeq;
+  SmallVector<StringRef, 0> bSeq;
+  aSeq.reserve(a0Toks.size());
+  bSeq.reserve(bPPToks.size());
+  for (const auto &t : a0Toks)
+    aSeq.push_back(StringRef(t.spelling));
+  for (const auto &t : bPPToks)
+    bSeq.push_back(StringRef(t.spelling));
+
+  std::vector<uint8_t> ignore(bPPToks.size(), 0);
+  for (const auto &st : diffutils::diff(aSeq, bSeq)) {
+    if (st.op != diffutils::Op::Equal)
+      continue;
+    const uint64_t len = st.aHi - st.aLo;
+    for (uint64_t k = 0; k < len; ++k) {
+      const uint64_t ai = st.aLo + k;
+      const uint64_t bi = st.bLo + k;
+      if (ai < a0Sensitive.size() && bi < ignore.size() && a0Sensitive[ai])
+        ignore[bi] = 1;
+    }
+  }
+  return ignore;
+}
+
 // In --check + --no-lines mode, allow token mismatches for *unmodified* tokens
 // that originate from line-directive-sensitive predefined macros such as
 // __LINE__/__FILE__/__FILE_NAME__/__BASE_FILE__.
@@ -552,29 +588,64 @@ buildNoLinesIgnoreMask(const json::Object &rootJson, const PPCtx &ctx,
   recoverZeroLengthNoLinesBuiltinSpans(rootJson, ctx, a0Toks, a0Sensitive,
                                        *sourceOrErr);
 
-  SmallVector<StringRef, 0> aSeq;
-  SmallVector<StringRef, 0> bSeq;
-  aSeq.reserve(a0Toks.size());
-  bSeq.reserve(bPPToks.size());
-  for (const auto &t : a0Toks)
-    aSeq.push_back(StringRef(t.spelling));
-  for (const auto &t : bPPToks)
-    bSeq.push_back(StringRef(t.spelling));
+  return propagateSensitiveASpansToBMask(a0Toks, a0Sensitive, bPPToks);
+}
 
-  std::vector<uint8_t> ignore(bPPToks.size(), 0);
-  auto steps = diffutils::diff(aSeq, bSeq);
-  for (const auto &st : steps) {
-    if (st.op != diffutils::Op::Equal)
-      continue;
-    const uint64_t len = st.aHi - st.aLo;
-    for (uint64_t k = 0; k < len; ++k) {
-      const uint64_t ai = st.aLo + k;
-      const uint64_t bi = st.bLo + k;
-      if (ai < a0Sensitive.size() && bi < ignore.size() && a0Sensitive[ai])
-        ignore[bi] = 1;
+Expected<std::vector<uint8_t>>
+buildRelaxedStringifyIgnoreMask(const json::Object &rootJson, const PPCtx &ctx,
+                                ArrayRef<PPTok> bPPToks) {
+  auto sourceOrErr = RefoldModel::ParseSourcePath(rootJson);
+  if (!sourceOrErr)
+    return sourceOrErr.takeError();
+
+  auto ppOrErr = preprocessToBytes(*sourceOrErr, ctx);
+  if (!ppOrErr)
+    return ppOrErr.takeError();
+  std::string a0Bytes = std::move(*ppOrErr);
+
+  std::vector<PPTok> a0Toks;
+  std::vector<std::size_t> a0Off;
+  const LangOptions lexLang = makeRefoldLexLangOptions(ctx.lang);
+  lexPPTokens(a0Bytes, a0Toks, a0Off, lexLang);
+
+  // Mark every A token produced by argument stringification (`#x`).  In relaxed
+  // mode the pipeline may fold an argument edit that leaves a stringified
+  // occurrence stale, so re-expanding the refolded source regenerates a
+  // different `#arg` than B carried.  That difference is tolerable only where B
+  // kept the original stringification, which the EQUAL-alignment propagation
+  // below enforces: an independently edited `#arg` in B is not aligned EQUAL to
+  // its original A token and therefore is never masked -- it must still match.
+  std::vector<uint8_t> a0Sensitive(a0Toks.size(), 0);
+  if (auto items = rootJson.getArray("items")) {
+    for (const auto &it : *items) {
+      const auto *obj = it.getAsObject();
+      if (!obj)
+        continue;
+      auto kind = obj->getString("kind");
+      if (!kind || *kind != "macro")
+        continue;
+      auto *spansVal = obj->get("stringify_spans");
+      if (!spansVal)
+        continue;
+      auto spansOrErr =
+          parsePPSpans(*spansVal, "relaxed-stringify.items.macro.stringify_spans");
+      if (!spansOrErr)
+        return spansOrErr.takeError();
+      for (const auto &sp : *spansOrErr) {
+        uint64_t bb = sp.begin;
+        uint64_t ee = sp.end;
+        if (ee < bb)
+          continue;
+        if (bb > a0Sensitive.size())
+          continue;
+        ee = std::min<uint64_t>(ee, a0Sensitive.size());
+        for (uint64_t i = bb; i < ee; ++i)
+          a0Sensitive[static_cast<size_t>(i)] = 1;
+      }
     }
   }
-  return ignore;
+
+  return propagateSensitiveASpansToBMask(a0Toks, a0Sensitive, bPPToks);
 }
 
 Error compareTokensNoLinesAware(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,

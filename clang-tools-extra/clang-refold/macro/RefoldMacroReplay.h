@@ -51,6 +51,10 @@ public:
     const RefoldMacroTopology *macroTopology = nullptr;
     const RefoldSourceMapper *sourceMapper = nullptr;
     bool strict = false;
+    /// Lexer options used to reproduce Clang's `#` (stringize) semantics when
+    /// validating stringified-argument replays.  May be null in unit contexts;
+    /// callers that need faithful stringization must provide it.
+    const clang::LangOptions *lexLang = nullptr;
   };
 
   explicit RefoldMacroOccurrenceReplay(Dependencies deps);

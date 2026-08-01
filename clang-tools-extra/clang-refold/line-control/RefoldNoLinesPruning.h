@@ -61,6 +61,23 @@ llvm::Expected<std::vector<uint8_t>>
 buildNoLinesIgnoreMask(const llvm::json::Object &rootJson, const PPCtx &ctx,
                        llvm::ArrayRef<PPTok> bPPToks);
 
+/// Build the per-B-token ignore mask that relaxes token comparison for
+/// stringified-argument observers under a relaxed (non-`--strict`) `--check`.
+///
+/// The mask marks every B-token that came from argument stringification (`#x`)
+/// *and* that B left equal to its original spelling.  In relaxed mode the refold
+/// pipeline may fold an argument edit while leaving a stringified occurrence
+/// stale, so re-expanding the refolded source regenerates a different `#arg`
+/// than B carried; that difference is tolerated only at these stale positions.
+/// A stringified occurrence that B independently edited is not aligned EQUAL to
+/// its original A token, so it is never masked and must still match exactly.
+/// Returns an `Error` when recheck preprocessing fails or the producer metadata
+/// is internally inconsistent.
+llvm::Expected<std::vector<uint8_t>>
+buildRelaxedStringifyIgnoreMask(const llvm::json::Object &rootJson,
+                                const PPCtx &ctx,
+                                llvm::ArrayRef<PPTok> bPPToks);
+
 /// Compare two preprocessed-token streams while honoring an ignore mask.
 ///
 /// Used by `--check --no-lines` mode.  Token-position mismatches whose B-side
