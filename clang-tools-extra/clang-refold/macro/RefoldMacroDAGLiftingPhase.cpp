@@ -44,7 +44,6 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FormatVariadic.h"
-#include "llvm/Support/MemoryBuffer.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -109,7 +108,6 @@ std::optional<MacroPatch> RefoldMacroDAGLiftingPhase::Run(
   StringRef invSpanText = discoveryResult.invSpanText;
   ArrayRef<std::pair<size_t, size_t>> invArgRanges =
       discoveryResult.invArgRanges;
-  const size_t numArgs = invArgRanges.size();
   const auto &invById = discoveryResult.invById;
   const MacroSubtreeReplayValidationContext subtreeValidationCtx{
       m, invSpanText, invArgRanges, invById};
@@ -731,120 +729,6 @@ std::optional<MacroPatch> RefoldMacroDAGLiftingPhase::Run(
     bool deferLeafPasteValidation = false;
     if (!leaf.pasteSpans.empty())
       deferLeafPasteValidation = allTouchedPasteArgsFromObservedLeafSeed;
-
-    // --- Special-case: chained call suffix arguments --------------------
-    //
-    // If the root invocation expands to an identifier that is immediately
-    // called (e.g. PICK1()(10)), the callee's arguments are spelled in the
-    // source as a chained call suffix following the root invocation. In
-    // this situation, the leaf edit cannot be lifted to the root via
-    // argDeps because the root has no formal parameters. Preserve the call
-    // chain by patching the chained suffix argument ranges directly in the
-    // invocation file text.
-    if (numArgs == 0 && leaf.callerMacroId && *leaf.callerMacroId == m.id &&
-        m.invFile && leaf.invFile && *leaf.invFile == *m.invFile) {
-      const std::string absPath = deps_.lineDirs.ToAbsolutePath(*m.invFile);
-      auto bufOrErr = llvm::MemoryBuffer::getFile(absPath);
-      if (bufOrErr) {
-        StringRef fileText = bufOrErr.get()->getBuffer();
-
-        // Compute the chained call end in the same way as the application
-        // Consume any trailing "(...)" groups after the root
-        // invocation.
-        const uint64_t chainEnd =
-            stringutils::extendChainedCallEnd(fileText, invEnd, "((x)+1)");
-        if (chainEnd > invEnd && chainEnd <= (uint64_t)fileText.size()) {
-          // Apply call-chain local edits right-to-left so the byte ranges
-          // remain relative to the original invocation spelling.
-          struct LocalEdit {
-            uint64_t begin; // relative to invStart
-            uint64_t end;   // relative to invStart
-            std::string repl;
-          };
-
-          SmallVector<LocalEdit, 4> localEdits;
-          bool ok = true;
-
-          for (auto &kv : leafEdits) {
-            const uint32_t argIdx = kv.first;
-            if (argIdx >= leaf.invArgRanges.size()) {
-              ok = false;
-              break;
-            }
-
-            const auto &rng = leaf.invArgRanges[argIdx];
-            if (!rng.first || !rng.second) {
-              ok = false;
-              break;
-            }
-
-            const uint64_t bAbs = *rng.first;
-            const uint64_t eAbs = *rng.second;
-            if (bAbs > eAbs || eAbs > (uint64_t)fileText.size() ||
-                bAbs < invStart || eAbs > chainEnd) {
-              ok = false;
-              break;
-            }
-
-            // Ensure the "old" text actually matches the invocation file at
-            // the recorded byte range, so we don't patch unrelated text.
-            StringRef oldInFile =
-                fileText.slice((size_t)bAbs, (size_t)eAbs).trim();
-            if (oldInFile != StringRef(kv.second.oldText).trim()) {
-              ok = false;
-              break;
-            }
-
-            localEdits.push_back(LocalEdit{
-                bAbs - invStart,
-                eAbs - invStart,
-                StringRef(kv.second.newText).trim().str(),
-            });
-          }
-
-          if (ok && !localEdits.empty()) {
-            llvm::sort(localEdits, [](const LocalEdit &a, const LocalEdit &b) {
-              return a.begin < b.begin;
-            });
-
-            uint64_t curB = 0;
-            for (const auto &e : localEdits) {
-              if (e.begin < curB || e.end < e.begin) {
-                ok = false;
-                break;
-              }
-              curB = e.end;
-            }
-          }
-
-          if (ok && !localEdits.empty()) {
-            std::string replText =
-                fileText.slice((size_t)invStart, (size_t)chainEnd).str();
-
-            // Apply edits back-to-front to keep byte indices stable.
-            for (auto it = localEdits.rbegin(); it != localEdits.rend(); ++it) {
-              replText.replace((size_t)it->begin, (size_t)(it->end - it->begin),
-                               it->repl);
-            }
-
-            MacroPatch candPatch{invStart, chainEnd, replText, m.id};
-            deps_.proofLattice.SetMacroPatchProof(
-                candPatch, deps_.proofLattice.MakeMacroPatchProof(
-                               MacroPatchProofKind::CallChainSuffix,
-                               /*preservesInvocationStructure=*/true, m.id));
-
-            auto acceptCert =
-                candidateValidator_.AcceptOrMergeDAGCandidatePatch(
-                    liftingCtx, dagCandidateAcceptanceCtx, std::move(candPatch),
-                    fileText.slice((size_t)invStart, (size_t)chainEnd),
-                    "DAG chained-call suffix patch");
-            if (!acceptCert.accepted)
-              return std::nullopt;
-            continue;
-          }
-        }
-      }
-    }
 
     // --- Build one explicit subtree certificate --------------------------
     //
