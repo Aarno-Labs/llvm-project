@@ -36,9 +36,6 @@ bool tuAnchorWitnessHasProvableEvidence(const TUAnchorWitness &witness) {
     return witness.hasLeftNeighbor && witness.hasRightNeighbor;
   case TUAnchorEvidenceKind::ZeroTokenIncludeBoundary:
     return witness.slotId != 0 && !witness.slotKind.empty();
-  case TUAnchorEvidenceKind::CorroboratedRightNeighbor:
-  case TUAnchorEvidenceKind::CorroboratedLeftNeighbor:
-    return witness.hasLeftNeighbor && witness.hasRightNeighbor;
   case TUAnchorEvidenceKind::Unknown:
   case TUAnchorEvidenceKind::ExactSlotBoundary:
     return false;
@@ -146,12 +143,6 @@ validateTUAnchorProof(AcceptedPathKind currentPath,
                               TUAnchorEvidenceKind::IncludeDirectiveBoundary,
                       ProofObligationKind::TUOutsideIncludeCoverageTracked,
                       ProofFailureReason::MissingTUOutsideIncludeCoverageProof);
-    if (witness->evidence == TUAnchorEvidenceKind::CorroboratedRightNeighbor ||
-        witness->evidence == TUAnchorEvidenceKind::CorroboratedLeftNeighbor) {
-      discharge.Require(witness->ownerDepthStable,
-                        ProofObligationKind::TUOwnerDepthStableTracked,
-                        ProofFailureReason::MissingTUOwnerDepthStability);
-    }
     break;
   }
 
@@ -447,9 +438,7 @@ AcceptedResultCandidate RefoldTUAnchorProof::BuildAcceptedTUAnchorCandidate(
         witness.evidence == TUAnchorEvidenceKind::ZeroTokenIncludeBoundary ||
         witness.evidence == TUAnchorEvidenceKind::IncludeDirectiveBoundary;
     candidate.zeroTokenFromDirectiveLayoutGap =
-        witness.evidence == TUAnchorEvidenceKind::ExactSlotBoundary ||
-        witness.evidence == TUAnchorEvidenceKind::CorroboratedLeftNeighbor ||
-        witness.evidence == TUAnchorEvidenceKind::CorroboratedRightNeighbor;
+        witness.evidence == TUAnchorEvidenceKind::ExactSlotBoundary;
     candidate.zeroTokenBoundarySignature =
         llvm::formatv("tu-anchor:evidence={0}:slot={1}:{2}:pp_gap={3}:"
                       "byte={4}:left={5}:{6}:right={7}:{8}:outside_include={9}:"

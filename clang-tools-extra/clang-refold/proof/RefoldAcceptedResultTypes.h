@@ -770,9 +770,7 @@ struct TheoremDomainContract {
   REFOLD_X(ImmediateRightNeighbor)                                             \
   REFOLD_X(ImmediateLeftNeighbor)                                              \
   REFOLD_X(IncludeDirectiveBoundary)                                           \
-  REFOLD_X(ZeroTokenIncludeBoundary)                                           \
-  REFOLD_X(CorroboratedRightNeighbor)                                          \
-  REFOLD_X(CorroboratedLeftNeighbor)
+  REFOLD_X(ZeroTokenIncludeBoundary)
 
 enum class TUAnchorEvidenceKind : uint8_t {
 #define REFOLD_X(name) name,

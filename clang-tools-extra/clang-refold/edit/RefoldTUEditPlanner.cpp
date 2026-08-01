@@ -833,113 +833,13 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
     }
   }
 
-  // In strict mode we stop here: without an exact structural anchor, an exact
-  // arg-like anchor, or an immediate TU neighbor, the gap is not provably TU.
-  if (deps_.strict)
-    return std::nullopt;
-
-  static constexpr uint64_t maX_SNAP_DISTANCE = 64;
-  const bool haveOwnerGaps =
-      (deps_.ownerDepthGap.size() == deps_.model.GetTokensCountA() + 1);
-  const uint32_t wantOwner = (haveOwnerGaps && pp < deps_.ownerDepthGap.size())
-                                 ? deps_.ownerDepthGap[pp]
-                                 : 0;
-
-  const RefoldModel::TokMapEntry *left = nullptr;
-  uint64_t dLeft = std::numeric_limits<uint64_t>::max();
-
-  // Non-strict fallback: walk leftward through nearby unmapped whitespace, but
-  // stop as soon as the owner-depth context changes. This prevents the probe
-  // from drifting across a structural ownership seam.
-  for (uint64_t d = 2; d <= maX_SNAP_DISTANCE; ++d) {
-    if (pp < d)
-      break;
-    if (haveOwnerGaps) {
-      const uint64_t gap = pp - (d - 1);
-      if (gap < deps_.ownerDepthGap.size() &&
-          deps_.ownerDepthGap[gap] != wantOwner)
-        break;
-    }
-    auto it = tokmapByPP.find(pp - d);
-    if (it != tokmapByPP.end()) {
-      left = &it->second;
-      dLeft = d;
-      break;
-    }
-  }
-
-  const RefoldModel::TokMapEntry *right = nullptr;
-  uint64_t dRight = std::numeric_limits<uint64_t>::max();
-  const uint64_t maxPP = deps_.model.GetTokensCountA();
-
-  // Mirror the same bounded whitespace probe to the right, with the same
-  // owner-depth guard.
-  for (uint64_t d = 1; d <= maX_SNAP_DISTANCE; ++d) {
-    uint64_t ppR = pp + d;
-    if (ppR >= maxPP)
-      break;
-    if (haveOwnerGaps && ppR < deps_.ownerDepthGap.size() &&
-        deps_.ownerDepthGap[ppR] != wantOwner)
-      break;
-    auto it = tokmapByPP.find(ppR);
-    if (it != tokmapByPP.end()) {
-      right = &it->second;
-      dRight = d;
-      break;
-    }
-  }
-
-  // Accept the non-strict probe only when both corroborating neighbors exist
-  // and both resolve to the TU. A one-sided or mixed-file result is not strong
-  // enough to prove TU ownership.
-  if (!left || !right)
-    return std::nullopt;
-  if (!deps_.pathIdentity.PathsEqual(tuPath, left->file) ||
-      !deps_.pathIdentity.PathsEqual(tuPath, right->file))
-    return std::nullopt;
-
-  // Use the nearer corroborating TU boundary as the concrete zero-width anchor,
-  // preferring the right side on an equal-distance tie.
-  if (dRight <= dLeft) {
-    TUAnchorWitness corroboratedRightWitness;
-    corroboratedRightWitness.evidence =
-        TUAnchorEvidenceKind::CorroboratedRightNeighbor;
-    corroboratedRightWitness.hasPPGap = true;
-    corroboratedRightWitness.ppGap = pp;
-    corroboratedRightWitness.hasTUByte = true;
-    corroboratedRightWitness.tuByte = right->b;
-    corroboratedRightWitness.hasLeftNeighbor = true;
-    corroboratedRightWitness.leftNeighborPP = pp - dLeft;
-    corroboratedRightWitness.hasRightNeighbor = true;
-    corroboratedRightWitness.rightNeighborPP = pp + dRight;
-    corroboratedRightWitness.outsideIncludeCoverage = true;
-    corroboratedRightWitness.ownerDepthStable = true;
-    if (witness)
-      *witness = corroboratedRightWitness;
-    recordAcceptedAnchorCandidate(AcceptedPathKind::TUProvableInsertionAnchor,
-                                  corroboratedRightWitness);
-    return TUInsertionAnchor(pp, right->b, corroboratedRightWitness);
-  }
-
-  TUAnchorWitness corroboratedLeftWitness;
-  corroboratedLeftWitness.evidence =
-      TUAnchorEvidenceKind::CorroboratedLeftNeighbor;
-  corroboratedLeftWitness.hasPPGap = true;
-  corroboratedLeftWitness.ppGap = pp;
-  corroboratedLeftWitness.hasTUByte = true;
-  corroboratedLeftWitness.tuByte = left->e;
-  corroboratedLeftWitness.hasLeftNeighbor = true;
-  corroboratedLeftWitness.leftNeighborPP = pp - dLeft;
-  corroboratedLeftWitness.hasRightNeighbor = true;
-  corroboratedLeftWitness.rightNeighborPP = pp + dRight;
-  corroboratedLeftWitness.outsideIncludeCoverage = true;
-  corroboratedLeftWitness.ownerDepthStable = true;
-
-  if (witness)
-    *witness = corroboratedLeftWitness;
-  recordAcceptedAnchorCandidate(AcceptedPathKind::TUProvableInsertionAnchor,
-                                corroboratedLeftWitness);
-  return TUInsertionAnchor(pp, left->e, corroboratedLeftWitness);
+  // Fail closed: without an exact structural anchor, an exact arg-like anchor,
+  // or an immediate mapped TU neighbor, the gap is not provably TU-owned.
+  // Proximity to a nearby mapped TU token across intervening unmapped positions
+  // is corroboration, not provenance -- a nearest-neighbor guess the prime
+  // directive forbids -- so we do not invent a zero-width anchor here. The
+  // caller falls back to a sound realization instead.
+  return std::nullopt;
 }
 
 std::optional<TUByteSpanPlan>
