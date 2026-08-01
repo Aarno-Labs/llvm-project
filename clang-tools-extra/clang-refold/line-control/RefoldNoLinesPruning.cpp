@@ -269,9 +269,14 @@ tokenMatchesNoLinesBuiltinEvent(const PPTok &tok,
   if (name == "__LINE__") {
     if (tok.kind != "numeric_constant")
       return false;
-    if (event.allowedSpellings.empty())
-      return std::all_of(tok.spelling.begin(), tok.spelling.end(),
-                         [](char c) { return c >= '0' && c <= '9'; });
+    // Fail closed when the allowed-spelling set is empty: it means the exact
+    // physical __LINE__ value could not be computed (e.g. the invocation source
+    // was unreadable or its offset was unrecoverable). Without the proven value
+    // this token cannot be certified as a __LINE__ expansion. Matching any
+    // all-digit token here would mark it builtin-sensitive and thereby ignore —
+    // silently absorbing — a genuine numeric-literal edit at this position.
+    // Requiring an exact proven spelling keeps recovery sound; the worst case is
+    // a conservative spurious diff, never a dropped edit.
     return event.allowedSpellings.count(tok.spelling) != 0;
   }
 
