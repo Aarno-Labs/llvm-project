@@ -290,62 +290,49 @@ RefoldMacroWholeCoverOrchestrator::ComputeWholeCoverPlan(
   if (plan.bTokEnd <= plan.bTokStart)
     return std::nullopt;
 
-  // If the mapped B envelope starts one token too far to the right, pull it
-  // left when the immediately preceding B token matches the first A cover
-  // token. This repairs boundary-placement drift without choosing by lexical
-  // neighbor preference: the token must exactly be the cover boundary token.
-  if (plan.covLoA < planner_->Deps().aToks.size() &&
-      plan.bTokStart < planner_->Deps().bToks.size()) {
-    StringRef want =
-        planner_->Deps().aToks[static_cast<size_t>(plan.covLoA)].spelling;
-    if (!want.empty()) {
-      if (planner_->Deps().bToks[plan.bTokStart].spelling != want &&
-          plan.bTokStart > 0 &&
-          planner_->Deps().bToks[plan.bTokStart - 1].spelling == want) {
-        plan.bTokStart--;
-        plan.adjustedLeft = true;
-      }
-    }
-  }
+  // The raw envelope from MapATokRangeToBTokenEnvelopeByTokenDiff is the
+  // certified whole-cover image: the token-level diff is atomic and already
+  // anchors a genuine boundary insertion exactly at the cover's start/end
+  // token, and downstream claim-clipping removes any B-only payload that a
+  // stronger/narrower candidate owns.  We deliberately do NOT nudge the seam by
+  // spelling equality with a neighboring B token: a repeated spelling is not
+  // provenance (a whole-cover expansion such as `"[" #x "]"` legitimately
+  // repeats the argument spelling), so a spelling-based ±1 shift can split the
+  // envelope at an uncertified token match and drop a real cover token.  The
+  // seam therefore stays exactly where the certified projection placed it.
+  plan.adjustedLeft = false;
+  plan.adjustedRight = false;
 
-  // Symmetrically, if the mapped B envelope includes one token too far to the
-  // right, contract it when the previous B token matches the last A cover
-  // token. This keeps the replacement envelope aligned with the macro-owned
-  // cover.
-  if (plan.covHiA > 0 && (plan.covHiA - 1) < planner_->Deps().aToks.size() &&
-      plan.bTokEnd > 0 && (plan.bTokEnd - 1) < planner_->Deps().bToks.size()) {
-    StringRef want =
-        planner_->Deps().aToks[static_cast<size_t>(plan.covHiA - 1)].spelling;
-    if (!want.empty()) {
-      // Do not contract a whole-cover replacement across a trailing B comment.
-      // Comments are source trivia, not macro-body delimiter tokens; clipping
-      // one out here splits an otherwise line-local insertion and forces a
-      // spurious #line resynchronization before the comment text.
-      const bool rightIsComment =
-          planner_->Deps().bToks[plan.bTokEnd - 1].kind == "comment";
-      if (!rightIsComment &&
-          planner_->Deps().bToks[plan.bTokEnd - 1].spelling != want &&
-          plan.bTokEnd >= 2 &&
-          planner_->Deps().bToks[plan.bTokEnd - 2].spelling == want) {
-        plan.bTokEnd--;
-        plan.adjustedRight = true;
-      }
-    }
-  }
-
-  if (plan.bTokEnd <= plan.bTokStart)
+  // Claim-clip the whole-cover B envelope: any boundary insertion already
+  // claimed by a stronger/narrower candidate is dropped so it is not emitted
+  // twice.  The surviving B tokens must form exactly one contiguous run; fail
+  // closed (offer no whole-cover candidate) otherwise, because:
+  //   * more than one kept segment means a claimed edit was removed from the
+  //     *interior* of the envelope, so the emitted source would splice the two
+  //     surviving sides directly together -- an unproven join that can paste
+  //     adjacent tokens and represents a foreign edit conflicting inside this
+  //     macro's realized expansion; and
+  //   * zero kept segments means the whole envelope was claimed away, leaving
+  //     nothing for this cover to materialize.
+  // Whole-cover has no proof that either shape reproduces the cover's B tokens,
+  // so a weaker sound path (or the conservative fallback) must handle the
+  // region.  This is a self-contained soundness gate: it does not rely on the
+  // downstream global certifier to reject an unsound splice after the fact.
+  llvm::SmallVector<std::pair<size_t, size_t>, 4> keptSegments =
+      planner_->Deps().bInsertionLedger->ClipBTokenRangeAgainstClaims(
+          plan.bTokStart, plan.bTokEnd);
+  if (keptSegments.size() != 1)
     return std::nullopt;
 
-  // Clip away B text that is already claimed by stronger/narrower accepted
-  // material before using the whole-cover text. The raw vs. clipped comparison
-  // records whether this candidate had to yield to existing claims.
-  std::string unclipped = (*planner_->Deps().sourceMapper)
-                              .SliceBSource(plan.bTokStart, plan.bTokEnd)
-                              .str();
-  std::string clipped =
-      planner_->Deps().bInsertionLedger->SliceBSourceClippedAgainstClaims(
-          plan.bTokStart, plan.bTokEnd);
-  plan.claimsClipped = (unclipped != clipped);
+  // The single kept segment is the sound whole-cover B image.  It equals the
+  // raw envelope exactly when nothing was claimed away; a narrower segment means
+  // this candidate yielded a boundary insertion to an existing claim.
+  const std::pair<size_t, size_t> &keptSegment = keptSegments.front();
+  plan.claimsClipped = (keptSegment.first != plan.bTokStart ||
+                        keptSegment.second != plan.bTokEnd);
+  std::string clipped = (*planner_->Deps().sourceMapper)
+                            .SliceBSource(keptSegment.first, keptSegment.second)
+                            .str();
   plan.clippedText = StringRef(clipped).trim().str();
 
   return plan;
