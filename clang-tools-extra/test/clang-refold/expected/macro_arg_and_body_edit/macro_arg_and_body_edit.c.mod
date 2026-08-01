@@ -1,7 +1,7 @@
 // RUN: %clang-refold-tester macro_arg_and_body_edit
 // RUN: %clang-refold-tester macro_arg_and_body_edit XXX
 #include "a.h"
-#pragma once
+
 
 #ifdef XXX
 int first(int x);

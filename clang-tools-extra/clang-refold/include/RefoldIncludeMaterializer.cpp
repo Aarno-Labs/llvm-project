@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "include/RefoldIncludeMaterializer.h"
+#include "include/RefoldPragmaOnceGuardRewriter.h"
 
 #include "core/RefoldLog.h"
 #include "edit/RefoldSourceEnvelopeTiling.h"
@@ -426,7 +427,8 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
     DenseMap<uint64_t, AcceptedResultCandidate>
         &includeExpansionAcceptedResults,
     DenseSet<uint64_t> *appliedExpandedMacroRootIds,
-    bool materializeIncludeNextInThisSubtree) const {
+    bool materializeIncludeNextInThisSubtree,
+    std::optional<uint64_t> ancestorArmIdAtIncludeSite) const {
   // Include materialization is memoized by include id. A parent may reach the
   // same child through recursive expansion, so avoid rebuilding already
   // materialized text.
@@ -477,7 +479,29 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
                                                        headerLoadPath)) {
     (void)TryRecordInlineIncludeRealizationFromB(
         *inc, *realizationReason, includeExpansion,
-        includeExpansionStartLineNos, includeExpansionAcceptedResults);
+        includeExpansionStartLineNos, includeExpansionAcceptedResults,
+        ancestorArmIdAtIncludeSite);
+    return;
+  }
+
+  // `#pragma once` is inert once this header's text lands in the TU, so its
+  // state is re-expressed as macro state before any other header-local edit is
+  // staged.  The rewriter owns the whole decision, including whether a guard is
+  // needed at all.  A rejection means source-level once-state could not be
+  // preserved, so fall back to realizing this include from B, which carries its
+  // own guard proof and fails closed independently.
+  if (PragmaOnceGuardEditResult guardResult =
+          pragmaOnceGuards_.StageMaterializedBodyGuardEdits(
+              *inc, headerPath, bytes, ancestorArmIdAtIncludeSite, edits);
+      !guardResult.proven) {
+    REFOLD_LOG_TRACE("pragma/once/guard",
+                     "source materialization inc#{0} rejected: {1} ({2})",
+                     includeId, toString(guardResult.rejection),
+                     guardResult.detail);
+    (void)TryRecordInlineIncludeRealizationFromB(
+        *inc, guardResult.detail, includeExpansion,
+        includeExpansionStartLineNos, includeExpansionAcceptedResults,
+        ancestorArmIdAtIncludeSite);
     return;
   }
 
@@ -754,8 +778,25 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
   // 3) Materialize child includes only when their subtree has work. For each
   // dirty child, recursively build the child's fully materialized text and then
   // replace the child's include directive in this header.
+  // Site ranges handled by the child loop below.  A skipped include edge carries
+  // no parent, so it never appears in `children`; the post-pass after this loop
+  // finds those by physical site instead and must not re-handle a site the loop
+  // already claimed.
+  SmallVector<std::pair<uint64_t, uint64_t>, 8> claimedChildSites;
+
+  // Physical headers whose bodies are inlined with a synthetic guard.  A child
+  // whose closure reaches one of these cannot survive as a directive.
+  const std::vector<std::string> guardedHeaderPaths =
+      pragmaOnceGuards_.ActiveGuardedHeaderPaths();
+
   if (auto it = children.find(includeId); it != children.end()) {
     for (const auto *child : it->second) {
+      {
+        const uint64_t claimStart =
+            std::clamp<uint64_t>(child->siteB, 0ULL, bytes.size());
+        claimedChildSites.emplace_back(
+            claimStart, extendIncludeDirectiveEnd(*child, bytes, claimStart));
+      }
       bool todo = subtreeWork.HasDescendantWork(child->id);
 
       // Forced include-next materialization is subtree-wide, not
@@ -769,6 +810,24 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
       if (materializeIncludeNextInThisSubtree &&
           subtreeWork.SubtreeContainsIncludeNext(child->id))
         todo = true;
+
+      // A child that would survive as a directive but whose closure re-enters an
+      // inlined once-header must be materialized instead.  The re-entry happens
+      // inside an unmodified header, where no TU-space guard can reach it, so
+      // preserving the directive would emit the guarded body a second time.
+      // Materializing turns that nested directive into a surviving include
+      // inside materialized text, which the ordinary wrapper does guard.
+      if (!todo) {
+        std::string reenteredPath;
+        if (pragmaOnceGuards_.IncludeClosureReentersHeader(
+                *child, guardedHeaderPaths, &reenteredPath)) {
+          REFOLD_LOG_TRACE("pragma/once/guard",
+                           "materializing child inc#{0} in inc#{1}: closure "
+                           "re-enters inlined once-header '{2}'",
+                           child->id, includeId, reenteredPath);
+          todo = true;
+        }
+      }
 
       IncludeReplayProofContext::CleanChildIncludeReplayPlan replayPlan;
       if (!todo) {
@@ -821,6 +880,46 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
         if (replayPlan.action !=
             IncludeReplayProofContext::CleanChildIncludeReplayAction::
                 Materialize) {
+          // This child survives as a real include directive inside the
+          // materialized parent.  If it opens a header whose body was inlined
+          // elsewhere, the directive must be guarded so it does not re-enter the
+          // header that the inlined copy already emitted.
+          const size_t ownerSize = bytes.size();
+          const uint64_t childSiteStart =
+              std::clamp<uint64_t>(child->siteB, 0ULL, ownerSize);
+          const uint64_t childSiteEnd =
+              extendIncludeDirectiveEnd(*child, bytes, childSiteStart);
+          if (childSiteStart < childSiteEnd) {
+            if (PragmaOnceGuardEditResult guardResult =
+                    pragmaOnceGuards_.StageSurvivingIncludeGuardEdit(
+                        *child, headerPath, includeId, bytes, childSiteStart,
+                        childSiteEnd,
+                        ComputeAncestorArmForChildInclude(
+                            *child, includeId, ancestorArmIdAtIncludeSite),
+                        edits);
+                !guardResult.proven) {
+              // Leaving an empty expansion here would silently delete the
+              // *parent's* whole body while the caller consumed it as a
+              // legitimate "materialized to nothing".  A child-guard rejection
+              // is a proof failure for the emitted TU, so it must be terminal.
+              REFOLD_LOG_TRACE(
+                  "pragma/once/guard",
+                  "nested surviving include inc#{0} in inc#{1} rejected: "
+                  "{2} ({3})",
+                  child->id, includeId, toString(guardResult.rejection),
+                  guardResult.detail);
+              terminalSink_.RequestTerminalFallback(
+                  MakeTerminalFallbackProofFailure(
+                      TerminalFallbackObligationKind::
+                          IncludeGuardStateStabilizable,
+                      TerminalFallbackFailureReason::
+                          IncludeGuardStateNotStabilizable),
+                  "pragma/once/guard", guardResult.detail);
+              includeExpansion[includeId] = std::string();
+              return;
+            }
+          }
+
           // No descendant edits depend on this child.  Either the original
           // directive was lookup-stable and can stay as-is, or we staged a
           // local operand rewrite above.
@@ -839,7 +938,9 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
           includeExpansion, includeExpansionLineControlPruneCandidates,
           includeExpansionLineControlSourceMappings,
           includeExpansionStartLineNos, includeExpansionAcceptedResults,
-          appliedExpandedMacroRootIds, forceIncludeNextMaterialization);
+          appliedExpandedMacroRootIds, forceIncludeNextMaterialization,
+          ComputeAncestorArmForChildInclude(*child, includeId,
+                                            ancestorArmIdAtIncludeSite));
 
       const auto &childText = includeExpansion[child->id];
       const size_t n = bytes.size();
@@ -946,6 +1047,78 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
     }
   }
 
+  // 3b) Guard skipped include edges sited in this header.
+  //
+  // An include suppressed by `#pragma once` or by a header guard is never
+  // entered, so the producer records no parent for it and it is invisible to the
+  // child index above.  Those directives nevertheless survive verbatim in the
+  // materialized text, and if their physical header was inlined at another
+  // occurrence they would re-enter a body that is already in the output.  They
+  // are therefore located by physical site rather than by include topology.
+  {
+    SmallVector<const RefoldModel::IncludeItem *, 4> skippedSiblings;
+    for (const RefoldModel::IncludeItem &candidate : model_.GetIncludes()) {
+      if (!paths_.PathsEqual(candidate.sitePath, headerPath))
+        continue;
+      const uint64_t siteStart =
+          std::clamp<uint64_t>(candidate.siteB, 0ULL, bytes.size());
+      const uint64_t siteEnd =
+          extendIncludeDirectiveEnd(candidate, bytes, siteStart);
+      if (siteStart >= siteEnd)
+        continue;
+      const bool claimed = llvm::any_of(
+          claimedChildSites, [&](const std::pair<uint64_t, uint64_t> &claim) {
+            return claim.first == siteStart && claim.second == siteEnd;
+          });
+      if (claimed)
+        continue;
+      if (!pragmaOnceGuards_.FindGuardForInclude(candidate))
+        continue;
+      skippedSiblings.push_back(&candidate);
+    }
+
+    // Repeated instances of one parent header produce several records for the
+    // same physical site.  They describe identical bytes, so one wrapper per
+    // distinct site is both necessary and sufficient.
+    llvm::sort(skippedSiblings, [](const RefoldModel::IncludeItem *lhs,
+                                   const RefoldModel::IncludeItem *rhs) {
+      return std::tie(lhs->siteB, lhs->id) < std::tie(rhs->siteB, rhs->id);
+    });
+    std::optional<uint64_t> lastStagedSiteB;
+    for (const RefoldModel::IncludeItem *sibling : skippedSiblings) {
+      if (lastStagedSiteB && *lastStagedSiteB == sibling->siteB)
+        continue;
+      const uint64_t siteStart =
+          std::clamp<uint64_t>(sibling->siteB, 0ULL, bytes.size());
+      const uint64_t siteEnd =
+          extendIncludeDirectiveEnd(*sibling, bytes, siteStart);
+      if (PragmaOnceGuardEditResult guardResult =
+              pragmaOnceGuards_.StageSurvivingIncludeGuardEdit(
+                  *sibling, headerPath, includeId, bytes, siteStart, siteEnd,
+                  ComputeAncestorArmForChildInclude(*sibling, includeId,
+                                                    ancestorArmIdAtIncludeSite),
+                  edits);
+          !guardResult.proven) {
+        // As above: an empty expansion would drop this header's whole body
+        // rather than fail, so the rejection is propagated as terminal.
+        REFOLD_LOG_TRACE("pragma/once/guard",
+                         "skipped nested include inc#{0} in inc#{1} rejected: "
+                         "{2} ({3})",
+                         sibling->id, includeId,
+                         toString(guardResult.rejection), guardResult.detail);
+        terminalSink_.RequestTerminalFallback(
+            MakeTerminalFallbackProofFailure(
+                TerminalFallbackObligationKind::IncludeGuardStateStabilizable,
+                TerminalFallbackFailureReason::
+                    IncludeGuardStateNotStabilizable),
+            "pragma/once/guard", guardResult.detail);
+        includeExpansion[includeId] = std::string();
+        return;
+      }
+      lastStagedSiteB = sibling->siteB;
+    }
+  }
+
   const size_t firstEmittedHeaderLine =
       computeFirstEmittedHeaderLine(bytes, edits);
 
@@ -977,6 +1150,61 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
       proofLattice_.AcceptedCandidateBuilder()
           .BuildAcceptedIncludeRealizationCandidate(
               AcceptedPathKind::IncludeMaterializedExpansion, *inc);
+}
+
+void RefoldIncludeMaterializer::CollectEnteredIncludeSubtree(
+    uint64_t includeId, SmallVectorImpl<uint64_t> &subtree) const {
+  // Only entered edges contribute content, and only an entered edge carries a
+  // producer parent link, so walking parents is both exact and complete here.
+  subtree.clear();
+  DenseSet<uint64_t> visited;
+  SmallVector<uint64_t, 16> worklist{includeId};
+  while (!worklist.empty()) {
+    const uint64_t current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    subtree.push_back(current);
+    for (const RefoldModel::IncludeItem &candidate : model_.GetIncludes())
+      if (candidate.parent && *candidate.parent == current)
+        worklist.push_back(candidate.id);
+  }
+  llvm::sort(subtree);
+}
+
+std::optional<uint64_t>
+RefoldIncludeMaterializer::ComputeAncestorArmForChildInclude(
+    const RefoldModel::IncludeItem &child,
+    std::optional<uint64_t> ownerIncludeId,
+    std::optional<uint64_t> ancestorArmIdAtIncludeSite) const {
+  // An ancestor arm already constrains everything below it: if the parent header
+  // was itself reached from inside a conditional, nothing in its subtree is
+  // unconditional, whatever the child's local nesting looks like.
+  if (ancestorArmIdAtIncludeSite)
+    return ancestorArmIdAtIncludeSite;
+
+  // Conditional groups are scoped to a concrete include instance, so the owner
+  // must match exactly: two instances of one header carry separate groups over
+  // the same byte ranges.
+  std::optional<uint64_t> innermost;
+  uint64_t innermostBodySize = 0;
+  for (const RefoldModel::CondGroup &group : model_.GetConds()) {
+    if (!paths_.PathsEqual(group.file, child.sitePath))
+      continue;
+    // A translation-unit-owned group has no parent include, so nullopt on both
+    // sides is the correct match rather than a missing owner.
+    if (group.parentIncludeId != ownerIncludeId)
+      continue;
+    for (const RefoldModel::CondArm &arm : group.arms) {
+      if (!arm.ContainsByte(child.siteB))
+        continue;
+      const uint64_t bodySize = arm.bodyE - arm.bodyB;
+      if (!innermost || bodySize < innermostBodySize) {
+        innermost = arm.id;
+        innermostBodySize = bodySize;
+      }
+    }
+  }
+  return innermost;
 }
 
 bool RefoldIncludeMaterializer::PathNamesMaterializedHeader(
@@ -1171,10 +1399,46 @@ bool RefoldIncludeMaterializer::TryRecordInlineIncludeRealizationFromB(
     DenseMap<uint64_t, std::string> &includeExpansion,
     DenseMap<uint64_t, size_t> &includeExpansionStartLineNos,
     DenseMap<uint64_t, AcceptedResultCandidate>
-        &includeExpansionAcceptedResults) const {
+        &includeExpansionAcceptedResults,
+    std::optional<uint64_t> ancestorArmIdAtIncludeSite) const {
   AcceptedResultCandidate realizationCandidate;
   if (auto realized = BuildInlineIncludeRealizationFromB(
           include, reason, &realizationCandidate)) {
+    // A body realized from B contains tokens, not header source, so it carries
+    // no `#pragma once` to rewrite and would neither set nor consult the guard.
+    // Emitting it unguarded beside a surviving include of the same header would
+    // duplicate the body, so the guard is applied here as well.
+    if (PragmaOnceGuardEditResult guardResult =
+            pragmaOnceGuards_.StageRealizedFromBGuardText(
+                include, ancestorArmIdAtIncludeSite, *realized);
+        !guardResult.proven) {
+      // Inline realization from B is the last realization path for this include,
+      // so an unprovable guard here has no sound lower fallback.  Requesting the
+      // terminal result is mandatory: leaving an empty expansion behind would be
+      // consumed as a legitimate "materialized to nothing" and would silently
+      // delete the header body while a surviving include of the same header
+      // stayed unguarded.
+      terminalSink_.RequestTerminalFallback(
+          MakeTerminalFallbackProofFailure(
+              TerminalFallbackObligationKind::IncludeGuardStateStabilizable,
+              TerminalFallbackFailureReason::IncludeGuardStateNotStabilizable),
+          "pragma/once/guard", guardResult.detail);
+      REFOLD_LOG_TRACE("pragma/once/guard",
+                       "B realization inc#{0} rejected: {1} ({2})", include.id,
+                       toString(guardResult.rejection), guardResult.detail);
+      includeExpansion[include.id] = std::string();
+      return false;
+    }
+
+    // The token body absorbed the content of every header entered beneath this
+    // include, and dropped all of their directives with it.  Restore each
+    // header's own controlling macro so a later path back to that physical file
+    // is skipped exactly as it was originally.
+    SmallVector<uint64_t, 16> enteredSubtree;
+    CollectEnteredIncludeSubtree(include.id, enteredSubtree);
+    (void)pragmaOnceGuards_.AppendRealizedFromBIncludeGuardRestoration(
+        enteredSubtree, *realized);
+
     includeExpansion[include.id] = std::move(*realized);
     includeExpansionStartLineNos[include.id] = 1;
     includeExpansionAcceptedResults[include.id] =

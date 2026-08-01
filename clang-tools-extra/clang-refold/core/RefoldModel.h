@@ -468,13 +468,30 @@ public:
     std::optional<StringRef> openedPath;
     std::optional<StringRef> enteredFileSpelling;
     std::optional<StringRef> enteredFileName;
+    /// Macro whose `#ifndef` guards the whole opened header, when HeaderSearch
+    /// recognized one.
+    ///
+    /// Absent for a header that relies on `#pragma once` instead, and for one
+    /// with no guard at all.  A body inlined from the edited preprocessed stream
+    /// contains tokens rather than source, so it carries none of the header's
+    /// own directives: defining this macro beside such a body restores the skip
+    /// behaviour that the lost `#define` would have produced.
+    std::optional<StringRef> controllingMacro;
     std::optional<IncludeLookupProvenance> lookup;
     std::optional<IncludeNextProvenance> includeNext;
 
     /// True when the target was spelled with angle brackets.
     bool angled;
-    /// Parent include edge id; nullopt means this include was reached from the
-    /// TU.
+    /// Parent include edge id for an include instance the producer actually
+    /// entered.
+    ///
+    /// The producer sets this from the file-enter callback, so nullopt does NOT
+    /// mean "reached from the TU".  A skipped include edge -- one suppressed by
+    /// `#pragma once` or by a header guard -- never carries a parent even when it
+    /// is lexically nested inside another header.  Use `sitePath` to distinguish
+    /// a TU-owned site from a header-owned one, and recover the owning include
+    /// instance from the materialization spine: `(sitePath, siteB)` alone is
+    /// ambiguous when the containing header has several instances.
     std::optional<uint64_t> parent;
     /// A-token spans contributed by the included file instance.
     std::vector<PPSpan> spans;
@@ -489,6 +506,7 @@ public:
                 std::optional<StringRef> openedPath,
                 std::optional<StringRef> enteredFileSpelling,
                 std::optional<StringRef> enteredFileName,
+                std::optional<StringRef> controllingMacro,
                 std::optional<IncludeLookupProvenance> lookup,
                 std::optional<IncludeNextProvenance> includeNext, bool angled,
                 std::optional<uint64_t> parent, std::vector<PPSpan> spans,
@@ -497,7 +515,8 @@ public:
           siteB(siteB), siteE(siteE), target(target),
           resolvedPath(resolvedPath), openedPath(openedPath),
           enteredFileSpelling(enteredFileSpelling),
-          enteredFileName(enteredFileName), lookup(std::move(lookup)),
+          enteredFileName(enteredFileName),
+          controllingMacro(controllingMacro), lookup(std::move(lookup)),
           includeNext(std::move(includeNext)), angled(angled), parent(parent),
           spans(std::move(spans)), decls(std::move(decls)) {
       cover.Init(this->spans);
@@ -877,9 +896,31 @@ public:
     uint64_t bodyB;
     /// Exclusive physical source-byte offset of the arm body.
     uint64_t bodyE;
-    /// Optional A-token span emitted by the selected arm.
+    /// Optional A-token span recorded for this arm, present only when
+    /// `selected` is true.  It is the PP-index range of the tokens that
+    /// `selected` matched, so it inherits every caveat documented below.
     std::optional<PPSpan> span;
-    /// True when this arm was selected by the producer preprocessing run.
+    /// True when at least one A token whose spelling file equals this arm's
+    /// physical file overlaps `[bodyB, bodyE)`.
+    ///
+    /// This is NOT a takenness oracle, despite the field name.  The producer
+    /// computes it as a byte-range overlap against a token map keyed by physical
+    /// path, so it disagrees with preprocessor control flow in both directions:
+    ///
+    /// * A taken arm reports false whenever it contributed no token spelled in
+    ///   its own file: a body of only `#include` (those tokens are attributed to
+    ///   the included file), a body of only `#define`/`#undef`/`#pragma`, or an
+    ///   empty body.
+    /// * A non-taken arm reports true when a different include instance of the
+    ///   same physical header occupied the same body byte range.  Arm records
+    ///   are instance-scoped through `CondGroup::parentIncludeId`, but the token
+    ///   query behind this flag is not, so one instance's tokens are visible to
+    ///   another instance's arm.
+    ///
+    /// Proofs that need to know whether an arm was actually taken must obtain
+    /// that fact another way and fail closed without it.  Structural properties
+    /// such as conditional dominance are preferable precisely because they do
+    /// not depend on takenness at all.
     bool selected;
     /// True when the producer observed this arm's condition evaluate
     /// `__has_include` / `__has_include_next`.  Absent in the map means false.

@@ -3,7 +3,7 @@
 // RUN: %clang-refold-tester nested_conds3 XXX YYY
 // RUN: %clang-refold-tester nested_conds3 XXX ZZZ
 #include "a.h"
-#pragma once
+
 
 #ifdef XXX
 #ifdef YYY

@@ -1,5 +1,5 @@
 // RUN: %clang-refold-tester inc_to_cond_to_include_boundary XXX YYY
-#pragma once
+
 
 #ifdef YYY
 char blah(int y);

@@ -22,6 +22,7 @@
 #include "edit/RefoldTextEditAssembler.h"
 #include "include/RefoldIncludeInsertionPlanner.h"
 #include "include/RefoldIncludeMaterializer.h"
+#include "include/RefoldPragmaOnceGuardRewriter.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldCounterStabilization.h"
 #include "macro/RefoldMacroPatchPlanner.h"
@@ -504,7 +505,40 @@ void RefoldEngine::InitializeIncludeMaterializer() {
       lineDirs_, finalReplaySurface_, sidebandPragmaEdits_, sourceMapper_,
       pathIdentity_, macroTopology_, lineControlProof_, LineObserverLayout(),
       MacroStateProof(), OwnerStateProof(), IncludeInsertionPlanner(),
-      ProofLattice(), *textEditAssembler_, terminalSink_, lexLang_);
+      ProofLattice(), *textEditAssembler_, PragmaOnceGuardRewriter(),
+      terminalSink_, lexLang_);
+}
+
+//===----------------------------------------------------------------------===//
+// Pragma-once guard rewriter construction
+//===----------------------------------------------------------------------===//
+//
+// The catalog is built from producer include/pragma facts and the physical
+// header bytes, so it must follow the text-edit assembler and proof lattice it
+// authorizes edits through.  The set of headers actually inlined is recorded
+// later, by include-materialization scheduling.
+
+void RefoldEngine::InitializePragmaOnceGuardRewriter() {
+  pragmaOnceGuardRewriter_ = std::make_unique<RefoldPragmaOnceGuardRewriter>(
+      RefoldPragmaOnceGuardRewriter::Dependencies{
+          model_, pathIdentity_, MacroStateProof(), lineDirs_,
+          lineControlProof_, *textEditAssembler_, ProofLattice(),
+          terminalSink_, lexLang_},
+      RefoldPragmaOnceGuardRewriter::GuardNameInputs{
+          model_.GetSourcePath(), tuSourceBytes_, aSource_, bSource_});
+}
+
+RefoldPragmaOnceGuardRewriter &RefoldEngine::PragmaOnceGuardRewriter() {
+  assert(pragmaOnceGuardRewriter_ &&
+         "pragma-once guard rewriter must be initialized");
+  return *pragmaOnceGuardRewriter_;
+}
+
+const RefoldPragmaOnceGuardRewriter &
+RefoldEngine::PragmaOnceGuardRewriter() const {
+  assert(pragmaOnceGuardRewriter_ &&
+         "pragma-once guard rewriter must be initialized");
+  return *pragmaOnceGuardRewriter_;
 }
 
 //===----------------------------------------------------------------------===//

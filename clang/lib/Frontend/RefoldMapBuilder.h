@@ -387,6 +387,22 @@ struct Item {
   std::string OpenedPath;
   std::string EnteredFileSpelling;
   std::string EnteredFileName;
+
+  // File entry opened by this include, retained so the controlling macro can be
+  // resolved at serialization time.  A header's include guard is only known to
+  // HeaderSearch once the file has actually been lexed, which has not happened
+  // yet when the InclusionDirective callback fires for a first inclusion.
+  OptionalFileEntryRef OpenedFileEntry;
+
+  // Name of the macro whose `#ifndef` guards this header's entire contents, when
+  // HeaderSearch recognized one.
+  //
+  // A consumer that inlines this header's *tokens* rather than its source loses
+  // every directive the header contained, including this guard.  The header's
+  // content is then present while its controlling macro stays undefined, so any
+  // later path back to the same physical file re-enters it.  Recording the name
+  // lets the consumer restore that state explicitly instead of failing closed.
+  std::string ControllingMacro;
   std::string LookupKind;
   std::optional<unsigned> LookupSearchChainIndex;
   std::string LookupDirectorySpelling;

@@ -45,6 +45,7 @@ class RefoldIncludeInsertionPlanner;
 class RefoldIncludeMaterializer;
 class RefoldLineObserverLayout;
 class RefoldPathIdentity;
+class RefoldPragmaOnceGuardRewriter;
 class RefoldProofLattice;
 class RefoldStructuralHunkDispatcher;
 class RefoldTerminalProofSink;
@@ -83,6 +84,9 @@ public:
     const RefoldTextEditAssembler *textEditAssembler = nullptr;
     /// Proof lattice used to construct accepted-result carriers.
     const RefoldProofLattice *proofLattice = nullptr;
+    /// Synthetic `#pragma once` guard catalog.  Mutable because the scheduler is
+    /// what learns which physical headers are actually inlined.
+    RefoldPragmaOnceGuardRewriter *pragmaOnceGuards = nullptr;
     /// Terminal fallback sink for fail-closed include scheduling failures.
     RefoldTerminalProofSink *terminalSink = nullptr;
     /// Sideband pragma edits that may be owned by materialized includes.
@@ -205,6 +209,20 @@ private:
   /// deterministic ordering are applied.
   llvm::DenseSet<uint64_t> BuildInitialMaterializationSeeds() const;
 
+  /// Collect the canonical physical paths reachable from a seed set's subtrees.
+  void CollectSubtreePhysicalPaths(const llvm::DenseSet<uint64_t> &seeds,
+                                   std::vector<std::string> &paths) const;
+
+  /// Force materialization of any include whose transitive closure re-enters an
+  /// inlined `#pragma once` header.
+  ///
+  /// A synthetic guard is emitted into TU byte-space and therefore cannot reach
+  /// a re-entry that occurs inside an unmodified header.  Since clang-refold
+  /// never edits headers, such an include must be materialized so its nested
+  /// directive becomes guardable, or the refolding is unsound.  Iterates to a
+  /// fixed point because materializing an include enlarges the inlined set.
+  void AddGuardReentryMaterializationSeeds(llvm::DenseSet<uint64_t> &seeds) const;
+
   /// Pulls selected include ancestors into the seed set so parent surfaces are
   /// materialized before child surfaces.
   void AddAncestorMaterializationSeeds(llvm::DenseSet<uint64_t> &seeds) const;
@@ -218,6 +236,81 @@ private:
 
   /// Materializes selected include ids in deterministic order.
   void MaterializeOrderedSeeds(llvm::ArrayRef<uint64_t> orderedSeeds);
+
+  /// Record which physical headers may be inlined, before any body is realized.
+  ///
+  /// The guard catalog must know the active set before the first materialized
+  /// body or TU include edit is finalized, because a clean include of a header
+  /// can need wrapping purely because a *different* instance of that same
+  /// physical header was inlined elsewhere.
+  ///
+  /// The set is deliberately an over-approximation taken from the ordered seeds
+  /// and their descendants: materialization decisions are refined during include
+  /// recursion, and under-approximating would leave an occurrence unguarded.
+  /// Over-approximating is inert for an unconditional pragma.
+  void RecordActiveGuardedHeaders(llvm::ArrayRef<uint64_t> orderedSeeds);
+
+  /// Stage the once-guard wrapper for a TU-owned include that survives as a
+  /// directive because its header was inlined at another occurrence.
+  bool StageTURootSurvivingIncludeGuards();
+
+  /// Prove that no surviving include can re-enter a header whose inlined body
+  /// lost its own include-guard protection.
+  ///
+  /// A body realized from the edited preprocessed stream is tokens, not source:
+  /// every directive it contained is gone, including the `#ifndef`/`#define`
+  /// pair a conventional include guard relies on.  The header's content is then
+  /// present in the TU while its controlling macro is undefined, so any later
+  /// path back to that physical file re-enters it and emits the content twice.
+  ///
+  /// A `#pragma once` header is handled instead by the synthetic guard, and a
+  /// *source*-materialized body carries its own guard directives along and
+  /// self-protects, so neither needs this check.
+  ///
+  /// Restoring the lost state properly would require defining each affected
+  /// header's real controlling macro, which the producer does not record today
+  /// (Clang tracks it as `HeaderFileInfo::ControllingMacro`).  Until it does,
+  /// this fails closed rather than emitting a duplicated body.
+  bool ProveNoReentryIntoUnprotectedInlinedHeaders();
+
+  /// Return whether the producer recorded a controlling macro for one physical
+  /// header, meaning its lost include-guard state can be restored by name.
+  bool HeaderControllingMacroIsRecorded(llvm::StringRef physicalPath) const;
+
+  /// Return whether any macro defined by one physical header is invoked from
+  /// outside that header.
+  ///
+  /// Restoring a header's include guard suppresses every later inclusion of it.
+  /// A body realized from B dropped the header's `#define`s together with its
+  /// guard, so that suppression also removes the only remaining source of its
+  /// macro state.  Restoration is admissible only when nothing outside the
+  /// header observes that state.
+  bool HeaderMacroStateIsObservedOutside(llvm::StringRef physicalPath) const;
+
+  /// Return whether one physical header contributed any A tokens.
+  ///
+  /// A header that is entirely directives has no content to duplicate, so
+  /// re-entering it is harmless for the content-duplication hazard and is often
+  /// required: it is the only remaining source of macro state that a
+  /// realized-from-B body discarded.
+  bool HeaderContributedTokens(llvm::StringRef physicalPath) const;
+
+  /// Return whether any include edge to one physical header was skipped.
+  ///
+  /// A skip is the only evidence that the header was protected at all.  Headers
+  /// with no protection by design -- Clang's `__stddef_*.h`, `assert.h` -- are
+  /// entered every time, so re-entering them in the refolded TU reproduces the
+  /// original instead of duplicating content.
+  bool HeaderWasEverSkipped(llvm::StringRef physicalPath) const;
+
+  /// Collect the physical paths whose content is emitted by one inlined body.
+  ///
+  /// This walks the *entered* include subtree, which is exact: `children_` is
+  /// built from producer parent links, and only an entered edge contributes
+  /// content.  A skipped edge under the same header contributed nothing, so
+  /// counting it would over-trigger.
+  void CollectEnteredSubtreePhysicalPaths(uint64_t includeId,
+                                          std::vector<std::string> &paths) const;
 
   /// Refreshes the public expanded-include result set from realized expansions.
   void RebuildExpandedIncludeIds();
@@ -274,6 +367,7 @@ private:
   const RefoldLineObserverLayout &lineObserverLayout_;
   const RefoldMacroStateRepairPlanner &macroStateRepairPlanner_;
   const RefoldTextEditAssembler &textEditAssembler_;
+  RefoldPragmaOnceGuardRewriter &pragmaOnceGuards_;
   const RefoldProofLattice &proofLattice_;
   RefoldTerminalProofSink &terminalSink_;
   const std::vector<SidebandPragmaEdit> &sidebandPragmaEdits_;

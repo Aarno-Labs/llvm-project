@@ -1217,6 +1217,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
               asOptString(*obj, "entered_file_spelling");
           std::optional<StringRef> enteredFileName =
               asOptString(*obj, "entered_file_name");
+          std::optional<StringRef> controllingMacro =
+              asOptString(*obj, "controlling_macro");
 
           auto lookupOrErr = parseOptionalIncludeLookupProvenance(
               *obj, "lookup", ctxItem, model.includeSearchChain_);
@@ -1333,6 +1335,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                           /*openedPath*/ openedPath,
                           /*enteredFileSpelling*/ enteredFileSpelling,
                           /*enteredFileName*/ enteredFileName,
+                          /*controllingMacro*/ controllingMacro,
                           /*lookup*/ std::move(lookup),
                           /*includeNext*/ std::move(includeNext),
                           /*angled*/ angled,

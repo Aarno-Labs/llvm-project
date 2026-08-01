@@ -148,6 +148,7 @@ class RefoldCounterStabilization;
 class RefoldExpansionFallbackPlanner;
 class RefoldIncludeInsertionPlanner;
 class RefoldIncludeMaterializer;
+class RefoldPragmaOnceGuardRewriter;
 class RefoldLineObserverLayout;
 class RefoldMixedOwnerTilingPlanner;
 class RefoldMacroPatchPlanner;
@@ -653,6 +654,14 @@ private:
   /// narrow orchestration hooks rather than borrowing RefoldEngine.
   std::unique_ptr<RefoldIncludeMaterializer> includeMaterializer_;
 
+  /// Synthetic `#pragma once` guard catalog owned by the engine.
+  ///
+  /// The rewriter re-expresses a physical header's once-state as macro state
+  /// when that header's text is inlined into the refolded TU, where the original
+  /// pragma is inert.  It is mutable because the set of headers actually inlined
+  /// is only known after include-materialization scheduling.
+  std::unique_ptr<RefoldPragmaOnceGuardRewriter> pragmaOnceGuardRewriter_;
+
   /// Expansion-fallback planner owned by the engine.
   ///
   /// The planner owns the explicit TU include-closure and terminal
@@ -768,6 +777,11 @@ private:
   /// materializer owns recursive include realization; RefoldEngine owns only
   /// construction order and final orchestration.
   void InitializeIncludeMaterializer();
+
+  /// Allocate and access the synthetic `#pragma once` guard rewriter.
+  void InitializePragmaOnceGuardRewriter();
+  RefoldPragmaOnceGuardRewriter &PragmaOnceGuardRewriter();
+  const RefoldPragmaOnceGuardRewriter &PragmaOnceGuardRewriter() const;
 
   /// Allocate the final text-edit assembler after all borrowed engine
   /// members have been constructed.  This stays out-of-line so RefoldEngine.h

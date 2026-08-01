@@ -144,6 +144,18 @@ enum class ProtectedSourceEditAuthorityKind : uint8_t {
   IncludePreservingSourceClosure,
   TUIncludeClosure,
   LineControlRepair,
+  /// Re-expresses a physical header's `#pragma once` state as a synthetic macro
+  /// guard when that header is inlined into the refolded TU.
+  ///
+  /// The operation replaces an exact `#pragma once` interval with a `#define` of
+  /// the guard macro, and wraps an exact surviving `#include` interval in an
+  /// `#ifndef`/`#endif` pair that preserves the original directive spelling.  It
+  /// is deliberately narrower than include materialization: it may consume only a
+  /// pragma or include directive, never an `#import` (which carries once
+  /// semantics this authority does not model) and never a `_Pragma` operator
+  /// (which the producer does not record for `once`).  Both therefore fail closed
+  /// structurally rather than by convention.
+  PragmaOnceGuardRewrite,
 };
 
 /// Exact protected preprocessing interval authorized for one emitted edit.

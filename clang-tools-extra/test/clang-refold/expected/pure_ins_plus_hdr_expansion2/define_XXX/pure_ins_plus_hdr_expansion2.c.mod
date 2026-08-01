@@ -1,6 +1,6 @@
 // RUN: %clang-refold-tester pure_ins_plus_hdr_expansion2 XXX
 int some_prefix_func(char* c);
-#pragma once
+
 
 #ifdef XXX
 int first(short x);

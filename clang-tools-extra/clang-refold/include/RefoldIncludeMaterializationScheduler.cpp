@@ -10,6 +10,7 @@
 #include "edit/RefoldTextEditAssembler.h"
 #include "include/RefoldIncludeInsertionPlanner.h"
 #include "include/RefoldIncludeMaterializer.h"
+#include "include/RefoldPragmaOnceGuardRewriter.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroStateRepairPlanner.h"
@@ -20,6 +21,7 @@
 #include "util/RefoldPathIdentity.h"
 #include "util/StringUtils.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
 #include <cassert>
@@ -62,6 +64,9 @@ RefoldIncludeMaterializationScheduler::RefoldIncludeMaterializationScheduler(
       textEditAssembler_(
           requireNonNull(deps_.textEditAssembler,
                          "include scheduler requires text edit assembler")),
+      pragmaOnceGuards_(
+          requireNonNull(deps_.pragmaOnceGuards,
+                         "include scheduler requires pragma-once guards")),
       proofLattice_(requireNonNull(deps_.proofLattice,
                                    "include scheduler requires proof lattice")),
       terminalSink_(requireNonNull(deps_.terminalSink,
@@ -80,9 +85,24 @@ bool RefoldIncludeMaterializationScheduler::MaterializeIncludeExpansions() {
   BuildLayoutOnlyIncludeMaterializationSeeds();
 
   DenseSet<uint64_t> seeds = BuildInitialMaterializationSeeds();
+  AddGuardReentryMaterializationSeeds(seeds);
   AddAncestorMaterializationSeeds(seeds);
   SmallVector<uint64_t, 32> orderedSeeds = OrderedMaterializationSeeds(seeds);
+  // The guard catalog must know which physical headers may be inlined before any
+  // body text is built, because a clean include can need wrapping purely because
+  // another instance of the same physical header was inlined elsewhere.
+  RecordActiveGuardedHeaders(orderedSeeds);
   MaterializeOrderedSeeds(orderedSeeds);
+
+  // A body realized from B carries no directives, so any header whose content it
+  // emitted has lost its own include-guard protection.  This must be proven
+  // before the realized text is committed.
+  if (!ProveNoReentryIntoUnprotectedInlinedHeaders()) {
+    REFOLD_LOG_DEBUG("fallback",
+                     "single-pass refold aborted: a surviving include can "
+                     "re-enter an inlined header that lost its include guard");
+    return false;
+  }
 
   // Global fail-closed composition rule: if include realization requested the
   // terminal fallback in this single pass, stop here rather than continuing to
@@ -95,6 +115,404 @@ bool RefoldIncludeMaterializationScheduler::MaterializeIncludeExpansions() {
   }
 
   RebuildExpandedIncludeIds();
+  return true;
+}
+
+void RefoldIncludeMaterializationScheduler::CollectSubtreePhysicalPaths(
+    const DenseSet<uint64_t> &seeds, std::vector<std::string> &paths) const {
+  paths.clear();
+  DenseSet<uint64_t> visited;
+  SmallVector<uint64_t, 32> worklist(seeds.begin(), seeds.end());
+
+  while (!worklist.empty()) {
+    const uint64_t includeId = worklist.pop_back_val();
+    if (!visited.insert(includeId).second)
+      continue;
+    if (const RefoldModel::IncludeItem *include =
+            model_.GetIncludeById(includeId))
+      if (include->openedPath && !include->openedPath->empty())
+        paths.push_back(include->openedPath->str());
+    if (auto it = children_.find(includeId); it != children_.end())
+      for (const RefoldModel::IncludeItem *child : it->second)
+        worklist.push_back(child->id);
+  }
+
+  llvm::sort(paths);
+  paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
+}
+
+void RefoldIncludeMaterializationScheduler::AddGuardReentryMaterializationSeeds(
+    DenseSet<uint64_t> &seeds) const {
+  // A guard lives in TU byte-space, so it cannot reach a re-entry that happens
+  // *inside* an unmodified header: wrapping `#include "outer.h"` protects
+  // `outer.h`, but `outer.h` on disk may include an already-inlined once-header,
+  // whose real `#pragma once` never fired because the inlined copy was spliced
+  // as text rather than included.  clang-refold never edits headers, so the only
+  // sound response is to materialize the offending include as well.  Its nested
+  // directive then becomes a surviving include inside materialized text, which
+  // the ordinary wrapper *can* guard.
+  //
+  // Materializing an include enlarges the inlined set, which can expose further
+  // re-entries, so this iterates to a fixed point.  Termination is guaranteed:
+  // every round either adds an include edge or stops, and the edge set is finite.
+  std::vector<std::string> onceHeaderPaths;
+  std::vector<std::string> inlinedPaths;
+
+  for (unsigned round = 0;; ++round) {
+    CollectSubtreePhysicalPaths(seeds, inlinedPaths);
+
+    onceHeaderPaths.clear();
+    for (const std::string &path : inlinedPaths)
+      if (pragmaOnceGuards_.HeaderEstablishesOnceState(path))
+        onceHeaderPaths.push_back(path);
+    if (onceHeaderPaths.empty())
+      return;
+
+    bool addedAny = false;
+    for (const RefoldModel::IncludeItem &include : model_.GetIncludes()) {
+      if (seeds.count(include.id))
+        continue;
+      // Only edges that survive as directives can re-enter.  An edge inside a
+      // subtree already scheduled for materialization is handled by the
+      // materializer's own child recursion.
+      std::string reentered;
+      if (!pragmaOnceGuards_.IncludeClosureReentersHeader(
+              include, onceHeaderPaths, &reentered)) {
+        continue;
+      }
+      REFOLD_LOG_TRACE(
+          "pragma/once/guard",
+          "forcing materialization of inc#{0} target='{1}': its closure "
+          "re-enters inlined once-header '{2}' (round {3})",
+          include.id, include.target, reentered, round);
+      seeds.insert(include.id);
+      addedAny = true;
+    }
+
+    if (!addedAny)
+      return;
+  }
+}
+
+void RefoldIncludeMaterializationScheduler::CollectEnteredSubtreePhysicalPaths(
+    uint64_t includeId, std::vector<std::string> &paths) const {
+  paths.clear();
+  DenseSet<uint64_t> visited;
+  SmallVector<uint64_t, 16> worklist{includeId};
+
+  while (!worklist.empty()) {
+    const uint64_t current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    if (const RefoldModel::IncludeItem *include =
+            model_.GetIncludeById(current))
+      if (include->openedPath && !include->openedPath->empty())
+        paths.push_back(include->openedPath->str());
+    if (auto it = children_.find(current); it != children_.end())
+      for (const RefoldModel::IncludeItem *child : it->second)
+        worklist.push_back(child->id);
+  }
+
+  llvm::sort(paths);
+  paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
+}
+
+bool RefoldIncludeMaterializationScheduler::HeaderMacroStateIsObservedOutside(
+    StringRef physicalPath) const {
+  // Restoring a header's guard suppresses re-entry into that header *and
+  // everything it includes*, so the owner domain must be the whole entered
+  // subtree.  Considering only the header's own definitions would miss the
+  // nested ones -- `bits/types.h` pulls in `bits/typesizes.h` and
+  // `bits/wordsize.h`, whose macros glibc uses everywhere.
+  DenseSet<uint64_t> ownerIds;
+  SmallVector<uint64_t, 16> worklist;
+  for (const RefoldModel::IncludeItem &include : model_.GetIncludes())
+    if (include.openedPath &&
+        pathIdentity_.PathsEqual(*include.openedPath, physicalPath))
+      worklist.push_back(include.id);
+  while (!worklist.empty()) {
+    const uint64_t current = worklist.pop_back_val();
+    if (!ownerIds.insert(current).second)
+      continue;
+    if (auto it = children_.find(current); it != children_.end())
+      for (const RefoldModel::IncludeItem *child : it->second)
+        worklist.push_back(child->id);
+  }
+  if (ownerIds.empty())
+    return true;
+
+  llvm::StringSet<> definedHere;
+  for (const RefoldModel::MacroDirective &directive :
+       model_.GetMacroDirectives()) {
+    if (directive.ownerIncludeId && ownerIds.count(*directive.ownerIncludeId))
+      definedHere.insert(directive.name);
+  }
+  if (definedHere.empty())
+    return false;
+
+  // An invocation of one of those names from outside this header means the
+  // definition is live after the header: suppressing a later re-entry would
+  // leave that use undefined.  Invocations inside the header's own instances do
+  // not count, because a body realized from B already carries their expansion.
+  for (const RefoldModel::MacroInvocation &invocation :
+       model_.GetMacroInvocations()) {
+    if (!definedHere.contains(invocation.name))
+      continue;
+    if (invocation.ownerIncludeId && ownerIds.count(*invocation.ownerIncludeId))
+      continue;
+    REFOLD_LOG_TRACE("pragma/once/guard",
+                     "header '{0}' macro '{1}' is observed outside it; its "
+                     "include-guard state cannot be restored",
+                     physicalPath, invocation.name);
+    return true;
+  }
+
+  return false;
+}
+
+bool RefoldIncludeMaterializationScheduler::HeaderContributedTokens(
+    StringRef physicalPath) const {
+  for (const RefoldModel::IncludeItem &include : model_.GetIncludes()) {
+    if (!include.openedPath ||
+        !pathIdentity_.PathsEqual(*include.openedPath, physicalPath)) {
+      continue;
+    }
+    for (const RefoldModel::PPSpan &span : include.spans)
+      if (span.begin < span.end)
+        return true;
+  }
+  return false;
+}
+
+bool RefoldIncludeMaterializationScheduler::HeaderWasEverSkipped(
+    StringRef physicalPath) const {
+  // Only a header the preprocessor actually *skipped* was protected in the
+  // original run.  If every edge to it was entered, the original emitted its
+  // content at each of those positions, so a refolded TU that re-enters it
+  // reproduces the original rather than duplicating anything.
+  //
+  // This distinction matters because a header can legitimately have no
+  // protection at all: Clang's `__stddef_*.h` are designed to be re-included
+  // under different `__need_*` macros, and `assert.h` re-reads on every `NDEBUG`
+  // change.  Treating "no controlling macro" as "unprotected" would fail closed
+  // on exactly those headers, which are the common case in any system include.
+  for (const RefoldModel::IncludeItem &include : model_.GetIncludes()) {
+    if (!include.openedPath ||
+        !pathIdentity_.PathsEqual(*include.openedPath, physicalPath)) {
+      continue;
+    }
+    const bool entered =
+        include.enteredFileName.has_value() || include.parent.has_value();
+    if (!entered)
+      return true;
+  }
+  return false;
+}
+
+bool RefoldIncludeMaterializationScheduler::HeaderControllingMacroIsRecorded(
+    StringRef physicalPath) const {
+  for (const RefoldModel::IncludeItem &include : model_.GetIncludes()) {
+    if (!include.openedPath ||
+        !pathIdentity_.PathsEqual(*include.openedPath, physicalPath)) {
+      continue;
+    }
+    if (include.controllingMacro && !include.controllingMacro->empty())
+      return true;
+  }
+  return false;
+}
+
+bool RefoldIncludeMaterializationScheduler::
+    ProveNoReentryIntoUnprotectedInlinedHeaders() {
+  std::vector<std::string> unprotectedPaths;
+
+  // Determinism: iterate realized includes by sorted id.
+  SmallVector<uint64_t, 32> realizedIds;
+  for (const auto &kv : includeExpansionAcceptedResults_)
+    realizedIds.push_back(kv.first);
+  llvm::sort(realizedIds);
+
+  for (uint64_t includeId : realizedIds) {
+    const AcceptedResultCandidate &candidate =
+        includeExpansionAcceptedResults_.find(includeId)->second;
+    if (candidate.proofSummary.inventory.currentPath !=
+        AcceptedPathKind::IncludeRealizationInlineFromB) {
+      continue;
+    }
+    std::vector<std::string> emitted;
+    CollectEnteredSubtreePhysicalPaths(includeId, emitted);
+    for (std::string &path : emitted) {
+      // A realized-from-B body whose own header carries synthetic once-state is
+      // already wrapped by `StageRealizedFromBGuardText()`, so re-entering that
+      // header is suppressed by the guard.
+      if (pragmaOnceGuards_.HeaderRequiresGuard(path))
+        continue;
+      // This check exists to prevent *duplicated content*.  A header that
+      // contributed no A tokens has no content to duplicate: re-entering it can
+      // only re-establish preprocessor state, which moves the refolded TU toward
+      // the original rather than away from it.  Feature-test and configuration
+      // headers such as `features.h` and `sys/cdefs.h` are entirely directives,
+      // and they are precisely the headers a later include must be free to
+      // re-enter, because that re-entry is the only remaining source of the
+      // macro state a realized-from-B body discarded.
+      if (!HeaderContributedTokens(path))
+        continue;
+      // A header the preprocessor never skipped was never protected, so
+      // re-entering it emits exactly what the original emitted.
+      if (!HeaderWasEverSkipped(path))
+        continue;
+      // A recorded controlling macro alone is not sufficient.  Restoring the
+      // guard suppresses every later inclusion of the header, and a body
+      // realized from B dropped the header's `#define`s along with its guard, so
+      // that suppression also removes the only remaining source of the macro
+      // state.  Restoration is therefore admitted only when the header's macro
+      // state is dead outside it -- true for `bits/types.h`, whose 16 macros are
+      // never invoked elsewhere, and false for `sys/cdefs.h`, whose
+      // `__GLIBC_USE` every glibc header depends on.
+      if (HeaderControllingMacroIsRecorded(path) &&
+          !HeaderMacroStateIsObservedOutside(path)) {
+        continue;
+      }
+      unprotectedPaths.push_back(std::move(path));
+    }
+  }
+
+  if (unprotectedPaths.empty())
+    return true;
+
+  llvm::sort(unprotectedPaths);
+  unprotectedPaths.erase(
+      std::unique(unprotectedPaths.begin(), unprotectedPaths.end()),
+      unprotectedPaths.end());
+
+  for (const RefoldModel::IncludeItem &include : model_.GetIncludes()) {
+    // Only a surviving directive can re-enter; a materialized edge is replaced
+    // by its body.
+    if (includeExpansion_.count(include.id))
+      continue;
+
+    // The re-entry side is intentionally over-approximated over *all* edges,
+    // not just entered ones: once the refolded TU is preprocessed, an edge that
+    // the producer skipped may be taken.
+    std::string reentered;
+    const bool directlyReenters =
+        include.openedPath &&
+        llvm::any_of(unprotectedPaths, [&](const std::string &path) {
+          return pathIdentity_.PathsEqual(*include.openedPath, path);
+        });
+    if (directlyReenters)
+      reentered = include.openedPath->str();
+    else if (!pragmaOnceGuards_.IncludeClosureReentersHeader(
+                 include, unprotectedPaths, &reentered))
+      continue;
+
+    const std::string detail =
+        llvm::formatv(
+            "surviving include inc#{0} target='{1}' re-enters '{2}', whose "
+            "content was inlined from the edited preprocessed stream and "
+            "therefore carries none of its own include-guard directives",
+            include.id, include.target, reentered)
+            .str();
+    REFOLD_LOG_TRACE("pragma/once/guard", "{0}", detail);
+    terminalSink_.RequestTerminalFallback(
+        MakeTerminalFallbackProofFailure(
+            TerminalFallbackObligationKind::IncludeGuardStateStabilizable,
+            TerminalFallbackFailureReason::IncludeGuardStateNotStabilizable),
+        "pragma/once/guard", detail);
+    return false;
+  }
+
+  return true;
+}
+
+void RefoldIncludeMaterializationScheduler::RecordActiveGuardedHeaders(
+    ArrayRef<uint64_t> orderedSeeds) {
+  // Walk each seed's whole subtree.  Recursive materialization can descend into
+  // any descendant include, so every physical header reachable from a seed is a
+  // header this run may inline.  Over-approximating here is sound; missing one
+  // would leave an occurrence of it unguarded.
+  DenseSet<uint64_t> visited;
+  SmallVector<uint64_t, 32> worklist(orderedSeeds.begin(), orderedSeeds.end());
+  std::vector<std::string> activePaths;
+
+  while (!worklist.empty()) {
+    const uint64_t includeId = worklist.pop_back_val();
+    if (!visited.insert(includeId).second)
+      continue;
+
+    if (const RefoldModel::IncludeItem *include =
+            model_.GetIncludeById(includeId)) {
+      if (include->openedPath && !include->openedPath->empty())
+        activePaths.push_back(include->openedPath->str());
+    }
+
+    if (auto it = children_.find(includeId); it != children_.end())
+      for (const RefoldModel::IncludeItem *child : it->second)
+        worklist.push_back(child->id);
+  }
+
+  // Deterministic order keeps guard numbering reproducible.
+  llvm::sort(activePaths);
+  activePaths.erase(std::unique(activePaths.begin(), activePaths.end()),
+                    activePaths.end());
+
+  SmallVector<StringRef, 16> activePathRefs;
+  activePathRefs.reserve(activePaths.size());
+  for (const std::string &path : activePaths)
+    activePathRefs.push_back(path);
+
+  pragmaOnceGuards_.SetActiveGuardedHeaders(activePathRefs);
+}
+
+bool RefoldIncludeMaterializationScheduler::StageTURootSurvivingIncludeGuards() {
+  // A TU-owned include that was never materialized survives as a real directive.
+  // If its physical header was inlined at some other occurrence, the directive
+  // must be guarded so it does not re-enter a header whose body is already in the
+  // output.
+  SmallVector<const RefoldModel::IncludeItem *, 16> survivors;
+  for (const RefoldModel::IncludeItem &include : model_.GetIncludes()) {
+    if (includeExpansion_.count(include.id))
+      continue;
+    // TU-owned sites only.  `parent` alone is not a reliable discriminator here:
+    // a skipped nested edge also has no parent, so the site path decides.
+    if (!pathIdentity_.PathsEqual(include.sitePath, request_.tuPath))
+      continue;
+    if (!pragmaOnceGuards_.FindGuardForInclude(include))
+      continue;
+    survivors.push_back(&include);
+  }
+
+  // Deterministic emission order.
+  llvm::sort(survivors, [](const RefoldModel::IncludeItem *lhs,
+                           const RefoldModel::IncludeItem *rhs) {
+    return lhs->id < rhs->id;
+  });
+
+  for (const RefoldModel::IncludeItem *include : survivors) {
+    auto [siteBegin, siteEnd] = ExtendedTUSiteRange(*include);
+    // A TU-owned site has no include ancestry, so its only enclosing arm is the
+    // one inside the TU itself.
+    const std::optional<uint64_t> ancestorArm =
+        includeMaterializer_.ComputeAncestorArmForChildInclude(
+            *include, /*ownerIncludeId=*/std::nullopt, std::nullopt);
+    if (PragmaOnceGuardEditResult guardResult =
+            pragmaOnceGuards_.StageSurvivingIncludeGuardEdit(
+                *include, request_.tuPath, std::nullopt, request_.tuBytes,
+                siteBegin, siteEnd, ancestorArm, tuEdits_);
+        !guardResult.proven) {
+      REFOLD_LOG_TRACE("pragma/once/guard",
+                       "TU surviving include inc#{0} rejected: {1} ({2})",
+                       include->id, toString(guardResult.rejection),
+                       guardResult.detail);
+      terminalSink_.RequestTerminalFallback(
+          MakeTerminalFallbackProofFailure(
+              TerminalFallbackObligationKind::IncludeGuardStateStabilizable,
+              TerminalFallbackFailureReason::IncludeGuardStateNotStabilizable),
+          "pragma/once/guard", guardResult.detail);
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -114,7 +532,10 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdits(
                                          macroStateRequest))
       return false;
   }
-  return true;
+
+  // Guard TU-owned includes that survive as directives only after every inlined
+  // body has been staged, so the surviving set is final.
+  return StageTURootSurvivingIncludeGuards();
 }
 
 const DenseSet<uint64_t> &
@@ -596,6 +1017,14 @@ bool RefoldIncludeMaterializationScheduler::TryPreserveSourceGraphOutput(
         std::move(*sourceGraphPlan.rejectedCleanupOutput));
   if (!sourceGraphPlan.preservedOutput)
     return false;
+
+  // A source-graph sidecar is a real file at a real include spelling, so the
+  // `#pragma once` copied into it keeps working natively and must not also be
+  // guarded.  Mixing a sidecar occurrence with an inlined copy of the same
+  // physical header would emit the body twice, so the catalog is told to fail
+  // that header closed rather than partially guard it.
+  if (include.openedPath && !include.openedPath->empty())
+    pragmaOnceGuards_.NoteSourceGraphPreservedOccurrence(*include.openedPath);
 
   request_.sourceGraphOutputs->push_back(
       std::move(*sourceGraphPlan.preservedOutput));

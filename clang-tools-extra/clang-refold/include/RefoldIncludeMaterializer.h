@@ -51,6 +51,7 @@ class LineDirectiveInserter;
 class RefoldOwnerStateProof;
 class RefoldProofLattice;
 class RefoldLineObserverLayout;
+class RefoldPragmaOnceGuardRewriter;
 class RefoldSourceMapper;
 class RefoldTextEditAssembler;
 
@@ -107,6 +108,7 @@ public:
       const RefoldIncludeInsertionPlanner &includeInsertionPlanner,
       const RefoldProofLattice &proofLattice,
       const RefoldTextEditAssembler &textEditAssembler,
+      const RefoldPragmaOnceGuardRewriter &pragmaOnceGuards,
       const RefoldTerminalProofSink &terminalSink,
       const clang::LangOptions &lexLang)
       : model_(model), aSource_(aSource), bSource_(bSource), aToks_(aToks),
@@ -119,7 +121,8 @@ public:
         macroStateProof_(macroStateProof), ownerStateProof_(ownerStateProof),
         includeInsertionPlanner_(includeInsertionPlanner),
         proofLattice_(proofLattice), textEditAssembler_(textEditAssembler),
-        terminalSink_(terminalSink), lexLang_(lexLang) {}
+        pragmaOnceGuards_(pragmaOnceGuards), terminalSink_(terminalSink),
+        lexLang_(lexLang) {}
 
   /// Realize an include expansion directly from the edited preprocessed stream
   /// B after the include-realization envelope has been proven by the shared
@@ -160,7 +163,23 @@ public:
       llvm::DenseMap<uint64_t, AcceptedResultCandidate>
           &includeExpansionAcceptedResults,
       llvm::DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr,
-      bool materializeIncludeNextInThisSubtree = false) const;
+      bool materializeIncludeNextInThisSubtree = false,
+      std::optional<uint64_t> ancestorArmIdAtIncludeSite = std::nullopt) const;
+
+  /// Return the innermost conditional arm enclosing one include's own site,
+  /// combined with the arm chain already accumulated from its ancestors.
+  ///
+  /// Once-state proofs need the arm chain across include boundaries, not only
+  /// inside one file: a pragma that is unconditional within its header still does
+  /// not dominate when the header itself was included from inside a conditional.
+  /// The chain is threaded through materialization rather than recovered from
+  /// `IncludeItem::parent`, because a skipped include edge carries no parent.
+  /// \p ownerIncludeId is the include instance owning the site's file, or
+  /// nullopt for a translation-unit-owned site.
+  std::optional<uint64_t> ComputeAncestorArmForChildInclude(
+      const RefoldModel::IncludeItem &child,
+      std::optional<uint64_t> ownerIncludeId,
+      std::optional<uint64_t> ancestorArmIdAtIncludeSite) const;
 
   /// Select the recorded header declaration that best owns an include-scoped
   /// patch.  This remains static because it is a pure declaration-span chooser
@@ -191,6 +210,11 @@ public:
                                  IncludeAnchorWitness *witness = nullptr) const;
 
 private:
+  /// Collect the include instances whose content a body realized from B
+  /// absorbed: this include and every descendant the producer actually entered.
+  void CollectEnteredIncludeSubtree(
+      uint64_t includeId, llvm::SmallVectorImpl<uint64_t> &subtree) const;
+
   /// Returns whether a path names the header currently being materialized.
   /// Logical and load-path spellings are both accepted, with physical-file
   /// equivalence used only as a hardening predicate.
@@ -213,7 +237,8 @@ private:
       llvm::DenseMap<uint64_t, std::string> &includeExpansion,
       llvm::DenseMap<uint64_t, size_t> &includeExpansionStartLineNos,
       llvm::DenseMap<uint64_t, AcceptedResultCandidate>
-          &includeExpansionAcceptedResults) const;
+          &includeExpansionAcceptedResults,
+      std::optional<uint64_t> ancestorArmIdAtIncludeSite = std::nullopt) const;
 
   /// Builds the parent-surface edit that rewrites a clean child include.
   /// The edit is accepted only when include replay proof has already supplied a
@@ -243,6 +268,7 @@ private:
   const RefoldIncludeInsertionPlanner &includeInsertionPlanner_;
   const RefoldProofLattice &proofLattice_;
   const RefoldTextEditAssembler &textEditAssembler_;
+  const RefoldPragmaOnceGuardRewriter &pragmaOnceGuards_;
   const RefoldTerminalProofSink &terminalSink_;
   const clang::LangOptions &lexLang_;
 };

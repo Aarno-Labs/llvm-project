@@ -79,6 +79,7 @@
 #include "include/RefoldIncludeInsertionPlanner.h"
 #include "include/RefoldIncludeMaterializationScheduler.h"
 #include "include/RefoldIncludeMaterializer.h"
+#include "include/RefoldPragmaOnceGuardRewriter.h"
 #include "include/RefoldIncludeReplayProof.h"
 #include "include/RefoldSourceGraphProof.h"
 #include "line-control/FinalLineControlModel.h"
@@ -335,6 +336,7 @@ RefoldEngine::RefoldEngine(
   InitializeTextEditAssembler();
   InitializeMacroStateRepairPlanner();
   InitializeLineObserverLayout();
+  InitializePragmaOnceGuardRewriter();
   InitializeIncludeMaterializer();
   InitializeExpansionFallbackPlanner();
 }
@@ -1750,6 +1752,7 @@ std::string RefoldEngine::FinalizeStructuralResult(
   includeSchedulerDeps.macroStateRepairPlanner = macroStateRepairPlanner_.get();
   includeSchedulerDeps.textEditAssembler = textEditAssembler_.get();
   includeSchedulerDeps.proofLattice = proofLattice_.get();
+  includeSchedulerDeps.pragmaOnceGuards = pragmaOnceGuardRewriter_.get();
   includeSchedulerDeps.terminalSink = &terminalSink_;
   includeSchedulerDeps.sidebandPragmaEdits = &sidebandPragmaEdits_;
 

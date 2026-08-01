@@ -1,5 +1,5 @@
 // RUN: %clang-refold-tester pure_ins_nested_cond_boundary1 XXX YYY
-#pragma once
+
 
 #ifdef YYY
 char blah(int y);

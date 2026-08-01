@@ -1290,6 +1290,11 @@ static constexpr const char *RefoldSchema = R"json(
           "minLength": 1,
           "description": "Producer-owned physical/FileManager path for the file opened by this include edge. This is the preferred input to physical identity proof; consumers should compare replayed candidates against it with path-equivalence logic rather than using filename-observer spelling."
         },
+        "controlling_macro": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Name of the macro whose #ifndef guards the entire contents of the file opened by this include edge, as recognized by HeaderSearch. Absent when the header has no such guard, including when it relies on #pragma once instead. A consumer that inlines this header's tokens rather than its source loses every directive the header contained, including this guard: the content is then present while the controlling macro stays undefined, so any later path back to the same physical file re-enters it. Defining this macro alongside such an inlined body restores the original skip behaviour. Resolved after the whole translation unit is lexed, because a header's guard is not known when its first inclusion is seen."
+        },
         "entered_file_spelling": {
           "type": "string",
           "minLength": 1,

@@ -2584,6 +2584,9 @@ void RefoldMapBuilder::onIncludeDirective(
     It.ResolvedPath = Spelled;
     It.OpenedPath = Abs;
     It.EnteredFileSpelling = Spelled;
+    // Retain the entry; the controlling macro is resolved after the whole TU has
+    // been lexed, because a first inclusion has not yet been read at this point.
+    It.OpenedFileEntry = File;
 
     // Seed abs->spelling mapping for later __FILE__/__LINE__-style emission.
     if (!Abs.empty() && !Spelled.empty())
@@ -4465,7 +4468,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "3.1");
+    JO.attribute("version", "3.2");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -5712,6 +5715,22 @@ void RefoldMapBuilder::writeJSON() {
         break;
     }
 
+    // Resolve each include's controlling macro now that the whole translation
+    // unit has been lexed.  HeaderSearch only records a header's `#ifndef` guard
+    // once it has finished reading the file, so this cannot be done from the
+    // InclusionDirective callback for a first inclusion.
+    {
+      HeaderSearch &HS = PP.getHeaderSearchInfo();
+      for (Item &It : Items) {
+        if (It.Kind != IK_Directive || !It.OpenedFileEntry)
+          continue;
+        if (const IdentifierInfo *Guard =
+                HS.getFileInfo(*It.OpenedFileEntry)
+                    .getControllingMacro(PP.getExternalSource()))
+          It.ControllingMacro = Guard->getName().str();
+      }
+    }
+
     // items...
     JO.attributeArray("items", [&] {
       for (const Item &It : Items) {
@@ -5879,6 +5898,8 @@ void RefoldMapBuilder::writeJSON() {
               JO.attribute("resolved_path", It.ResolvedPath);
             if (!It.OpenedPath.empty())
               JO.attribute("opened_path", It.OpenedPath);
+            if (!It.ControllingMacro.empty())
+              JO.attribute("controlling_macro", It.ControllingMacro);
             if (!It.EnteredFileSpelling.empty())
               JO.attribute("entered_file_spelling", It.EnteredFileSpelling);
             if (!It.EnteredFileName.empty())

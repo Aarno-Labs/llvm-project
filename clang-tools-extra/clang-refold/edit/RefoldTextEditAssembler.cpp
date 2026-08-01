@@ -651,6 +651,14 @@ bool protectedSourceAuthorityAcceptsKind(
            kind == PreprocessingStructureKind::Import;
   case ProtectedSourceEditAuthorityKind::LineControlRepair:
     return kind == PreprocessingStructureKind::LineControl;
+  case ProtectedSourceEditAuthorityKind::PragmaOnceGuardRewrite:
+    // Deliberately excludes Import and PragmaOperator: `#import` establishes
+    // once-state with no pragma at all, and the producer records nothing for
+    // `_Pragma("once")`.  Neither is modeled by the guard catalog, so omitting
+    // them here makes both fail closed at the emission firewall.
+    return kind == PreprocessingStructureKind::Pragma ||
+           kind == PreprocessingStructureKind::Include ||
+           kind == PreprocessingStructureKind::IncludeNext;
   case ProtectedSourceEditAuthorityKind::IncludePreservingSourceClosure:
   case ProtectedSourceEditAuthorityKind::TUIncludeClosure:
     // These two paths own a separate source-gap/closure proof.  They may carry
@@ -837,6 +845,13 @@ bool acceptedResultSupportsProtectedSourceAuthority(
             path ==
                 AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens);
   case ProtectedSourceEditAuthorityKind::IncludeMaterialization:
+    return candidate.kind == AcceptedResultCandidateKind::IncludePatch &&
+           (path == AcceptedPathKind::IncludeMaterializedExpansion ||
+            path == AcceptedPathKind::IncludeRealizationInlineFromB);
+  case ProtectedSourceEditAuthorityKind::PragmaOnceGuardRewrite:
+    // Synthetic once-state exists only because a header body was inlined, so the
+    // only carriers that can support it are the two include-realization paths
+    // that perform that inlining.
     return candidate.kind == AcceptedResultCandidateKind::IncludePatch &&
            (path == AcceptedPathKind::IncludeMaterializedExpansion ||
             path == AcceptedPathKind::IncludeRealizationInlineFromB);
