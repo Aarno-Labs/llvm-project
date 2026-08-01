@@ -1516,20 +1516,32 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
 
         return insertLineDirectiveAt(replacement, directive, *offset);
       }
-    }
 
-    if (stringutils::isIndentOnly(replacement, bol, replacement.size())) {
-      if (!rejoinsUntouchedTailSafelyAtBOL(originalFileText, e)) {
-        return replacement.str();
+      if (stringutils::isIndentOnly(replacement, bol, replacement.size())) {
+        // The directive is inserted *before* the replacement's trailing
+        // indentation, so the untouched original tail is emitted on its own
+        // physical line immediately after the directive.  Its logical line is
+        // therefore exactly `resumeLine`, whether or not that tail began at a
+        // BOL in the original file.
+        //
+        // `rejoinsUntouchedTailSafelyAtBOL()` is the precondition for
+        // *appending* a directive after a replacement, where the untouched tail
+        // keeps its original physical line; it is not an obligation for this
+        // insertion point, which gives the tail a fresh line either way.
+        //
+        // Discharging the resync locally is what keeps the repair ordered
+        // before the observers it protects: a refused injection can only be
+        // deferred to the next safe BOL in the emitted output, and that BOL may
+        // lie after a preserved `__LINE__` observer the drift already moved.
+        //
+        // Idempotence: if the prior line is already the same directive, do not
+        // emit it again before the indentation-only suffix.
+        if (replacement.substr(0, bol).ends_with(directive)) {
+          return replacement.str();
+        }
+
+        return insertLineDirectiveAt(replacement, directive, bol);
       }
-
-      // Idempotence: if the prior line is already the same directive, do not
-      // emit it again before the indentation-only suffix.
-      if (replacement.substr(0, bol).ends_with(directive)) {
-        return replacement.str();
-      }
-
-      return insertLineDirectiveAt(replacement, directive, bol);
     }
 
     // There is a newline, but the tail after it contains substantive text. A
