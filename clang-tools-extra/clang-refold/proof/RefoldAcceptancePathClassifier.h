@@ -8,10 +8,8 @@
 // primitives.
 //
 // Methods:
-//   * `InventoryMacroPatchProofAcceptancePath` /
-//     `InventoryMacroPatchAcceptancePath` — map a macro patch's proof
-//     (or its selected accepted-result carrier) into an acceptance-path
-//     inventory.
+//   * `InventoryMacroPatchProofAcceptancePath` — map a macro patch's
+//     proof carrier into an acceptance-path inventory.
 //   * `BuildAcceptancePathInventory` — turn an `AcceptedPathKind` into
 //     an `AcceptancePathInventory`.
 //   * `BuildTheoremProofClassForAcceptedPath` — turn an
@@ -85,11 +83,6 @@ public:
   /// inventory.
   AcceptancePathInventory
   InventoryMacroPatchProofAcceptancePath(const MacroPatchProof &proof) const;
-
-  /// Map a macro patch's selected accepted-result carrier into an
-  /// acceptance-path inventory.
-  AcceptancePathInventory
-  InventoryMacroPatchAcceptancePath(const MacroPatch &patch) const;
 
   /// Map an accepted path to its proof-discharge inventory.
   ///

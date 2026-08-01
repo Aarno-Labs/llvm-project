@@ -59,7 +59,7 @@ RefoldMacroStandardArgsOnlyPatchBuilder::TemplateSolver() const {
   return RefoldMacroArgsOnlyTemplateSolver(
       {&deps_.model, deps_.aToks, deps_.bToks, deps_.bTokOff,
        &deps_.sourceMapper, &deps_.macroTopology, &deps_.proofLattice,
-       &deps_.lexLang, deps_.strict});
+       &deps_.lexLang});
 }
 
 RefoldMacroOccurrenceReplay

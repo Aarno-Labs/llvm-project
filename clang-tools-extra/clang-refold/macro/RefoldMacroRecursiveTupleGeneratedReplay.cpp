@@ -216,9 +216,8 @@ struct TerminalGeneratedCalleeEdge {
   const RefoldModel::MacroInvocation *terminalInvocation = nullptr;
   /// Exact definition directive used by `terminalInvocation`.
   const RefoldModel::MacroDirective *terminalDefinition = nullptr;
-  /// Parent formal index that produced the terminal callee token.
-  uint32_t callerFormalIndex = 0;
-  /// Root formal index reached by composing `callerFormalIndex`.
+  /// Root formal index reached by composing the parent formal index that
+  /// produced the terminal callee token.
   uint32_t rootCalleeFormalIndex = 0;
 };
 
@@ -358,10 +357,6 @@ struct RecursiveTupleGeneratedReplaySolution {
   llvm::SmallVector<std::string, 8> oldSolvedActuals;
   /// Unique edited replay solution in terminal callee formal order.
   llvm::SmallVector<std::string, 8> newSolvedActuals;
-  /// True when terminal replay accepted stringification evidence.
-  bool usesStringification = false;
-  /// True when terminal replay accepted token-paste evidence.
-  bool usesPaste = false;
 };
 
 /// One accepted edit inside the source-spelled root tuple payload.
@@ -989,7 +984,6 @@ private:
     edge.parentInvocation = parentState.invocation;
     edge.terminalInvocation = &child;
     edge.terminalDefinition = terminalDefinition;
-    edge.callerFormalIndex = callerFormalIndex;
     edge.rootCalleeFormalIndex = *rootFormal;
     return TerminalGeneratedCalleeEdgeStatus::Accepted;
   }
@@ -1251,7 +1245,6 @@ private:
         depth >= graph_.MaxAcyclicTraversalDepth())
       return false;
 
-    bool sawGeneratedCalleeChild = false;
     for (const RefoldModel::MacroInvocation *child :
          graph_.ChildrenOf(state.invocation->id)) {
       if (!child)
@@ -1279,7 +1272,6 @@ private:
       case MacroCalleeOriginKind::Paste:
         return false;
       case MacroCalleeOriginKind::Opaque: {
-        sawGeneratedCalleeChild = true;
         std::optional<GeneratedTupleFormalState> childState =
             TryComposeNestedOpaqueGeneratedCalleeState(request, state, *child);
         if (!childState)
@@ -1305,7 +1297,6 @@ private:
         break;
       }
 
-      sawGeneratedCalleeChild = true;
       std::optional<GeneratedTupleFormalState> childState =
           TryComposeNestedGeneratedCalleeState(request, state, *child);
       if (!childState)
@@ -1327,7 +1318,6 @@ private:
       }
     }
 
-    (void)sawGeneratedCalleeChild;
     return true;
   }
 
@@ -2058,8 +2048,6 @@ public:
           solution.newSolvedActuals.assign(
               terminalSolution->newSolvedActuals.begin(),
               terminalSolution->newSolvedActuals.end());
-          solution.usesStringification = terminalSolution->usesStringification;
-          solution.usesPaste = terminalSolution->usesPaste;
           haveReferenceReplay = true;
           continue;
         }
@@ -2071,8 +2059,6 @@ public:
                         solution.newSolvedActuals.end(),
                         terminalSolution->newSolvedActuals.begin()))
           return std::nullopt;
-        solution.usesStringification |= terminalSolution->usesStringification;
-        solution.usesPaste |= terminalSolution->usesPaste;
       }
 
       if (!targetSolved)

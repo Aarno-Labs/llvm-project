@@ -1178,14 +1178,6 @@ RefoldPreprocessingStructureIndex RefoldPreprocessingStructureIndex::Build(
   return index;
 }
 
-bool RefoldPreprocessingStructureIndex::HasUnboundStructure() const {
-  for (const PreprocessingStructureInterval &interval : intervals_) {
-    if (!interval.IsProducerBound())
-      return true;
-  }
-  return false;
-}
-
 size_t RefoldPreprocessingStructureIndex::FirstPossibleOverlappingIndex(
     uint64_t begin) const {
   auto firstPossible = std::upper_bound(prefixMaximumIntervalEnds_.begin(),

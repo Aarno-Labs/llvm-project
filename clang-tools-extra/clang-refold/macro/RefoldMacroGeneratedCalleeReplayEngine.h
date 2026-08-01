@@ -6,8 +6,6 @@
 // generated-callee chain candidates outside the leaf fallback path:
 //
 //   * `GeneratedCalleeReplayPreservesEnvelope` — trivial envelope guard.
-//   * `GeneratedCalleeReplayIsAdmissible` — pre-build admission gate over
-//     the recovered generated-call context.
 //   * `BuildGeneratedCalleeReplayCandidate` — main higher-order chain
 //     replay candidate construction.
 //   * `BuildTupleGeneratedCalleeReplayCandidate` — tuple-aware variant
@@ -344,10 +342,6 @@ public:
 
   /// Trivial envelope guard ahead of higher-order replay.
   bool GeneratedCalleeReplayPreservesEnvelope(
-      const GeneratedCalleeReplayContext &ctx) const;
-
-  /// Pre-build admission gate over the recovered generated-call context.
-  bool GeneratedCalleeReplayIsAdmissible(
       const GeneratedCalleeReplayContext &ctx) const;
 
   /// Build the higher-order generated-callee chain replay candidate.

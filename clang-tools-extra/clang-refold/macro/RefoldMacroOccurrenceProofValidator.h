@@ -3,10 +3,10 @@
 // Macro subtree-membership / occurrence-proof predicates for clang-refold.
 //
 // This service owns the small, read-only predicates used by candidate
-// admission and DAG validation: ancestry walks, descendant-depth queries,
-// and counter-invocation containment. These predicates have no mutable
-// state; they take borrowed model and topology dependencies and answer
-// boolean / depth queries deterministically.
+// admission and DAG validation: descendant-depth queries and subtree
+// membership. These predicates have no mutable state; they take borrowed
+// model and topology dependencies and answer boolean / depth queries
+// deterministically.
 //
 // Replay-stability predicates such as paste/stringify/sibling-surface
 // validation and whole-envelope replay safety live in the replay-stability
@@ -50,9 +50,9 @@ struct MacroSubtreeReplayValidationContext {
 
 /// Answers read-only occurrence and subtree-membership proof predicates.
 ///
-/// The validator checks producer ancestry, descendant depth, and counter
-/// containment for macro DAG/subtree admission.  It does not mutate planning
-/// state or perform replay-surface validation.
+/// The validator checks descendant depth and subtree membership for macro
+/// DAG/subtree admission.  It does not mutate planning state or perform
+/// replay-surface validation.
 class RefoldMacroOccurrenceProofValidator {
 public:
   struct Dependencies {
@@ -62,17 +62,6 @@ public:
 
   explicit RefoldMacroOccurrenceProofValidator(Dependencies deps)
       : deps_(std::move(deps)) {}
-
-  /// Return whether `macro` lies in the producer caller ancestry chain that
-  /// terminates at `rootId`.  Fail-closed: broken or cyclic ancestry returns
-  /// false.
-  bool
-  CurrentLevelInvocationIsInSubtreeOf(const RefoldModel::MacroInvocation &macro,
-                                      uint64_t rootId) const;
-
-  /// Return whether the subtree rooted at `rootId` contains any
-  /// `__COUNTER__` invocation. Used to gate counter-stabilization replay.
-  bool CurrentLevelSubtreeContainsCounterInvocation(uint64_t rootId) const;
 
   /// Return the strict descendant distance from `candidate` to the validated
   /// root, or nullopt if the chain breaks before reaching it.  The root

@@ -13,7 +13,6 @@
 
 #include "core/RefoldLog.h"
 #include "macro/RefoldMacroTopology.h"
-#include "source/RefoldTokenTextAnalysis.h"
 #include "util/RefoldPathIdentity.h"
 #include "util/StringUtils.h"
 
@@ -280,11 +279,6 @@ RefoldLineControlProof::IncludeSubtreeLineStateObserverDemand(
   }
 
   return demand;
-}
-
-bool RefoldLineControlProof::IncludeSubtreeHasLineStateSensitiveBuiltin(
-    uint64_t includeId) const {
-  return IncludeSubtreeLineStateObserverDemand(includeId).Any();
 }
 
 bool RefoldLineControlProof::IncludeEntryLineDirectiveDischargesLayoutBarrier(

@@ -77,16 +77,11 @@ public:
   using MacroStateDirectiveLineInterval =
       ::clang::refold::MacroStateDirectiveLineInterval;
   using OwnerSourceRange = ::clang::refold::OwnerSourceRange;
-  using OwnerStateBoundary = ::clang::refold::OwnerStateBoundary;
-  using OwnerStateComponent = ::clang::refold::OwnerStateComponent;
   using ResyncOutcome = ::clang::refold::ResyncOutcome;
   using SelectedAcceptedResultCandidate =
       ::clang::refold::SelectedAcceptedResultCandidate;
   using StabilizedMaterializedHeaderMacroPatch =
       ::clang::refold::StabilizedMaterializedHeaderMacroPatch;
-  using StateMutationKind = ::clang::refold::StateMutationKind;
-  using SuffixStabilityWitnessKind =
-      ::clang::refold::SuffixStabilityWitnessKind;
   using TextEdit = ::clang::refold::TextEdit;
 
   /// Construct an include materializer over immutable A/B token/source inputs
@@ -227,18 +222,6 @@ private:
       const RefoldModel::IncludeItem &child, llvm::StringRef rewrittenOperand,
       IncludeReplayProofContext::OrdinaryIncludeDelimiterKind delimiterKind,
       llvm::StringRef ownerBytes) const;
-
-  /// Build a TextEdit while applying local or pending #line resync behavior
-  /// through the text-edit assembler service.
-  ///
-  /// Include materialization may need an immediate local resync or a deferred
-  /// pending resync depending on whether the emitted replacement crosses a
-  /// logical file boundary.  This helper keeps that policy in the final edit
-  /// assembler rather than duplicating it inside the include materializer.
-  TextEdit MakeTextEditWithResyncOrPending(
-      llvm::StringRef original, uint64_t start, uint64_t end,
-      llvm::StringRef replacement, llvm::StringRef fileSpelling,
-      std::optional<uint64_t> ownerIncludeId = std::nullopt) const;
 
   const RefoldModel &model_;
   llvm::StringRef aSource_;

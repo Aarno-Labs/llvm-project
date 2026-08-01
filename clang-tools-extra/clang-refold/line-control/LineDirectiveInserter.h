@@ -243,8 +243,9 @@ public:
   ///   reason about whether it is a no-op without risking token adjacency
   ///   changes).
   /// * If at BOL, attempt to reconstruct the current logical location from the
-  ///   most recent emitted #line directive (within a bounded lookback) plus the
-  ///   number of *non-line-spliced* newlines since then. If that reconstructed
+  ///   most recent emitted #line directive (found via an unbounded scan of the
+  ///   full output prefix) plus the number of *non-line-spliced* newlines since
+  ///   then. If that reconstructed
   ///   location already equals `(fileSpellingForDirective, targetLine)`, treat
   ///   the directive as a no-op and suppress it.
   ///
@@ -289,15 +290,16 @@ private:
 
   /// \brief Finds the most recent parseable #line directive in `out`.
   ///
-  /// This scan is intentionally bounded (currently 16 KiB) to keep refolding
-  /// fast even for large files. If the last relevant directive lies beyond the
-  /// lookback window, this method may return null and callers will behave
-  /// conservatively (i.e., they will emit directives rather than risk missing a
-  /// needed resync).
+  /// This scan is intentionally unbounded: it walks the full output prefix,
+  /// because source-authored line-control directives establish semantic
+  /// preprocessor state and missing an old directive can make `__LINE__` or
+  /// `__FILE__` replay wrong. If no parseable directive exists, this method
+  /// returns null and callers behave conservatively (i.e., they emit directives
+  /// rather than risk missing a needed resync).
   ///
   /// \param src source buffer
   /// \return parsed state for the last directive, or null if none is
-  ///         found/parseable in the window
+  ///         found/parseable
   static std::optional<LineDirectiveState>
   FindLastLineDirectiveState(StringRef src);
 
@@ -306,7 +308,7 @@ private:
   /// location.
   ///
   /// Mechanism: find the most recent parseable #line directive in `out`
-  /// (bounded lookback), then compute:
+  /// (unbounded scan of the full output prefix), then compute:
   ///
   ///     currentLine = lastDirective.line +
   ///                   countNonSplicedNewlines(out, lastDirective.afterIdx,

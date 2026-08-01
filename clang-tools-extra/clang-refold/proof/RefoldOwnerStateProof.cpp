@@ -673,11 +673,6 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
                    StateComponentForMissingStateFact(kind), detail);
   };
 
-  auto markMissingAndUnmodeled = [&](MissingStateFactKind kind,
-                                     StringRef detail) {
-    markMissing(kind, detail);
-  };
-
   auto finalize = [&]() {
     // There is no OwnerStateSummary compatibility bridge.  Build the canonical
     // theorem delta directly from precise producer facts and explicit
@@ -694,7 +689,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     return theoremDelta;
   };
   if (!owner.IsKnown()) {
-    markMissingAndUnmodeled(MissingStateFactKind::MissingOwnerOrderingFacts,
+    markMissing(MissingStateFactKind::MissingOwnerOrderingFacts,
                             "unknown owner identity");
     return finalize();
   }
@@ -780,7 +775,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
       }
     }
     if (span.end > aToks_.size())
-      markMissingAndUnmodeled(MissingStateFactKind::MissingOwnerOrderingFacts,
+      markMissing(MissingStateFactKind::MissingOwnerOrderingFacts,
                               "producer PP span extends past A-token stream");
   };
 
@@ -1056,7 +1051,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         }
 
         if (ordinal == 0)
-          markMissingAndUnmodeled(
+          markMissing(
               MissingStateFactKind::MissingCounterFacts,
               "__COUNTER__ invocation has no producer output range");
       };
@@ -1091,7 +1086,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         if (text[i++] == quote)
           return;
       }
-      markMissingAndUnmodeled(
+      markMissing(
           MissingStateFactKind::MissingConditionalFacts,
           "unterminated conditional string/character literal");
     };
@@ -1123,7 +1118,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         i += 2;
         const size_t end = text.find("*/", i);
         if (end == std::string::npos) {
-          markMissingAndUnmodeled(MissingStateFactKind::MissingConditionalFacts,
+          markMissing(MissingStateFactKind::MissingConditionalFacts,
                                   "unterminated conditional block comment");
           break;
         }
@@ -1146,7 +1141,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         }
         std::optional<StringRef> operand = readIdentifier();
         if (!operand) {
-          markMissingAndUnmodeled(MissingStateFactKind::MissingConditionalFacts,
+          markMissing(MissingStateFactKind::MissingConditionalFacts,
                                   "malformed defined() operand");
           continue;
         }
@@ -1157,7 +1152,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
           if (i < text.size() && text[i] == ')')
             ++i;
           else
-            markMissingAndUnmodeled(
+            markMissing(
                 MissingStateFactKind::MissingConditionalFacts,
                 "malformed defined() closing parenthesis");
         }
@@ -1183,11 +1178,11 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
                          "#undef directive state fact");
           facts.AddMacroUndefinition(identity);
         } else
-          markMissingAndUnmodeled(MissingStateFactKind::MissingMacroFacts,
+          markMissing(MissingStateFactKind::MissingMacroFacts,
                                   "unknown macro directive kind");
 
         if (directive.name.empty() || directive.text.empty())
-          markMissingAndUnmodeled(MissingStateFactKind::MissingMacroFacts,
+          markMissing(MissingStateFactKind::MissingMacroFacts,
                                   "macro directive missing name or text");
       };
 
@@ -1223,12 +1218,12 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         lineControlIdentityFromEvent(event);
     facts.AddLineControlEvent(identity);
     if (!event.active || !event.producerProven) {
-      markMissingAndUnmodeled(
+      markMissing(
           MissingStateFactKind::MissingLineControlFacts,
           "line-control event inactive or not producer-proven");
     }
     if (event.text.empty() || !event.siteB || !event.siteE) {
-      markMissingAndUnmodeled(
+      markMissing(
           MissingStateFactKind::MissingLineControlFacts,
           "line-control event missing directive text or source span");
     }
@@ -1276,12 +1271,12 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         group, arm, reverseSolvedDirectiveRequired));
 
     if (!conditionalArmSelectionTruthProducerProven(group, arm)) {
-      markMissingAndUnmodeled(
+      markMissing(
           MissingStateFactKind::MissingConditionalFacts,
           "conditional arm selection was not producer-proven");
     }
     if (reverseSolvedDirectiveRequired) {
-      markMissingAndUnmodeled(
+      markMissing(
           MissingStateFactKind::MissingConditionalFacts,
           "inactive conditional arm cannot serve as active source witness");
     }
@@ -1305,7 +1300,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
 
     const bool uniqueSelectedArm = conditionalGroupHasUniqueSelectedArm(group);
     if (!uniqueSelectedArm) {
-      markMissingAndUnmodeled(
+      markMissing(
           MissingStateFactKind::MissingConditionalFacts,
           "conditional group does not have exactly one producer-selected arm");
     }
@@ -1327,11 +1322,11 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     recordCounterInvocationEvents(macro);
     if (macro.name.empty() ||
         (macro.subkind != "obj" && macro.subkind != "func"))
-      markMissingAndUnmodeled(
+      markMissing(
           MissingStateFactKind::MissingMacroFacts,
           "macro invocation missing name or recognized kind");
     if (macro.subkind == "func" && !macro.definitionDirectiveId)
-      markMissingAndUnmodeled(
+      markMissing(
           MissingStateFactKind::MissingMacroFacts,
           "function-like macro invocation missing definition id");
 
@@ -1339,7 +1334,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     if (macro.invText)
       scanTextForBuiltins(*macro.invText);
     else if (macro.subkind == "func")
-      markMissingAndUnmodeled(
+      markMissing(
           MissingStateFactKind::MissingMacroFacts,
           "function-like macro invocation missing invocation text");
 
@@ -1367,7 +1362,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     if (directive)
       recordMacroDirective(*directive);
     else
-      markMissingAndUnmodeled(
+      markMissing(
           MissingStateFactKind::MissingMacroFacts,
           "macro directive owner id not found in producer map");
     return finalize();
@@ -1383,7 +1378,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     if (event)
       recordLineControl(*event);
     else
-      markMissingAndUnmodeled(
+      markMissing(
           MissingStateFactKind::MissingLineControlFacts,
           "line-control owner id not found in producer map");
     return finalize();
@@ -1399,7 +1394,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     if (pragma)
       recordPragma(*pragma);
     else
-      markMissingAndUnmodeled(MissingStateFactKind::MissingPragmaFacts,
+      markMissing(MissingStateFactKind::MissingPragmaFacts,
                               "pragma owner id not found in producer map");
     return finalize();
   }
@@ -1414,7 +1409,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     if (macro)
       recordMacroInvocation(*macro);
     else
-      markMissingAndUnmodeled(
+      markMissing(
           MissingStateFactKind::MissingMacroFacts,
           "macro invocation owner id not found in producer map");
     return finalize();
@@ -1427,12 +1422,12 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         recordConditionalArm(*armRef->group, *armRef->arm,
                              /*requireActiveOwner=*/true);
       } else {
-        markMissingAndUnmodeled(
+        markMissing(
             MissingStateFactKind::MissingConditionalFacts,
             "conditional arm owner id not found in producer map");
       }
     } else {
-      markMissingAndUnmodeled(MissingStateFactKind::MissingConditionalFacts,
+      markMissing(MissingStateFactKind::MissingConditionalFacts,
                               "conditional arm owner missing arm id");
     }
   }
@@ -1447,7 +1442,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
       }
     }
     if (!found)
-      markMissingAndUnmodeled(
+      markMissing(
           MissingStateFactKind::MissingConditionalFacts,
           "conditional group owner id not found in producer map");
     return finalize();
@@ -1514,7 +1509,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
            *owner.includeId == *event->ownerIncludeId);
       if (ownerMatchesByInclude) {
         recordLineControl(*event);
-        markMissingAndUnmodeled(
+        markMissing(
             MissingStateFactKind::MissingLineControlFacts,
             "line-control event matched by owner but lacks source span");
       }
@@ -1561,7 +1556,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
   }
 
   if (owner.IsInclude() && owner.includeId && !exactIncludeOwnerFound)
-    markMissingAndUnmodeled(MissingStateFactKind::MissingOwnerOrderingFacts,
+    markMissing(MissingStateFactKind::MissingOwnerOrderingFacts,
                             "include owner id not found in producer map");
 
   return finalize();
@@ -1990,50 +1985,6 @@ OwnerStateGraph RefoldOwnerStateProof::BuildOwnerStateGraph() const {
       dst.push_back(value);
   };
 
-  auto appendKeyedIndex = [&](llvm::StringMap<std::vector<uint64_t>> &map,
-                              StringRef key, uint64_t value) {
-    if (key.empty())
-      return;
-    appendUniqueIndex(map[key], value);
-  };
-
-  auto counterKey = [](const CounterEventIdentity &identity) {
-    return formatv("macro={0}:ordinal={1}:atok=[{2},{3})",
-                   identity.macroInvocationId, identity.occurrenceOrdinal,
-                   identity.aTokenBegin, identity.aTokenEnd)
-        .str();
-  };
-
-  auto includeKey = [](const IncludeStateIdentity &identity) {
-    if (identity.resolvedPath && !identity.resolvedPath->empty())
-      return formatv("resolved={0}", *identity.resolvedPath).str();
-    if (!identity.target.empty())
-      return formatv("target={0}", identity.target).str();
-    return formatv("include={0}", identity.includeId).str();
-  };
-
-  auto includeGuardKey = [](const IncludeGuardStateIdentity &identity) {
-    if (identity.guardMacroName && !identity.guardMacroName->empty())
-      return formatv("guard={0}", *identity.guardMacroName).str();
-    if (!identity.headerPath.empty())
-      return formatv("header={0}", identity.headerPath).str();
-    return formatv("include={0}", identity.includeId).str();
-  };
-
-  auto pragmaKey = [](const PragmaStateIdentity &identity) {
-    return formatv("pragma={0}:class={1}", identity.pragmaId,
-                   identity.classification)
-        .str();
-  };
-
-  auto conditionalKey = [](const ConditionalStateIdentity &identity) {
-    if (identity.armId)
-      return formatv("group={0}:arm={1}:role={2}", identity.groupId,
-                     *identity.armId, identity.role)
-          .str();
-    return formatv("group={0}:role={1}", identity.groupId, identity.role).str();
-  };
-
   auto recordComponentIndex = [&](OwnerStateComponent component,
                                   uint64_t siteIndex) {
     switch (component) {
@@ -2077,99 +2028,6 @@ OwnerStateGraph RefoldOwnerStateProof::BuildOwnerStateGraph() const {
       return;
     }
     llvm_unreachable("Invalid owner state component");
-  };
-
-  auto recordKeyedIndexes = [&](OwnerStateComponent component,
-                                const OwnerStateDelta &delta,
-                                uint64_t siteIndex) {
-    auto recordMacroName = [&](const MacroStateIdentity &identity) {
-      appendKeyedIndex(graph.observerIndex.observersByMacroName,
-                       identity.macroName, siteIndex);
-    };
-    auto recordMacroObservation =
-        [&](const MacroStateObservation &observation) {
-          recordMacroName(observation.identity);
-        };
-    auto recordMacroBucket = [&](const OwnerStateFacts &facts) {
-      for (const MacroStateIdentity &identity : facts.macroRequirements)
-        recordMacroName(identity);
-      for (const MacroStateObservation &observation :
-           facts.macroExpansionObservations)
-        recordMacroObservation(observation);
-      for (const MacroStateObservation &observation :
-           facts.definedOperatorObservations)
-        recordMacroObservation(observation);
-      for (const MacroStateObservation &observation :
-           facts.conditionalMacroObservations)
-        recordMacroObservation(observation);
-    };
-    auto recordCounterBucket = [&](const OwnerStateFacts &facts) {
-      for (const CounterEventIdentity &identity : facts.counterEvents)
-        appendKeyedIndex(graph.observerIndex.observersByCounterEvent,
-                         counterKey(identity), siteIndex);
-    };
-    auto recordPragmaBucket = [&](const OwnerStateFacts &facts) {
-      for (const PragmaStateIdentity &identity : facts.pragmaStateEvents)
-        appendKeyedIndex(graph.observerIndex.observersByPragmaState,
-                         pragmaKey(identity), siteIndex);
-    };
-    auto recordIncludeBucket = [&](const OwnerStateFacts &facts) {
-      for (const IncludeStateIdentity &identity : facts.includeStateEvents)
-        appendKeyedIndex(graph.observerIndex.observersByIncludeState,
-                         includeKey(identity), siteIndex);
-      for (const IncludeGuardStateIdentity &identity :
-           facts.includeGuardStateEvents)
-        appendKeyedIndex(graph.observerIndex.observersByIncludeGuard,
-                         includeGuardKey(identity), siteIndex);
-    };
-    auto recordConditionalBucket = [&](const OwnerStateFacts &facts) {
-      for (const ConditionalStateIdentity &identity :
-           facts.conditionalStateEvents)
-        appendKeyedIndex(graph.observerIndex.observersByConditionalState,
-                         conditionalKey(identity), siteIndex);
-    };
-
-    switch (component) {
-    case OwnerStateComponent::MacroState:
-    case OwnerStateComponent::DefinedOperator:
-      recordMacroBucket(delta.entry);
-      recordMacroBucket(delta.observes);
-      break;
-    case OwnerStateComponent::ConditionalState:
-      recordMacroBucket(delta.entry);
-      recordMacroBucket(delta.observes);
-      recordConditionalBucket(delta.entry);
-      recordConditionalBucket(delta.observes);
-      break;
-    case OwnerStateComponent::Counter:
-      recordCounterBucket(delta.entry);
-      recordCounterBucket(delta.observes);
-      break;
-    case OwnerStateComponent::PragmaState:
-      recordPragmaBucket(delta.entry);
-      recordPragmaBucket(delta.observes);
-      break;
-    case OwnerStateComponent::IncludeGuardState:
-    case OwnerStateComponent::IncludeState:
-      recordIncludeBucket(delta.entry);
-      recordIncludeBucket(delta.observes);
-      break;
-    case OwnerStateComponent::LineNumber:
-      appendKeyedIndex(graph.observerIndex.observersByConditionalState,
-                       "line-state", siteIndex);
-      break;
-    case OwnerStateComponent::FileState:
-      appendKeyedIndex(graph.observerIndex.observersByConditionalState,
-                       "file-state", siteIndex);
-      break;
-    case OwnerStateComponent::FileName:
-      appendKeyedIndex(graph.observerIndex.observersByConditionalState,
-                       "filename-state", siteIndex);
-      break;
-    case OwnerStateComponent::UnmodeledState:
-    case OwnerStateComponent::Unknown:
-      break;
-    }
   };
 
   auto countMissingFacts = [](const OwnerStateDelta &delta) -> uint64_t {
@@ -2245,7 +2103,6 @@ OwnerStateGraph RefoldOwnerStateProof::BuildOwnerStateGraph() const {
         const uint64_t siteIndex = graph.observerSites.size();
         graph.observerSites.push_back(std::move(site));
         recordComponentIndex(component, siteIndex);
-        recordKeyedIndexes(component, node.state, siteIndex);
         ++graph.audit.observedStateComponents;
       }
 

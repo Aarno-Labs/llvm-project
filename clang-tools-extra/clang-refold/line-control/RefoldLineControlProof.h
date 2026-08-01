@@ -17,7 +17,7 @@
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "proof/RefoldProofVocabulary.h"
-#include "source/RefoldSourceMapper.h"
+#include "source/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
@@ -31,7 +31,6 @@ namespace refold {
 
 class RefoldMacroTopology;
 class RefoldPathIdentity;
-class RefoldTokenTextAnalysis;
 
 /// Earliest preserved line-state observer in an owner suffix.
 ///
@@ -51,8 +50,7 @@ class RefoldLineControlProof {
 public:
   /// Construct a proof service over producer line-control and token-map facts.
   RefoldLineControlProof(
-      const RefoldModel &model, const RefoldSourceMapper &sourceMapper,
-      const RefoldPathIdentity &paths, const RefoldTokenTextAnalysis &tokenText,
+      const RefoldModel &model, const RefoldPathIdentity &paths,
       const RefoldMacroTopology &macroTopology,
       const LineDirectiveInserter &lineDirs, llvm::ArrayRef<PPTok> aToks,
       llvm::ArrayRef<PPTok> bToks, const std::vector<int64_t> &abTokMapA2B,
@@ -74,10 +72,6 @@ public:
   /// Summarize preserved line-state builtin demand inside an include subtree.
   LineStateObserverDemand
   IncludeSubtreeLineStateObserverDemand(uint64_t includeId) const;
-
-  /// Return whether an include subtree contains any preserved line-state
-  /// observer that can consume synthetic line-control repair.
-  bool IncludeSubtreeHasLineStateSensitiveBuiltin(uint64_t includeId) const;
 
   /// Return whether the child include still needs an entry #line wrapper to
   /// preserve physical blank-line layout before line-state observers.

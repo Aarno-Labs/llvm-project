@@ -556,14 +556,6 @@ public:
   /// distinguish those cases must first check `HasCompleteCertification()`.
   bool PairOccursOnOptimalPath(uint64_t aToken, uint64_t bToken) const;
 
-  /// Return true when every globally optimal path uses this exact match edge.
-  ///
-  /// This is stronger than having a unique individually admissible partner:
-  /// two crossing one-partner pairs may each occur on an optimal path while
-  /// neither is present on every optimal path. The oracle therefore derives
-  /// forcedness from the complete optimal-path DAG rather than partner counts.
-  bool PairIsForced(uint64_t aToken, uint64_t bToken) const;
-
   /// Compute the exact weighted-LCS objective inside one half-open A/B window.
   ///
   /// The query uses the same absolute A-gap costs as the global problem. It is
@@ -573,29 +565,6 @@ public:
   /// oracle and bounds before issuing the query.
   LcsObjective ObjectiveForWindow(uint64_t aBegin, uint64_t aEnd,
                                   uint64_t bBegin, uint64_t bEnd) const;
-
-  /// Return true when a globally optimal path passes through both window
-  /// endpoints in order.
-  ///
-  /// This companion query distinguishes an inadmissible window from an empty
-  /// frontier result without weakening the required vector-returning API.
-  bool WindowOccursOnOptimalPath(uint64_t aBegin, uint64_t aEnd,
-                                 uint64_t bBegin, uint64_t bEnd) const;
-
-  /// Project an A-token boundary to every exact B frontier admitted by the
-  /// globally conditioned weighted-LCS window.
-  ///
-  /// The returned vector is sorted and contains only frontiers that occur on
-  /// an optimal path from `(aWindowBegin,bWindowBegin)` to
-  /// `(aWindowEnd,bWindowEnd)` while that complete window remains admissible
-  /// in the global problem. Noncontiguous frontier sets remain noncontiguous;
-  /// no min/max range approximation is performed. An empty vector means that
-  /// certification is incomplete, the bounds are invalid, or the window is
-  /// not globally admissible. `HasCompleteCertification()` and
-  /// `WindowOccursOnOptimalPath()` distinguish those cases.
-  std::vector<uint64_t> ProjectATokenBoundaryToOptimalBFrontiers(
-      uint64_t aWindowBegin, uint64_t aWindowEnd, uint64_t bWindowBegin,
-      uint64_t bWindowEnd, uint64_t aBoundary) const;
 
   /// Enumerate every distinct core-optimal match map inside one conditioned
   /// forced-anchor window.
@@ -876,48 +845,17 @@ bool projectLcsBoundaryToOptimalBFrontiers(
 /// transitions, including stream endpoints when independently nominated, the
 /// endpoints of maximal runs of already-forced token edges,
 /// and any caller-supplied producer/protected-structure boundaries. Candidate
-/// nomination grants no B-side authority; `partitionLcsWindowsLinearSpace()`
+/// nomination grants no B-side authority; `partitionLcsWindowsLinearSpaceImpl()`
 /// must still prove a singleton optimal frontier.
 std::vector<uint64_t> nominateLcsPartitionBoundaries(
     ArrayRef<LcsAGapProvenance> gapProvenance,
     ArrayRef<int64_t> forcedMap = {},
     ArrayRef<uint64_t> additionalABoundaries = {});
 
-/// Partition one A/B rectangle at exact state seams.
-///
-/// Candidate order is normalized before proof, so input order cannot affect
-/// the result. Every candidate is tested against the complete enclosing-window
-/// objective using exact forward and suffix rows. All singleton frontiers are
-/// accepted together. A candidate with zero or multiple frontiers is never
-/// selected by rank, proximity, balance, or Hirschberg traversal order.
-///
-/// Callers should supply the bounded structural set returned by
-/// `nominateLcsPartitionBoundaries()` plus any exact producer/protected
-/// boundaries. The routine does not impose a lossy count cap or scan every A
-/// token boundary implicitly.
-///
-/// This exhaustive evidence API computes one complete forward/suffix
-/// projection per supplied candidate. It is appropriate for focused proof
-/// queries and tests, but production certification of large streams must use
-/// `certifyLcsWindowsWithinBudget()`, whose balanced recursion has a geometric
-/// work bound independent of the total nomination count.
-///
-/// The result contains only partition evidence; all windows remain
-/// `PartitionUnresolved` and publish no anchors. When diagnostic evidence is
-/// supplied, generated output is reset while the caller's canonical protected-
-/// boundary identity request is preserved for subsequent local certification.
-bool partitionLcsWindowsLinearSpace(
-    ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
-    ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
-    ArrayRef<LcsAGapProvenance> gapProvenance,
-    ArrayRef<uint64_t> candidateABoundaries,
-    LcsWindowPartitionResult &result,
-    LcsCertificationDiagnosticEvidence *diagnosticEvidence = nullptr);
-
 /// Partition the complete streams and certify each resulting window locally.
 ///
 /// Nonempty candidate A boundaries are first proved with
-/// `partitionLcsWindowsLinearSpace()`. Every resulting window is then passed,
+/// `partitionLcsWindowsLinearSpaceImpl()`. Every resulting window is then passed,
 /// in source order, to the existing bounded all-optimal certifier. Certified
 /// anchors are translated into the complete-stream maps; an uncertified window
 /// contributes no anchors but does not revoke anchors or exact seams proved in
@@ -1077,20 +1015,6 @@ certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                   LcsCertificationDiagnosticEvidence *diagnosticEvidence =
                       nullptr);
 
-/// Compatibility overload accepting edited-side B-gap surface profiles.
-///
-/// The core certifier deliberately ignores these profiles: line/whitespace
-/// shape is diagnostic evidence, not an anchor-selection theorem. `selectedMap`
-/// remains identical to `forcedMap` until the semantic resolver proves one
-/// downstream equivalence class.
-CertifiedLcsResult
-certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                  ArrayRef<LcsAGapProvenance> gapProvenance,
-                  ArrayRef<LcsBGapProvenance> bGapProvenance,
-                  unsigned long long maxBytes = DEFAULT_MAX_BYTES,
-                  LcsCertificationDiagnosticEvidence *diagnosticEvidence =
-                      nullptr);
-
 /// \brief Compute the provenance-certified owner-aware LCS map.
 ///
 /// This overload derives the scalar owner-depth array from `gapProvenance` and
@@ -1103,14 +1027,6 @@ certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 /// selecting one uncertified weighted LCS.
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                               ArrayRef<LcsAGapProvenance> gapProvenance,
-                              unsigned long long maxBytes = DEFAULT_MAX_BYTES);
-
-/// \brief Compatibility overload carrying edited-side B-gap diagnostics.
-///
-/// B-gap surface profiles do not participate in production anchor selection.
-std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                              ArrayRef<LcsAGapProvenance> gapProvenance,
-                              ArrayRef<LcsBGapProvenance> bGapProvenance,
                               unsigned long long maxBytes = DEFAULT_MAX_BYTES);
 
 /// \brief Compute a plain deterministic one-sided LCS backmap from A to B.

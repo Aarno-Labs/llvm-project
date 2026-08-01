@@ -646,20 +646,6 @@ inline bool looksLikeStringLiteralToken(StringRef tok) {
   return false;
 }
 
-/// Return a compact escaped tail of an output buffer for trace diagnostics.
-inline std::string dbgOutTail(StringRef out) {
-  size_t tailStart = out.size() > 140 ? out.size() - 140 : 0;
-  StringRef tail = out.drop_front(tailStart);
-
-  std::string result = tail.str();
-  size_t pos = 0;
-  while ((pos = result.find('\n', pos)) != std::string::npos) {
-    result.replace(pos, 1, "\\n");
-    pos += 2;
-  }
-  return result;
-}
-
 /// True iff \p offset is a beginning-of-line in \p text.
 inline bool isBOL(StringRef text, size_t offset) {
   size_t o = std::clamp(offset, size_t(0), text.size());

@@ -921,7 +921,6 @@ struct NeutralConditionalIslandPolicy {
   function_ref<bool(const RefoldModel::CondGroup &)> groupBelongs;
   function_ref<bool(const RefoldModel::IncludeItem &)> includeBelongs;
   function_ref<bool(const RefoldModel::IncludeItem &)> includeIsNeutral;
-  function_ref<bool(const RefoldModel::MacroDirective &)> directiveBelongs;
   function_ref<bool(const RefoldModel::PragmaDirective &)> pragmaBelongs;
   function_ref<bool(const RefoldModel::MacroInvocation &)> macroBelongs;
   function_ref<bool(const RefoldModel::MacroInvocation &)> macroIsNeutral;
@@ -1364,9 +1363,6 @@ bool RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
   auto includeBelongs = [&](const RefoldModel::IncludeItem &include) {
     return context.paths.PathsEqual(include.sitePath, context.tuPath);
   };
-  auto directiveBelongs = [&](const RefoldModel::MacroDirective &directive) {
-    return context.paths.PathsEqual(directive.sitePath, context.tuPath);
-  };
   auto pragmaBelongs = [&](const RefoldModel::PragmaDirective &pragma) {
     return context.paths.PathsEqual(pragma.sitePath, context.tuPath);
   };
@@ -1385,7 +1381,6 @@ bool RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
       groupBelongs,
       includeBelongs,
       includeIsNeutral,
-      directiveBelongs,
       pragmaBelongs,
       macroBelongs,
       macroIsNeutral};
@@ -1407,11 +1402,6 @@ bool RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
     return context.paths.PathsEqual(include.sitePath, context.headerPath) &&
            include.parent && *include.parent == context.includeId;
   };
-  auto directiveBelongs = [&](const RefoldModel::MacroDirective &directive) {
-    return context.paths.PathsEqual(directive.sitePath, context.headerPath) &&
-           directive.ownerIncludeId &&
-           *directive.ownerIncludeId == context.includeId;
-  };
   auto pragmaBelongs = [&](const RefoldModel::PragmaDirective &pragma) {
     return context.paths.PathsEqual(pragma.sitePath, context.headerPath);
   };
@@ -1430,7 +1420,6 @@ bool RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
       groupBelongs,
       includeBelongs,
       includeIsNeutral,
-      directiveBelongs,
       pragmaBelongs,
       macroBelongs,
       macroIsNeutral};

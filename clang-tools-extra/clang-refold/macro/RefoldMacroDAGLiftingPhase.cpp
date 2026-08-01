@@ -122,20 +122,10 @@ std::optional<MacroPatch> RefoldMacroDAGLiftingPhase::Run(
   const auto &splitInsertionRootCandidates =
       discoveryResult.splitInsertionRootCandidates;
   [[maybe_unused]] const auto &rootArgText = discoveryResult.rootArgText;
-  (void)hEff;
-  (void)rootHasDirectArgLikeSurface;
-  (void)rootInvocation;
-  (void)rootInvocationText;
-  (void)rootInvocationArgRanges;
 
-  // Short local aliases used throughout the body.  The `sizeof` casts
-  // silence "unused local typedef" warnings on code paths that never
-  // reference the alias directly (the shared type name still keeps the
-  // sub-service signatures readable at the callsites below).
+  // Short local aliases used at the leaf/split candidate loops below.
   using LeafCandidate = DAGLeafCandidate;
   using SplitInsertionRootCandidate = DAGSplitInsertionRootCandidate;
-  (void)sizeof(LeafCandidate);
-  (void)sizeof(SplitInsertionRootCandidate);
 
   // Build the per-call lifting context that the sub-services take by
   // reference.  Each field borrows from caller-owned storage; nothing

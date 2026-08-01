@@ -114,11 +114,6 @@ public:
   MacroPatchStagingSlot
   PrepareMacroPatchStagingSlot(const RefoldModel::MacroInvocation &macro);
 
-  /// Return true if this physical macro invocation span already has a staged
-  /// patch in the current dispatch pass.
-  bool
-  HasMacroPatchForInvocation(const RefoldModel::MacroInvocation &macro) const;
-
   /// Return the mutable owner->macro-id merge buckets consumed by
   /// macro-planning APIs.
   MacroPatchByOwnerByMacroIdMap &MacroPatchMergeBucketsForPlanner();

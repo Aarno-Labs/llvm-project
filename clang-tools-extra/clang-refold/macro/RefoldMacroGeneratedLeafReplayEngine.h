@@ -53,14 +53,10 @@ class RefoldSourceMapper;
 struct GeneratedLeafReplayContext {
   /// Root invocation whose generated leaf is being replayed.
   const RefoldModel::MacroInvocation &invocation;
-  /// Token-level edit hunk driving the replay attempt.
-  const diffutils::Hunk &hunk;
   /// Complete source spelling of the root invocation.
   llvm::StringRef baseInvocationText;
   /// Formal-content byte ranges inside `baseInvocationText`.
   llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges;
-  /// Whole-cover A-token envelope for the root invocation.
-  const std::pair<uint64_t, uint64_t> &wholeCoverATokens;
   /// Mutable B-token envelope refined by generated-leaf replay.
   std::pair<size_t, size_t> &bTokenEnvelope;
   /// Macro definition that owns the root replacement-list proof.

@@ -942,14 +942,6 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
   return TUInsertionAnchor(pp, left->e, corroboratedLeftWitness);
 }
 
-std::optional<TUInsertionAnchor>
-RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
-    const TUEditPlanningContext &ctx) const {
-  if (!ctx.hunk || !ctx.hunk->isInsertOnly())
-    return std::nullopt;
-  return FindProvableTUInsertionAnchor(ctx.hunk->aStart, ctx.tuPath);
-}
-
 std::optional<TUByteSpanPlan>
 RefoldTUEditPlanner::ProjectTUByteEnvelopeForOwnership(
     uint64_t a0, uint64_t a1, StringRef tuPath) const {
@@ -1147,13 +1139,6 @@ RefoldTUEditPlanner::PlanTUByteSpan(uint64_t a0, uint64_t a1,
   return TUByteSpanPlan(a0, a1, spanBegin, spanEnd);
 }
 
-std::optional<TUByteSpanPlan>
-RefoldTUEditPlanner::PlanTUByteSpan(const TUEditPlanningContext &ctx) const {
-  if (!ctx.hunk)
-    return std::nullopt;
-  return PlanTUByteSpan(ctx.hunk->aStart, ctx.hunk->aEnd, ctx.tuPath);
-}
-
 bool RefoldTUEditPlanner::ValidateTUOwnerRealizationCarrier(
     const diffutils::Hunk &hunk, const TUByteSpanPlan &span,
     const StructuralHunkSegmentBinding *structuralBinding) const {
@@ -1340,14 +1325,6 @@ RefoldTUEditPlanner::FindBoundaryParentIncludeForPureInsertion(
   return BoundaryParentIncludePlan(aPos, parent->id, parent->parent);
 }
 
-std::optional<BoundaryParentIncludePlan>
-RefoldTUEditPlanner::FindBoundaryParentIncludeForPureInsertion(
-    const TUEditPlanningContext &ctx) const {
-  if (!ctx.hunk)
-    return std::nullopt;
-  return FindBoundaryParentIncludeForPureInsertion(*ctx.hunk);
-}
-
 bool RefoldTUEditPlanner::TUReplacementExtensionIsBTokenClosed(
     uint64_t aTokStart, uint64_t oldEnd, uint64_t extEnd, uint64_t bStart,
     uint64_t bEnd, StringRef tuPath) const {
@@ -1388,17 +1365,6 @@ bool RefoldTUEditPlanner::TUReplacementExtensionIsBTokenClosed(
   return true;
 }
 
-bool RefoldTUEditPlanner::TUReplacementExtensionIsBTokenClosed(
-    const TUEditPlanningContext &ctx,
-    const TUTrailingCallSuffixExtension &extension) const {
-  if (!ctx.hunk)
-    return false;
-  return TUReplacementExtensionIsBTokenClosed(
-      extension.originalATokenEnd, extension.originalTUByteEnd,
-      extension.extendedTUByteEnd, extension.bTokenBegin, extension.bTokenEnd,
-      ctx.tuPath);
-}
-
 std::optional<TUTrailingCallSuffixExtension>
 RefoldTUEditPlanner::MaybeExtendTUSpanOverClosedTrailingCallSuffix(
     const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
@@ -1424,16 +1390,6 @@ RefoldTUEditPlanner::MaybeExtendTUSpanOverClosedTrailingCallSuffix(
   return TUTrailingCallSuffixExtension(h.aEnd, h.aEnd, oldEnd, extEnd, h.bStart,
                                        h.bEnd,
                                        /*bTokenSuffixClosed=*/true);
-}
-
-std::optional<TUTrailingCallSuffixExtension>
-RefoldTUEditPlanner::MaybeExtendTUSpanOverClosedTrailingCallSuffix(
-    const TUEditPlanningContext &ctx, const TUByteSpanPlan &initialSpan,
-    StringRef replacement) const {
-  if (!ctx.hunk)
-    return std::nullopt;
-  return MaybeExtendTUSpanOverClosedTrailingCallSuffix(
-      *ctx.hunk, ctx.tuPath, ctx.tuBytes, replacement, initialSpan);
 }
 
 void RefoldTUEditPlanner::MaybeExtendTUSpanOverClosedTrailingCallSuffix(
@@ -1482,24 +1438,6 @@ RefoldTUEditPlanner::BuildDirectTUHunkEditPlan(
                               acceptedPayload.str(), rawTUStart, rawTUEnd,
                               materializedBByteBegin, materializedBByteEnd,
                               acceptedPath);
-}
-
-std::optional<DirectTUHunkEditPlan>
-RefoldTUEditPlanner::BuildDirectTUHunkEditPlan(
-    const TUEditPlanningContext &ctx, const TUByteSpanPlan &span,
-    ResyncOutcome resync, StringRef acceptedPayload, uint64_t rawTUStart,
-    uint64_t rawTUEnd, std::optional<uint64_t> materializedBByteBegin,
-    std::optional<uint64_t> materializedBByteEnd,
-    AcceptedPathKind acceptedPath,
-    std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment) const {
-  if (!ctx.hunk)
-    return std::nullopt;
-
-  return BuildDirectTUHunkEditPlan(
-      *ctx.hunk, ctx.hunkIndex, span.byteRange(), std::move(resync),
-      acceptedPayload, rawTUStart, rawTUEnd, materializedBByteBegin,
-      materializedBByteEnd, acceptedPath,
-      std::move(insertionAnchorAdjustment));
 }
 
 bool maybeAdvanceTUInsertionPastSourceLineControlPrefix(

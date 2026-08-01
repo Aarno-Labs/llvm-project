@@ -56,8 +56,6 @@ const char *toString(FinalLineControlObligation obligation) {
     return "HeaderResumeRepair";
   case FinalLineControlObligation::LayoutBoundaryRepair:
     return "LayoutBoundaryRepair";
-  case FinalLineControlObligation::BuiltinObserverLive:
-    return "BuiltinObserverLive";
   case FinalLineControlObligation::CosmeticSyntheticResync:
     return "CosmeticSyntheticResync";
   case FinalLineControlObligation::DominatedSyntheticDirective:
@@ -82,15 +80,6 @@ const char *toString(FinalLineControlRemovalDischarge discharge) {
   switch (discharge) {
   case FinalLineControlRemovalDischarge::None:
     return "None";
-  case FinalLineControlRemovalDischarge::ObserverAndLayoutDead:
-    return "ObserverAndLayoutDead";
-  case FinalLineControlRemovalDischarge::SyntheticIncludeEntryDominated:
-    return "SyntheticIncludeEntryDominated";
-  case FinalLineControlRemovalDischarge::
-      SyntheticNewlineResyncStaleBeforeInclude:
-    return "SyntheticNewlineResyncStaleBeforeInclude";
-  case FinalLineControlRemovalDischarge::SyntheticTUPrologueDominatedByRepair:
-    return "SyntheticTUPrologueDominatedByRepair";
   case FinalLineControlRemovalDischarge::ValidationPreservedEquivalence:
     return "ValidationPreservedEquivalence";
   }
@@ -99,8 +88,6 @@ const char *toString(FinalLineControlRemovalDischarge discharge) {
 
 const char *toString(FinalLineDirective::Origin origin) {
   switch (origin) {
-  case FinalLineDirective::Origin::PreservedSource:
-    return "PreservedSource";
   case FinalLineDirective::Origin::SyntheticIncludeEntry:
     return "SyntheticIncludeEntry";
   case FinalLineDirective::Origin::SyntheticIncludeReturn:
@@ -111,8 +98,6 @@ const char *toString(FinalLineDirective::Origin origin) {
     return "SyntheticSourceLineResume";
   case FinalLineDirective::Origin::SyntheticTUPrologue:
     return "SyntheticTUPrologue";
-  case FinalLineDirective::Origin::SyntheticLayoutBarrier:
-    return "SyntheticLayoutBarrier";
   case FinalLineDirective::Origin::Unknown:
     return "Unknown";
   }

@@ -2541,7 +2541,6 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   const bool emitsSourceLineDirectiveResume = lineDirs_.Enabled() &&
                                               mixedSourceLineDirectiveResume &&
                                               sourceEnd < tuBytes.size();
-  std::vector<FinalLineControlPruneCandidate> sourceLineResumeCandidates;
   if (emitsSourceLineDirectiveResume) {
     // The consumed source envelope contained a source-spelled line-control
     // directive.  Re-emit only its net state, adjusted through the consumed
@@ -2558,12 +2557,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       padded.push_back('\n');
     }
 
-    const uint64_t resumeBegin = static_cast<uint64_t>(padded.size());
     padded +=
         formatSourceLineDirectiveGapResume(*mixedSourceLineDirectiveResume);
-    const uint64_t resumeEnd = static_cast<uint64_t>(padded.size());
-    (void)resumeBegin;
-    (void)resumeEnd;
     REFOLD_LOG_TRACE(
         "fallback",
         "TU/include closure emitted source #line resume line={0} file={1}",
@@ -2899,9 +2894,10 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
                 {},
                 {},
                 {}};
-  edit.lineControlPruneCandidates =
-      emitsSourceLineDirectiveResume ? std::move(sourceLineResumeCandidates)
-                                     : std::move(ro.lineControlPruneCandidates);
+  // A source-#line resume emits no prune candidates; only the ordinary resync
+  // path forwards them.
+  if (!emitsSourceLineDirectiveResume)
+    edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
   hooks_.certifyTextEditMaterializedBTokenRange(edit, bEnvelope->first,
                                                 bEnvelope->second);
   if (!hooks_.authorizeTUIncludeClosure ||

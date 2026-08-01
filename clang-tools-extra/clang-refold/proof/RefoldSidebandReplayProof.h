@@ -314,10 +314,6 @@ public:
   /// proof object instead of opening the nested replay proof directly.
   StringRef ReplacementText() const { return replay.ReplacementText(); }
 
-  /// Return the emitted replacement-text length carried by this sideband
-  /// proof.
-  uint64_t ReplacementTextSize() const { return replay.ReplacementTextSize(); }
-
   /// Return true when the B replay proof owns trailing blank-line material
   /// after the visible sideband line.
   bool OwnsTrailingReplayBlankLine() const {

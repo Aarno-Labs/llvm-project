@@ -368,24 +368,6 @@ static size_t computeFirstEmittedHeaderLine(
 
 } // namespace
 
-RefoldIncludeMaterializer::TextEdit
-RefoldIncludeMaterializer::MakeTextEditWithResyncOrPending(
-    StringRef original, uint64_t start, uint64_t end, StringRef replacement,
-    StringRef fileSpelling, std::optional<uint64_t> ownerIncludeId) const {
-  ResyncOutcome outcome = textEditAssembler_.ApplyResyncOrPend(
-      original, start, end, replacement, fileSpelling, ownerIncludeId);
-  TextEdit edit{start,
-                end,
-                std::move(outcome.text),
-                std::move(outcome.pending),
-                std::nullopt,
-                {},
-                {}};
-  edit.lineControlPruneCandidates =
-      std::move(outcome.lineControlPruneCandidates);
-  return edit;
-}
-
 std::optional<std::string>
 RefoldIncludeMaterializer::BuildInlineIncludeRealizationFromB(
     const RefoldModel::IncludeItem &inc, StringRef reason,
@@ -1289,9 +1271,9 @@ RefoldIncludeMaterializer::IncludeTextEditPlan
 RefoldIncludeMaterializer::ComputeIncludeTextEdits(
     const IncludeEdits &ie, std::string headerText) const {
   RefoldHeaderIncludeEditPlanner planner(
-      model_, aSource_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_,
-      lineDirs_, sourceMapper_, paths_, macroStateProof_, lineControlProof_,
-      ownerStateProof_, proofLattice_, textEditAssembler_, terminalSink_,
+      model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, lineDirs_,
+      sourceMapper_, paths_, macroStateProof_, lineControlProof_,
+      ownerStateProof_, proofLattice_, textEditAssembler_,
       sidebandPragmaEdits_, lexLang_);
   return planner.Compute(ie, std::move(headerText));
 }
@@ -1301,9 +1283,9 @@ RefoldIncludeMaterializer::ComputeChildBoundaryInsertByte(
     const IncludePatch &p, StringRef file,
     IncludeAnchorWitness *witness) const {
   RefoldHeaderIncludeEditPlanner planner(
-      model_, aSource_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_,
-      lineDirs_, sourceMapper_, paths_, macroStateProof_, lineControlProof_,
-      ownerStateProof_, proofLattice_, textEditAssembler_, terminalSink_,
+      model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, lineDirs_,
+      sourceMapper_, paths_, macroStateProof_, lineControlProof_,
+      ownerStateProof_, proofLattice_, textEditAssembler_,
       sidebandPragmaEdits_, lexLang_);
   return planner.ComputeChildBoundaryInsertByte(p, file, witness);
 }

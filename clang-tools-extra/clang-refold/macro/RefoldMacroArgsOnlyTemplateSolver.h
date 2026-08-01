@@ -101,7 +101,6 @@ public:
     const RefoldMacroTopology *macroTopology = nullptr;
     RefoldProofLattice *proofLattice = nullptr;
     const clang::LangOptions *lexLang = nullptr;
-    bool strict = false;
   };
 
   explicit RefoldMacroArgsOnlyTemplateSolver(Dependencies deps)

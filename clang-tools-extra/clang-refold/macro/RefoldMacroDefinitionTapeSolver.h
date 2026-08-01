@@ -48,11 +48,9 @@ public:
     const RefoldModel *model = nullptr;
     llvm::ArrayRef<PPTok> aToks;
     llvm::ArrayRef<PPTok> bToks;
-    llvm::ArrayRef<size_t> bTokOff;
     const RefoldSourceMapper *sourceMapper = nullptr;
     RefoldProofLattice *proofLattice = nullptr;
     const clang::LangOptions *lexLang = nullptr;
-    bool strict = false;
   };
 
   explicit RefoldMacroDefinitionTapeSolver(Dependencies deps)

@@ -4372,14 +4372,6 @@ bool RefoldMacroGeneratedCalleeReplayEngine::
          ctx.bTokenEnvelope.first < ctx.bTokenEnvelope.second;
 }
 
-bool RefoldMacroGeneratedCalleeReplayEngine::GeneratedCalleeReplayIsAdmissible(
-    const GeneratedCalleeReplayContext &ctx) const {
-  return ctx.followedGeneratedCall && ctx.currentDefinition &&
-         !ctx.currentActuals.empty() &&
-         macroDefinitionAcceptsActualCount(*ctx.currentDefinition,
-                                           ctx.currentActuals.size());
-}
-
 std::optional<TerminalGeneratedCalleeReplaySolution>
 RefoldMacroGeneratedCalleeReplayEngine::SolveTerminalGeneratedCalleeReplay(
     const TerminalGeneratedCalleeReplayRequest &ctx) const {

@@ -304,10 +304,6 @@ public:
       std::optional<uint64_t> ownerIncludeId,
       llvm::StringRef originalFileText) const;
 
-  /// Reject a preserved-gap audit at the common theorem/fallback boundary.
-  bool RejectPreservedStructuralGapAudit(llvm::StringRef emissionStage,
-                                         llvm::StringRef detail) const;
-
   /// \brief Verify that multiple carriers on one edit compose in source order.
   ///
   /// Individual carrier normalization is not enough for a composite `TextEdit`:
@@ -450,6 +446,10 @@ public:
           std::nullopt) const;
 
 private:
+  /// Reject a preserved-gap audit at the common theorem/fallback boundary.
+  bool RejectPreservedStructuralGapAudit(llvm::StringRef emissionStage,
+                                         llvm::StringRef detail) const;
+
   /// Return the immutable protected-structure census for the physical source
   /// owner being assembled, reusing the run-wide TU index when possible.
   ///

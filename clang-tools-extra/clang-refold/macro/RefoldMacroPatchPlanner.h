@@ -172,7 +172,6 @@ public:
 
   /// Read-only access to the higher-order generated-callee replay engine.
   /// Owns `GeneratedCalleeReplayPreservesEnvelope`,
-  /// `GeneratedCalleeReplayIsAdmissible`,
   /// `BuildGeneratedCalleeReplayCandidate`, and
   /// `BuildTupleGeneratedCalleeReplayCandidate`.
   const RefoldMacroGeneratedCalleeReplayEngine &

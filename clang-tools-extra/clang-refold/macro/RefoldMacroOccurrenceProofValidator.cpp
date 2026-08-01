@@ -8,47 +8,8 @@
 
 #include "macro/RefoldMacroTopology.h"
 
-#include "llvm/ADT/SmallVector.h"
-
-#include <algorithm>
-
-using namespace llvm;
-
 namespace clang {
 namespace refold {
-
-bool RefoldMacroOccurrenceProofValidator::CurrentLevelInvocationIsInSubtreeOf(
-    const RefoldModel::MacroInvocation &macro, uint64_t rootId) const {
-  uint64_t currentId = macro.id;
-  SmallVector<uint64_t, 8> seen;
-  while (true) {
-    if (currentId == rootId)
-      return true;
-    if (std::find(seen.begin(), seen.end(), currentId) != seen.end())
-      return false;
-    seen.push_back(currentId);
-
-    const RefoldModel::MacroInvocation *current =
-        (*deps_.macroTopology).FindMacroInvocationById(currentId);
-    if (!current || !current->callerMacroId)
-      return false;
-    currentId = *current->callerMacroId;
-  }
-}
-
-bool RefoldMacroOccurrenceProofValidator::
-    CurrentLevelSubtreeContainsCounterInvocation(uint64_t rootId) const {
-  if (!(*deps_.macroTopology).FindMacroInvocationById(rootId))
-    return false;
-  for (const RefoldModel::MacroInvocation &macro :
-       (*deps_.model).GetMacroInvocations()) {
-    if (macro.name != "__COUNTER__")
-      continue;
-    if (CurrentLevelInvocationIsInSubtreeOf(macro, rootId))
-      return true;
-  }
-  return false;
-}
 
 std::optional<unsigned>
 RefoldMacroOccurrenceProofValidator::CandidateDepthInValidatedSubtree(

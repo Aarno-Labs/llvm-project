@@ -2564,8 +2564,8 @@ HigherOrderGeneratedReplayProbe::TryBuildGeneratedLeafReplay(
     return std::nullopt;
 
   GeneratedLeafReplayContext generatedLeafCtx{
-      invocation,          hunk,   baseInvocationText, invocationArgRanges,
-      *cover,             *bEnv,  *rootDefinition,    oldExpansion,
+      invocation,   baseInvocationText, invocationArgRanges,
+      *bEnv,        *rootDefinition,    oldExpansion,
       newExpansion};
   return deps_.generatedLeafReplayEngine.BuildGeneratedLeafReplayCandidate(
       generatedLeafCtx);

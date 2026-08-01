@@ -1452,9 +1452,8 @@ struct SuffixObserverResult {
 
 /// Component-specific observer indexes for the persistent state graph.
 ///
-/// The unkeyed vectors are the gateway surface; keyed maps preserve the
-/// component identities so later proofs can ask more precise questions such
-/// as "who observes macro FOO?" without scanning every owner.
+/// The unkeyed vectors are the gateway surface consumed by suffix-observer
+/// queries.
 struct OwnerStateGraphObserverIndex {
   std::vector<uint64_t> macroStateObservers;
   std::vector<uint64_t> definedOperatorObservers;
@@ -1467,13 +1466,6 @@ struct OwnerStateGraphObserverIndex {
   std::vector<uint64_t> includeGuardStateObservers;
   std::vector<uint64_t> includeStateObservers;
   std::vector<uint64_t> unmodeledStateObservers;
-
-  llvm::StringMap<std::vector<uint64_t>> observersByMacroName;
-  llvm::StringMap<std::vector<uint64_t>> observersByCounterEvent;
-  llvm::StringMap<std::vector<uint64_t>> observersByPragmaState;
-  llvm::StringMap<std::vector<uint64_t>> observersByIncludeGuard;
-  llvm::StringMap<std::vector<uint64_t>> observersByIncludeState;
-  llvm::StringMap<std::vector<uint64_t>> observersByConditionalState;
 };
 
 /// graph census emitted to theorem/debug logs.

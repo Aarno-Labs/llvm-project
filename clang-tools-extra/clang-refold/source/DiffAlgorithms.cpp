@@ -734,17 +734,6 @@ bool OptimalTokenAlignmentOracle::PairOccursOnOptimalPath(
           PairOccursOnOptimalPathFact) != 0;
 }
 
-bool OptimalTokenAlignmentOracle::PairIsForced(uint64_t aToken,
-                                                uint64_t bToken) const {
-  if (!storage_ || aToken >= storage_->aTokenCount ||
-      bToken >= storage_->bTokenCount)
-    return false;
-  return (storage_->pairFacts[static_cast<size_t>(aToken) *
-                                  storage_->bTokenCount +
-                              static_cast<size_t>(bToken)] &
-          PairIsForcedFact) != 0;
-}
-
 LcsObjective OptimalTokenAlignmentOracle::ObjectiveForWindow(
     uint64_t aBegin, uint64_t aEnd, uint64_t bBegin, uint64_t bEnd) const {
   OracleWindowDp window;
@@ -753,55 +742,6 @@ LcsObjective OptimalTokenAlignmentOracle::ObjectiveForWindow(
     return LcsObjective{};
   return window.forward.Get(window.aWidth * window.stride + window.bWidth);
 }
-
-bool OptimalTokenAlignmentOracle::WindowOccursOnOptimalPath(
-    uint64_t aBegin, uint64_t aEnd, uint64_t bBegin, uint64_t bEnd) const {
-  OracleWindowDp window;
-  if (!storage_ ||
-      !buildOracleWindowDp(*storage_, aBegin, aEnd, bBegin, bEnd, window))
-    return false;
-  return oracleWindowOccursOnOptimalPath(*storage_, aBegin, aEnd, bBegin,
-                                         bEnd, window);
-}
-
-std::vector<uint64_t>
-OptimalTokenAlignmentOracle::ProjectATokenBoundaryToOptimalBFrontiers(
-    uint64_t aWindowBegin, uint64_t aWindowEnd, uint64_t bWindowBegin,
-    uint64_t bWindowEnd, uint64_t aBoundary) const {
-  std::vector<uint64_t> frontiers;
-  if (!storage_ || aBoundary < aWindowBegin || aBoundary > aWindowEnd ||
-      !oracleBoundsAreValid(*storage_, aWindowBegin, aWindowEnd, bWindowBegin,
-                            bWindowEnd))
-    return frontiers;
-
-  const size_t bWidth = static_cast<size_t>(bWindowEnd - bWindowBegin);
-  if (bWidth == std::numeric_limits<size_t>::max())
-    return frontiers;
-  const size_t frontierCount = bWidth + 1;
-  uint64_t frontierBytes = 0;
-  if (!arrayBytesChecked<uint64_t>(frontierCount, frontierBytes))
-    return frontiers;
-
-  OracleWindowDp window;
-  if (!buildOracleWindowDp(*storage_, aWindowBegin, aWindowEnd, bWindowBegin,
-                           bWindowEnd, window, frontierBytes) ||
-      !oracleWindowOccursOnOptimalPath(*storage_, aWindowBegin, aWindowEnd,
-                                       bWindowBegin, bWindowEnd, window))
-    return frontiers;
-
-  const size_t localA = static_cast<size_t>(aBoundary - aWindowBegin);
-  const LcsObjective windowObjective =
-      window.forward.Get(window.aWidth * window.stride + window.bWidth);
-  frontiers.reserve(frontierCount);
-  for (size_t localB = 0; localB <= window.bWidth; ++localB) {
-    const size_t state = localA * window.stride + localB;
-    if (objectiveSumEquals(window.forward.Get(state), window.suffix.Get(state),
-                           windowObjective))
-      frontiers.push_back(bWindowBegin + localB);
-  }
-  return frontiers;
-}
-
 
 OptimalLcsMapEnumeration
 OptimalTokenAlignmentOracle::EnumerateOptimalMapsForWindow(
@@ -2904,19 +2844,6 @@ static bool partitionLcsWindowsLinearSpaceImpl(
   return true;
 }
 
-bool partitionLcsWindowsLinearSpace(
-    ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
-    ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
-    ArrayRef<LcsAGapProvenance> gapProvenance,
-    ArrayRef<uint64_t> candidateABoundaries,
-    LcsWindowPartitionResult &result,
-    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
-  return partitionLcsWindowsLinearSpaceImpl(
-      a, aBegin, aEnd, b, bBegin, bEnd, gapProvenance,
-      candidateABoundaries, result, diagnosticEvidence,
-      /*resetDiagnosticOutputs=*/true);
-}
-
 /// Preserve the established one-window result from provenance input.
 ///
 /// A partition that proves no interior seam is semantically the original
@@ -3484,40 +3411,10 @@ certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   return result;
 }
 
-CertifiedLcsResult
-certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                  ArrayRef<LcsAGapProvenance> gapProvenance,
-                  ArrayRef<LcsBGapProvenance> bGapProvenance,
-                  unsigned long long maxBytes,
-                  LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
-  if (bGapProvenance.size() != b.size() + 1)
-    REFOLD_LOG_FATAL("lcs/map", "bGapProvenance length must be B.size() + 1");
-  if (!hasBoundaryVectorSize(a.size(), gapProvenance.size()))
-    REFOLD_LOG_FATAL("lcs/map", "gapProvenance length must be A.size() + 1");
-  if (b.size() > MAX)
-    REFOLD_LOG_FATAL("lcs/map", "B.size() exceeds int64_t index range");
-
-  (void)bGapProvenance;
-  CertifiedLcsResult result;
-  if (!certifyLcsWindowsIndependently(
-          a, b, gapProvenance, /*candidateABoundaries=*/{}, maxBytes,
-          result, diagnosticEvidence))
-    REFOLD_LOG_FATAL("lcs/map", "full-stream LCS certification failed");
-  return result;
-}
-
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                               ArrayRef<LcsAGapProvenance> gapProvenance,
                               unsigned long long maxBytes) {
   return certifiedLcsMapAB(a, b, gapProvenance, maxBytes).selectedMap;
-}
-
-std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                              ArrayRef<LcsAGapProvenance> gapProvenance,
-                              ArrayRef<LcsBGapProvenance> bGapProvenance,
-                              unsigned long long maxBytes) {
-  return certifiedLcsMapAB(a, b, gapProvenance, bGapProvenance, maxBytes)
-      .selectedMap;
 }
 
 [[maybe_unused]]

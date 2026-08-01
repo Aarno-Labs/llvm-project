@@ -190,8 +190,8 @@ static bool replayContainsPreprocessorDirectiveLine(StringRef replay) {
 } // namespace
 
 RefoldHeaderIncludeEditPlanner::RefoldHeaderIncludeEditPlanner(
-    const RefoldModel &model, StringRef aSource, StringRef bSource,
-    ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff,
+    const RefoldModel &model, StringRef bSource, ArrayRef<PPTok> aToks,
+    ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff,
     const std::vector<int64_t> &abTokMapA2B,
     const LineDirectiveInserter &lineDirs,
     const RefoldSourceMapper &sourceMapper, const RefoldPathIdentity &paths,
@@ -200,21 +200,15 @@ RefoldHeaderIncludeEditPlanner::RefoldHeaderIncludeEditPlanner(
     const RefoldOwnerStateProof &ownerStateProof,
     const RefoldProofLattice &proofLattice,
     const RefoldTextEditAssembler &textEditAssembler,
-    const RefoldTerminalProofSink &terminalSink,
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     const clang::LangOptions &lexLang)
-    : model_(model), aSource_(aSource), bSource_(bSource), aToks_(aToks),
-      bToks_(bToks), bTokOff_(bTokOff), abTokMapA2B_(abTokMapA2B),
-      lineDirs_(lineDirs), sourceMapper_(sourceMapper), paths_(paths),
+    : model_(model), bSource_(bSource), aToks_(aToks), bToks_(bToks),
+      bTokOff_(bTokOff), abTokMapA2B_(abTokMapA2B), lineDirs_(lineDirs),
+      sourceMapper_(sourceMapper), paths_(paths),
       macroStateProof_(macroStateProof), lineControlProof_(lineControlProof),
       ownerStateProof_(ownerStateProof), proofLattice_(proofLattice),
       textEditAssembler_(textEditAssembler),
-      sidebandPragmaEdits_(sidebandPragmaEdits), lexLang_(lexLang) {
-  // The terminal sink remains part of the construction API for parity with the
-  // materializer service boundary, but this planner does not currently request
-  // terminal fallback directly.
-  (void)terminalSink;
-}
+      sidebandPragmaEdits_(sidebandPragmaEdits), lexLang_(lexLang) {}
 
 RefoldHeaderIncludeEditPlanner::~RefoldHeaderIncludeEditPlanner() = default;
 

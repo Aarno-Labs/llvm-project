@@ -82,13 +82,11 @@ void AdjustFinalLineControlSourceMappingsAfterDeletion(
 /// stream, identified by the construction site that produced it.
 struct FinalLineDirective {
   enum class Origin : uint8_t {
-    PreservedSource,
     SyntheticIncludeEntry,
     SyntheticIncludeReturn,
     SyntheticNewlineResync,
     SyntheticSourceLineResume,
     SyntheticTUPrologue,
-    SyntheticLayoutBarrier,
     Unknown,
   };
 };
@@ -107,7 +105,6 @@ enum class FinalLineControlObligation : uint8_t {
   TUPrologueRepair,
   HeaderResumeRepair,
   LayoutBoundaryRepair,
-  BuiltinObserverLive,
   CosmeticSyntheticResync,
   DominatedSyntheticDirective,
 };
@@ -138,10 +135,6 @@ const char *toString(FinalLineControlRemovalVerdict verdict);
 /// validation proves the exact deletion preserves the accepted `-E -P` output.
 enum class FinalLineControlRemovalDischarge : uint8_t {
   None,
-  ObserverAndLayoutDead,
-  SyntheticIncludeEntryDominated,
-  SyntheticNewlineResyncStaleBeforeInclude,
-  SyntheticTUPrologueDominatedByRepair,
   ValidationPreservedEquivalence,
 };
 

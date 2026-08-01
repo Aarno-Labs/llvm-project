@@ -307,9 +307,8 @@ RefoldEngine::RefoldEngine(
       macroTopology_(model_, aToks_, bToks_, sourceMapper_, pathIdentity_),
       macroBoundarySelector_(model_, macroTopology_, sourceMapper_, bToks_,
                              lexLang_),
-      lineControlProof_(model_, sourceMapper_, pathIdentity_,
-                        tokenTextAnalysis_, macroTopology_, lineDirs_, aToks_,
-                        bToks_, abTokMapA2B_, abTokMapB2A_) {
+      lineControlProof_(model_, pathIdentity_, macroTopology_, lineDirs_,
+                        aToks_, bToks_, abTokMapA2B_, abTokMapB2A_) {
   alignmentSelectionOverride_ = std::move(alignmentSelectionOverride);
   alignmentSemanticResolverEnabled_ = alignmentSemanticResolverEnabled;
   alignmentSemanticTheoremActive_ = alignmentSelectionOverride_.has_value();

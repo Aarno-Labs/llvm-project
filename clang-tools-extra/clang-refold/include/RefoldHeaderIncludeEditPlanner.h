@@ -66,9 +66,9 @@ public:
   /// The referenced services remain owned by the caller and must outlive the
   /// planner invocation.
   RefoldHeaderIncludeEditPlanner(
-      const RefoldModel &model, llvm::StringRef aSource,
-      llvm::StringRef bSource, llvm::ArrayRef<PPTok> aToks,
-      llvm::ArrayRef<PPTok> bToks, llvm::ArrayRef<size_t> bTokOff,
+      const RefoldModel &model, llvm::StringRef bSource,
+      llvm::ArrayRef<PPTok> aToks, llvm::ArrayRef<PPTok> bToks,
+      llvm::ArrayRef<size_t> bTokOff,
       const std::vector<int64_t> &abTokMapA2B,
       const LineDirectiveInserter &lineDirs,
       const RefoldSourceMapper &sourceMapper, const RefoldPathIdentity &paths,
@@ -77,7 +77,6 @@ public:
       const RefoldOwnerStateProof &ownerStateProof,
       const RefoldProofLattice &proofLattice,
       const RefoldTextEditAssembler &textEditAssembler,
-      const RefoldTerminalProofSink &terminalSink,
       llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
       const clang::LangOptions &lexLang);
 
@@ -726,7 +725,6 @@ private:
   bool PlanPureInsertionPatch(const HeaderInsertionPlanningState &state) const;
 
   const RefoldModel &model_;
-  llvm::StringRef aSource_;
   llvm::StringRef bSource_;
   llvm::ArrayRef<PPTok> aToks_;
   llvm::ArrayRef<PPTok> bToks_;

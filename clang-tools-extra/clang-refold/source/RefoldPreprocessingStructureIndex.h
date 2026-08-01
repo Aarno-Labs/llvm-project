@@ -277,11 +277,6 @@ public:
     return directTUProtectionDiagnostics_;
   }
 
-  /// Return true when at least one protected interval lacks an exact producer
-  /// binding.  Later structural replay may use this to distinguish a safe
-  /// preserve-in-place boundary from a directive it is authorized to rebuild.
-  bool HasUnboundStructure() const;
-
   /// Return every interval overlapping the requested half-open byte range.
   std::vector<const PreprocessingStructureInterval *>
   FindOverlapping(uint64_t begin, uint64_t end) const;

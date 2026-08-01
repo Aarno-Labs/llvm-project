@@ -83,15 +83,6 @@ RefoldAcceptancePathClassifier::InventoryMacroPatchProofAcceptancePath(
 }
 
 ::clang::refold::AcceptancePathInventory
-RefoldAcceptancePathClassifier::InventoryMacroPatchAcceptancePath(
-    const MacroPatch &patch) const {
-  // Keep the full-patch overload as a convenience shim only. The classification
-  // decision itself is made from MacroPatchProof so the mapping has one source
-  // of truth and cannot drift from the theorem-facing carrier.
-  return InventoryMacroPatchProofAcceptancePath(patch.proof);
-}
-
-::clang::refold::AcceptancePathInventory
 RefoldAcceptancePathClassifier::BuildAcceptancePathInventory(
     AcceptedPathKind currentPath) const {
   AcceptancePathInventory inventory;

@@ -39,37 +39,6 @@ class RefoldPathIdentity;
 class RefoldTUAnchorProof;
 class RefoldTUEditPlanner;
 
-/// Shared immutable inputs for TU edit-planning routines.
-///
-/// Run-wide dependencies such as the model, path identity, TU-anchor proof
-/// builder remain constructor dependencies of RefoldTUEditPlanner.  This
-/// context is for per-hunk/per-file inputs that vary between calls and keeps
-/// planner entry points from growing broad ad-hoc parameter lists.
-struct TUEditPlanningContext {
-  /// Translation-unit path used for owner/proof diagnostics.
-  llvm::StringRef tuPath;
-  /// Translation-unit source bytes used for TU byte-span projection.
-  llvm::StringRef tuBytes;
-  /// A/B token-level hunk being planned; null only for default-constructed
-  /// values.
-  const diffutils::Hunk *hunk = nullptr;
-  /// Stable index of `hunk` in the A/B token-hunk vector.
-  uint64_t hunkIndex = 0;
-  /// Original A token stream for the current refold pass.
-  llvm::ArrayRef<PPTok> aTokens;
-  /// Edited B token stream for the current refold pass.
-  llvm::ArrayRef<PPTok> bTokens;
-
-  TUEditPlanningContext() = default;
-
-  TUEditPlanningContext(llvm::StringRef tuPath, llvm::StringRef tuBytes,
-                        const diffutils::Hunk &hunk, uint64_t hunkIndex,
-                        llvm::ArrayRef<PPTok> aTokens,
-                        llvm::ArrayRef<PPTok> bTokens)
-      : tuPath(tuPath), tuBytes(tuBytes), hunk(&hunk), hunkIndex(hunkIndex),
-        aTokens(aTokens), bTokens(bTokens) {}
-};
-
 /// Result of proving that an A-side PP gap has a concrete TU byte anchor.
 ///
 /// The optional witness mirrors the existing proof/audit side channel.  Callers
@@ -418,11 +387,6 @@ public:
       uint64_t pp, llvm::StringRef tuPath, TUAnchorWitness *witness = nullptr,
       AcceptedResultCandidate *acceptedCandidate = nullptr) const;
 
-  /// Context-shaped overload for future call sites that already carry a hunk
-  /// planning context.  The context hunk must be a pure insertion.
-  std::optional<TUInsertionAnchor>
-  FindProvableTUInsertionAnchor(const TUEditPlanningContext &ctx) const;
-
   /// Project the TU-owned subset of an A-token interval to its legacy physical
   /// min/max envelope for owner topology only.
   ///
@@ -459,10 +423,6 @@ public:
   /// point in the TU.
   std::optional<TUByteSpanPlan> PlanTUByteSpan(uint64_t a0, uint64_t a1,
                                                llvm::StringRef tuPath) const;
-
-  /// Context-shaped overload using the hunk stored in the planning context.
-  std::optional<TUByteSpanPlan>
-  PlanTUByteSpan(const TUEditPlanningContext &ctx) const;
 
   /// Revalidate the concrete carrier used by a direct TU owner realization.
   ///
@@ -507,11 +467,6 @@ public:
   std::optional<BoundaryParentIncludePlan>
   FindBoundaryParentIncludeForPureInsertion(const diffutils::Hunk &h) const;
 
-  /// Context-shaped overload using the hunk stored in the planning context.
-  std::optional<BoundaryParentIncludePlan>
-  FindBoundaryParentIncludeForPureInsertion(
-      const TUEditPlanningContext &ctx) const;
-
   /// Build the direct-TU hunk edit plan for an already-proved TU byte span.
   ///
   /// This method deliberately returns a plan, not an applied or globally
@@ -530,19 +485,6 @@ public:
       std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment =
           std::nullopt) const;
 
-  /// Context-shaped overload for call sites that already carry the A/B token
-  /// hunk and TU source-byte span planning records together.
-  std::optional<DirectTUHunkEditPlan>
-  BuildDirectTUHunkEditPlan(const TUEditPlanningContext &ctx,
-                            const TUByteSpanPlan &span, ResyncOutcome resync,
-                            llvm::StringRef acceptedPayload,
-                            uint64_t rawTUStart, uint64_t rawTUEnd,
-                            std::optional<uint64_t> materializedBByteBegin,
-                            std::optional<uint64_t> materializedBByteEnd,
-                            AcceptedPathKind acceptedPath,
-                            std::optional<TUInsertionAnchorAdjustment>
-                                insertionAnchorAdjustment = std::nullopt) const;
-
   /// Check whether the TU byte suffix [oldEnd, extEnd) is closed over the
   /// corresponding B-token interval.  This is a token-closure proof for a
   /// trailing call-suffix extension, not a general byte-span widening rule.
@@ -551,12 +493,6 @@ public:
                                             uint64_t bEnd,
                                             llvm::StringRef tuPath) const;
 
-  /// Context-shaped closure check for callers that already have a suffix
-  /// extension carrier.
-  bool TUReplacementExtensionIsBTokenClosed(
-      const TUEditPlanningContext &ctx,
-      const TUTrailingCallSuffixExtension &extension) const;
-
   /// Return the closed trailing call-suffix extension, if the existing TU span
   /// may be widened.  The returned carrier records the old and extended TU byte
   /// endpoints; callers decide whether to mutate their local span.
@@ -564,14 +500,6 @@ public:
   MaybeExtendTUSpanOverClosedTrailingCallSuffix(
       const diffutils::Hunk &h, llvm::StringRef tuPath, llvm::StringRef tuBytes,
       llvm::StringRef replacement, const TUByteSpanPlan &initialSpan) const;
-
-  /// Context-shaped overload for call sites that carry the A/B token hunk and
-  /// TU source-byte span together.  The replacement text remains explicit
-  /// because suffix discovery depends on the exact replacement surface.
-  std::optional<TUTrailingCallSuffixExtension>
-  MaybeExtendTUSpanOverClosedTrailingCallSuffix(
-      const TUEditPlanningContext &ctx, const TUByteSpanPlan &initialSpan,
-      llvm::StringRef replacement) const;
 
   /// TU source-byte-span mutating overload for engine orchestration.  It
   /// delegates to the carrier-returning planner method and only updates

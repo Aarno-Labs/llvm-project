@@ -740,13 +740,13 @@ void RefoldEngine::ResolveSemanticAlignment(
       std::move(resolution.selectedAnchorProofs);
   alignmentSemanticResolutionWitnesses_ = std::move(resolution.witnesses);
 
-  if (resolution.committedEquivalentClass) {
-    alignmentSemanticTheoremActive_ = true;
-    REFOLD_LOG_TRACE(
-        "lcs/semantic-resolver",
-        "committed one theorem-equivalent alignment class: witnesses={0}",
-        alignmentSemanticResolutionWitnesses_.size());
-  }
+  // Reaching here means resolution.committedEquivalentClass held; the early
+  // return above discharged the negative case.
+  alignmentSemanticTheoremActive_ = true;
+  REFOLD_LOG_TRACE(
+      "lcs/semantic-resolver",
+      "committed one theorem-equivalent alignment class: witnesses={0}",
+      alignmentSemanticResolutionWitnesses_.size());
 }
 
 AlignmentSemanticSimulationResult

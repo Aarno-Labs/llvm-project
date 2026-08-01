@@ -136,15 +136,6 @@ RefoldStructuralHunkDispatcher::PrepareMacroPatchStagingSlot(
   return slot;
 }
 
-bool RefoldStructuralHunkDispatcher::HasMacroPatchForInvocation(
-    const RefoldModel::MacroInvocation &macro) const {
-  if (!macro.invB || !macro.invE)
-    return false;
-  return FindMacroPatchKeyByInvocationSpan(macro.ownerIncludeId, *macro.invB,
-                                           *macro.invE)
-      .has_value();
-}
-
 RefoldStructuralHunkDispatcher::MacroPatchByOwnerByMacroIdMap &
 RefoldStructuralHunkDispatcher::MacroPatchMergeBucketsForPlanner() {
   return macroPatchByOwnerByMacroId_;
