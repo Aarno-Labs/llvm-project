@@ -1009,14 +1009,20 @@ RefoldIncludeMaterializer::MaterializedHeaderRequiresBRealizationReason(
   // directive; moving that directive out of its original header can therefore
   // flip the selected preprocessor branch even when ordinary macro state is
   // otherwise closed.
+  //
+  // The producer records `condUsesHasInclude` from Clang's actual evaluation,
+  // so it flags exactly the arms the preprocessor evaluated (the selected arm
+  // and any earlier arms whose condition was tested and failed) and catches
+  // macro-hidden or token-pasted operators a textual scan of `cond` would miss.
+  // Arms that follow the selected one are never evaluated, so they are never
+  // flagged -- which is sound, since they are unreachable under relocation when
+  // no evaluated arm used the operator.
   for (const RefoldModel::CondGroup *group :
        model_.GetCondGroups(headerPath, includeId)) {
     if (!group)
       continue;
     for (const RefoldModel::CondArm &arm : group->arms) {
-      if (!arm.cond)
-        continue;
-      if (arm.cond->contains("__has_include"))
+      if (arm.condUsesHasInclude)
         return "replay-context-sensitive conditional control in "
                "materialized header";
     }

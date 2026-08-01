@@ -546,13 +546,20 @@ RefoldOwnerStateProof::MakeOwnerStateDeltaCacheKey(const Owner &owner) {
 bool RefoldOwnerStateProof::IsVirtualInitialMacroDirectiveSource(
     StringRef sitePath) {
   // Clang serializes its predefined macro environment as #define directives in
-  // the pseudo-file "<built-in>".  Those directives seed the initial macro
-  // state before any source byte in the translation unit exists; they are not
+  // two synthetic buffers before the translation unit is processed:
+  //   * "<built-in>"     -- the compiler's own predefined macros, and
+  //   * "<command-line>" -- macros injected by -D/-U (and a few driver adds).
+  // The producer labels these directives with the matching synthetic path via
+  // SourceManager::isWrittenInBuiltinFile / isWrittenInCommandLineFile (see
+  // RefoldMapBuilder). Both seed the initial macro state before any editable
+  // source byte exists, and their site anchors point into the ~14 KB predefines
+  // buffer rather than any TU/header the refold can edit. They are therefore not
   // source-editable directive islands and cannot be ordered as suffix observers
-  // after a TU/header edit boundary.  They remain available through the exact
+  // after a TU/header edit boundary. They remain available through the exact
   // macro-directive index for owner-state accounting, but the graph builder
-  // must not manufacture ordinary source-order nodes for them.
-  return sitePath == "<built-in>";
+  // must not manufacture ordinary source-order nodes for them. Match the
+  // producer's exact spellings ("<command-line>" is hyphenated).
+  return sitePath == "<built-in>" || sitePath == "<command-line>";
 }
 
 OwnerStateFactIndex RefoldOwnerStateProof::BuildOwnerStateFactIndex() const {

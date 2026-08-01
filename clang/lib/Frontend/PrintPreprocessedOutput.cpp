@@ -1267,6 +1267,12 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
                           ExpansionContext.ParentExpansionFrameId);
       }
 
+      void HasInclude(SourceLocation Loc, StringRef FileName, bool IsAngled,
+                      OptionalFileEntryRef File,
+                      SrcMgr::CharacteristicKind FileType) override {
+        R->onHasInclude(Loc);
+      }
+
       void FileChanged(SourceLocation Loc, FileChangeReason Reason,
                        SrcMgr::CharacteristicKind, FileID) override {
         if (Reason == PPCallbacks::EnterFile) {

@@ -2254,6 +2254,13 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         // optional
         arm.cond = asOptString(*armObj, "cond");
 
+        // Optional; absent means the producer did not observe a lookup-context
+        // sensitive `__has_include` in this arm's condition, so it defaults
+        // false and older maps remain compatible.
+        if (std::optional<bool> usesHasInc =
+                armObj->getBoolean("cond_uses_has_include"))
+          arm.condUsesHasInclude = *usesHasInc;
+
         if (const json::Value *ppSpanVal = armObj->get("pp_span")) {
           if (!ppSpanVal->getAsNull()) {
             auto ppSpanObjOrErr = asObject(*ppSpanVal, ctxItem + ".pp_span");

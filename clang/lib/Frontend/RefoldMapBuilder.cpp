@@ -3299,6 +3299,22 @@ void RefoldMapBuilder::onLineControlDirective(SourceLocation Loc) {
   LineControlEvents.push_back(std::move(Ev));
 }
 
+void RefoldMapBuilder::onHasInclude(SourceLocation Loc) {
+  if (!enabled())
+    return;
+  if (Loc.isInvalid())
+    return;
+
+  // Resolve to the expansion site so a macro-hidden or paste-built operator is
+  // attributed to the physical directive line that triggered it.  The resulting
+  // (FileID, offset) shares the coordinate space of the conditional-arm byte
+  // ranges scanned from the same file buffer.
+  std::pair<FileID, unsigned> Decomposed = SM.getDecomposedExpansionLoc(Loc);
+  if (Decomposed.first.isInvalid())
+    return;
+  HasIncludeSites.emplace_back(Decomposed.first, Decomposed.second);
+}
+
 void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
   if (!enabled())
     return;
@@ -4449,7 +4465,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "3.0");
+    JO.attribute("version", "3.1");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -6355,6 +6371,13 @@ void RefoldMapBuilder::writeJSON() {
         if (Buf.empty())
           return;
 
+        // FileID of this file, used to match recorded __has_include evaluation
+        // sites (which carry FileID + file-local offset) against conditional-arm
+        // directive-line byte ranges scanned from the same buffer.
+        FileID EmitFID;
+        if (auto FER = SM.getFileManager().getOptionalFileRef(FilePath))
+          EmitFID = SM.translateFile(*FER);
+
         auto Groups = scanTopLevelConds(Buf, FilePath);
         llvm::errs() << "[refold] conds: " << (isTU ? "TU " : "") << FilePath
                      << " -> " << Groups.size() << " group(s)\n";
@@ -6406,8 +6429,34 @@ void RefoldMapBuilder::writeJSON() {
             // that arm.
             const bool SingleArmGroup = (G.Arms.size() == 1);
 
+            // Byte offset where the current arm's directive line begins.  For
+            // the first arm this is the group start (`#if`/`#ifdef` line); for
+            // each subsequent arm it is the previous arm's raw body end, which
+            // is the byte-offset of the next `#elif`/`#else` directive line.
+            // The condition text of arm i therefore lives in
+            // [PrevArmBodyE, A.BodyB).
+            uint64_t PrevArmBodyE = GroupB;
+
             JO.attributeArray("arms", [&] {
               for (const auto &A : G.Arms) {
+                const uint64_t DirectiveStart = PrevArmBodyE;
+                PrevArmBodyE = A.BodyE;
+
+                // An arm is context-sensitive when a recorded __has_include /
+                // __has_include_next evaluation site falls on its directive
+                // line [DirectiveStart, A.BodyB).  Matching the real evaluation
+                // site catches macro-hidden and token-pasted operators that a
+                // textual scan of the condition would miss.
+                bool CondUsesHasInclude = false;
+                if (EmitFID.isValid()) {
+                  for (const auto &Site : HasIncludeSites) {
+                    if (Site.first == EmitFID && Site.second >= DirectiveStart &&
+                        Site.second < A.BodyB) {
+                      CondUsesHasInclude = true;
+                      break;
+                    }
+                  }
+                }
                 // Compute the effective body range we will use for:
                 //  - computing pp_span (which tokens belong to this arm), and
                 //  - parent lookup for nested groups (ArmSlotSeeds).
@@ -6439,6 +6488,10 @@ void RefoldMapBuilder::writeJSON() {
                   JO.attribute("kind", A.Kind);
                   if (!A.Cond.empty())
                     JO.attribute("cond", A.Cond);
+                  // Elide the common false case to keep maps compact; the
+                  // consumer defaults absent to false.
+                  if (CondUsesHasInclude)
+                    JO.attribute("cond_uses_has_include", true);
                   JO.attribute("body_b", ArmBodyB);
                   JO.attribute("body_e", ArmBodyE);
 

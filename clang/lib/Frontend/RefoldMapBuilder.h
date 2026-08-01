@@ -497,6 +497,14 @@ struct CondArm {
   std::string Kind;  // "if","ifdef","ifndef","elif","else"
   std::string Cond; // optional (if/elif expr, or macro for ifdef/ifndef)
   uint64_t BodyB = 0, BodyE = 0;
+  /// True when this arm's condition actually evaluated `__has_include` /
+  /// `__has_include_next` during the real preprocessing run.  Because it is
+  /// captured from Clang's evaluation (via the HasInclude callback) rather than
+  /// scanned from `Cond`, it catches macro-hidden and token-pasted operators a
+  /// textual scan would miss.  These operators perform header lookup relative to
+  /// the file containing the directive, so relocating the header out of its
+  /// original directory can flip the selected branch.
+  bool CondUsesHasInclude = false;
 };
 
 /// A conditional group (#if..#endif) within a file, holding arms in order and
@@ -581,6 +589,11 @@ class RefoldMapBuilder {
 
   std::vector<TokMapEntry> TokMap;
   std::vector<LineControlEvent> LineControlEvents;
+
+  /// (FileID, file-local byte offset) of each site where `__has_include` /
+  /// `__has_include_next` was evaluated during preprocessing.  Consumed while
+  /// emitting conditional arms to set CondArm::CondUsesHasInclude.
+  std::vector<std::pair<clang::FileID, uint64_t>> HasIncludeSites;
 
   std::string OutPath;
   std::string
@@ -765,6 +778,14 @@ public:
   /// Pragmas are recorded as directive items with exact source text and site
   /// byte anchors. They do not contribute to A-token spans.
   void onPragma(SourceLocation HashLoc, StringRef FullText);
+
+  /// Callback for an evaluation of `__has_include` / `__has_include_next`.
+  ///
+  /// Records the (FileID, file-local offset) of the operator so conditional-arm
+  /// emission can mark the arm whose directive line contains it as
+  /// context-sensitive.  Captured from Clang's evaluation, so it observes the
+  /// operator even when it is produced by macro expansion or token pasting.
+  void onHasInclude(SourceLocation Loc);
 
   /// Entering a file (either TU or an included header).
   ///

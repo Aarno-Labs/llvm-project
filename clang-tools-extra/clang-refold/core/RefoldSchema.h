@@ -579,6 +579,10 @@ static constexpr const char *RefoldSchema = R"json(
         "selected": {
           "type": "boolean",
           "description": "True iff this arm contributed tokens in the preprocessed output for this file instance"
+        },
+        "cond_uses_has_include": {
+          "type": "boolean",
+          "description": "True iff the producer observed this arm's condition evaluate __has_include/__has_include_next. Optional; absent means false. Such arms are lookup-context sensitive and cannot be soundly source-replayed from a relocated (materialized) header."
         }
       },
       "allOf": [

@@ -881,6 +881,11 @@ public:
     std::optional<PPSpan> span;
     /// True when this arm was selected by the producer preprocessing run.
     bool selected;
+    /// True when the producer observed this arm's condition evaluate
+    /// `__has_include` / `__has_include_next`.  Absent in the map means false.
+    /// These operators are lookup-context sensitive, so an arm bearing one
+    /// cannot be soundly source-replayed from a relocated (materialized) header.
+    bool condUsesHasInclude = false;
 
     bool ContainsByte(uint64_t byteOffset) const {
       return bodyB <= byteOffset && byteOffset < bodyE;
