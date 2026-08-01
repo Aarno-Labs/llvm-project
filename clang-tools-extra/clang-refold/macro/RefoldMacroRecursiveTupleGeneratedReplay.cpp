@@ -1620,6 +1620,8 @@ private:
     if (child.invArgRanges.size() != formalCount)
       return std::nullopt;
 
+    // The callee is Opaque (no caller_param/tuple-ref witness), so recover it by
+    // finding the root-tuple slice(s) whose source text equals the callee name.
     llvm::SmallVector<uint32_t, 2> matchingCalleeFormals;
     for (uint32_t formalIndex = 0;
          formalIndex < parentState.rootTupleSliceByLocalFormal.size();
@@ -1636,7 +1638,15 @@ private:
       if (llvm::StringRef(*selectorText).trim() == childDefinition->name)
         matchingCalleeFormals.push_back(formalIndex);
     }
-    if (matchingCalleeFormals.size() != 1)
+    // Any match suffices; the choice need not be unique.  A name-spelling slice
+    // is a bare identifier, never a `(...)` tuple, so it can never be the args
+    // source below -- it is only *excluded* from that search.  A decoy element
+    // repeating the callee name thus changes neither the args source nor the
+    // edit, so requiring uniqueness would needlessly fall back to whole-cover
+    // expansion.  The args search's exact-source-range uniqueness fixes the
+    // edit; the callee choice is proof-structural, discharged by the downstream
+    // replay-solve and materialized-B-token / global certification.
+    if (matchingCalleeFormals.empty())
       return std::nullopt;
 
     std::optional<GeneratedTupleFormalState> childState =
