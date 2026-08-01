@@ -15,7 +15,6 @@
 #include "source/TokenTextHelpers.h"
 #include "util/RefoldPathIdentity.h"
 #include "util/StringUtils.h"
-#include "clang/Basic/TokenKinds.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FormatVariadic.h"
 
@@ -380,31 +379,20 @@ RefoldStructuralHunkDispatcher::ExpandedMacroRootIds() const {
   return appliedExpandedMacroRootIds_;
 }
 
-namespace {
-/// Return true iff \p kind is separator punctuation that may legitimately
-/// replace a horizontal source gap between two tokens.
-///
-/// This is intentionally narrower than "left-attachable punctuation": closing
-/// delimiters and operators can carry context-sensitive spacing conventions, so
-/// they are not treated as gap replacements here. Callers must still prove with
-/// `refoldNeedsLexicalSeparator()` that attaching the punctuation to the
-/// token on its left preserves lexical tokenization.
-bool isSeparatorGapReplacementPunctuation(tok::TokenKind kind) {
-  switch (kind) {
-  case tok::comma:
-  case tok::semi:
-  case tok::colon:
-    return true;
-  default:
-    return false;
-  }
-}
-} // namespace
-
-bool maybeConsumeOrdinarySeparatorGapForPunctuation(
+bool maybeConsumeLeftSourceGapWhenBAttaches(
     const RefoldModel &model, const RefoldPathIdentity &pathIdentity,
     StringRef tuPath, StringRef tuBytes, std::pair<uint64_t, uint64_t> &span,
-    StringRef replacement, const clang::LangOptions &lexLang) {
+    StringRef replacement, bool replayAttachesLeftInB,
+    const clang::LangOptions &lexLang) {
+  // Reproduce B's own boundary spacing instead of guessing from a punctuation
+  // whitelist: absorb the TU whitespace gap only when B placed the inserted
+  // content immediately against its left neighbour (no intervening B
+  // whitespace).  This is the mirror of the caller's rule that *prepends* B's
+  // leading whitespace when the TU lacks a gap -- together they make the
+  // rewritten source match B's spacing at the insertion boundary for any token
+  // kind.  When B kept a space there (e.g. `= y`), the gap is preserved.
+  if (!replayAttachesLeftInB)
+    return false;
   if (span.first != span.second || replacement.empty() ||
       stringutils::isWs(replacement.front()) || span.first == 0 ||
       span.first >= tuBytes.size() ||
@@ -447,9 +435,10 @@ bool maybeConsumeOrdinarySeparatorGapForPunctuation(
   std::optional<RefoldLexBoundaryToken> replLastTok =
       refoldLastLexToken(replacement, lexLang);
 
+  // Attaching must still preserve lexical tokenization on both sides (B's
+  // spacing decision is about layout, not about whether two tokens would merge).
   if (!leftTok || !rightTok || !replFirstTok || !replLastTok ||
       leftTok->end != gapBegin || rightTok->begin != 0 ||
-      !isSeparatorGapReplacementPunctuation(replFirstTok->kind) ||
       refoldNeedsLexicalSeparator(*leftTok, *replFirstTok, lexLang) ||
       refoldNeedsLexicalSeparator(*replLastTok, *rightTok, lexLang))
     return false;

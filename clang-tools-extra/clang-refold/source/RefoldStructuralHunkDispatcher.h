@@ -228,18 +228,20 @@ private:
 };
 
 /// Widen a zero-width TU insertion left across one ordinary whitespace gap when
-/// the replacement begins with the narrow lexical-separation punctuation class.
+/// B placed the inserted content immediately against its left neighbour, i.e.
+/// with no whitespace before the first inserted B token (\p replayAttachesLeftInB).
 ///
-/// This is limited to the punctuation set that may replace a horizontal source
-/// gap after lexical-separation proof.  The widening is allowed only when the
+/// This reproduces B's own boundary spacing rather than guessing from a token
+/// whitelist -- the mirror of the caller's rule that prepends B's leading
+/// whitespace when the TU lacks a gap.  The widening is allowed only when the
 /// absorbed gap does not overlap any recorded include or macro-invocation
 /// interval and the resulting left/right lexical neighbours do not require a
-/// synthesized separator on either side.
-bool maybeConsumeOrdinarySeparatorGapForPunctuation(
+/// synthesized separator on either side (which would change tokenization).
+bool maybeConsumeLeftSourceGapWhenBAttaches(
     const RefoldModel &model, const RefoldPathIdentity &pathIdentity,
     llvm::StringRef tuPath, llvm::StringRef tuBytes,
     std::pair<uint64_t, uint64_t> &span, llvm::StringRef replacement,
-    const clang::LangOptions &lexLang);
+    bool replayAttachesLeftInB, const clang::LangOptions &lexLang);
 
 } // namespace refold
 } // namespace clang

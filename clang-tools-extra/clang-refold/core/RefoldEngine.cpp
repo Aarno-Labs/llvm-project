@@ -1199,10 +1199,16 @@ bool RefoldEngine::DispatchStructuralHunks(
         bool consumedSeparatorGapForPunctuation = false;
 
         if (h.isInsertOnly()) {
+          // B attaches the inserted content to its left neighbour iff there is
+          // no whitespace before the first inserted B token.
+          const size_t bStartIdx = static_cast<size_t>(h.bStart);
+          const bool replayAttachesLeftInB =
+              bStartIdx < bTokOff_.size() && bTokOff_[bStartIdx] > 0 &&
+              !stringutils::isWs(bSource_[bTokOff_[bStartIdx] - 1]);
           consumedSeparatorGapForPunctuation =
-              maybeConsumeOrdinarySeparatorGapForPunctuation(
+              maybeConsumeLeftSourceGapWhenBAttaches(
                   model_, pathIdentity_, tuPath, tuBytes, span, StringRef(repl),
-                  lexLang_);
+                  replayAttachesLeftInB, lexLang_);
         }
 
         TUEditPlanner().MaybeExtendTUSpanOverClosedTrailingCallSuffix(
@@ -1406,10 +1412,16 @@ bool RefoldEngine::DispatchStructuralHunks(
       bool consumedSeparatorGapForPunctuation = false;
 
       if (!isDel && h.isInsertOnly()) {
+        // B attaches the inserted content to its left neighbour iff there is no
+        // whitespace before the first inserted B token.
+        const size_t bStartIdx = static_cast<size_t>(h.bStart);
+        const bool replayAttachesLeftInB =
+            bStartIdx < bTokOff_.size() && bTokOff_[bStartIdx] > 0 &&
+            !stringutils::isWs(bSource_[bTokOff_[bStartIdx] - 1]);
         consumedSeparatorGapForPunctuation =
-            maybeConsumeOrdinarySeparatorGapForPunctuation(
+            maybeConsumeLeftSourceGapWhenBAttaches(
                 model_, pathIdentity_, tuPath, tuBytes, span, StringRef(repl),
-                lexLang_);
+                replayAttachesLeftInB, lexLang_);
       }
 
       TUEditPlanner().MaybeExtendTUSpanOverClosedTrailingCallSuffix(
