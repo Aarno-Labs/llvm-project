@@ -13,6 +13,8 @@
 
 #include "proof/RefoldOwnerStateProof.h"
 
+#include "llvm/ADT/DenseMap.h"
+
 namespace clang {
 namespace refold {
 
@@ -1443,7 +1445,10 @@ findLineControlMacroNameOccurrences(StringRef text, StringRef name) {
 
 std::optional<std::pair<size_t, size_t>> findLineControlMacroOccurrenceForChild(
     const RefoldModel &model, const RefoldModel::MacroInvocation &parent,
-    const RefoldModel::MacroInvocation &child, StringRef text) {
+    const RefoldModel::MacroInvocation &child, StringRef text,
+    llvm::function_ref<std::optional<StringRef>(
+        const RefoldModel::MacroInvocation &)>
+        siblingExpandedText) {
   if (!child.invText || child.invText->empty())
     return std::nullopt;
 
@@ -1471,6 +1476,73 @@ std::optional<std::pair<size_t, size_t>> findLineControlMacroOccurrenceForChild(
   // record as child macro invocations.
   if (siblings.size() != occurrences.size())
     return std::nullopt;
+
+  // Order-independent fast path: when every same-spelled sibling expands to the
+  // *identical* text, the occurrence assignment cannot affect the spliced
+  // result -- any bijection places the same replacement at each occurrence.  So
+  // a deterministic bijection (sibling id order -> text order) is sound
+  // regardless of the siblings' source positions or files.  This keeps the
+  // common repeated-nested case (e.g. `#define FILE_NAME F F`, or a macro
+  // forwarded from a header) exact without the stricter body-invocation proof.
+  {
+    std::optional<StringRef> firstExpansion;
+    bool allSiblingsExpandIdentically = true;
+    for (const RefoldModel::MacroInvocation *sibling : siblings) {
+      std::optional<StringRef> expansion = siblingExpandedText(*sibling);
+      if (!expansion) {
+        allSiblingsExpandIdentically = false;
+        break;
+      }
+      if (!firstExpansion)
+        firstExpansion = *expansion;
+      else if (*expansion != *firstExpansion) {
+        allSiblingsExpandIdentically = false;
+        break;
+      }
+    }
+    if (allSiblingsExpandIdentically) {
+      SmallVector<const RefoldModel::MacroInvocation *, 4> byId(siblings.begin(),
+                                                               siblings.end());
+      llvm::sort(byId, [](const RefoldModel::MacroInvocation *lhs,
+                          const RefoldModel::MacroInvocation *rhs) {
+        return lhs->id < rhs->id;
+      });
+      for (size_t i = 0; i != byId.size(); ++i)
+        if (byId[i]->id == child.id)
+          return occurrences[i];
+      return std::nullopt;
+    }
+  }
+
+  // The siblings' expansions differ, so the assignment *does* matter.  The
+  // positional map below (k-th source-sorted sibling -> k-th text
+  // occurrence) is sound only when the siblings' source order matches their
+  // order of appearance in the parent's expanded replacement text.  That holds
+  // exactly for *body* invocations -- those spelled inside the parent macro's
+  // own definition replacement list -- because the replacement list is emitted
+  // in source order and argument substitution never reorders the body's own
+  // invocations.  It does NOT hold for argument invocations (a definition like
+  // `#define SWAP(a, b) b a` reorders same-spelled args relative to their
+  // call-site source order, even within one file) nor for siblings spelled in
+  // different files.  Require every sibling to be a body invocation of this
+  // parent -- spelled in the definition file, within the parent's `#define`
+  // directive byte range -- and otherwise fail closed rather than guess an
+  // unproven correspondence.  (A single-line replacement list is guaranteed by
+  // simpleLineControlMacroReplacementText, so the directive range bounds it.)
+  const RefoldModel::MacroDirective *parentDefinition =
+      parent.definitionDirectiveId
+          ? model.GetMacroDirectiveById(*parent.definitionDirectiveId)
+          : nullptr;
+  if (!parentDefinition)
+    return std::nullopt;
+  for (const RefoldModel::MacroInvocation *sibling : siblings) {
+    if (!sibling->invFile || *sibling->invFile != parentDefinition->sitePath)
+      return std::nullopt;
+    if (!sibling->invB || !sibling->invE ||
+        *sibling->invB < parentDefinition->siteB ||
+        *sibling->invE > parentDefinition->siteE)
+      return std::nullopt;
+  }
 
   llvm::sort(siblings, [](const RefoldModel::MacroInvocation *lhs,
                           const RefoldModel::MacroInvocation *rhs) {
@@ -1554,19 +1626,17 @@ expandLineControlMacroReplacementText(
     SmallVector<uint64_t, 4> macroInvocationIds;
   };
 
-  SmallVector<ChildReplacementPiece, 4> childPieces;
+  // Phase 1: expand every child of this macro once.  Occurrence assignment
+  // (phase 2) may need the sibling expansions to prove that a repeated
+  // same-spelled child maps to an order-independent set of text occurrences, so
+  // all sibling expansions must be available before any occurrence is assigned.
+  llvm::DenseMap<uint64_t, SourceLineDirectiveMacroReplacement> childExpansions;
+  SmallVector<const RefoldModel::MacroInvocation *, 4> childInvocations;
   for (const RefoldModel::MacroInvocation &child :
        model.GetMacroInvocations()) {
     if (!child.callerMacroId || *child.callerMacroId != macro.id)
       continue;
     if (!child.invText || child.invText->empty()) {
-      activeMacroIds.pop_back();
-      return std::nullopt;
-    }
-
-    std::optional<std::pair<size_t, size_t>> occurrence =
-        findLineControlMacroOccurrenceForChild(model, macro, child, out.text);
-    if (!occurrence) {
       activeMacroIds.pop_back();
       return std::nullopt;
     }
@@ -1587,11 +1657,34 @@ expandLineControlMacroReplacementText(
       return std::nullopt;
     }
 
-    childPieces.push_back({occurrence->first, occurrence->second, child.id,
-                           std::move(childReplacement->text),
-                           std::move(childReplacement->macroInvocationIds)});
+    childExpansions[child.id] = std::move(*childReplacement);
+    childInvocations.push_back(&child);
   }
   activeMacroIds.pop_back();
+
+  // Phase 2: assign each child a text occurrence, then splice its expansion in.
+  auto siblingExpandedText =
+      [&](const RefoldModel::MacroInvocation &sibling)
+      -> std::optional<StringRef> {
+    auto it = childExpansions.find(sibling.id);
+    if (it == childExpansions.end())
+      return std::nullopt;
+    return StringRef(it->second.text);
+  };
+  SmallVector<ChildReplacementPiece, 4> childPieces;
+  for (const RefoldModel::MacroInvocation *child : childInvocations) {
+    std::optional<std::pair<size_t, size_t>> occurrence =
+        findLineControlMacroOccurrenceForChild(model, macro, *child, out.text,
+                                               siblingExpandedText);
+    if (!occurrence)
+      return std::nullopt;
+
+    const SourceLineDirectiveMacroReplacement &childReplacement =
+        childExpansions.find(child->id)->second;
+    childPieces.push_back({occurrence->first, occurrence->second, child->id,
+                           childReplacement.text,
+                           childReplacement.macroInvocationIds});
+  }
 
   if (childPieces.empty())
     return out;

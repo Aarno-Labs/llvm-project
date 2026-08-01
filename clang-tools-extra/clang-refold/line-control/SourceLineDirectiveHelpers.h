@@ -393,15 +393,23 @@ findLineControlMacroNameOccurrences(StringRef text, StringRef name);
 /// The earlier proof required the child invocation spelling to occur exactly
 /// once in the parent's recovered replacement text.  That was sound but too
 /// narrow for definitions such as `#define FILE_NAME F F`: the refold map
-/// records both child invocations, and their source byte order disambiguates
-/// the two identical `F` spellings deterministically.  When repeated spellings
-/// are present, require a one-to-one correspondence between recorded
-/// same-spelling children and textual whole-token occurrences, then match them
-/// by source order and occurrence order.  Any unrecorded extra occurrence,
-/// missing source range, or ordering ambiguity still fails closed.
+/// records both child invocations, and a sound correspondence disambiguates
+/// the two identical `F` spellings.  When repeated spellings are present,
+/// require a one-to-one correspondence between recorded same-spelling children
+/// and textual whole-token occurrences, then assign them soundly: if every such
+/// sibling expands to the identical text the assignment is order-independent
+/// (any bijection is correct), and otherwise the siblings must all be body
+/// invocations spelled within the parent's own `#define` (source order ==
+/// replacement-list order).  \p siblingExpandedText returns a sibling's already
+/// computed line-control expansion so the identical-expansion path can be
+/// proven.  Any unrecorded extra occurrence, missing source range, argument or
+/// cross-file reordering, or other ambiguity still fails closed.
 std::optional<std::pair<size_t, size_t>> findLineControlMacroOccurrenceForChild(
     const RefoldModel &model, const RefoldModel::MacroInvocation &parent,
-    const RefoldModel::MacroInvocation &child, StringRef text);
+    const RefoldModel::MacroInvocation &child, StringRef text,
+    llvm::function_ref<std::optional<llvm::StringRef>(
+        const RefoldModel::MacroInvocation &)>
+        siblingExpandedText);
 
 /// Recover invocation argument spellings for a macro invocation that happened
 /// while expanding another macro replacement list.
