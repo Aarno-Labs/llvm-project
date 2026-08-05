@@ -1418,7 +1418,15 @@ static std::optional<size_t> findCarriedSuffixPrefixInsertionOffset(
   if (requireDeletedLineFromBOL) {
     if (editBegin > resumePrefixBegin)
       return std::nullopt;
-    if (!stringutils::isBOL(originalFileText, editBegin))
+    // The directive is inserted at the front of the replacement, so it needs to
+    // begin a logical line -- not to begin a physical one.  An edit that starts
+    // just past its line's indentation leaves that indentation copied verbatim
+    // ahead of the directive, and horizontal whitespace before `#` still
+    // introduces a directive.  Requiring a strict BOL here refuses the
+    // insertion point whenever the aligner anchors the edit after the indent,
+    // which leaves the repair with no placement before the observers it
+    // protects.
+    if (!stringutils::beginsLineAfterWs(originalFileText, editBegin))
       return std::nullopt;
     if (stringutils::countNonSplicedNewlines(originalFileText, editBegin,
                                              resumePrefixBegin) == 0)
