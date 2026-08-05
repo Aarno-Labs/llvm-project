@@ -21,14 +21,17 @@ RefoldIncludeSubtreeWorkClassifier::RefoldIncludeSubtreeWorkClassifier(
     const RefoldModel &model, const IncludeEditMap &perInclude,
     const MacroPatchByOwnerMap &macroPatchesByOwner,
     const IncludeChildrenMap &children,
-    ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits)
+    ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
+    const llvm::DenseSet<uint64_t> *ownersMustExpand)
     : model_(model), perInclude_(perInclude),
       macroPatchesByOwner_(macroPatchesByOwner), children_(children),
-      sidebandPragmaEdits_(sidebandPragmaEdits) {}
+      sidebandPragmaEdits_(sidebandPragmaEdits),
+      ownersMustExpand_(ownersMustExpand) {}
 
 bool RefoldIncludeSubtreeWorkClassifier::HasDescendantWork(
     uint64_t includeId) const {
-  bool selfWork = HasSidebandPragmaWork(includeId);
+  bool selfWork = HasSidebandPragmaWork(includeId) ||
+                  (ownersMustExpand_ && ownersMustExpand_->count(includeId));
   if (auto it = perInclude_.find(includeId); it != perInclude_.end())
     selfWork = selfWork || !it->second.patches.empty();
   if (!selfWork) {
@@ -90,6 +93,8 @@ RefoldIncludeSubtreeWorkClassifier::MaterializationWorkClass
 RefoldIncludeSubtreeWorkClassifier::ClassifyMaterializationWork(
     uint64_t includeId) const {
   bool sawSideband = HasSidebandPragmaWork(includeId);
+  if (ownersMustExpand_ && ownersMustExpand_->count(includeId))
+    return MaterializationWorkClass::Ordinary;
   if (HasLineDirectiveForcingSidebandWork(includeId))
     return MaterializationWorkClass::Ordinary;
   if (sawSideband && HasOrdinaryReplayTokens(includeId))

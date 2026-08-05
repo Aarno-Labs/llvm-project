@@ -792,6 +792,17 @@ RefoldIncludeMaterializationScheduler::BuildInitialMaterializationSeeds()
 
   // (b) Macro-owned work INSIDE headers (ownerIncludeId != null).
   structuralHunkDispatcher_.AddHeaderMacroPatchSeeds(seeds);
+
+  // (c) Includes the closing output check ruled out from keeping their
+  // directive.  These carry no edit of their own -- the divergence they own
+  // was realized somewhere inside them -- but they are seeded through the same
+  // path as an edited include, so expanding one is the ordinary
+  // materialization rather than a special case.
+  if (request_.ownersMustExpand) {
+    for (const RefoldModel::IncludeItem &include : model_.GetIncludes())
+      if (request_.ownersMustExpand->count(include.id))
+        seeds.insert(include.id);
+  }
   return seeds;
 }
 
@@ -857,7 +868,10 @@ void RefoldIncludeMaterializationScheduler::MaterializeOrderedSeeds(
         includeExpansionLineControlPruneCandidates_,
         includeExpansionLineControlSourceMappings_,
         includeExpansionStartLineNos_, includeExpansionAcceptedResults_,
-        &structuralHunkDispatcher_.MutableAppliedExpandedMacroRootIds());
+        &structuralHunkDispatcher_.MutableAppliedExpandedMacroRootIds(),
+        /*materializeIncludeNextInThisSubtree=*/false,
+        /*ancestorArmIdAtIncludeSite=*/std::nullopt,
+        request_.ownersMustExpand);
   }
 }
 

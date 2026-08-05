@@ -117,7 +117,15 @@ public:
     const std::vector<diffutils::Hunk> *rawByteHunks = nullptr;
     /// Dispatcher that receives staged include-owned/TU-root edits.
     RefoldStructuralHunkDispatcher *structuralHunkDispatcher = nullptr;
-    /// Optional source-graph sidecar output ledger.
+
+    /// Owners the closing output check ruled out from keeping their source
+    /// form, by producer item id.
+    ///
+    /// An include named here is seeded for materialization exactly as an
+    /// include carrying an edit is.  Narrowing does not introduce a second way
+    /// to expand an include: it marks the owner and lets the one expansion
+    /// path this scheduler already drives do the work.
+    const llvm::DenseSet<uint64_t> *ownersMustExpand = nullptr;
   };
 
   /// Constructs a run-scoped scheduler and builds the include child index once.

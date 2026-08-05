@@ -57,7 +57,8 @@ public:
       const RefoldModel &model, const IncludeEditMap &perInclude,
       const MacroPatchByOwnerMap &macroPatchesByOwner,
       const IncludeChildrenMap &children,
-      llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits);
+      llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
+      const llvm::DenseSet<uint64_t> *ownersMustExpand = nullptr);
 
   /// Returns whether the include subtree has any materialization work.
   /// Clean-child replay-context checks are intentionally outside this query.
@@ -92,6 +93,14 @@ private:
   const MacroPatchByOwnerMap &macroPatchesByOwner_;
   const IncludeChildrenMap &children_;
   llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits_;
+
+  /// Includes the closing output check ruled out from keeping their directive.
+  ///
+  /// Such an include carries no edit of its own -- the divergence it owns was
+  /// realized somewhere inside it -- so it is invisible to every other work
+  /// source here.  It is nonetheless work: the include must be materialized, and
+  /// an ancestor must be materialized to have somewhere to put it.
+  const llvm::DenseSet<uint64_t> *ownersMustExpand_ = nullptr;
 };
 
 } // namespace refold

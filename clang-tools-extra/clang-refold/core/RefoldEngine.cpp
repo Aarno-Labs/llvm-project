@@ -448,6 +448,29 @@ Expected<std::string> RefoldEngine::Refold(
   // attempts and only grows, which is what makes this terminate: every round
   // either verifies or gives up one more owner, ending at the translation unit.
   llvm::DenseSet<uint64_t> ownersMustExpand;
+
+  // Test-only seed for the narrowing set, with no default effect.
+  //
+  // Reaching an include through the owner search needs an assembly that
+  // diverges at a token no macro invocation covers, which means a live defect.
+  // This hook instead states the conclusion the search would have reached, so a
+  // test can exercise what marking an owner *does*: the include is expanded by
+  // the ordinary materialization path and nothing else in the file moves.  The
+  // value is an include target spelling, matched as a substring, because
+  // producer ids shift as a map is regenerated while `"leaf.h"` does not.
+  if (const char *forcedTarget =
+          std::getenv("CLANG_REFOLD_TEST_ONLY_FORCE_EXPAND_INCLUDE")) {
+    const StringRef wanted(forcedTarget);
+    for (const RefoldModel::IncludeItem &include : (*mOrErr).GetIncludes()) {
+      if (!include.target.contains(wanted))
+        continue;
+      REFOLD_LOG_INFO("assembly-verify",
+                      "test-only: marking include {0} (target={1}) must-expand",
+                      include.id, include.target);
+      ownersMustExpand.insert(include.id);
+    }
+  }
+
   const unsigned maxAttempts = 8;
 
   for (unsigned attempt = 0;; ++attempt) {
@@ -482,14 +505,9 @@ Expected<std::string> RefoldEngine::Refold(
     // it.  An owner already ruled out means expanding it was not enough, so
     // widen to the invocation that encloses it.
     std::optional<uint64_t> owner =
-        engine.FindSmallestMacroOwnerForEditedToken(verdict.mismatchTokenIndex);
-    while (owner && ownersMustExpand.count(*owner)) {
-      const RefoldModel::MacroInvocation *invocation =
-          engine.macroTopology_.FindMacroInvocationById(*owner);
-      owner = invocation && invocation->callerMacroId
-                  ? std::optional<uint64_t>(*invocation->callerMacroId)
-                  : std::nullopt;
-    }
+        engine.FindSmallestOwnerForEditedToken(verdict.mismatchTokenIndex);
+    while (owner && ownersMustExpand.count(*owner))
+      owner = engine.FindEnclosingOwner(*owner);
 
     // `fatal`: report and fail.  A theorem that mis-states which tokens it
     // realizes is a defect, and repairing it silently costs completeness in a
@@ -497,19 +515,12 @@ Expected<std::string> RefoldEngine::Refold(
     // survives.  `repair` opts into the conservative repair instead.
     if (verifyMode != OutputVerificationMode::Repair) {
       std::string owned = "<unattributed>";
-      if (owner) {
-        owned = std::to_string(*owner);
-        for (const RefoldModel::MacroInvocation &macro :
-             engine.model_.GetMacroInvocations())
-          if (macro.id == *owner) {
-            owned += " (" + macro.name.str() + ")";
-            break;
-          }
-      }
+      if (owner)
+        owned = engine.DescribeOwner(*owner);
       return createStringError(
           std::make_error_code(std::errc::illegal_byte_sequence),
           "refolded source does not replay the edited preprocessed stream: "
-          "%s; smallest region owning the divergence: macro invocation %s. "
+          "%s; smallest region owning the divergence: %s. "
           "Re-run with --verify-output=repair to expand that region "
           "instead of failing",
           verdict.reason.c_str(), owned.c_str());
@@ -517,10 +528,10 @@ Expected<std::string> RefoldEngine::Refold(
 
     if (owner && attempt + 1 < maxAttempts) {
       REFOLD_LOG_INFO("assembly-verify",
-                      "unsound assembly at edited token {0}; expanding macro "
-                      "invocation {1} and retrying: {2}",
-                      static_cast<uint64_t>(verdict.mismatchTokenIndex), *owner,
-                      verdict.reason);
+                      "unsound assembly at edited token {0}; expanding {1} "
+                      "and retrying: {2}",
+                      static_cast<uint64_t>(verdict.mismatchTokenIndex),
+                      engine.DescribeOwner(*owner), verdict.reason);
       ownersMustExpand.insert(*owner);
       continue;
     }
@@ -1992,6 +2003,7 @@ std::string RefoldEngine::FinalizeStructuralResult(
   includeSchedulerRequest.rawByteHunks =
       abByteHunks_ ? &*abByteHunks_ : nullptr;
   includeSchedulerRequest.structuralHunkDispatcher = &structuralHunkDispatcher;
+  includeSchedulerRequest.ownersMustExpand = &ownersMustExpand_;
 
   RefoldIncludeMaterializationScheduler includeMaterializationScheduler(
       std::move(includeSchedulerDeps), std::move(includeSchedulerRequest));
@@ -2176,7 +2188,7 @@ bool RefoldEngine::AuditPreservedLineObserversInFinalOutput(
   return true;
 }
 
-std::optional<uint64_t> RefoldEngine::FindSmallestMacroOwnerForEditedToken(
+std::optional<uint64_t> RefoldEngine::FindSmallestOwnerForEditedToken(
     std::size_t editedTokenIndex) const {
   if (!finalAssemblyVerifier_)
     return std::nullopt;
@@ -2220,27 +2232,70 @@ std::optional<uint64_t> RefoldEngine::FindSmallestMacroOwnerForEditedToken(
   if (aToken < 0)
     return std::nullopt;
 
-  // Several nested invocations can produce the same A token.  Take the
-  // narrowest, because expanding it gives up the least source structure; the
-  // caller widens outward only if that proves insufficient.  Width ties are
-  // broken by invocation id so the choice does not depend on model order.
-  const RefoldModel::MacroInvocation *owner = nullptr;
+  // Several nested owners can produce the same A token: an invocation inside an
+  // invocation, either of them inside an include.  Take the narrowest, because
+  // expanding it gives up the least source structure; the caller widens outward
+  // only if that proves insufficient.  Width ties are broken by producer id so
+  // the choice does not depend on model order.
+  //
+  // Macro invocations and include instances share one producer id space, so the
+  // result names an owner without having to say which kind it is.  That is what
+  // lets the caller record it in a single set and leave each subsystem's own
+  // expansion path to act on it.
+  std::optional<uint64_t> ownerId;
   uint64_t ownerWidth = std::numeric_limits<uint64_t>::max();
-  for (const RefoldModel::MacroInvocation &macro : model_.GetMacroInvocations()) {
-    for (const RefoldModel::PPSpan &span : macro.spans) {
-      if (static_cast<uint64_t>(aToken) < span.begin ||
-          static_cast<uint64_t>(aToken) >= span.end)
-        continue;
-      const uint64_t width = span.end - span.begin;
-      if (width < ownerWidth || (width == ownerWidth && owner && macro.id < owner->id)) {
-        owner = &macro;
-        ownerWidth = width;
-      }
+  auto considerOwner = [&](uint64_t id, uint64_t begin, uint64_t end) {
+    if (static_cast<uint64_t>(aToken) < begin ||
+        static_cast<uint64_t>(aToken) >= end)
+      return;
+    const uint64_t width = end - begin;
+    if (width < ownerWidth || (width == ownerWidth && ownerId && id < *ownerId)) {
+      ownerId = id;
+      ownerWidth = width;
     }
+  };
+
+  for (const RefoldModel::MacroInvocation &macro : model_.GetMacroInvocations())
+    for (const RefoldModel::PPSpan &span : macro.spans)
+      considerOwner(macro.id, span.begin, span.end);
+
+  // An include's cover is its whole expansion, so it is wider than any macro
+  // inside it and wins only when no invocation covers the token at all -- a
+  // location observer in a header body, for instance.  Before this, such a
+  // divergence had no owner and went straight to whole-translation-unit
+  // expansion.
+  for (const RefoldModel::IncludeItem &include : model_.GetIncludes())
+    if (include.cover.IsValid())
+      considerOwner(include.id, include.cover.begin, include.cover.end);
+
+  return ownerId;
+}
+
+std::string RefoldEngine::DescribeOwner(uint64_t ownerId) const {
+  if (const RefoldModel::MacroInvocation *macro =
+          macroTopology_.FindMacroInvocationById(ownerId))
+    return ("macro invocation " + Twine(ownerId) + " (" + macro->name + ")")
+        .str();
+  if (const RefoldModel::IncludeItem *include = model_.GetIncludeById(ownerId))
+    return ("include " + Twine(ownerId) + " (" + include->target + ")").str();
+  return ("region " + Twine(ownerId)).str();
+}
+
+std::optional<uint64_t>
+RefoldEngine::FindEnclosingOwner(uint64_t ownerId) const {
+  // Widening follows producer ancestry, never source overlap.  An invocation
+  // widens to its caller and then to the include instance that owns its
+  // callsite; an include widens to the include that entered it.  Running out of
+  // ancestry means the translation unit is the only region left.
+  if (const RefoldModel::MacroInvocation *macro =
+          macroTopology_.FindMacroInvocationById(ownerId)) {
+    if (macro->callerMacroId)
+      return macro->callerMacroId;
+    return macro->ownerIncludeId;
   }
-  if (!owner)
-    return std::nullopt;
-  return owner->id;
+  if (const RefoldModel::IncludeItem *include = model_.GetIncludeById(ownerId))
+    return include->parent;
+  return std::nullopt;
 }
 
 std::string RefoldEngine::RunRefoldPass() {

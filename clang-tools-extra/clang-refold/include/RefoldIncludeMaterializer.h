@@ -164,7 +164,8 @@ public:
           &includeExpansionAcceptedResults,
       llvm::DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr,
       bool materializeIncludeNextInThisSubtree = false,
-      std::optional<uint64_t> ancestorArmIdAtIncludeSite = std::nullopt) const;
+      std::optional<uint64_t> ancestorArmIdAtIncludeSite = std::nullopt,
+      const llvm::DenseSet<uint64_t> *ownersMustExpand = nullptr) const;
 
   /// Return the innermost conditional arm enclosing one include's own site,
   /// combined with the arm chain already accumulated from its ancestors.

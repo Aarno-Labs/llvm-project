@@ -428,7 +428,8 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
         &includeExpansionAcceptedResults,
     DenseSet<uint64_t> *appliedExpandedMacroRootIds,
     bool materializeIncludeNextInThisSubtree,
-    std::optional<uint64_t> ancestorArmIdAtIncludeSite) const {
+    std::optional<uint64_t> ancestorArmIdAtIncludeSite,
+    const DenseSet<uint64_t> *ownersMustExpand) const {
   // Include materialization is memoized by include id. A parent may reach the
   // same child through recursive expansion, so avoid rebuilding already
   // materialized text.
@@ -750,7 +751,8 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
   using MaterializationWorkClass =
       RefoldIncludeSubtreeWorkClassifier::MaterializationWorkClass;
   RefoldIncludeSubtreeWorkClassifier subtreeWork(
-      model_, perInclude, macroPatchesByOwner, children, sidebandPragmaEdits_);
+      model_, perInclude, macroPatchesByOwner, children, sidebandPragmaEdits_,
+      ownersMustExpand);
 
   // Include replay proof is read-only.  The function_ref services borrow
   // named adapter objects whose storage outlives the short-lived proof context.
@@ -940,7 +942,8 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
           includeExpansionStartLineNos, includeExpansionAcceptedResults,
           appliedExpandedMacroRootIds, forceIncludeNextMaterialization,
           ComputeAncestorArmForChildInclude(*child, includeId,
-                                            ancestorArmIdAtIncludeSite));
+                                            ancestorArmIdAtIncludeSite),
+          ownersMustExpand);
 
       const auto &childText = includeExpansion[child->id];
       const size_t n = bytes.size();

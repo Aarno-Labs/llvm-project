@@ -967,9 +967,15 @@ private:
   /// about the result that is kept.
 
 
-  /// Identify the smallest macro invocation that owns a diverging
-  /// edited-stream token, so an unsound region can be narrowed instead of
-  /// condemning the whole translation unit.
+  /// Identify the smallest region that owns a diverging edited-stream token,
+  /// so an unsound region can be narrowed instead of condemning the whole
+  /// translation unit.
+  ///
+  /// A region is a macro invocation or an include instance, named by producer
+  /// id.  Both live in one id space, so the result identifies an owner without
+  /// saying which kind it is -- which is the point: the caller records it in a
+  /// single set, and each subsystem's existing expansion path acts on the
+  /// owners belonging to it.  Narrowing adds no expansion machinery of its own.
   ///
   /// The verifier reports its mismatch in *preprocessed* edited-stream token
   /// numbering, while the producer's maps are expressed in the edited stream as
@@ -979,12 +985,23 @@ private:
   /// correspondence is therefore checked rather than assumed, and an
   /// unverifiable one yields no owner, leaving the caller to escalate.
   ///
-  /// The *smallest* covering invocation is returned.  Expanding it costs the
-  /// least source structure, and it is the first rung of a ladder: a caller
-  /// that expands it and still finds the assembly unsound escalates outward to
-  /// the enclosing invocation, and finally to the translation unit.
+  /// The *smallest* covering region is returned.  Expanding it costs the least
+  /// source structure, and it is the first rung of a ladder walked by
+  /// `FindEnclosingOwner()`.
   std::optional<uint64_t>
-  FindSmallestMacroOwnerForEditedToken(std::size_t editedTokenIndex) const;
+  FindSmallestOwnerForEditedToken(std::size_t editedTokenIndex) const;
+
+  /// Return a human-readable description of one owner, for diagnostics.
+  std::string DescribeOwner(uint64_t ownerId) const;
+
+  /// Return the region that encloses \p ownerId, for widening a narrowing step
+  /// that did not suffice.
+  ///
+  /// Ancestry is producer-recorded, never inferred from source overlap: an
+  /// invocation widens to its caller and then to the include instance owning
+  /// its callsite, and an include widens to the include that entered it.  No
+  /// enclosing region means the translation unit is all that is left.
+  std::optional<uint64_t> FindEnclosingOwner(uint64_t ownerId) const;
 
   std::string RunRefoldPass();
 };
