@@ -317,6 +317,29 @@ public:
   /// inlined in this run, so it is usable before the active set is recorded.
   bool HeaderEstablishesOnceState(llvm::StringRef physicalPath) const;
 
+  /// Return whether any macro defined inside one physical header's entered
+  /// include subtree is invoked from outside that subtree.
+  ///
+  /// Restoring a header's include guard suppresses every later inclusion of it
+  /// *and of everything it includes*.  A body realized from the edited stream
+  /// carries the header's expanded declarations and none of its `#define`s, so
+  /// that suppression also removes the only remaining source of the subtree's
+  /// macro state.  Guard restoration is therefore admissible only when nothing
+  /// outside the subtree observes that state.
+  ///
+  /// The subtree test walks recorded include parents upward from each owner, so
+  /// it needs no child index and stays exact for repeated instances of a header.
+  bool HeaderMacroStateIsObservedOutside(llvm::StringRef physicalPath) const;
+
+  /// Return whether a header protects itself against re-entry at all, by
+  /// `#pragma once` or by a classic `#ifndef` guard the producer named.
+  ///
+  /// Both kinds create the same hazard once a copy of the header is inlined
+  /// into the translation unit: a later `#include` of it must not expand the
+  /// content a second time.  They differ only in how the original expressed the
+  /// protection, which is not a reason to repair them differently.
+  bool HeaderEstablishesReentryProtection(llvm::StringRef physicalPath) const;
+
   /// Return whether the header opened by \p include transitively includes any of
   /// \p targetPaths, other than by being that header itself.
   ///
@@ -541,6 +564,11 @@ private:
   /// obligation rather than the last one observed.
   void RejectCandidate(HeaderCandidate &candidate,
                        PragmaOnceGuardRejection reason, std::string detail);
+
+  /// Return whether \p ownerIncludeId names an include instance that lies at or
+  /// beneath any instance of the header at \p physicalPath.
+  bool IncludeLiesInsideHeader(uint64_t ownerIncludeId,
+                               llvm::StringRef physicalPath) const;
 
   Dependencies deps_;
   GuardNameInputs inputs_;

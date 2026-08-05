@@ -859,6 +859,61 @@ RefoldPragmaOnceGuardRewriter::FindRejectionForInclude(
                    : PragmaOnceGuardRejection::None;
 }
 
+bool RefoldPragmaOnceGuardRewriter::IncludeLiesInsideHeader(
+    uint64_t ownerIncludeId, StringRef physicalPath) const {
+  // Walking parents upward is exact and index-free: an owner lies inside the
+  // header exactly when some ancestor instance -- or the owner itself -- opened
+  // that physical path.  Repeated instances of the header are all covered
+  // because each is an ancestor of its own subtree.
+  DenseSet<uint64_t> visited;
+  std::optional<uint64_t> current = ownerIncludeId;
+  while (current) {
+    if (!visited.insert(*current).second)
+      break;
+    const RefoldModel::IncludeItem *include =
+        deps_.model.GetIncludeById(*current);
+    if (!include)
+      break;
+    if (include->openedPath &&
+        deps_.pathIdentity.PathsEqual(*include->openedPath, physicalPath))
+      return true;
+    current = include->parent;
+  }
+  return false;
+}
+
+bool RefoldPragmaOnceGuardRewriter::HeaderMacroStateIsObservedOutside(
+    StringRef physicalPath) const {
+  llvm::StringSet<> definedInside;
+  for (const RefoldModel::MacroDirective &directive :
+       deps_.model.GetMacroDirectives()) {
+    if (directive.ownerIncludeId &&
+        IncludeLiesInsideHeader(*directive.ownerIncludeId, physicalPath))
+      definedInside.insert(directive.name);
+  }
+  if (definedInside.empty())
+    return false;
+
+  // An invocation of one of those names from outside the subtree means the
+  // definition is live after the header: suppressing a later re-entry would
+  // leave that use undefined.  Invocations inside the header's own instances do
+  // not count, because a body realized from B already carries their expansion.
+  for (const RefoldModel::MacroInvocation &invocation :
+       deps_.model.GetMacroInvocations()) {
+    if (!definedInside.contains(invocation.name))
+      continue;
+    if (invocation.ownerIncludeId &&
+        IncludeLiesInsideHeader(*invocation.ownerIncludeId, physicalPath))
+      continue;
+    REFOLD_LOG_TRACE("pragma/once/guard",
+                     "header '{0}' macro '{1}' is observed outside it; its "
+                     "include-guard state cannot be restored",
+                     physicalPath, invocation.name);
+    return true;
+  }
+  return false;
+}
+
 bool RefoldPragmaOnceGuardRewriter::HeaderEstablishesOnceState(
     StringRef physicalPath) const {
   const std::string canonical =
@@ -866,6 +921,25 @@ bool RefoldPragmaOnceGuardRewriter::HeaderEstablishesOnceState(
   const HeaderCandidate *candidate = FindCandidate(canonical);
   return candidate && !candidate->guard.sites.empty() &&
          candidate->guard.rejection == PragmaOnceGuardRejection::None;
+}
+
+bool RefoldPragmaOnceGuardRewriter::HeaderEstablishesReentryProtection(
+    StringRef physicalPath) const {
+  if (HeaderEstablishesOnceState(physicalPath))
+    return true;
+
+  // A classic guard is recorded on the include instance rather than on the
+  // header, so ask whether any instance opening this file named one.
+  for (const RefoldModel::IncludeItem &include : deps_.model.GetIncludes()) {
+    if (!include.controllingMacro || include.controllingMacro->empty())
+      continue;
+    std::optional<std::string> canonical =
+        CanonicalPhysicalPathForInclude(include);
+    if (canonical &&
+        deps_.pathIdentity.PathsEqual(*canonical, physicalPath))
+      return true;
+  }
+  return false;
 }
 
 bool RefoldPragmaOnceGuardRewriter::IncludeClosureReentersHeader(
@@ -952,8 +1026,17 @@ bool RefoldPragmaOnceGuardRewriter::AppendRealizedFromBIncludeGuardRestoration(
       continue;
 
     if (include->controllingMacro && !include->controllingMacro->empty()) {
-      guardByPath[*canonical] = include->controllingMacro->str();
-      continue;
+      // Priming the guard suppresses re-entry into the header and its whole
+      // include closure.  A realized-from-B body dropped every `#define` in that
+      // closure, so the prime is admissible only when nothing outside still
+      // observes those macros; otherwise the later `#include` must stay free to
+      // re-enter and re-establish them.  The re-entry hazard that remains is
+      // carried by the materialization scheduler's unprotected-header proof,
+      // which admits restoration under this same condition.
+      if (!HeaderMacroStateIsObservedOutside(*canonical)) {
+        guardByPath[*canonical] = include->controllingMacro->str();
+        continue;
+      }
     }
 
     // No controlling macro and no once-state means the header was never

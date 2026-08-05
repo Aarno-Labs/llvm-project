@@ -283,16 +283,6 @@ private:
   /// header, meaning its lost include-guard state can be restored by name.
   bool HeaderControllingMacroIsRecorded(llvm::StringRef physicalPath) const;
 
-  /// Return whether any macro defined by one physical header is invoked from
-  /// outside that header.
-  ///
-  /// Restoring a header's include guard suppresses every later inclusion of it.
-  /// A body realized from B dropped the header's `#define`s together with its
-  /// guard, so that suppression also removes the only remaining source of its
-  /// macro state.  Restoration is admissible only when nothing outside the
-  /// header observes that state.
-  bool HeaderMacroStateIsObservedOutside(llvm::StringRef physicalPath) const;
-
   /// Return whether one physical header contributed any A tokens.
   ///
   /// A header that is entirely directives has no content to duplicate, so

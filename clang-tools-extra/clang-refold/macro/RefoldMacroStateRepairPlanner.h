@@ -65,6 +65,15 @@ public:
     llvm::StringRef tuBytes;
     RefoldStructuralHunkDispatcher *structuralHunkDispatcher = nullptr;
     std::vector<TextEdit> *tuEdits = nullptr;
+
+    /// Regions the fallback ladder ruled out from keeping their source form.
+    ///
+    /// An include named here is going to be materialized, so repairing macro
+    /// state by deleting its directive is planning against a decision already
+    /// taken.  Declining to plan that transition is what leaves materialization
+    /// to do the work, and it is a *skip*, not a failure: nothing is refused
+    /// downstream and the pass is not abandoned.
+    const llvm::DenseSet<uint64_t> *ownersMustExpand = nullptr;
   };
 
   struct NamedMacroDirectiveRef {

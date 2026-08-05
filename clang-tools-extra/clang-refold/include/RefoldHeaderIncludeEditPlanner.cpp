@@ -1118,12 +1118,12 @@ bool RefoldHeaderIncludeEditPlanner::ProveHeaderSourceEnvelopeGap(
     gapPieces.push_back(std::move(piece));
   }
 
-  // Pragma/state proof for materialized header owners. A balanced diagnostic
-  // pragma island is a source-state atom: the island may be preserved across a
-  // header source gap only when push/pop depth returns to zero and every byte
-  // crossed by the island is trivia.
+  // Every pragma the gap covers is preserved.  A pragma is opaque
+  // preprocessor state: what it does is knowable only for the pragmas this
+  // tool models, so deleting the bytes around one must not delete it.
+  // `#pragma once` is the exception, owned by the once-guard rewriter.
   SmallVector<BalancedDiagnosticPragmaStateIsland, 4> pragmaIslands;
-  collectBalancedDiagnosticPragmaStateIslands(
+  collectPreservedPragmaStateIntervals(
       model_, state.headerText, gapBegin, gapEnd,
       [&](const RefoldModel::PragmaDirective &pragma) {
         return paths_.PathsEqual(pragma.sitePath, state.file);

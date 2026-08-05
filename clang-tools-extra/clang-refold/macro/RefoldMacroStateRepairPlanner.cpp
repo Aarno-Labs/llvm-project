@@ -16,6 +16,7 @@
 #include "edit/RefoldTextEditAssembler.h"
 #include "macro/RefoldMacroPatchPlanner.h"
 #include "macro/RefoldMacroStateProof.h"
+#include "proof/RefoldNeutralityProof.h"
 #include "macro/RefoldMacroTopology.h"
 #include "proof/RefoldAcceptedResultTypes.h"
 #include "proof/RefoldOwnerStateProof.h"
@@ -188,7 +189,8 @@ public:
       : deps_(deps), plan_(plan),
         dispatcher_(*request.structuralHunkDispatcher),
         tuEdits_(*request.tuEdits), tuPath_(request.tuPath),
-        tuBytes_(request.tuBytes) {
+        tuBytes_(request.tuBytes),
+        ownersMustExpand_(request.ownersMustExpand) {
     BuildDirectiveIndexOnce();
   }
 
@@ -317,6 +319,11 @@ private:
       bool requireKnownObserver = false) const;
   /// Mint the exact protected-source capability carried by one already-proved
   /// transition.  Raw source intervals are deliberately not accepted.
+  /// Return the include this transition would delete when its subtree carries,
+  /// anywhere, a pragma this repair cannot preserve.
+  std::optional<uint64_t> IncludeSubtreeCarryingUnmodeledPragma(
+      const ProvenMacroStateSourceTransition &transition) const;
+
   bool AuthorizeMacroStateSourceTransition(
       TextEdit &edit,
       const ProvenMacroStateSourceTransition &transition) const;
@@ -510,6 +517,8 @@ private:
   std::vector<TextEdit> &tuEdits_;
   StringRef tuPath_;
   StringRef tuBytes_;
+  /// Regions the fallback ladder ruled out; see MacroStateRepairRequest.
+  const llvm::DenseSet<uint64_t> *ownersMustExpand_ = nullptr;
   std::map<size_t, SmallVector<MacroStatePreservation, 4>>
       macroStatePreservationsByEdit_;
 };
@@ -755,6 +764,15 @@ MacroStateRepairContext::MacroStateSourceTransitionFor(
   const RefoldModel::IncludeItem *inc = OwningIncludeSiteInTU(directive);
   if (!inc)
     return std::nullopt;
+
+  // An include the ladder has ruled out is going to be materialized, so its
+  // directive is not a surface this repair may consume.  Skipping the plan
+  // rather than refusing it later is deliberate: a refusal at authorization
+  // time abandons the pass with no result, while skipping simply leaves the
+  // include to the realization that was already chosen for it.
+  if (ownersMustExpand_ && ownersMustExpand_->count(inc->id))
+    return std::nullopt;
+
   StringRef text = IncludeDirectiveText(*inc);
   if (text.empty())
     return std::nullopt;
@@ -839,6 +857,66 @@ MacroStateRepairContext::ProveMacroStateSourceTransition(
   return transition;
 }
 
+std::optional<uint64_t>
+MacroStateRepairContext::IncludeSubtreeCarryingUnmodeledPragma(
+    const ProvenMacroStateSourceTransition &transition) const {
+  // Which include instances does this consumed TU interval delete?  An
+  // include-owned transition consumes the directive line itself, so match by
+  // containment of the recorded site rather than by path alone: the same header
+  // can be included several times and only the covered instances die here.
+  llvm::SmallVector<uint64_t, 4> dyingRoots;
+  for (const RefoldModel::IncludeItem &include : Model().GetIncludes()) {
+    if (!PathIdentity().PathsEqual(include.sitePath, tuPath_))
+      continue;
+    if (include.siteB < transition.source.interval.begin ||
+        include.siteE > transition.source.interval.end)
+      continue;
+    dyingRoots.push_back(include.id);
+  }
+  if (dyingRoots.empty())
+    return std::nullopt;
+  llvm::sort(dyingRoots);
+
+  // Deleting an include deletes everything it entered, so the question is about
+  // the whole subtree: a pragma two headers down dies exactly as one in the
+  // directly included file does.
+  llvm::SmallVector<uint64_t, 16> subtree(dyingRoots.begin(), dyingRoots.end());
+  llvm::DenseSet<uint64_t> visited(dyingRoots.begin(), dyingRoots.end());
+  for (size_t index = 0; index < subtree.size(); ++index) {
+    for (const RefoldModel::IncludeItem &child : Model().GetIncludes()) {
+      if (!child.parent || *child.parent != subtree[index])
+        continue;
+      if (visited.insert(child.id).second)
+        subtree.push_back(child.id);
+    }
+  }
+
+  for (const RefoldModel::PragmaDirective &pragma : Model().GetPragmas()) {
+    if (pragmaDirectiveIsPragmaOnce(pragma, *deps_.lexLang))
+      continue;
+
+    // Prefer the producer's own ownership record.  Falling back to physical
+    // path is deliberately conservative: a header reached both inside and
+    // outside the dying subtree answers yes, which only declines a deletion.
+    if (pragma.ownerIncludeId) {
+      if (visited.count(*pragma.ownerIncludeId))
+        return dyingRoots.front();
+      continue;
+    }
+    for (uint64_t includeId : subtree) {
+      const RefoldModel::IncludeItem *include = Model().GetIncludeById(includeId);
+      const std::optional<StringRef> openedPath =
+          include ? (include->openedPath ? include->openedPath
+                                         : include->resolvedPath)
+                  : std::nullopt;
+      if (openedPath && PathIdentity().PathsEqual(*openedPath, pragma.sitePath))
+        return dyingRoots.front();
+    }
+  }
+
+  return std::nullopt;
+}
+
 bool MacroStateRepairContext::AuthorizeMacroStateSourceTransition(
     TextEdit &edit,
     const ProvenMacroStateSourceTransition &transition) const {
@@ -876,6 +954,33 @@ bool MacroStateRepairContext::AuthorizeMacroStateSourceTransition(
   const bool includeOwned =
       transition.source.surface ==
       MacroStateTransitionSurface::OwningTUIncludeDirective;
+
+  // This authority deletes a whole `#include` on the strength of having
+  // repaired the header's *macro* state.  That is only the state it can name.
+  // A pragma is opaque: what it does is knowable only for the pragmas this tool
+  // models, and there is no macro name to hoist it by, so an include whose
+  // subtree carries one cannot be deleted on this proof.  Refusing here leaves
+  // the ordinary realization lattice to materialize the include instead, where
+  // the pragma survives in place -- inside whatever conditional guards it, and
+  // with `#pragma once` still owned by the once-guard rewriter.
+  if (includeOwned) {
+    if (std::optional<uint64_t> pragmaOwner =
+            IncludeSubtreeCarryingUnmodeledPragma(transition)) {
+      // Refusing alone would abandon the pass with no result, so name the
+      // include: the fallback ladder rules out preserving it, and the next
+      // assembly materializes it instead of deleting it.  The pragma then
+      // survives where it was written.
+      TerminalSink().RequestTerminalFallback(
+          MakeTerminalFallbackProofFailure(
+              TerminalFallbackObligationKind::EmissionEditSetComposable,
+              TerminalFallbackFailureReason::UncomposableEmissionEditSet,
+              TerminalFallbackFailureContext::ForOwnerId(*pragmaOwner)),
+          "macro/state-repair",
+          "include-owned macro-state repair cannot preserve a pragma in the "
+          "include subtree; the include must be materialized instead");
+      return false;
+    }
+  }
   const ArrayRef<PreprocessingStructureKind> allowedKinds =
       includeOwned ? ArrayRef<PreprocessingStructureKind>(includeKinds)
                    : ArrayRef<PreprocessingStructureKind>(macroStateKinds);

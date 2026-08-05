@@ -516,26 +516,45 @@ int main(int argc, char **argv) {
   if (onlyCheck) {
     checkCtx = ctx;
 
+    // `preprocessToBytes` appends these verbatim to the recorded cc1 argv, so a
+    // declared directory must arrive already spelled as a search-path flag; a
+    // bare path would be read as another input file.  This mirrors the engine's
+    // observer-audit replay, which formats the same list the same way.
+    std::vector<std::string> verifyIncludeArgs;
+    verifyIncludeArgs.reserve(VerifyIncludeDirs.size() * 2);
+    for (const std::string &dir : VerifyIncludeDirs) {
+      verifyIncludeArgs.push_back("-I");
+      verifyIncludeArgs.push_back(dir);
+    }
+
     // Preprocess the refolded C source:
     {
-      auto ppOrErr = preprocessToBytes(CheckSrcPath, ctx, VerifyIncludeDirs);
+      auto ppOrErr = preprocessToBytes(CheckSrcPath, ctx, verifyIncludeArgs);
       if (!ppOrErr) {
         handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
-          REFOLD_LOG_FATAL("pp", "failed to preprocess --check input: {0}",
+          REFOLD_LOG_ERROR("pp", "failed to preprocess --check input: {0}",
                            e.message());
         });
+        // Fatal logging exits only in fatal mode, so the failure must be
+        // reported here as well; falling through would read an Expected
+        // that holds an error and abort.
+        return 1;
       }
       aBytes = std::move(*ppOrErr);
     }
 
     // Preprocess the edited preprocessed replay file.
     {
-      auto ppOrErr = preprocessToBytes(PPModPath, ctx, VerifyIncludeDirs);
+      auto ppOrErr = preprocessToBytes(PPModPath, ctx, verifyIncludeArgs);
       if (!ppOrErr) {
         handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
-          REFOLD_LOG_FATAL("pp", "failed to preprocess --pp-mod input: {0}",
+          REFOLD_LOG_ERROR("pp", "failed to preprocess --pp-mod input: {0}",
                            e.message());
         });
+        // Fatal logging exits only in fatal mode, so the failure must be
+        // reported here as well; falling through would read an Expected
+        // that holds an error and abort.
+        return 1;
       }
       bBytes = std::move(*ppOrErr);
     }

@@ -94,6 +94,40 @@ struct BalancedDiagnosticPragmaStateIsland {
 /// source bytes as an explicit gap piece.  The proof is therefore about the
 /// net boundary state, not about reconstructing or normalizing pragma
 /// spelling.
+/// Collect every pragma in a source gap whose state must survive deletion.
+///
+/// A pragma is opaque preprocessor state.  Its effect can only be known by
+/// modeling that particular pragma, and the refolder models exactly two:
+/// `#pragma once`, which the once-guard rewriter owns and replaces in place,
+/// and the balanced diagnostic island, whose net boundary state is provably
+/// nil.  Every other pragma -- `push_macro`, `pop_macro`, `pack`, a vendor
+/// pragma this tool has never heard of -- does something unknown, so deleting
+/// the bytes around it must not delete it.
+///
+/// This matters only for a pragma that contributes no tokens.  One that reaches
+/// `-E -P` output as text is ordinary content and is carried by the edit like
+/// any other bytes; `push_macro` and `pop_macro` are consumed by the
+/// preprocessor and appear nowhere in the token stream, so a gap is the only
+/// place they can be preserved.
+///
+/// `#pragma once` is excluded because preserving it here would fight the
+/// once-guard rewriter, which is the component that owns it.
+/// Return whether one recorded pragma is a `#pragma once`.
+///
+/// `#pragma once` is the one pragma with an owner: the once-guard rewriter
+/// replaces it in place when a header is inlined.  Every other preservation
+/// rule excludes it so the two do not fight.
+bool pragmaDirectiveIsPragmaOnce(const RefoldModel::PragmaDirective &pragma,
+                                 const clang::LangOptions &lang);
+
+void collectPreservedPragmaStateIntervals(
+    const RefoldModel &model, llvm::StringRef ownerBytes, uint64_t gapBegin,
+    uint64_t gapEnd,
+    llvm::function_ref<bool(const RefoldModel::PragmaDirective &)>
+        pragmaBelongs,
+    llvm::SmallVectorImpl<BalancedDiagnosticPragmaStateIsland> &out,
+    const clang::LangOptions &lang);
+
 void collectBalancedDiagnosticPragmaStateIslands(
     const RefoldModel &model, llvm::StringRef ownerBytes, uint64_t gapBegin,
     uint64_t gapEnd,

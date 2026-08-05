@@ -384,10 +384,15 @@ RefoldIncludeMaterializer::BuildInlineIncludeRealizationFromB(
       includeInsertionPlanner_.ResolveIncludeRealizationBTokenEnvelope(
           inc.cover.begin, inc.cover.end, &evidenceKind);
   if (!bEnvOpt) {
+    // Name the include.  Realizing it *from B* is what failed here, and the
+    // ladder's response -- seeding it for ordinary materialization -- is a
+    // different realization of the same include rather than a repeat of the one
+    // that just failed, so naming it is a repair and not a loop.
     terminalSink_.RequestTerminalFallback(
         MakeTerminalFallbackProofFailure(
             TerminalFallbackObligationKind::IncludeRealizationBEnvelopeMapped,
-            TerminalFallbackFailureReason::UnmappableIncludeBEnvelope),
+            TerminalFallbackFailureReason::UnmappableIncludeBEnvelope,
+            TerminalFallbackFailureContext::ForOwnerId(inc.id)),
         "include/mat",
         llvm::formatv("include realization from B failed to resolve a "
                       "canonical-or-consensus-resolvable B envelope for "
@@ -725,6 +730,13 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
 
       IncludeTextEditPlan plan = ComputeIncludeTextEdits(it->second, bytes);
       if (plan.requiresIncludeRealization) {
+        // Report why the include-preserving plan could not be discharged even
+        // when the realization that follows succeeds.  Without this the reason
+        // is observable only on the failure path, which hides the decision that
+        // turns a header into a directive-free body.
+        REFOLD_LOG_TRACE("include/mat",
+                         "inc#{0} requires whole-include realization: {1}",
+                         includeId, plan.realizationReason);
         AcceptedResultCandidate realizationCandidate;
         if (auto realized = BuildInlineIncludeRealizationFromB(
                 *inc, plan.realizationReason, &realizationCandidate)) {

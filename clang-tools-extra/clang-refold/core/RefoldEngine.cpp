@@ -478,8 +478,15 @@ Expected<std::string> RefoldEngine::Refold(
   const unsigned maxAttempts = 4;
 
   for (unsigned attempt = 0;; ++attempt) {
+    // Each attempt needs its own model.  Moving the parsed one in would leave
+    // every later attempt building an engine from a moved-from model -- no
+    // includes, no macro invocations, no directives -- so a marked region would
+    // have nothing to be marked against and the ladder would appear to make no
+    // progress.  `CloneForReadOnlyConsumer` exists for this: a plain copy would
+    // leave the clone's lookup tables pointing into the original's storage.
     RefoldEngine engine(
-        std::move(*mOrErr), aSource, aToks, aTokOff, bSource, bToks, bTokOff,
+        mOrErr->CloneForReadOnlyConsumer(), aSource, aToks, aTokOff, bSource,
+        bToks, bTokOff,
         noLines, strict, proofAuditMode, finalOutputPath, sidebandPragmaEdits,
         materializedEditMappings,
         std::move(finalLineControlValidationCallback));
@@ -1838,7 +1845,7 @@ std::string RefoldEngine::FinalizeStructuralResult(
   // macro-state repair phases.
   RefoldMacroStateRepairPlanner::MacroStateRepairRequest
       macroStateRepairRequest{tuPath, tuBytes, &structuralHunkDispatcher,
-                              &tuEdits};
+                              &tuEdits, &ownersMustExpand_};
   RefoldMacroStateRepairPlanner::MacroStateRepairPlan macroStateRepairPlan =
       MacroStateRepairPlanner().Plan(macroStateRepairRequest);
   if (!macroStateRepairPlan.success)

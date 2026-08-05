@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <map>
 #include <utility>
 
 using namespace llvm;
@@ -217,59 +218,6 @@ void RefoldIncludeMaterializationScheduler::CollectEnteredSubtreePhysicalPaths(
   paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
 }
 
-bool RefoldIncludeMaterializationScheduler::HeaderMacroStateIsObservedOutside(
-    StringRef physicalPath) const {
-  // Restoring a header's guard suppresses re-entry into that header *and
-  // everything it includes*, so the owner domain must be the whole entered
-  // subtree.  Considering only the header's own definitions would miss the
-  // nested ones -- `bits/types.h` pulls in `bits/typesizes.h` and
-  // `bits/wordsize.h`, whose macros glibc uses everywhere.
-  DenseSet<uint64_t> ownerIds;
-  SmallVector<uint64_t, 16> worklist;
-  for (const RefoldModel::IncludeItem &include : model_.GetIncludes())
-    if (include.openedPath &&
-        pathIdentity_.PathsEqual(*include.openedPath, physicalPath))
-      worklist.push_back(include.id);
-  while (!worklist.empty()) {
-    const uint64_t current = worklist.pop_back_val();
-    if (!ownerIds.insert(current).second)
-      continue;
-    if (auto it = children_.find(current); it != children_.end())
-      for (const RefoldModel::IncludeItem *child : it->second)
-        worklist.push_back(child->id);
-  }
-  if (ownerIds.empty())
-    return true;
-
-  llvm::StringSet<> definedHere;
-  for (const RefoldModel::MacroDirective &directive :
-       model_.GetMacroDirectives()) {
-    if (directive.ownerIncludeId && ownerIds.count(*directive.ownerIncludeId))
-      definedHere.insert(directive.name);
-  }
-  if (definedHere.empty())
-    return false;
-
-  // An invocation of one of those names from outside this header means the
-  // definition is live after the header: suppressing a later re-entry would
-  // leave that use undefined.  Invocations inside the header's own instances do
-  // not count, because a body realized from B already carries their expansion.
-  for (const RefoldModel::MacroInvocation &invocation :
-       model_.GetMacroInvocations()) {
-    if (!definedHere.contains(invocation.name))
-      continue;
-    if (invocation.ownerIncludeId && ownerIds.count(*invocation.ownerIncludeId))
-      continue;
-    REFOLD_LOG_TRACE("pragma/once/guard",
-                     "header '{0}' macro '{1}' is observed outside it; its "
-                     "include-guard state cannot be restored",
-                     physicalPath, invocation.name);
-    return true;
-  }
-
-  return false;
-}
-
 bool RefoldIncludeMaterializationScheduler::HeaderContributedTokens(
     StringRef physicalPath) const {
   for (const RefoldModel::IncludeItem &include : model_.GetIncludes()) {
@@ -324,7 +272,14 @@ bool RefoldIncludeMaterializationScheduler::HeaderControllingMacroIsRecorded(
 
 bool RefoldIncludeMaterializationScheduler::
     ProveNoReentryIntoUnprotectedInlinedHeaders() {
-  std::vector<std::string> unprotectedPaths;
+  // Each unprotected header is recorded together with the realized-from-B
+  // include whose body emitted it.  That include, not the directive that
+  // re-enters it, is the region at fault: its body carries the header's
+  // declarations without the header's own `#define`s or guard directives, and
+  // materializing it from source restores both at once.  Keyed by path and
+  // filled from ids in sorted order, so the smallest emitting id wins
+  // deterministically.
+  std::map<std::string, uint64_t> emittingRealizedInclude;
 
   // Determinism: iterate realized includes by sorted id.
   SmallVector<uint64_t, 32> realizedIds;
@@ -370,20 +325,31 @@ bool RefoldIncludeMaterializationScheduler::
       // never invoked elsewhere, and false for `sys/cdefs.h`, whose
       // `__GLIBC_USE` every glibc header depends on.
       if (HeaderControllingMacroIsRecorded(path) &&
-          !HeaderMacroStateIsObservedOutside(path)) {
+          !pragmaOnceGuards_.HeaderMacroStateIsObservedOutside(path)) {
         continue;
       }
-      unprotectedPaths.push_back(std::move(path));
+      emittingRealizedInclude.emplace(std::move(path), includeId);
     }
   }
 
-  if (unprotectedPaths.empty())
+  if (emittingRealizedInclude.empty())
     return true;
 
-  llvm::sort(unprotectedPaths);
-  unprotectedPaths.erase(
-      std::unique(unprotectedPaths.begin(), unprotectedPaths.end()),
-      unprotectedPaths.end());
+  // `std::map` already yields these sorted and unique.
+  std::vector<std::string> unprotectedPaths;
+  unprotectedPaths.reserve(emittingRealizedInclude.size());
+  for (const auto &entry : emittingRealizedInclude)
+    unprotectedPaths.push_back(entry.first);
+
+  // One request per faulty realized include rather than one per re-entering
+  // directive.  A single header can be re-entered by dozens of surviving edges
+  // -- glibc's `bits/types.h` is reached from 33 of them in one megalania
+  // translation unit -- and giving up those edges one ladder step at a time
+  // exhausts the attempt ceiling without ever addressing the body that lost the
+  // directives.  Materializing the emitting include from source discharges every
+  // one of those edges at once.  A representative detail is kept for each so the
+  // diagnostic still names a concrete re-entry.
+  std::map<uint64_t, std::string> faultDetailByRealizedInclude;
 
   bool reentryProven = true;
   for (const RefoldModel::IncludeItem &include : model_.GetIncludes()) {
@@ -395,32 +361,52 @@ bool RefoldIncludeMaterializationScheduler::
     // The re-entry side is intentionally over-approximated over *all* edges,
     // not just entered ones: once the refolded TU is preprocessed, an edge that
     // the producer skipped may be taken.
+    // Resolve to the recorded spelling rather than this edge's own, so the
+    // result is usable as a key into `emittingRealizedInclude`.
     std::string reentered;
-    const bool directlyReenters =
-        include.openedPath &&
-        llvm::any_of(unprotectedPaths, [&](const std::string &path) {
-          return pathIdentity_.PathsEqual(*include.openedPath, path);
-        });
-    if (directlyReenters)
-      reentered = include.openedPath->str();
+    const std::string *directlyReentered = nullptr;
+    if (include.openedPath) {
+      for (const std::string &path : unprotectedPaths) {
+        if (pathIdentity_.PathsEqual(*include.openedPath, path)) {
+          directlyReentered = &path;
+          break;
+        }
+      }
+    }
+    if (directlyReentered)
+      reentered = *directlyReentered;
     else if (!pragmaOnceGuards_.IncludeClosureReentersHeader(
                  include, unprotectedPaths, &reentered))
+      continue;
+
+    const auto emitting = emittingRealizedInclude.find(reentered);
+    if (emitting == emittingRealizedInclude.end())
       continue;
 
     const std::string detail =
         llvm::formatv(
             "surviving include inc#{0} target='{1}' re-enters '{2}', whose "
-            "content was inlined from the edited preprocessed stream and "
-            "therefore carries none of its own include-guard directives",
-            include.id, include.target, reentered)
+            "content was inlined from the edited preprocessed stream by inc#{3} "
+            "and therefore carries none of its own include-guard directives",
+            include.id, include.target, reentered, emitting->second)
             .str();
     REFOLD_LOG_TRACE("pragma/once/guard", "{0}", detail);
-    // The re-entering directive is the region at fault, so name it.  Expanding
-    // it is a repair rather than a duplication: this loop over-approximates
-    // across *all* edges, and the edge that actually endangers the output is
-    // one the producer skipped, which contributed no tokens.  Materializing
-    // such an edge emits nothing, which is what the original emitted there.
-    // An edge the producer did enter contributed its tokens either way.
+    faultDetailByRealizedInclude.emplace(emitting->second, detail);
+    reentryProven = false;
+  }
+
+  // Emitted after the scan, in include-id order, so the request sequence does
+  // not depend on which re-entering edge happened to be seen first.
+  for (const auto &entry : faultDetailByRealizedInclude) {
+    // Name the include whose realized-from-B body dropped the directives, not
+    // the directive that re-enters it.  The ladder's response -- seeding it for
+    // ordinary materialization -- is a *different* realization of the same
+    // include rather than a repeat of the one that just failed, so naming it is
+    // a repair and not a loop; this mirrors the response to an unmappable B
+    // envelope.  Materializing from source re-emits the header's own `#define`s
+    // and its own guard, so a later directive that re-enters it is suppressed
+    // exactly as the original suppressed it, and no guard macro has to be
+    // primed in translation-unit text to achieve that.
     //
     // Whatever it produces is verified again, so a repair that does not hold
     // widens rather than escaping.
@@ -428,13 +414,8 @@ bool RefoldIncludeMaterializationScheduler::
         MakeTerminalFallbackProofFailure(
             TerminalFallbackObligationKind::IncludeGuardStateStabilizable,
             TerminalFallbackFailureReason::IncludeGuardStateNotStabilizable,
-            TerminalFallbackFailureContext::ForOwnerId(include.id)),
-        "pragma/once/guard", detail);
-    // Keep scanning.  Every re-entering directive is independently at fault, and
-    // recording them all lets one attempt give up all of them; stopping here
-    // would cost one whole re-assembly per offending edge and, past the attempt
-    // ceiling, would reach the terminal carrier with work still available.
-    reentryProven = false;
+            TerminalFallbackFailureContext::ForOwnerId(entry.first)),
+        "pragma/once/guard", entry.second);
   }
 
   return reentryProven;

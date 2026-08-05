@@ -1122,6 +1122,60 @@ bool sourceTextIsOnlyIgnorableGapTrivia(StringRef text,
   return sourceTextIsOnlyWhitespaceAndCompleteComments(text, lang);
 }
 
+/// Return whether one recorded pragma is a `#pragma once`.
+///
+/// Matched on the producer-recorded directive text after the `#`/`pragma`
+/// keywords, so spacing and comment placement do not change the answer.
+bool pragmaDirectiveIsPragmaOnce(
+    const RefoldModel::PragmaDirective &pragma, const LangOptions &lang) {
+  std::vector<PPTok> tokens;
+  std::vector<size_t> offsets;
+  lexPPTokens(pragma.text.str(), tokens, offsets, lang);
+
+  // `# pragma once` lexes as `#`, `pragma`, `once`; the operator spelling
+  // `_Pragma("once")` carries its argument as a string literal instead.
+  for (size_t index = 0; index + 1 < tokens.size(); ++index)
+    if (tokens[index].spelling == "pragma" && tokens[index + 1].spelling == "once")
+      return true;
+  return false;
+}
+
+void collectPreservedPragmaStateIntervals(
+    const RefoldModel &model, StringRef ownerBytes, uint64_t gapBegin,
+    uint64_t gapEnd,
+    function_ref<bool(const RefoldModel::PragmaDirective &)> pragmaBelongs,
+    SmallVectorImpl<BalancedDiagnosticPragmaStateIsland> &out,
+    const LangOptions &lang) {
+  if (gapBegin >= gapEnd || gapEnd > ownerBytes.size())
+    return;
+
+  for (const auto &pragma : model.GetPragmas()) {
+    if (!pragmaBelongs(pragma))
+      continue;
+    if (gapBegin > pragma.siteB || pragma.siteB >= pragma.siteE ||
+        pragma.siteE > gapEnd)
+      continue;
+    if (pragmaDirectiveIsPragmaOnce(pragma, lang))
+      continue;
+
+    BalancedDiagnosticPragmaStateIsland interval;
+    interval.begin = pragma.siteB;
+    interval.end = pragma.siteE;
+    interval.id = pragma.id;
+    out.push_back(interval);
+  }
+
+  // Deterministic order, matching the balanced-island collector.
+  llvm::sort(out, [](const BalancedDiagnosticPragmaStateIsland &lhs,
+                     const BalancedDiagnosticPragmaStateIsland &rhs) {
+    if (lhs.begin != rhs.begin)
+      return lhs.begin < rhs.begin;
+    if (lhs.end != rhs.end)
+      return lhs.end < rhs.end;
+    return lhs.id < rhs.id;
+  });
+}
+
 void collectBalancedDiagnosticPragmaStateIslands(
     const RefoldModel &model, StringRef ownerBytes, uint64_t gapBegin,
     uint64_t gapEnd,
