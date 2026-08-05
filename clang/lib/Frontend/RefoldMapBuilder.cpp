@@ -157,6 +157,41 @@ static std::pair<size_t, size_t> lineSpanOf(StringRef S, size_t p) {
   return {L, R};
 }
 
+/// Return one past the end of the *logical* line whose first physical line ends
+/// at \p eol.
+///
+/// \p eol is what lineSpanOf() returns: one past the terminating newline, or
+/// the buffer size for an unterminated final line.  Translation phase 2 deletes
+/// a backslash that immediately precedes a newline and splices the next
+/// physical line on, so a single directive can extend well past its first
+/// newline:
+///
+/// \code
+///   #if !defined(offsetof) || \
+///       (__has_feature(modules) && !__building_module(_Builtin_stddef))
+/// \endcode
+///
+/// A conditional arm's body begins after the complete logical line, and the
+/// condition text of `#if`/`#elif` spans it, so both must be measured here
+/// rather than at the first newline.  Any backslash directly before the newline
+/// splices, including one that is itself preceded by a backslash, because phase
+/// 2 runs before escape sequences are interpreted.
+static size_t logicalLineEndOf(StringRef S, size_t eol) {
+  while (eol > 0 && eol < S.size() && S[eol - 1] == '\n') {
+    size_t backslash = eol - 1;
+    if (backslash > 0 && S[backslash - 1] == '\r')
+      --backslash;
+    if (backslash == 0 || S[backslash - 1] != '\\')
+      break;
+
+    const size_t next = lineSpanOf(S, eol).second;
+    if (next <= eol)
+      break;
+    eol = next;
+  }
+  return eol;
+}
+
 /// Return true iff a raw physical source line looks like a `#line` directive or
 /// GNU line-marker directive.  This is not used to interpret semantics; it only
 /// identifies the physical site corresponding to Clang's producer-proven
@@ -279,6 +314,94 @@ findLineControlDirectiveLineNearLoc(const SourceManager &SM,
 /// \note This routine deliberately avoids any heuristic guessing and is fully
 ///       deterministic: the same input buffer always produces the same groups.
 /// \sa CondGroup, CondArm
+/// Mark every byte of \p S that lies inside a comment.
+///
+/// A `#` that is commented out does not introduce a directive.  Scanning raw
+/// lines without tracking comment state invents conditional groups out of
+/// commented-out examples -- glibc headers document their own macros that way
+/// -- and a spurious `#if` or `#endif` unbalances the nesting stack, which then
+/// mis-attributes the extent of the *real* groups around it.
+///
+/// Comment state is resolved in one pass so it stays correct across the
+/// line-oriented scan below, which does not always advance one physical line at
+/// a time.  String and character literals are tracked because `/*` inside them
+/// opens nothing; escaped newlines are honoured because they continue a `//`
+/// comment onto the following physical line.
+///
+/// Being wrong in the permissive direction only preserves the previous
+/// behaviour, while being wrong in the restrictive direction would drop a real
+/// directive and unbalance the very nesting this protects, so anything not
+/// positively identified as a comment is left unmarked.
+static std::vector<char> computeCommentMask(StringRef S) {
+  std::vector<char> InComment(S.size(), 0);
+  const size_t N = S.size();
+
+  auto atEscapedNewline = [&](size_t I) -> size_t {
+    if (I >= N || S[I] != '\\')
+      return 0;
+    if (I + 1 < N && S[I + 1] == '\n')
+      return 2;
+    if (I + 2 < N && S[I + 1] == '\r' && S[I + 2] == '\n')
+      return 3;
+    return 0;
+  };
+
+  size_t I = 0;
+  while (I < N) {
+    if (size_t Splice = atEscapedNewline(I)) {
+      I += Splice;
+      continue;
+    }
+
+    if (S[I] == '"' || S[I] == '\'') {
+      const char Quote = S[I];
+      ++I;
+      while (I < N && S[I] != Quote) {
+        if (size_t Splice = atEscapedNewline(I)) {
+          I += Splice;
+          continue;
+        }
+        // An unterminated literal must not swallow the rest of the file.
+        if (S[I] == '\n')
+          break;
+        I += (S[I] == '\\' && I + 1 < N) ? 2 : 1;
+      }
+      if (I < N && S[I] == Quote)
+        ++I;
+      continue;
+    }
+
+    if (S[I] == '/' && I + 1 < N && S[I + 1] == '*') {
+      const size_t Begin = I;
+      I += 2;
+      while (I + 1 < N && !(S[I] == '*' && S[I + 1] == '/'))
+        ++I;
+      I = (I + 1 < N) ? I + 2 : N;
+      std::fill(InComment.begin() + Begin, InComment.begin() + I, 1);
+      continue;
+    }
+
+    if (S[I] == '/' && I + 1 < N && S[I + 1] == '/') {
+      const size_t Begin = I;
+      I += 2;
+      while (I < N) {
+        if (size_t Splice = atEscapedNewline(I)) {
+          I += Splice;
+          continue;
+        }
+        if (S[I] == '\n')
+          break;
+        ++I;
+      }
+      std::fill(InComment.begin() + Begin, InComment.begin() + I, 1);
+      continue;
+    }
+
+    ++I;
+  }
+  return InComment;
+}
+
 static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
                                                 llvm::StringRef FilePath) {
   // Scans the raw source buffer for preprocessor conditional directive groups:
@@ -344,11 +467,16 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
   };
   std::vector<Active> Stack;
 
+  const std::vector<char> InComment = computeCommentMask(Buf);
+
   while (p < N) {
     // Determine the [bol, eol) byte span for the current line containing `p`.
     // lineSpanOf() returns the bounds *excluding* the newline.
     auto span = lineSpanOf(Buf, p);
     size_t bol = span.first, eol = span.second;
+    // A directive line may be spliced across several physical lines; every use
+    // that consumes the *directive* rather than the keyword must span them.
+    const size_t logicalEol = logicalLineEndOf(Buf, eol);
     if (eol <= bol) {
       // Degenerate or empty line; move past it safely.
       p = std::min(N, eol + 1);
@@ -361,8 +489,9 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
     while (s < eol && isSpace</*kWithCR=*/true>(Buf[s]))
       ++s;
 
-    // Recognize directives only when we see '#" after optional indentation.
-    if (s < eol && Buf[s] == '#') {
+    // Recognize directives only when we see '#" after optional indentation,
+    // and only when that '#' is not commented out.
+    if (s < eol && Buf[s] == '#' && !InComment[s]) {
       // Skip whitespace after '#'.
       size_t q = s + 1;
       while (q < eol && isSpace</*kWithCR=*/true>(Buf[q]))
@@ -427,12 +556,12 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
                                       : 6)); // lengths: "if", "ifdef", "ifndef"
         while (condBeg < eol && isSpace</*kWithCR=*/true>(Buf[condBeg]))
           ++condBeg;
-        A.Cond = std::string(Buf.substr(condBeg, eol - condBeg));
+        A.Cond = std::string(Buf.substr(condBeg, logicalEol - condBeg));
 
         // The arm body begins immediately after this directive line.
-        // We use `eol` (not `eol+1`) so that the newline remains part of the
-        // body depending on downstream reconstruction policy.
-        A.BodyB = std::min(N, eol);
+        // We use the logical end (not `+1`) so that the newline remains part of
+        // the body depending on downstream reconstruction policy.
+        A.BodyB = std::min(N, logicalEol);
         A.BodyE = A.BodyB;
         G.Arms.push_back(std::move(A));
 
@@ -441,8 +570,8 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
         Groups.push_back(std::move(G));
         Stack.push_back(Active{idx});
 
-        // Advance to the end of this line.
-        p = std::min(N, eol);
+        // Advance past the whole directive, continuation lines included.
+        p = std::min(N, logicalEol);
         continue;
       }
 
@@ -452,7 +581,7 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
         // If there is no active group, this is a stray directive and we ignore
         // it.
         if (Stack.empty()) {
-          p = std::min(N, eol);
+          p = std::min(N, logicalEol);
           continue;
         }
 
@@ -470,25 +599,25 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
           size_t condBeg = q + 4; // "elif"
           while (condBeg < eol && isSpace</*kWithCR=*/true>(Buf[condBeg]))
             ++condBeg;
-          A.Cond = std::string(Buf.substr(condBeg, eol - condBeg));
+          A.Cond = std::string(Buf.substr(condBeg, logicalEol - condBeg));
         } else {
           // "else" has no condition text.
           A.Cond.clear();
         }
 
         // Arm body begins immediately after this directive line.
-        A.BodyB = std::min(N, eol);
+        A.BodyB = std::min(N, logicalEol);
         A.BodyE = A.BodyB;
         G.Arms.push_back(std::move(A));
 
-        p = std::min(N, eol);
+        p = std::min(N, logicalEol);
         continue;
       }
 
       case DK_Endif: {
         // Close the current innermost group.
         if (Stack.empty()) {
-          p = std::min(N, eol);
+          p = std::min(N, logicalEol);
           continue; // stray endif
         }
 
@@ -501,11 +630,11 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
         // Group extent: we record through the end of the '#endif' line.
         // This allows downstream logic to treat the group as spanning the
         // directives themselves, not just the arm bodies.
-        G.GroupE = std::min(N, eol);
+        G.GroupE = std::min(N, logicalEol);
 
         Stack.pop_back();
 
-        p = std::min(N, eol);
+        p = std::min(N, logicalEol);
         continue;
       }
 
@@ -516,8 +645,10 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
       }
     }
 
-    // Not a recognized directive line; advance to end-of-line.
-    p = std::min(N, eol);
+    // Not a recognized directive line.  Advance past the whole logical line:
+    // a continuation spliced onto an ordinary line is part of that line, so a
+    // `#` at its start does not introduce a directive.
+    p = std::min(N, logicalEol);
   }
 
   // If the file ends without closing some groups, conservatively close them at

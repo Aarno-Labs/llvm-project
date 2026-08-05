@@ -604,6 +604,7 @@ static void bindConditionalGroups(
     }
 
     bool exactArms = true;
+    std::string armMismatch;
     for (size_t armIndex = 0; armIndex < producerGroup.arms.size();
          ++armIndex) {
       const RefoldModel::CondArm &producerArm = producerGroup.arms[armIndex];
@@ -612,14 +613,21 @@ static void bindConditionalGroups(
       if (producerArm.kind != producerArmKind(scannedArm.interval.kind) ||
           producerArm.bodyB != scannedArm.interval.end) {
         exactArms = false;
+        armMismatch =
+            llvm::formatv(" (arm index={0}: producer kind='{1}' body_b={2}; "
+                          "scanned kind='{3}' directive=[{4},{5}))",
+                          armIndex, producerArm.kind, producerArm.bodyB,
+                          producerArmKind(scannedArm.interval.kind),
+                          scannedArm.interval.begin, scannedArm.interval.end)
+                .str();
         break;
       }
     }
     if (!exactArms) {
       diagnostics.push_back(
           llvm::formatv("conditional group id={0} could not be bound to exact "
-                        "arm-control directive intervals",
-                        producerGroup.id)
+                        "arm-control directive intervals{1}",
+                        producerGroup.id, armMismatch)
               .str());
       continue;
     }
