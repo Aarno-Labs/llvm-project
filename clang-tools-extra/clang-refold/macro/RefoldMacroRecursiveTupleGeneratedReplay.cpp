@@ -251,6 +251,45 @@ struct RootTupleSliceDerivation {
   llvm::SmallVector<RootTupleSliceBinding, 8> actualSlices;
 };
 
+/// One proven binding between a root tuple element and the formal consuming it.
+///
+/// The composed path records a binding for *every* formal of every invocation
+/// it traverses, not only for the terminal callee's actuals.  Two obligations
+/// need the complete set:
+///
+///   * an element consumed by an intermediate replacement list -- `x` in
+///     `ADD(g,x,t) -> ((x)+(g t))` -- never reaches the terminal replay solver,
+///     so its edited spelling has to be established some other way; and
+///   * the closing coverage certificate has to explain every A token inside the
+///     root whole-cover envelope the emitted patch claims to realize.
+///
+/// Recording the owning invocation and its local formal index is what makes
+/// both possible: the producer's argument spans for that pair are the exact
+/// A-token surface through which the element reaches the expansion.
+struct RootTupleElementBinding {
+  /// Invocation whose local formal consumes the element.
+  const RefoldModel::MacroInvocation *invocation = nullptr;
+  /// Local formal index of `invocation` bound to the element.
+  uint32_t formalIndex = 0;
+  /// Exact root tuple element slice bound to that formal.
+  RootTupleSliceBinding slice;
+};
+
+/// One root tuple element realized outside the terminal replay solution.
+///
+/// Coordinates are relative to the text between the root tuple parentheses,
+/// matching `RootTupleSliceBinding::rootTuplePayloadByte*`, so the tuple edit
+/// applier can place terminal-solved and separately realized elements with one
+/// set of rules.
+struct RealizedRootTupleElement {
+  /// Element payload begin, relative to the text between tuple parentheses.
+  uint64_t rootTuplePayloadByteBegin = 0;
+  /// Element payload end, relative to the text between tuple parentheses.
+  uint64_t rootTuplePayloadByteEnd = 0;
+  /// Edited spelling proven for the element.
+  std::string replacement;
+};
+
 /// One physical terminal generated-callee replay target.
 ///
 /// A single root tuple can feed more than one generated terminal, for example
@@ -301,6 +340,14 @@ struct ComposedGeneratedCalleePath {
   /// fields remain the durable witness anchor; this vector drives replay solving
   /// with the correct definition for each physical terminal.
   llvm::SmallVector<TerminalReplayTarget, 4> replayTargets;
+
+  /// Every (invocation, local formal) pair proven to consume a root tuple
+  /// element, accumulated over the whole composed path.
+  ///
+  /// This is a superset of `actualSlices`: it also names the elements consumed
+  /// by intermediate replacement lists and by callee selectors, about which the
+  /// terminal replay solution says nothing.
+  llvm::SmallVector<RootTupleElementBinding, 8> elementBindings;
 };
 
 
@@ -341,6 +388,14 @@ struct GeneratedTupleFormalState {
   /// the selector token is an exact root tuple element rather than by composing
   /// a distinct root selector formal.
   bool calleeSelectedFromRootTupleSlice = false;
+
+  /// Element bindings already proven by every ancestor of this invocation.
+  ///
+  /// The descent appends each parent's complete formal-to-element map before
+  /// following an edge, so a state reached at depth N carries the bindings of
+  /// all N ancestors.  The state's own bindings are added when it becomes a
+  /// path leaf, which is the only point at which they are final.
+  llvm::SmallVector<RootTupleElementBinding, 8> elementBindings;
 };
 
 /// Unique terminal generated-callee replay result for the composed path.
@@ -357,6 +412,13 @@ struct RecursiveTupleGeneratedReplaySolution {
   llvm::SmallVector<std::string, 8> oldSolvedActuals;
   /// Unique edited replay solution in terminal callee formal order.
   llvm::SmallVector<std::string, 8> newSolvedActuals;
+  /// Root tuple elements realized outside the terminal replay solution.
+  ///
+  /// Empty for the non-recursive shapes, where every element of the root tuple
+  /// is a terminal actual.  A recursive path whose intermediate replacement
+  /// list consumes elements of its own contributes one entry per changed
+  /// element.
+  llvm::SmallVector<RealizedRootTupleElement, 4> realizedElements;
 };
 
 /// One accepted edit inside the source-spelled root tuple payload.
@@ -1166,6 +1228,22 @@ private:
     for (const ComposedGeneratedCalleePath &path : paths.drop_front()) {
       if (!PathsHaveSameTupleEditObligation(collapsed, path))
         return std::nullopt;
+
+      // Equivalent paths agree on the tuple edit but reach it through distinct
+      // physical invocations, so their element bindings are a union rather than
+      // a repetition: each collapsed terminal contributes its own argument
+      // surface, and the coverage certificate needs all of them.
+      for (const RootTupleElementBinding &binding : path.elementBindings) {
+        const bool alreadyRecorded = llvm::any_of(
+            collapsed.elementBindings,
+            [&](const RootTupleElementBinding &recorded) {
+              return recorded.invocation == binding.invocation &&
+                     recorded.formalIndex == binding.formalIndex;
+            });
+        if (!alreadyRecorded)
+          collapsed.elementBindings.push_back(binding);
+      }
+
       if (path.replayTargets.empty()) {
         if (!path.terminalInvocation || !path.terminalDefinition)
           return std::nullopt;
@@ -1254,6 +1332,7 @@ private:
       case MacroCalleeOriginKind::LiteralMacroName:
         if (std::optional<GeneratedTupleFormalState> childState =
                 TryComposeNestedLiteralForwardingState(state, *child)) {
+          CarryParentElementBindings(state, *childState);
           llvm::SmallVector<ComposedGeneratedCalleePath, 2> descendantPaths;
           if (!CollectNestedGeneratedCalleePaths(request, rootInvocation,
                                                 *childState, depth + 1,
@@ -1276,6 +1355,7 @@ private:
             TryComposeNestedOpaqueGeneratedCalleeState(request, state, *child);
         if (!childState)
           return false;
+        CarryParentElementBindings(state, *childState);
 
         llvm::SmallVector<ComposedGeneratedCalleePath, 2> descendantPaths;
         if (!CollectNestedGeneratedCalleePaths(request, rootInvocation,
@@ -1301,6 +1381,7 @@ private:
           TryComposeNestedGeneratedCalleeState(request, state, *child);
       if (!childState)
         return false;
+      CarryParentElementBindings(state, *childState);
 
       llvm::SmallVector<ComposedGeneratedCalleePath, 2> descendantPaths;
       if (!CollectNestedGeneratedCalleePaths(request, rootInvocation,
@@ -1886,6 +1967,56 @@ private:
     return false;
   }
 
+  /// Append one binding per formal of \p state that consumes a root tuple
+  /// element.
+  ///
+  /// Repeats are dropped by owning invocation and local formal index so a state
+  /// reached through more than one traversal contributes each pair once.  The
+  /// bindings are proof facts already established by the compose step that
+  /// built `rootTupleSliceByLocalFormal`; nothing is inferred here.
+  static void AppendStateElementBindings(
+      const GeneratedTupleFormalState &state,
+      llvm::SmallVectorImpl<RootTupleElementBinding> &bindings) {
+    if (!state.invocation)
+      return;
+
+    for (uint32_t formalIndex = 0;
+         formalIndex < state.rootTupleSliceByLocalFormal.size();
+         ++formalIndex) {
+      const std::optional<RootTupleSliceBinding> &slice =
+          state.rootTupleSliceByLocalFormal[formalIndex];
+      if (!slice)
+        continue;
+
+      const bool alreadyRecorded =
+          llvm::any_of(bindings, [&](const RootTupleElementBinding &recorded) {
+            return recorded.invocation == state.invocation &&
+                   recorded.formalIndex == formalIndex;
+          });
+      if (alreadyRecorded)
+        continue;
+
+      RootTupleElementBinding binding;
+      binding.invocation = state.invocation;
+      binding.formalIndex = formalIndex;
+      binding.slice = *slice;
+      bindings.push_back(binding);
+    }
+  }
+
+  /// Carry the ancestor element bindings of \p parentState into \p childState.
+  ///
+  /// Called once per followed edge, before the child is explored further, so
+  /// the child inherits the complete ancestor chain regardless of which
+  /// compose variant proved the edge.
+  static void CarryParentElementBindings(
+      const GeneratedTupleFormalState &parentState,
+      GeneratedTupleFormalState &childState) {
+    childState.elementBindings.assign(parentState.elementBindings.begin(),
+                                      parentState.elementBindings.end());
+    AppendStateElementBindings(parentState, childState.elementBindings);
+  }
+
   /// Convert a generated formal state into the public composed path carrier.
   std::optional<ComposedGeneratedCalleePath> BuildPathForGeneratedState(
       const RefoldModel::MacroInvocation &rootInvocation,
@@ -1905,6 +2036,13 @@ private:
     path.actualSlices.assign(state.actualSlices.begin(),
                              state.actualSlices.end());
     path.replayTargets.push_back({state.invocation, state.definition});
+
+    // The leaf's own formals complete the chain: the ancestors were recorded as
+    // each edge was followed, and the leaf is terminal, so nothing further can
+    // consume an element.
+    path.elementBindings.assign(state.elementBindings.begin(),
+                                state.elementBindings.end());
+    AppendStateElementBindings(state, path.elementBindings);
     return path;
   }
 
@@ -1943,6 +2081,306 @@ std::optional<std::string> rootInvocationSourceSlice(
   return text.str();
 }
 
+/// Return the token spellings of \p text under the replay lexer options.
+llvm::SmallVector<std::string, 8> lexTokenSpellings(
+    llvm::StringRef text, const clang::LangOptions &lexLang) {
+  std::vector<PPTok> tokens;
+  std::vector<size_t> offsets;
+  lexPPTokens(text.str(), tokens, offsets, lexLang);
+
+  llvm::SmallVector<std::string, 8> spellings;
+  spellings.reserve(tokens.size());
+  for (const PPTok &token : tokens)
+    spellings.push_back(token.spelling);
+  return spellings;
+}
+
+/// Append the A-token surfaces through which one formal reaches the expansion.
+///
+/// Every argument-like span kind is collected, not only `Standard`: a formal
+/// that is stringified or pasted still occupies A tokens that the coverage
+/// certificate has to account for.  The realizer separately refuses to read an
+/// edited spelling out of a non-`Standard` surface, because those tokens are a
+/// transformation of the actual rather than the actual itself.
+void appendFormalFootprint(
+    const RefoldModel::MacroInvocation &invocation, uint32_t formalIndex,
+    llvm::SmallVectorImpl<const RefoldModel::PPArgSpan *> &spans) {
+  auto appendMatching = [&](const std::vector<RefoldModel::PPArgSpan> &source) {
+    for (const RefoldModel::PPArgSpan &span : source) {
+      if (span.argIdx != formalIndex || !span.IsValid() ||
+          span.begin >= span.end)
+        continue;
+      spans.push_back(&span);
+    }
+  };
+
+  appendMatching(invocation.argSpans);
+  appendMatching(invocation.stringifySpans);
+  appendMatching(invocation.pasteSpans);
+}
+
+/// Realizes root tuple elements the terminal replay solution does not cover,
+/// and certifies that the claimed root envelope contains no unexplained edit.
+///
+/// The recursive theorem rewrites exactly one root tuple actual, but only the
+/// terminal generated callee's actuals are solved by replaying a replacement
+/// list.  In `EXPR(ADD, (SUB, x, (y, z)))` with `ADD(g,x,t) -> ((x)+(g t))`,
+/// the element `x` is consumed by `ADD`'s own replacement list and never
+/// becomes a `SUB` actual, so the terminal solution says nothing about it.
+/// Emitting a patch that claims the root whole-cover envelope while leaving
+/// such an element unedited is exactly the unsound claim this class removes.
+///
+/// Each root tuple element is classified against the composed path and then
+/// discharged:
+///
+///   * *container* -- strictly contains another element, so it is explained by
+///     the elements it contains and carries no obligation of its own;
+///   * *terminal actual* -- solved by the terminal replay solution;
+///   * *substituted* -- reaches the expansion as a verbatim copy of the actual,
+///     so its edited spelling is read from the edited stream through the
+///     producer's own argument span; or
+///   * *unedited* -- every A token it contributes survives unchanged, which
+///     proves the element does not need an edit.
+///
+/// An element that fits none of these fails closed.
+class RootTupleElementRealizer {
+public:
+  RootTupleElementRealizer(const RefoldSourceMapper &sourceMapper,
+                           const clang::LangOptions &lexLang)
+      : sourceMapper_(sourceMapper), lexLang_(lexLang) {}
+
+  /// Realize the elements outside the terminal solution and certify coverage.
+  ///
+  /// Returns false when any element cannot be discharged or when the root
+  /// envelope contains an edited A token no accounted element explains.
+  bool RealizeAndCertify(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      const ComposedGeneratedCalleePath &path,
+      llvm::SmallVectorImpl<RealizedRootTupleElement> &realized) const {
+    if (!path.rootInvocation || path.elementBindings.empty())
+      return false;
+
+    // A-token surfaces of every element discharged below.  Container elements
+    // are deliberately excluded: their footprint is the union of their
+    // children's, and counting it directly would let an edited token inside a
+    // container pass coverage without any element having realized it.
+    llvm::SmallVector<std::pair<uint64_t, uint64_t>, 16> accountedSpans;
+
+    for (const RootTupleElementBinding &binding : path.elementBindings) {
+      if (!binding.invocation ||
+          binding.slice.rootTuplePayloadByteEnd <=
+              binding.slice.rootTuplePayloadByteBegin)
+        return false;
+      if (binding.slice.rootTupleFormalIndex != path.rootTupleFormalIndex)
+        return false;
+      if (IsContainerElement(path, binding.slice))
+        continue;
+
+      llvm::SmallVector<const RefoldModel::PPArgSpan *, 8> footprint;
+      appendFormalFootprint(*binding.invocation, binding.formalIndex,
+                            footprint);
+
+      // A formal consumed entirely as a callee name contributes no tokens of
+      // its own -- `f` in `ADD(f, t) -> f t` is spent selecting the callee, and
+      // the producer records no argument span for it.  Such an element carries
+      // no direct obligation, and it cannot mask one either: editing it would
+      // change the selected callee's body, and those tokens belong either to
+      // another element's footprint, where the checks below apply, or to no
+      // element at all, where the coverage certificate requires them unchanged.
+      if (footprint.empty())
+        continue;
+
+      if (!DischargeElement(path, binding, footprint, realized))
+        return false;
+
+      for (const RefoldModel::PPArgSpan *span : footprint)
+        accountedSpans.push_back({span->begin, span->end});
+    }
+
+    return RootEnvelopeChangeIsAccounted(request, accountedSpans);
+  }
+
+private:
+  /// Return whether \p element strictly contains another proven element.
+  static bool IsContainerElement(const ComposedGeneratedCalleePath &path,
+                                 const RootTupleSliceBinding &element) {
+    return llvm::any_of(
+        path.elementBindings, [&](const RootTupleElementBinding &other) {
+          const RootTupleSliceBinding &candidate = other.slice;
+          if (candidate.rootTuplePayloadByteEnd <=
+              candidate.rootTuplePayloadByteBegin)
+            return false;
+          const bool contained =
+              candidate.rootTuplePayloadByteBegin >=
+                  element.rootTuplePayloadByteBegin &&
+              candidate.rootTuplePayloadByteEnd <=
+                  element.rootTuplePayloadByteEnd;
+          const bool sameExtent =
+              candidate.rootTuplePayloadByteBegin ==
+                  element.rootTuplePayloadByteBegin &&
+              candidate.rootTuplePayloadByteEnd ==
+                  element.rootTuplePayloadByteEnd;
+          return contained && !sameExtent;
+        });
+  }
+
+  /// Return whether \p element names the same payload slice as a terminal
+  /// actual, which the terminal replay solution already solves.
+  static bool IsTerminalActualElement(const ComposedGeneratedCalleePath &path,
+                                      const RootTupleSliceBinding &element) {
+    return llvm::any_of(
+        path.actualSlices, [&](const RootTupleSliceBinding &actual) {
+          return actual.rootTuplePayloadByteBegin ==
+                     element.rootTuplePayloadByteBegin &&
+                 actual.rootTuplePayloadByteEnd ==
+                     element.rootTuplePayloadByteEnd;
+        });
+  }
+
+  /// Discharge one non-container element, recording an edit when it changed.
+  bool DischargeElement(
+      const ComposedGeneratedCalleePath &path,
+      const RootTupleElementBinding &binding,
+      llvm::ArrayRef<const RefoldModel::PPArgSpan *> footprint,
+      llvm::SmallVectorImpl<RealizedRootTupleElement> &realized) const {
+    // Terminal actuals stay with the replay solver, which proves them by
+    // inverting the terminal replacement list rather than by reading B.
+    if (IsTerminalActualElement(path, binding.slice))
+      return true;
+
+    std::optional<std::string> oldActual = rootInvocationSourceSlice(
+        *path.rootInvocation, binding.slice.absoluteByteBegin,
+        binding.slice.absoluteByteEnd);
+    if (!oldActual)
+      return false;
+
+    if (std::optional<std::string> edited =
+            RealizeSubstitutedElement(footprint, *oldActual)) {
+      if (llvm::StringRef(*edited) == llvm::StringRef(*oldActual).trim())
+        return true;
+      return RecordRealizedElement(binding.slice, std::move(*edited), realized);
+    }
+
+    // Not a verbatim substitution -- a callee selector, a stringified or pasted
+    // operand, or an actual that expanded further.  The element may still be
+    // left alone, but only after proving every A token it contributes survives
+    // unchanged.  Anything else is an edit this theorem cannot express.
+    for (const RefoldModel::PPArgSpan *span : footprint)
+      for (uint64_t aTok = span->begin; aTok < span->end; ++aTok)
+        if (!ATokenSurvivesUnchanged(aTok))
+          return false;
+    return true;
+  }
+
+  /// Record one realized element, requiring repeats to agree.
+  ///
+  /// A literal forwarder hands a formal to its child whole, so one element can
+  /// be bound by several invocations along the path and reach this point more
+  /// than once.  Each binding realizes the element through its own argument
+  /// spans, so agreement is a real obligation rather than bookkeeping: two
+  /// surfaces that disagree about the same element have no single edited
+  /// spelling, and emitting either would be a guess.
+  static bool RecordRealizedElement(
+      const RootTupleSliceBinding &slice, std::string edited,
+      llvm::SmallVectorImpl<RealizedRootTupleElement> &realized) {
+    for (const RealizedRootTupleElement &recorded : realized) {
+      if (recorded.rootTuplePayloadByteBegin !=
+              slice.rootTuplePayloadByteBegin ||
+          recorded.rootTuplePayloadByteEnd != slice.rootTuplePayloadByteEnd)
+        continue;
+      return recorded.replacement == edited;
+    }
+
+    RealizedRootTupleElement element;
+    element.rootTuplePayloadByteBegin = slice.rootTuplePayloadByteBegin;
+    element.rootTuplePayloadByteEnd = slice.rootTuplePayloadByteEnd;
+    element.replacement = std::move(edited);
+    realized.push_back(std::move(element));
+    return true;
+  }
+
+  /// Read the edited spelling of a verbatim-substituted element.
+  ///
+  /// Returns nullopt when the element is not a verbatim substitution, which is
+  /// a classification result rather than a failure: every span must be a
+  /// `Standard` contribution whose A tokens are exactly the tokens of the old
+  /// actual.  That equality is what rules out reading an expanded or
+  /// transformed surface back as if it were a source spelling.  All occurrences
+  /// must then agree on one edited spelling.
+  std::optional<std::string> RealizeSubstitutedElement(
+      llvm::ArrayRef<const RefoldModel::PPArgSpan *> footprint,
+      llvm::StringRef oldActual) const {
+    const llvm::SmallVector<std::string, 8> wantSpellings =
+        lexTokenSpellings(oldActual, lexLang_);
+    if (wantSpellings.empty())
+      return std::nullopt;
+
+    std::optional<std::string> agreedEdit;
+    for (const RefoldModel::PPArgSpan *span : footprint) {
+      if (span->kind != PPArgSpanKind::Standard)
+        return std::nullopt;
+      if (lexTokenSpellings(sourceMapper_.SliceASource(span->begin, span->end),
+                            lexLang_) != wantSpellings)
+        return std::nullopt;
+
+      const std::optional<std::pair<size_t, size_t>> bEnvelope =
+          sourceMapper_.MapAToBTokenEnvelopeByPPArgSpan(*span);
+      if (!bEnvelope || bEnvelope->second <= bEnvelope->first)
+        return std::nullopt;
+
+      llvm::StringRef edited =
+          sourceMapper_.SliceBSource(bEnvelope->first, bEnvelope->second)
+              .trim();
+      if (edited.empty())
+        return std::nullopt;
+      if (!agreedEdit)
+        agreedEdit = edited.str();
+      else if (llvm::StringRef(*agreedEdit) != edited)
+        return std::nullopt;
+    }
+
+    return agreedEdit;
+  }
+
+  /// Return whether one A token has an exact, spelling-identical B image.
+  bool ATokenSurvivesUnchanged(uint64_t aTok) const {
+    const std::optional<std::pair<size_t, size_t>> bEnvelope =
+        sourceMapper_.MapATokRangeAToBTokenEnvelope(aTok, aTok + 1);
+    if (!bEnvelope || bEnvelope->second <= bEnvelope->first)
+      return false;
+    return sourceMapper_.SliceASource(aTok, aTok + 1).trim() ==
+           sourceMapper_.SliceBSource(bEnvelope->first, bEnvelope->second)
+               .trim();
+  }
+
+  /// Certify that every edited A token in the root envelope is explained.
+  ///
+  /// The emitted patch claims the whole root whole-cover envelope, so the claim
+  /// is honest only when each A token in it either belongs to an element this
+  /// class discharged or survives into B unchanged.  A token that changed while
+  /// lying outside every accounted element is precisely the failure the closing
+  /// assembly verifier would otherwise have to catch after the fact.
+  bool RootEnvelopeChangeIsAccounted(
+      const RecursiveTupleGeneratedReplayRequest &request,
+      llvm::ArrayRef<std::pair<uint64_t, uint64_t>> accountedSpans) const {
+    for (uint64_t aTok = request.wholeCoverATokens.first;
+         aTok < request.wholeCoverATokens.second; ++aTok) {
+      const bool accounted = llvm::any_of(
+          accountedSpans, [&](const std::pair<uint64_t, uint64_t> &span) {
+            return aTok >= span.first && aTok < span.second;
+          });
+      if (accounted)
+        continue;
+      if (!ATokenSurvivesUnchanged(aTok))
+        return false;
+    }
+    return true;
+  }
+
+  const RefoldSourceMapper &sourceMapper_;
+  const clang::LangOptions &lexLang_;
+};
+
 /// Solves the terminal generated-callee replay for a composed path.
 ///
 /// This adapter is intentionally thin: it recovers the old terminal actual
@@ -1952,11 +2390,12 @@ std::optional<std::string> rootInvocationSourceSlice(
 /// and does not edit the root tuple payload; those are later theorem steps.
 class RecursiveTupleGeneratedReplaySolver {
 public:
-  explicit RecursiveTupleGeneratedReplaySolver(
+  RecursiveTupleGeneratedReplaySolver(
       const RefoldMacroGeneratedCalleeReplayEngine &generatedCalleeReplayEngine,
-      const RefoldSourceMapper &sourceMapper)
+      const RefoldSourceMapper &sourceMapper,
+      const clang::LangOptions &lexLang)
       : generatedCalleeReplayEngine_(generatedCalleeReplayEngine),
-        sourceMapper_(sourceMapper) {}
+        sourceMapper_(sourceMapper), elementRealizer_(sourceMapper, lexLang) {}
 
   /// Return the unique terminal replay solution for \p path, if provable.
   std::optional<RecursiveTupleGeneratedReplaySolution> Solve(
@@ -2076,6 +2515,14 @@ public:
     }
 
     if (!haveReferenceReplay)
+      return std::nullopt;
+
+    // The terminal replay has now solved every element the terminal consumes.
+    // Elements consumed by intermediate replacement lists are still open, and
+    // the whole-cover claim is not yet honest, so discharge both before the
+    // solution is allowed to leave this method.
+    if (!elementRealizer_.RealizeAndCertify(request, path,
+                                            solution.realizedElements))
       return std::nullopt;
     return solution;
   }
@@ -2223,6 +2670,7 @@ private:
 
   const RefoldMacroGeneratedCalleeReplayEngine &generatedCalleeReplayEngine_;
   const RefoldSourceMapper &sourceMapper_;
+  RootTupleElementRealizer elementRealizer_;
 };
 
 /// Applies solved terminal generated-callee replacements to the root tuple.
@@ -2314,6 +2762,33 @@ public:
       edit.begin = editBegin;
       edit.end = editEnd;
       edit.replacement = newText.str();
+      edits.push_back(std::move(edit));
+    }
+
+    // Elements consumed by an intermediate replacement list were realized
+    // against the edited stream rather than by inverting a replacement list.
+    // They are placed with the same payload-relative rules so the overlap and
+    // ordering checks below govern both kinds uniformly.
+    for (const RealizedRootTupleElement &element : solution.realizedElements) {
+      if (element.rootTuplePayloadByteEnd <=
+              element.rootTuplePayloadByteBegin ||
+          element.rootTuplePayloadByteEnd > payloadEnd - payloadBegin ||
+          element.replacement.empty())
+        return std::nullopt;
+
+      const size_t editBegin =
+          payloadBegin + static_cast<size_t>(element.rootTuplePayloadByteBegin);
+      const size_t editEnd =
+          payloadBegin + static_cast<size_t>(element.rootTuplePayloadByteEnd);
+      if (editEnd <= editBegin || editEnd > payloadEnd)
+        return std::nullopt;
+      if (tupleActual.slice(editBegin, editEnd) == element.replacement)
+        continue;
+
+      RootTupleElementEdit edit;
+      edit.begin = editBegin;
+      edit.end = editEnd;
+      edit.replacement = element.replacement;
       edits.push_back(std::move(edit));
     }
 
@@ -2509,7 +2984,7 @@ RefoldMacroRecursiveTupleGeneratedReplay::BuildCandidate(
     return std::nullopt;
 
   RecursiveTupleGeneratedReplaySolver replaySolver(
-      deps_.generatedCalleeReplayEngine, deps_.sourceMapper);
+      deps_.generatedCalleeReplayEngine, deps_.sourceMapper, deps_.lexLang);
   std::optional<RecursiveTupleGeneratedReplaySolution> replaySolution =
       replaySolver.Solve(request, *path);
   if (!replaySolution)
