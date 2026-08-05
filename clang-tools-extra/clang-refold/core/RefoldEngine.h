@@ -294,7 +294,7 @@ public:
       std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr,
       FinalLineControlValidationCallback finalLineControlValidationCallback =
           FinalLineControlValidationCallback(),
-      bool auditRepair = false,
+      OutputVerificationMode verifyMode = OutputVerificationMode::Off,
       llvm::ArrayRef<std::string> verifyIncludeDirs = {});
 
 private:

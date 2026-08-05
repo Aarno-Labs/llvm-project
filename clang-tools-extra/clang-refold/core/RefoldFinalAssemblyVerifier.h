@@ -38,6 +38,28 @@
 namespace clang {
 namespace refold {
 
+/// What the closing output check does with its verdict.
+///
+/// The check re-preprocesses the finished assembly and compares it to the
+/// edited stream.  It costs one preprocess of each side, so it is requested
+/// rather than always paid for, and what to do about a divergence is a policy
+/// the caller owns.
+enum class OutputVerificationMode {
+  /// Do not build or run the check.  Neither side is preprocessed, and a
+  /// theorem that mis-states what it realizes is not detected here.
+  Off,
+
+  /// Run the check and repair a divergence: rule out preserving the smallest
+  /// region that owns it, re-assemble, and repeat until the result replays or
+  /// nothing narrower is left.
+  Repair,
+
+  /// Run the check and fail the refold on a divergence.  Repairing silently
+  /// would cost completeness in a way nothing observes -- the output stays
+  /// correct, so the defective theorem survives.
+  Fatal
+};
+
 /// Result of checking one assembled final source against the edited stream.
 struct FinalAssemblyVerdict {
   /// True when the assembly replays the edited stream under the run's mode.

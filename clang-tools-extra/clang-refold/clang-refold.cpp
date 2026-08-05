@@ -11,7 +11,7 @@
 // Synopsis:
 //   clang-refold [--log-level=<value>] -p <A.i> -P <B.i.mod> -r <map.json> \
 //     -o <out.c> [--check <out.c>] [--no-lines] [--strict] \
-//     [--proof-audit-mode=<value>] [--emit-edit-map <path>]
+//     [--proof-audit=<value>] [--emit-edit-map <path>]
 //
 // Options:
 //   -p, --pp                Path to original preprocessed input A (.i).
@@ -26,8 +26,7 @@
 //                           are pruned (`__LINE__`, `__FILE__`, etc.).
 //   -s, --strict            Fail closed when the proof lattice would have
 //                           accepted a non-emitted-carrier path.
-//   --proof-audit-mode=<v>  Witness-resolver audit policy (default/off/probe/
-//                           strict).
+//   --proof-audit=<v>       Witness-resolver audit policy (off/probe/strict).
 //   --emit-edit-map         Write B↔source byte ranges for materialized edits.
 //   --log-level=<value>     Set log level (default is --info).
 //     =trace, =debug, =info, =warn, =error, =fatal
@@ -359,26 +358,24 @@ static cl::opt<bool> NoLines(
 static cl::alias NoLinesShort("n", cl::desc("Alias for --no-lines"),
                               cl::aliasopt(NoLines), cl::cat(RefoldCategory));
 
-static cl::opt<bool> AuditRepair(
-    "audit-repair",
-    cl::desc("On an assembly that does not replay the edited preprocessed "
-             "stream, expand the smallest region owning the divergence and "
-             "retry, instead of failing. Without this the divergence is "
-             "reported and the refold fails, which keeps a theorem that "
-             "mis-states what it realizes from being hidden behind a silent "
-             "loss of completeness"),
-    cl::init(false), cl::cat(RefoldCategory));
+static cl::opt<OutputVerificationMode> VerifyOutput(
+    "verify-output",
+    cl::desc("Verify the refolded source against --pp-mod by re-preprocessing "
+             "it (default: off)"),
+    cl::init(OutputVerificationMode::Off),
+    cl::values(clEnumValN(OutputVerificationMode::Off, "off",
+                          "Do not verify"),
+               clEnumValN(OutputVerificationMode::Repair, "repair",
+                          "Expand the smallest diverging region and retry"),
+               clEnumValN(OutputVerificationMode::Fatal, "fatal",
+                          "Report the divergence and fail")),
+    cl::cat(RefoldCategory));
 
 static cl::list<std::string> VerifyIncludeDirs(
     "verify-include-dir",
-    cl::desc("Additional include directory used only when re-preprocessing a "
-             "source for verification (--check, and the closing assembly and "
-             "line-observer checks). Repeatable. A verification replay resolves "
-             "every header the way the producer recorded first; these "
-             "directories are searched only after all of those have missed, "
-             "for headers the edit introduced that did not exist when the "
-             "producer ran. Where such a header lives cannot be derived from "
-             "the refold map, so it is declared here rather than guessed"),
+    cl::desc(
+        "Extra include dir for re-preprocessing verification (--check, "
+        "--verify-output). Repeatable; searched after producer paths miss."),
     cl::value_desc("dir"), cl::ZeroOrMore, cl::cat(RefoldCategory));
 
 static cl::opt<bool> StrictMode(
@@ -390,11 +387,18 @@ static cl::alias StrictModeShort("s", cl::desc("Alias for --strict"),
                                  cl::aliasopt(StrictMode),
                                  cl::cat(RefoldCategory));
 
-static cl::opt<std::string> ProofAuditModeOpt(
+static cl::opt<ProofAuditMode> ProofAuditModeOpt(
     "proof-audit",
-    cl::desc("Proof-audit mode: off, probe, or strict. Defaults to strict "
-             "with --strict and off otherwise."),
-    cl::value_desc("mode"), cl::init(""), cl::cat(RefoldCategory));
+    cl::desc("Set witness-resolver audit policy (default: strict with "
+             "--strict, off otherwise)"),
+    cl::init(ProofAuditMode::Default),
+    cl::values(clEnumValN(ProofAuditMode::Off, "off", "Do not audit"),
+               clEnumValN(ProofAuditMode::Probe, "probe",
+                          "Report resolver decisions without giving them "
+                          "authority"),
+               clEnumValN(ProofAuditMode::Strict, "strict",
+                          "Give the resolver authority and fail closed")),
+    cl::cat(RefoldCategory));
 
 static constexpr char Overview[] = R"(
   Deterministically reconstruct partially expanded C source from edited
@@ -441,26 +445,9 @@ int main(int argc, char **argv) {
   // must be specified at least once, which is not the case here.
   const bool onlyCheck = (CheckSrcPath.getNumOccurrences() != 0);
 
-  auto parseProofAuditMode = []() -> ProofAuditMode {
-    if (ProofAuditModeOpt.getNumOccurrences() == 0)
-      return ProofAuditMode::Default;
-
-    StringRef value(ProofAuditModeOpt.getValue());
-    if (value.equals_insensitive("off"))
-      return ProofAuditMode::Off;
-    if (value.equals_insensitive("probe"))
-      return ProofAuditMode::Probe;
-    if (value.equals_insensitive("strict"))
-      return ProofAuditMode::Strict;
-
-    REFOLD_LOG_FATAL("options",
-                     "invalid --proof-audit value: {0} "
-                     "(expected off, probe, or strict)",
-                     ProofAuditModeOpt);
-    return ProofAuditMode::Default;
-  };
-
-  ProofAuditMode proofAuditMode = parseProofAuditMode();
+  // `Default` is the unset state, and is deliberately not selectable: it means
+  // "derive from --strict", which is resolved downstream rather than here.
+  const ProofAuditMode proofAuditMode = ProofAuditModeOpt;
   if (StrictMode && proofAuditMode != ProofAuditMode::Default &&
       proofAuditMode != ProofAuditMode::Strict)
     REFOLD_LOG_FATAL("options", "--strict requires --proof-audit=strict");
@@ -687,7 +674,7 @@ int main(int argc, char **argv) {
       StrictMode, proofAuditMode, ModifiedSrcPath, sidebandPragmaEdits,
       emitEditMap ? &materializedEditMappings : nullptr,
       buildFinalLineControlValidationCallback(ModifiedSrcPath, ctx),
-      AuditRepair, VerifyIncludeDirs);
+      VerifyOutput, VerifyIncludeDirs);
   if (!refoldedOrErr) {
     // A malformed map and a refold that fails its closing verification both
     // arrive here, and both are answers about the input rather than internal

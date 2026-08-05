@@ -397,7 +397,7 @@ Expected<std::string> RefoldEngine::Refold(
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     std::vector<MaterializedEditMapping> *materializedEditMappings,
     FinalLineControlValidationCallback finalLineControlValidationCallback,
-    bool auditRepair,
+    OutputVerificationMode verifyMode,
     ArrayRef<std::string> verifyIncludeDirs) {
   // Build the refold model based on the parsed JSON object.
   auto mOrErr = RefoldModel::FromJson(rootJson);
@@ -409,6 +409,10 @@ Expected<std::string> RefoldEngine::Refold(
   // run's relaxation mode.  A verifier that cannot be built simply leaves the
   // check absent.
   //
+  // `Off` builds nothing at all: constructing the verifier preprocesses the
+  // edited stream, so a caller that does not want the check should not pay for
+  // it.
+  //
   // The assembly is re-preprocessed beside the *producer's* source, never
   // beside the refold output: a quoted include resolves against the including
   // file's own directory first, so an output directory holding a later copy of
@@ -416,18 +420,20 @@ Expected<std::string> RefoldEngine::Refold(
   // read.  Without that anchor the check is left absent rather than answered
   // wrongly.
   std::optional<RefoldFinalAssemblyVerifier> assemblyVerifier;
-  if (auto ctxOrErr = RefoldModel::ParsePreprocessContext(rootJson)) {
-    if (auto sourceOrErr = RefoldModel::ParseSourcePath(rootJson)) {
-      if (std::optional<std::string> anchor =
-              producerSourceAnchorPath(*sourceOrErr, *ctxOrErr))
-        assemblyVerifier = RefoldFinalAssemblyVerifier::Create(
-            rootJson, *ctxOrErr, bSource, noLines, strict, *anchor,
-            verifyIncludeDirs);
+  if (verifyMode != OutputVerificationMode::Off) {
+    if (auto ctxOrErr = RefoldModel::ParsePreprocessContext(rootJson)) {
+      if (auto sourceOrErr = RefoldModel::ParseSourcePath(rootJson)) {
+        if (std::optional<std::string> anchor =
+                producerSourceAnchorPath(*sourceOrErr, *ctxOrErr))
+          assemblyVerifier = RefoldFinalAssemblyVerifier::Create(
+              rootJson, *ctxOrErr, bSource, noLines, strict, *anchor,
+              verifyIncludeDirs);
+      } else {
+        consumeError(sourceOrErr.takeError());
+      }
     } else {
-      consumeError(sourceOrErr.takeError());
+      consumeError(ctxOrErr.takeError());
     }
-  } else {
-    consumeError(ctxOrErr.takeError());
   }
 
   // Narrowing loop.  Each attempt gets a *fresh* engine rather than re-running
@@ -485,11 +491,11 @@ Expected<std::string> RefoldEngine::Refold(
                   : std::nullopt;
     }
 
-    // Default: report and fail.  A theorem that mis-states which tokens it
+    // `fatal`: report and fail.  A theorem that mis-states which tokens it
     // realizes is a defect, and repairing it silently costs completeness in a
     // way nothing observes -- the output stays correct, so the broken theorem
-    // survives.  `--audit-repair` opts into the conservative repair instead.
-    if (!auditRepair) {
+    // survives.  `repair` opts into the conservative repair instead.
+    if (verifyMode != OutputVerificationMode::Repair) {
       std::string owned = "<unattributed>";
       if (owner) {
         owned = std::to_string(*owner);
@@ -504,7 +510,8 @@ Expected<std::string> RefoldEngine::Refold(
           std::make_error_code(std::errc::illegal_byte_sequence),
           "refolded source does not replay the edited preprocessed stream: "
           "%s; smallest region owning the divergence: macro invocation %s. "
-          "Re-run with --audit-repair to expand that region instead of failing",
+          "Re-run with --verify-output=repair to expand that region "
+          "instead of failing",
           verdict.reason.c_str(), owned.c_str());
     }
 

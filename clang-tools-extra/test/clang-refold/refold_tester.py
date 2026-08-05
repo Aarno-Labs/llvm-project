@@ -161,11 +161,12 @@ def main():
             'the relaxed pipeline folded) are tolerated while every other token '
             'must still match exactly.'))
   ap.add_argument(
-      '--audit-repair', action='store_true', required=False,
-      help=('Pass --audit-repair to clang-refold.  Without it the refolder '
-            'fails when an assembly does not replay the edited preprocessed '
-            'stream; with it, the smallest region owning the divergence is '
-            'expanded and the refold retried.'))
+      '--verify-output', default='fatal',
+      choices=('off', 'repair', 'fatal'), required=False,
+      help=('Value for clang-refold --verify-output.  The harness defaults to '
+            'fatal so a theorem that mis-states which tokens it realizes fails '
+            'a test rather than passing quietly; the tool itself defaults to '
+            'off.'))
   ap.add_argument(
       '--expect-refold-fail', action='store_true', required=False,
       help=('Negative assertion: the refold itself MUST fail, because its '
@@ -277,9 +278,9 @@ def main():
   line_flag = '' if args.with_lines else '--no-lines'
   # Strict is the harness default; --relaxed opts into the non-strict pipeline.
   strict_flag = '' if args.relaxed else '--strict'
-  audit_flag = '--audit-repair' if args.audit_repair else ''
+  verify_flag = f'--verify-output={args.verify_output}'
   clang_refold_cmd = (
-      f'{shlex.quote(args.refolder)} {line_flag} {strict_flag} {audit_flag} '
+      f'{shlex.quote(args.refolder)} {line_flag} {strict_flag} {verify_flag} '
       f'--log-level={shlex.quote(args.log)} '
       f'--pp {shlex.quote(out_i)} '
       f'--pp-mod {shlex.quote(exp_i_mod)} '

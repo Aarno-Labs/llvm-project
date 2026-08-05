@@ -21,7 +21,7 @@
 // letting the source be written and rejected afterwards.
 //
 // AUDIT: clang-refold: refolded source does not replay the edited preprocessed stream
-// AUDIT-SAME: --audit-repair
+// AUDIT-SAME: --verify-output=repair
 #define assert(expr) ((expr) ? (void)0 : __assert_fail(#expr))
 int x = 5;
 int y = 7;

@@ -1,8 +1,8 @@
-// RUN: %clang-refold-tester-relaxed-audit-repair assert_independent_stringified_arg_audit_repair_expands
+// RUN: %clang-refold-tester-relaxed-verify-repair assert_independent_stringified_arg_audit_repair_expands
 //
 // The repair counterpart of
 // assert_independent_stringified_arg_relaxed_check_rejects: the same fold is
-// unsound, but `--audit-repair` narrows instead of failing.
+// unsound, but `--verify-output=repair` narrows instead of failing.
 //
 // The closing verification rejects the assembly, names the smallest region
 // owning the divergence, and that region is expanded and the refold retried
