@@ -499,6 +499,21 @@ inline StringRef trimWsNoLF(StringRef text) {
   return text.slice(begin, end);
 }
 
+/// Return a view with only *leading* PP whitespace other than LF removed.
+///
+/// Use this instead of trimWsNoLF() when the trailing whitespace run is
+/// significant.  Indentation is not token-bearing and may legitimately differ
+/// between two spellings of the same text, but the whitespace that terminates
+/// a run separates it from whatever follows: dropping it would let `int ` and
+/// `int` compare equal even though only one of them keeps the following bytes
+/// in a separate token.
+inline StringRef trimLeadingWsNoLF(StringRef text) {
+  size_t begin = 0;
+  while (begin < text.size() && isWsNoLF(text[begin]))
+    ++begin;
+  return text.substr(begin);
+}
+
 /// True iff the clamped byte range [begin, end) contains only PP whitespace.
 ///
 /// The accepted whitespace set is the same ASCII set as isWs(): space, HT, LF,

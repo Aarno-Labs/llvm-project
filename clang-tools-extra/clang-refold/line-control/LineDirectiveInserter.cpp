@@ -1429,7 +1429,22 @@ static std::optional<size_t> findCarriedSuffixPrefixInsertionOffset(
       originalFileText.slice(resumePrefixBegin, editEnd);
   if (originalResumePrefix.empty())
     return std::nullopt;
-  if (replacement.substr(replacementPrefixOffset) != originalResumePrefix)
+
+  // The replacement tail must carry the same tokens as the original prefix it
+  // stands in for, but not necessarily the same indentation: the edited stream
+  // routinely respells leading whitespace, and requiring byte identity would
+  // refuse this insertion point whenever it does.  Only the *leading* run is
+  // ignored -- the trailing run separates the carried prefix from the untouched
+  // bytes resumed at `editEnd`, so it must still match exactly.
+  //
+  // Ignoring indentation here cannot change the emitted bytes.  This predicate
+  // only chooses where the directive is spliced into a replacement that is
+  // emitted either way, and the splice point is a beginning-of-line, so the
+  // carried prefix keeps its own indentation on the line the directive
+  // introduces.
+  StringRef replacementTail = replacement.substr(replacementPrefixOffset);
+  if (stringutils::trimLeadingWsNoLF(replacementTail) !=
+      stringutils::trimLeadingWsNoLF(originalResumePrefix))
     return std::nullopt;
   return replacementPrefixOffset;
 }
