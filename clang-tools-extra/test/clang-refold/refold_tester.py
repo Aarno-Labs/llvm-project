@@ -161,12 +161,17 @@ def main():
             'the relaxed pipeline folded) are tolerated while every other token '
             'must still match exactly.'))
   ap.add_argument(
-      '--expect-check-fail', action='store_true', required=False,
-      help=('Negative assertion: the refold must still succeed and match the '
-            'expected .c.mod, but the final re-preprocess check MUST reject it '
-            '(non-zero exit). Used to prove the relaxed check does not tolerate '
-            'an independently edited stringified argument (only a provably '
-            'stale one).'))
+      '--audit-repair', action='store_true', required=False,
+      help=('Pass --audit-repair to clang-refold.  Without it the refolder '
+            'fails when an assembly does not replay the edited preprocessed '
+            'stream; with it, the smallest region owning the divergence is '
+            'expanded and the refold retried.'))
+  ap.add_argument(
+      '--expect-refold-fail', action='store_true', required=False,
+      help=('Negative assertion: the refold itself MUST fail, because its '
+            'closing verification rejects the assembly.  No .c.mod comparison '
+            'and no checker run follow; the test asserts on the emitted '
+            'diagnosis instead.'))
   ap.add_argument('--clang', required=True)
   ap.add_argument('--refolder', required=True)
   ap.add_argument('--headers', required=True)
@@ -272,14 +277,23 @@ def main():
   line_flag = '' if args.with_lines else '--no-lines'
   # Strict is the harness default; --relaxed opts into the non-strict pipeline.
   strict_flag = '' if args.relaxed else '--strict'
+  audit_flag = '--audit-repair' if args.audit_repair else ''
   clang_refold_cmd = (
-      f'{shlex.quote(args.refolder)} {line_flag} {strict_flag} '
+      f'{shlex.quote(args.refolder)} {line_flag} {strict_flag} {audit_flag} '
       f'--log-level={shlex.quote(args.log)} '
       f'--pp {shlex.quote(out_i)} '
       f'--pp-mod {shlex.quote(exp_i_mod)} '
       f'--refold-map {shlex.quote(out_json)} '
       f'--out {shlex.quote(out_mod)}'
   )
+  if args.expect_refold_fail:
+    # The refold must refuse.  Nothing downstream is meaningful: there is no
+    # accepted source to compare or re-check, so the test asserts on the
+    # diagnosis recorded in the refold log.
+    run_expecting_failure(clang_refold_cmd, out_out)
+    shutil.copy2(src, src_out)
+    return
+
   run(clang_refold_cmd, out_out)
   shutil.copy2(src, src_out)
   shutil.copy2(exp_i_mod, out_i_mod)
@@ -299,10 +313,7 @@ def main():
       f'--pp-mod {shlex.quote(exp_i_mod)} '
       f'--refold-map {shlex.quote(out_json)}'
   )
-  if args.expect_check_fail:
-    run_expecting_failure(clang_refold_checker_cmd, verify_out)
-  else:
-    run(clang_refold_checker_cmd, verify_out)
+  run(clang_refold_checker_cmd, verify_out)
 
 
 if __name__ == '__main__':

@@ -88,6 +88,10 @@ struct FinalMacroCandidateAdmissionContext {
   const MacroSubtreeReplayValidationContext *replayStabilityCtx = nullptr;
   bool allowNonTopLevelMacroSelectorFailure = false;
 
+  /// Root invocations ruled out from keeping their callsite, or null when none
+  /// are.  Borrowed for the duration of one admission.
+  const llvm::DenseSet<uint64_t> *ownersMustExpand = nullptr;
+
   bool hasDirectArgsOnlyCandidate = false;
   bool hasDagRootReplayCandidate = false;
   bool hasExistingCallsiteCandidate = false;
@@ -170,6 +174,24 @@ bool addFinalMacroCandidate(
   // falls through to the TU-owned realizers that can emit the surrounding
   // material.  Candidates with no recorded B range are left to the existing
   // proof paths rather than being rejected on missing evidence.
+  // A previous attempt at this translation unit produced an assembly that did
+  // not replay the edited stream, and named this invocation as the owner of the
+  // divergence.  Every theorem that keeps the callsite states which B tokens it
+  // realizes and was believed; one of them was wrong.  Rather than guess which,
+  // refuse them all for this owner so its expansion realization -- which
+  // reproduces the edited tokens directly instead of claiming to -- is what
+  // remains.
+  if (ctx.ownersMustExpand &&
+      ctx.ownersMustExpand->count(ctx.invocation.id) &&
+      candidate.patch.proof.preservesInvocationStructure) {
+    REFOLD_LOG_TRACE(
+        "macro/final-candidate",
+        "reject inv id={0} name={1} origin={2} reason=owner-must-expand",
+        ctx.invocation.id, ctx.invocation.name,
+        finalMacroCandidateOriginName(candidate.origin));
+    return false;
+  }
+
   if (candidate.patch.materialized.hasBTokenRange &&
       !(candidate.patch.materialized.bTokStart <= ctx.hunk.bStart &&
         ctx.hunk.bEnd <= candidate.patch.materialized.bTokEnd)) {
@@ -612,7 +634,8 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
       baseInvText,
       finalMacroCandidates,
       &finalSubtreeValidationCtx,
-      allowNonTopLevelMacroSelectorFailure};
+      allowNonTopLevelMacroSelectorFailure,
+      deps_.ownersMustExpand};
 
 
   if (argsOnlyCandidate) {

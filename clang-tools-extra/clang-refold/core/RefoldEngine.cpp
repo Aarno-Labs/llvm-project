@@ -400,19 +400,126 @@ Expected<std::string> RefoldEngine::Refold(
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     std::vector<MaterializedEditMapping> *materializedEditMappings,
     FinalLineControlValidationCallback finalLineControlValidationCallback,
-    std::vector<SourceGraphOutput> *sourceGraphOutputs) {
+    std::vector<SourceGraphOutput> *sourceGraphOutputs, bool auditRepair) {
   // Build the refold model based on the parsed JSON object.
   auto mOrErr = RefoldModel::FromJson(rootJson);
   if (!mOrErr)
     return mOrErr.takeError();
 
-  // Construct an engine and run the instance pipeline.
-  RefoldEngine engine(
+  // Build the closing assembly check before the engine runs.  Everything it
+  // needs is already here: the producer context, the edited stream, and this
+  // run's relaxation mode.  A verifier that cannot be built simply leaves the
+  // check absent.
+  std::optional<RefoldFinalAssemblyVerifier> assemblyVerifier;
+  if (auto ctxOrErr = RefoldModel::ParsePreprocessContext(rootJson)) {
+    assemblyVerifier = RefoldFinalAssemblyVerifier::Create(
+        rootJson, *ctxOrErr, bSource, noLines, strict, finalOutputPath);
+  } else {
+    consumeError(ctxOrErr.takeError());
+  }
+
+  // Narrowing loop.  Each attempt gets a *fresh* engine rather than re-running
+  // the pass in place: planning services are built once per engine and several
+  // are deliberately single-shot -- the pragma-once guard catalog records its
+  // active header set exactly once, for instance -- so a second pass through
+  // the same engine is not a supported operation.  Rebuilding is also what the
+  // alignment resolver already does for its candidate probes, so the model
+  // carries a read-only clone for exactly this purpose.
+  //
+  // The set of owners ruled out from keeping their callsite is carried across
+  // attempts and only grows, which is what makes this terminate: every round
+  // either verifies or gives up one more owner, ending at the translation unit.
+  llvm::DenseSet<uint64_t> ownersMustExpand;
+  const unsigned maxAttempts = 8;
+
+  for (unsigned attempt = 0;; ++attempt) {
+    RefoldEngine engine(
       std::move(*mOrErr), aSource, aToks, aTokOff, bSource, bToks, bTokOff,
       noLines, strict, proofAuditMode, finalOutputPath, sidebandPragmaEdits,
       materializedEditMappings, std::move(finalLineControlValidationCallback),
-      sourceGraphOutputs);
-  return engine.Refold();
+        sourceGraphOutputs);
+    engine.finalAssemblyVerifier_ = assemblyVerifier;
+    engine.ownersMustExpand_ = ownersMustExpand;
+
+    std::string out = engine.Refold();
+
+    // Without a verifier, or once the conservative carrier has been taken, the
+    // result stands exactly as it would without this loop.
+    if (!assemblyVerifier || engine.terminalSink_.HasRequest())
+      return out;
+
+    const FinalAssemblyVerdict verdict = assemblyVerifier->Verify(out);
+    if (verdict.verified || verdict.inconclusive) {
+      if (verdict.inconclusive)
+        REFOLD_LOG_DEBUG("assembly-verify", "inconclusive: assembly not readable");
+      else if (attempt > 0)
+        REFOLD_LOG_INFO("assembly-verify",
+                        "verified after {0} narrowing step(s)", attempt);
+      return out;
+    }
+
+    // Name the smallest region owning the divergence and rule out preserving
+    // it.  An owner already ruled out means expanding it was not enough, so
+    // widen to the invocation that encloses it.
+    std::optional<uint64_t> owner =
+        engine.FindSmallestMacroOwnerForEditedToken(verdict.mismatchTokenIndex);
+    while (owner && ownersMustExpand.count(*owner)) {
+      const RefoldModel::MacroInvocation *invocation =
+          engine.macroTopology_.FindMacroInvocationById(*owner);
+      owner = invocation && invocation->callerMacroId
+                  ? std::optional<uint64_t>(*invocation->callerMacroId)
+                  : std::nullopt;
+    }
+
+    // Default: report and fail.  A theorem that mis-states which tokens it
+    // realizes is a defect, and repairing it silently costs completeness in a
+    // way nothing observes -- the output stays correct, so the broken theorem
+    // survives.  `--audit-repair` opts into the conservative repair instead.
+    if (!auditRepair) {
+      std::string owned = "<unattributed>";
+      if (owner) {
+        owned = std::to_string(*owner);
+        for (const RefoldModel::MacroInvocation &macro :
+             engine.model_.GetMacroInvocations())
+          if (macro.id == *owner) {
+            owned += " (" + macro.name.str() + ")";
+            break;
+          }
+      }
+      return createStringError(
+          std::make_error_code(std::errc::illegal_byte_sequence),
+          "refolded source does not replay the edited preprocessed stream: "
+          "%s; smallest region owning the divergence: macro invocation %s. "
+          "Re-run with --audit-repair to expand that region instead of failing",
+          verdict.reason.c_str(), owned.c_str());
+    }
+
+    if (owner && attempt + 1 < maxAttempts) {
+      REFOLD_LOG_INFO("assembly-verify",
+                      "unsound assembly at edited token {0}; expanding macro "
+                      "invocation {1} and retrying: {2}",
+                      static_cast<uint64_t>(verdict.mismatchTokenIndex), *owner,
+                      verdict.reason);
+      ownersMustExpand.insert(*owner);
+      continue;
+    }
+
+    // Nothing narrower is left to give up: the divergence could not be
+    // attributed, every enclosing owner is already expanded, or the ladder is
+    // spent.  Take the carrier that reproduces the edited stream by
+    // construction.
+    REFOLD_LOG_WARN("assembly-verify",
+                    "unsound assembly at edited token {0} could not be "
+                    "narrowed further; expanding the translation unit: {1}",
+                    static_cast<uint64_t>(verdict.mismatchTokenIndex),
+                    verdict.reason);
+    engine.terminalSink_.RequestTerminalFallback(
+        RefoldOwnerStateProof::SuffixStabilityTerminalFailureForComponent(
+            OwnerStateComponent::LineNumber),
+        "assembly-verify",
+        "assembled source does not replay the edited preprocessed stream");
+    return engine.expansionFallbackPlanner_->ResolvePostStructuralFallback();
+  }
 }
 
 std::string RefoldEngine::Refold() {
@@ -509,6 +616,7 @@ std::string RefoldEngine::Refold() {
   emitTheoremAuditSummary(lastTheoremAudit_);
   return out;
 }
+
 
 bool RefoldEngine::ValidateTokenCount() {
   // Make sure that when we re-lex the A-stream tokens that it matches the token
@@ -2038,6 +2146,73 @@ bool RefoldEngine::AuditPreservedLineObserversInFinalOutput(
                    static_cast<uint64_t>(lineObserverBTokens.size()),
                    static_cast<uint64_t>(common), firstObserver, firstSpelling);
   return true;
+}
+
+std::optional<uint64_t> RefoldEngine::FindSmallestMacroOwnerForEditedToken(
+    std::size_t editedTokenIndex) const {
+  if (!finalAssemblyVerifier_)
+    return std::nullopt;
+
+  // The producer's maps index the edited stream as written.  Only a replay that
+  // reproduces that stream token-for-token lets a verifier index be used as a
+  // producer index; anything else would silently address the wrong token.
+  const ArrayRef<PPTok> editedTokens = finalAssemblyVerifier_->EditedTokens();
+  if (editedTokens.size() != bToks_.size())
+    return std::nullopt;
+  for (size_t index = 0; index < editedTokens.size(); ++index)
+    if (editedTokens[index].spelling != bToks_[index].spelling)
+      return std::nullopt;
+
+  if (editedTokenIndex >= abTokMapB2A_.size())
+    return std::nullopt;
+
+  // The alignment relates tokens that agree across the two streams, so the
+  // diverging token is by construction the one it cannot relate.  Anchor on the
+  // nearest token it *can*: a neighbour inside the same expansion names the
+  // same owner, and a neighbour outside it names an owner whose region still
+  // contains the divergence once expanded.  Nearest-first with a left-hand tie
+  // break keeps the choice deterministic.
+  int64_t aToken = -1;
+  for (size_t distance = 0;
+       distance < abTokMapB2A_.size() && aToken < 0; ++distance) {
+    if (editedTokenIndex >= distance) {
+      const int64_t left = abTokMapB2A_[editedTokenIndex - distance];
+      if (left >= 0) {
+        aToken = left;
+        break;
+      }
+    }
+    const size_t right = editedTokenIndex + distance;
+    if (right < abTokMapB2A_.size()) {
+      const int64_t candidate = abTokMapB2A_[right];
+      if (candidate >= 0)
+        aToken = candidate;
+    }
+  }
+  if (aToken < 0)
+    return std::nullopt;
+
+  // Several nested invocations can produce the same A token.  Take the
+  // narrowest, because expanding it gives up the least source structure; the
+  // caller widens outward only if that proves insufficient.  Width ties are
+  // broken by invocation id so the choice does not depend on model order.
+  const RefoldModel::MacroInvocation *owner = nullptr;
+  uint64_t ownerWidth = std::numeric_limits<uint64_t>::max();
+  for (const RefoldModel::MacroInvocation &macro : model_.GetMacroInvocations()) {
+    for (const RefoldModel::PPSpan &span : macro.spans) {
+      if (static_cast<uint64_t>(aToken) < span.begin ||
+          static_cast<uint64_t>(aToken) >= span.end)
+        continue;
+      const uint64_t width = span.end - span.begin;
+      if (width < ownerWidth || (width == ownerWidth && owner && macro.id < owner->id)) {
+        owner = &macro;
+        ownerWidth = width;
+      }
+    }
+  }
+  if (!owner)
+    return std::nullopt;
+  return owner->id;
 }
 
 std::string RefoldEngine::RunRefoldPass() {

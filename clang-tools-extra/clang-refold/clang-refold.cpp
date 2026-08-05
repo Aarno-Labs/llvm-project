@@ -360,6 +360,16 @@ static cl::opt<bool> NoLines(
 static cl::alias NoLinesShort("n", cl::desc("Alias for --no-lines"),
                               cl::aliasopt(NoLines), cl::cat(RefoldCategory));
 
+static cl::opt<bool> AuditRepair(
+    "audit-repair",
+    cl::desc("On an assembly that does not replay the edited preprocessed "
+             "stream, expand the smallest region owning the divergence and "
+             "retry, instead of failing. Without this the divergence is "
+             "reported and the refold fails, which keeps a theorem that "
+             "mis-states what it realizes from being hidden behind a silent "
+             "loss of completeness"),
+    cl::init(false), cl::cat(RefoldCategory));
+
 static cl::opt<bool> StrictMode(
     "strict", cl::desc("Enable strict refolding and authoritative proof audit"),
     cl::init(false), cl::cat(RefoldCategory));
@@ -667,12 +677,14 @@ int main(int argc, char **argv) {
       StrictMode, proofAuditMode, ModifiedSrcPath, sidebandPragmaEdits,
       emitEditMap ? &materializedEditMappings : nullptr,
       buildFinalLineControlValidationCallback(ModifiedSrcPath, ctx),
-      &sourceGraphOutputs);
+      &sourceGraphOutputs, AuditRepair);
   if (!refoldedOrErr) {
-    handleAllErrors(refoldedOrErr.takeError(), [&](const ErrorInfoBase &e) {
-      REFOLD_LOG_FATAL("model", "failed to parse refold model: {0}",
-                       e.message());
-    });
+    // A malformed map and a refold that fails its closing verification both
+    // arrive here, and both are answers about the input rather than internal
+    // invariant breaks.  Report and exit non-zero: REFOLD_LOG_FATAL would abort
+    // with a crash banner, which misrepresents a refusal as a tool defect.
+    logAllUnhandledErrors(refoldedOrErr.takeError(), errs(), "clang-refold: ");
+    return 1;
   }
 
   // Finally, serialize the refolded C source to the output file.

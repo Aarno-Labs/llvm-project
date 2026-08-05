@@ -97,6 +97,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDENGINE_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDENGINE_H
 
+#include "core/RefoldFinalAssemblyVerifier.h"
 #include "core/RefoldModel.h"
 #include "edit/RefoldEditTypes.h"
 #include "edit/RefoldPatchTypes.h"
@@ -294,7 +295,8 @@ public:
       std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr,
       FinalLineControlValidationCallback finalLineControlValidationCallback =
           FinalLineControlValidationCallback(),
-      std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr);
+      std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr,
+      bool auditRepair = false);
 
 private:
   const RefoldModel model_;
@@ -374,6 +376,20 @@ private:
   std::vector<MaterializedEditMapping> *materializedEditMappings_ = nullptr;
   std::vector<SourceGraphOutput> *sourceGraphOutputs_ = nullptr;
   FinalLineControlValidationCallback finalLineControlValidationCallback_;
+
+  /// Closing assembly check for this run.  Absent when the edited stream could
+  /// not be preprocessed, and for candidate simulations, which are not judged.
+  std::optional<RefoldFinalAssemblyVerifier> finalAssemblyVerifier_;
+
+  /// Root macro invocations whose callsite must not be preserved.
+  ///
+  /// The closing assembly check names the owner of a divergence; adding it here
+  /// makes the next attempt refuse every candidate that would keep that
+  /// callsite, so its expansion realization is taken instead.  The set only
+  /// grows within a run, which is what makes the retry loop terminate: each
+  /// round either verifies or removes one more owner from contention, and the
+  /// ladder ends at the whole translation unit.
+  llvm::DenseSet<uint64_t> ownersMustExpand_;
 
   /// Final-output byte ranges for synthetic `#line` directives that the local
   /// emitters have explicitly made eligible for the final fixed-point pruner.
@@ -936,6 +952,34 @@ private:
   /// B produced from a `__LINE__` expansion are enforced, so this closes the
   /// newline-drift ordering hole without becoming a general re-check.
   bool AuditPreservedLineObserversInFinalOutput(llvm::StringRef finalSource);
+
+  /// Report whether the accepted assembly replays the edited stream.
+  ///
+  /// Observation only for now: the verdict is logged and nothing acts on it, so
+  /// the check can be measured against the corpus before any refold depends on
+  /// it.  Alignment candidate simulations re-enter the engine and are skipped,
+  /// because judging an assembly that is about to be discarded says nothing
+  /// about the result that is kept.
+
+
+  /// Identify the smallest macro invocation that owns a diverging
+  /// edited-stream token, so an unsound region can be narrowed instead of
+  /// condemning the whole translation unit.
+  ///
+  /// The verifier reports its mismatch in *preprocessed* edited-stream token
+  /// numbering, while the producer's maps are expressed in the edited stream as
+  /// written.  Those coincide only when re-preprocessing the edited stream is a
+  /// no-op, which is the ordinary case -- it is already `-E -P` output -- but is
+  /// not guaranteed: a stream carrying comments loses them on replay.  The
+  /// correspondence is therefore checked rather than assumed, and an
+  /// unverifiable one yields no owner, leaving the caller to escalate.
+  ///
+  /// The *smallest* covering invocation is returned.  Expanding it costs the
+  /// least source structure, and it is the first rung of a ladder: a caller
+  /// that expands it and still finds the assembly unsound escalates outward to
+  /// the enclosing invocation, and finally to the translation unit.
+  std::optional<uint64_t>
+  FindSmallestMacroOwnerForEditedToken(std::size_t editedTokenIndex) const;
 
   std::string RunRefoldPass();
 };

@@ -14,6 +14,7 @@ add_clang_tool(clang-refold
   line-control/RefoldNoLinesPruning.cpp
   edit/RefoldExpansionFallbackPlanner.cpp
   edit/RefoldBInsertionLedger.cpp
+  core/RefoldFinalAssemblyVerifier.cpp
   core/RefoldEngine.cpp
   core/RefoldAlignmentSemanticIntegration.cpp
   core/RefoldLangOptions.cpp

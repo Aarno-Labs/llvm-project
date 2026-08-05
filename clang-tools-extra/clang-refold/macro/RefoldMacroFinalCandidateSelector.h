@@ -64,6 +64,10 @@ public:
     const RefoldMacroPatchProofCertifier &proofCertifier;
     const RefoldMacroPatchReusePhase &patchReusePhase;
 
+    /// Root invocations ruled out from keeping their callsite, or null when
+    /// none are.  Borrowed from the planner's dependency bundle.
+    const llvm::DenseSet<uint64_t> *ownersMustExpand = nullptr;
+
     /// Compute the whole-cover replacement plan for an invocation.
     /// Wraps `RefoldMacroWholeCoverOrchestrator::ComputeWholeCoverPlan`.
     std::function<std::optional<WholeCoverPlan>(

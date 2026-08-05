@@ -38,6 +38,7 @@
 #include "clang/Basic/LangOptions.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -109,6 +110,11 @@ public:
     const RefoldSourceMapper *sourceMapper = nullptr;
     const RefoldOwnerClassifier *ownerClassifier = nullptr;
     bool strict = false;
+
+    /// Root invocations the caller has ruled out preserving, or null when no
+    /// owner is ruled out.  Borrowed: the set outlives the planner and may grow
+    /// between refold attempts.
+    const llvm::DenseSet<uint64_t> *ownersMustExpand = nullptr;
 
     // Borrowed proof services.  They are initialized before the macro planner
     // and outlive it; direct pointers keep the service graph explicit without

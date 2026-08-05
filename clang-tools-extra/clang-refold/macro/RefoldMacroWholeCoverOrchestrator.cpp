@@ -219,6 +219,7 @@ RefoldMacroWholeCoverOrchestrator::RefoldMacroWholeCoverOrchestrator(
           *planner_->Deps().model, *planner_->Deps().macroTopology,
           *planner_->Deps().proofLattice, planner_->ReplayStabilityValidator(),
           planner_->ProofCertifier(), patchReusePhase_,
+          planner_->Deps().ownersMustExpand,
           [this](const RefoldModel::MacroInvocation &m)
               -> std::optional<WholeCoverPlan> {
             return this->ComputeWholeCoverPlan(m);

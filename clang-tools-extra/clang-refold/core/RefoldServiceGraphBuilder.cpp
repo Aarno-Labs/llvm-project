@@ -410,6 +410,7 @@ void RefoldEngine::InitializeMacroPatchPlanner() {
   deps.sourceMapper = &sourceMapper_;
   deps.ownerClassifier = &OwnerClassifier();
   deps.strict = strict_;
+  deps.ownersMustExpand = &ownersMustExpand_;
 
   deps.macroStateProof = &MacroStateProof();
   deps.ownerStateProof = &OwnerStateProof();
