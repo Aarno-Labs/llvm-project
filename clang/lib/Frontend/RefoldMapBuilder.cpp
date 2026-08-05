@@ -4256,6 +4256,10 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
     M.SrcBegin = *TokB;
     M.SrcEnd = *TokE;
     M.File = TokFile;
+    // Record which include occurrence produced this token so per-occurrence
+    // queries can separate the token runs of a header entered more than once.
+    if (!IncludeStack.empty() && IncludeStack.back())
+      M.OwnerIncludeId = Items[*IncludeStack.back()].ID;
     TokMap.push_back(std::move(M));
   }
 
@@ -6298,9 +6302,16 @@ void RefoldMapBuilder::writeJSON() {
       //             (we treat the arm as "selected" for this run).
       //   - false => no such token; PPBegin/PPEnd will still be set to a
       //             deterministic insertion point, but the arm is not selected.
-      auto computeArmPPSpan = [&](llvm::StringRef File, uint64_t BodyB,
-                                  uint64_t BodyE, uint64_t &PPBegin,
-                                  uint64_t &PPEnd) -> bool {
+      // `OwnerIncId` selects one include occurrence (std::nullopt for the TU).
+      // Filtering on it as well as on `File` is what keeps a second occurrence
+      // of the same header from being answered with the first occurrence's
+      // tokens -- which would report a non-taken arm as selected and hand it a
+      // pp_span, and the arm slots derived from it, that belong to the earlier
+      // occurrence.
+      auto computeArmPPSpan = [&](llvm::StringRef File,
+                                  std::optional<uint64_t> OwnerIncId,
+                                  uint64_t BodyB, uint64_t BodyE,
+                                  uint64_t &PPBegin, uint64_t &PPEnd) -> bool {
         bool FoundAny = false;
         uint64_t Begin = 0;
         uint64_t End = 0;
@@ -6308,7 +6319,7 @@ void RefoldMapBuilder::writeJSON() {
         // Normal case: collect all PP tokens whose source span overlaps [BodyB,
         // BodyE).
         for (const TokMapEntry &TM : TokMap) {
-          if (TM.File != File)
+          if (TM.File != File || TM.OwnerIncludeId != OwnerIncId)
             continue;
 
           // No overlap if token ends at/before BodyB, or starts at/after BodyE.
@@ -6335,7 +6346,7 @@ void RefoldMapBuilder::writeJSON() {
           uint64_t Insert = 0;
 
           for (const TokMapEntry &TM : TokMap) {
-            if (TM.File != File)
+            if (TM.File != File || TM.OwnerIncludeId != OwnerIncId)
               continue;
             AnyForFile = true;
 
@@ -6501,8 +6512,8 @@ void RefoldMapBuilder::writeJSON() {
                 uint64_t ArmId = NextCondArmId++;
 
                 uint64_t PPBegin = 0, PPEnd = 0;
-                bool IsSelected = computeArmPPSpan(G.File, ArmBodyB, ArmBodyE,
-                                                   PPBegin, PPEnd);
+                bool IsSelected = computeArmPPSpan(
+                    G.File, parentIncId, ArmBodyB, ArmBodyE, PPBegin, PPEnd);
 
                 JO.object([&] {
                   JO.attribute("id", ArmId);

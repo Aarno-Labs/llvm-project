@@ -505,6 +505,19 @@ struct TokMapEntry {
   uint64_t PPIndex = 0;
   uint64_t SrcBegin = 0;
   uint64_t SrcEnd = 0;
+  /// Include instance that was being processed when this token was produced,
+  /// as an item ID; absent for tokens spelled in the TU itself.
+  ///
+  /// A header entered more than once contributes one token run per occurrence,
+  /// and those runs are indistinguishable by `File` alone.  Queries that are
+  /// scoped to a single include occurrence -- conditional-arm `pp_span` and the
+  /// arm slots derived from it -- must filter on this field, or a second
+  /// occurrence will be answered with the first occurrence's token range.
+  ///
+  /// This field is deliberately *not* serialized: it exists so the builder can
+  /// answer per-occurrence questions while the token map is still in memory,
+  /// and the emitted `tokmap` entries keep their {file, pp, b, e} shape.
+  std::optional<uint64_t> OwnerIncludeId;
 };
 
 /// One arm of a conditional group (#if/#elif/#else), with kind, condition text,
