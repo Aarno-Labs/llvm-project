@@ -133,7 +133,20 @@ extractDAGSpanText(const RefoldSourceMapper &sourceMapper,
   }
 
   // --- B-side extraction: map the A-span to its B envelope and slice B.
-  auto bEnv = sourceMapper.MapAToBTokenEnvelopeByPPArgSpan(sp);
+  //
+  // Boundary insertions are preserved here.  A lifted argument's neighbouring A
+  // material is the macro's own body text, fixed by the `#define` that produced
+  // it, so an edit appending tokens at the argument's trailing edge has this
+  // argument as its only possible owner.  Trimming it away drops the edit with
+  // no diagnostic: both the replay and expected ledgers are computed through
+  // this same call, so they agree with each other while both losing the token.
+  //
+  // This is deliberately local to DAG lifting.  Constructs that realize a
+  // boundary insertion by another route -- recursive tuple forwarding realizes
+  // it through element bindings -- rely on the default trim to keep the same
+  // tokens from being emitted twice.
+  auto bEnv = sourceMapper.MapAToBTokenEnvelopeByPPArgSpan(
+      sp, /*preserveBoundaryInsertions=*/true);
   if (!bEnv)
     return std::nullopt;
   if (bEnv->second <= bEnv->first)

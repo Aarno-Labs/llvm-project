@@ -770,7 +770,8 @@ RefoldSourceMapper::MapATokRangeToBTokenEnvelopeByTokenDiff(
 
 std::optional<std::pair<size_t, size_t>>
 RefoldSourceMapper::MapAToBTokenEnvelopeByPPArgSpan(
-    const RefoldModel::PPArgSpan &sp) const {
+    const RefoldModel::PPArgSpan &sp,
+    bool preserveBoundaryInsertions) const {
   // For a standard span that covers exactly one A token, prefer a direct
   // token-index projection when the token survived unchanged. This avoids
   // widening to a byte-derived B envelope that may contain repeated identical
@@ -829,12 +830,15 @@ RefoldSourceMapper::MapAToBTokenEnvelopeByPPArgSpan(
 
     size_t pp0 = static_cast<size_t>(*sp.ppByteBegin);
     size_t pp1 = static_cast<size_t>(*sp.ppByteEnd);
-    auto env = MapAByteRangeToBTokenEnvelope(pp0, pp1);
+    auto env =
+        preserveBoundaryInsertions
+            ? MapAByteRangeToBTokenEnvelopePreserveBoundaryInsertions(pp0, pp1)
+            : MapAByteRangeToBTokenEnvelope(pp0, pp1);
     REFOLD_LOG_TRACE("byte/env",
-                     "PPArgSpan['{0}' arg={1} Aidx={2} PPbytes=[{3},{4})] -> "
-                     "Btok=[{5},{6})",
-                     sp.kind, sp.argIdx, sp.begin, pp0, pp1, env.first,
-                     env.second);
+                     "PPArgSpan['{0}' arg={1} Aidx={2} PPbytes=[{3},{4})] "
+                     "preserveBoundaryInsertions={5} -> Btok=[{6},{7})",
+                     sp.kind, sp.argIdx, sp.begin, pp0, pp1,
+                     preserveBoundaryInsertions, env.first, env.second);
     return env;
   }
 

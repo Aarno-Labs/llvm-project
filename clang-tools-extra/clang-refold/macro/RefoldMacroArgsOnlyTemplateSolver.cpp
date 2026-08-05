@@ -464,9 +464,15 @@ private:
 
     std::vector<std::string> projectedExpansionByFormal(formalRanges.size());
     for (size_t i = 0; i < standardSpansOpt->size(); ++i) {
+      // Preserve boundary insertions: this projects a *nested* invocation's
+      // own argument, whose neighbouring A material is the enclosing macro's
+      // body text.  Trimming there drops an edit appended at the argument's
+      // trailing edge, and the reconstructed callsite is emitted with the token
+      // missing rather than being refused.
       auto bEnvelope = (*deps_.sourceMapper)
                            .MapAToBTokenEnvelopeByPPArgSpan(
-                               (*standardSpansOpt)[i]);
+                               (*standardSpansOpt)[i],
+                               /*preserveBoundaryInsertions=*/true);
       if (!bEnvelope || bEnvelope->first >= bEnvelope->second)
         return std::nullopt;
       std::string expansion =

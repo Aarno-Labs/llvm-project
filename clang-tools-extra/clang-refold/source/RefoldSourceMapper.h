@@ -202,7 +202,18 @@ public:
   /// Non-strict runs may approximate from the A-token offset table and then use
   /// the ordinary A-byte-to-B-token envelope mapper.
   std::optional<std::pair<size_t, size_t>>
-  MapAToBTokenEnvelopeByPPArgSpan(const RefoldModel::PPArgSpan &sp) const;
+  /// \p preserveBoundaryInsertions keeps B-side pure insertions anchored
+  /// exactly at the span's boundaries instead of trimming them away.  Only a
+  /// caller that is the sole surface able to materialize such an insertion may
+  /// pass true: for an argument reached through DAG lifting the neighbouring A
+  /// material is macro body text, fixed by the `#define`, so trimming there
+  /// discards the edit outright.  Callers whose construct realizes boundary
+  /// insertions by another route -- tuple element bindings, for one -- must
+  /// keep the default, because for them the trim is what prevents the same
+  /// tokens being emitted twice.
+  MapAToBTokenEnvelopeByPPArgSpan(
+      const RefoldModel::PPArgSpan &sp,
+      bool preserveBoundaryInsertions = false) const;
 
   /// Trim pure B-token insertions anchored at the edges of an A-token cover.
   ///
