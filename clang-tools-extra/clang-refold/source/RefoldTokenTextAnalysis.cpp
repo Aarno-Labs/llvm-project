@@ -6,7 +6,7 @@
 
 #include "source/RefoldTokenTextAnalysis.h"
 
-#include "include/RefoldSourceGraphProof.h"
+#include "source/RefoldPreprocessingDirectiveScanner.h"
 
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TokenKinds.h"
@@ -19,6 +19,22 @@ using namespace llvm;
 namespace clang {
 namespace refold {
 namespace {
+
+/// Return whether \p text contains a preprocessing directive introducer.
+///
+/// The shared logical-line scanner applies escaped-newline deletion, treats
+/// comments as whitespace, honours the active digraph/trigraph mode, and
+/// excludes `#` spellings inside comments and literals.
+///
+/// A scanner inconsistency reports true.  Callers use this as a macro-state
+/// neutrality predicate, so an unrecovered directive interval must stay
+/// fail-closed rather than read as "no directive here".
+static bool lineHasPreprocessingDirectiveIntroducer(
+    StringRef text, const clang::LangOptions &lexLang) {
+  PreprocessingDirectiveScanResult scan =
+      scanPreprocessingDirectives(text, lexLang);
+  return !scan.directives.empty() || !scan.diagnostics.empty();
+}
 
 /// Convert a raw-lexer token location into an offset relative to the scratch
 /// buffer's artificial base location.
@@ -154,8 +170,7 @@ bool RefoldTokenTextAnalysis::TextMentionsCounterObserver(
 }
 
 bool RefoldTokenTextAnalysis::TextContainsDirectiveLine(StringRef text) const {
-  return source_graph::lineHasPreprocessingDirectiveIntroducer(text,
-                                                              lexLang_);
+  return lineHasPreprocessingDirectiveIntroducer(text, lexLang_);
 }
 
 } // namespace refold

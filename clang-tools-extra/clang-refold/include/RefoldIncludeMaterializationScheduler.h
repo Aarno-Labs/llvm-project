@@ -17,7 +17,6 @@
 #include "core/RefoldModel.h"
 #include "edit/RefoldEditTypes.h"
 #include "edit/RefoldPatchTypes.h"
-#include "include/RefoldSourceGraphProof.h"
 #include "line-control/FinalLineControlModel.h"
 #include "macro/RefoldMacroStateRepairPlanner.h"
 #include "proof/RefoldAcceptedResultTypes.h"
@@ -119,7 +118,6 @@ public:
     /// Dispatcher that receives staged include-owned/TU-root edits.
     RefoldStructuralHunkDispatcher *structuralHunkDispatcher = nullptr;
     /// Optional source-graph sidecar output ledger.
-    std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr;
   };
 
   /// Constructs a run-scoped scheduler and builds the include child index once.
@@ -340,15 +338,6 @@ private:
   std::pair<uint64_t, uint64_t>
   ExtendedTUSiteRange(const RefoldModel::IncludeItem &include) const;
 
-  /// Tries to preserve an include as a source-graph sidecar instead of emitting
-  /// it into the TU, appending output carriers when the proof layer accepts or
-  /// rejects a sidecar path.
-  ///
-  /// A rejected source-graph path can still produce a cleanup-only carrier for
-  /// a stale generated sidecar.  The scheduler records those carriers but does
-  /// not perform filesystem writes; RefoldSourceGraphWriter owns the I/O side.
-  bool TryPreserveSourceGraphOutput(const RefoldModel::IncludeItem &include,
-                                    llvm::StringRef expansionText) const;
 
   /// Lowers one realized TU-root include expansion into a final TU text edit.
   bool StageTURootIncludeExpansionEdit(

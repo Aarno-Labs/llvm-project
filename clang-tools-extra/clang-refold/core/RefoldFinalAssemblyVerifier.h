@@ -76,9 +76,16 @@ public:
   /// \param editedStreamBytes the edited preprocessed stream, as written
   /// \param noLines whether the run prunes line directives
   /// \param strict whether the run is byte-exact about stringified operands
-  /// \param scratchNeighborPath a path whose directory hosts the temporary
-  ///        sources; using one directory for both sides keeps `__FILE__` and
-  ///        quoted-include lookup comparable between them
+  /// \param scratchNeighborPath the *producer's* source path, whose directory
+  ///        hosts the temporary sources.  It must not be the refold output
+  ///        path: a quoted include resolves against the including file's own
+  ///        directory before any `-I`, so preprocessing beside an output
+  ///        directory that holds a later copy of the same header answers the
+  ///        check against headers the producer never read.  See
+  ///        `producerSourceAnchorPath()`.
+  /// \param verifyIncludeDirs caller-declared last-resort include directories
+  ///        for headers the edit introduced, which no producer-recorded search
+  ///        path can find; see `buildFinalSourcePreprocessCallback()`
   ///
   /// Returns nullopt when the edited stream cannot be preprocessed, which
   /// leaves the caller with no verifier rather than a failing one.
@@ -86,7 +93,8 @@ public:
   Create(const llvm::json::Object &rootJson,
          const RefoldModel::PreprocessContext &ctx,
          llvm::StringRef editedStreamBytes, bool noLines, bool strict,
-         llvm::StringRef scratchNeighborPath);
+         llvm::StringRef scratchNeighborPath,
+         llvm::ArrayRef<std::string> verifyIncludeDirs);
 
   /// Check one assembled final source.
   FinalAssemblyVerdict Verify(llvm::StringRef finalSource) const;
@@ -100,6 +108,8 @@ private:
 
   RefoldModel::PreprocessContext ctx_;
   std::string scratchNeighborPath_;
+  /// Caller-declared last-resort include directories, replayed on every check.
+  std::vector<std::string> verifyIncludeDirs_;
 
   /// Edited stream after preprocessing -- the side of the comparison that is
   /// fixed for the lifetime of this verifier.

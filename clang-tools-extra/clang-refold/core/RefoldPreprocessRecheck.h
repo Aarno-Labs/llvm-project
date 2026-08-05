@@ -41,9 +41,16 @@ namespace refold {
 /// The returned bytes are the canonical "preprocessed source" used by every
 /// downstream verification path.  Errors are surfaced as `llvm::Error` rather
 /// than fatal-erroring so callers can attach contextual diagnostics.
+///
+/// \p extraArgs are appended after the producer's own arguments, so a search
+/// path supplied there is consulted only once every producer-recorded path has
+/// missed.  The ordering is the contract: a replay resolves a header the way the
+/// producer resolved it whenever it can, and reaches a caller-declared directory
+/// only for headers the producer never saw.
 llvm::Expected<std::string>
 preprocessToBytes(llvm::StringRef inputPath,
-                  const RefoldModel::PreprocessContext &ctx);
+                  const RefoldModel::PreprocessContext &ctx,
+                  llvm::ArrayRef<std::string> extraArgs = {});
 
 /// Compare two preprocessed-token streams for `--check` mode.
 ///

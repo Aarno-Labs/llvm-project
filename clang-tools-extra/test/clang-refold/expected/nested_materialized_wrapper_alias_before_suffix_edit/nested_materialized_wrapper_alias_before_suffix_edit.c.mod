@@ -4,6 +4,8 @@
 #define HDR_LINE 100
 #define HDR_FILE "logical_shared.c"
 int inserted_first = 1;
-#include "shared.h"
+#line HDR_LINE HDR_FILE
+int value = 101;
+const char *file = __FILE__;
 #include "wrapper.h"
 int wrapper_insert_after = 2;

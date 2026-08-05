@@ -71,7 +71,6 @@
 #include "core/RefoldLog.h"
 #include "core/RefoldPreprocessRecheck.h"
 #include "core/RefoldSchema.h"
-#include "include/RefoldSourceGraphWriter.h"
 #include "line-control/RefoldNoLinesPruning.h"
 #include "sideband/RefoldSidebandPragmaEdits.h"
 #include "source/DiffAlgorithms.h"
@@ -370,6 +369,18 @@ static cl::opt<bool> AuditRepair(
              "loss of completeness"),
     cl::init(false), cl::cat(RefoldCategory));
 
+static cl::list<std::string> VerifyIncludeDirs(
+    "verify-include-dir",
+    cl::desc("Additional include directory used only when re-preprocessing a "
+             "source for verification (--check, and the closing assembly and "
+             "line-observer checks). Repeatable. A verification replay resolves "
+             "every header the way the producer recorded first; these "
+             "directories are searched only after all of those have missed, "
+             "for headers the edit introduced that did not exist when the "
+             "producer ran. Where such a header lives cannot be derived from "
+             "the refold map, so it is declared here rather than guessed"),
+    cl::value_desc("dir"), cl::ZeroOrMore, cl::cat(RefoldCategory));
+
 static cl::opt<bool> StrictMode(
     "strict", cl::desc("Enable strict refolding and authoritative proof audit"),
     cl::init(false), cl::cat(RefoldCategory));
@@ -520,7 +531,7 @@ int main(int argc, char **argv) {
 
     // Preprocess the refolded C source:
     {
-      auto ppOrErr = preprocessToBytes(CheckSrcPath, ctx);
+      auto ppOrErr = preprocessToBytes(CheckSrcPath, ctx, VerifyIncludeDirs);
       if (!ppOrErr) {
         handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
           REFOLD_LOG_FATAL("pp", "failed to preprocess --check input: {0}",
@@ -532,7 +543,7 @@ int main(int argc, char **argv) {
 
     // Preprocess the edited preprocessed replay file.
     {
-      auto ppOrErr = preprocessToBytes(PPModPath, ctx);
+      auto ppOrErr = preprocessToBytes(PPModPath, ctx, VerifyIncludeDirs);
       if (!ppOrErr) {
         handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
           REFOLD_LOG_FATAL("pp", "failed to preprocess --pp-mod input: {0}",
@@ -671,13 +682,12 @@ int main(int argc, char **argv) {
 
   // Default behavior: single refold.
   std::vector<MaterializedEditMapping> materializedEditMappings;
-  std::vector<SourceGraphOutput> sourceGraphOutputs;
   auto refoldedOrErr = RefoldEngine::Refold(
       rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff, NoLines,
       StrictMode, proofAuditMode, ModifiedSrcPath, sidebandPragmaEdits,
       emitEditMap ? &materializedEditMappings : nullptr,
       buildFinalLineControlValidationCallback(ModifiedSrcPath, ctx),
-      &sourceGraphOutputs, AuditRepair);
+      AuditRepair, VerifyIncludeDirs);
   if (!refoldedOrErr) {
     // A malformed map and a refold that fails its closing verification both
     // arrive here, and both are answers about the input rather than internal
@@ -697,10 +707,6 @@ int main(int argc, char **argv) {
   os << *refoldedOrErr;
   os.close();
   REFOLD_LOG_INFO("finished", "wrote refolded C source: {0}", ModifiedSrcPath);
-
-  writeSourceGraphOutputs(
-      sourceGraphOutputs,
-      makeSourceGraphWriteOptionsForModifiedSourcePath(ModifiedSrcPath));
 
   if (emitEditMap) {
     writeMaterializedEditMap(EmitEditMapPath.getValue(), PPModPath,

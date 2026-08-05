@@ -986,51 +986,6 @@ RefoldIncludeMaterializationScheduler::ExtendedTUSiteRange(
   return {siteBegin, siteEnd};
 }
 
-bool RefoldIncludeMaterializationScheduler::TryPreserveSourceGraphOutput(
-    const RefoldModel::IncludeItem &include, StringRef expansionText) const {
-  if (!request_.sourceGraphOutputs)
-    return false;
-
-  source_graph::SourceGraphProofInputs sourceGraphProofInputs{
-      model_, request_.tuPath, includeExpansion_};
-
-  // function_ref does not own callable storage.  Keep the callback objects in
-  // this scope so the proof-service bundle never observes dangling lambdas.
-  auto includeHasIncluderSuppliedLineControlMacroState =
-      [&](const RefoldModel::IncludeItem &item) {
-        return IncludeHasIncluderSuppliedLineControlMacroState(item);
-      };
-  auto includeSubtreeHasLayoutOnlyMaterializationSeed =
-      [&](uint64_t includeId) {
-        return IncludeSubtreeHasLayoutOnlyMaterializationSeed(includeId);
-      };
-  source_graph::SourceGraphProofServices sourceGraphProofServices{
-      pathIdentity_, includeHasIncluderSuppliedLineControlMacroState,
-      includeSubtreeHasLayoutOnlyMaterializationSeed};
-
-  source_graph::SourceGraphOwnerPreservationOutputPlan sourceGraphPlan =
-      source_graph::planSourceGraphOwnerPreservationOutput(
-          sourceGraphProofInputs, include, expansionText,
-          sourceGraphProofServices);
-  if (sourceGraphPlan.rejectedCleanupOutput)
-    request_.sourceGraphOutputs->push_back(
-        std::move(*sourceGraphPlan.rejectedCleanupOutput));
-  if (!sourceGraphPlan.preservedOutput)
-    return false;
-
-  // A source-graph sidecar is a real file at a real include spelling, so the
-  // `#pragma once` copied into it keeps working natively and must not also be
-  // guarded.  Mixing a sidecar occurrence with an inlined copy of the same
-  // physical header would emit the body twice, so the catalog is told to fail
-  // that header closed rather than partially guard it.
-  if (include.openedPath && !include.openedPath->empty())
-    pragmaOnceGuards_.NoteSourceGraphPreservedOccurrence(*include.openedPath);
-
-  request_.sourceGraphOutputs->push_back(
-      std::move(*sourceGraphPlan.preservedOutput));
-  return true;
-}
-
 bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
     uint64_t includeId,
     RefoldMacroStateRepairPlanner::MacroStateRepairPlan &macroStatePlan,
@@ -1052,11 +1007,6 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
 
   std::string expansionText = expansionIt->second;
   auto [siteBegin, siteEnd] = ExtendedTUSiteRange(*include);
-
-  // If the source-graph writer can preserve this root include without replacing
-  // the site, it owns the output and no structural TU edit is needed.
-  if (TryPreserveSourceGraphOutput(*include, expansionText))
-    return true;
 
   // Repair consumed macro-state directives before wrapping the expansion so the
   // final TU edit carries the macro state required by the materialized header.

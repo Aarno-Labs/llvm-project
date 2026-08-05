@@ -63,7 +63,6 @@ struct AlignmentSemanticEquivalenceComponents {
   std::string structuralTilingWitnesses;
   std::string stagedTopology;
   std::string materializedMappings;
-  std::string sourceGraphOutputs;
   std::string finalTU;
   /// Exact final-line-control pruning inputs captured before executable
   /// validation. Equal unpruned source is sufficient only when the candidate

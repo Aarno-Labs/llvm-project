@@ -97,8 +97,6 @@ add_clang_tool(clang-refold
   macro/RefoldMacroStateProof.cpp
   proof/RefoldSidebandReplayProof.cpp
   proof/RefoldNeutralityProof.cpp
-  include/RefoldSourceGraphProof.cpp
-  include/RefoldSourceGraphWriter.cpp
   core/RefoldModel.cpp
   util/StringUtils.cpp
 )

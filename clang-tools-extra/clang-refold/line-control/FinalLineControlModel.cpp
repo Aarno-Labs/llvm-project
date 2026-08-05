@@ -734,20 +734,42 @@ preprocessedTokensEqualForLinePrune(StringRef currentPP, StringRef candidatePP,
   return true;
 }
 
+std::optional<std::string>
+producerSourceAnchorPath(StringRef producerSourcePath,
+                         const RefoldModel::PreprocessContext &ctx) {
+  if (producerSourcePath.empty())
+    return std::nullopt;
+
+  SmallString<256> anchor(producerSourcePath);
+  if (sys::path::is_absolute(anchor))
+    return anchor.str().str();
+
+  // A relative `source` is spelled relative to the producer working directory,
+  // which is the same directory `preprocessToBytes` re-enters.
+  if (ctx.cwd.empty())
+    return std::nullopt;
+  SmallString<256> resolved(ctx.cwd);
+  sys::path::append(resolved, producerSourcePath);
+  return resolved.str().str();
+}
+
 /// Create an internal final-pruning validation callback.
 ///
 /// The callback does not implement a user-facing `--check` mode.  It is an
 /// executable guard for one proposed `#line` deletion: preprocess the current
 /// accepted final source and the candidate final source through the same
 /// `clang -E -P` context, using one stable temporary source path located beside
-/// `--out`.  Reusing the same source path for both inputs keeps `__FILE__` and
-/// quoted-include lookup comparable.  Byte-for-byte equality is accepted first;
-/// if the only difference is preprocessing trivia, token-sequence equality is
-/// also accepted because the refolding soundness oracle is token equivalence.
+/// the producer's own source.  Reusing the same source path for both inputs
+/// keeps `__FILE__` and quoted-include lookup comparable, and anchoring on the
+/// producer's directory is what makes a quoted include resolve to the header the
+/// producer actually read.  Byte-for-byte equality is accepted first; if the
+/// only difference is preprocessing trivia, token-sequence equality is also
+/// accepted because the refolding soundness oracle is token equivalence.
 FinalSourcePreprocessCallback
-buildFinalSourcePreprocessCallback(StringRef outputPath,
-                                   const RefoldModel::PreprocessContext &ctx) {
-  SmallString<256> outputDir(outputPath);
+buildFinalSourcePreprocessCallback(StringRef anchorPath,
+                                   const RefoldModel::PreprocessContext &ctx,
+                                   ArrayRef<std::string> verifyIncludeDirs) {
+  SmallString<256> outputDir(anchorPath);
   sys::path::remove_filename(outputDir);
   if (outputDir.empty())
     outputDir = ".";
@@ -756,7 +778,15 @@ buildFinalSourcePreprocessCallback(StringRef outputPath,
   sys::path::append(model, ".clang-refold-observer-audit-%%%%%%.c");
   std::string modelText = model.str().str();
 
-  return [modelText, ctx](StringRef finalSource) -> std::optional<std::string> {
+  std::vector<std::string> extraArgs;
+  extraArgs.reserve(verifyIncludeDirs.size() * 2);
+  for (const std::string &dir : verifyIncludeDirs) {
+    extraArgs.push_back("-I");
+    extraArgs.push_back(dir);
+  }
+
+  return [modelText, ctx,
+          extraArgs](StringRef finalSource) -> std::optional<std::string> {
     SmallString<256> tmpPath;
     int tmpFD = -1;
     if (sys::fs::createUniqueFile(modelText, tmpFD, tmpPath))
@@ -771,7 +801,7 @@ buildFinalSourcePreprocessCallback(StringRef outputPath,
       consumeError(std::move(err));
       return std::nullopt;
     }
-    auto ppOrErr = preprocessToBytes(tmpPath, ctx);
+    auto ppOrErr = preprocessToBytes(tmpPath, ctx, extraArgs);
     if (!ppOrErr) {
       consumeError(ppOrErr.takeError());
       return std::nullopt;

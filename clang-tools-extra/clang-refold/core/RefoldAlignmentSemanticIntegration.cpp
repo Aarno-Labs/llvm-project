@@ -103,34 +103,6 @@ void appendMaterializedMappings(
   }
 }
 
-void appendSourceGraphOutputs(ExactKeyBuilder &key,
-                              ArrayRef<SourceGraphOutput> sourceGraphOutputs) {
-  std::vector<SourceGraphOutput> sortedOutputs(sourceGraphOutputs.begin(),
-                                                sourceGraphOutputs.end());
-  llvm::sort(sortedOutputs,
-             [](const SourceGraphOutput &lhs, const SourceGraphOutput &rhs) {
-               if (lhs.includeId != rhs.includeId)
-                 return lhs.includeId < rhs.includeId;
-               if (lhs.relativePath != rhs.relativePath)
-                 return lhs.relativePath < rhs.relativePath;
-               if (lhs.originalTarget != rhs.originalTarget)
-                 return lhs.originalTarget < rhs.originalTarget;
-               if (lhs.resolvedPath != rhs.resolvedPath)
-                 return lhs.resolvedPath < rhs.resolvedPath;
-               if (lhs.bytes != rhs.bytes)
-                 return lhs.bytes < rhs.bytes;
-               return lhs.cleanupOnly < rhs.cleanupOnly;
-             });
-  key.AddU64(sortedOutputs.size());
-  for (const SourceGraphOutput &output : sortedOutputs) {
-    key.AddU64(output.includeId);
-    key.AddString(output.relativePath);
-    key.AddString(output.originalTarget);
-    key.AddString(output.resolvedPath);
-    key.AddString(output.bytes);
-    key.AddBool(output.cleanupOnly);
-  }
-}
 
 void appendFinalLineControlOwner(
     ExactKeyBuilder &key,
@@ -666,7 +638,6 @@ std::string buildAlignmentRealizationEquivalenceKey(
   key.AddRaw(components.structuralTilingWitnesses);
   key.AddString(components.stagedTopology);
   key.AddRaw(components.materializedMappings);
-  key.AddRaw(components.sourceGraphOutputs);
   key.AddString(components.finalTU);
   key.AddRaw(components.destructiveMutationFootprint);
   key.AddRaw(components.insertionFrontiers);
@@ -689,7 +660,6 @@ std::string buildAlignmentConcreteOutputEquivalenceKey(
   // has already proved one identical output.
   key.AddString(components.finalTU);
   key.AddRaw(components.materializedMappings);
-  key.AddRaw(components.sourceGraphOutputs);
   key.AddRaw(components.finalLineControlPlan);
   return key.Take();
 }
@@ -754,7 +724,6 @@ RefoldEngine::SimulateSemanticAlignmentCandidate(
     const AlignmentSelectionOverride &selection) const {
   AlignmentSemanticSimulationResult result;
   std::vector<MaterializedEditMapping> materializedMappings;
-  std::vector<SourceGraphOutput> sourceGraphOutputs;
 
   // Candidate simulations must expose exactly the same optional output
   // surfaces as the parent run.  Supplying sidecar sinks unconditionally makes
@@ -766,15 +735,12 @@ RefoldEngine::SimulateSemanticAlignmentCandidate(
   // exactly as in the parent engine.
   std::vector<MaterializedEditMapping> *candidateMaterializedMappings =
       materializedEditMappings_ ? &materializedMappings : nullptr;
-  std::vector<SourceGraphOutput> *candidateSourceGraphOutputs =
-      sourceGraphOutputs_ ? &sourceGraphOutputs : nullptr;
 
   RefoldEngine candidate(
       model_.CloneForReadOnlyConsumer(), aSource_, aToks_, aTokOff_, bSource_,
       bToks_, bTokOff_, noLines_, strict_, proofAuditMode_, finalOutputPath_,
       sidebandPragmaEdits_, candidateMaterializedMappings,
-      FinalLineControlValidationCallback(), candidateSourceGraphOutputs,
-      selection, /*alignmentSemanticResolverEnabled=*/false,
+      FinalLineControlValidationCallback(), selection, /*alignmentSemanticResolverEnabled=*/false,
       StringRef(tuSourceBytes_));
 
   // Run the same complete structural pipeline with the outer planner policy.
@@ -836,9 +802,6 @@ RefoldEngine::SimulateSemanticAlignmentCandidate(
   ExactKeyBuilder materializedMappingKey;
   appendMaterializedMappings(materializedMappingKey, materializedMappings);
   components.materializedMappings = materializedMappingKey.Take();
-  ExactKeyBuilder sourceGraphOutputKey;
-  appendSourceGraphOutputs(sourceGraphOutputKey, sourceGraphOutputs);
-  components.sourceGraphOutputs = sourceGraphOutputKey.Take();
   if (candidate.terminalSink_.HasRequest()) {
     result.disposition =
         AlignmentSemanticSimulationDisposition::TerminalFallback;

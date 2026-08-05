@@ -804,24 +804,6 @@ void RefoldPragmaOnceGuardRewriter::SetActiveGuardedHeaders(
   AssignGuardNames();
 }
 
-void RefoldPragmaOnceGuardRewriter::NoteSourceGraphPreservedOccurrence(
-    StringRef physicalPath) {
-  const std::string canonical =
-      deps_.pathIdentity.GetCanonicalPath(physicalPath).str();
-  HeaderCandidate *candidate = FindCandidate(canonical);
-  if (!candidate)
-    return;
-
-  // A sidecar is a real file at a real include spelling, so its own
-  // `#pragma once` keeps working natively and needs no guard.  Mixing a sidecar
-  // occurrence with an inlined copy would emit the body twice, so the header
-  // becomes unusable rather than partially guarded.
-  RejectCandidate(*candidate,
-                  PragmaOnceGuardRejection::SidecarPreservedOccurrence,
-                  formatv("header '{0}' has a source-graph preserved occurrence",
-                          canonical)
-                      .str());
-}
 
 RefoldPragmaOnceGuardRewriter::HeaderCandidate *
 RefoldPragmaOnceGuardRewriter::FindCandidate(StringRef canonicalPath) {

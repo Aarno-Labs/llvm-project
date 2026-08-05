@@ -81,7 +81,6 @@
 #include "include/RefoldIncludeMaterializer.h"
 #include "include/RefoldPragmaOnceGuardRewriter.h"
 #include "include/RefoldIncludeReplayProof.h"
-#include "include/RefoldSourceGraphProof.h"
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/RefoldLineControlProof.h"
 #include "line-control/RefoldLineObserverLayout.h"
@@ -319,7 +318,6 @@ RefoldEngine::RefoldEngine(
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     std::vector<MaterializedEditMapping> *materializedEditMappings,
     FinalLineControlValidationCallback finalLineControlValidationCallback,
-    std::vector<SourceGraphOutput> *sourceGraphOutputs,
     std::optional<AlignmentSelectionOverride> alignmentSelectionOverride,
     bool alignmentSemanticResolverEnabled,
     std::optional<StringRef> tuSourceBytesOverride)
@@ -344,7 +342,6 @@ RefoldEngine::RefoldEngine(
           }}),
       finalReplaySurface_(buildFinalReplaySurface(model_, finalOutputPath)),
       materializedEditMappings_(materializedEditMappings),
-      sourceGraphOutputs_(sourceGraphOutputs),
       finalLineControlValidationCallback_(
           std::move(finalLineControlValidationCallback)),
       sidebandPragmaEdits_(sidebandPragmaEdits.begin(),
@@ -400,7 +397,8 @@ Expected<std::string> RefoldEngine::Refold(
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     std::vector<MaterializedEditMapping> *materializedEditMappings,
     FinalLineControlValidationCallback finalLineControlValidationCallback,
-    std::vector<SourceGraphOutput> *sourceGraphOutputs, bool auditRepair) {
+    bool auditRepair,
+    ArrayRef<std::string> verifyIncludeDirs) {
   // Build the refold model based on the parsed JSON object.
   auto mOrErr = RefoldModel::FromJson(rootJson);
   if (!mOrErr)
@@ -410,10 +408,24 @@ Expected<std::string> RefoldEngine::Refold(
   // needs is already here: the producer context, the edited stream, and this
   // run's relaxation mode.  A verifier that cannot be built simply leaves the
   // check absent.
+  //
+  // The assembly is re-preprocessed beside the *producer's* source, never
+  // beside the refold output: a quoted include resolves against the including
+  // file's own directory first, so an output directory holding a later copy of
+  // the same header would answer the check against headers the producer never
+  // read.  Without that anchor the check is left absent rather than answered
+  // wrongly.
   std::optional<RefoldFinalAssemblyVerifier> assemblyVerifier;
   if (auto ctxOrErr = RefoldModel::ParsePreprocessContext(rootJson)) {
-    assemblyVerifier = RefoldFinalAssemblyVerifier::Create(
-        rootJson, *ctxOrErr, bSource, noLines, strict, finalOutputPath);
+    if (auto sourceOrErr = RefoldModel::ParseSourcePath(rootJson)) {
+      if (std::optional<std::string> anchor =
+              producerSourceAnchorPath(*sourceOrErr, *ctxOrErr))
+        assemblyVerifier = RefoldFinalAssemblyVerifier::Create(
+            rootJson, *ctxOrErr, bSource, noLines, strict, *anchor,
+            verifyIncludeDirs);
+    } else {
+      consumeError(sourceOrErr.takeError());
+    }
   } else {
     consumeError(ctxOrErr.takeError());
   }
@@ -434,12 +446,14 @@ Expected<std::string> RefoldEngine::Refold(
 
   for (unsigned attempt = 0;; ++attempt) {
     RefoldEngine engine(
-      std::move(*mOrErr), aSource, aToks, aTokOff, bSource, bToks, bTokOff,
-      noLines, strict, proofAuditMode, finalOutputPath, sidebandPragmaEdits,
-      materializedEditMappings, std::move(finalLineControlValidationCallback),
-        sourceGraphOutputs);
+        std::move(*mOrErr), aSource, aToks, aTokOff, bSource, bToks, bTokOff,
+        noLines, strict, proofAuditMode, finalOutputPath, sidebandPragmaEdits,
+        materializedEditMappings,
+        std::move(finalLineControlValidationCallback));
     engine.finalAssemblyVerifier_ = assemblyVerifier;
     engine.ownersMustExpand_ = ownersMustExpand;
+    engine.verifyIncludeDirs_.assign(verifyIncludeDirs.begin(),
+                                     verifyIncludeDirs.end());
 
     std::string out = engine.Refold();
 
@@ -525,8 +539,6 @@ Expected<std::string> RefoldEngine::Refold(
 std::string RefoldEngine::Refold() {
   if (materializedEditMappings_)
     materializedEditMappings_->clear();
-  if (sourceGraphOutputs_)
-    sourceGraphOutputs_->clear();
   finalLineControlPruneCandidates_.clear();
   finalLineControlSourceMappings_.clear();
 
@@ -548,8 +560,6 @@ std::string RefoldEngine::Refold() {
     out = expansionFallbackPlanner_->ResolvePostStructuralFallback();
     finalLineControlPruneCandidates_.clear();
     finalLineControlSourceMappings_.clear();
-    if (sourceGraphOutputs_)
-      sourceGraphOutputs_->clear();
   }
 
   // Producer line-control and builtin-observer facts are not lowered into a
@@ -608,8 +618,6 @@ std::string RefoldEngine::Refold() {
     finalLineControlSourceMappings_.clear();
     if (materializedEditMappings_)
       materializedEditMappings_->clear();
-    if (sourceGraphOutputs_)
-      sourceGraphOutputs_->clear();
   }
 
   emitRefoldAttemptStatsSummary(lastStats_, terminalSink_.HasRequest());
@@ -1977,7 +1985,6 @@ std::string RefoldEngine::FinalizeStructuralResult(
   includeSchedulerRequest.rawByteHunks =
       abByteHunks_ ? &*abByteHunks_ : nullptr;
   includeSchedulerRequest.structuralHunkDispatcher = &structuralHunkDispatcher;
-  includeSchedulerRequest.sourceGraphOutputs = sourceGraphOutputs_;
 
   RefoldIncludeMaterializationScheduler includeMaterializationScheduler(
       std::move(includeSchedulerDeps), std::move(includeSchedulerRequest));
@@ -2085,12 +2092,26 @@ bool RefoldEngine::AuditPreservedLineObserversInFinalOutput(
   if (lineObserverBTokens.empty())
     return true;
 
-  FinalSourcePreprocessCallback preprocess = buildFinalSourcePreprocessCallback(
-      finalOutputPath_, RefoldModel::PreprocessContext{
-                            model_.GetPPCwd().str(),
-                            std::vector<std::string>(model_.GetPPArgv().begin(),
-                                                     model_.GetPPArgv().end()),
-                            model_.GetPPLang().str()});
+  const RefoldModel::PreprocessContext replayContext{
+      model_.GetPPCwd().str(),
+      std::vector<std::string>(model_.GetPPArgv().begin(),
+                               model_.GetPPArgv().end()),
+      model_.GetPPLang().str()};
+
+  // Replay beside the producer's source, for the same reason the closing
+  // assembly check does: an output directory may hold a later copy of a quoted
+  // header, and resolving to it would audit observers the producer never saw.
+  const std::optional<std::string> anchor =
+      producerSourceAnchorPath(model_.GetSourcePath(), replayContext);
+  if (!anchor) {
+    REFOLD_LOG_DEBUG("line/observer-audit",
+                     "skipped: no producer source anchor for replay");
+    return true;
+  }
+
+  FinalSourcePreprocessCallback preprocess =
+      buildFinalSourcePreprocessCallback(*anchor, replayContext,
+                                         verifyIncludeDirs_);
   const std::optional<std::string> replayed = preprocess(finalSource);
   if (!replayed) {
     // The preprocessor could not be run.  That is a reason to skip the check,

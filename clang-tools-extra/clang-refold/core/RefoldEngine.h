@@ -101,7 +101,6 @@
 #include "core/RefoldModel.h"
 #include "edit/RefoldEditTypes.h"
 #include "edit/RefoldPatchTypes.h"
-#include "include/RefoldSourceGraphProof.h"
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlProof.h"
@@ -295,8 +294,8 @@ public:
       std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr,
       FinalLineControlValidationCallback finalLineControlValidationCallback =
           FinalLineControlValidationCallback(),
-      std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr,
-      bool auditRepair = false);
+      bool auditRepair = false,
+      llvm::ArrayRef<std::string> verifyIncludeDirs = {});
 
 private:
   const RefoldModel model_;
@@ -374,12 +373,19 @@ private:
 
   std::optional<FinalReplaySurface> finalReplaySurface_;
   std::vector<MaterializedEditMapping> *materializedEditMappings_ = nullptr;
-  std::vector<SourceGraphOutput> *sourceGraphOutputs_ = nullptr;
   FinalLineControlValidationCallback finalLineControlValidationCallback_;
 
   /// Closing assembly check for this run.  Absent when the edited stream could
   /// not be preprocessed, and for candidate simulations, which are not judged.
   std::optional<RefoldFinalAssemblyVerifier> finalAssemblyVerifier_;
+
+  /// Caller-declared last-resort include directories for verification replays.
+  ///
+  /// The line-observer audit re-preprocesses the assembled source just as the
+  /// closing assembly check does, so it needs the same declared directories: an
+  /// edited stream naming a header the producer never saw is unreadable without
+  /// them, and an unreadable replay skips the audit entirely.
+  std::vector<std::string> verifyIncludeDirs_;
 
   /// Root macro invocations whose callsite must not be preserved.
   ///
@@ -843,7 +849,6 @@ private:
       std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr,
       FinalLineControlValidationCallback finalLineControlValidationCallback =
           FinalLineControlValidationCallback(),
-      std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr,
       std::optional<AlignmentSelectionOverride> alignmentSelectionOverride =
           std::nullopt,
       bool alignmentSemanticResolverEnabled = true,

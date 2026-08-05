@@ -31,6 +31,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
@@ -76,7 +77,8 @@ void readTempFileForPreprocessRecheck(StringRef path, std::string &out) {
 
 Expected<std::string>
 preprocessToBytes(StringRef inputPath,
-                  const RefoldModel::PreprocessContext &ctx) {
+                  const RefoldModel::PreprocessContext &ctx,
+                  ArrayRef<std::string> extraArgs) {
   // Force an absolute input path so it remains valid after we chdir.
   SmallString<256> absInput(inputPath);
   if (std::error_code ec = sys::fs::make_absolute(absInput)) {
@@ -100,6 +102,19 @@ preprocessToBytes(StringRef inputPath,
   bool hasE = false;
   bool hasP = false;
 
+  // Side-effect flags recorded from the producer build.  A recheck preprocesses
+  // a *candidate* source, so honoring these would write build artifacts
+  // describing a file the build never compiled -- and, worse, the paths are
+  // relative to the producer's build directory rather than this process's
+  // working directory, so the write usually fails and takes the whole recheck
+  // down with it.  Each name here takes one separate value argument.
+  static constexpr StringRef ValuedSideEffectFlags[] = {
+      "-dependency-file",     "-MT", "-MF", "-dependency-dot",
+      "-module-dependency-dir", "-header-include-file"};
+  // The same, without a value argument.
+  static constexpr StringRef ValuelessSideEffectFlags[] = {"-sys-header-deps",
+                                                           "-show-includes"};
+
   for (size_t i = 0; i < ctx.argv.size(); ++i) {
     StringRef a(ctx.argv[i]);
 
@@ -116,6 +131,12 @@ preprocessToBytes(StringRef inputPath,
       ++i; // skip value
       continue;
     }
+    if (llvm::is_contained(ValuedSideEffectFlags, a)) {
+      ++i; // skip value
+      continue;
+    }
+    if (llvm::is_contained(ValuelessSideEffectFlags, a))
+      continue;
 
     if (a == "-E")
       hasE = true;
@@ -131,6 +152,9 @@ preprocessToBytes(StringRef inputPath,
     args.insert(args.begin(), "-P");
   if (!hasE)
     args.insert(args.begin(), "-E");
+
+  // Appended last so every producer-recorded search path is tried first.
+  args.insert(args.end(), extraArgs.begin(), extraArgs.end());
 
   // Ensure language is specified (important for non-.c suffixes like '.mod').
   bool hasX = false;

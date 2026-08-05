@@ -62,13 +62,16 @@ void mergeIgnoreMask(std::vector<std::uint8_t> &combined,
 std::optional<RefoldFinalAssemblyVerifier> RefoldFinalAssemblyVerifier::Create(
     const json::Object &rootJson, const RefoldModel::PreprocessContext &ctx,
     StringRef editedStreamBytes, bool noLines, bool strict,
-    StringRef scratchNeighborPath) {
+    StringRef scratchNeighborPath, ArrayRef<std::string> verifyIncludeDirs) {
   RefoldFinalAssemblyVerifier verifier;
   verifier.ctx_ = ctx;
   verifier.scratchNeighborPath_ = scratchNeighborPath.str();
+  verifier.verifyIncludeDirs_.assign(verifyIncludeDirs.begin(),
+                                     verifyIncludeDirs.end());
 
   const FinalSourcePreprocessCallback preprocess =
-      buildFinalSourcePreprocessCallback(scratchNeighborPath, ctx);
+      buildFinalSourcePreprocessCallback(scratchNeighborPath, ctx,
+                                         verifyIncludeDirs);
 
   // Preprocess the edited stream once.  This is the fixed side of every later
   // comparison, and it is what makes the relation idempotence rather than
@@ -117,7 +120,8 @@ RefoldFinalAssemblyVerifier::Verify(StringRef finalSource) const {
   FinalAssemblyVerdict verdict;
 
   const FinalSourcePreprocessCallback preprocess =
-      buildFinalSourcePreprocessCallback(scratchNeighborPath_, ctx_);
+      buildFinalSourcePreprocessCallback(scratchNeighborPath_, ctx_,
+                                         verifyIncludeDirs_);
 
   std::vector<PPTok> assemblyTokens;
   std::vector<std::size_t> assemblyOffsets;

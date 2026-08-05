@@ -287,11 +287,6 @@ public:
   /// Record that an occurrence of \p physicalPath was preserved as a
   /// source-graph sidecar.
   ///
-  /// A sidecar is a real file at a real include spelling, so its own
-  /// `#pragma once` keeps working natively and must not be guarded.  Mixing a
-  /// sidecar occurrence with an inlined copy would duplicate the body, so this
-  /// marks the header unusable.
-  void NoteSourceGraphPreservedOccurrence(llvm::StringRef physicalPath);
 
   /// Return the guard for the physical header opened by \p include, if any.
   ///

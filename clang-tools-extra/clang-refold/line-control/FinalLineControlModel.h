@@ -266,12 +266,41 @@ struct FinalLineControlPruneResult {
 using FinalSourcePreprocessCallback =
     std::function<std::optional<std::string>(llvm::StringRef finalSource)>;
 
+/// Return the path whose directory must host verification temp sources.
+///
+/// A refolded source reproduces the edited stream only in the environment the
+/// producer preprocessed.  A quoted `#include` is resolved against the
+/// *including file's own directory* before any `-I` path, so re-preprocessing an
+/// assembly anywhere else can silently read a different header.  Pipelines that
+/// copy a codebase between stage directories hit this immediately: the same
+/// header exists at every stage with different contents, and the copy beside the
+/// output directory is not the one the producer read.
+///
+/// The producer's own top-level source path is therefore the anchor.  A relative
+/// spelling is resolved against the producer working directory.  Returns nullopt
+/// when no usable path can be formed, which leaves verification unavailable
+/// rather than answered against the wrong headers.
+std::optional<std::string>
+producerSourceAnchorPath(llvm::StringRef producerSourcePath,
+                         const RefoldModel::PreprocessContext &ctx);
+
 /// Build a callback that preprocesses an assembled final source through the
 /// producer-recorded context, using one stable temporary path beside \p
-/// outputPath so `__FILE__` and quoted-include lookup stay comparable.
-FinalSourcePreprocessCallback
-buildFinalSourcePreprocessCallback(llvm::StringRef outputPath,
-                                   const RefoldModel::PreprocessContext &ctx);
+/// anchorPath so `__FILE__` and quoted-include lookup stay comparable.
+///
+/// \p anchorPath must name the producer's own source, not the refold output;
+/// see `producerSourceAnchorPath()` for why the distinction is load-bearing.
+///
+///
+/// \p verifyIncludeDirs are caller-declared last-resort include directories.
+/// An edited stream may name a header that did not exist when the producer ran
+/// -- a transform that hoists globals into a new header, for instance -- so no
+/// producer-recorded search path can find it.  Where such a header lives is not
+/// derivable from the refold map, so it is declared rather than guessed; each
+/// directory is searched only after every producer-recorded path has missed.
+FinalSourcePreprocessCallback buildFinalSourcePreprocessCallback(
+    llvm::StringRef anchorPath, const RefoldModel::PreprocessContext &ctx,
+    llvm::ArrayRef<std::string> verifyIncludeDirs = {});
 
 using FinalLineControlValidationCallback =
     std::function<bool(llvm::StringRef currentOutput,
