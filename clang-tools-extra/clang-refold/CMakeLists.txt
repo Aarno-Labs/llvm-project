@@ -27,6 +27,7 @@ add_clang_tool(clang-refold
   include/RefoldIncludeMaterializationScheduler.cpp
   include/RefoldPragmaOnceGuardRewriter.cpp
   edit/RefoldTextEditAssembler.cpp
+  util/RefoldPathCanonicalization.cpp
   util/RefoldPathIdentity.cpp
   source/RefoldTokenTextAnalysis.cpp
   source/RefoldSourceMapper.cpp

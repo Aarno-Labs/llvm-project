@@ -6,7 +6,8 @@
 
 #include "util/RefoldPathIdentity.h"
 
-#include "core/RefoldLog.h"
+#include "util/RefoldPathCanonicalization.h"
+
 #include "proof/RefoldProofVocabulary.h"
 
 #include <filesystem>
@@ -30,34 +31,15 @@ RefoldPathIdentity::RefoldPathIdentity(const RefoldModel &model,
 }
 
 void RefoldPathIdentity::CacheCanonicalPath(StringRef path) const {
-  auto it = canonicalPathCache_.find(path);
-  if (it != canonicalPathCache_.end())
-    return;
-
-  std::error_code ec;
-  const auto canonical =
-      std::filesystem::weakly_canonical(std::filesystem::path(path.str()), ec);
-  if (ec) {
-    REFOLD_LOG_FATAL("path/canon", "failed to canonicalize '{0}': {1}", path,
-                     ec.message());
-  }
-
-  canonicalPathCache_.insert({path, canonical.string()});
+  (void)refoldCanonicalPath(path);
 }
 
 StringRef RefoldPathIdentity::GetCanonicalPath(StringRef path) const {
-  if (path.empty())
-    return {};
-
-  CacheCanonicalPath(path);
-  return canonicalPathCache_.find(path)->getValue();
+  return refoldCanonicalPath(path);
 }
 
 bool RefoldPathIdentity::PathsEqual(StringRef lhs, StringRef rhs) const {
-  if (lhs.empty() || rhs.empty())
-    return lhs == rhs;
-
-  return GetCanonicalPath(lhs) == GetCanonicalPath(rhs);
+  return refoldPathsEqual(lhs, rhs);
 }
 
 std::optional<std::string> RefoldPathIdentity::ProducerPhysicalIncludePath(

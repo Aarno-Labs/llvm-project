@@ -22,6 +22,8 @@
 
 #include "core/RefoldModel.h"
 
+#include "util/RefoldPathCanonicalization.h"
+
 #include "core/RefoldLog.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -3266,7 +3268,7 @@ RefoldModel::FirstConditionalArmStartA(const CondGroup &group) const {
   for (const auto &slot : slots_) {
     // Only arm-begin slots in the same recorded file and include-owner domain
     // can mark the first A-token position for this conditional group.
-    if (slot.kind != "arm_begin" || slot.file != group.file)
+    if (slot.kind != "arm_begin" || !refoldPathsEqual(slot.file, group.file))
       continue;
 
     if (slot.ownerIncludeId != group.parentIncludeId)
@@ -3297,7 +3299,9 @@ std::vector<const RefoldModel::Slot *> RefoldModel::FindSlots(
   // wildcards, which lets callers search broadly and then rely on the stable
   // ordering below.
   for (const auto &slot : slots_) {
-    if (file && slot.file != *file)
+    // Slot files carry the producer's spelling, which need not match the
+    // caller's for the same file; compare physical identity, not text.
+    if (file && !refoldPathsEqual(slot.file, *file))
       continue;
     if (kind && slot.kind != *kind)
       continue;

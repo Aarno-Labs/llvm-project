@@ -15,7 +15,6 @@
 
 #include "core/RefoldModel.h"
 
-#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <optional>
@@ -26,9 +25,11 @@ namespace refold {
 
 /// Read-only path identity oracle for one refold run.
 ///
-/// The canonical-path cache is intentionally owned by this service rather than
-/// by RefoldEngine.  Proof and planning services receive this oracle directly
-/// when they need canonical path comparison or include-edge identity checks.
+/// Proof and planning services receive this oracle directly when they need
+/// canonical path comparison or include-edge identity checks.  Canonicalization
+/// itself is answered from the one process-wide cache in
+/// `util/RefoldPathCanonicalization.h`, which layers below this one -- the model
+/// among them -- also use, so a path is resolved once no matter who asks.
 class RefoldPathIdentity {
 public:
   RefoldPathIdentity(const RefoldModel &model,
@@ -43,7 +44,7 @@ public:
 
   /// Return the cached weakly-canonical spelling for one non-empty path.
   ///
-  /// The returned view remains valid for the lifetime of this service. Empty
+  /// The returned view remains valid for the lifetime of the process. Empty
   /// paths produce an empty view; canonicalization failures are fatal, matching
   /// the physical-identity policy used by `PathsEqual()`.
   llvm::StringRef GetCanonicalPath(llvm::StringRef path) const;
@@ -81,8 +82,6 @@ public:
   bool SameEnteredFileSpelling(llvm::StringRef candidateSpelling,
                                const RefoldModel::IncludeItem &include) const;
 
-private:
-  mutable llvm::StringMap<std::string> canonicalPathCache_;
 };
 
 } // namespace refold
