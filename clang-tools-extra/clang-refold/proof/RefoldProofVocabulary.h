@@ -1245,6 +1245,15 @@ NormalizeTerminalFallbackFailureReason(TerminalFallbackFailureReason reason);
 /// not encode theorem facts only inside a free-form detail string.
 struct TerminalFallbackFailureContext {
   std::optional<std::string> owner;
+
+  /// Producer id of the region whose proof failed, when the site knows it.
+  ///
+  /// This is what lets a terminal request be narrowed instead of taken: the
+  /// fallback ladder can rule out preserving that one region and re-assemble,
+  /// rather than emitting the edited stream for the whole translation unit.
+  /// Sites that genuinely have no region -- a translation-unit-wide producer
+  /// inconsistency, say -- leave it absent and the terminal carrier stands.
+  std::optional<uint64_t> ownerId;
   std::optional<uint64_t> hunk;
   std::optional<std::string> stateComponent;
 
@@ -1258,6 +1267,7 @@ struct TerminalFallbackFailureContext {
   std::optional<uint64_t> bTokenEnd;
 
   static TerminalFallbackFailureContext ForStateComponent(llvm::StringRef name);
+  static TerminalFallbackFailureContext ForOwnerId(uint64_t ownerId);
   static TerminalFallbackFailureContext
   ForHunkTokenEnvelope(uint64_t hunkIndex, uint64_t aBegin, uint64_t aEnd,
                        uint64_t bBegin, uint64_t bEnd);

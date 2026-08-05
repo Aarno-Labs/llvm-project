@@ -385,6 +385,7 @@ bool RefoldIncludeMaterializationScheduler::
       std::unique(unprotectedPaths.begin(), unprotectedPaths.end()),
       unprotectedPaths.end());
 
+  bool reentryProven = true;
   for (const RefoldModel::IncludeItem &include : model_.GetIncludes()) {
     // Only a surviving directive can re-enter; a materialized edge is replaced
     // by its body.
@@ -414,15 +415,29 @@ bool RefoldIncludeMaterializationScheduler::
             include.id, include.target, reentered)
             .str();
     REFOLD_LOG_TRACE("pragma/once/guard", "{0}", detail);
+    // The re-entering directive is the region at fault, so name it.  Expanding
+    // it is a repair rather than a duplication: this loop over-approximates
+    // across *all* edges, and the edge that actually endangers the output is
+    // one the producer skipped, which contributed no tokens.  Materializing
+    // such an edge emits nothing, which is what the original emitted there.
+    // An edge the producer did enter contributed its tokens either way.
+    //
+    // Whatever it produces is verified again, so a repair that does not hold
+    // widens rather than escaping.
     terminalSink_.RequestTerminalFallback(
         MakeTerminalFallbackProofFailure(
             TerminalFallbackObligationKind::IncludeGuardStateStabilizable,
-            TerminalFallbackFailureReason::IncludeGuardStateNotStabilizable),
+            TerminalFallbackFailureReason::IncludeGuardStateNotStabilizable,
+            TerminalFallbackFailureContext::ForOwnerId(include.id)),
         "pragma/once/guard", detail);
-    return false;
+    // Keep scanning.  Every re-entering directive is independently at fault, and
+    // recording them all lets one attempt give up all of them; stopping here
+    // would cost one whole re-assembly per offending edge and, past the attempt
+    // ceiling, would reach the terminal carrier with work still available.
+    reentryProven = false;
   }
 
-  return true;
+  return reentryProven;
 }
 
 void RefoldIncludeMaterializationScheduler::RecordActiveGuardedHeaders(
@@ -504,10 +519,15 @@ bool RefoldIncludeMaterializationScheduler::StageTURootSurvivingIncludeGuards() 
                        "TU surviving include inc#{0} rejected: {1} ({2})",
                        include->id, toString(guardResult.rejection),
                        guardResult.detail);
+      // The include that could not be guarded is the region at fault, and
+      // expanding it is a repair: it stops being a directive, so there is no
+      // surviving occurrence left to guard.  Naming it lets the fallback ladder
+      // try that before emitting the edited stream for the whole file.
       terminalSink_.RequestTerminalFallback(
           MakeTerminalFallbackProofFailure(
               TerminalFallbackObligationKind::IncludeGuardStateStabilizable,
-              TerminalFallbackFailureReason::IncludeGuardStateNotStabilizable),
+              TerminalFallbackFailureReason::IncludeGuardStateNotStabilizable,
+              TerminalFallbackFailureContext::ForOwnerId(include->id)),
           "pragma/once/guard", guardResult.detail);
       return false;
     }

@@ -10,6 +10,7 @@
 #include "core/RefoldLog.h"
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/RefoldNoLinesPruning.h"
+#include "source/DiffAlgorithms.h"
 
 #include "llvm/Support/Error.h"
 
@@ -143,22 +144,82 @@ RefoldFinalAssemblyVerifier::Verify(StringRef finalSource) const {
 
   verdict.verified = false;
   verdict.reason = toString(std::move(err));
-
-  // Anchor the divergence for callers that must locate the region responsible.
-  // The comparison reports the first mismatch, so the first index at which the
-  // streams differ is the same position it described.
-  const std::size_t common =
-      std::min(assemblyTokens.size(), editedTokens_.size());
-  verdict.mismatchTokenIndex = common;
-  for (std::size_t index = 0; index < common; ++index) {
-    if (!ignoreMask_.empty() && index < ignoreMask_.size() && ignoreMask_[index])
-      continue;
-    if (assemblyTokens[index].spelling != editedTokens_[index].spelling) {
-      verdict.mismatchTokenIndex = index;
-      break;
-    }
-  }
+  AppendDivergentRanges(assemblyTokens, verdict.divergentRanges);
+  verdict.mismatchTokenIndex = verdict.divergentRanges.empty()
+                                   ? std::min(assemblyTokens.size(),
+                                              editedTokens_.size())
+                                   : verdict.divergentRanges.front().first;
   return verdict;
+}
+
+void RefoldFinalAssemblyVerifier::AppendDivergentRanges(
+    llvm::ArrayRef<PPTok> assemblyTokens,
+    std::vector<std::pair<std::size_t, std::size_t>> &ranges) const {
+  auto masked = [&](std::size_t index) {
+    return !ignoreMask_.empty() && index < ignoreMask_.size() &&
+           ignoreMask_[index];
+  };
+  auto append = [&](std::size_t begin, std::size_t end) {
+    if (begin >= end)
+      return;
+    if (!ranges.empty() && ranges.back().second == begin)
+      ranges.back().second = end;
+    else
+      ranges.emplace_back(begin, end);
+  };
+
+  // Equal lengths mean the streams correspond position for position, which is
+  // the ordinary case: both are `-E -P` output of the same translation unit.
+  // A direct scan is then exact, and each maximal run of differing positions is
+  // one diverging region.
+  if (assemblyTokens.size() == editedTokens_.size()) {
+    std::size_t runBegin = 0;
+    bool inRun = false;
+    for (std::size_t index = 0; index < editedTokens_.size(); ++index) {
+      const bool differs =
+          !masked(index) &&
+          assemblyTokens[index].spelling != editedTokens_[index].spelling;
+      if (differs && !inRun) {
+        runBegin = index;
+        inRun = true;
+      } else if (!differs && inRun) {
+        append(runBegin, index);
+        inRun = false;
+      }
+    }
+    if (inRun)
+      append(runBegin, editedTokens_.size());
+    return;
+  }
+
+  // Unequal lengths mean tokens were inserted or removed, so position `i` on
+  // one side no longer names position `i` on the other and a direct scan would
+  // report every position after the first shift.  Align the two streams first
+  // and take the gaps, which is the same operation the refolder already
+  // performs on the original and edited streams.
+  llvm::SmallVector<llvm::StringRef, 0> assemblySpellings;
+  llvm::SmallVector<llvm::StringRef, 0> editedSpellings;
+  assemblySpellings.reserve(assemblyTokens.size());
+  editedSpellings.reserve(editedTokens_.size());
+  for (const PPTok &token : assemblyTokens)
+    assemblySpellings.push_back(token.spelling);
+  for (const PPTok &token : editedTokens_)
+    editedSpellings.push_back(token.spelling);
+
+  const std::vector<int64_t> alignment =
+      diffutils::lcsMapAB(assemblySpellings, editedSpellings);
+  for (const diffutils::Hunk &hunk : diffutils::hunksFromMap(
+           alignment, assemblySpellings.size(), editedSpellings.size())) {
+    // A hunk every one of whose edited positions is masked is a permitted
+    // difference, not a divergence.
+    bool everyPositionMasked = hunk.bStart < hunk.bEnd;
+    for (uint64_t index = hunk.bStart; index < hunk.bEnd; ++index)
+      everyPositionMasked = everyPositionMasked && masked(index);
+    if (everyPositionMasked)
+      continue;
+    append(static_cast<std::size_t>(hunk.bStart),
+           static_cast<std::size_t>(hunk.bEnd));
+  }
 }
 
 } // namespace refold

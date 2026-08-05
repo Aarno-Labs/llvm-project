@@ -471,7 +471,11 @@ Expected<std::string> RefoldEngine::Refold(
     }
   }
 
-  const unsigned maxAttempts = 8;
+  // Every diverging region is given up in one attempt, so a further attempt is
+  // only ever needed to *widen*: a region that was expanded and still diverges
+  // escalates to the region enclosing it.  That is bounded by nesting depth,
+  // not by how many regions diverged.
+  const unsigned maxAttempts = 4;
 
   for (unsigned attempt = 0;; ++attempt) {
     RefoldEngine engine(
@@ -486,9 +490,44 @@ Expected<std::string> RefoldEngine::Refold(
 
     std::string out = engine.Refold();
 
-    // Without a verifier, or once the conservative carrier has been taken, the
-    // result stands exactly as it would without this loop.
-    if (!assemblyVerifier || engine.terminalSink_.HasRequest())
+    // A terminal request means the run gave up and `out` is the edited stream
+    // for the whole file.  Before accepting that, see whether any request named
+    // the region whose proof failed: ruling that one region out and assembling
+    // again is strictly less than giving up the file, and it costs nothing when
+    // no request names a region -- which is every run that never fell back.
+    //
+    // This is deliberately not gated on the verification mode.  It repairs the
+    // fallback ladder, not a verification verdict, and a caller that asked for
+    // no verification still wants the smaller answer.
+    if (engine.terminalSink_.HasRequest()) {
+      // Retry only when *every* recorded request names a region that can still
+      // be given up.  One request naming nothing -- an unowned hunk, a
+      // translation-unit wide producer inconsistency -- means the terminal
+      // carrier is reachable whatever becomes of the others, so further whole
+      // re-assemblies buy nothing.  This is a cost policy, not a proof: taking
+      // the carrier is always correct, so stopping early can only forgo
+      // completeness there was no path to.
+      llvm::SmallVector<uint64_t, 8> owners;
+      const bool everyRequestNarrowable =
+          engine.AppendNarrowableOwnersForTerminalRequests(ownersMustExpand,
+                                                          owners);
+      if (everyRequestNarrowable && !owners.empty() &&
+          attempt + 1 < maxAttempts) {
+        for (uint64_t owner : owners) {
+          REFOLD_LOG_INFO("fallback",
+                          "terminal fallback names {0}; expanding it and "
+                          "retrying instead of the whole translation unit",
+                          engine.DescribeOwner(owner));
+          ownersMustExpand.insert(owner);
+        }
+        continue;
+      }
+      return out;
+    }
+
+    // Without a verifier the result stands exactly as it would without this
+    // loop.
+    if (!assemblyVerifier)
       return out;
 
     const FinalAssemblyVerdict verdict = assemblyVerifier->Verify(out);
@@ -501,13 +540,21 @@ Expected<std::string> RefoldEngine::Refold(
       return out;
     }
 
-    // Name the smallest region owning the divergence and rule out preserving
-    // it.  An owner already ruled out means expanding it was not enough, so
-    // widen to the invocation that encloses it.
-    std::optional<uint64_t> owner =
-        engine.FindSmallestOwnerForEditedToken(verdict.mismatchTokenIndex);
-    while (owner && ownersMustExpand.count(*owner))
-      owner = engine.FindEnclosingOwner(*owner);
+    // Name the smallest region owning each diverging region and rule out
+    // preserving it.  An owner already ruled out means expanding it was not
+    // enough, so widen to the region enclosing it.
+    llvm::SmallVector<uint64_t, 8> owners;
+    for (const std::pair<std::size_t, std::size_t> &range :
+         verdict.divergentRanges) {
+      std::optional<uint64_t> candidate =
+          engine.FindSmallestOwnerForEditedToken(range.first);
+      while (candidate && ownersMustExpand.count(*candidate))
+        candidate = engine.FindEnclosingOwner(*candidate);
+      if (candidate && !llvm::is_contained(owners, *candidate))
+        owners.push_back(*candidate);
+    }
+    const std::optional<uint64_t> owner =
+        owners.empty() ? std::nullopt : std::optional<uint64_t>(owners.front());
 
     // `fatal`: report and fail.  A theorem that mis-states which tokens it
     // realizes is a defect, and repairing it silently costs completeness in a
@@ -526,13 +573,17 @@ Expected<std::string> RefoldEngine::Refold(
           verdict.reason.c_str(), owned.c_str());
     }
 
-    if (owner && attempt + 1 < maxAttempts) {
+    if (!owners.empty() && attempt + 1 < maxAttempts) {
       REFOLD_LOG_INFO("assembly-verify",
-                      "unsound assembly at edited token {0}; expanding {1} "
-                      "and retrying: {2}",
-                      static_cast<uint64_t>(verdict.mismatchTokenIndex),
-                      engine.DescribeOwner(*owner), verdict.reason);
-      ownersMustExpand.insert(*owner);
+                      "unsound assembly: {0} diverging region(s), expanding "
+                      "{1} owner(s) and retrying: {2}",
+                      verdict.divergentRanges.size(), owners.size(),
+                      verdict.reason);
+      for (uint64_t candidate : owners) {
+        REFOLD_LOG_INFO("assembly-verify", "  expanding {0}",
+                        engine.DescribeOwner(candidate));
+        ownersMustExpand.insert(candidate);
+      }
       continue;
     }
 
@@ -2232,6 +2283,42 @@ std::optional<uint64_t> RefoldEngine::FindSmallestOwnerForEditedToken(
   if (aToken < 0)
     return std::nullopt;
 
+  return FindSmallestOwnerForAToken(static_cast<uint64_t>(aToken));
+}
+
+bool RefoldEngine::AppendNarrowableOwnersForTerminalRequests(
+    const llvm::DenseSet<uint64_t> &alreadyExpanded,
+    llvm::SmallVectorImpl<uint64_t> &owners) const {
+  // Every region the ledger names is independently at fault, so give up all of
+  // them in one attempt.  Taking only the first would cost one re-assembly per
+  // region and, past the attempt ceiling, would reach the terminal carrier with
+  // narrowing still available.  A request naming nothing is not a defect: a
+  // translation-unit wide producer inconsistency has no smaller region to name.
+  bool everyRequestNarrowable = true;
+  for (const TerminalFallbackRequest &request : terminalSink_.Requests()) {
+    const TerminalFallbackFailureContext &context = request.failure.context;
+
+    std::optional<uint64_t> owner = context.ownerId;
+    if (!owner && context.aTokenBegin && context.aTokenEnd &&
+        *context.aTokenBegin < *context.aTokenEnd)
+      owner = FindSmallestOwnerForAToken(*context.aTokenBegin);
+
+    // Widen past anything already given up, exactly as the verification path
+    // does: expanding it once was not enough.
+    while (owner && alreadyExpanded.count(*owner))
+      owner = FindEnclosingOwner(*owner);
+    if (!owner) {
+      everyRequestNarrowable = false;
+      continue;
+    }
+    if (!llvm::is_contained(owners, *owner))
+      owners.push_back(*owner);
+  }
+  return everyRequestNarrowable;
+}
+
+std::optional<uint64_t>
+RefoldEngine::FindSmallestOwnerForAToken(uint64_t aToken) const {
   // Several nested owners can produce the same A token: an invocation inside an
   // invocation, either of them inside an include.  Take the narrowest, because
   // expanding it gives up the least source structure; the caller widens outward
@@ -2245,8 +2332,7 @@ std::optional<uint64_t> RefoldEngine::FindSmallestOwnerForEditedToken(
   std::optional<uint64_t> ownerId;
   uint64_t ownerWidth = std::numeric_limits<uint64_t>::max();
   auto considerOwner = [&](uint64_t id, uint64_t begin, uint64_t end) {
-    if (static_cast<uint64_t>(aToken) < begin ||
-        static_cast<uint64_t>(aToken) >= end)
+    if (aToken < begin || aToken >= end)
       return;
     const uint64_t width = end - begin;
     if (width < ownerWidth || (width == ownerWidth && ownerId && id < *ownerId)) {

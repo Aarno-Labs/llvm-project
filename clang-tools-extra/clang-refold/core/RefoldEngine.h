@@ -991,6 +991,29 @@ private:
   std::optional<uint64_t>
   FindSmallestOwnerForEditedToken(std::size_t editedTokenIndex) const;
 
+  /// Collect every region named by this run's terminal-fallback requests that
+  /// has not already been given up.
+  ///
+  /// Returns false when at least one request names no such region.  The caller
+  /// uses that to stop retrying: a request that cannot be narrowed makes the
+  /// terminal carrier reachable regardless of what the others do.
+  ///
+  /// A terminal request records the region whose proof failed when the site
+  /// knows it.  Recovering that region is what lets the ladder expand one
+  /// macro or one include instead of emitting the edited stream for the whole
+  /// translation unit.  Requests naming no region yield nothing, which leaves
+  /// the terminal carrier in place.
+  bool AppendNarrowableOwnersForTerminalRequests(
+      const llvm::DenseSet<uint64_t> &alreadyExpanded,
+      llvm::SmallVectorImpl<uint64_t> &owners) const;
+
+  /// Return the smallest region covering one *original*-stream token.
+  ///
+  /// This is the half of the search that does not depend on the edited stream,
+  /// so a terminal-fallback request that recorded an A-token range can reuse it
+  /// without a verifier having run.
+  std::optional<uint64_t> FindSmallestOwnerForAToken(uint64_t aToken) const;
+
   /// Return a human-readable description of one owner, for diagnostics.
   std::string DescribeOwner(uint64_t ownerId) const;
 

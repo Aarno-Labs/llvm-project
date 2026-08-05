@@ -211,6 +211,13 @@ TerminalFallbackFailureContext::ForStateComponent(StringRef name) {
 }
 
 TerminalFallbackFailureContext
+TerminalFallbackFailureContext::ForOwnerId(uint64_t ownerId) {
+  TerminalFallbackFailureContext context;
+  context.ownerId = ownerId;
+  return context;
+}
+
+TerminalFallbackFailureContext
 TerminalFallbackFailureContext::ForHunkTokenEnvelope(uint64_t hunkIndex,
                                                      uint64_t aBegin,
                                                      uint64_t aEnd,
@@ -226,8 +233,9 @@ TerminalFallbackFailureContext::ForHunkTokenEnvelope(uint64_t hunkIndex,
 }
 
 bool TerminalFallbackFailureContext::Empty() const {
-  return !owner && !hunk && !stateComponent && !sourcePath && !sourceBegin &&
-         !sourceEnd && !aTokenBegin && !aTokenEnd && !bTokenBegin && !bTokenEnd;
+  return !owner && !ownerId && !hunk && !stateComponent && !sourcePath &&
+         !sourceBegin && !sourceEnd && !aTokenBegin && !aTokenEnd &&
+         !bTokenBegin && !bTokenEnd;
 }
 
 std::string TerminalFallbackFailureContext::ToString() const {
@@ -246,6 +254,8 @@ std::string TerminalFallbackFailureContext::ToString() const {
 
   if (owner)
     add("owner", *owner);
+  if (ownerId)
+    add("ownerId", *ownerId);
   if (hunk)
     add("hunk", *hunk);
   if (stateComponent)

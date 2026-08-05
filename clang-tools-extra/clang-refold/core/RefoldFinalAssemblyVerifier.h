@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -82,6 +83,17 @@ struct FinalAssemblyVerdict {
   /// Only meaningful when the assembly was rejected; this is the anchor a
   /// caller uses to find the region responsible.
   std::size_t mismatchTokenIndex = 0;
+
+  /// Every diverging run, as half-open ranges of preprocessed edited-stream
+  /// token indices, in ascending order.
+  ///
+  /// Reporting only the first divergence forces the caller to re-assemble once
+  /// per diverging region, which is one whole refold per region and, past any
+  /// attempt ceiling, reaches the conservative carrier with work still
+  /// available.  Every region is reported so a caller can give all of them up
+  /// in one attempt; what remains for a second attempt is widening, which is
+  /// bounded by nesting depth rather than by the number of divergences.
+  std::vector<std::pair<std::size_t, std::size_t>> divergentRanges;
 };
 
 /// Checks assembled final sources against the edited preprocessed stream.
@@ -127,6 +139,11 @@ public:
 
 private:
   RefoldFinalAssemblyVerifier() = default;
+
+  /// Append every diverging run, in ascending edited-stream token order.
+  void AppendDivergentRanges(
+      llvm::ArrayRef<PPTok> assemblyTokens,
+      std::vector<std::pair<std::size_t, std::size_t>> &ranges) const;
 
   RefoldModel::PreprocessContext ctx_;
   std::string scratchNeighborPath_;
