@@ -926,6 +926,17 @@ private:
   ///
   /// The caller reacts to typed requests recorded in RefoldTerminalProofSink by
   /// selecting the explicit terminal fallback result.
+  /// Prove that the assembled source re-expands every preserved `__LINE__`
+  /// observer to the value the edited stream carries, and request terminal
+  /// fallback when it does not.
+  ///
+  /// The observer is located by the preprocessor rather than by any byte
+  /// mapping: the assembled source is preprocessed through the producer's
+  /// recorded context and its token stream compared to B.  Only positions that
+  /// B produced from a `__LINE__` expansion are enforced, so this closes the
+  /// newline-drift ordering hole without becoming a general re-check.
+  bool AuditPreservedLineObserversInFinalOutput(llvm::StringRef finalSource);
+
   std::string RunRefoldPass();
 };
 

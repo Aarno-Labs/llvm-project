@@ -491,6 +491,20 @@ std::string RefoldEngine::Refold() {
 
   out = finalLinePrune.output;
 
+  // Closing proof for newline-drift repairs, on the accepted assembly only.
+  // A repair that could not be injected into its own replacement was deferred
+  // to the next safe beginning-of-line, and no site along that path establishes
+  // that the flush point precedes the observers the drift displaced.
+  if (!AuditPreservedLineObserversInFinalOutput(out)) {
+    out = expansionFallbackPlanner_->ResolvePostStructuralFallback();
+    finalLineControlPruneCandidates_.clear();
+    finalLineControlSourceMappings_.clear();
+    if (materializedEditMappings_)
+      materializedEditMappings_->clear();
+    if (sourceGraphOutputs_)
+      sourceGraphOutputs_->clear();
+  }
+
   emitRefoldAttemptStatsSummary(lastStats_, terminalSink_.HasRequest());
   emitTheoremAuditSummary(lastTheoremAudit_);
   return out;
@@ -1923,6 +1937,107 @@ std::string RefoldEngine::FinalizeStructuralResult(
 
   lastStats_.expandedMacros = finalEmission.expandedMacroCount;
   return std::move(finalEmission.tuText);
+}
+
+bool RefoldEngine::AuditPreservedLineObserversInFinalOutput(
+    StringRef finalSource) {
+  // Without line directives the logical stream is not reconstructed at all, and
+  // a terminal result carries no preserved observer to displace.
+  if (!lineDirs_.Enabled() || terminalSink_.HasRequest())
+    return true;
+
+  // Alignment candidate simulations re-enter the engine.  Judging an assembly
+  // that is about to be discarded would let a probe condemn the production
+  // result, which is how two earlier attempts at this proof failed.
+  if (alignmentSelectionOverride_)
+    return true;
+
+  // Enforce only the positions B produced by expanding `__LINE__`.  Those are
+  // exactly the observers the deferral can displace, and restricting to them
+  // keeps this from becoming a second, general re-check of the whole stream.
+  //
+  // A macro invocation's spans are recorded in the *original* stream's token
+  // numbering, so they must be carried across the alignment before they can
+  // index the edited stream.
+  llvm::DenseSet<uint64_t> lineObserverBTokens;
+  for (const RefoldModel::MacroInvocation &macro :
+       model_.GetMacroInvocations()) {
+    if (macro.name != "__LINE__")
+      continue;
+    for (const RefoldModel::PPSpan &span : macro.spans) {
+      for (uint64_t aToken = span.begin; aToken < span.end; ++aToken) {
+        if (aToken >= abTokMapA2B_.size())
+          continue;
+        const int64_t bToken = abTokMapA2B_[static_cast<size_t>(aToken)];
+        if (bToken >= 0)
+          lineObserverBTokens.insert(static_cast<uint64_t>(bToken));
+      }
+    }
+  }
+  if (lineObserverBTokens.empty())
+    return true;
+
+  FinalSourcePreprocessCallback preprocess = buildFinalSourcePreprocessCallback(
+      finalOutputPath_, RefoldModel::PreprocessContext{
+                            model_.GetPPCwd().str(),
+                            std::vector<std::string>(model_.GetPPArgv().begin(),
+                                                     model_.GetPPArgv().end()),
+                            model_.GetPPLang().str()});
+  const std::optional<std::string> replayed = preprocess(finalSource);
+  if (!replayed) {
+    // The preprocessor could not be run.  That is a reason to skip the check,
+    // never to reject an assembly this audit could not read.
+    REFOLD_LOG_DEBUG("line/observer-audit",
+                     "skipped: could not preprocess the assembled source");
+    return true;
+  }
+
+  std::vector<PPTok> replayedToks;
+  std::vector<size_t> replayedOff;
+  lexPPTokens(*replayed, replayedToks, replayedOff,
+              makeRefoldLexLangOptions(model_.GetPPLang()));
+
+  const size_t common = std::min(replayedToks.size(), bToks_.size());
+  for (size_t index = 0; index < common; ++index) {
+    if (replayedToks[index].spelling == bToks_[index].spelling)
+      continue;
+    if (!lineObserverBTokens.count(static_cast<uint64_t>(index)))
+      break; // A divergence elsewhere is out of this proof's scope.
+
+    REFOLD_LOG_TRACE("line/observer-audit",
+                     "displaced observer at B token {0}: assembled '{1}' vs "
+                     "edited stream '{2}'",
+                     static_cast<uint64_t>(index), replayedToks[index].spelling,
+                     bToks_[index].spelling);
+    terminalSink_.RequestTerminalFallback(
+        RefoldOwnerStateProof::SuffixStabilityTerminalFailureForComponent(
+            OwnerStateComponent::LineNumber),
+        "line/observer-audit",
+        llvm::formatv("assembled source re-expands a preserved __LINE__ "
+                      "observer to '{0}' where the edited stream carries "
+                      "'{1}' (B token {2})",
+                      replayedToks[index].spelling, bToks_[index].spelling,
+                      static_cast<uint64_t>(index))
+            .str());
+    return false;
+  }
+
+  // Report one audited position and the value it carries.  A silent no-op --
+  // spans that never reach the edited stream's numbering, for instance -- still
+  // reports a clean audit, so the count alone does not show the audit looked
+  // anywhere meaningful.
+  uint64_t firstObserver = std::numeric_limits<uint64_t>::max();
+  for (uint64_t token : lineObserverBTokens)
+    firstObserver = std::min(firstObserver, token);
+  const StringRef firstSpelling =
+      firstObserver < bToks_.size() ? StringRef(bToks_[firstObserver].spelling)
+                                    : StringRef("<out-of-range>");
+  REFOLD_LOG_TRACE("line/observer-audit",
+                   "observers={0} tokens={1} firstObserver={2} carries='{3}' "
+                   "clean",
+                   static_cast<uint64_t>(lineObserverBTokens.size()),
+                   static_cast<uint64_t>(common), firstObserver, firstSpelling);
+  return true;
 }
 
 std::string RefoldEngine::RunRefoldPass() {

@@ -744,6 +744,42 @@ preprocessedTokensEqualForLinePrune(StringRef currentPP, StringRef candidatePP,
 /// quoted-include lookup comparable.  Byte-for-byte equality is accepted first;
 /// if the only difference is preprocessing trivia, token-sequence equality is
 /// also accepted because the refolding soundness oracle is token equivalence.
+FinalSourcePreprocessCallback
+buildFinalSourcePreprocessCallback(StringRef outputPath,
+                                   const RefoldModel::PreprocessContext &ctx) {
+  SmallString<256> outputDir(outputPath);
+  sys::path::remove_filename(outputDir);
+  if (outputDir.empty())
+    outputDir = ".";
+
+  SmallString<256> model(outputDir);
+  sys::path::append(model, ".clang-refold-observer-audit-%%%%%%.c");
+  std::string modelText = model.str().str();
+
+  return [modelText, ctx](StringRef finalSource) -> std::optional<std::string> {
+    SmallString<256> tmpPath;
+    int tmpFD = -1;
+    if (sys::fs::createUniqueFile(modelText, tmpFD, tmpPath))
+      return std::nullopt;
+    {
+      raw_fd_ostream closeStream(tmpFD, /*shouldClose=*/true);
+      closeStream.close();
+    }
+    auto cleanup = make_scope_exit([&]() { (void)sys::fs::remove(tmpPath); });
+
+    if (Error err = writePruneValidationSource(tmpPath, finalSource)) {
+      consumeError(std::move(err));
+      return std::nullopt;
+    }
+    auto ppOrErr = preprocessToBytes(tmpPath, ctx);
+    if (!ppOrErr) {
+      consumeError(ppOrErr.takeError());
+      return std::nullopt;
+    }
+    return std::move(*ppOrErr);
+  };
+}
+
 FinalLineControlValidationCallback buildFinalLineControlValidationCallback(
     StringRef outputPath, const RefoldModel::PreprocessContext &ctx) {
   SmallString<256> outputDir(outputPath);

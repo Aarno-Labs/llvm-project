@@ -259,6 +259,20 @@ struct FinalLineControlPruneResult {
 };
 
 /// Optional executable oracle for a proposed final-stream #line deletion.
+/// Preprocess one assembled final source and return its `-E -P` bytes.
+///
+/// Empty result means the preprocessor could not be run, which is a reason to
+/// skip a check rather than to reject a refold.
+using FinalSourcePreprocessCallback =
+    std::function<std::optional<std::string>(llvm::StringRef finalSource)>;
+
+/// Build a callback that preprocesses an assembled final source through the
+/// producer-recorded context, using one stable temporary path beside \p
+/// outputPath so `__FILE__` and quoted-include lookup stay comparable.
+FinalSourcePreprocessCallback
+buildFinalSourcePreprocessCallback(llvm::StringRef outputPath,
+                                   const RefoldModel::PreprocessContext &ctx);
+
 using FinalLineControlValidationCallback =
     std::function<bool(llvm::StringRef currentOutput,
                        llvm::StringRef candidateOutput, std::string &reason)>;
