@@ -71,6 +71,8 @@
 #include "source/DiffAlgorithms.h"
 #include "util/StringUtils.h"
 
+#include <cstdlib>
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/CommandLine.h"
@@ -370,11 +372,19 @@ inline bool inDebugMode() { return inLogLevel(LogLevel::Debug); }
 
 inline bool inTraceMode() { return inLogLevel(LogLevel::Trace); }
 
+/// Report an unrecoverable condition and terminate with a nonzero status.
+///
+/// This exits rather than aborting.  A fatal here is a refusal -- an unreadable
+/// input, a missing producer artifact, a proof the tool declines to make -- not
+/// a violated internal invariant, and aborting turned those refusals into core
+/// dumps with an LLVM stack trace that read as compiler crashes.  The
+/// diagnostic is already emitted above, so the exit status is the whole
+/// remaining signal.
 template <typename... Args>
 [[noreturn]]
 static inline void fatal(StringRef tag, StringRef msg, Args &&...args) {
   logMsg(LogLevel::Fatal, tag, msg, std::forward<Args>(args)...);
-  std::abort();
+  std::exit(1);
 }
 
 template <typename... Args>
