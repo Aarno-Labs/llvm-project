@@ -39,7 +39,8 @@ RefoldProofLattice::RefoldProofLattice(
         &mixedOwnerTilingSegmentBindings,
     std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses,
     Hooks hooks)
-    : hooks_(std::move(hooks)), model_(model), bSource_(bSource), bToks_(bToks),
+    : hooks_(std::move(hooks)), model_(model),
+      macroTopology_(macroTopology), bSource_(bSource), bToks_(bToks),
       witnessTrace_(strict, proofAuditMode, alignmentSemanticTheoremActive),
       equivalenceKeyBuilder_(RefoldWitnessEquivalenceKeyBuilder::Dependencies{
           sourceMapper, bSource, bToks}),
@@ -428,7 +429,16 @@ std::string RefoldProofLattice::BuildOwnerUnresolvedNoTUAnchorDetail(
   // to produce a macro/include/TU witness. Record those exhausted search spaces
   // explicitly so the terminal fallback explains the domain wall in proof
   // terms, not merely as `OwnerKind::Unknown`.
-  const bool macroOwnerExhausted = true;
+  // Ask whether any producer-recorded invocation covers this hunk rather than
+  // asserting the search failed.  This was a hardcoded `true`, so the detail
+  // reported an exhausted macro search that had never been run -- and a hunk
+  // whose tail lies inside an expansion looked identical to one no macro comes
+  // near.  When an invocation *is* named here, the hunk reached this refusal
+  // with a macro owner available, which is a different defect from having none.
+  const RefoldModel::MacroInvocation *coveringMacro =
+      macroTopology_.SmallestCoveringPatchableMacro(h.aStart, h.aEnd,
+                                                    owner.includeId);
+  const bool macroOwnerExhausted = coveringMacro == nullptr;
   const bool includeOwnerExhausted = owner.kind != OwnerKind::Include;
 
   // For pure insertions, check whether the insertion could still be explained

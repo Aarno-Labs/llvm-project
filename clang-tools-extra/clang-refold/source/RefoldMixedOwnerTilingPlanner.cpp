@@ -611,6 +611,17 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
             deps_.macroTopology.FindMacroInvocationById(edge.realizer.id);
         if (!macro || !macro->invFile || !macro->invB || !macro->invE)
           return std::nullopt;
+        // A macro realizer must realize the *whole* invocation, not a suffix of
+        // its expansion.  Otherwise the search offers one candidate per interior
+        // split point, each handing this realizer a different sub-range of the
+        // same expansion at equal cost, so the partition is reported ambiguous
+        // and the hunk falls back to the edited stream.  Those candidates are
+        // not tilings the macro lattice could realize: the invocation is spelled
+        // once in source and can only be replayed whole.  Requiring the exact
+        // recorded cover removes them by admissibility rather than preferring
+        // one of them, which would be ordering mistaken for proof.
+        if (edge.aStart != macro->cover.begin || edge.aEnd != macro->cover.end)
+          return std::nullopt;
         owner = Owner::MacroInvocation(macro->id);
         source = OwnerSourceRange::From(*macro->invFile, *macro->invB,
                                         *macro->invE, macro->ownerIncludeId);
@@ -1390,8 +1401,16 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         // source spellings.  Equality is a repeated physical mapping; a lower
         // offset is nonmonotone.  Either condition makes the direct structural
         // path unavailable rather than selecting one spelling heuristically.
-        if (!havePrevious || entry.b < previousBegin || entry.b < previousEnd)
+        if (!havePrevious || entry.b < previousBegin || entry.b < previousEnd) {
+          REFOLD_LOG_TRACE(
+              "tiling/runplan",
+              "abandoned: hunk A=[{0},{1}) pp={2} maps to source [{3},{4}) "
+              "which is not strictly after the previous token's [{5},{6}); "
+              "repeated physical spelling (macro expansion) or nonmonotone",
+              h.aStart, h.aEnd, pp, entry.b, entry.e, previousBegin,
+              previousEnd);
           return std::nullopt;
+        }
 
         bool crossesProtectedStructure = false;
         bool crossesConditionalControl = false;
@@ -2814,6 +2833,66 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         return std::nullopt;
 
       if (ambiguousBest) {
+        if (inTraceMode()) {
+          unsigned tiedCount = 0;
+          for (auto it = finalStates.begin(); it != finalStates.end(); ++it) {
+            const PartitionStateKey &key = it->first;
+            if (key.bPos != h.bEnd ||
+                (!key.mixedRealizers && !key.preservedPreprocessingStructure))
+              continue;
+            if (it->second.cost != bestCost)
+              continue;
+            ++tiedCount;
+            // Reconstruct this tied state's edge chain so the dump shows the
+            // actual tiling, not just the DP bookkeeping that reached it.
+            {
+              std::string chain;
+              uint64_t aPos2 = h.aEnd;
+              PartitionStateKey k2 = it->first;
+              unsigned guard = 0;
+              while (aPos2 != h.aStart && guard++ < 64) {
+                const uint64_t aOff2 = aPos2 - h.aStart;
+                const auto s2 = dp[static_cast<size_t>(aOff2)].find(k2);
+                if (s2 == dp[static_cast<size_t>(aOff2)].end() ||
+                    !s2->second.valid)
+                  break;
+                const PartitionEdge &e2 = edges[s2->second.edgeIndex];
+                chain = llvm::formatv("[{0},{1})->[{2},{3}) r={4}/{5} gaps={6} | ",
+                                      e2.aStart, e2.aEnd, e2.bStart, e2.bEnd,
+                                      static_cast<int>(e2.realizer.kind),
+                                      e2.realizer.id,
+                                      s2->second.stateGapsBeforeEdge.size())
+                            .str() + chain;
+                aPos2 = e2.aStart;
+                k2 = s2->second.prev;
+              }
+              REFOLD_LOG_TRACE("tiling/partition", "    chain: {0}", chain);
+            }
+            REFOLD_LOG_TRACE(
+                "tiling/partition",
+                "  tied final state: cost={0} selfAmbiguous={1} edgeIndex={2} "
+                "firstRealizer={3}/{4} lastRealizer={5}/{6} "
+                "lastTokenEdgeIndex={7} mixed={8} preserved={9}",
+                it->second.cost, it->second.ambiguous, it->second.edgeIndex,
+                static_cast<int>(key.firstRealizer.kind), key.firstRealizer.id,
+                static_cast<int>(key.lastRealizer.kind), key.lastRealizer.id,
+                key.lastTokenEdgeIndex, key.mixedRealizers,
+                key.preservedPreprocessingStructure);
+          }
+          REFOLD_LOG_TRACE("tiling/partition",
+                           "  tiedFinalStates={0} bestCost={1}", tiedCount,
+                           bestCost);
+        }
+        // The hunk *can* be tiled -- the DP reached a minimum-cost partition --
+        // but two or more partitions tie there, so no single tiling is proven.
+        // Report it: an ambiguous tie is a different situation from a hunk that
+        // admits no partition at all, and only the former has a fix available
+        // (a proof-backed criterion that makes one tiling uniquely admissible,
+        // not a cost tiebreak, which would be ordering mistaken for proof).
+        REFOLD_LOG_TRACE("tiling/partition",
+                         "ambiguous: hunk A=[{0},{1}) B=[{2},{3}) has multiple "
+                         "minimum-cost partitions; declining to choose",
+                         h.aStart, h.aEnd, h.bStart, h.bEnd);
         return std::nullopt;
       }
 
@@ -3171,6 +3250,12 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       return partition;
     };
 
+    // An edge emitted by a proven partition is a minimal proven segment, and a
+    // binding was recorded naming exactly it.  Splitting it again in a later
+    // round replaces that hunk without retracting its binding, which then names
+    // a hunk the final list no longer contains -- the ledger check reports it as
+    // "matches 0 normalized hunks".  Treat an emitted edge as final instead.
+    std::set<std::tuple<uint64_t, uint64_t, uint64_t, uint64_t>> emittedEdges;
     bool changed = true;
     while (changed) {
       changed = false;
@@ -3178,6 +3263,11 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       splitHunks.reserve(hunks.size());
 
       for (const auto &h : hunks) {
+        if (emittedEdges.count(
+                std::make_tuple(h.aStart, h.aEnd, h.bStart, h.bEnd))) {
+          splitHunks.push_back(h);
+          continue;
+        }
         auto partition = tryBuildStructuralPartition(h);
         if (!partition) {
           splitHunks.push_back(h);
@@ -3223,6 +3313,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
               MixedOwnerTilingSegmentBinding{
                   edge.aStart, edge.aEnd, edge.bStart, edge.bEnd,
                   mixedWitnessIndex, mixedWitnessId, currentSegmentIndex});
+          emittedEdges.insert(
+              std::make_tuple(edge.aStart, edge.aEnd, edge.bStart, edge.bEnd));
           splitHunks.push_back(
               diffutils::Hunk{edge.aStart, edge.aEnd, edge.bStart, edge.bEnd});
         }

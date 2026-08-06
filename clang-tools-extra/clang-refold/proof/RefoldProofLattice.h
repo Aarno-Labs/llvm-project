@@ -293,6 +293,9 @@ public:
 private:
   Hooks hooks_;
   const RefoldModel &model_;
+  /// Retained so an owner-unresolved diagnostic can ask whether a producer
+  /// invocation covers the hunk instead of asserting the search was exhausted.
+  const RefoldMacroTopology &macroTopology_;
   llvm::StringRef bSource_;
   llvm::ArrayRef<PPTok> bToks_;
   RefoldWitnessTrace witnessTrace_;
