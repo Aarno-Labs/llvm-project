@@ -90,10 +90,15 @@ public:
     const AlignmentSelectionOverride *alignmentOverride = nullptr;
     /// Production semantic resolver invoked after exact core certification and
     /// before token hunks are published. Empty for isolated simulations.
+    ///
+    /// The `uint64_t` parameter is the same certification proof budget the
+    /// core theorem ran under. Per-window pair facts are recomputed on demand
+    /// during resolution, so the resolver must charge that work against the
+    /// identical budget rather than an independently chosen one.
     std::function<void(
         llvm::ArrayRef<llvm::StringRef>, llvm::ArrayRef<llvm::StringRef>,
         llvm::ArrayRef<diffutils::LcsAGapProvenance>,
-        llvm::ArrayRef<diffutils::LcsBGapProvenance>,
+        llvm::ArrayRef<diffutils::LcsBGapProvenance>, uint64_t,
         diffutils::CertifiedLcsResult &)>
         semanticAlignmentResolver;
   };

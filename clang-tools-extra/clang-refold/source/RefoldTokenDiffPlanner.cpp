@@ -194,7 +194,8 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
       std::vector<diffutils::LcsBGapProvenance> bGapProvenance =
           ComputeLcsBGapProvenanceForPP();
       deps_.semanticAlignmentResolver(aSeq, bSeq, gapProvenance,
-                                      bGapProvenance, alignment);
+                                      bGapProvenance, certificationByteBudget,
+                                      alignment);
     }
     if (inTraceMode())
       TraceAlignmentCertificationRun(alignment, diagnosticEvidence,

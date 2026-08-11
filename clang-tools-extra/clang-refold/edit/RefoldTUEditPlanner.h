@@ -439,6 +439,29 @@ public:
       const diffutils::Hunk &hunk, const TUByteSpanPlan &span,
       const StructuralHunkSegmentBinding *structuralBinding = nullptr) const;
 
+  /// Return true when a pure insertion would supply a macro replacement-list
+  /// literal from outside its invocation.
+  ///
+  /// The token LCS may slide an inserted token left across identical fixed
+  /// replacement-list literals. With `#define M(x) ((x) >= 0)`, rewriting the
+  /// actual to `(y).f` admits an alignment in which the TU token preceding the
+  /// invocation anchors to the macro body's leading `(` and the invocation's
+  /// own leading `(` becomes a pure insertion in the TU. Both parentheses are
+  /// spelled identically, so nothing textual separates them; only definition
+  /// tape replay against the producer-recorded expansion envelope can decide
+  /// which side owns the token, and `RefoldMacroDefinitionTapeSolver` exists to
+  /// make exactly that decision.
+  ///
+  /// Reaching a direct-TU carrier means that replay did not absorb the token.
+  /// Emitting it as TU text would leave the invocation realizing an incomplete
+  /// instance of its replacement list, with a fixed body literal supplied by a
+  /// neighboring carrier that never proved the composition. The realized source
+  /// then reproduces a different expansion than the edited stream requires, so
+  /// this configuration fails closed rather than composing two locally valid
+  /// carriers into an unproved whole.
+  bool InsertionSuppliesMacroBoundaryLiteral(
+      const diffutils::Hunk &hunk) const;
+
   /// Validate a provisional direct-TU source envelope.
   ///
   /// Complete producer-bound `#define`/`#undef` intervals may be recognized

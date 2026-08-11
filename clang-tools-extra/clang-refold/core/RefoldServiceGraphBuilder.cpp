@@ -147,7 +147,7 @@ void RefoldEngine::InitializeTokenDiffPlanner() {
               ? std::function<void(
                     ArrayRef<StringRef>, ArrayRef<StringRef>,
                     ArrayRef<diffutils::LcsAGapProvenance>,
-                    ArrayRef<diffutils::LcsBGapProvenance>,
+                    ArrayRef<diffutils::LcsBGapProvenance>, uint64_t,
                     diffutils::CertifiedLcsResult &)>(
                     [this](ArrayRef<StringRef> aLexemes,
                            ArrayRef<StringRef> bLexemes,
@@ -155,15 +155,17 @@ void RefoldEngine::InitializeTokenDiffPlanner() {
                                aGapProvenance,
                            ArrayRef<diffutils::LcsBGapProvenance>
                                bGapProvenance,
+                           uint64_t certificationByteBudget,
                            diffutils::CertifiedLcsResult &alignment) {
                       ResolveSemanticAlignment(aLexemes, bLexemes,
                                                aGapProvenance, bGapProvenance,
+                                               certificationByteBudget,
                                                alignment);
                     })
               : std::function<void(
                     ArrayRef<StringRef>, ArrayRef<StringRef>,
                     ArrayRef<diffutils::LcsAGapProvenance>,
-                    ArrayRef<diffutils::LcsBGapProvenance>,
+                    ArrayRef<diffutils::LcsBGapProvenance>, uint64_t,
                     diffutils::CertifiedLcsResult &)>()});
 }
 

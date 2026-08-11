@@ -670,34 +670,43 @@ void RefoldEngine::ResolveSemanticAlignment(
     ArrayRef<StringRef> aLexemes, ArrayRef<StringRef> bLexemes,
     ArrayRef<diffutils::LcsAGapProvenance> aGapProvenance,
     ArrayRef<diffutils::LcsBGapProvenance> bGapProvenance,
+    uint64_t certificationByteBudget,
     diffutils::CertifiedLcsResult &alignment) {
   alignmentSemanticResolutionWitnesses_.clear();
   if (!alignmentSemanticResolverEnabled_ || alignmentSelectionOverride_)
     return;
 
-  // The current semantic theorem enumerates complete global optimal maps and
-  // compares their full planner realizations. A certified local window without
-  // retained pair facts is sufficient for core anchors, but not for that
-  // cross-window theorem. Fail closed to the union of independently certified
-  // core anchors rather than revoking anchors from neighboring windows or
-  // consulting incomplete alignment explanations.
-  if (!alignment.HasCompleteSemanticOracleForWindow(/*windowIndex=*/0)) {
-    alignment.RetainOnlyCoreForcedAnchors();
-    REFOLD_LOG_TRACE(
-        "lcs/semantic-resolver",
-        "semantic restoration unavailable for the complete certification "
-        "partition; retaining independently certified core anchors");
-    return;
-  }
-
+  // Semantic restoration needs the all-optimal pair facts for the window it is
+  // resolving. The partitioned certifier releases those facts on purpose, so
+  // they are recomputed one window at a time through the callbacks below: the
+  // resolver retains a window, resolves inside it, and releases it again. A
+  // window whose facts cannot be recomputed within the proof budget keeps
+  // exactly its independently certified core anchors, and its neighbors remain
+  // resolvable on their own facts.
   RefoldAlignmentSemanticResolver resolver(
       RefoldAlignmentSemanticResolver::Dependencies{
           aLexemes, bLexemes, alignment, aGapProvenance, bGapProvenance,
           [this](const AlignmentSelectionOverride &selection) {
             return SimulateSemanticAlignmentCandidate(selection);
+          },
+          [&](size_t windowIndex) {
+            return diffutils::retainCertifiedWindowOracle(
+                aLexemes, bLexemes, aGapProvenance, certificationByteBudget,
+                windowIndex, alignment);
+          },
+          [&](size_t windowIndex) {
+            if (windowIndex < alignment.windowOracles.size()) {
+              alignment.windowOracles[windowIndex] =
+                  diffutils::OptimalTokenAlignmentOracle{};
+            }
           }});
   RefoldAlignmentSemanticResolver::ResolutionResult resolution =
       resolver.Resolve();
+
+  // Quadratic proof payload has no consumer past this point; the committed
+  // anchors and their witnesses are the durable output.
+  alignment.windowOracles.clear();
+
   if (!resolution.committedEquivalentClass) {
     // Enumeration failure, proof-budget exhaustion, or multiple inequivalent
     // realizations grants no rank-selected authority. Preserve the exact core

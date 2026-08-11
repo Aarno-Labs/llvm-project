@@ -533,6 +533,16 @@ struct OptimalLcsMapEnumeration {
 /// relation needed by pair, window-objective, and boundary-frontier queries.
 /// Callers cannot mutate those facts or manufacture a completed
 /// certification.
+///
+/// Every coordinate in this class is *oracle-local*: index zero denotes the
+/// first token of the certified rectangle this oracle was built from, not the
+/// first token of the complete stream. The historical complete-stream oracle
+/// satisfies both readings because its rectangle begins at `(0,0)`; an oracle
+/// retained for an interior certification window does not, so its callers must
+/// translate by that window's `aBegin`/`bBegin` before issuing a query and
+/// translate returned B indices back afterwards. `CertifiedLcsResult` exposes
+/// `certificationWindows[i]` alongside `windowOracles[i]` precisely so that
+/// translation reads its origin from a recorded fact.
 class OptimalTokenAlignmentOracle {
 public:
   struct Storage;
@@ -705,6 +715,20 @@ struct CertifiedLcsResult {
   /// grow these ledgers without changing their ordered semantics.
   llvm::SmallVector<LcsCertifiedBoundary, 1> certifiedBoundaries;
   llvm::SmallVector<LcsCertificationWindow, 1> certificationWindows;
+  /// Optional all-optimal oracles retained for individual windows.
+  ///
+  /// The vector is either empty or exactly parallel to `certificationWindows`.
+  /// An entry is populated only by an explicit `retainCertifiedWindowOracle()`
+  /// request whose independent recertification reproduced the forced anchors
+  /// already published for that window, so a present oracle is a checked fact
+  /// rather than a second opinion. Entries are in window-local coordinates; see
+  /// `OptimalTokenAlignmentOracle` for the translation contract.
+  ///
+  /// Retention is deliberately per window and on demand. The quadratic cost of
+  /// these facts is what partitioning exists to avoid, so retaining every
+  /// window would reintroduce exactly the complete-grid payload the partition
+  /// scheduler refused to allocate.
+  llvm::SmallVector<OptimalTokenAlignmentOracle, 1> windowOracles;
 
   /// Return true when an A/B match edge lies wholly inside a certified window.
   bool AnchorBelongsToCertifiedWindow(uint64_t aToken,
@@ -729,12 +753,25 @@ struct CertifiedLcsResult {
   ///
   /// A `Certified` status proves core-forced anchors, but it does not imply
   /// that the quadratic pair facts needed by semantic equivalence remain
-  /// available. The current conservative implementation retains those facts
-  /// only for the single complete-stream compatibility window. Partitioned
-  /// results therefore return false even when every local window certified;
-  /// a later compositional theorem may extend this query without weakening the
-  /// fail-closed contract.
+  /// available. Two independent surfaces can supply them: the historical
+  /// complete-stream compatibility oracle, which is available only when the
+  /// whole stream certified as one window, and a per-window oracle installed by
+  /// `retainCertifiedWindowOracle()`. Every other window answers false, so a
+  /// caller can never read pair facts from a window whose facts were released.
+  ///
+  /// Availability is deliberately per window rather than aggregate. Ambiguity
+  /// inside a certified window is resolvable on that window's own facts; a
+  /// neighboring uncertified window contributes no anchors to any candidate and
+  /// therefore cannot make one candidate look better than another.
   bool HasCompleteSemanticOracleForWindow(size_t windowIndex) const;
+
+  /// Return the oracle usable for semantic restoration inside one window.
+  ///
+  /// Returns null unless `HasCompleteSemanticOracleForWindow(windowIndex)`
+  /// holds. The returned oracle is in window-local coordinates; callers must
+  /// translate by `certificationWindows[windowIndex]`'s origin.
+  const OptimalTokenAlignmentOracle *
+  GetSemanticOracleForWindow(size_t windowIndex) const;
 
   /// Discard every semantic-restored selection while preserving all
   /// independently certified core anchors.
@@ -813,6 +850,29 @@ bool certifyLcsWindow(
     ArrayRef<LcsAGapProvenance> gapProvenance,
     unsigned long long maxBytes, LcsWindowCertificationResult &result,
     LcsCertificationDiagnosticEvidence *diagnosticEvidence = nullptr);
+
+/// Retain the all-optimal oracle for one already-certified window on demand.
+///
+/// The window is certified a second time, in isolation, with its quadratic
+/// pair facts retained instead of released. The recertification is admitted
+/// only when it reproduces the forced anchors already published for that
+/// window byte-for-byte; a disagreement leaves the result untouched and returns
+/// false, so this routine can add proof surface but never revise a published
+/// one. It also never changes `certificationWindows`, seams, maps, anchor
+/// proofs, or the global objective.
+///
+/// Retention is charged the complete-oracle payload, which is strictly larger
+/// than the payload the original pass checked, because the oracle keeps its own
+/// owner-gap copy alive. A window that certified without retention may
+/// therefore be unaffordable with it; that case returns false and is a
+/// successful fail-closed outcome, not an error.
+///
+/// Returns true when `result.windowOracles[windowIndex]` is populated, either
+/// by this call or because the window already had a usable oracle.
+bool retainCertifiedWindowOracle(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<LcsAGapProvenance> gapProvenance, unsigned long long maxBytes,
+    size_t windowIndex, CertifiedLcsResult &result);
 
 /// Compute the exact checked heap-payload requirement for one certification
 /// rectangle without running dynamic programming or allocating its tables.

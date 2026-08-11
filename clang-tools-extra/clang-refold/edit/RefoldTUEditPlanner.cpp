@@ -16,6 +16,7 @@
 #include "edit/RefoldTUAnchorProof.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlProof.h"
+#include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroTopology.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
 #include "util/RefoldPathIdentity.h"
@@ -1039,6 +1040,58 @@ RefoldTUEditPlanner::PlanTUByteSpan(uint64_t a0, uint64_t a1,
   return TUByteSpanPlan(a0, a1, spanBegin, spanEnd);
 }
 
+bool RefoldTUEditPlanner::InsertionSuppliesMacroBoundaryLiteral(
+    const diffutils::Hunk &hunk) const {
+  // The first geometry below is `RefoldMacroDefinitionTapeSolver'`s
+  // left-boundary slide predicate: that solver owns the seam, and reaching a
+  // direct-TU carrier means it already declined. The second geometry is not
+  // one that solver claims, so no service has tried to absorb the token there;
+  // this refuses it outright, which is conservative rather than proved
+  // complete. The spelling test below keeps both narrow.
+  if (!hunk.isInsertOnly() || hunk.bStart >= hunk.bEnd)
+    return false;
+
+  // Two gaps admit the slide against one invocation: the gap before the TU
+  // token that precedes the expansion, and the gap before the expansion's own
+  // first token. Both put the insertion inside the run of identical literals
+  // that spans the seam, so probe the invocation from either side.
+  for (const uint64_t probe : {hunk.aStart, hunk.aStart + 1}) {
+    const RefoldModel::MacroInvocation *invocation =
+        deps_.macroTopology.SmallestCoveringPatchableMacro(probe, probe + 1);
+    if (!invocation || !invocation->invPPByteBegin || !invocation->invPPByteEnd)
+      continue;
+
+    const std::optional<std::pair<uint64_t, uint64_t>> cover =
+        RefoldMacroWholeCoverProof::GetWholeCoverATokRange(*invocation);
+    if (!cover || cover->first == 0 ||
+        (hunk.aStart != cover->first && hunk.aStart + 1 != cover->first) ||
+        cover->first >= deps_.aTokens.size())
+      continue;
+
+    // The seam is ambiguous only when the two tokens flanking it are spelled
+    // identically: the TU token preceding the invocation and the leading fixed
+    // token of its expansion. That equality is what lets the token LCS anchor
+    // the TU token to the macro-body literal and orphan the invocation's own
+    // literal into a pure insertion. When the spellings differ, no slide is
+    // possible and the inserted tokens are unambiguously ordinary TU text --
+    // for example a `[0]` subscript appearing immediately before a callsite,
+    // which must keep its direct-TU carrier.
+    if (deps_.aTokens[static_cast<size_t>(cover->first) - 1].spelling !=
+        deps_.aTokens[static_cast<size_t>(cover->first)].spelling)
+      continue;
+
+    REFOLD_LOG_DEBUG(
+        "tu/insert",
+        "rejecting direct-TU insertion at A gap {0}: B=[{1},{2}) would supply "
+        "a replacement-list literal of macro {3} ({4}) whose expansion cover "
+        "is A=[{5},{6})",
+        hunk.aStart, hunk.bStart, hunk.bEnd, invocation->id, invocation->name,
+        cover->first, cover->second);
+    return true;
+  }
+  return false;
+}
+
 bool RefoldTUEditPlanner::ValidateTUOwnerRealizationCarrier(
     const diffutils::Hunk &hunk, const TUByteSpanPlan &span,
     const StructuralHunkSegmentBinding *structuralBinding) const {
@@ -1078,6 +1131,12 @@ bool RefoldTUEditPlanner::ValidateTUOwnerRealizationCarrier(
     return false;
 
   if (hunk.isInsertOnly()) {
+    // An inserted token that is really a macro replacement-list literal has no
+    // direct-TU realization. Reject before the anchor theorems below, which
+    // prove where the insertion lands but not that the TU owns what it emits.
+    if (InsertionSuppliesMacroBoundaryLiteral(hunk))
+      return false;
+
     // A pure insertion retains the exact producer/provenance anchor even when
     // a separate theorem consumes adjacent trivia or moves the insertion past
     // a preserved source #line prefix.  The base anchor therefore remains the

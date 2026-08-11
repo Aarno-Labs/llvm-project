@@ -71,11 +71,13 @@
 #include "source/DiffAlgorithms.h"
 #include "util/StringUtils.h"
 
+#include <chrono>
 #include <cstdlib>
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/FormatAdapters.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/WithColor.h"
@@ -171,6 +173,23 @@ static inline StringRef toString(LogLevel level) {
 
 extern cl::opt<LogLevel> LogLevelOpt;
 
+/// Seconds elapsed since this run emitted its first log line.
+///
+/// Logs are read to find where wall time goes, so the useful quantity is
+/// elapsed time rather than the wall clock: the gap between two timestamps is
+/// the cost of the work between them. A steady clock is used so the reading
+/// cannot jump if the system clock is adjusted mid-run.
+///
+/// This must not be a local static inside the logging template. Each template
+/// instantiation would then own a separate origin, so every call site would
+/// restart from zero and the timings would be meaningless. One inline function
+/// gives the whole program a single origin.
+inline double elapsedLogSeconds() {
+  using clock = std::chrono::steady_clock;
+  static const clock::time_point runStart = clock::now();
+  return std::chrono::duration<double>(clock::now() - runStart).count();
+}
+
 inline raw_ostream::Colors levelColor(LogLevel level) {
   using color = raw_ostream::Colors;
   switch (level) {
@@ -198,6 +217,7 @@ void logMsg(LogLevel level, StringRef tag, StringRef msg, Args &&...args) {
   }
 
   auto &os = outs();
+  const double elapsedSeconds = elapsedLogSeconds();
   const bool useColor = os.has_colors(); // false if redirected
 
   auto printMsg = [](raw_ostream &os, StringRef msg, auto &&...args) {
@@ -214,13 +234,15 @@ void logMsg(LogLevel level, StringRef tag, StringRef msg, Args &&...args) {
 
   // Colored prefix based on level (fatal is bold “bright red”)
   if (level == LogLevel::Trace || !useColor) {
-    os << formatv("[{0,-5}][{1}]  ", level,
+    os << format("[%9.3f]", elapsedSeconds)
+       << formatv("[{0,-5}][{1}]  ", level,
                   fmt_align(tag, AlignStyle::Left, 21, '.'));
     printMsg(os, msg, std::forward<Args>(args)...);
   } else {
     const bool bold = (level == LogLevel::Fatal);
     WithColor _(os, levelColor(level), bold);
-    os << formatv("[{0,-5}][{1}]  ", level,
+    os << format("[%9.3f]", elapsedSeconds)
+       << formatv("[{0,-5}][{1}]  ", level,
                   fmt_align(tag, AlignStyle::Left, 21, '.'));
     printMsg(os, msg, std::forward<Args>(args)...);
   }

@@ -842,11 +842,24 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
       for (size_t aToken = 0; aToken < witness.representativeMap.size();
            ++aToken) {
         const int64_t bToken = witness.representativeMap[aToken];
-        if (bToken < 0 ||
-            (aToken < abTokAnchorProofs_.size() &&
-             abTokAnchorProofs_[aToken].kind ==
-                 diffutils::LcsAnchorProofKind::CoreOptimalPathForced))
+        if (bToken < 0)
           continue;
+        if (aToken < abTokAnchorProofs_.size()) {
+          const diffutils::LcsAnchorProof &proof = abTokAnchorProofs_[aToken];
+          if (proof.kind ==
+              diffutils::LcsAnchorProofKind::CoreOptimalPathForced)
+            continue;
+          // Resolution is per certification window, so every witness records
+          // the same complete-stream map but owes evidence only for the
+          // anchors it proved. An anchor authorized by a different witness is
+          // that witness's obligation and is checked against it below. With a
+          // single witness this skips nothing: every non-forced anchor then
+          // names that one witness.
+          if (proof.kind == diffutils::LcsAnchorProofKind::
+                                EquivalentNormalizedHunkAndOwner &&
+              proof.semanticWitnessId != witness.witnessId)
+            continue;
+        }
         if (!anchorEvidence.count(
                 {aToken, static_cast<uint64_t>(bToken)})) {
           REFOLD_LOG_FATAL(

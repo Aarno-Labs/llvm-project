@@ -592,13 +592,39 @@ bool CertifiedLcsResult::HasCompleteGlobalOracle() const {
 
 bool CertifiedLcsResult::HasCompleteSemanticOracleForWindow(
     size_t windowIndex) const {
-  // The retained all-optimal oracle currently represents only the historical
-  // complete-stream problem. A certified local window without retained pair
-  // facts authorizes its core-forced anchors, but it cannot support semantic
-  // map enumeration. Keep that distinction explicit so no caller can read
-  // pair facts from an uncertified or non-retained window by accident.
-  return windowIndex == 0 && certificationWindows.size() == 1 &&
-         HasCompleteGlobalOracle();
+  return GetSemanticOracleForWindow(windowIndex) != nullptr;
+}
+
+const OptimalTokenAlignmentOracle *
+CertifiedLcsResult::GetSemanticOracleForWindow(size_t windowIndex) const {
+  // The historical complete-stream oracle answers for the one-window case and
+  // keeps that path byte-identical to its previous behavior.
+  if (windowIndex == 0 && certificationWindows.size() == 1 &&
+      HasCompleteGlobalOracle())
+    return &oracle;
+
+  // Otherwise only an explicitly retained per-window oracle authorizes map
+  // enumeration. A certified window whose quadratic facts were released
+  // authorizes its core-forced anchors and nothing more, so answering from
+  // `status` alone would hand a caller pair facts that no longer exist.
+  if (windowIndex >= certificationWindows.size() ||
+      windowIndex >= windowOracles.size() || !globalObjectiveIsExact)
+    return nullptr;
+
+  const LcsCertificationWindow &window = certificationWindows[windowIndex];
+  const OptimalTokenAlignmentOracle &windowOracle = windowOracles[windowIndex];
+  if (!window.IsCertified() || !windowOracle.HasCompleteCertification() ||
+      forcedMap.size() != selectedMap.size() ||
+      forcedMap.size() != selectedAnchorProofs.size())
+    return nullptr;
+
+  // The oracle is in window-local coordinates, so its extent must equal this
+  // window's exact width on both sides. An oracle built for a different
+  // rectangle would silently reinterpret every translated query.
+  if (windowOracle.GetATokenCount() != window.aEnd - window.aBegin ||
+      windowOracle.GetBTokenCount() != window.bEnd - window.bBegin)
+    return nullptr;
+  return &windowOracle;
 }
 
 void CertifiedLcsResult::RetainOnlyCoreForcedAnchors() {
@@ -1717,10 +1743,17 @@ static void appendCertifiedAmbiguityDiagnostics(
 ///
 /// `aWindow` and `bWindow` begin at local DP state `(0,0)`. Nonnegative map
 /// values are translated by `absoluteBBegin` before publication. When
-/// `retainedOracleStorage` is non-null, this must be the complete-stream window;
-/// its quadratic state is moved into the compatibility oracle instead of being
-/// released at return. All ordinary subwindow calls pass null and retain only
-/// linear-size maps and proof records.
+/// `retainedOracleStorage` is non-null, this call's quadratic state is moved
+/// into an oracle instead of being released at return. All ordinary subwindow
+/// calls pass null and retain only linear-size maps and proof records.
+///
+/// The retained storage is always expressed in this rectangle's local
+/// coordinates: pair facts, objective tables, and the owner-gap vector are all
+/// indexed from `(0,0)`, never from `absoluteABegin`/`absoluteBBegin`. The
+/// complete-stream adopter may read those coordinates as absolute only because
+/// its rectangle starts at the stream origin; an interior window must be
+/// published through `CertifiedLcsResult::windowOracles`, whose contract
+/// requires callers to translate.
 static bool certifyLcsWindowCore(
     ArrayRef<StringRef> aWindow, ArrayRef<StringRef> bWindow,
     ArrayRef<uint32_t> ownerDepthGap, uint64_t absoluteABegin,
@@ -1735,9 +1768,7 @@ static bool certifyLcsWindowCore(
   if (!hasBoundaryVectorSize(n, ownerDepthGap.size()) ||
       absoluteABegin > std::numeric_limits<uint64_t>::max() - n ||
       absoluteBBegin > std::numeric_limits<uint64_t>::max() - m ||
-      absoluteBBegin + m > MAX ||
-      (retainedOracleStorage &&
-       (absoluteABegin != 0 || absoluteBBegin != 0)))
+      absoluteBBegin + m > MAX)
     return false;
 
   const uint64_t absoluteAEnd = absoluteABegin + n;
@@ -2616,6 +2647,113 @@ bool certifyLcsWindow(
       /*globalATokenCount=*/a.size(), /*globalBTokenCount=*/b.size(), maxBytes,
       /*ownerDepthGapCopyCount=*/1, result, diagnosticEvidence,
       /*retainedOracleStorage=*/nullptr);
+}
+
+bool retainCertifiedWindowOracle(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<LcsAGapProvenance> gapProvenance, unsigned long long maxBytes,
+    size_t windowIndex, CertifiedLcsResult &result) {
+  // An already-usable oracle, including the historical complete-stream one, is
+  // answered without recomputing anything.
+  if (result.GetSemanticOracleForWindow(windowIndex))
+    return true;
+
+  if (windowIndex >= result.certificationWindows.size() ||
+      !hasBoundaryVectorSize(a.size(), gapProvenance.size()) ||
+      b.size() > MAX || !result.globalObjectiveIsExact ||
+      result.forcedMap.size() != a.size() ||
+      result.selectedMap.size() != a.size() ||
+      result.selectedAnchorProofs.size() != a.size() ||
+      !result.CertificationPartitionIsWellFormed(a.size(), b.size()))
+    return false;
+
+  const LcsCertificationWindow window =
+      result.certificationWindows[windowIndex];
+  if (!window.IsCertified())
+    return false;
+
+  const size_t aWidth = static_cast<size_t>(window.aEnd - window.aBegin);
+  const size_t bWidth = static_cast<size_t>(window.bEnd - window.bBegin);
+
+  // Retention keeps a second owner-gap payload alive for the lifetime of the
+  // oracle, so it is charged the complete-oracle requirement rather than the
+  // isolated-window one the original pass checked. Test the affordability
+  // through the shared helper first: a window that certified without retention
+  // is not automatically affordable with it, and that is a fail-closed outcome
+  // rather than a certification failure to warn about.
+  uint64_t requiredBytes = 0;
+  if (!getLcsCertificationRequiredBytes(aWidth, bWidth,
+                                        /*retainCompleteOracle=*/true,
+                                        requiredBytes) ||
+      requiredBytes > maxBytes) {
+    REFOLD_LOG_TRACE(
+        "lcs/oracle",
+        "window oracle retention declined: window={0} A=[{1},{2}) B=[{3},{4}) "
+        "requiredBytes={5} maxBytes={6}",
+        windowIndex, window.aBegin, window.aEnd, window.bBegin, window.bEnd,
+        requiredBytes, maxBytes);
+    return false;
+  }
+
+  std::vector<uint32_t> ownerDepthGap = copyOwnerDepthGaps(
+      gapProvenance, static_cast<size_t>(window.aBegin),
+      static_cast<size_t>(window.aBegin) + aWidth);
+
+  LcsWindowCertificationResult localResult;
+  std::shared_ptr<OptimalTokenAlignmentOracle::Storage> oracleStorage;
+  if (!certifyLcsWindowCore(
+          a.slice(static_cast<size_t>(window.aBegin), aWidth),
+          b.slice(static_cast<size_t>(window.bBegin), bWidth), ownerDepthGap,
+          window.aBegin, window.bBegin, /*globalATokenCount=*/a.size(),
+          /*globalBTokenCount=*/b.size(), maxBytes,
+          /*ownerDepthGapCopyCount=*/2, localResult,
+          /*diagnosticEvidence=*/nullptr, &oracleStorage) ||
+      !oracleStorage || !localResult.window.IsCertified() ||
+      localResult.window.aBegin != window.aBegin ||
+      localResult.window.aEnd != window.aEnd ||
+      localResult.window.bBegin != window.bBegin ||
+      localResult.window.bEnd != window.bEnd ||
+      localResult.forcedMap.size() != aWidth)
+    return false;
+
+  // The recertification is admitted only as agreement with the published
+  // proof, never as a revision of it. Reproducing this window's exact forced
+  // anchors is what makes the retained pair facts facts about the alignment
+  // the planner is actually using; a disagreement means the two passes did not
+  // solve the same problem, and no anchor may be read from either.
+  for (size_t localA = 0; localA < aWidth; ++localA) {
+    if (localResult.forcedMap[localA] !=
+        result.forcedMap[static_cast<size_t>(window.aBegin) + localA]) {
+      REFOLD_LOG_WARN(
+          "lcs/oracle",
+          "window oracle retention rejected: recertified forced anchor "
+          "disagrees at A[{0}] (retained={1}, published={2})",
+          window.aBegin + localA, localResult.forcedMap[localA],
+          result.forcedMap[static_cast<size_t>(window.aBegin) + localA]);
+      return false;
+    }
+  }
+
+  if (result.windowOracles.empty())
+    result.windowOracles.resize(result.certificationWindows.size());
+  else if (result.windowOracles.size() != result.certificationWindows.size())
+    return false;
+  result.windowOracles[windowIndex] =
+      OptimalTokenAlignmentOracle(std::move(oracleStorage));
+
+  // Publish only what the query contract accepts, so a retained oracle that
+  // fails any dimension check is dropped here rather than surfacing later.
+  if (!result.GetSemanticOracleForWindow(windowIndex)) {
+    result.windowOracles[windowIndex] = OptimalTokenAlignmentOracle{};
+    return false;
+  }
+  REFOLD_LOG_TRACE(
+      "lcs/oracle",
+      "retained window oracle: window={0} A=[{1},{2}) B=[{3},{4}) "
+      "requiredBytes={5}",
+      windowIndex, window.aBegin, window.aEnd, window.bBegin, window.bEnd,
+      requiredBytes);
+  return true;
 }
 
 bool projectLcsBoundaryToOptimalBFrontiers(

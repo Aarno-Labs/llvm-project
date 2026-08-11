@@ -156,24 +156,6 @@ bool addFinalMacroCandidate(
       candidate.patch.materialized.bTokStart,
       candidate.patch.materialized.bTokEnd);
 
-  // A macro candidate realizes a hunk by rewriting the callsite, so the B
-  // tokens it emits are exactly the ones its own patch covers.  If the hunk
-  // demands B tokens outside that range, this candidate cannot produce them and
-  // admitting it silently drops edited material.
-  //
-  // The shape that exposed this is an edit landing immediately *before* a
-  // callsite: `*d` rewritten to `d[0]` in `if (*d != TOLE(*s))` arrives as a
-  // zero-width hunk anchored one token before the invocation, whose inserted
-  // `[0]` lies outside every candidate's B range.  Both the args-only and
-  // whole-cover origins accepted it and emitted only the callsite rewrite,
-  // leaving `if (d != TOLE(s[0]))` -- a pointer compared against an integer.
-  //
-  // The direct-callee phase already refuses the same shape on the A side
-  // ("hunk-not-inside-cover").  Checking realized B coverage here states the
-  // requirement directly and applies it to every candidate origin, so the hunk
-  // falls through to the TU-owned realizers that can emit the surrounding
-  // material.  Candidates with no recorded B range are left to the existing
-  // proof paths rather than being rejected on missing evidence.
   // A previous attempt at this translation unit produced an assembly that did
   // not replay the edited stream, and named this invocation as the owner of the
   // divergence.  Every theorem that keeps the callsite states which B tokens it
@@ -192,6 +174,24 @@ bool addFinalMacroCandidate(
     return false;
   }
 
+  // A macro candidate realizes a hunk by rewriting the callsite, so the B
+  // tokens it emits are exactly the ones its own patch covers.  If the hunk
+  // demands B tokens outside that range, this candidate cannot produce them and
+  // admitting it silently drops edited material.
+  //
+  // The shape that exposed this is an edit landing immediately *before* a
+  // callsite: `*d` rewritten to `d[0]` in `if (*d != TOLE(*s))` arrives as a
+  // zero-width hunk anchored one token before the invocation, whose inserted
+  // `[0]` lies outside every candidate's B range.  Both the args-only and
+  // whole-cover origins accepted it and emitted only the callsite rewrite,
+  // leaving `if (d != TOLE(s[0]))` -- a pointer compared against an integer.
+  //
+  // The direct-callee phase already refuses the same shape on the A side
+  // ("hunk-not-inside-cover").  Checking realized B coverage here states the
+  // requirement directly and applies it to every candidate origin, so the hunk
+  // falls through to the TU-owned realizers that can emit the surrounding
+  // material.  Candidates with no recorded B range are left to the existing
+  // proof paths rather than being rejected on missing evidence.
   if (candidate.patch.materialized.hasBTokenRange &&
       !(candidate.patch.materialized.bTokStart <= ctx.hunk.bStart &&
         ctx.hunk.bEnd <= candidate.patch.materialized.bTokEnd)) {

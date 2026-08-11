@@ -889,12 +889,18 @@ private:
   /// provenance.  No macro/include/TU owner dispatch may consume the sequence
   /// before this method completes.
   /// Resolve non-forced core-optimal anchors through isolated full structural
-  /// simulations and one exact semantic equivalence class.
+  /// simulations and one exact semantic equivalence class per certification
+  /// window.
+  ///
+  /// `certificationByteBudget` is the budget the core theorem ran under; the
+  /// per-window pair facts recomputed during resolution are charged against
+  /// that same budget.
   void ResolveSemanticAlignment(
       llvm::ArrayRef<llvm::StringRef> aLexemes,
       llvm::ArrayRef<llvm::StringRef> bLexemes,
       llvm::ArrayRef<diffutils::LcsAGapProvenance> aGapProvenance,
       llvm::ArrayRef<diffutils::LcsBGapProvenance> bGapProvenance,
+      uint64_t certificationByteBudget,
       diffutils::CertifiedLcsResult &alignment);
 
   /// Run one candidate map through a fresh, non-recursive structural engine.
@@ -943,10 +949,6 @@ private:
       StringRef tuPath, StringRef tuBytes, ArrayRef<diffutils::Hunk> hunks,
       RefoldStructuralHunkDispatcher &structuralHunkDispatcher);
 
-  /// \brief Run the structural refold pass.
-  ///
-  /// The caller reacts to typed requests recorded in RefoldTerminalProofSink by
-  /// selecting the explicit terminal fallback result.
   /// Prove that the assembled source re-expands every preserved `__LINE__`
   /// observer to the value the edited stream carries, and request terminal
   /// fallback when it does not.
@@ -957,15 +959,6 @@ private:
   /// B produced from a `__LINE__` expansion are enforced, so this closes the
   /// newline-drift ordering hole without becoming a general re-check.
   bool AuditPreservedLineObserversInFinalOutput(llvm::StringRef finalSource);
-
-  /// Report whether the accepted assembly replays the edited stream.
-  ///
-  /// Observation only for now: the verdict is logged and nothing acts on it, so
-  /// the check can be measured against the corpus before any refold depends on
-  /// it.  Alignment candidate simulations re-enter the engine and are skipped,
-  /// because judging an assembly that is about to be discarded says nothing
-  /// about the result that is kept.
-
 
   /// Identify the smallest region that owns a diverging edited-stream token,
   /// so an unsound region can be narrowed instead of condemning the whole
@@ -1026,6 +1019,10 @@ private:
   /// enclosing region means the translation unit is all that is left.
   std::optional<uint64_t> FindEnclosingOwner(uint64_t ownerId) const;
 
+  /// \brief Run the structural refold pass.
+  ///
+  /// The caller reacts to typed requests recorded in RefoldTerminalProofSink by
+  /// selecting the explicit terminal fallback result.
   std::string RunRefoldPass();
 };
 

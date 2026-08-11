@@ -147,6 +147,16 @@ public:
     /// map strictly as a proposal. These ranks never grant anchor authority.
     llvm::ArrayRef<diffutils::LcsBGapProvenance> bGapProvenance;
     SimulationCallback simulate;
+    /// Materialize one certification window's all-optimal pair facts, which
+    /// the partitioned certifier deliberately released. Returns true when
+    /// `coreAlignment.HasCompleteSemanticOracleForWindow(windowIndex)` holds
+    /// afterwards. Retention is requested one window at a time so peak
+    /// quadratic storage stays bounded by the largest single window rather
+    /// than the complete grid.
+    std::function<bool(size_t)> retainWindowOracle;
+    /// Release the facts retained for one window once it has been resolved.
+    /// Committed anchors survive; only the quadratic payload is dropped.
+    std::function<void(size_t)> releaseWindowOracle;
   };
 
   struct ResolutionResult {
@@ -162,16 +172,52 @@ public:
   /// Resolve non-forced core-optimal maps through exact source-preservation,
   /// realized-source equivalence, and counterfactual theorems.
   ///
-  /// The current theorem requires one retained complete-stream oracle. A
-  /// partitioned or partially certified result therefore returns the
-  /// independently certified core map without inspecting unavailable pair
-  /// facts; future compositional restoration may relax that gate per window.
+  /// Resolution is per certification window. Every window whose all-optimal
+  /// pair facts are available is resolved independently, in source order, and
+  /// each committed window contributes its anchors to the base map used by the
+  /// next. A window without retained facts, or one whose ambiguity the theorems
+  /// below cannot close, keeps exactly its core-forced anchors and does not
+  /// prevent an independent window from committing. The single-window
+  /// complete-stream case reduces to the historical whole-stream theorem.
   ///
   /// Enumeration budgets are proof budgets only: exceeding one returns the
-  /// forced-only map and cannot authorize a partial class or ranked winner.
+  /// forced-only map for that window and cannot authorize a partial class or
+  /// ranked winner.
   ResolutionResult Resolve() const;
 
 private:
+  /// Outcome of resolving the ambiguity inside one certification window.
+  struct WindowResolution {
+    bool committed = false;
+    /// Complete-stream map: `baseMap` with this window's choice substituted.
+    std::vector<int64_t> selectedMap;
+    std::vector<AlignmentSemanticAnchorEvidence> anchorEvidence;
+    std::string equivalenceKey;
+    uint64_t enumeratedMapCount = 0;
+    uint64_t acceptedMapCount = 0;
+    uint64_t rejectedMapCount = 0;
+    /// Candidate simulations this window ran, charged against the run's work
+    /// budget whether or not the window committed.
+    size_t simulationsSpent = 0;
+  };
+
+  /// Resolve the ambiguity inside one certification window.
+  ///
+  /// Candidate maps differ from `baseMap` only inside the window's A range, so
+  /// every simulation observes identical anchors everywhere else and the
+  /// comparison isolates this window's choice. `windowIndex` must satisfy
+  /// `HasCompleteSemanticOracleForWindow()`.
+  ///
+  /// `simulationBudget` is how many candidate simulations the run has left. A
+  /// window whose complete candidate set exceeds it is declined outright and
+  /// never partially simulated: uniqueness is a property of the whole
+  /// enumerated set, so committing on a prefix would be the ranked selection
+  /// this resolver exists to avoid.
+  WindowResolution
+  ResolveCertificationWindow(size_t windowIndex,
+                             llvm::ArrayRef<int64_t> baseMap,
+                             size_t simulationBudget) const;
+
   Dependencies deps_;
 };
 

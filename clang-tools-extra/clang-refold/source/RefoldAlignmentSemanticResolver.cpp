@@ -23,6 +23,7 @@
 #include "llvm/Support/FormatVariadic.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <optional>
@@ -42,6 +43,64 @@ constexpr size_t MaxUniqueMapsPerForcedWindow = 256;
 constexpr size_t MaxGlobalSemanticCandidateMaps = 256;
 constexpr size_t MaxProposalCounterfactuals = 256;
 
+/// Environment override for the per-run candidate-simulation work budget.
+constexpr const char *CandidateSimulationBudgetEnvironment =
+    "CLANG_REFOLD_CANDIDATE_SIMULATION_WORK_BUDGET";
+
+/// Work one run may spend re-planning candidate alignments, in token-squared
+/// units.
+///
+/// Each candidate is realized by a complete refold of the translation unit, so
+/// a limit expressed in candidates is not a cost bound: the same allowance is
+/// a few seconds on one stream and many minutes on another. Measured
+/// per-candidate cost grows faster than stream length -- roughly with its
+/// square, since certification dominates a pass -- so a candidate is charged
+/// the square of the A-token count. That makes the ceiling mean about the same
+/// machine work on any input, and it stays a deterministic function of the
+/// inputs; a wall-clock budget would model cost better but would let two
+/// machines commit different alignments for the same source.
+///
+/// The size is calibrated on measured behaviour: across the corpus the window
+/// that *commits* enumerates four candidates, while windows enumerating
+/// sixteen have never committed -- sixteen candidates emitting sixteen
+/// distinct concrete outputs can no longer collapse to one class. This admits
+/// the former with margin and declines the latter.
+///
+/// Calibration can be wrong for an input not yet seen: a window needing more
+/// candidates than this is declined where a larger budget would have resolved
+/// it. That costs completeness, never soundness. A declined window keeps the
+/// anchors the core theorem published, and a window that does run still
+/// enumerates its complete candidate set and is judged by the unchanged commit
+/// theorems -- the budget gates whether a window runs, never how it is judged.
+constexpr uint64_t DefaultCandidateSimulationWorkBudget = 2500000000ULL;
+
+/// Return how many candidate simulations this run may spend in total.
+///
+/// A run that cannot afford two candidates cannot resolve anything, since a
+/// window needs at least two competing maps to be ambiguous, so there is no
+/// floor propping small allowances up to a usable number.
+size_t getCandidateSimulationBudget(size_t aTokenCount) {
+  uint64_t workBudget = DefaultCandidateSimulationWorkBudget;
+  if (const char *injected =
+          std::getenv(CandidateSimulationBudgetEnvironment)) {
+    if (*injected != '\0' &&
+        StringRef(injected).getAsInteger(10, workBudget)) {
+      REFOLD_LOG_WARN(
+          "lcs/semantic-resolver",
+          "invalid {0} value '{1}'; using the default work budget {2}",
+          CandidateSimulationBudgetEnvironment, injected,
+          DefaultCandidateSimulationWorkBudget);
+      workBudget = DefaultCandidateSimulationWorkBudget;
+    }
+  }
+  if (aTokenCount == 0)
+    return 0;
+  const uint64_t tokens = static_cast<uint64_t>(aTokenCount);
+  if (tokens > std::numeric_limits<uint64_t>::max() / tokens)
+    return 0;
+  return static_cast<size_t>(workBudget / (tokens * tokens));
+}
+
 struct ForcedAnchor {
   uint64_t aToken = 0;
   uint64_t bToken = 0;
@@ -60,10 +119,19 @@ bool isForcedAnchor(const diffutils::CertifiedLcsResult &alignment,
          alignment.forcedMap[aToken] == bToken;
 }
 
+/// Collect the forced anchors whose A token lies inside `[aBegin, aEnd)`.
+///
+/// Forced anchors delimit the sub-rectangles the all-optimal enumeration is
+/// conditioned on. Restricting them to one certification window is exact
+/// because that window's endpoints are themselves proved DP seams, so every
+/// locally optimal path enters and leaves at the same two states.
 std::vector<ForcedAnchor>
-collectForcedAnchors(const diffutils::CertifiedLcsResult &alignment) {
+collectForcedAnchors(const diffutils::CertifiedLcsResult &alignment,
+                     uint64_t aBegin, uint64_t aEnd) {
   std::vector<ForcedAnchor> anchors;
-  for (size_t aToken = 0; aToken < alignment.forcedMap.size(); ++aToken) {
+  const size_t limit =
+      std::min<size_t>(static_cast<size_t>(aEnd), alignment.forcedMap.size());
+  for (size_t aToken = static_cast<size_t>(aBegin); aToken < limit; ++aToken) {
     const int64_t bToken = alignment.forcedMap[aToken];
     if (bToken >= 0)
       anchors.push_back(
@@ -354,6 +422,7 @@ bool noMoreSourceDestructive(
                                      rhs.expandedMacroRootIds);
 }
 
+
 [[maybe_unused]] StringRef basisName(AlignmentSemanticAnchorBasis basis) {
   switch (basis) {
   case AlignmentSemanticAnchorBasis::FinalSourceNecessary:
@@ -398,44 +467,186 @@ RefoldAlignmentSemanticResolver::Resolve() const {
     }
   }
 
-  const diffutils::OptimalTokenAlignmentOracle &oracle =
-      deps_.coreAlignment.oracle;
-  if (!deps_.coreAlignment.HasCompleteSemanticOracleForWindow(
-          /*windowIndex=*/0) ||
-      !deps_.simulate ||
-      deps_.coreAlignment.forcedMap.size() != deps_.aLexemes.size() ||
-      oracle.GetATokenCount() != deps_.aLexemes.size() ||
-      oracle.GetBTokenCount() != deps_.bLexemes.size())
+  if (!deps_.simulate ||
+      deps_.coreAlignment.forcedMap.size() != deps_.aLexemes.size())
     return result;
 
+  // Resolve window by window in source order. A committed window's anchors
+  // become part of the base map for every later window, so each simulation
+  // observes the alignment production would actually use up to that point.
+  std::vector<int64_t> baseMap = deps_.coreAlignment.forcedMap;
+  std::vector<WindowResolution> committedWindows;
+  size_t simulationBudget =
+      getCandidateSimulationBudget(deps_.aLexemes.size());
+  size_t windowsWithOracle = 0;
+  for (size_t windowIndex = 0;
+       windowIndex < deps_.coreAlignment.certificationWindows.size();
+       ++windowIndex) {
+    // Materialize this window's pair facts, resolve, then release them before
+    // moving on. Holding every window's facts at once would reintroduce the
+    // complete-grid payload that partitioning exists to avoid.
+    if (deps_.retainWindowOracle)
+      (void)deps_.retainWindowOracle(windowIndex);
+    if (!deps_.coreAlignment.HasCompleteSemanticOracleForWindow(windowIndex)) {
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "window {0} keeps core-forced anchors: no retained all-optimal "
+          "pair facts",
+          windowIndex);
+      continue;
+    }
+    ++windowsWithOracle;
+    WindowResolution resolution =
+        ResolveCertificationWindow(windowIndex, baseMap, simulationBudget);
+    if (deps_.releaseWindowOracle)
+      deps_.releaseWindowOracle(windowIndex);
+    // Charge whether or not the window committed: a declined window still
+    // re-planned the unit once per candidate.
+    simulationBudget -= std::min(simulationBudget, resolution.simulationsSpent);
+    if (!resolution.committed)
+      continue;
+    baseMap = resolution.selectedMap;
+    committedWindows.push_back(std::move(resolution));
+  }
+
+  result.completeEnumeration = windowsWithOracle != 0;
+  if (committedWindows.empty()) {
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "forced-only alignment retained: {0} window(s) had retained pair "
+        "facts, none resolved to one admissible realization",
+        windowsWithOracle);
+    return result;
+  }
+
+  // Each committed window carries its own durable witness. Every witness
+  // records the final complete-stream map so the production planner can check
+  // any anchor against any witness, while anchor evidence stays scoped to the
+  // window that proved it.
+  result.selectedMap = baseMap;
+  result.selectedAnchorProofs.assign(result.selectedMap.size(),
+                                     diffutils::LcsAnchorProof{});
+  for (size_t aToken = 0; aToken < result.selectedMap.size(); ++aToken) {
+    if (result.selectedMap[aToken] >= 0 &&
+        isForcedAnchor(deps_.coreAlignment, aToken,
+                       result.selectedMap[aToken])) {
+      result.selectedAnchorProofs[aToken] = diffutils::LcsAnchorProof{
+          diffutils::LcsAnchorProofKind::CoreOptimalPathForced, 0};
+    }
+  }
+
+  uint64_t nextWitnessId = 1;
+  for (WindowResolution &resolution : committedWindows) {
+    AlignmentSemanticResolutionWitness witness;
+    witness.witnessId = nextWitnessId++;
+    witness.enumeratedMapCount = resolution.enumeratedMapCount;
+    witness.acceptedMapCount = resolution.acceptedMapCount;
+    witness.rejectedMapCount = resolution.rejectedMapCount;
+    witness.completeEnumeration = true;
+    witness.equivalenceKey = std::move(resolution.equivalenceKey);
+    witness.representativeMap = result.selectedMap;
+    witness.anchorEvidence = std::move(resolution.anchorEvidence);
+    for (const AlignmentSemanticAnchorEvidence &evidence :
+         witness.anchorEvidence) {
+      if (evidence.aToken >= result.selectedAnchorProofs.size())
+        return ResolutionResult{};
+      result.selectedAnchorProofs[evidence.aToken] = diffutils::LcsAnchorProof{
+          diffutils::LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner,
+          witness.witnessId};
+    }
+    result.witnesses.push_back(std::move(witness));
+  }
+
+  // Every mapped A token must carry authority by now: forced anchors above,
+  // window-proved anchors from the loop. An unexplained mapped token would
+  // reach the planner as an unauthorized anchor, so fail closed instead.
+  for (size_t aToken = 0; aToken < result.selectedMap.size(); ++aToken) {
+    if (result.selectedMap[aToken] >= 0 &&
+        !result.selectedAnchorProofs[aToken].IsAuthorized()) {
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "forced-only alignment retained: A[{0}] has no anchor authority "
+          "after per-window resolution",
+          aToken);
+      ResolutionResult forcedOnly;
+      forcedOnly.selectedMap = deps_.coreAlignment.forcedMap;
+      forcedOnly.selectedAnchorProofs.assign(
+          forcedOnly.selectedMap.size(), diffutils::LcsAnchorProof{});
+      for (size_t token = 0; token < forcedOnly.selectedMap.size(); ++token) {
+        if (forcedOnly.selectedMap[token] >= 0) {
+          forcedOnly.selectedAnchorProofs[token] = diffutils::LcsAnchorProof{
+              diffutils::LcsAnchorProofKind::CoreOptimalPathForced, 0};
+        }
+      }
+      forcedOnly.completeEnumeration = result.completeEnumeration;
+      return forcedOnly;
+    }
+  }
+
+  result.committedEquivalentClass = true;
+  return result;
+}
+
+RefoldAlignmentSemanticResolver::WindowResolution
+RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
+    size_t windowIndex, ArrayRef<int64_t> baseMap,
+    size_t simulationBudget) const {
+  WindowResolution result;
+
+  const diffutils::OptimalTokenAlignmentOracle *oraclePtr =
+      deps_.coreAlignment.GetSemanticOracleForWindow(windowIndex);
+  if (!oraclePtr ||
+      windowIndex >= deps_.coreAlignment.certificationWindows.size() ||
+      baseMap.size() != deps_.aLexemes.size())
+    return result;
+  const diffutils::OptimalTokenAlignmentOracle &oracle = *oraclePtr;
+  const diffutils::LcsCertificationWindow &window =
+      deps_.coreAlignment.certificationWindows[windowIndex];
+
+  // Oracle coordinates are window-local; the enumeration below therefore
+  // translates each stream rectangle into the oracle's frame and translates
+  // every returned B index back.
+  const uint64_t oracleABegin = window.aBegin;
+  const uint64_t oracleBBegin = window.bBegin;
+
   const std::vector<ForcedAnchor> forcedAnchors =
-      collectForcedAnchors(deps_.coreAlignment);
-  std::vector<std::vector<std::vector<int64_t>>> windowMaps;
-  uint64_t aBegin = 0;
-  uint64_t bBegin = 0;
+      collectForcedAnchors(deps_.coreAlignment, window.aBegin, window.aEnd);
+  std::vector<std::vector<std::vector<int64_t>>> subWindowMaps;
+  std::vector<uint64_t> subWindowABegins;
+  uint64_t aBegin = window.aBegin;
+  uint64_t bBegin = window.bBegin;
   for (size_t anchorIndex = 0; anchorIndex <= forcedAnchors.size();
        ++anchorIndex) {
     const uint64_t aEnd = anchorIndex < forcedAnchors.size()
                               ? forcedAnchors[anchorIndex].aToken
-                              : deps_.aLexemes.size();
+                              : window.aEnd;
     const uint64_t bEnd = anchorIndex < forcedAnchors.size()
                               ? forcedAnchors[anchorIndex].bToken
-                              : deps_.bLexemes.size();
-    if (aBegin > aEnd || bBegin > bEnd)
+                              : window.bEnd;
+    if (aBegin > aEnd || bBegin > bEnd || aEnd > window.aEnd ||
+        bEnd > window.bEnd)
       return result;
 
     diffutils::OptimalLcsMapEnumeration enumeration =
         oracle.EnumerateOptimalMapsForWindow(
-            aBegin, aEnd, bBegin, bEnd, MaxUniqueMapsPerForcedWindow);
+            aBegin - oracleABegin, aEnd - oracleABegin, bBegin - oracleBBegin,
+            bEnd - oracleBBegin, MaxUniqueMapsPerForcedWindow);
     if (!enumeration.complete || enumeration.maps.empty()) {
       REFOLD_LOG_TRACE(
           "lcs/semantic-resolver",
-          "forced-only alignment retained: exact map enumeration incomplete "
-          "for A=[{0},{1}) B=[{2},{3})",
-          aBegin, aEnd, bBegin, bEnd);
+          "window {0} keeps core-forced anchors: exact map enumeration "
+          "incomplete for A=[{1},{2}) B=[{3},{4})",
+          windowIndex, aBegin, aEnd, bBegin, bEnd);
       return result;
     }
-    windowMaps.push_back(std::move(enumeration.maps));
+    for (std::vector<int64_t> &map : enumeration.maps) {
+      for (int64_t &mapped : map) {
+        if (mapped >= 0)
+          mapped += static_cast<int64_t>(oracleBBegin);
+      }
+    }
+    subWindowMaps.push_back(std::move(enumeration.maps));
+    subWindowABegins.push_back(aBegin);
     if (anchorIndex < forcedAnchors.size()) {
       aBegin = forcedAnchors[anchorIndex].aToken + 1;
       bBegin = forcedAnchors[anchorIndex].bToken + 1;
@@ -443,42 +654,36 @@ RefoldAlignmentSemanticResolver::Resolve() const {
   }
 
   size_t globalCandidateCount = 1;
-  for (const auto &maps : windowMaps) {
+  for (const auto &maps : subWindowMaps) {
     if (maps.size() > MaxGlobalSemanticCandidateMaps /
                           std::max<size_t>(globalCandidateCount, 1)) {
       REFOLD_LOG_TRACE(
           "lcs/semantic-resolver",
-          "forced-only alignment retained: complete map product exceeds "
-          "proof budget ({0})",
-          MaxGlobalSemanticCandidateMaps);
+          "window {0} keeps core-forced anchors: complete map product "
+          "exceeds proof budget ({1})",
+          windowIndex, MaxGlobalSemanticCandidateMaps);
       return result;
     }
     globalCandidateCount *= maps.size();
   }
 
   std::vector<std::vector<int64_t>> globalMaps;
-  globalMaps.push_back(deps_.coreAlignment.forcedMap);
-  aBegin = 0;
-  for (size_t windowIndex = 0; windowIndex < windowMaps.size();
-       ++windowIndex) {
-    const uint64_t aEnd = windowIndex < forcedAnchors.size()
-                              ? forcedAnchors[windowIndex].aToken
-                              : deps_.aLexemes.size();
+  globalMaps.emplace_back(baseMap.begin(), baseMap.end());
+  for (size_t subWindow = 0; subWindow < subWindowMaps.size(); ++subWindow) {
+    const uint64_t subABegin = subWindowABegins[subWindow];
     std::vector<std::vector<int64_t>> expanded;
-    expanded.reserve(globalMaps.size() * windowMaps[windowIndex].size());
+    expanded.reserve(globalMaps.size() * subWindowMaps[subWindow].size());
     for (const std::vector<int64_t> &base : globalMaps) {
-      for (const std::vector<int64_t> &local : windowMaps[windowIndex]) {
-        if (local.size() != aEnd - aBegin)
+      for (const std::vector<int64_t> &local : subWindowMaps[subWindow]) {
+        if (static_cast<size_t>(subABegin) + local.size() > base.size())
           return result;
         std::vector<int64_t> candidate = base;
         for (size_t localA = 0; localA < local.size(); ++localA)
-          candidate[static_cast<size_t>(aBegin) + localA] = local[localA];
+          candidate[static_cast<size_t>(subABegin) + localA] = local[localA];
         expanded.push_back(std::move(candidate));
       }
     }
     globalMaps = std::move(expanded);
-    if (windowIndex < forcedAnchors.size())
-      aBegin = forcedAnchors[windowIndex].aToken + 1;
   }
 
   llvm::sort(globalMaps,
@@ -489,58 +694,71 @@ RefoldAlignmentSemanticResolver::Resolve() const {
              });
   globalMaps.erase(std::unique(globalMaps.begin(), globalMaps.end()),
                    globalMaps.end());
-  result.completeEnumeration = true;
-  if (globalMaps.size() <= 1)
+  if (globalMaps.size() <= 1) {
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "window {0} has no alignment ambiguity: exactly one complete "
+        "core-optimal map",
+        windowIndex);
     return result;
+  }
+
+  if (globalMaps.size() > simulationBudget) {
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "window {0} keeps core-forced anchors: {1} candidates exceed the "
+        "run's remaining simulation budget ({2})",
+        windowIndex, globalMaps.size(), simulationBudget);
+    return result;
+  }
 
   std::vector<AlignmentSemanticSimulationResult> simulations;
   simulations.reserve(globalMaps.size());
   for (const std::vector<int64_t> &candidateMap : globalMaps) {
     if (!isStrictlyMonotoneMap(candidateMap, deps_.bLexemes.size()) ||
-        !mapLexemesAgree(candidateMap, deps_.aLexemes, deps_.bLexemes))
-      return result;
+        !mapLexemesAgree(candidateMap, deps_.aLexemes, deps_.bLexemes)) {
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "window {0} keeps core-forced anchors: an enumerated map is not a "
+          "monotone lexeme-agreeing alignment",
+          windowIndex);
+      return WindowResolution{};
+    }
     simulations.push_back(
         deps_.simulate(buildSimulationSelection(candidateMap,
                                                 deps_.coreAlignment)));
   }
+  result.simulationsSpent = simulations.size();
 
   auto commitRealizationClass =
       [&](StringRef equivalenceKey, ArrayRef<size_t> classMembers,
-          ArrayRef<RequiredAnchor> requiredAnchors) -> ResolutionResult {
+          ArrayRef<RequiredAnchor> requiredAnchors) -> WindowResolution {
+    WindowResolution committed;
     if (classMembers.empty())
-      return result;
+      return committed;
 
     const size_t representativeIndex = classMembers.front();
-    const uint64_t witnessId = 1;
-
-    AlignmentSemanticResolutionWitness witness;
-    witness.witnessId = witnessId;
-    witness.enumeratedMapCount = globalMaps.size();
-    witness.acceptedMapCount = classMembers.size();
-    witness.rejectedMapCount =
-        witness.enumeratedMapCount - witness.acceptedMapCount;
-    witness.completeEnumeration = true;
-    witness.equivalenceKey = equivalenceKey.str();
-    witness.representativeMap = globalMaps[representativeIndex];
+    committed.enumeratedMapCount = globalMaps.size();
+    committed.acceptedMapCount = classMembers.size();
+    committed.rejectedMapCount =
+        committed.enumeratedMapCount - committed.acceptedMapCount;
+    committed.equivalenceKey = equivalenceKey.str();
+    committed.selectedMap = globalMaps[representativeIndex];
 
     std::map<std::pair<uint64_t, uint64_t>, AlignmentSemanticAnchorBasis>
         requiredBasis;
     for (const RequiredAnchor &anchor : requiredAnchors)
       requiredBasis[{anchor.aToken, anchor.bToken}] = anchor.basis;
 
-    ResolutionResult committed = result;
-    committed.selectedMap = witness.representativeMap;
-    committed.selectedAnchorProofs.assign(committed.selectedMap.size(),
-                                          diffutils::LcsAnchorProof{});
+    // Record evidence only for anchors this window actually chose. Anchors
+    // outside the window are either core-forced or already proved by an
+    // earlier window's witness, and restating them here would claim authority
+    // this enumeration never established.
     for (size_t aToken = 0; aToken < committed.selectedMap.size(); ++aToken) {
       const int64_t bToken = committed.selectedMap[aToken];
-      if (bToken < 0)
+      if (bToken < 0 || aToken < window.aBegin || aToken >= window.aEnd ||
+          isForcedAnchor(deps_.coreAlignment, aToken, bToken))
         continue;
-      if (isForcedAnchor(deps_.coreAlignment, aToken, bToken)) {
-        committed.selectedAnchorProofs[aToken] = diffutils::LcsAnchorProof{
-            diffutils::LcsAnchorProofKind::CoreOptimalPathForced, 0};
-        continue;
-      }
 
       const auto required = requiredBasis.find(
           {aToken, static_cast<uint64_t>(bToken)});
@@ -549,25 +767,58 @@ RefoldAlignmentSemanticResolver::Resolve() const {
               ? AlignmentSemanticAnchorBasis::
                     EquivalentRealizationRepresentative
               : required->second;
-      witness.anchorEvidence.push_back(AlignmentSemanticAnchorEvidence{
+      committed.anchorEvidence.push_back(AlignmentSemanticAnchorEvidence{
           aToken, static_cast<uint64_t>(bToken), basis});
-      committed.selectedAnchorProofs[aToken] = diffutils::LcsAnchorProof{
-          diffutils::LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner,
-          witnessId};
     }
 
     REFOLD_LOG_TRACE(
         "lcs/semantic-resolver",
-        "committing realized-source class: candidates={0} survivors={1} "
-        "classMembers={2} requiredAnchors={3} representative={4}",
-        globalMaps.size(), classMembers.size(),
-        formatMapIndices(classMembers), requiredAnchors.size(),
-        representativeIndex);
+        "window {0} committing realized-source class: candidates={1} "
+        "classMembers={2} requiredAnchors={3} representative={4} anchors={5}",
+        windowIndex, globalMaps.size(), formatMapIndices(classMembers),
+        requiredAnchors.size(), representativeIndex,
+        committed.anchorEvidence.size());
 
-    committed.witnesses.push_back(std::move(witness));
-    committed.committedEquivalentClass = true;
+    committed.committed = true;
     return committed;
   };
+
+  // Permanent census of the simulated candidate set. Every commit rule below
+  // is a statement about these counts, so reporting them makes a declined
+  // window explain itself instead of failing silently. Reading finished
+  // simulation records cannot affect candidate order or any proof decision.
+  if (inTraceMode()) {
+    size_t acceptedCount = 0;
+    size_t terminalFallbackCount = 0;
+    size_t proofIncompleteCount = 0;
+    std::set<StringRef> concreteOutputKeys;
+    std::set<StringRef> realizationKeys;
+    for (const AlignmentSemanticSimulationResult &simulation : simulations) {
+      switch (simulation.disposition) {
+      case AlignmentSemanticSimulationDisposition::Accepted:
+        ++acceptedCount;
+        break;
+      case AlignmentSemanticSimulationDisposition::TerminalFallback:
+        ++terminalFallbackCount;
+        break;
+      case AlignmentSemanticSimulationDisposition::ProofIncomplete:
+        ++proofIncompleteCount;
+        break;
+      }
+      if (!simulation.concreteOutputEquivalenceKey.empty())
+        concreteOutputKeys.insert(simulation.concreteOutputEquivalenceKey);
+      if (!simulation.realizationEquivalenceKey.empty())
+        realizationKeys.insert(simulation.realizationEquivalenceKey);
+    }
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "window {0} candidate census: enumerated={1} accepted={2} "
+        "terminalFallback={3} proofIncomplete={4} distinctConcreteOutputs={5} "
+        "distinctRealizations={6}",
+        windowIndex, simulations.size(), acceptedCount, terminalFallbackCount,
+        proofIncompleteCount, concreteOutputKeys.size(),
+        realizationKeys.size());
+  }
 
   // The strongest equivalence theorem needs no historical boundary proposal:
   // when every complete core-optimal map independently satisfies the full
@@ -598,6 +849,11 @@ RefoldAlignmentSemanticResolver::Resolve() const {
     return commitRealizationClass(onlyClass.first, onlyClass.second,
                                   ArrayRef<RequiredAnchor>());
   }
+  REFOLD_LOG_TRACE(
+      "lcs/semantic-resolver",
+      "window {0} is not observationally irrelevant: everyMapAccepted={1} "
+      "distinctConcreteOutputClasses={2}",
+      windowIndex, everyCompleteMapAccepted, completeOutputClasses.size());
 
   // A complete accepted simulation is an independent proof that its source
   // realization reproduces the requested B stream and preserves every tracked
@@ -637,22 +893,52 @@ RefoldAlignmentSemanticResolver::Resolve() const {
         leastDestructiveMaps.push_back(candidateIndex);
     }
 
+    // Class the surviving minima by their concrete emitted artifact, not by
+    // internal proof-carrier provenance. Every member of `acceptedMaps` has
+    // already passed the complete end-to-end theorem audit independently, which
+    // is exactly the precondition `concreteOutputEquivalenceKey` documents for
+    // itself: at that point the authoritative question is whether alignment
+    // ambiguity changes the emitted source and the deterministic post-emission
+    // pruning inputs, not which carrier proved the same bytes. Two minima that
+    // differ only in the structural-tiling witness spelling emit identical
+    // source, so separating them here would manufacture ambiguity the output
+    // does not have. The stricter realization key still governs the
+    // counterfactual path below, where members have not all been audited.
     std::map<std::string, std::vector<size_t>> leastRealizationClasses;
-    for (size_t mapIndex : leastDestructiveMaps)
-      leastRealizationClasses[simulations[mapIndex].realizationEquivalenceKey]
+    for (size_t mapIndex : leastDestructiveMaps) {
+      const AlignmentSemanticSimulationResult &simulation =
+          simulations[mapIndex];
+      if (simulation.concreteOutputEquivalenceKey.empty()) {
+        leastRealizationClasses.clear();
+        break;
+      }
+      leastRealizationClasses[simulation.concreteOutputEquivalenceKey]
           .push_back(mapIndex);
+    }
 
     if (leastRealizationClasses.size() == 1) {
       const auto &onlyClass = *leastRealizationClasses.begin();
       REFOLD_LOG_TRACE(
           "lcs/semantic-resolver",
-          "committing globally least source-mutation class: accepted={0} "
-          "least={1} classMembers={2}",
-          acceptedMaps.size(), leastDestructiveMaps.size(),
+          "window {0} committing globally least source-mutation class: "
+          "accepted={1} least={2} classMembers={3}",
+          windowIndex, acceptedMaps.size(), leastDestructiveMaps.size(),
           formatMapIndices(onlyClass.second));
       return commitRealizationClass(onlyClass.first, onlyClass.second,
                                     ArrayRef<RequiredAnchor>());
     }
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "window {0} has no unique least source-mutation class: accepted={1} "
+        "leastDestructive={2} leastRealizationClasses={3}",
+        windowIndex, acceptedMaps.size(), leastDestructiveMaps.size(),
+        leastRealizationClasses.size());
+  } else {
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "window {0} skips source-mutation containment: proofIncomplete={1} "
+        "accepted={2}",
+        windowIndex, hasProofIncompleteMap, acceptedMaps.size());
   }
 
   // Reconstruct the old boundary map strictly as a proposal. The old balance
@@ -660,28 +946,45 @@ RefoldAlignmentSemanticResolver::Resolve() const {
   // counterfactuals that the theorem below must discharge.
   if (deps_.aGapProvenance.size() != deps_.aLexemes.size() + 1 ||
       deps_.bGapProvenance.size() != deps_.bLexemes.size() + 1)
-    return result;
+    return WindowResolution{};
   LegacyAlignmentDiagnosticResult proposal =
       reconstructLegacyBoundaryProposal(
           deps_.aLexemes, deps_.bLexemes, deps_.aGapProvenance,
           deps_.bGapProvenance, deps_.coreAlignment);
   if (!proposal.complete || !proposal.monotone || !proposal.lexemesAgree ||
-      !proposal.jointlyCoreOptimal)
-    return result;
+      !proposal.jointlyCoreOptimal) {
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "window {0} keeps core-forced anchors: legacy boundary proposal is "
+        "not a complete jointly core-optimal map",
+        windowIndex);
+    return WindowResolution{};
+  }
 
+  // Only anchors inside this window are counterfactual candidates. A proposal
+  // anchor elsewhere is not something this window's enumeration varies, so
+  // testing it would spend a full simulation to prove an anchor no candidate
+  // here disagrees about.
   std::vector<RequiredAnchor> requiredAnchors;
   const AlignmentSemanticSimulationResult *proposalSimulation = nullptr;
   std::optional<AlignmentSemanticSimulationResult> ownedProposalSimulation;
   size_t proposalNonForcedCount = 0;
   for (size_t aToken = 0; aToken < proposal.selectedMap.size(); ++aToken) {
     const int64_t bToken = proposal.selectedMap[aToken];
-    if (bToken >= 0 && !isForcedAnchor(deps_.coreAlignment, aToken, bToken))
+    if (bToken >= 0 && aToken >= window.aBegin && aToken < window.aEnd &&
+        !isForcedAnchor(deps_.coreAlignment, aToken, bToken))
       ++proposalNonForcedCount;
   }
 
   if (proposalNonForcedCount != 0) {
-    if (proposalNonForcedCount > MaxProposalCounterfactuals)
-      return result;
+    if (proposalNonForcedCount > MaxProposalCounterfactuals) {
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "window {0} keeps core-forced anchors: {1} proposal anchors exceed "
+          "the counterfactual budget ({2})",
+          windowIndex, proposalNonForcedCount, MaxProposalCounterfactuals);
+      return WindowResolution{};
+    }
     // The historical proposal is commonly one of the already simulated
     // complete maps. Reuse that byte-identical theorem result instead of
     // cloning and refolding the entire translation unit a second time.
@@ -698,12 +1001,18 @@ RefoldAlignmentSemanticResolver::Resolve() const {
                                    deps_.coreAlignment)));
       proposalSimulation = &*ownedProposalSimulation;
     }
-    if (!proposalSimulation->accepted)
-      return result;
+    if (!proposalSimulation->accepted) {
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "window {0} keeps core-forced anchors: the legacy proposal's own "
+          "simulation was not accepted ('{1}')",
+          windowIndex, proposalSimulation->rejectionReason);
+      return WindowResolution{};
+    }
 
     for (size_t aToken = 0; aToken < proposal.selectedMap.size(); ++aToken) {
       const int64_t bToken = proposal.selectedMap[aToken];
-      if (bToken < 0 ||
+      if (bToken < 0 || aToken < window.aBegin || aToken >= window.aEnd ||
           isForcedAnchor(deps_.coreAlignment, aToken, bToken))
         continue;
 
@@ -758,8 +1067,14 @@ RefoldAlignmentSemanticResolver::Resolve() const {
     if (mapContainsRequiredAnchors(globalMaps[mapIndex], requiredAnchors))
       survivingMaps.push_back(mapIndex);
   }
-  if (survivingMaps.empty())
-    return result;
+  if (survivingMaps.empty()) {
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "window {0} keeps core-forced anchors: no enumerated map contains "
+        "every one of the {1} required anchors",
+        windowIndex, requiredAnchors.size());
+    return WindowResolution{};
+  }
 
   // Unknown witness dimensions are not semantic rejections. If a surviving
   // core-optimal map is proof-incomplete, uniqueness has not been established
@@ -769,10 +1084,10 @@ RefoldAlignmentSemanticResolver::Resolve() const {
         AlignmentSemanticSimulationDisposition::ProofIncomplete) {
       REFOLD_LOG_TRACE(
           "lcs/semantic-resolver",
-          "forced-only alignment retained: surviving map {0} has incomplete "
-          "proof ('{1}')",
-          mapIndex, simulations[mapIndex].rejectionReason);
-      return result;
+          "window {0} keeps core-forced anchors: surviving map {1} has "
+          "incomplete proof ('{2}')",
+          windowIndex, mapIndex, simulations[mapIndex].rejectionReason);
+      return WindowResolution{};
     }
   }
 
@@ -784,13 +1099,26 @@ RefoldAlignmentSemanticResolver::Resolve() const {
         AlignmentSemanticSimulationDisposition::TerminalFallback)
       continue;
     if (!simulation.accepted ||
-        simulation.realizationEquivalenceKey.empty())
-      return result;
+        simulation.realizationEquivalenceKey.empty()) {
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "window {0} keeps core-forced anchors: surviving map {1} carries no "
+          "realization key ('{2}')",
+          windowIndex, mapIndex, simulation.rejectionReason);
+      return WindowResolution{};
+    }
     realizationClasses[simulation.realizationEquivalenceKey].push_back(
         mapIndex);
   }
-  if (realizationClasses.size() != 1)
-    return result;
+  if (realizationClasses.size() != 1) {
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "window {0} keeps core-forced anchors: {1} surviving map(s) span {2} "
+        "distinct realization classes after {3} required anchor(s)",
+        windowIndex, survivingMaps.size(), realizationClasses.size(),
+        requiredAnchors.size());
+    return WindowResolution{};
+  }
 
   const auto &onlyClass = *realizationClasses.begin();
   return commitRealizationClass(onlyClass.first, onlyClass.second,
