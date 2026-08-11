@@ -540,7 +540,14 @@ Expected<std::string> RefoldEngine::Refold(
     const FinalAssemblyVerdict verdict = assemblyVerifier->Verify(out);
     if (verdict.verified || verdict.inconclusive) {
       if (verdict.inconclusive)
-        REFOLD_LOG_DEBUG("assembly-verify", "inconclusive: assembly not readable");
+        // An inconclusive verdict is not a rejection, but it does mean this
+        // assembly ships unverified.  Say so where a run that asked for
+        // verification will see it: at debug level the one signal that the
+        // check did not happen is indistinguishable from the check passing.
+        REFOLD_LOG_WARN("assembly-verify",
+                        "assembly NOT verified: the final source could not be "
+                        "preprocessed for checking, so --verify-output has "
+                        "nothing to compare and the result stands unchecked");
       else if (attempt > 0)
         REFOLD_LOG_INFO("assembly-verify",
                         "verified after {0} narrowing step(s)", attempt);
@@ -683,6 +690,32 @@ std::string RefoldEngine::Refold() {
   }
 
   out = finalLinePrune.output;
+
+  // The assembly check in RunRefoldPass() ran against the text as assembled,
+  // and the prune above has just deleted directives from it.  Whatever it
+  // removed was therefore never checked: re-verify the text that will actually
+  // be written, so a prune that changes how the source preprocesses cannot ship
+  // behind a verdict that was reached before it ran.
+  if (finalLinePrune.changed && finalAssemblyVerifier_) {
+    const FinalAssemblyVerdict prunedVerdict =
+        finalAssemblyVerifier_->Verify(out);
+    if (!prunedVerdict.verified && !prunedVerdict.inconclusive) {
+      REFOLD_LOG_WARN("assembly-verify",
+                      "final line-control prune broke the assembly: {0}; "
+                      "taking the terminal carrier instead",
+                      prunedVerdict.reason);
+      terminalSink_.RequestTerminalFallback(
+          RefoldOwnerStateProof::SuffixStabilityTerminalFailureForComponent(
+              OwnerStateComponent::LineNumber),
+          "assembly-verify",
+          "pruned assembly does not replay the edited preprocessed stream");
+      out = expansionFallbackPlanner_->ResolvePostStructuralFallback();
+      finalLineControlPruneCandidates_.clear();
+      finalLineControlSourceMappings_.clear();
+      if (materializedEditMappings_)
+        materializedEditMappings_->clear();
+    }
+  }
 
   // Closing proof for newline-drift repairs, on the accepted assembly only.
   // A repair that could not be injected into its own replacement was deferred

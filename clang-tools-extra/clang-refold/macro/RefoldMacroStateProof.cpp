@@ -105,11 +105,20 @@ bool RefoldMacroStateProof::SourceChunkObservesMacroStateDirectiveWhenCrossed(
 /// Recover the complete physical source interval for a recorded macro-state
 /// directive line.
 ///
-/// The producer anchors MacroDirective::siteB at the macro name, not at the
-/// `#`. This helper reparses the recorded directive spelling to find the name
-/// offset, translates that anchor back to the physical line start, and accepts
-/// the interval only if the recovered file bytes exactly equal
-/// MacroDirective::text.
+/// When the producer recorded the directive's physical extent, that pair *is*
+/// the interval and is returned directly.  Otherwise the interval is recovered
+/// from the recorded spelling: MacroDirective::siteB is anchored at the macro
+/// name rather than at the `#`, so this reparses MacroDirective::text to find
+/// the name offset, translates that anchor back to the line start, and accepts
+/// the result only if the file bytes there equal the recorded text exactly.
+///
+/// The two paths are not interchangeable in strength.  MacroDirective::text is
+/// rendered from parsed macro tokens with canonical spacing, so the text
+/// comparison is a proof only for a directive whose source spelling already
+/// matches that rendering; it necessarily fails for tabs, runs of spaces, and
+/// backslash continuations, and no transform recovers the source bytes from a
+/// pretty-printer's output.  The recorded extent replaces that inference with a
+/// fact and therefore does not need the comparison.
 std::optional<MacroStateDirectiveLineInterval>
 RefoldMacroStateProof::RecoverMacroStateDirectiveLineInterval(
     const RefoldModel::MacroDirective &directive, StringRef expectedPath,
@@ -127,6 +136,22 @@ RefoldMacroStateProof::RecoverMacroStateDirectiveLineInterval(
       return std::nullopt;
   } else if (directive.ownerIncludeId) {
     return std::nullopt;
+  }
+
+  // Producer-recorded physical extent.  The model parser already proved the
+  // pair is ordered and contains the name-anchored site range; only its fit to
+  // these particular file bytes remains to be checked here, because the caller
+  // supplies the buffer.
+  if (directive.directiveLineB && directive.directiveLineE) {
+    if (*directive.directiveLineE > fileBytes.size())
+      return std::nullopt;
+
+    MacroStateDirectiveLineInterval recorded;
+    recorded.directive = &directive;
+    recorded.begin = *directive.directiveLineB;
+    recorded.end = *directive.directiveLineE;
+    recorded.name = directive.name;
+    return recorded;
   }
 
   StringRef text = directive.text;
@@ -248,8 +273,33 @@ RefoldMacroStateProof::RecoverMacroDefinitionReplacementListInterval(
   result.directive = definition;
   result.nameTextBegin = nameTextBegin;
   result.replacementTextBegin = pos;
+  // Text offsets are converted to source offsets through `fileBase`, which is
+  // only meaningful if the recorded directive prefix is the source prefix
+  // byte-for-byte.  The producer's physical extent is what can settle that: it
+  // names the real `#`, so agreement proves the conversion and disagreement
+  // proves the recorded spelling is a re-rendering this helper cannot invert.
   result.fileBase = definition->siteB - nameTextBegin;
   result.fileBegin = result.fileBase + pos;
+
+  if (definition->directiveLineB && definition->directiveLineE) {
+    if (*definition->directiveLineB != result.fileBase)
+      return std::nullopt;
+
+    // The replacement list runs to the end of the directive's logical line.
+    // Bounding it by the recorded text length instead would reject every
+    // definition whose source line carries bytes the rendering drops -- a
+    // trailing comment, or a backslash continuation -- because those make the
+    // source strictly longer than its canonical spelling.
+    result.fileEnd = *definition->directiveLineE;
+    if (result.fileBegin > result.fileEnd)
+      return std::nullopt;
+    return result;
+  }
+
+  // Without a recorded extent there is no way to tell a faithful rendering from
+  // a re-rendering, so keep the historical bound: the source span must fit
+  // inside the recorded spelling.  That admits only canonically spelled
+  // definitions, which is the most this evidence supports.
   result.fileEnd = definition->siteE;
   if (result.fileBegin > result.fileEnd ||
       result.fileEnd > result.fileBase + text.size())

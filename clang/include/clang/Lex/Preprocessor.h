@@ -814,6 +814,14 @@ private:
   /// callbacks and remains best-effort afterward for diagnostics/debugging.
   IncludeLookupProvenance LastIncludeLookupProvenance;
 
+  /// Spelling location of the `#` token that introduced the preprocessing
+  /// directive currently being handled, or an invalid location outside
+  /// directive handling.
+  ///
+  /// HandleDirective() owns this and restores the previous value on exit, so it
+  /// names the innermost directive under construction.
+  SourceLocation CurrentDirectiveIntroducerLoc;
+
   /// The current macro we are expanding, if we are expanding a macro.
   ///
   /// One of CurLexer and CurTokenLexer must be null.
@@ -1281,6 +1289,21 @@ public:
 
   const IncludeLookupProvenance &getLastIncludeLookupProvenance() const {
     return LastIncludeLookupProvenance;
+  }
+
+  /// Return the spelling location of the `#` that introduced the directive
+  /// currently being handled, or an invalid location when no directive is being
+  /// handled.
+  ///
+  /// This is a tiny, location-only side channel rather than an extension of the
+  /// PPCallbacks signatures: clang-refold must record the physical extent of a
+  /// `#define`/`#undef` directive, whose spelling starts at the introducer
+  /// rather than at the macro name reported by MacroDefined/MacroUndefined,
+  /// while existing callback clients should not have to absorb a new parameter.
+  /// It is valid synchronously during a callback issued from directive
+  /// handling; callers must treat any other observation as unavailable.
+  SourceLocation getCurrentDirectiveIntroducerLoc() const {
+    return CurrentDirectiveIntroducerLoc;
   }
 
   IdentifierTable &getIdentifierTable() { return Identifiers; }

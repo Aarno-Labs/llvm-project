@@ -1394,6 +1394,24 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           md.siteB = *asOptUInt64(*obj, "site_b");
           md.siteE = *asOptUInt64(*obj, "site_e");
 
+          // Optional producer-recorded physical extent of the whole directive
+          // spelling.  Accept it only as a well-formed pair that also contains
+          // the name-anchored site range: those are two independent producer
+          // measurements of one directive, and a map where they disagree is not
+          // evidence of anything.  A partial or inconsistent record is dropped
+          // rather than repaired, which leaves the pre-existing text-based
+          // recovery path in charge.
+          std::optional<uint64_t> directiveLineB =
+              asOptUInt64(*obj, "directive_line_b");
+          std::optional<uint64_t> directiveLineE =
+              asOptUInt64(*obj, "directive_line_e");
+          if (directiveLineB && directiveLineE &&
+              *directiveLineB < *directiveLineE &&
+              *directiveLineB <= md.siteB && md.siteE <= *directiveLineE) {
+            md.directiveLineB = directiveLineB;
+            md.directiveLineE = directiveLineE;
+          }
+
           // Optional producer-owned replay data for #define directives.
           // #undef records intentionally keep these vectors empty: their only
           // semantic payload is the macro-state transition, not

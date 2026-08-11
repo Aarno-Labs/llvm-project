@@ -51,8 +51,17 @@ enum class MacroStateObservationKind {
 /// Exact source-line interval for a producer-recorded macro-state directive.
 ///
 /// MacroDirective::siteB is anchored at the macro name, not necessarily at the
-/// beginning of the physical directive line.  This witness records the
-/// validated full-line interval recovered from the recorded directive text.
+/// beginning of the physical directive line, and it stops at the first physical
+/// newline.  This witness records the validated interval for the whole
+/// directive spelling: the producer-recorded physical extent when the map
+/// carries it, and otherwise the interval recovered from the recorded directive
+/// text.
+///
+/// `[begin,end)` spans the directive from its `#` through the end of its
+/// logical line, so it may cover several physical lines when the spelling is
+/// backslash-continued.  It is not in general `directive->text.size()` bytes
+/// long: the recorded text is a canonical rendering of the parsed definition,
+/// not a slice of the source.
 struct MacroStateDirectiveLineInterval {
   const RefoldModel::MacroDirective *directive = nullptr;
   uint64_t begin = 0;
@@ -161,14 +170,20 @@ public:
       llvm::StringRef chunk,
       llvm::StringRef following = llvm::StringRef()) const;
 
-  /// Recover and byte-verify the complete physical source line for a recorded
-  /// #define/#undef directive in \p fileBytes.
+  /// Recover the complete physical source extent of a recorded #define/#undef
+  /// directive in \p fileBytes.
   ///
   /// The helper is the single owner for the repeated proof used by TU carry,
   /// header materialization, include edits, expansion fallback, and replay
   /// stability: the directive must match \p expectedPath, match the requested
-  /// include-owner instance, have a producer-recorded macro name, and its
-  /// reconstructed full-line bytes must exactly equal MacroDirective::text.
+  /// include-owner instance, and have a producer-recorded macro name.
+  ///
+  /// The extent itself comes from whichever evidence the map carries.  A
+  /// producer-recorded physical extent is returned as the interval directly,
+  /// bounds-checked against \p fileBytes.  Without one, the interval is
+  /// reconstructed from the macro-name anchor and admitted only when those file
+  /// bytes exactly equal MacroDirective::text, which restricts the legacy path
+  /// to directives already spelled the way Clang renders them.
   std::optional<MacroStateDirectiveLineInterval>
   RecoverMacroStateDirectiveLineInterval(
       const RefoldModel::MacroDirective &directive,

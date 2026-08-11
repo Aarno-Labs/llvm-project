@@ -817,6 +817,30 @@ static void bindMacroDirectives(
     }
 
     ScannedDirective &scanned = directives[*scannedIndex];
+
+    // A producer-recorded physical extent and this scanner measure the same
+    // thing by two independent routes: Clang's own directive introducer token
+    // plus its escaped-newline predicate, against a language-mode-aware lexical
+    // scan of the file bytes.  Requiring exact agreement is what keeps the
+    // recorded extent a fact rather than a second opinion, and it is checked
+    // here because this is the only place both are in hand.
+    //
+    // The recorded begin is the `#` itself, so it is compared against
+    // introducerBegin rather than against the lexical interval begin, which
+    // also covers any leading trivia on the logical-line prefix.
+    if (modelDirective.directiveLineB && modelDirective.directiveLineE &&
+        (recovered->begin != scanned.introducerBegin ||
+         recovered->end != scanned.interval.end)) {
+      diagnostics.push_back(
+          llvm::formatv("macro directive id={0} recorded physical extent "
+                        "[{1},{2}) disagrees with the scanned logical line "
+                        "introducer={3} end={4}",
+                        modelDirective.id, recovered->begin, recovered->end,
+                        scanned.introducerBegin, scanned.interval.end)
+              .str());
+      continue;
+    }
+
     attachModelBinding(scanned,
                        PreprocessingStructureModelKind::MacroDirective,
                        modelDirective.id, recovered->begin, recovered->end,

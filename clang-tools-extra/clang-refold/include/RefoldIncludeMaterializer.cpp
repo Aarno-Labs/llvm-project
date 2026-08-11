@@ -72,6 +72,135 @@ namespace refold {
 
 namespace {
 
+/// One macro patch already staged as a header TextEdit, with the A-token cover
+/// its callsite realizes.
+struct StagedMacroPatchEdit {
+  /// Position of the staged edit in the header's edit list.
+  size_t editIndex = 0;
+  /// Producer macro invocation id realized by the staged edit.
+  uint64_t macroId = 0;
+  /// True when the model supplied a valid A-token cover for that invocation.
+  bool hasCover = false;
+  /// Inclusive first A token realized by the staged edit.
+  uint64_t coverBegin = 0;
+  /// Exclusive last A token realized by the staged edit.
+  uint64_t coverEnd = 0;
+};
+
+/// Byte range and realized A-token cover declared by one mapped-header edit.
+struct HeaderEnvelopeRealization {
+  uint64_t startByte = 0;
+  uint64_t endByte = 0;
+  uint64_t coverBegin = 0;
+  uint64_t coverEnd = 0;
+};
+
+/// Collect the mapped-header edits that state both the bytes they replace and
+/// the A-token interval they realize.
+///
+/// Only the include-preserving mapped delete/replace path records that pair, on
+/// its accepted carrier's anchor witness.  An edit without it declares no
+/// realized cover, so nothing may be proved subsumed by it.
+static SmallVector<HeaderEnvelopeRealization, 4> headerEnvelopeRealizations(
+    ArrayRef<RefoldIncludeMaterializer::TextEdit> planEdits) {
+  SmallVector<HeaderEnvelopeRealization, 4> realizations;
+  for (const RefoldIncludeMaterializer::TextEdit &edit : planEdits) {
+    for (const auto &carrier : edit.acceptedResults) {
+      if (!carrier)
+        continue;
+      const ProofSummary &summary = carrier->proofSummary;
+      if (summary.inventory.currentPath !=
+          AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens)
+        continue;
+      if (!summary.hasIncludeAnchorWitness)
+        continue;
+
+      const IncludeAnchorWitness &witness = summary.includeAnchorWitness;
+      if (!witness.hasByteRange || !witness.hasFirstPP || !witness.hasLastPP)
+        continue;
+      if (witness.startByte >= witness.endByte ||
+          witness.firstPP > witness.lastPP)
+        continue;
+
+      realizations.push_back(
+          HeaderEnvelopeRealization{witness.startByte, witness.endByte,
+                                    witness.firstPP, witness.lastPP + 1});
+    }
+  }
+  return realizations;
+}
+
+/// Discard staged macro-patch edits that a mapped-header edit already realizes,
+/// or report that the two edit sets cannot be composed.
+///
+/// A mapped-header edit whose range was widened to a proven source envelope
+/// replaces those bytes with B material covering the A tokens named by its
+/// witness.  When a staged macro patch sits inside that byte range and realizes
+/// a cover inside that same A interval, the envelope already emits it, so the
+/// staged copy is a duplicate that would only collide at emission.  Every other
+/// intersection -- a staged cover that escapes the envelope's, a partial byte
+/// overlap, or a missing cover on either side -- leaves the two edits
+/// genuinely incomparable, and the caller falls back rather than picking one.
+static bool dropStagedMacroPatchEditsSubsumedByHeaderEnvelope(
+    uint64_t includeId, ArrayRef<RefoldIncludeMaterializer::TextEdit> planEdits,
+    ArrayRef<StagedMacroPatchEdit> stagedMacroPatchEdits,
+    std::vector<RefoldIncludeMaterializer::TextEdit> &edits) {
+  const SmallVector<HeaderEnvelopeRealization, 4> realizations =
+      headerEnvelopeRealizations(planEdits);
+  if (realizations.empty())
+    return true;
+
+  DenseSet<size_t> subsumed;
+  for (const StagedMacroPatchEdit &staged : stagedMacroPatchEdits) {
+    if (staged.editIndex >= edits.size())
+      return false;
+    const RefoldIncludeMaterializer::TextEdit &stagedEdit =
+        edits[staged.editIndex];
+
+    for (const HeaderEnvelopeRealization &realization : realizations) {
+      if (stagedEdit.end <= realization.startByte ||
+          realization.endByte <= stagedEdit.start)
+        continue;
+
+      const bool byteContained = realization.startByte <= stagedEdit.start &&
+                                 stagedEdit.end <= realization.endByte;
+      const bool coverContained = staged.hasCover &&
+                                  realization.coverBegin <= staged.coverBegin &&
+                                  staged.coverEnd <= realization.coverEnd;
+      if (!byteContained || !coverContained) {
+        REFOLD_LOG_TRACE("include/mat",
+                         "inc#{0} staged macro patch macro#{1} bytes=[{2},{3}) "
+                         "cover=[{4},{5}) is not realized by header envelope "
+                         "bytes=[{6},{7}) cover=[{8},{9})",
+                         includeId, staged.macroId, stagedEdit.start,
+                         stagedEdit.end, staged.coverBegin, staged.coverEnd,
+                         realization.startByte, realization.endByte,
+                         realization.coverBegin, realization.coverEnd);
+        return false;
+      }
+      subsumed.insert(staged.editIndex);
+    }
+  }
+
+  if (subsumed.empty())
+    return true;
+
+  REFOLD_LOG_TRACE("include/mat",
+                   "inc#{0} dropping {1} staged macro patch edit(s) already "
+                   "realized by a widened header source envelope",
+                   includeId, subsumed.size());
+
+  std::vector<RefoldIncludeMaterializer::TextEdit> kept;
+  kept.reserve(edits.size() - subsumed.size());
+  for (size_t index = 0; index < edits.size(); ++index) {
+    if (subsumed.contains(index))
+      continue;
+    kept.push_back(std::move(edits[index]));
+  }
+  edits = std::move(kept);
+  return true;
+}
+
 /// Adapt staged header TextEdits into the narrow interval-only surface needed
 /// by RefoldMacroStateProof.  Macro-state stabilization only has to reject
 /// overlapping local edits; it must not depend on edit payloads, accepted
@@ -652,6 +781,12 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
   // admitted only when every crossed source byte is proven non-observing;
   // otherwise materialization fails closed instead of emitting a refolding that
   // preprocesses under the wrong macro environment.
+  // Header source-envelope widening in pass 2 can extend one include patch over
+  // bytes that a macro patch staged here already owns.  Remember which A-token
+  // cover each staged edit realizes so that collision can be decided by proof
+  // rather than by edit order.
+  SmallVector<StagedMacroPatchEdit, 4> stagedMacroPatchEdits;
+
   if (auto it = macroPatchesByOwner.find(includeId);
       it != macroPatchesByOwner.end()) {
     for (const auto &mp : it->second) {
@@ -718,6 +853,22 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
       textEditAssembler_.AttachAcceptedResultCarrier(
           edit, proofLattice_.AcceptedCandidateBuilder()
                     .BuildAcceptedEmittedMacroCandidate(mp));
+
+      StagedMacroPatchEdit staged;
+      staged.editIndex = edits.size();
+      staged.macroId = mp.macroId;
+      for (const auto &inv : model_.GetMacroInvocations()) {
+        if (inv.id != mp.macroId)
+          continue;
+        if (inv.cover.IsValid()) {
+          staged.hasCover = true;
+          staged.coverBegin = inv.cover.begin;
+          staged.coverEnd = inv.cover.end;
+        }
+        break;
+      }
+      stagedMacroPatchEdits.push_back(staged);
+
       edits.push_back(std::move(edit));
     }
   }
@@ -740,6 +891,44 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
         AcceptedResultCandidate realizationCandidate;
         if (auto realized = BuildInlineIncludeRealizationFromB(
                 *inc, plan.realizationReason, &realizationCandidate)) {
+          includeExpansion[includeId] = std::move(*realized);
+          includeExpansionStartLineNos[includeId] = 1;
+          includeExpansionAcceptedResults[includeId] =
+              std::move(realizationCandidate);
+          return;
+        }
+        includeExpansion[includeId] = std::string();
+        return;
+      }
+
+      // A header patch that widened to a full source envelope replaces its
+      // whole byte range with B material, which necessarily deletes the
+      // callsite of any macro patch pass 1 staged inside that range.  The two
+      // edits then collide, and the applicator's composition law -- edits must
+      // not overlap in original-byte space -- fails the whole translation unit
+      // closed.
+      //
+      // Resolve the collision here, where both edit sets and their realized
+      // A-token covers are in hand, instead of letting it reach emission.  The
+      // widened envelope already realizes every A token in the cover it
+      // declares, so a staged macro patch whose own cover lies inside that one
+      // is emitted twice and the staged copy is redundant.  Anything else --
+      // a cover that escapes the envelope, a partial byte overlap, or a
+      // missing cover on either side -- is not proven redundant, so fall back
+      // to whole-include realization rather than choosing between them.
+      if (!dropStagedMacroPatchEditsSubsumedByHeaderEnvelope(
+              includeId, plan.edits, stagedMacroPatchEdits, edits)) {
+        AcceptedResultCandidate realizationCandidate;
+        const std::string reason =
+            llvm::formatv("staged macro patch in include #{0} is not provably "
+                          "realized by a widened header source envelope",
+                          includeId)
+                .str();
+        REFOLD_LOG_TRACE("include/mat",
+                         "inc#{0} requires whole-include realization: {1}",
+                         includeId, reason);
+        if (auto realized = BuildInlineIncludeRealizationFromB(
+                *inc, reason, &realizationCandidate)) {
           includeExpansion[includeId] = std::move(*realized);
           includeExpansionStartLineNos[includeId] = 1;
           includeExpansionAcceptedResults[includeId] =

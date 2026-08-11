@@ -140,6 +140,15 @@ private:
 
     /// Model id for non-directive pieces, when applicable.
     uint64_t id = 0;
+
+    /// Exact source spelling for a piece whose bytes live outside the header
+    /// currently being emitted.
+    ///
+    /// Pieces collected from an include subtree name offsets in the file that
+    /// declared them, not in this header's buffer, so their bytes must be
+    /// captured where that buffer is open.  Empty means `[begin,end)` indexes
+    /// the emitted header text and is sliced from it directly.
+    std::string sourceText;
   };
 
   /// Candidate byte anchor for a pure header insertion.
@@ -468,8 +477,12 @@ private:
 
   /// Verifies that a recorded macro directive can be recovered from its owner
   /// file spelling.  Failure keeps macro-state preservation fail-closed.
+  ///
+  /// \param exactSourceText when non-null, receives the directive's exact
+  ///        source spelling read from the owner file.
   bool RecordedMacroDirectiveMatchesOwnerFile(
-      const RefoldModel::MacroDirective &directive) const;
+      const RefoldModel::MacroDirective &directive,
+      std::string *exactSourceText = nullptr) const;
 
   /// Collects macro-state directives that may be preserved with an include
   /// subtree.  The replacement text must not observe any collected directive.
@@ -506,6 +519,13 @@ private:
       const RefoldModel::IncludeItem &currentInclude, llvm::StringRef file,
       const RefoldModel::MacroInvocation &macro, uint64_t materialBeginA,
       uint64_t materialEndA) const;
+
+  /// Returns whether a macro invocation's recorded callsite bytes lie inside a
+  /// `#define` directive line, making them macro-definition state rather than a
+  /// distinct physical occurrence in this file's editable text.
+  bool HeaderMacroInvocationSiteIsMacroDefinitionState(
+      const RefoldPreprocessingStructureIndex &sourceStructureIndex,
+      const RefoldModel::MacroInvocation &macro) const;
 
   /// Returns whether a #line directive can start at an existing header offset.
   /// Beginning-of-line and indent-only prefixes are accepted.

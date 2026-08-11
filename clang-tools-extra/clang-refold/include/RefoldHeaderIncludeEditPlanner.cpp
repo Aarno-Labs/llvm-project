@@ -559,16 +559,20 @@ bool RefoldHeaderIncludeEditPlanner::HeaderSelectedArmEffectiveMaterialInside(
 
 std::string RefoldHeaderIncludeEditPlanner::PreservedGapPieceText(
     const HeaderPreservedGapPiece &piece, StringRef headerText) {
-  // Macro-state directives are preserved from the producer's recorded text so
-  // spelling such as leading whitespace and line continuations matches the
-  // directive record, not a best-effort slice reconstructed from ownership.
-  if (piece.kind == HeaderPreservedGapPiece::Kind::MacroStateDirective &&
-      piece.directive)
-    return piece.directive->text.str();
-
-  // Other preserved gap pieces are source intervals in the materialized header
-  // buffer. Require a valid in-buffer range before copying bytes into the
-  // replacement payload.
+  // Every preserved gap piece is emitted as exact source bytes.
+  //
+  // A macro-state directive must NOT be re-emitted from MacroDirective::text.
+  // That string is rendered from the parsed MacroInfo with canonical
+  // single-space separation, so re-emitting it silently rewrites the directive:
+  // tabs and runs of spaces collapse, and a backslash-continued definition is
+  // folded onto one physical line.  Folding physical lines away also moves
+  // every line observer in the header suffix.
+  //
+  // A piece collected from an include subtree already carries its bytes,
+  // because they belong to the file that declared it rather than to the header
+  // being emitted.  Every other piece is an interval in this header's buffer.
+  if (!piece.sourceText.empty())
+    return piece.sourceText;
   if (piece.end <= headerText.size() && piece.begin <= piece.end)
     return headerText.slice(piece.begin, piece.end).str();
   return std::string();
@@ -669,7 +673,8 @@ bool RefoldHeaderIncludeEditPlanner::IncludeOwnsDirective(
 }
 
 bool RefoldHeaderIncludeEditPlanner::RecordedMacroDirectiveMatchesOwnerFile(
-    const RefoldModel::MacroDirective &directive) const {
+    const RefoldModel::MacroDirective &directive,
+    std::string *exactSourceText) const {
   const RefoldModel::IncludeItem *owner = nullptr;
   if (!directive.ownerIncludeId)
     return false;
@@ -687,10 +692,20 @@ bool RefoldHeaderIncludeEditPlanner::RecordedMacroDirectiveMatchesOwnerFile(
     return false;
   const MemoryBuffer &mb = **bufOrErr;
   StringRef ownerBytes(mb.getBufferStart(), mb.getBufferSize());
-  return macroStateProof_
-      .RecoverMacroStateDirectiveLineInterval(directive, ownerPath, ownerBytes,
-                                              directive.ownerIncludeId)
-      .has_value();
+  std::optional<MacroStateDirectiveLineInterval> interval =
+      macroStateProof_.RecoverMacroStateDirectiveLineInterval(
+          directive, ownerPath, ownerBytes, directive.ownerIncludeId);
+  if (!interval)
+    return false;
+
+  // The owner buffer is only open here, so capture the directive's exact
+  // spelling now.  A caller that preserves this directive in a different
+  // header cannot slice these bytes later, and re-rendering the directive from
+  // MacroDirective::text would rewrite its whitespace and fold away any line
+  // continuation.
+  if (exactSourceText)
+    *exactSourceText = ownerBytes.slice(interval->begin, interval->end).str();
+  return true;
 }
 
 bool RefoldHeaderIncludeEditPlanner::
@@ -707,13 +722,17 @@ bool RefoldHeaderIncludeEditPlanner::
     if (macroStateProof_.ReplacementObservesMacroStateDirective(
             directive, replacement, /*unparseableObserves=*/true))
       return false;
-    if (!RecordedMacroDirectiveMatchesOwnerFile(directive))
+    std::string exactSourceText;
+    if (!RecordedMacroDirectiveMatchesOwnerFile(directive, &exactSourceText))
+      return false;
+    if (exactSourceText.empty())
       return false;
 
     HeaderPreservedGapPiece piece;
     piece.kind = HeaderPreservedGapPiece::Kind::MacroStateDirective;
     piece.directive = &directive;
     piece.id = directive.id;
+    piece.sourceText = std::move(exactSourceText);
     pieces.push_back(std::move(piece));
   }
 
@@ -926,6 +945,44 @@ bool RefoldHeaderIncludeEditPlanner::HeaderMacroInvocationOverlapsMaterial(
   return materialBeginA < macro.cover.end && macro.cover.begin < materialEndA;
 }
 
+/// A macro named in a `#define` replacement list is re-expanded on every
+/// expansion of that definition, and the producer records the same definition
+/// bytes as the invocation site each time.  Those bytes are shared macro-state,
+/// not a physical occurrence in this file's editable text:
+///
+///   * consuming them in a source envelope would rewrite the definition to
+///     realize a use-site edit, which the macro rules forbid outright; and
+///   * two expansions of one definition contribute two pieces over one
+///     identical byte range, which no source-piece order can resolve, so the
+///     whole envelope census collapses and the include falls back.
+///
+/// Containment in an exact lexical `#define` interval is the proof, taken from
+/// the shared preprocessing-structure index rather than from forwarding
+/// metadata: an invocation written in a caller's *argument* is spelled at the
+/// callsite, lies outside every directive line, and is therefore still a
+/// genuine source piece.
+///
+/// Excluding a piece is the fail-closed direction.  The bytes it would have
+/// covered become an inter-piece gap, and ProveHeaderSourceEnvelopeGap() still
+/// has to prove every one of them; it cannot prove a live callsite, so a
+/// mistaken exclusion costs a preserved envelope and never a silent edit.
+bool RefoldHeaderIncludeEditPlanner::
+    HeaderMacroInvocationSiteIsMacroDefinitionState(
+        const RefoldPreprocessingStructureIndex &sourceStructureIndex,
+        const RefoldModel::MacroInvocation &macro) const {
+  if (!macro.invB || !macro.invE || *macro.invB >= *macro.invE)
+    return false;
+
+  for (const PreprocessingStructureInterval &interval :
+       sourceStructureIndex.GetIntervals()) {
+    if (interval.kind != PreprocessingStructureKind::MacroDefine)
+      continue;
+    if (interval.begin <= *macro.invB && *macro.invE <= interval.end)
+      return true;
+  }
+  return false;
+}
+
 bool RefoldHeaderIncludeEditPlanner::HeaderLineDirectiveStartsAtPrefix(
     StringRef headerText, uint64_t pos) {
   if (pos >= headerText.size())
@@ -1005,6 +1062,17 @@ bool RefoldHeaderIncludeEditPlanner::HeaderSourceEnvelopePieceContains(
     // complete source-bearing invocation is proved consumed, those mapped token
     // intervals are internal evidence, not separate parent-header pieces.
     return true;
+  }
+  if (outer.kind == "macro-invocation" && piece.kind == "macro-invocation") {
+    // A callsite spelled inside another callsite's bytes is an argument
+    // callsite: it is expanded while expanding the outer call, so its output is
+    // part of the outer expansion rather than a second parent-header piece.
+    // Both pieces reached this list only after being proved fully consumed, so
+    // what remains to establish is that the inner really is interior to the
+    // outer expansion.  Requiring its PP cover to nest in the outer's is that
+    // proof; two invocations whose source bytes nest while their covers do not
+    // are not in this relationship and stay unorderable.
+    return outer.ppBegin <= piece.ppBegin && piece.ppEnd <= outer.ppEnd;
   }
   if (outer.kind == "conditional-group" &&
       (piece.kind == "token" || piece.kind == "macro-invocation" ||
@@ -1327,6 +1395,14 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
     std::optional<uint64_t> tokEnd =
         sourceMapper_.ByteEndForPPInFile(state.file, pp);
     if (!tokBegin || !tokEnd || *tokBegin >= *tokEnd) {
+      REFOLD_LOG_TRACE("hdr/env",
+                       "inc#{0} source-piece census abandoned at pp={1}: no "
+                       "exact token byte bounds in {2} (b={3} e={4})",
+                       state.include.id, pp, state.file,
+                       tokBegin ? llvm::formatv("{0}", *tokBegin).str()
+                                : std::string("<none>"),
+                       tokEnd ? llvm::formatv("{0}", *tokEnd).str()
+                              : std::string("<none>"));
       hunkSourcePieces.clear();
       break;
     }
@@ -1353,6 +1429,11 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
     // include and its parent directive at the same time. Leave that to include
     // realization rather than inventing a parent-local range.
     hasPartialChildIncludeOverlap = true;
+    REFOLD_LOG_TRACE("hdr/env",
+                     "partial child-include overlap: inc#{0} child#{1} "
+                     "cover=[{2},{3}) material=[{4},{5}) site=[{6},{7})",
+                     state.include.id, child.id, child.cover.begin,
+                     child.cover.end, fullLo, fullHi, child.siteB, child.siteE);
   }
 
   bool hasCompleteMacroInvocationPiece = false;
@@ -1364,6 +1445,22 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
     if (!HeaderMacroInvocationOverlapsMaterial(state.include, state.file, macro,
                                                fullLo, fullHi))
       continue;
+
+    // A callsite spelled inside a `#define` replacement list is definition
+    // state, not a distinct source occurrence.  It contributes no piece and no
+    // partial-overlap refusal of its own: its produced tokens lie within the
+    // cover of whichever invocation expanded the definition, and that
+    // invocation is classified by this same census.
+    if (HeaderMacroInvocationSiteIsMacroDefinitionState(sourceStructureIndex,
+                                                        macro)) {
+      REFOLD_LOG_TRACE("hdr/env",
+                       "inc#{0} macro#{1} name={2} site=[{3},{4}) is macro "
+                       "definition state; not a source-envelope piece",
+                       state.include.id, macro.id, macro.name,
+                       macro.invB.value_or(0), macro.invE.value_or(0));
+      continue;
+    }
+
     if (HeaderMacroInvocationIsConsumedSourceEnvelope(state.include, state.file,
                                                       state.headerText, macro,
                                                       fullLo, fullHi)) {
@@ -1378,6 +1475,11 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
     // delete only part of the callsite's produced material. That is not a
     // source-envelope proof; require a stronger/coalesced candidate.
     hasPartialMacroInvocationOverlap = true;
+    REFOLD_LOG_TRACE("hdr/env",
+                     "partial macro-invocation overlap: inc#{0} macro#{1} "
+                     "name={2} cover=[{3},{4}) material=[{5},{6})",
+                     state.include.id, macro.id, macro.name, macro.cover.begin,
+                     macro.cover.end, fullLo, fullHi);
   }
 
   // Classify incomplete conditional overlap against the concrete source
@@ -1388,13 +1490,33 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
   {
     SmallVector<HeaderSourceEnvelopePiece, 8> sourcePieces = hunkSourcePieces;
     if (sourcePieces.size() >= 2 &&
-        normalizeSourceEnvelopePieces(sourcePieces,
-                                      HeaderSourceEnvelopePieceKindPrecedes,
-                                      HeaderSourceEnvelopePieceContains)) {
+        normalizeSourceEnvelopePieces(
+            sourcePieces, HeaderSourceEnvelopePieceKindPrecedes,
+            HeaderSourceEnvelopePieceContains,
+            [&](const SourceEnvelopeOverlapRejection<HeaderSourceEnvelopePiece>
+                    &rejection) {
+              REFOLD_LOG_TRACE(
+                  "hdr/env",
+                  "inc#{0} source-envelope pieces unorderable: outer "
+                  "kind={1} id={2} source=[{3},{4}) pp=[{5},{6}) vs inner "
+                  "kind={7} id={8} source=[{9},{10}) pp=[{11},{12})",
+                  state.include.id, rejection.outer.kind, rejection.outer.id,
+                  rejection.outer.begin, rejection.outer.end,
+                  rejection.outer.ppBegin, rejection.outer.ppEnd,
+                  rejection.inner.kind, rejection.inner.id,
+                  rejection.inner.begin, rejection.inner.end,
+                  rejection.inner.ppBegin, rejection.inner.ppEnd);
+            })) {
       preConditionalSourceEnvelope = {
           sourceEnvelopePieceBegin(sourcePieces.front()),
           sourceEnvelopePieceEnd(sourcePieces.back())};
     }
+    if (!preConditionalSourceEnvelope)
+      REFOLD_LOG_TRACE(
+          "hdr/env",
+          "inc#{0} no pre-conditional source envelope: pieces={1} "
+          "(need >= 2 and a normalizable order) material=[{2},{3})",
+          state.include.id, sourcePieces.size(), fullLo, fullHi);
   }
   for (const auto &group : model_.GetConds()) {
     if (!HeaderConditionalGroupSelectedMaterialOverlaps(
@@ -1424,6 +1546,16 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
     }
 
     hasPartialConditionalGroupOverlap = true;
+    REFOLD_LOG_TRACE(
+        "hdr/env",
+        "partial conditional-group overlap: inc#{0} group#{1} "
+        "group=[{2},{3}) material=[{4},{5}) preEnvelope={6}",
+        state.include.id, group.id, group.groupB, group.groupE, fullLo, fullHi,
+        preConditionalSourceEnvelope
+            ? llvm::formatv("[{0},{1})", preConditionalSourceEnvelope->begin,
+                            preConditionalSourceEnvelope->end)
+                  .str()
+            : std::string("<none>"));
   }
 
   const bool shouldTryFullHeaderEnvelope =
@@ -1512,6 +1644,14 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
   // neighboring macro/include syntax behind. Either the edit widened to the
   // proven source envelope above, or this include must be realized from B.
   if (fullHeaderEnvelopeBlockedByPartialOverlap) {
+    REFOLD_LOG_TRACE(
+        "hdr/env",
+        "inc#{0} patch[{1}] blocked by partial overlap: childInclude={2} "
+        "macroInvocation={3} conditionalGroup={4} material=[{5},{6}) "
+        "mappedBytes=[{7},{8})",
+        state.include.id, state.patchIndex, hasPartialChildIncludeOverlap,
+        hasPartialMacroInvocationOverlap, hasPartialConditionalGroupOverlap,
+        fullLo, fullHi, state.startByte.value_or(0), state.endByte.value_or(0));
     state.plan.requiresIncludeRealization = true;
     state.plan.realizationReason =
         llvm::formatv("DELETE/REPLACE: patch[{0}] in header file {1} "

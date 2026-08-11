@@ -1250,6 +1250,15 @@ void Preprocessor::HandleDirective(Token &Result) {
   // Save the '#' token in case we need to return it later.
   Token SavedHash = Result;
 
+  // Publish the introducer for the directive we are about to handle.  Callbacks
+  // such as MacroDefined report the macro name rather than the `#`, so a client
+  // that must recover the directive's physical spelling extent has no other
+  // exact anchor.  The previous value is restored on exit so a directive
+  // handled while another is still on the stack cannot leave a stale location
+  // behind.
+  llvm::SaveAndRestore RestoreDirectiveIntroducer(CurrentDirectiveIntroducerLoc,
+                                                  SavedHash.getLocation());
+
   // Read the next token, the directive flavor.  This isn't expanded due to
   // C99 6.10.3p8.
   LexUnexpandedToken(Result);

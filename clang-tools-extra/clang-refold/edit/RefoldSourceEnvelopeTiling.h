@@ -58,12 +58,27 @@ sourceEnvelopePieceEnd(const std::pair<uint64_t, uint64_t> &piece) {
   return piece.second;
 }
 
+/// Reported when normalization rejects a pair of overlapping pieces.
+///
+/// A rejection is a fail-closed refusal, not an error, so it carries no
+/// behavior.  Callers pass a reporter only to name the exact pair in a
+/// diagnostic; the rejection itself is identical either way.
+template <typename PieceT> struct SourceEnvelopeOverlapRejection {
+  const PieceT &outer;
+  const PieceT &inner;
+};
+
 /// Sort by physical source-byte interval, absorb caller-approved nested pieces,
 /// and reject every other overlap as ambiguous.
-template <typename PieceT, typename KindLess, typename NestedCovered>
+///
+/// \param reportRejection invoked at most once, with the exact pair that made
+///        the piece set unorderable, immediately before returning false.
+template <typename PieceT, typename KindLess, typename NestedCovered,
+          typename ReportRejection>
 bool normalizeSourceEnvelopePieces(llvm::SmallVectorImpl<PieceT> &pieces,
                                    KindLess kindLess,
-                                   NestedCovered nestedCovered) {
+                                   NestedCovered nestedCovered,
+                                   ReportRejection reportRejection) {
   llvm::sort(pieces, [&](const PieceT &lhs, const PieceT &rhs) {
     const uint64_t lhsBegin = sourceEnvelopePieceBegin(lhs);
     const uint64_t rhsBegin = sourceEnvelopePieceBegin(rhs);
@@ -99,12 +114,23 @@ bool normalizeSourceEnvelopePieces(llvm::SmallVectorImpl<PieceT> &pieces,
       continue;
     }
 
+    reportRejection(SourceEnvelopeOverlapRejection<PieceT>{outer, piece});
     return false;
   }
 
   pieces.clear();
   pieces.append(outerPieces.begin(), outerPieces.end());
   return true;
+}
+
+/// Normalize without reporting which pair caused a rejection.
+template <typename PieceT, typename KindLess, typename NestedCovered>
+bool normalizeSourceEnvelopePieces(llvm::SmallVectorImpl<PieceT> &pieces,
+                                   KindLess kindLess,
+                                   NestedCovered nestedCovered) {
+  return normalizeSourceEnvelopePieces(
+      pieces, kindLess, nestedCovered,
+      [](const SourceEnvelopeOverlapRejection<PieceT> &) {});
 }
 
 /// Prove every physical source-byte gap between normalized source-envelope

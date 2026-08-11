@@ -360,6 +360,18 @@ struct Item {
       SiteEnd;                 // one-past-end of the directive line (incl. EOL)
   std::string SitePath;        // file path that contains the directive
 
+  // --- Complete physical extent of a macro-state directive line ---
+  // For `#define`/`#undef`, the half-open source-byte range of the whole
+  // directive as spelled, from its `#` introducer through the end of the
+  // logical line reached after every translation-phase-2 splice.  Unlike
+  // [SiteBegin, SiteEnd), which is anchored on the macro name token and stops
+  // at the first physical newline, this range is exactly the bytes a consumer
+  // may preserve to keep the directive.  It is recorded only when every
+  // producer self-consistency check passes; consumers must fall back when it is
+  // absent.
+  std::optional<uint64_t> DirectiveLineBegin;
+  std::optional<uint64_t> DirectiveLineEnd;
+
   // --- Pragma-operator provenance (Subkind == "#pragma") ---
   // True when the directive was spelled with the `_Pragma("...")` operator
   // rather than a `#pragma` directive line.  Lets the consumer fold a pragma
@@ -658,6 +670,29 @@ class RefoldMapBuilder {
   ///          valid)
   std::optional<std::pair<uint64_t, uint64_t>>
   computeDirectiveLine(SourceLocation HashLoc);
+
+  /// Compute the complete physical extent of the macro-state directive that
+  /// Clang is handling right now.
+  ///
+  /// The returned half-open byte range starts at the `#` token Clang tokenized
+  /// as this directive's introducer and ends one past the terminating newline
+  /// of the logical line reached after every translation-phase-2 splice.  A
+  /// backslash-continued `#define` therefore reports its whole span rather than
+  /// stopping at its first physical newline, which is what
+  /// computeDirectiveLine() reports for the same directive.
+  ///
+  /// This is recorded as a fact rather than reconstructed later: the introducer
+  /// comes from Preprocessor::getCurrentDirectiveIntroducerLoc() and the end
+  /// comes from Clang's own escaped-newline predicate, so no consumer has to
+  /// recover the extent from a rendered directive spelling.
+  ///
+  /// \param MacroNameLoc spelling location of the directive's macro name token,
+  ///        used to prove the introducer and the extent describe one directive.
+  /// \returns (begin, end) in the directive's source file, or nullopt when any
+  ///          self-consistency check fails, in which case the field is omitted
+  ///          and consumers keep their pre-existing recovery path.
+  std::optional<std::pair<uint64_t, uint64_t>>
+  computeCurrentMacroStateDirectivePhysicalExtent(SourceLocation MacroNameLoc);
 
   /// Canonical absolute path for a file entry (when possible).
   ///

@@ -3335,21 +3335,63 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
       if (!groupContainsEdit)
         continue;
 
-      std::optional<LineStateObserverSite> firstObserver =
-          lineControlProof_.FirstOwnerSuffixLineStateObserverSite(
-              ownerIncludeId, emissionOwner, group->groupE);
+      // Find the first line-state observer after the group that still exists in
+      // the emitted text.
+      //
+      // A recorded observer whose source bytes an edit replaced is not an
+      // observer of the output: those bytes carry the edited preprocessed
+      // stream's already-expanded value, a constant that no emitted `#line` can
+      // change.  Skipping it and continuing past that edit is therefore exact,
+      // not a relaxation -- and it is required, because a `#line` cannot be
+      // placed at an offset the output does not contain.
+      //
+      // The skip is authorized only when a normalized edit demonstrably covers
+      // the observer.  An offset that is unmapped for any other reason means
+      // the source-mapping inventory is incomplete, which stays fail-closed
+      // below.
+      std::optional<LineStateObserverSite> firstObserver;
+      std::optional<uint64_t> finalOffset;
+      for (uint64_t searchFrom = group->groupE;;) {
+        firstObserver = lineControlProof_.FirstOwnerSuffixLineStateObserverSite(
+            ownerIncludeId, emissionOwner, searchFrom);
+        if (!firstObserver || !firstObserver->demand.Any())
+          break;
+
+        // If the observer is still inside the conditional group, an arm-local
+        // repair is the only statement that can dominate it.  The join repair
+        // is required only for observers reached after the group has rejoined.
+        if (firstObserver->offset < group->groupE)
+          break;
+
+        finalOffset = sourceOffsetToFinalOffset(firstObserver->offset);
+        if (finalOffset)
+          break;
+
+        const TextEdit *consumingEdit = nullptr;
+        for (const TextEdit &edit : norm) {
+          if (edit.start < edit.end && edit.start <= firstObserver->offset &&
+              firstObserver->offset < edit.end) {
+            consumingEdit = &edit;
+            break;
+          }
+        }
+        if (!consumingEdit || consumingEdit->end <= searchFrom)
+          break;
+
+        REFOLD_LOG_TRACE(
+            "linedir/conditional-join",
+            "{0} group#{1}: observer at {2} was replaced by the edit at "
+            "[{3},{4}); resuming the search after it",
+            emissionOwner, group->id, firstObserver->offset,
+            consumingEdit->start, consumingEdit->end);
+        searchFrom = consumingEdit->end;
+        firstObserver.reset();
+      }
+
       if (!firstObserver || !firstObserver->demand.Any())
         continue;
-
-      // If the first observer is still inside the conditional group, an
-      // arm-local repair is the only statement that can dominate it.  The join
-      // repair is required only for observers reached after the group has
-      // rejoined.
       if (firstObserver->offset < group->groupE)
         continue;
-
-      std::optional<uint64_t> finalOffset =
-          sourceOffsetToFinalOffset(firstObserver->offset);
       const OwnerStateBoundary observerBoundary =
           OwnerStateBoundary::FromSource(
               OwnerSourceRange::From(emissionOwner, firstObserver->offset,

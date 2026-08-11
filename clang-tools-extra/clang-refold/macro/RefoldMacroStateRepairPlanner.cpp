@@ -29,10 +29,12 @@
 #include "util/RefoldPathIdentity.h"
 #include "util/StringUtils.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MemoryBuffer.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -302,6 +304,11 @@ private:
   std::string DirectiveTextForPreservation(
       const RefoldModel::MacroDirective &directive) const;
 
+  /// Returns the directive's exact source spelling, or its recorded canonical
+  /// text when the map has no physical extent or the file cannot be read.
+  StringRef
+  ExactDirectiveSourceText(const RefoldModel::MacroDirective &directive) const;
+
   /// Reconstructs the macro-state transition represented by a source directive.
   std::optional<MacroStateSourceTransition> MacroStateSourceTransitionFor(
       const RefoldModel::MacroDirective &directive) const;
@@ -375,6 +382,9 @@ private:
   bool DirectCalleePatchRequiresDefinitionBeforeReplacement(
       const TextEdit &edit, const RefoldModel::MacroDirective &definition,
       StringRef macroName) const;
+  /// Returns whether this edit's replacement folds preserved TU source in with
+  /// its B payload, so the replacement is not wholly in B's macro state.
+  bool EditClosesOverPreservedTUSource(const TextEdit &edit) const;
 
   /// Builds the owner-state boundary immediately after a macro directive.
   OwnerStateBoundary MacroDirectiveSuffixBoundary(
@@ -504,6 +514,11 @@ private:
       const RefoldModel::MacroInvocation &invocation,
       const RefoldModel::IncludeItem &materializedInclude,
       uint64_t materializedSiteEnd) const;
+  /// Returns whether `definition`'s recorded replacement list names
+  /// `macroName`.
+  bool DefinitionReplacementListNamesMacro(
+      const RefoldModel::MacroDirective &definition,
+      llvm::StringRef macroName) const;
   /// Returns whether a materialized include must carry a definition afterward
   /// to satisfy surviving downstream observers.
   bool MaterializedIncludeNeedsDefinitionAfterward(
@@ -521,6 +536,8 @@ private:
   const llvm::DenseSet<uint64_t> *ownersMustExpand_ = nullptr;
   std::map<size_t, SmallVector<MacroStatePreservation, 4>>
       macroStatePreservationsByEdit_;
+  /// Exact source spelling per macro-directive id, read on first use.
+  mutable llvm::DenseMap<uint64_t, std::string> exactDirectiveSourceText_;
 };
 
 void MacroStateRepairContext::BuildDirectiveIndexOnce() {
@@ -685,10 +702,50 @@ MacroStateRepairContext::MacroDirectiveFullSourceInterval(
       directive, tuPath_, tuBytes_, std::nullopt);
 }
 
+/// MacroDirective::text is rendered from the parsed MacroInfo, so it is not the
+/// bytes any emitted source contains.  An empty replacement list renders with a
+/// trailing space, runs of whitespace collapse to one space, and a
+/// backslash-continued definition folds onto a single line.  Both searching an
+/// emitted payload for a directive and re-emitting one need the real spelling,
+/// which the producer's recorded physical extent identifies exactly.
+///
+/// The defining file is read on first use and cached.  A map without the
+/// extent, or a file that cannot be read, falls back to the recorded text and
+/// therefore to the previous behaviour.
+StringRef MacroStateRepairContext::ExactDirectiveSourceText(
+    const RefoldModel::MacroDirective &directive) const {
+  auto cached = exactDirectiveSourceText_.find(directive.id);
+  if (cached != exactDirectiveSourceText_.end())
+    return cached->second;
+
+  std::string text = directive.text.str();
+  if (directive.directiveLineB && directive.directiveLineE &&
+      *directive.directiveLineB < *directive.directiveLineE &&
+      !directive.sitePath.empty()) {
+    StringRef bytes;
+    std::unique_ptr<llvm::MemoryBuffer> owned;
+    if (PathIdentity().PathsEqual(directive.sitePath, tuPath_)) {
+      bytes = tuBytes_;
+    } else if (auto bufOrErr =
+                   llvm::MemoryBuffer::getFile(directive.sitePath)) {
+      owned = std::move(*bufOrErr);
+      bytes = owned->getBuffer();
+    }
+    if (*directive.directiveLineE <= bytes.size()) {
+      text = bytes.slice(*directive.directiveLineB, *directive.directiveLineE)
+                 .str();
+    }
+  }
+
+  return exactDirectiveSourceText_.try_emplace(directive.id, std::move(text))
+      .first->second;
+}
+
 bool MacroStateRepairContext::MacroStateDirectiveAppearsAtLineStart(
     const TextEdit &edit, const RefoldModel::MacroDirective &directive) const {
-  return !directive.text.empty() &&
-         stringutils::containsAtLineStartAfterIndent(edit.text, directive.text);
+  StringRef spelling = ExactDirectiveSourceText(directive);
+  return !spelling.empty() &&
+         stringutils::containsAtLineStartAfterIndent(edit.text, spelling);
 }
 
 std::optional<size_t>
@@ -741,7 +798,10 @@ bool MacroStateRepairContext::MacroDirectiveTouchedByTUEdit(
 
 std::string MacroStateRepairContext::DirectiveTextForPreservation(
     const RefoldModel::MacroDirective &directive) const {
-  std::string textLocal = directive.text.str();
+  // Re-emit the directive as it was written.  Preserving a directive is a
+  // source-fidelity operation, so it must not rewrite the spelling into
+  // MacroDirective::text's canonical rendering.
+  std::string textLocal = ExactDirectiveSourceText(directive).str();
   if (textLocal.empty() || textLocal.back() != '\n')
     textLocal.push_back('\n');
   return textLocal;
@@ -1362,6 +1422,29 @@ bool MacroStateRepairContext::
   return false;
 }
 
+/// A TU include closure realizes an unresolved hunk by keeping the original
+/// `#include` line, and any source-neutral zero-token material around it,
+/// inside the replacement alongside the B payload.  Its replacement text is
+/// therefore a mixture of two macro states: the B payload is already fully
+/// expanded, while the preserved source must still be preprocessed exactly as
+/// it was.
+///
+/// No fact currently partitions a replacement into its B-derived and
+/// preserved-source bytes, so this reports only that such a mixture exists.
+/// Callers that would rewrite the macro state of a whole replacement must treat
+/// that as missing evidence rather than as permission.
+bool MacroStateRepairContext::EditClosesOverPreservedTUSource(
+    const TextEdit &edit) const {
+  for (const auto &carrier : edit.acceptedResults) {
+    if (!carrier)
+      continue;
+    if (carrier->proofSummary.inventory.currentPath ==
+        AcceptedPathKind::TUIncludeClosureEdit)
+      return true;
+  }
+  return false;
+}
+
 OwnerStateBoundary MacroStateRepairContext::MacroDirectiveSuffixBoundary(
     const RefoldModel::MacroDirective &directive) const {
   return OwnerStateBoundary::FromSource(
@@ -1928,6 +2011,18 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
       continue;
     TextEdit &edit = tuEdits_[editIndex];
     if (edit.start > edit.end || edit.end > tuBytes_.size())
+      continue;
+
+    // This partition rewrites the macro state seen by the entire replacement.
+    // That is justified only for a B-derived payload: B is already fully
+    // expanded, so a live definition named there would be a spurious
+    // re-expansion that the synthetic #undef removes.  When the replacement
+    // also carries preserved TU source, an observation may instead be an
+    // expansion the preserved source requires, and nothing records which
+    // replacement bytes are which.  Refuse rather than assume: undefining the
+    // macro would otherwise silently change how the preserved source
+    // preprocesses.
+    if (EditClosesOverPreservedTUSource(edit))
       continue;
 
     const size_t editStart = static_cast<size_t>(edit.start);
@@ -2857,6 +2952,25 @@ bool MacroStateRepairContext::MaterializedIncludeNeedsDefinitionAfterward(
   return false;
 }
 
+/// A carried definition is only usable if every macro its replacement list
+/// names is still defined where the carried copy lands.  The producer records
+/// the replacement list as a token tape, so the reference is read from that
+/// tape rather than rediscovered by reparsing directive text.  Parameter
+/// references cannot name another macro and are skipped.
+bool MacroStateRepairContext::DefinitionReplacementListNamesMacro(
+    const RefoldModel::MacroDirective &definition, StringRef macroName) const {
+  if (macroName.empty())
+    return false;
+  for (const RefoldModel::MacroReplacementToken &token :
+       definition.replacementTokens) {
+    if (token.kind != RefoldModel::MacroReplacementTokenKind::Literal)
+      continue;
+    if (token.spelling == macroName)
+      return true;
+  }
+  return false;
+}
+
 bool MacroStateRepairContext::RepairConsumedDefinitionsForMaterializedInclude(
     const RefoldModel::IncludeItem &materializedInclude,
     uint64_t materializedSiteBegin, uint64_t materializedSiteEnd,
@@ -2871,6 +2985,9 @@ bool MacroStateRepairContext::RepairConsumedDefinitionsForMaterializedInclude(
                             {}};
   std::string preservedDirectivePrefix;
 
+  // Every definition this materialized include would consume and that the
+  // replacement does not already carry.
+  SmallVector<const NamedMacroDirectiveRef *, 8> candidates;
   for (const NamedMacroDirectiveRef &ref : plan_.namedMacroDirectives) {
     const RefoldModel::MacroDirective &definition = *ref.directive;
     if (definition.subkind != "#define")
@@ -2885,8 +3002,59 @@ bool MacroStateRepairContext::RepairConsumedDefinitionsForMaterializedInclude(
       continue;
     if (MacroStateDirectiveAppearsAtLineStart(replacementProbe, definition))
       continue;
-    if (!MaterializedIncludeNeedsDefinitionAfterward(
-            materializedInclude, materializedSiteEnd, definition))
+    candidates.push_back(&ref);
+  }
+
+  // Seed the carry set with the definitions a surviving suffix observer names
+  // directly.
+  DenseSet<uint64_t> carriedDefinitionIds;
+  for (const NamedMacroDirectiveRef *ref : candidates) {
+    if (MaterializedIncludeNeedsDefinitionAfterward(
+            materializedInclude, materializedSiteEnd, *ref->directive))
+      carriedDefinitionIds.insert(ref->directive->id);
+  }
+
+  // Close that set over replacement-list references.
+  //
+  // A surviving observer names the macro it invokes, not the macros that
+  // invocation expands into, so the seed is only the outermost layer.  Carrying
+  // `usbi_err` while consuming the `_usbi_log` its body names would emit a
+  // definition that no longer expands: the identifier survives into the output
+  // and the refolded source stops matching the edited stream.  A definition
+  // therefore travels with every consumed definition its replacement list
+  // names, transitively.
+  //
+  // Candidates are visited in producer record order, which is the order the
+  // directives appear in the header, so a definition is emitted before the one
+  // whose body names it -- the order the original source already proved works.
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (const NamedMacroDirectiveRef *ref : candidates) {
+      if (carriedDefinitionIds.contains(ref->directive->id))
+        continue;
+      for (const NamedMacroDirectiveRef *carried : candidates) {
+        if (!carriedDefinitionIds.contains(carried->directive->id))
+          continue;
+        if (!DefinitionReplacementListNamesMacro(*carried->directive,
+                                                 ref->name))
+          continue;
+        REFOLD_LOG_TRACE(
+            "include/materialized-macro-state",
+            "inc#{0}: carrying definition #{1} for macro '{2}' because "
+            "carried definition #{3} names it in its replacement list",
+            materializedInclude.id, ref->directive->id, ref->name,
+            carried->directive->id);
+        carriedDefinitionIds.insert(ref->directive->id);
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  for (const NamedMacroDirectiveRef *refPtr : candidates) {
+    const NamedMacroDirectiveRef &ref = *refPtr;
+    const RefoldModel::MacroDirective &definition = *ref.directive;
+    if (!carriedDefinitionIds.contains(definition.id))
       continue;
 
     if (DefinitionHasOtherSurvivingSameNameTransition(definition, ref.name)) {

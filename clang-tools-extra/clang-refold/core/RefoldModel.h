@@ -780,9 +780,26 @@ public:
     /// Physical source file containing the directive site.
     StringRef sitePath;
     /// Inclusive physical source-byte offset of the directive site.
+    ///
+    /// This is anchored on the macro name token, not on the `#`, and it stops
+    /// at the first physical newline.  Prefer the directive-line pair below
+    /// when the whole directive spelling is required.
     uint64_t siteB;
     /// Exclusive physical source-byte offset of the directive site.
     uint64_t siteE;
+    /// Inclusive physical source-byte offset of the directive's `#` introducer.
+    ///
+    /// Together with `directiveLineE` this is the producer's record of the
+    /// directive's complete physical spelling, spanning every
+    /// translation-phase-2 splice.  The pair is present or absent as a unit,
+    /// and it is absent in maps written before the producer recorded it;
+    /// consumers must then fall back to recovering the interval from `text`,
+    /// which cannot succeed for a directive whose source spelling is not
+    /// canonical.
+    std::optional<uint64_t> directiveLineB;
+    /// Exclusive physical source-byte offset one past the directive's logical
+    /// line, including its terminating newline when the file has one.
+    std::optional<uint64_t> directiveLineE;
     /// Include instance that owns the directive site, or nullopt for TU.
     std::optional<uint64_t> ownerIncludeId;
     /// A-token spans contributed by this directive, when any.
