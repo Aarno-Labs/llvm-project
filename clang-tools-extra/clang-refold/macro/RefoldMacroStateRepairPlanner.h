@@ -86,6 +86,16 @@ public:
     bool directiveIndexBuilt = false;
     llvm::DenseMap<uint64_t, NamedMacroDirectiveRef> macroDirectiveById;
     llvm::SmallVector<NamedMacroDirectiveRef, 64> namedMacroDirectives;
+    /// Positions in `namedMacroDirectives` grouped by controlled macro name.
+    ///
+    /// Macro-state questions are always asked about one name, but the ordered
+    /// view is sorted by directive id, so answering them by scanning it is
+    /// linear in the number of directives in the translation unit and pays a
+    /// string comparison per entry.  This index answers the same question over
+    /// only the directives that share the name.  Each bucket keeps the ordered
+    /// view's relative order, so a walk through a bucket sees directives in the
+    /// same id order a full scan would.
+    llvm::StringMap<llvm::SmallVector<uint32_t, 2>> namedMacroDirectivesByName;
     llvm::DenseSet<uint64_t> preservedDefinitionDirectiveIds;
     llvm::DenseSet<uint64_t> syntheticUndefPartitionedDefinitionIds;
   };

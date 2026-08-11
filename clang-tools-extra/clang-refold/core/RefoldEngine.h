@@ -397,6 +397,31 @@ private:
   /// ladder ends at the whole translation unit.
   llvm::DenseSet<uint64_t> ownersMustExpand_;
 
+  /// Whether this attempt resolves alignment ambiguity at all.
+  ///
+  /// False for the first attempt of every run, which plans on the core
+  /// theorem's forced anchors alone. A candidate map is realized by a complete
+  /// refold of the translation unit, so resolution is not run until an attempt
+  /// has produced evidence that ambiguity is what limited it -- see
+  /// `AlignmentResolutionIsDemanded()`. When it is set, *every* window that can
+  /// carry ambiguity is resolved, because a partially resolved alignment is a
+  /// different alignment rather than a weaker one.
+  bool resolveAlignmentAmbiguity_ = false;
+
+  /// The core theorem's forced A-to-B map for this attempt, retained after
+  /// token-diff planning.
+  ///
+  /// A forced anchor is an edge every optimal path takes. That makes it the
+  /// exact test for whether a hunk frontier is pinned -- and therefore whether
+  /// resolution could place the hunk anywhere else -- which is the evidence
+  /// `AlignmentResolutionIsDemanded()` reads.
+  std::vector<int64_t> alignmentForcedMap_;
+
+  /// A ranges of this attempt's certified certification windows, in window
+  /// order.  Paired with `alignmentForcedMap_` these say which regions of the
+  /// stream still admit more than one optimal map.
+  std::vector<std::pair<uint64_t, uint64_t>> certificationWindowARanges_;
+
   /// Final-output byte ranges for synthetic `#line` directives that the local
   /// emitters have explicitly made eligible for the final fixed-point pruner.
   /// The vector is cleared at the start of each top-level refold attempt and is
@@ -983,6 +1008,25 @@ private:
   /// `FindEnclosingOwner()`.
   std::optional<uint64_t>
   FindSmallestOwnerForEditedToken(std::size_t editedTokenIndex) const;
+
+  /// Return whether this attempt showed that alignment ambiguity is what
+  /// limited it, so the next attempt should resolve and re-plan.
+  ///
+  /// Two kinds of evidence count, matching the two ways a run falls short:
+  ///
+  ///   * it gave up, and a terminal request localized the failure to a range of
+  ///     A tokens -- the coordinates the resolver actually moves; or
+  ///   * it emitted source but expanded a macro root or materialized an
+  ///     include, which is the preservation loss forced-only anchors cause and
+  ///     resolution repairs.
+  ///
+  /// A terminal request that names no A-token range is not evidence.  Such a
+  /// failure is a fact about producer or preprocessor state, and it recurs
+  /// unchanged under every alignment, so simulating candidates against it buys
+  /// a complete refold of the translation unit per candidate and no proof.
+  /// That is an attribution rule, not a budget: a request that does name tokens
+  /// is honoured however expensive its window turns out to be.
+  bool AlignmentResolutionIsDemanded() const;
 
   /// Collect every region named by this run's terminal-fallback requests that
   /// has not already been given up.

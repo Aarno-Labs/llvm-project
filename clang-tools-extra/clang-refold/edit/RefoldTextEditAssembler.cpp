@@ -3108,15 +3108,33 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
   // If that law is violated, do not guess whether an insertion should be
   // merged into, ordered around, or shadowed by a replacement. Fail closed to
   // the explicit terminal fallback instead.
+  // Record which A tokens an uncomposable edit came from whenever the edit
+  // knows them.  Two edits colliding in source-byte space is a property of the
+  // hunk partition, so the token range is what lets the caller tell a failure a
+  // different alignment could still repair from one no anchor placement
+  // reaches.  An edit without direct TU hunk provenance names nothing and
+  // leaves the request unattributed exactly as before.
+  auto uncomposableEditFailure = [](const TextEdit &edit, size_t editIndex) {
+    if (!edit.directTUHunkAStart || !edit.directTUHunkAEnd)
+      return MakeTerminalFallbackProofFailure(
+          TerminalFallbackObligationKind::EmissionEditSetComposable,
+          TerminalFallbackFailureReason::UncomposableEmissionEditSet);
+    return MakeTerminalFallbackProofFailure(
+        TerminalFallbackObligationKind::EmissionEditSetComposable,
+        TerminalFallbackFailureReason::UncomposableEmissionEditSet,
+        TerminalFallbackFailureContext::ForHunkTokenEnvelope(
+            edit.directTUHunkIndex.value_or(editIndex),
+            *edit.directTUHunkAStart, *edit.directTUHunkAEnd,
+            edit.directTUHunkBStart.value_or(0),
+            edit.directTUHunkBEnd.value_or(0)));
+  };
+
   uint64_t validatedCursor = 0;
   for (size_t editIndex = 0; editIndex < norm.size(); ++editIndex) {
     const TextEdit &e = norm[editIndex];
     if (e.end < e.start || e.end > n) {
       terminalSink_.RequestTerminalFallback(
-          MakeTerminalFallbackProofFailure(
-              TerminalFallbackObligationKind::EmissionEditSetComposable,
-              TerminalFallbackFailureReason::UncomposableEmissionEditSet),
-          "edits/apply",
+          uncomposableEditFailure(e, editIndex), "edits/apply",
           llvm::formatv("bad normalized edit bounds in {0}: edit#{1}=[{2},{3}) "
                         "fileLen={4} textLen={5}",
                         emissionOwner, editIndex, e.start, e.end, n,
@@ -3126,10 +3144,7 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     }
     if (e.start < validatedCursor) {
       terminalSink_.RequestTerminalFallback(
-          MakeTerminalFallbackProofFailure(
-              TerminalFallbackObligationKind::EmissionEditSetComposable,
-              TerminalFallbackFailureReason::UncomposableEmissionEditSet),
-          "edits/apply",
+          uncomposableEditFailure(e, editIndex), "edits/apply",
           llvm::formatv("overlapping normalized edits in {0}: previousEnd={1} "
                         "edit#{2}=[{3},{4}) textLen={5}",
                         emissionOwner, validatedCursor, editIndex, e.start,

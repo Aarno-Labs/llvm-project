@@ -23,7 +23,6 @@
 #include "llvm/Support/FormatVariadic.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <limits>
 #include <map>
 #include <optional>
@@ -42,64 +41,6 @@ namespace {
 constexpr size_t MaxUniqueMapsPerForcedWindow = 256;
 constexpr size_t MaxGlobalSemanticCandidateMaps = 256;
 constexpr size_t MaxProposalCounterfactuals = 256;
-
-/// Environment override for the per-run candidate-simulation work budget.
-constexpr const char *CandidateSimulationBudgetEnvironment =
-    "CLANG_REFOLD_CANDIDATE_SIMULATION_WORK_BUDGET";
-
-/// Work one run may spend re-planning candidate alignments, in token-squared
-/// units.
-///
-/// Each candidate is realized by a complete refold of the translation unit, so
-/// a limit expressed in candidates is not a cost bound: the same allowance is
-/// a few seconds on one stream and many minutes on another. Measured
-/// per-candidate cost grows faster than stream length -- roughly with its
-/// square, since certification dominates a pass -- so a candidate is charged
-/// the square of the A-token count. That makes the ceiling mean about the same
-/// machine work on any input, and it stays a deterministic function of the
-/// inputs; a wall-clock budget would model cost better but would let two
-/// machines commit different alignments for the same source.
-///
-/// The size is calibrated on measured behaviour: across the corpus the window
-/// that *commits* enumerates four candidates, while windows enumerating
-/// sixteen have never committed -- sixteen candidates emitting sixteen
-/// distinct concrete outputs can no longer collapse to one class. This admits
-/// the former with margin and declines the latter.
-///
-/// Calibration can be wrong for an input not yet seen: a window needing more
-/// candidates than this is declined where a larger budget would have resolved
-/// it. That costs completeness, never soundness. A declined window keeps the
-/// anchors the core theorem published, and a window that does run still
-/// enumerates its complete candidate set and is judged by the unchanged commit
-/// theorems -- the budget gates whether a window runs, never how it is judged.
-constexpr uint64_t DefaultCandidateSimulationWorkBudget = 2500000000ULL;
-
-/// Return how many candidate simulations this run may spend in total.
-///
-/// A run that cannot afford two candidates cannot resolve anything, since a
-/// window needs at least two competing maps to be ambiguous, so there is no
-/// floor propping small allowances up to a usable number.
-size_t getCandidateSimulationBudget(size_t aTokenCount) {
-  uint64_t workBudget = DefaultCandidateSimulationWorkBudget;
-  if (const char *injected =
-          std::getenv(CandidateSimulationBudgetEnvironment)) {
-    if (*injected != '\0' &&
-        StringRef(injected).getAsInteger(10, workBudget)) {
-      REFOLD_LOG_WARN(
-          "lcs/semantic-resolver",
-          "invalid {0} value '{1}'; using the default work budget {2}",
-          CandidateSimulationBudgetEnvironment, injected,
-          DefaultCandidateSimulationWorkBudget);
-      workBudget = DefaultCandidateSimulationWorkBudget;
-    }
-  }
-  if (aTokenCount == 0)
-    return 0;
-  const uint64_t tokens = static_cast<uint64_t>(aTokenCount);
-  if (tokens > std::numeric_limits<uint64_t>::max() / tokens)
-    return 0;
-  return static_cast<size_t>(workBudget / (tokens * tokens));
-}
 
 struct ForcedAnchor {
   uint64_t aToken = 0;
@@ -476,12 +417,23 @@ RefoldAlignmentSemanticResolver::Resolve() const {
   // observes the alignment production would actually use up to that point.
   std::vector<int64_t> baseMap = deps_.coreAlignment.forcedMap;
   std::vector<WindowResolution> committedWindows;
-  size_t simulationBudget =
-      getCandidateSimulationBudget(deps_.aLexemes.size());
   size_t windowsWithOracle = 0;
   for (size_t windowIndex = 0;
        windowIndex < deps_.coreAlignment.certificationWindows.size();
        ++windowIndex) {
+    // A window the core theorem already determined has one optimal map, so
+    // resolution would recompute its quadratic pair facts only to return the
+    // anchors it already has. Skipping it changes no outcome; every window that
+    // can carry ambiguity is still resolved, and none is passed over for cost.
+    if (!WindowCarriesAmbiguity(windowIndex)) {
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "window {0} needs no resolution: the core theorem forced every one "
+          "of its A tokens, so exactly one optimal map crosses it",
+          windowIndex);
+      continue;
+    }
+
     // Materialize this window's pair facts, resolve, then release them before
     // moving on. Holding every window's facts at once would reintroduce the
     // complete-grid payload that partitioning exists to avoid.
@@ -497,12 +449,9 @@ RefoldAlignmentSemanticResolver::Resolve() const {
     }
     ++windowsWithOracle;
     WindowResolution resolution =
-        ResolveCertificationWindow(windowIndex, baseMap, simulationBudget);
+        ResolveCertificationWindow(windowIndex, baseMap);
     if (deps_.releaseWindowOracle)
       deps_.releaseWindowOracle(windowIndex);
-    // Charge whether or not the window committed: a declined window still
-    // re-planned the unit once per candidate.
-    simulationBudget -= std::min(simulationBudget, resolution.simulationsSpent);
     if (!resolution.committed)
       continue;
     baseMap = resolution.selectedMap;
@@ -587,10 +536,32 @@ RefoldAlignmentSemanticResolver::Resolve() const {
   return result;
 }
 
+bool RefoldAlignmentSemanticResolver::WindowCarriesAmbiguity(
+    size_t windowIndex) const {
+  if (windowIndex >= deps_.coreAlignment.certificationWindows.size())
+    return false;
+  const diffutils::LcsCertificationWindow &window =
+      deps_.coreAlignment.certificationWindows[windowIndex];
+  if (!window.IsCertified())
+    return false;
+
+  // An A token the core theorem left unmatched is the only way a competing
+  // optimal map can differ inside this rectangle. Its absence is what makes the
+  // window's map unique; one occurrence is enough to have to resolve.
+  const uint64_t aEnd =
+      std::min<uint64_t>(window.aEnd, deps_.coreAlignment.forcedMap.size());
+  for (uint64_t aToken = window.aBegin; aToken < aEnd; ++aToken)
+    if (deps_.coreAlignment.forcedMap[aToken] < 0)
+      return true;
+
+  // A window reaching past the recorded forced map is not a window this
+  // routine can speak for; resolve it rather than assume it is determined.
+  return aEnd != window.aEnd;
+}
+
 RefoldAlignmentSemanticResolver::WindowResolution
 RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
-    size_t windowIndex, ArrayRef<int64_t> baseMap,
-    size_t simulationBudget) const {
+    size_t windowIndex, ArrayRef<int64_t> baseMap) const {
   WindowResolution result;
 
   const diffutils::OptimalTokenAlignmentOracle *oraclePtr =
@@ -703,15 +674,6 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     return result;
   }
 
-  if (globalMaps.size() > simulationBudget) {
-    REFOLD_LOG_TRACE(
-        "lcs/semantic-resolver",
-        "window {0} keeps core-forced anchors: {1} candidates exceed the "
-        "run's remaining simulation budget ({2})",
-        windowIndex, globalMaps.size(), simulationBudget);
-    return result;
-  }
-
   std::vector<AlignmentSemanticSimulationResult> simulations;
   simulations.reserve(globalMaps.size());
   for (const std::vector<int64_t> &candidateMap : globalMaps) {
@@ -728,7 +690,6 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         deps_.simulate(buildSimulationSelection(candidateMap,
                                                 deps_.coreAlignment)));
   }
-  result.simulationsSpent = simulations.size();
 
   auto commitRealizationClass =
       [&](StringRef equivalenceKey, ArrayRef<size_t> classMembers,

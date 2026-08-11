@@ -676,6 +676,19 @@ void RefoldEngine::ResolveSemanticAlignment(
   if (!alignmentSemanticResolverEnabled_ || alignmentSelectionOverride_)
     return;
 
+  // Resolution runs only on an attempt that was asked for it. Until then the
+  // production map is exactly what the core theorem published, which is the
+  // alignment used before per-window resolution existed -- so this leaves the
+  // run in a state the pipeline has always been able to plan from, rather than
+  // a partially resolved one.
+  if (!resolveAlignmentAmbiguity_) {
+    alignment.RetainOnlyCoreForcedAnchors();
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "core-forced anchors retained: this attempt was not asked "
+                     "to resolve alignment ambiguity");
+    return;
+  }
+
   // Semantic restoration needs the all-optimal pair facts for the window it is
   // resolving. The partitioned certifier releases those facts on purpose, so
   // they are recomputed one window at a time through the callbacks below: the

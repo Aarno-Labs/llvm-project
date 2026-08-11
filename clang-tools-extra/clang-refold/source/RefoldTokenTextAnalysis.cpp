@@ -61,6 +61,17 @@ RefoldTokenTextAnalysis::FirstRawIdentifierObservationOffsetInText(
   if (name.empty() || text.empty())
     return std::nullopt;
 
+  // The only way this returns an offset is a token whose bytes, taken from
+  // `text`, equal `name`.  So `name` occurring nowhere in `text` as a plain
+  // substring is a complete answer, and it is one a byte search gives without
+  // copying the payload and lexing it to the end.  The reverse does not hold --
+  // a substring hit may be part of a longer identifier, inside a string
+  // literal, or in a comment -- so a hit still has to be lexed.  This only
+  // decides the negative case, which is the common one: most payloads mention
+  // most macros not at all.
+  if (text.find(name) == StringRef::npos)
+    return std::nullopt;
+
   const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
   std::string lexBuf = text.str();
   lexBuf.push_back('\0');
@@ -103,6 +114,15 @@ std::optional<size_t>
 RefoldTokenTextAnalysis::FirstFunctionLikeInvocationOffsetInText(
     StringRef name, StringRef text, StringRef suffix) const {
   if (name.empty() || text.empty())
+    return std::nullopt;
+
+  // The NAME token must start in `text` and the loop below rejects any token
+  // reaching past `text`, so a match requires `name` to occur in `text` as a
+  // plain substring -- the suffix contributes only the following `(`.  Deciding
+  // that negative case with a byte search avoids concatenating the payload and
+  // suffix into a fresh buffer and lexing all of it.  A substring hit proves
+  // nothing on its own and is still lexed.
+  if (text.find(name) == StringRef::npos)
     return std::nullopt;
 
   const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);

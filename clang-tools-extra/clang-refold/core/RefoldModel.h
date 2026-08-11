@@ -1099,6 +1099,18 @@ public:
   /// Return the ordered producer A-token to physical source-byte map entries.
   ArrayRef<TokMapEntry> GetTokmap() const { return tokmap_; }
 
+  /// Return whether `GetTokmap()[index]` was contributed by the translation
+  /// unit's own source file rather than by an included one.
+  ///
+  /// Answered from a flag computed once when the map is loaded.  Asking it as
+  /// `PathsEqual(entry.file, tuPath)` instead is the same question, but each
+  /// entry stores its own copy of the path spelling, so every ask canonicalizes
+  /// two strings -- and the callers walk the whole map, once per edit they are
+  /// placing.  The flag turns that into one canonicalization per entry per run.
+  bool TokmapEntryIsTUOwned(std::size_t index) const {
+    return index < tokmapEntryIsTUOwned_.size() && tokmapEntryIsTUOwned_[index];
+  }
+
   /// Return producer include instances.
   ArrayRef<IncludeItem> GetIncludes() const { return includes_; }
   /// Return producer macro invocation instances.
@@ -1304,6 +1316,10 @@ private:
 
   DenseMap<uint64_t, TokMapEntry> tokmapByPP_; // key = pp
   std::vector<TokMapEntry> tokmap_;
+  /// Parallel to `tokmap_`: whether each entry's file is the TU source
+  /// path.  Computed once when the map is loaded; see
+  /// `TokmapEntryIsTUOwned()`.
+  std::vector<bool> tokmapEntryIsTUOwned_;
 
   std::vector<IncludeItem> includes_;
   std::vector<MacroInvocation> macroInvs_;

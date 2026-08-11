@@ -310,7 +310,11 @@ private:
   ExactDirectiveSourceText(const RefoldModel::MacroDirective &directive) const;
 
   /// Reconstructs the macro-state transition represented by a source directive.
+  /// Memoized; see the definition for why the answer is stable per directive.
   std::optional<MacroStateSourceTransition> MacroStateSourceTransitionFor(
+      const RefoldModel::MacroDirective &directive) const;
+  /// Uncached body of `MacroStateSourceTransitionFor()`.
+  std::optional<MacroStateSourceTransition> ComputeMacroStateSourceTransition(
       const RefoldModel::MacroDirective &directive) const;
   /// Return a point boundary in the final TU source carrier.
   OwnerStateBoundary FinalTUStateBoundary(uint64_t sourceOffset) const;
@@ -538,6 +542,11 @@ private:
       macroStatePreservationsByEdit_;
   /// Exact source spelling per macro-directive id, read on first use.
   mutable llvm::DenseMap<uint64_t, std::string> exactDirectiveSourceText_;
+  /// Memoized `MacroStateSourceTransitionFor()` results, keyed on directive id.
+  /// Absent transitions are cached too: proving one absent costs the same
+  /// interval recovery as proving one present.
+  mutable llvm::DenseMap<uint64_t, std::optional<MacroStateSourceTransition>>
+      macroStateSourceTransition_;
 };
 
 void MacroStateRepairContext::BuildDirectiveIndexOnce() {
@@ -546,6 +555,7 @@ void MacroStateRepairContext::BuildDirectiveIndexOnce() {
 
   plan_.macroDirectiveById.clear();
   plan_.namedMacroDirectives.clear();
+  plan_.namedMacroDirectivesByName.clear();
 
   // Build a name-indexed view of macro-state directives that can affect later
   // preserved source.  The producer records the controlled #define/#undef macro
@@ -570,6 +580,16 @@ void MacroStateRepairContext::BuildDirectiveIndexOnce() {
                                             const NamedMacroDirectiveRef &rhs) {
     return lhs.directive->id < rhs.directive->id;
   });
+
+  // Group by controlled name after the sort, so each bucket lists positions in
+  // ascending directive id exactly as the ordered view does.  Every macro-state
+  // question below is asked about a single name; answering one by walking the
+  // whole ordered view costs a string comparison per directive in the unit.
+  for (uint32_t position = 0; position < plan_.namedMacroDirectives.size();
+       ++position) {
+    plan_.namedMacroDirectivesByName[plan_.namedMacroDirectives[position].name]
+        .push_back(position);
+  }
 
   plan_.directiveIndexBuilt = true;
 }
@@ -809,6 +829,32 @@ std::string MacroStateRepairContext::DirectiveTextForPreservation(
 
 std::optional<MacroStateSourceTransition>
 MacroStateRepairContext::MacroStateSourceTransitionFor(
+    const RefoldModel::MacroDirective &directive) const {
+  // Memoized on directive id.
+  //
+  // Everything below reads state that is fixed for the whole repair pass: the
+  // path-identity service, `tuPath_`/`tuBytes_`, the directive and its owning
+  // include from the model, and `ownersMustExpand_`, which the driver sets
+  // before the engine runs and never changes during it.  Nothing here consults
+  // the mutable parts of `plan_`, so the answer for one directive cannot change
+  // between calls within a context.  `ExactDirectiveSourceText()` is already
+  // cached on the same key for the same reason.
+  //
+  // This is worth caching rather than merely tidy: the interval recovery below
+  // raw-lexes the defining file's directive line, and the callers ask about the
+  // same directives repeatedly while walking edits.
+  auto cached = macroStateSourceTransition_.find(directive.id);
+  if (cached != macroStateSourceTransition_.end())
+    return cached->second;
+
+  std::optional<MacroStateSourceTransition> computed =
+      ComputeMacroStateSourceTransition(directive);
+  macroStateSourceTransition_[directive.id] = computed;
+  return computed;
+}
+
+std::optional<MacroStateSourceTransition>
+MacroStateRepairContext::ComputeMacroStateSourceTransition(
     const RefoldModel::MacroDirective &directive) const {
   if (PathIdentity().PathsEqual(directive.sitePath, tuPath_) &&
       !directive.ownerIncludeId) {
@@ -1085,10 +1131,19 @@ MacroStateRepairContext::ActiveDefinitionAtSourceOffset(StringRef macroName,
                                                         uint64_t offset) const {
   const RefoldModel::MacroDirective *active = nullptr;
   uint64_t activeEnd = 0;
-  for (const NamedMacroDirectiveRef &ref : plan_.namedMacroDirectives) {
+
+  // Only directives controlling this macro can define its state here, so ask
+  // the name index rather than scanning every directive in the unit.  The
+  // bucket is in the same ascending-id order the ordered view uses, and the
+  // winner below is chosen by explicit comparison, so this visits a subset in
+  // the same relative order and selects the same directive.
+  const auto bucket = plan_.namedMacroDirectivesByName.find(macroName);
+  if (bucket == plan_.namedMacroDirectivesByName.end())
+    return nullptr;
+
+  for (uint32_t position : bucket->second) {
+    const NamedMacroDirectiveRef &ref = plan_.namedMacroDirectives[position];
     const RefoldModel::MacroDirective &candidate = *ref.directive;
-    if (StringRef(ref.name) != macroName)
-      continue;
     std::optional<MacroStateSourceTransition> transition =
         MacroStateSourceTransitionFor(candidate);
     if (!transition || transition->interval.end > offset)

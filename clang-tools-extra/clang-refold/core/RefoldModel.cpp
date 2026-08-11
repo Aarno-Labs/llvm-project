@@ -2317,6 +2317,20 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
   if (Error auditErr = validateIncludeMetadataAudit(model))
     return std::move(auditErr);
   model.CompleteIncludeNextDerivedProvenance();
+
+  // Settle TU ownership for every token-map entry once.
+  //
+  // Each entry stores its own copy of the contributing file's path spelling, so
+  // asking "did the translation unit contribute this token?" is a physical path
+  // comparison, and a spelling that differs from the source path has to be
+  // canonicalized before it can be answered.  Consumers ask it while walking
+  // the whole map, once per edit they place, which multiplies one cheap fact
+  // into millions of canonicalizations.  Answer it here, once per entry.
+  model.tokmapEntryIsTUOwned_.assign(model.tokmap_.size(), false);
+  for (std::size_t index = 0; index < model.tokmap_.size(); ++index) {
+    model.tokmapEntryIsTUOwned_[index] =
+        refoldPathsEqual(model.tokmap_[index].file, model.sourcePath_);
+  }
   return model;
 }
 
@@ -2334,6 +2348,7 @@ RefoldModel RefoldModel::CloneForReadOnlyConsumer() const {
   clone.tokPPByteEndA_ = tokPPByteEndA_;
   clone.tokmapByPP_ = tokmapByPP_;
   clone.tokmap_ = tokmap_;
+  clone.tokmapEntryIsTUOwned_ = tokmapEntryIsTUOwned_;
   clone.includes_ = includes_;
   clone.macroInvs_ = macroInvs_;
   clone.macroDirs_ = macroDirs_;
@@ -3317,15 +3332,21 @@ std::vector<const RefoldModel::Slot *> RefoldModel::FindSlots(
   // wildcards, which lets callers search broadly and then rely on the stable
   // ordering below.
   for (const auto &slot : slots_) {
-    // Slot files carry the producer's spelling, which need not match the
-    // caller's for the same file; compare physical identity, not text.
-    if (file && !refoldPathsEqual(slot.file, *file))
-      continue;
-    if (kind && slot.kind != *kind)
-      continue;
+    // The filters form a conjunction, so their order cannot change which slots
+    // survive -- only how much work rejecting a slot costs.  Physical path
+    // identity is by far the most expensive of them: two spellings that differ
+    // must each be canonicalized before they can be compared.  Apply the
+    // integer and kind filters first so a slot ruled out by any of them is
+    // never canonicalized at all.
     if (ref && slot.ref != ref)
       continue;
     if (ownerIncludeId && slot.ownerIncludeId != ownerIncludeId)
+      continue;
+    if (kind && slot.kind != *kind)
+      continue;
+    // Slot files carry the producer's spelling, which need not match the
+    // caller's for the same file; compare physical identity, not text.
+    if (file && !refoldPathsEqual(slot.file, *file))
       continue;
     out.push_back(&slot);
   }

@@ -172,13 +172,19 @@ public:
   /// Resolve non-forced core-optimal maps through exact source-preservation,
   /// realized-source equivalence, and counterfactual theorems.
   ///
-  /// Resolution is per certification window. Every window whose all-optimal
-  /// pair facts are available is resolved independently, in source order, and
-  /// each committed window contributes its anchors to the base map used by the
-  /// next. A window without retained facts, or one whose ambiguity the theorems
-  /// below cannot close, keeps exactly its core-forced anchors and does not
-  /// prevent an independent window from committing. The single-window
-  /// complete-stream case reduces to the historical whole-stream theorem.
+  /// Resolution is per certification window. Every window that can carry
+  /// ambiguity at all is resolved -- see `WindowCarriesAmbiguity()` -- and each
+  /// is resolved independently, in source order, with every committed window
+  /// contributing its anchors to the base map used by the next. A window
+  /// without retained facts, or one whose ambiguity the theorems below cannot
+  /// close, keeps exactly its core-forced anchors and does not prevent an
+  /// independent window from committing. The single-window complete-stream case
+  /// reduces to the historical whole-stream theorem.
+  ///
+  /// Nothing here is skipped to save work. The only windows passed over are
+  /// those the core theorem already determined completely, where resolution has
+  /// no ambiguity to resolve and running it would return the same anchors after
+  /// paying for them.
   ///
   /// Enumeration budgets are proof budgets only: exceeding one returns the
   /// forced-only map for that window and cannot authorize a partial class or
@@ -196,9 +202,6 @@ private:
     uint64_t enumeratedMapCount = 0;
     uint64_t acceptedMapCount = 0;
     uint64_t rejectedMapCount = 0;
-    /// Candidate simulations this window ran, charged against the run's work
-    /// budget whether or not the window committed.
-    size_t simulationsSpent = 0;
   };
 
   /// Resolve the ambiguity inside one certification window.
@@ -208,15 +211,30 @@ private:
   /// comparison isolates this window's choice. `windowIndex` must satisfy
   /// `HasCompleteSemanticOracleForWindow()`.
   ///
-  /// `simulationBudget` is how many candidate simulations the run has left. A
-  /// window whose complete candidate set exceeds it is declined outright and
-  /// never partially simulated: uniqueness is a property of the whole
-  /// enumerated set, so committing on a prefix would be the ranked selection
-  /// this resolver exists to avoid.
+  /// The window's complete candidate set is always enumerated and simulated in
+  /// full: uniqueness is a property of the whole enumerated set, so committing
+  /// on a prefix would be the ranked selection this resolver exists to avoid.
   WindowResolution
   ResolveCertificationWindow(size_t windowIndex,
-                             llvm::ArrayRef<int64_t> baseMap,
-                             size_t simulationBudget) const;
+                             llvm::ArrayRef<int64_t> baseMap) const;
+
+  /// Return whether one certification window can carry alignment ambiguity.
+  ///
+  /// A forced anchor is, by definition, an edge every optimal path takes. A
+  /// window whose A tokens are all forced-matched therefore admits exactly one
+  /// optimal map through it: the matched A tokens are maximal, so a competing
+  /// optimal map matches the same tokens, and each of those matches is forced
+  /// to the same B token. Its unmatched B tokens are pinned by the same
+  /// anchors. Resolution can only rediscover that map.
+  ///
+  /// This is a statement about the window's proof state, not about its cost.
+  /// It never passes over a window whose outcome could differ, which is what
+  /// separates it from a work budget: a budget declines windows that would have
+  /// committed, this declines only windows with nothing to commit. Recomputing
+  /// a window's all-optimal pair facts is quadratic in its own rectangle, so
+  /// skipping the determined ones is worth stating as a theorem rather than
+  /// paying for the same answer.
+  bool WindowCarriesAmbiguity(size_t windowIndex) const;
 
   Dependencies deps_;
 };

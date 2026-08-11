@@ -564,13 +564,29 @@ RefoldTUEditPlanner::FindProvableTUInsertionAnchor(
       uint64_t leftGap = 0;
       uint64_t rightGap = deps_.model.GetTokensCountA();
 
-      for (const auto &entry : deps_.model.GetTokmap()) {
-        if (deps_.pathIdentity.PathsEqual(entry.file, tuPath)) {
-          if (entry.e <= include.siteB)
-            leftGap = std::max(leftGap, entry.pp + 1);
-          if (entry.b >= include.siteE)
-            rightGap = std::min(rightGap, entry.pp);
-        }
+      // This walks every token in the translation unit, and it runs once per
+      // insertion anchored here, so the per-entry test has to be cheap.  The
+      // model settles TU ownership for each entry when the map is loaded, which
+      // answers exactly this question without canonicalizing two path spellings
+      // per token.  That precomputed answer is against the model's own source
+      // path, so use it only when this really is that file; a caller planning
+      // against some other path still gets the direct comparison.
+      const ArrayRef<RefoldModel::TokMapEntry> tokmap = deps_.model.GetTokmap();
+      const bool tuPathIsModelSource =
+          deps_.pathIdentity.PathsEqual(tuPath, deps_.model.GetSourcePath());
+      for (std::size_t entryIndex = 0; entryIndex < tokmap.size();
+           ++entryIndex) {
+        const RefoldModel::TokMapEntry &entry = tokmap[entryIndex];
+        const bool entryIsTUOwned =
+            tuPathIsModelSource
+                ? deps_.model.TokmapEntryIsTUOwned(entryIndex)
+                : deps_.pathIdentity.PathsEqual(entry.file, tuPath);
+        if (!entryIsTUOwned)
+          continue;
+        if (entry.e <= include.siteB)
+          leftGap = std::max(leftGap, entry.pp + 1);
+        if (entry.b >= include.siteE)
+          rightGap = std::min(rightGap, entry.pp);
       }
 
       for (const auto &other : deps_.model.GetIncludes()) {

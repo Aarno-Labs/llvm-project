@@ -389,6 +389,23 @@ RefoldEngine::~RefoldEngine() = default;
 
 // ========================== Public entry points ==========================
 
+/// Attach the edited-stream token an assembly check disagreed at.
+///
+/// The failed obligation is about preprocessor state, so the state component
+/// stays exactly as the proof recorded it.  What the check additionally knows,
+/// and previously discarded, is *where* the two streams parted: a single edited
+/// token index.  That is the difference between "this translation unit is out
+/// of domain" and "the edit geometry around this token is", and the retry ladder
+/// needs it to tell a failure a different alignment could repair from one it
+/// could not.
+static TerminalFallbackProofFailure
+withDivergingEditedToken(TerminalFallbackProofFailure failure,
+                         std::size_t mismatchTokenIndex) {
+  failure.context.bTokenBegin = static_cast<uint64_t>(mismatchTokenIndex);
+  failure.context.bTokenEnd = static_cast<uint64_t>(mismatchTokenIndex) + 1;
+  return failure;
+}
+
 Expected<std::string> RefoldEngine::Refold(
     const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
     ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
@@ -475,7 +492,31 @@ Expected<std::string> RefoldEngine::Refold(
   // only ever needed to *widen*: a region that was expanded and still diverges
   // escalates to the region enclosing it.  That is bounded by nesting depth,
   // not by how many regions diverged.
-  const unsigned maxAttempts = 4;
+  // The ladder is counted separately from the loop, because a
+  // resolve-and-re-plan attempt must not consume a narrowing step: adding
+  // resolution to the loop would otherwise shorten a ladder that already
+  // worked and could strand a translation unit one widening short of its
+  // answer.  Resolution needs no allowance of its own -- it happens at most
+  // once.
+  const unsigned maxNarrowingAttempts = 4;
+  unsigned narrowingAttempts = 0;
+
+  // Alignment ambiguity is resolved on demand.  Every candidate map a window
+  // enumerates is realized by a complete refold of the translation unit, so the
+  // first attempt plans on the core theorem's forced anchors alone and resolves
+  // nothing; only an attempt that produces evidence ambiguity is what limited
+  // it turns this on, and then the next attempt resolves every window that can
+  // carry ambiguity.
+  //
+  // It is deliberately one flag rather than a set of windows.  A committed
+  // window contributes its anchors to the base map the next window is compared
+  // against, so resolving windows {1,3} is not a less complete version of
+  // resolving {1,2,3} -- it is a different alignment.  All-or-nothing keeps the
+  // resolved attempt byte-identical to what whole-stream resolution produced.
+  //
+  // Nothing here weighs cost.  The flag is set by evidence and cleared never,
+  // so no input is declined into the terminal carrier for being expensive.
+  bool resolveAlignmentAmbiguity = false;
 
   for (unsigned attempt = 0;; ++attempt) {
     // Each attempt needs its own model.  Moving the parsed one in would leave
@@ -489,13 +530,37 @@ Expected<std::string> RefoldEngine::Refold(
         bToks, bTokOff,
         noLines, strict, proofAuditMode, finalOutputPath, sidebandPragmaEdits,
         materializedEditMappings,
-        std::move(finalLineControlValidationCallback));
+        // Copied, not moved: this runs once per attempt, and a moved-from
+        // callback would silently disable final line-control validation for
+        // every attempt after the first.
+        finalLineControlValidationCallback);
     engine.finalAssemblyVerifier_ = assemblyVerifier;
     engine.ownersMustExpand_ = ownersMustExpand;
+    engine.resolveAlignmentAmbiguity_ = resolveAlignmentAmbiguity;
     engine.verifyIncludeDirs_.assign(verifyIncludeDirs.begin(),
                                      verifyIncludeDirs.end());
 
     std::string out = engine.Refold();
+
+    // Turn resolution on and re-plan when this attempt showed that alignment
+    // ambiguity is what limited it.  This happens at most once per run: the
+    // resolved attempt already resolves every window that can carry ambiguity,
+    // so a further request would ask the identical question of the identical
+    // alignment.
+    //
+    // It runs before the narrowing ladders below because resolving ambiguity
+    // gives up nothing, while expanding a region trades away a preserved macro
+    // or include permanently.  The ladders keep their full allowance: `attempt`
+    // is not what bounds them.
+    if (!resolveAlignmentAmbiguity && engine.AlignmentResolutionIsDemanded()) {
+      REFOLD_LOG_INFO("fallback",
+                      "attempt {0} is limited by alignment ambiguity; "
+                      "resolving every ambiguous certification window and "
+                      "re-planning",
+                      attempt);
+      resolveAlignmentAmbiguity = true;
+      continue;
+    }
 
     // A terminal request means the run gave up and `out` is the edited stream
     // for the whole file.  Before accepting that, see whether any request named
@@ -519,7 +584,7 @@ Expected<std::string> RefoldEngine::Refold(
           engine.AppendNarrowableOwnersForTerminalRequests(ownersMustExpand,
                                                           owners);
       if (everyRequestNarrowable && !owners.empty() &&
-          attempt + 1 < maxAttempts) {
+          narrowingAttempts + 1 < maxNarrowingAttempts) {
         for (uint64_t owner : owners) {
           REFOLD_LOG_INFO("fallback",
                           "terminal fallback names {0}; expanding it and "
@@ -527,6 +592,7 @@ Expected<std::string> RefoldEngine::Refold(
                           engine.DescribeOwner(owner));
           ownersMustExpand.insert(owner);
         }
+        ++narrowingAttempts;
         continue;
       }
       return out;
@@ -587,7 +653,7 @@ Expected<std::string> RefoldEngine::Refold(
           verdict.reason.c_str(), owned.c_str());
     }
 
-    if (!owners.empty() && attempt + 1 < maxAttempts) {
+    if (!owners.empty() && narrowingAttempts + 1 < maxNarrowingAttempts) {
       REFOLD_LOG_INFO("assembly-verify",
                       "unsound assembly: {0} diverging region(s), expanding "
                       "{1} owner(s) and retrying: {2}",
@@ -598,6 +664,7 @@ Expected<std::string> RefoldEngine::Refold(
                         engine.DescribeOwner(candidate));
         ownersMustExpand.insert(candidate);
       }
+      ++narrowingAttempts;
       continue;
     }
 
@@ -611,8 +678,10 @@ Expected<std::string> RefoldEngine::Refold(
                     static_cast<uint64_t>(verdict.mismatchTokenIndex),
                     verdict.reason);
     engine.terminalSink_.RequestTerminalFallback(
-        RefoldOwnerStateProof::SuffixStabilityTerminalFailureForComponent(
-            OwnerStateComponent::LineNumber),
+        withDivergingEditedToken(
+            RefoldOwnerStateProof::SuffixStabilityTerminalFailureForComponent(
+                OwnerStateComponent::LineNumber),
+            verdict.mismatchTokenIndex),
         "assembly-verify",
         "assembled source does not replay the edited preprocessed stream");
     return engine.expansionFallbackPlanner_->ResolvePostStructuralFallback();
@@ -705,8 +774,11 @@ std::string RefoldEngine::Refold() {
                       "taking the terminal carrier instead",
                       prunedVerdict.reason);
       terminalSink_.RequestTerminalFallback(
-          RefoldOwnerStateProof::SuffixStabilityTerminalFailureForComponent(
-              OwnerStateComponent::LineNumber),
+          withDivergingEditedToken(
+              RefoldOwnerStateProof::
+                  SuffixStabilityTerminalFailureForComponent(
+                      OwnerStateComponent::LineNumber),
+              prunedVerdict.mismatchTokenIndex),
           "assembly-verify",
           "pruned assembly does not replay the edited preprocessed stream");
       out = expansionFallbackPlanner_->ResolvePostStructuralFallback();
@@ -799,6 +871,18 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   // deterministic token-diff plan below.
   assert(tokenDiffPlanner_ && "token diff planner service not initialized");
   RefoldTokenDiffPlanner::TokenDiffPlan diffPlan = tokenDiffPlanner_->Plan();
+
+  // Retain the core theorem's forced map.  A forced anchor is an edge every
+  // optimal path takes, so it is exactly what tells a hunk frontier this run
+  // *chose* from one no realignment can move.  The demand check below reads it
+  // rather than re-deriving anything.
+  alignmentForcedMap_ = diffPlan.alignment.forcedMap;
+  certificationWindowARanges_.clear();
+  for (const diffutils::LcsCertificationWindow &window :
+       diffPlan.alignment.certificationWindows) {
+    if (window.IsCertified())
+      certificationWindowARanges_.emplace_back(window.aBegin, window.aEnd);
+  }
 
   // Production non-forced anchors must resolve to one durable semantic
   // witness retained by this engine run. Isolated candidate simulations carry
@@ -2339,6 +2423,90 @@ std::optional<uint64_t> RefoldEngine::FindSmallestOwnerForEditedToken(
   return FindSmallestOwnerForAToken(static_cast<uint64_t>(aToken));
 }
 
+bool RefoldEngine::AlignmentResolutionIsDemanded() const {
+  // A candidate simulation is handed its alignment and must never ask for
+  // another one; recursion is impossible by construction, and this keeps that
+  // explicit at the demand boundary rather than relying on the resolver's own
+  // guard.
+  if (alignmentSelectionOverride_ || !alignmentSemanticResolverEnabled_)
+    return false;
+
+  if (terminalSink_.HasRequest()) {
+    // The run gave up. Alignment is implicated only when a request localizes
+    // its failure to A tokens: the resolver's whole lever is where anchors sit
+    // inside a certification window, so a failure the plan could not tie to any
+    // A token is not one a different anchor placement reaches. A materialized
+    // include whose payload observes the very macro it consumes, for instance,
+    // records the state component and no token range, and it fails identically
+    // under every alignment -- proving that costs one complete refold of the
+    // translation unit per enumerated candidate, and proves nothing.
+    //
+    // This is the same attribution discipline
+    // `AppendNarrowableOwnersForTerminalRequests()` applies to regions, and it
+    // is evidence rather than a cost model: a request that names tokens is
+    // always honoured, however many candidates its window turns out to hold.
+    for (const TerminalFallbackRequest &request : terminalSink_.Requests()) {
+      const TerminalFallbackFailureContext &context = request.failure.context;
+      // Either stream localizes the failure. A hunk that could not be realized
+      // names the A tokens it consumed; a closing assembly check names the
+      // edited token the two streams parted at. Both say the plan reached a
+      // specific place and could not proceed there, which is what a different
+      // anchor placement can change.
+      if ((context.aTokenBegin && context.aTokenEnd) ||
+          (context.bTokenBegin && context.bTokenEnd))
+        return true;
+    }
+    return false;
+  }
+
+  // The run emitted source, so no ladder above would retry -- but emitting
+  // source is not the same as refolding well. Expanding a macro root or
+  // materializing an include is the concession the pipeline exists to avoid,
+  // and forced-only anchors cause it directly: the hunk covering a callsite is
+  // wider than the invocation, no carrier can preserve it, and the expansion
+  // realization is taken. Resolving narrows the hunk and the callsite survives.
+  //
+  // A run that conceded nothing has nothing for resolution to restore, and that
+  // is the common case -- which is what makes resolving nothing the default
+  // rather than an optimization.
+  if (!alignmentSimulationPreservationFootprint_.expandedIncludeIds.empty() ||
+      !alignmentSimulationPreservationFootprint_.expandedMacroRootIds.empty())
+    return true;
+
+  // Preservation is not the only thing ambiguity decides. A hunk whose frontier
+  // the core theorem did not pin had its placement chosen by tie-breaking
+  // rather than proved, and resolution may put it somewhere else -- a pure
+  // insertion landing on the far side of a conditional arm, say. The output is
+  // sound either way, so no ladder above objects; it is simply not the
+  // placement the theorems select.
+  //
+  // Ask whether the frontier can actually move, not whether ambiguity exists
+  // somewhere nearby. A hunk sitting immediately between two forced anchors is
+  // pinned by them: every optimal map takes those edges, so no realignment
+  // reaches this hunk however ambiguous the rest of its window is. Asking the
+  // weaker question -- does this hunk touch a window that carries ambiguity --
+  // is true of nearly every real translation unit, and turns demand-driven
+  // resolution back into eager resolution plus a wasted pass.
+  const uint64_t aCount = static_cast<uint64_t>(alignmentForcedMap_.size());
+  for (const std::pair<uint64_t, uint64_t> &range : certificationWindowARanges_) {
+    const uint64_t aEnd = std::min<uint64_t>(range.second, aCount);
+    bool carriesAmbiguity = aEnd != range.second;
+    for (uint64_t aToken = range.first; !carriesAmbiguity && aToken < aEnd;
+         ++aToken)
+      carriesAmbiguity = alignmentForcedMap_[aToken] < 0;
+    if (!carriesAmbiguity)
+      continue;
+    for (const diffutils::Hunk &hunk : abTokHunks_) {
+      // Closed on both ends: a pure insertion occupies no token, so it sits
+      // *at* a position, and a position on a window edge is reachable from
+      // either side.
+      if (hunk.aStart <= range.second && range.first <= hunk.aEnd)
+        return true;
+    }
+  }
+  return false;
+}
+
 bool RefoldEngine::AppendNarrowableOwnersForTerminalRequests(
     const llvm::DenseSet<uint64_t> &alreadyExpanded,
     llvm::SmallVectorImpl<uint64_t> &owners) const {
@@ -2467,7 +2635,6 @@ std::string RefoldEngine::RunRefoldPass() {
 
   std::unique_ptr<llvm::MemoryBuffer> tuBuffer = LoadTUSource(tuPath);
   StringRef tuBytes = tuBuffer->getBuffer();
-
   std::vector<diffutils::Hunk> hunks = PlanTokenDiff(tuPath);
   TraceStructuralHunkEnvelopes(hunks);
 
@@ -2477,7 +2644,6 @@ std::string RefoldEngine::RunRefoldPass() {
   if (!DispatchStructuralHunks(tuPath, tuBytes, hunks,
                                 structuralHunkDispatcher))
     return std::string();
-
   return FinalizeStructuralResult(tuPath, tuBytes, hunks,
                                   structuralHunkDispatcher);
 }
