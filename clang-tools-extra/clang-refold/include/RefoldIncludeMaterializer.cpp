@@ -1002,16 +1002,25 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
       }
       bool todo = subtreeWork.HasDescendantWork(child->id);
 
-      // Forced include-next materialization is subtree-wide, not
-      // direct-child-only.  The bug class this machinery protects against is a
-      // materialized header that preserves a clean ordinary child include whose
-      // nested #include_next then resumes lookup from the wrong HeaderSearch
-      // cursor.  Force materialization along any path that can reach
-      // #include_next so the directive itself is eventually replaced by the
-      // producer-selected subtree unless a normal, local proof has already kept
-      // us out of this forced mode.
+      // Forced include-next materialization follows relocation, not
+      // reachability.  `#include_next` resumes the search after the directory
+      // of the file *containing* the directive, so it is perturbed exactly when
+      // its own directive line is moved onto the flattened parent surface --
+      // true for this edge only when the edge is itself an `#include_next`.  A
+      // child preserved as a directive is a firewall: the compiler opens the
+      // real file at its real location, so every directive inside it,
+      // `#include_next` among them, is evaluated from the cursor the original
+      // used.  Descendants that are themselves materialized re-test this at
+      // their own level, through `forceIncludeNextMaterialization` below.
+      //
+      // Forcing on the whole subtree instead inlined headers whose text never
+      // moves: a clean `<stdint.h>` with no descendant work was materialized
+      // only because something below it spelled `#include_next`, could not be
+      // materialized from source because its own arms use `__has_include_next`,
+      // and so fell to a B realization that dropped every directive in its
+      // subtree along with the include guards.
       if (materializeIncludeNextInThisSubtree &&
-          subtreeWork.SubtreeContainsIncludeNext(child->id))
+          child->subkind == "#include_next")
         todo = true;
 
       // A child that would survive as a directive but whose closure re-enters an

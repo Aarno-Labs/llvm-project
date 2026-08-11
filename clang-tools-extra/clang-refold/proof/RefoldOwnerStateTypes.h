@@ -1426,7 +1426,21 @@ struct SuffixStateObserverSite {
   uint64_t nodeId = 0;
   OwnerStateGraphNodeKind nodeKind = OwnerStateGraphNodeKind::Unknown;
   Owner owner;
+  /// Physical source range where the observing token is *spelled*.
   OwnerSourceRange source;
+  /// Physical source range where the observation is *performed*, used to order
+  /// this site against a boundary.
+  ///
+  /// These are the same range for an ordinary token, and they differ for a
+  /// builtin spelled inside a macro replacement list: `__LINE__` in a `#define`
+  /// body is spelled once, at the definition, but evaluated at every expansion
+  /// point.  Ordering by the spelling would place every expansion of such a
+  /// macro at the definition, so a boundary anywhere after the `#define` would
+  /// find no suffix observer at all -- not because none exists, but because all
+  /// of them were recorded upstream of it.  This range is the outermost
+  /// invocation callsite whenever the observing token comes from a macro body,
+  /// and `source` otherwise.
+  OwnerSourceRange observationSource;
   OwnerTokenRange aTokens;
   OwnerStateComponent component = OwnerStateComponent::Unknown;
   SuffixObservationKind observationKind = SuffixObservationKind::Unknown;

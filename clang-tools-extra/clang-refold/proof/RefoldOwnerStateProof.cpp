@@ -2110,6 +2110,42 @@ OwnerStateGraph RefoldOwnerStateProof::BuildOwnerStateGraph() const {
     return bucketMutates(delta.mutates) || bucketMutates(delta.exit);
   };
 
+  // Resolve where a node's observation is performed, as opposed to where its
+  // token is spelled.  A token spelled inside a macro replacement list is
+  // evaluated at the expansion point, so the outermost invocation callsite is
+  // the position a boundary must be ordered against.  Only a root invocation
+  // with a complete recorded callsite span in the node's own owner file is
+  // accepted; anything else keeps the spelling range, which is exactly the
+  // previous behaviour.
+  auto resolveObservationSource =
+      [&](const OwnerStateGraphNode &node) -> OwnerSourceRange {
+    if (!node.aTokens.IsValid() || node.aTokens.Empty())
+      return node.source;
+
+    const RefoldModel::MacroInvocation *covering =
+        macroTopology_.SmallestCoveringPatchableMacro(
+            node.aTokens.begin, node.aTokens.end, node.source.includeId);
+    if (!covering)
+      return node.source;
+
+    const RefoldModel::MacroInvocation *root =
+        macroTopology_.FindMacroInvocationById(
+            macroTopology_.GetRootMacroId(covering->id));
+    if (!root || !root->invFile || root->invFile->empty() || !root->invB ||
+        !root->invE || *root->invB >= *root->invE)
+      return node.source;
+
+    // The callsite must live in the same owner surface the boundary is
+    // expressed in, or the two are not comparable and ordering by it would be
+    // a different kind of guess than the one being removed.
+    if (node.source.HasPath() &&
+        !paths_.PathsEqual(node.source.path, *root->invFile))
+      return node.source;
+
+    return OwnerSourceRange::From(*root->invFile, *root->invB, *root->invE,
+                                  node.source.includeId);
+  };
+
   auto rebuildObserverIndex = [&]() {
     graph.observerSites.clear();
     graph.audit = OwnerStateGraphAuditStats();
@@ -2133,6 +2169,7 @@ OwnerStateGraph RefoldOwnerStateProof::BuildOwnerStateGraph() const {
         site.nodeKind = node.kind;
         site.owner = closure.owner;
         site.source = node.source;
+        site.observationSource = resolveObservationSource(node);
         site.aTokens = node.aTokens;
         site.component = component;
         site.observationKind = ObservationKindForComponent(component);
@@ -2153,6 +2190,7 @@ OwnerStateGraph RefoldOwnerStateProof::BuildOwnerStateGraph() const {
         site.nodeKind = node.kind;
         site.owner = closure.owner;
         site.source = node.source;
+        site.observationSource = resolveObservationSource(node);
         site.aTokens = node.aTokens;
         site.component = OwnerStateComponent::UnmodeledState;
         site.observationKind = ObservationKindForComponent(site.component);
@@ -2305,9 +2343,14 @@ SuffixObserverQueryResult RefoldOwnerStateProof::FindSuffixObservers(
     bool sourceAfter = false;
     bool tokenAfter = false;
 
-    if (sourceComparable(site.source)) {
+    // Order against where the observation happens, not where its token is
+    // spelled.  The two coincide for every ordinary token; they differ for a
+    // builtin in a macro replacement list, whose spelling sits at the `#define`
+    // while each evaluation happens at an expansion point that may be anywhere
+    // after it.
+    if (sourceComparable(site.observationSource)) {
       comparable = true;
-      sourceAfter = sourceIsAfterBoundary(site.source);
+      sourceAfter = sourceIsAfterBoundary(site.observationSource);
     }
 
     if (tokenComparable(site.aTokens)) {
