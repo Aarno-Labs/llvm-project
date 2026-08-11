@@ -86,6 +86,24 @@ public:
   /// consumes the result.
   bool TextContainsDirectiveLine(llvm::StringRef text) const;
 
+  /// Return whether any preprocessing-directive logical line in \p text could
+  /// observe whether \p name is defined.
+  ///
+  /// `#ifdef NAME`, `#if defined(NAME)`, and a macro-expanded `#include`,
+  /// `#line` or `#pragma` operand all depend on the macro's definedness, so a
+  /// directive of those kinds naming it reports true.  A `#define` naming it in
+  /// a replacement list does not: the body is stored as tokens and expanded
+  /// only at each later invocation, where the name behaves exactly as it
+  /// originally did.  A `#define` body that spells `defined` is refused rather
+  /// than analysed, because it can smuggle a test into an `#if` that evaluates
+  /// the body later.
+  ///
+  /// The directive inventory comes from the shared scanner, which understands
+  /// logical lines, splices, comments and literals.  A scan the scanner could
+  /// not fully cover reports true, so callers stay fail-closed.
+  bool DirectiveLineInTextCouldObserveDefinedness(llvm::StringRef name,
+                                                  llvm::StringRef text) const;
+
 private:
   clang::LangOptions lexLang_;
 };

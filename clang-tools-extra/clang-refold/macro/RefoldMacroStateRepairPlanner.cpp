@@ -3142,8 +3142,18 @@ bool MacroStateRepairContext::RepairConsumedDefinitionsForMaterializedInclude(
       return false;
     }
 
+    // A payload that names the macro normally forbids carrying its definition
+    // out in front: the payload's tokens are already expanded, so making the
+    // name expandable again would change how it re-preprocesses.  The one
+    // exception is a definition that expands to itself -- `#define stderr
+    // stderr` and its siblings -- where expansion is the identity and the
+    // payload is unaffected.  That exception does not extend to a conditional
+    // test on the name, which the proof excludes by requiring that no directive
+    // line in the payload names it.
     if (FirstReplacementObservationOffset(replacementProbe, definition,
-                                          ref.name)) {
+                                          ref.name) &&
+        !MacroStateProof().SelfReferentialDefinitionIsUnobservableInText(
+            definition, ref.name, StringRef(replacementProbe.text))) {
       (void)CheckMacroStateTerminal(
           definition, StateMutationKind::Consumed,
           "include/materialized-macro-state",

@@ -161,6 +161,35 @@ public:
       const RefoldModel::MacroDirective &directive, llvm::StringRef replacement,
       bool unprovenObserves) const;
 
+  /// Return whether \p directive defines an object-like macro whose whole
+  /// replacement list is its own name, as in `#define stderr stderr`.
+  ///
+  /// The idiom is common in system headers -- glibc spells `stdin`, `stdout`
+  /// and `stderr` this way so they are macros as C89/C99 require.  Expanding
+  /// such a macro is the identity on the token: the name is not re-expanded
+  /// during its own replacement, so the resulting token stream equals the
+  /// original one.
+  bool MacroDefinitionIsSelfReferentialIdentity(
+      const RefoldModel::MacroDirective &directive) const;
+
+  /// Return whether making \p directive active before \p text is provably
+  /// unobservable *because* the definition expands to itself.
+  ///
+  /// An ordinary expansion of a self-referential identity macro cannot change
+  /// the token stream, so a payload that merely names the macro is unaffected.
+  /// A conditional test is a different matter: `#ifdef X` or `defined(X)` flips
+  /// from false to true, and that is a real difference.  Such a test can only
+  /// be spelled on a preprocessing-directive logical line, so this admits the
+  /// payload exactly when no directive line in it names the macro.
+  ///
+  /// The directive inventory comes from the shared preprocessing-directive
+  /// scanner, which understands logical lines, splices, comments and literals.
+  /// An incomplete scan proves nothing and reports observable, so a payload the
+  /// scanner cannot fully cover keeps failing closed.
+  bool SelfReferentialDefinitionIsUnobservableInText(
+      const RefoldModel::MacroDirective &directive, llvm::StringRef macroName,
+      llvm::StringRef text) const;
+
   /// Return whether moving `directive` across `chunk` could change semantics.
   ///
   /// `following` is considered only for function-like invocation observations

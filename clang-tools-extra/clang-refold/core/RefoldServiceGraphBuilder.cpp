@@ -198,8 +198,8 @@ void RefoldEngine::InitializeTUEditPlanner() {
       std::make_unique<RefoldTUEditPlanner>(RefoldTUEditPlanner::Deps{
           model_, pathIdentity_, macroTopology_, TUAnchorProof(), lineDirs_,
           *preprocessingStructureIndex_, tuSourceBytes_, aToks_,
-          static_cast<uint64_t>(bToks_.size()), abTokMapA2B_, ownerDepthGap_,
-          strict_});
+          static_cast<uint64_t>(bToks_.size()), bToks_, abTokMapA2B_,
+          ownerDepthGap_, strict_});
 }
 
 void RefoldEngine::InitializePreprocessingStructureIndex() {

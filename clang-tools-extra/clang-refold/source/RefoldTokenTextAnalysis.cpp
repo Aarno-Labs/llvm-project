@@ -6,6 +6,7 @@
 
 #include "source/RefoldTokenTextAnalysis.h"
 
+#include "core/RefoldLog.h"
 #include "source/RefoldPreprocessingDirectiveScanner.h"
 
 #include "clang/Basic/SourceLocation.h"
@@ -191,6 +192,43 @@ bool RefoldTokenTextAnalysis::TextMentionsCounterObserver(
 
 bool RefoldTokenTextAnalysis::TextContainsDirectiveLine(StringRef text) const {
   return lineHasPreprocessingDirectiveIntroducer(text, lexLang_);
+}
+
+bool RefoldTokenTextAnalysis::DirectiveLineInTextCouldObserveDefinedness(
+    StringRef name, StringRef text) const {
+  if (name.empty() || text.empty())
+    return false;
+
+  const PreprocessingDirectiveScanResult scan =
+      scanPreprocessingDirectives(text, lexLang_);
+  if (!scan.IsComplete())
+    return true;
+
+  for (const PreprocessingDirectiveLine &line : scan.directives) {
+    if (!line.IsValid() || line.end > text.size())
+      return true;
+    const StringRef directiveText = text.slice(line.begin, line.end);
+    if (!FirstRawIdentifierObservationOffsetInText(name, directiveText))
+      continue;
+
+    // A `#define` stores its replacement list as tokens and does not expand it
+    // at definition time, so naming the macro in a macro body is not a test of
+    // whether that macro is defined -- the name is expanded later, at each
+    // invocation, exactly as it would have been originally.  Every other
+    // directive either tests definedness directly (`#if`, `#ifdef`, `#elif`
+    // and friends) or macro-expands its operands (`#include`, `#line`,
+    // `#pragma`), so naming the macro there can change what the directive
+    // does.
+    if (line.keyword != "define")
+      return true;
+
+    // `#define HAS(x) defined(x)` smuggles a definedness test into a body that
+    // a later `#if` evaluates.  A body that spells `defined` at all is refused
+    // rather than analysed.
+    if (FirstRawIdentifierObservationOffsetInText("defined", directiveText))
+      return true;
+  }
+  return false;
 }
 
 } // namespace refold

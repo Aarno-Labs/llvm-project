@@ -84,6 +84,53 @@ bool RefoldMacroStateProof::ReplacementObservesMacroStateDirective(
       .has_value();
 }
 
+bool RefoldMacroStateProof::MacroDefinitionIsSelfReferentialIdentity(
+    const RefoldModel::MacroDirective &directive) const {
+  if (directive.subkind != "#define" || directive.name.empty())
+    return false;
+  // A function-like macro only expands before `(`, and its replacement list is
+  // reached through argument substitution.  The identity argument below is
+  // about a bare name expanding to itself, so it does not cover that shape.
+  if (directive.functionLike || !directive.defParams.empty())
+    return false;
+  if (directive.replacementTokens.size() != 1)
+    return false;
+  const RefoldModel::MacroReplacementToken &token =
+      directive.replacementTokens.front();
+  return token.kind == RefoldModel::MacroReplacementTokenKind::Literal &&
+         !token.paramIndex && token.spelling == directive.name;
+}
+
+bool RefoldMacroStateProof::SelfReferentialDefinitionIsUnobservableInText(
+    const RefoldModel::MacroDirective &directive, StringRef macroName,
+    StringRef text) const {
+  if (!MacroDefinitionIsSelfReferentialIdentity(directive))
+    return false;
+  if (macroName.empty() || macroName != directive.name)
+    return false;
+  if (text.empty())
+    return true;
+
+  // Only a directive line can spell a conditional test, so the payload's
+  // directive inventory is the complete set of places where activating the
+  // definition could be observed as something other than the identity.  An
+  // incomplete scan reports named, which keeps this fail-closed.
+  if (tokenText_.DirectiveLineInTextCouldObserveDefinedness(macroName, text)) {
+    REFOLD_LOG_TRACE("macro/state",
+                     "self-referential '{0}' is named by a payload directive "
+                     "line that could observe its definedness",
+                     macroName);
+    return false;
+  }
+
+  REFOLD_LOG_TRACE("macro/state",
+                   "self-referential '{0}' expands to itself and is named by no "
+                   "directive line in the payload, so activating it before the "
+                   "payload cannot change how it preprocesses",
+                   macroName);
+  return true;
+}
+
 /// True when moving `directive` across `chunk` could change how that chunk
 /// preprocesses.
 ///

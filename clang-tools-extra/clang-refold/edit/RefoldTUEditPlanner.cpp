@@ -1096,6 +1096,31 @@ bool RefoldTUEditPlanner::InsertionSuppliesMacroBoundaryLiteral(
         deps_.aTokens[static_cast<size_t>(cover->first)].spelling)
       continue;
 
+    // Identical flanking spellings make the slide *possible*; they do not make
+    // it what happened.  The refusal exists because the inserted tokens might
+    // be the invocation's own leading replacement-list literal, orphaned into a
+    // pure insertion by that slide -- so the insertion can only be that literal
+    // if it actually begins with it.  When the first inserted token is spelled
+    // differently, the TU carrier is emitting new text that the macro does not
+    // own, and refusing it costs the whole translation unit for nothing:
+    // `estrtonum(EARGF(usage()), ...)` gaining a leading `xjg,` argument
+    // inserts at the gap where `EARGF`'s expansion begins, but emits `xjg` `,`
+    // where the body's leading literal is `(`.
+    if (hunk.bStart >= deps_.bTokens.size())
+      continue;
+    if (deps_.bTokens[static_cast<size_t>(hunk.bStart)].spelling !=
+        deps_.aTokens[static_cast<size_t>(cover->first)].spelling) {
+      REFOLD_LOG_TRACE(
+          "tu/insert",
+          "direct-TU insertion at A gap {0} keeps its carrier: it emits '{1}' "
+          "where macro {2} ({3}) begins its replacement list with '{4}', so it "
+          "cannot be that literal orphaned by a boundary slide",
+          hunk.aStart, deps_.bTokens[static_cast<size_t>(hunk.bStart)].spelling,
+          invocation->id, invocation->name,
+          deps_.aTokens[static_cast<size_t>(cover->first)].spelling);
+      continue;
+    }
+
     REFOLD_LOG_DEBUG(
         "tu/insert",
         "rejecting direct-TU insertion at A gap {0}: B=[{1},{2}) would supply "

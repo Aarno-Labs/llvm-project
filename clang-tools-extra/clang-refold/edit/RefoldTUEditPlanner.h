@@ -303,6 +303,8 @@ public:
     llvm::ArrayRef<PPTok> aTokens;
     /// Number of edited-preprocessed B tokens available to direct hunks.
     uint64_t bTokenCount = 0;
+    /// B-token stream, used to ask what an insertion would actually emit.
+    llvm::ArrayRef<PPTok> bTokens;
     /// A-to-B token map from the token diff planner.
     const std::vector<int64_t> &abTokenMapA2B;
     /// A-side PP-gap owner-depth profile from the token diff planner.
