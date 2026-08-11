@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cassert>
 #include <map>
+#include <optional>
 #include <utility>
 
 using namespace llvm;
@@ -1090,19 +1091,31 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
   // include realization envelope, but allow sideband-only materializations to
   // certify the narrower sideband pragma replay range.
   auto acceptedIt = includeExpansionAcceptedResults_.find(includeId);
+  std::optional<std::pair<uint64_t, uint64_t>> sidebandBRange;
+  if (sidebandOnly || IncludeUsesOnlySidebandReplayEnvelope(include->id))
+    sidebandBRange =
+        textEditAssembler_.SidebandPragmaMaterializedBByteRangeForInclude(
+            include->id);
+
   if (auto bEnv =
           includeInsertionPlanner_.ResolveIncludeRealizationBTokenEnvelope(
               include->cover.begin, include->cover.end)) {
     textEditAssembler_.CertifyTextEditMaterializedBTokenRange(edit, bEnv->first,
                                                               bEnv->second);
-  } else if (sidebandOnly ||
-             IncludeUsesOnlySidebandReplayEnvelope(include->id)) {
-    if (auto sidebandBRange =
-            textEditAssembler_.SidebandPragmaMaterializedBByteRangeForInclude(
-                include->id)) {
-      textEditAssembler_.CertifyTextEditMaterializedBByteRange(
-          edit, sidebandBRange->first, sidebandBRange->second);
-    }
+  } else if (sidebandBRange) {
+    textEditAssembler_.CertifyTextEditMaterializedBByteRange(
+        edit, sidebandBRange->first, sidebandBRange->second);
+  } else if (!include->cover.IsValid()) {
+    // The producer recorded no preprocessed span for this include occurrence,
+    // so it consumed no A token. A once-only or guard-suppressed re-inclusion
+    // is the ordinary way to reach this state: the file is not re-entered, so
+    // neither it nor its subtree can own an A token, and no A/B hunk can be
+    // attributed to it. Whatever this edit stages at the directive site is
+    // therefore preprocessor state only -- the guarded body that re-establishes
+    // once-state in the single output TU -- and realizes no B bytes at all.
+    // Certify that instead of inventing a B envelope for an occurrence with no
+    // B image.
+    textEditAssembler_.CertifyTextEditMaterializesNoBPayload(edit);
   }
 
   // Preserve the accepted-result proof produced by the include materializer

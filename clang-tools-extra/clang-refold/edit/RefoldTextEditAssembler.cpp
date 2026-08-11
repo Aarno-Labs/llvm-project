@@ -2147,8 +2147,23 @@ void RefoldTextEditAssembler::CertifyTextEditMaterializedBByteRange(
     REFOLD_LOG_FATAL("edit-map",
                      "invalid materialized B byte range [{0},{1}) bLen={2}",
                      begin, end, bSource_.size());
+  if (edit.materializesNoBPayload)
+    REFOLD_LOG_FATAL("edit-map",
+                     "edit at source=[{0},{1}) was certified B-payload-free and "
+                     "cannot also carry materialized B byte range [{2},{3})",
+                     edit.start, edit.end, begin, end);
   edit.materializedBByteBegin = begin;
   edit.materializedBByteEnd = end;
+}
+
+void RefoldTextEditAssembler::CertifyTextEditMaterializesNoBPayload(
+    TextEdit &edit) const {
+  if (edit.materializedBByteBegin || edit.materializedBByteEnd)
+    REFOLD_LOG_FATAL("edit-map",
+                     "edit at source=[{0},{1}) cannot be both B-payload-free "
+                     "and carry a materialized B byte range",
+                     edit.start, edit.end);
+  edit.materializesNoBPayload = true;
 }
 
 void RefoldTextEditAssembler::CertifyTextEditMaterializedBTokenRange(
@@ -2230,6 +2245,12 @@ RefoldTextEditAssembler::MacroPatchMaterializedOutputTextRange(
 std::optional<std::pair<uint64_t, uint64_t>>
 RefoldTextEditAssembler::TextEditMaterializedBByteRange(
     const TextEdit &edit) const {
+  // A certified B-payload-free edit has no envelope by construction. Callers
+  // must consult `materializesNoBPayload` before treating this as the missing
+  // certificate that fails closed.
+  if (edit.materializesNoBPayload)
+    return std::nullopt;
+
   if (edit.materializedBByteBegin && edit.materializedBByteEnd) {
     if (*edit.materializedBByteEnd < *edit.materializedBByteBegin ||
         *edit.materializedBByteEnd > static_cast<uint64_t>(bSource_.size()))
@@ -2377,6 +2398,11 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
       bool mergedBByteRangeContiguous = true;
       std::optional<uint64_t> mergedOutByteBegin;
       std::optional<uint64_t> mergedOutByteEnd;
+      // A fragment certified to realize no B bytes tiles the empty B range, so
+      // it can neither break the contiguity of the surrounding witnesses nor
+      // widen the merged refolded-output envelope. The merged edit inherits the
+      // certificate only when every fragment carried it.
+      bool mergedMaterializesNoBPayload = true;
       // Same-offset insertions become one physical edit in source order. The
       // sidecar can describe that merged edit only when the contributing
       // B-side witnesses tile one contiguous byte range in the same order.
@@ -2396,6 +2422,10 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
                                       ordered[k].e->acceptedResults.begin(),
                                       ordered[k].e->acceptedResults.end());
         appendUniqueProtectedSourceAuthorizations(merged, *ordered[k].e);
+        if (ordered[k].e->materializesNoBPayload)
+          continue;
+
+        mergedMaterializesNoBPayload = false;
         if (auto bRange = TextEditMaterializedBByteRange(*ordered[k].e)) {
           if (!mergedBByteBegin) {
             mergedBByteBegin = bRange->first;
@@ -2419,7 +2449,9 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
               mergedOutByteEnd ? std::max(*mergedOutByteEnd, outEnd) : outEnd;
         }
       }
-      if (mergedBByteBegin && mergedBByteEnd && mergedBByteRangeContiguous)
+      if (mergedMaterializesNoBPayload)
+        CertifyTextEditMaterializesNoBPayload(merged);
+      else if (mergedBByteBegin && mergedBByteEnd && mergedBByteRangeContiguous)
         CertifyTextEditMaterializedBByteRange(merged, *mergedBByteBegin,
                                               *mergedBByteEnd);
       if (mergedOutByteBegin && mergedOutByteEnd)
@@ -2600,6 +2632,10 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     TextEdit merged = *first;
     std::optional<std::pair<uint64_t, uint64_t>> mergedBRange =
         TextEditMaterializedBByteRange(merged);
+    // Duplicate writers of one physical replacement must agree on whether that
+    // replacement realizes B payload at all. One duplicate claiming a B-side
+    // envelope while another certifies the payload-free case is exactly the
+    // ambiguity this merge is not allowed to resolve.
     bool mergedBRangeAmbiguous = false;
     std::optional<std::pair<uint64_t, uint64_t>> mergedOutRange =
         TextEditMaterializedOutputTextRange(merged);
@@ -2636,6 +2672,9 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
       // see the emitted replacement as macro-expanded.
       if (!merged.expandedMacroRootId && dup.expandedMacroRootId)
         merged.expandedMacroRootId = dup.expandedMacroRootId;
+
+      if (dup.materializesNoBPayload != merged.materializesNoBPayload)
+        mergedBRangeAmbiguous = true;
 
       if (std::optional<std::pair<uint64_t, uint64_t>> dupBRange =
               TextEditMaterializedBByteRange(dup)) {
@@ -2697,7 +2736,7 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
               .str());
       return originalFileText.str();
     }
-    if (mergedBRange)
+    if (mergedBRange && !merged.materializesNoBPayload)
       CertifyTextEditMaterializedBByteRange(merged, mergedBRange->first,
                                             mergedBRange->second);
     if (mergedOutRange)
@@ -3192,7 +3231,17 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     // Record only the replacement bytes written by this edit. Copied original
     // slices and emitted #line/resync material are intentionally outside the
     // mapped source range because they are not materialized B edit payload.
-    if (materializedEditMappings) {
+    if (materializedEditMappings && e.materializesNoBPayload) {
+      // A replacement proved to realize no B bytes contributes no edit-map row,
+      // exactly like a copied original slice or an emitted #line resync. The
+      // certificate is what distinguishes it from an edit that never reached a
+      // B-side certifier at all; that case still fails closed below.
+      REFOLD_LOG_TRACE("edit-map",
+                       "B-payload-free edit in {0} at source=[{1},{2}) emits "
+                       "{3} byte(s) of preprocessor state and is omitted from "
+                       "the materialized edit map",
+                       emissionOwner, e.start, e.end, e.text.size());
+    } else if (materializedEditMappings) {
       std::optional<std::pair<uint64_t, uint64_t>> bRange =
           TextEditMaterializedBByteRange(e);
       if (!bRange) {

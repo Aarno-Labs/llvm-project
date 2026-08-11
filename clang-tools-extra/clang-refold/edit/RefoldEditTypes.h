@@ -287,6 +287,19 @@ struct TextEdit {
   /// Exclusive byte offset inside this edit's replacement `text` to report as
   /// the refolded-output side of the materialized edit map.
   std::optional<uint64_t> materializedOutputTextEnd = std::nullopt;
+
+  /// True when a producer of this edit proved that its replacement realizes no
+  /// bytes of the edited preprocessed stream B at all.
+  ///
+  /// This is a certified fact, not the absence of one. An edit whose payload is
+  /// pure preprocessor state — for example the once-guard body staged for an
+  /// include occurrence the producer records as contributing zero A tokens —
+  /// has no B-side materialization envelope to report, and reporting an
+  /// invented one would be a fabricated correspondence. Such an edit is omitted
+  /// from the materialized edit map exactly like a copied original slice, while
+  /// an edit that merely never reached a certifier keeps
+  /// `materializedBByteBegin`/`End` unset and still fails closed.
+  bool materializesNoBPayload = false;
 };
 
 /// Replacement text produced while wrapping a materialized include together

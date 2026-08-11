@@ -331,6 +331,16 @@ public:
   void CertifyTextEditMaterializedBByteRange(TextEdit &edit, uint64_t begin,
                                              uint64_t end) const;
 
+  /// Certify that a TextEdit realizes no bytes of the edited preprocessed
+  /// stream B.
+  ///
+  /// Use this only where the caller has proved that the emitted replacement is
+  /// pure preprocessor state with no B-side payload. The certified edit is
+  /// omitted from the materialized edit map instead of contributing an invented
+  /// B-byte range; edits that simply reached emission without a certifier keep
+  /// failing closed.
+  void CertifyTextEditMaterializesNoBPayload(TextEdit &edit) const;
+
   /// Certify a TextEdit with the B-byte range described by a B-token envelope.
   void CertifyTextEditMaterializedBTokenRange(TextEdit &edit,
                                               uint64_t bTokBegin,
