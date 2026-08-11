@@ -125,6 +125,39 @@ static bool diagnosticPragmaSettingAction(StringRef action) {
          action == "fatal" || action == "remark";
 }
 
+/// Attach the boundary a state transition failed at to a terminal fallback
+/// context, so the narrowing ladder can name the region to give up instead of
+/// taking the whole-translation-unit carrier.
+///
+/// The include instance owning the boundary is the region at stake: a state
+/// transition fails across an edit boundary that sits inside exactly one
+/// include instance, and giving up that instance's `#include` emits the
+/// directive's own source inline, which is a different -- and strictly
+/// smaller -- question than expanding the file.  A boundary in the translation
+/// unit itself carries no include id and correctly leaves the request
+/// unattributed.
+///
+/// The A-token range is deliberately *not* carried.  A state boundary names the
+/// directive whose transition could not be proved, not the tokens a plan failed
+/// to realize, and `RefoldEngine::AlignmentResolutionIsDemanded()` reads a token
+/// range as evidence that a different anchor placement could change the
+/// outcome.  A macro-state failure fails identically under every alignment, so
+/// publishing its directive's tokens there would demand a full resolved re-plan
+/// per translation unit and prove nothing.
+static void
+attachStateBoundaryToTerminalContext(TerminalFallbackFailureContext &context,
+                                     const OwnerStateBoundary &boundary) {
+  if (!boundary.hasSourceBoundary || !boundary.source.IsComplete())
+    return;
+  if (!context.ownerId)
+    context.ownerId = boundary.source.includeId;
+  if (!context.sourcePath) {
+    context.sourcePath = boundary.source.path;
+    context.sourceBegin = boundary.source.begin;
+    context.sourceEnd = boundary.source.end;
+  }
+}
+
 } // namespace
 
 bool sourceTextIsOnlyWhitespaceAndCompleteComments(StringRef text,
@@ -2584,6 +2617,12 @@ RefoldOwnerStateProof::CheckStateTransitionAcrossEditBoundary(
 
   auto requestTerminal = [&](TerminalFallbackProofFailure failure,
                              std::string message) {
+    // Every gateway rejection knows the boundary it was asked about, and until
+    // now discarded it: the request carried only the state component, so the
+    // fallback ladder had no region to give up and took the whole file.  This
+    // is the single exit for all of them, so attributing here covers every
+    // rejection above without each one restating the fact.
+    attachStateBoundaryToTerminalContext(failure.context, request.boundary);
     proof.failure = failure;
     theoremAudit_.RecordStateTransitionGatewayTerminalFailure();
     if (!theoremAudit_.AuditTerminalFallbackProofFailure(failure,

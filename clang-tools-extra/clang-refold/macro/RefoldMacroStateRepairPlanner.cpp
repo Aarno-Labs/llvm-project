@@ -407,11 +407,20 @@ private:
                           StringRef detail,
                           bool requireKnownObserver = false) const;
   /// Validates terminal fallback evidence for a macro-state transition.
+  ///
+  /// `failingOwnerId` names the region whose realization the check condemns,
+  /// when the caller knows one that is more specific than the directive's own
+  /// include instance -- the materialized include that consumes the definition,
+  /// or the invocation whose surviving callsite observes it.  That region is
+  /// what the fallback ladder gives up instead of the translation unit; leaving
+  /// it absent falls back to the include instance owning the directive, and a
+  /// directive in the translation unit itself stays honestly unattributed.
   StateTransitionProof
   CheckMacroStateTerminal(const RefoldModel::MacroDirective &directive,
                           StateMutationKind mutation, StringRef stage,
-                          StringRef detail,
-                          bool requireKnownObserver = true) const;
+                          StringRef detail, bool requireKnownObserver = true,
+                          std::optional<uint64_t> failingOwnerId =
+                              std::nullopt) const;
   /// Maps a preservation placement to the corresponding owner-state mutation.
   StateMutationKind MutationForMacroStatePreservationPlacement(
       MacroStatePreservationPlacement placement) const;
@@ -1530,14 +1539,22 @@ StateTransitionProof MacroStateRepairContext::CheckMacroStateRepaired(
 
 StateTransitionProof MacroStateRepairContext::CheckMacroStateTerminal(
     const RefoldModel::MacroDirective &directive, StateMutationKind mutation,
-    StringRef stage, StringRef detail, bool requireKnownObserver) const {
+    StringRef stage, StringRef detail, bool requireKnownObserver,
+    std::optional<uint64_t> failingOwnerId) const {
   const OwnerStateBoundary boundary = MacroDirectiveSuffixBoundary(directive);
-  return CheckMacroStateWithWitness(
-      boundary, mutation,
-      OwnerStateProof().BuildStateTransitionWitness(
-          SuffixStabilityWitnessKind::TerminalStateFailure,
-          OwnerStateComponent::MacroState, boundary, detail),
-      stage, detail, requireKnownObserver);
+  SuffixStabilityWitness witness = OwnerStateProof().BuildStateTransitionWitness(
+      SuffixStabilityWitnessKind::TerminalStateFailure,
+      OwnerStateComponent::MacroState, boundary, detail);
+
+  // Prefer the caller's region over the directive's own include instance.  The
+  // gateway fills the boundary's include id in when nothing more specific
+  // arrives, and the directive's owner is the header the `#define` sits in --
+  // which is not the region whose realization just failed.
+  if (failingOwnerId && witness.terminalFailure)
+    witness.terminalFailure->failure.context.ownerId = failingOwnerId;
+
+  return CheckMacroStateWithWitness(boundary, mutation, std::move(witness),
+                                    stage, detail, requireKnownObserver);
 }
 
 StateMutationKind
@@ -2586,7 +2603,7 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
                         "surviving include observes macro state",
                         invocation.name, invocation.id, definition->id)
               .str(),
-          /*RequireKnownObserver=*/true);
+          /*RequireKnownObserver=*/true, invocation.id);
       continue;
     }
 
@@ -2604,7 +2621,7 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
                         "placement and no whole-cover realization is available",
                         invocation.name, invocation.id, definition->id)
               .str(),
-          /*RequireKnownObserver=*/true);
+          /*RequireKnownObserver=*/true, invocation.id);
       continue;
     }
 
@@ -3121,7 +3138,7 @@ bool MacroStateRepairContext::RepairConsumedDefinitionsForMaterializedInclude(
                         "survives in the suffix",
                         materializedInclude.id, definition.id, ref.name)
               .str(),
-          /*RequireKnownObserver=*/true);
+          /*RequireKnownObserver=*/true, materializedInclude.id);
       return false;
     }
 
@@ -3135,7 +3152,7 @@ bool MacroStateRepairContext::RepairConsumedDefinitionsForMaterializedInclude(
                         "observes that macro",
                         materializedInclude.id, definition.id, ref.name)
               .str(),
-          /*RequireKnownObserver=*/true);
+          /*RequireKnownObserver=*/true, materializedInclude.id);
       return false;
     }
 

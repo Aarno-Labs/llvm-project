@@ -492,13 +492,20 @@ Expected<std::string> RefoldEngine::Refold(
   // only ever needed to *widen*: a region that was expanded and still diverges
   // escalates to the region enclosing it.  That is bounded by nesting depth,
   // not by how many regions diverged.
-  // The ladder is counted separately from the loop, because a
-  // resolve-and-re-plan attempt must not consume a narrowing step: adding
-  // resolution to the loop would otherwise shorten a ladder that already
-  // worked and could strand a translation unit one widening short of its
-  // answer.  Resolution needs no allowance of its own -- it happens at most
-  // once.
-  const unsigned maxNarrowingAttempts = 4;
+  //
+  // There is deliberately no ceiling on the ladder.  A constant bound is not a
+  // proof, and it can itself force the whole-translation-unit carrier: a unit
+  // whose ladder was still naming fresh regions would stop mid-descent and emit
+  // the edited stream for the entire file with narrowing still available.
+  // Termination comes from the set instead -- `ownersMustExpand` only grows,
+  // every retry must add at least one region that is not already in it, and the
+  // number of producer regions is finite -- so the loop below stops when a round
+  // makes no progress rather than when a counter runs out.
+  //
+  // The ladder is still counted separately from the loop, because a
+  // resolve-and-re-plan attempt must not be mistaken for a narrowing step: the
+  // count is what the closing diagnostics report, and folding resolution into it
+  // would misreport how far the ladder actually descended.
   unsigned narrowingAttempts = 0;
 
   // Alignment ambiguity is resolved on demand.  Every candidate map a window
@@ -572,28 +579,49 @@ Expected<std::string> RefoldEngine::Refold(
     // fallback ladder, not a verification verdict, and a caller that asked for
     // no verification still wants the smaller answer.
     if (engine.terminalSink_.HasRequest()) {
-      // Retry only when *every* recorded request names a region that can still
-      // be given up.  One request naming nothing -- an unowned hunk, a
-      // translation-unit wide producer inconsistency -- means the terminal
-      // carrier is reachable whatever becomes of the others, so further whole
-      // re-assemblies buy nothing.  This is a cost policy, not a proof: taking
-      // the carrier is always correct, so stopping early can only forgo
-      // completeness there was no path to.
+      // Give up every region that any request names, and take the carrier only
+      // when *no* request names one.
+      //
+      // This deliberately no longer waits for every request to be narrowable.
+      // That rule was a cost policy -- it avoided re-assemblies that might not
+      // reach a smaller answer -- but the two outcomes it chooses between are
+      // not a whole answer and a slightly smaller one: they are a partial
+      // refold and a verbatim copy of the entire file.  One unattributable
+      // request among fifty would surrender every include, macro and directive
+      // in the unit alongside it.  A request naming nothing still contributes
+      // nothing here; it simply no longer vetoes the regions that others named.
       llvm::SmallVector<uint64_t, 8> owners;
       const bool everyRequestNarrowable =
           engine.AppendNarrowableOwnersForTerminalRequests(ownersMustExpand,
                                                           owners);
-      if (everyRequestNarrowable && !owners.empty() &&
-          narrowingAttempts + 1 < maxNarrowingAttempts) {
+      if (!everyRequestNarrowable)
+        REFOLD_LOG_INFO("fallback",
+                        "some terminal requests name no region; narrowing the "
+                        "{0} region(s) that were named and re-planning",
+                        static_cast<uint64_t>(owners.size()));
+      if (!owners.empty()) {
+        // Progress, not a counter, is what bounds this.  Record only regions
+        // the set did not already hold: a round that names nothing new would
+        // re-plan the identical input and reach the identical verdict, so it
+        // must fall through to the carrier rather than loop.
+        bool expandedNewOwner = false;
         for (uint64_t owner : owners) {
+          if (!ownersMustExpand.insert(owner).second)
+            continue;
+          expandedNewOwner = true;
           REFOLD_LOG_INFO("fallback",
                           "terminal fallback names {0}; expanding it and "
                           "retrying instead of the whole translation unit",
                           engine.DescribeOwner(owner));
-          ownersMustExpand.insert(owner);
         }
-        ++narrowingAttempts;
-        continue;
+        if (expandedNewOwner) {
+          ++narrowingAttempts;
+          continue;
+        }
+        REFOLD_LOG_WARN("fallback",
+                        "terminal fallback named only regions already given "
+                        "up after {0} narrowing step(s); taking the carrier",
+                        narrowingAttempts);
       }
       return out;
     }
@@ -653,19 +681,26 @@ Expected<std::string> RefoldEngine::Refold(
           verdict.reason.c_str(), owned.c_str());
     }
 
-    if (!owners.empty() && narrowingAttempts + 1 < maxNarrowingAttempts) {
-      REFOLD_LOG_INFO("assembly-verify",
-                      "unsound assembly: {0} diverging region(s), expanding "
-                      "{1} owner(s) and retrying: {2}",
-                      verdict.divergentRanges.size(), owners.size(),
-                      verdict.reason);
+    if (!owners.empty()) {
+      // Same progress rule as the terminal ladder above: only a round that
+      // gives up a region not already given up can change the next assembly.
+      bool expandedNewOwner = false;
       for (uint64_t candidate : owners) {
+        if (!ownersMustExpand.insert(candidate).second)
+          continue;
+        expandedNewOwner = true;
         REFOLD_LOG_INFO("assembly-verify", "  expanding {0}",
                         engine.DescribeOwner(candidate));
-        ownersMustExpand.insert(candidate);
       }
-      ++narrowingAttempts;
-      continue;
+      if (expandedNewOwner) {
+        REFOLD_LOG_INFO("assembly-verify",
+                        "unsound assembly: {0} diverging region(s), expanded "
+                        "{1} owner(s) and retrying: {2}",
+                        verdict.divergentRanges.size(), owners.size(),
+                        verdict.reason);
+        ++narrowingAttempts;
+        continue;
+      }
     }
 
     // Nothing narrower is left to give up: the divergence could not be
@@ -1762,7 +1797,106 @@ bool RefoldEngine::DispatchStructuralHunks(
 
     if (auto spanPlan = TUEditPlanner().PlanTUByteSpan(h.aStart, h.aEnd,
                                                        tuPath)) { // [b, e)
-      auto span = spanPlan->byteRange();
+      if (std::optional<TextEdit> directEdit = BuildDirectTUByteSpanEditForHunk(
+              h, i, isDel, tuPath, tuBytes, spanPlan->byteRange())) {
+        structuralHunkDispatcher.AddTUEdit(std::move(*directEdit));
+        continue;
+      }
+    }
+
+    // Before we escalate to the explicit terminal out-of-domain carrier, try
+    // the declared TUIncludeClosureEdit class.  This source-closure proof keeps
+    // already-proved structural work alive by materializing a closed run of
+    // top-level TU `#include` directives directly into TU source text when that
+    // run either exactly covers the unresolved PP hunk or can be widened to the
+    // full include cover without absorbing another token diff.
+    llvm::SmallVector<std::pair<uint64_t, uint64_t>, 8> stagedSourceIntervals =
+        structuralHunkDispatcher.BuildTUClosureSourceIntervals();
+    if (auto closureEdit = expansionFallbackPlanner_
+                               ->BuildTUIncludeClosureEditForUnresolvedHunk(
+                                   h, tuPath, tuBytes, stagedSourceIntervals)) {
+      structuralHunkDispatcher.AddTUEdit(std::move(*closureEdit));
+      continue;
+    }
+
+    // The hunk has no realization of its own.  If its owner was already ruled
+    // out from keeping its callsite, emit that owner's expansion here rather
+    // than giving up the translation unit.
+    //
+    // Marking an owner must-expand tells the macro selector not to preserve the
+    // callsite, but nothing else then emits the invocation's expansion at that
+    // site: for an include, materialization supplies the body, while a
+    // TU-level invocation has no such step.  The hunk therefore fails again on
+    // every retry, and widening dead-ends because a TU-level invocation has
+    // neither a caller nor an owning include -- so the ladder reaches the
+    // whole-file carrier with the region it named still unrealized.  Staging
+    // the invocation's proved whole-cover replacement closes that gap: the
+    // region is expanded exactly where it failed and every other hunk keeps
+    // its refolded realization.
+    if (std::optional<uint64_t> failingOwner =
+            FindSmallestOwnerForAToken(h.aStart)) {
+      if (ownersMustExpand_.count(*failingOwner)) {
+        if (const RefoldModel::MacroInvocation *invocation =
+                macroTopology_.FindMacroInvocationById(*failingOwner)) {
+          if (invocation->invB && invocation->invE) {
+            if (std::optional<WholeCoverPlan> wholeCoverPlan =
+                    MacroPatchPlanner().ComputeWholeCoverPlan(*invocation)) {
+              MacroPatch wholeCoverPatch{*invocation->invB, *invocation->invE,
+                                         wholeCoverPlan->clippedText,
+                                         invocation->id};
+              ProofLattice().CertifyMacroWholeCoverRealizationPatch(
+                  wholeCoverPatch, *wholeCoverPlan, *invocation);
+              MacroPatchPlanner().CertifyMacroPatchOwnerWitness(
+                  wholeCoverPatch,
+                  invocation->ownerIncludeId
+                      ? Owner::Include(*invocation->ownerIncludeId)
+                      : Owner::TU());
+              RefoldStructuralHunkDispatcher::MacroPatchStagingSlot slot =
+                  structuralHunkDispatcher.PrepareMacroPatchStagingSlot(
+                      *invocation);
+              structuralHunkDispatcher.StageMacroPatch(
+                  slot, std::move(wholeCoverPatch));
+              REFOLD_LOG_INFO(
+                  "classify",
+                  "hunk A=[{0},{1}) has no realization; emitting the expansion "
+                  "of already-given-up {2} at source=[{3},{4}) and refolding "
+                  "the rest",
+                  h.aStart, h.aEnd, DescribeOwner(*failingOwner),
+                  *invocation->invB, *invocation->invE);
+              continue;
+            }
+          }
+        }
+      }
+    }
+
+    // Use the explicit theorem-boundary interpretation for this last ownership
+    // gap. By the time control reaches this branch, the engine has already
+    // failed to prove a macro owner, include owner, truthful TU-owned byte
+    // span, any exact/provable TU insertion anchor, and the declared
+    // TUIncludeClosureEdit source-closure class. Do not manufacture a weaker
+    // success class here; terminate via the named out-of-domain boundary
+    // instead.
+    terminalSink_.RequestTerminalFallback(
+        MakeTerminalFallbackProofFailure(
+            TerminalFallbackObligationKind::OwnerClosedCover,
+            TerminalFallbackFailureReason::NoOwnerClosedCover,
+            TerminalFallbackFailureContext::ForHunkTokenEnvelope(
+                i, h.aStart, h.aEnd, h.bStart, h.bEnd)),
+        "classify",
+        ProofLattice().BuildOwnerUnresolvedNoTUAnchorDetail(i, h, tuPath, owner,
+                                                            mapsToTU));
+    continue;
+  }
+
+  return true;
+}
+
+std::optional<TextEdit> RefoldEngine::BuildDirectTUByteSpanEditForHunk(
+    const diffutils::Hunk &h, size_t hunkIndex, bool isDel, StringRef tuPath,
+    StringRef tuBytes, std::pair<uint64_t, uint64_t> span) {
+  {
+    {
       std::string repl;
       const uint64_t rawTUStart = span.first;
       const uint64_t rawTUEnd = span.second;
@@ -1905,52 +2039,13 @@ bool RefoldEngine::DispatchStructuralHunks(
               ? ResyncOutcome(padded, std::nullopt)
               : textEditAssembler_->ApplyResyncOrPend(
                     tuBytes, span.first, span.second, padded, tuPath);
-      if (std::optional<TextEdit> directEdit =
-              textEditAssembler_->BuildDirectTUHunkTextEdit(
-                  h, i, span, std::move(ro), StringRef(padded), rawTUStart,
-                  rawTUEnd, materializedBByteBegin, materializedBByteEnd,
-                  AcceptedPathKind::TUByteSpanConservativeEdit,
-                  std::move(insertionAnchorAdjustment))) {
-        structuralHunkDispatcher.AddTUEdit(std::move(*directEdit));
-        continue;
-      }
+      return textEditAssembler_->BuildDirectTUHunkTextEdit(
+          h, hunkIndex, span, std::move(ro), StringRef(padded), rawTUStart,
+          rawTUEnd, materializedBByteBegin, materializedBByteEnd,
+          AcceptedPathKind::TUByteSpanConservativeEdit,
+          std::move(insertionAnchorAdjustment));
     }
-
-    // Before we escalate to the explicit terminal out-of-domain carrier, try
-    // the declared TUIncludeClosureEdit class.  This source-closure proof keeps
-    // already-proved structural work alive by materializing a closed run of
-    // top-level TU `#include` directives directly into TU source text when that
-    // run either exactly covers the unresolved PP hunk or can be widened to the
-    // full include cover without absorbing another token diff.
-    llvm::SmallVector<std::pair<uint64_t, uint64_t>, 8> stagedSourceIntervals =
-        structuralHunkDispatcher.BuildTUClosureSourceIntervals();
-    if (auto closureEdit = expansionFallbackPlanner_
-                               ->BuildTUIncludeClosureEditForUnresolvedHunk(
-                                   h, tuPath, tuBytes, stagedSourceIntervals)) {
-      structuralHunkDispatcher.AddTUEdit(std::move(*closureEdit));
-      continue;
-    }
-
-    // Use the explicit theorem-boundary interpretation for this last ownership
-    // gap. By the time control reaches this branch, the engine has already
-    // failed to prove a macro owner, include owner, truthful TU-owned byte
-    // span, any exact/provable TU insertion anchor, and the declared
-    // TUIncludeClosureEdit source-closure class. Do not manufacture a weaker
-    // success class here; terminate via the named out-of-domain boundary
-    // instead.
-    terminalSink_.RequestTerminalFallback(
-        MakeTerminalFallbackProofFailure(
-            TerminalFallbackObligationKind::OwnerClosedCover,
-            TerminalFallbackFailureReason::NoOwnerClosedCover,
-            TerminalFallbackFailureContext::ForHunkTokenEnvelope(
-                i, h.aStart, h.aEnd, h.bStart, h.bEnd)),
-        "classify",
-        ProofLattice().BuildOwnerUnresolvedNoTUAnchorDetail(i, h, tuPath, owner,
-                                                            mapsToTU));
-    continue;
   }
-
-  return true;
 }
 
 std::string RefoldEngine::FinalizeStructuralResult(
@@ -2519,21 +2614,40 @@ bool RefoldEngine::AppendNarrowableOwnersForTerminalRequests(
   for (const TerminalFallbackRequest &request : terminalSink_.Requests()) {
     const TerminalFallbackFailureContext &context = request.failure.context;
 
-    std::optional<uint64_t> owner = context.ownerId;
-    if (!owner && context.aTokenBegin && context.aTokenEnd &&
-        *context.aTokenBegin < *context.aTokenEnd)
-      owner = FindSmallestOwnerForAToken(*context.aTokenBegin);
+    // A request that names its region explicitly names exactly one, and it is
+    // the region whose realization failed.  A request that instead recorded the
+    // A tokens it could not realize may span several, so take every one of them
+    // -- expanding only the region owning the first token cannot repair a
+    // divergence sitting inside a later one.
+    llvm::SmallVector<uint64_t, 8> requestOwners;
+    if (context.ownerId)
+      requestOwners.push_back(*context.ownerId);
+    else if (context.aTokenBegin && context.aTokenEnd)
+      AppendMinimalOwnersCoveringATokenRange(*context.aTokenBegin,
+                                             *context.aTokenEnd, requestOwners);
 
-    // Widen past anything already given up, exactly as the verification path
-    // does: expanding it once was not enough.
-    while (owner && alreadyExpanded.count(*owner))
-      owner = FindEnclosingOwner(*owner);
-    if (!owner) {
+    if (requestOwners.empty()) {
       everyRequestNarrowable = false;
       continue;
     }
-    if (!llvm::is_contained(owners, *owner))
-      owners.push_back(*owner);
+
+    // Widen past anything already given up, exactly as the verification path
+    // does: expanding it once was not enough.  Each region widens on its own --
+    // they can sit at different depths, and one already-expanded region must
+    // not suppress a sibling that has never been given up.
+    bool namedAnyRegion = false;
+    for (uint64_t requestOwner : requestOwners) {
+      std::optional<uint64_t> owner = requestOwner;
+      while (owner && alreadyExpanded.count(*owner))
+        owner = FindEnclosingOwner(*owner);
+      if (!owner)
+        continue;
+      namedAnyRegion = true;
+      if (!llvm::is_contained(owners, *owner))
+        owners.push_back(*owner);
+    }
+    if (!namedAnyRegion)
+      everyRequestNarrowable = false;
   }
   return everyRequestNarrowable;
 }
@@ -2576,6 +2690,63 @@ RefoldEngine::FindSmallestOwnerForAToken(uint64_t aToken) const {
       considerOwner(include.id, include.cover.begin, include.cover.end);
 
   return ownerId;
+}
+
+void RefoldEngine::AppendMinimalOwnersCoveringATokenRange(
+    uint64_t aBegin, uint64_t aEnd,
+    llvm::SmallVectorImpl<uint64_t> &owners) const {
+  if (aEnd <= aBegin)
+    return;
+
+  // Collect the regions that meet the range at all before asking about
+  // individual tokens.  The model is walked once here rather than once per
+  // token, which keeps a wide failing range from costing a full scan of every
+  // invocation and include for each of its tokens.
+  struct CoveringOwner {
+    uint64_t id;
+    uint64_t begin;
+    uint64_t end;
+  };
+  SmallVector<CoveringOwner, 16> covering;
+  auto considerOwner = [&](uint64_t id, uint64_t begin, uint64_t end) {
+    if (end <= aBegin || begin >= aEnd)
+      return;
+    covering.push_back(CoveringOwner{id, begin, end});
+  };
+
+  for (const RefoldModel::MacroInvocation &macro : model_.GetMacroInvocations())
+    for (const RefoldModel::PPSpan &span : macro.spans)
+      considerOwner(macro.id, span.begin, span.end);
+  for (const RefoldModel::IncludeItem &include : model_.GetIncludes())
+    if (include.cover.IsValid())
+      considerOwner(include.id, include.cover.begin, include.cover.end);
+
+  // Each token contributes the narrowest region covering it, with width ties
+  // broken by producer id so the choice does not depend on model order.  A
+  // token no region covers is owned by the translation unit and contributes
+  // nothing, which is what leaves a wholly TU-owned range unattributed.
+  SmallVector<uint64_t, 8> selected;
+  for (uint64_t aToken = aBegin; aToken < aEnd; ++aToken) {
+    std::optional<uint64_t> narrowestId;
+    uint64_t narrowestWidth = std::numeric_limits<uint64_t>::max();
+    for (const CoveringOwner &candidate : covering) {
+      if (aToken < candidate.begin || aToken >= candidate.end)
+        continue;
+      const uint64_t width = candidate.end - candidate.begin;
+      if (width < narrowestWidth ||
+          (width == narrowestWidth && narrowestId && candidate.id < *narrowestId)) {
+        narrowestId = candidate.id;
+        narrowestWidth = width;
+      }
+    }
+    if (narrowestId && !llvm::is_contained(selected, *narrowestId))
+      selected.push_back(*narrowestId);
+  }
+
+  llvm::sort(selected);
+  for (uint64_t ownerId : selected)
+    if (!llvm::is_contained(owners, ownerId))
+      owners.push_back(ownerId);
 }
 
 std::string RefoldEngine::DescribeOwner(uint64_t ownerId) const {

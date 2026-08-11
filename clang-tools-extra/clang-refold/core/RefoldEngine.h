@@ -1031,9 +1031,10 @@ private:
   /// Collect every region named by this run's terminal-fallback requests that
   /// has not already been given up.
   ///
-  /// Returns false when at least one request names no such region.  The caller
-  /// uses that to stop retrying: a request that cannot be narrowed makes the
-  /// terminal carrier reachable regardless of what the others do.
+  /// Returns false when at least one request names no such region.  That is
+  /// reported for diagnostics only: the caller narrows the regions that *were*
+  /// named regardless, because the alternative to a partial refold is a
+  /// verbatim copy of the whole translation unit, not a marginally larger one.
   ///
   /// A terminal request records the region whose proof failed when the site
   /// knows it.  Recovering that region is what lets the ladder expand one
@@ -1051,6 +1052,25 @@ private:
   /// without a verifier having run.
   std::optional<uint64_t> FindSmallestOwnerForAToken(uint64_t aToken) const;
 
+  /// Append the minimal regions covering every token of `[aBegin, aEnd)`.
+  ///
+  /// A failing range routinely spans several regions, and naming only the one
+  /// owning its first token cannot repair a divergence inside a later one:
+  /// widening escalates through that first region's *ancestry*, which need
+  /// never reach a sibling include holding the rest of the range.
+  ///
+  /// The result is the minimal antichain -- each token's narrowest owner,
+  /// deduplicated -- and deliberately not the transitive closure.  Every
+  /// enclosing region also covers these tokens, so including them would give up
+  /// a whole header to repair a hunk one invocation wide.  Escalating to an
+  /// enclosing region stays the caller's separate widening step.
+  ///
+  /// Owners are appended in ascending producer id, and ids already present in
+  /// \p owners are not repeated, so the result does not depend on model order.
+  void AppendMinimalOwnersCoveringATokenRange(
+      uint64_t aBegin, uint64_t aEnd,
+      llvm::SmallVectorImpl<uint64_t> &owners) const;
+
   /// Return a human-readable description of one owner, for diagnostics.
   std::string DescribeOwner(uint64_t ownerId) const;
 
@@ -1062,6 +1082,25 @@ private:
   /// its callsite, and an include widens to the include that entered it.  No
   /// enclosing region means the translation unit is all that is left.
   std::optional<uint64_t> FindEnclosingOwner(uint64_t ownerId) const;
+
+  /// Build the ordinary direct-TU byte-span edit realizing one token hunk over
+  /// \p span, the TU byte range a direct-TU proof has already accepted.
+  ///
+  /// This is the realization half of the direct-TU path: the caller supplies a
+  /// span that `RefoldTUEditPlanner::PlanTUByteSpan()` proved, and this turns it
+  /// into replacement text -- B token slice, gap and spacing repair, trailing
+  /// call-suffix extension, line-control resync -- and certifies the resulting
+  /// edit.  Returns std::nullopt when the edit could not be certified, leaving
+  /// the caller to escalate.
+  ///
+  /// It is separate from span planning so that a caller holding a *different*
+  /// proved span for the same hunk can reuse the identical realization rather
+  /// than restating it.
+  std::optional<TextEdit>
+  BuildDirectTUByteSpanEditForHunk(const diffutils::Hunk &h, size_t hunkIndex,
+                                   bool isDel, StringRef tuPath,
+                                   StringRef tuBytes,
+                                   std::pair<uint64_t, uint64_t> span);
 
   /// \brief Run the structural refold pass.
   ///
