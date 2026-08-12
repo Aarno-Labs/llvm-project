@@ -89,7 +89,87 @@ static uint64_t getLcsDiagnosticEvidenceByteBudget() {
 RefoldTokenDiffPlanner::RefoldTokenDiffPlanner(Dependencies deps)
     : deps_(deps) {}
 
-RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
+uint64_t AlignmentCertificationMemo::DigestLexemes(ArrayRef<StringRef> lexemes) {
+  // FNV-1a over every lexeme's exact bytes, with each length folded in so that
+  // a different tokenization of the same characters digests differently.
+  uint64_t digest = 0xcbf29ce484222325ULL;
+  auto mix = [&digest](uint8_t byte) {
+    digest ^= byte;
+    digest *= 0x100000001b3ULL;
+  };
+  for (StringRef lexeme : lexemes) {
+    for (uint64_t length = lexeme.size(); length != 0; length >>= 8)
+      mix(static_cast<uint8_t>(length & 0xff));
+    mix(0xff);
+    for (char c : lexeme)
+      mix(static_cast<uint8_t>(c));
+  }
+  return digest;
+}
+
+CertifiedAlignmentFacts RefoldTokenDiffPlanner::CertifyAlignment(
+    ArrayRef<StringRef> aSeq, ArrayRef<StringRef> bSeq,
+    uint64_t certificationByteBudget) {
+  CertifiedAlignmentFacts facts;
+  facts.aGapProvenance = ComputeLcsAGapProvenanceForPP(deps_.ownerDepthGap);
+
+  uint64_t completeStreamRequiredBytes = 0;
+  const bool completeStreamIsRepresentable =
+      diffutils::getLcsCertificationRequiredBytes(
+          aSeq.size(), bSeq.size(), /*retainCompleteOracle=*/true,
+          completeStreamRequiredBytes);
+
+  std::vector<uint64_t> candidateABoundaries;
+  diffutils::LcsCertificationDiagnosticEvidence *diagnosticEvidenceOut =
+      inTraceMode() ? &facts.diagnosticEvidence : nullptr;
+  if (diagnosticEvidenceOut) {
+    facts.diagnosticEvidence.admissiblePairByteBudget =
+        getLcsDiagnosticEvidenceByteBudget();
+  }
+
+  if (completeStreamIsRepresentable &&
+      completeStreamRequiredBytes <= certificationByteBudget) {
+    // A fitting complete-stream theorem is already exact and retains the
+    // semantic oracle. Ordinary runs therefore avoid both partition-frontier
+    // DP and protected-boundary collection. Trace runs still collect the
+    // nominations needed by the permanent evidence transcript.
+    if (diagnosticEvidenceOut) {
+      facts.protectedBoundaries = CollectProtectedAlignmentBoundarySurfaces(
+          /*retainDiagnosticIdentities=*/true);
+      initializeAlignmentDiagnosticEvidence(facts.protectedBoundaries,
+                                            facts.diagnosticEvidence);
+    }
+    facts.alignment = diffutils::certifiedLcsMapAB(
+        aSeq, bSeq, facts.aGapProvenance, certificationByteBudget,
+        diagnosticEvidenceOut);
+    if (diagnosticEvidenceOut) {
+      candidateABoundaries = diffutils::nominateLcsPartitionBoundaries(
+          facts.aGapProvenance, /*forcedMap=*/{},
+          facts.protectedBoundaries.proofSchedulingCoordinates);
+      facts.diagnosticEvidence.candidateABoundaries.assign(
+          candidateABoundaries.begin(), candidateABoundaries.end());
+    }
+  } else {
+    facts.protectedBoundaries = CollectProtectedAlignmentBoundarySurfaces(
+        /*retainDiagnosticIdentities=*/diagnosticEvidenceOut != nullptr);
+    if (diagnosticEvidenceOut)
+      initializeAlignmentDiagnosticEvidence(facts.protectedBoundaries,
+                                            facts.diagnosticEvidence);
+    candidateABoundaries = diffutils::nominateLcsPartitionBoundaries(
+        facts.aGapProvenance, /*forcedMap=*/{},
+        facts.protectedBoundaries.proofSchedulingCoordinates);
+    if (!diffutils::certifyLcsWindowsWithinBudget(
+            aSeq, bSeq, facts.aGapProvenance, candidateABoundaries,
+            certificationByteBudget, facts.alignment, diagnosticEvidenceOut)) {
+      REFOLD_LOG_FATAL("lcs/map", "window-local LCS certification failed");
+    }
+  }
+
+  return facts;
+}
+
+RefoldTokenDiffPlanner::TokenDiffPlan
+RefoldTokenDiffPlanner::Plan(AlignmentCertificationMemo *certificationMemo) {
   std::vector<StringRef> aSeq = MapLexemes(deps_.aToks, deps_.aTokOff);
   std::vector<StringRef> bSeq = MapLexemes(deps_.bToks, deps_.bTokOff);
 
@@ -119,72 +199,41 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
         alignment.forcedMap[aToken] = alignment.selectedMap[aToken];
     }
   } else {
-    std::vector<diffutils::LcsAGapProvenance> gapProvenance =
-        ComputeLcsAGapProvenanceForPP(deps_.ownerDepthGap);
-    const uint64_t certificationByteBudget =
-        getLcsCertificationByteBudget();
-    uint64_t completeStreamRequiredBytes = 0;
-    const bool completeStreamIsRepresentable =
-        diffutils::getLcsCertificationRequiredBytes(
-            aSeq.size(), bSeq.size(), /*retainCompleteOracle=*/true,
-            completeStreamRequiredBytes);
+    const uint64_t certificationByteBudget = getLcsCertificationByteBudget();
 
-    AlignmentProtectedBoundarySurfaces protectedBoundaries;
-    std::vector<uint64_t> candidateABoundaries;
-    diffutils::LcsCertificationDiagnosticEvidence diagnosticEvidence;
-    diffutils::LcsCertificationDiagnosticEvidence *diagnosticEvidenceOut =
-        inTraceMode() ? &diagnosticEvidence : nullptr;
-    if (diagnosticEvidenceOut) {
-      diagnosticEvidence.admissiblePairByteBudget =
-          getLcsDiagnosticEvidenceByteBudget();
-    }
-
-    if (completeStreamIsRepresentable &&
-        completeStreamRequiredBytes <= certificationByteBudget) {
-      // A fitting complete-stream theorem is already exact and retains the
-      // semantic oracle. Ordinary runs therefore avoid both partition-frontier
-      // DP and protected-boundary collection. Trace runs still collect the
-      // nominations needed by the permanent evidence transcript.
-      if (diagnosticEvidenceOut) {
-        protectedBoundaries = CollectProtectedAlignmentBoundarySurfaces(
-            /*retainDiagnosticIdentities=*/true);
-        initializeAlignmentDiagnosticEvidence(protectedBoundaries,
-                                              diagnosticEvidence);
-      }
-      alignment = diffutils::certifiedLcsMapAB(
-          aSeq, bSeq, gapProvenance, certificationByteBudget,
-          diagnosticEvidenceOut);
-      if (diagnosticEvidenceOut) {
-        candidateABoundaries = diffutils::nominateLcsPartitionBoundaries(
-            gapProvenance, /*forcedMap=*/{},
-            protectedBoundaries.proofSchedulingCoordinates);
-        diagnosticEvidence.candidateABoundaries.assign(
-            candidateABoundaries.begin(), candidateABoundaries.end());
-      }
+    // Certification is the same quadratic theorem on every attempt of one run,
+    // so a run proves it once and each attempt takes its own copy of the result.
+    // The recorded streams are re-checked rather than assumed.
+    const uint64_t aLexemeDigest =
+        AlignmentCertificationMemo::DigestLexemes(aSeq);
+    const uint64_t bLexemeDigest =
+        AlignmentCertificationMemo::DigestLexemes(bSeq);
+    CertifiedAlignmentFacts facts;
+    if (certificationMemo && certificationMemo->MatchesInputs(
+                                 aLexemeDigest, bLexemeDigest,
+                                 certificationByteBudget)) {
+      facts = certificationMemo->facts;
+      REFOLD_LOG_TRACE(
+          "lcs/certification",
+          "replaying this run's certified alignment: A={0} B={1} windows={2}",
+          aSeq.size(), bSeq.size(),
+          static_cast<uint64_t>(facts.alignment.certificationWindows.size()));
     } else {
-      protectedBoundaries = CollectProtectedAlignmentBoundarySurfaces(
-          /*retainDiagnosticIdentities=*/diagnosticEvidenceOut != nullptr);
-      if (diagnosticEvidenceOut)
-        initializeAlignmentDiagnosticEvidence(protectedBoundaries,
-                                              diagnosticEvidence);
-      candidateABoundaries = diffutils::nominateLcsPartitionBoundaries(
-          gapProvenance, /*forcedMap=*/{},
-          protectedBoundaries.proofSchedulingCoordinates);
-      if (!diffutils::certifyLcsWindowsWithinBudget(
-              aSeq, bSeq, gapProvenance, candidateABoundaries,
-              certificationByteBudget, alignment, diagnosticEvidenceOut)) {
-        REFOLD_LOG_FATAL("lcs/map",
-                         "window-local LCS certification failed");
-      }
+      facts = CertifyAlignment(aSeq, bSeq, certificationByteBudget);
+      if (certificationMemo)
+        certificationMemo->Record(aLexemeDigest, bLexemeDigest,
+                                  certificationByteBudget, facts);
     }
+    alignment = facts.alignment;
+
     // Local certifiers publish immutable ambiguity records before releasing
     // their quadratic state. The planner only serializes those completed facts.
     if (inTraceMode()) {
       TraceProtectedAlignmentBoundaryIdentities(
-          protectedBoundaries.diagnosticIdentities);
+          facts.protectedBoundaries.diagnosticIdentities);
       TraceAlignmentAmbiguityWindows(
-          aSeq, diagnosticEvidence.ambiguityWindows,
-          protectedBoundaries.diagnosticIdentities);
+          aSeq, facts.diagnosticEvidence.ambiguityWindows,
+          facts.protectedBoundaries.diagnosticIdentities);
     }
     if (deps_.semanticAlignmentResolver) {
       // The historical boundary policy is reconstructed only as a proposal.
@@ -193,12 +242,12 @@ RefoldTokenDiffPlanner::TokenDiffPlan RefoldTokenDiffPlanner::Plan() {
       // complete counterfactual and realization-equivalence theorems.
       std::vector<diffutils::LcsBGapProvenance> bGapProvenance =
           ComputeLcsBGapProvenanceForPP();
-      deps_.semanticAlignmentResolver(aSeq, bSeq, gapProvenance,
+      deps_.semanticAlignmentResolver(aSeq, bSeq, facts.aGapProvenance,
                                       bGapProvenance, certificationByteBudget,
                                       alignment);
     }
     if (inTraceMode())
-      TraceAlignmentCertificationRun(alignment, diagnosticEvidence,
+      TraceAlignmentCertificationRun(alignment, facts.diagnosticEvidence,
                                      aSeq.size(), bSeq.size());
   }
   const std::vector<int64_t> &a2b = alignment.selectedMap;

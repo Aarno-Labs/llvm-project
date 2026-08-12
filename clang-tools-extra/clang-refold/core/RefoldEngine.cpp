@@ -525,6 +525,18 @@ Expected<std::string> RefoldEngine::Refold(
   // so no input is declined into the terminal carrier for being expensive.
   bool resolveAlignmentAmbiguity = false;
 
+  // Resolution is asked once per run and replayed by every attempt after that.
+  // See `AlignmentSemanticResolutionMemo`: the question every attempt puts to
+  // the resolver is the same one, and answering it costs a complete refold of
+  // the translation unit per enumerated candidate map.
+  AlignmentSemanticResolutionMemo alignmentResolutionMemo;
+
+  // The core alignment is likewise certified once per run.  See
+  // `AlignmentCertificationMemo`: every attempt certifies the identical lexeme
+  // streams under the identical budget, and that theorem is the quadratic
+  // dynamic program window partitioning exists to bound.
+  AlignmentCertificationMemo alignmentCertificationMemo;
+
   for (unsigned attempt = 0;; ++attempt) {
     // Each attempt needs its own model.  Moving the parsed one in would leave
     // every later attempt building an engine from a moved-from model -- no
@@ -544,6 +556,8 @@ Expected<std::string> RefoldEngine::Refold(
     engine.finalAssemblyVerifier_ = assemblyVerifier;
     engine.ownersMustExpand_ = ownersMustExpand;
     engine.resolveAlignmentAmbiguity_ = resolveAlignmentAmbiguity;
+    engine.alignmentResolutionMemo_ = &alignmentResolutionMemo;
+    engine.alignmentCertificationMemo_ = &alignmentCertificationMemo;
     engine.verifyIncludeDirs_.assign(verifyIncludeDirs.begin(),
                                      verifyIncludeDirs.end());
 
@@ -560,13 +574,94 @@ Expected<std::string> RefoldEngine::Refold(
     // or include permanently.  The ladders keep their full allowance: `attempt`
     // is not what bounds them.
     if (!resolveAlignmentAmbiguity && engine.AlignmentResolutionIsDemanded()) {
-      REFOLD_LOG_INFO("fallback",
-                      "attempt {0} is limited by alignment ambiguity; "
-                      "resolving every ambiguous certification window and "
-                      "re-planning",
-                      attempt);
+      // The evidence asks for resolution, so resolve -- but only a resolution
+      // that commits a window changes what the next attempt would plan.  When
+      // every ambiguous window keeps its core-forced anchors,
+      // `ResolveSemanticAlignment()` retains exactly the map this attempt
+      // planned from, so the re-planned attempt would re-derive this attempt's
+      // output byte for byte.
+      //
+      // So publish the theorem first and re-plan only when an anchor actually
+      // moved.  The probe is not additional work: it is the resolution the next
+      // attempt would have run, recorded so that attempt -- and every narrowing
+      // attempt after it -- replays the answer instead of realizing every
+      // candidate map again.
       resolveAlignmentAmbiguity = true;
-      continue;
+
+      // Resolution moves an anchor only inside a window that carries ambiguity.
+      // When the core theorem forced every A token of every certified window,
+      // resolution passes over all of them and commits nothing, so the map it
+      // publishes is the one this attempt already planned from.  That is
+      // knowable from the retained forced map in one linear scan, and it is the
+      // common shape: a unit can demand resolution because it conceded a macro
+      // root while carrying no ambiguity for resolution to spend itself on.
+      if (!engine.AnyCertificationWindowCarriesAmbiguity()) {
+        // Falls through to this attempt's terminal and verification handling:
+        // the result stands, so it must still be judged like any other.
+        REFOLD_LOG_INFO(
+            "fallback",
+            "attempt {0} is limited by alignment ambiguity, but the core "
+            "theorem determined every certified window; resolution has nothing "
+            "to commit and this result stands",
+            attempt);
+      } else {
+        // The probe must present the same optional output surfaces as the
+        // attempt it stands in for, because a candidate simulation mirrors its
+        // parent's surfaces and two alignments may otherwise be separated by
+        // provenance production was never asked for.  Only whether the sidecar
+        // exists is observable, so scratch storage answers it without
+        // disturbing the mappings that belong to the attempt that will be
+        // emitted.
+        std::vector<MaterializedEditMapping> probeMaterializedEditMappings;
+        RefoldEngine probe(
+            mOrErr->CloneForReadOnlyConsumer(), aSource, aToks, aTokOff,
+            bSource, bToks, bTokOff, noLines, strict, proofAuditMode,
+            finalOutputPath, sidebandPragmaEdits,
+            materializedEditMappings ? &probeMaterializedEditMappings : nullptr,
+            // A probe stops before final line-control pruning, the callback's
+            // only consumer, and a candidate simulation is handed an empty one
+            // regardless -- so resolution cannot observe its absence.
+            FinalLineControlValidationCallback());
+        probe.ownersMustExpand_ = ownersMustExpand;
+        probe.resolveAlignmentAmbiguity_ = true;
+        probe.alignmentResolutionMemo_ = &alignmentResolutionMemo;
+        // The probe certifies nothing new: this attempt already recorded the
+        // alignment, so the probe replays it and spends its time only on the
+        // resolution the next attempt would otherwise have paid for.
+        probe.alignmentCertificationMemo_ = &alignmentCertificationMemo;
+        probe.verifyIncludeDirs_.assign(verifyIncludeDirs.begin(),
+                                        verifyIncludeDirs.end());
+        probe.ProbeAlignmentResolution();
+
+        if (alignmentResolutionMemo.resolution.committedEquivalentClass) {
+          REFOLD_LOG_INFO(
+              "fallback",
+              "attempt {0} is limited by alignment ambiguity; resolution "
+              "committed {1} window witness(es), re-planning against them",
+              attempt,
+              static_cast<uint64_t>(
+                  alignmentResolutionMemo.resolution.witnesses.size()));
+          continue;
+        }
+
+        if (!alignmentResolutionMemo.recorded) {
+          // The probe stopped before token-diff planning published a theorem,
+          // so nothing was proved either way.  A re-planned attempt would reach
+          // the same stopping point, so this attempt's result stands.
+          REFOLD_LOG_WARN("fallback",
+                          "attempt {0} is limited by alignment ambiguity, but "
+                          "the resolution probe published no theorem; this "
+                          "result stands",
+                          attempt);
+        } else {
+          REFOLD_LOG_INFO("fallback",
+                          "attempt {0} is limited by alignment ambiguity, but "
+                          "every ambiguous certification window kept its "
+                          "core-forced anchors; re-planning would reproduce "
+                          "this attempt, so this result stands",
+                          attempt);
+        }
+      }
     }
 
     // A terminal request means the run gave up and `out` is the edited stream
@@ -721,6 +816,17 @@ Expected<std::string> RefoldEngine::Refold(
         "assembled source does not replay the edited preprocessed stream");
     return engine.expansionFallbackPlanner_->ResolvePostStructuralFallback();
   }
+}
+
+void RefoldEngine::ProbeAlignmentResolution() {
+  // Deliberately not routed through `Refold()`.  That entry point clears the
+  // caller's materialized-mapping sidecar, and those mappings belong to the
+  // attempt that will actually be emitted, not to a probe that emits nothing.
+  stopAfterAlignmentResolution_ = true;
+  terminalSink_.Reset();
+  resetRefoldAttemptStats(lastStats_, model_);
+  TheoremAudit().Reset();
+  (void)RunRefoldPass();
 }
 
 std::string RefoldEngine::Refold() {
@@ -905,7 +1011,8 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   // byte-hunk cache construction.  Owner-aware tiling starts from this
   // deterministic token-diff plan below.
   assert(tokenDiffPlanner_ && "token diff planner service not initialized");
-  RefoldTokenDiffPlanner::TokenDiffPlan diffPlan = tokenDiffPlanner_->Plan();
+  RefoldTokenDiffPlanner::TokenDiffPlan diffPlan =
+      tokenDiffPlanner_->Plan(alignmentCertificationMemo_);
 
   // Retain the core theorem's forced map.  A forced anchor is an edge every
   // optimal path takes, so it is exactly what tells a hunk frontier this run
@@ -2518,6 +2625,35 @@ std::optional<uint64_t> RefoldEngine::FindSmallestOwnerForEditedToken(
   return FindSmallestOwnerForAToken(static_cast<uint64_t>(aToken));
 }
 
+bool RefoldEngine::CertificationWindowCarriesAmbiguity(
+    const std::pair<uint64_t, uint64_t> &aRange) const {
+  // This is the resolver's own `WindowCarriesAmbiguity()` theorem, stated
+  // against the forced map this attempt retained.  A forced anchor is an edge
+  // every optimal path takes, so a window whose A tokens are all forced-matched
+  // admits exactly one optimal map through it.  An A token the core theorem left
+  // unmatched is the only way a competing optimal map can differ inside the
+  // rectangle.
+  const uint64_t aCount = static_cast<uint64_t>(alignmentForcedMap_.size());
+  const uint64_t aEnd = std::min<uint64_t>(aRange.second, aCount);
+
+  // A window reaching past the recorded forced map is not one this routine can
+  // speak for; treat it as ambiguous rather than assume it is determined.
+  if (aEnd != aRange.second)
+    return true;
+
+  for (uint64_t aToken = aRange.first; aToken < aEnd; ++aToken)
+    if (alignmentForcedMap_[aToken] < 0)
+      return true;
+  return false;
+}
+
+bool RefoldEngine::AnyCertificationWindowCarriesAmbiguity() const {
+  for (const std::pair<uint64_t, uint64_t> &range : certificationWindowARanges_)
+    if (CertificationWindowCarriesAmbiguity(range))
+      return true;
+  return false;
+}
+
 bool RefoldEngine::AlignmentResolutionIsDemanded() const {
   // A candidate simulation is handed its alignment and must never ask for
   // another one; recursion is impossible by construction, and this keeps that
@@ -2582,14 +2718,8 @@ bool RefoldEngine::AlignmentResolutionIsDemanded() const {
   // weaker question -- does this hunk touch a window that carries ambiguity --
   // is true of nearly every real translation unit, and turns demand-driven
   // resolution back into eager resolution plus a wasted pass.
-  const uint64_t aCount = static_cast<uint64_t>(alignmentForcedMap_.size());
   for (const std::pair<uint64_t, uint64_t> &range : certificationWindowARanges_) {
-    const uint64_t aEnd = std::min<uint64_t>(range.second, aCount);
-    bool carriesAmbiguity = aEnd != range.second;
-    for (uint64_t aToken = range.first; !carriesAmbiguity && aToken < aEnd;
-         ++aToken)
-      carriesAmbiguity = alignmentForcedMap_[aToken] < 0;
-    if (!carriesAmbiguity)
+    if (!CertificationWindowCarriesAmbiguity(range))
       continue;
     for (const diffutils::Hunk &hunk : abTokHunks_) {
       // Closed on both ends: a pure insertion occupies no token, so it sits
@@ -2807,6 +2937,13 @@ std::string RefoldEngine::RunRefoldPass() {
   std::unique_ptr<llvm::MemoryBuffer> tuBuffer = LoadTUSource(tuPath);
   StringRef tuBytes = tuBuffer->getBuffer();
   std::vector<diffutils::Hunk> hunks = PlanTokenDiff(tuPath);
+
+  // A probe has what it came for: token-diff planning is where alignment
+  // resolution publishes its theorem.  Planning past this point would be the
+  // very pass the probe exists to decide against running.
+  if (stopAfterAlignmentResolution_)
+    return std::string();
+
   TraceStructuralHunkEnvelopes(hunks);
 
   RefoldStructuralHunkDispatcher structuralHunkDispatcher;

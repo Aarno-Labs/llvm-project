@@ -143,6 +143,7 @@ using namespace llvm;
 namespace clang {
 namespace refold {
 
+struct AlignmentCertificationMemo;
 class RefoldBInsertionLedger;
 class RefoldCounterStabilization;
 class RefoldExpansionFallbackPlanner;
@@ -407,6 +408,30 @@ private:
   /// carry ambiguity is resolved, because a partially resolved alignment is a
   /// different alignment rather than a weaker one.
   bool resolveAlignmentAmbiguity_ = false;
+
+  /// This run's recorded alignment-resolution theorem, owned by the narrowing
+  /// loop and shared by every attempt it builds.
+  ///
+  /// Null for a candidate simulation, which is handed its alignment and never
+  /// resolves, and for any engine built outside that loop.  See
+  /// `AlignmentSemanticResolutionMemo` for why one answer serves every attempt.
+  AlignmentSemanticResolutionMemo *alignmentResolutionMemo_ = nullptr;
+
+  /// This run's certified core alignment, owned by the narrowing loop and
+  /// shared by every attempt it builds.
+  ///
+  /// Null for a candidate simulation, which is handed its alignment through
+  /// `alignmentSelectionOverride_` and never certifies one.  See
+  /// `AlignmentCertificationMemo`.
+  AlignmentCertificationMemo *alignmentCertificationMemo_ = nullptr;
+
+  /// Whether this engine exists only to publish the alignment-resolution
+  /// theorem.
+  ///
+  /// A probe answers one question -- does resolution commit any window -- and
+  /// stops as soon as token-diff planning has answered it.  It plans no edits,
+  /// assembles nothing, and emits nothing; its whole output is the memo.
+  bool stopAfterAlignmentResolution_ = false;
 
   /// The core theorem's forced A-to-B map for this attempt, retained after
   /// token-diff planning.
@@ -891,6 +916,19 @@ private:
   /// \returns The refolded C/C++ source text for the translation unit.
   std::string Refold();
 
+  /// Publish this run's alignment-resolution theorem into
+  /// `alignmentResolutionMemo_` without planning or emitting anything.
+  ///
+  /// The narrowing loop calls this when an attempt's evidence says alignment
+  /// ambiguity is what limited it.  Resolution either commits a window, in which
+  /// case the loop re-plans against the recorded answer, or commits none, in
+  /// which case the resolved attempt would retain exactly the core-forced
+  /// anchors the finished attempt already planned from and would therefore
+  /// reproduce its output byte for byte.  Asking here costs the alignment work
+  /// that attempt would have started with; running the attempt to find out costs
+  /// a complete pass.
+  void ProbeAlignmentResolution();
+
   /// Validate that the producer-recorded A token count still matches the
   /// re-lexed A stream for the current refold attempt.
   ///
@@ -1027,6 +1065,23 @@ private:
   /// That is an attribution rule, not a budget: a request that does name tokens
   /// is honoured however expensive its window turns out to be.
   bool AlignmentResolutionIsDemanded() const;
+
+  /// Return whether one certified window's A range can carry alignment
+  /// ambiguity, given the forced map this attempt retained.
+  ///
+  /// This restates the resolver's `WindowCarriesAmbiguity()` theorem against
+  /// `alignmentForcedMap_` and `certificationWindowARanges_`, which hold exactly
+  /// the certified windows the resolver would consider.
+  bool CertificationWindowCarriesAmbiguity(
+      const std::pair<uint64_t, uint64_t> &aRange) const;
+
+  /// Return whether any certified window can carry alignment ambiguity.
+  ///
+  /// When none can, resolution would pass over every window and commit nothing,
+  /// so the alignment it publishes is the core-forced map the attempt already
+  /// planned from.  Answering this costs one linear scan of the forced map; the
+  /// alternative is a complete resolution pass that reaches the same conclusion.
+  bool AnyCertificationWindowCarriesAmbiguity() const;
 
   /// Collect every region named by this run's terminal-fallback requests that
   /// has not already been given up.

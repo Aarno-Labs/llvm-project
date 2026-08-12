@@ -689,32 +689,54 @@ void RefoldEngine::ResolveSemanticAlignment(
     return;
   }
 
-  // Semantic restoration needs the all-optimal pair facts for the window it is
-  // resolving. The partitioned certifier releases those facts on purpose, so
-  // they are recomputed one window at a time through the callbacks below: the
-  // resolver retains a window, resolves inside it, and releases it again. A
-  // window whose facts cannot be recomputed within the proof budget keeps
-  // exactly its independently certified core anchors, and its neighbors remain
-  // resolvable on their own facts.
-  RefoldAlignmentSemanticResolver resolver(
-      RefoldAlignmentSemanticResolver::Dependencies{
-          aLexemes, bLexemes, alignment, aGapProvenance, bGapProvenance,
-          [this](const AlignmentSelectionOverride &selection) {
-            return SimulateSemanticAlignmentCandidate(selection);
-          },
-          [&](size_t windowIndex) {
-            return diffutils::retainCertifiedWindowOracle(
-                aLexemes, bLexemes, aGapProvenance, certificationByteBudget,
-                windowIndex, alignment);
-          },
-          [&](size_t windowIndex) {
-            if (windowIndex < alignment.windowOracles.size()) {
-              alignment.windowOracles[windowIndex] =
-                  diffutils::OptimalTokenAlignmentOracle{};
-            }
-          }});
-  RefoldAlignmentSemanticResolver::ResolutionResult resolution =
-      resolver.Resolve();
+  // Every attempt of one run resolves the identical alignment, and each
+  // candidate map costs a complete refold of the translation unit to realize, so
+  // the answer is proved once and replayed after that. The recorded facts are
+  // re-checked rather than assumed: a caller reaching here with a different
+  // forced map or window partition resolves again.
+  RefoldAlignmentSemanticResolver::ResolutionResult resolution;
+  if (alignmentResolutionMemo_ &&
+      alignmentResolutionMemo_->MatchesInputs(aLexemes.size(), bLexemes.size(),
+                                              alignment)) {
+    resolution = alignmentResolutionMemo_->resolution;
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "replaying this run's recorded resolution: committed={0} witnesses={1}",
+        resolution.committedEquivalentClass, resolution.witnesses.size());
+  } else {
+    // Semantic restoration needs the all-optimal pair facts for the window it is
+    // resolving. The partitioned certifier releases those facts on purpose, so
+    // they are recomputed one window at a time through the callbacks below: the
+    // resolver retains a window, resolves inside it, and releases it again. A
+    // window whose facts cannot be recomputed within the proof budget keeps
+    // exactly its independently certified core anchors, and its neighbors remain
+    // resolvable on their own facts.
+    RefoldAlignmentSemanticResolver resolver(
+        RefoldAlignmentSemanticResolver::Dependencies{
+            aLexemes, bLexemes, alignment, aGapProvenance, bGapProvenance,
+            [this](const AlignmentSelectionOverride &selection) {
+              return SimulateSemanticAlignmentCandidate(selection);
+            },
+            [&](size_t windowIndex) {
+              return diffutils::retainCertifiedWindowOracle(
+                  aLexemes, bLexemes, aGapProvenance, certificationByteBudget,
+                  windowIndex, alignment);
+            },
+            [&](size_t windowIndex) {
+              if (windowIndex < alignment.windowOracles.size()) {
+                alignment.windowOracles[windowIndex] =
+                    diffutils::OptimalTokenAlignmentOracle{};
+              }
+            }});
+    resolution = resolver.Resolve();
+
+    // Record against the alignment as the resolver saw it, before the commit
+    // below rewrites its selected map.  `forcedMap` and the window partition are
+    // untouched by that rewrite, which is what makes them a stable key.
+    if (alignmentResolutionMemo_)
+      alignmentResolutionMemo_->Record(aLexemes.size(), bLexemes.size(),
+                                       alignment, resolution);
+  }
 
   // Quadratic proof payload has no consumer past this point; the committed
   // anchors and their witnesses are the durable output.

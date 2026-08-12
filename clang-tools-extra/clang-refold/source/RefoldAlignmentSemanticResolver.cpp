@@ -1086,5 +1086,55 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
                                 requiredAnchors);
 }
 
+/// Return the window partition identity carried by \p alignment.
+static std::vector<AlignmentSemanticResolutionMemo::WindowIdentity>
+collectWindowIdentities(const diffutils::CertifiedLcsResult &alignment) {
+  std::vector<AlignmentSemanticResolutionMemo::WindowIdentity> identities;
+  identities.reserve(alignment.certificationWindows.size());
+  for (const diffutils::LcsCertificationWindow &window :
+       alignment.certificationWindows) {
+    identities.push_back(AlignmentSemanticResolutionMemo::WindowIdentity{
+        window.aBegin, window.aEnd, window.bBegin, window.bEnd,
+        window.IsCertified()});
+  }
+  return identities;
+}
+
+bool AlignmentSemanticResolutionMemo::MatchesInputs(
+    size_t aLexemes, size_t bLexemes,
+    const diffutils::CertifiedLcsResult &alignment) const {
+  if (!recorded || aLexemeCount != aLexemes || bLexemeCount != bLexemes ||
+      forcedMap != alignment.forcedMap)
+    return false;
+
+  const std::vector<WindowIdentity> identities =
+      collectWindowIdentities(alignment);
+  if (identities.size() != certificationWindows.size())
+    return false;
+  for (size_t window = 0; window < identities.size(); ++window) {
+    const WindowIdentity &recordedWindow = certificationWindows[window];
+    const WindowIdentity &current = identities[window];
+    if (recordedWindow.aBegin != current.aBegin ||
+        recordedWindow.aEnd != current.aEnd ||
+        recordedWindow.bBegin != current.bBegin ||
+        recordedWindow.bEnd != current.bEnd ||
+        recordedWindow.certified != current.certified)
+      return false;
+  }
+  return true;
+}
+
+void AlignmentSemanticResolutionMemo::Record(
+    size_t aLexemes, size_t bLexemes,
+    const diffutils::CertifiedLcsResult &alignment,
+    RefoldAlignmentSemanticResolver::ResolutionResult result) {
+  aLexemeCount = aLexemes;
+  bLexemeCount = bLexemes;
+  forcedMap = alignment.forcedMap;
+  certificationWindows = collectWindowIdentities(alignment);
+  resolution = std::move(result);
+  recorded = true;
+}
+
 } // namespace refold
 } // namespace clang

@@ -239,6 +239,65 @@ private:
   Dependencies deps_;
 };
 
+/// One run's recorded alignment-resolution theorem.
+///
+/// Resolution is a function of run constants alone: the A and B token streams,
+/// their gap provenance, the certification byte budget, and the parsed model as
+/// it stands before any region has been given up.  The narrowing ladder builds a
+/// fresh engine per attempt, and the one engine input that differs between
+/// attempts -- the set of owners whose callsite must not be preserved -- is
+/// first read during structural dispatch, which runs strictly after token-diff
+/// planning has published this theorem.  Every attempt therefore puts the
+/// identical question to the resolver, and answering it costs one complete
+/// refold of the translation unit per enumerated candidate map.  Recording the
+/// answer lets a run pay for it once instead of once per attempt.
+///
+/// This is a memo, not a budget.  It never declines a window, never shortens an
+/// enumeration, and never changes which anchors are committed: what it replays
+/// is exactly what the resolver proved.  `MatchesInputs()` re-checks the core
+/// facts the answer was proved about, so a caller that reaches the resolver with
+/// a different alignment recomputes rather than inheriting a theorem about
+/// someone else's stream.
+struct AlignmentSemanticResolutionMemo {
+  /// Identity of one window in the partition an answer was proved against.
+  ///
+  /// The rectangle and its certification status are what decide whether a
+  /// window is resolved at all and which pairs its enumeration may consider.
+  struct WindowIdentity {
+    uint64_t aBegin = 0;
+    uint64_t aEnd = 0;
+    uint64_t bBegin = 0;
+    uint64_t bEnd = 0;
+    bool certified = false;
+  };
+
+  /// Whether `resolution` holds an answer this run already proved.
+  bool recorded = false;
+
+  /// The core-theorem facts `resolution` was proved about.
+  std::vector<int64_t> forcedMap;
+  std::vector<WindowIdentity> certificationWindows;
+  size_t aLexemeCount = 0;
+  size_t bLexemeCount = 0;
+
+  /// The recorded answer, replayed verbatim whenever the facts still match.
+  RefoldAlignmentSemanticResolver::ResolutionResult resolution;
+
+  /// Return whether a recorded answer was proved about exactly these facts.
+  ///
+  /// The forced map and the certified window partition are what the resolver
+  /// enumerates against, so two calls that agree on both, on the same token
+  /// stream lengths, are asking one question.  Comparing them is linear; proving
+  /// the answer again is a whole-translation-unit refold per candidate.
+  bool MatchesInputs(size_t aLexemes, size_t bLexemes,
+                     const diffutils::CertifiedLcsResult &alignment) const;
+
+  /// Record \p result as this run's answer for these facts.
+  void Record(size_t aLexemes, size_t bLexemes,
+              const diffutils::CertifiedLcsResult &alignment,
+              RefoldAlignmentSemanticResolver::ResolutionResult result);
+};
+
 } // namespace refold
 } // namespace clang
 

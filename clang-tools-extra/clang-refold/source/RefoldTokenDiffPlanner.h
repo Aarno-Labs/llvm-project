@@ -16,6 +16,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDTOKENDIFFPLANNER_H
 
 #include "source/DiffAlgorithms.h"
+#include "source/RefoldAlignmentDiagnostic.h"
 #include "source/RefoldAlignmentSemanticResolver.h"
 #include "source/RefoldToken.h"
 
@@ -31,8 +32,76 @@
 namespace clang {
 namespace refold {
 
-struct AlignmentProtectedBoundarySurfaces;
 struct AlignmentProtectedBoundaryIdentity;
+
+/// Everything one core-alignment certification run publishes.
+///
+/// These four facts are produced together and consumed together: the certified
+/// alignment itself, the A-gap provenance the certifier ran against and the
+/// resolver later reads, and the two evidence surfaces a trace run reports.
+struct CertifiedAlignmentFacts {
+  /// The alignment exactly as certification published it, before any resolver
+  /// has substituted a non-forced anchor.
+  diffutils::CertifiedLcsResult alignment;
+  std::vector<diffutils::LcsAGapProvenance> aGapProvenance;
+  diffutils::LcsCertificationDiagnosticEvidence diagnosticEvidence;
+  AlignmentProtectedBoundarySurfaces protectedBoundaries;
+};
+
+/// One run's certified core alignment, recorded before any attempt resolves it.
+///
+/// Certification consumes run constants alone: the A and B lexeme streams, the
+/// A-gap provenance derived from them, and the certification byte budget.  Every
+/// attempt of one run therefore certifies identical streams and reaches an
+/// identical result -- and re-deriving it means re-running the quadratic dynamic
+/// program that window partitioning exists to bound.  Recording it lets a run
+/// certify once however far the narrowing ladder descends.
+///
+/// What is recorded is pre-resolution, and every attempt takes its own copy, so
+/// one attempt's committed anchors can never become the next attempt's starting
+/// facts.  The evidence transcript is recorded with it so a trace run reports
+/// the same certification facts on every attempt rather than only on the attempt
+/// that happened to compute them.
+///
+/// This is a memo, not a budget: it never narrows a window, never lowers the
+/// budget, and never changes which anchors the core theorem forces.
+struct AlignmentCertificationMemo {
+  /// Whether `facts` holds a result this run already certified.
+  bool recorded = false;
+
+  /// Identity of the streams `facts` was certified from.
+  ///
+  /// The digest covers every lexeme's exact bytes and its boundaries, so two
+  /// streams agreeing on it are the same input to the certifier.  Computing it
+  /// is one linear scan; proving the alignment again is a quadratic dynamic
+  /// program over the same tokens.
+  uint64_t aLexemeDigest = 0;
+  uint64_t bLexemeDigest = 0;
+  uint64_t certificationByteBudget = 0;
+
+  /// The recorded result, copied out on every match.
+  CertifiedAlignmentFacts facts;
+
+  /// Return the identity digest of one lexeme stream.
+  static uint64_t DigestLexemes(llvm::ArrayRef<llvm::StringRef> lexemes);
+
+  /// Return whether a recorded result was certified from exactly these inputs.
+  bool MatchesInputs(uint64_t aDigest, uint64_t bDigest,
+                     uint64_t byteBudget) const {
+    return recorded && aLexemeDigest == aDigest && bLexemeDigest == bDigest &&
+           certificationByteBudget == byteBudget;
+  }
+
+  /// Record \p certified as this run's result for these inputs.
+  void Record(uint64_t aDigest, uint64_t bDigest, uint64_t byteBudget,
+              CertifiedAlignmentFacts certified) {
+    aLexemeDigest = aDigest;
+    bLexemeDigest = bDigest;
+    certificationByteBudget = byteBudget;
+    facts = std::move(certified);
+    recorded = true;
+  }
+};
 class RefoldMacroTopology;
 class RefoldModel;
 class RefoldPathIdentity;
@@ -128,9 +197,26 @@ public:
   /// the cached `abTokHunks` at this stage. Later owner-aware normalization
   /// may split the vector, but this service deliberately stops at the
   /// deterministic token/LCS boundary.
-  TokenDiffPlan Plan();
+  ///
+  /// \p certificationMemo, when supplied, carries one run's certified alignment
+  /// across the attempts of that run.  It is consulted only for an alignment the
+  /// same run already certified from the same streams under the same budget, and
+  /// it never changes what certification would have concluded.
+  TokenDiffPlan Plan(AlignmentCertificationMemo *certificationMemo = nullptr);
 
 private:
+  /// Certify the core A-to-B alignment and collect its evidence transcript.
+  ///
+  /// This is the quadratic core theorem: it publishes the forced map, the
+  /// certified window partition, and the diagnostic surfaces a trace run
+  /// reports.  It reads only the lexeme streams, the owner depth gaps already
+  /// computed for this pass, and \p certificationByteBudget, which is what makes
+  /// its result replayable across the attempts of one run.
+  CertifiedAlignmentFacts
+  CertifyAlignment(llvm::ArrayRef<llvm::StringRef> aSeq,
+                   llvm::ArrayRef<llvm::StringRef> bSeq,
+                   uint64_t certificationByteBudget);
+
   /// Map preprocessor tokens into the stable lexeme sequence consumed by LCS.
   ///
   /// Returned `StringRef`s point into the caller-owned token spellings.  The
