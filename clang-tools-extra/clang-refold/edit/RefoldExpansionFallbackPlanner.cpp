@@ -24,6 +24,7 @@
 #include "macro/RefoldMacroStateProof.h"
 #include "proof/RefoldNeutralityProof.h"
 #include "proof/RefoldOwnerStateProof.h"
+#include "proof/RefoldPragmaTaxonomy.h"
 #include "proof/RefoldProofLattice.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
@@ -85,41 +86,58 @@ namespace refold {
 
 namespace {
 
+/// One preserved directive's A-token frontier and what its state does.
+///
+/// The frontier says where the directive sits; the classification says what a
+/// payload would observe by crossing it.  Both are needed to place edited
+/// material that the alignment cannot place on its own.
+struct PreservedDirectiveFrontier {
+  uint64_t aFrontier = 0;
+  PragmaClassification classification;
+};
+
 /// Derive where each preserved tokenless directive cuts the realized B payload.
 ///
 /// A closure that preserves a directive in place must emit the B material that
 /// belongs before it, then the directive's own source bytes, then the B
-/// material that belongs after it.  `aFrontiers` holds one A-token frontier per
-/// preserved directive, in source order: the directive sits between A tokens
-/// `frontier - 1` and `frontier`.  The returned split is the first B token in
-/// `[bMaterialBegin, bMaterialEnd)` whose aligned A token is at or beyond that
-/// frontier, so B material aligned to A tokens before the directive stays
-/// before it and material aligned after it stays after.
+/// material that belongs after it.  A directive sits between A tokens
+/// `frontier - 1` and `frontier`, so a B token aligned to an A token below the
+/// frontier belongs before it and one aligned at or above belongs after.
 ///
-/// The derivation is admissible only when every B token in the material range
-/// is aligned to an A token.  An unaligned B token is edited material with no
-/// A-side position, so nothing determines which side of the directive it
-/// belongs on; the same is true when the aligned indices are not monotone
-/// across the material.  Both fail closed, which is what keeps a payload that
-/// straddles the directive rejected rather than silently placed.
+/// Alignment alone does not place every token.  Edited material is unaligned:
+/// it has no A-side position, so nothing in the alignment says which side it
+/// belongs on.  Such a token is still *determined* when the aligned tokens
+/// around it agree -- monotonicity forces material between two before-tokens to
+/// be before -- and the only genuinely ambiguous material is what lies strictly
+/// between the last determined-before anchor and the first determined-after
+/// one.  That zone is where a payload straddles the directive.
 ///
-/// A split is a seam at protected preprocessing state, so the two anchors that
-/// bracket it must be forced by the core objective rather than merely selected.
-/// A forced anchor is used by every core-optimal alignment, so no other
+/// The zone is admitted by insensitivity, not by choice.  When re-preprocessing
+/// the zone's own bytes cannot observe the state the directive changes, both
+/// placements produce the same translation unit, so committing to one is a
+/// proof rather than a guess -- the same move the alignment's semantic resolver
+/// makes for an anchor whose alternatives are equivalent.  The commitment is
+/// deterministic: the zone goes before the directive.  A sensitive zone, or one
+/// whose directive is unclassified, fails closed exactly as before.
+///
+/// A split is a seam at protected preprocessing state, so the anchors bracketing
+/// it must be forced by the core objective rather than merely selected.  A
+/// forced anchor is used by every core-optimal alignment, so no other
 /// admissible alignment moves it across the directive, and monotonicity then
-/// fixes the side of every remaining material token.  A resolver-authorized
+/// fixes the side of every remaining determined token.  A resolver-authorized
 /// anchor cannot stand in: its witness holds that the remaining explanations
 /// agree on one normalized edit realization, which is a claim about the
 /// contiguous realization it was proved against, not about this partitioned
 /// one.
 ///
-/// Splits are returned in the same order as `aFrontiers` and are
-/// non-decreasing.
+/// Splits are returned in `frontiers` order and are non-decreasing.
 std::optional<SmallVector<size_t, 4>> deriveBPayloadSplitsAtATokenFrontiers(
     ArrayRef<int64_t> abTokMapB2A,
     ArrayRef<diffutils::LcsAnchorProof> abTokAnchorProofs,
-    ArrayRef<uint64_t> aFrontiers, size_t bMaterialBegin, size_t bMaterialEnd,
-    std::string *reason) {
+    ArrayRef<PreservedDirectiveFrontier> frontiers, size_t bMaterialBegin,
+    size_t bMaterialEnd,
+    llvm::function_ref<StringRef(size_t, size_t)> sliceBSource,
+    const LangOptions &lang, std::string *reason) {
   auto refuse =
       [&](std::string detail) -> std::optional<SmallVector<size_t, 4>> {
     if (reason)
@@ -127,74 +145,103 @@ std::optional<SmallVector<size_t, 4>> deriveBPayloadSplitsAtATokenFrontiers(
     return std::nullopt;
   };
 
-  if (aFrontiers.empty() || bMaterialEnd < bMaterialBegin)
+  if (frontiers.empty() || bMaterialEnd < bMaterialBegin)
     return refuse("no preserved directive frontier to split at");
 
-  // Resolve every B token's aligned A index once.  The material range is
-  // usually a handful of tokens, and the same census answers each frontier.
-  SmallVector<uint64_t, 16> alignedA;
+  // Resolve every B token's aligned A index once; -1 marks edited material with
+  // no A-side position.  The material range is usually a handful of tokens, and
+  // the same census answers each frontier.
+  SmallVector<int64_t, 16> alignedA;
   alignedA.reserve(bMaterialEnd - bMaterialBegin);
+  std::optional<int64_t> previousAligned;
   for (size_t bTok = bMaterialBegin; bTok < bMaterialEnd; ++bTok) {
     if (bTok >= abTokMapB2A.size())
       return refuse(
           llvm::formatv("B token {0} is outside the alignment map", bTok)
               .str());
     const int64_t mappedA = abTokMapB2A[bTok];
-    if (mappedA < 0)
-      return refuse(
-          llvm::formatv("B token {0} is unaligned edited material with no "
-                        "determined side of the preserved directive",
-                        bTok)
-              .str());
-    const uint64_t aTok = static_cast<uint64_t>(mappedA);
-    if (!alignedA.empty() && aTok <= alignedA.back())
-      return refuse(llvm::formatv("B token {0} aligns to A token {1}, which is "
-                                  "not monotone after A token {2}",
-                                  bTok, aTok, alignedA.back())
-                        .str());
-    alignedA.push_back(aTok);
+    if (mappedA >= 0) {
+      if (previousAligned && mappedA <= *previousAligned)
+        return refuse(llvm::formatv("B token {0} aligns to A token {1}, which "
+                                    "is not monotone after A token {2}",
+                                    bTok, mappedA, *previousAligned)
+                          .str());
+      previousAligned = mappedA;
+    }
+    alignedA.push_back(mappedA);
   }
 
   // Return whether the alignment anchor at one material B token is forced by
   // the core objective.  `offset` is relative to `bMaterialBegin`.
   auto materialAnchorIsCoreForced = [&](size_t offset) -> bool {
-    const uint64_t aTok = alignedA[offset];
-    if (aTok >= abTokAnchorProofs.size())
+    const int64_t aTok = alignedA[offset];
+    if (aTok < 0 || static_cast<size_t>(aTok) >= abTokAnchorProofs.size())
       return false;
-    return abTokAnchorProofs[aTok].kind ==
+    return abTokAnchorProofs[static_cast<size_t>(aTok)].kind ==
            diffutils::LcsAnchorProofKind::CoreOptimalPathForced;
   };
 
   SmallVector<size_t, 4> splits;
-  splits.reserve(aFrontiers.size());
+  splits.reserve(frontiers.size());
   size_t previousSplit = bMaterialBegin;
-  for (uint64_t frontier : aFrontiers) {
-    size_t split = bMaterialEnd;
+  for (const PreservedDirectiveFrontier &frontier : frontiers) {
+    // Bracket the directive with the determined anchors on either side.
+    std::optional<size_t> lastBefore;
+    size_t firstAfter = bMaterialEnd;
     for (size_t offset = 0; offset < alignedA.size(); ++offset) {
-      if (alignedA[offset] >= frontier) {
-        split = bMaterialBegin + offset;
-        break;
+      const int64_t aTok = alignedA[offset];
+      if (aTok < 0)
+        continue;
+      if (static_cast<uint64_t>(aTok) < frontier.aFrontier) {
+        lastBefore = offset;
+        continue;
       }
+      firstAfter = bMaterialBegin + offset;
+      break;
     }
+
+    if (lastBefore && bMaterialBegin + *lastBefore >= firstAfter)
+      return refuse(llvm::formatv("determined anchors bracketing A frontier "
+                                  "{0} are not ordered",
+                                  frontier.aFrontier)
+                        .str());
+
+    // Everything strictly between the brackets is unaligned by construction:
+    // an aligned token there would have moved one of the two brackets.
+    const size_t zoneBegin =
+        lastBefore ? bMaterialBegin + *lastBefore + 1 : bMaterialBegin;
+    const size_t split = firstAfter;
+
+    if (zoneBegin < split) {
+      const StringRef zone = sliceBSource(zoneBegin, split);
+      if (payloadObservesPragmaState(frontier.classification, zone, lang))
+        return refuse(
+            llvm::formatv("edited B material [{0},{1}) has no determined side "
+                          "of the preserved directive and observes its {2} "
+                          "state",
+                          zoneBegin, split,
+                          toString(frontier.classification.effect))
+                .str());
+    }
+
     if (split < previousSplit)
       return refuse(llvm::formatv("preserved directive frontiers derive "
                                   "non-monotone B splits {0} after {1}",
                                   split, previousSplit)
                         .str());
 
-    if (split > bMaterialBegin &&
-        !materialAnchorIsCoreForced(split - 1 - bMaterialBegin))
+    if (lastBefore && !materialAnchorIsCoreForced(*lastBefore))
       return refuse(
           llvm::formatv("B token {0} left of the split at A frontier {1} is "
                         "not a core-forced alignment anchor",
-                        split - 1, frontier)
+                        bMaterialBegin + *lastBefore, frontier.aFrontier)
               .str());
     if (split < bMaterialEnd &&
         !materialAnchorIsCoreForced(split - bMaterialBegin))
       return refuse(
           llvm::formatv("B token {0} right of the split at A frontier {1} is "
                         "not a core-forced alignment anchor",
-                        split, frontier)
+                        split, frontier.aFrontier)
               .str());
 
     previousSplit = split;
@@ -966,38 +1013,14 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   // zero-token file cannot change the PP token stream.
   auto pragmaIsConsumableIncludeLocalState =
       [&](const RefoldModel::PragmaDirective &pragma) -> bool {
-    StringRef text = pragma.text.trim();
-    size_t pos = 0;
-
-    auto consumeWord = [&](StringRef word) {
-      if (!text.substr(pos).starts_with(word))
-        return false;
-      pos += word.size();
-      if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-        return false;
-      return true;
-    };
-
-    stringutils::skipNonNewlineWs(text, pos);
-    if (pos >= text.size() || text[pos] != '#')
-      return false;
-    ++pos;
-
-    stringutils::skipNonNewlineWs(text, pos);
-    if (!consumeWord("pragma"))
-      return false;
-
-    stringutils::skipNonNewlineWs(text, pos);
-    if (!consumeWord("once"))
-      return false;
-
-    stringutils::skipNonNewlineWs(text, pos);
-
-    // Treat comments after `once` as directive trivia, not as another pragma
-    // operand.  Clang accepts `#pragma once /* ... */`, and for refolding it
-    // has the same include-local state effect as the bare spelling.  Reuse the
-    // existing trivia recognizer so incomplete comments remain fail-closed.
-    return isWsOrCompleteCommentTrivia(text.drop_front(pos));
+    // The taxonomy owns which spellings mean once-state, including the rule
+    // that trailing comments are directive trivia while an incomplete comment
+    // fails closed.  `IncludeOnce` is the only effect admitted here: for an
+    // otherwise source-neutral zero-token include, suppressing future textual
+    // inclusion of the same zero-token file cannot change the PP token stream,
+    // and no other classified effect has that property.
+    return classifyPragmaDirective(pragma.text.trim()).effect ==
+           PragmaStateEffect::IncludeOnce;
   };
 
   const RecordedIncludeSideEffectResolver recordedIncludeSideEffectResolver(
@@ -1655,6 +1678,9 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     uint64_t end = 0;
     uint64_t id = 0;
     uint64_t aFrontier = 0;
+    /// What this directive's state does, for placing edited material that the
+    /// alignment cannot place.  Its StringRefs point into `tuBytes`.
+    PragmaClassification classification;
   };
 
   // Producer coordinate surfaces for projecting a tokenless TU directive onto
@@ -1739,7 +1765,9 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       }
 
       pragmas.push_back({exactRange->first, exactRange->second, pragma.id,
-                         /*aFrontier=*/0});
+                         /*aFrontier=*/0,
+                         classifyPragmaDirective(tuBytes.slice(
+                             exactRange->first, exactRange->second))});
     }
 
     if (pragmas.empty())
@@ -2739,17 +2767,21 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     rawReplacement =
         sourceMapper_.SliceBSource(bMaterialBegin, bMaterialEnd).str();
   } else {
-    SmallVector<uint64_t, 4> preservedAFrontiers;
-    preservedAFrontiers.reserve(mixedPositionPreservedTUPragmas.size());
+    SmallVector<PreservedDirectiveFrontier, 4> preservedFrontiers;
+    preservedFrontiers.reserve(mixedPositionPreservedTUPragmas.size());
     for (const TUPositionPreservedPragma &pragma :
          mixedPositionPreservedTUPragmas)
-      preservedAFrontiers.push_back(pragma.aFrontier);
+      preservedFrontiers.push_back({pragma.aFrontier, pragma.classification});
 
     std::string splitReason;
     std::optional<SmallVector<size_t, 4>> splits =
         deriveBPayloadSplitsAtATokenFrontiers(
-            abTokMapB2A_, abTokAnchorProofs_, preservedAFrontiers,
-            bMaterialBegin, bMaterialEnd, &splitReason);
+            abTokMapB2A_, abTokAnchorProofs_, preservedFrontiers,
+            bMaterialBegin, bMaterialEnd,
+            [&](size_t begin, size_t end) {
+              return sourceMapper_.SliceBSource(begin, end);
+            },
+            lexLang_, &splitReason);
     if (!splits) {
       REFOLD_LOG_TRACE(
           "fallback",

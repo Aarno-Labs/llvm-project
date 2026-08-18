@@ -102,6 +102,7 @@ add_clang_library(clangRefold STATIC
   macro/RefoldMacroStateProof.cpp
   proof/RefoldSidebandReplayProof.cpp
   proof/RefoldNeutralityProof.cpp
+  proof/RefoldPragmaTaxonomy.cpp
   core/RefoldLog.cpp
   core/RefoldModel.cpp
   util/StringUtils.cpp

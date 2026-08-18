@@ -8,6 +8,8 @@
 
 #include "include/RefoldPragmaOnceGuardRewriter.h"
 
+#include "proof/RefoldPragmaTaxonomy.h"
+
 #include "core/RefoldLog.h"
 #include "edit/RefoldTextEditAssembler.h"
 #include "line-control/LineDirectiveInserter.h"
@@ -62,17 +64,11 @@ ArrayRef<PreprocessingStructureKind> includeGuardKinds() {
 /// Return whether \p text names the `once` pragma operand.
 ///
 /// Shared by the directive recognizer and the `_Pragma` operator detector so a
-/// single grammar decides what counts as once-state.
+/// single grammar decides what counts as once-state.  That grammar now lives in
+/// the pragma taxonomy, which owns every spelling classification, so this stays
+/// as a local name for the same rule rather than a second copy of it.
 bool operandIsOnceKeyword(StringRef text) {
-  size_t pos = 0;
-  stringutils::skipNonNewlineWs(text, pos);
-  if (!text.substr(pos).starts_with("once"))
-    return false;
-  pos += 4;
-  if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-    return false;
-  stringutils::skipNonNewlineWs(text, pos);
-  return isWsOrCompleteCommentTrivia(text.drop_front(pos));
+  return pragmaOperandNamesOnce(text);
 }
 
 /// Return whether a `_Pragma` / `__pragma` operator spelling carries `once`.
