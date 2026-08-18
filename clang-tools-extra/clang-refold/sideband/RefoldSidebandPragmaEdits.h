@@ -129,7 +129,7 @@ bool buildSidebandPragmaSourceEdits(
 /// request terminal fallback and cause the function to return false.
 bool appendSidebandPragmaSourceEdits(
     llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
-    llvm::StringRef tuPath, llvm::StringRef tuBytes,
+    const RefoldModel &model, llvm::StringRef tuPath, llvm::StringRef tuBytes,
     const RefoldPathIdentity &pathIdentity,
     const RefoldTextEditAssembler &textEditAssembler,
     const RefoldProofLattice &proofLattice,

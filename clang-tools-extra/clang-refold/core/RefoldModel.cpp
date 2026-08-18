@@ -1468,6 +1468,18 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
               obj->getBoolean("via_pragma_operator").value_or(false);
           pd.operatorB = asOptUInt64(*obj, "operator_b");
           pd.operatorE = asOptUInt64(*obj, "operator_e");
+          // Stringified-argument provenance. Both fields are producer-emitted
+          // together; a partial pair is treated as absent rather than repaired,
+          // so a truncated record cannot authorize an argument-site edit.
+          pd.stringifiedFromMacroId =
+              asOptUInt64(*obj, "stringified_from_macro_id");
+          if (std::optional<uint64_t> argIndex =
+                  asOptUInt64(*obj, "stringified_from_arg_index"))
+            pd.stringifiedFromArgIndex = static_cast<uint32_t>(*argIndex);
+          if (!pd.stringifiedFromMacroId || !pd.stringifiedFromArgIndex) {
+            pd.stringifiedFromMacroId.reset();
+            pd.stringifiedFromArgIndex.reset();
+          }
 
           model.pragmas_.push_back(std::move(pd));
         } else {

@@ -265,6 +265,91 @@ foldPragmaDirectiveBackIntoOperator(StringRef siteText, StringRef directive) {
   return out;
 }
 
+/// Return the pragma whose site is exactly \p sourceRange and whose content the
+/// producer proved came from a stringified macro argument.
+///
+/// Matching on the exact site range keeps this bound to the directive the
+/// sideband edit is replacing; a pragma merely overlapping the range is a
+/// different directive and must not lend its provenance.
+static const RefoldModel::PragmaDirective *findStringifiedArgPragmaForSourceRange(
+    const RefoldModel &model, StringRef tuPath,
+    const RefoldPathIdentity &pathIdentity,
+    std::pair<uint64_t, uint64_t> sourceRange) {
+  for (const RefoldModel::PragmaDirective &pragma : model.GetPragmas()) {
+    if (!pragma.stringifiedFromMacroId || !pragma.stringifiedFromArgIndex)
+      continue;
+    if (!pathIdentity.PathsEqual(pragma.sitePath, tuPath))
+      continue;
+    if (pragma.siteB != sourceRange.first || pragma.siteE != sourceRange.second)
+      continue;
+    return &pragma;
+  }
+  return nullptr;
+}
+
+/// Return the macro invocation carrying \p id, or null.
+static const RefoldModel::MacroInvocation *
+findMacroInvocationById(const RefoldModel &model, uint64_t id) {
+  for (const RefoldModel::MacroInvocation &invocation :
+       model.GetMacroInvocations()) {
+    if (invocation.id == id)
+      return &invocation;
+  }
+  return nullptr;
+}
+
+/// Return whether \p Content is already in Clang's stringified normal form.
+///
+/// `#param` strips leading and trailing whitespace and collapses every internal
+/// whitespace run to one space, so a content that differs from its own
+/// normalized form would not survive being written back into the argument and
+/// stringified again. Requiring the fixed point keeps the fold exact instead of
+/// relying on the closing check to notice the drift.
+static bool contentIsStringifyNormalized(StringRef Content) {
+  if (Content.empty() || isSpace(Content.front()) || isSpace(Content.back()))
+    return false;
+  for (size_t I = 0; I + 1 < Content.size(); ++I) {
+    if (isSpace(Content[I]) && (Content[I] != ' ' || isSpace(Content[I + 1])))
+      return false;
+  }
+  return llvm::none_of(Content, [](char C) { return C == '\n' || C == '\r'; });
+}
+
+/// Fold a replayed `#pragma` back into the macro argument that produced it.
+///
+/// A `_Pragma` whose operand is `#param` takes its content from an argument, so
+/// the source construct to edit is that argument and not the pragma: the site
+/// holds a macro invocation, and materializing a `#pragma` over it would delete
+/// the invocation. The producer proves which argument supplied the content;
+/// this rewrites exactly that argument's bytes inside the invocation.
+///
+/// Refuses when the argument range does not lie inside the site, or when the
+/// replacement content is not already stringify-normalized, so anything that
+/// would not reproduce itself through `#param` is materialized instead.
+static std::optional<std::string> foldPragmaDirectiveBackIntoStringifiedArg(
+    StringRef siteText, uint64_t siteBegin, uint64_t argBegin, uint64_t argEnd,
+    StringRef directive) {
+  StringRef content = directive.trim();
+  if (!content.consume_front("#pragma"))
+    return std::nullopt;
+  content = content.trim();
+  if (!contentIsStringifyNormalized(content))
+    return std::nullopt;
+  if (argBegin < siteBegin || argEnd < argBegin)
+    return std::nullopt;
+  const uint64_t relBegin = argBegin - siteBegin;
+  const uint64_t relEnd = argEnd - siteBegin;
+  if (relEnd > siteText.size())
+    return std::nullopt;
+
+  std::string out;
+  out.reserve(siteText.size() + content.size());
+  out.append(siteText.data(), siteText.data() + relBegin);
+  out.append(content.data(), content.data() + content.size());
+  out.append(siteText.data() + relEnd, siteText.data() + siteText.size());
+  return out;
+}
+
 /// Convert a physical or replayed pragma directive spelling to the canonical
 /// sideband identity used for matching.
 ///
@@ -2316,6 +2401,7 @@ bool buildSidebandPragmaSourceEdits(
 
 bool appendSidebandPragmaSourceEdits(
     llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
+    const RefoldModel &model,
     llvm::StringRef tuPath, llvm::StringRef tuBytes,
     const RefoldPathIdentity &pathIdentity,
     const RefoldTextEditAssembler &textEditAssembler,
@@ -2398,8 +2484,46 @@ bool appendSidebandPragmaSourceEdits(
     StringRef siteText = tuBytes.slice(
         sourceRange.first, std::min<uint64_t>(sourceRange.second,
                                               static_cast<uint64_t>(tuBytes.size())));
-    std::string foldedReplacement = foldPragmaDirectiveBackIntoOperator(
-        siteText, sideband.ReplacementText());
+    // Prefer folding back into the argument that supplied the content. The
+    // site of such a pragma is a macro invocation, so the operator fold below
+    // cannot recognize it -- there is no `_Pragma` spelling there -- and
+    // without this the invocation is replaced by a raw `#pragma`.
+    std::string foldedReplacement;
+    std::optional<std::string> argFold;
+    if (const RefoldModel::PragmaDirective *pragma =
+            findStringifiedArgPragmaForSourceRange(model, tuPath, pathIdentity,
+                                                   sourceRange)) {
+      if (const RefoldModel::MacroInvocation *invocation =
+              findMacroInvocationById(model, *pragma->stringifiedFromMacroId)) {
+        const uint32_t argIndex = *pragma->stringifiedFromArgIndex;
+        if (argIndex < invocation->invArgRanges.size()) {
+          const auto &argRange = invocation->invArgRanges[argIndex];
+          if (argRange.first && argRange.second) {
+            argFold = foldPragmaDirectiveBackIntoStringifiedArg(
+                siteText, sourceRange.first, *argRange.first, *argRange.second,
+                sideband.ReplacementText());
+            // Report the fold itself. That a sideband edit ran says nothing
+            // about which construct survived, so this is the only signal
+            // separating a preserved invocation from a directive materialized
+            // over it -- and the only one countable on a corpus, whose
+            // retained artifacts are these logs and not the refold maps.
+            if (argFold)
+              REFOLD_LOG_TRACE(
+                  "pragma/sideband",
+                  "folding pragma content back into stringified argument {0} "
+                  "of macro invocation {1} at source=[{2},{3}) instead of "
+                  "materializing the directive over it",
+                  argIndex, invocation->id, sourceRange.first,
+                  sourceRange.second);
+          }
+        }
+      }
+    }
+    if (argFold)
+      foldedReplacement = std::move(*argFold);
+    else
+      foldedReplacement = foldPragmaDirectiveBackIntoOperator(
+          siteText, sideband.ReplacementText());
 
     ResyncOutcome ro = textEditAssembler.ApplyResyncOrPend(
         tuBytes, sourceRange.first, sourceRange.second, foldedReplacement,

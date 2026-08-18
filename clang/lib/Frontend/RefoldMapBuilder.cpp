@@ -3587,6 +3587,29 @@ void RefoldMapBuilder::onPragmaOperator(SourceLocation OperatorLoc,
                    /*TextIsProvisional=*/true);
 }
 
+/// Undo the string-literal quoting that `#param` applies, recovering the text
+/// `_Pragma` destringizes back out of it.
+///
+/// Stringification only ever emits an ordinary quoted literal escaping `\` and
+/// `"`, so this inverse is exact rather than a general literal parser.
+static std::optional<std::string> destringizeStringifiedArg(StringRef Quoted) {
+  if (Quoted.size() < 2 || Quoted.front() != '"' || Quoted.back() != '"')
+    return std::nullopt;
+  StringRef Body = Quoted.drop_front().drop_back();
+  std::string Out;
+  Out.reserve(Body.size());
+  for (size_t I = 0; I < Body.size(); ++I) {
+    if (Body[I] == '\\' && I + 1 < Body.size() &&
+        (Body[I + 1] == '\\' || Body[I + 1] == '"')) {
+      Out.push_back(Body[I + 1]);
+      ++I;
+      continue;
+    }
+    Out.push_back(Body[I]);
+  }
+  return Out;
+}
+
 void RefoldMapBuilder::recordPragmaItem(SourceLocation HashLoc,
                                         StringRef FullText,
                                         bool RequireOperatorSpelling,
@@ -3761,6 +3784,58 @@ void RefoldMapBuilder::recordPragmaItem(SourceLocation HashLoc,
   It.PragmaOperatorBegin = OperatorBegin;
   It.PragmaOperatorEnd = OperatorEnd;
   It.PragmaTextProvisional = TextIsProvisional;
+
+  // Stringified-argument provenance.
+  //
+  // A `_Pragma` whose operand is `#param` is reported at the invocation's own
+  // line, so the consumer sees a pragma whose site holds no pragma spelling and
+  // no way back to the argument that supplied its content. Record that edge
+  // here, where the invocation's exact per-argument stringifications are
+  // already known, having been computed with Clang's own StringifyArgument.
+  //
+  // The match is producer-internal throughout: the operand's destringized
+  // content is compared against the producer's own stringification of each
+  // actual, never against source bytes. Ambiguity records nothing.
+  if (RequireOperatorSpelling && HashLoc.isMacroID() && !FullText.empty()) {
+    StringRef Content = FullText;
+    if (Content.consume_front("#pragma ")) {
+      Content = Content.rtrim('\n');
+      const uint64_t SiteOff = SM.getFileOffset(FileLoc);
+      const Item *Innermost = nullptr;
+      for (const Item &Candidate : Items) {
+        // A macro invocation carries its file in InvFile; SitePath is the
+        // directive-record field and is empty here.
+        if (Candidate.Kind != IK_Macro || !Candidate.InvBegin ||
+            !Candidate.InvEnd || Candidate.InvFile != SitePath)
+          continue;
+        if (SiteOff < *Candidate.InvBegin || SiteOff >= *Candidate.InvEnd)
+          continue;
+        if (!Innermost ||
+            (*Candidate.InvEnd - *Candidate.InvBegin) <
+                (*Innermost->InvEnd - *Innermost->InvBegin))
+          Innermost = &Candidate;
+      }
+      if (Innermost) {
+        std::optional<uint32_t> SoleArg;
+        bool Ambiguous = false;
+        for (const auto &KV : Innermost->StringifySpell2ArgIndices) {
+          std::optional<std::string> Destringized =
+              destringizeStringifiedArg(KV.getKey());
+          if (!Destringized || *Destringized != Content)
+            continue;
+          if (KV.getValue().size() != 1 || SoleArg) {
+            Ambiguous = true;
+            break;
+          }
+          SoleArg = KV.getValue().front();
+        }
+        if (!Ambiguous && SoleArg) {
+          It.PragmaStringifiedFromMacroId = Innermost->ID;
+          It.PragmaStringifiedFromArgIndex = *SoleArg;
+        }
+      }
+    }
+  }
 
   Items.push_back(std::move(It));
 
@@ -4775,7 +4850,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "3.3");
+    JO.attribute("version", "3.4");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -6195,6 +6270,18 @@ void RefoldMapBuilder::writeJSON() {
                 JO.attribute("operator_b", *It.PragmaOperatorBegin);
                 JO.attribute("operator_e", *It.PragmaOperatorEnd);
               }
+            }
+
+            // Stringified-argument provenance.  Emitted only for a pragma whose
+            // content came from `#param`, so every other pragma record stays
+            // byte-identical.
+            if (It.Subkind == "#pragma" && It.PragmaStringifiedFromMacroId &&
+                It.PragmaStringifiedFromArgIndex) {
+              JO.attribute("stringified_from_macro_id",
+                           *It.PragmaStringifiedFromMacroId);
+              JO.attribute("stringified_from_arg_index",
+                           static_cast<int64_t>(
+                               *It.PragmaStringifiedFromArgIndex));
             }
           }
 

@@ -1629,7 +1629,7 @@ bool RefoldEngine::StageSidebandEdits(
   // TU/include/macro realization can strip or avoid any separately-owned
   // sideband replay bytes from ordinary hunk replacements.
   return appendSidebandPragmaSourceEdits(
-      sidebandPragmaEdits_, tuPath, tuBytes, pathIdentity_, *textEditAssembler_,
+      sidebandPragmaEdits_, model_, tuPath, tuBytes, pathIdentity_, *textEditAssembler_,
       ProofLattice(), terminalSink_, structuralHunkDispatcher);
 }
 

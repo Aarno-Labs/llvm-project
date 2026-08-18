@@ -832,6 +832,18 @@ public:
     /// the owner from slot/segment facts or reject repeated-header ambiguity
     /// instead of binding the pragma by physical path alone.
     std::optional<uint64_t> ownerIncludeId;
+    /// Invocation whose stringified argument supplied this pragma's content,
+    /// when the producer proved that edge.
+    ///
+    /// Set together with `stringifiedFromArgIndex`, and only for a `_Pragma`
+    /// whose operand is `#param`. The pragma is then reported at the
+    /// invocation's own line, so its site holds no pragma spelling at all;
+    /// these two fields are the only way back to the argument that supplied
+    /// the content, and matching the content against argument text instead
+    /// would be repeated-spelling provenance.
+    std::optional<uint64_t> stringifiedFromMacroId;
+    /// Index into that invocation's argument ranges.
+    std::optional<uint32_t> stringifiedFromArgIndex;
     /// True when the pragma was spelled as `_Pragma("...")` rather than as a
     /// preprocessing directive line.
     bool viaPragmaOperator = false;

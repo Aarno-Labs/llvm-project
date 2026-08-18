@@ -384,6 +384,24 @@ struct Item {
   // that overlaps ordinary tokens.
   std::optional<uint64_t> PragmaOperatorBegin;
   std::optional<uint64_t> PragmaOperatorEnd;
+  // --- Stringified-argument provenance (Subkind == "#pragma") ---
+  // When a macro replacement stringifies a formal into the `_Pragma` operand
+  // (`#define DIAG(x) _Pragma(#x)`), the pragma's content is the invocation's
+  // actual argument, restringized and destringized back to itself. These record
+  // which invocation supplied it and which of its arguments.
+  //
+  // The consumer cannot recover this. The pragma's expansion site is the
+  // invocation's own line, so nothing at that site is spelled as a pragma, and
+  // matching the pragma's content against argument text would be exactly the
+  // repeated-spelling provenance the refolder forbids. With this edge, a
+  // content edit folds back into the feeding argument instead of materializing
+  // a raw `#pragma` over the invocation.
+  //
+  // Both are set together or not at all, and only when exactly one of the
+  // invocation's stringified arguments accounts for the content, so an
+  // ambiguous replacement records nothing rather than an arbitrary argument.
+  std::optional<uint64_t> PragmaStringifiedFromMacroId;
+  std::optional<unsigned> PragmaStringifiedFromArgIndex;
   // True while Text was reconstructed from the `_Pragma` operator's own
   // destringized content rather than supplied by a pragma-printing callback.
   // A later callback reporting the same physical line replaces the text; the

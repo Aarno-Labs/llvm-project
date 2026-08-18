@@ -1602,6 +1602,16 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "integer",
           "minimum": 0,
           "description": "For a _Pragma operator, end byte offset (exclusive) of the _Pragma(\"...\") expression within 'site_path'."
+        },
+        "stringified_from_macro_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Macro invocation item id whose stringified argument supplied this pragma's content, for a _Pragma whose operand is #param. Emitted together with stringified_from_arg_index and only when exactly one argument accounts for the content; absent for every other pragma. Such a pragma is reported at the invocation's own line, so its site holds no pragma spelling, and this edge is the only sound way back to the argument."
+        },
+        "stringified_from_arg_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Index into that invocation's inv_arg_ranges identifying the argument whose stringification supplied this pragma's content."
         }
       }
     },
