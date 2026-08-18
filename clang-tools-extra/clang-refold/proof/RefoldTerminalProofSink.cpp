@@ -50,8 +50,6 @@ StringRef toString(TerminalFallbackObligationKind obligation) {
     return "IncludeGuardStateStabilizable";
   case TerminalFallbackObligationKind::ConditionalStateStabilizable:
     return "ConditionalStateStabilizable";
-  case TerminalFallbackObligationKind::ReverseSolvedDirectiveForbidden:
-    return "ReverseSolvedDirectiveForbidden";
   case TerminalFallbackObligationKind::ProducerFactsAvailable:
     return "ProducerFactsAvailable";
   case TerminalFallbackObligationKind::IncludeRealizationBEnvelopeMapped:
@@ -90,8 +88,6 @@ StringRef toString(TerminalFallbackFailureReason reason) {
     return "IncludeGuardStateNotStabilizable";
   case TerminalFallbackFailureReason::ConditionalStateNotStabilizable:
     return "ConditionalStateNotStabilizable";
-  case TerminalFallbackFailureReason::ReverseSolvedDirectiveRequired:
-    return "ReverseSolvedDirectiveRequired";
   case TerminalFallbackFailureReason::MalformedInvocationPreservation:
     return "MalformedInvocationPreservation";
   case TerminalFallbackFailureReason::MissingProducerFacts:
@@ -140,8 +136,6 @@ StringRef toString(TheoremFallbackFailureKind kind) {
     return "IncludeGuardStateNotStabilizable";
   case TheoremFallbackFailureKind::ConditionalStateNotStabilizable:
     return "ConditionalStateNotStabilizable";
-  case TheoremFallbackFailureKind::ReverseSolvedDirectiveRequired:
-    return "ReverseSolvedDirectiveRequired";
   case TheoremFallbackFailureKind::MalformedInvocationPreservation:
     return "MalformedInvocationPreservation";
   case TheoremFallbackFailureKind::MissingProducerFacts:
@@ -176,8 +170,6 @@ NormalizeTerminalFallbackFailureReason(TerminalFallbackFailureReason reason) {
     return TheoremFallbackFailureKind::IncludeGuardStateNotStabilizable;
   case TerminalFallbackFailureReason::ConditionalStateNotStabilizable:
     return TheoremFallbackFailureKind::ConditionalStateNotStabilizable;
-  case TerminalFallbackFailureReason::ReverseSolvedDirectiveRequired:
-    return TheoremFallbackFailureKind::ReverseSolvedDirectiveRequired;
   case TerminalFallbackFailureReason::MalformedInvocationPreservation:
     return TheoremFallbackFailureKind::MalformedInvocationPreservation;
   case TerminalFallbackFailureReason::MissingProducerFacts:

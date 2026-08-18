@@ -280,18 +280,6 @@ writeMaterializedEditMap(StringRef path, StringRef ppModPath,
 
 // ------------------------- Command-Line Options ------------------------------
 
-static cl::OptionCategory RefoldCategory("clang-refold options");
-
-cl::opt<LogLevel> LogLevelOpt(
-    "log-level", cl::desc("Set log level"),
-    cl::values(clEnumValN(LogLevel::Trace, "trace", "Trace"),
-               clEnumValN(LogLevel::Debug, "debug", "Debug"),
-               clEnumValN(LogLevel::Info, "info", "Info  (default)"),
-               clEnumValN(LogLevel::Warn, "warn", "Warn"),
-               clEnumValN(LogLevel::Error, "error", "Error"),
-               clEnumValN(LogLevel::Fatal, "fatal", "Fatal")),
-    cl::init(LogLevel::Info), cl::cat(RefoldCategory));
-
 static cl::opt<std::string>
     PPPath("pp", // long name: --pp
            cl::desc("Path to preprocessed file (.c.i) [required(1)]"),

@@ -144,7 +144,6 @@ classifyTerminalFallbackFailure(const TerminalFallbackProofFailure &failure) {
   case FailureReason::NoCanonicalSuffixOrder:
     return FallbackClass::UnknownSuffixState;
   case FailureReason::UnknownPragmaCrossesBoundary:
-  case FailureReason::ReverseSolvedDirectiveRequired:
     return FallbackClass::UnsupportedDirectiveInteraction;
   case FailureReason::LineControlStateNotProducerProven:
     return FallbackClass::LineControlObserverMismatch;
@@ -331,7 +330,6 @@ classifyStrictDomainForTerminalFallback(
   case FailureReason::NoOwnerClosedCover:
   case FailureReason::NoTUAnchorForUnresolvedOwner:
   case FailureReason::UnknownPragmaCrossesBoundary:
-  case FailureReason::ReverseSolvedDirectiveRequired:
   case FailureReason::MalformedInvocationPreservation:
   case FailureReason::ValidationFailure:
   case FailureReason::TheoremAuditInvariantViolation:

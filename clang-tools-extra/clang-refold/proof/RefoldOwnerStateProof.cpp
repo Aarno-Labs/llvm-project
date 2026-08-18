@@ -2542,43 +2542,6 @@ RefoldOwnerStateProof::SuffixStabilityTerminalFailureForComponent(
   llvm_unreachable("Invalid owner state component");
 }
 
-TerminalFallbackProofFailure
-RefoldOwnerStateProof::ReverseSolvedDirectiveTerminalFailure(
-    OwnerStateComponent component, const OwnerStateBoundary &boundary,
-    StringRef directiveKind, StringRef detail) {
-  TerminalFallbackFailureContext context =
-      TerminalFallbackFailureContext::ForStateComponent(toString(component));
-  if (boundary.hasSourceBoundary && boundary.source.IsComplete()) {
-    context.sourcePath = boundary.source.path;
-    context.sourceBegin = boundary.source.begin;
-    context.sourceEnd = boundary.source.end;
-  }
-  if (boundary.hasTokenBoundary && boundary.aTokens.IsValid()) {
-    context.aTokenBegin = boundary.aTokens.begin;
-    context.aTokenEnd = boundary.aTokens.end;
-  }
-  (void)directiveKind;
-  (void)detail;
-  return MakeTerminalFallbackProofFailure(
-      TerminalFallbackObligationKind::ReverseSolvedDirectiveForbidden,
-      TerminalFallbackFailureReason::ReverseSolvedDirectiveRequired,
-      std::move(context));
-}
-
-SuffixStabilityWitness
-RefoldOwnerStateProof::BuildReverseSolvedDirectiveTerminalWitness(
-    const OwnerStateBoundary &boundary, OwnerStateComponent component,
-    StringRef directiveKind, StringRef detail) {
-  TerminalStateFailureWitness witness;
-  witness.component = component;
-  witness.boundary = boundary;
-  witness.failure = ReverseSolvedDirectiveTerminalFailure(
-      component, boundary, directiveKind, detail);
-  witness.hasFailure = true;
-  witness.detail = detail.str();
-  return SuffixStabilityWitness::From(std::move(witness));
-}
-
 OwnerStateComponent
 RefoldOwnerStateProof::ComponentNamedBySuffixStabilityWitness(
     const SuffixStabilityWitness &witness) {
@@ -2707,34 +2670,6 @@ RefoldOwnerStateProof::CheckStateTransitionAcrossEditBoundary(
                       "component={0} witness={1} detail={2}",
                       request.component, request.witness.kind, request.detail)
             .str());
-  }
-
-  if (request.requiresDirectiveClosureProof) {
-    const StringRef directiveLabel = request.directiveKind.empty()
-                                         ? StringRef("<unknown>")
-                                         : StringRef(request.directiveKind);
-    if (request.directiveClosureStatus !=
-        DirectiveClosureStatus::DirectiveOwnerInsideAcceptedClosure) {
-      return requestTerminal(
-          ReverseSolvedDirectiveTerminalFailure(request.component,
-                                                request.boundary,
-                                                directiveLabel, request.detail),
-          llvm::formatv("state-transition gateway rejected reverse-solved "
-                        "directive rewrite: component={0} mutation={1} "
-                        "directive={2} closureStatus={3} stage={4} detail={5}",
-                        request.component, request.mutation, directiveLabel,
-                        request.directiveClosureStatus, request.stage,
-                        request.detail)
-              .str());
-    }
-
-    REFOLD_LOG_TRACE(
-        "state/gateway",
-        "state-transition gateway accepted directive-closure proof before "
-        "suffix query: component={0} mutation={1} directive={2} stage={3} "
-        "detail={4}",
-        request.component, request.mutation, directiveLabel, request.stage,
-        request.detail);
   }
 
   const SuffixObserverQueryResult observers =
@@ -2895,25 +2830,6 @@ RefoldOwnerStateProof::CheckStateTransitionAcrossEditBoundary(
                     static_cast<uint64_t>(observerCount),
                     hasIncomparableObserver ? "YES" : "NO", request.detail)
           .str());
-}
-
-StateTransitionProof
-RefoldOwnerStateProof::CheckReverseSolvedDirectiveAcrossEditBoundary(
-    const OwnerStateBoundary &boundary, OwnerStateComponent component,
-    StateMutationKind mutation, DirectiveClosureStatus directiveClosureStatus,
-    StringRef directiveKind, StringRef stage, StringRef detail) const {
-  StateTransitionGatewayRequest request;
-  request.boundary = boundary;
-  request.component = component;
-  request.mutation = mutation;
-  request.witness = SuffixStabilityWitness::None();
-  request.stage = stage.str();
-  request.detail = detail.str();
-  request.requireKnownObserver = false;
-  request.requiresDirectiveClosureProof = true;
-  request.directiveClosureStatus = directiveClosureStatus;
-  request.directiveKind = directiveKind.str();
-  return CheckStateTransitionAcrossEditBoundary(request);
 }
 
 StateTransitionProof

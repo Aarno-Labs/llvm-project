@@ -1684,35 +1684,6 @@ inline StringRef toString(DirectStateCheckClosureKind kind) {
 
 // Direct state-check inventory helpers live on RefoldOwnerStateProof.
 
-/// Producer-closure proof for edits that would otherwise reverse-solve an
-/// upstream directive from downstream B-side tokens.
-///
-/// Changing macro definitions, #line operands, include paths, or conditional
-/// truth from the resulting expansion is forbidden unless the directive owner
-/// itself belongs to the accepted owner closure.  Unknown closure proof is
-/// also fail-closed because absence of a producer fact is not evidence that
-/// reverse-solving is safe.
-enum class DirectiveClosureStatus : uint8_t {
-  NotADirectiveStateRewrite,
-  DirectiveOwnerInsideAcceptedClosure,
-  DirectiveOwnerOutsideAcceptedClosure,
-  Unknown
-};
-
-inline StringRef toString(DirectiveClosureStatus status) {
-  switch (status) {
-  case DirectiveClosureStatus::NotADirectiveStateRewrite:
-    return "NotADirectiveStateRewrite";
-  case DirectiveClosureStatus::DirectiveOwnerInsideAcceptedClosure:
-    return "DirectiveOwnerInsideAcceptedClosure";
-  case DirectiveClosureStatus::DirectiveOwnerOutsideAcceptedClosure:
-    return "DirectiveOwnerOutsideAcceptedClosure";
-  case DirectiveClosureStatus::Unknown:
-    return "Unknown";
-  }
-  llvm_unreachable("Invalid directive closure status");
-}
-
 /// Typed witness that the preserved suffix does not observe the changed
 /// state.
 struct SuffixUnobservedWitness {
@@ -1885,17 +1856,6 @@ struct StateTransitionGatewayRequest {
   std::string stage;
   std::string detail;
   bool requireKnownObserver = false;
-
-  /// reverse-solving gate.  When true, the request represents a state
-  /// rewrite whose source directive would have to be inferred from downstream
-  /// B-side expansion unless the directive owner is already inside the
-  /// accepted edit closure.  The gateway rejects Outside/Unknown before
-  /// consulting suffix observers, because suffix repair cannot justify
-  /// changing unedited upstream source state.
-  bool requiresDirectiveClosureProof = false;
-  DirectiveClosureStatus directiveClosureStatus =
-      DirectiveClosureStatus::NotADirectiveStateRewrite;
-  std::string directiveKind;
 };
 
 } // namespace refold

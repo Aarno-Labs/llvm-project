@@ -1,7 +1,11 @@
 set(LLVM_LINK_COMPONENTS Support)
 
-add_clang_tool(clang-refold
-  clang-refold.cpp
+# The refold engine is built as a library so its proof vocabulary and pure
+# coordinate theorems can be exercised by unit tests.  Several terminal-
+# fallback obligations are internal-invariant assertions that no input can
+# reach, so a lit test cannot pin them; the library boundary is what makes
+# them testable at all.  The tool itself is a thin main over this library.
+add_clang_library(clangRefold STATIC
   sideband/RefoldSidebandPragmaEdits.cpp
   source/DiffAlgorithms.cpp
   source/RefoldAlignmentDiagnostic.cpp
@@ -98,13 +102,33 @@ add_clang_tool(clang-refold
   macro/RefoldMacroStateProof.cpp
   proof/RefoldSidebandReplayProof.cpp
   proof/RefoldNeutralityProof.cpp
+  core/RefoldLog.cpp
   core/RefoldModel.cpp
   util/StringUtils.cpp
+
+  # clang-refold.cpp is the tool's main and is deliberately not part of the
+  # library, so this source list is intentionally partial.
+  PARTIAL_SOURCES_INTENDED
 )
 
-target_link_libraries(clang-refold PRIVATE
+# Link the clang component libraries directly rather than through
+# clang_target_link_libraries(), which would resolve to libclang-cpp.so when the
+# dylib is enabled.  The tool is deployed by copying the binary into a separate
+# tree, so it keeps the static linkage it had before the library split and gains
+# no runtime dependency from it.
+target_link_libraries(clangRefold PRIVATE
   clangBasic
   clangLex
   clangFrontend
   clangSerialization
+)
+
+add_clang_tool(clang-refold
+  clang-refold.cpp
+
+  PARTIAL_SOURCES_INTENDED
+)
+
+target_link_libraries(clang-refold PRIVATE
+  clangRefold
 )

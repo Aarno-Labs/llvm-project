@@ -108,7 +108,6 @@ class RefoldOwnerStateProof {
   using DirectStateCheckKind = ::clang::refold::DirectStateCheckKind;
   using DirectStateCheckClosureKind =
       ::clang::refold::DirectStateCheckClosureKind;
-  using DirectiveClosureStatus = ::clang::refold::DirectiveClosureStatus;
   using SuffixUnobservedWitness = ::clang::refold::SuffixUnobservedWitness;
   using StateRepairWitness = ::clang::refold::StateRepairWitness;
   using OwnerMaterializationWitness =
@@ -278,28 +277,6 @@ public:
   /// observer of `component`.
   static TerminalFallbackProofFailure
   SuffixStabilityTerminalFailureForComponent(OwnerStateComponent component);
-  /// Return the terminal fallback proof failure for a forbidden reverse-solved
-  /// directive rewrite.
-  static TerminalFallbackProofFailure ReverseSolvedDirectiveTerminalFailure(
-      OwnerStateComponent component, const OwnerStateBoundary &boundary,
-      llvm::StringRef directiveKind, llvm::StringRef detail);
-  /// Build a typed terminal witness for a forbidden reverse-solved directive
-  /// rewrite.  Component-specific helpers may wrap this, but the proof failure
-  /// kind is intentionally shared by macro, line-control, include, and
-  /// conditional state.
-  static SuffixStabilityWitness BuildReverseSolvedDirectiveTerminalWitness(
-      const OwnerStateBoundary &boundary, OwnerStateComponent component,
-      llvm::StringRef directiveKind, llvm::StringRef detail);
-
-  /// Route an explicit reverse-solving decision through the same state gateway
-  /// used for suffix stability.  The request is rejected unless the caller
-  /// proves that the directive owner itself is inside the accepted edit
-  /// closure.
-  StateTransitionProof CheckReverseSolvedDirectiveAcrossEditBoundary(
-      const OwnerStateBoundary &boundary, OwnerStateComponent component,
-      StateMutationKind mutation, DirectiveClosureStatus directiveClosureStatus,
-      llvm::StringRef directiveKind, llvm::StringRef stage,
-      llvm::StringRef detail) const;
   /// Return the state component explicitly named by a typed suffix-stability
   /// witness, or Unknown when the witness is absent/malformed.
   static OwnerStateComponent

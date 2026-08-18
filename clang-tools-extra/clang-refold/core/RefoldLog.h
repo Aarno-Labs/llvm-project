@@ -173,6 +173,10 @@ static inline StringRef toString(LogLevel level) {
 
 extern cl::opt<LogLevel> LogLevelOpt;
 
+/// Option category shared by the engine's logging option and the tool's own
+/// options, so both appear under one heading in `--help`.
+extern cl::OptionCategory RefoldCategory;
+
 /// Seconds elapsed since this run emitted its first log line.
 ///
 /// Logs are read to find where wall time goes, so the useful quantity is
