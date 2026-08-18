@@ -3680,20 +3680,25 @@ void RefoldMapBuilder::recordPragmaItem(SourceLocation HashLoc,
     }
   }
 
-  // A caller that asserts operator spelling requires the operator to be
-  // literally present at the reported location. A `_Pragma` produced by macro
-  // expansion reports its expansion site, whose physical line holds the macro
-  // invocation and no pragma spelling at all.
+  // A `_Pragma` produced by macro expansion reports its expansion site, whose
+  // physical line holds the macro invocation and no pragma spelling at all.
   //
-  // Such an occurrence is left to the printing paths, which already record it as
-  // an ordinary pragma anchored to the invocation line -- the anchor the
-  // sideband pragma edits depend on. Claiming operator provenance for it here
-  // would replace that anchor with a rangeless record and strand those edits.
-  // A pragma that is *consumed* at an expansion site is therefore still not
-  // recorded anywhere; see the deferred-defect note on macro-generated
-  // `_Pragma("once")`.
-  if (RequireOperatorSpelling && !ViaOperator)
-    return;
+  // Do not claim operator provenance for it. The printing paths anchor such an
+  // occurrence to the invocation line as an ordinary pragma, and that anchor is
+  // what the sideband pragma edits delete; replacing it with a rangeless
+  // operator record strands them.
+  //
+  // Do still contribute the reconstructed text. A pragma with a dedicated
+  // callback (`message`, `diagnostic`, ...) is reported with no spelling of its
+  // own, so without this the item's `text` falls back to the physical line --
+  // `DIAG(message("hi"))` for a pragma generated from a macro argument, which
+  // is not a pragma spelling and which no consumer can reconcile against the
+  // tokens the pragma actually emitted. The text stays provisional, so a
+  // printing path that does supply a spelling still wins.
+  if (RequireOperatorSpelling && !ViaOperator) {
+    OperatorBegin.reset();
+    OperatorEnd.reset();
+  }
 
   const std::string SitePath = filePathForLocAbs(SM, FileLoc, EmitAbsPaths);
 
