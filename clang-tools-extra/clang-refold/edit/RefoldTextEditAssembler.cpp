@@ -675,6 +675,16 @@ bool protectedSourceAuthorityAcceptsKind(
     // once-state with no pragma at all, and the producer records nothing for
     // `_Pragma("once")`.  Neither is modeled by the guard catalog, so omitting
     // them here makes both fail closed at the emission firewall.
+    //
+    // The producer now does record the operator, and an operator-spelled once
+    // header is guarded through the B-realized path instead, which places the
+    // define at the top of the body rather than over the operator's own bytes.
+    // Admitting PragmaOperator here would route it back through that byte
+    // rewrite, which writes `#define <guard>` over the site and is well formed
+    // only where the site owns its physical line -- a `_Pragma("once")` sharing
+    // its line with other source is a legal expression, and the replacement
+    // would not begin a logical line.  Add that line-ownership check before
+    // admitting this kind.
     return kind == PreprocessingStructureKind::Pragma ||
            kind == PreprocessingStructureKind::Include ||
            kind == PreprocessingStructureKind::IncludeNext;

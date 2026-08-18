@@ -315,21 +315,6 @@ bool RefoldPragmaOnceGuardRewriter::DiscoverPragmaOnceSites(
         return false;
       }
 
-      // The rewrite replaces the site's own bytes with a `#define` line, which
-      // is well formed only when the operator has its line to itself.  A
-      // mid-line `_Pragma` is a legal expression this rewrite cannot express.
-      if (!stringutils::intervalIsAloneOnItsLine(
-              bytes, interval.structureSpellingBegin,
-              interval.structureSpellingEnd)) {
-        rejection = PragmaOnceGuardRejection::PragmaOperatorOnce;
-        detail = formatv("header '{0}' spells once through a pragma operator at "
-                         "[{1},{2}) that shares its line with other source",
-                         physicalPath, interval.structureSpellingBegin,
-                         interval.structureSpellingEnd)
-                     .str();
-        return false;
-      }
-
       PragmaOnceSite site;
       site.begin = interval.begin;
       site.end = interval.end;
