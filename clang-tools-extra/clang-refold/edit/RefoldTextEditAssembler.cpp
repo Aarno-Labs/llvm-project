@@ -288,6 +288,8 @@ bool structuralTilingWitnessesAgree(
             right.sourceBytesPreservedUnchanged ||
         left.protectedStructurePreservedOutsideSegment !=
             right.protectedStructurePreservedOutsideSegment ||
+        left.macroStatePlacementInsensitiveProven !=
+            right.macroStatePlacementInsensitiveProven ||
         left.ownerSignature != right.ownerSignature ||
         left.sourceSignature != right.sourceSignature ||
         left.producerPathSignature != right.producerPathSignature ||

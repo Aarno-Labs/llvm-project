@@ -35,6 +35,7 @@
 #include "source/RefoldPreprocessingStructureIndexProvider.h"
 #include "source/RefoldSourceGapProof.h"
 #include "source/RefoldSourceMapper.h"
+#include "source/TokenTextHelpers.h"
 #include "util/RefoldPathIdentity.h"
 
 
@@ -242,6 +243,42 @@ void logAcceptedStructuralTiling(
       witness.preservedGapsDisjointFromEdits);
 }
 
+/// Producer-recorded preprocessing content of one protected structural gap.
+struct ProtectedGapFacts {
+  /// Kinds of every protected interval in the gap, in source order.
+  SmallVector<PreprocessingStructureKind, 2> kinds;
+  /// Macro names bound by the `#define`/`#undef` intervals in the gap.
+  SmallVector<StringRef, 2> macroNames;
+  /// False when a macro-state interval in the gap had no recoverable producer
+  /// name, so `macroNames` is not the complete set and no rule may conclude
+  /// anything from a name's absence.
+  bool macroNamesComplete = true;
+};
+
+/// Return whether every protected interval preserved in one structural gap is a
+/// macro directive that the preprocessor consumes.
+///
+/// `#define` and `#undef` contribute no token to either preprocessed stream, so
+/// a payload moved across one changes no token order; their only effect is on
+/// the definition bound to one macro name.  A gap holding anything else -- a
+/// conditional control, an include, a line control, a pragma, or a directive
+/// nobody classified -- is not answered here and keeps its caller failing
+/// closed.
+///
+/// An empty list returns false.  A run boundary exists only because something
+/// was preserved there, so an empty list means the kinds were never recorded,
+/// and reporting true would let a payload theorem run with no directive to
+/// reason about.
+bool gapPreservesOnlyMacroStateDirectives(
+    ArrayRef<PreprocessingStructureKind> gapKinds) {
+  if (gapKinds.empty())
+    return false;
+  return llvm::all_of(gapKinds, [](PreprocessingStructureKind kind) {
+    return kind == PreprocessingStructureKind::MacroDefine ||
+           kind == PreprocessingStructureKind::MacroUndef;
+  });
+}
+
 } // namespace
 
 RefoldMixedOwnerTilingPlanner::RefoldMixedOwnerTilingPlanner(Dependencies deps)
@@ -266,6 +303,68 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       -> const RefoldPreprocessingStructureIndex * {
     return lookupStructureIndexForSource(source).index;
   };
+
+  // Return whether anything after `gap` could still observe the macro state its
+  // directives bind.
+  //
+  // This is a precedence rule, not a soundness condition.  Splitting at a
+  // preserved macro-state gap leaves the directive exactly where it was, so
+  // source outside the hunk sees an unchanged directive position either way;
+  // the placement obligations proved at the caller are what make the split
+  // sound.  What this decides is *who owns the seam*.  The macro-state liveness
+  // planner is the only stage that models resurrection, undef/restore, and
+  // replay ordering for a consumed directive, and it engages exactly when the
+  // name still matters downstream.  Reporting true there leaves the seam to it,
+  // so a hunk it already handles keeps the placement it proves rather than
+  // having the tiler decide by an alignment that models none of that.
+  //
+  // Deference is decided conservatively and only for a translation-unit gap,
+  // because that is the buffer whose remaining bytes are available here:
+  //
+  //   * an unrecoverable macro name reports true, since a name that cannot be
+  //     read cannot be shown to be unused;
+  //   * a surviving `#include` after the gap reports true, because the included
+  //     text is not examined here and may name the macro -- this is what keeps
+  //     a definition consumed by a later header on the planner's side;
+  //   * otherwise the name must not be spelled as an identifier anywhere after
+  //     the gap.  A spelling reached only through another macro's replacement
+  //     list is not tracked; missing one costs deference, never soundness.
+  auto macroStateGapBelongsToLivenessPlanner =
+      [&](const OwnerSourceRange &gap, const ProtectedGapFacts &gapFacts) {
+        if (!gapFacts.macroNamesComplete || gapFacts.macroNames.empty())
+          return true;
+        if (!deps_.pathIdentity.PathsEqual(gap.path, deps_.tuPath) ||
+            gap.end > deps_.tuBytes.size()) {
+          return true;
+        }
+
+        const RefoldPreprocessingStructureIndex *structureIndex =
+            getStructureIndexForSource(gap);
+        if (!structureIndex || !structureIndex->IsProtectionCensusComplete())
+          return true;
+        for (const PreprocessingStructureInterval *interval :
+             structureIndex->FindOverlapping(gap.end, deps_.tuBytes.size())) {
+          if (!interval)
+            return true;
+          if (interval->kind == PreprocessingStructureKind::Include ||
+              interval->kind == PreprocessingStructureKind::IncludeNext ||
+              interval->kind == PreprocessingStructureKind::Import) {
+            return true;
+          }
+        }
+
+        SmallVector<RefoldLexBoundaryToken, 64> suffixTokens;
+        refoldLexBoundaryTokens(deps_.tuBytes.drop_front(gap.end),
+                                deps_.lexLang, suffixTokens);
+        for (const RefoldLexBoundaryToken &token : suffixTokens) {
+          if (token.kind != tok::raw_identifier)
+            continue;
+          for (StringRef macroName : gapFacts.macroNames)
+            if (token.spelling == macroName)
+              return true;
+        }
+        return false;
+      };
 
   // Structural witnesses are rebuilt from the current token diff and attached
   // to later accepted candidates by exact A/B token-envelope binding.  The
@@ -399,6 +498,10 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       std::optional<uint64_t> producerItemId;
       std::optional<uint64_t> producerConditionalGroupId;
       std::optional<uint64_t> producerConditionalArmId;
+      /// Placement proof for a preserved `#define`/`#undef` seam.  See
+      /// `StructuralHunkTilingEdgeWitness::macroStatePlacementInsensitiveProven`
+      /// for what it establishes and where it is validated.
+      bool macroStatePlacementInsensitiveProven = false;
       std::optional<OwnerClosure> closure;
 
       bool IsTokenSegment() const {
@@ -561,10 +664,28 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       SmallVector<PhysicalSourceRun, 8> runs;
       /// Exact source gap between `runs[i]` and `runs[i + 1]`.
       SmallVector<OwnerSourceRange, 8> protectedGaps;
+      /// Producer-recorded content of `protectedGaps[i]`, in source order.
+      ///
+      /// The gap proof establishes that each of these intervals lies wholly
+      /// inside the gap, so this is the complete preprocessing content of that
+      /// gap.  Carrying it forward lets a later theorem ask what a gap contains
+      /// without re-reading source bytes, which is the only form of the
+      /// question that stays correct when the gap belongs to an included header
+      /// rather than to the translation unit.
+      SmallVector<ProtectedGapFacts, 8> protectedGapFacts;
       /// Exact lower/upper B-token projection for each interior run boundary.
       /// These records are populated only for replacement hunks and remain in
       /// the same order as `protectedGaps`.
       SmallVector<StructuralBoundaryProjectionWitness, 8> boundaryProjections;
+      /// Whether everything committed after `protectedGaps[i]` was proved
+      /// unable to observe the macro-definition state that gap changes.
+      ///
+      /// Populated only for replacement hunks, in the same order as
+      /// `protectedGaps`.  This is the one fact that lets a `#define`/`#undef`
+      /// separator be split rather than handed to the macro-state liveness
+      /// planner, so it is recorded where it is proved and read where the
+      /// deferral is decided, instead of being derived twice.
+      SmallVector<bool, 8> macroStatePlacementProven;
     };
 
     std::set<uint64_t> duplicateTokmapPP;
@@ -1416,6 +1537,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
 
         bool crossesProtectedStructure = false;
         bool crossesConditionalControl = false;
+        ProtectedGapFacts gapFacts;
         if (previousEnd < entry.b) {
           // Canonical run construction and later state-gap discharge must use
           // the same physical byte-cover theorem.  Treat every indexed
@@ -1433,6 +1555,24 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
             if (!interval ||
                 interval->ownerIncludeId != tokenOwner->includeId) {
               return std::nullopt;
+            }
+            gapFacts.kinds.push_back(interval->kind);
+            // Recover the macro name a `#define`/`#undef` in this gap binds.
+            // The name is producer-owned; a macro-state interval that cannot be
+            // resolved to one leaves the set incomplete rather than silently
+            // shorter.
+            if (interval->kind == PreprocessingStructureKind::MacroDefine ||
+                interval->kind == PreprocessingStructureKind::MacroUndef) {
+              const RefoldModel::MacroDirective *directive =
+                  interval->modelKind ==
+                              PreprocessingStructureModelKind::MacroDirective &&
+                          interval->modelItemId
+                      ? deps_.model.GetMacroDirectiveById(*interval->modelItemId)
+                      : nullptr;
+              if (directive && !directive->name.empty())
+                gapFacts.macroNames.push_back(directive->name);
+              else
+                gapFacts.macroNamesComplete = false;
             }
             switch (interval->kind) {
             case PreprocessingStructureKind::ConditionalIf:
@@ -1472,6 +1612,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
           plan.runs.push_back(currentRun);
           plan.protectedGaps.push_back(OwnerSourceRange::From(
               entry.file, previousEnd, entry.b, tokenOwner->includeId));
+          plan.protectedGapFacts.push_back(std::move(gapFacts));
           currentRun.aStart = pp;
           currentRun.aEnd = pp + 1;
           currentRun.source = OwnerSourceRange::From(
@@ -1495,7 +1636,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       }
       plan.runs.push_back(currentRun);
       if (plan.runs.empty() ||
-          plan.protectedGaps.size() + 1 != plan.runs.size()) {
+          plan.protectedGaps.size() + 1 != plan.runs.size() ||
+          plan.protectedGapFacts.size() != plan.protectedGaps.size()) {
         return std::nullopt;
       }
 
@@ -1926,6 +2068,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
             edge.producerConditionalGroupId;
         segmentWitness.producerConditionalArmId =
             edge.producerConditionalArmId;
+        segmentWitness.macroStatePlacementInsensitiveProven =
+            edge.macroStatePlacementInsensitiveProven;
         segmentWitness.allowEmptyBEnvelope = edge.allowEmptyBEnvelope;
         segmentWitness.sourceBytesPreservedUnchanged =
             edge.IsStateGap() &&
@@ -2413,6 +2557,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
           physicalSourceRuns->runs.size() >= 2) {
         bool projectionsComplete = true;
         physicalSourceRuns->boundaryProjections.clear();
+        physicalSourceRuns->macroStatePlacementProven.clear();
         for (size_t runIndex = 0;
              runIndex + 1 < physicalSourceRuns->runs.size(); ++runIndex) {
           const uint64_t aBoundary =
@@ -2421,34 +2566,59 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
               projection =
                   deps_.sourceMapper.ProjectATokenBoundaryToBTokenBounds(
                       h.aStart, h.aEnd, h.bStart, h.bEnd, aBoundary);
+          bool macroStatePlacementProven = false;
           // A strict range means the payload cannot be split at this seam by
           // alignment alone. That is not the end of the question: when the
-          // preserved gap is a pragma whose state the payload provably cannot
-          // observe, both placements re-preprocess to the same tokens and are
+          // preserved gap changes state the payload provably cannot observe,
+          // both placements re-preprocess to the same tokens and are
           // equivalent refolds, so committing one is a proof rather than a
           // preference. Refusing instead surrenders the translation unit and
           // deletes the very directive the refusal was protecting.
           //
-          // The predicate defaults to observable for anything unclassified, so
-          // an unrecognized pragma keeps refusing here.
+          // Two directive families can discharge that obligation, and each
+          // defaults to observable, so an unrecognized pragma and any gap
+          // holding a conditional control, an include, or a line control keep
+          // refusing here.
           if (projection && !projection->IsUnique() &&
-              runIndex < physicalSourceRuns->protectedGaps.size()) {
+              runIndex < physicalSourceRuns->protectedGaps.size() &&
+              runIndex < physicalSourceRuns->protectedGapFacts.size()) {
             const OwnerSourceRange &gap =
                 physicalSourceRuns->protectedGaps[runIndex];
-            if (gap.IsValid() && gap.end <= deps_.tuBytes.size() &&
-                gap.begin <= gap.end) {
+            if (gap.IsValid() && gap.begin <= gap.end) {
+              std::optional<std::pair<uint64_t, uint64_t>> payloadBytes =
+                  deps_.sourceMapper.BTokenRangeToByteRange(
+                      projection->lowerBTokenBoundary,
+                      projection->upperBTokenBoundary);
+              const bool payloadBytesUsable =
+                  payloadBytes &&
+                  payloadBytes->second <= deps_.bSource.size() &&
+                  payloadBytes->first <= payloadBytes->second;
+              const StringRef payload =
+                  payloadBytesUsable
+                      ? deps_.bSource.slice(payloadBytes->first,
+                                            payloadBytes->second)
+                      : StringRef();
+
+              // `tuBytes` holds the translation unit, but a canonical run plan
+              // may be derived wholly inside an included header, in which case
+              // this gap's offsets index that header and reading them out of
+              // the TU classifies unrelated bytes.  A size check does not catch
+              // that: the offsets are in range whenever the TU is long enough.
+              // Only a TU-owned gap may be classified by spelling.
+              const bool gapIsTUOwned =
+                  deps_.pathIdentity.PathsEqual(gap.path, deps_.tuPath) &&
+                  gap.end <= deps_.tuBytes.size();
+
               // The gap spans the whole source region between two runs, so it
               // carries the newline that ends the preceding line. The
               // classifier takes a logical directive and will not recognize a
               // spelling behind leading trivia, reporting Unknown -- which
               // observes everything and would refuse every pragma here.
               const PragmaClassification classification =
-                  classifyPragmaDirective(
-                      deps_.tuBytes.slice(gap.begin, gap.end).trim());
-              std::optional<std::pair<uint64_t, uint64_t>> payloadBytes =
-                  deps_.sourceMapper.BTokenRangeToByteRange(
-                      projection->lowerBTokenBoundary,
-                      projection->upperBTokenBoundary);
+                  gapIsTUOwned ? classifyPragmaDirective(
+                                     deps_.tuBytes.slice(gap.begin, gap.end)
+                                         .trim())
+                               : PragmaClassification();
               // Equivalence requires that moving the payload across the
               // directive change no token order, which holds only when the
               // preprocessor consumes the directive and emits nothing for it.
@@ -2457,19 +2627,50 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
               // the payload's side of it is token order and is fixed by the
               // alignment, not free to choose. Restrict to the effects whose
               // directives Clang consumes; anything else keeps refusing.
-              const bool directiveIsConsumed =
+              const bool pragmaIsConsumed =
                   classification.effect == PragmaStateEffect::IncludeOnce ||
                   classification.effect == PragmaStateEffect::MacroStateStack ||
                   classification.effect == PragmaStateEffect::PoisonIdentifiers ||
                   classification.effect == PragmaStateEffect::SystemHeader;
-              if (directiveIsConsumed && payloadBytes &&
-                  payloadBytes->second <= deps_.bSource.size() &&
-                  payloadBytes->first <= payloadBytes->second &&
-                  !payloadObservesPragmaState(
-                      classification,
-                      deps_.bSource.slice(payloadBytes->first,
-                                          payloadBytes->second),
-                      deps_.lexLang)) {
+              const bool insensitiveToPragma =
+                  pragmaIsConsumed && payloadBytesUsable &&
+                  !payloadObservesPragmaState(classification, payload,
+                                              deps_.lexLang);
+
+              // `#define` and `#undef` are consumed exactly as those pragmas
+              // are, and the state they change -- the definition bound to one
+              // macro name -- is reachable only through an identifier.  The
+              // kinds are producer-recorded, so unlike the pragma spelling this
+              // question is answered without reading source bytes and stays
+              // correct for a gap inside an included header.
+              //
+              // The obligation is deliberately wider than the ambiguous
+              // payload.  Committing a side is decided by `[lower,upper)`
+              // alone, because every token outside that range has a forced
+              // alignment and keeps the side it already had.  Everything from
+              // the committed boundary to the end of the hunk nevertheless
+              // lands after the directive, so requiring that whole suffix to
+              // name no identifier keeps B payload that mentions the macro out
+              // of this path entirely.  It subsumes the placement obligation.
+              std::optional<std::pair<uint64_t, uint64_t>> committedSuffixBytes =
+                  deps_.sourceMapper.BTokenRangeToByteRange(
+                      projection->lowerBTokenBoundary, h.bEnd);
+              const bool committedSuffixUsable =
+                  committedSuffixBytes &&
+                  committedSuffixBytes->second <= deps_.bSource.size() &&
+                  committedSuffixBytes->first <= committedSuffixBytes->second;
+              const ProtectedGapFacts &gapFacts =
+                  physicalSourceRuns->protectedGapFacts[runIndex];
+              const bool insensitiveToMacroDirectives =
+                  gapPreservesOnlyMacroStateDirectives(gapFacts.kinds) &&
+                  payloadBytesUsable && committedSuffixUsable &&
+                  !payloadObservesMacroDefinitionState(
+                      deps_.bSource.slice(committedSuffixBytes->first,
+                                          committedSuffixBytes->second),
+                      deps_.lexLang) &&
+                  !macroStateGapBelongsToLivenessPlanner(gap, gapFacts);
+
+              if (insensitiveToPragma || insensitiveToMacroDirectives) {
                 // Equivalent placements: commit the lower frontier, which
                 // leaves the undetermined payload after the preserved
                 // directive. The side is arbitrary precisely because
@@ -2477,14 +2678,18 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
                 // was taken so it is not a bare tie-break.
                 REFOLD_LOG_TRACE(
                     "tiling/structural",
-                    "payload B=[{0},{1}) does not observe the {2} pragma "
-                    "preserved at source=[{3},{4}); committing it after the "
-                    "directive rather than surrendering the translation unit",
+                    "payload B=[{0},{1}) does not observe the {2} state "
+                    "preserved at source='{3}'[{4},{5}); committing it after "
+                    "the directive rather than surrendering the translation "
+                    "unit",
                     projection->lowerBTokenBoundary,
                     projection->upperBTokenBoundary,
-                    toString(classification.effect), gap.begin, gap.end);
+                    insensitiveToPragma ? toString(classification.effect)
+                                        : StringRef("MacroDefinition"),
+                    gap.path, gap.begin, gap.end);
                 projection->upperBTokenBoundary =
                     projection->lowerBTokenBoundary;
+                macroStatePlacementProven = insensitiveToMacroDirectives;
               }
             }
           }
@@ -2533,11 +2738,15 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
           boundaryWitness.bTokenBoundary = bBoundary;
           boundaryWitness.uniqueProjection = true;
           physicalSourceRuns->boundaryProjections.push_back(boundaryWitness);
+          physicalSourceRuns->macroStatePlacementProven.push_back(
+              macroStatePlacementProven);
         }
 
         if (!projectionsComplete ||
             physicalSourceRuns->boundaryProjections.size() + 1 !=
-                physicalSourceRuns->runs.size())
+                physicalSourceRuns->runs.size() ||
+            physicalSourceRuns->macroStatePlacementProven.size() !=
+                physicalSourceRuns->boundaryProjections.size())
           return std::nullopt;
       }
 
@@ -2763,8 +2972,25 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
                 // edits and no consumed macro-state transition, thereby
                 // replacing its established ordering theorem with an unrelated
                 // byte/token alignment.  Defer instead of stealing the hunk.
-                if (transitionContainsMacroStateDirective(*transitionGaps))
+                //
+                // The exception is a seam where that decision is already
+                // empty.  Everything committed after the separator was proved
+                // to name no identifier, so no B payload can reach the
+                // definition the directive binds: there is no order to choose
+                // and nothing to undefine and restore.  Deferring then buys
+                // the planner no authority it can use, and costs the directive
+                // its place in the source -- the planner's remaining move is
+                // to relocate it past the replacement.  Every seam without
+                // that proof still defers.
+                const bool macroStatePlacementProven =
+                    *boundaryIndex <
+                        physicalSourceRuns->macroStatePlacementProven.size() &&
+                    physicalSourceRuns
+                        ->macroStatePlacementProven[*boundaryIndex];
+                if (transitionContainsMacroStateDirective(*transitionGaps) &&
+                    !macroStatePlacementProven) {
                   continue;
+                }
 
                 const StructuralBoundaryProjectionWitness &projection =
                     physicalSourceRuns
@@ -3294,6 +3520,33 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       if (!mixedOwnerTilingStateSummariesCompose(h, path,
                                                  &stateCompositionReason)) {
         return std::nullopt;
+      }
+
+      // Carry the seam proof from the boundary-projection theorem onto the
+      // preserved gap edge that will hold it in the durable witness.  The
+      // projection recorded its verdict per canonical run boundary, while the
+      // gap edge is normalized to the exact directive line inside that
+      // boundary's source gap, so the two are matched by containment rather
+      // than by position.
+      if (physicalSourceRuns) {
+        for (size_t gapIndex = 0;
+             gapIndex < physicalSourceRuns->protectedGaps.size() &&
+             gapIndex < physicalSourceRuns->macroStatePlacementProven.size();
+             ++gapIndex) {
+          if (!physicalSourceRuns->macroStatePlacementProven[gapIndex])
+            continue;
+          const OwnerSourceRange &provenGap =
+              physicalSourceRuns->protectedGaps[gapIndex];
+          for (PartitionEdge &gapEdge : path) {
+            if (!gapEdge.IsStateGap() || !gapEdge.closure ||
+                !sourceSitesComparable(gapEdge.closure->source, provenGap) ||
+                gapEdge.closure->source.begin < provenGap.begin ||
+                gapEdge.closure->source.end > provenGap.end) {
+              continue;
+            }
+            gapEdge.macroStatePlacementInsensitiveProven = true;
+          }
+        }
       }
 
       StructuralPartition partition;

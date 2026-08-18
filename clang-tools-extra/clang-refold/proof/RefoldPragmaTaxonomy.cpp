@@ -256,6 +256,18 @@ bool payloadObservesPragmaState(const PragmaClassification &classification,
   return false;
 }
 
+bool payloadObservesMacroDefinitionState(StringRef payload,
+                                         const LangOptions &lang) {
+  // Delegate rather than repeat the identifier scan.  `MacroStateStack` is the
+  // effect kind for "the definition bound to one macro name changed", which is
+  // what a `#define` or `#undef` does; asking the same predicate keeps one
+  // answer for one state kind.
+  PragmaClassification macroDefinitionState;
+  macroDefinitionState.effect = PragmaStateEffect::MacroStateStack;
+  macroDefinitionState.binding = PragmaConstructBinding::NonBinding;
+  return payloadObservesPragmaState(macroDefinitionState, payload, lang);
+}
+
 StringRef toString(PragmaStateEffect effect) {
   switch (effect) {
   case PragmaStateEffect::Unknown:

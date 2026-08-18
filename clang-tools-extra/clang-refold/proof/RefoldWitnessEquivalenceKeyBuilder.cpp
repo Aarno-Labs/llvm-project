@@ -791,6 +791,8 @@ std::string mixedOwnerTilingSignature(const MixedOwnerTilingWitness &tiling) {
        << (segment.sourceBytesPreservedUnchanged ? 1 : 0)
        << ":protected_outside="
        << (segment.protectedStructurePreservedOutsideSegment ? 1 : 0)
+       << ":macro_state_placement_insensitive="
+       << (segment.macroStatePlacementInsensitiveProven ? 1 : 0)
        << ":owner=" << segment.ownerSignature
        << ":source=" << segment.sourceSignature
        << ":producer=" << segment.producerPathSignature

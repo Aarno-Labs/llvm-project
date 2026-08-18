@@ -1291,6 +1291,21 @@ struct StructuralHunkTilingEdgeWitness {
   std::optional<uint64_t> producerConditionalGroupId;
   std::optional<uint64_t> producerConditionalArmId;
 
+  /// True when everything committed after this preserved `#define`/`#undef`
+  /// was proved to name no identifier.
+  ///
+  /// A macro-state directive between two token segments is otherwise reserved
+  /// for the macro-state liveness planner, which is the only stage that can
+  /// order the directive against payload that mentions the name it binds.  This
+  /// flag records the one case where that planner has nothing to decide, so the
+  /// directive may stay exactly where it is instead of being relocated past the
+  /// replacement.
+  ///
+  /// It is meaningful only on a `StateGap` edge whose protected structure is a
+  /// producer-bound `MacroDefine` or `MacroUndef`; set anywhere else it is a
+  /// malformed witness and the tiling proof rejects it.
+  bool macroStatePlacementInsensitiveProven = false;
+
   /// Affirmative physical evidence for `PreservedInPlace`.
   ///
   /// The edge emits no replacement bytes, and the final assembler independently

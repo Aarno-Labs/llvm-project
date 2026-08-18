@@ -16,7 +16,26 @@ namespace clang {
 namespace refold {
 namespace {
 
-/// Return whether the durable partition preserves a macro-state directive.
+/// Return whether one durable edge preserves a producer-bound macro-state
+/// directive.
+bool edgePreservesMacroStateDirective(
+    const StructuralHunkTilingEdgeWitness &edge) {
+  if (edge.kind != StructuralHunkTilingEdgeKind::StateGap ||
+      !edge.protectedPreprocessingStructure ||
+      !edge.protectedStructureIdentityRecorded ||
+      edge.producerIdentityKind !=
+          StructuralProducerIdentityKind::MacroDirective ||
+      !edge.producerItemId) {
+    return false;
+  }
+  return edge.protectedStructureKind ==
+             StructuralProtectedStructureKind::MacroDefine ||
+         edge.protectedStructureKind ==
+             StructuralProtectedStructureKind::MacroUndef;
+}
+
+/// Return whether the partition preserves a macro-state directive whose
+/// placement was never proved.
 ///
 /// Producer-bound #define/#undef lines are owned by the specialized macro-state
 /// repair theorem. Direct-TU span planning may discover those lines as evidence
@@ -24,22 +43,33 @@ namespace {
 /// not compose with the repair theorem merely because its B boundaries are
 /// unique, so such a witness must fail independently at every later proof
 /// boundary as well as in the planner.
-bool replacementPreservesMacroStateDirective(
+///
+/// The single exception is an edge carrying
+/// `macroStatePlacementInsensitiveProven`, which records that everything
+/// committed after the directive names no identifier and therefore cannot reach
+/// the definition it binds.  That leaves the repair theorem with no ordering to
+/// decide, so there is nothing for this gate to protect.  The flag is validated
+/// rather than trusted: it is honoured only on an edge that really is a
+/// producer-bound macro-state gap, so a stale or reconstructed witness cannot
+/// set it on an unrelated edge and pass.
+bool replacementPreservesUnprovenMacroStateDirective(
     const StructuralHunkTilingWitness &witness) {
   return llvm::any_of(
       witness.edges, [](const StructuralHunkTilingEdgeWitness &edge) {
-        if (edge.kind != StructuralHunkTilingEdgeKind::StateGap ||
-            !edge.protectedPreprocessingStructure ||
-            !edge.protectedStructureIdentityRecorded ||
-            edge.producerIdentityKind !=
-                StructuralProducerIdentityKind::MacroDirective ||
-            !edge.producerItemId) {
+        if (!edgePreservesMacroStateDirective(edge))
           return false;
-        }
-        return edge.protectedStructureKind ==
-                   StructuralProtectedStructureKind::MacroDefine ||
-               edge.protectedStructureKind ==
-                   StructuralProtectedStructureKind::MacroUndef;
+        return !edge.macroStatePlacementInsensitiveProven;
+      });
+}
+
+/// Return whether any edge claims the macro-state placement proof without being
+/// a producer-bound macro-state gap that could carry it.
+bool witnessHasMisplacedMacroStatePlacementProof(
+    const StructuralHunkTilingWitness &witness) {
+  return llvm::any_of(
+      witness.edges, [](const StructuralHunkTilingEdgeWitness &edge) {
+        return edge.macroStatePlacementInsensitiveProven &&
+               !edgePreservesMacroStateDirective(edge);
       });
 }
 
@@ -252,8 +282,12 @@ bool structuralReplacementBoundaryProjectionIsComplete(
   // Macro-state directive ordering remains under the dedicated liveness repair
   // theorem.  Rejecting it here prevents a stale, forged, or externally
   // reconstructed structural witness from bypassing the planner-level gate.
-  if (replacementPreservesMacroStateDirective(witness))
+  // Only a seam carrying the placement-insensitivity proof is exempt, and the
+  // proof is honoured only where it could have been established.
+  if (witnessHasMisplacedMacroStatePlacementProof(witness) ||
+      replacementPreservesUnprovenMacroStateDirective(witness)) {
     return false;
+  }
 
   if (!structuralPreservedSourceTopologyIsComplete(witness))
     return false;

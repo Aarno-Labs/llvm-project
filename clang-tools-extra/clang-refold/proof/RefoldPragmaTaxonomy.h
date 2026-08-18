@@ -145,6 +145,25 @@ bool payloadObservesPragmaState(const PragmaClassification &classification,
                                 llvm::StringRef payload,
                                 const LangOptions &lang);
 
+/// Return whether re-preprocessing `payload` could observe the macro-definition
+/// state a `#define` or `#undef` directive changes.
+///
+/// A macro directive is not a pragma, but it changes exactly the state
+/// `push_macro`/`pop_macro` change -- the definition bound to one macro name --
+/// so this is the `MacroStateStack` question asked of a directive that carries
+/// no pragma spelling.  Answering it here rather than at the call site is what
+/// keeps the two from drifting apart: a payload naming no identifier at all is
+/// the only thing either can currently prove, and a later refinement backed by
+/// the macro-liveness facts `RefoldMacroStateProof` already holds should
+/// improve both at once.
+///
+/// `true` is the fail-closed answer.  It does not depend on the directive's
+/// name or replacement list, because a payload can reach a definition through
+/// another macro that expands to it, which no comparison against the directive's
+/// own spelling would catch.
+bool payloadObservesMacroDefinitionState(llvm::StringRef payload,
+                                         const LangOptions &lang);
+
 /// Return a stable diagnostic spelling for a state effect.
 llvm::StringRef toString(PragmaStateEffect effect);
 
