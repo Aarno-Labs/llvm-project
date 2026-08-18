@@ -15,6 +15,7 @@
 #include "source/RefoldPreprocessingStructureIndex.h"
 #include "source/RefoldPreprocessingStructureIndexProvider.h"
 #include "source/RefoldSourceMapper.h"
+#include "source/RefoldTokenlessSourceProjection.h"
 #include "util/RefoldPathIdentity.h"
 #include "util/StringUtils.h"
 
@@ -408,16 +409,6 @@ formatAlignmentWindowAnchor(const AlignmentWindowAnchor &anchor) {
   llvm_unreachable("invalid alignment window anchor kind");
 }
 
-static bool sourceIntervalPrecedes(const RefoldModel::TokMapEntry &entry,
-                                   uint64_t sourceBegin) {
-  return entry.e <= sourceBegin;
-}
-
-static bool sourceIntervalFollows(const RefoldModel::TokMapEntry &entry,
-                                  uint64_t sourceEnd) {
-  return entry.b >= sourceEnd;
-}
-
 static StringRef alignmentBoundaryRoleName(AlignmentBoundaryRole role) {
   switch (role) {
   case AlignmentBoundaryRole::StructureBoundary:
@@ -586,34 +577,9 @@ private:
       const PreprocessingStructureInterval &interval,
       ArrayRef<const RefoldModel::TokMapEntry *> mappedTokens,
       ArrayRef<const RefoldModel::IncludeItem *> childIncludes) const {
-    uint64_t lowerBoundary = 0;
-    uint64_t upperBoundary = aTokenCount_;
-    bool overlapsMappedToken = false;
-
-    for (const RefoldModel::TokMapEntry *entry : mappedTokens) {
-      if (sourceIntervalPrecedes(*entry, interval.begin)) {
-        lowerBoundary = std::max(lowerBoundary, entry->pp + 1);
-      } else if (sourceIntervalFollows(*entry, interval.end)) {
-        upperBoundary = std::min(upperBoundary, entry->pp);
-      } else {
-        overlapsMappedToken = true;
-      }
-    }
-
-    // Tokmap names the file that spelled a token, while an exact child include
-    // cover fixes where a nested occurrence entered and left the owning source
-    // stream. Both forms are producer-backed coordinates.
-    for (const RefoldModel::IncludeItem *include : childIncludes) {
-      if (include->siteE <= interval.begin) {
-        lowerBoundary = std::max(lowerBoundary, include->cover.end);
-      } else if (include->siteB >= interval.end) {
-        upperBoundary = std::min(upperBoundary, include->cover.begin);
-      }
-    }
-
-    if (overlapsMappedToken || lowerBoundary != upperBoundary)
-      return std::nullopt;
-    return lowerBoundary;
+    return projectTokenlessSourceIntervalToATokenFrontier(
+        mappedTokens, childIncludes, aTokenCount_, interval.begin,
+        interval.end);
   }
 
   void CollectFromIndex(

@@ -29,6 +29,7 @@
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
 #include "source/RefoldSourceGapProof.h"
+#include "source/RefoldTokenlessSourceProjection.h"
 #include "source/TokenTextHelpers.h"
 #include "util/RefoldDenseMapInfo.h"
 
@@ -83,6 +84,124 @@ namespace refold {
 // normal proof lattice.
 
 namespace {
+
+/// Derive where each preserved tokenless directive cuts the realized B payload.
+///
+/// A closure that preserves a directive in place must emit the B material that
+/// belongs before it, then the directive's own source bytes, then the B
+/// material that belongs after it.  `aFrontiers` holds one A-token frontier per
+/// preserved directive, in source order: the directive sits between A tokens
+/// `frontier - 1` and `frontier`.  The returned split is the first B token in
+/// `[bMaterialBegin, bMaterialEnd)` whose aligned A token is at or beyond that
+/// frontier, so B material aligned to A tokens before the directive stays
+/// before it and material aligned after it stays after.
+///
+/// The derivation is admissible only when every B token in the material range
+/// is aligned to an A token.  An unaligned B token is edited material with no
+/// A-side position, so nothing determines which side of the directive it
+/// belongs on; the same is true when the aligned indices are not monotone
+/// across the material.  Both fail closed, which is what keeps a payload that
+/// straddles the directive rejected rather than silently placed.
+///
+/// A split is a seam at protected preprocessing state, so the two anchors that
+/// bracket it must be forced by the core objective rather than merely selected.
+/// A forced anchor is used by every core-optimal alignment, so no other
+/// admissible alignment moves it across the directive, and monotonicity then
+/// fixes the side of every remaining material token.  A resolver-authorized
+/// anchor cannot stand in: its witness holds that the remaining explanations
+/// agree on one normalized edit realization, which is a claim about the
+/// contiguous realization it was proved against, not about this partitioned
+/// one.
+///
+/// Splits are returned in the same order as `aFrontiers` and are
+/// non-decreasing.
+std::optional<SmallVector<size_t, 4>> deriveBPayloadSplitsAtATokenFrontiers(
+    ArrayRef<int64_t> abTokMapB2A,
+    ArrayRef<diffutils::LcsAnchorProof> abTokAnchorProofs,
+    ArrayRef<uint64_t> aFrontiers, size_t bMaterialBegin, size_t bMaterialEnd,
+    std::string *reason) {
+  auto refuse =
+      [&](std::string detail) -> std::optional<SmallVector<size_t, 4>> {
+    if (reason)
+      *reason = std::move(detail);
+    return std::nullopt;
+  };
+
+  if (aFrontiers.empty() || bMaterialEnd < bMaterialBegin)
+    return refuse("no preserved directive frontier to split at");
+
+  // Resolve every B token's aligned A index once.  The material range is
+  // usually a handful of tokens, and the same census answers each frontier.
+  SmallVector<uint64_t, 16> alignedA;
+  alignedA.reserve(bMaterialEnd - bMaterialBegin);
+  for (size_t bTok = bMaterialBegin; bTok < bMaterialEnd; ++bTok) {
+    if (bTok >= abTokMapB2A.size())
+      return refuse(
+          llvm::formatv("B token {0} is outside the alignment map", bTok)
+              .str());
+    const int64_t mappedA = abTokMapB2A[bTok];
+    if (mappedA < 0)
+      return refuse(
+          llvm::formatv("B token {0} is unaligned edited material with no "
+                        "determined side of the preserved directive",
+                        bTok)
+              .str());
+    const uint64_t aTok = static_cast<uint64_t>(mappedA);
+    if (!alignedA.empty() && aTok <= alignedA.back())
+      return refuse(llvm::formatv("B token {0} aligns to A token {1}, which is "
+                                  "not monotone after A token {2}",
+                                  bTok, aTok, alignedA.back())
+                        .str());
+    alignedA.push_back(aTok);
+  }
+
+  // Return whether the alignment anchor at one material B token is forced by
+  // the core objective.  `offset` is relative to `bMaterialBegin`.
+  auto materialAnchorIsCoreForced = [&](size_t offset) -> bool {
+    const uint64_t aTok = alignedA[offset];
+    if (aTok >= abTokAnchorProofs.size())
+      return false;
+    return abTokAnchorProofs[aTok].kind ==
+           diffutils::LcsAnchorProofKind::CoreOptimalPathForced;
+  };
+
+  SmallVector<size_t, 4> splits;
+  splits.reserve(aFrontiers.size());
+  size_t previousSplit = bMaterialBegin;
+  for (uint64_t frontier : aFrontiers) {
+    size_t split = bMaterialEnd;
+    for (size_t offset = 0; offset < alignedA.size(); ++offset) {
+      if (alignedA[offset] >= frontier) {
+        split = bMaterialBegin + offset;
+        break;
+      }
+    }
+    if (split < previousSplit)
+      return refuse(llvm::formatv("preserved directive frontiers derive "
+                                  "non-monotone B splits {0} after {1}",
+                                  split, previousSplit)
+                        .str());
+
+    if (split > bMaterialBegin &&
+        !materialAnchorIsCoreForced(split - 1 - bMaterialBegin))
+      return refuse(
+          llvm::formatv("B token {0} left of the split at A frontier {1} is "
+                        "not a core-forced alignment anchor",
+                        split - 1, frontier)
+              .str());
+    if (split < bMaterialEnd &&
+        !materialAnchorIsCoreForced(split - bMaterialBegin))
+      return refuse(
+          llvm::formatv("B token {0} right of the split at A frontier {1} is "
+                        "not a core-forced alignment anchor",
+                        split, frontier)
+              .str());
+
+    previousSplit = split;
+    splits.push_back(split);
+  }
+  return splits;
+}
 
 /// Include-tree adjacency facts shared by the include-closure resolvers below.
 ///
@@ -1525,7 +1644,182 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     return true;
   };
 
+  // One TU pragma directive that a closure preserves at its original position
+  // inside the replacement instead of consuming or relocating it.
+  //
+  // `aFrontier` is the producer-backed A-token index the directive sits at; the
+  // B payload is cut there so the directive keeps the same position relative to
+  // surviving material.
+  struct TUPositionPreservedPragma {
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    uint64_t id = 0;
+    uint64_t aFrontier = 0;
+  };
+
+  // Producer coordinate surfaces for projecting a tokenless TU directive onto
+  // the A stream.  They mirror the direct-TU surfaces the alignment's
+  // protected-boundary collector projects against: tokmap entries spelled by
+  // this TU, and the include occurrences this TU entered directly.  Both are
+  // run constants, so they are built once, but only on first use: a closure gap
+  // that needs them is rare and building them walks the whole tokmap.
+  bool tuTokenlessProjectionSurfacesReady = false;
+  SmallVector<const RefoldModel::TokMapEntry *, 32> tuMappedATokens;
+  SmallVector<const RefoldModel::IncludeItem *, 8> tuChildIncludes;
+  auto ensureTUTokenlessProjectionSurfaces = [&]() {
+    if (tuTokenlessProjectionSurfacesReady)
+      return;
+    tuTokenlessProjectionSurfacesReady = true;
+    for (const auto &entry : model_.GetTokmap()) {
+      if (entry.pp < aToks_.size() && paths_.PathsEqual(entry.file, tuPath))
+        tuMappedATokens.push_back(&entry);
+    }
+    for (const auto &inc : model_.GetIncludes()) {
+      if (!inc.parent && inc.cover.IsValid() &&
+          inc.cover.end <= aToks_.size() &&
+          paths_.PathsEqual(inc.sitePath, tuPath))
+        tuChildIncludes.push_back(&inc);
+    }
+  };
+
+  // Prove that an owner gap is exactly trivia plus complete TU pragma
+  // directives, and project each of those directives onto the A stream.
+  //
+  // A pragma is neither consumable nor relocatable: its net state is not
+  // identity, so deleting it drops a state transition and moving it changes
+  // where that transition happens.  The remaining sound realization is to keep
+  // it in place and split the replacement's B payload around it, which needs
+  // exactly one extra fact per directive -- the A-token frontier it sits at.
+  // The projection supplies that fact from producer coordinates and fails
+  // closed when the directive is not tokenless or its position is not
+  // determined; the gap proof separately guarantees that no other protected
+  // structure hides in the same gap.
+  auto collectPositionPreservedTUPragmaGapPieces =
+      [&](uint64_t gapBegin, uint64_t gapEnd,
+          SmallVectorImpl<TUPositionPreservedPragma> &out) -> bool {
+    if (gapBegin >= gapEnd || gapEnd > tuBytes.size())
+      return false;
+
+    // Recover the exact directive extents first.  The indexed lexical extent,
+    // not the recorded site, is what gets copied verbatim: the index owns the
+    // complete logical directive line.
+    SmallVector<TUPositionPreservedPragma, 4> pragmas;
+    for (const auto &pragma : model_.GetPragmas()) {
+      if (!paths_.PathsEqual(pragma.sitePath, tuPath))
+        continue;
+      if (pragma.siteB >= pragma.siteE || pragma.siteB < gapBegin ||
+          gapEnd < pragma.siteE)
+        continue;
+
+      // Only a directive-spelled pragma owns a complete logical line that can
+      // be copied verbatim.  A `_Pragma("...")` operator is an expression whose
+      // bytes may live inside a macro replacement list, so re-emitting them at
+      // a derived split would move source that belongs to another owner.
+      if (pragma.viaPragmaOperator) {
+        REFOLD_LOG_TRACE(
+            "fallback",
+            "TU/include closure cannot preserve pragma id={0} in place: "
+            "operator-spelled pragmas have no preservable directive line",
+            pragma.id);
+        return false;
+      }
+
+      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+          findSourceGapProducerInterval(
+              preprocessingStructureIndex_,
+              PreprocessingStructureModelKind::PragmaDirective, pragma.id);
+      if (!exactRange || exactRange->first >= exactRange->second ||
+          exactRange->first < gapBegin || gapEnd < exactRange->second) {
+        REFOLD_LOG_TRACE(
+            "fallback",
+            "TU/include closure cannot preserve TU pragma id={0} in place: "
+            "no exact indexed directive interval inside gap [{1},{2})",
+            pragma.id, gapBegin, gapEnd);
+        return false;
+      }
+
+      pragmas.push_back({exactRange->first, exactRange->second, pragma.id,
+                         /*aFrontier=*/0});
+    }
+
+    if (pragmas.empty())
+      return false;
+
+    llvm::sort(pragmas, [](const TUPositionPreservedPragma &lhs,
+                           const TUPositionPreservedPragma &rhs) {
+      if (lhs.begin != rhs.begin)
+        return lhs.begin < rhs.begin;
+      return lhs.id < rhs.id;
+    });
+
+    ensureTUTokenlessProjectionSurfaces();
+    for (TUPositionPreservedPragma &piece : pragmas) {
+      std::optional<uint64_t> aFrontier =
+          projectTokenlessSourceIntervalToATokenFrontier(
+              tuMappedATokens, tuChildIncludes, aToks_.size(), piece.begin,
+              piece.end);
+      if (!aFrontier) {
+        REFOLD_LOG_TRACE(
+            "fallback",
+            "TU/include closure cannot preserve TU pragma id={0} in place: "
+            "source=[{1},{2}) has no unique A-token frontier",
+            piece.id, piece.begin, piece.end);
+        return false;
+      }
+      piece.aFrontier = *aFrontier;
+    }
+
+    // Submit the directives as opaque preserved pieces so the shared gap
+    // theorem proves the complete byte coverage of the gap.  Every protected
+    // interval in the gap must be one of these pieces: an unrelated directive
+    // hiding beside the pragma is not preserved by this composition and fails
+    // closed here.
+    enum : uint32_t { PragmaPieceClass = 0 };
+    SmallVector<SourceGapProofPiece, 4> proofPieces;
+    proofPieces.reserve(pragmas.size());
+    for (size_t pieceIndex = 0; pieceIndex < pragmas.size(); ++pieceIndex) {
+      const TUPositionPreservedPragma &piece = pragmas[pieceIndex];
+      proofPieces.push_back(SourceGapProofPiece{
+          piece.begin, piece.end, piece.id, PragmaPieceClass, PragmaPieceClass,
+          0, pieceIndex});
+    }
+
+    std::string gapReason;
+    std::optional<SourceGapProofResult> gapProof =
+        proveSourceGapWithIndexedTrivia(preprocessingStructureIndex_, gapBegin,
+                                        gapEnd, proofPieces, &gapReason);
+    if (!gapProof) {
+      REFOLD_LOG_TRACE(
+          "fallback",
+          "TU/include closure rejected position-preserved TU pragma gap "
+          "source=[{0},{1}): {2}",
+          gapBegin, gapEnd, gapReason);
+      return false;
+    }
+    if (gapProof->outerPiecePayloadIndices.size() != pragmas.size()) {
+      REFOLD_LOG_TRACE(
+          "fallback",
+          "TU/include closure rejected position-preserved TU pragma gap "
+          "source=[{0},{1}): {2} of {3} directives survived normalization",
+          gapBegin, gapEnd, gapProof->outerPiecePayloadIndices.size(),
+          pragmas.size());
+      return false;
+    }
+
+    for (size_t payloadIndex : gapProof->outerPiecePayloadIndices) {
+      const TUPositionPreservedPragma &piece = pragmas[payloadIndex];
+      REFOLD_LOG_TRACE(
+          "fallback",
+          "TU/include closure preserving TU pragma id={0} in place "
+          "source=[{1},{2}) aFrontier={3} gap=[{4},{5})",
+          piece.id, piece.begin, piece.end, piece.aFrontier, gapBegin, gapEnd);
+      out.push_back(piece);
+    }
+    return true;
+  };
+
   std::string mixedPreservedConditionalControlTrivia;
+  SmallVector<TUPositionPreservedPragma, 4> mixedPositionPreservedTUPragmas;
   SmallVector<TUPreservedGapPiece, 8> mixedPreservedZeroTokenGapPieces;
   SmallVector<std::pair<uint64_t, uint64_t>, 4>
       mixedPreservedSourceLineDirectiveGapPieces;
@@ -2176,6 +2470,15 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
             return true;
           }
 
+          // A pragma cannot be consumed or relocated, but it can be kept where
+          // it is when the B payload can be split around it.  Try that before
+          // the ordinary rejection; the split itself is derived later, once
+          // the B material range is known, and refuses there if it is not
+          // determined.
+          if (collectPositionPreservedTUPragmaGapPieces(
+                  gapBegin, gapEnd, mixedPositionPreservedTUPragmas))
+            return true;
+
           if (std::optional<std::string> pragmaReason =
                   nonConsumableTUPragmaGapReason(gapBegin, gapEnd)) {
             REFOLD_LOG_TRACE("fallback", "TU/include closure rejected: {0}",
@@ -2427,8 +2730,114 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     return std::nullopt;
   }
 
-  std::string rawReplacement =
-      sourceMapper_.SliceBSource(bMaterialBegin, bMaterialEnd).str();
+  // Compose the realized B payload.  Without a preserved in-place directive
+  // that is one contiguous B slice; with one, the payload is partitioned at the
+  // directive's derived split so the directive keeps its original position
+  // relative to the surviving material.
+  std::string rawReplacement;
+  if (mixedPositionPreservedTUPragmas.empty()) {
+    rawReplacement =
+        sourceMapper_.SliceBSource(bMaterialBegin, bMaterialEnd).str();
+  } else {
+    SmallVector<uint64_t, 4> preservedAFrontiers;
+    preservedAFrontiers.reserve(mixedPositionPreservedTUPragmas.size());
+    for (const TUPositionPreservedPragma &pragma :
+         mixedPositionPreservedTUPragmas)
+      preservedAFrontiers.push_back(pragma.aFrontier);
+
+    std::string splitReason;
+    std::optional<SmallVector<size_t, 4>> splits =
+        deriveBPayloadSplitsAtATokenFrontiers(
+            abTokMapB2A_, abTokAnchorProofs_, preservedAFrontiers,
+            bMaterialBegin, bMaterialEnd, &splitReason);
+    if (!splits) {
+      REFOLD_LOG_TRACE(
+          "fallback",
+          "TU/include closure rejected: B payload [{0},{1}) cannot be "
+          "partitioned around {2} preserved TU pragma(s): {3}",
+          bMaterialBegin, bMaterialEnd, mixedPositionPreservedTUPragmas.size(),
+          splitReason);
+      return std::nullopt;
+    }
+
+    // A preserved directive owns its own logical line: it must begin one, and
+    // the payload after it must begin a fresh one.  When the directive opens
+    // the replacement, the line must start at the source position the
+    // replacement is spliced into.  A payload ending in a line splice would
+    // swallow the separator instead of ending the line, so that shape stays
+    // rejected rather than emitting a glued directive.
+    auto startPreservedDirectiveLine = [&](std::string &text) -> bool {
+      if (text.empty()) {
+        if (lineDirectiveStartsAtPrefix(sourceBegin))
+          return true;
+        if (!canStartLineDirectiveWithOptionalLeadingNewline(sourceBegin))
+          return false;
+        text.push_back('\n');
+        return true;
+      }
+      if (text.back() == '\n')
+        return true;
+      if (text.back() == '\\')
+        return false;
+      text.push_back('\n');
+      return true;
+    };
+
+    std::string splitTrace;
+    size_t cursor = bMaterialBegin;
+    uint64_t previousPragmaEnd = 0;
+    for (size_t index = 0; index < mixedPositionPreservedTUPragmas.size();
+         ++index) {
+      const TUPositionPreservedPragma &pragma =
+          mixedPositionPreservedTUPragmas[index];
+
+      // The preserved directives are emitted in the order they were collected,
+      // so that order must be their source order.  Gaps are proved left to
+      // right and each gap sorts its own directives, but the composition
+      // depends on the result rather than assuming it.
+      if (pragma.begin < previousPragmaEnd) {
+        REFOLD_LOG_TRACE(
+            "fallback",
+            "TU/include closure rejected: preserved TU pragma id={0} "
+            "source=[{1},{2}) is not in source order after byte {3}",
+            pragma.id, pragma.begin, pragma.end, previousPragmaEnd);
+        return std::nullopt;
+      }
+      previousPragmaEnd = pragma.end;
+
+      const size_t split = (*splits)[index];
+      StringRef leadingPayload = sourceMapper_.SliceBSource(cursor, split);
+      rawReplacement.append(leadingPayload.begin(), leadingPayload.end());
+      if (!startPreservedDirectiveLine(rawReplacement)) {
+        REFOLD_LOG_TRACE(
+            "fallback",
+            "TU/include closure rejected: preserved TU pragma id={0} cannot "
+            "start a physical line after the realized B payload",
+            pragma.id);
+        return std::nullopt;
+      }
+
+      StringRef pragmaBytes = tuBytes.slice(pragma.begin, pragma.end);
+      rawReplacement.append(pragmaBytes.begin(), pragmaBytes.end());
+      if (rawReplacement.back() != '\n')
+        rawReplacement.push_back('\n');
+
+      if (!splitTrace.empty())
+        splitTrace += ",";
+      splitTrace += std::to_string(split);
+      cursor = split;
+    }
+    StringRef trailingPayload =
+        sourceMapper_.SliceBSource(cursor, bMaterialEnd);
+    rawReplacement.append(trailingPayload.begin(), trailingPayload.end());
+
+    REFOLD_LOG_DEBUG(
+        "fallback",
+        "TU/include closure partitioned B payload [{0},{1}) around {2} "
+        "preserved TU pragma(s): splits={3} result='{4}'",
+        bMaterialBegin, bMaterialEnd, mixedPositionPreservedTUPragmas.size(),
+        splitTrace, stringutils::showWsWithClip(rawReplacement, 120));
+  }
   std::string replacement = rawReplacement;
 
   // Delete-only mixed closures may span a conditional-control tail that must

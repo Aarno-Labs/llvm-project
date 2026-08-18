@@ -591,12 +591,11 @@ void RefoldEngine::InitializeExpansionFallbackPlanner() {
   };
 
   expansionFallbackPlanner_ = std::make_unique<RefoldExpansionFallbackPlanner>(
-      model_, bSource_, aToks_, abTokHunks_, abTokMapB2A_, lineDirs_,
-      sourceMapper_, pathIdentity_, macroTopology_, lineControlProof_,
-      MacroStateProof(), *preprocessingStructureIndex_, terminalSink_,
-      lexLang_, IncludeInsertionPlanner(),
-      ProofLattice(), TheoremAudit(), lastStats_, materializedEditMappings_,
-      std::move(hooks));
+      model_, bSource_, aToks_, abTokHunks_, abTokMapB2A_, abTokAnchorProofs_,
+      lineDirs_, sourceMapper_, pathIdentity_, macroTopology_,
+      lineControlProof_, MacroStateProof(), *preprocessingStructureIndex_,
+      terminalSink_, lexLang_, IncludeInsertionPlanner(), ProofLattice(),
+      TheoremAudit(), lastStats_, materializedEditMappings_, std::move(hooks));
 }
 
 } // namespace refold

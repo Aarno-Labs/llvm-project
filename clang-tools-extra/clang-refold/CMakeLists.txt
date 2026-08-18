@@ -34,6 +34,7 @@ add_clang_tool(clang-refold
   source/RefoldSourceMapper.cpp
   source/RefoldToken.cpp
   source/RefoldTokenDiffPlanner.cpp
+  source/RefoldTokenlessSourceProjection.cpp
   source/RefoldMixedOwnerTilingPlanner.cpp
   source/RefoldPreprocessingDirectiveScanner.cpp
   source/RefoldPreprocessingStructureIndex.cpp

@@ -79,6 +79,7 @@ public:
       llvm::ArrayRef<PPTok> aToks,
       const std::vector<diffutils::Hunk> &abTokHunks,
       const std::vector<int64_t> &abTokMapB2A,
+      const std::vector<diffutils::LcsAnchorProof> &abTokAnchorProofs,
       const LineDirectiveInserter &lineDirs,
       const RefoldSourceMapper &sourceMapper, const RefoldPathIdentity &paths,
       const RefoldMacroTopology &macroTopology,
@@ -93,13 +94,14 @@ public:
       std::vector<MaterializedEditMapping> *materializedEditMappings,
       Hooks hooks)
       : model_(model), bSource_(bSource), aToks_(aToks),
-        abTokHunks_(abTokHunks), abTokMapB2A_(abTokMapB2A), lineDirs_(lineDirs),
+        abTokHunks_(abTokHunks), abTokMapB2A_(abTokMapB2A),
+        abTokAnchorProofs_(abTokAnchorProofs), lineDirs_(lineDirs),
         sourceMapper_(sourceMapper), paths_(paths),
         macroTopology_(macroTopology), lineControlProof_(lineControlProof),
         macroStateProof_(macroStateProof),
         preprocessingStructureIndex_(preprocessingStructureIndex),
-        terminalSink_(terminalSink),
-        lexLang_(lexLang), includeInsertionPlanner_(includeInsertionPlanner),
+        terminalSink_(terminalSink), lexLang_(lexLang),
+        includeInsertionPlanner_(includeInsertionPlanner),
         proofLattice_(proofLattice), theoremAuditService_(theoremAuditService),
         lastStats_(lastStats),
         materializedEditMappings_(materializedEditMappings),
@@ -127,6 +129,11 @@ private:
   llvm::ArrayRef<PPTok> aToks_;
   const std::vector<diffutils::Hunk> &abTokHunks_;
   const std::vector<int64_t> &abTokMapB2A_;
+  /// Per-A-token authority for the selected alignment anchors.  A seam proof
+  /// may rely only on `CoreOptimalPathForced` entries: a resolver-authorized
+  /// anchor is admissible under a witness that assumed one normalized edit
+  /// realization, so it cannot also authorize a different realization.
+  const std::vector<diffutils::LcsAnchorProof> &abTokAnchorProofs_;
   const LineDirectiveInserter &lineDirs_;
   const RefoldSourceMapper &sourceMapper_;
   const RefoldPathIdentity &paths_;

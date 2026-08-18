@@ -1,0 +1,6 @@
+int untouched = ((5) + 1);
+int arr[] = {
+2, 7,
+
+8, 9
+};
