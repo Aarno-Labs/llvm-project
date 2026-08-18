@@ -15,6 +15,7 @@
 
 #include "clang/Basic/LangOptions.h"
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstddef>
@@ -48,6 +49,21 @@ public:
   /// token.
   bool RawIdentifierAppearsInText(llvm::StringRef name,
                                   llvm::StringRef text) const;
+
+  /// Collect every raw identifier spelling in `text`, in first-appearance
+  /// order and without repeats.
+  ///
+  /// The predicates above answer "does `text` name *this* macro".  A proof that
+  /// must reason about macros the payload does not spell -- an identifier that
+  /// is itself a live macro can expand to a name nothing in the payload
+  /// mentions -- needs the identifier inventory instead, which is what this
+  /// returns.  The same raw-lexer rules apply, so a spelling inside a comment
+  /// or a literal is not an identifier.
+  ///
+  /// The collected spellings point into `text` and must not outlive it.
+  void CollectRawIdentifiersInText(
+      llvm::StringRef text,
+      llvm::SmallVectorImpl<llvm::StringRef> &out) const;
 
   /// Return the byte offset of the first function-like invocation of `name`.
   ///

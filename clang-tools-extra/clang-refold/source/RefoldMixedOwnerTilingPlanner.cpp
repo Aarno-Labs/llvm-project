@@ -26,6 +26,7 @@
 #include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
 #include "core/RefoldOwnerClassifier.h"
+#include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroTopology.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofLattice.h"
@@ -247,12 +248,13 @@ void logAcceptedStructuralTiling(
 struct ProtectedGapFacts {
   /// Kinds of every protected interval in the gap, in source order.
   SmallVector<PreprocessingStructureKind, 2> kinds;
-  /// Macro names bound by the `#define`/`#undef` intervals in the gap.
-  SmallVector<StringRef, 2> macroNames;
+  /// Macro definitions bound by the `#define`/`#undef` intervals in the gap,
+  /// each carrying the producer record that fixes how it is observed.
+  SmallVector<MacroStateBinding, 2> macroBindings;
   /// False when a macro-state interval in the gap had no recoverable producer
-  /// name, so `macroNames` is not the complete set and no rule may conclude
-  /// anything from a name's absence.
-  bool macroNamesComplete = true;
+  /// record, so `macroBindings` is not the complete set and no rule may
+  /// conclude anything from a name's absence.
+  bool macroBindingsComplete = true;
 };
 
 /// Return whether every protected interval preserved in one structural gap is a
@@ -321,17 +323,20 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
   // Deference is decided conservatively and only for a translation-unit gap,
   // because that is the buffer whose remaining bytes are available here:
   //
-  //   * an unrecoverable macro name reports true, since a name that cannot be
+  //   * an unrecoverable macro record reports true, since a name that cannot be
   //     read cannot be shown to be unused;
   //   * a surviving `#include` after the gap reports true, because the included
   //     text is not examined here and may name the macro -- this is what keeps
   //     a definition consumed by a later header on the planner's side;
-  //   * otherwise the name must not be spelled as an identifier anywhere after
-  //     the gap.  A spelling reached only through another macro's replacement
-  //     list is not tracked; missing one costs deference, never soundness.
+  //   * otherwise nothing after the gap may observe the directive, in that
+  //     directive's own observation mode: a bare mention of a function-like
+  //     name is not an invocation and does not reach the definition, so it does
+  //     not make the seam the planner's.  A spelling reached only through
+  //     another macro's replacement list is not tracked; missing one costs
+  //     deference, never soundness.
   auto macroStateGapBelongsToLivenessPlanner =
       [&](const OwnerSourceRange &gap, const ProtectedGapFacts &gapFacts) {
-        if (!gapFacts.macroNamesComplete || gapFacts.macroNames.empty())
+        if (!gapFacts.macroBindingsComplete || gapFacts.macroBindings.empty())
           return true;
         if (!deps_.pathIdentity.PathsEqual(gap.path, deps_.tuPath) ||
             gap.end > deps_.tuBytes.size()) {
@@ -353,15 +358,16 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
           }
         }
 
-        SmallVector<RefoldLexBoundaryToken, 64> suffixTokens;
-        refoldLexBoundaryTokens(deps_.tuBytes.drop_front(gap.end),
-                                deps_.lexLang, suffixTokens);
-        for (const RefoldLexBoundaryToken &token : suffixTokens) {
-          if (token.kind != tok::raw_identifier)
-            continue;
-          for (StringRef macroName : gapFacts.macroNames)
-            if (token.spelling == macroName)
-              return true;
+        const StringRef suffix = deps_.tuBytes.drop_front(gap.end);
+        for (const MacroStateBinding &binding : gapFacts.macroBindings) {
+          if (!binding.directive)
+            return true;
+          if (deps_.macroStateProof
+                  .FirstMacroStateObservationOffsetInText(
+                      *binding.directive, binding.name, suffix)
+                  .has_value()) {
+            return true;
+          }
         }
         return false;
       };
@@ -1557,10 +1563,11 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
               return std::nullopt;
             }
             gapFacts.kinds.push_back(interval->kind);
-            // Recover the macro name a `#define`/`#undef` in this gap binds.
-            // The name is producer-owned; a macro-state interval that cannot be
-            // resolved to one leaves the set incomplete rather than silently
-            // shorter.
+            // Recover the producer record for a `#define`/`#undef` in this gap.
+            // The record carries both the bound name and the definition's
+            // shape, which is what fixes how a payload observes it; a
+            // macro-state interval that cannot be resolved to one leaves the
+            // set incomplete rather than silently shorter.
             if (interval->kind == PreprocessingStructureKind::MacroDefine ||
                 interval->kind == PreprocessingStructureKind::MacroUndef) {
               const RefoldModel::MacroDirective *directive =
@@ -1570,9 +1577,10 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
                       ? deps_.model.GetMacroDirectiveById(*interval->modelItemId)
                       : nullptr;
               if (directive && !directive->name.empty())
-                gapFacts.macroNames.push_back(directive->name);
+                gapFacts.macroBindings.push_back(
+                    MacroStateBinding{directive->name, directive});
               else
-                gapFacts.macroNamesComplete = false;
+                gapFacts.macroBindingsComplete = false;
             }
             switch (interval->kind) {
             case PreprocessingStructureKind::ConditionalIf:
@@ -2632,10 +2640,33 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
                   classification.effect == PragmaStateEffect::MacroStateStack ||
                   classification.effect == PragmaStateEffect::PoisonIdentifiers ||
                   classification.effect == PragmaStateEffect::SystemHeader;
+              // `push_macro`/`pop_macro` change the definition bound to one
+              // macro name, which is the state a `#define` changes and the
+              // question the macro-state proof answers.  The classification
+              // records the name but nothing about either definition it swaps
+              // between, so the binding carries no directive and takes the
+              // conservative identifier-token observation mode.  Answering it
+              // here rather than inside the taxonomy is what keeps that
+              // classification a pure function of text.
+              MacroStateObservationAnswer pragmaMacroState =
+                  MacroStateObservationAnswer::Unproven;
+              if (classification.effect ==
+                      PragmaStateEffect::MacroStateStack &&
+                  payloadBytesUsable) {
+                SmallVector<MacroStateBinding, 2> pushedBindings;
+                for (StringRef pushedName : classification.namedIdentifiers)
+                  pushedBindings.push_back(
+                      MacroStateBinding{pushedName, nullptr});
+                pragmaMacroState =
+                    deps_.macroStateProof.PayloadObservesMacroStateBindings(
+                        pushedBindings, payload)
+                        ? MacroStateObservationAnswer::Observed
+                        : MacroStateObservationAnswer::Unobserved;
+              }
               const bool insensitiveToPragma =
                   pragmaIsConsumed && payloadBytesUsable &&
                   !payloadObservesPragmaState(classification, payload,
-                                              deps_.lexLang);
+                                              deps_.lexLang, pragmaMacroState);
 
               // `#define` and `#undef` are consumed exactly as those pragmas
               // are, and the state they change -- the definition bound to one
@@ -2644,14 +2675,20 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
               // question is answered without reading source bytes and stays
               // correct for a gap inside an included header.
               //
+              // Which identifiers reach the definition is the macro-state
+              // proof's question, not this planner's: the payload observes the
+              // gap when it spells a bound name in that binding's own
+              // observation mode, or when it names any identifier a recorded
+              // `#define` binds, since such an identifier can expand to a bound
+              // name it never spells.
+              //
               // The obligation is deliberately wider than the ambiguous
               // payload.  Committing a side is decided by `[lower,upper)`
               // alone, because every token outside that range has a forced
               // alignment and keeps the side it already had.  Everything from
               // the committed boundary to the end of the hunk nevertheless
-              // lands after the directive, so requiring that whole suffix to
-              // name no identifier keeps B payload that mentions the macro out
-              // of this path entirely.  It subsumes the placement obligation.
+              // lands after the directive, so asking the question of that whole
+              // suffix subsumes the placement obligation.
               std::optional<std::pair<uint64_t, uint64_t>> committedSuffixBytes =
                   deps_.sourceMapper.BTokenRangeToByteRange(
                       projection->lowerBTokenBoundary, h.bEnd);
@@ -2663,11 +2700,12 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
                   physicalSourceRuns->protectedGapFacts[runIndex];
               const bool insensitiveToMacroDirectives =
                   gapPreservesOnlyMacroStateDirectives(gapFacts.kinds) &&
-                  payloadBytesUsable && committedSuffixUsable &&
-                  !payloadObservesMacroDefinitionState(
+                  gapFacts.macroBindingsComplete && payloadBytesUsable &&
+                  committedSuffixUsable &&
+                  !deps_.macroStateProof.PayloadObservesMacroStateBindings(
+                      gapFacts.macroBindings,
                       deps_.bSource.slice(committedSuffixBytes->first,
-                                          committedSuffixBytes->second),
-                      deps_.lexLang) &&
+                                          committedSuffixBytes->second)) &&
                   !macroStateGapBelongsToLivenessPlanner(gap, gapFacts);
 
               if (insensitiveToPragma || insensitiveToMacroDirectives) {

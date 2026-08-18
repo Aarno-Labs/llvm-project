@@ -208,7 +208,8 @@ bool pragmaOperandNamesOnce(StringRef operandText) {
 }
 
 bool payloadObservesPragmaState(const PragmaClassification &classification,
-                                StringRef payload, const LangOptions &lang) {
+                                StringRef payload, const LangOptions &lang,
+                                MacroStateObservationAnswer macroState) {
   switch (classification.effect) {
   case PragmaStateEffect::Unknown:
     return true;
@@ -220,9 +221,21 @@ bool payloadObservesPragmaState(const PragmaClassification &classification,
     // no payload placement can observe them.
     return false;
 
+  case PragmaStateEffect::MacroStateStack:
+    // A caller holding the producer's macro records answers this one; only
+    // without such a proof does the any-identifier scan below decide it.
+    switch (macroState) {
+    case MacroStateObservationAnswer::Unobserved:
+      return false;
+    case MacroStateObservationAnswer::Observed:
+      return true;
+    case MacroStateObservationAnswer::Unproven:
+      break;
+    }
+    break;
+
   case PragmaStateEffect::IncludeOnce:
   case PragmaStateEffect::PoisonIdentifiers:
-  case PragmaStateEffect::MacroStateStack:
     break;
   }
 
@@ -244,8 +257,8 @@ bool payloadObservesPragmaState(const PragmaClassification &classification,
       continue;
 
     // A saved or restored macro definition can change how any identifier
-    // expands, and proving otherwise needs macro-liveness facts this
-    // classification does not carry.  Treat every identifier as observing.
+    // expands.  Reaching here means no caller proved otherwise, so treat every
+    // identifier as observing.
     if (classification.effect == PragmaStateEffect::MacroStateStack)
       return true;
 
@@ -254,18 +267,6 @@ bool payloadObservesPragmaState(const PragmaClassification &classification,
         return true;
   }
   return false;
-}
-
-bool payloadObservesMacroDefinitionState(StringRef payload,
-                                         const LangOptions &lang) {
-  // Delegate rather than repeat the identifier scan.  `MacroStateStack` is the
-  // effect kind for "the definition bound to one macro name changed", which is
-  // what a `#define` or `#undef` does; asking the same predicate keeps one
-  // answer for one state kind.
-  PragmaClassification macroDefinitionState;
-  macroDefinitionState.effect = PragmaStateEffect::MacroStateStack;
-  macroDefinitionState.binding = PragmaConstructBinding::NonBinding;
-  return payloadObservesPragmaState(macroDefinitionState, payload, lang);
 }
 
 StringRef toString(PragmaStateEffect effect) {

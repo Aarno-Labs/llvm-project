@@ -121,6 +121,28 @@ PragmaClassification classifyPragmaDirective(llvm::StringRef directiveText);
 /// `classifyPragmaDirective` keeps one definition of what counts as once-state.
 bool pragmaOperandNamesOnce(llvm::StringRef operandText);
 
+/// A caller's proof about the macro definitions a classification binds.
+///
+/// `payloadObservesPragmaState` cannot answer that question.  Deciding whether
+/// re-preprocessing a payload can observe a change to one macro's definition
+/// needs the producer's macro records -- which identifiers are bound anywhere
+/// in the run, and in what shape -- and this classification is deliberately a
+/// pure function of text.  Handing it the proof *service* would end that; so a
+/// caller holding `RefoldMacroStateProof` answers the question itself and
+/// passes the verdict here as a fact.
+///
+/// Every caller without such a proof leaves this `Unproven`, which keeps the
+/// historical rule: a `MacroStateStack` payload containing any identifier is
+/// observing.
+enum class MacroStateObservationAnswer : uint8_t {
+  /// Not answered; `MacroStateStack` falls back to the any-identifier rule.
+  Unproven,
+  /// Proven that re-preprocessing the payload cannot observe the change.
+  Unobserved,
+  /// The caller's proof reports the change observable.
+  Observed,
+};
+
 /// Return whether re-preprocessing `payload` on the other side of this pragma
 /// could observe the state it changes.
 ///
@@ -138,31 +160,17 @@ bool pragmaOperandNamesOnce(llvm::StringRef operandText);
 ///     so a payload containing no directive-introducing token is unaffected.
 ///   * `PoisonIdentifiers` is observed by a payload naming a poisoned
 ///     identifier.
-///   * `MacroStateStack` is observed by any payload containing an identifier,
-///     because deciding otherwise needs macro-liveness analysis this
-///     classification deliberately does not perform.
-bool payloadObservesPragmaState(const PragmaClassification &classification,
-                                llvm::StringRef payload,
-                                const LangOptions &lang);
-
-/// Return whether re-preprocessing `payload` could observe the macro-definition
-/// state a `#define` or `#undef` directive changes.
+///   * `MacroStateStack` is answered by `macroState` when the caller proved it,
+///     and otherwise by the fail-closed rule that any payload containing an
+///     identifier observes.
 ///
-/// A macro directive is not a pragma, but it changes exactly the state
-/// `push_macro`/`pop_macro` change -- the definition bound to one macro name --
-/// so this is the `MacroStateStack` question asked of a directive that carries
-/// no pragma spelling.  Answering it here rather than at the call site is what
-/// keeps the two from drifting apart: a payload naming no identifier at all is
-/// the only thing either can currently prove, and a later refinement backed by
-/// the macro-liveness facts `RefoldMacroStateProof` already holds should
-/// improve both at once.
-///
-/// `true` is the fail-closed answer.  It does not depend on the directive's
-/// name or replacement list, because a payload can reach a definition through
-/// another macro that expands to it, which no comparison against the directive's
-/// own spelling would catch.
-bool payloadObservesMacroDefinitionState(llvm::StringRef payload,
-                                         const LangOptions &lang);
+/// `macroState` applies only to `MacroStateStack`.  It is ignored for every
+/// other effect, whose observation is a property of the payload's own text.
+bool payloadObservesPragmaState(
+    const PragmaClassification &classification, llvm::StringRef payload,
+    const LangOptions &lang,
+    MacroStateObservationAnswer macroState =
+        MacroStateObservationAnswer::Unproven);
 
 /// Return a stable diagnostic spelling for a state effect.
 llvm::StringRef toString(PragmaStateEffect effect);

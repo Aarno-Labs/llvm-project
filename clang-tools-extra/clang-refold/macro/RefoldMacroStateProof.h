@@ -48,6 +48,19 @@ enum class MacroStateObservationKind {
   FunctionLikeInvocation,
 };
 
+/// One macro name whose binding a preserved directive changes.
+///
+/// A `#define`/`#undef` carries its producer record in `directive`, which fixes
+/// the observation mode exactly: an object-like definition is observed by the
+/// bare name, a function-like one only by NAME followed by `(`.  A
+/// `#pragma push_macro("M")` or `pop_macro("M")` names a macro without
+/// recording the shape of either definition it swaps between, so it leaves
+/// `directive` null and takes the conservative identifier-token mode.
+struct MacroStateBinding {
+  llvm::StringRef name;
+  const RefoldModel::MacroDirective *directive = nullptr;
+};
+
 /// Exact source-line interval for a producer-recorded macro-state directive.
 ///
 /// MacroDirective::siteB is anchored at the macro name, not necessarily at the
@@ -160,6 +173,36 @@ public:
   bool ReplacementObservesMacroStateDirective(
       const RefoldModel::MacroDirective &directive, llvm::StringRef replacement,
       bool unprovenObserves) const;
+
+  /// True iff re-preprocessing \p payload could observe a change to the macro
+  /// definitions \p bindings bind.
+  ///
+  /// This is the placement question for material whose side of a preserved
+  /// macro-state directive the alignment does not fix: when the answer is
+  /// false, both sides re-preprocess to the same tokens and either is a
+  /// realization of the same edit.
+  ///
+  /// Two obligations are discharged, and neither alone is enough.
+  ///
+  /// * The payload must not observe any bound name directly, decided per
+  ///   binding in that binding's own observation mode.  A binding whose record
+  ///   decided that by function-likeness additionally requires every recorded
+  ///   `#define` for the name to agree on the shape, since otherwise the mode
+  ///   depends on which definition is live -- which is what crossing the
+  ///   directive changes.
+  /// * No identifier in the payload may *expand* to a bound name.  A payload
+  ///   identifier that is itself a live macro does not stand for itself, and
+  ///   its replacement list can name a bound macro the payload never spells, so
+  ///   the transitive closure over recorded replacement lists must reach none
+  ///   of them.  The producer records every `#define` the preprocessor saw, so
+  ///   an identifier absent from that index cannot be live.
+  ///
+  /// An empty binding list reports observed: a placement question is asked only
+  /// because something was preserved, so no bindings means the names were never
+  /// recovered rather than that nothing is bound.
+  bool PayloadObservesMacroStateBindings(
+      llvm::ArrayRef<MacroStateBinding> bindings,
+      llvm::StringRef payload) const;
 
   /// Return whether \p directive defines an object-like macro whose whole
   /// replacement list is its own name, as in `#define stderr stderr`.

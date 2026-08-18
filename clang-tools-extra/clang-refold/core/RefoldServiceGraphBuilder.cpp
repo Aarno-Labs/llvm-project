@@ -172,6 +172,8 @@ void RefoldEngine::InitializeTokenDiffPlanner() {
 void RefoldEngine::InitializeMixedOwnerTilingPlanner() {
   assert(preprocessingStructureIndexProvider_ &&
          "structure-index provider must precede structural tiling");
+  assert(macroStateProof_ &&
+         "macro-state proof must precede structural tiling");
 
   // Structural tiling borrows the owner/proof services and exact preprocessing
   // census needed to prove deterministic token-hunk partitions.  The planner
@@ -182,7 +184,7 @@ void RefoldEngine::InitializeMixedOwnerTilingPlanner() {
   mixedOwnerTilingPlanner_ = std::make_unique<RefoldMixedOwnerTilingPlanner>(
       RefoldMixedOwnerTilingPlanner::Dependencies{
           model_, model_.GetSourcePath(), pathIdentity_, macroTopology_,
-          sourceMapper_, tuSourceBytes_, bSource_, lexLang_,
+          MacroStateProof(), sourceMapper_, tuSourceBytes_, bSource_, lexLang_,
           OwnerClassifier(), OwnerStateProof(),
           *preprocessingStructureIndexProvider_, abTokHunks_,
           mixedOwnerTilingWitnesses_, mixedOwnerTilingSegmentBindings_});

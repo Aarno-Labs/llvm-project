@@ -156,16 +156,45 @@ TEST(RefoldPragmaTaxonomy, OnceIsObservedOnlyByDirectiveCapablePayload) {
   EXPECT_TRUE(payloadObservesPragmaState(once, "#include \"h.h\"", lang));
 }
 
-TEST(RefoldPragmaTaxonomy, MacroStateIsObservedByAnyIdentifier) {
+TEST(RefoldPragmaTaxonomy, MacroStateIsObservedByAnyIdentifierWithoutAProof) {
   const LangOptions lang = cLangOptions();
   const PragmaClassification push =
       classifyPragmaDirective("#pragma push_macro(\"M\")\n");
 
   // Deliberately conservative: deciding that some other identifier is
-  // unaffected needs macro-liveness facts this classification does not carry.
+  // unaffected needs macro-liveness facts this classification does not carry,
+  // and an unproven answer keeps the any-identifier rule.
   EXPECT_FALSE(payloadObservesPragmaState(push, "1 + 2", lang));
   EXPECT_TRUE(payloadObservesPragmaState(push, "M", lang));
   EXPECT_TRUE(payloadObservesPragmaState(push, "unrelated", lang));
+}
+
+TEST(RefoldPragmaTaxonomy, MacroStateDefersToACallerSuppliedProof) {
+  const LangOptions lang = cLangOptions();
+  const PragmaClassification push =
+      classifyPragmaDirective("#pragma push_macro(\"M\")\n");
+
+  // A caller holding the producer's macro records answers this effect itself;
+  // the classification stops guessing in both directions.
+  EXPECT_FALSE(payloadObservesPragmaState(
+      push, "unrelated", lang, MacroStateObservationAnswer::Unobserved));
+  EXPECT_TRUE(payloadObservesPragmaState(
+      push, "1 + 2", lang, MacroStateObservationAnswer::Observed));
+}
+
+TEST(RefoldPragmaTaxonomy, MacroStateProofDoesNotReachOtherEffects) {
+  const LangOptions lang = cLangOptions();
+  const PragmaClassification poison =
+      classifyPragmaDirective("#pragma GCC poison FOO\n");
+  const PragmaClassification unknown =
+      classifyPragmaDirective("#pragma omp parallel for\n");
+
+  // The answer names one state kind.  Supplying it must not relax an effect
+  // whose observation is a property of the payload's own text.
+  EXPECT_TRUE(payloadObservesPragmaState(
+      poison, "FOO", lang, MacroStateObservationAnswer::Unobserved));
+  EXPECT_TRUE(payloadObservesPragmaState(
+      unknown, "1", lang, MacroStateObservationAnswer::Unobserved));
 }
 
 TEST(RefoldPragmaTaxonomy, UnknownObservesEverything) {

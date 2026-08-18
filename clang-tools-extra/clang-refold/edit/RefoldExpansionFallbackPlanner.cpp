@@ -97,48 +97,54 @@ struct PreservedDirectiveFrontier {
   /// contributes one; a preserved `#include` contributes one per pragma its
   /// header owns, because re-entering the header re-runs all of them.
   SmallVector<PragmaClassification, 2> classifications;
-  /// Macro names a preserved `#define`/`#undef` binds.  A payload naming one
-  /// preprocesses differently on either side of the directive, so the name is
-  /// what a straddling zone would observe by crossing it.
-  SmallVector<StringRef, 2> boundMacroNames;
+  /// Macro definitions a preserved `#define`/`#undef` binds.  A payload that
+  /// can observe one preprocesses differently on either side of the directive,
+  /// so the binding is what a straddling zone would observe by crossing it.
+  SmallVector<MacroStateBinding, 2> macroBindings;
 };
 
-/// Return whether `payload` names a macro a preserved directive binds.
+/// Return the macro-state observation answer for the names a `push_macro` or
+/// `pop_macro` classification binds.
 ///
-/// A preserved `#define`/`#undef` changes what an identifier means across it,
-/// so a straddling zone naming that identifier preprocesses differently on
-/// either side. The name is recovered from the producer's directive record
-/// rather than by scanning the directive's text, and the raw lexer decides what
-/// an identifier is, so a spelling inside a literal or comment is not counted.
-bool payloadNamesBoundMacro(ArrayRef<StringRef> boundMacroNames,
-                            StringRef payload, const LangOptions &lang) {
-  if (boundMacroNames.empty())
-    return false;
+/// `push_macro`/`pop_macro` change the definition bound to one macro name --
+/// exactly the state a `#define` changes -- so the same proof answers both.
+/// The classification records the name but nothing about either definition it
+/// swaps between, so the binding carries no producer record and takes the
+/// conservative identifier-token observation mode.  Anything but
+/// `MacroStateStack` leaves the answer unproven, which the taxonomy ignores.
+MacroStateObservationAnswer macroStateStackObservation(
+    const RefoldMacroStateProof &macroStateProof,
+    const PragmaClassification &classification, StringRef payload) {
+  if (classification.effect != PragmaStateEffect::MacroStateStack)
+    return MacroStateObservationAnswer::Unproven;
 
-  SmallVector<RefoldLexBoundaryToken, 32> tokens;
-  refoldLexBoundaryTokens(payload, lang, tokens);
-  for (const RefoldLexBoundaryToken &token : tokens) {
-    if (token.kind != tok::raw_identifier)
-      continue;
-    for (StringRef bound : boundMacroNames)
-      if (token.spelling == bound)
-        return true;
-  }
-  return false;
+  SmallVector<MacroStateBinding, 2> bindings;
+  for (StringRef name : classification.namedIdentifiers)
+    bindings.push_back(MacroStateBinding{name, nullptr});
+  return macroStateProof.PayloadObservesMacroStateBindings(bindings, payload)
+             ? MacroStateObservationAnswer::Observed
+             : MacroStateObservationAnswer::Unobserved;
 }
 
 /// Return whether `payload` can observe any state the preserved directive
 /// establishes.  An unclassified effect observes everything, so a directive
 /// with no recorded classification is never insensitive.
 bool payloadObservesPreservedDirectiveState(
+    const RefoldMacroStateProof &macroStateProof,
     const PreservedDirectiveFrontier &frontier, StringRef payload,
     const LangOptions &lang) {
-  if (frontier.classifications.empty() && frontier.boundMacroNames.empty())
+  if (frontier.classifications.empty() && frontier.macroBindings.empty())
     return true;
   for (const PragmaClassification &classification : frontier.classifications)
-    if (payloadObservesPragmaState(classification, payload, lang))
+    if (payloadObservesPragmaState(
+            classification, payload, lang,
+            macroStateStackObservation(macroStateProof, classification,
+                                       payload)))
       return true;
-  return payloadNamesBoundMacro(frontier.boundMacroNames, payload, lang);
+  if (frontier.macroBindings.empty())
+    return false;
+  return macroStateProof.PayloadObservesMacroStateBindings(
+      frontier.macroBindings, payload);
 }
 
 /// Which side of a preserved directive an observing zone may be realized on.
@@ -217,10 +223,11 @@ ObservingZonePlacement placementForObservedEffect(PragmaStateEffect effect) {
 }
 
 ObservingZonePlacement observingZonePlacement(
+    const RefoldMacroStateProof &macroStateProof,
     const PreservedDirectiveFrontier &frontier, StringRef zone,
     const LangOptions &lang) {
   // An unclassified frontier observes everything and proves nothing.
-  if (frontier.classifications.empty() && frontier.boundMacroNames.empty())
+  if (frontier.classifications.empty() && frontier.macroBindings.empty())
     return ObservingZonePlacement::Undetermined;
 
   // A zone naming a macro the preserved directive binds is legal on both sides
@@ -230,8 +237,11 @@ ObservingZonePlacement observingZonePlacement(
   // an `#undef` would force it after, for the same reason read the other way.
   // Deciding that needs the definition's liveness at the split, which this
   // frontier does not carry, so it stays undetermined.
-  if (payloadNamesBoundMacro(frontier.boundMacroNames, zone, lang))
+  if (!frontier.macroBindings.empty() &&
+      macroStateProof.PayloadObservesMacroStateBindings(frontier.macroBindings,
+                                                        zone)) {
     return ObservingZonePlacement::Undetermined;
+  }
 
   // A preserved `#include` contributes one effect per pragma its header owns,
   // so several may be observed at once. Every observed effect must admit the
@@ -239,7 +249,9 @@ ObservingZonePlacement observingZonePlacement(
   // at all, which is the undetermined answer rather than a preference.
   std::optional<ObservingZonePlacement> agreed;
   for (const PragmaClassification &classification : frontier.classifications) {
-    if (!payloadObservesPragmaState(classification, zone, lang))
+    if (!payloadObservesPragmaState(
+            classification, zone, lang,
+            macroStateStackObservation(macroStateProof, classification, zone)))
       continue;
 
     const ObservingZonePlacement placement =
@@ -290,6 +302,7 @@ ObservingZonePlacement observingZonePlacement(
 ///
 /// Splits are returned in `frontiers` order and are non-decreasing.
 std::optional<SmallVector<size_t, 4>> deriveBPayloadSplitsAtATokenFrontiers(
+    const RefoldMacroStateProof &macroStateProof,
     ArrayRef<int64_t> abTokMapB2A,
     ArrayRef<diffutils::LcsAnchorProof> abTokAnchorProofs,
     ArrayRef<PreservedDirectiveFrontier> frontiers, size_t bMaterialBegin,
@@ -372,11 +385,12 @@ std::optional<SmallVector<size_t, 4>> deriveBPayloadSplitsAtATokenFrontiers(
 
     if (zoneBegin < split) {
       const StringRef zone = sliceBSource(zoneBegin, split);
-      if (payloadObservesPreservedDirectiveState(frontier, zone, lang)) {
+      if (payloadObservesPreservedDirectiveState(macroStateProof, frontier,
+                                                 zone, lang)) {
         // Observing is not the same as ambiguous. An observed effect can leave
         // exactly one admissible side, in which case the zone is placed by
         // proof rather than by preference.
-        if (observingZonePlacement(frontier, zone, lang) !=
+        if (observingZonePlacement(macroStateProof, frontier, zone, lang) !=
             ObservingZonePlacement::ForcedBefore) {
           return refuse(
               llvm::formatv("edited B material [{0},{1}) has no determined side "
@@ -1952,9 +1966,9 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     /// material the alignment cannot place.  StringRefs point into `tuBytes`
     /// for a pragma, or into the model's pragma text for an include.
     SmallVector<PragmaClassification, 2> classifications;
-    /// Macro names a preserved `#define`/`#undef` binds.  Empty for the other
-    /// kinds.  StringRefs point into the model's directive record.
-    SmallVector<StringRef, 2> boundMacroNames;
+    /// Macro definitions a preserved `#define`/`#undef` binds.  Empty for the
+    /// other kinds.  Each binding points into the model's directive record.
+    SmallVector<MacroStateBinding, 2> macroBindings;
   };
 
   // Producer coordinate surfaces for projecting a tokenless TU directive onto
@@ -2069,14 +2083,14 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (exactRange->first < gapBegin || gapEnd < exactRange->second)
         continue;
 
-      SmallVector<StringRef, 2> boundMacroNames;
+      SmallVector<MacroStateBinding, 2> macroBindings;
       if (!directive.name.empty())
-        boundMacroNames.push_back(directive.name);
+        macroBindings.push_back(MacroStateBinding{directive.name, &directive});
 
       pragmas.push_back({TUPositionPreservedDirective::Kind::MacroDirective,
                          exactRange->first, exactRange->second, directive.id,
                          /*aFrontier=*/0,
-                         /*classifications=*/{}, std::move(boundMacroNames)});
+                         /*classifications=*/{}, std::move(macroBindings)});
     }
 
     // A zero-token include whose header owns non-consumable state is the same
@@ -3178,12 +3192,13 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     for (const TUPositionPreservedDirective &pragma :
          mixedPositionPreservedTUDirectives)
       preservedFrontiers.push_back(
-          {pragma.aFrontier, pragma.classifications, pragma.boundMacroNames});
+          {pragma.aFrontier, pragma.classifications, pragma.macroBindings});
 
     std::string splitReason;
     std::optional<SmallVector<size_t, 4>> splits =
         deriveBPayloadSplitsAtATokenFrontiers(
-            abTokMapB2A_, abTokAnchorProofs_, preservedFrontiers,
+            macroStateProof_, abTokMapB2A_, abTokAnchorProofs_,
+            preservedFrontiers,
             bMaterialBegin, bMaterialEnd,
             [&](size_t begin, size_t end) {
               return sourceMapper_.SliceBSource(begin, end);

@@ -13,6 +13,8 @@
 #include "clang/Basic/TokenKinds.h"
 #include "clang/Lex/Lexer.h"
 
+#include "llvm/ADT/STLExtras.h"
+
 #include <string>
 
 using namespace llvm;
@@ -109,6 +111,47 @@ RefoldTokenTextAnalysis::FirstRawIdentifierObservationOffsetInText(
 bool RefoldTokenTextAnalysis::RawIdentifierAppearsInText(StringRef name,
                                                          StringRef text) const {
   return FirstRawIdentifierObservationOffsetInText(name, text).has_value();
+}
+
+void RefoldTokenTextAnalysis::CollectRawIdentifiersInText(
+    StringRef text, SmallVectorImpl<StringRef> &out) const {
+  out.clear();
+  if (text.empty())
+    return;
+
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string lexBuf = text.str();
+  lexBuf.push_back('\0');
+
+  const char *bufStart = lexBuf.data();
+  const char *bufEnd = bufStart + text.size();
+  Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+  lexer.SetCommentRetentionState(true);
+
+  Token token;
+  while (true) {
+    lexer.LexFromRawLexer(token);
+    if (token.is(tok::eof))
+      return;
+
+    // Comments are retained so the raw lexer steps over them explicitly; an
+    // identifier spelled inside one is not a preprocessing token.
+    if (token.is(tok::comment))
+      continue;
+    if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
+      continue;
+
+    const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
+    const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+    if (localEnd < localBegin || localEnd > text.size())
+      continue;
+
+    // The spelling is taken from `text`, not from the scratch copy, so the
+    // returned references stay valid for the caller's buffer.
+    const StringRef spelling = text.slice(localBegin, localEnd);
+    if (!llvm::is_contained(out, spelling))
+      out.push_back(spelling);
+  }
 }
 
 std::optional<size_t>

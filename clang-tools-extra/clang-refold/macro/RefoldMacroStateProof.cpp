@@ -84,6 +84,153 @@ bool RefoldMacroStateProof::ReplacementObservesMacroStateDirective(
       .has_value();
 }
 
+/// Return whether every recorded `#define` for `name` agrees on
+/// function-likeness.
+///
+/// The observation mode for a name is a property of the definition live at the
+/// replay position, not of the one directive being crossed.  When two recorded
+/// definitions disagree, a bare NAME observes one and not the other, so
+/// crossing a directive that selects between them is itself observable and the
+/// shape-exact rule cannot decide the name.
+static bool recordedDefinitionsAgreeOnShape(const RefoldModel &model,
+                                            StringRef name, bool functionLike) {
+  for (const RefoldModel::MacroDirective *directive :
+       model.GetMacroDirectivesByName(name)) {
+    if (!directive)
+      return false;
+    if (directive->subkind != "#define")
+      continue;
+    if (directive->functionLike != functionLike)
+      return false;
+  }
+  return true;
+}
+
+/// Return whether a replacement-list token can synthesize a name no replacement
+/// list spells.
+///
+/// `#` and `##` build their result from operand text at expansion time, so a
+/// walk over recorded spellings cannot see what comes out.  Both digraph
+/// spellings are included because the producer records the token as written.
+static bool replacementTokenCanSynthesizeName(StringRef spelling) {
+  return spelling == "#" || spelling == "##" || spelling == "%:" ||
+         spelling == "%:%:";
+}
+
+/// Return whether expanding a macro named `start` can produce a token spelling
+/// one of `boundNames`.
+///
+/// A payload identifier that is itself a live macro does not stand for itself:
+/// it expands to its replacement list, whose identifiers may be live in turn.
+/// Nothing short of the transitive closure over the producer's recorded
+/// replacement lists answers whether a bound definition is reached, and reached
+/// is what makes the payload's side of the directive observable.
+///
+/// `start` itself is not tested against `boundNames`; spelling a bound name is
+/// the direct observation the caller decides in that binding's own mode.  This
+/// answers only what expanding the spelling can additionally produce.
+///
+/// `ParamRef` tokens stand for argument text rather than for a name of their
+/// own.  Arguments are spelled in the payload, so the caller's identifier
+/// inventory already seeds a walk from each of them, and following the
+/// parameter here would add nothing.
+///
+/// A `#`/`##` operand reports reachable: it can build a bound name out of
+/// pieces, and no recorded spelling shows the result.
+static bool macroExpansionCanReachBoundName(const RefoldModel &model,
+                                            StringRef start,
+                                            ArrayRef<StringRef> boundNames) {
+  SmallVector<StringRef, 8> worklist;
+  SmallVector<StringRef, 16> visited;
+  worklist.push_back(start);
+  visited.push_back(start);
+
+  while (!worklist.empty()) {
+    const StringRef name = worklist.pop_back_val();
+    for (const RefoldModel::MacroDirective *directive :
+         model.GetMacroDirectivesByName(name)) {
+      if (!directive)
+        return true;
+      if (directive->subkind != "#define")
+        continue;
+
+      for (const RefoldModel::MacroReplacementToken &token :
+           directive->replacementTokens) {
+        if (token.kind != RefoldModel::MacroReplacementTokenKind::Literal)
+          continue;
+        if (replacementTokenCanSynthesizeName(token.spelling))
+          return true;
+        if (token.spelling.empty() ||
+            !stringutils::isIdentStart(token.spelling.front())) {
+          continue;
+        }
+        if (llvm::is_contained(boundNames, token.spelling))
+          return true;
+        if (!llvm::is_contained(visited, token.spelling)) {
+          visited.push_back(token.spelling);
+          worklist.push_back(token.spelling);
+        }
+      }
+    }
+  }
+  return false;
+}
+
+bool RefoldMacroStateProof::PayloadObservesMacroStateBindings(
+    ArrayRef<MacroStateBinding> bindings, StringRef payload) const {
+  // A placement question is asked only because a directive was preserved, so an
+  // empty list means the bindings were never recovered.
+  if (bindings.empty())
+    return true;
+  if (payload.empty())
+    return false;
+
+  SmallVector<StringRef, 2> boundNames;
+  for (const MacroStateBinding &binding : bindings) {
+    if (binding.name.empty())
+      return true;
+    boundNames.push_back(binding.name);
+
+    if (!binding.directive) {
+      // No record of the definition's shape, so the conservative
+      // identifier-token observation is the only one available.
+      if (tokenText_.RawIdentifierAppearsInText(binding.name, payload))
+        return true;
+      continue;
+    }
+
+    if (FirstMacroStateObservationOffsetInText(*binding.directive, binding.name,
+                                               payload)
+            .has_value()) {
+      return true;
+    }
+    // The shape-exact rule just cleared a spelling of this name.  It may do so
+    // only when every recorded definition agrees on the mode it decided by.
+    if (tokenText_.RawIdentifierAppearsInText(binding.name, payload) &&
+        !recordedDefinitionsAgreeOnShape(model_, binding.name,
+                                         binding.directive->functionLike)) {
+      return true;
+    }
+  }
+
+  // Reachability.  The producer records every `#define` the preprocessor saw,
+  // so an identifier no record binds cannot be live and stands for itself; one
+  // that is bound expands, and its expansion may name a bound macro the payload
+  // never spells.
+  SmallVector<StringRef, 16> identifiers;
+  tokenText_.CollectRawIdentifiersInText(payload, identifiers);
+  for (StringRef identifier : identifiers) {
+    if (macroExpansionCanReachBoundName(model_, identifier, boundNames)) {
+      REFOLD_LOG_TRACE("macro/state",
+                       "payload identifier '{0}' expands to a preserved "
+                       "macro-state binding it does not spell",
+                       identifier);
+      return true;
+    }
+  }
+  return false;
+}
+
 bool RefoldMacroStateProof::MacroDefinitionIsSelfReferentialIdentity(
     const RefoldModel::MacroDirective &directive) const {
   if (directive.subkind != "#define" || directive.name.empty())

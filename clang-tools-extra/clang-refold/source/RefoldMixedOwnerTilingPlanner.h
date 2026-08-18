@@ -31,6 +31,7 @@
 namespace clang {
 namespace refold {
 
+class RefoldMacroStateProof;
 class RefoldMacroTopology;
 class RefoldModel;
 class RefoldOwnerClassifier;
@@ -83,6 +84,11 @@ public:
     const RefoldPathIdentity &pathIdentity;
     /// Macro topology service for macro-owned segment classification.
     const RefoldMacroTopology &macroTopology;
+    /// Macro-state proof service.  A preserved `#define`/`#undef` or
+    /// `push_macro`/`pop_macro` between two source runs makes the side of the
+    /// undetermined payload a macro-observation question, which only the
+    /// producer's macro records can answer.
+    const RefoldMacroStateProof &macroStateProof;
     /// Source mapper for A/B token and physical source-byte projection.
     RefoldSourceMapper &sourceMapper;
     /// Original translation-unit source bytes, used to read the exact spelling
