@@ -155,6 +155,13 @@ public:
       RefoldRecorder->onPragma(Loc, StringRef());
   }
 
+  void recordPragmaOperator(SourceLocation Loc, StringRef Content) {
+    // A `_Pragma` consumed by its handler emits no tokens and never reaches the
+    // pragma-printing path below, so this is its only recording opportunity.
+    if (RefoldRecorder)
+      RefoldRecorder->onPragmaOperator(Loc, Content);
+  }
+
   /// Ensure that the output stream position is at the beginning of a new line
   /// and inserts one if it does not. It is intended to ensure that directives
   /// inserted by the directives not from the input source (such as #line) are
@@ -178,6 +185,7 @@ public:
   void Ident(SourceLocation Loc, StringRef str) override;
   void PragmaDirective(SourceLocation Loc,
                        PragmaIntroducerKind Introducer) override;
+  void PragmaOperatorDirective(SourceLocation Loc, StringRef Content) override;
   void PragmaMessage(SourceLocation Loc, StringRef Namespace,
                      PragmaMessageKind Kind, StringRef Str) override;
   void PragmaDebug(SourceLocation Loc, StringRef DebugType) override;
@@ -588,6 +596,21 @@ void PrintPPOutputPPCallbacks::PragmaDirective(
   // Recording the source line gives the refold consumer a conservative
   // structural marker for otherwise tokenless pragma state inside include gaps.
   recordPragma(Loc);
+}
+
+void PrintPPOutputPPCallbacks::PragmaOperatorDirective(SourceLocation Loc,
+                                                       StringRef Content) {
+  // `_Pragma` spellings that are passed through to the output are already
+  // recorded by the pragma-printing path, and those that have a dedicated
+  // callback (`message`, `diagnostic`, ...) are recorded there. Neither covers
+  // a pragma the preprocessor consumes -- `once`, `push_macro`, `pop_macro`,
+  // `GCC poison`, `GCC system_header` -- which produces no tokens and is
+  // therefore invisible in the recorded stream unless captured here.
+  //
+  // Recording every operator spelling and letting the later, richer callback
+  // replace the text keeps one structural marker per physical pragma line
+  // without having to predict which handler will consume this pragma.
+  recordPragmaOperator(Loc, Content);
 }
 
 /// MacroDefined - This hook is called whenever a macro definition is seen.

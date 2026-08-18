@@ -230,6 +230,22 @@ public:
                                PragmaIntroducerKind Introducer) {
   }
 
+  /// Callback invoked for a `_Pragma("...")` operator after its string operand
+  /// has been destringized and immediately before the pragma handlers run.
+  ///
+  /// The generic PragmaDirective hook reports only a location and an introducer
+  /// kind, so it cannot carry the operator's content, and a pragma consumed by
+  /// its handler (`once`, `push_macro`, `GCC poison`, `GCC system_header`) never
+  /// reaches the printing path that reconstructs a `#pragma` spelling for
+  /// passed-through pragmas.  This is therefore the only point at which an
+  /// operator-spelled *consumed* pragma is observable at all.
+  ///
+  /// \param Loc The location of the `_Pragma` token itself.  This is a macro
+  ///        location when the operator came from an expansion.
+  /// \param Content The destringized directive content, without the `#pragma`
+  ///        introducer and without a trailing newline.
+  virtual void PragmaOperatorDirective(SourceLocation Loc, StringRef Content) {}
+
   /// Callback invoked when a \#pragma comment directive is read.
   virtual void PragmaComment(SourceLocation Loc, const IdentifierInfo *Kind,
                              StringRef Str) {
@@ -568,6 +584,11 @@ public:
                        PragmaIntroducerKind Introducer) override {
     First->PragmaDirective(Loc, Introducer);
     Second->PragmaDirective(Loc, Introducer);
+  }
+
+  void PragmaOperatorDirective(SourceLocation Loc, StringRef Content) override {
+    First->PragmaOperatorDirective(Loc, Content);
+    Second->PragmaOperatorDirective(Loc, Content);
   }
 
   void PragmaComment(SourceLocation Loc, const IdentifierInfo *Kind,

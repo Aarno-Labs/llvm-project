@@ -166,6 +166,44 @@ inline constexpr void skipNonNewlineWs(StringRef text, size_t &pos) {
     ++pos;
 }
 
+/// Return whether `[begin,end)` is the only non-whitespace content on its
+/// physical line in \p text.
+///
+/// A caller that rewrites an interval into a *directive* needs this: a
+/// directive is one only when it begins a line, so an interval sharing its line
+/// with other source cannot be replaced by one.  A `#pragma` directive line
+/// satisfies this by construction; a `_Pragma` operator is an expression-like
+/// spelling that may sit anywhere a token may, so it must be checked.
+///
+/// `\r` terminates the scan in both directions, so a CRLF line behaves like an
+/// LF one: scanning backwards it is the CR of the preceding terminator, and
+/// scanning forwards it opens this line's terminator.  An empty or
+/// out-of-bounds range is not alone on its line.
+inline constexpr bool intervalIsAloneOnItsLine(StringRef text, uint64_t begin,
+                                               uint64_t end) {
+  if (begin >= end || end > text.size())
+    return false;
+
+  for (uint64_t pos = begin; pos > 0;) {
+    --pos;
+    const char c = text[pos];
+    if (c == '\n' || c == '\r')
+      break;
+    if (!isNonNewlineWs(c))
+      return false;
+  }
+
+  for (uint64_t pos = end; pos < text.size(); ++pos) {
+    const char c = text[pos];
+    if (c == '\n' || c == '\r')
+      break;
+    if (!isNonNewlineWs(c))
+      return false;
+  }
+
+  return true;
+}
+
 /// Advance over one C backslash-newline splice at \p pos.
 ///
 /// The splice must be fully contained in the half-open byte range

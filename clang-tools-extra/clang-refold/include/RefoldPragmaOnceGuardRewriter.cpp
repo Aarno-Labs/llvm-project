@@ -294,18 +294,52 @@ bool RefoldPragmaOnceGuardRewriter::DiscoverPragmaOnceSites(
         interval.structureSpellingBegin,
         interval.structureSpellingEnd - interval.structureSpellingBegin);
 
-    // `_Pragma("once")` has real once semantics but the producer records no
-    // pragma item for it, so no inventory can account for it.  Fail closed.
+    // `_Pragma("once")` establishes the same once-state as `#pragma once`, so
+    // it is admitted on the same terms -- but only against an exact producer
+    // binding.  The binding is what proves this operator actually executed in
+    // this include-owner domain; the spelling alone does not, because the same
+    // bytes could sit in a macro replacement list or in a conditional arm that
+    // was never taken.  Unbound, the header's once-state cannot be accounted
+    // for, and a missed once site is exactly the case that duplicates a body.
     if (interval.kind == PreprocessingStructureKind::PragmaOperator) {
       if (!pragmaOperatorSpellingIsOnce(spelling))
         continue;
-      rejection = PragmaOnceGuardRejection::PragmaOperatorOnce;
-      detail = formatv("header '{0}' establishes once-state through a pragma "
-                       "operator at [{1},{2})",
-                       physicalPath, interval.structureSpellingBegin,
-                       interval.structureSpellingEnd)
-                   .str();
-      return false;
+
+      if (!interval.IsProducerBound()) {
+        rejection = PragmaOnceGuardRejection::PragmaOperatorOnce;
+        detail = formatv("header '{0}' establishes once-state through a pragma "
+                         "operator at [{1},{2}) with no exact producer binding",
+                         physicalPath, interval.structureSpellingBegin,
+                         interval.structureSpellingEnd)
+                     .str();
+        return false;
+      }
+
+      // The rewrite replaces the site's own bytes with a `#define` line, which
+      // is well formed only when the operator has its line to itself.  A
+      // mid-line `_Pragma` is a legal expression this rewrite cannot express.
+      if (!stringutils::intervalIsAloneOnItsLine(
+              bytes, interval.structureSpellingBegin,
+              interval.structureSpellingEnd)) {
+        rejection = PragmaOnceGuardRejection::PragmaOperatorOnce;
+        detail = formatv("header '{0}' spells once through a pragma operator at "
+                         "[{1},{2}) that shares its line with other source",
+                         physicalPath, interval.structureSpellingBegin,
+                         interval.structureSpellingEnd)
+                     .str();
+        return false;
+      }
+
+      PragmaOnceSite site;
+      site.begin = interval.begin;
+      site.end = interval.end;
+      site.spellingBegin = interval.structureSpellingBegin;
+      site.spellingEnd = interval.structureSpellingEnd;
+      site.modelItemId = interval.modelItemId;
+      site.enclosingArmId =
+          InnermostEnclosingArm(sourcePath, ownerIncludeId, interval.begin);
+      sites.push_back(site);
+      continue;
     }
 
     if (interval.kind != PreprocessingStructureKind::Pragma)
@@ -334,16 +368,17 @@ bool RefoldPragmaOnceGuardRewriter::DiscoverPragmaOnceSites(
       continue;
     if (!refoldTextIsPragmaOnceDirective(pragma.text))
       continue;
-    if (pragma.viaPragmaOperator) {
-      rejection = PragmaOnceGuardRejection::PragmaOperatorOnce;
-      detail = formatv("header '{0}' has operator-spelled once pragma id={1}",
-                       physicalPath, pragma.id)
-                   .str();
-      return false;
-    }
+    // An operator-spelled record anchors at its own exact operator range, not
+    // at `siteB`: `siteB` is the start of the whole physical line, which for a
+    // mid-line operator lies outside every discovered site.  A record with no
+    // recoverable operator range binds to no interval and so stays uncovered,
+    // which is the intended fail-closed answer.
+    const uint64_t recordAnchor = pragma.viaPragmaOperator && pragma.operatorB
+                                      ? *pragma.operatorB
+                                      : pragma.siteB;
 
     const bool covered = llvm::any_of(sites, [&](const PragmaOnceSite &site) {
-      return site.begin <= pragma.siteB && pragma.siteB < site.end;
+      return site.begin <= recordAnchor && recordAnchor < site.end;
     });
     if (!covered) {
       rejection = PragmaOnceGuardRejection::UnboundPragmaRecord;

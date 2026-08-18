@@ -3564,6 +3564,33 @@ void RefoldMapBuilder::onHasInclude(SourceLocation Loc) {
 }
 
 void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
+  recordPragmaItem(HashLoc, FullText, /*RequireOperatorSpelling=*/false,
+                   /*TextIsProvisional=*/false);
+}
+
+void RefoldMapBuilder::onPragmaOperator(SourceLocation OperatorLoc,
+                                        StringRef Content) {
+  if (!enabled())
+    return;
+
+  // Reconstruct the canonical `#pragma` spelling the passed-through printing
+  // path would have produced, so a consumed operator pragma carries the same
+  // `text` shape as every other pragma record and no consumer has to
+  // destringize.  The text is provisional: when this pragma does reach the
+  // printer, that callback's reconstruction replaces it.
+  SmallString<64> CanonicalText;
+  CanonicalText += "#pragma ";
+  CanonicalText += Content;
+  CanonicalText += '\n';
+
+  recordPragmaItem(OperatorLoc, CanonicalText, /*RequireOperatorSpelling=*/true,
+                   /*TextIsProvisional=*/true);
+}
+
+void RefoldMapBuilder::recordPragmaItem(SourceLocation HashLoc,
+                                        StringRef FullText,
+                                        bool RequireOperatorSpelling,
+                                        bool TextIsProvisional) {
   if (!enabled())
     return;
 
@@ -3653,6 +3680,21 @@ void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
     }
   }
 
+  // A caller that asserts operator spelling requires the operator to be
+  // literally present at the reported location. A `_Pragma` produced by macro
+  // expansion reports its expansion site, whose physical line holds the macro
+  // invocation and no pragma spelling at all.
+  //
+  // Such an occurrence is left to the printing paths, which already record it as
+  // an ordinary pragma anchored to the invocation line -- the anchor the
+  // sideband pragma edits depend on. Claiming operator provenance for it here
+  // would replace that anchor with a rangeless record and strand those edits.
+  // A pragma that is *consumed* at an expansion site is therefore still not
+  // recorded anywhere; see the deferred-defect note on macro-generated
+  // `_Pragma("once")`.
+  if (RequireOperatorSpelling && !ViaOperator)
+    return;
+
   const std::string SitePath = filePathForLocAbs(SM, FileLoc, EmitAbsPaths);
 
   // Multiple PP callback paths can report the same pragma. For example, the
@@ -3660,13 +3702,23 @@ void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
   // `#pragma GCC system_header` is also visible as a FileChanged reason. Keep
   // only one structural marker for a physical pragma line.
   if (Line) {
-    for (const Item &Existing : Items) {
+    for (Item &Existing : Items) {
       if (Existing.Kind != IK_Directive || Existing.Subkind != "#pragma")
         continue;
-      if (Existing.SitePath == SitePath && Existing.SiteBegin &&
-          Existing.SiteEnd && *Existing.SiteBegin == Line->first &&
-          *Existing.SiteEnd == Line->second)
-        return;
+      if (Existing.SitePath != SitePath || !Existing.SiteBegin ||
+          !Existing.SiteEnd || *Existing.SiteBegin != Line->first ||
+          *Existing.SiteEnd != Line->second)
+        continue;
+      // The operator hook runs before the pragma handlers, so its record is
+      // already in place when a printing callback reports the same pragma. That
+      // callback's reconstruction is the authoritative spelling, so adopt its
+      // text rather than dropping it as a duplicate; everything else about the
+      // item, including its id and position, stays fixed.
+      if (Existing.PragmaTextProvisional && !FullText.empty()) {
+        Existing.Text = FullText.str();
+        Existing.PragmaTextProvisional = false;
+      }
+      return;
     }
   }
 
@@ -3703,6 +3755,7 @@ void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
   It.ViaPragmaOperator = ViaOperator;
   It.PragmaOperatorBegin = OperatorBegin;
   It.PragmaOperatorEnd = OperatorEnd;
+  It.PragmaTextProvisional = TextIsProvisional;
 
   Items.push_back(std::move(It));
 

@@ -384,6 +384,11 @@ struct Item {
   // that overlaps ordinary tokens.
   std::optional<uint64_t> PragmaOperatorBegin;
   std::optional<uint64_t> PragmaOperatorEnd;
+  // True while Text was reconstructed from the `_Pragma` operator's own
+  // destringized content rather than supplied by a pragma-printing callback.
+  // A later callback reporting the same physical line replaces the text; the
+  // flag is builder-internal state and is never serialized.
+  bool PragmaTextProvisional = false;
   std::string TargetAsWritten; // as-written header token ("e.h" or <vector>)
   // Historical JSON name `resolved_path`.  With the current producer default
   // EmitAbsPaths == false, this stores the producer-observed entered-file
@@ -740,6 +745,18 @@ class RefoldMapBuilder {
                   PPEnd);
   }
 
+  /// Shared implementation behind onPragma and onPragmaOperator.
+  ///
+  /// \param RequireOperatorSpelling When true, refuse to record unless the
+  ///        reported location literally spells `_Pragma`. This is what keeps a
+  ///        macro-generated operator from being anchored to a physical line
+  ///        that contains no pragma at all.
+  /// \param TextIsProvisional When true, a later callback reporting the same
+  ///        physical line replaces this item's text rather than being dropped
+  ///        as a duplicate.
+  void recordPragmaItem(SourceLocation HashLoc, StringRef FullText,
+                        bool RequireOperatorSpelling, bool TextIsProvisional);
+
 public:
   /// Construct a builder bound to a preprocessor and an output path.
   ///
@@ -842,6 +859,18 @@ public:
   /// Pragmas are recorded as directive items with exact source text and site
   /// byte anchors. They do not contribute to A-token spans.
   void onPragma(SourceLocation HashLoc, StringRef FullText);
+
+  /// Callback for a `_Pragma("...")` operator, reported with its destringized
+  /// content before the pragma handlers run.
+  ///
+  /// A pragma consumed by its handler (`once`, `push_macro`, `GCC poison`)
+  /// produces no tokens and never reaches a pragma-printing callback, so
+  /// without this entry point it is recorded nowhere and the consumer cannot
+  /// distinguish "no once-state" from "once-state it cannot see". Recording is
+  /// refused unless the operator is literally spelled at the reported location,
+  /// so a macro-generated `_Pragma` does not manufacture a directive line at
+  /// its expansion site.
+  void onPragmaOperator(SourceLocation OperatorLoc, StringRef Content);
 
   /// Callback for an evaluation of `__has_include` / `__has_include_next`.
   ///

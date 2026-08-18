@@ -292,6 +292,16 @@ void Preprocessor::Handle_Pragma(Token &Tok) {
 
   EnterSourceFileWithLexer(TL, nullptr);
 
+  // Report the destringized content before the handlers run.  A pragma consumed
+  // by its handler produces no tokens and never reaches the printing path that
+  // reconstructs a `#pragma` spelling, so this is the only point at which an
+  // operator-spelled consumed pragma is observable.  `prepare_PragmaString`
+  // leaves a leading space and a trailing newline in place of the quotes.
+  if (Callbacks) {
+    StringRef PragmaContent = StringRef(StrVal.data(), StrVal.size()).trim();
+    Callbacks->PragmaOperatorDirective(PragmaLoc, PragmaContent);
+  }
+
   // With everything set up, lex this as a #pragma directive.
   HandlePragmaDirective({PIK__Pragma, PragmaLoc});
 
