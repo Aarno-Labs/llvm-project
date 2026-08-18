@@ -558,8 +558,11 @@ struct TokMapEntry {
 /// One arm of a conditional group (#if/#elif/#else), with kind, condition text,
 /// and body byte range (exclusive of directive lines).
 struct CondArm {
-  std::string Kind;  // "if","ifdef","ifndef","elif","else"
-  std::string Cond; // optional (if/elif expr, or macro for ifdef/ifndef)
+  // "if","ifdef","ifndef","elif","elifdef","elifndef","else"
+  std::string Kind;
+  /// Optional: the if/elif expression, or the macro name for
+  /// ifdef/ifndef/elifdef/elifndef.
+  std::string Cond;
   uint64_t BodyB = 0, BodyE = 0;
   /// True when this arm's condition actually evaluated `__has_include` /
   /// `__has_include_next` during the real preprocessing run.  Because it is

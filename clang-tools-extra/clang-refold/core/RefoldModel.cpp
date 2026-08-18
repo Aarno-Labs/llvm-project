@@ -1482,6 +1482,21 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           }
 
           model.pragmas_.push_back(std::move(pd));
+        } else if (skStr == "#import") {
+          // `#import` is a Clang extension that includes a header and marks it
+          // as imported, so a later `#include` of the same file is skipped.
+          // Admitting it into `includes_` would present it to every include
+          // proof as a plain `#include`, because those proofs narrow on
+          // `#include_next` rather than widening from `#include`; a replay,
+          // materialization or relocation would then silently drop the
+          // once-state.  Refusing the whole map is the sound answer until an
+          // include proof exists that discharges that state, and it is not
+          // written because `#import` is in neither C nor C++.
+          return createStringError(
+              inconvertibleErrorCode(),
+              "Directive subkind '#import' at items[%zu] is recorded but not "
+              "supported: no include proof discharges its once-state",
+              i);
         } else {
           return createStringError(
               inconvertibleErrorCode(),

@@ -557,14 +557,16 @@ static constexpr const char *RefoldSchema = R"json(
             "ifdef",
             "ifndef",
             "elif",
+            "elifdef",
+            "elifndef",
             "else"
           ],
-          "description": "Arm directive kind (#if/#ifdef/#ifndef/#elif/#else)."
+          "description": "Arm directive kind (#if/#ifdef/#ifndef/#elif/#elifdef/#elifndef/#else)."
         },
         "cond": {
           "type": "string",
           "minLength": 1,
-          "description": "As written after #if/#elif, or the macro name for ifdef/ifndef (optional)"
+          "description": "As written after #if/#elif, or the macro name for ifdef/ifndef/elifdef/elifndef (optional)"
         },
         "body_b": {
           "type": "integer",
@@ -1265,9 +1267,10 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "string",
           "enum": [
             "#include",
-            "#include_next"
+            "#include_next",
+            "#import"
           ],
-          "description": "Preprocessor include directive kind."
+          "description": "Preprocessor include directive kind. '#import' is a Clang extension that also marks the header as imported; no consumer proof realizes that once-state, so items carrying it fail include realization closed."
         },
         "text": {
           "type": "string",

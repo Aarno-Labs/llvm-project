@@ -274,12 +274,13 @@ findLineControlDirectiveLineNearLoc(const SourceManager &SM,
 ///    `#endif` line (half-open),
 ///  - an ordered list of arms (\c CondArm) for each peer directive at depth 0:
 ///    the initial \c #if / \c #ifdef / \c #ifndef arm, any number of
-///    \c #elif arms, and an optional \c #else arm.
+///    \c #elif / \c #elifdef / \c #elifndef arms, and an optional \c #else
+///    arm.
 ///    Each arm carries:
 ///      * \c Kind — the directive kind ("if", "ifdef", "ifndef", "elif",
-///      "else"),
-///      * \c Cond — the as-written condition text for
-///      "if"/"elif"/"ifdef"/"ifndef"
+///      "elifdef", "elifndef", "else"),
+///      * \c Cond — the as-written controlling text: the expression for
+///      "if"/"elif", the macro name for "ifdef"/"ifndef"/"elifdef"/"elifndef"
 ///                  (trimmed of leading spaces after the keyword),
 ///      * \c BodyB / \c BodyE — the half-open byte interval of the arm’s body
 ///        (the text after the directive line up to—but not including—the next
@@ -504,6 +505,8 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
         DK_Ifdef,
         DK_Ifndef,
         DK_Elif,
+        DK_Elifdef,
+        DK_Elifndef,
         DK_Else,
         DK_Endif
       };
@@ -520,6 +523,12 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
       } else if (kw_at(q, eol, "ifndef")) {
         Kind = DK_Ifndef;
         Tag = "ifndef";
+      } else if (kw_at(q, eol, "elifdef")) {
+        Kind = DK_Elifdef;
+        Tag = "elifdef";
+      } else if (kw_at(q, eol, "elifndef")) {
+        Kind = DK_Elifndef;
+        Tag = "elifndef";
       } else if (kw_at(q, eol, "elif")) {
         Kind = DK_Elif;
         Tag = "elif";
@@ -576,6 +585,8 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
       }
 
       case DK_Elif:
+      case DK_Elifdef:
+      case DK_Elifndef:
       case DK_Else: {
         // Transition to a new arm of the current innermost group.
         // If there is no active group, this is a stray directive and we ignore
@@ -594,9 +605,12 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
         // Start the new arm.
         CondArm A;
         A.Kind = Tag.str();
-        if (Kind == DK_Elif) {
-          // Capture the raw condition expression following "elif".
-          size_t condBeg = q + 4; // "elif"
+        if (Kind != DK_Else) {
+          // Capture the raw controlling text following the keyword: the
+          // expression for `#elif`, the macro name for `#elifdef` and
+          // `#elifndef`.  `Tag` is the keyword exactly as matched, so its
+          // length is the offset to skip regardless of which one it was.
+          size_t condBeg = q + Tag.size();
           while (condBeg < eol && isSpace</*kWithCR=*/true>(Buf[condBeg]))
             ++condBeg;
           A.Cond = std::string(Buf.substr(condBeg, logicalEol - condBeg));
@@ -2725,13 +2739,25 @@ void RefoldMapBuilder::onIncludeDirective(
   }
   const bool IsInclude = (K == tok::pp_include);
   const bool IsIncludeNext = (K == tok::pp_include_next);
-  assert((IsInclude || IsIncludeNext) &&
-         "include directive must be one of: #include or #include_next");
+  // `#import` is a Clang language extension, accepted in C and C++ as well as
+  // Objective-C.  It is recorded under its own subkind rather than folded into
+  // `#include` because it also marks the header as imported, so a later
+  // `#include` of the same file is skipped.  No consumer proof realizes that
+  // once-state, and every include realization site admits only `#include` and
+  // `#include_next`, so an `#import` item fails those proofs closed.  Recording
+  // it faithfully is what makes that refusal happen: labelling it `#include`
+  // would present a directive with once-only semantics as one without.
+  const bool IsImport = (K == tok::pp_import);
+  assert((IsInclude || IsIncludeNext || IsImport) &&
+         "include directive must be one of: #include, #include_next or "
+         "#import");
 
   Item It;
   It.ID = Items.size();
   It.Kind = IK_Directive;
-  It.Subkind = IsIncludeNext ? "#include_next" : "#include";
+  It.Subkind = IsImport        ? "#import"
+               : IsIncludeNext ? "#include_next"
+                               : "#include";
   It.Loc = HashLoc;
   It.IsAngled = IsAngled;
   std::string DirLine = "#";
@@ -6286,7 +6312,16 @@ void RefoldMapBuilder::writeJSON() {
           }
 
           // Include-site anchors and structure for partial refolding.
-          if (It.Subkind == "#include" || It.Subkind == "#include_next") {
+          //
+          // `#import` is included here, and only here among the include sites,
+          // because these are identity facts -- which header this directive
+          // named and which file it opened -- and the schema requires `target`
+          // of every directive item.  The sites that emit anchors a proof would
+          // *realize* an include from (decls, per-instance conditional groups,
+          // include slots) deliberately stay narrow, so an `#import` has no
+          // producer facts to replay or relocate it with.
+          if (It.Subkind == "#include" || It.Subkind == "#include_next" ||
+              It.Subkind == "#import") {
             JO.attribute("target", It.TargetAsWritten); // can't be empty
             if (!It.ResolvedPath.empty())
               JO.attribute("resolved_path", It.ResolvedPath);
