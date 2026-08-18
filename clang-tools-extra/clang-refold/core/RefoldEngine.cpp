@@ -480,6 +480,200 @@ static bool terminalRequestNamesRegion(
 /// This is also where whole-file surrender is meant to be replaced by a
 /// region-scoped realization, which is why the attribution census below reports
 /// what each request left behind to work from.
+/// One boundary-straddling deletion run moved onto its owner's cover.
+struct OwnerAlignedDeletionSlide {
+  std::vector<int64_t> map;
+  /// The run before and after the move, and the signed token distance.
+  uint64_t originalABegin = 0;
+  uint64_t originalAEnd = 0;
+  uint64_t repairedABegin = 0;
+  uint64_t repairedAEnd = 0;
+  int64_t offset = 0;
+  /// A tokens whose anchor the move created; they are no longer core-forced.
+  SmallVector<uint64_t, 4> movedAnchors;
+};
+
+/// Return the innermost include owning one A token, or nullopt for the TU.
+static std::optional<uint64_t> innermostOwnerForAToken(const RefoldModel &model,
+                                                       uint64_t aToken) {
+  return model.InnermostIncludeAtPP(aToken);
+}
+
+/// Return whether every A token of `[aBegin, aEnd)` has the same owner.
+///
+/// This is the property that lets a single owner realize the run. A run failing
+/// it is exactly the shape whose `OwnerClosedCover` obligation cannot be
+/// discharged, because no owner covers all of its tokens.
+static bool runHasOneOwner(const RefoldModel &model, uint64_t aBegin,
+                           uint64_t aEnd) {
+  if (aEnd <= aBegin)
+    return false;
+  const std::optional<uint64_t> owner =
+      innermostOwnerForAToken(model, aBegin);
+  for (uint64_t aToken = aBegin + 1; aToken < aEnd; ++aToken) {
+    if (innermostOwnerForAToken(model, aToken) != owner)
+      return false;
+  }
+  return true;
+}
+
+/// Return whether `[aBegin, aEnd)` is a maximal unmapped run of `map`.
+static bool isMaximalDeletionRun(ArrayRef<int64_t> map, uint64_t aBegin,
+                                 uint64_t aEnd) {
+  if (aEnd <= aBegin || aEnd > map.size())
+    return false;
+  for (uint64_t aToken = aBegin; aToken < aEnd; ++aToken) {
+    if (map[aToken] >= 0)
+      return false;
+  }
+  if (aBegin > 0 && map[aBegin - 1] < 0)
+    return false;
+  if (aEnd < map.size() && map[aEnd] < 0)
+    return false;
+  return true;
+}
+
+/// Move a straddling deletion run onto a single owner, when the tokens allow.
+///
+/// A deletion run `[s, e)` may slide one position left when `A[s-1]` and
+/// `A[e-1]` have the same spelling, and one position right when `A[s]` and
+/// `A[e]` do. Either move keeps the map strictly monotone and preserves the
+/// exact matched-token count, so the result is still a maximum-length common
+/// subsequence -- it is a different optimal alignment, not a worse one.
+///
+/// It is not optimal under the owner-depth tie-break, and that is the whole
+/// point: that tie-break is an additive per-deleted-token cost, so it rewards a
+/// run for swallowing a shallow token in place of a deep one. At an include
+/// boundary that reward is exactly what pulls a run off its owner's cover and
+/// onto a straddle no owner can realize. Correcting the tie-break globally is
+/// not sound -- a run that crosses a boundary while *fully consuming* the
+/// include on the far side realizes perfectly well, and penalizing it relocates
+/// includes across conditional boundaries. So the correction is applied here,
+/// scoped to a run whose proof has already failed.
+///
+/// Returns nullopt when no request names a straddling run, or when no admissible
+/// slide makes one owner-uniform. The caller then proceeds to the existing
+/// narrowing ladder unchanged.
+static std::optional<OwnerAlignedDeletionSlide>
+buildOwnerAlignedDeletionSlide(const RefoldModel &model, ArrayRef<PPTok> aToks,
+                               ArrayRef<int64_t> baseMap,
+                               ArrayRef<TerminalFallbackRequest> requests) {
+  // A slide is only ever a small correction: the run is being nudged back onto
+  // a cover it already overlaps, not searched for across the stream.
+  constexpr uint64_t maxSlideDistance = 64;
+
+  auto spellingsEqual = [&](uint64_t lhs, uint64_t rhs) {
+    return lhs < aToks.size() && rhs < aToks.size() &&
+           aToks[lhs].spelling == aToks[rhs].spelling;
+  };
+
+  for (const TerminalFallbackRequest &request : requests) {
+    const TerminalFallbackFailureContext &context = request.failure.context;
+    if (!context.aTokenBegin || !context.aTokenEnd || !context.bTokenBegin ||
+        !context.bTokenEnd)
+      continue;
+    // Only a pure deletion slides: a replacement's B payload is anchored to the
+    // A interval it replaces, so moving the interval would change what the
+    // payload realizes.
+    if (*context.bTokenBegin != *context.bTokenEnd)
+      continue;
+
+    const uint64_t aBegin = *context.aTokenBegin;
+    const uint64_t aEnd = *context.aTokenEnd;
+    if (!isMaximalDeletionRun(baseMap, aBegin, aEnd))
+      continue;
+    // A run already covered by one owner is not this defect.
+    if (runHasOneOwner(model, aBegin, aEnd))
+      continue;
+
+    const uint64_t runLength = aEnd - aBegin;
+    for (uint64_t distance = 1; distance <= maxSlideDistance; ++distance) {
+      // Left first, then right, so the choice does not depend on iteration
+      // order anywhere else.
+      for (int direction : {-1, 1}) {
+        const bool left = direction < 0;
+        if (left && aBegin < distance)
+          continue;
+        if (!left && aEnd + distance > baseMap.size())
+          continue;
+
+        const uint64_t movedBegin =
+            left ? aBegin - distance : aBegin + distance;
+        const uint64_t movedEnd = movedBegin + runLength;
+
+        // Every step of the slide must exchange two identically spelled
+        // tokens, or the map would stop agreeing with the streams.
+        bool admissible = true;
+        for (uint64_t step = 0; step < distance && admissible; ++step) {
+          admissible = left ? spellingsEqual(aBegin - 1 - step,
+                                             aEnd - 1 - step)
+                            : spellingsEqual(aBegin + step, aEnd + step);
+        }
+        if (!admissible)
+          continue;
+        if (!runHasOneOwner(model, movedBegin, movedEnd))
+          continue;
+
+        OwnerAlignedDeletionSlide slide;
+        slide.map.assign(baseMap.begin(), baseMap.end());
+        slide.originalABegin = aBegin;
+        slide.originalAEnd = aEnd;
+        slide.repairedABegin = movedBegin;
+        slide.repairedAEnd = movedEnd;
+        slide.offset = left ? -static_cast<int64_t>(distance)
+                            : static_cast<int64_t>(distance);
+        for (uint64_t step = 0; step < distance; ++step) {
+          const uint64_t vacated = left ? aBegin - 1 - step : aEnd + step;
+          const uint64_t claimed = left ? aEnd - 1 - step : aBegin + step;
+          slide.map[claimed] = slide.map[vacated];
+          slide.map[vacated] = -1;
+          slide.movedAnchors.push_back(claimed);
+        }
+        return slide;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+/// Build the alignment override that realizes one owner-alignment repair.
+///
+/// Anchors the core theorem forced keep that proof. The anchors the slide
+/// created carry `OwnerAlignedDeletionSlide` instead, because they are not on
+/// every core-optimal path -- the map is match-count optimal but deliberately
+/// not depth-optimal.
+static AlignmentSelectionOverride buildOwnerAlignedSlideOverride(
+    const OwnerAlignedDeletionSlide &slide,
+    const diffutils::CertifiedLcsResult &coreAlignment) {
+  AlignmentSelectionOverride selection;
+  selection.selectedMap = slide.map;
+  selection.selectedAnchorProofs.assign(slide.map.size(),
+                                        diffutils::LcsAnchorProof{});
+  selection.globalObjective = coreAlignment.globalObjective;
+  selection.globalObjectiveIsExact = coreAlignment.globalObjectiveIsExact;
+  selection.allWindowsCertified = coreAlignment.allWindowsCertified;
+  selection.certifiedBoundaries = coreAlignment.certifiedBoundaries;
+  selection.certificationWindows = coreAlignment.certificationWindows;
+
+  for (size_t aToken = 0; aToken < slide.map.size(); ++aToken) {
+    if (slide.map[aToken] < 0)
+      continue;
+    if (llvm::is_contained(slide.movedAnchors, aToken)) {
+      selection.selectedAnchorProofs[aToken] = diffutils::LcsAnchorProof{
+          diffutils::LcsAnchorProofKind::OwnerAlignedDeletionSlide, 0};
+      continue;
+    }
+    if (aToken < coreAlignment.selectedAnchorProofs.size()) {
+      selection.selectedAnchorProofs[aToken] =
+          coreAlignment.selectedAnchorProofs[aToken];
+      continue;
+    }
+    selection.selectedAnchorProofs[aToken] = diffutils::LcsAnchorProof{
+        diffutils::LcsAnchorProofKind::OwnerAlignedDeletionSlide, 0};
+  }
+  return selection;
+}
+
 static std::string
 takeTerminalCarrier(std::string carrier,
                     ArrayRef<TerminalFallbackRequest> requests) {
@@ -639,6 +833,12 @@ Expected<std::string> RefoldEngine::Refold(
   // dynamic program window partitioning exists to bound.
   AlignmentCertificationMemo alignmentCertificationMemo;
 
+  // Set once, by the owner-alignment repair below, and then carried by every
+  // later attempt: the repaired alignment is the one the run planned from from
+  // that point on.
+  std::optional<AlignmentSelectionOverride> ownerAlignedSlideOverride;
+  bool attemptedOwnerAlignedSlide = false;
+
   for (unsigned attempt = 0;; ++attempt) {
     // Each attempt needs its own model.  Moving the parsed one in would leave
     // every later attempt building an engine from a moved-from model -- no
@@ -654,7 +854,7 @@ Expected<std::string> RefoldEngine::Refold(
         // Copied, not moved: this runs once per attempt, and a moved-from
         // callback would silently disable final line-control validation for
         // every attempt after the first.
-        finalLineControlValidationCallback);
+        finalLineControlValidationCallback, ownerAlignedSlideOverride);
     engine.finalAssemblyVerifier_ = assemblyVerifier;
     engine.ownersMustExpand_ = ownersMustExpand;
     engine.resolveAlignmentAmbiguity_ = resolveAlignmentAmbiguity;
@@ -776,6 +976,36 @@ Expected<std::string> RefoldEngine::Refold(
     // fallback ladder, not a verification verdict, and a caller that asked for
     // no verification still wants the smaller answer.
     if (engine.terminalSink_.HasRequest()) {
+      // Before giving any region up, see whether a request failed only because
+      // its deletion run sits across an owner boundary rather than on one.
+      //
+      // This runs ahead of the narrowing ladder for the same reason resolution
+      // does: moving a run costs nothing -- the alignment keeps its exact
+      // matched-token count -- while expanding a region trades away a preserved
+      // include or macro permanently. It is attempted once per run, because a
+      // second attempt would put the identical question to the identical
+      // alignment.
+      if (!attemptedOwnerAlignedSlide &&
+          alignmentCertificationMemo.recorded) {
+        attemptedOwnerAlignedSlide = true;
+        if (std::optional<OwnerAlignedDeletionSlide> slide =
+                buildOwnerAlignedDeletionSlide(
+                    *mOrErr, aToks,
+                    alignmentCertificationMemo.facts.alignment.selectedMap,
+                    engine.terminalSink_.Requests())) {
+          REFOLD_LOG_INFO(
+              "fallback",
+              "terminal fallback names a deletion run A=[{0},{1}) that "
+              "straddles an owner boundary; moving it by {2} token(s) to "
+              "A=[{3},{4}), where one owner covers it, and re-planning",
+              slide->originalABegin, slide->originalAEnd, slide->offset,
+              slide->repairedABegin, slide->repairedAEnd);
+          ownerAlignedSlideOverride = buildOwnerAlignedSlideOverride(
+              *slide, alignmentCertificationMemo.facts.alignment);
+          continue;
+        }
+      }
+
       // Give up every region that any request names, and take the carrier only
       // when *no* request names one.
       //

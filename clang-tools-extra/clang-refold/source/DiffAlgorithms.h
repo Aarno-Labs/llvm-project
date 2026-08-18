@@ -296,6 +296,18 @@ enum class LcsAnchorProofKind : uint8_t {
   /// A semantic alignment resolver proved that every remaining admissible
   /// explanation produces one equivalent normalized owner/edit realization.
   EquivalentNormalizedHunkAndOwner,
+  /// The owner-alignment repair moved this anchor so a deletion run stops
+  /// bisecting the owner that produced its tokens.
+  ///
+  /// The move preserves the exact matched-token count, so the map is still a
+  /// maximum-length common subsequence; it is not optimal under the owner-depth
+  /// tie-break, which is exactly why the core objective did not select it. That
+  /// tie-break rewards a run for swallowing a shallow token in place of a deep
+  /// one, which is how a run comes to straddle a boundary no single owner can
+  /// cover. The repair is requested only after an attempt has already asked for
+  /// the terminal carrier, so it can only replace surrendering the whole
+  /// translation unit.
+  OwnerAlignedDeletionSlide,
 };
 
 inline StringRef toString(LcsAnchorProofKind kind) {
@@ -306,6 +318,8 @@ inline StringRef toString(LcsAnchorProofKind kind) {
     return "CoreOptimalPathForced";
   case LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner:
     return "EquivalentNormalizedHunkAndOwner";
+  case LcsAnchorProofKind::OwnerAlignedDeletionSlide:
+    return "OwnerAlignedDeletionSlide";
   }
   llvm_unreachable("invalid LCS anchor proof kind");
 }
@@ -322,6 +336,8 @@ struct LcsAnchorProof {
       return semanticWitnessId == 0;
     if (kind == LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner)
       return semanticWitnessId != 0;
+    if (kind == LcsAnchorProofKind::OwnerAlignedDeletionSlide)
+      return semanticWitnessId == 0;
     return false;
   }
 };

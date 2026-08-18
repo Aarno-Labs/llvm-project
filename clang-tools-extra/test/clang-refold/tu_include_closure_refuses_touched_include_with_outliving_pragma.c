@@ -18,11 +18,13 @@
 // default `--verify-output=off` because only the closing check would have
 // caught it.
 //
-// PINS A REFUSAL, NOT A DESIRED OUTPUT.  The expected `.c.mod` is the raw
-// edited preprocessed stream: refusing the closure is correct, but nothing yet
-// materializes the include so the deletion can be applied inside its body, and
-// that is owner-closed-cover work.  When it lands this test should preserve the
-// header body with its pragma and give up nothing.
+// The refusal below is still the point of this test, and the CHECK lines still
+// pin it.  What changed is what the refusal now costs: nothing.  The closure is
+// refused, the attempt asks for the terminal carrier, and the ladder moves the
+// straddling deletion run back onto the header's own cover -- so the include
+// materializes, the pragma survives where it was written, and no source
+// structure is given up.  The expected `.c.mod` is that refold, not the raw
+// edited preprocessed stream it used to pin.
 //
 // CHECK: TU/include closure rejected
 // CHECK-SAME: consume touched include
