@@ -21,6 +21,8 @@
 
 #include "source/RefoldMixedOwnerTilingPlanner.h"
 
+#include "proof/RefoldPragmaTaxonomy.h"
+
 #include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
 #include "core/RefoldOwnerClassifier.h"
@@ -2419,6 +2421,74 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
               projection =
                   deps_.sourceMapper.ProjectATokenBoundaryToBTokenBounds(
                       h.aStart, h.aEnd, h.bStart, h.bEnd, aBoundary);
+          // A strict range means the payload cannot be split at this seam by
+          // alignment alone. That is not the end of the question: when the
+          // preserved gap is a pragma whose state the payload provably cannot
+          // observe, both placements re-preprocess to the same tokens and are
+          // equivalent refolds, so committing one is a proof rather than a
+          // preference. Refusing instead surrenders the translation unit and
+          // deletes the very directive the refusal was protecting.
+          //
+          // The predicate defaults to observable for anything unclassified, so
+          // an unrecognized pragma keeps refusing here.
+          if (projection && !projection->IsUnique() &&
+              runIndex < physicalSourceRuns->protectedGaps.size()) {
+            const OwnerSourceRange &gap =
+                physicalSourceRuns->protectedGaps[runIndex];
+            if (gap.IsValid() && gap.end <= deps_.tuBytes.size() &&
+                gap.begin <= gap.end) {
+              // The gap spans the whole source region between two runs, so it
+              // carries the newline that ends the preceding line. The
+              // classifier takes a logical directive and will not recognize a
+              // spelling behind leading trivia, reporting Unknown -- which
+              // observes everything and would refuse every pragma here.
+              const PragmaClassification classification =
+                  classifyPragmaDirective(
+                      deps_.tuBytes.slice(gap.begin, gap.end).trim());
+              std::optional<std::pair<uint64_t, uint64_t>> payloadBytes =
+                  deps_.sourceMapper.BTokenRangeToByteRange(
+                      projection->lowerBTokenBoundary,
+                      projection->upperBTokenBoundary);
+              // Equivalence requires that moving the payload across the
+              // directive change no token order, which holds only when the
+              // preprocessor consumes the directive and emits nothing for it.
+              // A pragma that is printed instead -- `message`, `warning`,
+              // `error`, `GCC diagnostic` -- is spelled into both streams, so
+              // the payload's side of it is token order and is fixed by the
+              // alignment, not free to choose. Restrict to the effects whose
+              // directives Clang consumes; anything else keeps refusing.
+              const bool directiveIsConsumed =
+                  classification.effect == PragmaStateEffect::IncludeOnce ||
+                  classification.effect == PragmaStateEffect::MacroStateStack ||
+                  classification.effect == PragmaStateEffect::PoisonIdentifiers ||
+                  classification.effect == PragmaStateEffect::SystemHeader;
+              if (directiveIsConsumed && payloadBytes &&
+                  payloadBytes->second <= deps_.bSource.size() &&
+                  payloadBytes->first <= payloadBytes->second &&
+                  !payloadObservesPragmaState(
+                      classification,
+                      deps_.bSource.slice(payloadBytes->first,
+                                          payloadBytes->second),
+                      deps_.lexLang)) {
+                // Equivalent placements: commit the lower frontier, which
+                // leaves the undetermined payload after the preserved
+                // directive. The side is arbitrary precisely because
+                // equivalence is proved; the witness below records which side
+                // was taken so it is not a bare tie-break.
+                REFOLD_LOG_TRACE(
+                    "tiling/structural",
+                    "payload B=[{0},{1}) does not observe the {2} pragma "
+                    "preserved at source=[{3},{4}); committing it after the "
+                    "directive rather than surrendering the translation unit",
+                    projection->lowerBTokenBoundary,
+                    projection->upperBTokenBoundary,
+                    toString(classification.effect), gap.begin, gap.end);
+                projection->upperBTokenBoundary =
+                    projection->lowerBTokenBoundary;
+              }
+            }
+          }
+
           if (!projection || !projection->IsUnique()) {
             if (inTraceMode()) {
               REFOLD_LOG_TRACE("tiling/structural",

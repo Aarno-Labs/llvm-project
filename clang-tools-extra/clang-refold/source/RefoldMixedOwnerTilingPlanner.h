@@ -19,6 +19,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMIXEDOWNERTILINGPLANNER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMIXEDOWNERTILINGPLANNER_H
 
+#include "clang/Basic/LangOptions.h"
 #include "proof/RefoldAcceptedResultTypes.h"
 #include "source/DiffAlgorithms.h"
 
@@ -84,6 +85,14 @@ public:
     const RefoldMacroTopology &macroTopology;
     /// Source mapper for A/B token and physical source-byte projection.
     RefoldSourceMapper &sourceMapper;
+    /// Original translation-unit source bytes, used to read the exact spelling
+    /// of a directive preserved between two physical source runs.
+    llvm::StringRef tuBytes;
+    /// Edited preprocessed bytes, used to read the payload whose side of such a
+    /// directive is undetermined.
+    llvm::StringRef bSource;
+    /// Lexer options for classifying that directive and its payload.
+    const clang::LangOptions &lexLang;
     /// Owner classifier used to assign hunk subranges to owner domains.
     const RefoldOwnerClassifier &ownerClassifier;
     /// Owner-state proof service used to discharge zero-token state gaps.

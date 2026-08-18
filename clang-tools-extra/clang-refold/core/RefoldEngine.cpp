@@ -674,7 +674,7 @@ static AlignmentSelectionOverride buildOwnerAlignedSlideOverride(
   return selection;
 }
 
-static std::string
+static llvm::Error
 takeTerminalCarrier(std::string carrier,
                     ArrayRef<TerminalFallbackRequest> requests) {
   uint64_t attributed = 0;
@@ -699,7 +699,31 @@ takeTerminalCarrier(std::string carrier,
                   static_cast<uint64_t>(requests.size()), attributed,
                   static_cast<uint64_t>(requests.size()) - attributed);
 
-  return carrier;
+  // Fail rather than emit the edited preprocessed stream.
+  //
+  // Surrendering looks safe to the closing check -- the carrier *is* B, so it
+  // replays B exactly -- while deleting every comment and directive in the
+  // file. That is the one outcome the refolder may never produce, so the
+  // absence of a proof is reported as the absence of an answer.
+  //
+  // Reaching here means no admissible realization was found for some region and
+  // no ladder rung could repair it. That can be correct: a payload whose side
+  // of a preserved directive is genuinely undetermined has no sound placement,
+  // because a pragma may change compiled meaning without changing the
+  // preprocessed tokens, so both placements pass the closing check while
+  // differing in what they mean. The right answer there is to say so, not to
+  // silently drop the directive along with the rest of the file's structure.
+  //
+  // The census above names every request that led here, so the failure carries
+  // its own attribution.
+  (void)carrier;
+  return createStringError(
+      std::make_error_code(std::errc::illegal_byte_sequence),
+      "no admissible refold: %llu terminal request(s) reached the seam and "
+      "none could be narrowed; emitting the edited preprocessed stream would "
+      "drop every comment and directive in the translation unit. See the "
+      "fallback/carrier census above for the failing obligations",
+      static_cast<unsigned long long>(requests.size()));
 }
 
 Expected<std::string> RefoldEngine::Refold(

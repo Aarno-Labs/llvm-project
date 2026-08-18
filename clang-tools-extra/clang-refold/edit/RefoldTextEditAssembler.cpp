@@ -143,6 +143,23 @@ bool textEditInterferesWithPreservedSourceInterval(
   const uint64_t sourceEnd = preservedSegment.sourceEnd;
   if (edit.end < edit.start || sourceEnd <= sourceBegin)
     return true;
+
+  // An edit whose replacement bytes are exactly the bytes it replaces applies
+  // no change, so it cannot disturb a preserved interval however much it
+  // overlaps one: the emitted file is identical whether it is applied or not.
+  // A pass-through directive re-emitted verbatim is such an edit, and it
+  // otherwise collides with the very gap that preserves it, failing a
+  // composition the tiling had already partitioned correctly.
+  //
+  // This is decided against the original bytes of the owner being assembled,
+  // so it holds for header-owned edits on the same terms as TU-owned ones. An
+  // edit that is not exactly the replaced text simply fails the comparison and
+  // is judged by the overlap rules below, so the exemption can never be
+  // claimed for an edit that does change something.
+  if (edit.start <= edit.end && edit.end <= originalFileText.size() &&
+      originalFileText.slice(edit.start, edit.end) == StringRef(edit.text))
+    return false;
+
   if (edit.start != edit.end)
     return edit.start < sourceEnd && sourceBegin < edit.end;
   if (edit.start == sourceBegin &&
