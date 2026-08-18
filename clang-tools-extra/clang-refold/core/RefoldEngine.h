@@ -1096,6 +1096,30 @@ private:
   /// macro or one include instead of emitting the edited stream for the whole
   /// translation unit.  Requests naming no region yield nothing, which leaves
   /// the terminal carrier in place.
+  /// Narrow a replacement hunk whose B payload is reproduced by tokens at its
+  /// own edges, when exactly one narrowing preserves source line numbering.
+  ///
+  /// Suppressing a non-forced anchor widens a hunk: the tokens the anchor would
+  /// have matched fall inside it, and the hunk becomes a replacement whose B
+  /// payload is spelled identically to A tokens at its own edges. Every way of
+  /// re-anchoring those payload tokens is an equally optimal alignment; they
+  /// differ only in where the surviving deletion lands.
+  ///
+  /// The narrowings are separated by what they do to newlines. A deletion that
+  /// removes one renumbers every line after it, and `__LINE__`, `#line` and the
+  /// other location observers are semantic, so that is a real change to the
+  /// surviving source rather than a matter of layout. A deletion that removes
+  /// none cannot move any observer. This also subsumes the preprocessing
+  /// firewall for this shape: a directive occupies its own logical line, so a
+  /// range crossing one necessarily takes the newlines bounding it.
+  ///
+  /// Returns the sole newline-preserving narrowing. When none or several
+  /// qualify it returns nullopt and the ladder proceeds unchanged, so the
+  /// repair never chooses between equals. Runs only after an attempt has
+  /// requested the terminal carrier.
+  std::optional<AlignmentSelectionOverride> BuildLineAlignedHunkNarrowing(
+      const diffutils::CertifiedLcsResult &coreAlignment) const;
+
   bool AppendNarrowableOwnersForTerminalRequests(
       const llvm::DenseSet<uint64_t> &alreadyExpanded,
       llvm::SmallVectorImpl<uint64_t> &owners) const;

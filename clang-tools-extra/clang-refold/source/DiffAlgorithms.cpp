@@ -700,6 +700,7 @@ describeLcsCertificationRun(
   uint64_t retainedAnchors = 0;
   uint64_t coreForcedAnchors = 0;
   uint64_t semanticAnchors = 0;
+  uint64_t ownerAlignedSlideAnchors = 0;
   for (size_t aToken = 0; aToken < result.selectedMap.size(); ++aToken) {
     if (result.selectedMap[aToken] < 0)
       continue;
@@ -715,12 +716,21 @@ describeLcsCertificationRun(
     case LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner:
       ++semanticAnchors;
       break;
+    case LcsAnchorProofKind::OwnerAlignedDeletionSlide:
+      ++ownerAlignedSlideAnchors;
+      break;
     }
   }
+  // Every retained anchor is reported under the proof that authorized it, so
+  // the named counts sum to the total. An anchor counted in the total and in
+  // no kind would read as a census of forced anchors that silently omits the
+  // repaired ones.
   lines.push_back(
       formatv("retained anchors total={0} CoreOptimalPathForced={1} "
-              "EquivalentNormalizedHunkAndOwner={2}",
-              retainedAnchors, coreForcedAnchors, semanticAnchors)
+              "EquivalentNormalizedHunkAndOwner={2} "
+              "OwnerAlignedDeletionSlide={3}",
+              retainedAnchors, coreForcedAnchors, semanticAnchors,
+              ownerAlignedSlideAnchors)
           .str());
 
   for (size_t index = 0; index < result.certificationWindows.size(); ++index) {

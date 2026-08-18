@@ -1,4 +1,3 @@
-
 int a = 1;
 #pragma message("x")
 int b = 2;

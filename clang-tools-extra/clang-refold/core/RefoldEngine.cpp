@@ -1004,6 +1004,17 @@ Expected<std::string> RefoldEngine::Refold(
               *slide, alignmentCertificationMemo.facts.alignment);
           continue;
         }
+
+        // A suppressed anchor widens a hunk into a replacement whose payload is
+        // spelled by A tokens at its own edges. Re-anchoring them narrows it
+        // back to a deletion, and the candidate narrowings differ in whether
+        // the surviving deletion renumbers the lines after it.
+        if (std::optional<AlignmentSelectionOverride> narrowing =
+                engine.BuildLineAlignedHunkNarrowing(
+                    alignmentCertificationMemo.facts.alignment)) {
+          ownerAlignedSlideOverride = std::move(narrowing);
+          continue;
+        }
       }
 
       // Give up every region that any request names, and take the carrier only
@@ -3068,6 +3079,136 @@ bool RefoldEngine::AlignmentResolutionIsDemanded() const {
     }
   }
   return false;
+}
+
+std::optional<AlignmentSelectionOverride>
+RefoldEngine::BuildLineAlignedHunkNarrowing(
+    const diffutils::CertifiedLcsResult &coreAlignment) const {
+  ArrayRef<int64_t> baseMap = coreAlignment.selectedMap;
+  const auto &tokmapByPP = model_.GetTokmapByPP();
+  StringRef tuPath = model_.GetSourcePath();
+  StringRef tuBytes = tuSourceBytes_;
+
+  // Source extent of one A-token run, when every token is spelled in the TU.
+  auto runSourceRange =
+      [&](uint64_t aBegin,
+          uint64_t aEnd) -> std::optional<std::pair<uint64_t, uint64_t>> {
+    uint64_t begin = std::numeric_limits<uint64_t>::max();
+    uint64_t end = 0;
+    for (uint64_t aToken = aBegin; aToken < aEnd; ++aToken) {
+      auto entry = tokmapByPP.find(aToken);
+      if (entry == tokmapByPP.end() ||
+          !pathIdentity_.PathsEqual(entry->second.file, tuPath))
+        return std::nullopt;
+      begin = std::min(begin, entry->second.b);
+      end = std::max(end, entry->second.e);
+    }
+    if (begin > end || end > tuBytes.size())
+      return std::nullopt;
+    return std::make_pair(begin, end);
+  };
+
+  auto aTokenSpellingMatchesB = [&](uint64_t aToken, uint64_t bToken) {
+    return aToken < aToks_.size() && bToken < bToks_.size() &&
+           aToks_[aToken].spelling == bToks_[bToken].spelling;
+  };
+
+  auto removesNoNewline = [&](std::pair<uint64_t, uint64_t> range) {
+    return tuBytes.slice(range.first, range.second).find('\n') ==
+           StringRef::npos;
+  };
+
+  for (const TerminalFallbackRequest &request : terminalSink_.Requests()) {
+    const TerminalFallbackFailureContext &context = request.failure.context;
+    if (!context.aTokenBegin || !context.aTokenEnd || !context.bTokenBegin ||
+        !context.bTokenEnd)
+      continue;
+    const uint64_t aBegin = *context.aTokenBegin;
+    const uint64_t aEnd = *context.aTokenEnd;
+    const uint64_t bBegin = *context.bTokenBegin;
+    const uint64_t bEnd = *context.bTokenEnd;
+    // Only a replacement narrows; a pure deletion has no payload to re-anchor.
+    if (bEnd <= bBegin || aEnd <= aBegin || aEnd > baseMap.size())
+      continue;
+    // The whole A interval must be unmatched, or the payload is already
+    // anchored and this is not the suppressed-anchor shape.
+    bool wholeIntervalUnmatched = true;
+    for (uint64_t aToken = aBegin; aToken < aEnd && wholeIntervalUnmatched;
+         ++aToken)
+      wholeIntervalUnmatched = baseMap[aToken] < 0;
+    if (!wholeIntervalUnmatched)
+      continue;
+
+    const uint64_t payload = bEnd - bBegin;
+    if (payload >= aEnd - aBegin)
+      continue;
+
+    std::optional<AlignmentSelectionOverride> sole;
+    uint64_t qualifying = 0;
+    for (uint64_t leftPeel = 0; leftPeel <= payload; ++leftPeel) {
+      const uint64_t rightPeel = payload - leftPeel;
+      // Every peeled pair must agree in spelling, or the map would stop
+      // agreeing with the streams.
+      bool admissible = true;
+      for (uint64_t i = 0; i < leftPeel && admissible; ++i)
+        admissible = aTokenSpellingMatchesB(aBegin + i, bBegin + i);
+      for (uint64_t j = 0; j < rightPeel && admissible; ++j)
+        admissible = aTokenSpellingMatchesB(aEnd - 1 - j, bEnd - 1 - j);
+      if (!admissible)
+        continue;
+
+      const uint64_t runBegin = aBegin + leftPeel;
+      const uint64_t runEnd = aEnd - rightPeel;
+      if (runEnd <= runBegin)
+        continue;
+      std::optional<std::pair<uint64_t, uint64_t>> range =
+          runSourceRange(runBegin, runEnd);
+      if (!range || !removesNoNewline(*range))
+        continue;
+
+      ++qualifying;
+      if (qualifying > 1)
+        break;
+
+      AlignmentSelectionOverride selection;
+      selection.selectedMap.assign(baseMap.begin(), baseMap.end());
+      for (uint64_t i = 0; i < leftPeel; ++i)
+        selection.selectedMap[aBegin + i] = static_cast<int64_t>(bBegin + i);
+      for (uint64_t j = 0; j < rightPeel; ++j)
+        selection.selectedMap[aEnd - 1 - j] = static_cast<int64_t>(bEnd - 1 - j);
+      selection.selectedAnchorProofs.assign(selection.selectedMap.size(),
+                                            diffutils::LcsAnchorProof{});
+      selection.globalObjective = coreAlignment.globalObjective;
+      selection.globalObjectiveIsExact = coreAlignment.globalObjectiveIsExact;
+      selection.allWindowsCertified = coreAlignment.allWindowsCertified;
+      selection.certifiedBoundaries = coreAlignment.certifiedBoundaries;
+      selection.certificationWindows = coreAlignment.certificationWindows;
+      for (size_t aToken = 0; aToken < selection.selectedMap.size(); ++aToken) {
+        if (selection.selectedMap[aToken] < 0)
+          continue;
+        if (aToken < coreAlignment.selectedAnchorProofs.size() &&
+            coreAlignment.selectedAnchorProofs[aToken].kind ==
+                diffutils::LcsAnchorProofKind::CoreOptimalPathForced) {
+          selection.selectedAnchorProofs[aToken] =
+              coreAlignment.selectedAnchorProofs[aToken];
+          continue;
+        }
+        selection.selectedAnchorProofs[aToken] = diffutils::LcsAnchorProof{
+            diffutils::LcsAnchorProofKind::OwnerAlignedDeletionSlide, 0};
+      }
+      REFOLD_LOG_INFO(
+          "fallback",
+          "terminal fallback names replacement hunk A=[{0},{1}) B=[{2},{3}); "
+          "re-anchoring {4} payload token(s) leaves the sole deletion "
+          "A=[{5},{6}) source=[{7},{8}) that removes no source line",
+          aBegin, aEnd, bBegin, bEnd, payload, runBegin, runEnd, range->first,
+          range->second);
+      sole = std::move(selection);
+    }
+    if (qualifying == 1 && sole)
+      return sole;
+  }
+  return std::nullopt;
 }
 
 bool RefoldEngine::AppendNarrowableOwnersForTerminalRequests(
