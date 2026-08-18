@@ -562,6 +562,103 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
   // lines.  Therefore every byte crossed by each carried definition must be
   // proven non-observing for that definition.  Otherwise the macro-state move
   // would change how preserved header source preprocesses.
+  // Alternative repair, attempted only when a definition cannot be carried:
+  // leave every definition exactly where it is, undefine the observed ones
+  // immediately before the replacement's own line, and restore them immediately
+  // after it from the producer's directive text.
+  //
+  // The restore is what makes this self-contained.  Macro state after the
+  // repaired interval is identical to the state before it, so no obligation
+  // falls on the header suffix or on translation-unit source after the include
+  // -- neither of which this proof can see.  Only the repaired line changes
+  // what it observes, and the three chunks that line is made of are each
+  // proven indifferent to the name below.
+  auto buildUndefRestoreMaterializedHeaderPatch =
+      [&]() -> std::optional<StabilizedMaterializedHeaderMacroPatch> {
+    const uint64_t lineStart = static_cast<uint64_t>(
+        stringutils::lineStartOffset(bytes, static_cast<size_t>(mp.invStart)));
+    if (lineStart > mp.invStart)
+      return std::nullopt;
+
+    // A spliced physical line continues a logical line that began earlier, so a
+    // `#undef` inserted at this offset would not start a directive line.
+    if (lineStart > 0 &&
+        stringutils::isLineSplice(bytes, static_cast<size_t>(lineStart) - 1))
+      return std::nullopt;
+
+    const uint64_t restoreEnd = materializedHeaderLineEndAfter(mpEnd);
+    if (restoreEnd < mpEnd || restoreEnd > bytes.size())
+      return std::nullopt;
+    if (materializedHeaderRangeOverlapsStagedEdit(lineStart, restoreEnd))
+      return std::nullopt;
+
+    // A directive inside the replacement may select an arm whose conditional
+    // state is itself part of the owner proof, which is no longer a plain
+    // token repair.  A B-derived payload carries no directive, so this excludes
+    // only cases this repair was never meant to cover.
+    if (tokenText_.TextContainsDirectiveLine(StringRef(mp.replacement)))
+      return std::nullopt;
+
+    const StringRef sameLinePrefix = bytes.slice(lineStart, mp.invStart);
+    const StringRef sameLineSuffix = bytes.slice(mpEnd, restoreEnd);
+
+    for (const auto &candidate : candidates) {
+      // The definition must be complete before the repaired line, or the
+      // synthesized `#undef` would precede the `#define` it undoes.
+      if (candidate.end > lineStart)
+        return std::nullopt;
+
+      // The prefix is preprocessed after the `#undef` and the suffix before the
+      // restore, so both see the name undefined where they originally saw it
+      // defined.  Neither may observe it.
+      if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
+              *candidate.directive, candidate.name, sameLinePrefix,
+              StringRef(mp.replacement))) {
+        return std::nullopt;
+      }
+      if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
+              *candidate.directive, candidate.name, sameLineSuffix,
+              StringRef())) {
+        return std::nullopt;
+      }
+    }
+
+    std::string replacement;
+    for (const auto &candidate : candidates)
+      replacement += (Twine("#undef ") + candidate.name + "\n").str();
+    replacement.append(bytes.begin() + lineStart, bytes.begin() + mp.invStart);
+    replacement += mp.replacement;
+    replacement.append(bytes.begin() + mpEnd, bytes.begin() + restoreEnd);
+    if (!replacement.empty() && replacement.back() != '\n')
+      replacement.push_back('\n');
+    // Restore in source order, so several definitions re-establish the same
+    // last-one-wins order they had originally.
+    for (const auto &candidate : candidates) {
+      replacement.append(candidate.directive->text.begin(),
+                         candidate.directive->text.end());
+      if (replacement.empty() || replacement.back() != '\n')
+        replacement.push_back('\n');
+    }
+
+    for (const auto &candidate : candidates) {
+      (void)widenMaterializedHeaderMacroState(
+          materializedHeaderMacroStateBoundary(lineStart, restoreEnd),
+          StateMutationKind::WidenedIntoClosure,
+          llvm::formatv("include-owned macro patch in {0} undefines '{1}' "
+                        "(#{2}) across replay interval [{3},{4}) and restores "
+                        "it immediately after",
+                        headerPath, candidate.name, candidate.directive->id,
+                        lineStart, restoreEnd)
+              .str());
+    }
+
+    StabilizedMaterializedHeaderMacroPatch stabilized;
+    stabilized.start = lineStart;
+    stabilized.end = restoreEnd;
+    stabilized.replacement = std::move(replacement);
+    return stabilized;
+  };
+
   for (const auto &candidate : candidates) {
     std::string crossed;
     appendCrossedSourceExcludingCarried(crossed, candidate.end, mp.invStart);
@@ -570,11 +667,16 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
     if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
             *candidate.directive, candidate.name, StringRef(crossed),
             following)) {
+      if (std::optional<StabilizedMaterializedHeaderMacroPatch> undefRestore =
+              buildUndefRestoreMaterializedHeaderPatch()) {
+        return undefRestore;
+      }
       (void)failMaterializedHeaderMacroState(
           materializedHeaderMacroStateBoundary(candidate.begin, candidate.end),
           StateMutationKind::MovedLater,
           llvm::formatv("include-owned macro patch in {0} cannot carry "
-                        "#{1} for '{2}' across observing header source",
+                        "#{1} for '{2}' across observing header source, and "
+                        "cannot undefine and restore it around the replacement",
                         headerPath, candidate.directive->id, candidate.name)
               .str());
       return StabilizedMaterializedHeaderMacroPatch{};

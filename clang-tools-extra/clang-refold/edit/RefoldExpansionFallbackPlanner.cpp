@@ -1074,6 +1074,58 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     return false;
   };
 
+  // Does an include's subtree own a pragma whose effect outlives the include?
+  //
+  // This is the narrower question the *touched* includes need.  Consuming a
+  // touched include is justified by the closure realizing its expansion, which
+  // accounts for its tokens and, through macro-state liveness repair, for its
+  // macro directives.  It does not account for pragma state that survives the
+  // include's end.  Deleting an include deletes everything it entered, so the
+  // question covers the whole subtree: a pragma two headers down dies exactly
+  // as one in the directly included file does.
+  auto includeSubtreeOwnsOutlivingPragma =
+      [&](const RefoldModel::IncludeItem &root) -> bool {
+    llvm::SmallVector<uint64_t, 16> subtree{root.id};
+    llvm::DenseSet<uint64_t> visited{root.id};
+    for (size_t index = 0; index < subtree.size(); ++index) {
+      for (const RefoldModel::IncludeItem &child : model_.GetIncludes()) {
+        if (child.parent && *child.parent == subtree[index] &&
+            visited.insert(child.id).second) {
+          subtree.push_back(child.id);
+        }
+      }
+    }
+
+    for (const RefoldModel::PragmaDirective &pragma : model_.GetPragmas()) {
+      if (pragmaIsConsumableIncludeLocalState(pragma))
+        continue;
+      if (pragma.ownerIncludeId) {
+        if (visited.count(*pragma.ownerIncludeId))
+          return true;
+        continue;
+      }
+      // Falling back to physical path is deliberately conservative: a header
+      // reached both inside and outside the subtree answers yes, which only
+      // declines a consumption.
+      for (uint64_t includeId : subtree) {
+        const RefoldModel::IncludeItem *include =
+            model_.GetIncludeById(includeId);
+        if (!include)
+          continue;
+        StringRef openedPath;
+        if (include->openedPath && !include->openedPath->empty())
+          openedPath = *include->openedPath;
+        else if (include->resolvedPath)
+          openedPath = *include->resolvedPath;
+        if (!openedPath.empty() &&
+            paths_.PathsEqual(openedPath, pragma.sitePath)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
   const RecordedIncludeSideEffectResolver recordedIncludeSideEffectResolver(
       model_, paths_, pragmaIsConsumableIncludeLocalState);
 
@@ -2414,10 +2466,30 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
         continue;
       if (inc.siteB >= sourceEnd || sourceBegin >= inc.siteE)
         continue;
-      if (includeIsTouched(inc))
-        continue;
       std::optional<std::string> sideEffectReason =
           includeRecordedSideEffectReason(inc);
+
+      // A *touched* include is consumed because this closure realizes its
+      // expansion, and that accounts for its tokens.  It does not account for
+      // preprocessor state the header establishes that outlives the include:
+      // `#pragma push_macro` is popped by the translation unit after the
+      // include has ended, so consuming the directive deletes the push while
+      // the pop survives, and the pop then restores nothing.  Consuming is
+      // sound only when every recorded effect is include-local, which is what
+      // the side-effect resolver decides.  Otherwise leave the closure
+      // unformed so the realization lattice materializes the include instead,
+      // where the directive survives where it was written.
+      if (includeIsTouched(inc)) {
+        if (!includeSubtreeOwnsOutlivingPragma(inc))
+          continue;
+        REFOLD_LOG_TRACE(
+            "fallback",
+            "TU/include closure rejected: source interval [{0},{1}) would "
+            "consume touched include id={2} site=[{3},{4}) whose subtree owns "
+            "a pragma outliving it",
+            sourceBegin, sourceEnd, inc.id, inc.siteB, inc.siteE);
+        return std::nullopt;
+      }
       if (!inc.cover.IsValid() && !sideEffectReason &&
           sourceBegin <= inc.siteB && inc.siteE <= sourceEnd)
         continue;
