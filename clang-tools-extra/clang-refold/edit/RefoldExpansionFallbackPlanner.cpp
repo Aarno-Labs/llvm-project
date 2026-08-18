@@ -97,7 +97,35 @@ struct PreservedDirectiveFrontier {
   /// contributes one; a preserved `#include` contributes one per pragma its
   /// header owns, because re-entering the header re-runs all of them.
   SmallVector<PragmaClassification, 2> classifications;
+  /// Macro names a preserved `#define`/`#undef` binds.  A payload naming one
+  /// preprocesses differently on either side of the directive, so the name is
+  /// what a straddling zone would observe by crossing it.
+  SmallVector<StringRef, 2> boundMacroNames;
 };
+
+/// Return whether `payload` names a macro a preserved directive binds.
+///
+/// A preserved `#define`/`#undef` changes what an identifier means across it,
+/// so a straddling zone naming that identifier preprocesses differently on
+/// either side. The name is recovered from the producer's directive record
+/// rather than by scanning the directive's text, and the raw lexer decides what
+/// an identifier is, so a spelling inside a literal or comment is not counted.
+bool payloadNamesBoundMacro(ArrayRef<StringRef> boundMacroNames,
+                            StringRef payload, const LangOptions &lang) {
+  if (boundMacroNames.empty())
+    return false;
+
+  SmallVector<RefoldLexBoundaryToken, 32> tokens;
+  refoldLexBoundaryTokens(payload, lang, tokens);
+  for (const RefoldLexBoundaryToken &token : tokens) {
+    if (token.kind != tok::raw_identifier)
+      continue;
+    for (StringRef bound : boundMacroNames)
+      if (token.spelling == bound)
+        return true;
+  }
+  return false;
+}
 
 /// Return whether `payload` can observe any state the preserved directive
 /// establishes.  An unclassified effect observes everything, so a directive
@@ -105,12 +133,12 @@ struct PreservedDirectiveFrontier {
 bool payloadObservesPreservedDirectiveState(
     const PreservedDirectiveFrontier &frontier, StringRef payload,
     const LangOptions &lang) {
-  if (frontier.classifications.empty())
+  if (frontier.classifications.empty() && frontier.boundMacroNames.empty())
     return true;
   for (const PragmaClassification &classification : frontier.classifications)
     if (payloadObservesPragmaState(classification, payload, lang))
       return true;
-  return false;
+  return payloadNamesBoundMacro(frontier.boundMacroNames, payload, lang);
 }
 
 /// Which side of a preserved directive an observing zone may be realized on.
@@ -192,7 +220,17 @@ ObservingZonePlacement observingZonePlacement(
     const PreservedDirectiveFrontier &frontier, StringRef zone,
     const LangOptions &lang) {
   // An unclassified frontier observes everything and proves nothing.
-  if (frontier.classifications.empty())
+  if (frontier.classifications.empty() && frontier.boundMacroNames.empty())
+    return ObservingZonePlacement::Undetermined;
+
+  // A zone naming a macro the preserved directive binds is legal on both sides
+  // and merely preprocesses differently, so its side is decided by which one
+  // reproduces B rather than by legality.  A `#define` would force the zone
+  // before it -- the name must survive unexpanded to appear in B at all -- and
+  // an `#undef` would force it after, for the same reason read the other way.
+  // Deciding that needs the definition's liveness at the split, which this
+  // frontier does not carry, so it stays undetermined.
+  if (payloadNamesBoundMacro(frontier.boundMacroNames, zone, lang))
     return ObservingZonePlacement::Undetermined;
 
   // A preserved `#include` contributes one effect per pragma its header owns,
@@ -1903,7 +1941,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   // than refusing the closure, since refusing surrenders every directive in the
   // translation unit rather than this one.
   struct TUPositionPreservedDirective {
-    enum class Kind { Pragma, Include };
+    enum class Kind { Pragma, Include, MacroDirective };
 
     Kind kind = Kind::Pragma;
     uint64_t begin = 0;
@@ -1914,6 +1952,9 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     /// material the alignment cannot place.  StringRefs point into `tuBytes`
     /// for a pragma, or into the model's pragma text for an include.
     SmallVector<PragmaClassification, 2> classifications;
+    /// Macro names a preserved `#define`/`#undef` binds.  Empty for the other
+    /// kinds.  StringRefs point into the model's directive record.
+    SmallVector<StringRef, 2> boundMacroNames;
   };
 
   // Producer coordinate surfaces for projecting a tokenless TU directive onto
@@ -2003,6 +2044,39 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       pragmas.push_back({TUPositionPreservedDirective::Kind::Pragma,
                          exactRange->first, exactRange->second, pragma.id,
                          /*aFrontier=*/0, std::move(classifications)});
+    }
+
+    // A macro directive in the gap is preserved on the same terms.  It is
+    // tokenless and it is meaningful source, so consuming it would drop a
+    // macro-state transition the gap theorem would otherwise report as an
+    // unowned protected interval -- which is what refused the whole closure
+    // before, costing every directive in the translation unit to avoid
+    // dropping this one.
+    for (const auto &directive : model_.GetMacroDirectives()) {
+      if (directive.subkind != "#define" && directive.subkind != "#undef")
+        continue;
+      if (!paths_.PathsEqual(directive.sitePath, tuPath))
+        continue;
+      if (directive.ownerIncludeId)
+        continue;
+
+      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+          findSourceGapProducerInterval(
+              preprocessingStructureIndex_,
+              PreprocessingStructureModelKind::MacroDirective, directive.id);
+      if (!exactRange || exactRange->first >= exactRange->second)
+        continue;
+      if (exactRange->first < gapBegin || gapEnd < exactRange->second)
+        continue;
+
+      SmallVector<StringRef, 2> boundMacroNames;
+      if (!directive.name.empty())
+        boundMacroNames.push_back(directive.name);
+
+      pragmas.push_back({TUPositionPreservedDirective::Kind::MacroDirective,
+                         exactRange->first, exactRange->second, directive.id,
+                         /*aFrontier=*/0,
+                         /*classifications=*/{}, std::move(boundMacroNames)});
     }
 
     // A zero-token include whose header owns non-consumable state is the same
@@ -3103,7 +3177,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     preservedFrontiers.reserve(mixedPositionPreservedTUDirectives.size());
     for (const TUPositionPreservedDirective &pragma :
          mixedPositionPreservedTUDirectives)
-      preservedFrontiers.push_back({pragma.aFrontier, pragma.classifications});
+      preservedFrontiers.push_back(
+          {pragma.aFrontier, pragma.classifications, pragma.boundMacroNames});
 
     std::string splitReason;
     std::optional<SmallVector<size_t, 4>> splits =
