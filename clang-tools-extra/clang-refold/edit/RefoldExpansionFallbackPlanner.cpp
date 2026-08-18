@@ -113,6 +113,109 @@ bool payloadObservesPreservedDirectiveState(
   return false;
 }
 
+/// Which side of a preserved directive an observing zone may be realized on.
+enum class ObservingZonePlacement {
+  /// No side is proven, so the partition fails closed.
+  Undetermined,
+  /// Only the side before the directive is admissible.
+  ForcedBefore,
+};
+
+/// Decide the side of a zone that *observes* the directive's state.
+///
+/// Observation is not the same as ambiguity. A zone is placeable whenever the
+/// set of sides that are both legal and reproduce B is a singleton, and
+/// observation is one of the ways that set shrinks to one rather than a reason
+/// to give up. Three situations reach a verdict, and they need different
+/// evidence:
+///
+/// * the zone does not observe at all -- both sides are equivalent, which the
+///   caller admits before reaching here;
+/// * exactly one side is *legal* -- decided below, for `PoisonIdentifiers`;
+/// * both sides are legal but only one reproduces B -- needs macro-liveness
+///   facts and is not decided here.
+///
+/// `PoisonIdentifiers` is the second case. `GCC poison` is consumed by the
+/// preprocessor and emits no token, so both placements produce the *same* token
+/// stream and the difference is purely legality: naming a poisoned identifier
+/// after the directive is an error, naming it before is not. A zone naming one
+/// is therefore realizable on exactly one side, and it is the side a determined
+/// zone already takes, so admitting it commits to nothing new.
+///
+/// Everything else stays `Undetermined`, and the restriction is the point.
+/// `MacroStateStack` observation is not a legality question -- such a zone is
+/// legal on both sides and merely expands differently, so its side is decided
+/// by which one reproduces B, which needs facts this classification does not
+/// carry. An unclassified directive observes everything and is never admitted.
+/// A future kind may well be forced the other way: `pop_macro` restores a
+/// definition, so a zone needing the restored one would be forced *after*,
+/// which is why this returns a side rather than a yes/no.
+/// The side a single observed effect admits.
+///
+/// Enumerated exhaustively so that adding a pragma kind is a decision here
+/// rather than a silent fall-through to the unsafe answer.
+ObservingZonePlacement placementForObservedEffect(PragmaStateEffect effect) {
+  switch (effect) {
+  case PragmaStateEffect::PoisonIdentifiers:
+    // Consumed, so both sides emit the same tokens; only the earlier side is
+    // legal.
+    return ObservingZonePlacement::ForcedBefore;
+
+  case PragmaStateEffect::MacroStateStack:
+    // Legal on both sides, expanding differently. Deciding it means proving
+    // which side reproduces B, which needs macro-liveness facts.
+    return ObservingZonePlacement::Undetermined;
+
+  case PragmaStateEffect::IncludeOnce:
+    // Reported observing when the zone could introduce a directive at all.
+    // Both sides are legal and which reproduces B depends on what that
+    // directive would include, so nothing here fixes a side.
+    return ObservingZonePlacement::Undetermined;
+
+  case PragmaStateEffect::Unknown:
+    // The unsafe answer by construction; an unrecognized spelling proves
+    // nothing about either side.
+    return ObservingZonePlacement::Undetermined;
+
+  case PragmaStateEffect::NoState:
+  case PragmaStateEffect::DiagnosticState:
+  case PragmaStateEffect::SystemHeader:
+    // These never report observation, so a zone never reaches here through
+    // them. Answer conservatively rather than assert, because the verdict is
+    // only consulted after an observation was already reported.
+    return ObservingZonePlacement::Undetermined;
+  }
+  return ObservingZonePlacement::Undetermined;
+}
+
+ObservingZonePlacement observingZonePlacement(
+    const PreservedDirectiveFrontier &frontier, StringRef zone,
+    const LangOptions &lang) {
+  // An unclassified frontier observes everything and proves nothing.
+  if (frontier.classifications.empty())
+    return ObservingZonePlacement::Undetermined;
+
+  // A preserved `#include` contributes one effect per pragma its header owns,
+  // so several may be observed at once. Every observed effect must admit the
+  // same side: one effect forcing a side the next forbids leaves no placement
+  // at all, which is the undetermined answer rather than a preference.
+  std::optional<ObservingZonePlacement> agreed;
+  for (const PragmaClassification &classification : frontier.classifications) {
+    if (!payloadObservesPragmaState(classification, zone, lang))
+      continue;
+
+    const ObservingZonePlacement placement =
+        placementForObservedEffect(classification.effect);
+    if (placement == ObservingZonePlacement::Undetermined)
+      return ObservingZonePlacement::Undetermined;
+    if (agreed && *agreed != placement)
+      return ObservingZonePlacement::Undetermined;
+    agreed = placement;
+  }
+
+  return agreed.value_or(ObservingZonePlacement::Undetermined);
+}
+
 /// Derive where each preserved tokenless directive cuts the realized B payload.
 ///
 /// A closure that preserves a directive in place must emit the B material that
@@ -231,17 +334,32 @@ std::optional<SmallVector<size_t, 4>> deriveBPayloadSplitsAtATokenFrontiers(
 
     if (zoneBegin < split) {
       const StringRef zone = sliceBSource(zoneBegin, split);
-      if (payloadObservesPreservedDirectiveState(frontier, zone, lang))
-        return refuse(
-            llvm::formatv("edited B material [{0},{1}) has no determined side "
-                          "of the preserved directive and observes its {2} "
-                          "state",
-                          zoneBegin, split,
-                          frontier.classifications.empty()
-                              ? StringRef("unclassified")
-                              : toString(frontier.classifications.front()
-                                             .effect))
-                .str());
+      if (payloadObservesPreservedDirectiveState(frontier, zone, lang)) {
+        // Observing is not the same as ambiguous. An observed effect can leave
+        // exactly one admissible side, in which case the zone is placed by
+        // proof rather than by preference.
+        if (observingZonePlacement(frontier, zone, lang) !=
+            ObservingZonePlacement::ForcedBefore) {
+          return refuse(
+              llvm::formatv("edited B material [{0},{1}) has no determined side "
+                            "of the preserved directive and observes its {2} "
+                            "state",
+                            zoneBegin, split,
+                            frontier.classifications.empty()
+                                ? StringRef("unclassified")
+                                : toString(frontier.classifications.front()
+                                               .effect))
+                  .str());
+        }
+
+        REFOLD_LOG_TRACE(
+            "fallback",
+            "edited B material [{0},{1}) observes the preserved directive's "
+            "{2} state, which admits only the side before it; placing it there "
+            "by proof rather than by preference",
+            zoneBegin, split,
+            toString(frontier.classifications.front().effect));
+      }
     }
 
     if (split < previousSplit)
