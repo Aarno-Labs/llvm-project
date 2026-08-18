@@ -406,6 +406,108 @@ withDivergingEditedToken(TerminalFallbackProofFailure failure,
   return failure;
 }
 
+/// Describe which attribution surfaces one terminal request carries.
+///
+/// A region-scoped realization needs somewhere to put the payload it cannot
+/// prove, and the only fields the narrowing ladder reads are `ownerId` and the A
+/// token range. Reporting the whole surface -- including the hunk, the source
+/// span, and the B token range -- is what turns "does every request name a
+/// region" into a question with an observable answer rather than an audit.
+static std::string describeTerminalRequestAttribution(
+    const TerminalFallbackFailureContext &context) {
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  auto field = [&os](StringRef name, const std::optional<uint64_t> &value) {
+    os << ' ' << name << '=';
+    if (value)
+      os << *value;
+    else
+      os << '-';
+  };
+
+  field("ownerId", context.ownerId);
+  field("hunk", context.hunk);
+  os << " source=";
+  if (context.sourcePath && context.sourceBegin && context.sourceEnd)
+    os << *context.sourcePath << '[' << *context.sourceBegin << ','
+       << *context.sourceEnd << ')';
+  else
+    os << '-';
+  os << " aTokens=";
+  if (context.aTokenBegin && context.aTokenEnd)
+    os << '[' << *context.aTokenBegin << ',' << *context.aTokenEnd << ')';
+  else
+    os << '-';
+  os << " bTokens=";
+  if (context.bTokenBegin && context.bTokenEnd)
+    os << '[' << *context.bTokenBegin << ',' << *context.bTokenEnd << ')';
+  else
+    os << '-';
+  return text;
+}
+
+/// Return whether a terminal request names any region at all.
+///
+/// This is the precondition a region-scoped realization needs from every
+/// request. It is deliberately weaker than what such a realization will
+/// ultimately require -- a named region must additionally be placeable between
+/// preserved directives -- so a run reporting every request attributed is
+/// necessary, not sufficient.
+static bool terminalRequestNamesRegion(
+    const TerminalFallbackFailureContext &context) {
+  return context.ownerId.has_value() || context.hunk.has_value() ||
+         (context.sourceBegin.has_value() && context.sourceEnd.has_value()) ||
+         (context.aTokenBegin.has_value() && context.aTokenEnd.has_value());
+}
+
+/// Take the raw-B terminal carrier as this run's final answer.
+///
+/// This is the one seam where the driver gives up the entire translation unit:
+/// either the narrowing ladder is spent and every region a terminal request
+/// named is already expanded, or the closing assembly check could not attribute
+/// its divergence to any region that is not. Both callers have already produced
+/// the carrier text; routing them through here makes "this run emitted raw B" a
+/// single observable fact instead of two returns that must be kept in step.
+///
+/// It is deliberately not the per-attempt summary in
+/// `emitRefoldAttemptStatsSummary()`. That runs once per attempt *and* once per
+/// candidate simulation, so it reports terminal requests the ladder went on to
+/// repair: a run that recovers still prints `terminalFallback=yes(raw-B)` there,
+/// and a run that surrenders can print `terminalFallback=no`. Only the driver
+/// frame knows which attempt was the last one, and candidate simulations never
+/// reach it -- they call the instance `Refold()` directly.
+///
+/// This is also where whole-file surrender is meant to be replaced by a
+/// region-scoped realization, which is why the attribution census below reports
+/// what each request left behind to work from.
+static std::string
+takeTerminalCarrier(std::string carrier,
+                    ArrayRef<TerminalFallbackRequest> requests) {
+  uint64_t attributed = 0;
+  for (const TerminalFallbackRequest &request : requests) {
+    const bool namesRegion = terminalRequestNamesRegion(request.failure.context);
+    attributed += namesRegion ? 1 : 0;
+    REFOLD_LOG_WARN("fallback/carrier",
+                    "  request obligation={0} reason={1} stage={2} "
+                    "namesRegion={3}{4}",
+                    request.failure.obligation, request.failure.reason,
+                    request.stage.empty() ? StringRef("<unspecified>")
+                                          : StringRef(request.stage),
+                    namesRegion ? "yes" : "no",
+                    describeTerminalRequestAttribution(request.failure.context));
+  }
+
+  REFOLD_LOG_WARN("fallback/carrier",
+                  "emitting the raw edited preprocessed stream for the whole "
+                  "translation unit ({0} bytes): requests={1} attributed={2} "
+                  "unattributed={3}",
+                  static_cast<uint64_t>(carrier.size()),
+                  static_cast<uint64_t>(requests.size()), attributed,
+                  static_cast<uint64_t>(requests.size()) - attributed);
+
+  return carrier;
+}
+
 Expected<std::string> RefoldEngine::Refold(
     const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
     ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
@@ -718,7 +820,9 @@ Expected<std::string> RefoldEngine::Refold(
                         "up after {0} narrowing step(s); taking the carrier",
                         narrowingAttempts);
       }
-      return out;
+      // `out` is already the carrier: this attempt's own `Refold()` replaced it
+      // when it saw the request.  Nothing narrower is left to give up.
+      return takeTerminalCarrier(std::move(out), engine.terminalSink_.Requests());
     }
 
     // Without a verifier the result stands exactly as it would without this
@@ -814,7 +918,11 @@ Expected<std::string> RefoldEngine::Refold(
             verdict.mismatchTokenIndex),
         "assembly-verify",
         "assembled source does not replay the edited preprocessed stream");
-    return engine.expansionFallbackPlanner_->ResolvePostStructuralFallback();
+    // The request recorded just above is part of this census, which is why the
+    // carrier is taken after it rather than before.
+    return takeTerminalCarrier(
+        engine.expansionFallbackPlanner_->ResolvePostStructuralFallback(),
+        engine.terminalSink_.Requests());
   }
 }
 

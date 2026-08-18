@@ -1120,12 +1120,17 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
                   "{2} ({3})",
                   child->id, includeId, toString(guardResult.rejection),
                   guardResult.detail);
+              // Name the include whose guard could not be proved.  Expanding
+              // it is a repair -- it stops being a directive, so no surviving
+              // occurrence is left to guard -- and the fallback ladder can only
+              // try that for a region a request actually names.
               terminalSink_.RequestTerminalFallback(
                   MakeTerminalFallbackProofFailure(
                       TerminalFallbackObligationKind::
                           IncludeGuardStateStabilizable,
                       TerminalFallbackFailureReason::
-                          IncludeGuardStateNotStabilizable),
+                          IncludeGuardStateNotStabilizable,
+                      TerminalFallbackFailureContext::ForOwnerId(child->id)),
                   "pragma/once/guard", guardResult.detail);
               includeExpansion[includeId] = std::string();
               return;
@@ -1319,11 +1324,14 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
                          "{2} ({3})",
                          sibling->id, includeId,
                          toString(guardResult.rejection), guardResult.detail);
+        // Same attribution as the nested-include rejection above: the
+        // unguardable occurrence is the region at fault.
         terminalSink_.RequestTerminalFallback(
             MakeTerminalFallbackProofFailure(
                 TerminalFallbackObligationKind::IncludeGuardStateStabilizable,
                 TerminalFallbackFailureReason::
-                    IncludeGuardStateNotStabilizable),
+                    IncludeGuardStateNotStabilizable,
+                TerminalFallbackFailureContext::ForOwnerId(sibling->id)),
             "pragma/once/guard", guardResult.detail);
         includeExpansion[includeId] = std::string();
         return;
@@ -1634,7 +1642,8 @@ bool RefoldIncludeMaterializer::TryRecordInlineIncludeRealizationFromB(
       terminalSink_.RequestTerminalFallback(
           MakeTerminalFallbackProofFailure(
               TerminalFallbackObligationKind::IncludeGuardStateStabilizable,
-              TerminalFallbackFailureReason::IncludeGuardStateNotStabilizable),
+              TerminalFallbackFailureReason::IncludeGuardStateNotStabilizable,
+              TerminalFallbackFailureContext::ForOwnerId(include.id)),
           "pragma/once/guard", guardResult.detail);
       REFOLD_LOG_TRACE("pragma/once/guard",
                        "B realization inc#{0} rejected: {1} ({2})", include.id,

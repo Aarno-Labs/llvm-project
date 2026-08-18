@@ -1304,10 +1304,27 @@ bool MacroStateRepairContext::AuthorizeMaterializedDefinitionTransitions() {
                                                 source->interval.end);
     }
     if (!source || !editIndex || *editIndex >= tuEdits_.size()) {
+      // Name the definition that could not be materialized.  Its own directive
+      // is the region at fault, and it is known here even when the transition
+      // that would have carried it is not: `source` is exactly what is missing
+      // in the first disjunct, so the attribution comes from the directive
+      // rather than from the transition.  A request naming nothing leaves the
+      // ladder with the whole translation unit as its only move.
+      TerminalFallbackFailureContext context;
+      if (state.definition->ownerIncludeId)
+        context.ownerId = *state.definition->ownerIncludeId;
+      context.sourcePath = state.definition->sitePath;
+      context.sourceBegin = state.definition->directiveLineB
+                                ? *state.definition->directiveLineB
+                                : state.definition->siteB;
+      context.sourceEnd = state.definition->directiveLineE
+                              ? *state.definition->directiveLineE
+                              : state.definition->siteE;
       TerminalSink().RequestTerminalFallback(
           MakeTerminalFallbackProofFailure(
               TerminalFallbackObligationKind::EmissionEditSetComposable,
-              TerminalFallbackFailureReason::UncomposableEmissionEditSet),
+              TerminalFallbackFailureReason::UncomposableEmissionEditSet,
+              std::move(context)),
           "macro-definition-materialization",
           "materialized definition transition has no exact containing final "
           "TU edit");

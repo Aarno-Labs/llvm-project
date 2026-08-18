@@ -1149,7 +1149,6 @@ struct TheoremAuditStats {
 enum class TerminalFallbackObligationKind : uint8_t {
   Unknown,
   OwnerClosedCover,
-  DeterministicMixedOwnerTiling,
   StateTransitionClosure,
   PragmaBoundaryKnown,
   LineControlStateProducerProven,
@@ -1158,9 +1157,7 @@ enum class TerminalFallbackObligationKind : uint8_t {
   IncludeGuardStateStabilizable,
   ConditionalStateStabilizable,
   ReverseSolvedDirectiveForbidden,
-  InvocationPreservationWellFormed,
   ProducerFactsAvailable,
-  FinalValidationSucceeded,
   IncludeRealizationBEnvelopeMapped,
   EmissionArtifactDischarged,
   EmissionEditSetComposable,

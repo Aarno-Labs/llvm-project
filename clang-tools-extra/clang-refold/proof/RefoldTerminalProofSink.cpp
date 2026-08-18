@@ -36,8 +36,6 @@ StringRef toString(TerminalFallbackObligationKind obligation) {
     return "Unknown";
   case TerminalFallbackObligationKind::OwnerClosedCover:
     return "OwnerClosedCover";
-  case TerminalFallbackObligationKind::DeterministicMixedOwnerTiling:
-    return "DeterministicMixedOwnerTiling";
   case TerminalFallbackObligationKind::StateTransitionClosure:
     return "StateTransitionClosure";
   case TerminalFallbackObligationKind::PragmaBoundaryKnown:
@@ -54,12 +52,8 @@ StringRef toString(TerminalFallbackObligationKind obligation) {
     return "ConditionalStateStabilizable";
   case TerminalFallbackObligationKind::ReverseSolvedDirectiveForbidden:
     return "ReverseSolvedDirectiveForbidden";
-  case TerminalFallbackObligationKind::InvocationPreservationWellFormed:
-    return "InvocationPreservationWellFormed";
   case TerminalFallbackObligationKind::ProducerFactsAvailable:
     return "ProducerFactsAvailable";
-  case TerminalFallbackObligationKind::FinalValidationSucceeded:
-    return "FinalValidationSucceeded";
   case TerminalFallbackObligationKind::IncludeRealizationBEnvelopeMapped:
     return "IncludeRealizationBEnvelopeMapped";
   case TerminalFallbackObligationKind::EmissionArtifactDischarged:

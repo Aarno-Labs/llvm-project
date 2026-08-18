@@ -173,6 +173,15 @@ def main():
             'closing verification rejects the assembly.  No .c.mod comparison '
             'and no checker run follow; the test asserts on the emitted '
             'diagnosis instead.'))
+  ap.add_argument(
+      '--emit-edit-map', action='store_true', required=False,
+      help=('Request the materialized-edit-map sidecar.  Several emission '
+            'proofs are reachable only when the sidecar was asked for -- the '
+            'edit-map ambiguity checks in RefoldTextEditAssembler are guarded '
+            'on it -- so without this the whole gated surface is unreachable '
+            'from lit however the input is shaped.  The sidecar is written '
+            'beside the other outputs and is not diffed: its contents carry '
+            'absolute paths, so pinning it would be machine-dependent.'))
   ap.add_argument('--clang', required=True)
   ap.add_argument('--refolder', required=True)
   ap.add_argument('--headers', required=True)
@@ -279,13 +288,17 @@ def main():
   # Strict is the harness default; --relaxed opts into the non-strict pipeline.
   strict_flag = '' if args.relaxed else '--strict'
   verify_flag = f'--verify-output={args.verify_output}'
+  edit_map_flag = ''
+  if args.emit_edit_map:
+    out_edit_map = os.path.join(tmp_out, f'{testname}.editmap.json')
+    edit_map_flag = f' --emit-edit-map={shlex.quote(out_edit_map)}'
   clang_refold_cmd = (
       f'{shlex.quote(args.refolder)} {line_flag} {strict_flag} {verify_flag} '
       f'--log-level={shlex.quote(args.log)} '
       f'--pp {shlex.quote(out_i)} '
       f'--pp-mod {shlex.quote(exp_i_mod)} '
       f'--refold-map {shlex.quote(out_json)} '
-      f'--out {shlex.quote(out_mod)}'
+      f'--out {shlex.quote(out_mod)}{edit_map_flag}'
   )
   if args.expect_refold_fail:
     # The refold must refuse.  Nothing downstream is meaningful: there is no
