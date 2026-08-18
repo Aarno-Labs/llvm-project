@@ -1308,6 +1308,22 @@ std::string RefoldEngine::Refold() {
   // to the next safe beginning-of-line, and no site along that path establishes
   // that the flush point precedes the observers the drift displaced.
   if (!AuditPreservedLineObserversInFinalOutput(out)) {
+    // Record the request before falling back, exactly as the prune check above
+    // does. The edited preprocessed stream is not an answer this engine may
+    // return on its own: without a request the driver sees a successful
+    // assembly, the closing verifier passes it because the stream replays
+    // itself by construction, and a result that dropped every comment and
+    // directive ships with a zero exit. Naming the failure is what routes it to
+    // the one place allowed to decide there is no admissible refold.
+    REFOLD_LOG_WARN("assembly-verify",
+                    "preserved line observers were displaced in the final "
+                    "output; requesting the terminal fallback rather than "
+                    "returning the edited preprocessed stream");
+    terminalSink_.RequestTerminalFallback(
+        RefoldOwnerStateProof::SuffixStabilityTerminalFailureForComponent(
+            OwnerStateComponent::LineNumber),
+        "assembly-verify",
+        "preserved line observers do not hold in the final output");
     out = expansionFallbackPlanner_->ResolvePostStructuralFallback();
     finalLineControlPruneCandidates_.clear();
     finalLineControlSourceMappings_.clear();
