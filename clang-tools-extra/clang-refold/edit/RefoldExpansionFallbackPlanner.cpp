@@ -93,8 +93,25 @@ namespace {
 /// material that the alignment cannot place on its own.
 struct PreservedDirectiveFrontier {
   uint64_t aFrontier = 0;
-  PragmaClassification classification;
+  /// Every state effect the preserved directive establishes.  A pragma
+  /// contributes one; a preserved `#include` contributes one per pragma its
+  /// header owns, because re-entering the header re-runs all of them.
+  SmallVector<PragmaClassification, 2> classifications;
 };
+
+/// Return whether `payload` can observe any state the preserved directive
+/// establishes.  An unclassified effect observes everything, so a directive
+/// with no recorded classification is never insensitive.
+bool payloadObservesPreservedDirectiveState(
+    const PreservedDirectiveFrontier &frontier, StringRef payload,
+    const LangOptions &lang) {
+  if (frontier.classifications.empty())
+    return true;
+  for (const PragmaClassification &classification : frontier.classifications)
+    if (payloadObservesPragmaState(classification, payload, lang))
+      return true;
+  return false;
+}
 
 /// Derive where each preserved tokenless directive cuts the realized B payload.
 ///
@@ -214,13 +231,16 @@ std::optional<SmallVector<size_t, 4>> deriveBPayloadSplitsAtATokenFrontiers(
 
     if (zoneBegin < split) {
       const StringRef zone = sliceBSource(zoneBegin, split);
-      if (payloadObservesPragmaState(frontier.classification, zone, lang))
+      if (payloadObservesPreservedDirectiveState(frontier, zone, lang))
         return refuse(
             llvm::formatv("edited B material [{0},{1}) has no determined side "
                           "of the preserved directive and observes its {2} "
                           "state",
                           zoneBegin, split,
-                          toString(frontier.classification.effect))
+                          frontier.classifications.empty()
+                              ? StringRef("unclassified")
+                              : toString(frontier.classifications.front()
+                                             .effect))
                 .str());
     }
 
@@ -1011,16 +1031,47 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   // is the one admitted spelling because, for an otherwise source-neutral
   // zero-token include, suppressing future textual inclusion of the same
   // zero-token file cannot change the PP token stream.
-  auto pragmaIsConsumableIncludeLocalState =
+  // Return whether a pragma establishes include-once state for its file.
+  //
+  // This is the narrow question the `#pragma once` reactivation repair asks:
+  // consuming the include that entered a once-header can make a later skipped
+  // include of the same header live again.  Only `IncludeOnce` answers it, and
+  // widening this predicate would make some other header claim once-state and
+  // corrupt that repair.
+  auto pragmaEstablishesIncludeOnceState =
       [&](const RefoldModel::PragmaDirective &pragma) -> bool {
-    // The taxonomy owns which spellings mean once-state, including the rule
-    // that trailing comments are directive trivia while an incomplete comment
-    // fails closed.  `IncludeOnce` is the only effect admitted here: for an
-    // otherwise source-neutral zero-token include, suppressing future textual
-    // inclusion of the same zero-token file cannot change the PP token stream,
-    // and no other classified effect has that property.
     return classifyPragmaDirective(pragma.text.trim()).effect ==
            PragmaStateEffect::IncludeOnce;
+  };
+
+  // Return whether a pragma's state dies with the include that carries it.
+  //
+  // A zero-token include inside a replacement envelope is deleted whole, so a
+  // pragma it owns is admissible exactly when nothing outside the include can
+  // observe the state it changed.  Two classified effects qualify, for
+  // different reasons:
+  //
+  //   * `IncludeOnce` suppresses future textual inclusion of a file that
+  //     produced no tokens, which cannot change the PP token stream;
+  //   * `SystemHeader` suppresses diagnostics from that point in the containing
+  //     file, and the pragma and every byte in its scope are deleted together.
+  //
+  // Every other effect either outlives the include (`PoisonIdentifiers`,
+  // `MacroStateStack`) or is unclassified, and stays side-effect bearing.
+  auto pragmaIsConsumableIncludeLocalState =
+      [&](const RefoldModel::PragmaDirective &pragma) -> bool {
+    switch (classifyPragmaDirective(pragma.text.trim()).effect) {
+    case PragmaStateEffect::IncludeOnce:
+    case PragmaStateEffect::SystemHeader:
+      return true;
+    case PragmaStateEffect::Unknown:
+    case PragmaStateEffect::NoState:
+    case PragmaStateEffect::PoisonIdentifiers:
+    case PragmaStateEffect::MacroStateStack:
+    case PragmaStateEffect::DiagnosticState:
+      return false;
+    }
+    return false;
   };
 
   const RecordedIncludeSideEffectResolver recordedIncludeSideEffectResolver(
@@ -1667,20 +1718,32 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     return true;
   };
 
-  // One TU pragma directive that a closure preserves at its original position
-  // inside the replacement instead of consuming or relocating it.
+  // One TU directive that a closure preserves at its original position inside
+  // the replacement instead of consuming or relocating it.
   //
   // `aFrontier` is the producer-backed A-token index the directive sits at; the
   // B payload is cut there so the directive keeps the same position relative to
   // surviving material.
-  struct TUPositionPreservedPragma {
+  //
+  // Two directive kinds qualify, for the same reason.  A pragma's state is not
+  // identity and cannot be moved, and a zero-token `#include` whose header owns
+  // such a pragma carries that state transitively: consuming either would drop
+  // it.  Preserving the directive keeps the transition at its original
+  // position, which is sound where deleting it is not -- and strictly better
+  // than refusing the closure, since refusing surrenders every directive in the
+  // translation unit rather than this one.
+  struct TUPositionPreservedDirective {
+    enum class Kind { Pragma, Include };
+
+    Kind kind = Kind::Pragma;
     uint64_t begin = 0;
     uint64_t end = 0;
     uint64_t id = 0;
     uint64_t aFrontier = 0;
-    /// What this directive's state does, for placing edited material that the
-    /// alignment cannot place.  Its StringRefs point into `tuBytes`.
-    PragmaClassification classification;
+    /// Every state effect this directive establishes, for placing edited
+    /// material the alignment cannot place.  StringRefs point into `tuBytes`
+    /// for a pragma, or into the model's pragma text for an include.
+    SmallVector<PragmaClassification, 2> classifications;
   };
 
   // Producer coordinate surfaces for projecting a tokenless TU directive onto
@@ -1720,16 +1783,16 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   // closed when the directive is not tokenless or its position is not
   // determined; the gap proof separately guarantees that no other protected
   // structure hides in the same gap.
-  auto collectPositionPreservedTUPragmaGapPieces =
+  auto collectPositionPreservedTUDirectiveGapPieces =
       [&](uint64_t gapBegin, uint64_t gapEnd,
-          SmallVectorImpl<TUPositionPreservedPragma> &out) -> bool {
+          SmallVectorImpl<TUPositionPreservedDirective> &out) -> bool {
     if (gapBegin >= gapEnd || gapEnd > tuBytes.size())
       return false;
 
     // Recover the exact directive extents first.  The indexed lexical extent,
     // not the recorded site, is what gets copied verbatim: the index owns the
     // complete logical directive line.
-    SmallVector<TUPositionPreservedPragma, 4> pragmas;
+    SmallVector<TUPositionPreservedDirective, 4> pragmas;
     for (const auto &pragma : model_.GetPragmas()) {
       if (!paths_.PathsEqual(pragma.sitePath, tuPath))
         continue;
@@ -1764,24 +1827,73 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
         return false;
       }
 
-      pragmas.push_back({exactRange->first, exactRange->second, pragma.id,
-                         /*aFrontier=*/0,
-                         classifyPragmaDirective(tuBytes.slice(
-                             exactRange->first, exactRange->second))});
+      SmallVector<PragmaClassification, 2> classifications;
+      classifications.push_back(classifyPragmaDirective(
+          tuBytes.slice(exactRange->first, exactRange->second)));
+      pragmas.push_back({TUPositionPreservedDirective::Kind::Pragma,
+                         exactRange->first, exactRange->second, pragma.id,
+                         /*aFrontier=*/0, std::move(classifications)});
+    }
+
+    // A zero-token include whose header owns non-consumable state is the same
+    // problem one level down: the state is not the include's own text, but
+    // deleting the directive drops it just the same.  Preserve the directive
+    // and the header is re-entered at its original position, which re-runs
+    // every transition it owns exactly where it ran before.  This is only for
+    // includes the closure would otherwise have to absorb: a touched include is
+    // part of the realized material, and one that produces tokens is not
+    // tokenless and has no frontier.
+    for (const auto &inc : model_.GetIncludes()) {
+      if (!paths_.PathsEqual(inc.sitePath, tuPath) || inc.parent)
+        continue;
+      if (inc.siteB >= inc.siteE || inc.siteB < gapBegin || gapEnd < inc.siteE)
+        continue;
+      if (includeIsTouched(inc) || inc.cover.IsValid())
+        continue;
+      if (!includeHasRecordedSideEffects(inc))
+        continue;
+
+      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+          findSourceGapProducerInterval(
+              preprocessingStructureIndex_,
+              PreprocessingStructureModelKind::IncludeDirective, inc.id);
+      if (!exactRange || exactRange->first >= exactRange->second ||
+          exactRange->first < gapBegin || gapEnd < exactRange->second) {
+        REFOLD_LOG_TRACE(
+            "fallback",
+            "TU/include closure cannot preserve include id={0} in place: no "
+            "exact indexed directive interval inside gap [{1},{2})",
+            inc.id, gapBegin, gapEnd);
+        return false;
+      }
+
+      // The header's own pragmas are the state a payload could observe by
+      // landing on the far side of the preserved directive.  An include whose
+      // header records none is still preserved; it then has no classification
+      // and any ambiguous payload beside it fails closed.
+      SmallVector<PragmaClassification, 2> classifications;
+      if (inc.resolvedPath)
+        for (const auto &pragma : model_.GetPragmas())
+          if (paths_.PathsEqual(pragma.sitePath, *inc.resolvedPath))
+            classifications.push_back(classifyPragmaDirective(pragma.text));
+
+      pragmas.push_back({TUPositionPreservedDirective::Kind::Include,
+                         exactRange->first, exactRange->second, inc.id,
+                         /*aFrontier=*/0, std::move(classifications)});
     }
 
     if (pragmas.empty())
       return false;
 
-    llvm::sort(pragmas, [](const TUPositionPreservedPragma &lhs,
-                           const TUPositionPreservedPragma &rhs) {
+    llvm::sort(pragmas, [](const TUPositionPreservedDirective &lhs,
+                           const TUPositionPreservedDirective &rhs) {
       if (lhs.begin != rhs.begin)
         return lhs.begin < rhs.begin;
       return lhs.id < rhs.id;
     });
 
     ensureTUTokenlessProjectionSurfaces();
-    for (TUPositionPreservedPragma &piece : pragmas) {
+    for (TUPositionPreservedDirective &piece : pragmas) {
       std::optional<uint64_t> aFrontier =
           projectTokenlessSourceIntervalToATokenFrontier(
               tuMappedATokens, tuChildIncludes, aToks_.size(), piece.begin,
@@ -1806,7 +1918,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     SmallVector<SourceGapProofPiece, 4> proofPieces;
     proofPieces.reserve(pragmas.size());
     for (size_t pieceIndex = 0; pieceIndex < pragmas.size(); ++pieceIndex) {
-      const TUPositionPreservedPragma &piece = pragmas[pieceIndex];
+      const TUPositionPreservedDirective &piece = pragmas[pieceIndex];
       proofPieces.push_back(SourceGapProofPiece{
           piece.begin, piece.end, piece.id, PragmaPieceClass, PragmaPieceClass,
           0, pieceIndex});
@@ -1835,10 +1947,10 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     }
 
     for (size_t payloadIndex : gapProof->outerPiecePayloadIndices) {
-      const TUPositionPreservedPragma &piece = pragmas[payloadIndex];
+      const TUPositionPreservedDirective &piece = pragmas[payloadIndex];
       REFOLD_LOG_TRACE(
           "fallback",
-          "TU/include closure preserving TU pragma id={0} in place "
+          "TU/include closure preserving TU directive id={0} in place "
           "source=[{1},{2}) aFrontier={3} gap=[{4},{5})",
           piece.id, piece.begin, piece.end, piece.aFrontier, gapBegin, gapEnd);
       out.push_back(piece);
@@ -1847,7 +1959,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   };
 
   std::string mixedPreservedConditionalControlTrivia;
-  SmallVector<TUPositionPreservedPragma, 4> mixedPositionPreservedTUPragmas;
+  SmallVector<TUPositionPreservedDirective, 4> mixedPositionPreservedTUDirectives;
   SmallVector<TUPreservedGapPiece, 8> mixedPreservedZeroTokenGapPieces;
   SmallVector<std::pair<uint64_t, uint64_t>, 4>
       mixedPreservedSourceLineDirectiveGapPieces;
@@ -2274,6 +2386,21 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       return false;
     };
 
+    // Return whether an include's directive site lies wholly between two
+    // required source pieces rather than overlapping one.  Only such an include
+    // is a candidate for position preservation: one overlapping a piece is part
+    // of the material the closure realizes.
+    auto includeLiesInsideEnvelopeGap =
+        [&](const RefoldModel::IncludeItem &inc) -> bool {
+      for (size_t idx = 1; idx < mergedPieces.size(); ++idx) {
+        const uint64_t gapBegin = mergedPieces[idx - 1].second;
+        const uint64_t gapEnd = mergedPieces[idx].first;
+        if (gapBegin <= inc.siteB && inc.siteE <= gapEnd)
+          return true;
+      }
+      return false;
+    };
+
     // Do not silently delete any include directive other than the run whose
     // expansion is explicitly part of this closure.  A complete unrelated
     // include with an empty PP cover may be consumed only when it is fully
@@ -2297,6 +2424,21 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (sideEffectReason &&
           includeIsInsidePreservableZeroTokenConditionalGap(inc))
         continue;
+
+      // An include whose header owns non-consumable state need not sink the
+      // whole closure.  When it lies in a gap between required source pieces it
+      // can be preserved there instead, and the gap proof below decides that.
+      // Rejecting here would give up every directive in the translation unit to
+      // avoid dropping this one, which is a strictly worse trade.
+      if (sideEffectReason && !inc.cover.IsValid() &&
+          includeLiesInsideEnvelopeGap(inc)) {
+        REFOLD_LOG_TRACE(
+            "fallback",
+            "TU/include closure deferring unrelated include id={0} "
+            "site=[{1},{2}) to the source-gap proof: {3}",
+            inc.id, inc.siteB, inc.siteE, *sideEffectReason);
+        continue;
+      }
 
       if (sideEffectReason) {
         REFOLD_LOG_TRACE(
@@ -2503,8 +2645,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
           // the ordinary rejection; the split itself is derived later, once
           // the B material range is known, and refuses there if it is not
           // determined.
-          if (collectPositionPreservedTUPragmaGapPieces(
-                  gapBegin, gapEnd, mixedPositionPreservedTUPragmas))
+          if (collectPositionPreservedTUDirectiveGapPieces(
+                  gapBegin, gapEnd, mixedPositionPreservedTUDirectives))
             return true;
 
           if (std::optional<std::string> pragmaReason =
@@ -2763,15 +2905,15 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   // directive's derived split so the directive keeps its original position
   // relative to the surviving material.
   std::string rawReplacement;
-  if (mixedPositionPreservedTUPragmas.empty()) {
+  if (mixedPositionPreservedTUDirectives.empty()) {
     rawReplacement =
         sourceMapper_.SliceBSource(bMaterialBegin, bMaterialEnd).str();
   } else {
     SmallVector<PreservedDirectiveFrontier, 4> preservedFrontiers;
-    preservedFrontiers.reserve(mixedPositionPreservedTUPragmas.size());
-    for (const TUPositionPreservedPragma &pragma :
-         mixedPositionPreservedTUPragmas)
-      preservedFrontiers.push_back({pragma.aFrontier, pragma.classification});
+    preservedFrontiers.reserve(mixedPositionPreservedTUDirectives.size());
+    for (const TUPositionPreservedDirective &pragma :
+         mixedPositionPreservedTUDirectives)
+      preservedFrontiers.push_back({pragma.aFrontier, pragma.classifications});
 
     std::string splitReason;
     std::optional<SmallVector<size_t, 4>> splits =
@@ -2787,7 +2929,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
           "fallback",
           "TU/include closure rejected: B payload [{0},{1}) cannot be "
           "partitioned around {2} preserved TU pragma(s): {3}",
-          bMaterialBegin, bMaterialEnd, mixedPositionPreservedTUPragmas.size(),
+          bMaterialBegin, bMaterialEnd, mixedPositionPreservedTUDirectives.size(),
           splitReason);
       return std::nullopt;
     }
@@ -2818,10 +2960,10 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     std::string splitTrace;
     size_t cursor = bMaterialBegin;
     uint64_t previousPragmaEnd = 0;
-    for (size_t index = 0; index < mixedPositionPreservedTUPragmas.size();
+    for (size_t index = 0; index < mixedPositionPreservedTUDirectives.size();
          ++index) {
-      const TUPositionPreservedPragma &pragma =
-          mixedPositionPreservedTUPragmas[index];
+      const TUPositionPreservedDirective &pragma =
+          mixedPositionPreservedTUDirectives[index];
 
       // The preserved directives are emitted in the order they were collected,
       // so that order must be their source order.  Gaps are proved left to
@@ -2866,8 +3008,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     REFOLD_LOG_DEBUG(
         "fallback",
         "TU/include closure partitioned B payload [{0},{1}) around {2} "
-        "preserved TU pragma(s): splits={3} result='{4}'",
-        bMaterialBegin, bMaterialEnd, mixedPositionPreservedTUPragmas.size(),
+        "preserved TU directive(s): splits={3} result='{4}'",
+        bMaterialBegin, bMaterialEnd, mixedPositionPreservedTUDirectives.size(),
         splitTrace, stringutils::showWsWithClip(rawReplacement, 120));
   }
   std::string replacement = rawReplacement;
@@ -3165,7 +3307,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   auto pathHasPragmaOnce = [&](StringRef resolvedPath) -> bool {
     for (const auto &pragma : model_.GetPragmas())
       if (paths_.PathsEqual(pragma.sitePath, resolvedPath) &&
-          pragmaIsConsumableIncludeLocalState(pragma))
+          pragmaEstablishesIncludeOnceState(pragma))
         return true;
     return false;
   };
