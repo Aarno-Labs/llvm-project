@@ -2057,7 +2057,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
           tuBytes.slice(exactRange->first, exactRange->second)));
       pragmas.push_back({TUPositionPreservedDirective::Kind::Pragma,
                          exactRange->first, exactRange->second, pragma.id,
-                         /*aFrontier=*/0, std::move(classifications)});
+                         /*aFrontier=*/0, std::move(classifications),
+                         /*macroBindings=*/{}});
     }
 
     // A macro directive in the gap is preserved on the same terms.  It is
@@ -2137,7 +2138,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
 
       pragmas.push_back({TUPositionPreservedDirective::Kind::Include,
                          exactRange->first, exactRange->second, inc.id,
-                         /*aFrontier=*/0, std::move(classifications)});
+                         /*aFrontier=*/0, std::move(classifications),
+                         /*macroBindings=*/{}});
     }
 
     if (pragmas.empty())
