@@ -39,6 +39,7 @@ class RefoldOwnerStateProof;
 class RefoldPathIdentity;
 class RefoldPreprocessingStructureIndexProvider;
 class RefoldSourceMapper;
+class RefoldTokenTextAnalysis;
 
 /// Normalizes token hunks whose A-side cover requires a structural split.
 ///
@@ -89,6 +90,9 @@ public:
     /// undetermined payload a macro-observation question, which only the
     /// producer's macro records can answer.
     const RefoldMacroStateProof &macroStateProof;
+    /// Raw-token text analysis used by the per-structure gap-crossing proof to
+    /// take the payload's directive inventory.
+    const RefoldTokenTextAnalysis &tokenText;
     /// Source mapper for A/B token and physical source-byte projection.
     RefoldSourceMapper &sourceMapper;
     /// Original translation-unit source bytes, used to read the exact spelling

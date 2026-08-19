@@ -184,7 +184,8 @@ void RefoldEngine::InitializeMixedOwnerTilingPlanner() {
   mixedOwnerTilingPlanner_ = std::make_unique<RefoldMixedOwnerTilingPlanner>(
       RefoldMixedOwnerTilingPlanner::Dependencies{
           model_, model_.GetSourcePath(), pathIdentity_, macroTopology_,
-          MacroStateProof(), sourceMapper_, tuSourceBytes_, bSource_, lexLang_,
+          MacroStateProof(), tokenTextAnalysis_, sourceMapper_, tuSourceBytes_,
+          bSource_, lexLang_,
           OwnerClassifier(), OwnerStateProof(),
           *preprocessingStructureIndexProvider_, abTokHunks_,
           mixedOwnerTilingWitnesses_, mixedOwnerTilingSegmentBindings_});

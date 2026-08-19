@@ -92,6 +92,7 @@ add_clang_library(clangRefold STATIC
   proof/RefoldOwnerRealizationProofBuilder.cpp
   proof/RefoldProofLattice.cpp
   proof/RefoldProofSummaryBuilder.cpp
+  proof/RefoldStructuralGapCrossingProof.cpp
   proof/RefoldStructuralHunkTilingProof.cpp
   proof/RefoldWitnessClassifier.cpp
   proof/RefoldWitnessEquivalenceKeyBuilder.cpp

@@ -77,6 +77,14 @@ struct SourceGapProofPiece {
 struct SourceGapProofResult {
   /// Caller payload indices for the surviving outer pieces, in source order.
   std::vector<size_t> outerPiecePayloadIndices;
+  /// Caller payload indices for pieces an outer piece explicitly absorbed.
+  ///
+  /// An absorbed piece is proved, not dropped: it was wholly nested inside a
+  /// piece whose class mask declared that its own proof already covers that
+  /// nested class.  Reporting it separately lets a caller that requires every
+  /// submitted piece to be accounted for distinguish absorption from a piece
+  /// that silently vanished.
+  std::vector<size_t> absorbedPiecePayloadIndices;
   /// Exact protected intervals observed in the queried gap, in index order.
   std::vector<const PreprocessingStructureInterval *> protectedIntervals;
 };

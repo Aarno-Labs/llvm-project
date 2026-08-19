@@ -34,7 +34,8 @@ void setSourceGapFailure(std::string *reason, std::string message) {
 std::optional<std::vector<SourceGapProofPiece>> normalizeSourceGapPieces(
     const RefoldPreprocessingStructureIndex &structureIndex,
     uint64_t gapBegin, uint64_t gapEnd,
-    ArrayRef<SourceGapProofPiece> submitted, std::string *reason) {
+    ArrayRef<SourceGapProofPiece> submitted,
+    std::vector<size_t> &absorbedPayloadIndices, std::string *reason) {
   std::vector<SourceGapProofPiece> pieces(submitted.begin(), submitted.end());
   for (const SourceGapProofPiece &piece : pieces) {
     if (piece.end <= piece.begin || piece.begin < gapBegin ||
@@ -75,6 +76,7 @@ std::optional<std::vector<SourceGapProofPiece>> normalizeSourceGapPieces(
     const SourceGapProofPiece &outer = outerPieces.back();
     if (outer.begin <= piece.begin && piece.end <= outer.end &&
         outer.Absorbs(piece)) {
+      absorbedPayloadIndices.push_back(piece.payloadIndex);
       continue;
     }
 
@@ -111,13 +113,14 @@ std::optional<SourceGapProofResult> proveSourceGapImpl(
     return std::nullopt;
   }
 
+  SourceGapProofResult result;
   std::optional<std::vector<SourceGapProofPiece>> normalized =
       normalizeSourceGapPieces(structureIndex, gapBegin, gapEnd,
-                               submittedPieces, reason);
+                               submittedPieces,
+                               result.absorbedPiecePayloadIndices, reason);
   if (!normalized)
     return std::nullopt;
 
-  SourceGapProofResult result;
   result.protectedIntervals =
       structureIndex.FindOverlapping(gapBegin, gapEnd);
 
