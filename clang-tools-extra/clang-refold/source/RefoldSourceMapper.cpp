@@ -127,6 +127,33 @@ RefoldSourceMapper::BTokenRangeToByteRange(uint64_t bTokBegin,
   return std::make_pair(begin, end);
 }
 
+std::optional<StringRef>
+RefoldSourceMapper::SliceBTokenMaterial(uint64_t bStartTok,
+                                        uint64_t bEndTok) const {
+  // The range must name at least one real token: the last token's own end is
+  // what bounds the material, and an empty range has no such bound.
+  if (bEndTok <= bStartTok || bEndTok > static_cast<uint64_t>(bToks_.size()) ||
+      bEndTok >= static_cast<uint64_t>(bTokOff_.size()))
+    return std::nullopt;
+
+  const size_t lastTok = static_cast<size_t>(bEndTok) - 1;
+  const size_t begin = bTokOff_[static_cast<size_t>(bStartTok)];
+  const size_t lastBegin = bTokOff_[lastTok];
+  const StringRef lastSpelling(bToks_[lastTok].spelling);
+  const size_t end = lastBegin + lastSpelling.size();
+
+  // `lexPPTokens` assigns each token the exact byte slice it was lexed from, so
+  // `offset + spelling.size()` is that token's physical end.  Check that
+  // correspondence against the buffer rather than assuming it: if the slice
+  // does not read back as the recorded spelling, the offset table and the byte
+  // buffer disagree and no byte range chosen from them is trustworthy.
+  if (end > bSource_.size() || begin > end ||
+      bSource_.substr(lastBegin, lastSpelling.size()) != lastSpelling)
+    return std::nullopt;
+
+  return bSource_.substr(begin, end - begin);
+}
+
 std::optional<size_t>
 RefoldSourceMapper::FindExactOwningArgSpanForPureInsertion(
     uint64_t aPos, ArrayRef<RefoldModel::PPArgSpan> argSpans) const {

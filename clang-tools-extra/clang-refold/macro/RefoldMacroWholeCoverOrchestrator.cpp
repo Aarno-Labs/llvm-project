@@ -331,10 +331,22 @@ RefoldMacroWholeCoverOrchestrator::ComputeWholeCoverPlan(
   const std::pair<size_t, size_t> &keptSegment = keptSegments.front();
   plan.claimsClipped = (keptSegment.first != plan.bTokStart ||
                         keptSegment.second != plan.bTokEnd);
-  std::string clipped = (*planner_->Deps().sourceMapper)
-                            .SliceBSource(keptSegment.first, keptSegment.second)
-                            .str();
-  plan.clippedText = StringRef(clipped).trim().str();
+
+  // Materialize the kept segment from the bytes its B tokens occupy, not from
+  // the first byte of the token that follows it.  The trailing trivia is not
+  // part of what this cover realizes, and after sideband pragma normalization
+  // it can hold a whole directive line: the sideband path removed those lines
+  // from the token stream and pairs each one with the source directive that
+  // produced it, so carrying the bytes here would emit the directive a second
+  // time while that source directive still stands.  The realized text is
+  // trimmed either way, so this changes nothing for a range whose trailing
+  // trivia is whitespace.
+  std::optional<StringRef> material =
+      (*planner_->Deps().sourceMapper)
+          .SliceBTokenMaterial(keptSegment.first, keptSegment.second);
+  if (!material)
+    return std::nullopt;
+  plan.clippedText = material->trim().str();
 
   return plan;
 }
@@ -378,26 +390,29 @@ RefoldMacroWholeCoverOrchestrator::TryCounterLiteralWholeCoverPatch(
   if (m.name != "__COUNTER__")
     return std::nullopt;
 
+  // Both branches realize the literal from the bytes their B tokens occupy;
+  // see ComputeWholeCoverPlan for why the trivia after the last token is not
+  // this range's to carry.
   std::optional<std::string> repl;
   std::optional<std::pair<uint64_t, uint64_t>> counterBTokenRange;
   if (h.bEnd > h.bStart) {
     counterBTokenRange = std::make_pair(static_cast<uint64_t>(h.bStart),
                                         static_cast<uint64_t>(h.bEnd));
-    repl = (*planner_->Deps().sourceMapper)
-               .SliceBSource(static_cast<size_t>(h.bStart),
-                             static_cast<size_t>(h.bEnd))
-               .trim()
-               .str();
+    if (std::optional<StringRef> material =
+            (*planner_->Deps().sourceMapper)
+                .SliceBTokenMaterial(static_cast<size_t>(h.bStart),
+                                     static_cast<size_t>(h.bEnd)))
+      repl = material->trim().str();
   } else {
     auto bEnv = (*planner_->Deps().sourceMapper)
                     .MapATokRangeAToBTokenEnvelope(h.aStart, h.aEnd);
     if (bEnv && bEnv->second > bEnv->first) {
       counterBTokenRange = std::make_pair(static_cast<uint64_t>(bEnv->first),
                                           static_cast<uint64_t>(bEnv->second));
-      repl = (*planner_->Deps().sourceMapper)
-                 .SliceBSource(bEnv->first, bEnv->second)
-                 .trim()
-                 .str();
+      if (std::optional<StringRef> material =
+              (*planner_->Deps().sourceMapper)
+                  .SliceBTokenMaterial(bEnv->first, bEnv->second))
+        repl = material->trim().str();
     }
   }
   if (!repl)

@@ -703,12 +703,6 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
       out.append(bytes.begin() + cursor, bytes.begin() + end);
   };
 
-  // The replacement payload will be emitted before each carried definition,
-  // and the original line suffix after the macro invocation must also remain
-  // before those definitions so the directives still start on real directive
-  // lines.  Therefore every byte crossed by each carried definition must be
-  // proven non-observing for that definition.  Otherwise the macro-state move
-  // would change how preserved header source preprocesses.
   // Alternative repair, attempted only when a definition cannot be carried:
   // leave every definition exactly where it is, undefine the observed ones
   // immediately before the replacement's own line, and restore them immediately
@@ -806,6 +800,12 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
     return stabilized;
   };
 
+  // The replacement payload will be emitted before each carried definition,
+  // and the original line suffix after the macro invocation must also remain
+  // before those definitions so the directives still start on real directive
+  // lines.  Therefore every byte crossed by each carried definition must be
+  // proven non-observing for that definition.  Otherwise the macro-state move
+  // would change how preserved header source preprocesses.
   for (const auto &candidate : candidates) {
     std::string crossed;
     appendCrossedSourceExcludingCarried(crossed, candidate.end, mp.invStart);

@@ -106,6 +106,30 @@ public:
   std::optional<std::pair<uint64_t, uint64_t>>
   BTokenRangeToByteRange(uint64_t bTokBegin, uint64_t bTokEnd) const;
 
+  /// Slice the edited B-side preprocessed source by the bytes its tokens
+  /// physically occupy: from the first token's first byte through the last
+  /// token's last byte.
+  ///
+  /// `SliceBSource` ends the interval at the *next* token's first byte, so it
+  /// also carries whatever trivia follows the last token of the range.  That
+  /// trailing trivia is not part of what the token range realizes, and in a raw
+  /// `-E -P` replay surface it is not always whitespace: sideband pragma
+  /// directive lines are removed from the token stream by
+  /// `filterSidebandPragmaTokens` but deliberately left in the byte buffer, so
+  /// the bytes after a token can hold a complete directive line.  A caller that
+  /// materializes B bytes as replacement source text must ask for the tokens'
+  /// own material, or it emits that directive again alongside the source
+  /// directive that is still standing.
+  ///
+  /// Bytes lying strictly between two tokens of the range are inside what the
+  /// range realizes and are returned unchanged; this accessor narrows only the
+  /// trailing edge.  Fails closed with `std::nullopt` for an empty or
+  /// out-of-range token interval, which has no last token to bound it, and when
+  /// the offset table and the byte buffer do not agree on the last token's
+  /// spelling.
+  std::optional<llvm::StringRef> SliceBTokenMaterial(uint64_t bStartTok,
+                                                     uint64_t bEndTok) const;
+
   /// Determine whether an edit hunk is entirely contained by macro argument
   /// spans.
   ///

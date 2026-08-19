@@ -551,9 +551,17 @@ static uint64_t byteOffsetForNormalTokenGap(StringRef bytes,
 /// Remove pragma sideband tokens from an already-lexed raw replay stream.
 ///
 /// The byte buffer itself is left untouched.  Kept token offsets therefore
-/// still point into the original raw `.i` file, preserving correct B-slice
-/// materializa- tion and terminal-fallback behavior while restoring the token
+/// still point into the original raw `.i` file, preserving B-slice
+/// materialization and terminal-fallback behavior while restoring the token
 /// sequence that the refold map actually describes.
+///
+/// One consequence is load-bearing for every consumer of the filtered table:
+/// the bytes between two adjacent kept tokens are no longer whitespace-only.
+/// They may hold a complete directive line whose replay this module owns, so a
+/// caller that materializes a token range as replacement text must take the
+/// bytes its tokens occupy (`RefoldSourceMapper::SliceBTokenMaterial`) rather
+/// than the interval running to the next token's first byte, which would emit
+/// the directive again beside the source directive it was paired with.
 void filterSidebandPragmaTokens(ArrayRef<SidebandPragmaLine> lines,
                                 std::vector<PPTok> &toks,
                                 std::vector<std::size_t> &tokOff,
