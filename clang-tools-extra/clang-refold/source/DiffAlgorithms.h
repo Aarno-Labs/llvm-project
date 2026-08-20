@@ -244,10 +244,25 @@ struct Hunk {
 /// * Space: *O(N+M)*
 /// Here `N = A.size()`, `M = B.size()`, and `D` is the minimal edit distance.
 ///
+/// Both overloads are one templated implementation over one element type; only
+/// the element differs. Pick the one that matches what is being compared: the
+/// `StringRef` overload for a sequence of token spellings, the `char` overload
+/// for a sequence of source bytes.
+///
+/// The two agree where their inputs describe the same sequence. The algorithm
+/// reads elements only through `==`, and a byte sequence and the sequence of
+/// one-character `StringRef`s over those same bytes induce the same equality
+/// relation, so they admit the same shortest edit scripts and the same
+/// tie-breaks select among them. Diffing bytes directly is therefore a choice
+/// of representation, never a different diff -- but it avoids materializing one
+/// 16-byte `StringRef` per source character and comparing single bytes through
+/// `memcmp`, which on a large edit distance is the dominant cost.
+///
 /// \param a Left sequence.
 /// \param b Right sequence.
 /// \returns Ordered list of `Step` records: `EQUAL`, `INSERT`, and `DELETE`.
 std::vector<Step> diff(ArrayRef<StringRef> a, ArrayRef<StringRef> b);
+std::vector<Step> diff(ArrayRef<char> a, ArrayRef<char> b);
 
 /// \brief Coalesce contiguous non-EQUAL steps into larger Hunk regions.
 ///

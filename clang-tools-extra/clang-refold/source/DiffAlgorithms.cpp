@@ -3767,9 +3767,14 @@ static void appendDeleteSteps(std::vector<Step> &out, uint64_t aLo,
 /// * The left subproblem is A[aLo,aStart) × B[bLo,bStart)
 /// * The right subproblem is A[aEnd,aHi) × B[bEnd,bHi)
 /// Find the middle snake used by Myers' divide-and-conquer SES recursion.
-static MiddleSnake findMiddleSnake(ArrayRef<StringRef> a, int64_t aLo,
-                                   int64_t aHi, ArrayRef<StringRef> b,
-                                   int64_t bLo, int64_t bHi) {
+///
+/// \tparam Element the sequence element type.  The algorithm reads elements
+/// only through `==`, so a sequence of one-character `StringRef`s and the
+/// sequence of the same characters induce the same equality relation and
+/// therefore the same shortest edit script.  See `diff(ArrayRef<char>, ...)`.
+template <typename Element>
+MiddleSnake findMiddleSnake(ArrayRef<Element> a, int64_t aLo, int64_t aHi,
+                            ArrayRef<Element> b, int64_t bLo, int64_t bHi) {
   const int64_t n = aHi - aLo;
   const int64_t m = bHi - bLo;
   const int64_t delta = n - m;
@@ -3860,9 +3865,10 @@ static MiddleSnake findMiddleSnake(ArrayRef<StringRef> a, int64_t aLo,
 /// otherwise splits the remaining middle box at Myers' middle snake. Steps are
 /// appended in forward order as recursion unwinds, so callers do not need a
 /// reversal or normalization pass.
-static void diffLinearRec(ArrayRef<StringRef> a, int64_t aLo, int64_t aHi,
-                          ArrayRef<StringRef> b, int64_t bLo, int64_t bHi,
-                          std::vector<Step> &out) {
+template <typename Element>
+void diffLinearRec(ArrayRef<Element> a, int64_t aLo, int64_t aHi,
+                   ArrayRef<Element> b, int64_t bLo, int64_t bHi,
+                   std::vector<Step> &out) {
   // Peel a common prefix eagerly so recursive boxes stay small and the emitted
   // script remains in forward order without any post-pass reversal.
   while (aLo < aHi && bLo < bHi &&
@@ -3918,23 +3924,28 @@ static void diffLinearRec(ArrayRef<StringRef> a, int64_t aLo, int64_t aHi,
     return;
   }
 
-  const MiddleSnake snake = findMiddleSnake(a, aLo, aMidHi, b, bLo, bMidHi);
+  const MiddleSnake snake =
+      findMiddleSnake<Element>(a, aLo, aMidHi, b, bLo, bMidHi);
 
   // Recurse around the middle snake. The snake itself is an equal run on an
   // optimal SES path, so it can be emitted directly between the two
   // subproblems.
-  diffLinearRec(a, aLo, snake.aStart, b, bLo, snake.bStart, out);
+  diffLinearRec<Element>(a, aLo, snake.aStart, b, bLo, snake.bStart, out);
   appendEqualSteps(out, static_cast<uint64_t>(snake.aStart),
                    static_cast<uint64_t>(snake.bStart),
                    static_cast<uint64_t>(snake.aEnd - snake.aStart));
-  diffLinearRec(a, snake.aEnd, aMidHi, b, snake.bEnd, bMidHi, out);
+  diffLinearRec<Element>(a, snake.aEnd, aMidHi, b, snake.bEnd, bMidHi, out);
   appendEqualSteps(out, static_cast<uint64_t>(aMidHi),
                    static_cast<uint64_t>(bMidHi),
                    static_cast<uint64_t>(suffixLen));
 }
-} // namespace
-
-std::vector<Step> diff(ArrayRef<StringRef> a, ArrayRef<StringRef> b) {
+/// Run the linear-space Myers SES over one element type.
+///
+/// Both public `diff` overloads are this function; only the element type
+/// differs.  Keeping one body is what makes the two overloads the same
+/// algorithm rather than two implementations that must be kept in agreement.
+template <typename Element>
+std::vector<Step> diffElements(ArrayRef<Element> a, ArrayRef<Element> b) {
   if (a.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
       b.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
     REFOLD_LOG_FATAL("diff/myers", "input size exceeds int64_t range");
@@ -3942,9 +3953,18 @@ std::vector<Step> diff(ArrayRef<StringRef> a, ArrayRef<StringRef> b) {
 
   std::vector<Step> out;
   out.reserve(a.size() + b.size());
-  diffLinearRec(a, 0, static_cast<int64_t>(a.size()), b, 0,
-                static_cast<int64_t>(b.size()), out);
+  diffLinearRec<Element>(a, 0, static_cast<int64_t>(a.size()), b, 0,
+                         static_cast<int64_t>(b.size()), out);
   return out;
+}
+} // namespace
+
+std::vector<Step> diff(ArrayRef<StringRef> a, ArrayRef<StringRef> b) {
+  return diffElements<StringRef>(a, b);
+}
+
+std::vector<Step> diff(ArrayRef<char> a, ArrayRef<char> b) {
+  return diffElements<char>(a, b);
 }
 
 std::vector<Hunk> coalesce(ArrayRef<Step> steps) {

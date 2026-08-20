@@ -310,13 +310,13 @@ RefoldSourceMapper::BuildByteHunksFromRawText(RawByteHunkMemo *memo) const {
     return memo->hunks;
   }
 
-  // Diff at byte granularity by representing each source character as a
-  // one-character StringRef into the existing source buffers. This avoids
-  // copying per-byte strings while still using the shared diff/coalesce path.
-  std::vector<StringRef> aRefs = stringutils::splitChars(aSource_);
-  std::vector<StringRef> bRefs = stringutils::splitChars(bSource_);
-
-  auto steps = diffutils::diff(aRefs, bRefs);
+  // Diff at byte granularity, over the source buffers themselves.  The shared
+  // diff/coalesce path compares elements only through `==`, so bytes and
+  // one-character StringRefs over those bytes yield the same edit script; the
+  // byte overload just does not build a 16-byte element per source character
+  // or route every single-byte comparison through `memcmp`.
+  auto steps = diffutils::diff(ArrayRef<char>(aSource_.data(), aSource_.size()),
+                               ArrayRef<char>(bSource_.data(), bSource_.size()));
   std::vector<diffutils::Hunk> hunks = diffutils::coalesce(steps);
   if (memo)
     memo->Record(aDigest, bDigest, hunks);
