@@ -659,10 +659,15 @@ static std::optional<uint64_t> projectAGapToBGap(ArrayRef<int64_t> aToB,
 
 /// Project a B-side normal-token gap back to A through the ordinary-token LCS.
 ///
-/// This is used to decide whether a sideband pragma that survived in B is the
-/// same source pragma that appeared in A.  Matching by raw text is insufficient
-/// for duplicate unknown pragmas; matching by absolute B gap is also unstable
-/// when normal-token edits before the pragma changed the token count.
+/// This names one exact A-side gap, so it is what a B-only sideband insertion
+/// needs: the directive has no A-side counterpart to take a source placement
+/// from, and the placement has to be a single map-backed boundary.  It succeeds
+/// only when the boundary has a unique image, which is why an edited neighbor
+/// defeats it -- with an A token unmapped beside the gap, more than one A gap is
+/// an admissible preimage and none of them is forced.
+///
+/// Deciding whether a directive *surviving* in B is the same one that appeared
+/// in A does not need that: see `certifiedWindowBeforeGap`.
 static std::optional<uint64_t> projectBGapToAGap(ArrayRef<int64_t> aToB,
                                                  uint64_t bGap) {
   std::optional<uint64_t> leftA;
@@ -689,6 +694,55 @@ static std::optional<uint64_t> projectBGapToAGap(ArrayRef<int64_t> aToB,
   if (leftA)
     return *leftA + 1;
   return 0;
+}
+
+/// Mark every A-side normal token the ordinary-token LCS matched.
+static std::vector<uint8_t> buildMatchedATokens(ArrayRef<int64_t> aToB) {
+  std::vector<uint8_t> matched(aToB.size(), 0);
+  for (size_t a = 0; a < aToB.size(); ++a)
+    matched[a] = aToB[a] >= 0 ? 1 : 0;
+  return matched;
+}
+
+/// Mark every B-side normal token the ordinary-token LCS matched.
+static std::vector<uint8_t> buildMatchedBTokens(ArrayRef<int64_t> aToB,
+                                                size_t bTokenCount) {
+  std::vector<uint8_t> matched(bTokenCount, 0);
+  for (size_t a = 0; a < aToB.size(); ++a) {
+    if (aToB[a] < 0)
+      continue;
+    const size_t b = static_cast<size_t>(aToB[a]);
+    if (b < bTokenCount)
+      matched[b] = 1;
+  }
+  return matched;
+}
+
+/// Return the number of alignment-certified tokens before a normal-token gap.
+///
+/// The ordinary-token LCS matches exactly the tokens whose identity is common
+/// to both streams, and those matches are the anchors every other position is
+/// certified against.  Counting the matches before a gap names the *window*
+/// between two consecutive anchors that the gap falls in.  The count is derived
+/// the same way from either stream, so an A-side window and a B-side window are
+/// directly comparable, and a directive that survived unedited is in the same
+/// window on both sides: the anchors around it did not move relative to it.
+///
+/// This is deliberately weaker than `projectBGapToAGap`.  It does not name an
+/// opposite-side gap and must not be used as one -- a window can contain
+/// several gaps, which is exactly why the projection fails where this succeeds.
+/// It answers only the pairing question: are these two directives certified to
+/// the same position between anchors?  Ambiguity inside a window is not
+/// resolved here; the caller must refuse a window that two lines share.
+static uint64_t certifiedWindowBeforeGap(ArrayRef<uint8_t> matchedTokens,
+                                         uint64_t gap) {
+  const uint64_t limit =
+      std::min<uint64_t>(gap, static_cast<uint64_t>(matchedTokens.size()));
+  uint64_t certified = 0;
+  for (uint64_t i = 0; i < limit; ++i)
+    if (matchedTokens[static_cast<size_t>(i)])
+      ++certified;
+  return certified;
 }
 
 static bool isOnlyWhitespaceForSidebandBlock(StringRef text) {
@@ -1942,18 +1996,74 @@ bool buildSidebandPragmaSourceEdits(
   aTextRefs.reserve(aLines.size());
   bTextRefs.reserve(bLines.size());
 
-  for (const auto &line : aLines)
-    aKeys.push_back(std::to_string(line.normalTokenGap) + "\x1f" +
-                    line.canonicalText);
+  // Pair A-side and B-side sideband lines in the certified-window coordinate.
+  //
+  // The gaps themselves are not comparable across the streams: an ordinary-token
+  // edit anywhere before a directive shifts its absolute gap, and projecting one
+  // stream's gap onto the other names a single opposite gap only when the
+  // flanking tokens are both mapped and adjacent.  Any edit touching a token
+  // beside the directive breaks that adjacency, and the projection then refuses
+  // a directive that plainly survived -- the whole file falls to the terminal
+  // fallback because one neighbor was replaced.
+  //
+  // Identity does not need a gap.  Two directives are the same occurrence when
+  // they sit between the same certified anchors, and `certifiedWindowBeforeGap`
+  // computes that from either stream.  Ambiguity inside a window is refused
+  // rather than resolved: see `sidebandWindowKeysAreUnambiguous`.
+  const std::vector<uint8_t> matchedATokens = buildMatchedATokens(normalA2B);
+  const std::vector<uint8_t> matchedBTokens =
+      buildMatchedBTokens(normalA2B, normalB.size());
 
-  for (const auto &line : bLines) {
-    std::optional<uint64_t> projectedGap =
-        projectBGapToAGap(normalA2B, line.normalTokenGap);
-    if (!projectedGap)
-      return false;
-    bKeys.push_back(std::to_string(*projectedGap) + "\x1f" +
-                    line.canonicalText);
-  }
+  auto sidebandWindowKey = [](uint64_t window, StringRef canonicalText) {
+    return std::to_string(window) + "\x1f" + canonicalText.str();
+  };
+
+  // Refuse a window that does not determine which directive is meant.
+  //
+  // A window is coarser than a gap, so two lines of one stream can share a
+  // window key while sitting at different gaps.  Pairing them by position in
+  // the key sequence would be an order tie-break, not a proof, and the two
+  // choices name different source directives.  Lines that share a window *and*
+  // a gap are a different matter: the previous exact-gap key could not tell
+  // them apart either, so refusing them would withdraw folds that already work.
+  // The guard therefore rejects exactly the ambiguity this coordinate
+  // introduces and nothing that was already accepted.
+  auto sidebandWindowKeysAreUnambiguous =
+      [&](ArrayRef<SidebandPragmaLine> lines,
+          ArrayRef<uint8_t> matchedTokens) -> bool {
+    std::map<std::string, uint64_t> gapForKey;
+    for (const SidebandPragmaLine &line : lines) {
+      const std::string key = sidebandWindowKey(
+          certifiedWindowBeforeGap(matchedTokens, line.normalTokenGap),
+          line.canonicalText);
+      auto inserted = gapForKey.emplace(key, line.normalTokenGap);
+      if (!inserted.second && inserted.first->second != line.normalTokenGap) {
+        REFOLD_LOG_TRACE(
+            "pragma/sideband",
+            "refusing sideband pairing: certified window {0} holds two "
+            "directives spelled '{1}' at normal-token gaps {2} and {3}",
+            certifiedWindowBeforeGap(matchedTokens, line.normalTokenGap),
+            stringutils::showWs(StringRef(line.canonicalText).trim()),
+            inserted.first->second, line.normalTokenGap);
+        return false;
+      }
+    }
+    return true;
+  };
+
+  if (!sidebandWindowKeysAreUnambiguous(aLines, matchedATokens) ||
+      !sidebandWindowKeysAreUnambiguous(bLines, matchedBTokens))
+    return false;
+
+  for (const auto &line : aLines)
+    aKeys.push_back(sidebandWindowKey(
+        certifiedWindowBeforeGap(matchedATokens, line.normalTokenGap),
+        line.canonicalText));
+
+  for (const auto &line : bLines)
+    bKeys.push_back(sidebandWindowKey(
+        certifiedWindowBeforeGap(matchedBTokens, line.normalTokenGap),
+        line.canonicalText));
 
   for (const auto &key : aKeys)
     aTextRefs.push_back(key);
@@ -1973,24 +2083,31 @@ bool buildSidebandPragmaSourceEdits(
 
   struct SidebandBReplayBlockProof {
   private:
-    uint64_t ownerGap = 0;
+    uint64_t ownerCoordinate = 0;
     SidebandBReplayProof replay;
 
-    SidebandBReplayBlockProof(uint64_t ownerGap, SidebandBReplayProof replay)
-        : ownerGap(ownerGap), replay(std::move(replay)) {}
+    SidebandBReplayBlockProof(uint64_t ownerCoordinate,
+                              SidebandBReplayProof replay)
+        : ownerCoordinate(ownerCoordinate), replay(std::move(replay)) {}
 
   public:
-    /// Build a B-side block proof after all lines in the block have projected
-    /// to one normal-token owner gap and the replay proof has bound the emitted
-    /// text to its raw-B witness range.
-    static SidebandBReplayBlockProof Create(uint64_t ownerGap,
+    /// Build a B-side block proof after every line in the block resolved to one
+    /// owner coordinate and the replay proof has bound the emitted text to its
+    /// raw-B witness range.
+    static SidebandBReplayBlockProof Create(uint64_t ownerCoordinate,
                                             SidebandBReplayProof replay) {
-      return SidebandBReplayBlockProof(ownerGap, std::move(replay));
+      return SidebandBReplayBlockProof(ownerCoordinate, std::move(replay));
     }
 
-    /// Return the normal-token gap that owns every sideband replay line in the
+    /// Return the single owner coordinate shared by every replay line in the
     /// block.
-    uint64_t OwnerGap() const { return ownerGap; }
+    ///
+    /// Which coordinate this is depends on the prover that built the block, and
+    /// the two are not interchangeable: `proveBReplayBlockAtProjectedAGap`
+    /// yields an exact A-side normal-token gap, usable as a source placement,
+    /// while `proveBReplayBlockInCertifiedWindow` yields a certified-anchor
+    /// window, comparable across streams but naming no gap.
+    uint64_t OwnerCoordinate() const { return ownerCoordinate; }
 
     /// Consume the replay proof carried by this block.
     SidebandBReplayProof TakeReplay() { return std::move(replay); }
@@ -2025,29 +2142,63 @@ bool buildSidebandPragmaSourceEdits(
     return BoundSidebandSourceAtom{&pragma, binding.ownerIncludeId};
   };
 
-  auto proveBReplayBlock =
-      [&](uint64_t bStart,
-          uint64_t bEnd) -> std::optional<SidebandBReplayBlockProof> {
+  /// Prove one contiguous run of B sideband lines is a single replay block that
+  /// resolves to one owner coordinate, and bind its raw-B witness range.
+  ///
+  /// `lineOwner` supplies the coordinate for one line.  The block is rejected
+  /// unless every line resolves and all resolutions agree, so the coordinate is
+  /// a property of the block rather than of any one line in it.
+  auto proveBReplayBlockIn =
+      [&](uint64_t bStart, uint64_t bEnd,
+          function_ref<std::optional<uint64_t>(const SidebandPragmaLine &)>
+              lineOwner) -> std::optional<SidebandBReplayBlockProof> {
     if (bStart >= bEnd || bEnd > bLines.size())
       return std::nullopt;
 
-    std::optional<uint64_t> ownerGap;
+    std::optional<uint64_t> owner;
     for (uint64_t b = bStart; b < bEnd; ++b) {
-      std::optional<uint64_t> projectedGap = projectedBGapForSidebandLine(
-          normalA2B, bLines[static_cast<size_t>(b)]);
-      if (!projectedGap || (ownerGap && *ownerGap != *projectedGap))
+      std::optional<uint64_t> lineCoordinate =
+          lineOwner(bLines[static_cast<size_t>(b)]);
+      if (!lineCoordinate || (owner && *owner != *lineCoordinate))
         return std::nullopt;
-      ownerGap = *projectedGap;
+      owner = *lineCoordinate;
     }
 
     const uint64_t begin = bLines[static_cast<size_t>(bStart)].begin;
     const uint64_t end = sidebandBlockReplacementBEnd(bBytes, bLines, rawBToks,
                                                       rawBTokOff, bStart, bEnd);
-    if (!ownerGap || end < begin || end > static_cast<uint64_t>(bBytes.size()))
+    if (!owner || end < begin || end > static_cast<uint64_t>(bBytes.size()))
       return std::nullopt;
     return SidebandBReplayBlockProof::Create(
-        *ownerGap,
+        *owner,
         SidebandBReplayProof::FromText(bBytes.slice(begin, end), begin, end));
+  };
+
+  /// Prove a replay block whose owner coordinate is an exact A-side gap.
+  ///
+  /// Required by the insertion path, which has no A-side line to take a
+  /// placement from and must name one map-backed source boundary.
+  auto proveBReplayBlockAtProjectedAGap =
+      [&](uint64_t bStart,
+          uint64_t bEnd) -> std::optional<SidebandBReplayBlockProof> {
+    return proveBReplayBlockIn(
+        bStart, bEnd, [&](const SidebandPragmaLine &line) {
+          return projectedBGapForSidebandLine(normalA2B, line);
+        });
+  };
+
+  /// Prove a replay block whose owner coordinate is a certified-anchor window.
+  ///
+  /// Used where the block is matched against A-side lines that carry their own
+  /// exact gaps, so only the cross-stream comparison needs a common coordinate.
+  auto proveBReplayBlockInCertifiedWindow =
+      [&](uint64_t bStart,
+          uint64_t bEnd) -> std::optional<SidebandBReplayBlockProof> {
+    return proveBReplayBlockIn(
+        bStart, bEnd, [&](const SidebandPragmaLine &line) {
+          return std::optional<uint64_t>(
+              certifiedWindowBeforeGap(matchedBTokens, line.normalTokenGap));
+        });
   };
 
   auto sourceGapMaterialIsPreservable =
@@ -2073,16 +2224,25 @@ bool buildSidebandPragmaSourceEdits(
         StringRef(*sourceBytes).slice(leftEnd, rightBegin));
   };
 
+  /// Prove one contiguous run of A sideband lines is a single owner-local
+  /// source run, optionally certified to lie in a given B-side owner window.
+  ///
+  /// The A gaps stay exact: every line in the run must sit at the run's own
+  /// first gap, which is what makes the run one directive block rather than
+  /// several separated by ordinary tokens.  Only the comparison *against the B
+  /// side* is made in the certified-window coordinate, because that is the
+  /// comparison the two streams' gaps cannot express.
   auto proveSourceRun = [&](uint64_t aStart, uint64_t aEnd,
-                            std::optional<uint64_t> ownerGap)
+                            std::optional<uint64_t> ownerWindow)
       -> std::optional<SidebandSourceProof> {
     if (aStart >= aEnd || aEnd > aLines.size())
       return std::nullopt;
     std::optional<BoundSidebandSourceAtom> first = bindSourceAtom(aStart);
     if (!first || !first->pragma)
       return std::nullopt;
-    if (ownerGap &&
-        aLines[static_cast<size_t>(aStart)].normalTokenGap != *ownerGap)
+    const uint64_t runGap = aLines[static_cast<size_t>(aStart)].normalTokenGap;
+    if (ownerWindow &&
+        certifiedWindowBeforeGap(matchedATokens, runGap) != *ownerWindow)
       return std::nullopt;
 
     SidebandSourceProof proof = SidebandSourceProof::ConsumedSourceRun(
@@ -2095,8 +2255,7 @@ bool buildSidebandPragmaSourceEdits(
     // directives in a gap are preservable insertion anchors, not bytes that a
     // sideband replacement run may silently consume.
     for (uint64_t a = aStart + 1; a < aEnd; ++a) {
-      if (ownerGap &&
-          aLines[static_cast<size_t>(a)].normalTokenGap != *ownerGap)
+      if (ownerWindow && aLines[static_cast<size_t>(a)].normalTokenGap != runGap)
         return std::nullopt;
       std::optional<BoundSidebandSourceAtom> atom = bindSourceAtom(a);
       if (!atom || !atom->pragma ||
@@ -2121,11 +2280,14 @@ bool buildSidebandPragmaSourceEdits(
   auto proveInsertion =
       [&](uint64_t bStart,
           uint64_t bEnd) -> std::optional<ProvedSidebandInsertion> {
+    // A B-only insertion has no A-side line to inherit a placement from, so its
+    // owner must be one exact, map-backed A gap; the certified window used for
+    // pairing names no gap and cannot serve here.
     std::optional<SidebandBReplayBlockProof> insertedBlock =
-        proveBReplayBlock(bStart, bEnd);
+        proveBReplayBlockAtProjectedAGap(bStart, bEnd);
     if (!insertedBlock)
       return std::nullopt;
-    const uint64_t ownerGap = insertedBlock->OwnerGap();
+    const uint64_t ownerGap = insertedBlock->OwnerCoordinate();
 
     auto matchedNeighborInInsertionGap =
         [&](uint64_t bIdx) -> std::optional<BoundSidebandSourceAtom> {
@@ -2217,7 +2379,7 @@ bool buildSidebandPragmaSourceEdits(
         }
 
         std::optional<SidebandBReplayBlockProof> replayWithNext =
-            proveBReplayBlock(bStart, bEnd + 1);
+            proveBReplayBlockAtProjectedAGap(bStart, bEnd + 1);
         if (!replayWithNext)
           return std::nullopt;
         return ProvedSidebandInsertion{
@@ -2259,17 +2421,19 @@ bool buildSidebandPragmaSourceEdits(
       return false;
 
     std::optional<SidebandBReplayBlockProof> bBlock =
-        proveBReplayBlock(h.bStart, h.bEnd);
+        proveBReplayBlockInCertifiedWindow(h.bStart, h.bEnd);
     if (!bBlock)
       return false;
 
-    const uint64_t ownerGap = bBlock->OwnerGap();
+    const uint64_t ownerWindow = bBlock->OwnerCoordinate();
     std::vector<BoundSidebandSourceAtom> atoms;
     atoms.reserve(static_cast<size_t>(h.aEnd - h.aStart));
 
     bool sawPreservedDirectiveGap = false;
     for (uint64_t a = h.aStart; a < h.aEnd; ++a) {
-      if (aLines[static_cast<size_t>(a)].normalTokenGap != ownerGap)
+      if (certifiedWindowBeforeGap(
+              matchedATokens,
+              aLines[static_cast<size_t>(a)].normalTokenGap) != ownerWindow)
         return false;
       std::optional<BoundSidebandSourceAtom> atom = bindSourceAtom(a);
       if (!atom || !atom->pragma)
@@ -2371,11 +2535,11 @@ bool buildSidebandPragmaSourceEdits(
       // the equal-arity fallback only for legacy independent replacement hunks
       // that do not form one closed owner-local source run.
       std::optional<SidebandBReplayBlockProof> bBlock =
-          proveBReplayBlock(h.bStart, h.bEnd);
+          proveBReplayBlockInCertifiedWindow(h.bStart, h.bEnd);
       if (bBlock) {
-        const uint64_t ownerGap = bBlock->OwnerGap();
+        const uint64_t ownerWindow = bBlock->OwnerCoordinate();
         std::optional<SidebandSourceProof> source =
-            proveSourceRun(h.aStart, h.aEnd, ownerGap);
+            proveSourceRun(h.aStart, h.aEnd, ownerWindow);
         if (source &&
             appendProvedSidebandEdit(std::move(source), bBlock->TakeReplay()))
           return true;
