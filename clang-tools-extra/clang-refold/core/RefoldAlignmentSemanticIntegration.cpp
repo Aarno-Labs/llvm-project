@@ -787,6 +787,12 @@ RefoldEngine::SimulateSemanticAlignmentCandidate(
       FinalLineControlValidationCallback(), selection, /*alignmentSemanticResolverEnabled=*/false,
       StringRef(tuSourceBytes_));
 
+  // A candidate is handed a different alignment, but it diffs the same A and B
+  // buffers this engine did, so the raw byte hunks are shared rather than
+  // rebuilt once per enumerated map.  The memo is keyed on those bytes, so a
+  // candidate can only ever replay a result built from exactly them.
+  candidate.rawByteHunkMemo_ = rawByteHunkMemo_;
+
   // Run the same complete structural pipeline with the outer planner policy.
   // The alignment override activates the dedicated semantic theorem boundary,
   // so witness resolution and no-legacy auditing are strict without changing

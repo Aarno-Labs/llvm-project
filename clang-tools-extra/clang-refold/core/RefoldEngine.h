@@ -425,6 +425,15 @@ private:
   /// `AlignmentCertificationMemo`.
   AlignmentCertificationMemo *alignmentCertificationMemo_ = nullptr;
 
+  /// This run's raw A/B byte hunks, owned by the narrowing loop and shared by
+  /// every attempt it builds.
+  ///
+  /// Unlike the two memos above this one is also handed to candidate
+  /// simulations: a simulation is given a different alignment, but it reads the
+  /// same A and B buffers, so the byte diff it would build is the same one.
+  /// See `RawByteHunkMemo`.
+  RawByteHunkMemo *rawByteHunkMemo_ = nullptr;
+
   /// Whether this engine exists only to publish the alignment-resolution
   /// theorem.
   ///

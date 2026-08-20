@@ -29,6 +29,57 @@
 namespace clang {
 namespace refold {
 
+/// One run's raw A/B byte hunks, recorded the first time they are built.
+///
+/// The raw byte diff reads the A and B source buffers and nothing else.  Both
+/// are run constants -- an attempt narrows which owners must expand and which
+/// anchors it plans from, never the streams themselves -- so every attempt of
+/// one run, every candidate simulation it enumerates, and the resolution probe
+/// that stands in for the next attempt all diff identical bytes and reach an
+/// identical hunk sequence.
+///
+/// Re-deriving it is not cheap.  The byte diff is Myers' algorithm over one
+/// `StringRef` per source character, so its cost grows with the product of the
+/// stream length and the A/B edit distance; on an edit that widens the stream
+/// several-fold it is the largest single cost in a pass.  Recording it lets a
+/// run pay that once however far the narrowing ladder descends.
+///
+/// This is a memo, not a budget.  It never coarsens the diff, never bounds it,
+/// and never changes which hunks are published: a recorded result is returned
+/// only to a caller presenting the exact bytes it was built from.
+struct RawByteHunkMemo {
+  /// Whether `hunks` holds a result this run already built.
+  bool recorded = false;
+
+  /// Identity of the source buffers `hunks` was built from.
+  ///
+  /// The digest covers every byte and the buffer length, so two buffers
+  /// agreeing on it present the same input to the diff.  Computing it is one
+  /// linear scan over bytes the diff would otherwise walk many times.
+  uint64_t aSourceDigest = 0;
+  uint64_t bSourceDigest = 0;
+
+  /// The recorded hunks, copied out on every match.
+  std::vector<diffutils::Hunk> hunks;
+
+  /// Return the identity digest of one source buffer.
+  static uint64_t DigestSource(llvm::StringRef source);
+
+  /// Return whether a recorded result was built from exactly these buffers.
+  bool MatchesInputs(uint64_t aDigest, uint64_t bDigest) const {
+    return recorded && aSourceDigest == aDigest && bSourceDigest == bDigest;
+  }
+
+  /// Record \p built as this run's byte hunks for these buffers.
+  void Record(uint64_t aDigest, uint64_t bDigest,
+              std::vector<diffutils::Hunk> built) {
+    aSourceDigest = aDigest;
+    bSourceDigest = bDigest;
+    hunks = std::move(built);
+    recorded = true;
+  }
+};
+
 /// Projects between A/B token, byte, and source-coordinate domains.
 ///
 /// The mapper is deliberately read-only with respect to source buffers and
@@ -156,7 +207,13 @@ public:
   /// byte spans from A to B, avoiding ambiguity from token-level LCS anchoring.
   /// This is especially important for insert-only edits, where token-only LCS
   /// can choose any stable equivalent insertion point.
-  std::vector<diffutils::Hunk> BuildByteHunksFromRawText() const;
+  ///
+  /// When \p memo is supplied it carries this run's already-built hunks across
+  /// attempts.  The recorded bytes are re-checked rather than assumed, so a
+  /// replay is returned only for the exact buffers it was built from; see
+  /// `RawByteHunkMemo`.
+  std::vector<diffutils::Hunk>
+  BuildByteHunksFromRawText(RawByteHunkMemo *memo) const;
 
   /// Build the prefix-summed A->B byte-length delta cache for byte hunks.
   ///

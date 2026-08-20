@@ -107,6 +107,7 @@ class RefoldModel;
 class RefoldPathIdentity;
 class RefoldPreprocessingStructureIndexProvider;
 class RefoldSourceMapper;
+struct RawByteHunkMemo;
 
 /// Builds the deterministic A/B preprocessed-token diff plan.
 ///
@@ -202,7 +203,12 @@ public:
   /// across the attempts of that run.  It is consulted only for an alignment the
   /// same run already certified from the same streams under the same budget, and
   /// it never changes what certification would have concluded.
-  TokenDiffPlan Plan(AlignmentCertificationMemo *certificationMemo = nullptr);
+  ///
+  /// \p byteHunkMemo does the same for the raw A/B byte diff built at the end
+  /// of planning.  That diff reads the source buffers alone, so it too is one
+  /// answer per run rather than one per attempt; see `RawByteHunkMemo`.
+  TokenDiffPlan Plan(AlignmentCertificationMemo *certificationMemo = nullptr,
+                     RawByteHunkMemo *byteHunkMemo = nullptr);
 
 private:
   /// Certify the core A-to-B alignment and collect its evidence transcript.

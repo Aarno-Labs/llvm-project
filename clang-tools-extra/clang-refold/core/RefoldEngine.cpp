@@ -857,6 +857,12 @@ Expected<std::string> RefoldEngine::Refold(
   // dynamic program window partitioning exists to bound.
   AlignmentCertificationMemo alignmentCertificationMemo;
 
+  // The raw byte diff is likewise one answer per run.  See `RawByteHunkMemo`:
+  // it reads the A and B buffers alone, and an attempt changes neither, so an
+  // attempt, a candidate simulation, and the resolution probe all build the
+  // identical hunks from the identical bytes.
+  RawByteHunkMemo rawByteHunkMemo;
+
   // Set once, by the owner-alignment repair below, and then carried by every
   // later attempt: the repaired alignment is the one the run planned from from
   // that point on.
@@ -884,6 +890,7 @@ Expected<std::string> RefoldEngine::Refold(
     engine.resolveAlignmentAmbiguity_ = resolveAlignmentAmbiguity;
     engine.alignmentResolutionMemo_ = &alignmentResolutionMemo;
     engine.alignmentCertificationMemo_ = &alignmentCertificationMemo;
+    engine.rawByteHunkMemo_ = &rawByteHunkMemo;
     engine.verifyIncludeDirs_.assign(verifyIncludeDirs.begin(),
                                      verifyIncludeDirs.end());
 
@@ -955,6 +962,10 @@ Expected<std::string> RefoldEngine::Refold(
         // alignment, so the probe replays it and spends its time only on the
         // resolution the next attempt would otherwise have paid for.
         probe.alignmentCertificationMemo_ = &alignmentCertificationMemo;
+        // The probe reaches the end of token-diff planning, which is where the
+        // raw byte diff is built, so without this it would rebuild the hunks
+        // the attempt it stands in for has already published.
+        probe.rawByteHunkMemo_ = &rawByteHunkMemo;
         probe.verifyIncludeDirs_.assign(verifyIncludeDirs.begin(),
                                         verifyIncludeDirs.end());
         probe.ProbeAlignmentResolution();
@@ -1401,7 +1412,7 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   // deterministic token-diff plan below.
   assert(tokenDiffPlanner_ && "token diff planner service not initialized");
   RefoldTokenDiffPlanner::TokenDiffPlan diffPlan =
-      tokenDiffPlanner_->Plan(alignmentCertificationMemo_);
+      tokenDiffPlanner_->Plan(alignmentCertificationMemo_, rawByteHunkMemo_);
 
   // Retain the core theorem's forced map.  A forced anchor is an edge every
   // optimal path takes, so it is exactly what tells a hunk frontier this run

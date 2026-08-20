@@ -170,7 +170,8 @@ CertifiedAlignmentFacts RefoldTokenDiffPlanner::CertifyAlignment(
 }
 
 RefoldTokenDiffPlanner::TokenDiffPlan
-RefoldTokenDiffPlanner::Plan(AlignmentCertificationMemo *certificationMemo) {
+RefoldTokenDiffPlanner::Plan(AlignmentCertificationMemo *certificationMemo,
+                             RawByteHunkMemo *byteHunkMemo) {
   std::vector<StringRef> aSeq = MapLexemes(deps_.aToks, deps_.aTokOff);
   std::vector<StringRef> bSeq = MapLexemes(deps_.bToks, deps_.bTokOff);
 
@@ -372,7 +373,7 @@ RefoldTokenDiffPlanner::Plan(AlignmentCertificationMemo *certificationMemo) {
   // Raw byte hunks are built alongside the token diff so every later
   // A-byte -> B-byte projection observes caches derived from the same A/B
   // inputs as the token hunk plan.
-  deps_.abByteHunks = deps_.sourceMapper.BuildByteHunksFromRawText();
+  deps_.abByteHunks = deps_.sourceMapper.BuildByteHunksFromRawText(byteHunkMemo);
   deps_.sourceMapper.BuildByteHunkPrefixDeltaCache();
   return TokenDiffPlan{std::move(hunks), std::move(alignment)};
 }
