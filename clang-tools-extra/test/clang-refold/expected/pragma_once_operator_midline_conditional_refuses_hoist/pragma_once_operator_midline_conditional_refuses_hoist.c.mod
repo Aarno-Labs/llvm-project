@@ -39,10 +39,20 @@
 // of drift at the site.  Reaching it requires admitting `PragmaOperator` to the
 // guard-rewrite authority together with the line-ownership check named in the
 // companion test.
-#include "guard_once_operator_midline_conditional.h"
+#define MIDLINE_COND_V 4
+#ifndef __CLANG_REFOLD_ONCE_1
+#if 1
+int cond_op = 9;
+#define __CLANG_REFOLD_ONCE_1
+#endif
+int cond_use = MIDLINE_COND_V;
+#endif
 
 int mid = 0;
 
+#ifndef __CLANG_REFOLD_ONCE_1
+#define __CLANG_REFOLD_ONCE_1
 #include "guard_once_operator_midline_conditional.h"
+#endif
 
 int tail = MIDLINE_COND_V;

@@ -194,6 +194,10 @@ static constexpr const char *RefoldSchema = R"json(
   ],
   "additionalProperties": false,
   "properties": {
+    "pragma_images_complete": {
+      "type": "boolean",
+      "description": "True when every pragma the preprocessor printed into the preprocessed output was bound to a pragma item carrying pp_byte_begin/pp_byte_end. Only then does a pragma item lacking those fields prove that the preprocessor emitted nothing for that directive; Clang hands one printing callback an invalid source location, so an emission can be printed without any site identifying which item it belongs to. Absent or false means absence of an image is missing evidence, not a fact, and a proof that depends on the distinction must fail closed."
+    },
     "version": {
       "type": "string",
       "minLength": 1,
@@ -1606,6 +1610,16 @@ static constexpr const char *RefoldSchema = R"json(
           "minimum": 0,
           "description": "For a _Pragma operator, end byte offset (exclusive) of the _Pragma(\"...\") expression within 'site_path'."
         },
+        "pp_byte_begin": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Begin byte offset of this pragma's image in the preprocessed output (A stream): the '#' of the emitted directive. Emitted only for a pragma the preprocessor re-emits; a pragma consumed by its own handler ('once', 'region', 'GCC poison', 'push_macro') produces no output and carries neither offset. The absence of these two fields is therefore the producer's answer to whether clang emits anything for this spelling, which is not recoverable from the directive text. Same coordinate system as tokens.pp_byte_begin."
+        },
+        "pp_byte_end": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "End byte offset (exclusive) of this pragma's image in the preprocessed output (A stream), one past its last token. The newline terminating the directive line is emitted by the next line's layout and is deliberately outside this range."
+        },
         "stringified_from_macro_id": {
           "type": "integer",
           "minimum": 0,
@@ -1616,6 +1630,14 @@ static constexpr const char *RefoldSchema = R"json(
           "minimum": 0,
           "description": "Index into that invocation's inv_arg_ranges identifying the argument whose stringification supplied this pragma's content."
         }
+      },
+      "dependentRequired": {
+        "pp_byte_begin": [
+          "pp_byte_end"
+        ],
+        "pp_byte_end": [
+          "pp_byte_begin"
+        ]
       }
     },
     "FileItem": {

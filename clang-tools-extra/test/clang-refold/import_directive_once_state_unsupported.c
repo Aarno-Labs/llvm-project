@@ -1,5 +1,4 @@
-// RUN: %clang-refold-tester import_directive_once_state_unsupported
-// XFAIL: *
+// RUN: %clang-refold-tester-expect-refold-fail import_directive_once_state_unsupported
 // Refusal shape: an `#import` directive anywhere in the translation unit.
 //
 // `#import` is a Clang language extension, not C and not C++.  It includes the
@@ -28,6 +27,15 @@
 // silently.  Making the refusal local therefore requires an explicit gate at
 // each realization site, which is only worth writing if `#import` needs to be
 // supported.
+//
+// PINNED BY ASSERTION, NOT BY `XFAIL`.  The harness requires the refold to
+// fail, so this reports as a passing test.  A shape that must never fold is not
+// unfinished work, and an expected-failure entry would say it is -- and would
+// sit in the remaining-work count forever.  If the shape ever starts folding
+// this test fails, which is the same alarm `XPASS` used to raise.  The expected
+// refold beside this file is no longer diffed; it stays as the record of what
+// admitting it would have produced.  The `.c.i` still is, so producer drift is
+// still caught.
 //
 // TRIAGE: correct.  This should stay expected-to-fail unless `#import` becomes
 // a target, in which case the work is the realization-site audit above and not

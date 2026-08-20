@@ -851,6 +851,31 @@ public:
     std::optional<uint64_t> operatorB;
     /// Exclusive byte offset of the exact `_Pragma("...")` expression.
     std::optional<uint64_t> operatorE;
+    /// Inclusive byte offset of this directive's image in the preprocessed
+    /// stream A, when the preprocessor re-emitted it.
+    ///
+    /// Set together with `ppByteEnd`, and only by the producer's printing path.
+    /// A pragma consumed by its own handler produces no output and leaves both
+    /// unset, so `HasEmittedImage()` is the producer's answer to whether clang
+    /// emits anything for this spelling.
+    std::optional<uint64_t> ppByteBegin;
+    /// Exclusive byte offset of this directive's image in A, one past its last
+    /// token.  The terminating newline is emitted by the next line's layout and
+    /// is outside the range.
+    std::optional<uint64_t> ppByteEnd;
+
+    /// Return whether the preprocessor emitted this directive into the
+    /// preprocessed stream.
+    ///
+    /// This is a recorded producer fact, not a property of the directive text:
+    /// whether a spelling reaches the printing path or is swallowed by its own
+    /// handler is a question only the preprocessor can answer, and two pragmas
+    /// with identical state effects can differ on it.  An older map records no
+    /// image for any pragma, so a caller must treat `false` as "no proof of an
+    /// image" and fail closed where that distinction matters.
+    bool HasEmittedImage() const {
+      return ppByteBegin.has_value() && ppByteEnd.has_value();
+    }
   };
 
   /// Producer record for one physical file's emitted A-token contribution.
@@ -1092,6 +1117,16 @@ public:
   StringRef GetSourcePath() const { return sourcePath_; }
   /// Return the producer preprocessing working directory.
   StringRef GetPPCwd() const { return ppCwd_; }
+
+  /// Return whether every pragma the preprocessor printed was bound to a
+  /// recorded item.
+  ///
+  /// Only then does `PragmaDirective::HasEmittedImage()` returning false prove
+  /// that the preprocessor emitted nothing for that directive.  When this is
+  /// false -- an older map, or a printing path whose callback could not name a
+  /// site -- absence of an image is missing evidence rather than a fact, and a
+  /// proof that depends on the distinction must fail closed.
+  bool PragmaImagesComplete() const { return pragmaImagesComplete_; }
   /// Return the producer language token used to configure the raw lexer for
   /// source-byte slices in this model.
   StringRef GetPPLang() const { return ppLang_; }
@@ -1314,6 +1349,7 @@ private:
   StringRef version_;
   StringRef sourcePath_;
   StringRef ppCwd_;
+  bool pragmaImagesComplete_ = false;
   StringRef ppLang_;
   std::vector<std::string> ppArgv_;
   std::vector<IncludeSearchEntry> includeSearchChain_;

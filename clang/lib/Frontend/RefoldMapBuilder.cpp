@@ -3589,9 +3589,11 @@ void RefoldMapBuilder::onHasInclude(SourceLocation Loc) {
   HasIncludeSites.emplace_back(Decomposed.first, Decomposed.second);
 }
 
-void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
+void RefoldMapBuilder::onPragma(
+    SourceLocation HashLoc, StringRef FullText,
+    std::optional<std::pair<uint64_t, uint64_t>> EmittedPPRange) {
   recordPragmaItem(HashLoc, FullText, /*RequireOperatorSpelling=*/false,
-                   /*TextIsProvisional=*/false);
+                   /*TextIsProvisional=*/false, EmittedPPRange);
 }
 
 void RefoldMapBuilder::onPragmaOperator(SourceLocation OperatorLoc,
@@ -3636,12 +3638,18 @@ static std::optional<std::string> destringizeStringifiedArg(StringRef Quoted) {
   return Out;
 }
 
-void RefoldMapBuilder::recordPragmaItem(SourceLocation HashLoc,
-                                        StringRef FullText,
-                                        bool RequireOperatorSpelling,
-                                        bool TextIsProvisional) {
+void RefoldMapBuilder::recordPragmaItem(
+    SourceLocation HashLoc, StringRef FullText, bool RequireOperatorSpelling,
+    bool TextIsProvisional,
+    std::optional<std::pair<uint64_t, uint64_t>> EmittedPPRange) {
   if (!enabled())
     return;
+
+  // A malformed range is dropped rather than recorded: its presence is a proof
+  // fact downstream, so an inverted or empty one would assert re-emission while
+  // naming no bytes.
+  if (EmittedPPRange && EmittedPPRange->first >= EmittedPPRange->second)
+    EmittedPPRange.reset();
 
   SourceLocation FileLoc = SM.getFileLoc(HashLoc);
   if (!FileLoc.isValid())
@@ -3772,6 +3780,16 @@ void RefoldMapBuilder::recordPragmaItem(SourceLocation HashLoc,
         Existing.Text = FullText.str();
         Existing.PragmaTextProvisional = false;
       }
+      // The generic directive callback usually records the item before the
+      // printing path runs, so the emitted image arrives on a report that would
+      // otherwise be dropped as a duplicate.  Contribute it to the item already
+      // held.  Only the printing path supplies a range, so at most one report
+      // per pragma carries one; keep the first rather than letting a later
+      // callback move an image that is already anchored.
+      if (EmittedPPRange && !Existing.PragmaPPBegin) {
+        Existing.PragmaPPBegin = EmittedPPRange->first;
+        Existing.PragmaPPEnd = EmittedPPRange->second;
+      }
       return;
     }
   }
@@ -3810,6 +3828,10 @@ void RefoldMapBuilder::recordPragmaItem(SourceLocation HashLoc,
   It.PragmaOperatorBegin = OperatorBegin;
   It.PragmaOperatorEnd = OperatorEnd;
   It.PragmaTextProvisional = TextIsProvisional;
+  if (EmittedPPRange) {
+    It.PragmaPPBegin = EmittedPPRange->first;
+    It.PragmaPPEnd = EmittedPPRange->second;
+  }
 
   // Stringified-argument provenance.
   //
@@ -4875,8 +4897,20 @@ void RefoldMapBuilder::writeJSON() {
 
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
+  // Whether every pragma the preprocessor printed was bound to a recorded
+  // item.  Only then may a consumer read a pragma carrying no image as one the
+  // preprocessor emitted nothing for; otherwise a print that no callback could
+  // attribute would look exactly like a consumed directive.
+  uint64_t PragmaItemsWithImage = 0;
+  for (const Item &It : Items)
+    if (It.Kind == IK_Directive && It.Subkind == "#pragma" && It.PragmaPPBegin)
+      ++PragmaItemsWithImage;
+  const bool PragmaImagesComplete =
+      PragmaItemsWithImage == PragmasEmittedIntoOutput;
+
   JO.object([&] {
-    JO.attribute("version", "3.4");
+    JO.attribute("version", "3.5");
+    JO.attribute("pragma_images_complete", PragmaImagesComplete);
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -6296,6 +6330,15 @@ void RefoldMapBuilder::writeJSON() {
                 JO.attribute("operator_b", *It.PragmaOperatorBegin);
                 JO.attribute("operator_e", *It.PragmaOperatorEnd);
               }
+            }
+
+            // Image of the pragma in the preprocessed stream A.  Emitted only
+            // for a pragma the preprocessor re-emitted, so a consumed pragma's
+            // record stays byte-identical and the field's *absence* carries the
+            // fact that clang printed nothing for the spelling.
+            if (It.Subkind == "#pragma" && It.PragmaPPBegin && It.PragmaPPEnd) {
+              JO.attribute("pp_byte_begin", *It.PragmaPPBegin);
+              JO.attribute("pp_byte_end", *It.PragmaPPEnd);
             }
 
             // Stringified-argument provenance.  Emitted only for a pragma whose

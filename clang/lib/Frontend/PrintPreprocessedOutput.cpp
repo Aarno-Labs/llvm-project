@@ -100,6 +100,7 @@ private:
   std::unique_ptr<llvm::raw_null_ostream> NullOS;
   unsigned NumToksToSkip;
   RefoldMapBuilder *RefoldRecorder = nullptr;
+  RefoldCountingRawOstream *RefoldCount = nullptr;
 
   Token PrevTok;
   Token PrevPrevTok;
@@ -109,7 +110,8 @@ public:
                            bool defines, bool DumpIncludeDirectives,
                            bool DumpEmbedDirectives, bool UseLineDirectives,
                            bool MinimizeWhitespace, bool DirectivesOnly,
-                           bool KeepSystemIncludes, RefoldMapBuilder *Recorder)
+                           bool KeepSystemIncludes, RefoldMapBuilder *Recorder,
+                           RefoldCountingRawOstream *Counter = nullptr)
       : PP(pp), SM(PP.getSourceManager()), ConcatInfo(PP), OS(os),
         DisableLineMarkers(lineMarkers), DumpDefines(defines),
         DumpIncludeDirectives(DumpIncludeDirectives),
@@ -117,7 +119,7 @@ public:
         UseLineDirectives(UseLineDirectives),
         MinimizeWhitespace(MinimizeWhitespace), DirectivesOnly(DirectivesOnly),
         KeepSystemIncludes(KeepSystemIncludes), OrigOS(os), NumToksToSkip(0),
-        RefoldRecorder(Recorder) {
+        RefoldRecorder(Recorder), RefoldCount(Counter) {
     CurLine = 0;
     CurFilename += "<uninit>";
     EmittedTokensOnThisLine = false;
@@ -146,14 +148,66 @@ public:
     return EmittedDirectiveOnThisLine;
   }
 
-  void recordPragma(SourceLocation Loc) {
+  void recordPragma(SourceLocation Loc,
+                    std::optional<std::pair<uint64_t, uint64_t>>
+                        EmittedPPRange = std::nullopt) {
     // Keep pragma recording independent from printing. Pragmas often produce no
     // ordinary PP tokens, but they are still source structure the refold
     // consumer must see before deciding whether a zero-token include gap is
     // safe to consume.
     if (RefoldRecorder)
-      RefoldRecorder->onPragma(Loc, StringRef());
+      RefoldRecorder->onPragma(Loc, StringRef(), EmittedPPRange);
   }
+
+  /// Measure the bytes one pragma-printing callback writes, and record that
+  /// range as the directive's image in the preprocessed output.
+  ///
+  /// Every such callback has the same shape: record the pragma, move to its
+  /// line, write the directive, mark the line.  The image is the bytes written
+  /// from the line move to the end of the callback, so capturing it has to be a
+  /// scope: a plain call placed where `recordPragma` sits cannot see the writes
+  /// that follow it.  That is exactly how the pragma-specific callbacks came to
+  /// record no image while printing one, so the line move belongs to this scope
+  /// rather than to each callback, and forgetting to measure now means
+  /// forgetting to emit.
+  ///
+  /// The initial `recordPragma` keeps its original position, so the item and
+  /// its id are created exactly when they were before; the destructor's second
+  /// report contributes only the range to that same item.
+  class EmittedPragmaImageScope {
+  public:
+    EmittedPragmaImageScope(PrintPPOutputPPCallbacks &Callbacks,
+                            SourceLocation Loc)
+        : Callbacks(Callbacks), Loc(Loc) {
+      // Count the emission before anything else, because this is the one step
+      // that cannot fail: an invalid location stops the pragma being recorded
+      // or bound, but it does not stop the directive being printed.
+      if (Callbacks.RefoldRecorder)
+        Callbacks.RefoldRecorder->onPragmaEmittedIntoOutput();
+      Callbacks.recordPragma(Loc);
+      Callbacks.MoveToLine(Loc, /*RequireStartOfLine=*/true);
+      Measuring = Callbacks.RefoldRecorder != nullptr &&
+                  Callbacks.RefoldCount != nullptr;
+      if (Measuring)
+        Begin = Callbacks.RefoldCount->bytesWritten();
+    }
+
+    ~EmittedPragmaImageScope() {
+      if (!Measuring)
+        return;
+      Callbacks.recordPragma(
+          Loc, std::make_pair(Begin, Callbacks.RefoldCount->bytesWritten()));
+    }
+
+    EmittedPragmaImageScope(const EmittedPragmaImageScope &) = delete;
+    EmittedPragmaImageScope &operator=(const EmittedPragmaImageScope &) = delete;
+
+  private:
+    PrintPPOutputPPCallbacks &Callbacks;
+    SourceLocation Loc;
+    bool Measuring = false;
+    uint64_t Begin = 0;
+  };
 
   void recordPragmaOperator(SourceLocation Loc, StringRef Content) {
     // A `_Pragma` consumed by its handler emits no tokens and never reaches the
@@ -664,8 +718,7 @@ void PrintPPOutputPPCallbacks::PragmaMessage(SourceLocation Loc,
                                              StringRef Namespace,
                                              PragmaMessageKind Kind,
                                              StringRef Str) {
-  recordPragma(Loc);
-  MoveToLine(Loc, /*RequireStartOfLine=*/true);
+  EmittedPragmaImageScope Emitted(*this, Loc);
   *OS << "#pragma ";
   if (!Namespace.empty())
     *OS << Namespace << ' ';
@@ -690,8 +743,7 @@ void PrintPPOutputPPCallbacks::PragmaMessage(SourceLocation Loc,
 
 void PrintPPOutputPPCallbacks::PragmaDebug(SourceLocation Loc,
                                            StringRef DebugType) {
-  recordPragma(Loc);
-  MoveToLine(Loc, /*RequireStartOfLine=*/true);
+  EmittedPragmaImageScope Emitted(*this, Loc);
 
   *OS << "#pragma clang __debug ";
   *OS << DebugType;
@@ -701,16 +753,14 @@ void PrintPPOutputPPCallbacks::PragmaDebug(SourceLocation Loc,
 
 void PrintPPOutputPPCallbacks::
 PragmaDiagnosticPush(SourceLocation Loc, StringRef Namespace) {
-  recordPragma(Loc);
-  MoveToLine(Loc, /*RequireStartOfLine=*/true);
+  EmittedPragmaImageScope Emitted(*this, Loc);
   *OS << "#pragma " << Namespace << " diagnostic push";
   setEmittedDirectiveOnThisLine();
 }
 
 void PrintPPOutputPPCallbacks::
 PragmaDiagnosticPop(SourceLocation Loc, StringRef Namespace) {
-  recordPragma(Loc);
-  MoveToLine(Loc, /*RequireStartOfLine=*/true);
+  EmittedPragmaImageScope Emitted(*this, Loc);
   *OS << "#pragma " << Namespace << " diagnostic pop";
   setEmittedDirectiveOnThisLine();
 }
@@ -719,8 +769,7 @@ void PrintPPOutputPPCallbacks::PragmaDiagnostic(SourceLocation Loc,
                                                 StringRef Namespace,
                                                 diag::Severity Map,
                                                 StringRef Str) {
-  recordPragma(Loc);
-  MoveToLine(Loc, /*RequireStartOfLine=*/true);
+  EmittedPragmaImageScope Emitted(*this, Loc);
   *OS << "#pragma " << Namespace << " diagnostic ";
   switch (Map) {
   case diag::Severity::Remark:
@@ -746,8 +795,7 @@ void PrintPPOutputPPCallbacks::PragmaDiagnostic(SourceLocation Loc,
 void PrintPPOutputPPCallbacks::PragmaWarning(SourceLocation Loc,
                                              PragmaWarningSpecifier WarningSpec,
                                              ArrayRef<int> Ids) {
-  recordPragma(Loc);
-  MoveToLine(Loc, /*RequireStartOfLine=*/true);
+  EmittedPragmaImageScope Emitted(*this, Loc);
 
   *OS << "#pragma warning(";
   switch(WarningSpec) {
@@ -771,8 +819,7 @@ void PrintPPOutputPPCallbacks::PragmaWarning(SourceLocation Loc,
 
 void PrintPPOutputPPCallbacks::PragmaWarningPush(SourceLocation Loc,
                                                  int Level) {
-  recordPragma(Loc);
-  MoveToLine(Loc, /*RequireStartOfLine=*/true);
+  EmittedPragmaImageScope Emitted(*this, Loc);
   *OS << "#pragma warning(push";
   if (Level >= 0)
     *OS << ", " << Level;
@@ -781,16 +828,14 @@ void PrintPPOutputPPCallbacks::PragmaWarningPush(SourceLocation Loc,
 }
 
 void PrintPPOutputPPCallbacks::PragmaWarningPop(SourceLocation Loc) {
-  recordPragma(Loc);
-  MoveToLine(Loc, /*RequireStartOfLine=*/true);
+  EmittedPragmaImageScope Emitted(*this, Loc);
   *OS << "#pragma warning(pop)";
   setEmittedDirectiveOnThisLine();
 }
 
 void PrintPPOutputPPCallbacks::PragmaExecCharsetPush(SourceLocation Loc,
                                                      StringRef Str) {
-  recordPragma(Loc);
-  MoveToLine(Loc, /*RequireStartOfLine=*/true);
+  EmittedPragmaImageScope Emitted(*this, Loc);
   *OS << "#pragma character_execution_set(push";
   if (!Str.empty())
     *OS << ", " << Str;
@@ -799,24 +844,21 @@ void PrintPPOutputPPCallbacks::PragmaExecCharsetPush(SourceLocation Loc,
 }
 
 void PrintPPOutputPPCallbacks::PragmaExecCharsetPop(SourceLocation Loc) {
-  recordPragma(Loc);
-  MoveToLine(Loc, /*RequireStartOfLine=*/true);
+  EmittedPragmaImageScope Emitted(*this, Loc);
   *OS << "#pragma character_execution_set(pop)";
   setEmittedDirectiveOnThisLine();
 }
 
 void PrintPPOutputPPCallbacks::
 PragmaAssumeNonNullBegin(SourceLocation Loc) {
-  recordPragma(Loc);
-  MoveToLine(Loc, /*RequireStartOfLine=*/true);
+  EmittedPragmaImageScope Emitted(*this, Loc);
   *OS << "#pragma clang assume_nonnull begin";
   setEmittedDirectiveOnThisLine();
 }
 
 void PrintPPOutputPPCallbacks::
 PragmaAssumeNonNullEnd(SourceLocation Loc) {
-  recordPragma(Loc);
-  MoveToLine(Loc, /*RequireStartOfLine=*/true);
+  EmittedPragmaImageScope Emitted(*this, Loc);
   *OS << "#pragma clang assume_nonnull end";
   setEmittedDirectiveOnThisLine();
 }
@@ -910,20 +952,35 @@ namespace {
 struct UnknownPragmaHandler : public PragmaHandler {
   const char *Prefix;
   PrintPPOutputPPCallbacks *Callbacks;
-  RefoldMapBuilder *RefoldRecorder; // may be null
+  RefoldMapBuilder *RefoldRecorder;      // may be null
+  RefoldCountingRawOstream *RefoldCount; // may be null
 
   // Set to true if tokens should be expanded
   bool ShouldExpandTokens;
 
   UnknownPragmaHandler(const char *prefix, PrintPPOutputPPCallbacks *callbacks,
-                       bool RequireTokenExpansion, RefoldMapBuilder *recorder)
+                       bool RequireTokenExpansion, RefoldMapBuilder *recorder,
+                       RefoldCountingRawOstream *counter = nullptr)
       : Prefix(prefix), Callbacks(callbacks), RefoldRecorder(recorder),
-        ShouldExpandTokens(RequireTokenExpansion) {}
+        RefoldCount(counter), ShouldExpandTokens(RequireTokenExpansion) {}
   void HandlePragma(Preprocessor &PP, PragmaIntroducer Introducer,
                     Token &PragmaTok) override {
     // Figure out what line we went to and insert the appropriate number of
     // newline characters.
     Callbacks->MoveToLine(PragmaTok.getLocation(), /*RequireStartOfLine=*/true);
+
+    // This handler is the preprocessor's printing path: reaching it is what
+    // makes a pragma visible in the preprocessed output at all.  Bracket the
+    // writes below to record where the directive lands, taken after MoveToLine
+    // so the range starts at the emitted '#' rather than at the newlines that
+    // positioned it.  The same counter supplies per-token offsets, so pragma
+    // and token images share one coordinate system.
+    if (RefoldRecorder)
+      RefoldRecorder->onPragmaEmittedIntoOutput();
+    const bool RecordPPRange = RefoldRecorder != nullptr && RefoldCount;
+    const uint64_t PragmaPPBegin =
+        RecordPPRange ? RefoldCount->bytesWritten() : 0;
+
     Callbacks->OS->write(Prefix, strlen(Prefix));
     Callbacks->setEmittedTokensOnThisLine();
 
@@ -961,6 +1018,14 @@ struct UnknownPragmaHandler : public PragmaHandler {
         PP.LexUnexpandedToken(PragmaTok);
     }
 
+    // The emitted image ends at the last token written above.  The newline that
+    // terminates the directive line is emitted by whatever lays out the next
+    // line, so it belongs to no directive and is deliberately outside the range.
+    std::optional<std::pair<uint64_t, uint64_t>> EmittedPPRange;
+    if (RecordPPRange)
+      EmittedPPRange =
+          std::make_pair(PragmaPPBegin, RefoldCount->bytesWritten());
+
     // Terminate the line to match other directive 'text' fields.
     PragmaText.push_back('\n');
 
@@ -970,7 +1035,7 @@ struct UnknownPragmaHandler : public PragmaHandler {
       // location for _Pragma)
       SourceLocation HashLoc =
           Introducer.Loc.isValid() ? Introducer.Loc : PragmaTok.getLocation();
-      RefoldRecorder->onPragma(HashLoc, StringRef(PragmaText));
+      RefoldRecorder->onPragma(HashLoc, StringRef(PragmaText), EmittedPPRange);
     }
 
     Callbacks->setEmittedDirectiveOnThisLine();
@@ -1208,7 +1273,7 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
       PP, OutOS, !Opts.ShowLineMarkers, Opts.ShowMacros,
       Opts.ShowIncludeDirectives, Opts.ShowEmbedDirectives,
       Opts.UseLineDirectives, Opts.MinimizeWhitespace, Opts.DirectivesOnly,
-      Opts.KeepSystemIncludes, RefoldRecorder.get());
+      Opts.KeepSystemIncludes, RefoldRecorder.get(), CountingOS.get());
 
   // Expand macros in pragmas with -fms-extensions.  The assumption is that
   // the majority of pragmas in such a file will be Microsoft pragmas.
@@ -1217,17 +1282,17 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
       new UnknownPragmaHandler(
           "#pragma", Callbacks,
           /*RequireTokenExpansion=*/PP.getLangOpts().MicrosoftExt,
-          RefoldRecorder.get()));
+          RefoldRecorder.get(), CountingOS.get()));
 
   std::unique_ptr<UnknownPragmaHandler> GCCHandler(new UnknownPragmaHandler(
       "#pragma GCC", Callbacks,
       /*RequireTokenExpansion=*/PP.getLangOpts().MicrosoftExt,
-      RefoldRecorder.get()));
+      RefoldRecorder.get(), CountingOS.get()));
 
   std::unique_ptr<UnknownPragmaHandler> ClangHandler(new UnknownPragmaHandler(
       "#pragma clang", Callbacks,
       /*RequireTokenExpansion=*/PP.getLangOpts().MicrosoftExt,
-      RefoldRecorder.get()));
+      RefoldRecorder.get(), CountingOS.get()));
 
   PP.AddPragmaHandler(MicrosoftExtHandler.get());
   PP.AddPragmaHandler("GCC", GCCHandler.get());
@@ -1240,7 +1305,8 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
   //  replacement.
   std::unique_ptr<UnknownPragmaHandler> OpenMPHandler(new UnknownPragmaHandler(
       "#pragma omp", Callbacks,
-      /*RequireTokenExpansion=*/true, RefoldRecorder.get()));
+      /*RequireTokenExpansion=*/true, RefoldRecorder.get(),
+      CountingOS.get()));
   PP.AddPragmaHandler("omp", OpenMPHandler.get());
 
   PP.addPPCallbacks(std::unique_ptr<PPCallbacks>(Callbacks));

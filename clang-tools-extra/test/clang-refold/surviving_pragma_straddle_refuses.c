@@ -1,5 +1,4 @@
-// RUN: %clang-refold-tester surviving_pragma_straddle_refuses
-// XFAIL: *
+// RUN: %clang-refold-tester-expect-refold-fail surviving_pragma_straddle_refuses
 // Refusal shape: one B token replacing material on both sides of a pragma
 // that survives into the preprocessed stream.
 //
@@ -25,8 +24,17 @@
 // so the taxonomy treats it as binding whatever follows and as changing state
 // the payload may observe; both placements replay B while differing in what
 // they mean.  This is the same undetermined placement that
-// `undetermined_payload_side_refuses_without_dropping_structure` pins over a
+// `consumed_pragma_straddle_commits_payload_and_preserves_directive` pins over a
 // consumed pragma, reached here over a re-emitted one.
+//
+// PINNED BY ASSERTION, NOT BY `XFAIL`.  The harness requires the refold to
+// fail, so this reports as a passing test.  A shape that must never fold is not
+// unfinished work, and an expected-failure entry would say it is -- and would
+// sit in the remaining-work count forever.  If the shape ever starts folding
+// this test fails, which is the same alarm `XPASS` used to raise.  The expected
+// refold beside this file is no longer diffed; it stays as the record of what
+// admitting it would have produced.  The `.c.i` still is, so producer drift is
+// still caught.
 //
 // TRIAGE: correct for now, and the honest bucket for it is the placement
 // question rather than the pairing one.  It is a tripwire: if this starts

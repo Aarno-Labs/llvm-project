@@ -767,6 +767,13 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
     return versOrErr.takeError();
   model.version_ = *versOrErr;
 
+  // Whether the producer accounted for every pragma it printed.  Absent in an
+  // older map, which is the fail-closed answer: a consumer may not read "this
+  // pragma records no image" as "the preprocessor emitted nothing for it"
+  // unless the producer certified that every emission was bound to an item.
+  model.pragmaImagesComplete_ =
+      root.getBoolean("pragma_images_complete").value_or(false);
+
   // source
   auto srcPathOrErr = applyToField(asString, root, "source");
   if (!srcPathOrErr)
@@ -1468,6 +1475,17 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
               obj->getBoolean("via_pragma_operator").value_or(false);
           pd.operatorB = asOptUInt64(*obj, "operator_b");
           pd.operatorE = asOptUInt64(*obj, "operator_e");
+          // Image of the directive in the preprocessed stream A.  Present only
+          // when the preprocessor re-emitted the pragma, so absence is a fact
+          // and not missing data: it says clang printed nothing for this
+          // spelling.  A partial pair is treated as absent rather than
+          // repaired, because half a range proves neither.
+          pd.ppByteBegin = asOptUInt64(*obj, "pp_byte_begin");
+          pd.ppByteEnd = asOptUInt64(*obj, "pp_byte_end");
+          if (!pd.ppByteBegin || !pd.ppByteEnd || *pd.ppByteEnd <= *pd.ppByteBegin) {
+            pd.ppByteBegin.reset();
+            pd.ppByteEnd.reset();
+          }
           // Stringified-argument provenance. Both fields are producer-emitted
           // together; a partial pair is treated as absent rather than repaired,
           // so a truncated record cannot authorize an argument-site edit.
@@ -2365,6 +2383,7 @@ RefoldModel RefoldModel::CloneForReadOnlyConsumer() const {
   RefoldModel clone;
   clone.root_ = root_;
   clone.version_ = version_;
+  clone.pragmaImagesComplete_ = pragmaImagesComplete_;
   clone.sourcePath_ = sourcePath_;
   clone.ppCwd_ = ppCwd_;
   clone.ppLang_ = ppLang_;

@@ -1,5 +1,4 @@
-// RUN: %clang-refold-tester sideband_pragma_ambiguous_certified_window_refuses
-// XFAIL: *
+// RUN: %clang-refold-tester-expect-refold-fail sideband_pragma_ambiguous_certified_window_refuses
 // Refusal shape: two identical surviving pragmas certified to one window, and
 // only one of them left in B.
 //
@@ -19,6 +18,15 @@
 //
 //   refusing sideband pairing: certified window 4 holds two directives
 //   spelled '#pragma pack(1)' at normal-token gaps 4 and 6
+//
+// PINNED BY ASSERTION, NOT BY `XFAIL`.  The harness requires the refold to
+// fail, so this reports as a passing test.  A shape that must never fold is not
+// unfinished work, and an expected-failure entry would say it is -- and would
+// sit in the remaining-work count forever.  If the shape ever starts folding
+// this test fails, which is the same alarm `XPASS` used to raise.  The expected
+// refold beside this file is no longer diffed; it stays as the record of what
+// admitting it would have produced.  The `.c.i` still is, so producer drift is
+// still caught.
 //
 // TRIAGE: correct, and it must never pass while the input stays this shape.
 // It is the fail-closed half of the certified-window pairing: the coordinate is

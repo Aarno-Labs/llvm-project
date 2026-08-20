@@ -47,27 +47,31 @@ GapCrossingEvidence admitStructure(
   return evidence;
 }
 
-/// Return whether a pragma's state effect is one the preprocessor consumes.
+/// Return whether the preprocessor emitted nothing for this pragma.
 ///
 /// Equivalence requires that moving the payload across the directive change no
 /// token order, which holds only when the preprocessor consumes the directive
-/// and emits nothing for it.  A pragma that is printed instead -- `message`,
-/// `warning`, `error`, `GCC diagnostic` -- is spelled into both streams, so the
-/// payload's side of it is token order and is fixed by the alignment, not free
-/// to choose.
-bool pragmaEffectIsConsumed(PragmaStateEffect effect) {
-  switch (effect) {
-  case PragmaStateEffect::IncludeOnce:
-  case PragmaStateEffect::MacroStateStack:
-  case PragmaStateEffect::PoisonIdentifiers:
-  case PragmaStateEffect::SystemHeader:
-    return true;
-  case PragmaStateEffect::Unknown:
-  case PragmaStateEffect::NoState:
-  case PragmaStateEffect::DiagnosticState:
-    return false;
-  }
-  llvm_unreachable("invalid pragma state effect");
+/// and emits nothing for it.  A pragma that is printed instead is spelled into
+/// both streams, so the payload's side of it is token order and is fixed by the
+/// alignment, not free to choose.
+///
+/// The producer records each pragma's image in A when it printed one, so this
+/// reads that fact rather than inferring it.  The state effect used to stand in
+/// for it, and the proxy was exact only by coincidence: every effect the
+/// taxonomy classified happened to be one clang consumes.  It answered
+/// `false` for `region` -- a spelling clang consumes and emits nothing for --
+/// purely because the taxonomy had never classified it, which is a different
+/// question from what the preprocessor printed.
+///
+/// Absence of an image is the admitting answer here, so it has to be a recorded
+/// fact rather than missing data.  It is one only when the producer certified
+/// that every pragma it printed was bound to an item: Clang hands one printing
+/// callback an invalid location, and a map written before that was accounted
+/// for cannot tell a directive nobody could record from one that was consumed.
+/// Without the certificate this proves nothing and the crossing fails closed.
+bool pragmaEmitsNoImage(const RefoldModel &model,
+                        const RefoldModel::PragmaDirective &pragma) {
+  return model.PragmaImagesComplete() && !pragma.HasEmittedImage();
 }
 
 /// Return whether a structure kind is a conditional-control directive.
@@ -190,10 +194,16 @@ GapCrossingEvidence RefoldStructuralGapCrossingProver::ProvePragma(
   if (!pragma || pragma->text.empty())
     return rejectStructure(interval, GapCrossingRejection::NoProducerRecord);
 
+  // Two independent questions, and answering both is what makes the crossing
+  // sound.  Whether the directive has an image in the streams is a producer
+  // fact; what state it changes is a property of its spelling.  A pragma with
+  // an image cannot be crossed however harmless its effect, and a pragma
+  // without one still cannot be crossed by a payload that observes its state.
+  if (!pragmaEmitsNoImage(deps_.model, *pragma))
+    return rejectStructure(interval, GapCrossingRejection::PragmaNotConsumed);
+
   const PragmaClassification classification =
       classifyPragmaDirective(pragma->text);
-  if (!pragmaEffectIsConsumed(classification.effect))
-    return rejectStructure(interval, GapCrossingRejection::PragmaNotConsumed);
 
   // `push_macro`/`pop_macro` change the definition bound to one macro name,
   // which is the state a `#define` changes and the question the macro-state

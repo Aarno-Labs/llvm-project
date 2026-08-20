@@ -36,6 +36,7 @@
 // this cell should eventually produce.  What must not happen is reaching it by
 // letting the insensitivity theorem commit a side.
 #define ZZ VALUE
-int arr[] = { 1,
+int arr[] = {
 #define VALUE 3
-2 };
+#undef ZZ
+ZZ };

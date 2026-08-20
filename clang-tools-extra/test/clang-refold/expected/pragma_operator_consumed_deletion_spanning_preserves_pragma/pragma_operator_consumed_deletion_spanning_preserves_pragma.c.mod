@@ -16,7 +16,7 @@
 //
 // Both spellings of `region` remain unclassified, so this pins the deletion
 // only: the straddling *replacement* across the same pragma still refuses, in
-// `undetermined_payload_side_refuses_without_dropping_structure`.
+// `consumed_pragma_straddle_commits_payload_and_preserves_directive`.
 int arr[] = { 
 _Pragma("region")
  };

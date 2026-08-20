@@ -182,6 +182,18 @@ PragmaClassification classifyPragmaDirective(StringRef directiveText) {
     return result;
   }
 
+  // Editor-only region markers.  Clang registers `PragmaRegionHandler` for both
+  // spellings and its handler body is empty -- the directive is recognized,
+  // consumed, and does nothing -- so it changes no state a payload could
+  // observe and binds to nothing that follows it.  The operand is free text a
+  // folding editor displays, so it is not validated for the same reason the
+  // diagnostic spellings' operands are not.
+  if (head == "region" || head == "endregion") {
+    result.effect = PragmaStateEffect::NoState;
+    result.binding = PragmaConstructBinding::NonBinding;
+    return result;
+  }
+
   if (head == "push_macro" || head == "pop_macro") {
     StringRef macroName;
     if (!consumeParenthesizedStringOperand(text, pos, macroName))

@@ -384,6 +384,20 @@ struct Item {
   // that overlaps ordinary tokens.
   std::optional<uint64_t> PragmaOperatorBegin;
   std::optional<uint64_t> PragmaOperatorEnd;
+  // --- Image of the pragma in the preprocessed stream A ---
+  // Half-open byte range of the directive text as printed into the preprocessed
+  // output: from the '#' of the emitted `#pragma` through its last token,
+  // excluding the newline that terminates the line (the next line's layout
+  // emits that).  Recorded only by the printing path, so a pragma the
+  // preprocessor consumes -- `once`, `region`, `GCC poison`, `push_macro` --
+  // has no range at all.
+  //
+  // Presence is therefore the exact answer to whether clang re-emits this
+  // spelling, which is a producer fact: the preprocessor either printed the
+  // directive or it did not, and no amount of consumer classification can
+  // recover that from the text.
+  std::optional<uint64_t> PragmaPPBegin;
+  std::optional<uint64_t> PragmaPPEnd;
   // --- Stringified-argument provenance (Subkind == "#pragma") ---
   // When a macro replacement stringifies a formal into the `_Pragma` operand
   // (`#define DIAG(x) _Pragma(#x)`), the pragma's content is the invocation's
@@ -667,6 +681,9 @@ class RefoldMapBuilder {
       Cwd; // Captured working directory (for resolving relative spellings)
 
   std::string TUSourcePath;  // TU path spelling (for JSON 'source')
+  // Number of pragmas the preprocessor printed into the preprocessed output,
+  // counted by every printing path.  See onPragmaEmittedIntoOutput.
+  uint64_t PragmasEmittedIntoOutput = 0;
   // Keep legacy `resolved_path` spelling-preserving by default.  New include
   // maps always carry the split fields: `opened_path` for physical identity and
   // `entered_file_spelling` for filename-observer proof.
@@ -775,8 +792,15 @@ class RefoldMapBuilder {
   /// \param TextIsProvisional When true, a later callback reporting the same
   ///        physical line replaces this item's text rather than being dropped
   ///        as a duplicate.
-  void recordPragmaItem(SourceLocation HashLoc, StringRef FullText,
-                        bool RequireOperatorSpelling, bool TextIsProvisional);
+  /// \param EmittedPPRange See onPragma.  A duplicate report carrying a range
+  ///        contributes it to the item already recorded, because the generic
+  ///        directive callback usually creates that item before the printing
+  ///        path runs.
+  void recordPragmaItem(
+      SourceLocation HashLoc, StringRef FullText, bool RequireOperatorSpelling,
+      bool TextIsProvisional,
+      std::optional<std::pair<uint64_t, uint64_t>> EmittedPPRange =
+          std::nullopt);
 
 public:
   /// Construct a builder bound to a preprocessor and an output path.
@@ -879,7 +903,33 @@ public:
   ///
   /// Pragmas are recorded as directive items with exact source text and site
   /// byte anchors. They do not contribute to A-token spans.
-  void onPragma(SourceLocation HashLoc, StringRef FullText);
+  ///
+  /// \param EmittedPPRange The half-open byte range this directive occupies in
+  ///        the preprocessed output, when the caller is the printing path that
+  ///        just wrote it.  Only that path can supply it, and only a pragma the
+  ///        preprocessor re-emits ever reaches it: a pragma consumed by its own
+  ///        handler produces no output and is recorded through the generic
+  ///        directive callback with no range.  The presence of a range is
+  ///        therefore the producer's answer to "does clang emit anything for
+  ///        this spelling", which no consumer can decide from the text.
+  void onPragma(SourceLocation HashLoc, StringRef FullText,
+                std::optional<std::pair<uint64_t, uint64_t>> EmittedPPRange =
+                    std::nullopt);
+
+  /// Count one pragma the preprocessor printed into the preprocessed output.
+  ///
+  /// Called by every printing path, before and independently of whether that
+  /// path can bind the emission to a recorded item.  Some cannot: Clang hands
+  /// `PPCallbacks::PragmaAssumeNonNullEnd` an invalid `SourceLocation`, so its
+  /// directive is printed while no site identifies which item it belongs to.
+  ///
+  /// The count is what makes absence of an image mean something.  A consumer
+  /// reads "this pragma has no image" as "the preprocessor emitted nothing for
+  /// it", and that reading is only valid when every emission was accounted
+  /// for -- otherwise a print nobody could record would be indistinguishable
+  /// from a directive that was consumed.  Comparing this count against the
+  /// number of items carrying an image decides `pragma_images_complete`.
+  void onPragmaEmittedIntoOutput() { ++PragmasEmittedIntoOutput; }
 
   /// Callback for a `_Pragma("...")` operator, reported with its destringized
   /// content before the pragma handlers run.
