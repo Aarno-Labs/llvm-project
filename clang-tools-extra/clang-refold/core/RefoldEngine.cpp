@@ -1414,6 +1414,24 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   RefoldTokenDiffPlanner::TokenDiffPlan diffPlan =
       tokenDiffPlanner_->Plan(alignmentCertificationMemo_, rawByteHunkMemo_);
 
+  // A probe has its answer the instant the call above returns: alignment
+  // resolution publishes its theorem into `alignmentResolutionMemo_` from
+  // inside it, and that memo is the only state the narrowing loop reads back
+  // from a probe engine.  Everything below -- the witness-ledger audit, hunk
+  // edge retraction, mixed-owner structural tiling, insertion provenance --
+  // builds the plan for an emission a probe never performs.
+  //
+  // Skipping the witness audit here loses no proof.  It validates this
+  // engine's own resolution witnesses, and this engine emits nothing.  When
+  // the memo commits, the loop re-plans a fresh attempt that replays those
+  // witnesses through `ResolveSemanticAlignment` and audits them on the path
+  // that does emit; when it declines, `ResolveSemanticAlignment` leaves the
+  // witness ledger empty and keeps only core-forced anchors, so the audit had
+  // nothing to check.  Nothing is ever emitted on unaudited witnesses either
+  // way.
+  if (stopAfterAlignmentResolution_)
+    return std::vector<diffutils::Hunk>();
+
   // Retain the core theorem's forced map.  A forced anchor is an edge every
   // optimal path takes, so it is exactly what tells a hunk frontier this run
   // *chose* from one no realignment can move.  The demand check below reads it
@@ -3470,7 +3488,8 @@ std::string RefoldEngine::RunRefoldPass() {
 
   // A probe has what it came for: token-diff planning is where alignment
   // resolution publishes its theorem.  Planning past this point would be the
-  // very pass the probe exists to decide against running.
+  // very pass the probe exists to decide against running.  PlanTokenDiff()
+  // returns no hunks in this mode, having stopped at that publication point.
   if (stopAfterAlignmentResolution_)
     return std::string();
 
