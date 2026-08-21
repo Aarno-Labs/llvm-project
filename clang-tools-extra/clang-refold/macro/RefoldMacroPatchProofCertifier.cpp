@@ -67,6 +67,13 @@ void RefoldMacroPatchProofCertifier::CertifyWholeCoverAcceptedCandidate(
   // root, and owner-realization witness together.  Keep that operation atomic
   // by routing through the named proof-carrier helper.
   AttachWholeCoverProofCarrier(patch, plan, invocation);
+
+  // The whole-cover replacement is `WholeCoverPlan::clippedText`, which is the
+  // trimmed material of the cover's own B tokens and nothing else.  This is the
+  // one place that fact is known, so record the partition here: the whole
+  // replacement is B-derived payload, and no byte of the original callsite
+  // spelling survives in it.
+  patch.materialized.replacementIsWhollyBPayload = true;
 }
 
 void RefoldMacroPatchProofCertifier::CertifyReusedMacroPatchAcceptedCandidate(

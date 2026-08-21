@@ -120,6 +120,28 @@ struct MaterializedSurface {
   uint64_t outputByteStart = 0;
   /// Exclusive byte offset inside the patch replacement text.
   uint64_t outputByteEnd = 0;
+
+  /// True when every byte of the patch replacement is B-derived payload.
+  ///
+  /// A repair that rewrites the macro environment a replacement is
+  /// preprocessed under may reinterpret only B-derived bytes.  B is already
+  /// fully expanded, so a live definition named there is a spurious
+  /// re-expansion the repair removes; preserved source may instead *require*
+  /// that expansion, and rewriting its environment would silently change how it
+  /// preprocesses.
+  ///
+  /// This is deliberately not `hasOutputByteRange`.  That range reports which
+  /// replacement bytes correspond to the materialized B-token envelope, and a
+  /// patch that preserves the original callsite spelling around an edited
+  /// argument -- `ID(VAL)` for an edit that only changed the actual -- sets it
+  /// to the whole replacement while the callsite spelling around the payload is
+  /// preserved source.  The two questions have opposite answers on exactly that
+  /// patch, so they get separate fields.
+  ///
+  /// Set only where the fact is established: a realization built wholly from
+  /// B's own bytes.  Absence is missing evidence rather than permission, so
+  /// every unpartitioned path keeps failing closed.
+  bool replacementIsWhollyBPayload = false;
 };
 
 /// First-class macro whole-cover realization certificate.
@@ -204,6 +226,21 @@ struct MacroPatch {
   /// Owner/conditional-arm certificate for the patch surface, when proven.
   OwnerCertificate ownerCert = {};
 };
+
+/// Drop every byte-level claim about a patch replacement that rewriting its
+/// text invalidates.
+///
+/// Merging two replacements produces bytes neither certifier examined, so the
+/// materialized output-byte range and the B-payload partition both stop
+/// describing the text they were proved about.  Clearing them together, through
+/// one named operation, is what keeps a later merge from silently inheriting a
+/// partition established for different bytes -- the B-payload certificate in
+/// particular licenses rewriting the macro environment the replacement is
+/// preprocessed under, which must never outlive the text it was proved for.
+inline void invalidateMacroPatchReplacementByteProvenance(MacroPatch &patch) {
+  patch.materialized.hasOutputByteRange = false;
+  patch.materialized.replacementIsWhollyBPayload = false;
+}
 
 /// Specialized authority carried by an exact direct-header byte patch.
 ///

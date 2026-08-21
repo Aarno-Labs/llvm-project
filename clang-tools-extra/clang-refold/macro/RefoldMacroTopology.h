@@ -100,6 +100,35 @@ public:
       uint64_t aStart, uint64_t aEnd,
       std::optional<uint64_t> ownerIncludeId = std::nullopt) const;
 
+  /// Prove that a run of A tokens sharing one physical source spelling is
+  /// exactly one macro invocation's whole cover, and return that cover's
+  /// A-token range.
+  ///
+  /// Two distinct A tokens carry the same physical spelling only when one macro
+  /// expansion produced both, so any walk over per-token source mappings sees a
+  /// repeated offset there instead of a strictly increasing one.  The repeat by
+  /// itself proves nothing about how much of that expansion the caller
+  /// consumes, and a caller that claims the shared spelling for replacement
+  /// while consuming only part of the expansion would drop the tokens it never
+  /// asked to replace.  Admit the repeat only when the producer's own records
+  /// close the group: the shared spelling is the invocation's recorded source
+  /// extent, its whole cover is self-contained at the callsite, that cover
+  /// begins at \p groupAStart, the caller consumes every token in it, and every
+  /// token the cover claims carries this same spelling.
+  ///
+  /// \param groupAStart First A token of the maximal run sharing \p entry's
+  ///        source spelling.
+  /// \param entry Token map entry for the repeating token.
+  /// \param ownerIncludeId Include occurrence the caller is walking, if any.
+  /// \param consumedAEnd Exclusive end of the A range the caller consumes; the
+  ///        cover must lie wholly inside it.
+  /// \returns The whole cover's half-open A-token range, or nullopt when any
+  ///          required fact is absent, leaving the caller to fail closed.
+  std::optional<std::pair<uint64_t, uint64_t>>
+  WholeCoverForRepeatedSourceSpelling(
+      uint64_t groupAStart, const RefoldModel::TokMapEntry &entry,
+      std::optional<uint64_t> ownerIncludeId, uint64_t consumedAEnd) const;
+
   /// Build the stable identity for one concrete `__COUNTER__` event.
   CounterEventIdentity BuildCounterEventIdentity(
       const RefoldModel::MacroInvocation &macro, uint64_t occurrenceOrdinal,

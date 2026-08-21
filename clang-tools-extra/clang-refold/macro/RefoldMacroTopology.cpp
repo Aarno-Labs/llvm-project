@@ -12,6 +12,7 @@
 #include "macro/RefoldMacroTopology.h"
 
 #include "line-control/RefoldLineObserverLayout.h"
+#include "macro/RefoldMacroReplay.h"
 #include "util/StringUtils.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -296,6 +297,54 @@ enum class MacroCoverRank : uint8_t {
 };
 
 } // namespace
+
+std::optional<std::pair<uint64_t, uint64_t>>
+RefoldMacroTopology::WholeCoverForRepeatedSourceSpelling(
+    uint64_t groupAStart, const RefoldModel::TokMapEntry &entry,
+    std::optional<uint64_t> ownerIncludeId, uint64_t consumedAEnd) const {
+  const RefoldModel::MacroInvocation *invocation =
+      SmallestCoveringPatchableMacro(groupAStart, entry.pp + 1, ownerIncludeId);
+  if (!invocation || !invocation->invB || !invocation->invE)
+    return std::nullopt;
+
+  // The caller claims the shared spelling as the source it replaces, so that
+  // spelling must be the invocation's own recorded extent rather than some
+  // wider or narrower interval that merely contains it.  Byte offsets are
+  // file-relative, so compare the file too: a header-owned invocation can carry
+  // offsets that numerically coincide with translation-unit ones, and an owner
+  // filter the caller may not have applied is not what should decide this.
+  if (!invocation->invFile ||
+      !paths_.PathsEqual(*invocation->invFile, entry.file) ||
+      *invocation->invB != entry.b || *invocation->invE != entry.e)
+    return std::nullopt;
+
+  // Coarse containment is not provenance: a cover whose tokens are interleaved
+  // with material a nested invocation owns cannot be replaced at this callsite.
+  if (!RefoldMacroWholeCoverProof::MacroWholeCoverIsSelfContained(*invocation))
+    return std::nullopt;
+
+  const std::optional<std::pair<uint64_t, uint64_t>> cover =
+      RefoldMacroWholeCoverProof::GetWholeCoverATokRange(*invocation);
+  if (!cover || cover->first != groupAStart || cover->second <= cover->first ||
+      cover->second > consumedAEnd)
+    return std::nullopt;
+
+  // Every token the cover claims must carry this same spelling.  Without that
+  // the group and the cover are different token sets, and the caller would
+  // consume a source extent that does not correspond to the tokens it replaces.
+  const auto &tokmapByPP = model_.GetTokmapByPP();
+  for (uint64_t coverPP = cover->first; coverPP < cover->second; ++coverPP) {
+    auto coverIt = tokmapByPP.find(coverPP);
+    if (coverIt == tokmapByPP.end())
+      return std::nullopt;
+    const RefoldModel::TokMapEntry &coverEntry = coverIt->second;
+    if (coverEntry.pp != coverPP || coverEntry.b != entry.b ||
+        coverEntry.e != entry.e || coverEntry.file != entry.file)
+      return std::nullopt;
+  }
+
+  return cover;
+}
 
 const RefoldModel::MacroInvocation *
 RefoldMacroTopology::SmallestCoveringPatchableMacro(

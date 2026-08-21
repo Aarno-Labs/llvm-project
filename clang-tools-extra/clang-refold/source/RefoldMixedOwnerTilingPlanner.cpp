@@ -1522,6 +1522,13 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       uint64_t previousEnd = 0;
       bool havePrevious = false;
 
+      // First A token of the maximal group that shares one physical source
+      // spelling, and the exclusive end of the group once it has been proven to
+      // be a whole macro cover.  Distinct A tokens repeat a spelling only inside
+      // one expansion, so these track that expansion rather than a search.
+      uint64_t repeatedSpellingGroupStart = 0;
+      uint64_t repeatedSpellingGroupEnd = 0;
+
       PhysicalSourceRun currentRun;
 
       for (uint64_t pp = h.aStart; pp < h.aEnd; ++pp) {
@@ -1570,6 +1577,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
           currentRun.condArmId = tokenOwner->condArmId;
           previousBegin = entry.b;
           previousEnd = entry.e;
+          repeatedSpellingGroupStart = pp;
+          repeatedSpellingGroupEnd = 0;
           havePrevious = true;
           continue;
         }
@@ -1583,6 +1592,47 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
             physicalOwner->includeId != tokenOwner->includeId ||
             structureIndex != tokenStructureIndex) {
           return std::nullopt;
+        }
+
+        // Distinct A tokens repeat one physical spelling exactly when a single
+        // macro expansion produced them.  That repetition is admissible only
+        // when the producer's records prove the repeating group is one
+        // invocation's self-contained whole cover; the run then consumes that
+        // callsite spelling once, which is what replacing the invocation means.
+        // Prove it at the group's first repetition and consume the rest of the
+        // proven cover by index, so a partially consumed expansion still falls
+        // through to the refusal below.
+        if (havePrevious && entry.b == previousBegin &&
+            entry.e == previousEnd) {
+          if (pp >= repeatedSpellingGroupEnd) {
+            const std::optional<std::pair<uint64_t, uint64_t>> wholeCover =
+                deps_.macroTopology.WholeCoverForRepeatedSourceSpelling(
+                    repeatedSpellingGroupStart, entry, tokenOwner->includeId,
+                    h.aEnd);
+            if (!wholeCover) {
+              REFOLD_LOG_TRACE(
+                  "tiling/runplan",
+                  "abandoned: hunk A=[{0},{1}) pp={2} repeats the source "
+                  "spelling [{3},{4}) first taken by pp={5}, and that group is "
+                  "not one macro invocation's self-contained whole cover",
+                  h.aStart, h.aEnd, pp, entry.b, entry.e,
+                  repeatedSpellingGroupStart);
+              return std::nullopt;
+            }
+            repeatedSpellingGroupEnd = wholeCover->second;
+          }
+
+          // A whole cover is produced at one callsite, so it cannot change
+          // conditional arm partway through.  Keep the run's arm check uniform
+          // with the ordinary continuation below rather than assuming it.
+          if (physicalOwner->condArmId != tokenOwner->condArmId)
+            return std::nullopt;
+
+          // The run already spans this spelling; the token adds no new source
+          // bytes, so `previousBegin`/`previousEnd` and `currentRun.source`
+          // stay exactly where the group's first token put them.
+          currentRun.aEnd = pp + 1;
+          continue;
         }
 
         // Distinct A tokens must map to strictly ordered, nonoverlapping raw
@@ -1676,6 +1726,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         physicalOwner->condArmId = tokenOwner->condArmId;
         previousBegin = entry.b;
         previousEnd = entry.e;
+        repeatedSpellingGroupStart = pp;
+        repeatedSpellingGroupEnd = 0;
       }
 
       if (!havePrevious || currentRun.aEnd <= currentRun.aStart ||

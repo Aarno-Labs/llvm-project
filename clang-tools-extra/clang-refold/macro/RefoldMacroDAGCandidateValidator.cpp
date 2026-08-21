@@ -1341,7 +1341,7 @@ RefoldMacroDAGCandidateValidator::AcceptOrMergeDAGCandidatePatch(
   // proof-valid. Update the unique patch in place while preserving the
   // accumulated validation metadata for any later candidate.
   accCtx.uniquePatch->replacement = std::move(*merged);
-  accCtx.uniquePatch->materialized.hasOutputByteRange = false;
+  invalidateMacroPatchReplacementByteProvenance(*accCtx.uniquePatch);
   unionMacroPatchMaterializedBTokenRange(*accCtx.uniquePatch, candPatch);
   accCtx.uniquePatchValidation = std::move(*mergedValidation);
   if (!accCtx.uniquePatch->macroId)

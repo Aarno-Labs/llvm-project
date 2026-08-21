@@ -705,16 +705,24 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
 
   // Alternative repair, attempted only when a definition cannot be carried:
   // leave every definition exactly where it is, undefine the observed ones
-  // immediately before the replacement's own line, and restore them immediately
-  // after it from the producer's directive text.
+  // immediately before the replacement, and restore them immediately after it
+  // from the producer's directive text.
   //
   // The restore is what makes this self-contained.  Macro state after the
   // repaired interval is identical to the state before it, so no obligation
   // falls on the header suffix or on translation-unit source after the include
-  // -- neither of which this proof can see.  Only the repaired line changes
-  // what it observes, and the three chunks that line is made of are each
-  // proven indifferent to the name below.
-  auto buildUndefRestoreMaterializedHeaderPatch =
+  // -- neither of which this proof can see.
+  //
+  // Two brackets implement it, and they trade different obligations.  The wider
+  // one spans the replacement's whole physical line and asks that line's
+  // preserved prefix and suffix to be indifferent to the name; the narrower one
+  // spans only the replacement and instead asks that the bytes it reinterprets
+  // are B-derived payload.  Neither subsumes the other, so both are attempted,
+  // widest first.
+  //
+  // The wider bracket: preferred because it is the established shape, so every
+  // input it already handled stays byte-identical.
+  auto buildUndefRestoreAroundReplacementLine =
       [&]() -> std::optional<StabilizedMaterializedHeaderMacroPatch> {
     const uint64_t lineStart = static_cast<uint64_t>(
         stringutils::lineStartOffset(bytes, static_cast<size_t>(mp.invStart)));
@@ -800,6 +808,100 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
     return stabilized;
   };
 
+  // The narrower bracket, for a line the wider one cannot serve.  A line may
+  // carry both B-derived payload and preserved source that *requires* the name
+  // to expand -- `int patched(void) { return ID(4242) + VAL; }` edited to read
+  // `VAL` inside the invocation -- where undefining across the whole line
+  // breaks the preserved `+ VAL` and not undefining breaks the payload.
+  // Bracketing only the replacement leaves every byte outside it in its
+  // original macro state, so the surrounding source is asked for nothing at all
+  // and the two readings of the name coexist on one line.
+  auto buildUndefRestoreAroundBPayload =
+      [&]() -> std::optional<StabilizedMaterializedHeaderMacroPatch> {
+    // Only B-derived bytes may be reinterpreted under a rewritten macro
+    // environment.  Without the partition certificate the replacement may hold
+    // preserved callsite spelling that requires the name to expand -- an
+    // args-only patch emitting `ID(VAL)` is exactly that -- so absence of the
+    // certificate keeps this repair unavailable.
+    if (!mp.replacementIsWhollyBPayload)
+      return std::nullopt;
+
+    // A directive inside the replacement may select an arm whose conditional
+    // state is itself part of the owner proof, which is no longer a plain
+    // token repair.  A B-derived payload carries no directive, so this excludes
+    // only cases this repair was never meant to cover.
+    if (tokenText_.TextContainsDirectiveLine(StringRef(mp.replacement)))
+      return std::nullopt;
+
+    // The synthesized directives are inserted at the replacement's own
+    // boundaries, each on a fresh physical line.  Both boundaries are token
+    // boundaries by construction, so the added newlines are ordinary
+    // whitespace -- unless the replacement sits on a directive line, where
+    // splitting the logical line would change what the directive says, or
+    // inside a spliced logical line, where a new physical line ends the splice.
+    const uint64_t lineStart = static_cast<uint64_t>(
+        stringutils::lineStartOffset(bytes, static_cast<size_t>(mp.invStart)));
+    if (lineStart > mp.invStart)
+      return std::nullopt;
+    if (lineStart > 0 &&
+        stringutils::isLineSplice(bytes, static_cast<size_t>(lineStart) - 1))
+      return std::nullopt;
+    const uint64_t enclosingLineEnd = materializedHeaderLineEndAfter(mpEnd);
+    if (enclosingLineEnd < mpEnd || enclosingLineEnd > bytes.size())
+      return std::nullopt;
+    if (tokenText_.TextContainsDirectiveLine(
+            bytes.slice(lineStart, enclosingLineEnd)))
+      return std::nullopt;
+
+    if (materializedHeaderRangeOverlapsStagedEdit(mp.invStart, mpEnd))
+      return std::nullopt;
+
+    for (const auto &candidate : candidates) {
+      // The definition must be complete before the synthesized `#undef`, or the
+      // `#undef` would precede the `#define` it undoes.
+      if (candidate.end > mp.invStart)
+        return std::nullopt;
+    }
+
+    // Source outside `[mp.invStart, mpEnd)` is untouched and keeps the macro
+    // state it originally had: the prefix is preprocessed before the `#undef`
+    // and the suffix after the restore.  Neither is asked for anything, which
+    // is what lets a line carry both readings of the name.
+    std::string replacement;
+    replacement.push_back('\n');
+    for (const auto &candidate : candidates)
+      replacement += (Twine("#undef ") + candidate.name + "\n").str();
+    replacement += mp.replacement;
+    if (replacement.empty() || replacement.back() != '\n')
+      replacement.push_back('\n');
+    // Restore in source order, so several definitions re-establish the same
+    // last-one-wins order they had originally.
+    for (const auto &candidate : candidates) {
+      replacement.append(candidate.directive->text.begin(),
+                         candidate.directive->text.end());
+      if (replacement.empty() || replacement.back() != '\n')
+        replacement.push_back('\n');
+    }
+
+    for (const auto &candidate : candidates) {
+      (void)widenMaterializedHeaderMacroState(
+          materializedHeaderMacroStateBoundary(mp.invStart, mpEnd),
+          StateMutationKind::WidenedIntoClosure,
+          llvm::formatv("include-owned macro patch in {0} undefines '{1}' "
+                        "(#{2}) across B-derived replay payload [{3},{4}) and "
+                        "restores it immediately after",
+                        headerPath, candidate.name, candidate.directive->id,
+                        mp.invStart, mpEnd)
+              .str());
+    }
+
+    StabilizedMaterializedHeaderMacroPatch stabilized;
+    stabilized.start = mp.invStart;
+    stabilized.end = mpEnd;
+    stabilized.replacement = std::move(replacement);
+    return stabilized;
+  };
+
   // The replacement payload will be emitted before each carried definition,
   // and the original line suffix after the macro invocation must also remain
   // before those definitions so the directives still start on real directive
@@ -815,7 +917,11 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
             *candidate.directive, candidate.name, StringRef(crossed),
             following)) {
       if (std::optional<StabilizedMaterializedHeaderMacroPatch> undefRestore =
-              buildUndefRestoreMaterializedHeaderPatch()) {
+              buildUndefRestoreAroundReplacementLine()) {
+        return undefRestore;
+      }
+      if (std::optional<StabilizedMaterializedHeaderMacroPatch> undefRestore =
+              buildUndefRestoreAroundBPayload()) {
         return undefRestore;
       }
       (void)failMaterializedHeaderMacroState(

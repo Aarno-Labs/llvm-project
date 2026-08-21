@@ -170,7 +170,7 @@ void RefoldMacroPatchReusePhase::MergeCurrentRootWithExistingCallsitePatch(
   // replay validation, so update only the candidate.  The caller remains
   // responsible for final acceptance/selection of that candidate.
   candidate.replacement = std::move(*merged);
-  candidate.materialized.hasOutputByteRange = false;
+  invalidateMacroPatchReplacementByteProvenance(candidate);
   if (!candidate.macroId)
     candidate.macroId = existingPatch->macroId;
 }

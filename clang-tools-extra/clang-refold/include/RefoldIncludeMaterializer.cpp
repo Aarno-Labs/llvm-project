@@ -798,8 +798,10 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
       std::vector<MacroStateDirectiveLineInterval> movedMacroStateTransitions;
       if (std::optional<StabilizedMaterializedHeaderMacroPatch> stabilized =
               macroStateProof_.StabilizeMaterializedHeaderMacroPatchReplay(
-                  MacroStatePatchReplayInput{mp.invRange.begin, mp.invRange.end,
-                                             StringRef(mp.replacement)},
+                  MacroStatePatchReplayInput{
+                      mp.invRange.begin, mp.invRange.end,
+                      StringRef(mp.replacement),
+                      mp.materialized.replacementIsWhollyBPayload},
                   mpEnd, headerPath, includeId, StringRef(bytes),
                   macroStateStagedEditIntervals(edits))) {
         // Empty {0,0,""} is the local sentinel used by the stabilizer after

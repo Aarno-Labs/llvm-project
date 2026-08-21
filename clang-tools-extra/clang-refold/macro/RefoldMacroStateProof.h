@@ -108,6 +108,14 @@ struct MacroStatePatchReplayInput {
   uint64_t invStart = 0;
   uint64_t invEnd = 0;
   llvm::StringRef replacement;
+
+  /// True when every byte of `replacement` is B-derived payload, copied from
+  /// the patch's `MaterializedSurface::replacementIsWhollyBPayload`.
+  ///
+  /// The undefine/restore repair reinterprets the macro environment of the
+  /// replacement bytes, which is sound only over payload B already expanded.
+  /// Absence keeps that repair unavailable.
+  bool replacementIsWhollyBPayload = false;
 };
 
 /// Half-open interval for an edit already staged in the materialized header.

@@ -996,6 +996,13 @@ RefoldTUEditPlanner::PlanTUByteSpan(uint64_t a0, uint64_t a1,
   uint64_t previousEnd = 0;
   bool havePrevious = false;
 
+  // First A token of the maximal group sharing one physical source spelling,
+  // and the exclusive end of that group once it has been proven to be a whole
+  // macro cover.  Distinct A tokens repeat a spelling only inside one
+  // expansion, so these track that expansion rather than a search.
+  uint64_t repeatedSpellingGroupStart = 0;
+  uint64_t repeatedSpellingGroupEnd = 0;
+
   for (uint64_t pp = a0; pp < a1; ++pp) {
     if (duplicateTokmapPP_.count(pp) != 0) {
       return reject("duplicate producer token mapping inside A envelope",
@@ -1023,7 +1030,34 @@ RefoldTUEditPlanner::PlanTUByteSpan(uint64_t a0, uint64_t a1,
       spanEnd = entry.e;
       previousBegin = entry.b;
       previousEnd = entry.e;
+      repeatedSpellingGroupStart = pp;
+      repeatedSpellingGroupEnd = 0;
       havePrevious = true;
+      continue;
+    }
+
+    // Distinct A tokens repeat one physical spelling exactly when a single
+    // macro expansion produced them.  The span consumes that spelling once, so
+    // the repetition is admissible when the producer's records prove the
+    // repeating group is one invocation's self-contained whole cover and this
+    // envelope consumes all of it; a partially consumed expansion still falls
+    // through to the refusal below.  Prove it at the group's first repetition
+    // and consume the rest of the proven cover by index.
+    if (entry.b == previousBegin && entry.e == previousEnd) {
+      if (pp >= repeatedSpellingGroupEnd) {
+        const std::optional<std::pair<uint64_t, uint64_t>> wholeCover =
+            deps_.macroTopology.WholeCoverForRepeatedSourceSpelling(
+                repeatedSpellingGroupStart, entry, std::nullopt, a1);
+        if (!wholeCover) {
+          return reject("repeated TU token spelling is not one macro "
+                        "invocation's self-contained whole cover",
+                        "safe owner/fallback path");
+        }
+        repeatedSpellingGroupEnd = wholeCover->second;
+      }
+      // The envelope already spans this spelling, so it contributes no new
+      // source bytes and leaves `previousBegin`/`previousEnd` where the group's
+      // first token put them.
       continue;
     }
 
@@ -1042,6 +1076,8 @@ RefoldTUEditPlanner::PlanTUByteSpan(uint64_t a0, uint64_t a1,
     previousBegin = entry.b;
     previousEnd = entry.e;
     spanEnd = entry.e;
+    repeatedSpellingGroupStart = pp;
+    repeatedSpellingGroupEnd = 0;
   }
 
   if (!havePrevious) {

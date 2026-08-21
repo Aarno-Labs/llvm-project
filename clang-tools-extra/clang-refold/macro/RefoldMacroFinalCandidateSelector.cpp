@@ -504,7 +504,7 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
             deps_.patchReusePhase.ValidateMergedDirectAndDagRootReplacement(
                 m, baseInvText, StringRef(*merged))) {
           argsOnlyCandidate->replacement = std::move(*merged);
-          argsOnlyCandidate->materialized.hasOutputByteRange = false;
+          invalidateMacroPatchReplacementByteProvenance(*argsOnlyCandidate);
           if (!argsOnlyCandidate->macroId)
             argsOnlyCandidate->macroId = existingPatch->macroId;
 
