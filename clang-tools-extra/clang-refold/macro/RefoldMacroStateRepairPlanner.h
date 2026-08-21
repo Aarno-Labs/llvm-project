@@ -98,6 +98,13 @@ public:
     llvm::StringMap<llvm::SmallVector<uint32_t, 2>> namedMacroDirectivesByName;
     llvm::DenseSet<uint64_t> preservedDefinitionDirectiveIds;
     llvm::DenseSet<uint64_t> syntheticUndefPartitionedDefinitionIds;
+    /// Definitions carried past an observing replacement.
+    ///
+    /// Recorded for the same reason as the synthetic-undef set: the closing
+    /// audit has to tell a definition whose observation was discharged from one
+    /// that no repair reached.  Without it a declining repair is
+    /// indistinguishable from a repair that was never needed.
+    llvm::DenseSet<uint64_t> carriedGapDefinitionIds;
   };
 
   /// Creates a macro-state repair planner bound to the subsystem dependencies

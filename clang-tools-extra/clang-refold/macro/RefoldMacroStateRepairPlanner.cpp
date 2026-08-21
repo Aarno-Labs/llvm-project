@@ -23,6 +23,7 @@
 #include "proof/RefoldProofLattice.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldTerminalProofSink.h"
+#include "source/RefoldPreprocessingDirectiveScanner.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
 #include "source/RefoldTokenTextAnalysis.h"
 #include "source/TokenTextHelpers.h"
@@ -473,6 +474,16 @@ private:
   /// Synthesizes undef repairs before observed gap definitions when required to
   /// preserve macro-state partitioning.
   void SynthesizeUndefBeforeObservedGapDefinitions();
+  /// Fails closed on a replacement that still observes a definition live at its
+  /// own position after every repair has been attempted.
+  void RequireEveryObservedGapDefinitionRepaired();
+  /// Returns whether every byte of an edit's replacement is B-derived payload.
+  bool EditReplacementIsMappedBPayload(const TextEdit &edit) const;
+  /// Returns the offset at which a replacement reads a macro while that macro
+  /// is still bound, or nullopt when it never does.
+  std::optional<size_t> ReplacementReadsMacroWhileBound(
+      const TextEdit &edit, const RefoldModel::MacroDirective &definition,
+      StringRef macroName) const;
   /// Repairs definitions required by surviving callsites after final TU edits.
   void RepairSurvivingDefinitionCallsites();
   /// Preserves consumed undef directives that remain semantically required and
@@ -2249,6 +2260,203 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
         synthesizedCount);
 }
 
+bool MacroStateRepairContext::EditReplacementIsMappedBPayload(
+    const TextEdit &edit) const {
+  // The audit may only speak where it can attribute every byte it reads.  A
+  // mapped direct-TU edit is the one carrier whose replacement is the edited
+  // stream's own slice for the hunk and nothing else, so a macro name in it is
+  // already-expanded output that must not expand again.
+  //
+  // Every other carrier mixes.  A conservative direct-TU edit re-emits original
+  // source with a local rewrite -- the `_Pragma(#x)` argument fold re-emits
+  // `DIAG(message("bye"))`, whose `DIAG` is preserved spelling the accepted
+  // proof needs to expand.  A TU include closure folds preserved directives in
+  // beside the payload.  A line-observer realization splices original bytes
+  // around a synthetic `#line`.  In all of those an observation may be
+  // preserved source *requiring* the expansion, and no fact partitions the
+  // replacement's bytes, so accusing them would be a refusal on evidence this
+  // audit does not have.  That is the standing partition gap, not a hole opened
+  // here; the same gap already stops the synthetic-undef repair from acting on
+  // a closure edit.
+  if (edit.acceptedResults.empty())
+    return false;
+  for (const auto &carrier : edit.acceptedResults) {
+    if (!carrier)
+      return false;
+    if (carrier->kind != AcceptedResultCandidateKind::TUTextEdit ||
+        carrier->proofSummary.inventory.currentPath !=
+            AcceptedPathKind::TUByteSpanMappedEdit)
+      return false;
+  }
+  return true;
+}
+
+std::optional<size_t> MacroStateRepairContext::ReplacementReadsMacroWhileBound(
+    const TextEdit &edit, const RefoldModel::MacroDirective &definition,
+    StringRef macroName) const {
+  // Every repair that makes a name inert ahead of a payload does it the same
+  // way: it puts an `#undef` for that name into the replacement in front of the
+  // read.  The synthetic partition writes one; the undef-advance repair moves a
+  // preserved one there; a carried definition is re-emitted after the payload.
+  // Reading the emitted text answers the audit's actual question -- is the name
+  // still bound where the payload reads it -- for every repair at once, and
+  // cannot drift out of step with a repair that forgets to record itself in a
+  // ledger.
+  //
+  // Two kinds of mention have to be told apart.  A name inside a directive line
+  // is that directive's operand, not a payload read: the `#undef` performing the
+  // repair necessarily spells the name it removes.  A name outside one is a read,
+  // and it is a problem exactly when no `#undef` for that name precedes it.
+  if (macroName.empty())
+    return std::nullopt;
+
+  const StringRef text(edit.text);
+  const PreprocessingDirectiveScanResult scan =
+      scanPreprocessingDirectives(text, LexLang());
+  // An incomplete census proves nothing about what the replacement contains, so
+  // every mention stays a read and the audit keeps failing closed.
+  const bool censusComplete = scan.IsComplete();
+
+  auto directiveLineContaining =
+      [&](size_t offset) -> const PreprocessingDirectiveLine * {
+    if (!censusComplete)
+      return nullptr;
+    for (const PreprocessingDirectiveLine &line : scan.directives) {
+      if (line.IsValid() && offset >= line.begin && offset < line.end)
+        return &line;
+    }
+    return nullptr;
+  };
+
+  auto undefinesMacroBefore = [&](size_t offset) {
+    if (!censusComplete)
+      return false;
+    for (const PreprocessingDirectiveLine &line : scan.directives) {
+      if (!line.IsValid() || line.end > offset)
+        continue;
+      // An `#include` standing before the read brings in text this audit never
+      // examines, and that text may undefine the name -- a repair can neutralise
+      // a macro by moving the include that undefines it ahead of the payload.
+      // Not being able to see inside is a reason to stay silent, not a reason to
+      // accuse.
+      if (StringRef(line.keyword) == "include" ||
+          StringRef(line.keyword) == "include_next" ||
+          StringRef(line.keyword) == "import")
+        return true;
+      if (StringRef(line.keyword) != "undef")
+        continue;
+      // `#undef` takes exactly one identifier operand, so an exact identifier
+      // match inside the operand names this macro and nothing else.
+      if (TokenTextAnalysis()
+              .FirstRawIdentifierObservationOffsetInText(
+                  macroName, text.slice(line.introducerEnd, line.end))
+              .has_value())
+        return true;
+    }
+    return false;
+  };
+
+  const StringRef suffix = tuBytes_.drop_front(edit.end);
+  size_t cursor = 0;
+  while (cursor <= text.size()) {
+    const std::optional<size_t> hit =
+        MacroStateProof().FirstMacroStateObservationOffsetInText(
+            definition, macroName, text.drop_front(cursor), suffix);
+    if (!hit)
+      return std::nullopt;
+    const size_t at = cursor + *hit;
+
+    if (const PreprocessingDirectiveLine *line = directiveLineContaining(at)) {
+      // Step past the whole directive line so its operand is not re-examined.
+      if (line->end <= at)
+        return at;
+      cursor = line->end;
+      continue;
+    }
+
+    if (undefinesMacroBefore(at))
+      return std::nullopt;
+    return at;
+  }
+  return std::nullopt;
+}
+
+void MacroStateRepairContext::RequireEveryObservedGapDefinitionRepaired() {
+  // Several repairs can neutralise a macro that is live where a replacement
+  // lands -- advancing a preserved `#undef` before it, synthesising one,
+  // carrying the definition past it, preserving a consumed `#undef` -- and each
+  // declines when its own obligations are unmet.  Each declined by simply moving
+  // on, and nobody asked what happens when they all do, so a payload no repair
+  // could reach was emitted under a macro environment B never had and the name
+  // expanded a second time.  Neither the payload's own proof nor the emission
+  // audit asks about macro liveness, so nothing downstream caught it; only
+  // `--verify-output`, which the tool leaves off by default, did.
+  //
+  // Ask the question once more, after every repair phase has run, and fail
+  // closed on what is left.  Two things make the answer trustworthy rather than
+  // a re-derivation that drifts from the repairs:
+  //
+  //   * it reads the emitted replacement text, so a repair that neutralised the
+  //     name by putting an `#undef` in front of the read discharges the
+  //     obligation whether or not it recorded itself in a ledger; and
+  //   * it speaks only where every byte of the replacement is attributable to B
+  //     (`EditReplacementIsMappedBPayload`), because a name in preserved source
+  //     may be an expansion that source requires.
+  for (size_t editIndex = 0; editIndex < tuEdits_.size(); ++editIndex) {
+    const TextEdit &edit = tuEdits_[editIndex];
+    if (edit.start > edit.end || edit.end > tuBytes_.size())
+      continue;
+
+    if (!EditReplacementIsMappedBPayload(edit))
+      continue;
+
+    for (const NamedMacroDirectiveRef &ref : plan_.namedMacroDirectives) {
+      const RefoldModel::MacroDirective &definition = *ref.directive;
+      if (definition.subkind != "#define")
+        continue;
+      if (plan_.syntheticUndefPartitionedDefinitionIds.contains(definition.id) ||
+          plan_.carriedGapDefinitionIds.contains(definition.id) ||
+          plan_.preservedDefinitionDirectiveIds.contains(definition.id))
+        continue;
+
+      // The name must actually be bound where the replacement lands.  A
+      // definition that a later `#undef` or redefinition has already displaced
+      // binds nothing here and cannot be re-expanded.
+      if (ActiveDefinitionAtSourceOffset(ref.name, edit.start) != &definition)
+        continue;
+      const std::optional<size_t> boundReadOffset =
+          ReplacementReadsMacroWhileBound(edit, definition, ref.name);
+      if (!boundReadOffset)
+        continue;
+
+      // A definition that expands to itself is a fixed point: the name survives
+      // its own expansion, so the payload reads the same token either way and
+      // there is nothing to repair.
+      if (MacroStateProof().SelfReferentialDefinitionIsUnobservableInText(
+              definition, ref.name, StringRef(edit.text)))
+        continue;
+
+      // The definition's own directive bytes being consumed by this edit means
+      // the replacement carries the transition rather than observing across it,
+      // which the materialized-definition authorization proves separately.
+      if (definition.sitePath == Model().GetSourcePath() &&
+          definition.siteB >= edit.start && definition.siteE <= edit.end)
+        continue;
+
+      (void)CheckMacroStateTerminal(
+          definition, StateMutationKind::Consumed, "macro/liveness",
+          llvm::formatv(
+              "TU replacement [{0},{1}) observes macro '{2}', whose definition "
+              "#{3} is active at that position, and neither carrying the "
+              "definition past the replacement nor undefining it before the "
+              "replacement was available",
+              edit.start, edit.end, ref.name, definition.id)
+              .str());
+      return;
+    }
+  }
+}
+
 void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
   SmallVector<size_t, 16> editOrder;
   editOrder.reserve(tuEdits_.size());
@@ -2430,6 +2638,7 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
 
     for (const MacroStateGapCarryCandidate &candidate : candidates) {
       carriedDirectiveIds.insert(candidate.directive->id);
+      plan_.carriedGapDefinitionIds.insert(candidate.directive->id);
       ++carriedCount;
       REFOLD_LOG_WARN("macro/liveness",
                       "carrying observed gap #define after TU replacement: "
@@ -2954,6 +3163,19 @@ bool MacroStateRepairContext::RunInitialRepair() {
                      "single-pass refold aborted while authorizing exact "
                      "macro-state repair transitions; terminal fallback will "
                      "be emitted");
+    return false;
+  }
+
+  // Last, after every repair phase has had its turn.  Placing this earlier
+  // reads a half-repaired edit set: `PreserveConsumedUndefs` and
+  // `ApplyQueuedMacroStatePreservations` both still discharge observations at
+  // that point, and the audit accused edits they were about to fix.
+  RequireEveryObservedGapDefinitionRepaired();
+  if (TerminalSink().HasRequest()) {
+    REFOLD_LOG_DEBUG("fallback",
+                     "single-pass refold aborted with an undischarged "
+                     "macro-state observation in a replacement payload; "
+                     "terminal fallback will be emitted");
     return false;
   }
 
