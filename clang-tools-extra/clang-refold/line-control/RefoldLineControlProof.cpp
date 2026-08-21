@@ -230,8 +230,18 @@ RefoldLineControlProof::IncludeSubtreeLineStateObserverDemand(
 
   for (const auto &macro : model_.GetMacroInvocations()) {
     const bool observesLine = macro.name == "__LINE__";
-    const bool observesFile =
-        macro.name == "__FILE__" || macro.name == "__BASE_FILE__";
+    // `__BASE_FILE__` is deliberately absent here, unlike in the owner-suffix
+    // demand.  The directive this demand selects is the *include-entry* one,
+    // and it names the entered child file.  Clang resolves `__BASE_FILE__` from
+    // the top of the presumed include stack, so an entry directive can only
+    // make the builtin read the child's own spelling -- never the top-level
+    // file the producer observed.  It is therefore not a repair for this
+    // observer at this boundary, and asking for one turns a completeness gap
+    // into an unsatisfiable FileState obligation.  The observer is instead
+    // discharged by `MaterializedHeaderRequiresBRealizationReason`, which
+    // refuses to copy a preserved `__BASE_FILE__` spelling into a flattened
+    // body at all, so no such spelling remains for an entry directive to serve.
+    const bool observesFile = macro.name == "__FILE__";
     const bool observesFileName = macro.name == "__FILE_NAME__";
     if (!observesLine && !observesFile && !observesFileName)
       continue;

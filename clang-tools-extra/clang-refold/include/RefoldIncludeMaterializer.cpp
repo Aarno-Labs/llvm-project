@@ -1574,44 +1574,48 @@ RefoldIncludeMaterializer::MaterializedHeaderRequiresBRealizationReason(
     }
   }
 
-  // __BASE_FILE__ can be repaired by line directives, but in --no-lines mode a
-  // materialized include owner has no way to preserve the source-spelled
-  // observer without changing the top-level file it observes.
-  if (!lineDirs_.Enabled()) {
-    for (const RefoldModel::MacroInvocation &macro :
-         model_.GetMacroInvocations()) {
-      if (macro.name != "__BASE_FILE__")
-        continue;
-      if (!lineControlProof_.LineStateBuiltinInvocationIsPreservedObserver(
-              macro))
-        continue;
+  // `__BASE_FILE__` names the top of the *presumed* include stack, not the
+  // current logical file: Clang walks `PresumedLoc::getIncludeLoc()` to the
+  // outermost entry before taking the filename.  Materializing an include
+  // deletes that edge, so in the flattened output the walk terminates at the
+  // spelling itself and the builtin observes the enclosing surface -- the
+  // synthetic include-entry `#line` installed for the copied body, or the
+  // output path when no directive dominates it.  A line directive therefore
+  // *moves* this observer rather than repairing it, and it does so in both line
+  // modes.  The only deterministic repair for a preserved source-spelled
+  // observer in a materialized owner is the producer-proven B realization,
+  // which literalizes the value the producer actually observed.
+  for (const RefoldModel::MacroInvocation &macro :
+       model_.GetMacroInvocations()) {
+    if (macro.name != "__BASE_FILE__")
+      continue;
+    if (!lineControlProof_.LineStateBuiltinInvocationIsPreservedObserver(macro))
+      continue;
 
-      const RefoldModel::MacroInvocation *site =
-          lineControlProof_.LineStateObservableMacroSite(macro);
-      std::optional<uint64_t> owner = site && site->ownerIncludeId
-                                          ? site->ownerIncludeId
-                                          : macro.ownerIncludeId;
-      if (!owner || *owner != includeId)
-        continue;
+    const RefoldModel::MacroInvocation *site =
+        lineControlProof_.LineStateObservableMacroSite(macro);
+    std::optional<uint64_t> owner = site && site->ownerIncludeId
+                                        ? site->ownerIncludeId
+                                        : macro.ownerIncludeId;
+    if (!owner || *owner != includeId)
+      continue;
 
-      // The owner id is the semantic proof.  The file spelling checks are only
-      // hardening against malformed producer records that accidentally attach a
-      // builtin from another source buffer to this include instance.
-      if (site && site->invFile &&
-          !PathNamesMaterializedHeader(*site->invFile, headerPath,
-                                       headerLoadPath))
-        continue;
-      if (macro.invFile &&
-          !PathNamesMaterializedHeader(*macro.invFile, headerPath,
-                                       headerLoadPath) &&
-          (!site || !site->invFile ||
-           !PathNamesMaterializedHeader(*site->invFile, headerPath,
-                                        headerLoadPath)))
-        continue;
+    // The owner id is the semantic proof.  The file spelling checks are only
+    // hardening against malformed producer records that accidentally attach a
+    // builtin from another source buffer to this include instance.
+    if (site && site->invFile &&
+        !PathNamesMaterializedHeader(*site->invFile, headerPath,
+                                     headerLoadPath))
+      continue;
+    if (macro.invFile &&
+        !PathNamesMaterializedHeader(*macro.invFile, headerPath,
+                                     headerLoadPath) &&
+        (!site || !site->invFile ||
+         !PathNamesMaterializedHeader(*site->invFile, headerPath,
+                                      headerLoadPath)))
+      continue;
 
-      return "__BASE_FILE__ observer in materialized header without line "
-             "repair";
-    }
+    return "__BASE_FILE__ observer in materialized header";
   }
 
   return std::nullopt;
