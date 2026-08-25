@@ -188,6 +188,20 @@ struct PreprocessingDirectiveScanResult {
 bool sourceTextEndsWithNonSplicedPhysicalNewline(
     llvm::StringRef sourceBytes, const clang::LangOptions &lexLang);
 
+/// Return whether a byte appended after `sourceBytes` would be the first byte
+/// of a translated logical line.
+///
+/// This is `sourceTextEndsWithNonSplicedPhysicalNewline` weakened by the one
+/// spelling C allows between a logical-line boundary and a directive
+/// introducer: horizontal white-space.  A trailing space/tab/vertical-tab/
+/// form-feed run is removed before the newline test, which leaves the splice
+/// analysis exact -- that run can contain no escaped newline, because neither a
+/// backslash nor a trigraph introducer is horizontal white-space and either one
+/// stops the scan.  A trailing comment would also preserve the boundary and is
+/// deliberately still rejected; no proof needs it.
+bool sourceTextEndsAtLogicalLineBeginning(llvm::StringRef sourceBytes,
+                                          const clang::LangOptions &lexLang);
+
 /// Return whether `insertion` begins by terminating the logical line at the
 /// end of `sourcePrefix`.
 ///

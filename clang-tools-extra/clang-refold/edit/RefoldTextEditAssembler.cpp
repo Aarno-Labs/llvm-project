@@ -810,15 +810,21 @@ bool sourceEditInterferesWithProtectedInterval(
 
   // A zero-width insertion has no half-open overlap.  At the exact
   // beginning of a directive line it is nevertheless safe only when the
-  // inserted payload is a complete sequence of physical lines: the payload
-  // must end in a newline so the original directive introducer remains at
-  // logical BOL.  This is an exact lexical condition, not placement by
+  // payload leaves the original directive introducer at the beginning of a
+  // translated logical line: the payload must end in an unspliced physical
+  // newline, optionally followed by horizontal white-space, which C permits
+  // before `#`.  This is an exact lexical condition, not placement by
   // proximity.
+  //
+  // The horizontal-white-space tail is not a concession: token-aligned
+  // diffing attributes the white-space run preceding the next surviving token
+  // to the insertion hunk, so a payload that inserts whole lines before an
+  // indented directive legitimately arrives as "...;\n    ".
   if (edit.start == interval.begin ||
       edit.start == interval.structureSpellingBegin) {
     if (edit.text.empty())
       return false;
-    return !sourceTextEndsWithNonSplicedPhysicalNewline(edit.text, lexLang);
+    return !sourceTextEndsAtLogicalLineBeginning(edit.text, lexLang);
   }
   if (edit.start > interval.begin && edit.start < interval.end)
     return true;

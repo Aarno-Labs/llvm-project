@@ -759,6 +759,18 @@ bool sourceTextEndsWithNonSplicedPhysicalNewline(
   return !spliceEnd || *spliceEnd != sourceBytes.size();
 }
 
+bool sourceTextEndsAtLogicalLineBeginning(StringRef sourceBytes,
+                                          const LangOptions &lexLang) {
+  size_t end = sourceBytes.size();
+  while (end > 0 &&
+         (sourceBytes[end - 1] == ' ' || sourceBytes[end - 1] == '\t' ||
+          sourceBytes[end - 1] == '\v' || sourceBytes[end - 1] == '\f')) {
+    --end;
+  }
+  return sourceTextEndsWithNonSplicedPhysicalNewline(
+      sourceBytes.take_front(end), lexLang);
+}
+
 bool insertionBeginsWithNonSplicedPhysicalNewline(
     StringRef sourcePrefix, StringRef insertion, const LangOptions &lexLang) {
   if (insertion.empty() ||
