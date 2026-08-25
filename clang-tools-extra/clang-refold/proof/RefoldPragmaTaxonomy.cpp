@@ -1,8 +1,24 @@
 //===--- RefoldPragmaTaxonomy.cpp - Pragma classification -------*- C++ -*-===//
 //
-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// One classification of pragma spellings, answering the two questions the
+// engine asks about a pragma it cannot delete.
+//
+//   * What state does it change?  A payload moved across the directive is sound
+//     only when re-preprocessing that payload cannot observe the change.
+//   * Does it bind to the construct that follows it?  Replacing or deleting
+//     that construct is wrong even when no directive moved and none was
+//     crossed: `#pragma omp parallel for` means nothing without its loop.
+//
+// These were previously two separate deferrals in the terminal-fallback
+// roadmap, described as unrelated.  They are one artifact seen from two sides:
+// the same vocabulary, the same operands, and the same rule for spellings
+// nobody classified.  Splitting them is how two classifications of the same
+// pragma drift apart and disagree.
+//
+// Every unclassified spelling is `Unknown`, which is simultaneously the most
+// state-changing and the most binding answer.  Adding a spelling here can only
+// admit realizations that were previously refused; it can never remove a
+// restriction from a spelling that is already classified.
 //
 //===----------------------------------------------------------------------===//
 

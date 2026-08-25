@@ -1,8 +1,18 @@
 //===--- RefoldTokenlessSourceProjection.cpp --------------------*- C++ -*-===//
 //
-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// Producer-backed projection of a tokenless physical source interval onto the
+// A-token stream.
+//
+// A directive occupies source bytes but contributes no preprocessed token, so
+// its position in A is not observable from the token stream itself.  It is
+// recoverable exactly from producer coordinates: the tokmap says which source
+// bytes spelled each A token, and an include cover says where a nested
+// occurrence entered and left the owning stream.  Together they bound the
+// interval from both sides, and the projection is admissible only when those
+// bounds meet at one frontier.
+//
+// This is a coordinate theorem, not a policy: it decides where a tokenless
+// interval sits, never whether crossing, moving, or preserving it is sound.
 //
 //===----------------------------------------------------------------------===//
 
