@@ -42,7 +42,8 @@ RefoldOwnerStateProof::RefoldOwnerStateProof(
     const RefoldTerminalProofSink &terminalSink)
     : model_(inputs.model), aToks_(inputs.aToks), lexLang_(inputs.lexLang),
       paths_(paths), tokenText_(tokenText), macroTopology_(macroTopology),
-      theoremAudit_(theoremAudit), terminalSink_(terminalSink) {}
+      theoremAudit_(theoremAudit), terminalSink_(terminalSink),
+      ownerStateGraphMemo_(inputs.ownerStateGraphMemo) {}
 
 bool rawLexerCommentTokenIsComplete(StringRef spelling) {
   if (spelling.starts_with("//"))
@@ -2256,9 +2257,65 @@ OwnerStateGraph RefoldOwnerStateProof::BuildOwnerStateGraph() const {
   return graph;
 }
 
+void RefoldOwnerStateProof::ReplayOwnerStateGraphAudit(
+    const OwnerStateGraph &graph) const {
+  if (!theoremAudit_.IsNoLegacyAuditEnabled())
+    return;
+
+  for (const OwnerStateGraphNode &node : graph.nodes) {
+    if (node.kind == OwnerStateGraphNodeKind::CounterEvent) {
+      AuditDirectStateCheckClosure(
+          DirectStateCheckKind::CounterEvent, OwnerStateComponent::Counter,
+          DirectStateCheckClosureKind::OwnerStateGraphEdge,
+          StateMutationKind::Unknown, "owner-state-graph", node.detail);
+      continue;
+    }
+
+    // A line-control node mutates three components at once, so the build
+    // records one inventory item for each rather than a single combined item.
+    if (node.kind == OwnerStateGraphNodeKind::LineControlEvent) {
+      for (OwnerStateComponent component :
+           {OwnerStateComponent::LineNumber, OwnerStateComponent::FileState,
+            OwnerStateComponent::FileName})
+        AuditDirectStateCheckClosure(
+            DirectStateCheckKind::LineControlDirective, component,
+            DirectStateCheckClosureKind::OwnerStateGraphEdge,
+            StateMutationKind::Unknown, "owner-state-graph", node.detail);
+      continue;
+    }
+
+    const DirectStateCheckKind directKind =
+        DirectStateCheckKindForGraphNode(node.kind);
+    if (directKind == DirectStateCheckKind::Unknown)
+      continue;
+    AuditDirectStateCheckClosure(
+        directKind, DirectStateComponentForGraphNode(node.kind),
+        DirectStateCheckClosureKind::OwnerStateGraphEdge,
+        StateMutationKind::Unknown, "owner-state-graph", node.detail);
+  }
+}
+
 const OwnerStateGraph &RefoldOwnerStateProof::GetOwnerStateGraph() const {
   if (!ownerStateGraphCache_) {
+    // A recorded graph is this run's own census of the same producer facts over
+    // the same A stream, so replaying it is the build's result, not an
+    // approximation of it.  `MatchesInputs` checks that rather than assuming
+    // it, and a caller presenting different facts builds its own.
+    if (ownerStateGraphMemo_ &&
+        ownerStateGraphMemo_->MatchesInputs(model_, aToks_)) {
+      ownerStateGraphCache_ = ownerStateGraphMemo_->graph;
+      theoremAudit_.RecordOwnerStateGraphAudit(ownerStateGraphCache_->audit);
+      ReplayOwnerStateGraphAudit(*ownerStateGraphCache_);
+      REFOLD_LOG_TRACE("state/graph",
+                       "owner-state graph: replaying this run's recorded "
+                       "census: nodes={0}",
+                       ownerStateGraphCache_->nodes.size());
+      return *ownerStateGraphCache_;
+    }
+
     ownerStateGraphCache_ = BuildOwnerStateGraph();
+    if (ownerStateGraphMemo_)
+      ownerStateGraphMemo_->Record(model_, aToks_, *ownerStateGraphCache_);
     const OwnerStateGraphAuditStats &audit = ownerStateGraphCache_->audit;
     theoremAudit_.RecordOwnerStateGraphAudit(audit);
     REFOLD_LOG_TRACE("state/graph",

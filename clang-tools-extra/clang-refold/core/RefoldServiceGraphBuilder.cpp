@@ -354,10 +354,17 @@ RefoldTheoremAudit &RefoldEngine::TheoremAudit() const {
 }
 
 void RefoldEngine::InitializeOwnerStateProof() {
-  RefoldOwnerStateProofInputs inputs{model_, aToks_, bToks_, lexLang_};
+  RefoldOwnerStateProofInputs inputs{model_, aToks_, bToks_, lexLang_,
+                                     ownerStateGraphMemo_};
   ownerStateProof_ = std::make_unique<RefoldOwnerStateProof>(
       inputs, pathIdentity_, tokenTextAnalysis_, macroTopology_, TheoremAudit(),
       terminalSink_);
+}
+
+void RefoldEngine::AdoptOwnerStateGraphMemo(OwnerStateGraphMemo *memo) {
+  ownerStateGraphMemo_ = memo;
+  if (ownerStateProof_)
+    ownerStateProof_->SetOwnerStateGraphMemo(memo);
 }
 
 RefoldOwnerStateProof &RefoldEngine::OwnerStateProof() {

@@ -25,6 +25,7 @@
 
 #include "clang/Basic/LangOptions.h"
 
+#include <cassert>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -38,11 +39,83 @@ namespace refold {
 /// Keeping these facts in one small aggregate makes the service's source,
 /// token, path, and proof dependencies explicit.  The service does not mutate
 /// these buffers.
+/// One run's owner-state graph, recorded the first time it is built.
+///
+/// `BuildOwnerStateGraph` reads the producer model and the A token stream and
+/// nothing else.  Both are run constants -- an attempt narrows which owners
+/// must expand and which anchors it plans from, and a candidate simulation is
+/// handed a different alignment, but neither rewrites the producer facts or the
+/// A stream -- so every attempt of one run, every candidate simulation it
+/// enumerates, and the resolution probe that stands in for the next attempt
+/// census the same owners and reach an identical graph.
+///
+/// Re-deriving it is not cheap.  The build attaches a canonical state summary
+/// to every owner the producer recorded, so its cost grows with the owner
+/// count rather than with the edit; on a translation unit whose ambiguous
+/// windows enumerate many candidate maps it is the largest single cost in a
+/// pass.  Recording it lets a run pay that once however many candidates it
+/// simulates.
+///
+/// This is a memo, not a budget.  It never coarsens the census, never bounds
+/// it, and never changes which owners are graphed: a recorded graph is returned
+/// only to a caller presenting the exact producer document and A stream it was
+/// built from.
+struct OwnerStateGraphMemo {
+  /// Whether `graph` holds a result this run already built.
+  bool recorded = false;
+
+  /// Identity of the producer facts `graph` was built from.
+  ///
+  /// Every model field is a deterministic function of the producer document,
+  /// and a read-only clone shares that document rather than reparsing it, so
+  /// agreeing on the document and the map version is agreeing on the facts the
+  /// census reads.  See `RefoldModel::GetProducerDocument`.
+  const llvm::json::Object *producerDocument = nullptr;
+  llvm::StringRef producerVersion;
+
+  /// Identity of the A token stream the census was taken over.
+  const PPTok *aTokensData = nullptr;
+  size_t aTokensSize = 0;
+
+  /// The recorded graph, copied out on every match.
+  OwnerStateGraph graph;
+
+  /// Return whether a recorded graph was built from exactly these inputs.
+  bool MatchesInputs(const RefoldModel &model,
+                     llvm::ArrayRef<PPTok> aToks) const {
+    return recorded && producerDocument == model.GetProducerDocument() &&
+           producerVersion == model.GetVersion() &&
+           aTokensData == aToks.data() && aTokensSize == aToks.size();
+  }
+
+  /// Record \p built as this run's owner-state graph for these inputs.
+  void Record(const RefoldModel &model, llvm::ArrayRef<PPTok> aToks,
+              OwnerStateGraph built) {
+    producerDocument = model.GetProducerDocument();
+    producerVersion = model.GetVersion();
+    aTokensData = aToks.data();
+    aTokensSize = aToks.size();
+    graph = std::move(built);
+    recorded = true;
+  }
+};
+
+/// Immutable construction inputs borrowed by the owner-state proof service.
+///
+/// Keeping these facts in one small aggregate makes the service's source,
+/// token, path, and proof dependencies explicit.  The service does not mutate
+/// these buffers.
 struct RefoldOwnerStateProofInputs {
   const RefoldModel &model;
   llvm::ArrayRef<PPTok> aToks;
   llvm::ArrayRef<PPTok> bToks;
   const clang::LangOptions &lexLang;
+
+  /// This run's recorded owner-state graph, or null to always build one.
+  ///
+  /// Null for any engine built outside the narrowing loop that owns the memo.
+  /// See `OwnerStateGraphMemo`.
+  OwnerStateGraphMemo *ownerStateGraphMemo = nullptr;
 };
 
 class RefoldTheoremAudit;
@@ -238,6 +311,32 @@ public:
   FindSuffixObservers(const OwnerStateBoundary &boundary,
                       OwnerStateComponent component) const;
 
+  /// Use \p memo as this run's recorded owner-state graph.
+  ///
+  /// The service graph is built before the narrowing loop that owns the memo
+  /// can hand it out, and no census is taken during construction, so the memo
+  /// is attached afterwards.  Attaching one after a graph has already been
+  /// built for this engine is refused: the engine would then answer from its
+  /// own census while recording nothing, which hides the memo from every later
+  /// consumer.
+  void SetOwnerStateGraphMemo(OwnerStateGraphMemo *memo) {
+    assert(!ownerStateGraphCache_ &&
+           "owner-state graph memo attached after this engine built a census");
+    ownerStateGraphMemo_ = memo;
+  }
+
+  /// Replay the direct-state-check inventory a graph build would have recorded.
+  ///
+  /// Building the census records one inventory item per graph node as it is
+  /// created.  A run that replays a recorded graph never runs that build, so
+  /// this walks the recorded nodes and records the identical items.  The
+  /// inventory is a per-engine no-legacy audit surface whose enablement differs
+  /// between an attempt and a candidate simulation, so it is replayed for each
+  /// consumer rather than recorded alongside the graph.  Every item it emits is
+  /// a closed `OwnerStateGraphEdge`, which is counted and never reported as a
+  /// finding, so replay order does not matter.
+  void ReplayOwnerStateGraphAudit(const OwnerStateGraph &graph) const;
+
   /// Record one direct-state-check inventory item for no-legacy audit.
   void AuditDirectStateCheckClosure(DirectStateCheckKind checkKind,
                                     OwnerStateComponent component,
@@ -362,6 +461,12 @@ private:
   const RefoldMacroTopology &macroTopology_;
   const RefoldTheoremAudit &theoremAudit_;
   const RefoldTerminalProofSink &terminalSink_;
+
+  /// This run's recorded owner-state graph, or null to always build one.
+  ///
+  /// Borrowed, never owned: the narrowing loop that owns the memo outlives
+  /// every engine it hands it to.  See `OwnerStateGraphMemo`.
+  OwnerStateGraphMemo *ownerStateGraphMemo_ = nullptr;
 
   /// Lazily built owner-state census indexes.
   ///

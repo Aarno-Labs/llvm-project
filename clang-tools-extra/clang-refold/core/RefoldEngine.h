@@ -144,6 +144,7 @@ namespace clang {
 namespace refold {
 
 struct AlignmentCertificationMemo;
+struct OwnerStateGraphMemo;
 class RefoldBInsertionLedger;
 class RefoldCounterStabilization;
 class RefoldExpansionFallbackPlanner;
@@ -433,6 +434,22 @@ private:
   /// same A and B buffers, so the byte diff it would build is the same one.
   /// See `RawByteHunkMemo`.
   RawByteHunkMemo *rawByteHunkMemo_ = nullptr;
+
+  /// This run's owner-state graph, owned by the narrowing loop and shared by
+  /// every attempt it builds.
+  ///
+  /// Like the byte-hunk memo above this one is also handed to candidate
+  /// simulations: a simulation is given a different alignment, but it censuses
+  /// the same producer owners over the same A stream, so the graph it would
+  /// build is the same one.  See `OwnerStateGraphMemo`.
+  OwnerStateGraphMemo *ownerStateGraphMemo_ = nullptr;
+
+  /// Adopt \p memo as this engine's owner-state graph memo.
+  ///
+  /// The owner-state proof service is constructed with the service graph,
+  /// before the narrowing loop can hand out its memo, so this forwards to the
+  /// already-built service rather than only recording the pointer.
+  void AdoptOwnerStateGraphMemo(OwnerStateGraphMemo *memo);
 
   /// Whether this engine exists only to publish the alignment-resolution
   /// theorem.

@@ -863,6 +863,12 @@ Expected<std::string> RefoldEngine::Refold(
   // identical hunks from the identical bytes.
   RawByteHunkMemo rawByteHunkMemo;
 
+  // The owner-state census is likewise one answer per run.  See
+  // `OwnerStateGraphMemo`: it reads the producer model and the A stream alone,
+  // and every attempt clones that model from this one parse, so an attempt, a
+  // candidate simulation, and the resolution probe all census identical owners.
+  OwnerStateGraphMemo ownerStateGraphMemo;
+
   // Set once, by the owner-alignment repair below, and then carried by every
   // later attempt: the repaired alignment is the one the run planned from from
   // that point on.
@@ -891,6 +897,7 @@ Expected<std::string> RefoldEngine::Refold(
     engine.alignmentResolutionMemo_ = &alignmentResolutionMemo;
     engine.alignmentCertificationMemo_ = &alignmentCertificationMemo;
     engine.rawByteHunkMemo_ = &rawByteHunkMemo;
+    engine.AdoptOwnerStateGraphMemo(&ownerStateGraphMemo);
     engine.verifyIncludeDirs_.assign(verifyIncludeDirs.begin(),
                                      verifyIncludeDirs.end());
 
@@ -966,6 +973,10 @@ Expected<std::string> RefoldEngine::Refold(
         // raw byte diff is built, so without this it would rebuild the hunks
         // the attempt it stands in for has already published.
         probe.rawByteHunkMemo_ = &rawByteHunkMemo;
+        // The probe drives the same candidate simulations the resolver would,
+        // and each of those censuses owners, so without this the probe and its
+        // candidates would rebuild the census this attempt already published.
+        probe.AdoptOwnerStateGraphMemo(&ownerStateGraphMemo);
         probe.verifyIncludeDirs_.assign(verifyIncludeDirs.begin(),
                                         verifyIncludeDirs.end());
         probe.ProbeAlignmentResolution();

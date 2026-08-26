@@ -793,6 +793,14 @@ RefoldEngine::SimulateSemanticAlignmentCandidate(
   // candidate can only ever replay a result built from exactly them.
   candidate.rawByteHunkMemo_ = rawByteHunkMemo_;
 
+  // A candidate censuses the same producer owners over the same A stream this
+  // engine did -- the alignment it is handed selects anchors, it does not
+  // change which owners the producer recorded -- so the owner-state graph is
+  // shared rather than rebuilt once per enumerated map.  The memo is keyed on
+  // the producer document and that stream, so a candidate can only ever replay
+  // a census built from exactly them.
+  candidate.AdoptOwnerStateGraphMemo(ownerStateGraphMemo_);
+
   // Run the same complete structural pipeline with the outer planner policy.
   // The alignment override activates the dedicated semantic theorem boundary,
   // so witness resolution and no-legacy auditing are strict without changing

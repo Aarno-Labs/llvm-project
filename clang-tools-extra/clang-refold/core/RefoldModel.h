@@ -1113,6 +1113,17 @@ public:
 
   /// Return the producer map version string.
   StringRef GetVersion() const { return version_; }
+  /// Return the parsed producer document this model was built from.
+  ///
+  /// This is an identity handle, not a way to read producer JSON: every model
+  /// field is a deterministic function of this document, and
+  /// `CloneForReadOnlyConsumer` shares it rather than reparsing, so two models
+  /// reporting the same document and `GetVersion()` hold the same producer
+  /// facts.  A run-scoped memo over model-derived state uses that to check a
+  /// recorded result belongs to the caller instead of assuming it.  The
+  /// document outlives every `RefoldEngine` built from the model, so the
+  /// pointer stays a stable identity for the whole run.
+  const json::Object *GetProducerDocument() const { return root_; }
   /// Return the original physical translation-unit source path.
   StringRef GetSourcePath() const { return sourcePath_; }
   /// Return the producer preprocessing working directory.
