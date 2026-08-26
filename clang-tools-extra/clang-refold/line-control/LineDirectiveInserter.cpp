@@ -725,6 +725,33 @@ static bool collectLineControlLogicalLine(StringRef src, size_t lineBegin,
     if (skipLineSplice(pos))
       continue;
 
+    // A line comment runs to the end of the logical line.  Copy it verbatim,
+    // exactly as the block-comment arm below does: the caller replaces
+    // complete comments with whitespace before parsing the directive
+    // spelling, so recognizing the form is all this scan owes it.
+    //
+    // Recognizing it is not optional.  Comments are not recognized inside
+    // literals, but the converse holds too -- a quote inside comment prose is
+    // comment text, not the start of a literal.  Without this arm an
+    // apostrophe in a line comment opens a character literal that no closing
+    // quote ends, the literal arm below reaches the newline and fails the
+    // whole line, and the caller abandons its entire prefix scan -- losing
+    // every source `#line` directive that follows the comment.
+    if (pos + 1 < limit && src[pos] == '/' && src[pos + 1] == '/') {
+      logicalLine.push_back(src[pos++]);
+      logicalLine.push_back(src[pos++]);
+      while (pos < limit) {
+        // A spliced line comment continues onto the next physical line, so
+        // splice removal here is what stops the comment at its real end.
+        if (skipLineSplice(pos))
+          continue;
+        if (src[pos] == '\n')
+          break;
+        logicalLine.push_back(src[pos++]);
+      }
+      continue;
+    }
+
     // Comments are not recognized inside string or character literals.  Still
     // apply backslash-newline splicing while copying the literal, because
     // splices are removed before the preprocessor even sees the directive
