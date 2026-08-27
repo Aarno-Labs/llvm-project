@@ -363,6 +363,52 @@ bool noMoreSourceDestructive(
                                      rhs.expandedMacroRootIds);
 }
 
+/// Running least-element tracker for the exact source-transformation
+/// containment preorder used by the least-source-mutation commit rule.
+///
+/// That rule keeps the accepted maps that are no more destructive than *every*
+/// accepted map.  Because the test is universally quantified over the ground
+/// set, admitting a further map can only remove least elements, never add one:
+/// the least set over a prefix of the accepted maps therefore contains the
+/// least set over all of them.  An empty prefix result is consequently a proof
+/// that the completed rule finds no least element -- which is what allows a
+/// window to stop realizing candidates before the enumeration is exhausted.
+///
+/// Indices refer to the caller's simulation vector, which is supplied on every
+/// call so that the tracker never holds a reference into storage the caller may
+/// still be growing.
+class SourceContainmentMinimaTracker {
+public:
+  /// Admit the accepted simulation at \p index into the ground set and update
+  /// the least set to account for it.
+  void Admit(size_t index,
+             ArrayRef<AlignmentSemanticSimulationResult> simulations) {
+    ground_.push_back(index);
+    llvm::erase_if(minima_, [&](size_t least) {
+      return !noMoreSourceDestructive(simulations[least], simulations[index]);
+    });
+    // The ground set already contains `index`, matching the completed rule's
+    // self-comparison exactly.
+    const bool noMoreDestructiveThanEveryAdmitted =
+        llvm::all_of(ground_, [&](size_t other) {
+          return noMoreSourceDestructive(simulations[index],
+                                         simulations[other]);
+        });
+    if (noMoreDestructiveThanEveryAdmitted)
+      minima_.push_back(index);
+  }
+
+  /// True while the completed containment rule may still find a least element.
+  /// An empty ground set has admitted no evidence either way.
+  bool MayStillHaveLeastElement() const {
+    return ground_.empty() || !minima_.empty();
+  }
+
+private:
+  std::vector<size_t> ground_;
+  std::vector<size_t> minima_;
+};
+
 
 [[maybe_unused]] StringRef basisName(AlignmentSemanticAnchorBasis basis) {
   switch (basis) {
@@ -674,6 +720,41 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     return result;
   }
 
+  // Reachability of the legacy-proposal theorem is the one commit rule that no
+  // simulation can influence: its proposal is reconstructed from the lexemes,
+  // the gap provenance, and the core alignment alone.  Deciding it before any
+  // candidate is realized is what lets the loop below stop as soon as no rule
+  // can still fire; the proposal itself is reused at the rule's own position
+  // below, so reconstructing it here costs nothing and decides nothing early.
+  const bool gapProvenanceCoversStreams =
+      deps_.aGapProvenance.size() == deps_.aLexemes.size() + 1 &&
+      deps_.bGapProvenance.size() == deps_.bLexemes.size() + 1;
+  LegacyAlignmentDiagnosticResult proposal;
+  if (gapProvenanceCoversStreams)
+    proposal = reconstructLegacyBoundaryProposal(
+        deps_.aLexemes, deps_.bLexemes, deps_.aGapProvenance,
+        deps_.bGapProvenance, deps_.coreAlignment);
+  const bool legacyProposalRuleReachable =
+      gapProvenanceCoversStreams && proposal.complete && proposal.monotone &&
+      proposal.lexemesAgree && proposal.jointlyCoreOptimal;
+
+  // Realizing one candidate costs a complete refold of the translation unit, so
+  // the loop below tracks whether either simulation-dependent commit rule can
+  // still fire and stops once neither can.  Both tests are monotone -- a rule
+  // ruled out by a realized prefix stays ruled out however the enumeration
+  // continues -- so stopping returns exactly the result the exhausted loop
+  // would have returned, namely this window's core-forced anchors.
+  //
+  //   observational irrelevance: needs every candidate accepted with one shared
+  //     concrete-output class, so a second class or one unaccepted candidate
+  //     ends it;
+  //   least source mutation: needs a least element under containment, so an
+  //     empty running least set ends it (see SourceContainmentMinimaTracker).
+  bool observationalRuleReachable = true;
+  bool containmentRuleReachable = true;
+  std::optional<std::string> soleConcreteOutputKey;
+  SourceContainmentMinimaTracker containmentMinima;
+
   std::vector<AlignmentSemanticSimulationResult> simulations;
   simulations.reserve(globalMaps.size());
   for (const std::vector<int64_t> &candidateMap : globalMaps) {
@@ -689,6 +770,50 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     simulations.push_back(
         deps_.simulate(buildSimulationSelection(candidateMap,
                                                 deps_.coreAlignment)));
+
+    const size_t realizedIndex = simulations.size() - 1;
+    const AlignmentSemanticSimulationResult &realized =
+        simulations[realizedIndex];
+    const bool realizedIsCompleteAccepted =
+        realized.disposition ==
+            AlignmentSemanticSimulationDisposition::Accepted &&
+        realized.accepted;
+
+    if (observationalRuleReachable) {
+      if (!realizedIsCompleteAccepted ||
+          realized.concreteOutputEquivalenceKey.empty()) {
+        observationalRuleReachable = false;
+      } else if (!soleConcreteOutputKey) {
+        soleConcreteOutputKey = realized.concreteOutputEquivalenceKey;
+      } else if (*soleConcreteOutputKey !=
+                 realized.concreteOutputEquivalenceKey) {
+        observationalRuleReachable = false;
+      }
+    }
+
+    if (containmentRuleReachable) {
+      // The completed rule stops admitting maps at the first proof-incomplete
+      // candidate and skips itself entirely when one exists, so mirror both.
+      if (realized.disposition ==
+          AlignmentSemanticSimulationDisposition::ProofIncomplete) {
+        containmentRuleReachable = false;
+      } else {
+        if (realizedIsCompleteAccepted &&
+            !realized.realizationEquivalenceKey.empty())
+          containmentMinima.Admit(realizedIndex, simulations);
+        containmentRuleReachable = containmentMinima.MayStillHaveLeastElement();
+      }
+    }
+
+    if (!observationalRuleReachable && !containmentRuleReachable &&
+        !legacyProposalRuleReachable) {
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "window {0} keeps core-forced anchors: no commit rule remains "
+          "reachable after realizing {1} of {2} enumerated map(s)",
+          windowIndex, simulations.size(), globalMaps.size());
+      return WindowResolution{};
+    }
   }
 
   auto commitRealizationClass =
@@ -902,18 +1027,15 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         windowIndex, hasProofIncompleteMap, acceptedMaps.size());
   }
 
-  // Reconstruct the old boundary map strictly as a proposal. The old balance
-  // and surface ranks cannot authorize an anchor; they only identify the
-  // counterfactuals that the theorem below must discharge.
-  if (deps_.aGapProvenance.size() != deps_.aLexemes.size() + 1 ||
-      deps_.bGapProvenance.size() != deps_.bLexemes.size() + 1)
+  // The old boundary map is held strictly as a proposal. The old balance and
+  // surface ranks cannot authorize an anchor; they only identify the
+  // counterfactuals that the theorem below must discharge.  It was
+  // reconstructed before the enumeration above, which needed to know whether
+  // this rule could still fire; the reachability decision recorded there is
+  // the one this rule reaches here.
+  if (!gapProvenanceCoversStreams)
     return WindowResolution{};
-  LegacyAlignmentDiagnosticResult proposal =
-      reconstructLegacyBoundaryProposal(
-          deps_.aLexemes, deps_.bLexemes, deps_.aGapProvenance,
-          deps_.bGapProvenance, deps_.coreAlignment);
-  if (!proposal.complete || !proposal.monotone || !proposal.lexemesAgree ||
-      !proposal.jointlyCoreOptimal) {
+  if (!legacyProposalRuleReachable) {
     REFOLD_LOG_TRACE(
         "lcs/semantic-resolver",
         "window {0} keeps core-forced anchors: legacy boundary proposal is "
