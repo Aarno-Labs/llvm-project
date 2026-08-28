@@ -353,6 +353,20 @@ struct Item {
   std::optional<uint64_t> InvBegin;
   std::optional<uint64_t> InvEnd;
 
+  /// The file instance that `InvBegin`/`InvEnd` index into.
+  ///
+  /// `InvFile` names a physical path, and a header entered more than once in
+  /// one translation unit yields the same path *and* the same byte offsets for
+  /// every inclusion.  Path plus offset therefore cannot tell two inclusions
+  /// of one header apart, while `FileID` names exactly one entry of one file.
+  /// Every test that decides whether a token's spelling position lies inside
+  /// this invocation must compare this field, or it will attribute a token of
+  /// one inclusion to an invocation belonging to another.
+  ///
+  /// Valid whenever `InvBegin` is set; both are established from the same
+  /// invocation-begin file location.
+  clang::FileID InvFileID;
+
   // --- New: include-site anchors and structure ---
   std::optional<uint64_t>
       SiteBegin; // byte offset of '#' in the directive's file

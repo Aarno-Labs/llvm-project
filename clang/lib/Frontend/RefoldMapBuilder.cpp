@@ -1844,7 +1844,8 @@ static const Item *findUniqueWholeArgNestedChild(const Item &Parent,
   for (const Item &Child : Items) {
     if (Child.Kind != IK_Macro || Child.ID == Parent.ID || !Child.InvBegin ||
         !Child.InvEnd || Child.InvFile != Parent.InvFile ||
-        !Child.CallerMacroId || *Child.CallerMacroId != Parent.ID)
+        Child.InvFileID != Parent.InvFileID || !Child.CallerMacroId ||
+        *Child.CallerMacroId != Parent.ID)
       continue;
     if (*Child.InvBegin != TrimmedBegin || *Child.InvEnd != TrimmedEnd)
       continue;
@@ -2659,8 +2660,12 @@ std::optional<uint32_t> RefoldMapBuilder::argIndexForSpellingLoc(
     SourceLocation Fl =
         CurrentLoc.isMacroID() ? Sm.getFileLoc(CurrentLoc) : CurrentLoc;
 
+    // MI.InvArgRanges are offsets into one *instance* of MI.InvFile.  A header
+    // entered more than once repeats those offsets, so the path match must be
+    // qualified by the file instance or a token of another inclusion would
+    // land in this invocation's argument slots.
     std::string TokFile = filePathForLocAbs(Sm, Fl, EmitAbsPaths);
-    if (TokFile == MI.InvFile) {
+    if (TokFile == MI.InvFile && Sm.getFileID(Fl) == MI.InvFileID) {
       auto TokB = Sm.getFileOffset(Fl);
       SourceLocation EndL = Lexer::getLocForEndOfToken(Fl, 0, Sm, Lang);
       auto TokE = EndL.isValid() ? Sm.getFileOffset(EndL) : TokB;
@@ -3227,6 +3232,9 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
     It.InvBegin = SM.getFileOffset(InvBeginFileLoc);
     It.InvEnd = SM.getFileOffset(InvEndFileLoc);
     It.InvFile = filePathForLocAbs(SM, InvBeginFileLoc, EmitAbsPaths);
+    // The offsets above are file-local, so they only identify this invocation
+    // together with the file *instance* they were taken from. Record it.
+    It.InvFileID = SM.getFileID(InvBeginFileLoc);
 
     if (SM.isWrittenInSameFile(InvBeginFileLoc, InvEndFileLoc) &&
         *It.InvEnd >= *It.InvBegin) {
@@ -3361,8 +3369,11 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
     std::optional<Candidate> Best;
     for (size_t I = 0; I < NewIdx; ++I) {
       const Item &Cand = Items[I];
+      // Same spelling offsets in a different inclusion of the same header are
+      // a different call site, not a containing one.
       if (Cand.Kind != IK_Macro || Cand.InvFile != CurIt.InvFile ||
-          !Cand.InvBegin || !Cand.InvEnd || Cand.InvArgRanges.empty() ||
+          Cand.InvFileID != CurIt.InvFileID || !Cand.InvBegin ||
+          !Cand.InvEnd || Cand.InvArgRanges.empty() ||
           *Cand.InvEnd <= *Cand.InvBegin)
         continue;
 
@@ -3854,7 +3865,8 @@ void RefoldMapBuilder::recordPragmaItem(
         // A macro invocation carries its file in InvFile; SitePath is the
         // directive-record field and is empty here.
         if (Candidate.Kind != IK_Macro || !Candidate.InvBegin ||
-            !Candidate.InvEnd || Candidate.InvFile != SitePath)
+            !Candidate.InvEnd || Candidate.InvFile != SitePath ||
+            Candidate.InvFileID != FID)
           continue;
         if (SiteOff < *Candidate.InvBegin || SiteOff >= *Candidate.InvEnd)
           continue;
@@ -3956,6 +3968,10 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
   std::string TokFile;
   std::optional<uint64_t> TokB;
   std::optional<uint64_t> TokE;
+  // The file *instance* TokB/TokE index into.  TokFile is only a path, so it
+  // is shared by every inclusion of a header entered more than once; this is
+  // what separates them.
+  FileID TokFileID;
   bool HasTokMap = false;
   {
     SourceLocation FL = SM.getFileLoc(L);
@@ -3967,6 +3983,7 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
         TokB = SM.getFileOffset(FL);
         TokE = SM.getFileOffset(FEL);
         TokFile = filePathForLocAbs(SM, FL, EmitAbsPaths); // e.g. "./e.h"
+        TokFileID = SM.getFileID(FL);
         HasTokMap = !TokFile.empty();
       }
     }
@@ -4643,7 +4660,12 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
         continue;
       if (!MI.InvBegin || !MI.InvEnd || !TokB || !TokE)
         continue;
-      if (MI.InvFile != TokFile)
+      // Byte containment alone conflates inclusions: a header entered twice
+      // spells the same invocation at the same offsets in both, so an
+      // invocation recorded for one inclusion lexically "contains" the tokens
+      // of the other.  Requiring the same file instance is what makes this an
+      // enclosing-invocation test rather than a same-spelling test.
+      if (MI.InvFile != TokFile || MI.InvFileID != TokFileID)
         continue;
       if (*MI.InvBegin <= *TokB && *TokE <= *MI.InvEnd) {
         // Ensure the enclosing macro's primary token span covers nested
@@ -5417,7 +5439,8 @@ void RefoldMapBuilder::writeJSON() {
         if (fileLoc.isInvalid())
           return std::nullopt;
 
-        if (filePathForLocAbs(SM, fileLoc, EmitAbsPaths) != caller.InvFile)
+        if (filePathForLocAbs(SM, fileLoc, EmitAbsPaths) != caller.InvFile ||
+            SM.getFileID(fileLoc) != caller.InvFileID)
           return std::nullopt;
 
         const uint64_t tokenBegin = SM.getFileOffset(fileLoc);
@@ -6092,7 +6115,8 @@ void RefoldMapBuilder::writeJSON() {
             if (Child.Kind != IK_Macro || Child.ID == Parent.ID ||
                 !Child.InvBegin || !Child.InvEnd || Child.InvFile.empty())
               continue;
-            if (Child.InvFile != Parent.InvFile)
+            if (Child.InvFile != Parent.InvFile ||
+                Child.InvFileID != Parent.InvFileID)
               continue;
             if (*Child.InvBegin < *R.first || *Child.InvEnd > *R.second ||
                 *Child.InvEnd <= *Child.InvBegin)
