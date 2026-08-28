@@ -578,6 +578,122 @@ static bool macroPatchIsCallsiteForInvocation(
          RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
              patch.replacement, invocation);
 }
+
+/// An argument replacement re-spelled in the original call-site bytes.
+///
+/// `text` carries exactly the token sequence the caller certified.  The
+/// half-open byte range `[newBegin, newEnd)` of the certified replacement was
+/// copied verbatim and now starts at `resultBegin` in `text`; every byte
+/// outside it came from the original argument spelling.
+struct RespelledArgumentReplacement {
+  std::string text;
+  uint64_t newBegin = 0;
+  uint64_t newEnd = 0;
+  uint64_t resultBegin = 0;
+};
+
+/// Re-spell a certified argument replacement using the original call-site
+/// argument spelling wherever the two agree token-for-token.
+///
+/// `newArgText` is derived from the modified preprocessed stream B, where an
+/// expansion occupies a single physical line.  Splicing it verbatim over an
+/// argument whose source spelling spanned several lines collapses the
+/// invocation onto one line.  That collapse is observable: `__LINE__` in the
+/// callee's replacement list takes the line of the invocation's *closing
+/// paren*, so a lost newline moves the observer and the closing check rejects
+/// the assembly.  Interior indentation and comments are lost the same way.
+///
+/// The repair aligns the two token sequences from both ends and copies only
+/// the differing interior out of `newArgText`, keeping the original bytes
+/// around it.
+///
+/// Proof obligation: the result must carry exactly the token sequence that was
+/// certified, namely `newArgText`'s.  That is discharged by re-lexing the
+/// spliced text and requiring kind-and-spelling equality token for token, so
+/// every way the splice could change meaning -- a retained comment that
+/// swallows it, tokens gluing at a seam, an original spelling that is not
+/// token-identical outside the interior -- returns `std::nullopt` and leaves
+/// the caller with the uncollapsed B text.  This is a spelling choice only; it
+/// admits nothing and rejects nothing.
+std::optional<RespelledArgumentReplacement>
+respellArgumentReplacementInBaseSpelling(StringRef baseArgText,
+                                         StringRef newArgText,
+                                         const LangOptions &lexLang) {
+  SmallVector<RefoldLexBoundaryToken, 16> baseToks;
+  SmallVector<RefoldLexBoundaryToken, 16> newToks;
+  refoldLexBoundaryTokens(baseArgText, lexLang, baseToks);
+  refoldLexBoundaryTokens(newArgText, lexLang, newToks);
+
+  const size_t baseCount = baseToks.size();
+  const size_t newCount = newToks.size();
+  if (baseCount == 0 || newCount == 0)
+    return std::nullopt;
+
+  auto sameToken = [](const RefoldLexBoundaryToken &lhs,
+                      const RefoldLexBoundaryToken &rhs) -> bool {
+    return lhs.kind == rhs.kind && lhs.spelling == rhs.spelling;
+  };
+
+  size_t prefix = 0;
+  while (prefix < baseCount && prefix < newCount &&
+         sameToken(baseToks[prefix], newToks[prefix]))
+    ++prefix;
+
+  // The original spelling already carries the certified tokens; keep its bytes
+  // whole rather than re-deriving them from B.
+  if (prefix == baseCount && prefix == newCount) {
+    RespelledArgumentReplacement identical;
+    identical.text = baseArgText.str();
+    return identical;
+  }
+
+  size_t suffix = 0;
+  while (suffix < baseCount - prefix && suffix < newCount - prefix &&
+         sameToken(baseToks[baseCount - 1 - suffix],
+                   newToks[newCount - 1 - suffix]))
+    ++suffix;
+
+  // A pure insertion or deletion leaves one side's differing interval empty,
+  // which has no byte range to splice against.  Give up one matched token at a
+  // time -- left edge first, so the choice stays deterministic -- until both
+  // intervals name real tokens.
+  size_t baseMidEndTok = baseCount - suffix;
+  size_t newMidEndTok = newCount - suffix;
+  while (prefix >= baseMidEndTok || prefix >= newMidEndTok) {
+    if (prefix > 0) {
+      --prefix;
+      continue;
+    }
+    if (suffix > 0) {
+      --suffix;
+      baseMidEndTok = baseCount - suffix;
+      newMidEndTok = newCount - suffix;
+      continue;
+    }
+    return std::nullopt;
+  }
+
+  RespelledArgumentReplacement out;
+  const uint64_t baseMidBegin = baseToks[prefix].begin;
+  const uint64_t baseMidEnd = baseToks[baseMidEndTok - 1].end;
+  out.newBegin = newToks[prefix].begin;
+  out.newEnd = newToks[newMidEndTok - 1].end;
+  out.resultBegin = baseMidBegin;
+
+  out.text = baseArgText.substr(0, baseMidBegin).str();
+  out.text += newArgText.substr(out.newBegin, out.newEnd - out.newBegin);
+  out.text += baseArgText.substr(baseMidEnd);
+
+  SmallVector<RefoldLexBoundaryToken, 16> resultToks;
+  refoldLexBoundaryTokens(out.text, lexLang, resultToks);
+  if (resultToks.size() != newCount)
+    return std::nullopt;
+  for (size_t i = 0; i < newCount; ++i)
+    if (!sameToken(resultToks[i], newToks[i]))
+      return std::nullopt;
+
+  return out;
+}
 } // namespace
 
 std::optional<RefoldMacroPatchPlanner::InvocationActualLayout>
@@ -682,22 +798,61 @@ RefoldMacroPatchPlanner::BuildInvocationRewriteWithRange(
     if (replIt == replByArgIdx.end())
       return std::nullopt;
 
+    StringRef replacementText = replIt->second;
+
+    std::optional<std::pair<uint64_t, uint64_t>> materializedRel;
+    if (materializedRangeByArgIdx) {
+      auto matIt = materializedRangeByArgIdx->find(argIdx);
+      if (matIt != materializedRangeByArgIdx->end()) {
+        if (matIt->second.second < matIt->second.first ||
+            matIt->second.second > replacementText.size())
+          return std::nullopt;
+        materializedRel = matIt->second;
+      }
+    }
+
+    // The replacement is derived from B, where the whole expansion sits on one
+    // physical line.  An argument whose original spelling spanned several lines
+    // must not be collapsed onto one: `__LINE__` in the callee's replacement
+    // list observes the line of the invocation's closing paren, so the collapse
+    // would move a preserved line observer.  Re-spell the certified replacement
+    // in the original argument's bytes when the two agree token for token
+    // outside the edit; the helper fails closed to the B text otherwise.
+    const StringRef baseArgText = baseInvocationText.slice(r.begin, r.end);
+    std::string respelledStorage;
+    if (baseArgText.contains('\n')) {
+      if (auto respelled = respellArgumentReplacementInBaseSpelling(
+              baseArgText, replacementText, *deps_.lexLang)) {
+        std::optional<std::pair<uint64_t, uint64_t>> remapped;
+        if (materializedRel && materializedRel->first >= respelled->newBegin &&
+            materializedRel->second <= respelled->newEnd) {
+          remapped = std::make_pair(
+              respelled->resultBegin +
+                  (materializedRel->first - respelled->newBegin),
+              respelled->resultBegin +
+                  (materializedRel->second - respelled->newBegin));
+        }
+
+        // A materialized output interval that does not land inside the spliced
+        // region has no proven image in the re-spelled bytes, so keep the
+        // uncollapsed replacement for that argument rather than guess one.
+        if (!materializedRel || remapped) {
+          respelledStorage = std::move(respelled->text);
+          replacementText = respelledStorage;
+          materializedRel = remapped;
+        }
+      }
+    }
+
     const uint64_t replBegin = static_cast<uint64_t>(out.text.size());
-    out.text.append(replIt->second);
+    out.text.append(replacementText.begin(), replacementText.end());
     const uint64_t replEnd = static_cast<uint64_t>(out.text.size());
 
     uint64_t materializedBegin = replBegin;
     uint64_t materializedEnd = replEnd;
-    if (materializedRangeByArgIdx) {
-      auto matIt = materializedRangeByArgIdx->find(argIdx);
-      if (matIt != materializedRangeByArgIdx->end()) {
-        const uint64_t relBegin = matIt->second.first;
-        const uint64_t relEnd = matIt->second.second;
-        if (relEnd < relBegin || relEnd > replIt->second.size())
-          return std::nullopt;
-        materializedBegin = replBegin + relBegin;
-        materializedEnd = replBegin + relEnd;
-      }
+    if (materializedRel) {
+      materializedBegin = replBegin + materializedRel->first;
+      materializedEnd = replBegin + materializedRel->second;
     }
 
     mappedBegin = mappedBegin ? std::min(*mappedBegin, materializedBegin)
