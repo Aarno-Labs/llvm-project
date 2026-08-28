@@ -51,6 +51,7 @@ RefoldMacroTopology::RefoldMacroTopology(const RefoldModel &model,
 void RefoldMacroTopology::BuildMacroInvocationGraph() {
   macroInvocationById_.clear();
   macroChildrenById_.clear();
+  lineObserverAncestorIds_.clear();
 
   ArrayRef<RefoldModel::MacroInvocation> macroInvocations =
       model_.GetMacroInvocations();
@@ -65,6 +66,32 @@ void RefoldMacroTopology::BuildMacroInvocationGraph() {
     if (mi.callerMacroId)
       macroChildrenById_[*mi.callerMacroId].push_back(&mi);
   }
+
+  // Record the caller chain above every `__LINE__` expansion.  Walking upwards
+  // once per observer keeps the containment query a single lookup, and stopping
+  // at an already-recorded ancestor is exact: an id is recorded only after its
+  // own chain has been walked to the top, so its ancestors are already in the
+  // set.  That stop also bounds a malformed producer map with a cyclic
+  // caller_macro_id.
+  for (const auto &mi : macroInvocations) {
+    if (mi.name != "__LINE__")
+      continue;
+    std::optional<uint64_t> callerId = mi.callerMacroId;
+    while (callerId) {
+      if (!lineObserverAncestorIds_.insert(*callerId).second)
+        break;
+      const RefoldModel::MacroInvocation *caller =
+          FindMacroInvocationById(*callerId);
+      if (!caller)
+        break;
+      callerId = caller->callerMacroId;
+    }
+  }
+}
+
+bool RefoldMacroTopology::ExpansionContainsLineObserver(
+    uint64_t macroId) const {
+  return lineObserverAncestorIds_.contains(macroId);
 }
 
 const RefoldModel::MacroInvocation *

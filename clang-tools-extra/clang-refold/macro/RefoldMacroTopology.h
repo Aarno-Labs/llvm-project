@@ -23,6 +23,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -65,6 +66,17 @@ public:
 
   /// Follow caller_macro_id links to the outermost resolved invocation.
   uint64_t GetRootMacroId(uint64_t macroId) const;
+
+  /// True iff a `__LINE__` expansion occurs inside \p macroId's expansion,
+  /// directly or through any nested invocation.
+  ///
+  /// The answer is a `caller_macro_id` reachability fact over the recorded
+  /// invocation graph: `__LINE__` is itself a recorded invocation, so the
+  /// invocations that observe a physical line inside their own spelling are
+  /// exactly its ancestors.  Only `__LINE__` is reported.  The other
+  /// line-directive-sensitive builtins name a file rather than a position in
+  /// one, so moving a newline inside an invocation cannot change them.
+  bool ExpansionContainsLineObserver(uint64_t macroId) const;
 
   /// True iff \p m is lexically contained in a producer-recorded #define
   /// extent.
@@ -159,6 +171,11 @@ private:
   llvm::DenseMap<uint64_t,
                  llvm::SmallVector<const RefoldModel::MacroInvocation *, 4>>
       macroChildrenById_;
+
+  /// Every invocation that has a `__LINE__` expansion somewhere beneath it.
+  /// Built once with the invocation graph by walking each `__LINE__` record's
+  /// caller chain upwards, so the query is a single lookup.
+  llvm::DenseSet<uint64_t> lineObserverAncestorIds_;
 
   /// Per-run source-text cache used while building #define containment extents.
   /// It is intentionally not process-global because the producer working

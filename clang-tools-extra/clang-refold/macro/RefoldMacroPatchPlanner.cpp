@@ -826,11 +826,13 @@ RefoldMacroPatchPlanner::BuildInvocationRewriteWithRange(
         std::optional<std::pair<uint64_t, uint64_t>> remapped;
         if (materializedRel && materializedRel->first >= respelled->newBegin &&
             materializedRel->second <= respelled->newEnd) {
-          remapped = std::make_pair(
+          const uint64_t remappedBegin =
               respelled->resultBegin +
-                  (materializedRel->first - respelled->newBegin),
-              respelled->resultBegin +
-                  (materializedRel->second - respelled->newBegin));
+              (materializedRel->first - respelled->newBegin);
+          const uint64_t remappedEnd =
+              remappedBegin +
+              (materializedRel->second - materializedRel->first);
+          remapped = std::make_pair(remappedBegin, remappedEnd);
         }
 
         // A materialized output interval that does not land inside the spliced
@@ -867,9 +869,34 @@ RefoldMacroPatchPlanner::BuildInvocationRewriteWithRange(
   if (!mappedBegin || !mappedEnd)
     return std::nullopt;
 
+  if (!InvocationRewritePreservesLineObservers(ctx, out.text))
+    return std::nullopt;
+
   out.materializedOutputByteStart = *mappedBegin;
   out.materializedOutputByteEnd = *mappedEnd;
   return out;
+}
+
+bool RefoldMacroPatchPlanner::InvocationRewritePreservesLineObservers(
+    const InvocationActualRecoveryContext &ctx,
+    StringRef rewrittenInvocationText) const {
+  if (!deps_.macroTopology->ExpansionContainsLineObserver(ctx.invocation.id))
+    return true;
+
+  const size_t baseLineBreaks = ctx.baseInvocationText.count('\n');
+  const size_t rewrittenLineBreaks = rewrittenInvocationText.count('\n');
+  if (baseLineBreaks == rewrittenLineBreaks)
+    return true;
+
+  REFOLD_LOG_DEBUG(
+      "macro/line-observer",
+      "refusing callsite rewrite of inv id={0} name={1}: a __LINE__ expands "
+      "inside it and the rewrite spans {2} line break(s) where the recorded "
+      "spelling spans {3}",
+      ctx.invocation.id, ctx.invocation.name,
+      static_cast<uint64_t>(rewrittenLineBreaks),
+      static_cast<uint64_t>(baseLineBreaks));
+  return false;
 }
 
 RefoldMacroPatchPlanner::MacroPatchReuseAdmissionContext

@@ -472,6 +472,32 @@ private:
       const llvm::DenseMap<uint32_t, std::pair<uint64_t, uint64_t>>
           *materializedRangeByArgIdx = nullptr) const;
 
+  /// Return whether a rewritten invocation spelling may replace the recorded
+  /// callsite without displacing a line observer expanded inside it.
+  ///
+  /// `__LINE__` in the callee's replacement list takes the line of the
+  /// invocation's *closing paren*, and one spelled in an actual takes the line
+  /// of that spelling.  Neither is repairable from outside the invocation: a
+  /// `#line` placed before or after it resynchronizes the surrounding stream
+  /// but not a position inside it, and a use-site edit may not rewrite the
+  /// definition that spells the observer.  A rewrite that changes how many
+  /// physical lines the invocation spans is therefore not realizable at all,
+  /// and admitting one emits a callsite whose observer silently reads a
+  /// different value than the edited stream carries.
+  ///
+  /// Refusing here costs one expanded invocation.  Letting it through costs the
+  /// whole translation unit, because the closing check then rejects the
+  /// assembly and the terminal fallback emits the raw edited stream -- and with
+  /// output verification off it costs correctness instead.
+  ///
+  /// The rule is stated on the newline count because that is what moves the
+  /// closing paren.  A rewrite that keeps the count but moves a newline across
+  /// an actual-spelled observer is outside this floor and remains the closing
+  /// check's to catch.
+  bool InvocationRewritePreservesLineObservers(
+      const InvocationActualRecoveryContext &ctx,
+      llvm::StringRef rewrittenInvocationText) const;
+
   /// Construct the args-only template solver on demand. Lightweight; borrows
   /// source/model/proof state from the planner's dependencies.
   RefoldMacroArgsOnlyTemplateSolver TemplateSolver() const;
