@@ -409,10 +409,12 @@ withDivergingEditedToken(TerminalFallbackProofFailure failure,
 /// Describe which attribution surfaces one terminal request carries.
 ///
 /// A region-scoped realization needs somewhere to put the payload it cannot
-/// prove, and the only fields the narrowing ladder reads are `ownerId` and the A
-/// token range. Reporting the whole surface -- including the hunk, the source
-/// span, and the B token range -- is what turns "does every request name a
-/// region" into a question with an observable answer rather than an audit.
+/// prove, and the fields the narrowing ladder reads are `ownerId`, the A token
+/// range, and -- for a check that runs against the assembled source and knows
+/// only where the two streams parted -- the B token range.  Reporting the whole
+/// surface, the hunk and the source span included, is what turns "does every
+/// request name a region" into a question with an observable answer rather than
+/// an audit.
 static std::string describeTerminalRequestAttribution(
     const TerminalFallbackFailureContext &context) {
   std::string text;
@@ -2976,10 +2978,21 @@ bool RefoldEngine::AuditPreservedLineObserversInFinalOutput(
                      "edited stream '{2}'",
                      static_cast<uint64_t>(index), replayedToks[index].spelling,
                      bToks_[index].spelling);
-    terminalSink_.RequestTerminalFallback(
+    // `index` addresses the edited stream directly -- the loop above walks it
+    // against `bToks_` -- so this audit can both record it and name the region
+    // owning it, without the verifier-numbering check a closing-verifier index
+    // needs first.  Naming it is what lets the ladder give up one macro or
+    // include; an unattributed request surrenders the whole translation unit
+    // for a single displaced observer.  It also keeps the attribution available
+    // with output verification off, where there is no verifier to reconcile
+    // against and this audit is the only guard left.
+    TerminalFallbackProofFailure displacement = withDivergingEditedToken(
         RefoldOwnerStateProof::SuffixStabilityTerminalFailureForComponent(
             OwnerStateComponent::LineNumber),
-        "line/observer-audit",
+        index);
+    displacement.context.ownerId = FindSmallestOwnerForBToken(index);
+    terminalSink_.RequestTerminalFallback(
+        displacement, "line/observer-audit",
         llvm::formatv("assembled source re-expands a preserved __LINE__ "
                       "observer to '{0}' where the edited stream carries "
                       "'{1}' (B token {2})",
@@ -3022,7 +3035,12 @@ std::optional<uint64_t> RefoldEngine::FindSmallestOwnerForEditedToken(
     if (editedTokens[index].spelling != bToks_[index].spelling)
       return std::nullopt;
 
-  if (editedTokenIndex >= abTokMapB2A_.size())
+  return FindSmallestOwnerForBToken(static_cast<uint64_t>(editedTokenIndex));
+}
+
+std::optional<uint64_t>
+RefoldEngine::FindSmallestOwnerForBToken(uint64_t bToken) const {
+  if (bToken >= abTokMapB2A_.size())
     return std::nullopt;
 
   // The alignment relates tokens that agree across the two streams, so the
@@ -3032,16 +3050,16 @@ std::optional<uint64_t> RefoldEngine::FindSmallestOwnerForEditedToken(
   // contains the divergence once expanded.  Nearest-first with a left-hand tie
   // break keeps the choice deterministic.
   int64_t aToken = -1;
-  for (size_t distance = 0;
-       distance < abTokMapB2A_.size() && aToken < 0; ++distance) {
-    if (editedTokenIndex >= distance) {
-      const int64_t left = abTokMapB2A_[editedTokenIndex - distance];
+  for (size_t distance = 0; distance < abTokMapB2A_.size() && aToken < 0;
+       ++distance) {
+    if (bToken >= distance) {
+      const int64_t left = abTokMapB2A_[bToken - distance];
       if (left >= 0) {
         aToken = left;
         break;
       }
     }
-    const size_t right = editedTokenIndex + distance;
+    const size_t right = bToken + distance;
     if (right < abTokMapB2A_.size()) {
       const int64_t candidate = abTokMapB2A_[right];
       if (candidate >= 0)
@@ -3308,12 +3326,25 @@ bool RefoldEngine::AppendNarrowableOwnersForTerminalRequests(
     // A tokens it could not realize may span several, so take every one of them
     // -- expanding only the region owning the first token cannot repair a
     // divergence sitting inside a later one.
+    //
+    // A check that runs against the *assembled* source has neither: it knows
+    // only the edited-stream token the two streams parted at.  Carry that
+    // through the same alignment the closing verifier uses to name the region
+    // it reports, so a divergence an assembly check found is narrowable to the
+    // macro or include owning it instead of surrendering the translation unit.
+    // The mapping fails closed when the alignment cannot relate the streams,
+    // which leaves the request unattributed exactly as before.
     llvm::SmallVector<uint64_t, 8> requestOwners;
     if (context.ownerId)
       requestOwners.push_back(*context.ownerId);
     else if (context.aTokenBegin && context.aTokenEnd)
       AppendMinimalOwnersCoveringATokenRange(*context.aTokenBegin,
                                              *context.aTokenEnd, requestOwners);
+    else if (context.bTokenBegin) {
+      if (std::optional<uint64_t> owner =
+              FindSmallestOwnerForEditedToken(*context.bTokenBegin))
+        requestOwners.push_back(*owner);
+    }
 
     if (requestOwners.empty()) {
       everyRequestNarrowable = false;

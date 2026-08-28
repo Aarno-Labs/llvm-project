@@ -1073,6 +1073,17 @@ private:
   std::optional<uint64_t>
   FindSmallestOwnerForEditedToken(std::size_t editedTokenIndex) const;
 
+  /// Name the smallest region owning one *edited stream* token, given an index
+  /// already known to address that stream.
+  ///
+  /// This is the half of `FindSmallestOwnerForEditedToken()` after the
+  /// verifier-numbering check, exposed for a caller that indexed the edited
+  /// stream itself and so has nothing to reconcile.  Do not call it with an
+  /// index reported by the closing verifier: that numbering coincides with the
+  /// producer's only when re-preprocessing the edited stream is a no-op, and
+  /// `FindSmallestOwnerForEditedToken()` exists to check it.
+  std::optional<uint64_t> FindSmallestOwnerForBToken(uint64_t bToken) const;
+
   /// Return whether this attempt showed that alignment ambiguity is what
   /// limited it, so the next attempt should resolve and re-plan.
   ///
