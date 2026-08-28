@@ -1383,22 +1383,25 @@ std::string RefoldEngine::Refold() {
   // to the next safe beginning-of-line, and no site along that path establishes
   // that the flush point precedes the observers the drift displaced.
   if (!AuditPreservedLineObserversInFinalOutput(out)) {
-    // Record the request before falling back, exactly as the prune check above
-    // does. The edited preprocessed stream is not an answer this engine may
-    // return on its own: without a request the driver sees a successful
-    // assembly, the closing verifier passes it because the stream replays
-    // itself by construction, and a result that dropped every comment and
-    // directive ships with a zero exit. Naming the failure is what routes it to
-    // the one place allowed to decide there is no admissible refold.
+    // The audit has already recorded the request, naming the displaced observer
+    // and the region owning it.  Raising a second one here for the same failure
+    // buys nothing and costs accuracy: it carries neither, so a single
+    // displaced observer was censused as two requests, one of them
+    // unattributable, and read as though a second and unnarrowable problem
+    // existed beside it.
+    //
+    // The request itself is not optional, which is why the invariant is
+    // asserted rather than assumed.  The edited preprocessed stream is not an
+    // answer this engine may return on its own: without a request the driver
+    // sees a successful assembly, the closing verifier passes it because the
+    // stream replays itself by construction, and a result that dropped every
+    // comment and directive ships with a zero exit.
+    assert(terminalSink_.HasRequest() &&
+           "the line-observer audit must record its request before failing");
     REFOLD_LOG_WARN("assembly-verify",
                     "preserved line observers were displaced in the final "
-                    "output; requesting the terminal fallback rather than "
+                    "output; taking the terminal fallback rather than "
                     "returning the edited preprocessed stream");
-    terminalSink_.RequestTerminalFallback(
-        RefoldOwnerStateProof::SuffixStabilityTerminalFailureForComponent(
-            OwnerStateComponent::LineNumber),
-        "assembly-verify",
-        "preserved line observers do not hold in the final output");
     out = expansionFallbackPlanner_->ResolvePostStructuralFallback();
     finalLineControlPruneCandidates_.clear();
     finalLineControlSourceMappings_.clear();
@@ -2949,6 +2952,18 @@ bool RefoldEngine::AuditPreservedLineObserversInFinalOutput(
     StringRef finalSource) {
   // Without line directives the logical stream is not reconstructed at all, and
   // a terminal result carries no preserved observer to displace.
+  //
+  // The second half of that is why an earlier check reaching the seam takes
+  // this one out of the run entirely, and why that is correct rather than a
+  // gap.  A check that raised a request has already replaced the assembly with
+  // `ResolvePostStructuralFallback()` -- the edited stream itself -- and that
+  // text re-expands every observer to the value the edited stream carries by
+  // construction.  Auditing it would assert nothing.  So on a unit where the
+  // final line-control prune re-check fails first, this audit never runs, and
+  // the diagnosis comes from the prune's own report rather than from the
+  // per-observer one here; a unit where the prune has nothing to reject reaches
+  // this audit instead.  Neither is a missed observer: the two are alternatives
+  // on the same failure, not a first and second line of defence.
   if (!lineDirs_.Enabled() || terminalSink_.HasRequest())
     return true;
 

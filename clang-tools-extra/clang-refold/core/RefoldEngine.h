@@ -1047,6 +1047,13 @@ private:
   /// recorded context and its token stream compared to B.  Only positions that
   /// B produced from a `__LINE__` expansion are enforced, so this closes the
   /// newline-drift ordering hole without becoming a general re-check.
+  ///
+  /// Returns false only after recording the terminal request that names the
+  /// displaced observer and the region owning it, so the caller performs the
+  /// fallback without raising a second request for the same failure.  It also
+  /// returns true, auditing nothing, once any earlier check has reached the
+  /// seam: the assembly has been replaced by the edited stream at that point,
+  /// which replays every observer by construction.
   bool AuditPreservedLineObserversInFinalOutput(llvm::StringRef finalSource);
 
   /// Identify the smallest region that owns a diverging edited-stream token,
