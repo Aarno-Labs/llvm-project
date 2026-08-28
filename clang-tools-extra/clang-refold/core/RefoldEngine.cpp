@@ -1296,6 +1296,10 @@ std::string RefoldEngine::Refold() {
     }
   }
 
+  // Keep the text the prune replaced.  Deciding which of the two diverged, in
+  // the check below, needs both, and `out` is overwritten here in any case, so
+  // moving it aside costs nothing.
+  const std::string prePruneAssembly = std::move(out);
   out = finalLinePrune.output;
 
   // The assembly check in RunRefoldPass() ran against the text as assembled,
@@ -1307,18 +1311,65 @@ std::string RefoldEngine::Refold() {
     const FinalAssemblyVerdict prunedVerdict =
         finalAssemblyVerifier_->Verify(out);
     if (!prunedVerdict.verified && !prunedVerdict.inconclusive) {
-      REFOLD_LOG_WARN("assembly-verify",
-                      "final line-control prune broke the assembly: {0}; "
-                      "taking the terminal carrier instead",
-                      prunedVerdict.reason);
+      // Being the first check to run is not evidence of having caused what it
+      // found.  Nothing verifies the pre-prune assembly on this path: the
+      // driver's verifier is positioned after `Refold()` returns and is skipped
+      // once a terminal request exists, so a divergence the prune merely
+      // inherited and one the prune introduced are indistinguishable unless the
+      // pre-prune text is checked here.  Check it -- one extra replay, on a
+      // path already headed for a fallback -- and name the text that actually
+      // diverged.
+      const FinalAssemblyVerdict prePruneVerdict =
+          finalAssemblyVerifier_->Verify(prePruneAssembly);
+
+      // Three outcomes, and only one of them convicts the prune.  An
+      // inconclusive pre-prune verdict is its own answer: the comparison could
+      // not be made, which is neither evidence for the prune nor against it,
+      // and reporting it as either is the defect being repaired.
+      const bool pruneIntroducedDivergence = prePruneVerdict.verified;
+      const bool divergencePredatesPrune =
+          !prePruneVerdict.verified && !prePruneVerdict.inconclusive;
+
+      if (pruneIntroducedDivergence)
+        REFOLD_LOG_WARN(
+            "assembly-verify",
+            "final line-control prune broke the assembly: {0}; the pre-prune "
+            "assembly replays the edited stream, so the prune is what "
+            "diverged; taking the terminal carrier instead",
+            prunedVerdict.reason);
+      else if (divergencePredatesPrune)
+        REFOLD_LOG_WARN(
+            "assembly-verify",
+            "assembly does not replay the edited preprocessed stream: {0}; the "
+            "pre-prune assembly does not either ({1}), so the final "
+            "line-control prune is not the cause -- it is only the first check "
+            "that ran; taking the terminal carrier instead",
+            prunedVerdict.reason, prePruneVerdict.reason);
+      else
+        REFOLD_LOG_WARN(
+            "assembly-verify",
+            "assembly does not replay the edited preprocessed stream after "
+            "the final line-control prune: {0}; the pre-prune assembly could "
+            "not be preprocessed for comparison, so whether the prune caused "
+            "this is unestablished; taking the terminal carrier instead",
+            prunedVerdict.reason);
+
+      // Attribute the request to the earlier divergence when one was
+      // established: that is the divergence a narrowing step has to repair, and
+      // the prune's own mismatch is downstream of it.  An unestablished
+      // pre-prune verdict carries no token to prefer, so the prune's stands.
       terminalSink_.RequestTerminalFallback(
           withDivergingEditedToken(
-              RefoldOwnerStateProof::
-                  SuffixStabilityTerminalFailureForComponent(
-                      OwnerStateComponent::LineNumber),
-              prunedVerdict.mismatchTokenIndex),
+              RefoldOwnerStateProof::SuffixStabilityTerminalFailureForComponent(
+                  OwnerStateComponent::LineNumber),
+              divergencePredatesPrune ? prePruneVerdict.mismatchTokenIndex
+                                      : prunedVerdict.mismatchTokenIndex),
           "assembly-verify",
-          "pruned assembly does not replay the edited preprocessed stream");
+          divergencePredatesPrune
+              ? "assembly does not replay the edited preprocessed stream "
+                "before or after the final line-control prune"
+              : "pruned assembly does not replay the edited preprocessed "
+                "stream");
       out = expansionFallbackPlanner_->ResolvePostStructuralFallback();
       finalLineControlPruneCandidates_.clear();
       finalLineControlSourceMappings_.clear();
