@@ -124,6 +124,65 @@ public:
   std::string ResolvePostStructuralFallback();
 
 private:
+  /// True when the proposed widened A range would cover any token diff hunk
+  /// besides \p realizedHunk, the hunk currently being realized.
+  bool RangeHasForeignTokenDiff(const diffutils::Hunk &realizedHunk,
+                                uint64_t begin, uint64_t end) const;
+
+  /// True when the source gap [begin, end) is exactly indexed lexer trivia.
+  ///
+  /// Exact lexical trivia and literal conditional-control preservation are
+  /// submitted through the shared source-gap theorem.  This predicate and the
+  /// one below remain narrow semantic policies; neither keeps a second
+  /// preprocessing inventory or byte-cover implementation beside structural
+  /// hunk tiling.
+  bool GapIsIndexedLexerTrivia(uint64_t begin, uint64_t end) const;
+
+  /// True when the source gap [begin, end) is trivia that a pure include
+  /// closure may carry forward verbatim between two touched include
+  /// directives.
+  bool GapIsIndexedPreservableIncludeClosureTrivia(llvm::StringRef tuBytes,
+                                                   uint64_t begin,
+                                                   uint64_t end) const;
+
+  /// Does \p root's include subtree own a pragma whose effect outlives it?
+  ///
+  /// Consuming a touched include is justified by the closure realizing its
+  /// expansion; that does not account for pragma state surviving the include's
+  /// end, so the whole subtree is asked, not just the directly included file.
+  bool
+  IncludeSubtreeOwnsOutlivingPragma(const RefoldModel::IncludeItem &root) const;
+
+  /// Recover the full physical source interval for a TU-spelled macro-state
+  /// directive, or std::nullopt when the producer facts do not determine it.
+  std::optional<MacroStateDirectiveLineInterval>
+  MacroDirectiveFullSourceInterval(
+      llvm::StringRef tuPath, llvm::StringRef tuBytes,
+      const RefoldModel::MacroDirective &directive) const;
+
+  /// Return a TU-spelled pragma wholly contained in the physical source line
+  /// [lineBegin, lineEnd], if the refold map recorded one there.
+  ///
+  /// Diagnostic-only: pragmas are never consumed as source-neutral artifacts,
+  /// so this only lets a rejection name the pragma that blocked the closure.
+  const RefoldModel::PragmaDirective *
+  FindTUPragmaOnSourceLine(llvm::StringRef tuPath, uint64_t lineBegin,
+                           uint64_t lineEnd) const;
+
+  /// Return a concrete rejection reason when a TU gap contains a recorded
+  /// pragma that blocks closure, or std::nullopt when none does.
+  std::optional<std::string>
+  NonConsumableTUPragmaGapReason(llvm::StringRef tuPath, uint64_t gapBegin,
+                                 uint64_t gapEnd) const;
+
+  /// True when the resolved header at \p resolvedPath carries `#pragma once`.
+  ///
+  /// The recorded pragma table is used instead of guessing from include
+  /// emptiness: an empty later include can have other causes, but a recorded
+  /// `#pragma once` gives the exact source-order state transition the
+  /// reactivation repair must preserve.
+  bool PathHasPragmaOnce(llvm::StringRef resolvedPath) const;
+
   const RefoldModel &model_;
   llvm::StringRef bSource_;
   llvm::ArrayRef<PPTok> aToks_;

@@ -913,7 +913,239 @@ private:
   mutable DenseMap<uint64_t, bool> preservableCache_;
 };
 
+/// True when \p cand would be absorbed by the closed A-side range
+/// [begin, end].
+///
+/// Token-consuming edits use interval overlap; pure insertions use the closed
+/// insertion-gap test, because a widened include materialization would
+/// otherwise absorb an insertion payload without going through the normal
+/// candidate-conflict law.
+bool hunkTouchesAClosedRange(const diffutils::Hunk &cand, uint64_t begin,
+                             uint64_t end) {
+  if (end < begin)
+    end = begin;
+
+  if (cand.aStart < cand.aEnd)
+    return cand.aStart < end && begin < cand.aEnd;
+  return cand.bStart < cand.bEnd && cand.aStart >= begin && cand.aStart <= end;
+}
+
+/// True when the proposed widened source range would overlap an already staged
+/// edit.  Zero-width staged edits are treated as closed insertion points.
+bool sourceTouchesStagedEdit(
+    ArrayRef<std::pair<uint64_t, uint64_t>> stagedSourceIntervals,
+    uint64_t begin, uint64_t end) {
+  for (const auto &interval : stagedSourceIntervals) {
+    if (interval.first < interval.second) {
+      if (interval.first < end && begin < interval.second)
+        return true;
+      continue;
+    }
+
+    if (begin <= interval.first && interval.first <= end)
+      return true;
+  }
+  return false;
+}
+
+/// True when a `#line` directive emitted at \p pos would start a preprocessing
+/// directive, because nothing but indentation precedes it on its line.
+bool lineDirectiveStartsAtPrefix(StringRef tuBytes, uint64_t pos) {
+  if (pos >= tuBytes.size())
+    return true;
+  if (stringutils::isBOL(tuBytes, static_cast<size_t>(pos)))
+    return true;
+
+  size_t lineStart = static_cast<size_t>(pos);
+  while (lineStart > 0 && tuBytes[lineStart - 1] != '\n')
+    --lineStart;
+  return stringutils::isIndentOnly(tuBytes, lineStart,
+                                   static_cast<size_t>(pos));
+}
+
+/// True when a `#line` directive can start at \p pos, synthesizing a leading
+/// newline if one is needed.
+///
+/// A delete-only closure may need that newline.  Reject the only local case
+/// where it would be swallowed as a line splice instead of starting a fresh
+/// preprocessing directive.
+bool canStartLineDirectiveWithOptionalLeadingNewline(StringRef tuBytes,
+                                                     uint64_t pos) {
+  if (lineDirectiveStartsAtPrefix(tuBytes, pos))
+    return true;
+
+  return pos == 0 || tuBytes[pos - 1] != '\\';
+}
+
+/// True when a pragma establishes include-once state for its file.
+///
+/// This is the narrow question the `#pragma once` reactivation repair asks:
+/// consuming the include that entered a once-header can make a later skipped
+/// include of the same header live again.  Only `IncludeOnce` answers it, and
+/// widening this predicate would make some other header claim once-state and
+/// corrupt that repair.
+bool pragmaEstablishesIncludeOnceState(
+    const RefoldModel::PragmaDirective &pragma) {
+  return classifyPragmaDirective(pragma.text.trim()).effect ==
+         PragmaStateEffect::IncludeOnce;
+}
+
+/// True when a pragma's state dies with the include that carries it.
+///
+/// A zero-token include inside a replacement envelope is deleted whole, so a
+/// pragma it owns is admissible exactly when nothing outside the include can
+/// observe the state it changed.  Two classified effects qualify, for
+/// different reasons:
+///
+///   * `IncludeOnce` suppresses future textual inclusion of a file that
+///     produced no tokens, which cannot change the PP token stream;
+///   * `SystemHeader` suppresses diagnostics from that point in the containing
+///     file, and the pragma and every byte in its scope are deleted together.
+///
+/// Every other effect either outlives the include (`PoisonIdentifiers`,
+/// `MacroStateStack`) or is unclassified, and stays side-effect bearing.
+bool pragmaIsConsumableIncludeLocalState(
+    const RefoldModel::PragmaDirective &pragma) {
+  switch (classifyPragmaDirective(pragma.text.trim()).effect) {
+  case PragmaStateEffect::IncludeOnce:
+  case PragmaStateEffect::SystemHeader:
+    return true;
+  case PragmaStateEffect::Unknown:
+  case PragmaStateEffect::NoState:
+  case PragmaStateEffect::PoisonIdentifiers:
+  case PragmaStateEffect::MacroStateStack:
+  case PragmaStateEffect::DiagnosticState:
+    return false;
+  }
+  return false;
+}
+
 } // namespace
+
+bool RefoldExpansionFallbackPlanner::RangeHasForeignTokenDiff(
+    const diffutils::Hunk &realizedHunk, uint64_t begin, uint64_t end) const {
+  for (const diffutils::Hunk &cand : abTokHunks_) {
+    if (cand == realizedHunk)
+      continue;
+    if (hunkTouchesAClosedRange(cand, begin, end))
+      return true;
+  }
+  return false;
+}
+
+bool RefoldExpansionFallbackPlanner::GapIsIndexedLexerTrivia(
+    uint64_t begin, uint64_t end) const {
+  return proveSourceGapWithIndexedTrivia(preprocessingStructureIndex_, begin,
+                                         end, ArrayRef<SourceGapProofPiece>())
+      .has_value();
+}
+
+bool RefoldExpansionFallbackPlanner::
+    GapIsIndexedPreservableIncludeClosureTrivia(StringRef tuBytes,
+                                                uint64_t begin,
+                                                uint64_t end) const {
+  return proveSourceGapWithPolicy(
+             preprocessingStructureIndex_, begin, end,
+             ArrayRef<SourceGapProofPiece>(),
+             [&](uint64_t neutralBegin, uint64_t neutralEnd) {
+               return isPreservableIncludeClosureGapTrivia(
+                   tuBytes.slice(neutralBegin, neutralEnd));
+             },
+             [](size_t) {}, sourceGapConditionalDirectiveKindMask())
+      .has_value();
+}
+
+bool RefoldExpansionFallbackPlanner::IncludeSubtreeOwnsOutlivingPragma(
+    const RefoldModel::IncludeItem &root) const {
+  llvm::SmallVector<uint64_t, 16> subtree{root.id};
+  llvm::DenseSet<uint64_t> visited{root.id};
+  for (size_t index = 0; index < subtree.size(); ++index) {
+    for (const RefoldModel::IncludeItem &child : model_.GetIncludes()) {
+      if (child.parent && *child.parent == subtree[index] &&
+          visited.insert(child.id).second) {
+        subtree.push_back(child.id);
+      }
+    }
+  }
+
+  for (const RefoldModel::PragmaDirective &pragma : model_.GetPragmas()) {
+    if (pragmaIsConsumableIncludeLocalState(pragma))
+      continue;
+    if (pragma.ownerIncludeId) {
+      if (visited.count(*pragma.ownerIncludeId))
+        return true;
+      continue;
+    }
+    // Falling back to physical path is deliberately conservative: a header
+    // reached both inside and outside the subtree answers yes, which only
+    // declines a consumption.
+    for (uint64_t includeId : subtree) {
+      const RefoldModel::IncludeItem *include =
+          model_.GetIncludeById(includeId);
+      if (!include)
+        continue;
+      StringRef openedPath;
+      if (include->openedPath && !include->openedPath->empty())
+        openedPath = *include->openedPath;
+      else if (include->resolvedPath)
+        openedPath = *include->resolvedPath;
+      if (!openedPath.empty() &&
+          paths_.PathsEqual(openedPath, pragma.sitePath)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+std::optional<MacroStateDirectiveLineInterval>
+RefoldExpansionFallbackPlanner::MacroDirectiveFullSourceInterval(
+    StringRef tuPath, StringRef tuBytes,
+    const RefoldModel::MacroDirective &directive) const {
+  return macroStateProof_.RecoverMacroStateDirectiveLineInterval(
+      directive, tuPath, tuBytes, std::nullopt);
+}
+
+const RefoldModel::PragmaDirective *
+RefoldExpansionFallbackPlanner::FindTUPragmaOnSourceLine(
+    StringRef tuPath, uint64_t lineBegin, uint64_t lineEnd) const {
+  for (const auto &pragma : model_.GetPragmas()) {
+    if (!paths_.PathsEqual(pragma.sitePath, tuPath))
+      continue;
+    if (lineBegin <= pragma.siteB && pragma.siteE <= lineEnd &&
+        pragma.siteB < pragma.siteE)
+      return &pragma;
+  }
+  return nullptr;
+}
+
+std::optional<std::string>
+RefoldExpansionFallbackPlanner::NonConsumableTUPragmaGapReason(
+    StringRef tuPath, uint64_t gapBegin, uint64_t gapEnd) const {
+  for (const auto &pragma : model_.GetPragmas()) {
+    if (!paths_.PathsEqual(pragma.sitePath, tuPath))
+      continue;
+    if (gapBegin <= pragma.siteB && pragma.siteE <= gapEnd &&
+        pragma.siteB < pragma.siteE) {
+      return llvm::formatv("source gap [{0},{1}) contains non-consumable "
+                           "TU pragma id={2} site=[{3},{4}) text='{5}'",
+                           gapBegin, gapEnd, pragma.id, pragma.siteB,
+                           pragma.siteE,
+                           stringutils::showWsWithClip(pragma.text, 120))
+          .str();
+    }
+  }
+  return std::nullopt;
+}
+
+bool RefoldExpansionFallbackPlanner::PathHasPragmaOnce(
+    StringRef resolvedPath) const {
+  for (const auto &pragma : model_.GetPragmas())
+    if (paths_.PathsEqual(pragma.sitePath, resolvedPath) &&
+        pragmaEstablishesIncludeOnceState(pragma))
+      return true;
+  return false;
+}
 
 std::optional<RefoldExpansionFallbackPlanner::TextEdit>
 RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
@@ -941,30 +1173,6 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
         tuPath, tuBytes.size());
     return std::nullopt;
   }
-
-  // Exact lexical trivia and literal conditional-control preservation are
-  // submitted through the shared source-gap theorem.  The text predicates
-  // below remain narrow semantic policies; none of them keeps a second
-  // preprocessing inventory or byte-cover implementation beside structural
-  // hunk tiling.
-  auto gapIsIndexedLexerTrivia = [&](uint64_t begin, uint64_t end) {
-    return proveSourceGapWithIndexedTrivia(
-               preprocessingStructureIndex_, begin, end,
-               ArrayRef<SourceGapProofPiece>())
-        .has_value();
-  };
-  auto gapIsIndexedPreservableIncludeClosureTrivia =
-      [&](uint64_t begin, uint64_t end) {
-        return proveSourceGapWithPolicy(
-                   preprocessingStructureIndex_, begin, end,
-                   ArrayRef<SourceGapProofPiece>(),
-                   [&](uint64_t neutralBegin, uint64_t neutralEnd) {
-                     return isPreservableIncludeClosureGapTrivia(
-                         tuBytes.slice(neutralBegin, neutralEnd));
-                   },
-                   [](size_t) {}, sourceGapConditionalDirectiveKindMask())
-            .has_value();
-      };
 
   // This source-closure path is the declared TUIncludeClosureEdit proof class:
   // one closed TU source interval may replace top-level include directives plus
@@ -1075,54 +1283,6 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   const bool hunkInsideCover =
       includeCoversContiguous && coverBegin <= h.aStart && h.aEnd <= coverEnd;
 
-  // Return true when `cand` would be absorbed by the closed A-side range
-  // [begin, end]. Token-consuming edits use interval overlap; pure insertions
-  // use the closed insertion-gap test.
-  auto hunkTouchesAClosedRange = [](const diffutils::Hunk &cand, uint64_t begin,
-                                    uint64_t end) -> bool {
-    if (end < begin)
-      end = begin;
-
-    // A-consuming edits touch the extra cover when their token intervals
-    // overlap it. Pure insertions touch the cover when their insertion anchor
-    // lies in the closed gap interval: a widened include materialization would
-    // otherwise absorb the insertion payload without going through the normal
-    // candidate-conflict law.
-    if (cand.aStart < cand.aEnd)
-      return cand.aStart < end && begin < cand.aEnd;
-    return cand.bStart < cand.bEnd && cand.aStart >= begin &&
-           cand.aStart <= end;
-  };
-
-  // Return true when the proposed widened A range would cover any other token
-  // diff hunk besides the hunk currently being realized.
-  auto rangeHasForeignTokenDiff = [&](uint64_t begin, uint64_t end) -> bool {
-    for (const diffutils::Hunk &cand : abTokHunks_) {
-      if (cand == h)
-        continue;
-      if (hunkTouchesAClosedRange(cand, begin, end))
-        return true;
-    }
-    return false;
-  };
-
-  // Return true when the proposed widened source range would overlap an edit
-  // that has already been staged. Zero-width staged edits are treated as closed
-  // insertion points.
-  auto sourceTouchesStagedEdit = [&](uint64_t begin, uint64_t end) -> bool {
-    for (const auto &interval : stagedSourceIntervals) {
-      if (interval.first < interval.second) {
-        if (interval.first < end && begin < interval.second)
-          return true;
-        continue;
-      }
-
-      if (begin <= interval.first && interval.first <= end)
-        return true;
-    }
-    return false;
-  };
-
   // The include-only closure case below materializes exactly the include cover.
   // A mixed TU/include hunk is wider: the edit consumes tokens on both sides of
   // the include cover, so the A materialization range must close over the whole
@@ -1183,110 +1343,6 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     return false;
   };
 
-  // Return true iff the pragma is explicitly classified as source-neutral when
-  // its containing include directive is consumed by a zero-token gap closure.
-  //
-  // Keep this whitelist deliberately small.  Most pragmas model compiler state
-  // rather than token material, and the refold map does not currently carry the
-  // state-region information needed to replay or repair them.  `#pragma once`
-  // is the one admitted spelling because, for an otherwise source-neutral
-  // zero-token include, suppressing future textual inclusion of the same
-  // zero-token file cannot change the PP token stream.
-  // Return whether a pragma establishes include-once state for its file.
-  //
-  // This is the narrow question the `#pragma once` reactivation repair asks:
-  // consuming the include that entered a once-header can make a later skipped
-  // include of the same header live again.  Only `IncludeOnce` answers it, and
-  // widening this predicate would make some other header claim once-state and
-  // corrupt that repair.
-  auto pragmaEstablishesIncludeOnceState =
-      [&](const RefoldModel::PragmaDirective &pragma) -> bool {
-    return classifyPragmaDirective(pragma.text.trim()).effect ==
-           PragmaStateEffect::IncludeOnce;
-  };
-
-  // Return whether a pragma's state dies with the include that carries it.
-  //
-  // A zero-token include inside a replacement envelope is deleted whole, so a
-  // pragma it owns is admissible exactly when nothing outside the include can
-  // observe the state it changed.  Two classified effects qualify, for
-  // different reasons:
-  //
-  //   * `IncludeOnce` suppresses future textual inclusion of a file that
-  //     produced no tokens, which cannot change the PP token stream;
-  //   * `SystemHeader` suppresses diagnostics from that point in the containing
-  //     file, and the pragma and every byte in its scope are deleted together.
-  //
-  // Every other effect either outlives the include (`PoisonIdentifiers`,
-  // `MacroStateStack`) or is unclassified, and stays side-effect bearing.
-  auto pragmaIsConsumableIncludeLocalState =
-      [&](const RefoldModel::PragmaDirective &pragma) -> bool {
-    switch (classifyPragmaDirective(pragma.text.trim()).effect) {
-    case PragmaStateEffect::IncludeOnce:
-    case PragmaStateEffect::SystemHeader:
-      return true;
-    case PragmaStateEffect::Unknown:
-    case PragmaStateEffect::NoState:
-    case PragmaStateEffect::PoisonIdentifiers:
-    case PragmaStateEffect::MacroStateStack:
-    case PragmaStateEffect::DiagnosticState:
-      return false;
-    }
-    return false;
-  };
-
-  // Does an include's subtree own a pragma whose effect outlives the include?
-  //
-  // This is the narrower question the *touched* includes need.  Consuming a
-  // touched include is justified by the closure realizing its expansion, which
-  // accounts for its tokens and, through macro-state liveness repair, for its
-  // macro directives.  It does not account for pragma state that survives the
-  // include's end.  Deleting an include deletes everything it entered, so the
-  // question covers the whole subtree: a pragma two headers down dies exactly
-  // as one in the directly included file does.
-  auto includeSubtreeOwnsOutlivingPragma =
-      [&](const RefoldModel::IncludeItem &root) -> bool {
-    llvm::SmallVector<uint64_t, 16> subtree{root.id};
-    llvm::DenseSet<uint64_t> visited{root.id};
-    for (size_t index = 0; index < subtree.size(); ++index) {
-      for (const RefoldModel::IncludeItem &child : model_.GetIncludes()) {
-        if (child.parent && *child.parent == subtree[index] &&
-            visited.insert(child.id).second) {
-          subtree.push_back(child.id);
-        }
-      }
-    }
-
-    for (const RefoldModel::PragmaDirective &pragma : model_.GetPragmas()) {
-      if (pragmaIsConsumableIncludeLocalState(pragma))
-        continue;
-      if (pragma.ownerIncludeId) {
-        if (visited.count(*pragma.ownerIncludeId))
-          return true;
-        continue;
-      }
-      // Falling back to physical path is deliberately conservative: a header
-      // reached both inside and outside the subtree answers yes, which only
-      // declines a consumption.
-      for (uint64_t includeId : subtree) {
-        const RefoldModel::IncludeItem *include =
-            model_.GetIncludeById(includeId);
-        if (!include)
-          continue;
-        StringRef openedPath;
-        if (include->openedPath && !include->openedPath->empty())
-          openedPath = *include->openedPath;
-        else if (include->resolvedPath)
-          openedPath = *include->resolvedPath;
-        if (!openedPath.empty() &&
-            paths_.PathsEqual(openedPath, pragma.sitePath)) {
-          return true;
-        }
-      }
-    }
-    return false;
-  };
-
   const RecordedIncludeSideEffectResolver recordedIncludeSideEffectResolver(
       model_, paths_, pragmaIsConsumableIncludeLocalState);
 
@@ -1343,71 +1399,16 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   using MacroDirectiveSourceInterval = MacroStateDirectiveLineInterval;
 
-  // Recover the full physical source interval for a TU-spelled macro-state
-  // directive. The shared helper owns the macro-name-anchor reconstruction and
-  // exact-byte validation against the TU source bytes.
-  auto macroDirectiveFullSourceInterval =
-      [&](const RefoldModel::MacroDirective &directive) {
-        return macroStateProof_.RecoverMacroStateDirectiveLineInterval(
-            directive, tuPath, tuBytes, std::nullopt);
-      };
-
   auto macroDirectiveIsConsumableStateGap =
       [&](const RefoldModel::MacroDirective &directive, uint64_t begin,
           uint64_t end) -> std::optional<MacroDirectiveSourceInterval> {
     std::optional<MacroDirectiveSourceInterval> interval =
-        macroDirectiveFullSourceInterval(directive);
+        MacroDirectiveFullSourceInterval(tuPath, tuBytes, directive);
     if (!interval)
       return std::nullopt;
     if (interval->begin < begin || end < interval->end)
       return std::nullopt;
     return interval;
-  };
-
-  // Return a TU-spelled pragma that is wholly contained in the physical source
-  // line being scanned, if the refold map recorded one there.
-  //
-  // Unlike #define/#undef, pragmas are deliberately not treated as consumable
-  // source-neutral artifacts here.  A pragma may mutate compiler state without
-  // producing PP tokens, and the refold map currently records only its spelling
-  // and source anchors, not the state region needed to prove deletion safe.
-  // This helper is therefore diagnostic-only: it lets the rejection log name
-  // the exact pragma that blocked the closure instead of reporting an opaque
-  // non-trivia gap.
-  auto findTUPragmaOnSourceLine =
-      [&](uint64_t lineBegin,
-          uint64_t lineEnd) -> const RefoldModel::PragmaDirective * {
-    for (const auto &pragma : model_.GetPragmas()) {
-      if (!paths_.PathsEqual(pragma.sitePath, tuPath))
-        continue;
-      if (lineBegin <= pragma.siteB && pragma.siteE <= lineEnd &&
-          pragma.siteB < pragma.siteE)
-        return &pragma;
-    }
-    return nullptr;
-  };
-
-  // Return a concrete diagnostic when a TU gap contains a recorded pragma that
-  // blocks closure.  This is checked at the outer rejection site as well as in
-  // the line scanner, because a pragma-only gap has no consumable recorded
-  // pieces; without this fast path the scanner is never entered and the user
-  // only sees a generic "non-trivia gap" rejection.
-  auto nonConsumableTUPragmaGapReason =
-      [&](uint64_t gapBegin, uint64_t gapEnd) -> std::optional<std::string> {
-    for (const auto &pragma : model_.GetPragmas()) {
-      if (!paths_.PathsEqual(pragma.sitePath, tuPath))
-        continue;
-      if (gapBegin <= pragma.siteB && pragma.siteE <= gapEnd &&
-          pragma.siteB < pragma.siteE) {
-        return llvm::formatv("source gap [{0},{1}) contains non-consumable "
-                             "TU pragma id={2} site=[{3},{4}) text='{5}'",
-                             gapBegin, gapEnd, pragma.id, pragma.siteB,
-                             pragma.siteE,
-                             stringutils::showWsWithClip(pragma.text, 120))
-            .str();
-      }
-    }
-    return std::nullopt;
   };
 
   // Return true iff a recorded TU conditional group may be preserved as
@@ -1700,7 +1701,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
             !parseLiteralEmptyConditionalDirectiveLine(
                 tuBytes.slice(scanCursor, lineEnd), conditionalDepth)) {
           if (const RefoldModel::PragmaDirective *pragma =
-                  findTUPragmaOnSourceLine(scanCursor, lineEnd)) {
+                  FindTUPragmaOnSourceLine(tuPath, scanCursor, lineEnd)) {
             REFOLD_LOG_TRACE(
                 "fallback",
                 "TU/include closure rejected: source gap [{0},{1}) contains "
@@ -2216,31 +2217,6 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       mixedPreservedSourceLineDirectiveGapPieces;
   std::optional<SourceLineDirectiveGapResume> mixedSourceLineDirectiveResume;
 
-  auto lineDirectiveStartsAtPrefix = [&](uint64_t pos) -> bool {
-    if (pos >= tuBytes.size())
-      return true;
-    if (stringutils::isBOL(tuBytes, static_cast<size_t>(pos)))
-      return true;
-
-    size_t lineStart = static_cast<size_t>(pos);
-    while (lineStart > 0 && tuBytes[lineStart - 1] != '\n')
-      --lineStart;
-    return stringutils::isIndentOnly(tuBytes, lineStart,
-                                     static_cast<size_t>(pos));
-  };
-
-  auto canStartLineDirectiveWithOptionalLeadingNewline =
-      [&](uint64_t pos) -> bool {
-    if (lineDirectiveStartsAtPrefix(pos))
-      return true;
-
-    // A delete-only closure may need to synthesize a leading newline before the
-    // replacement-local #line directive. Reject the only local case where that
-    // newline would be swallowed as a line splice instead of starting a fresh
-    // preprocessing directive.
-    return pos == 0 || tuBytes[pos - 1] != '\\';
-  };
-
   // Prove a mixed TU/include closure.
   //
   // This handles a single replacement hunk whose A-side tokens are split
@@ -2679,7 +2655,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       // unformed so the realization lattice materializes the include instead,
       // where the directive survives where it was written.
       if (includeIsTouched(inc)) {
-        if (!includeSubtreeOwnsOutlivingPragma(inc))
+        if (!IncludeSubtreeOwnsOutlivingPragma(inc))
           continue;
         REFOLD_LOG_TRACE(
             "fallback",
@@ -2854,8 +2830,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
                                                           gap.end());
             return true;
           }
-          if (gapIsIndexedPreservableIncludeClosureTrivia(gapBegin,
-                                                            gapEnd))
+          if (GapIsIndexedPreservableIncludeClosureTrivia(tuBytes, gapBegin,
+                                                          gapEnd))
             return true;
 
           SmallVector<TUPreservedGapPiece, 4> preservedZeroTokenPieces;
@@ -2921,7 +2897,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
             return true;
 
           if (std::optional<std::string> pragmaReason =
-                  nonConsumableTUPragmaGapReason(gapBegin, gapEnd)) {
+                  NonConsumableTUPragmaGapReason(tuPath, gapBegin, gapEnd)) {
             REFOLD_LOG_TRACE("fallback", "TU/include closure rejected: {0}",
                              *pragmaReason);
           } else {
@@ -2945,7 +2921,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     }
 
     if (lineDirs_.Enabled() && mixedSourceLineDirectiveResume &&
-        !lineDirectiveStartsAtPrefix(sourceEnd)) {
+        !lineDirectiveStartsAtPrefix(tuBytes, sourceEnd)) {
       REFOLD_LOG_TRACE(
           "fallback",
           "TU/include closure rejected: source #line state from consumed "
@@ -2956,7 +2932,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     if (lineDirs_.Enabled() && mixedSourceLineDirectiveResume &&
         h.isDeleteOnly() &&
-        !canStartLineDirectiveWithOptionalLeadingNewline(sourceBegin)) {
+        !canStartLineDirectiveWithOptionalLeadingNewline(tuBytes,
+                                                         sourceBegin)) {
       REFOLD_LOG_TRACE(
           "fallback",
           "TU/include closure rejected: delete-only source #line resume "
@@ -2989,8 +2966,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     // not a hidden multi-region merge: any independent token edit or insertion
     // in the extra cover must be handled by the normal partition/lattice path.
     const bool prefixClean =
-        !rangeHasForeignTokenDiff(materialBeginA, h.aStart);
-    const bool suffixClean = !rangeHasForeignTokenDiff(h.aEnd, materialEndA);
+        !RangeHasForeignTokenDiff(h, materialBeginA, h.aStart);
+    const bool suffixClean = !RangeHasForeignTokenDiff(h, h.aEnd, materialEndA);
     if (!prefixClean || !suffixClean) {
       REFOLD_LOG_TRACE(
           "fallback",
@@ -3002,7 +2979,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       return std::nullopt;
     }
 
-    if (sourceTouchesStagedEdit(sourceBegin, sourceEnd)) {
+    if (sourceTouchesStagedEdit(stagedSourceIntervals, sourceBegin,
+                                sourceEnd)) {
       REFOLD_LOG_TRACE(
           "fallback",
           "TU include-closure rejected: widened source interval [{0},{1}) "
@@ -3055,7 +3033,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
         // Retain the historical policy of consuming whitespace-only gaps, but
         // submit their physical byte coverage to the same exact lexical census
         // used by every other source-gap path.
-        if (!gapIsIndexedLexerTrivia(sourceCursor, inc->siteB)) {
+        if (!GapIsIndexedLexerTrivia(sourceCursor, inc->siteB)) {
           REFOLD_LOG_TRACE(
               "fallback",
               "TU include-closure rejected: whitespace gap before inc#{0} "
@@ -3072,8 +3050,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
               "TU include-closure consuming zero-token source gap before "
               "inc#{0} gap='{1}'",
               inc->id, stringutils::showWsWithClip(gap, 120));
-        } else if (!gapIsIndexedPreservableIncludeClosureTrivia(
-                       sourceCursor, inc->siteB) &&
+        } else if (!GapIsIndexedPreservableIncludeClosureTrivia(
+                       tuBytes, sourceCursor, inc->siteB) &&
                    !gapIsPreservableRecordedConditionalIncludeClosure(
                        sourceCursor, inc->siteB)) {
           REFOLD_LOG_TRACE(
@@ -3215,9 +3193,10 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     // rejected rather than emitting a glued directive.
     auto startPreservedDirectiveLine = [&](std::string &text) -> bool {
       if (text.empty()) {
-        if (lineDirectiveStartsAtPrefix(sourceBegin))
+        if (lineDirectiveStartsAtPrefix(tuBytes, sourceBegin))
           return true;
-        if (!canStartLineDirectiveWithOptionalLeadingNewline(sourceBegin))
+        if (!canStartLineDirectiveWithOptionalLeadingNewline(tuBytes,
+                                                             sourceBegin))
           return false;
         text.push_back('\n');
         return true;
@@ -3407,7 +3386,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     // preprocessing directive rather than gluing `#line` onto the preceding
     // source line.
     if (padded.empty()) {
-      if (!lineDirectiveStartsAtPrefix(sourceBegin))
+      if (!lineDirectiveStartsAtPrefix(tuBytes, sourceBegin))
         padded.push_back('\n');
     } else if (padded.back() != '\n') {
       padded.push_back('\n');
@@ -3571,20 +3550,6 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   // proof class cannot decide whether that source observes the moved header
   // state, so it rejects instead of emitting a refolding that would reactivate
   // the include.
-  // A consumed include only creates the reactivation hazard when the
-  // physical header is known to carry include-local once state.  We use the
-  // recorded pragma table instead of guessing from include emptiness: an empty
-  // later include can have other causes, but a consumable `#pragma once` in the
-  // resolved header gives the exact source-order state transition we must
-  // preserve.
-  auto pathHasPragmaOnce = [&](StringRef resolvedPath) -> bool {
-    for (const auto &pragma : model_.GetPragmas())
-      if (paths_.PathsEqual(pragma.sitePath, resolvedPath) &&
-          pragmaEstablishesIncludeOnceState(pragma))
-        return true;
-    return false;
-  };
-
   // Interpret "consumed" in the final widened source interval, not in the
   // original hunk.  The closure may have already been padded/widened above, and
   // the reactivation proof must reason about the exact bytes that will be
@@ -3601,7 +3566,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   for (const RefoldModel::IncludeItem *inc : touched) {
     if (!inc->resolvedPath || !includeIntervalIsConsumed(*inc))
       continue;
-    if (!pathHasPragmaOnce(*inc->resolvedPath))
+    if (!PathHasPragmaOnce(*inc->resolvedPath))
       continue;
     if (!llvm::any_of(consumedPragmaOncePaths, [&](StringRef path) {
           return paths_.PathsEqual(path, *inc->resolvedPath);
@@ -3693,7 +3658,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       // preserved source between the deleted entering include and the skipped
       // include can observe the header macro state at the old position.
       StringRef gap = tuBytes.slice(closureSourceEnd, next->siteB);
-      if (!gapIsIndexedLexerTrivia(closureSourceEnd, next->siteB)) {
+      if (!GapIsIndexedLexerTrivia(closureSourceEnd, next->siteB)) {
         REFOLD_LOG_TRACE(
             "fallback",
             "TU include-closure rejected: consuming earlier #pragma once "
@@ -3704,7 +3669,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
         return false;
       }
 
-      if (sourceTouchesStagedEdit(sourceBegin, next->siteE)) {
+      if (sourceTouchesStagedEdit(stagedSourceIntervals, sourceBegin,
+                                  next->siteE)) {
         REFOLD_LOG_TRACE(
             "fallback",
             "TU include-closure rejected: extending over reactivated "
