@@ -327,6 +327,34 @@ private:
 /// nullopt; ambiguity, unsupported shapes, and unprovable B envelopes continue
 /// to fail closed through the delegated replay engines rather than introducing a
 /// fallback candidate.
+/// Root facts shared by the higher-order generated-replay theorems.
+///
+/// Every theorem in the probe needs the same four producer facts before it may
+/// judge its own shape: a defined function-like `#define` root, the invocation's
+/// whole-cover A-token range, and that range's B envelope.  Recovering them once
+/// is what lets each theorem state only the gate that is genuinely its own.
+struct HigherOrderReplayRoot {
+  /// Defining `#define` directive for the root invocation.  Never null.
+  const RefoldModel::MacroDirective *rootDefinition = nullptr;
+  /// Whole-cover A-token range for the root invocation.
+  std::pair<uint64_t, uint64_t> cover;
+  /// B-token envelope the whole cover maps onto.
+  std::pair<size_t, size_t> bEnvelope;
+};
+
+/// Which recursive-tuple family candidate a tuple replay attempt should build.
+///
+/// The three tuple-family theorems share their entire root admission and
+/// request construction and differ only in the terminal candidate they ask
+/// `RefoldMacroRecursiveTupleGeneratedReplay` to prove.  Naming that difference
+/// keeps each theorem visible at the ranking site without duplicating the
+/// admission around it.
+enum class TupleFamilyCandidate : uint8_t {
+  Recursive,
+  PasteTuple,
+  ObjectSelectorTuple,
+};
+
 class HigherOrderGeneratedReplayProbe {
 public:
   explicit HigherOrderGeneratedReplayProbe(
@@ -357,27 +385,32 @@ private:
       const diffutils::Hunk &hunk, llvm::StringRef baseInvocationText,
       llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
 
-  std::optional<MacroPatch> TryBuildRecursiveTupleGeneratedCalleeReplay(
+  /// Return the root invocation's defining directive when it is a function-like
+  /// `#define` and the invocation carries the source span every theorem needs,
+  /// or null.  This is the admission step common to all eight theorems.
+  const RefoldModel::MacroDirective *
+  AdmitReplayRootDefinition(
+      const RefoldModel::MacroInvocation &invocation) const;
+
+  /// Return the shared root facts, or nullopt when the root is inadmissible or
+  /// its whole cover has no B envelope.  Generated-leaf replay deliberately does
+  /// not use this: it stays admissible when the cover envelope is unmappable.
+  std::optional<HigherOrderReplayRoot>
+  AdmitReplayRoot(const RefoldModel::MacroInvocation &invocation) const;
+
+  /// Build one recursive-tuple family candidate named by \p candidate.
+  std::optional<MacroPatch> TryBuildRecursiveTupleFamilyReplay(
       const RefoldModel::MacroInvocation &invocation,
       llvm::StringRef baseInvocationText,
-      llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
+      llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges,
+      TupleFamilyCandidate candidate) const;
 
   std::optional<MacroPatch> TryBuildTupleGeneratedCalleeReplay(
       const RefoldModel::MacroInvocation &invocation,
       llvm::StringRef baseInvocationText,
       llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
 
-  std::optional<MacroPatch> TryBuildPasteTupleGeneratedCalleeReplay(
-      const RefoldModel::MacroInvocation &invocation,
-      llvm::StringRef baseInvocationText,
-      llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
-
   std::optional<MacroPatch> TryBuildPasteGeneratedCalleeReplay(
-      const RefoldModel::MacroInvocation &invocation,
-      llvm::StringRef baseInvocationText,
-      llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
-
-  std::optional<MacroPatch> TryBuildObjectSelectorTupleGeneratedCalleeReplay(
       const RefoldModel::MacroInvocation &invocation,
       llvm::StringRef baseInvocationText,
       llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;

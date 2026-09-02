@@ -2304,9 +2304,9 @@ std::optional<MacroPatch> HigherOrderGeneratedReplayProbe::TryBuild(
   // callee and that later tuple elements supply its actuals.  Try these proofs
   // before the ordinary chain solver so wrappers such as `WRAP((LOG, A))` do
   // not collapse the selector to the terminal replacement-list literal `emit`.
-  if (auto objectSelectorTupleGeneratedPatch =
-          TryBuildObjectSelectorTupleGeneratedCalleeReplay(
-              invocation, baseInvocationText, invocationArgRanges))
+  if (auto objectSelectorTupleGeneratedPatch = TryBuildRecursiveTupleFamilyReplay(
+          invocation, baseInvocationText, invocationArgRanges,
+          TupleFamilyCandidate::ObjectSelectorTuple))
     return objectSelectorTupleGeneratedPatch;
 
   if (auto functionSelectorTupleGeneratedPatch =
@@ -2314,17 +2314,18 @@ std::optional<MacroPatch> HigherOrderGeneratedReplayProbe::TryBuild(
               invocation, baseInvocationText, invocationArgRanges))
     return functionSelectorTupleGeneratedPatch;
 
-  if (auto pasteTupleGeneratedPatch = TryBuildPasteTupleGeneratedCalleeReplay(
-          invocation, baseInvocationText, invocationArgRanges))
+  if (auto pasteTupleGeneratedPatch = TryBuildRecursiveTupleFamilyReplay(
+          invocation, baseInvocationText, invocationArgRanges,
+          TupleFamilyCandidate::PasteTuple))
     return pasteTupleGeneratedPatch;
 
   if (auto tupleGeneratedPatch = TryBuildTupleGeneratedCalleeReplay(
           invocation, baseInvocationText, invocationArgRanges))
     return tupleGeneratedPatch;
 
-  if (auto recursiveTupleGeneratedPatch =
-          TryBuildRecursiveTupleGeneratedCalleeReplay(
-              invocation, baseInvocationText, invocationArgRanges))
+  if (auto recursiveTupleGeneratedPatch = TryBuildRecursiveTupleFamilyReplay(
+          invocation, baseInvocationText, invocationArgRanges,
+          TupleFamilyCandidate::Recursive))
     return recursiveTupleGeneratedPatch;
 
   if (auto generatedCalleePatch = TryBuildGeneratedCalleeReplay(
@@ -2352,6 +2353,51 @@ HigherOrderGeneratedReplayProbe::FindRootDefinition(
 }
 
 
+/// Return the root invocation's defining directive when it is a function-like
+/// `#define` and the invocation carries the source span every higher-order
+/// theorem needs.  This is the admission step shared by all eight theorems; it
+/// proves nothing about any individual theorem's own shape.
+const RefoldModel::MacroDirective *
+HigherOrderGeneratedReplayProbe::AdmitReplayRootDefinition(
+    const RefoldModel::MacroInvocation &invocation) const {
+  if (!invocation.definitionDirectiveId || !invocation.invB ||
+      !invocation.invE)
+    return nullptr;
+
+  const RefoldModel::MacroDirective *rootDefinition =
+      FindRootDefinition(invocation);
+  if (!rootDefinition || rootDefinition->subkind != "#define" ||
+      !rootDefinition->functionLike)
+    return nullptr;
+  return rootDefinition;
+}
+
+
+/// Return the root facts every cover-based higher-order theorem requires.
+///
+/// Generated-leaf replay intentionally does not call this: it remains
+/// admissible when the whole cover has no mappable B envelope, so folding it
+/// into this admission would narrow its domain.
+std::optional<HigherOrderReplayRoot>
+HigherOrderGeneratedReplayProbe::AdmitReplayRoot(
+    const RefoldModel::MacroInvocation &invocation) const {
+  const RefoldModel::MacroDirective *rootDefinition =
+      AdmitReplayRootDefinition(invocation);
+  if (!rootDefinition)
+    return std::nullopt;
+
+  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
+  if (!cover || cover->first >= cover->second)
+    return std::nullopt;
+
+  auto bEnv = MapWholeCoverBEnvelope(*cover);
+  if (!bEnv)
+    return std::nullopt;
+
+  return HigherOrderReplayRoot{rootDefinition, *cover, *bEnv};
+}
+
+
 /// Recover the root whole-cover B envelope using the same primary mapping and
 /// boundary-insertion-preserving fallback as the former inline blocks.
 std::optional<std::pair<size_t, size_t>>
@@ -2376,24 +2422,16 @@ std::optional<MacroPatch>
 HigherOrderGeneratedReplayProbe::TryBuildGeneratedCalleeReplay(
     const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
     ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
-  if (!invocation.definitionDirectiveId || !invocation.invB ||
-      !invocation.invE || !invocation.stringifySpans.empty() ||
-      !invocation.pasteSpans.empty())
+  // This theorem's own domain: the root must not itself carry stringify or
+  // paste operations, and must take at least one formal.
+  if (!invocation.stringifySpans.empty() || !invocation.pasteSpans.empty())
     return std::nullopt;
 
-  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
-  if (!cover || cover->first >= cover->second)
+  std::optional<HigherOrderReplayRoot> root = AdmitReplayRoot(invocation);
+  if (!root || root->rootDefinition->defParams.empty())
     return std::nullopt;
 
-  auto bEnv = MapWholeCoverBEnvelope(*cover);
-  if (!bEnv)
-    return std::nullopt;
-
-  const RefoldModel::MacroDirective *rootDefinition =
-      FindRootDefinition(invocation);
-  if (!rootDefinition || rootDefinition->subkind != "#define" ||
-      !rootDefinition->functionLike || rootDefinition->defParams.empty())
-    return std::nullopt;
+  const RefoldModel::MacroDirective *rootDefinition = root->rootDefinition;
 
   SmallVector<GeneratedCalleeSourceSlot, 8> currentActuals;
   currentActuals.reserve(invocationArgRanges.size());
@@ -2431,8 +2469,8 @@ HigherOrderGeneratedReplayProbe::TryBuildGeneratedCalleeReplay(
       baseInvocationText,
       invocationArgRanges,
       *rootDefinition,
-      *cover,
-      *bEnv,
+      root->cover,
+      root->bEnvelope,
       replayPrefixLiterals,
       replaySuffixStack,
       currentDefinition,
@@ -2458,14 +2496,12 @@ HigherOrderGeneratedReplayProbe::TryBuildGeneratedLeafReplay(
     const RefoldModel::MacroInvocation &invocation, const diffutils::Hunk &hunk,
     StringRef baseInvocationText,
     ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
-  if (!invocation.definitionDirectiveId || !invocation.invB ||
-      !invocation.invE)
-    return std::nullopt;
-
+  // Generated-leaf replay deliberately does not require a mappable whole-cover
+  // B envelope, so it admits on the root definition alone.  Its own domain adds
+  // only that the root takes at least one formal.
   const RefoldModel::MacroDirective *rootDefinition =
-      FindRootDefinition(invocation);
-  if (!rootDefinition || rootDefinition->subkind != "#define" ||
-      !rootDefinition->functionLike || rootDefinition->defParams.empty())
+      AdmitReplayRootDefinition(invocation);
+  if (!rootDefinition || rootDefinition->defParams.empty())
     return std::nullopt;
 
   bool hasGeneratedCall = false;
@@ -2576,36 +2612,32 @@ HigherOrderGeneratedReplayProbe::TryBuildGeneratedLeafReplay(
 /// direct tuple-generated proofs have declined, but before generated-leaf /
 /// whole-cover fallback can materialize the edited expansion directly.
 std::optional<MacroPatch>
-HigherOrderGeneratedReplayProbe::TryBuildRecursiveTupleGeneratedCalleeReplay(
+HigherOrderGeneratedReplayProbe::TryBuildRecursiveTupleFamilyReplay(
     const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
-    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
-  if (!invocation.definitionDirectiveId || !invocation.invB ||
-      !invocation.invE)
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges,
+    TupleFamilyCandidate candidate) const {
+  std::optional<HigherOrderReplayRoot> root = AdmitReplayRoot(invocation);
+  if (!root)
     return std::nullopt;
 
-  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
-  if (!cover || cover->first >= cover->second)
-    return std::nullopt;
-
-  auto bEnv = MapWholeCoverBEnvelope(*cover);
-  if (!bEnv)
-    return std::nullopt;
-
-  const RefoldModel::MacroDirective *rootDefinition =
-      FindRootDefinition(invocation);
-  if (!rootDefinition || rootDefinition->subkind != "#define" ||
-      !rootDefinition->functionLike)
-    return std::nullopt;
-
-  RefoldMacroRecursiveTupleGeneratedReplay recursiveReplay(
+  RefoldMacroRecursiveTupleGeneratedReplay tupleReplay(
       RefoldMacroRecursiveTupleGeneratedReplay::Dependencies{
           deps_.model, deps_.sourceMapper, deps_.macroTopology,
           deps_.generatedCalleeReplayEngine, deps_.proofCertifier,
           deps_.lexLang});
-  RecursiveTupleGeneratedReplayRequest recursiveRequest{
-      invocation, *rootDefinition, baseInvocationText, invocationArgRanges,
-      *cover, *bEnv};
-  return recursiveReplay.BuildCandidate(recursiveRequest);
+  RecursiveTupleGeneratedReplayRequest request{
+      invocation, *root->rootDefinition, baseInvocationText,
+      invocationArgRanges, root->cover, root->bEnvelope};
+
+  switch (candidate) {
+  case TupleFamilyCandidate::Recursive:
+    return tupleReplay.BuildCandidate(request);
+  case TupleFamilyCandidate::PasteTuple:
+    return tupleReplay.BuildPasteTupleCandidate(request);
+  case TupleFamilyCandidate::ObjectSelectorTuple:
+    return tupleReplay.BuildObjectSelectorTupleCandidate(request);
+  }
+  llvm_unreachable("unhandled tuple family candidate");
 }
 
 
@@ -2621,27 +2653,13 @@ std::optional<MacroPatch>
 HigherOrderGeneratedReplayProbe::TryBuildPasteGeneratedCalleeReplay(
     const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
     ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
-  if (!invocation.definitionDirectiveId || !invocation.invB ||
-      !invocation.invE)
-    return std::nullopt;
-
-  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
-  if (!cover || cover->first >= cover->second)
-    return std::nullopt;
-
-  auto bEnv = MapWholeCoverBEnvelope(*cover);
-  if (!bEnv)
-    return std::nullopt;
-
-  const RefoldModel::MacroDirective *rootDefinition =
-      FindRootDefinition(invocation);
-  if (!rootDefinition || rootDefinition->subkind != "#define" ||
-      !rootDefinition->functionLike)
+  std::optional<HigherOrderReplayRoot> root = AdmitReplayRoot(invocation);
+  if (!root)
     return std::nullopt;
 
   PasteGeneratedCalleeReplayContext pasteGeneratedContext{
-      invocation, baseInvocationText, invocationArgRanges, *cover, *bEnv,
-      *rootDefinition};
+      invocation,   baseInvocationText,   invocationArgRanges,
+      root->cover,  root->bEnvelope,      *root->rootDefinition};
   return deps_.generatedCalleeReplayEngine
       .BuildPasteGeneratedCalleeReplayCandidate(pasteGeneratedContext);
 }
@@ -2654,120 +2672,22 @@ std::optional<MacroPatch>
 HigherOrderGeneratedReplayProbe::TryBuildFunctionSelectorTupleGeneratedCalleeReplay(
     const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
     ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
-  if (!invocation.definitionDirectiveId || !invocation.invB ||
-      !invocation.invE)
-    return std::nullopt;
-
-  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
-  if (!cover || cover->first >= cover->second)
-    return std::nullopt;
-
-  auto bEnv = MapWholeCoverBEnvelope(*cover);
-  if (!bEnv)
-    return std::nullopt;
-
-  const RefoldModel::MacroDirective *rootDefinition =
-      FindRootDefinition(invocation);
-  if (!rootDefinition || rootDefinition->subkind != "#define" ||
-      !rootDefinition->functionLike)
+  std::optional<HigherOrderReplayRoot> root = AdmitReplayRoot(invocation);
+  if (!root)
     return std::nullopt;
 
   FunctionSelectorTupleGeneratedCalleeReplayContext selectorTupleContext{
-      invocation, baseInvocationText, invocationArgRanges, *cover, *bEnv,
-      *rootDefinition};
+      invocation,   baseInvocationText,   invocationArgRanges,
+      root->cover,  root->bEnvelope,      *root->rootDefinition};
   return deps_.generatedCalleeReplayEngine
       .BuildFunctionSelectorTupleGeneratedCalleeReplayCandidate(
           selectorTupleContext);
-}
-
-/// Try the paste/tuple generated-callee theorem for roots such as `a##b t`.
-///
-/// This probe sits after ordinary generated-callee replay and before the
-/// direct tuple-generated bridge.  It only recognizes a root replacement tape
-/// whose final token is the tuple actual and whose preceding tape contains a
-/// paste expression that can deterministically synthesize the generated callee
-/// token.
-std::optional<MacroPatch>
-HigherOrderGeneratedReplayProbe::TryBuildPasteTupleGeneratedCalleeReplay(
-    const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
-    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
-  if (!invocation.definitionDirectiveId || !invocation.invB ||
-      !invocation.invE)
-    return std::nullopt;
-
-  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
-  if (!cover || cover->first >= cover->second)
-    return std::nullopt;
-
-  auto bEnv = MapWholeCoverBEnvelope(*cover);
-  if (!bEnv)
-    return std::nullopt;
-
-  const RefoldModel::MacroDirective *rootDefinition =
-      FindRootDefinition(invocation);
-  if (!rootDefinition || rootDefinition->subkind != "#define" ||
-      !rootDefinition->functionLike)
-    return std::nullopt;
-
-  RefoldMacroRecursiveTupleGeneratedReplay tupleReplay(
-      RefoldMacroRecursiveTupleGeneratedReplay::Dependencies{
-          deps_.model, deps_.sourceMapper, deps_.macroTopology,
-          deps_.generatedCalleeReplayEngine, deps_.proofCertifier,
-          deps_.lexLang});
-  RecursiveTupleGeneratedReplayRequest tupleRequest{
-      invocation, *rootDefinition, baseInvocationText, invocationArgRanges,
-      *cover, *bEnv};
-  return tupleReplay.BuildPasteTupleCandidate(tupleRequest);
-}
-
-/// Try the object-selector/tuple generated-callee theorem for roots such as
-/// `f t` where `f` is an object-like selector actual.
-///
-/// This probe sits before paste/tuple and ordinary tuple-generated replay.  It
-/// is intentionally limited to the source-level `f t` shape so ordinary
-/// args-only and existing generated-callee proofs keep owning simpler direct
-/// cases.
-std::optional<MacroPatch>
-HigherOrderGeneratedReplayProbe::TryBuildObjectSelectorTupleGeneratedCalleeReplay(
-    const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
-    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
-  if (!invocation.definitionDirectiveId || !invocation.invB ||
-      !invocation.invE)
-    return std::nullopt;
-
-  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
-  if (!cover || cover->first >= cover->second)
-    return std::nullopt;
-
-  auto bEnv = MapWholeCoverBEnvelope(*cover);
-  if (!bEnv)
-    return std::nullopt;
-
-  const RefoldModel::MacroDirective *rootDefinition =
-      FindRootDefinition(invocation);
-  if (!rootDefinition || rootDefinition->subkind != "#define" ||
-      !rootDefinition->functionLike)
-    return std::nullopt;
-
-  RefoldMacroRecursiveTupleGeneratedReplay tupleReplay(
-      RefoldMacroRecursiveTupleGeneratedReplay::Dependencies{
-          deps_.model, deps_.sourceMapper, deps_.macroTopology,
-          deps_.generatedCalleeReplayEngine, deps_.proofCertifier,
-          deps_.lexLang});
-  RecursiveTupleGeneratedReplayRequest tupleRequest{
-      invocation, *rootDefinition, baseInvocationText, invocationArgRanges,
-      *cover, *bEnv};
-  return tupleReplay.BuildObjectSelectorTupleCandidate(tupleRequest);
 }
 
 std::optional<MacroPatch>
 HigherOrderGeneratedReplayProbe::TryBuildTupleGeneratedCalleeReplay(
     const RefoldModel::MacroInvocation &invocation, StringRef baseInvocationText,
     ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
-  if (!invocation.definitionDirectiveId || !invocation.invB ||
-      !invocation.invE)
-    return std::nullopt;
-
   // Do not reject merely because the root invocation reports stringify or paste
   // spans.  The producer records descendant semantic uses on the forwarding root
   // when a tuple element selects a generated callee, for example:
@@ -2788,20 +2708,11 @@ HigherOrderGeneratedReplayProbe::TryBuildTupleGeneratedCalleeReplay(
   // the narrow literal-forwarder shape, so removing this early metadata gate does
   // not admit direct root stringify/paste replay.
 
-  auto cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(invocation);
-  if (!cover || cover->first >= cover->second)
+  std::optional<HigherOrderReplayRoot> root = AdmitReplayRoot(invocation);
+  if (!root || root->rootDefinition->replacementTokens.size() != 2)
     return std::nullopt;
 
-  auto bEnv = MapWholeCoverBEnvelope(*cover);
-  if (!bEnv)
-    return std::nullopt;
-
-  const RefoldModel::MacroDirective *rootDefinition =
-      FindRootDefinition(invocation);
-  if (!rootDefinition || rootDefinition->subkind != "#define" ||
-      !rootDefinition->functionLike ||
-      rootDefinition->replacementTokens.size() != 2)
-    return std::nullopt;
+  const RefoldModel::MacroDirective *rootDefinition = root->rootDefinition;
 
   const auto &rootTok0 = rootDefinition->replacementTokens[0];
   const auto &rootTok1 = rootDefinition->replacementTokens[1];
@@ -2825,8 +2736,8 @@ HigherOrderGeneratedReplayProbe::TryBuildTupleGeneratedCalleeReplay(
       invocation,
       baseInvocationText,
       invocationArgRanges,
-      *cover,
-      *bEnv,
+      root->cover,
+      root->bEnvelope,
       *rootDefinition,
       *forwarderDefinition,
       callerArgIdx,
@@ -2853,8 +2764,8 @@ HigherOrderGeneratedReplayProbe::TryBuildTupleGeneratedCalleeReplay(
         invocation,
         baseInvocationText,
         invocationArgRanges,
-        *cover,
-        *bEnv,
+        root->cover,
+        root->bEnvelope,
         *rootDefinition,
         *forwarderDefinition,
         callerArgIdx,
