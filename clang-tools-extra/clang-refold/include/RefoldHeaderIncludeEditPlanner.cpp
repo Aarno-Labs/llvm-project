@@ -714,7 +714,7 @@ bool RefoldHeaderIncludeEditPlanner::
         SmallVectorImpl<HeaderPreservedGapPiece> &out) const {
   SmallVector<HeaderPreservedGapPiece, 4> pieces;
   for (const auto &directive : model_.GetMacroDirectives()) {
-    if (directive.subkind != "#define" && directive.subkind != "#undef")
+    if (!directive.IsMacroStateDirective())
       continue;
     if (!IncludeOwnsDirective(directive, root))
       continue;
@@ -1673,32 +1673,6 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
   return true;
 }
 
-bool RefoldHeaderIncludeEditPlanner::ActiveHeaderDefinitionAtByte(
-    const RefoldModel::MacroDirective &definition, StringRef macroName,
-    const RefoldModel::IncludeItem &include, StringRef file,
-    StringRef headerText, uint64_t offset) const {
-  // The carry proof applies only to the definition that is active at the
-  // replacement start. Re-emitting a shadowed definition after the B payload
-  // would synthesize a macro state that never existed at this point.
-  const RefoldModel::MacroDirective *active = nullptr;
-  uint64_t activeEnd = 0;
-  for (const auto &candidate : model_.GetMacroDirectives()) {
-    std::optional<MacroStateDirectiveLineInterval> piece =
-        macroStateProof_.RecoverMacroStateDirectiveLineInterval(
-            candidate, file, headerText, std::optional<uint64_t>(include.id));
-    if (!piece || piece->end > offset)
-      continue;
-    if (StringRef(piece->name) != macroName)
-      continue;
-    if (!active || piece->end > activeEnd ||
-        (piece->end == activeEnd && candidate.id > active->id)) {
-      active = &candidate;
-      activeEnd = piece->end;
-    }
-  }
-  return active == &definition && definition.subkind == "#define";
-}
-
 bool RefoldHeaderIncludeEditPlanner::HeaderRangeOverlapsStagedEdit(
     ArrayRef<TextEdit> edits, uint64_t begin, uint64_t end) {
   for (const TextEdit &edit : edits)
@@ -1727,7 +1701,7 @@ void RefoldHeaderIncludeEditPlanner::CollectHeaderMacroStateCarryCandidates(
   // if they stayed there. Those are exactly the definitions whose source-order
   // position must be reconsidered to make the replacement see B's macro state.
   for (const auto &directive : model_.GetMacroDirectives()) {
-    if (directive.subkind != "#define")
+    if (!directive.IsDefine())
       continue;
 
     std::optional<MacroStateDirectiveLineInterval> piece =
@@ -1739,9 +1713,12 @@ void RefoldHeaderIncludeEditPlanner::CollectHeaderMacroStateCarryCandidates(
     if (HeaderRangeOverlapsStagedEdit(state.plan.edits, piece->begin,
                                       piece->end))
       continue;
-    if (!ActiveHeaderDefinitionAtByte(directive, piece->name, state.include,
-                                      state.file, state.headerText,
-                                      *state.startByte))
+    // The carry proof applies only to the definition that is live at the
+    // replacement start.  Re-emitting a shadowed definition after the B
+    // payload would synthesize a macro state that never existed here.
+    if (!macroStateProof_.DefinitionIsLiveAtOwnerByte(
+            directive, piece->name, state.file, state.headerText,
+            std::optional<uint64_t>(state.include.id), *state.startByte))
       continue;
     if (!macroStateProof_.ReplacementObservesMacroStateDirective(
             directive, StringRef(state.replacement),

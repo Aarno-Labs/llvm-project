@@ -42,8 +42,7 @@ namespace refold {
 MacroStateObservationKind
 RefoldMacroStateProof::MacroStateObservationKindForDirective(
     const RefoldModel::MacroDirective &directive, StringRef macroName) const {
-  if (directive.subkind == "#define" && directive.name == macroName &&
-      directive.functionLike) {
+  if (directive.IsFunctionLikeDefine() && directive.name == macroName) {
     return MacroStateObservationKind::FunctionLikeInvocation;
   }
   return MacroStateObservationKind::IdentifierToken;
@@ -75,7 +74,7 @@ RefoldMacroStateProof::FirstMacroStateObservationOffsetInText(
 bool RefoldMacroStateProof::ReplacementObservesMacroStateDirective(
     const RefoldModel::MacroDirective &directive, StringRef replacement,
     bool unprovenObserves) const {
-  if (directive.subkind != "#define" && directive.subkind != "#undef")
+  if (!directive.IsMacroStateDirective())
     return false;
   if (directive.name.empty())
     return unprovenObserves;
@@ -98,7 +97,7 @@ static bool recordedDefinitionsAgreeOnShape(const RefoldModel &model,
        model.GetMacroDirectivesByName(name)) {
     if (!directive)
       return false;
-    if (directive->subkind != "#define")
+    if (!directive->IsDefine())
       continue;
     if (directive->functionLike != functionLike)
       return false;
@@ -151,7 +150,7 @@ static bool macroExpansionCanReachBoundName(const RefoldModel &model,
          model.GetMacroDirectivesByName(name)) {
       if (!directive)
         return true;
-      if (directive->subkind != "#define")
+      if (!directive->IsDefine())
         continue;
 
       for (const RefoldModel::MacroReplacementToken &token :
@@ -233,7 +232,7 @@ bool RefoldMacroStateProof::PayloadObservesMacroStateBindings(
 
 bool RefoldMacroStateProof::MacroDefinitionIsSelfReferentialIdentity(
     const RefoldModel::MacroDirective &directive) const {
-  if (directive.subkind != "#define" || directive.name.empty())
+  if (!directive.IsDefine() || directive.name.empty())
     return false;
   // A function-like macro only expands before `(`, and its replacement list is
   // reached through argument substitution.  The identity argument below is
@@ -317,7 +316,7 @@ std::optional<MacroStateDirectiveLineInterval>
 RefoldMacroStateProof::RecoverMacroStateDirectiveLineInterval(
     const RefoldModel::MacroDirective &directive, StringRef expectedPath,
     StringRef fileBytes, std::optional<uint64_t> requiredOwnerIncludeId) const {
-  if (directive.subkind != "#define" && directive.subkind != "#undef")
+  if (!directive.IsMacroStateDirective())
     return std::nullopt;
   if (directive.name.empty() || directive.text.empty())
     return std::nullopt;
@@ -390,6 +389,29 @@ RefoldMacroStateProof::RecoverMacroStateDirectiveLineInterval(
   return result;
 }
 
+bool RefoldMacroStateProof::DefinitionIsLiveAtOwnerByte(
+    const RefoldModel::MacroDirective &definition, StringRef macroName,
+    StringRef expectedPath, StringRef fileBytes,
+    std::optional<uint64_t> requiredOwnerIncludeId, uint64_t offset) const {
+  const RefoldModel::MacroDirective *active = nullptr;
+  uint64_t activeEnd = 0;
+  for (const auto &candidate : model_.GetMacroDirectives()) {
+    std::optional<MacroStateDirectiveLineInterval> piece =
+        RecoverMacroStateDirectiveLineInterval(
+            candidate, expectedPath, fileBytes, requiredOwnerIncludeId);
+    if (!piece || piece->end > offset)
+      continue;
+    if (StringRef(piece->name) != macroName)
+      continue;
+    if (!active || piece->end > activeEnd ||
+        (piece->end == activeEnd && candidate.id > active->id)) {
+      active = &candidate;
+      activeEnd = piece->end;
+    }
+  }
+  return active == &definition && definition.IsDefine();
+}
+
 /// Recover the source interval occupied by the replacement list of the macro
 /// definition used by `invocation`.
 ///
@@ -407,7 +429,7 @@ RefoldMacroStateProof::RecoverMacroDefinitionReplacementListInterval(
   const RefoldModel::MacroDirective *definition =
       model_.GetMacroDirectiveById(*invocation.definitionDirectiveId);
 
-  if (!definition || definition->subkind != "#define")
+  if (!definition || !definition->IsDefine())
     return std::nullopt;
   if (definition->name != invocation.name)
     return std::nullopt;
@@ -554,31 +576,6 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
             directive, headerPath, bytes, std::optional<uint64_t>(includeId));
       };
 
-  // Reconstruct the active definition for `macroName` immediately before a
-  // header byte offset using only directives owned by this materialized
-  // include. The last matching #define/#undef before the offset wins, with
-  // directive id as a deterministic tie-breaker for equal byte endpoints.
-  auto activeMaterializedHeaderDefinitionAtByte =
-      [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
-          uint64_t offset) {
-        const RefoldModel::MacroDirective *active = nullptr;
-        uint64_t activeEnd = 0;
-        for (const auto &candidate : model_.GetMacroDirectives()) {
-          std::optional<MaterializedHeaderMacroStateDirectivePiece> piece =
-              materializedHeaderMacroStateDirectiveInterval(candidate);
-          if (!piece || piece->end > offset)
-            continue;
-          if (StringRef(piece->name) != macroName)
-            continue;
-          if (!active || piece->end > activeEnd ||
-              (piece->end == activeEnd && candidate.id > active->id)) {
-            active = &candidate;
-            activeEnd = piece->end;
-          }
-        }
-        return active == &definition && definition.subkind == "#define";
-      };
-
   // A macro-state repair interval must not overlap an edit already staged for
   // this materialized header.  Overlap would require composing two proof
   // artifacts, which belongs to the global edit-composition layer rather than
@@ -614,14 +611,15 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
   SmallVector<MaterializedHeaderMacroStateDirectivePiece, 4> candidates;
   bool observedUncarriedDefinition = false;
   for (const auto &directive : model_.GetMacroDirectives()) {
-    if (directive.subkind != "#define")
+    if (!directive.IsDefine())
       continue;
     std::optional<MaterializedHeaderMacroStateDirectivePiece> piece =
         materializedHeaderMacroStateDirectiveInterval(directive);
     if (!piece || piece->end > mp.invStart)
       continue;
-    if (!activeMaterializedHeaderDefinitionAtByte(directive, piece->name,
-                                                  mp.invStart))
+    if (!DefinitionIsLiveAtOwnerByte(directive, piece->name, headerPath, bytes,
+                                     std::optional<uint64_t>(includeId),
+                                     mp.invStart))
       continue;
     if (!ReplacementObservesMacroStateDirective(directive,
                                                 StringRef(mp.replacement),

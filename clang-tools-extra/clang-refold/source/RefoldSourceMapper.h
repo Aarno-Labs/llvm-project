@@ -262,18 +262,16 @@ public:
   /// trimmed out because they are not part of the A range's image and must be
   /// discharged by their own insertion owner.  Zero-width ranges remain valid
   /// insertion anchors.
-  std::pair<size_t, size_t>
-  MapAByteRangeToBTokenEnvelope(size_t aByteBegin, size_t aByteEnd) const;
-
-  /// Map an A-byte range to B tokens while preserving boundary insertions.
   ///
-  /// This variant intentionally keeps B-side insertions that occur exactly at
-  /// the projected A-range boundaries.  Callers use it only when the boundary
-  /// inserted tokens belong to the range being materialized rather than to
-  /// surrounding untouched text.
+  /// \p preserveBoundaryInsertions suppresses that trim, keeping B-side
+  /// insertions that occur exactly at the projected A-range boundaries.  Only a
+  /// caller for which the boundary-inserted tokens belong to the range being
+  /// materialized -- rather than to the surrounding untouched text -- may pass
+  /// true; for everyone else the trim is what prevents the same tokens being
+  /// emitted twice.
   std::pair<size_t, size_t>
-  MapAByteRangeToBTokenEnvelopePreserveBoundaryInsertions(
-      size_t aByteBegin, size_t aByteEnd) const;
+  MapAByteRangeToBTokenEnvelope(size_t aByteBegin, size_t aByteEnd,
+                                bool preserveBoundaryInsertions = false) const;
 
   /// Map a producer-recorded PP argument span to its B-token envelope.
   ///
@@ -282,7 +280,7 @@ public:
   /// closed rather than silently downgrading to a consumer-side approximation.
   /// Non-strict runs may approximate from the A-token offset table and then use
   /// the ordinary A-byte-to-B-token envelope mapper.
-  std::optional<std::pair<size_t, size_t>>
+  ///
   /// \p preserveBoundaryInsertions keeps B-side pure insertions anchored
   /// exactly at the span's boundaries instead of trimming them away.  Only a
   /// caller that is the sole surface able to materialize such an insertion may
@@ -292,7 +290,7 @@ public:
   /// insertions by another route -- tuple element bindings, for one -- must
   /// keep the default, because for them the trim is what prevents the same
   /// tokens being emitted twice.
-  MapAToBTokenEnvelopeByPPArgSpan(
+  std::optional<std::pair<size_t, size_t>> MapAToBTokenEnvelopeByPPArgSpan(
       const RefoldModel::PPArgSpan &sp,
       bool preserveBoundaryInsertions = false) const;
 
@@ -349,17 +347,6 @@ public:
   /// projected range.
   std::optional<std::pair<size_t, size_t>>
   MapATokRangeToBTokenEnvelopeByTokenDiff(uint64_t beginTok,
-                                          uint64_t endTok) const;
-
-  /// Map a whole-cover A-token replacement interval to its B-token envelope.
-  ///
-  /// Whole-cover mapping intentionally preserves pure-insertion payloads
-  /// anchored exactly at the A-range boundaries.  Whole-cover macro replacement
-  /// wants the full B-side image of the cover; later claim clipping is
-  /// responsible for preventing duplicate emission of standalone boundary
-  /// insertions.
-  std::optional<std::pair<size_t, size_t>>
-  MapATokRangeAToBTokenEnvelopeWholeCover(uint64_t beginTok,
                                           uint64_t endTok) const;
 
   /// Project one exact A-token boundary to lower/upper B-token boundaries.

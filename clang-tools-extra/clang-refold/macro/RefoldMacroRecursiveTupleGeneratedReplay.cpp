@@ -96,7 +96,7 @@ public:
         model.GetMacroDirectives();
     definitionsById_.reserve(directives.size());
     for (const RefoldModel::MacroDirective &directive : directives) {
-      if (directive.subkind != "#define")
+      if (!directive.IsDefine())
         continue;
       auto inserted =
           definitionsById_.insert(std::make_pair(directive.id, &directive));
@@ -2883,8 +2883,7 @@ RefoldMacroRecursiveTupleGeneratedReplay::BuildPasteTupleCandidate(
       !rootInvocation.pasteSpans.empty())
     return std::nullopt;
 
-  if (request.rootDefinition.subkind != "#define" ||
-      !request.rootDefinition.functionLike ||
+  if (!request.rootDefinition.IsFunctionLikeDefine() ||
       request.rootDefinition.replacementTokens.size() < 4)
     return std::nullopt;
 
@@ -2932,8 +2931,7 @@ RefoldMacroRecursiveTupleGeneratedReplay::BuildObjectSelectorTupleCandidate(
       !rootInvocation.pasteSpans.empty())
     return std::nullopt;
 
-  if (request.rootDefinition.subkind != "#define" ||
-      !request.rootDefinition.functionLike ||
+  if (!request.rootDefinition.IsFunctionLikeDefine() ||
       request.rootDefinition.replacementTokens.size() != 2)
     return std::nullopt;
 

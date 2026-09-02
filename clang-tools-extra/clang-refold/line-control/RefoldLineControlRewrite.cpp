@@ -1341,7 +1341,7 @@ std::optional<std::string> simpleLineControlMacroReplacementText(
 
   const RefoldModel::MacroDirective *definition =
       model.GetMacroDirectiveById(*macro.definitionDirectiveId);
-  if (!definition || definition->subkind != "#define")
+  if (!definition || !definition->IsDefine())
     return std::nullopt;
 
   StringRef text = definition->text;

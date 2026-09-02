@@ -795,30 +795,6 @@ bool RefoldMacroReplayStabilityValidator::
         directive, *m.invFile, *headerBytes, m.ownerIncludeId);
   };
 
-  // Determine whether `definition` is the active macro definition for
-  // `macroName` immediately before the preserved callsite.  A later #undef
-  // or #define for the same name cancels this definition for replay
-  // stability purposes.
-  auto activeDefinitionAtPatch =
-      [&](const RefoldModel::MacroDirective &definition, StringRef macroName) {
-        const RefoldModel::MacroDirective *active = nullptr;
-        uint64_t activeEnd = 0;
-        for (const auto &candidate : deps_.model.GetMacroDirectives()) {
-          std::optional<HeaderDirectivePiece> piece =
-              directiveInterval(candidate);
-          if (!piece || piece->end > patch.invRange.begin)
-            continue;
-          if (StringRef(piece->name) != macroName)
-            continue;
-          if (!active || piece->end > activeEnd ||
-              (piece->end == activeEnd && candidate.id > active->id)) {
-            active = &candidate;
-            activeEnd = piece->end;
-          }
-        }
-        return active == &definition && definition.subkind == "#define";
-      };
-
   // If any active header-owned definition would be observed by the
   // replacement, this structure-preserving candidate is inadmissible.  It
   // is not enough that the rewritten text is token-equivalent somewhere;
@@ -828,7 +804,12 @@ bool RefoldMacroReplayStabilityValidator::
     std::optional<HeaderDirectivePiece> piece = directiveInterval(directive);
     if (!piece || piece->end > patch.invRange.begin)
       continue;
-    if (!activeDefinitionAtPatch(directive, piece->name))
+    // A recovered interval means the header bytes were read, so the shared
+    // liveness proof can re-read them from the memoized storage.  A later
+    // `#undef` or `#define` for the same name cancels this definition.
+    if (!deps_.macroStateProof.DefinitionIsLiveAtOwnerByte(
+            directive, piece->name, *m.invFile, *getHeaderBytes(),
+            m.ownerIncludeId, patch.invRange.begin))
       continue;
     if (deps_.macroStateProof
             .FirstMacroStateObservationOffsetInText(directive, piece->name,

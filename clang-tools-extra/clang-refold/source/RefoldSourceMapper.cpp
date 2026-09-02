@@ -561,15 +561,17 @@ size_t RefoldSourceMapper::BTokIndexCeil(size_t bByte) const {
   return lo;
 }
 
-std::pair<size_t, size_t>
-RefoldSourceMapper::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
-                                                  size_t aByteEnd) const {
+std::pair<size_t, size_t> RefoldSourceMapper::MapAByteRangeToBTokenEnvelope(
+    size_t aByteBegin, size_t aByteEnd, bool preserveBoundaryInsertions) const {
   // Normalize malformed ranges to an empty A-byte interval. Callers may pass
   // zero-width ranges for insertion anchors, so do not reject them here.
   if (aByteEnd < aByteBegin)
     aByteEnd = aByteBegin;
 
-  const bool nonEmpty = (aByteEnd > aByteBegin);
+  // Boundary insertions are trimmed only for a non-empty A range, and only
+  // when the caller has not claimed them as part of the range's own image.
+  const bool trimBoundaryInsertions =
+      (aByteEnd > aByteBegin) && !preserveBoundaryInsertions;
 
   if (inTraceMode()) {
     // Diagnostic aid: boundary pure insertions are the subtle case for envelope
@@ -577,7 +579,7 @@ RefoldSourceMapper::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
     // boundary is not part of the A range's image, but lower/upper byte
     // projection can otherwise make it look adjacent enough to be included.
     auto tracePureInsAt = [&](size_t aByte, llvm::StringRef which) {
-      if (!nonEmpty || !abByteHunks_ || abByteHunks_->empty())
+      if (!trimBoundaryInsertions || !abByteHunks_ || abByteHunks_->empty())
         return;
 
       const uint64_t val = static_cast<uint64_t>(aByte);
@@ -615,7 +617,7 @@ RefoldSourceMapper::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
   // For non-empty A ranges, remove pure insertions anchored exactly at the
   // range boundaries from the projected B envelope. This is semantic behavior,
   // not trace-only logging.
-  if (nonEmpty && abByteHunks_ && !abByteHunks_->empty()) {
+  if (trimBoundaryInsertions && abByteHunks_ && !abByteHunks_->empty()) {
     auto trimBegin = [&]() {
       const uint64_t key = static_cast<uint64_t>(aByteBegin);
       auto it = std::lower_bound(
@@ -696,35 +698,6 @@ RefoldSourceMapper::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
   return {bTokBegin, bTokEnd};
 }
 
-std::pair<size_t, size_t>
-RefoldSourceMapper::MapAByteRangeToBTokenEnvelopePreserveBoundaryInsertions(
-    size_t aByteBegin, size_t aByteEnd) const {
-  // Normalize malformed ranges to an empty A-byte interval. Unlike the default
-  // mapper, this variant intentionally keeps B-side insertions that project to
-  // the A-range boundaries.
-  if (aByteEnd < aByteBegin)
-    aByteEnd = aByteBegin;
-
-  // Project the A-byte range into B-byte space using the normal lower/upper
-  // boundary semantics, but do not trim pure insertions anchored at either
-  // boundary.
-  size_t bByteBegin = MapAByteToBByteLowerBound(aByteBegin);
-  size_t bByteEnd = MapAByteToBByteUpperBound(aByteEnd);
-
-  if (bByteEnd < bByteBegin)
-    bByteEnd = bByteBegin;
-  if (bByteEnd > bSource_.size())
-    bByteEnd = bSource_.size();
-
-  // Convert the B-byte envelope into an exclusive B-token range.
-  size_t bTokBegin = BTokIndexFloor(bByteBegin);
-  size_t bTokEnd = BTokIndexCeil(bByteEnd);
-  if (bTokEnd < bTokBegin)
-    bTokEnd = bTokBegin;
-
-  return {bTokBegin, bTokEnd};
-}
-
 std::optional<std::pair<size_t, size_t>>
 RefoldSourceMapper::MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
     uint64_t beginTok, uint64_t endTok) const {
@@ -748,8 +721,8 @@ RefoldSourceMapper::MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
 
   const size_t aByteBegin = aTokOff_[static_cast<size_t>(beginTok)];
   const size_t aByteEnd = aTokOff_[idxEnd];
-  return MapAByteRangeToBTokenEnvelopePreserveBoundaryInsertions(aByteBegin,
-                                                                 aByteEnd);
+  return MapAByteRangeToBTokenEnvelope(aByteBegin, aByteEnd,
+                                       /*preserveBoundaryInsertions=*/true);
 }
 
 std::optional<std::pair<size_t, size_t>>
@@ -894,9 +867,7 @@ RefoldSourceMapper::MapAToBTokenEnvelopeByPPArgSpan(
     size_t pp0 = static_cast<size_t>(*sp.ppByteBegin);
     size_t pp1 = static_cast<size_t>(*sp.ppByteEnd);
     auto env =
-        preserveBoundaryInsertions
-            ? MapAByteRangeToBTokenEnvelopePreserveBoundaryInsertions(pp0, pp1)
-            : MapAByteRangeToBTokenEnvelope(pp0, pp1);
+        MapAByteRangeToBTokenEnvelope(pp0, pp1, preserveBoundaryInsertions);
     REFOLD_LOG_TRACE("byte/env",
                      "PPArgSpan['{0}' arg={1} Aidx={2} PPbytes=[{3},{4})] "
                      "preserveBoundaryInsertions={5} -> Btok=[{6},{7})",
@@ -1157,51 +1128,6 @@ RefoldSourceMapper::MapATokRangeAToBTokenEnvelope(uint64_t beginTok,
   }
 
   return env;
-}
-
-std::optional<std::pair<size_t, size_t>>
-RefoldSourceMapper::MapATokRangeAToBTokenEnvelopeWholeCover(
-    uint64_t beginTok, uint64_t endTok) const {
-  const uint64_t nA = static_cast<uint64_t>(aToks_.size());
-
-  if (nA == 0 || aTokOff_.empty())
-    return std::nullopt;
-
-  // Normalize to a non-empty A-token cover. Whole-cover mapping is for
-  // materializing an existing A token interval, not for representing an
-  // insertion point.
-  beginTok = std::clamp(beginTok, static_cast<uint64_t>(0), nA);
-  endTok = std::clamp(endTok, beginTok, nA);
-  if (endTok <= beginTok)
-    return std::nullopt;
-
-  // `aTokOff_` must provide the exclusive byte boundary for `endTok`, including
-  // the final sentinel when the cover reaches the end of A.
-  const size_t idxEnd = static_cast<size_t>(endTok);
-  if (idxEnd >= aTokOff_.size())
-    return std::nullopt;
-
-  const size_t aByteBegin = aTokOff_[static_cast<size_t>(beginTok)];
-  const size_t aByteEnd = aTokOff_[idxEnd];
-
-  // Whole-cover envelopes intentionally use raw lower/upper byte projections
-  // and do not trim boundary insertions. The goal is to materialize the full B
-  // envelope corresponding to the covered A range.
-  size_t bByteBegin = MapAByteToBByteLowerBound(aByteBegin);
-  size_t bByteEnd = MapAByteToBByteUpperBound(aByteEnd);
-
-  if (bByteEnd < bByteBegin)
-    bByteEnd = bByteBegin;
-  if (bByteEnd > bSource_.size())
-    bByteEnd = bSource_.size();
-
-  // Convert the projected B-byte envelope into an exclusive B-token range.
-  size_t bTokBegin = BTokIndexFloor(bByteBegin);
-  size_t bTokEnd = BTokIndexCeil(bByteEnd);
-  if (bTokEnd < bTokBegin)
-    bTokEnd = bTokBegin;
-
-  return std::make_pair(bTokBegin, bTokEnd);
 }
 
 std::optional<std::pair<size_t, size_t>>

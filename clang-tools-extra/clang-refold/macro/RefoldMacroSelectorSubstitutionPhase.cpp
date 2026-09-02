@@ -132,8 +132,7 @@ static void traceDirectCalleeSearchSummary(
 static std::optional<ProducerFunctionMacroDefinition>
 producerFunctionDefinitionFromDirective(
     const RefoldModel::MacroDirective &directive) {
-  if (directive.subkind != "#define" || directive.name.empty() ||
-      !directive.functionLike)
+  if (!directive.IsFunctionLikeDefine() || directive.name.empty())
     return std::nullopt;
 
   ProducerFunctionMacroDefinition definition;
@@ -153,12 +152,12 @@ activeFunctionDefinitionBefore(const RefoldModel &model, uint64_t beforeItemId,
        model.GetMacroDirectivesByName(name)) {
     if (directive->id >= beforeItemId)
       continue;
-    if (directive->subkind != "#define" && directive->subkind != "#undef")
+    if (!directive->IsMacroStateDirective())
       continue;
     if (!active || directive->id > active->id)
       active = directive;
   }
-  if (!active || active->subkind != "#define")
+  if (!active || !active->IsDefine())
     return std::nullopt;
   return producerFunctionDefinitionFromDirective(*active);
 }

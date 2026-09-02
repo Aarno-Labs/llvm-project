@@ -567,7 +567,7 @@ bool RefoldIncludeMaterializationScheduler::
     DefinitionIsSuppliedByImmediateIncluder(
         const RefoldModel::IncludeItem &include,
         const RefoldModel::MacroDirective &definition) const {
-  if (definition.subkind != "#define")
+  if (!definition.IsDefine())
     return false;
   if (!pathIdentity_.PathsEqual(definition.sitePath, include.sitePath))
     return false;

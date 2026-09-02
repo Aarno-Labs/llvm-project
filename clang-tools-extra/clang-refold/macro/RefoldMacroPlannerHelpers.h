@@ -351,7 +351,7 @@ resolveFunctionLikeMacroThroughObjectAliases(const RefoldModel &model,
     const RefoldModel::MacroDirective *alias = nullptr;
     for (const RefoldModel::MacroDirective *directive :
          model.GetMacroDirectivesByName(current)) {
-      if (directive->subkind != "#define")
+      if (!directive->IsDefine())
         continue;
       if (directive->functionLike) {
         if (functionLike)
@@ -389,7 +389,7 @@ inline bool isObjectLikeSingleTokenAliasName(const RefoldModel &model,
                                              llvm::StringRef name) {
   for (const RefoldModel::MacroDirective *directive :
        model.GetMacroDirectivesByName(name)) {
-    if (directive->subkind != "#define" || directive->functionLike)
+    if (!directive->IsObjectLikeDefine())
       continue;
     if (directive->replacementTokens.size() == 1 &&
         directive->replacementTokens[0].kind ==

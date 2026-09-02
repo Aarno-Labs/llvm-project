@@ -590,8 +590,8 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
 
   const RefoldModel::MacroDirective *definition =
       getDefinitionDirectiveForInvocation(deps_.model, m);
-  if (!definition || definition->subkind != "#define" ||
-      !definition->functionLike || definition->name != m.name ||
+  if (!definition || !definition->IsFunctionLikeDefine() ||
+      definition->name != m.name ||
       definition->defParams.size() != m.defParams.size() ||
       definition->replacementTokens.empty() || !m.cover.IsValid() ||
       !m.stringifySpans.empty() || !m.pasteSpans.empty())

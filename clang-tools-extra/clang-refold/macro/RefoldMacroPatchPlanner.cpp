@@ -281,7 +281,7 @@ const RefoldModel::MacroDirective *findDefinitionDirectiveById(
     const RefoldModel &model, uint64_t directiveId) {
   const RefoldModel::MacroDirective *directive =
       model.GetMacroDirectiveById(directiveId);
-  if (!directive || directive->subkind != "#define")
+  if (!directive || !directive->IsDefine())
     return nullptr;
   return directive;
 }

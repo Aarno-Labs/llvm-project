@@ -109,7 +109,7 @@ makeOriginalDefinitionReplayedStandardArgSpanRepair(
 bool isDirectSelectorTupleForwarder(
     const RefoldModel::MacroDirective &definition, uint32_t &selectorArgIdx,
     uint32_t &tupleArgIdx) {
-  if (definition.subkind != "#define" || !definition.functionLike ||
+  if (!definition.IsFunctionLikeDefine() ||
       definition.replacementTokens.size() != 2)
     return false;
 
@@ -253,7 +253,7 @@ std::optional<InvocationRewriteWithRange> buildInvocationRewriteDroppingFinalArg
 /// call-site actual text.
 std::optional<DirectVaOptPasteTokenShape>
 matchDirectVaOptPasteTokenShape(const RefoldModel::MacroDirective &definition) {
-  if (definition.subkind != "#define" || !definition.functionLike ||
+  if (!definition.IsFunctionLikeDefine() ||
       definition.replacementTokens.size() != 6)
     return std::nullopt;
 
@@ -459,7 +459,7 @@ struct DirectVaOptStringifyDeactivationShape {
 std::optional<DirectVaOptStringifyDeactivationShape>
 matchDirectVaOptStringifyDeactivationShape(
     const RefoldModel::MacroDirective &definition) {
-  if (definition.subkind != "#define" || !definition.functionLike ||
+  if (!definition.IsFunctionLikeDefine() ||
       definition.replacementTokens.size() != 7)
     return std::nullopt;
 
@@ -649,8 +649,8 @@ std::optional<GeneratedVaOptStringifyPayloadActivationShape>
 matchGeneratedVaOptStringifyPayloadActivationShape(
     const RefoldModel::MacroDirective &rootDefinition,
     const RefoldModel::MacroDirective &calleeDefinition) {
-  if (rootDefinition.subkind != "#define" || !rootDefinition.functionLike ||
-      calleeDefinition.subkind != "#define" || !calleeDefinition.functionLike ||
+  if (!rootDefinition.IsFunctionLikeDefine() ||
+      !calleeDefinition.IsFunctionLikeDefine() ||
       rootDefinition.replacementTokens.size() != 4 ||
       calleeDefinition.replacementTokens.size() != 6 ||
       rootDefinition.defParams.size() < 2 ||
@@ -989,8 +989,8 @@ DefinitionReplayedStandardArgSpanRepair getDefinitionReplayedStandardArgSpans(
   // per replacement-list parameter reference.
   const RefoldModel::MacroDirective *definition =
       getDefinitionDirectiveForInvocation(model, m);
-  if (!definition || definition->subkind != "#define" ||
-      !definition->functionLike || definition->name != m.name ||
+  if (!definition || !definition->IsFunctionLikeDefine() ||
+      definition->name != m.name ||
       definition->defParams.size() != m.defParams.size() || out.empty() ||
       !m.stringifySpans.empty() || !m.pasteSpans.empty() ||
       !m.cover.IsValid() || m.cover.end > aToks.size())

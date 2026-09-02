@@ -635,7 +635,7 @@ private:
     // remain side-effect-bearing structure that this closure must not erase.
     for (const auto &directive : model_.GetMacroDirectives()) {
       if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id &&
-          directive.subkind != "#define" && directive.subkind != "#undef") {
+          !directive.IsMacroStateDirective()) {
         return finish(Rejected(wantReason, [&] {
           return llvm::formatv("include id={0} path='{1}' owns "
                                "non-consumable macro directive id={2} "
@@ -2059,7 +2059,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     // before, costing every directive in the translation unit to avoid
     // dropping this one.
     for (const auto &directive : model_.GetMacroDirectives()) {
-      if (directive.subkind != "#define" && directive.subkind != "#undef")
+      if (!directive.IsMacroStateDirective())
         continue;
       if (!paths_.PathsEqual(directive.sitePath, tuPath))
         continue;

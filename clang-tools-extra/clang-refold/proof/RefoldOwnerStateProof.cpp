@@ -849,9 +849,9 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
       [&](const RefoldModel::MacroDirective &directive) -> MacroStateIdentity {
     MacroStateIdentity identity;
     identity.macroName = directive.name.str();
-    if (directive.subkind == "#define")
+    if (directive.IsDefine())
       identity.definitionDirectiveId = directive.id;
-    else if (directive.subkind == "#undef")
+    else if (directive.IsUndef())
       identity.undefDirectiveId = directive.id;
     identity.functionLike = directive.functionLike;
     identity.arity = static_cast<uint32_t>(directive.defParams.size());
@@ -1208,12 +1208,12 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
   auto recordMacroDirective =
       [&](const RefoldModel::MacroDirective &directive) {
         const MacroStateIdentity identity = identityFromDirective(directive);
-        if (directive.subkind == "#define") {
+        if (directive.IsDefine()) {
           auditDeltaFact(DirectStateCheckKind::MacroDefinitionDirective,
                          OwnerStateComponent::MacroState,
                          "#define directive state fact");
           facts.AddMacroDefinition(identity);
-        } else if (directive.subkind == "#undef") {
+        } else if (directive.IsUndef()) {
           auditDeltaFact(DirectStateCheckKind::MacroUndefDirective,
                          OwnerStateComponent::MacroState,
                          "#undef directive state fact");
@@ -1861,11 +1861,9 @@ OwnerStateGraph RefoldOwnerStateProof::BuildOwnerStateGraph() const {
     // macro definitions seed the initial environment before source processing
     // and are deliberately skipped above; they cannot be suffix observers after
     // a source edit boundary.
-    addNode(directive.subkind == "#define"
-                ? OwnerStateGraphNodeKind::MacroDefineEvent
-            : directive.subkind == "#undef"
-                ? OwnerStateGraphNodeKind::MacroUndefEvent
-                : OwnerStateGraphNodeKind::Unknown,
+    addNode(directive.IsDefine()  ? OwnerStateGraphNodeKind::MacroDefineEvent
+            : directive.IsUndef() ? OwnerStateGraphNodeKind::MacroUndefEvent
+                                  : OwnerStateGraphNodeKind::Unknown,
             Owner::MacroDirective(directive.id, condArmId),
             OwnerSourceRange::From(directive.sitePath, directive.siteB,
                                    directive.siteE, directive.ownerIncludeId),

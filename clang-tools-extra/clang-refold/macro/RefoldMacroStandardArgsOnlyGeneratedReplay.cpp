@@ -879,8 +879,7 @@ public:
 
     const RefoldModel::MacroDirective *rootDefinition =
         deps_.model.GetMacroDirectiveById(*invocation_.definitionDirectiveId);
-    if (!rootDefinition || rootDefinition->subkind != "#define" ||
-        !rootDefinition->functionLike)
+    if (!rootDefinition || !rootDefinition->IsFunctionLikeDefine())
       return false;
 
     // This fallback proves the common tuple-wrapper shape directly from the
@@ -1531,8 +1530,7 @@ public:
 
     const RefoldModel::MacroDirective *childDefinition =
         deps_.model.GetMacroDirectiveById(*tupleChild->definitionDirectiveId);
-    if (!childDefinition || childDefinition->subkind != "#define" ||
-        !childDefinition->functionLike)
+    if (!childDefinition || !childDefinition->IsFunctionLikeDefine())
       return true;
 
     // First replay the child replacement list itself.  Some tuple forwarders do
@@ -1919,7 +1917,7 @@ private:
     FunctionLikeCalleeResolution result;
     for (const RefoldModel::MacroDirective *directive :
          deps_.model.GetMacroDirectivesByName(calleeName)) {
-      if (directive->subkind == "#define" && directive->functionLike) {
+      if (directive->IsFunctionLikeDefine()) {
         if (result.definition) {
           result.ambiguous = true;
           result.definition = nullptr;
@@ -2343,8 +2341,7 @@ HigherOrderGeneratedReplayProbe::AdmitReplayRootDefinition(
 
   const RefoldModel::MacroDirective *rootDefinition =
       FindRootDefinition(invocation);
-  if (!rootDefinition || rootDefinition->subkind != "#define" ||
-      !rootDefinition->functionLike)
+  if (!rootDefinition || !rootDefinition->IsFunctionLikeDefine())
     return nullptr;
   return rootDefinition;
 }

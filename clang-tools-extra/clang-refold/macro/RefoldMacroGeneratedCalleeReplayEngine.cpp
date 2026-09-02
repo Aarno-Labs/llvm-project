@@ -2961,7 +2961,7 @@ struct ObjectSelectorTupleGeneratedReplayCandidate {
 /// spellings for this theorem.
 bool isSingleTokenObjectSelectorAlias(
     const RefoldModel::MacroDirective &directive) {
-  return directive.subkind == "#define" && !directive.functionLike &&
+  return directive.IsObjectLikeDefine() &&
          directive.replacementTokens.size() == 1 &&
          directive.replacementTokens[0].kind ==
              RefoldModel::MacroReplacementTokenKind::Literal &&
@@ -4505,8 +4505,7 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
   std::optional<PasteGeneratedReplayCandidate> uniqueCandidate;
   for (const RefoldModel::MacroDirective &candidateDefinition :
        deps_.model.GetMacroDirectives()) {
-    if (candidateDefinition.subkind != "#define" ||
-        !candidateDefinition.functionLike ||
+    if (!candidateDefinition.IsFunctionLikeDefine() ||
         !macroDefinitionAcceptsActualCount(candidateDefinition,
                                            oldGeneratedActuals.size()))
       continue;
@@ -4743,8 +4742,7 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
   std::optional<PasteTupleGeneratedReplayCandidate> uniqueCandidate;
   for (const RefoldModel::MacroDirective &candidateDefinition :
        deps_.model.GetMacroDirectives()) {
-    if (candidateDefinition.subkind != "#define" ||
-        !candidateDefinition.functionLike ||
+    if (!candidateDefinition.IsFunctionLikeDefine() ||
         candidateDefinition.defParams.size() != oldTupleActuals.size() ||
         !macroDefinitionAcceptsActualCount(candidateDefinition,
                                            oldTupleActuals.size()))
@@ -4896,8 +4894,7 @@ bool parsePastedSelectorArgumentTupleRootShape(
     PastedSelectorArgumentTupleShape &shape) {
   ArrayRef<RefoldModel::MacroReplacementToken> toks(
       definition.replacementTokens.data(), definition.replacementTokens.size());
-  if (definition.subkind != "#define" || !definition.functionLike ||
-      toks.size() != 5)
+  if (!definition.IsFunctionLikeDefine() || toks.size() != 5)
     return false;
 
   const auto &selectorTok = toks[0];
@@ -4937,8 +4934,7 @@ bool parsePastedSelectorArgumentTupleRootShape(
 std::optional<std::string> replaySelectorToIdentifier(
     const RefoldModel::MacroDirective &selectorDefinition,
     ArrayRef<std::string> selectorActuals) {
-  if (selectorDefinition.subkind != "#define" ||
-      !selectorDefinition.functionLike ||
+  if (!selectorDefinition.IsFunctionLikeDefine() ||
       selectorDefinition.defParams.size() != selectorActuals.size() ||
       !macroDefinitionAcceptsActualCount(selectorDefinition,
                                          selectorActuals.size()))
@@ -4999,8 +4995,7 @@ bool parseFunctionSelectorTupleRootShape(
     FunctionSelectorTupleShape &shape) {
   ArrayRef<RefoldModel::MacroReplacementToken> toks(
       definition.replacementTokens.data(), definition.replacementTokens.size());
-  if (definition.subkind != "#define" || !definition.functionLike ||
-      toks.size() < 6)
+  if (!definition.IsFunctionLikeDefine() || toks.size() < 6)
     return false;
 
   const auto &selectorTok = toks.front();
@@ -5251,8 +5246,7 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
 
                 for (const RefoldModel::MacroDirective &candidateDefinition :
                      deps_.model.GetMacroDirectives()) {
-                  if (candidateDefinition.subkind != "#define" ||
-                      !candidateDefinition.functionLike ||
+                  if (!candidateDefinition.IsFunctionLikeDefine() ||
                       candidateDefinition.id == oldCalleeDefinition->id ||
                       candidateDefinition.defParams.size() !=
                           oldTupleActuals.size() ||
@@ -5464,8 +5458,8 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
       uniqueCandidate;
   for (const RefoldModel::MacroDirective &selectorDirective :
        deps_.model.GetMacroDirectives()) {
-    if (selectorDirective.subkind != "#define" ||
-        !selectorDirective.functionLike || selectorDirective.name == oldSelector ||
+    if (!selectorDirective.IsFunctionLikeDefine() ||
+        selectorDirective.name == oldSelector ||
         !macroDefinitionAcceptsActualCount(selectorDirective,
                                            shape.candidateCalleeNames.size()))
       continue;
@@ -5651,8 +5645,7 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
   std::optional<ObjectSelectorTupleGeneratedReplayCandidate> uniqueCandidate;
   for (const RefoldModel::MacroDirective &candidateDefinition :
        deps_.model.GetMacroDirectives()) {
-    if (candidateDefinition.subkind != "#define" ||
-        !candidateDefinition.functionLike ||
+    if (!candidateDefinition.IsFunctionLikeDefine() ||
         candidateDefinition.defParams.size() != oldTupleActuals.size() ||
         !macroDefinitionAcceptsActualCount(candidateDefinition,
                                            oldTupleActuals.size()))

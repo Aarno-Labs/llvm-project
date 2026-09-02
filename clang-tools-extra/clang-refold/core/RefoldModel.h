@@ -808,6 +808,30 @@ public:
     std::vector<MacroDefParam> defParams;
     /// Producer replacement-list replay tokens for a #define.
     std::vector<MacroReplacementToken> replacementTokens;
+
+    /// True iff this directive is a `#define`.
+    ///
+    /// `subkind` carries the producer's directive spelling verbatim, so these
+    /// predicates are the one place that spelling is compared.  They are not a
+    /// shorthand for well-formedness: a directive that is neither `#define`
+    /// nor `#undef` answers false to every one of them, which keeps a caller
+    /// that gates on them failing closed.
+    bool IsDefine() const { return subkind == "#define"; }
+
+    /// True iff this directive is an `#undef`.
+    bool IsUndef() const { return subkind == "#undef"; }
+
+    /// True iff this directive mutates macro state, i.e. is a `#define` or an
+    /// `#undef`.
+    bool IsMacroStateDirective() const { return IsDefine() || IsUndef(); }
+
+    /// True iff this directive is a function-like `#define`, the `NAME(...)`
+    /// shape rather than `NAME`.  `functionLike` is producer-owned and is
+    /// meaningful only on a `#define`, so it is never read alone.
+    bool IsFunctionLikeDefine() const { return IsDefine() && functionLike; }
+
+    /// True iff this directive is an object-like `#define`.
+    bool IsObjectLikeDefine() const { return IsDefine() && !functionLike; }
   };
 
   /// Producer record for one pragma directive line.

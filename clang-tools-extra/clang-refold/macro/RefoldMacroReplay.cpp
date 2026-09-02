@@ -1243,8 +1243,8 @@ RefoldMacroBoundarySelector::BoundaryDefinitionTapeReplayMacro(
       continue;
 
     const RefoldModel::MacroDirective *definition = definitionFor(macro);
-    if (!definition || definition->subkind != "#define" ||
-        !definition->functionLike || definition->name != macro.name ||
+    if (!definition || !definition->IsFunctionLikeDefine() ||
+        definition->name != macro.name ||
         definition->defParams.size() != macro.defParams.size() ||
         definition->replacementTokens.empty())
       continue;

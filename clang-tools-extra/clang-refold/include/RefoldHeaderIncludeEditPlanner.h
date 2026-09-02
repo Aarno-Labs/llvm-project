@@ -575,13 +575,6 @@ private:
   bool TryApplyDeleteReplaceSourceEnvelope(
       const HeaderSourceEnvelopePlanningState &state) const;
 
-  /// Returns whether a definition is the active macro binding at a header byte.
-  /// Shadowed or non-define directives are not eligible for carry.
-  bool ActiveHeaderDefinitionAtByte(
-      const RefoldModel::MacroDirective &definition, llvm::StringRef macroName,
-      const RefoldModel::IncludeItem &include, llvm::StringRef file,
-      llvm::StringRef headerText, uint64_t offset) const;
-
   /// Returns whether a header range overlaps an already staged edit.
   /// Macro-state carry only moves directive bytes that are still intact.
   static bool HeaderRangeOverlapsStagedEdit(llvm::ArrayRef<TextEdit> edits,

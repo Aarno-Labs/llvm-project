@@ -801,9 +801,8 @@ static void bindMacroDirectives(
     }
 
     const PreprocessingStructureKind expectedKind =
-        modelDirective.subkind == "#define"
-            ? PreprocessingStructureKind::MacroDefine
-            : PreprocessingStructureKind::MacroUndef;
+        modelDirective.IsDefine() ? PreprocessingStructureKind::MacroDefine
+                                  : PreprocessingStructureKind::MacroUndef;
     std::optional<size_t> scannedIndex = findUniqueDirectiveForProducerRange(
         directives, recovered->begin, recovered->end, expectedKind);
     if (!scannedIndex) {

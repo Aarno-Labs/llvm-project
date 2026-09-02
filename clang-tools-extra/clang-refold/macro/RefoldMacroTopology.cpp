@@ -161,7 +161,7 @@ void RefoldMacroTopology::BuildDefineDirectiveIndex() const {
 
   for (const auto &d : model_.GetMacroDirectives()) {
     // Only object/function macro definitions need widened directive extents.
-    if ("#define" != d.subkind)
+    if (!d.IsDefine())
       continue;
 
     // Without a spelling path there is no source file to index.  Leave the

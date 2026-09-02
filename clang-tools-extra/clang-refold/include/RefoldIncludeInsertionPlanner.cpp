@@ -63,8 +63,12 @@ RefoldIncludeInsertionPlanner::ResolveIncludeRealizationBTokenEnvelope(
     return !sourceMapper_.SliceBSource(env->first, env->second).trim().empty();
   };
 
-  const auto wholeCover =
-      sourceMapper_.MapATokRangeAToBTokenEnvelopeWholeCover(beginTok, endTok);
+  // Two projections, not three.  A whole-cover mapper used to be consulted
+  // here as a third opinion, but it computed the preserve-boundary projection
+  // byte for byte, so it could only ever agree with `preserveBoundary` and the
+  // consensus counted one projection twice.  Restoring a genuine third opinion
+  // -- the token-diff mapper is the candidate -- would strengthen this proof
+  // and needs its own gate and regression.
   const auto preserveBoundary =
       sourceMapper_.MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
           beginTok, endTok);
@@ -93,7 +97,6 @@ RefoldIncludeInsertionPlanner::ResolveIncludeRealizationBTokenEnvelope(
       conflict = true;
   };
 
-  consider(wholeCover);
   consider(preserveBoundary);
   consider(trimEdge);
 

@@ -436,8 +436,7 @@ GeneratedLeafReplayResolver::TryGeneratedSelectorActualRewrite(
         deps_.isObjectLikeSingleTokenAlias(selectorText);
     for (const RefoldModel::MacroDirective &sourceDirective :
          deps_.model.GetMacroDirectives()) {
-      if (sourceDirective.subkind != "#define" ||
-          sourceDirective.name.empty() ||
+      if (!sourceDirective.IsDefine() || sourceDirective.name.empty() ||
           sourceDirective.name == selectorText)
         continue;
 

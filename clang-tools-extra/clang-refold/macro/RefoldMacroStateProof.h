@@ -270,6 +270,26 @@ public:
       llvm::StringRef expectedPath, llvm::StringRef fileBytes,
       std::optional<uint64_t> requiredOwnerIncludeId) const;
 
+  /// True iff \p definition is the macro-state directive that is live for
+  /// \p macroName immediately before \p offset, and is a `#define`.
+  ///
+  /// This is the carry proof's admission rule, shared by header include edits,
+  /// materialized-header patch stabilization, and replay stability: carrying or
+  /// re-emitting a *shadowed* definition would synthesize a macro state that
+  /// never existed at that point, so only the live one is admissible.  A later
+  /// `#undef` for the same name therefore also rejects, because it wins the
+  /// selection below and is not a `#define`.
+  ///
+  /// Liveness is decided over the same owner-restricted intervals
+  /// RecoverMacroStateDirectiveLineInterval admits: candidates ending after
+  /// \p offset, naming another macro, or lacking a recoverable interval do not
+  /// participate.  The last directive to end wins, with the greater directive
+  /// id as a deterministic tie-breaker for equal endpoints.
+  bool DefinitionIsLiveAtOwnerByte(
+      const RefoldModel::MacroDirective &definition, llvm::StringRef macroName,
+      llvm::StringRef expectedPath, llvm::StringRef fileBytes,
+      std::optional<uint64_t> requiredOwnerIncludeId, uint64_t offset) const;
+
   /// Recover the source interval for the replacement list of the #define used
   /// by \p invocation, if the defining directive and invocation shape are
   /// producer-proven and byte-coordinate translation is well-formed.

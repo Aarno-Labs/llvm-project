@@ -584,8 +584,7 @@ void MacroStateRepairContext::BuildDirectiveIndexOnce() {
   // ignored fail-closed.
   for (const RefoldModel::MacroDirective &directiveLocal :
        Model().GetMacroDirectives()) {
-    if (directiveLocal.subkind != "#define" &&
-        directiveLocal.subkind != "#undef")
+    if (!directiveLocal.IsMacroStateDirective())
       continue;
     if (directiveLocal.name.empty())
       continue;
@@ -1174,7 +1173,7 @@ MacroStateRepairContext::ActiveDefinitionAtSourceOffset(StringRef macroName,
       activeEnd = transition->interval.end;
     }
   }
-  return active && active->subkind == "#define" ? active : nullptr;
+  return active && active->IsDefine() ? active : nullptr;
 }
 
 bool MacroStateRepairContext::MacroStateDirectiveCanBeDelayedAfterEdit(
@@ -1201,7 +1200,7 @@ bool MacroStateRepairContext::MacroStateDirectiveCanBeDelayedAfterEdit(
 
 bool MacroStateRepairContext::MacroStateDefinitionAvailableBeforeSourceOffset(
     const RefoldModel::MacroDirective &definition, uint64_t offset) const {
-  if (definition.subkind != "#define")
+  if (!definition.IsDefine())
     return false;
 
   if (PathIdentity().PathsEqual(definition.sitePath, tuPath_) &&
@@ -1266,7 +1265,7 @@ bool MacroStateRepairContext::AuthorizeMaterializedDefinitionTransitions() {
        Model().GetMacroInvocations()) {
     const RefoldModel::MacroDirective *definition =
         ActiveDefinitionForInvocation(invocation);
-    if (!definition || definition->subkind != "#define" ||
+    if (!definition || !definition->IsDefine() ||
         !DefinitionDirectiveTouchedByTUEdit(*definition)) {
       continue;
     }
@@ -1488,7 +1487,7 @@ bool MacroStateRepairContext::
     DirectCalleePatchRequiresDefinitionBeforeReplacement(
         const TextEdit &edit, const RefoldModel::MacroDirective &definition,
         StringRef macroName) const {
-  if (definition.subkind != "#define")
+  if (!definition.IsDefine())
     return false;
   if (!ReplacementObservesPreservedDefinition(edit, definition, macroName))
     return false;
@@ -1786,7 +1785,7 @@ void MacroStateRepairContext::
 
     for (const NamedMacroDirectiveRef &undefRef : plan_.namedMacroDirectives) {
       const RefoldModel::MacroDirective &undefDirective = *undefRef.directive;
-      if (undefDirective.subkind != "#undef")
+      if (!undefDirective.IsUndef())
         continue;
       if (advancedDirectiveIds.contains(undefDirective.id))
         continue;
@@ -2014,9 +2013,8 @@ MacroStateRepairContext::TryQueueMacroStateDirectivePreservation(
   TextEdit &edit = tuEdits_[editIndex];
 
   const RefoldModel::MacroDirective *definitionObservedByReplacement =
-      observedDefinition
-          ? observedDefinition
-          : (directive.subkind == "#define" ? &directive : nullptr);
+      observedDefinition ? observedDefinition
+                         : (directive.IsDefine() ? &directive : nullptr);
   const std::optional<size_t> firstObservationOffset =
       definitionObservedByReplacement
           ? FirstReplacementObservationOffset(
@@ -2028,7 +2026,7 @@ MacroStateRepairContext::TryQueueMacroStateDirectivePreservation(
   const bool editStartsAtPhysicalBOL =
       edit.start == 0 || tuBytes_[edit.start - 1] == '\n';
   const bool beforePlacementWouldExposeDefine =
-      directive.subkind == "#define" && replacementObservesDefinition;
+      directive.IsDefine() && replacementObservesDefinition;
   if (editStartsAtPhysicalBOL && !beforePlacementWouldExposeDefine) {
     macroStatePreservationsByEdit_[editIndex].push_back(MacroStatePreservation{
         &directive, MacroStatePreservationPlacement::BeforeReplacement});
@@ -2038,7 +2036,7 @@ MacroStateRepairContext::TryQueueMacroStateDirectivePreservation(
   if (!MacroStateDirectiveCanBeDelayedAfterEdit(edit, directive))
     return std::nullopt;
 
-  if (directive.subkind == "#undef" && replacementObservesDefinition) {
+  if (directive.IsUndef() && replacementObservesDefinition) {
     if (!firstObservationOffset || !definitionObservedByReplacement)
       return std::nullopt;
     std::optional<size_t> insertionOffset =
@@ -2057,7 +2055,7 @@ MacroStateRepairContext::TryQueueMacroStateDirectivePreservation(
         *firstObservationOffset);
   }
 
-  if (directive.subkind == "#define" && replacementObservesDefinition &&
+  if (directive.IsDefine() && replacementObservesDefinition &&
       definitionObservedByReplacement) {
     if (!firstObservationOffset)
       return std::nullopt;
@@ -2074,7 +2072,7 @@ MacroStateRepairContext::TryQueueMacroStateDirectivePreservation(
     }
   }
 
-  if (directive.subkind == "#undef" && !replacementObservesDefinition &&
+  if (directive.IsUndef() && !replacementObservesDefinition &&
       definitionObservedByReplacement) {
     (void)TryWidenEditToDelayedMacroStateBoundary(
         editIndex, *definitionObservedByReplacement, macroName);
@@ -2141,7 +2139,7 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
     SmallVector<SyntheticUndefCandidate, 4> candidates;
     for (const NamedMacroDirectiveRef &ref : plan_.namedMacroDirectives) {
       const RefoldModel::MacroDirective &definitionLocal = *ref.directive;
-      if (definitionLocal.subkind != "#define")
+      if (!definitionLocal.IsDefine())
         continue;
       if (plan_.syntheticUndefPartitionedDefinitionIds.contains(
               definitionLocal.id))
@@ -2412,7 +2410,7 @@ void MacroStateRepairContext::RequireEveryObservedGapDefinitionRepaired() {
 
     for (const NamedMacroDirectiveRef &ref : plan_.namedMacroDirectives) {
       const RefoldModel::MacroDirective &definition = *ref.directive;
-      if (definition.subkind != "#define")
+      if (!definition.IsDefine())
         continue;
       if (plan_.syntheticUndefPartitionedDefinitionIds.contains(definition.id) ||
           plan_.carriedGapDefinitionIds.contains(definition.id) ||
@@ -2482,7 +2480,7 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
     SmallVector<MacroStateGapCarryCandidate, 4> candidates;
     for (const NamedMacroDirectiveRef &ref : plan_.namedMacroDirectives) {
       const RefoldModel::MacroDirective &directiveLocal = *ref.directive;
-      if (directiveLocal.subkind != "#define")
+      if (!directiveLocal.IsDefine())
         continue;
       if (carriedDirectiveIds.contains(directiveLocal.id))
         continue;
@@ -2659,7 +2657,7 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
 
 bool MacroStateRepairContext::DefinitionDirectiveTouchedByTUEdit(
     const RefoldModel::MacroDirective &directive) const {
-  if (directive.subkind != "#define")
+  if (!directive.IsDefine())
     return false;
   return MacroDirectiveTouchedByTUEdit(directive);
 }
@@ -2706,7 +2704,7 @@ MacroStateRepairContext::FallbackActiveDefinitionForInvocation(
       continue;
     best = &directiveLocal;
   }
-  if (!best || best->subkind != "#define")
+  if (!best || !best->IsDefine())
     return nullptr;
   return best;
 }
@@ -2717,7 +2715,7 @@ MacroStateRepairContext::ActiveDefinitionForInvocation(
   if (invocation.definitionDirectiveId) {
     auto it = plan_.macroDirectiveById.find(*invocation.definitionDirectiveId);
     if (it != plan_.macroDirectiveById.end() && it->second.directive &&
-        it->second.directive->subkind == "#define")
+        it->second.directive->IsDefine())
       return it->second.directive;
     return nullptr;
   }
@@ -2732,8 +2730,7 @@ bool MacroStateRepairContext::DefinitionHasOtherSurvivingSameNameTransition(
       continue;
     if (StringRef(ref.name) != macroName)
       continue;
-    if (directiveLocal.subkind != "#define" &&
-        directiveLocal.subkind != "#undef")
+    if (!directiveLocal.IsMacroStateDirective())
       continue;
 
     // A transition consumed by a final TU edit does not remain in the emitted
@@ -2905,9 +2902,9 @@ MacroStateRepairContext::PreviousLiveDefinitionBeforeDirective(
       break;
     if (StringRef(ref.name) != StringRef(undefRef.name))
       continue;
-    if (directiveLocal.subkind == "#define")
+    if (directiveLocal.IsDefine())
       active = &directiveLocal;
-    else if (directiveLocal.subkind == "#undef")
+    else if (directiveLocal.IsUndef())
       active = nullptr;
   }
   return active;
@@ -2922,7 +2919,7 @@ size_t MacroStateRepairContext::PreserveConsumedUndefs() {
   size_t undefLivenessHazards = 0;
   for (const NamedMacroDirectiveRef &ref : plan_.namedMacroDirectives) {
     const RefoldModel::MacroDirective &undefDirective = *ref.directive;
-    if (undefDirective.subkind != "#undef")
+    if (!undefDirective.IsUndef())
       continue;
 
     std::optional<size_t> editIndex =
@@ -3301,7 +3298,7 @@ bool MacroStateRepairContext::RepairConsumedDefinitionsForMaterializedInclude(
   SmallVector<const NamedMacroDirectiveRef *, 8> candidates;
   for (const NamedMacroDirectiveRef &ref : plan_.namedMacroDirectives) {
     const RefoldModel::MacroDirective &definition = *ref.directive;
-    if (definition.subkind != "#define")
+    if (!definition.IsDefine())
       continue;
     if (plan_.preservedDefinitionDirectiveIds.contains(definition.id))
       continue;
