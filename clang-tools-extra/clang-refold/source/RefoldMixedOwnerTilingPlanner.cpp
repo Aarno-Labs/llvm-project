@@ -543,48 +543,134 @@ struct SourceOwnerIdentity {
   std::optional<uint64_t> condArmId;
 };
 
-} // namespace
-
-RefoldMixedOwnerTilingPlanner::RefoldMixedOwnerTilingPlanner(Dependencies deps)
-    : deps_(deps) {}
-
-RefoldMixedOwnerTilingPlanner::MixedOwnerTilingPlan
-RefoldMixedOwnerTilingPlanner::FinishPlan(std::vector<diffutils::Hunk> hunks) {
-  // Refresh the token-level hunk cache after normalization.
-  deps_.abTokHunks = hunks;
-
-  MixedOwnerTilingPlan plan;
-  plan.hunks = std::move(hunks);
-  plan.mixedOwnerWitnessCount = deps_.mixedOwnerTilingWitnesses.size();
-  plan.segmentBindingCount = deps_.mixedOwnerTilingSegmentBindings.size();
-  return plan;
+/// Return whether a preserved transition contains a #define or #undef.
+///
+/// Direct TU realization treats complete producer-bound macro-state lines
+/// specially: it may consume them only because RefoldMacroStateRepairPlanner
+/// subsequently proves their final-stream liveness and repositions or
+/// replays them when necessary.  A structural replacement would instead
+/// leave the directive physically in place and emit independent edits on
+/// both sides.  Boundary projection proves only how B tokens are
+/// partitioned; it does not prove equivalence with that later macro-state
+/// ordering theorem. Therefore boundary-projected tiling must defer these
+/// transitions to the existing whole-hunk path until an explicit
+/// composition theorem connects projected fragments with macro-state
+/// liveness repair.
+bool transitionContainsMacroStateDirective(
+    const ClosedStateGapTransition &transition) {
+  return llvm::any_of(transition.gaps, [](const PartitionEdge &gap) {
+    if (!gap.IsStateGap() || !gap.protectedPreprocessingStructure ||
+        !gap.protectedStructureIdentityRecorded ||
+        gap.producerIdentityKind !=
+            StructuralProducerIdentityKind::MacroDirective ||
+        !gap.producerItemId) {
+      return false;
+    }
+    return gap.protectedStructureKind ==
+               StructuralProtectedStructureKind::MacroDefine ||
+           gap.protectedStructureKind ==
+               StructuralProtectedStructureKind::MacroUndef;
+  });
 }
 
-RefoldMixedOwnerTilingPlanner::MixedOwnerTilingPlan
-RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
-  // Per-structure placement proofs for a preserved structural gap.  The prover
-  // reads producer records only, so one instance answers gaps in the TU and in
-  // any included header alike.
-  const RefoldStructuralGapCrossingProver gapCrossingProver(
-      RefoldStructuralGapCrossingProver::Dependencies{
-          deps_.model, deps_.macroStateProof, deps_.tokenText, deps_.lexLang});
+Owner ownerForPreservedStructureInterval(
+    const PreprocessingStructureInterval &interval) {
+  // Prefer an exact producer identity when one exists.  The structure
+  // index's lexical interval remains the physical authority, so this owner
+  // is only a stable theorem label and never authorizes reconstruction.
+  // Conditional controls are especially important: one `CondGroup` owns
+  // several disjoint directive lines, while a structural deletion may
+  // preserve only one of those lines.
+  switch (interval.modelKind) {
+  case PreprocessingStructureModelKind::MacroDirective:
+    if (interval.modelItemId)
+      return Owner::MacroDirective(*interval.modelItemId);
+    break;
 
-  // All structural proofs use the shared occurrence-local index provider. The
-  // provider returns the engine-owned TU index and lazily caches header indexes
-  // by canonical physical path plus concrete include owner. Missing source text
-  // remains explicit incomplete evidence and never creates an approximate
-  // index.
-  auto lookupStructureIndexForSource = [&](const OwnerSourceRange &source)
-      -> RefoldPreprocessingStructureIndexProvider::LookupResult {
-    if (!source.IsComplete())
-      return {nullptr, {}, "source coordinates are incomplete"};
-    return deps_.preprocessingStructureIndexes.Get(source.path,
-                                                   source.includeId);
-  };
-  auto getStructureIndexForSource = [&](const OwnerSourceRange &source)
-      -> const RefoldPreprocessingStructureIndex * {
-    return lookupStructureIndexForSource(source).index;
-  };
+  case PreprocessingStructureModelKind::IncludeDirective:
+    if (interval.modelItemId)
+      return Owner::Include(*interval.modelItemId);
+    break;
+
+  case PreprocessingStructureModelKind::PragmaDirective:
+    if (interval.modelItemId) {
+      return Owner::PragmaIsland(*interval.modelItemId,
+                                 interval.ownerConditionalArmId);
+    }
+    break;
+
+  case PreprocessingStructureModelKind::LineControlEvent:
+    if (interval.modelItemId)
+      return Owner::LineControlIsland(*interval.modelItemId);
+    break;
+
+  case PreprocessingStructureModelKind::ConditionalDirective:
+    if (interval.conditionalGroupId)
+      return Owner::ConditionalGroup(*interval.conditionalGroupId);
+    break;
+
+  case PreprocessingStructureModelKind::None:
+    break;
+  }
+
+  // A lexically exact non-conditional directive need not have a producer
+  // record in order to be preserved safely.  Bind it to its concrete
+  // physical TU/include occurrence: the disposition theorem proves that
+  // the bytes are untouched and retain their order, so no semantic claim
+  // about the unknown directive is required.  Conditional binding failures
+  // never reach this fallback because they make the protection census
+  // incomplete globally.
+  if (interval.ownerIncludeId) {
+    return Owner::Include(*interval.ownerIncludeId,
+                          interval.ownerConditionalArmId);
+  }
+  return Owner::TU(interval.ownerConditionalArmId);
+}
+
+void appendUniqueStateComponent(SmallVectorImpl<OwnerStateComponent> &out,
+                                OwnerStateComponent component) {
+  if (component == OwnerStateComponent::Unknown)
+    return;
+  if (!llvm::is_contained(out, component))
+    out.push_back(component);
+}
+
+StructuralTilingReason
+classifyStructuralTilingReason(bool mixedRealizers,
+                               bool preservedPreprocessingStructure) {
+  if (mixedRealizers && preservedPreprocessingStructure) {
+    return StructuralTilingReason::MixedRealizersAndPreservedStructure;
+  }
+  if (mixedRealizers)
+    return StructuralTilingReason::MixedRealizers;
+  if (preservedPreprocessingStructure) {
+    return StructuralTilingReason::PreservedPreprocessingStructure;
+  }
+  return StructuralTilingReason::Unknown;
+}
+
+/// Proof layer for one structural tiling pass.
+///
+/// Every predicate here answers one question about one original hunk from the
+/// borrowed producer services and its own arguments.  None of them reads or
+/// writes the planner's witness and segment-binding ledgers, and none carries
+/// state from one hunk to the next, so a single instance serves a whole pass.
+///
+/// The layer is a class rather than a set of private planner members because
+/// the partition types above are file-local: a member function declared in
+/// `RefoldMixedOwnerTilingPlanner.h` could not name them in its signature.
+/// `Dependencies` is public in that header and is held by reference here.
+class StructuralTilingProver {
+public:
+  explicit StructuralTilingProver(
+      RefoldMixedOwnerTilingPlanner::Dependencies &deps)
+      : deps_(deps) {
+    std::set<uint64_t> seenTokmapPP;
+    for (const RefoldModel::TokMapEntry &entry : deps_.model.GetTokmap()) {
+      if (!seenTokmapPP.insert(entry.pp).second)
+        duplicateTokmapPP_.insert(entry.pp);
+    }
+  }
 
   // Return whether anything after `gap` could still observe the macro state its
   // directives bind.
@@ -614,56 +700,43 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
   //     not make the seam the planner's.  A spelling reached only through
   //     another macro's replacement list is not tracked; missing one costs
   //     deference, never soundness.
-  auto macroStateGapBelongsToLivenessPlanner =
-      [&](const OwnerSourceRange &gap, const GapCrossingProof &crossing) {
-        if (!crossing.macroBindingsComplete || crossing.macroBindings.empty())
-          return true;
-        if (!deps_.pathIdentity.PathsEqual(gap.path, deps_.tuPath) ||
-            gap.end > deps_.tuBytes.size()) {
-          return true;
-        }
+  bool MacroStateGapBelongsToLivenessPlanner(
+      const OwnerSourceRange &gap, const GapCrossingProof &crossing) const {
+    if (!crossing.macroBindingsComplete || crossing.macroBindings.empty())
+      return true;
+    if (!deps_.pathIdentity.PathsEqual(gap.path, deps_.tuPath) ||
+        gap.end > deps_.tuBytes.size()) {
+      return true;
+    }
 
-        const RefoldPreprocessingStructureIndex *structureIndex =
-            getStructureIndexForSource(gap);
-        if (!structureIndex || !structureIndex->IsProtectionCensusComplete())
-          return true;
-        for (const PreprocessingStructureInterval *interval :
-             structureIndex->FindOverlapping(gap.end, deps_.tuBytes.size())) {
-          if (!interval)
-            return true;
-          if (interval->kind == PreprocessingStructureKind::Include ||
-              interval->kind == PreprocessingStructureKind::IncludeNext ||
-              interval->kind == PreprocessingStructureKind::Import) {
-            return true;
-          }
-        }
+    const RefoldPreprocessingStructureIndex *structureIndex =
+        GetStructureIndexForSource(gap);
+    if (!structureIndex || !structureIndex->IsProtectionCensusComplete())
+      return true;
+    for (const PreprocessingStructureInterval *interval :
+         structureIndex->FindOverlapping(gap.end, deps_.tuBytes.size())) {
+      if (!interval)
+        return true;
+      if (interval->kind == PreprocessingStructureKind::Include ||
+          interval->kind == PreprocessingStructureKind::IncludeNext ||
+          interval->kind == PreprocessingStructureKind::Import) {
+        return true;
+      }
+    }
 
-        const StringRef suffix = deps_.tuBytes.drop_front(gap.end);
-        for (const MacroStateBinding &binding : crossing.macroBindings) {
-          if (!binding.directive)
-            return true;
-          if (deps_.macroStateProof
-                  .FirstMacroStateObservationOffsetInText(*binding.directive,
-                                                          binding.name, suffix)
-                  .has_value()) {
-            return true;
-          }
-        }
-        return false;
-      };
-
-  // Structural witnesses are rebuilt from the current token diff and attached
-  // to later accepted candidates by exact A/B token-envelope binding.  The
-  // legacy ledger type names are retained temporarily to avoid unrelated API
-  // churn while same-realizer structure preservation is introduced.
-  deps_.mixedOwnerTilingWitnesses.clear();
-  deps_.mixedOwnerTilingSegmentBindings.clear();
-
-  // Tiling only has work to do when there is at least one hunk to split; with
-  // none, the plan is the unchanged input.  Returning early here keeps the
-  // whole tiling body at function indentation instead of nesting it.
-  if (hunks.empty())
-    return FinishPlan(std::move(hunks));
+    const StringRef suffix = deps_.tuBytes.drop_front(gap.end);
+    for (const MacroStateBinding &binding : crossing.macroBindings) {
+      if (!binding.directive)
+        return true;
+      if (deps_.macroStateProof
+              .FirstMacroStateObservationOffsetInText(*binding.directive,
+                                                      binding.name, suffix)
+              .has_value()) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   // Split replace/delete hunks when one unique structural partition is proven.
   //
@@ -692,8 +765,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
   // the searched graph: they are attached to token-to-token DP transitions,
   // counted in the proof cost, and included in ambiguity detection even though
   // they are not emitted as hunks.
-  auto classifyHunkRealizer = [&](uint64_t aStart,
-                                  uint64_t aEnd) -> HunkRealizer {
+  HunkRealizer ClassifyHunkRealizer(uint64_t aStart, uint64_t aEnd) const {
     if (aEnd <= aStart)
       return {};
 
@@ -713,73 +785,10 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       return {HunkRealizerKind::TU, 0};
 
     return {};
-  };
-
-  const size_t noTokenEdgeIndex = std::numeric_limits<size_t>::max();
-
-  /// Return whether a preserved transition contains a #define or #undef.
-  ///
-  /// Direct TU realization treats complete producer-bound macro-state lines
-  /// specially: it may consume them only because RefoldMacroStateRepairPlanner
-  /// subsequently proves their final-stream liveness and repositions or
-  /// replays them when necessary.  A structural replacement would instead
-  /// leave the directive physically in place and emit independent edits on
-  /// both sides.  Boundary projection proves only how B tokens are
-  /// partitioned; it does not prove equivalence with that later macro-state
-  /// ordering theorem. Therefore boundary-projected tiling must defer these
-  /// transitions to the existing whole-hunk path until an explicit
-  /// composition theorem connects projected fragments with macro-state
-  /// liveness repair.
-  auto transitionContainsMacroStateDirective =
-      [](const ClosedStateGapTransition &transition) {
-        return llvm::any_of(transition.gaps, [](const PartitionEdge &gap) {
-          if (!gap.IsStateGap() || !gap.protectedPreprocessingStructure ||
-              !gap.protectedStructureIdentityRecorded ||
-              gap.producerIdentityKind !=
-                  StructuralProducerIdentityKind::MacroDirective ||
-              !gap.producerItemId) {
-            return false;
-          }
-          return gap.protectedStructureKind ==
-                     StructuralProtectedStructureKind::MacroDefine ||
-                 gap.protectedStructureKind ==
-                     StructuralProtectedStructureKind::MacroUndef;
-        });
-      };
-
-  std::set<uint64_t> duplicateTokmapPP;
-  std::set<uint64_t> seenTokmapPP;
-  for (const RefoldModel::TokMapEntry &entry : deps_.model.GetTokmap()) {
-    if (!seenTokmapPP.insert(entry.pp).second)
-      duplicateTokmapPP.insert(entry.pp);
   }
 
-  auto mappedTUSourceRangeForTokens =
-      [&](uint64_t aStart, uint64_t aEnd) -> std::optional<OwnerSourceRange> {
-    const auto &tokmapByPP = deps_.model.GetTokmapByPP();
-    uint64_t sourceBegin = std::numeric_limits<uint64_t>::max();
-    uint64_t sourceEnd = 0;
-    bool sawTU = false;
-
-    for (uint64_t pp = aStart; pp < aEnd; ++pp) {
-      auto it = tokmapByPP.find(pp);
-      if (it == tokmapByPP.end())
-        continue;
-      const RefoldModel::TokMapEntry &entry = it->second;
-      if (!deps_.pathIdentity.PathsEqual(entry.file, deps_.tuPath))
-        return std::nullopt;
-      sourceBegin = std::min<uint64_t>(sourceBegin, entry.b);
-      sourceEnd = std::max<uint64_t>(sourceEnd, entry.e);
-      sawTU = true;
-    }
-
-    if (!sawTU || sourceBegin > sourceEnd)
-      return std::nullopt;
-    return OwnerSourceRange::From(deps_.tuPath, sourceBegin, sourceEnd);
-  };
-
-  auto buildTokenSegmentClosure =
-      [&](const PartitionEdge &edge) -> std::optional<OwnerClosure> {
+  std::optional<OwnerClosure>
+  BuildTokenSegmentClosure(const PartitionEdge &edge) const {
     if (!edge.IsTokenSegment() || edge.aEnd <= edge.aStart ||
         edge.bEnd < edge.bStart ||
         (!edge.allowEmptyBEnvelope && edge.bEnd <= edge.bStart))
@@ -821,7 +830,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
     }
     case HunkRealizerKind::TU: {
       owner = Owner::TU();
-      source = mappedTUSourceRangeForTokens(edge.aStart, edge.aEnd);
+      source = MappedTUSourceRangeForTokens(edge.aStart, edge.aEnd);
       if (!source)
         return std::nullopt;
       break;
@@ -834,668 +843,17 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         OwnerClosure::From(std::move(owner), std::move(*source),
                            OwnerTokenRange::From(edge.aStart, edge.aEnd),
                            OwnerTokenRange::From(edge.bStart, edge.bEnd)));
-  };
+  }
 
-  auto sourceSitesComparable = [&](const OwnerSourceRange &lhs,
-                                   const OwnerSourceRange &rhs) {
+  bool SourceSitesComparable(const OwnerSourceRange &lhs,
+                             const OwnerSourceRange &rhs) const {
     return lhs.IsComplete() && rhs.IsComplete() &&
            deps_.pathIdentity.PathsEqual(lhs.path, rhs.path) &&
            lhs.includeId == rhs.includeId;
-  };
+  }
 
-  auto sourceSiteMatchesGap = [&](const OwnerSourceRange &gap, StringRef file,
-                                  std::optional<uint64_t> ownerIncludeId,
-                                  uint64_t begin, uint64_t end) {
-    return gap.IsComplete() && deps_.pathIdentity.PathsEqual(gap.path, file) &&
-           gap.includeId == ownerIncludeId && gap.begin <= begin &&
-           begin <= end && end <= gap.end;
-  };
-
-  auto sourceSitePathMatchesGap = [&](const OwnerSourceRange &gap,
-                                      StringRef file, uint64_t begin,
-                                      uint64_t end) {
-    return gap.IsComplete() && deps_.pathIdentity.PathsEqual(gap.path, file) &&
-           gap.begin <= begin && begin <= end && end <= gap.end;
-  };
-
-  auto resolveSourceOwnerIdentity =
-      [&](StringRef file, uint64_t begin,
-          uint64_t end) -> std::optional<SourceOwnerIdentity> {
-    ArrayRef<RefoldModel::Segment> segments =
-        deps_.model.GetSegmentsForFile(file);
-    if (segments.empty())
-      return std::nullopt;
-
-    uint64_t cursor = begin;
-    bool sawCover = false;
-    SourceOwnerIdentity identity;
-
-    for (const RefoldModel::Segment &segment : segments) {
-      if (segment.e <= begin)
-        continue;
-      if (end <= segment.b)
-        break;
-      if (!intervalsOverlap(begin, end, segment.b, segment.e))
-        continue;
-
-      const uint64_t partBegin = std::max<uint64_t>(begin, segment.b);
-      const uint64_t partEnd = std::min<uint64_t>(end, segment.e);
-      if (partBegin > cursor)
-        return std::nullopt;
-
-      SourceOwnerIdentity part{segment.ownerIncludeId, segment.ownerCondArmId};
-      if (!sawCover) {
-        identity = part;
-        sawCover = true;
-      } else if (identity.includeId != part.includeId ||
-                 identity.condArmId != part.condArmId) {
-        return std::nullopt;
-      }
-      cursor = partEnd;
-    }
-
-    if (!sawCover || cursor < end)
-      return std::nullopt;
-    return identity;
-  };
-
-  auto bindSourceOwnerToGap =
-      [&](const OwnerSourceRange &gap, StringRef file, uint64_t begin,
-          uint64_t end) -> std::optional<SourceOwnerIdentity> {
-    if (!sourceSitePathMatchesGap(gap, file, begin, end))
-      return std::nullopt;
-
-    std::optional<SourceOwnerIdentity> identity =
-        resolveSourceOwnerIdentity(file, begin, end);
-    if (!identity) {
-      // Older maps do not always provide segment facts for TU-only files.
-      // Treat that as TU-owned only when the enclosing gap is also TU-owned.
-      // For include-owned gaps, accepting a path-only match would bind a
-      // repeated header pragma/conditional to an arbitrary include instance.
-      if (gap.includeId)
-        return std::nullopt;
-      identity = SourceOwnerIdentity{};
-    }
-
-    if (identity->includeId != gap.includeId)
-      return std::nullopt;
-    return identity;
-  };
-
-  auto makeStateGapEdge = [&](Owner owner, OwnerSourceRange source,
-                              uint64_t aBoundary,
-                              uint64_t bBoundary) -> PartitionEdge {
-    PartitionEdge gap;
-    gap.kind = PartitionEdgeKind::StateGap;
-    gap.aStart = aBoundary;
-    gap.aEnd = aBoundary;
-    gap.bStart = bBoundary;
-    gap.bEnd = bBoundary;
-    gap.closure = deps_.ownerStateProof.AttachCanonicalStateSummary(
-        OwnerClosure::From(std::move(owner), std::move(source),
-                           OwnerTokenRange::From(aBoundary, aBoundary),
-                           OwnerTokenRange::From(bBoundary, bBoundary)));
-    return gap;
-  };
-
-  auto collectZeroTokenStateGaps =
-      [&](const OwnerSourceRange &gapSource, uint64_t aBoundary,
-          uint64_t bBoundary) -> SmallVector<PartitionEdge, 8> {
-    SmallVector<PartitionEdge, 8> gaps;
-    if (!gapSource.IsComplete() || gapSource.end <= gapSource.begin)
-      return gaps;
-
-    // Sideband directives are zero-token owners.  They are collected in
-    // source order and represented as proof-only partition edges so the mixed
-    // owner tiler can distinguish "there is no source gap" from "there is a
-    // state gap that was proved closed".
-    for (const RefoldModel::MacroDirective &directive :
-         deps_.model.GetMacroDirectives()) {
-      if (!sourceSiteMatchesGap(gapSource, directive.sitePath,
-                                directive.ownerIncludeId, directive.siteB,
-                                directive.siteE))
-        continue;
-      gaps.push_back(makeStateGapEdge(
-          Owner::MacroDirective(directive.id),
-          OwnerSourceRange::From(directive.sitePath, directive.siteB,
-                                 directive.siteE, directive.ownerIncludeId),
-          aBoundary, bBoundary));
-    }
-
-    for (const RefoldModel::LineControlEvent &event :
-         deps_.model.GetLineControls()) {
-      if (!event.siteB || !event.siteE)
-        continue;
-      if (!sourceSiteMatchesGap(gapSource, event.physicalFile,
-                                event.ownerIncludeId, *event.siteB,
-                                *event.siteE))
-        continue;
-      gaps.push_back(makeStateGapEdge(
-          Owner::LineControlIsland(event.id),
-          OwnerSourceRange::From(event.physicalFile, *event.siteB, *event.siteE,
-                                 event.ownerIncludeId),
-          aBoundary, bBoundary));
-    }
-
-    for (const RefoldModel::PragmaDirective &pragma :
-         deps_.model.GetPragmas()) {
-      // bind zero-token pragmas to the same source owner as the gap.  Newer
-      // maps can carry owner_include_id directly; older maps are resolved
-      // through segment facts.  A repeated-header pragma must never be
-      // accepted from path+byte containment alone because the same file bytes
-      // may be visited by several include occurrences.
-      if (!pragma.ownerIncludeId) {
-        unsigned samePhysicalSiteWithoutOwner = 0;
-        for (const RefoldModel::PragmaDirective &other :
-             deps_.model.GetPragmas()) {
-          if (!other.ownerIncludeId &&
-              deps_.pathIdentity.PathsEqual(other.sitePath, pragma.sitePath) &&
-              other.siteB == pragma.siteB && other.siteE == pragma.siteE)
-            ++samePhysicalSiteWithoutOwner;
-        }
-        if (samePhysicalSiteWithoutOwner > 1)
-          continue;
-      }
-      std::optional<SourceOwnerIdentity> identity = bindSourceOwnerToGap(
-          gapSource, pragma.sitePath, pragma.siteB, pragma.siteE);
-      if (!identity)
-        continue;
-      if (pragma.ownerIncludeId &&
-          *pragma.ownerIncludeId != identity->includeId.value_or(
-                                        std::numeric_limits<uint64_t>::max()) &&
-          !identity->includeId) {
-        continue;
-      }
-
-      // A header pragma item describes a physical directive, not necessarily
-      // a unique replay occurrence.  When segment facts prove that this
-      // source gap belongs to a concrete repeated include instance, bind the
-      // state-gap closure to that occurrence even if the serialized
-      // owner_include_id names another replay of the same physical pragma.
-      // The segment-derived identity is the stronger proof here.
-      gaps.push_back(makeStateGapEdge(
-          Owner::PragmaIsland(pragma.id, identity->condArmId),
-          OwnerSourceRange::From(pragma.sitePath, pragma.siteB, pragma.siteE,
-                                 identity->includeId),
-          aBoundary, bBoundary));
-    }
-
-    for (const RefoldModel::IncludeItem &include : deps_.model.GetIncludes()) {
-      if (!sourceSiteMatchesGap(gapSource, include.sitePath, include.parent,
-                                include.siteB, include.siteE))
-        continue;
-      // Non-empty includes already have token edges in the normal tiling.
-      // Only zero-token include transitions are sideband gap owners here.
-      if (include.cover.IsValid())
-        continue;
-      gaps.push_back(makeStateGapEdge(
-          Owner::Include(include.id),
-          OwnerSourceRange::From(include.sitePath, include.siteB, include.siteE,
-                                 include.parent),
-          aBoundary, bBoundary));
-    }
-
-    for (const RefoldModel::MacroInvocation &macro :
-         deps_.model.GetMacroInvocations()) {
-      if (!macro.invFile || !macro.invB || !macro.invE)
-        continue;
-      if (macro.cover.IsValid())
-        continue;
-      if (!sourceSiteMatchesGap(gapSource, *macro.invFile, macro.ownerIncludeId,
-                                *macro.invB, *macro.invE))
-        continue;
-      gaps.push_back(makeStateGapEdge(
-          Owner::MacroInvocation(macro.id),
-          OwnerSourceRange::From(*macro.invFile, *macro.invB, *macro.invE,
-                                 macro.ownerIncludeId),
-          aBoundary, bBoundary));
-    }
-
-    for (const RefoldModel::CondGroup &group : deps_.model.GetConds()) {
-      if (!sourceSiteMatchesGap(gapSource, group.file, group.parentIncludeId,
-                                group.groupB, group.groupE))
-        continue;
-      // A conditional group owns the directive island
-      // (#if/#elif/#else/#endif) and the branch-selection state.  Individual
-      // arms own only their body intervals.  Using arm ids for the whole
-      // group created overlapping zero-token owners and lost the distinction
-      // between branch structure and selected-arm content.
-      gaps.push_back(makeStateGapEdge(
-          Owner::ConditionalGroup(group.id),
-          OwnerSourceRange::From(group.file, group.groupB, group.groupE,
-                                 group.parentIncludeId),
-          aBoundary, bBoundary));
-    }
-
-    llvm::sort(gaps, [](const PartitionEdge &lhs, const PartitionEdge &rhs) {
-      const OwnerSourceRange &l = lhs.closure->source;
-      const OwnerSourceRange &r = rhs.closure->source;
-      if (l.path != r.path)
-        return l.path < r.path;
-      if (l.includeId != r.includeId)
-        return l.includeId.value_or(std::numeric_limits<uint64_t>::max()) <
-               r.includeId.value_or(std::numeric_limits<uint64_t>::max());
-      if (l.begin != r.begin)
-        return l.begin < r.begin;
-      if (l.end != r.end)
-        return l.end < r.end;
-
-      auto ownerKey = [](const Owner &owner) {
-        const uint64_t none = std::numeric_limits<uint64_t>::max();
-        return std::make_tuple(
-            static_cast<unsigned>(owner.kind), owner.includeId.value_or(none),
-            owner.macroInvocationId.value_or(none),
-            owner.macroDirectiveId.value_or(none),
-            owner.lineControlId.value_or(none), owner.pragmaId.value_or(none),
-            owner.condGroupId.value_or(none), owner.condArmId.value_or(none));
-      };
-      return ownerKey(lhs.closure->owner) < ownerKey(rhs.closure->owner);
-    });
-
-    return gaps;
-  };
-
-  /// Prove that proof-only owners plus exact trivia cover the whole gap.
-  ///
-  /// `outerGapIndices` receives, in source order, the indices of the owners
-  /// that survived normalization as outer pieces.  An owner absorbed by a
-  /// containing one is proved rather than dropped, but it is not a sibling in
-  /// the ordered state chain: its bytes are already inside the containing
-  /// edge, which is preserved in place, so listing it again would make the
-  /// chain overlap itself.
-  auto sourceGapIsFullyCovered =
-      [&](const OwnerSourceRange &gapSource, ArrayRef<PartitionEdge> gaps,
-          std::string *reason,
-          SmallVectorImpl<size_t> &outerGapIndices) -> bool {
-    outerGapIndices.clear();
-    if (!gapSource.IsComplete()) {
-      if (reason)
-        *reason = "source gap has incomplete source coordinates";
-      return false;
-    }
-
-    const auto structureLookup = lookupStructureIndexForSource(gapSource);
-    const RefoldPreprocessingStructureIndex *structureIndex =
-        structureLookup.index;
-    if (!structureIndex) {
-      if (reason) {
-        *reason = structureLookup.incompleteEvidenceReason.empty()
-                      ? "source gap has no exact preprocessing-structure index"
-                      : structureLookup.incompleteEvidenceReason.str();
-      }
-      return false;
-    }
-
-    SmallVector<SourceGapProofPiece, 8> pieces;
-    pieces.reserve(gaps.size());
-    for (size_t gapIndex = 0; gapIndex < gaps.size(); ++gapIndex) {
-      const PartitionEdge &gap = gaps[gapIndex];
-      if (!gap.closure || !gap.closure->source.IsComplete()) {
-        if (reason)
-          *reason = "state-gap edge lacks a complete source closure";
-        return false;
-      }
-
-      const OwnerSourceRange &owned = gap.closure->source;
-      if (!deps_.pathIdentity.PathsEqual(owned.path, gapSource.path) ||
-          owned.begin < gapSource.begin || owned.end > gapSource.end) {
-        if (reason) {
-          *reason = llvm::formatv("state-gap owner [{0},{1}) is outside source "
-                                  "gap [{2},{3})",
-                                  owned.begin, owned.end, gapSource.begin,
-                                  gapSource.end)
-                        .str();
-        }
-        return false;
-      }
-
-      // The same physical header can be entered repeatedly.  A path and byte
-      // range therefore do not identify the source surface by themselves;
-      // every proof-only owner must retain the concrete include occurrence of
-      // the token carriers on both sides of the gap.
-      if (owned.includeId != gapSource.includeId) {
-        if (reason)
-          *reason = "state-gap owner belongs to a different include instance";
-        return false;
-      }
-
-      const Owner &owner = gap.closure->owner;
-      pieces.push_back(SourceGapProofPiece{
-          owned.begin, owned.end, structuralGapOwnerStableId(owner),
-          static_cast<uint32_t>(owner.kind),
-          structuralGapOwnerNestingClass(owner),
-          structuralGapOwnerAbsorbedNestingClasses(deps_.model, owner),
-          gapIndex});
-    }
-
-    // Structural tiling does not permit overlapping proof-only owners.  The
-    // shared theorem now performs the same deterministic interval
-    // normalization, exact preprocessing-inventory check, and lexer-trivia
-    // coverage used by expansion fallback.  No directive-looking byte can be
-    // skipped merely because it contributed no ordinary PP token.
-    std::optional<SourceGapProofResult> proof = proveSourceGapWithIndexedTrivia(
-        *structureIndex, gapSource.begin, gapSource.end, pieces, reason);
-    // Every submitted owner must be accounted for: it either survived as an
-    // outer piece or was absorbed by a containing piece whose proof declared
-    // that nested class.  Anything else means an owner vanished.
-    if (!proof || proof->outerPiecePayloadIndices.size() +
-                          proof->absorbedPiecePayloadIndices.size() !=
-                      gaps.size()) {
-      return false;
-    }
-    outerGapIndices.assign(proof->outerPiecePayloadIndices.begin(),
-                           proof->outerPiecePayloadIndices.end());
-    return true;
-  };
-
-  auto stateGapOwnerMatchesStructureIdentity =
-      [&](const PartitionEdge &gap,
-          const PreprocessingStructureInterval &interval) {
-        if (!gap.closure)
-          return false;
-
-        const Owner &owner = gap.closure->owner;
-        switch (interval.modelKind) {
-        case PreprocessingStructureModelKind::MacroDirective:
-          return interval.modelItemId && owner.IsMacroDirective() &&
-                 owner.macroDirectiveId == interval.modelItemId;
-
-        case PreprocessingStructureModelKind::IncludeDirective:
-          return interval.modelItemId && owner.IsInclude() &&
-                 owner.includeId == interval.modelItemId;
-
-        case PreprocessingStructureModelKind::PragmaDirective:
-          return interval.modelItemId && owner.IsPragmaIsland() &&
-                 owner.pragmaId == interval.modelItemId;
-
-        case PreprocessingStructureModelKind::LineControlEvent:
-          return interval.modelItemId && owner.IsLineControlIsland() &&
-                 owner.lineControlId == interval.modelItemId;
-
-        case PreprocessingStructureModelKind::ConditionalDirective:
-          return interval.conditionalGroupId && owner.IsConditionalGroup() &&
-                 owner.condGroupId == interval.conditionalGroupId;
-
-        case PreprocessingStructureModelKind::None:
-          break;
-        }
-
-        // A producer macro-state record can fail the structure index's
-        // full-line text binding when the producer serializes normalized
-        // directive trivia while `site_b/site_e` still identify the exact
-        // physical macro-name site.  The lexical scanner nevertheless proves
-        // the complete `#define`/`#undef` line.  In that case, bind the two
-        // facts here only when one stable macro-directive id has the expected
-        // directive kind and its exact producer site is wholly contained in
-        // the lexical line in the same physical owner occurrence.
-        //
-        // This is not source-nearest recovery: the owner id, directive kind,
-        // path, include occurrence, and nested byte ranges must all agree.
-        // Multiple records with the same id or any partial crossing fail
-        // closed.  Once bound, the lexical interval replaces the narrower
-        // producer site as the physical preservation authority, avoiding two
-        // overlapping proof-only edges for the same directive.
-        if (interval.modelItemId || !owner.IsMacroDirective() ||
-            !owner.macroDirectiveId ||
-            (interval.kind != PreprocessingStructureKind::MacroDefine &&
-             interval.kind != PreprocessingStructureKind::MacroUndef)) {
-          return false;
-        }
-
-        const RefoldModel::MacroDirective *matchedDirective = nullptr;
-        for (const RefoldModel::MacroDirective &directive :
-             deps_.model.GetMacroDirectives()) {
-          if (directive.id != *owner.macroDirectiveId)
-            continue;
-          if (matchedDirective)
-            return false;
-          matchedDirective = &directive;
-        }
-        if (!matchedDirective)
-          return false;
-
-        const StringRef expectedSubkind =
-            interval.kind == PreprocessingStructureKind::MacroDefine
-                ? StringRef("#define")
-                : StringRef("#undef");
-        if (matchedDirective->subkind != expectedSubkind ||
-            !deps_.pathIdentity.PathsEqual(matchedDirective->sitePath,
-                                           interval.sourcePath) ||
-            matchedDirective->ownerIncludeId != interval.ownerIncludeId ||
-            matchedDirective->siteE <= matchedDirective->siteB ||
-            interval.begin > matchedDirective->siteB ||
-            matchedDirective->siteE > interval.end) {
-          return false;
-        }
-
-        const OwnerSourceRange &owned = gap.closure->source;
-        return owned.IsComplete() &&
-               deps_.pathIdentity.PathsEqual(owned.path,
-                                             matchedDirective->sitePath) &&
-               owned.includeId == matchedDirective->ownerIncludeId &&
-               owned.begin == matchedDirective->siteB &&
-               owned.end == matchedDirective->siteE;
-      };
-
-  auto ownerForPreservedStructureInterval =
-      [](const PreprocessingStructureInterval &interval) -> Owner {
-    // Prefer an exact producer identity when one exists.  The structure
-    // index's lexical interval remains the physical authority, so this owner
-    // is only a stable theorem label and never authorizes reconstruction.
-    // Conditional controls are especially important: one `CondGroup` owns
-    // several disjoint directive lines, while a structural deletion may
-    // preserve only one of those lines.
-    switch (interval.modelKind) {
-    case PreprocessingStructureModelKind::MacroDirective:
-      if (interval.modelItemId)
-        return Owner::MacroDirective(*interval.modelItemId);
-      break;
-
-    case PreprocessingStructureModelKind::IncludeDirective:
-      if (interval.modelItemId)
-        return Owner::Include(*interval.modelItemId);
-      break;
-
-    case PreprocessingStructureModelKind::PragmaDirective:
-      if (interval.modelItemId) {
-        return Owner::PragmaIsland(*interval.modelItemId,
-                                   interval.ownerConditionalArmId);
-      }
-      break;
-
-    case PreprocessingStructureModelKind::LineControlEvent:
-      if (interval.modelItemId)
-        return Owner::LineControlIsland(*interval.modelItemId);
-      break;
-
-    case PreprocessingStructureModelKind::ConditionalDirective:
-      if (interval.conditionalGroupId)
-        return Owner::ConditionalGroup(*interval.conditionalGroupId);
-      break;
-
-    case PreprocessingStructureModelKind::None:
-      break;
-    }
-
-    // A lexically exact non-conditional directive need not have a producer
-    // record in order to be preserved safely.  Bind it to its concrete
-    // physical TU/include occurrence: the disposition theorem proves that
-    // the bytes are untouched and retain their order, so no semantic claim
-    // about the unknown directive is required.  Conditional binding failures
-    // never reach this fallback because they make the protection census
-    // incomplete globally.
-    if (interval.ownerIncludeId) {
-      return Owner::Include(*interval.ownerIncludeId,
-                            interval.ownerConditionalArmId);
-    }
-    return Owner::TU(interval.ownerConditionalArmId);
-  };
-
-  auto bindProtectedStructureIntervalsToStateGaps =
-      [&](const OwnerSourceRange &gapSource, uint64_t aBoundary,
-          uint64_t bBoundary, SmallVectorImpl<PartitionEdge> &gaps,
-          std::string *reason) -> std::optional<bool> {
-    const auto structureLookup = lookupStructureIndexForSource(gapSource);
-    const RefoldPreprocessingStructureIndex *structureIndex =
-        structureLookup.index;
-    if (!structureIndex ||
-        !structureIndex->IsDirectTUProtectionCensusComplete()) {
-      if (reason) {
-        *reason = structureLookup.incompleteEvidenceReason.empty()
-                      ? "preprocessing-structure census is incomplete for "
-                        "source gap"
-                      : structureLookup.incompleteEvidenceReason.str();
-      }
-      return std::nullopt;
-    }
-
-    std::vector<const PreprocessingStructureInterval *> protectedIntervals =
-        structureIndex->FindOverlapping(gapSource.begin, gapSource.end);
-    if (protectedIntervals.empty())
-      return false;
-
-    // Work transactionally.  A failed exact binding must not widen one state
-    // owner and then let the historical mixed-realizer path observe a partly
-    // modified gap graph.
-    SmallVector<PartitionEdge, 8> normalizedGaps(gaps.begin(), gaps.end());
-    for (const PreprocessingStructureInterval *interval : protectedIntervals) {
-      if (!interval || interval->begin < gapSource.begin ||
-          interval->end > gapSource.end) {
-        if (reason) {
-          *reason = "protected preprocessing interval is only partially inside "
-                    "source gap";
-        }
-        return std::nullopt;
-      }
-      size_t matchingGapIndex = std::numeric_limits<size_t>::max();
-      for (size_t gapIndex = 0; gapIndex < normalizedGaps.size(); ++gapIndex) {
-        const PartitionEdge &gap = normalizedGaps[gapIndex];
-        if (!gap.closure || !gap.closure->source.IsComplete() ||
-            !stateGapOwnerMatchesStructureIdentity(gap, *interval)) {
-          continue;
-        }
-
-        const OwnerSourceRange &owned = gap.closure->source;
-        if (!deps_.pathIdentity.PathsEqual(owned.path, interval->sourcePath) ||
-            owned.includeId != interval->ownerIncludeId)
-          continue;
-
-        // When present, the exact model id relates a producer state owner to
-        // one lexical interval.  Source coordinates must additionally be
-        // nested in one direction: the producer may name a narrow site inside
-        // the complete logical directive line, or a conditional-group owner
-        // may enclose several of its bound control lines.  Partial crossing
-        // is neither relation and is rejected.
-        const bool ownerContainsInterval =
-            owned.begin <= interval->begin && interval->end <= owned.end;
-        const bool intervalContainsOwner =
-            interval->begin <= owned.begin && owned.end <= interval->end;
-        if (!ownerContainsInterval && !intervalContainsOwner)
-          continue;
-
-        if (matchingGapIndex != std::numeric_limits<size_t>::max()) {
-          if (reason) {
-            *reason = "protected preprocessing interval has ambiguous "
-                      "state-gap ownership";
-          }
-          return std::nullopt;
-        }
-        matchingGapIndex = gapIndex;
-      }
-
-      if (matchingGapIndex == std::numeric_limits<size_t>::max()) {
-        // Some producer owners are intentionally broader than one lexical
-        // directive.  In particular, a conditional group spans from its
-        // opening control through the matching `#endif`, while a structural
-        // deletion may preserve only one control line between two token
-        // segments.  Unmodeled non-conditional directives can likewise lack
-        // a producer owner entirely.  The exact lexical census is sufficient
-        // to instantiate a proof-only physical owner because this edge will
-        // be authorized only as `PreservedInPlace`, never reconstructed.
-        Owner exactOwner = ownerForPreservedStructureInterval(*interval);
-
-        OwnerSourceRange exactSource =
-            OwnerSourceRange::From(interval->sourcePath, interval->begin,
-                                   interval->end, interval->ownerIncludeId);
-        PartitionEdge exactGap =
-            makeStateGapEdge(std::move(exactOwner), std::move(exactSource),
-                             aBoundary, bBoundary);
-        if (!exactGap.closure || !exactGap.closure->IsComplete()) {
-          if (reason)
-            *reason = "exact protected state-gap owner has no closure";
-          return std::nullopt;
-        }
-        matchingGapIndex = normalizedGaps.size();
-        normalizedGaps.push_back(std::move(exactGap));
-      }
-
-      PartitionEdge &matchingGap = normalizedGaps[matchingGapIndex];
-      const OwnerSourceRange &owned = matchingGap.closure->source;
-      if (owned.begin != interval->begin || owned.end != interval->end) {
-        // The lexical interval is the physical preservation authority.  A
-        // producer site may be narrower (for example, just the macro name) or
-        // broader (for example, the complete conditional group).  Once the
-        // model identity is uniquely bound, normalize the proof-only edge to
-        // the exact logical directive line in either case.  This prevents a
-        // broad conditional owner from swallowing token-bearing arm bytes and
-        // prevents a narrow producer site from leaving directive bytes
-        // unaccounted for as trivia.
-        OwnerSourceRange exactSource =
-            OwnerSourceRange::From(interval->sourcePath, interval->begin,
-                                   interval->end, interval->ownerIncludeId);
-        matchingGap.closure = deps_.ownerStateProof.AttachCanonicalStateSummary(
-            OwnerClosure::From(
-                matchingGap.closure->owner, std::move(exactSource),
-                matchingGap.closure->aTokens, matchingGap.closure->bTokens));
-      }
-      matchingGap.protectedPreprocessingStructure = true;
-      matchingGap.gapDisposition = StructuralGapDisposition::PreservedInPlace;
-      matchingGap.protectedStructureIdentityRecorded = true;
-      matchingGap.protectedStructureKind =
-          structuralProtectedStructureKind(interval->kind);
-      matchingGap.producerIdentityKind =
-          structuralProducerIdentityKind(interval->modelKind);
-      matchingGap.producerItemId = interval->modelItemId;
-      if (interval->modelKind == PreprocessingStructureModelKind::None &&
-          matchingGap.closure->owner.IsMacroDirective() &&
-          matchingGap.closure->owner.macroDirectiveId) {
-        // The exact source-contained fallback above recovered a unique
-        // producer macro identity even though the shared index could not bind
-        // normalized producer text to the physical line.  Persist that typed
-        // identity in the generalized witness rather than leaving the
-        // preserved directive as an anonymous lexical interval.
-        matchingGap.producerIdentityKind =
-            StructuralProducerIdentityKind::MacroDirective;
-        matchingGap.producerItemId =
-            matchingGap.closure->owner.macroDirectiveId;
-      }
-      matchingGap.producerConditionalGroupId = interval->conditionalGroupId;
-      matchingGap.producerConditionalArmId = interval->conditionalArmId;
-    }
-
-    llvm::sort(
-        normalizedGaps, [](const PartitionEdge &lhs, const PartitionEdge &rhs) {
-          const OwnerSourceRange &l = lhs.closure->source;
-          const OwnerSourceRange &r = rhs.closure->source;
-          if (l.path != r.path)
-            return l.path < r.path;
-          if (l.includeId != r.includeId) {
-            return l.includeId.value_or(std::numeric_limits<uint64_t>::max()) <
-                   r.includeId.value_or(std::numeric_limits<uint64_t>::max());
-          }
-          if (l.begin != r.begin)
-            return l.begin < r.begin;
-          if (l.end != r.end)
-            return l.end < r.end;
-          return lhs.closure->owner.kind < rhs.closure->owner.kind;
-        });
-
-    gaps.assign(normalizedGaps.begin(), normalizedGaps.end());
-    return true;
-  };
-
-  auto buildPhysicalSourceRunPlan =
-      [&](const diffutils::Hunk &h) -> std::optional<PhysicalSourceRunPlan> {
+  std::optional<PhysicalSourceRunPlan>
+  BuildPhysicalSourceRunPlan(const diffutils::Hunk &h) const {
     if (h.aEnd <= h.aStart)
       return std::nullopt;
 
@@ -1518,7 +876,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
     PhysicalSourceRun currentRun;
 
     for (uint64_t pp = h.aStart; pp < h.aEnd; ++pp) {
-      if (duplicateTokmapPP.count(pp) != 0)
+      if (duplicateTokmapPP_.count(pp) != 0)
         return std::nullopt;
 
       auto entryIt = tokmapByPP.find(pp);
@@ -1530,7 +888,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         return std::nullopt;
 
       std::optional<SourceOwnerIdentity> tokenOwner =
-          resolveSourceOwnerIdentity(entry.file, entry.b, entry.e);
+          ResolveSourceOwnerIdentity(entry.file, entry.b, entry.e);
       if (!tokenOwner) {
         // Older maps can omit segment facts for the top-level TU.  That
         // omission is unambiguous only for the exact TU source; a header path
@@ -1544,7 +902,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       OwnerSourceRange tokenSource = OwnerSourceRange::From(
           entry.file, entry.b, entry.e, tokenOwner->includeId);
       const RefoldPreprocessingStructureIndex *tokenStructureIndex =
-          getStructureIndexForSource(tokenSource);
+          GetStructureIndexForSource(tokenSource);
       if (!tokenStructureIndex ||
           !tokenStructureIndex->IsDirectTUProtectionCensusComplete() ||
           !tokenStructureIndex->IsExactTokenSpellingInterval(entry.b,
@@ -1725,140 +1083,11 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
     }
 
     return plan;
-  };
+  }
 
-  auto stateGapComposesSafely = [&](const PartitionEdge &gap,
-                                    std::string *reason) -> bool {
-    if (!gap.IsStateGap() || !gap.closure) {
-      if (reason)
-        *reason = "state-gap edge has no closure";
-      return false;
-    }
-
-    // A preserved-in-place gap is discharged by physical source identity,
-    // not by replaying or interpreting its state transition.  Exact lexical
-    // binding, complete byte coverage, and the later source-order/disjoint
-    // proof guarantee that even an implementation-defined pragma or a
-    // conditional transition with incomplete value-level modeling executes
-    // from the same bytes in the same position.  Requiring a fully modeled
-    // state delta here would conflate preservation with reconstruction and
-    // defeat the purpose of the disposition.
-    if (gap.gapDisposition == StructuralGapDisposition::PreservedInPlace) {
-      return true;
-    }
-
-    const OwnerStateDelta &summary = gap.closure->stateOut;
-    if (deps_.ownerStateProof.OwnerStateDeltaHasUnmodeledState(summary)) {
-      if (reason)
-        *reason = "state gap contains unmodeled producer state";
-      return false;
-    }
-    if (deps_.ownerStateProof.OwnerStateDeltaHasUnknownPragmaState(summary)) {
-      if (reason)
-        *reason = "state gap contains unknown pragma state";
-      return false;
-    }
-
-    // composes state effects across the reconstructed path as a whole. This
-    // local check therefore rejects only state-gap effects that cannot
-    // participate in any ordered composition proof. A modeled state mutation
-    // followed by a later observer is not rejected here merely because it is
-    // visible after the gap: the later token/state edge may be part of the
-    // same widened mixed-owner tiling closure.
-    return true;
-  };
-
-  auto appendUniqueStateComponent =
-      [](SmallVectorImpl<OwnerStateComponent> &out,
-         OwnerStateComponent component) {
-        if (component == OwnerStateComponent::Unknown)
-          return;
-        if (!llvm::is_contained(out, component))
-          out.push_back(component);
-      };
-
-  auto stateComponentsObservedBySummary = [&](const OwnerStateDelta &summary) {
-    // Mixed-owner proof consumes the canonical theorem-facing delta directly.
-    // composition is tied to precise Entry/Observes/Mutates/Exit facts and
-    // explicit missing-fact markers, not a flat owner-state projection.
-    const OwnerStateDelta theoremDelta = summary;
-    const StateObservations &observations = theoremDelta.observes;
-    SmallVector<OwnerStateComponent, 8> components;
-    if (observations.HasMacroRequirements() ||
-        observations.HasMacroExpansionObservations())
-      appendUniqueStateComponent(components, OwnerStateComponent::MacroState);
-    if (observations.HasDefinedOperatorObservations())
-      appendUniqueStateComponent(components,
-                                 OwnerStateComponent::DefinedOperator);
-    if (observations.HasConditionalMacroObservations() ||
-        observations.HasConditionalStateEvents())
-      appendUniqueStateComponent(components,
-                                 OwnerStateComponent::ConditionalState);
-    if (llvm::any_of(observations.builtinLocationObservations,
-                     [](const BuiltinLocationObservation &obs) {
-                       return obs.kind ==
-                              BuiltinLocationObservationKind::LineState;
-                     }))
-      appendUniqueStateComponent(components, OwnerStateComponent::LineNumber);
-    if (llvm::any_of(observations.builtinLocationObservations,
-                     [](const BuiltinLocationObservation &obs) {
-                       return obs.kind ==
-                              BuiltinLocationObservationKind::FileState;
-                     }))
-      appendUniqueStateComponent(components, OwnerStateComponent::FileState);
-    if (llvm::any_of(observations.builtinLocationObservations,
-                     [](const BuiltinLocationObservation &obs) {
-                       return obs.kind ==
-                              BuiltinLocationObservationKind::FileNameState;
-                     }))
-      appendUniqueStateComponent(components, OwnerStateComponent::FileName);
-    if (observations.HasCounterEvents())
-      appendUniqueStateComponent(components, OwnerStateComponent::Counter);
-    if (observations.HasPragmaStateEvents() ||
-        observations.HasTheoremUnknownPragmaState())
-      appendUniqueStateComponent(components, OwnerStateComponent::PragmaState);
-    if (observations.HasIncludeGuardStateEvents())
-      appendUniqueStateComponent(components,
-                                 OwnerStateComponent::IncludeGuardState);
-    if (observations.HasIncludeStateEvents())
-      appendUniqueStateComponent(components, OwnerStateComponent::IncludeState);
-    for (const MissingStateFact &fact : observations.missingStateFacts) {
-      if (fact.kind == MissingStateFactKind::MissingLineControlFacts) {
-        appendUniqueStateComponent(components, OwnerStateComponent::LineNumber);
-        appendUniqueStateComponent(components, OwnerStateComponent::FileState);
-        appendUniqueStateComponent(components, OwnerStateComponent::FileName);
-        continue;
-      }
-      appendUniqueStateComponent(
-          components,
-          deps_.ownerStateProof.StateComponentForMissingStateFact(fact.kind));
-    }
-    if (observations.HasMissingFactKind(
-            MissingStateFactKind::MissingOwnerOrderingFacts))
-      appendUniqueStateComponent(components,
-                                 OwnerStateComponent::UnmodeledState);
-    return components;
-  };
-
-  auto mergedEdgeStateSummary = [&](const PartitionEdge &edge) {
-    OwnerStateDelta summary;
-    if (edge.closure) {
-      summary.MergeFrom(edge.closure->stateIn);
-      summary.MergeFrom(edge.closure->stateOut);
-    } else {
-      OwnerStateFacts missingFacts;
-      missingFacts.AddMissingStateFact(
-          MissingStateFactKind::MissingOwnerOrderingFacts,
-          "partition edge has no owner closure");
-      summary = deps_.ownerStateProof.BuildTheoremStateDelta(missingFacts,
-                                                             OwnerStateDelta());
-    }
-    return summary;
-  };
-
-  auto mixedOwnerTilingStateSummariesCompose =
-      [&](const diffutils::Hunk &h, ArrayRef<PartitionEdge> path,
-          std::string *reason) -> bool {
+  bool MixedOwnerTilingStateSummariesCompose(const diffutils::Hunk &h,
+                                             ArrayRef<PartitionEdge> path,
+                                             std::string *reason) const {
     // treats the reconstructed token/state-gap path as one ordered
     // state-composition proof.  Earlier checks prove that each individual
     // token segment has a closure and that each zero-token source gap is
@@ -1885,7 +1114,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         continue;
       }
 
-      const OwnerStateDelta summary = mergedEdgeStateSummary(edge);
+      const OwnerStateDelta summary = MergedEdgeStateSummary(edge);
       if (edge.IsStateGap() &&
           deps_.ownerStateProof.OwnerStateDeltaHasUnmodeledState(summary)) {
         if (reason)
@@ -1900,7 +1129,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       }
 
       for (OwnerStateComponent observed :
-           stateComponentsObservedBySummary(summary)) {
+           StateComponentsObservedBySummary(summary)) {
         if (llvm::is_contained(activeMutations, observed))
           appendUniqueStateComponent(internallyObservedMutations, observed);
       }
@@ -1926,11 +1155,12 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
     }
 
     return true;
-  };
+  }
 
-  auto buildStructuralTilingWitness =
-      [&](const diffutils::Hunk &h, const StructuralPartition &partition,
-          uint64_t witnessId) -> MixedOwnerTilingWitness {
+  MixedOwnerTilingWitness
+  BuildStructuralTilingWitness(const diffutils::Hunk &h,
+                               const StructuralPartition &partition,
+                               uint64_t witnessId) const {
     ArrayRef<PartitionEdge> path = partition.edges;
     MixedOwnerTilingWitness witness;
     witness.witnessId = witnessId;
@@ -2159,7 +1389,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         if (edge.IsTokenSegment() && structuralReason &&
             partition.sourceByteCoverComplete) {
           const RefoldPreprocessingStructureIndex *structureIndex =
-              getStructureIndexForSource(edge.closure->source);
+              GetStructureIndexForSource(edge.closure->source);
           segmentWitness.protectedStructurePreservedOutsideSegment =
               structureIndex &&
               structureIndex->IsDirectTUProtectionCensusComplete() &&
@@ -2223,11 +1453,11 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
     witness.globalCompositionSignature =
         RefoldWitnessTrace::FormatWitnessTraceHash(compositionStorage);
     return witness;
-  };
+  }
 
-  auto buildClosedStateGapTransition =
-      [&](const PartitionEdge *prev,
-          const PartitionEdge &cur) -> std::optional<ClosedStateGapTransition> {
+  std::optional<ClosedStateGapTransition>
+  BuildClosedStateGapTransition(const PartitionEdge *prev,
+                                const PartitionEdge &cur) const {
     ClosedStateGapTransition transition;
 
     // The first token segment has no predecessor, and token owners from
@@ -2238,7 +1468,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
     if (!prev->IsTokenSegment() || !cur.IsTokenSegment() || !prev->closure ||
         !cur.closure)
       return std::nullopt;
-    if (!sourceSitesComparable(prev->closure->source, cur.closure->source) ||
+    if (!SourceSitesComparable(prev->closure->source, cur.closure->source) ||
         cur.closure->source.begin < prev->closure->source.end)
       return transition;
 
@@ -2246,7 +1476,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         prev->closure->source.path, prev->closure->source.end,
         cur.closure->source.begin, prev->closure->source.includeId);
     SmallVector<PartitionEdge, 8> collected =
-        collectZeroTokenStateGaps(gapSource, prev->aEnd, prev->bEnd);
+        CollectZeroTokenStateGaps(gapSource, prev->aEnd, prev->bEnd);
 
     // Exact lexical intervals are bound before byte coverage so a producer
     // site that names only the directive keyword/name cannot leave the rest
@@ -2256,7 +1486,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
     SmallVector<PartitionEdge, 8> exactCollected = collected;
     std::string structureReason;
     std::optional<bool> protectedBinding =
-        bindProtectedStructureIntervalsToStateGaps(gapSource, prev->aEnd,
+        BindProtectedStructureIntervalsToStateGaps(gapSource, prev->aEnd,
                                                    prev->bEnd, exactCollected,
                                                    &structureReason);
 
@@ -2264,7 +1494,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
                                 SmallVectorImpl<PartitionEdge> &validated) {
       std::string coverageReason;
       SmallVector<size_t, 8> outerGapIndices;
-      if (!sourceGapIsFullyCovered(gapSource, candidate, &coverageReason,
+      if (!SourceGapIsFullyCovered(gapSource, candidate, &coverageReason,
                                    outerGapIndices)) {
         return false;
       }
@@ -2279,7 +1509,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         lastGapEnd = gap.closure->source.end;
 
         std::string stateReason;
-        if (!stateGapComposesSafely(gap, &stateReason))
+        if (!StateGapComposesSafely(gap, &stateReason))
           return false;
         validated.push_back(gap);
       }
@@ -2321,60 +1551,60 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
 
     transition.hasProtectedPreprocessingStructure = false;
     return transition;
-  };
+  }
 
-  auto structuralPartitionSourceCoverComplete =
-      [&](ArrayRef<PartitionEdge> path) {
-        const PartitionEdge *previousToken = nullptr;
-        SmallVector<PartitionEdge, 4> gapsBetweenTokens;
-        bool sawToken = false;
+  bool
+  StructuralPartitionSourceCoverComplete(ArrayRef<PartitionEdge> path) const {
+    const PartitionEdge *previousToken = nullptr;
+    SmallVector<PartitionEdge, 4> gapsBetweenTokens;
+    bool sawToken = false;
 
-        for (const PartitionEdge &edge : path) {
-          if (edge.IsStateGap()) {
-            if (!previousToken)
-              return false;
-            gapsBetweenTokens.push_back(edge);
-            continue;
-          }
+    for (const PartitionEdge &edge : path) {
+      if (edge.IsStateGap()) {
+        if (!previousToken)
+          return false;
+        gapsBetweenTokens.push_back(edge);
+        continue;
+      }
 
-          if (!edge.closure || !edge.closure->source.IsComplete())
-            return false;
-          sawToken = true;
-          if (!previousToken) {
-            previousToken = &edge;
-            continue;
-          }
+      if (!edge.closure || !edge.closure->source.IsComplete())
+        return false;
+      sawToken = true;
+      if (!previousToken) {
+        previousToken = &edge;
+        continue;
+      }
 
-          if (!previousToken->closure ||
-              !sourceSitesComparable(previousToken->closure->source,
-                                     edge.closure->source) ||
-              edge.closure->source.begin < previousToken->closure->source.end) {
-            return false;
-          }
+      if (!previousToken->closure ||
+          !SourceSitesComparable(previousToken->closure->source,
+                                 edge.closure->source) ||
+          edge.closure->source.begin < previousToken->closure->source.end) {
+        return false;
+      }
 
-          OwnerSourceRange gapSource = OwnerSourceRange::From(
-              previousToken->closure->source.path,
-              previousToken->closure->source.end, edge.closure->source.begin,
-              previousToken->closure->source.includeId);
-          std::string coverageReason;
-          SmallVector<size_t, 8> outerGapIndices;
-          if (!sourceGapIsFullyCovered(gapSource, gapsBetweenTokens,
-                                       &coverageReason, outerGapIndices)) {
-            return false;
-          }
+      OwnerSourceRange gapSource = OwnerSourceRange::From(
+          previousToken->closure->source.path,
+          previousToken->closure->source.end, edge.closure->source.begin,
+          previousToken->closure->source.includeId);
+      std::string coverageReason;
+      SmallVector<size_t, 8> outerGapIndices;
+      if (!SourceGapIsFullyCovered(gapSource, gapsBetweenTokens,
+                                   &coverageReason, outerGapIndices)) {
+        return false;
+      }
 
-          gapsBetweenTokens.clear();
-          previousToken = &edge;
-        }
+      gapsBetweenTokens.clear();
+      previousToken = &edge;
+    }
 
-        // A proof-only gap cannot trail the final emitted token segment: it
-        // would have no following edit boundary proving that the structure
-        // remains outside the emitted carrier.
-        return sawToken && gapsBetweenTokens.empty();
-      };
+    // A proof-only gap cannot trail the final emitted token segment: it
+    // would have no following edit boundary proving that the structure
+    // remains outside the emitted carrier.
+    return sawToken && gapsBetweenTokens.empty();
+  }
 
-  auto preservedInPlaceGapSourceOrderIsProven = [&](ArrayRef<PartitionEdge>
-                                                        path) {
+  bool
+  PreservedInPlaceGapSourceOrderIsProven(ArrayRef<PartitionEdge> path) const {
     const PartitionEdge *previousToken = nullptr;
     SmallVector<const PartitionEdge *, 4> gapsBetweenTokens;
     bool sawPreservedGap = false;
@@ -2385,7 +1615,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
             !edge.closure || !edge.closure->source.IsComplete() ||
             edge.closure->source.end <= edge.closure->source.begin ||
             !previousToken || !previousToken->closure ||
-            !sourceSitesComparable(previousToken->closure->source,
+            !SourceSitesComparable(previousToken->closure->source,
                                    edge.closure->source) ||
             edge.closure->source.begin < previousToken->closure->source.end) {
           return false;
@@ -2394,7 +1624,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         if (!gapsBetweenTokens.empty()) {
           const PartitionEdge *previousGap = gapsBetweenTokens.back();
           if (!previousGap->closure ||
-              !sourceSitesComparable(previousGap->closure->source,
+              !SourceSitesComparable(previousGap->closure->source,
                                      edge.closure->source) ||
               edge.closure->source.begin < previousGap->closure->source.end) {
             return false;
@@ -2427,7 +1657,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         continue;
       }
 
-      if (!sourceSitesComparable(previousToken->closure->source,
+      if (!SourceSitesComparable(previousToken->closure->source,
                                  edge.closure->source) ||
           edge.closure->source.begin < previousToken->closure->source.end) {
         return false;
@@ -2436,7 +1666,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       uint64_t cursor = previousToken->closure->source.end;
       for (const PartitionEdge *gap : gapsBetweenTokens) {
         if (!gap || !gap->closure ||
-            !sourceSitesComparable(previousToken->closure->source,
+            !SourceSitesComparable(previousToken->closure->source,
                                    gap->closure->source) ||
             gap->closure->source.begin < cursor ||
             edge.closure->source.begin < gap->closure->source.end) {
@@ -2452,82 +1682,879 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
     // A trailing source gap has no following emitted segment against
     // which its physical source position can be certified.
     return sawPreservedGap && gapsBetweenTokens.empty();
-  };
+  }
 
-  auto preservedInPlaceGapsAreDisjointFromAllTokenSegments =
-      [&](ArrayRef<PartitionEdge> path) {
-        SmallVector<const PartitionEdge *, 8> tokenSegments;
-        SmallVector<const PartitionEdge *, 8> preservedGaps;
+  bool PreservedInPlaceGapsAreDisjointFromAllTokenSegments(
+      ArrayRef<PartitionEdge> path) const {
+    SmallVector<const PartitionEdge *, 8> tokenSegments;
+    SmallVector<const PartitionEdge *, 8> preservedGaps;
 
-        for (const PartitionEdge &edge : path) {
-          if (!edge.closure || !edge.closure->source.IsComplete())
-            return false;
-          if (edge.IsStateGap()) {
-            if (edge.gapDisposition !=
-                StructuralGapDisposition::PreservedInPlace) {
-              return false;
-            }
-            if (edge.closure->source.end <= edge.closure->source.begin)
-              return false;
-            preservedGaps.push_back(&edge);
-            continue;
-          }
-          tokenSegments.push_back(&edge);
-        }
-
-        if (preservedGaps.empty())
+    for (const PartitionEdge &edge : path) {
+      if (!edge.closure || !edge.closure->source.IsComplete())
+        return false;
+      if (edge.IsStateGap()) {
+        if (edge.gapDisposition != StructuralGapDisposition::PreservedInPlace) {
           return false;
-
-        // The same physical structure interval may appear only once in the
-        // durable path.  Duplicate or overlapping preserved gaps would make
-        // source-order authority ambiguous even though neither one emits
-        // bytes directly.
-        for (size_t i = 0; i < preservedGaps.size(); ++i) {
-          for (size_t j = i + 1; j < preservedGaps.size(); ++j) {
-            const OwnerSourceRange &lhs = preservedGaps[i]->closure->source;
-            const OwnerSourceRange &rhs = preservedGaps[j]->closure->source;
-            if (!sourceSitesComparable(lhs, rhs))
-              continue;
-            if (lhs.begin < rhs.end && rhs.begin < lhs.end)
-              return false;
-          }
         }
+        if (edge.closure->source.end <= edge.closure->source.begin)
+          return false;
+        preservedGaps.push_back(&edge);
+        continue;
+      }
+      tokenSegments.push_back(&edge);
+    }
 
-        // Check every emitted token carrier, not only the two path-adjacent
-        // segments.  A mixed-owner A-order path can revisit the same physical
-        // source file later; local predecessor/successor checks alone would
-        // not exclude such a non-adjacent carrier from intersecting an
-        // earlier
-        // preserved interval.
-        for (const PartitionEdge *gap : preservedGaps) {
-          for (const PartitionEdge *token : tokenSegments) {
-            if (!gap || !token || !gap->closure || !token->closure)
-              return false;
-            const OwnerSourceRange &gapSource = gap->closure->source;
-            const OwnerSourceRange &tokenSource = token->closure->source;
-            if (!sourceSitesComparable(gapSource, tokenSource))
-              continue;
-            if (tokenSource.begin < gapSource.end &&
-                gapSource.begin < tokenSource.end) {
-              return false;
-            }
-          }
+    if (preservedGaps.empty())
+      return false;
+
+    // The same physical structure interval may appear only once in the
+    // durable path.  Duplicate or overlapping preserved gaps would make
+    // source-order authority ambiguous even though neither one emits
+    // bytes directly.
+    for (size_t i = 0; i < preservedGaps.size(); ++i) {
+      for (size_t j = i + 1; j < preservedGaps.size(); ++j) {
+        const OwnerSourceRange &lhs = preservedGaps[i]->closure->source;
+        const OwnerSourceRange &rhs = preservedGaps[j]->closure->source;
+        if (!SourceSitesComparable(lhs, rhs))
+          continue;
+        if (lhs.begin < rhs.end && rhs.begin < lhs.end)
+          return false;
+      }
+    }
+
+    // Check every emitted token carrier, not only the two path-adjacent
+    // segments.  A mixed-owner A-order path can revisit the same physical
+    // source file later; local predecessor/successor checks alone would
+    // not exclude such a non-adjacent carrier from intersecting an
+    // earlier
+    // preserved interval.
+    for (const PartitionEdge *gap : preservedGaps) {
+      for (const PartitionEdge *token : tokenSegments) {
+        if (!gap || !token || !gap->closure || !token->closure)
+          return false;
+        const OwnerSourceRange &gapSource = gap->closure->source;
+        const OwnerSourceRange &tokenSource = token->closure->source;
+        if (!SourceSitesComparable(gapSource, tokenSource))
+          continue;
+        if (tokenSource.begin < gapSource.end &&
+            gapSource.begin < tokenSource.end) {
+          return false;
         }
-        return true;
+      }
+    }
+    return true;
+  }
+
+private:
+  // All structural proofs use the shared occurrence-local index provider. The
+  // provider returns the engine-owned TU index and lazily caches header indexes
+  // by canonical physical path plus concrete include owner. Missing source text
+  // remains explicit incomplete evidence and never creates an approximate
+  // index.
+  RefoldPreprocessingStructureIndexProvider::LookupResult
+  LookupStructureIndexForSource(const OwnerSourceRange &source) const {
+    if (!source.IsComplete())
+      return {nullptr, {}, "source coordinates are incomplete"};
+    return deps_.preprocessingStructureIndexes.Get(source.path,
+                                                   source.includeId);
+  }
+
+  const RefoldPreprocessingStructureIndex *
+  GetStructureIndexForSource(const OwnerSourceRange &source) const {
+    return LookupStructureIndexForSource(source).index;
+  }
+
+  std::optional<OwnerSourceRange>
+  MappedTUSourceRangeForTokens(uint64_t aStart, uint64_t aEnd) const {
+    const auto &tokmapByPP = deps_.model.GetTokmapByPP();
+    uint64_t sourceBegin = std::numeric_limits<uint64_t>::max();
+    uint64_t sourceEnd = 0;
+    bool sawTU = false;
+
+    for (uint64_t pp = aStart; pp < aEnd; ++pp) {
+      auto it = tokmapByPP.find(pp);
+      if (it == tokmapByPP.end())
+        continue;
+      const RefoldModel::TokMapEntry &entry = it->second;
+      if (!deps_.pathIdentity.PathsEqual(entry.file, deps_.tuPath))
+        return std::nullopt;
+      sourceBegin = std::min<uint64_t>(sourceBegin, entry.b);
+      sourceEnd = std::max<uint64_t>(sourceEnd, entry.e);
+      sawTU = true;
+    }
+
+    if (!sawTU || sourceBegin > sourceEnd)
+      return std::nullopt;
+    return OwnerSourceRange::From(deps_.tuPath, sourceBegin, sourceEnd);
+  }
+
+  bool SourceSiteMatchesGap(const OwnerSourceRange &gap, StringRef file,
+                            std::optional<uint64_t> ownerIncludeId,
+                            uint64_t begin, uint64_t end) const {
+    return gap.IsComplete() && deps_.pathIdentity.PathsEqual(gap.path, file) &&
+           gap.includeId == ownerIncludeId && gap.begin <= begin &&
+           begin <= end && end <= gap.end;
+  }
+
+  bool SourceSitePathMatchesGap(const OwnerSourceRange &gap, StringRef file,
+                                uint64_t begin, uint64_t end) const {
+    return gap.IsComplete() && deps_.pathIdentity.PathsEqual(gap.path, file) &&
+           gap.begin <= begin && begin <= end && end <= gap.end;
+  }
+
+  std::optional<SourceOwnerIdentity>
+  ResolveSourceOwnerIdentity(StringRef file, uint64_t begin,
+                             uint64_t end) const {
+    ArrayRef<RefoldModel::Segment> segments =
+        deps_.model.GetSegmentsForFile(file);
+    if (segments.empty())
+      return std::nullopt;
+
+    uint64_t cursor = begin;
+    bool sawCover = false;
+    SourceOwnerIdentity identity;
+
+    for (const RefoldModel::Segment &segment : segments) {
+      if (segment.e <= begin)
+        continue;
+      if (end <= segment.b)
+        break;
+      if (!intervalsOverlap(begin, end, segment.b, segment.e))
+        continue;
+
+      const uint64_t partBegin = std::max<uint64_t>(begin, segment.b);
+      const uint64_t partEnd = std::min<uint64_t>(end, segment.e);
+      if (partBegin > cursor)
+        return std::nullopt;
+
+      SourceOwnerIdentity part{segment.ownerIncludeId, segment.ownerCondArmId};
+      if (!sawCover) {
+        identity = part;
+        sawCover = true;
+      } else if (identity.includeId != part.includeId ||
+                 identity.condArmId != part.condArmId) {
+        return std::nullopt;
+      }
+      cursor = partEnd;
+    }
+
+    if (!sawCover || cursor < end)
+      return std::nullopt;
+    return identity;
+  }
+
+  std::optional<SourceOwnerIdentity>
+  BindSourceOwnerToGap(const OwnerSourceRange &gap, StringRef file,
+                       uint64_t begin, uint64_t end) const {
+    if (!SourceSitePathMatchesGap(gap, file, begin, end))
+      return std::nullopt;
+
+    std::optional<SourceOwnerIdentity> identity =
+        ResolveSourceOwnerIdentity(file, begin, end);
+    if (!identity) {
+      // Older maps do not always provide segment facts for TU-only files.
+      // Treat that as TU-owned only when the enclosing gap is also TU-owned.
+      // For include-owned gaps, accepting a path-only match would bind a
+      // repeated header pragma/conditional to an arbitrary include instance.
+      if (gap.includeId)
+        return std::nullopt;
+      identity = SourceOwnerIdentity{};
+    }
+
+    if (identity->includeId != gap.includeId)
+      return std::nullopt;
+    return identity;
+  }
+
+  PartitionEdge MakeStateGapEdge(Owner owner, OwnerSourceRange source,
+                                 uint64_t aBoundary, uint64_t bBoundary) const {
+    PartitionEdge gap;
+    gap.kind = PartitionEdgeKind::StateGap;
+    gap.aStart = aBoundary;
+    gap.aEnd = aBoundary;
+    gap.bStart = bBoundary;
+    gap.bEnd = bBoundary;
+    gap.closure = deps_.ownerStateProof.AttachCanonicalStateSummary(
+        OwnerClosure::From(std::move(owner), std::move(source),
+                           OwnerTokenRange::From(aBoundary, aBoundary),
+                           OwnerTokenRange::From(bBoundary, bBoundary)));
+    return gap;
+  }
+
+  SmallVector<PartitionEdge, 8>
+  CollectZeroTokenStateGaps(const OwnerSourceRange &gapSource,
+                            uint64_t aBoundary, uint64_t bBoundary) const {
+    SmallVector<PartitionEdge, 8> gaps;
+    if (!gapSource.IsComplete() || gapSource.end <= gapSource.begin)
+      return gaps;
+
+    // Sideband directives are zero-token owners.  They are collected in
+    // source order and represented as proof-only partition edges so the mixed
+    // owner tiler can distinguish "there is no source gap" from "there is a
+    // state gap that was proved closed".
+    for (const RefoldModel::MacroDirective &directive :
+         deps_.model.GetMacroDirectives()) {
+      if (!SourceSiteMatchesGap(gapSource, directive.sitePath,
+                                directive.ownerIncludeId, directive.siteB,
+                                directive.siteE))
+        continue;
+      gaps.push_back(MakeStateGapEdge(
+          Owner::MacroDirective(directive.id),
+          OwnerSourceRange::From(directive.sitePath, directive.siteB,
+                                 directive.siteE, directive.ownerIncludeId),
+          aBoundary, bBoundary));
+    }
+
+    for (const RefoldModel::LineControlEvent &event :
+         deps_.model.GetLineControls()) {
+      if (!event.siteB || !event.siteE)
+        continue;
+      if (!SourceSiteMatchesGap(gapSource, event.physicalFile,
+                                event.ownerIncludeId, *event.siteB,
+                                *event.siteE))
+        continue;
+      gaps.push_back(MakeStateGapEdge(
+          Owner::LineControlIsland(event.id),
+          OwnerSourceRange::From(event.physicalFile, *event.siteB, *event.siteE,
+                                 event.ownerIncludeId),
+          aBoundary, bBoundary));
+    }
+
+    for (const RefoldModel::PragmaDirective &pragma :
+         deps_.model.GetPragmas()) {
+      // bind zero-token pragmas to the same source owner as the gap.  Newer
+      // maps can carry owner_include_id directly; older maps are resolved
+      // through segment facts.  A repeated-header pragma must never be
+      // accepted from path+byte containment alone because the same file bytes
+      // may be visited by several include occurrences.
+      if (!pragma.ownerIncludeId) {
+        unsigned samePhysicalSiteWithoutOwner = 0;
+        for (const RefoldModel::PragmaDirective &other :
+             deps_.model.GetPragmas()) {
+          if (!other.ownerIncludeId &&
+              deps_.pathIdentity.PathsEqual(other.sitePath, pragma.sitePath) &&
+              other.siteB == pragma.siteB && other.siteE == pragma.siteE)
+            ++samePhysicalSiteWithoutOwner;
+        }
+        if (samePhysicalSiteWithoutOwner > 1)
+          continue;
+      }
+      std::optional<SourceOwnerIdentity> identity = BindSourceOwnerToGap(
+          gapSource, pragma.sitePath, pragma.siteB, pragma.siteE);
+      if (!identity)
+        continue;
+      if (pragma.ownerIncludeId &&
+          *pragma.ownerIncludeId != identity->includeId.value_or(
+                                        std::numeric_limits<uint64_t>::max()) &&
+          !identity->includeId) {
+        continue;
+      }
+
+      // A header pragma item describes a physical directive, not necessarily
+      // a unique replay occurrence.  When segment facts prove that this
+      // source gap belongs to a concrete repeated include instance, bind the
+      // state-gap closure to that occurrence even if the serialized
+      // owner_include_id names another replay of the same physical pragma.
+      // The segment-derived identity is the stronger proof here.
+      gaps.push_back(MakeStateGapEdge(
+          Owner::PragmaIsland(pragma.id, identity->condArmId),
+          OwnerSourceRange::From(pragma.sitePath, pragma.siteB, pragma.siteE,
+                                 identity->includeId),
+          aBoundary, bBoundary));
+    }
+
+    for (const RefoldModel::IncludeItem &include : deps_.model.GetIncludes()) {
+      if (!SourceSiteMatchesGap(gapSource, include.sitePath, include.parent,
+                                include.siteB, include.siteE))
+        continue;
+      // Non-empty includes already have token edges in the normal tiling.
+      // Only zero-token include transitions are sideband gap owners here.
+      if (include.cover.IsValid())
+        continue;
+      gaps.push_back(MakeStateGapEdge(
+          Owner::Include(include.id),
+          OwnerSourceRange::From(include.sitePath, include.siteB, include.siteE,
+                                 include.parent),
+          aBoundary, bBoundary));
+    }
+
+    for (const RefoldModel::MacroInvocation &macro :
+         deps_.model.GetMacroInvocations()) {
+      if (!macro.invFile || !macro.invB || !macro.invE)
+        continue;
+      if (macro.cover.IsValid())
+        continue;
+      if (!SourceSiteMatchesGap(gapSource, *macro.invFile, macro.ownerIncludeId,
+                                *macro.invB, *macro.invE))
+        continue;
+      gaps.push_back(MakeStateGapEdge(
+          Owner::MacroInvocation(macro.id),
+          OwnerSourceRange::From(*macro.invFile, *macro.invB, *macro.invE,
+                                 macro.ownerIncludeId),
+          aBoundary, bBoundary));
+    }
+
+    for (const RefoldModel::CondGroup &group : deps_.model.GetConds()) {
+      if (!SourceSiteMatchesGap(gapSource, group.file, group.parentIncludeId,
+                                group.groupB, group.groupE))
+        continue;
+      // A conditional group owns the directive island
+      // (#if/#elif/#else/#endif) and the branch-selection state.  Individual
+      // arms own only their body intervals.  Using arm ids for the whole
+      // group created overlapping zero-token owners and lost the distinction
+      // between branch structure and selected-arm content.
+      gaps.push_back(MakeStateGapEdge(
+          Owner::ConditionalGroup(group.id),
+          OwnerSourceRange::From(group.file, group.groupB, group.groupE,
+                                 group.parentIncludeId),
+          aBoundary, bBoundary));
+    }
+
+    llvm::sort(gaps, [](const PartitionEdge &lhs, const PartitionEdge &rhs) {
+      const OwnerSourceRange &l = lhs.closure->source;
+      const OwnerSourceRange &r = rhs.closure->source;
+      if (l.path != r.path)
+        return l.path < r.path;
+      if (l.includeId != r.includeId)
+        return l.includeId.value_or(std::numeric_limits<uint64_t>::max()) <
+               r.includeId.value_or(std::numeric_limits<uint64_t>::max());
+      if (l.begin != r.begin)
+        return l.begin < r.begin;
+      if (l.end != r.end)
+        return l.end < r.end;
+
+      auto ownerKey = [](const Owner &owner) {
+        const uint64_t none = std::numeric_limits<uint64_t>::max();
+        return std::make_tuple(
+            static_cast<unsigned>(owner.kind), owner.includeId.value_or(none),
+            owner.macroInvocationId.value_or(none),
+            owner.macroDirectiveId.value_or(none),
+            owner.lineControlId.value_or(none), owner.pragmaId.value_or(none),
+            owner.condGroupId.value_or(none), owner.condArmId.value_or(none));
       };
+      return ownerKey(lhs.closure->owner) < ownerKey(rhs.closure->owner);
+    });
 
-  auto classifyStructuralTilingReason =
-      [](bool mixedRealizers, bool preservedPreprocessingStructure) {
-        if (mixedRealizers && preservedPreprocessingStructure) {
-          return StructuralTilingReason::MixedRealizersAndPreservedStructure;
+    return gaps;
+  }
+
+  /// Prove that proof-only owners plus exact trivia cover the whole gap.
+  ///
+  /// `outerGapIndices` receives, in source order, the indices of the owners
+  /// that survived normalization as outer pieces.  An owner absorbed by a
+  /// containing one is proved rather than dropped, but it is not a sibling in
+  /// the ordered state chain: its bytes are already inside the containing
+  /// edge, which is preserved in place, so listing it again would make the
+  /// chain overlap itself.
+  bool SourceGapIsFullyCovered(const OwnerSourceRange &gapSource,
+                               ArrayRef<PartitionEdge> gaps,
+                               std::string *reason,
+                               SmallVectorImpl<size_t> &outerGapIndices) const {
+    outerGapIndices.clear();
+    if (!gapSource.IsComplete()) {
+      if (reason)
+        *reason = "source gap has incomplete source coordinates";
+      return false;
+    }
+
+    const auto structureLookup = LookupStructureIndexForSource(gapSource);
+    const RefoldPreprocessingStructureIndex *structureIndex =
+        structureLookup.index;
+    if (!structureIndex) {
+      if (reason) {
+        *reason = structureLookup.incompleteEvidenceReason.empty()
+                      ? "source gap has no exact preprocessing-structure index"
+                      : structureLookup.incompleteEvidenceReason.str();
+      }
+      return false;
+    }
+
+    SmallVector<SourceGapProofPiece, 8> pieces;
+    pieces.reserve(gaps.size());
+    for (size_t gapIndex = 0; gapIndex < gaps.size(); ++gapIndex) {
+      const PartitionEdge &gap = gaps[gapIndex];
+      if (!gap.closure || !gap.closure->source.IsComplete()) {
+        if (reason)
+          *reason = "state-gap edge lacks a complete source closure";
+        return false;
+      }
+
+      const OwnerSourceRange &owned = gap.closure->source;
+      if (!deps_.pathIdentity.PathsEqual(owned.path, gapSource.path) ||
+          owned.begin < gapSource.begin || owned.end > gapSource.end) {
+        if (reason) {
+          *reason = llvm::formatv("state-gap owner [{0},{1}) is outside source "
+                                  "gap [{2},{3})",
+                                  owned.begin, owned.end, gapSource.begin,
+                                  gapSource.end)
+                        .str();
         }
-        if (mixedRealizers)
-          return StructuralTilingReason::MixedRealizers;
-        if (preservedPreprocessingStructure) {
-          return StructuralTilingReason::PreservedPreprocessingStructure;
+        return false;
+      }
+
+      // The same physical header can be entered repeatedly.  A path and byte
+      // range therefore do not identify the source surface by themselves;
+      // every proof-only owner must retain the concrete include occurrence of
+      // the token carriers on both sides of the gap.
+      if (owned.includeId != gapSource.includeId) {
+        if (reason)
+          *reason = "state-gap owner belongs to a different include instance";
+        return false;
+      }
+
+      const Owner &owner = gap.closure->owner;
+      pieces.push_back(SourceGapProofPiece{
+          owned.begin, owned.end, structuralGapOwnerStableId(owner),
+          static_cast<uint32_t>(owner.kind),
+          structuralGapOwnerNestingClass(owner),
+          structuralGapOwnerAbsorbedNestingClasses(deps_.model, owner),
+          gapIndex});
+    }
+
+    // Structural tiling does not permit overlapping proof-only owners.  The
+    // shared theorem now performs the same deterministic interval
+    // normalization, exact preprocessing-inventory check, and lexer-trivia
+    // coverage used by expansion fallback.  No directive-looking byte can be
+    // skipped merely because it contributed no ordinary PP token.
+    std::optional<SourceGapProofResult> proof = proveSourceGapWithIndexedTrivia(
+        *structureIndex, gapSource.begin, gapSource.end, pieces, reason);
+    // Every submitted owner must be accounted for: it either survived as an
+    // outer piece or was absorbed by a containing piece whose proof declared
+    // that nested class.  Anything else means an owner vanished.
+    if (!proof || proof->outerPiecePayloadIndices.size() +
+                          proof->absorbedPiecePayloadIndices.size() !=
+                      gaps.size()) {
+      return false;
+    }
+    outerGapIndices.assign(proof->outerPiecePayloadIndices.begin(),
+                           proof->outerPiecePayloadIndices.end());
+    return true;
+  }
+
+  bool StateGapOwnerMatchesStructureIdentity(
+      const PartitionEdge &gap,
+      const PreprocessingStructureInterval &interval) const {
+    if (!gap.closure)
+      return false;
+
+    const Owner &owner = gap.closure->owner;
+    switch (interval.modelKind) {
+    case PreprocessingStructureModelKind::MacroDirective:
+      return interval.modelItemId && owner.IsMacroDirective() &&
+             owner.macroDirectiveId == interval.modelItemId;
+
+    case PreprocessingStructureModelKind::IncludeDirective:
+      return interval.modelItemId && owner.IsInclude() &&
+             owner.includeId == interval.modelItemId;
+
+    case PreprocessingStructureModelKind::PragmaDirective:
+      return interval.modelItemId && owner.IsPragmaIsland() &&
+             owner.pragmaId == interval.modelItemId;
+
+    case PreprocessingStructureModelKind::LineControlEvent:
+      return interval.modelItemId && owner.IsLineControlIsland() &&
+             owner.lineControlId == interval.modelItemId;
+
+    case PreprocessingStructureModelKind::ConditionalDirective:
+      return interval.conditionalGroupId && owner.IsConditionalGroup() &&
+             owner.condGroupId == interval.conditionalGroupId;
+
+    case PreprocessingStructureModelKind::None:
+      break;
+    }
+
+    // A producer macro-state record can fail the structure index's
+    // full-line text binding when the producer serializes normalized
+    // directive trivia while `site_b/site_e` still identify the exact
+    // physical macro-name site.  The lexical scanner nevertheless proves
+    // the complete `#define`/`#undef` line.  In that case, bind the two
+    // facts here only when one stable macro-directive id has the expected
+    // directive kind and its exact producer site is wholly contained in
+    // the lexical line in the same physical owner occurrence.
+    //
+    // This is not source-nearest recovery: the owner id, directive kind,
+    // path, include occurrence, and nested byte ranges must all agree.
+    // Multiple records with the same id or any partial crossing fail
+    // closed.  Once bound, the lexical interval replaces the narrower
+    // producer site as the physical preservation authority, avoiding two
+    // overlapping proof-only edges for the same directive.
+    if (interval.modelItemId || !owner.IsMacroDirective() ||
+        !owner.macroDirectiveId ||
+        (interval.kind != PreprocessingStructureKind::MacroDefine &&
+         interval.kind != PreprocessingStructureKind::MacroUndef)) {
+      return false;
+    }
+
+    const RefoldModel::MacroDirective *matchedDirective = nullptr;
+    for (const RefoldModel::MacroDirective &directive :
+         deps_.model.GetMacroDirectives()) {
+      if (directive.id != *owner.macroDirectiveId)
+        continue;
+      if (matchedDirective)
+        return false;
+      matchedDirective = &directive;
+    }
+    if (!matchedDirective)
+      return false;
+
+    const StringRef expectedSubkind =
+        interval.kind == PreprocessingStructureKind::MacroDefine
+            ? StringRef("#define")
+            : StringRef("#undef");
+    if (matchedDirective->subkind != expectedSubkind ||
+        !deps_.pathIdentity.PathsEqual(matchedDirective->sitePath,
+                                       interval.sourcePath) ||
+        matchedDirective->ownerIncludeId != interval.ownerIncludeId ||
+        matchedDirective->siteE <= matchedDirective->siteB ||
+        interval.begin > matchedDirective->siteB ||
+        matchedDirective->siteE > interval.end) {
+      return false;
+    }
+
+    const OwnerSourceRange &owned = gap.closure->source;
+    return owned.IsComplete() &&
+           deps_.pathIdentity.PathsEqual(owned.path,
+                                         matchedDirective->sitePath) &&
+           owned.includeId == matchedDirective->ownerIncludeId &&
+           owned.begin == matchedDirective->siteB &&
+           owned.end == matchedDirective->siteE;
+  }
+
+  std::optional<bool> BindProtectedStructureIntervalsToStateGaps(
+      const OwnerSourceRange &gapSource, uint64_t aBoundary, uint64_t bBoundary,
+      SmallVectorImpl<PartitionEdge> &gaps, std::string *reason) const {
+    const auto structureLookup = LookupStructureIndexForSource(gapSource);
+    const RefoldPreprocessingStructureIndex *structureIndex =
+        structureLookup.index;
+    if (!structureIndex ||
+        !structureIndex->IsDirectTUProtectionCensusComplete()) {
+      if (reason) {
+        *reason = structureLookup.incompleteEvidenceReason.empty()
+                      ? "preprocessing-structure census is incomplete for "
+                        "source gap"
+                      : structureLookup.incompleteEvidenceReason.str();
+      }
+      return std::nullopt;
+    }
+
+    std::vector<const PreprocessingStructureInterval *> protectedIntervals =
+        structureIndex->FindOverlapping(gapSource.begin, gapSource.end);
+    if (protectedIntervals.empty())
+      return false;
+
+    // Work transactionally.  A failed exact binding must not widen one state
+    // owner and then let the historical mixed-realizer path observe a partly
+    // modified gap graph.
+    SmallVector<PartitionEdge, 8> normalizedGaps(gaps.begin(), gaps.end());
+    for (const PreprocessingStructureInterval *interval : protectedIntervals) {
+      if (!interval || interval->begin < gapSource.begin ||
+          interval->end > gapSource.end) {
+        if (reason) {
+          *reason = "protected preprocessing interval is only partially inside "
+                    "source gap";
         }
-        return StructuralTilingReason::Unknown;
-      };
+        return std::nullopt;
+      }
+      size_t matchingGapIndex = std::numeric_limits<size_t>::max();
+      for (size_t gapIndex = 0; gapIndex < normalizedGaps.size(); ++gapIndex) {
+        const PartitionEdge &gap = normalizedGaps[gapIndex];
+        if (!gap.closure || !gap.closure->source.IsComplete() ||
+            !StateGapOwnerMatchesStructureIdentity(gap, *interval)) {
+          continue;
+        }
+
+        const OwnerSourceRange &owned = gap.closure->source;
+        if (!deps_.pathIdentity.PathsEqual(owned.path, interval->sourcePath) ||
+            owned.includeId != interval->ownerIncludeId)
+          continue;
+
+        // When present, the exact model id relates a producer state owner to
+        // one lexical interval.  Source coordinates must additionally be
+        // nested in one direction: the producer may name a narrow site inside
+        // the complete logical directive line, or a conditional-group owner
+        // may enclose several of its bound control lines.  Partial crossing
+        // is neither relation and is rejected.
+        const bool ownerContainsInterval =
+            owned.begin <= interval->begin && interval->end <= owned.end;
+        const bool intervalContainsOwner =
+            interval->begin <= owned.begin && owned.end <= interval->end;
+        if (!ownerContainsInterval && !intervalContainsOwner)
+          continue;
+
+        if (matchingGapIndex != std::numeric_limits<size_t>::max()) {
+          if (reason) {
+            *reason = "protected preprocessing interval has ambiguous "
+                      "state-gap ownership";
+          }
+          return std::nullopt;
+        }
+        matchingGapIndex = gapIndex;
+      }
+
+      if (matchingGapIndex == std::numeric_limits<size_t>::max()) {
+        // Some producer owners are intentionally broader than one lexical
+        // directive.  In particular, a conditional group spans from its
+        // opening control through the matching `#endif`, while a structural
+        // deletion may preserve only one control line between two token
+        // segments.  Unmodeled non-conditional directives can likewise lack
+        // a producer owner entirely.  The exact lexical census is sufficient
+        // to instantiate a proof-only physical owner because this edge will
+        // be authorized only as `PreservedInPlace`, never reconstructed.
+        Owner exactOwner = ownerForPreservedStructureInterval(*interval);
+
+        OwnerSourceRange exactSource =
+            OwnerSourceRange::From(interval->sourcePath, interval->begin,
+                                   interval->end, interval->ownerIncludeId);
+        PartitionEdge exactGap =
+            MakeStateGapEdge(std::move(exactOwner), std::move(exactSource),
+                             aBoundary, bBoundary);
+        if (!exactGap.closure || !exactGap.closure->IsComplete()) {
+          if (reason)
+            *reason = "exact protected state-gap owner has no closure";
+          return std::nullopt;
+        }
+        matchingGapIndex = normalizedGaps.size();
+        normalizedGaps.push_back(std::move(exactGap));
+      }
+
+      PartitionEdge &matchingGap = normalizedGaps[matchingGapIndex];
+      const OwnerSourceRange &owned = matchingGap.closure->source;
+      if (owned.begin != interval->begin || owned.end != interval->end) {
+        // The lexical interval is the physical preservation authority.  A
+        // producer site may be narrower (for example, just the macro name) or
+        // broader (for example, the complete conditional group).  Once the
+        // model identity is uniquely bound, normalize the proof-only edge to
+        // the exact logical directive line in either case.  This prevents a
+        // broad conditional owner from swallowing token-bearing arm bytes and
+        // prevents a narrow producer site from leaving directive bytes
+        // unaccounted for as trivia.
+        OwnerSourceRange exactSource =
+            OwnerSourceRange::From(interval->sourcePath, interval->begin,
+                                   interval->end, interval->ownerIncludeId);
+        matchingGap.closure = deps_.ownerStateProof.AttachCanonicalStateSummary(
+            OwnerClosure::From(
+                matchingGap.closure->owner, std::move(exactSource),
+                matchingGap.closure->aTokens, matchingGap.closure->bTokens));
+      }
+      matchingGap.protectedPreprocessingStructure = true;
+      matchingGap.gapDisposition = StructuralGapDisposition::PreservedInPlace;
+      matchingGap.protectedStructureIdentityRecorded = true;
+      matchingGap.protectedStructureKind =
+          structuralProtectedStructureKind(interval->kind);
+      matchingGap.producerIdentityKind =
+          structuralProducerIdentityKind(interval->modelKind);
+      matchingGap.producerItemId = interval->modelItemId;
+      if (interval->modelKind == PreprocessingStructureModelKind::None &&
+          matchingGap.closure->owner.IsMacroDirective() &&
+          matchingGap.closure->owner.macroDirectiveId) {
+        // The exact source-contained fallback above recovered a unique
+        // producer macro identity even though the shared index could not bind
+        // normalized producer text to the physical line.  Persist that typed
+        // identity in the generalized witness rather than leaving the
+        // preserved directive as an anonymous lexical interval.
+        matchingGap.producerIdentityKind =
+            StructuralProducerIdentityKind::MacroDirective;
+        matchingGap.producerItemId =
+            matchingGap.closure->owner.macroDirectiveId;
+      }
+      matchingGap.producerConditionalGroupId = interval->conditionalGroupId;
+      matchingGap.producerConditionalArmId = interval->conditionalArmId;
+    }
+
+    llvm::sort(
+        normalizedGaps, [](const PartitionEdge &lhs, const PartitionEdge &rhs) {
+          const OwnerSourceRange &l = lhs.closure->source;
+          const OwnerSourceRange &r = rhs.closure->source;
+          if (l.path != r.path)
+            return l.path < r.path;
+          if (l.includeId != r.includeId) {
+            return l.includeId.value_or(std::numeric_limits<uint64_t>::max()) <
+                   r.includeId.value_or(std::numeric_limits<uint64_t>::max());
+          }
+          if (l.begin != r.begin)
+            return l.begin < r.begin;
+          if (l.end != r.end)
+            return l.end < r.end;
+          return lhs.closure->owner.kind < rhs.closure->owner.kind;
+        });
+
+    gaps.assign(normalizedGaps.begin(), normalizedGaps.end());
+    return true;
+  }
+
+  bool StateGapComposesSafely(const PartitionEdge &gap,
+                              std::string *reason) const {
+    if (!gap.IsStateGap() || !gap.closure) {
+      if (reason)
+        *reason = "state-gap edge has no closure";
+      return false;
+    }
+
+    // A preserved-in-place gap is discharged by physical source identity,
+    // not by replaying or interpreting its state transition.  Exact lexical
+    // binding, complete byte coverage, and the later source-order/disjoint
+    // proof guarantee that even an implementation-defined pragma or a
+    // conditional transition with incomplete value-level modeling executes
+    // from the same bytes in the same position.  Requiring a fully modeled
+    // state delta here would conflate preservation with reconstruction and
+    // defeat the purpose of the disposition.
+    if (gap.gapDisposition == StructuralGapDisposition::PreservedInPlace) {
+      return true;
+    }
+
+    const OwnerStateDelta &summary = gap.closure->stateOut;
+    if (deps_.ownerStateProof.OwnerStateDeltaHasUnmodeledState(summary)) {
+      if (reason)
+        *reason = "state gap contains unmodeled producer state";
+      return false;
+    }
+    if (deps_.ownerStateProof.OwnerStateDeltaHasUnknownPragmaState(summary)) {
+      if (reason)
+        *reason = "state gap contains unknown pragma state";
+      return false;
+    }
+
+    // composes state effects across the reconstructed path as a whole. This
+    // local check therefore rejects only state-gap effects that cannot
+    // participate in any ordered composition proof. A modeled state mutation
+    // followed by a later observer is not rejected here merely because it is
+    // visible after the gap: the later token/state edge may be part of the
+    // same widened mixed-owner tiling closure.
+    return true;
+  }
+
+  SmallVector<OwnerStateComponent, 8>
+  StateComponentsObservedBySummary(const OwnerStateDelta &summary) const {
+    // Mixed-owner proof consumes the canonical theorem-facing delta directly.
+    // composition is tied to precise Entry/Observes/Mutates/Exit facts and
+    // explicit missing-fact markers, not a flat owner-state projection.
+    const OwnerStateDelta theoremDelta = summary;
+    const StateObservations &observations = theoremDelta.observes;
+    SmallVector<OwnerStateComponent, 8> components;
+    if (observations.HasMacroRequirements() ||
+        observations.HasMacroExpansionObservations())
+      appendUniqueStateComponent(components, OwnerStateComponent::MacroState);
+    if (observations.HasDefinedOperatorObservations())
+      appendUniqueStateComponent(components,
+                                 OwnerStateComponent::DefinedOperator);
+    if (observations.HasConditionalMacroObservations() ||
+        observations.HasConditionalStateEvents())
+      appendUniqueStateComponent(components,
+                                 OwnerStateComponent::ConditionalState);
+    if (llvm::any_of(observations.builtinLocationObservations,
+                     [](const BuiltinLocationObservation &obs) {
+                       return obs.kind ==
+                              BuiltinLocationObservationKind::LineState;
+                     }))
+      appendUniqueStateComponent(components, OwnerStateComponent::LineNumber);
+    if (llvm::any_of(observations.builtinLocationObservations,
+                     [](const BuiltinLocationObservation &obs) {
+                       return obs.kind ==
+                              BuiltinLocationObservationKind::FileState;
+                     }))
+      appendUniqueStateComponent(components, OwnerStateComponent::FileState);
+    if (llvm::any_of(observations.builtinLocationObservations,
+                     [](const BuiltinLocationObservation &obs) {
+                       return obs.kind ==
+                              BuiltinLocationObservationKind::FileNameState;
+                     }))
+      appendUniqueStateComponent(components, OwnerStateComponent::FileName);
+    if (observations.HasCounterEvents())
+      appendUniqueStateComponent(components, OwnerStateComponent::Counter);
+    if (observations.HasPragmaStateEvents() ||
+        observations.HasTheoremUnknownPragmaState())
+      appendUniqueStateComponent(components, OwnerStateComponent::PragmaState);
+    if (observations.HasIncludeGuardStateEvents())
+      appendUniqueStateComponent(components,
+                                 OwnerStateComponent::IncludeGuardState);
+    if (observations.HasIncludeStateEvents())
+      appendUniqueStateComponent(components, OwnerStateComponent::IncludeState);
+    for (const MissingStateFact &fact : observations.missingStateFacts) {
+      if (fact.kind == MissingStateFactKind::MissingLineControlFacts) {
+        appendUniqueStateComponent(components, OwnerStateComponent::LineNumber);
+        appendUniqueStateComponent(components, OwnerStateComponent::FileState);
+        appendUniqueStateComponent(components, OwnerStateComponent::FileName);
+        continue;
+      }
+      appendUniqueStateComponent(
+          components,
+          deps_.ownerStateProof.StateComponentForMissingStateFact(fact.kind));
+    }
+    if (observations.HasMissingFactKind(
+            MissingStateFactKind::MissingOwnerOrderingFacts))
+      appendUniqueStateComponent(components,
+                                 OwnerStateComponent::UnmodeledState);
+    return components;
+  }
+
+  OwnerStateDelta MergedEdgeStateSummary(const PartitionEdge &edge) const {
+    OwnerStateDelta summary;
+    if (edge.closure) {
+      summary.MergeFrom(edge.closure->stateIn);
+      summary.MergeFrom(edge.closure->stateOut);
+    } else {
+      OwnerStateFacts missingFacts;
+      missingFacts.AddMissingStateFact(
+          MissingStateFactKind::MissingOwnerOrderingFacts,
+          "partition edge has no owner closure");
+      summary = deps_.ownerStateProof.BuildTheoremStateDelta(missingFacts,
+                                                             OwnerStateDelta());
+    }
+    return summary;
+  }
+
+  RefoldMixedOwnerTilingPlanner::Dependencies &deps_;
+
+  /// Preprocessed-token indices claimed by more than one tokmap entry.  Such a
+  /// token has no unique physical source position, so a canonical source run
+  /// cannot be derived through it.
+  std::set<uint64_t> duplicateTokmapPP_;
+};
+
+} // namespace
+
+RefoldMixedOwnerTilingPlanner::RefoldMixedOwnerTilingPlanner(Dependencies deps)
+    : deps_(deps) {}
+
+RefoldMixedOwnerTilingPlanner::MixedOwnerTilingPlan
+RefoldMixedOwnerTilingPlanner::FinishPlan(std::vector<diffutils::Hunk> hunks) {
+  // Refresh the token-level hunk cache after normalization.
+  deps_.abTokHunks = hunks;
+
+  MixedOwnerTilingPlan plan;
+  plan.hunks = std::move(hunks);
+  plan.mixedOwnerWitnessCount = deps_.mixedOwnerTilingWitnesses.size();
+  plan.segmentBindingCount = deps_.mixedOwnerTilingSegmentBindings.size();
+  return plan;
+}
+
+RefoldMixedOwnerTilingPlanner::MixedOwnerTilingPlan
+RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
+  // Per-structure placement proofs for a preserved structural gap.  The prover
+  // reads producer records only, so one instance answers gaps in the TU and in
+  // any included header alike.
+  const RefoldStructuralGapCrossingProver gapCrossingProver(
+      RefoldStructuralGapCrossingProver::Dependencies{
+          deps_.model, deps_.macroStateProof, deps_.tokenText, deps_.lexLang});
+
+  // Structural witnesses are rebuilt from the current token diff and attached
+  // to later accepted candidates by exact A/B token-envelope binding.  The
+  // legacy ledger type names are retained temporarily to avoid unrelated API
+  // churn while same-realizer structure preservation is introduced.
+  deps_.mixedOwnerTilingWitnesses.clear();
+  deps_.mixedOwnerTilingSegmentBindings.clear();
+
+  // Tiling only has work to do when there is at least one hunk to split; with
+  // none, the plan is the unchanged input.  Returning early here keeps the
+  // whole tiling body at function indentation instead of nesting it.
+  if (hunks.empty())
+    return FinishPlan(std::move(hunks));
+
+  const size_t noTokenEdgeIndex = std::numeric_limits<size_t>::max();
+
+  // Every predicate the tiling proof needs reads producer facts and its own
+  // arguments only, so one instance answers every hunk of this pass.
+  const StructuralTilingProver prover(deps_);
 
   // boundary: failures while *searching* for a structural
   // partition are non-applicability, not terminal proof failures.  Until a
@@ -2576,7 +2603,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
     // claim preserved preprocessing structure without matching these exact
     // maximal runs.
     std::optional<PhysicalSourceRunPlan> physicalSourceRuns =
-        buildPhysicalSourceRunPlan(h);
+        prover.BuildPhysicalSourceRunPlan(h);
 
     // The boundary-projection theorem binds every canonical physical
     // source-run boundary to one exact B-token boundary before the DP may
@@ -2667,7 +2694,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
               const bool crossable =
                   crossing.Crossable() &&
                   (!crossing.carriesMacroStateDirective ||
-                   !macroStateGapBelongsToLivenessPlanner(gap, crossing));
+                   !prover.MacroStateGapBelongsToLivenessPlanner(gap, crossing));
 
               if (crossable) {
                 // Equivalent placements: commit the lower frontier, which
@@ -2755,7 +2782,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       // pieces. This keeps source structure maximally coarse while remaining
       // deterministic.
       for (uint64_t aHi = h.aEnd; aHi > aLo; --aHi) {
-        HunkRealizer realizer = classifyHunkRealizer(aLo, aHi);
+        HunkRealizer realizer = prover.ClassifyHunkRealizer(aLo, aHi);
         if (realizer.kind == HunkRealizerKind::Unknown)
           continue;
 
@@ -2820,7 +2847,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         edge.allowEmptyBEnvelope =
             deleteOnlyHunk ||
             (replaceHunk && exactPhysicalRunIndex && edgeBStart == edgeBEnd);
-        edge.closure = buildTokenSegmentClosure(edge);
+        edge.closure = prover.BuildTokenSegmentClosure(edge);
         if (!edge.closure)
           continue;
 
@@ -2843,7 +2870,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
            ++runIndex) {
         const PhysicalSourceRun &run = physicalSourceRuns->runs[runIndex];
         if (candidate.aStart != run.aStart || candidate.aEnd != run.aEnd ||
-            !sourceSitesComparable(candidate.closure->source, run.source) ||
+            !prover.SourceSitesComparable(candidate.closure->source, run.source) ||
             candidate.closure->source.begin != run.source.begin ||
             candidate.closure->source.end != run.source.end) {
           continue;
@@ -2894,7 +2921,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
           // this DP edge from existing at all.  This lets cost and ambiguity
           // account for the real token+state proof graph instead of adding
           // state gaps as an after-the-fact annotation.
-          auto transitionGaps = buildClosedStateGapTransition(prevEdge, edge);
+          auto transitionGaps = prover.BuildClosedStateGapTransition(prevEdge, edge);
           if (!transitionGaps)
             continue;
 
@@ -2940,7 +2967,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
 
               const OwnerSourceRange &provedGap =
                   physicalSourceRuns->protectedGaps[*boundaryIndex];
-              if (!sourceSitesComparable(prevEdge->closure->source,
+              if (!prover.SourceSitesComparable(prevEdge->closure->source,
                                          provedGap) ||
                   provedGap.begin != prevEdge->closure->source.end ||
                   provedGap.end != edge.closure->source.begin) {
@@ -3007,7 +3034,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
 
               const OwnerSourceRange &provedGap =
                   physicalSourceRuns->protectedGaps[*previousRun];
-              if (!sourceSitesComparable(prevEdge->closure->source,
+              if (!prover.SourceSitesComparable(prevEdge->closure->source,
                                          provedGap) ||
                   provedGap.begin != prevEdge->closure->source.end ||
                   provedGap.end != edge.closure->source.begin) {
@@ -3391,7 +3418,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
     }
 
     const bool sourceByteCoverComplete =
-        structuralPartitionSourceCoverComplete(path);
+        prover.StructuralPartitionSourceCoverComplete(path);
     if (requiresCanonicalPhysicalRunProof && !sourceByteCoverComplete) {
       return std::nullopt;
     }
@@ -3403,10 +3430,10 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
                      StructuralGapDisposition::PreservedInPlace;
         });
     const bool preservedGapSourceOrderProven =
-        hasPreservedInPlaceGap && preservedInPlaceGapSourceOrderIsProven(path);
+        hasPreservedInPlaceGap && prover.PreservedInPlaceGapSourceOrderIsProven(path);
     const bool preservedGapsDisjointFromTokenSegments =
         hasPreservedInPlaceGap &&
-        preservedInPlaceGapsAreDisjointFromAllTokenSegments(path);
+        prover.PreservedInPlaceGapsAreDisjointFromAllTokenSegments(path);
     if (hasPreservedInPlaceGap && (!preservedGapSourceOrderProven ||
                                    !preservedGapsDisjointFromTokenSegments)) {
       return std::nullopt;
@@ -3489,7 +3516,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
     }
 
     std::string stateCompositionReason;
-    if (!mixedOwnerTilingStateSummariesCompose(h, path,
+    if (!prover.MixedOwnerTilingStateSummariesCompose(h, path,
                                                &stateCompositionReason)) {
       return std::nullopt;
     }
@@ -3519,7 +3546,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
             physicalSourceRuns->protectedGaps[gapIndex];
         for (PartitionEdge &gapEdge : path) {
           if (!gapEdge.IsStateGap() || !gapEdge.closure ||
-              !sourceSitesComparable(gapEdge.closure->source, provenGap) ||
+              !prover.SourceSitesComparable(gapEdge.closure->source, provenGap) ||
               gapEdge.closure->source.begin < provenGap.begin ||
               gapEdge.closure->source.end > provenGap.end) {
             continue;
@@ -3587,7 +3614,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       const uint64_t mixedWitnessId =
           static_cast<uint64_t>(mixedWitnessIndex) + 1;
       MixedOwnerTilingWitness witness =
-          buildStructuralTilingWitness(h, *partition, mixedWitnessId);
+          prover.BuildStructuralTilingWitness(h, *partition, mixedWitnessId);
       const bool preservesStructure =
           partition->reason ==
               StructuralTilingReason::PreservedPreprocessingStructure ||
