@@ -1020,6 +1020,1005 @@ bool pragmaIsConsumableIncludeLocalState(
   return false;
 }
 
+struct TUPreservedGapPiece {
+  enum class Kind {
+    ZeroTokenMacroInvocation,
+    ZeroTokenConditionalGroup,
+    BalancedPragmaStateIsland
+  };
+
+  Kind kind = Kind::ZeroTokenMacroInvocation;
+  uint64_t begin = 0;
+  uint64_t end = 0;
+  uint64_t id = 0;
+};
+
+// One TU directive that a closure preserves at its original position inside
+// the replacement instead of consuming or relocating it.
+//
+// `aFrontier` is the producer-backed A-token index the directive sits at; the
+// B payload is cut there so the directive keeps the same position relative to
+// surviving material.
+//
+// Two directive kinds qualify, for the same reason.  A pragma's state is not
+// identity and cannot be moved, and a zero-token `#include` whose header owns
+// such a pragma carries that state transitively: consuming either would drop
+// it.  Preserving the directive keeps the transition at its original
+// position, which is sound where deleting it is not -- and strictly better
+// than refusing the closure, since refusing surrenders every directive in the
+// translation unit rather than this one.
+struct TUPositionPreservedDirective {
+  enum class Kind { Pragma, Include, MacroDirective };
+
+  Kind kind = Kind::Pragma;
+  uint64_t begin = 0;
+  uint64_t end = 0;
+  uint64_t id = 0;
+  uint64_t aFrontier = 0;
+  /// Every state effect this directive establishes, for placing edited
+  /// material the alignment cannot place.  StringRefs point into the TU
+  /// source bytes for a pragma, or into the model's pragma text for an
+  /// include.
+  SmallVector<PragmaClassification, 2> classifications;
+  /// Macro definitions a preserved `#define`/`#undef` binds.  Empty for the
+  /// other kinds.  Each binding points into the model's directive record.
+  SmallVector<MacroStateBinding, 2> macroBindings;
+};
+
+/// Proves what the source gaps inside a proposed TU/include-closure
+/// replacement contain: which bytes a closure may consume, which it must
+/// preserve verbatim, and which directives it must keep at their original
+/// position.
+///
+/// Every obligation here is discharged against one call of
+/// BuildTUIncludeClosureEditForUnresolvedHunk, so the per-call facts -- the
+/// ordered touched-include run, the realized hunk, the TU source surface, and
+/// the three derived proof contexts -- are held as members while the planner's
+/// shared services are supplied once at construction rather than threaded
+/// through every call site.
+///
+/// `touched` is aliased, not copied: the planner fills and sorts it before
+/// constructing the prover and only reads it afterwards.
+class TUIncludeClosureSourceGapProver {
+public:
+  TUIncludeClosureSourceGapProver(
+      const RefoldModel &model, const RefoldPathIdentity &paths,
+      const RefoldMacroStateProof &macroStateProof,
+      const RefoldSourceMapper &sourceMapper,
+      const RefoldPreprocessingStructureIndex &preprocessingStructureIndex,
+      llvm::ArrayRef<PPTok> aToks, const clang::LangOptions &lexLang,
+      const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
+      ArrayRef<const RefoldModel::IncludeItem *> touched)
+      : model_(model), paths_(paths), macroStateProof_(macroStateProof),
+        preprocessingStructureIndex_(preprocessingStructureIndex),
+        aToks_(aToks), lexLang_(lexLang), tuPath_(tuPath), tuBytes_(tuBytes),
+        touched_(touched),
+        recordedIncludeSideEffectResolver_(model, paths,
+                                           pragmaIsConsumableIncludeLocalState),
+        conditionalStateIncludePreservationResolver_(
+            model, paths, macroStateProof, sourceMapper, h,
+            pragmaIsConsumableIncludeLocalState),
+        tuSourceNeutrality_(
+            RefoldSourceNeutralityProof::BuildTUSourceNeutralityContext(
+                model, macroStateProof, paths, tuBytes, tuPath,
+                isWsOrCompleteCommentTrivia)) {}
+
+  /// Return true iff the PP token is part of one of the include expansions that
+  /// this closure is explicitly consuming.
+  bool TokenCoveredByTouchedInclude(uint64_t pp) const {
+    for (const RefoldModel::IncludeItem *inc : touched_)
+      if (inc->cover.begin <= pp && pp < inc->cover.end)
+        return true;
+    return false;
+  }
+
+  /// Return true iff this include directive belongs to the touched include run
+  /// whose expansion participates in the closure proof.
+  bool IncludeIsTouched(const RefoldModel::IncludeItem &inc) const {
+    for (const RefoldModel::IncludeItem *touchedInc : touched_)
+      if (touchedInc->id == inc.id)
+        return true;
+    return false;
+  }
+
+  /// Return true iff the macro invocation is part of the source spelling of a
+  /// touched include directive.  Macro-expanded include targets, for example
+  ///
+  ///   #define HDR "two.inc"
+  ///   #include HDR
+  ///
+  /// are control spelling for the include directive, not independent TU
+  /// material. When the closure consumes the touched include site, complete
+  /// macro calls wholly inside that site are consumed with it.  Partial
+  /// overlaps remain rejected by the ordinary macro-overlap guard below.
+  bool MacroInvocationIsInsideTouchedIncludeDirective(
+      const RefoldModel::MacroInvocation &m) const {
+    if (!m.invFile || m.invFile->empty() ||
+        !paths_.PathsEqual(*m.invFile, tuPath_))
+      return false;
+    if (!m.invB || !m.invE || *m.invB >= *m.invE)
+      return false;
+
+    for (const RefoldModel::IncludeItem *inc : touched_) {
+      if (!paths_.PathsEqual(inc->sitePath, tuPath_))
+        continue;
+      if (inc->siteB <= *m.invB && *m.invE <= inc->siteE)
+        return true;
+    }
+    return false;
+  }
+
+  std::optional<std::string>
+  /// Return the first recorded reason that prevents consuming `inc` and its
+  /// descendants as a zero-token source gap, or std::nullopt when none does.
+  IncludeRecordedSideEffectReason(const RefoldModel::IncludeItem &inc) const {
+    return recordedIncludeSideEffectResolver_.FindReason(inc);
+  }
+
+  bool
+  /// Return whether any recorded reason prevents consuming `inc` and its
+  /// descendants as a zero-token source gap.
+  IncludeHasRecordedSideEffects(const RefoldModel::IncludeItem &inc) const {
+    return recordedIncludeSideEffectResolver_.HasReason(inc);
+  }
+
+  /// Return true iff the macro invocation is a complete zero-token TU callsite
+  /// inside the candidate replacement envelope.  Partial overlaps remain
+  /// non-refoldable here because deleting only part of a macro call would not
+  /// be a proved source closure.
+  bool
+  MacroInvocationIsConsumableZeroTokenGap(const RefoldModel::MacroInvocation &m,
+                                          uint64_t begin, uint64_t end) const {
+    if (m.invFile && !m.invFile->empty() &&
+        !paths_.PathsEqual(*m.invFile, tuPath_))
+      return false;
+    if (!m.invB || !m.invE || *m.invB >= *m.invE)
+      return false;
+    if (*m.invB < begin || end < *m.invE)
+      return false;
+    return MacroInvocationIsSourceNeutralZeroToken(m);
+  }
+
+  /// Return true iff a pure include-closure inter-include gap can be preserved
+  /// verbatim by tiling it with lexical trivia and complete recorded zero-token
+  /// conditional groups.
+  ///
+  /// This extends `isPreservableIncludeClosureGapTrivia()` without weakening
+  /// its no-heuristics contract.  The directive spelling inside each
+  /// conditional group can be macro-dependent (`#ifdef`, `#ifndef`, `#if
+  /// defined(...)`, ...) because the producer has already recorded the complete
+  /// group boundaries and which arms materialized A tokens for this
+  /// preprocessing run.  We preserve the original bytes rather than consuming
+  /// them, so this helper is used only by the pure include-closure gap path.
+  bool
+  GapIsPreservableRecordedConditionalIncludeClosure(uint64_t gapBegin,
+                                                    uint64_t gapEnd) const {
+    if (gapBegin >= gapEnd || gapEnd > tuBytes_.size())
+      return false;
+
+    struct ConditionalPiece {
+      uint64_t begin;
+      uint64_t end;
+      uint64_t id;
+    };
+
+    SmallVector<ConditionalPiece, 8> pieces;
+    for (const auto &group : model_.GetConds()) {
+      if (!ConditionalGroupIsPreservableIncludeClosureGap(group, gapBegin,
+                                                          gapEnd)) {
+        continue;
+      }
+      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+          findSourceGapConditionalGroupRange(preprocessingStructureIndex_,
+                                             group.id);
+      if (!exactRange || exactRange->first < gapBegin ||
+          exactRange->second > gapEnd) {
+        continue;
+      }
+      pieces.push_back({exactRange->first, exactRange->second, group.id});
+    }
+
+    if (pieces.empty())
+      return false;
+
+    SmallVector<SourceGapProofPiece, 8> proofPieces;
+    proofPieces.reserve(pieces.size());
+    for (size_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
+      const ConditionalPiece &piece = pieces[pieceIndex];
+      proofPieces.push_back(SourceGapProofPiece{
+          piece.begin, piece.end, piece.id,
+          /*kindOrder=*/0, /*nestingClass=*/0,
+          /*absorbedNestingClasses=*/uint64_t{1}, pieceIndex});
+    }
+
+    std::string gapReason;
+    std::optional<SourceGapProofResult> gapProof =
+        proveSourceGapWithIndexedTrivia(preprocessingStructureIndex_, gapBegin,
+                                        gapEnd, proofPieces, &gapReason);
+    if (!gapProof) {
+      REFOLD_LOG_TRACE("fallback",
+                       "TU include-closure rejected recorded conditional gap "
+                       "source=[{0},{1}): {2}",
+                       gapBegin, gapEnd, gapReason);
+      return false;
+    }
+
+    REFOLD_LOG_TRACE("fallback",
+                     "TU include-closure preserving recorded conditional gap "
+                     "source=[{0},{1}) conditionalGroups={2}",
+                     gapBegin, gapEnd,
+                     gapProof->outerPiecePayloadIndices.size());
+    return true;
+  }
+
+  /// Return true iff a complete TU conditional group is source-neutral
+  /// inside a mixed TU/include source envelope.
+  ///
+  /// This is the recorded-structure proof for conditional islands that produce
+  /// no A-side tokens.  Unlike the literal textual #if/#endif scanner, it does
+  /// not try to evaluate the condition.  The producer has already recorded the
+  /// selected arm and the arm token spans; this proof only checks that
+  /// replaying the complete group verbatim is a neutral source gap.  Macro
+  /// invocations in conditional-control lines are therefore allowed because
+  /// they remain inside the preserved group.  Recorded artifacts in arm bodies
+  /// still fail closed: those may carry source tokens, macro state, include
+  /// effects, or pragmas that require their own proof.
+  bool
+  ConditionalGroupIsConsumableZeroTokenGap(const RefoldModel::CondGroup &group,
+                                           uint64_t begin, uint64_t end) const {
+    auto includeIsNeutral = [&](const RefoldModel::IncludeItem &inc) {
+      return (!inc.cover.IsValid() && !IncludeHasRecordedSideEffects(inc)) ||
+             IncludeIsPreservableConditionalStateInclude(inc);
+    };
+    NeutralConditionalIslandContext islandContext{
+        /*requireGroupBeginAtLineStart=*/false,
+        NeutralConditionalArmSpanMode::SelectedArmsOnly};
+    return RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
+        tuSourceNeutrality_, group, begin, end, islandContext,
+        includeIsNeutral);
+  }
+
+  /// Prove that a source gap inside a replacement envelope consists only of
+  /// lexical trivia plus complete source-neutral artifacts: zero-token include
+  /// trees, source-neutral zero-token macro invocation trees, and TU-spelled
+  /// macro-state directives whose later liveness obligations are handled by the
+  /// macro-state repair pass.
+  ///
+  /// These artifacts have no PP tokens, so token overlap alone cannot make them
+  /// part of the touched hunk.  If they lie physically between required source
+  /// pieces of a proved mixed closure, however, they are inside the source
+  /// interval being replaced and may be consumed with the B-side material.
+  ///
+  /// The conditional-control proof is deliberately mode-sensitive.  Mixed
+  /// whole-envelope closures may consume complete TU conditional groups because
+  /// their surrounding source interval is itself replaced.  Pure
+  /// include-closure inter-include gaps, however, project include material and
+  /// preserve inert source gaps; they must not delete an otherwise-preservable
+  /// empty #if/#endif island just because it has no PP tokens.
+  bool
+  GapIsConsumableZeroTokenSourceClosure(uint64_t gapBegin, uint64_t gapEnd,
+                                        bool allowTUConditionalControl) const {
+    if (gapBegin >= gapEnd || gapEnd > tuBytes_.size())
+      return false;
+
+    struct GapPiece {
+      uint64_t begin;
+      uint64_t end;
+      uint64_t id;
+      StringRef kind;
+    };
+
+    SmallVector<GapPiece, 8> pieces;
+    for (const auto &inc : model_.GetIncludes()) {
+      if (!paths_.PathsEqual(inc.sitePath, tuPath_) || IncludeIsTouched(inc))
+        continue;
+      if (inc.cover.IsValid() || IncludeHasRecordedSideEffects(inc))
+        continue;
+      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+          findSourceGapProducerInterval(
+              preprocessingStructureIndex_,
+              PreprocessingStructureModelKind::IncludeDirective, inc.id);
+      if (exactRange && gapBegin <= exactRange->first &&
+          exactRange->second <= gapEnd) {
+        pieces.push_back(
+            {exactRange->first, exactRange->second, inc.id, "include"});
+      }
+    }
+
+    for (const auto &m : model_.GetMacroInvocations())
+      if (MacroInvocationIsConsumableZeroTokenGap(m, gapBegin, gapEnd))
+        pieces.push_back({*m.invB, *m.invE, m.id, "macro"});
+
+    for (const auto &directive : model_.GetMacroDirectives())
+      if (std::optional<MacroDirectiveSourceInterval> interval =
+              MacroDirectiveIsConsumableStateGap(directive, gapBegin, gapEnd))
+        pieces.push_back(
+            {interval->begin, interval->end, directive.id, "macro-directive"});
+
+    if (allowTUConditionalControl)
+      for (const auto &group : model_.GetConds())
+        if (ConditionalGroupIsConsumableZeroTokenGap(group, gapBegin, gapEnd)) {
+          std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+              findSourceGapConditionalGroupRange(preprocessingStructureIndex_,
+                                                 group.id);
+          if (exactRange && gapBegin <= exactRange->first &&
+              exactRange->second <= gapEnd) {
+            pieces.push_back({exactRange->first, exactRange->second, group.id,
+                              "conditional"});
+          }
+        }
+
+    uint64_t scanCursor = gapBegin;
+    uint64_t includeCount = 0;
+    uint64_t macroCount = 0;
+    uint64_t macroDirectiveCount = 0;
+    uint64_t conditionalGroupCount = 0;
+    uint64_t conditionalDirectiveCount = 0;
+    unsigned conditionalDepth = 0;
+
+    // Scan source bytes that are not covered by recorded zero-token artifacts.
+    // These interstitial bytes may contain ordinary lexical trivia and literal
+    // conditional-control directives.  The conditional depth is carried across
+    // consumed artifacts, which is what admits shapes such as:
+    //
+    //   #if 1
+    //   #define GAP_VALUE 99
+    //   #endif
+    //
+    // when the #define line is itself a proved consumable macro-state artifact.
+    bool atLineStart = stringutils::beginsLineAfterWs(tuBytes_, gapBegin);
+    auto scanNeutralControlTrivia = [&](uint64_t begin,
+                                        uint64_t limit) -> bool {
+      scanCursor = begin;
+      while (scanCursor < limit) {
+        char ch = tuBytes_[scanCursor];
+        if (stringutils::isWs(ch)) {
+          atLineStart = ch == '\n' || ch == '\r';
+          ++scanCursor;
+          continue;
+        }
+
+        if (ch == '/') {
+          const uint64_t before = scanCursor;
+          StringRef rest = tuBytes_.drop_front(scanCursor);
+          if (rest.starts_with("/*")) {
+            scanCursor += 2;
+            bool closed = false;
+            while (scanCursor + 1 < limit) {
+              if (tuBytes_[scanCursor] == '*' &&
+                  tuBytes_[scanCursor + 1] == '/') {
+                scanCursor += 2;
+                closed = true;
+                break;
+              }
+              ++scanCursor;
+            }
+            if (!closed)
+              return false;
+            StringRef skipped = tuBytes_.slice(before, scanCursor);
+            atLineStart = skipped.ends_with("\n") || skipped.ends_with("\r");
+            continue;
+          }
+
+          if (rest.starts_with("//")) {
+            scanCursor += 2;
+            while (scanCursor < limit && tuBytes_[scanCursor] != '\n' &&
+                   tuBytes_[scanCursor] != '\r')
+              ++scanCursor;
+
+            // A line comment may end at the end of the whole gap, but it may
+            // not run into a following recorded artifact.  In that case the
+            // artifact's spelling would be inside the comment, contradicting
+            // the proof that it is an independently recorded source artifact.
+            if (scanCursor >= limit)
+              return limit == gapEnd;
+
+            ++scanCursor;
+            atLineStart = true;
+            continue;
+          }
+        }
+
+        // Literal conditional-control directives are source-neutral only at a
+        // physical directive boundary.  Any other directive or token spelling
+        // is real source that this closure has not proved safe to erase.
+        if (ch != '#' || !atLineStart)
+          return false;
+
+        uint64_t lineEnd = scanCursor;
+        while (lineEnd < limit && tuBytes_[lineEnd] != '\n')
+          ++lineEnd;
+        if (lineEnd < limit)
+          ++lineEnd;
+
+        if (!allowTUConditionalControl ||
+            !parseLiteralEmptyConditionalDirectiveLine(
+                tuBytes_.slice(scanCursor, lineEnd), conditionalDepth)) {
+          if (const RefoldModel::PragmaDirective *pragma =
+                  FindTUPragmaOnSourceLine(scanCursor, lineEnd)) {
+            REFOLD_LOG_TRACE(
+                "fallback",
+                "TU/include closure rejected: source gap [{0},{1}) contains "
+                "non-consumable TU pragma id={2} site=[{3},{4}) text='{5}'",
+                gapBegin, gapEnd, pragma->id, pragma->siteB, pragma->siteE,
+                stringutils::showWsWithClip(pragma->text, 120));
+          }
+          return false;
+        }
+
+        ++conditionalDirectiveCount;
+        scanCursor = lineEnd;
+        atLineStart = true;
+      }
+      return scanCursor == limit;
+    };
+
+    if (pieces.empty())
+      return false;
+
+    enum : uint32_t {
+      ConditionalPieceClass = 0,
+      IncludePieceClass = 1,
+      MacroPieceClass = 2,
+      MacroDirectivePieceClass = 3,
+    };
+
+    SmallVector<SourceGapProofPiece, 8> proofPieces;
+    proofPieces.reserve(pieces.size());
+    for (size_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
+      const GapPiece &piece = pieces[pieceIndex];
+      uint32_t pieceClass = MacroDirectivePieceClass;
+      uint64_t absorbedClasses = 0;
+      if (piece.kind == "conditional") {
+        pieceClass = ConditionalPieceClass;
+        absorbedClasses = uint64_t{1} << ConditionalPieceClass;
+      } else if (piece.kind == "include") {
+        pieceClass = IncludePieceClass;
+      } else if (piece.kind == "macro") {
+        pieceClass = MacroPieceClass;
+        absorbedClasses = uint64_t{1} << MacroPieceClass;
+      }
+      proofPieces.push_back(
+          SourceGapProofPiece{piece.begin, piece.end, piece.id, pieceClass,
+                              pieceClass, absorbedClasses, pieceIndex});
+    }
+
+    const uint64_t uncoveredConditionalKinds =
+        allowTUConditionalControl ? sourceGapConditionalDirectiveKindMask() : 0;
+
+    std::string gapReason;
+    std::optional<SourceGapProofResult> gapProof = proveSourceGapWithPolicy(
+        preprocessingStructureIndex_, gapBegin, gapEnd, proofPieces,
+        [&](uint64_t begin, uint64_t end) {
+          return scanNeutralControlTrivia(begin, end);
+        },
+        [&](size_t payloadIndex) {
+          const GapPiece &piece = pieces[payloadIndex];
+
+          // The artifact itself has already been independently proved
+          // zero-token and complete. Consume it as one opaque source-neutral
+          // piece, then continue scanning surrounding control/trivia bytes at
+          // the same conditional depth.
+          StringRef pieceBytes = tuBytes_.slice(piece.begin, piece.end);
+          atLineStart =
+              pieceBytes.ends_with("\n") || pieceBytes.ends_with("\r");
+          if (piece.kind == "include")
+            ++includeCount;
+          else if (piece.kind == "macro")
+            ++macroCount;
+          else if (piece.kind == "macro-directive")
+            ++macroDirectiveCount;
+          else
+            ++conditionalGroupCount;
+        },
+        uncoveredConditionalKinds, &gapReason);
+    if (!gapProof || conditionalDepth != 0) {
+      REFOLD_LOG_TRACE(
+          "fallback",
+          "TU/include closure rejected zero-token source gap "
+          "source=[{0},{1}): {2}",
+          gapBegin, gapEnd,
+          gapProof ? StringRef("unbalanced literal conditional controls")
+                   : StringRef(gapReason));
+      return false;
+    }
+
+    REFOLD_LOG_TRACE(
+        "fallback",
+        "TU/include closure consuming zero-token source gap "
+        "source=[{0},{1}) includes={2} macros={3} macroDirectives={4} "
+        "conditionalGroups={5} conditionalDirectives={6}",
+        gapBegin, gapEnd, includeCount, macroCount, macroDirectiveCount,
+        conditionalGroupCount, conditionalDirectiveCount);
+    return true;
+  }
+
+  /// Return the original TU bytes a preserved gap piece re-emits, or the
+  /// empty string when the piece does not name a valid TU interval.
+  std::string PreservedTUGapPieceText(const TUPreservedGapPiece &piece) const {
+    if (piece.end <= tuBytes_.size() && piece.begin <= piece.end)
+      return tuBytes_.slice(piece.begin, piece.end).str();
+    return std::string();
+  }
+
+  /// Prove that a source gap is exactly trivia plus complete zero-token
+  /// artifacts whose original bytes are preserved, and append those pieces.
+  ///
+  /// Unlike GapIsConsumableZeroTokenSourceClosure, the proved pieces are not
+  /// deleted: the caller re-emits their original spelling, so the gap keeps
+  /// every source-visible artifact it started with.
+  bool CollectPreservableZeroTokenGapPieces(
+      uint64_t gapBegin, uint64_t gapEnd,
+      SmallVectorImpl<TUPreservedGapPiece> &out) const {
+    if (gapBegin >= gapEnd || gapEnd > tuBytes_.size())
+      return false;
+
+    struct GapPiece {
+      uint64_t begin;
+      uint64_t end;
+      uint64_t id;
+      TUPreservedGapPiece::Kind kind;
+    };
+
+    SmallVector<GapPiece, 8> pieces;
+    for (const auto &m : model_.GetMacroInvocations()) {
+      if (MacroInvocationIsConsumableZeroTokenGap(m, gapBegin, gapEnd)) {
+        pieces.push_back({*m.invB, *m.invE, m.id,
+                          TUPreservedGapPiece::Kind::ZeroTokenMacroInvocation});
+      }
+    }
+
+    for (const auto &group : model_.GetConds()) {
+      if (ConditionalGroupIsConsumableZeroTokenGap(group, gapBegin, gapEnd)) {
+        std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+            findSourceGapConditionalGroupRange(preprocessingStructureIndex_,
+                                               group.id);
+        if (exactRange && gapBegin <= exactRange->first &&
+            exactRange->second <= gapEnd) {
+          pieces.push_back(
+              {exactRange->first, exactRange->second, group.id,
+               TUPreservedGapPiece::Kind::ZeroTokenConditionalGroup});
+        }
+      }
+    }
+
+    // Pragma/state proof: a complete diagnostic push/settings/pop sequence that
+    // is wholly inside this owner gap and crosses only trivia has identity net
+    // state at both boundaries.  Preserve the original pragma bytes as an
+    // explicit gap piece instead of treating the gap as opaque trivia; unknown
+    // or unbalanced pragmas remain non-consumable and will still force the
+    // ordinary fail-closed path below.
+    SmallVector<BalancedDiagnosticPragmaStateIsland, 4> pragmaIslands;
+    collectBalancedDiagnosticPragmaStateIslands(
+        model_, tuBytes_, gapBegin, gapEnd,
+        [&](const RefoldModel::PragmaDirective &pragma) {
+          return paths_.PathsEqual(pragma.sitePath, tuPath_);
+        },
+        pragmaIslands, lexLang_);
+    for (const BalancedDiagnosticPragmaStateIsland &island : pragmaIslands) {
+      pieces.push_back({island.begin, island.end, island.id,
+                        TUPreservedGapPiece::Kind::BalancedPragmaStateIsland});
+    }
+
+    if (pieces.empty())
+      return false;
+
+    SmallVector<SourceGapProofPiece, 8> proofPieces;
+    proofPieces.reserve(pieces.size());
+    for (size_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
+      const GapPiece &piece = pieces[pieceIndex];
+      const uint32_t pieceClass = static_cast<uint32_t>(piece.kind);
+      uint64_t absorbedClasses = 0;
+      if (piece.kind == TUPreservedGapPiece::Kind::ZeroTokenMacroInvocation) {
+        absorbedClasses = uint64_t{1} << pieceClass;
+      } else if (piece.kind ==
+                 TUPreservedGapPiece::Kind::ZeroTokenConditionalGroup) {
+        // The independently proved complete conditional island owns nested
+        // macro invocations, nested conditional records, and balanced pragma
+        // islands in its source bytes.
+        absorbedClasses =
+            (uint64_t{1} << static_cast<uint32_t>(
+                 TUPreservedGapPiece::Kind::ZeroTokenMacroInvocation)) |
+            (uint64_t{1} << static_cast<uint32_t>(
+                 TUPreservedGapPiece::Kind::ZeroTokenConditionalGroup)) |
+            (uint64_t{1} << static_cast<uint32_t>(
+                 TUPreservedGapPiece::Kind::BalancedPragmaStateIsland));
+      }
+      proofPieces.push_back(
+          SourceGapProofPiece{piece.begin, piece.end, piece.id, pieceClass,
+                              pieceClass, absorbedClasses, pieceIndex});
+    }
+
+    std::string gapReason;
+    std::optional<SourceGapProofResult> gapProof =
+        proveSourceGapWithIndexedTrivia(preprocessingStructureIndex_, gapBegin,
+                                        gapEnd, proofPieces, &gapReason);
+    if (!gapProof) {
+      REFOLD_LOG_TRACE("fallback",
+                       "TU/include closure rejected preserved zero-token gap "
+                       "source=[{0},{1}): {2}",
+                       gapBegin, gapEnd, gapReason);
+      return false;
+    }
+
+    SmallVector<TUPreservedGapPiece, 8> accepted;
+    for (size_t payloadIndex : gapProof->outerPiecePayloadIndices) {
+      const GapPiece &piece = pieces[payloadIndex];
+      accepted.push_back({piece.kind, piece.begin, piece.end, piece.id});
+    }
+
+    out.append(accepted.begin(), accepted.end());
+    REFOLD_LOG_TRACE("fallback",
+                     "TU/include closure preserving zero-token source gap "
+                     "source=[{0},{1}) pieces={2}",
+                     gapBegin, gapEnd, accepted.size());
+    return true;
+  }
+
+  /// Prove that an owner gap is exactly trivia plus complete TU pragma
+  /// directives, and project each of those directives onto the A stream.
+  ///
+  /// A pragma is neither consumable nor relocatable: its net state is not
+  /// identity, so deleting it drops a state transition and moving it changes
+  /// where that transition happens.  The remaining sound realization is to keep
+  /// it in place and split the replacement's B payload around it, which needs
+  /// exactly one extra fact per directive -- the A-token frontier it sits at.
+  /// The projection supplies that fact from producer coordinates and fails
+  /// closed when the directive is not tokenless or its position is not
+  /// determined; the gap proof separately guarantees that no other protected
+  /// structure hides in the same gap.
+  bool CollectPositionPreservedTUDirectiveGapPieces(
+      uint64_t gapBegin, uint64_t gapEnd,
+      SmallVectorImpl<TUPositionPreservedDirective> &out) const {
+    if (gapBegin >= gapEnd || gapEnd > tuBytes_.size())
+      return false;
+
+    // Recover the exact directive extents first.  The indexed lexical extent,
+    // not the recorded site, is what gets copied verbatim: the index owns the
+    // complete logical directive line.
+    SmallVector<TUPositionPreservedDirective, 4> pragmas;
+    for (const auto &pragma : model_.GetPragmas()) {
+      if (!paths_.PathsEqual(pragma.sitePath, tuPath_))
+        continue;
+      if (pragma.siteB >= pragma.siteE || pragma.siteB < gapBegin ||
+          gapEnd < pragma.siteE)
+        continue;
+
+      // Only a directive-spelled pragma owns a complete logical line that can
+      // be copied verbatim.  A `_Pragma("...")` operator is an expression whose
+      // bytes may live inside a macro replacement list, so re-emitting them at
+      // a derived split would move source that belongs to another owner.
+      if (pragma.viaPragmaOperator) {
+        REFOLD_LOG_TRACE(
+            "fallback",
+            "TU/include closure cannot preserve pragma id={0} in place: "
+            "operator-spelled pragmas have no preservable directive line",
+            pragma.id);
+        return false;
+      }
+
+      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+          findSourceGapProducerInterval(
+              preprocessingStructureIndex_,
+              PreprocessingStructureModelKind::PragmaDirective, pragma.id);
+      if (!exactRange || exactRange->first >= exactRange->second ||
+          exactRange->first < gapBegin || gapEnd < exactRange->second) {
+        REFOLD_LOG_TRACE(
+            "fallback",
+            "TU/include closure cannot preserve TU pragma id={0} in place: "
+            "no exact indexed directive interval inside gap [{1},{2})",
+            pragma.id, gapBegin, gapEnd);
+        return false;
+      }
+
+      SmallVector<PragmaClassification, 2> classifications;
+      classifications.push_back(classifyPragmaDirective(
+          tuBytes_.slice(exactRange->first, exactRange->second)));
+      pragmas.push_back({TUPositionPreservedDirective::Kind::Pragma,
+                         exactRange->first, exactRange->second, pragma.id,
+                         /*aFrontier=*/0, std::move(classifications),
+                         /*macroBindings=*/{}});
+    }
+
+    // A macro directive in the gap is preserved on the same terms.  It is
+    // tokenless and it is meaningful source, so consuming it would drop a
+    // macro-state transition the gap theorem would otherwise report as an
+    // unowned protected interval -- which is what refused the whole closure
+    // before, costing every directive in the translation unit to avoid
+    // dropping this one.
+    for (const auto &directive : model_.GetMacroDirectives()) {
+      if (!directive.IsMacroStateDirective())
+        continue;
+      if (!paths_.PathsEqual(directive.sitePath, tuPath_))
+        continue;
+      if (directive.ownerIncludeId)
+        continue;
+
+      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+          findSourceGapProducerInterval(
+              preprocessingStructureIndex_,
+              PreprocessingStructureModelKind::MacroDirective, directive.id);
+      if (!exactRange || exactRange->first >= exactRange->second)
+        continue;
+      if (exactRange->first < gapBegin || gapEnd < exactRange->second)
+        continue;
+
+      SmallVector<MacroStateBinding, 2> macroBindings;
+      if (!directive.name.empty())
+        macroBindings.push_back(MacroStateBinding{directive.name, &directive});
+
+      pragmas.push_back({TUPositionPreservedDirective::Kind::MacroDirective,
+                         exactRange->first, exactRange->second, directive.id,
+                         /*aFrontier=*/0,
+                         /*classifications=*/{}, std::move(macroBindings)});
+    }
+
+    // A zero-token include whose header owns non-consumable state is the same
+    // problem one level down: the state is not the include's own text, but
+    // deleting the directive drops it just the same.  Preserve the directive
+    // and the header is re-entered at its original position, which re-runs
+    // every transition it owns exactly where it ran before.  This is only for
+    // includes the closure would otherwise have to absorb: a touched include is
+    // part of the realized material, and one that produces tokens is not
+    // tokenless and has no frontier.
+    for (const auto &inc : model_.GetIncludes()) {
+      if (!paths_.PathsEqual(inc.sitePath, tuPath_) || inc.parent)
+        continue;
+      if (inc.siteB >= inc.siteE || inc.siteB < gapBegin || gapEnd < inc.siteE)
+        continue;
+      if (IncludeIsTouched(inc) || inc.cover.IsValid())
+        continue;
+      if (!IncludeHasRecordedSideEffects(inc))
+        continue;
+
+      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
+          findSourceGapProducerInterval(
+              preprocessingStructureIndex_,
+              PreprocessingStructureModelKind::IncludeDirective, inc.id);
+      if (!exactRange || exactRange->first >= exactRange->second ||
+          exactRange->first < gapBegin || gapEnd < exactRange->second) {
+        REFOLD_LOG_TRACE(
+            "fallback",
+            "TU/include closure cannot preserve include id={0} in place: no "
+            "exact indexed directive interval inside gap [{1},{2})",
+            inc.id, gapBegin, gapEnd);
+        return false;
+      }
+
+      // The header's own pragmas are the state a payload could observe by
+      // landing on the far side of the preserved directive.  An include whose
+      // header records none is still preserved; it then has no classification
+      // and any ambiguous payload beside it fails closed.
+      SmallVector<PragmaClassification, 2> classifications;
+      if (inc.resolvedPath)
+        for (const auto &pragma : model_.GetPragmas())
+          if (paths_.PathsEqual(pragma.sitePath, *inc.resolvedPath))
+            classifications.push_back(classifyPragmaDirective(pragma.text));
+
+      pragmas.push_back({TUPositionPreservedDirective::Kind::Include,
+                         exactRange->first, exactRange->second, inc.id,
+                         /*aFrontier=*/0, std::move(classifications),
+                         /*macroBindings=*/{}});
+    }
+
+    if (pragmas.empty())
+      return false;
+
+    llvm::sort(pragmas, [](const TUPositionPreservedDirective &lhs,
+                           const TUPositionPreservedDirective &rhs) {
+      if (lhs.begin != rhs.begin)
+        return lhs.begin < rhs.begin;
+      return lhs.id < rhs.id;
+    });
+
+    EnsureTUTokenlessProjectionSurfaces();
+    for (TUPositionPreservedDirective &piece : pragmas) {
+      std::optional<uint64_t> aFrontier =
+          projectTokenlessSourceIntervalToATokenFrontier(
+              tuMappedATokens_, tuChildIncludes_, aToks_.size(), piece.begin,
+              piece.end);
+      if (!aFrontier) {
+        REFOLD_LOG_TRACE(
+            "fallback",
+            "TU/include closure cannot preserve TU pragma id={0} in place: "
+            "source=[{1},{2}) has no unique A-token frontier",
+            piece.id, piece.begin, piece.end);
+        return false;
+      }
+      piece.aFrontier = *aFrontier;
+    }
+
+    // Submit the directives as opaque preserved pieces so the shared gap
+    // theorem proves the complete byte coverage of the gap.  Every protected
+    // interval in the gap must be one of these pieces: an unrelated directive
+    // hiding beside the pragma is not preserved by this composition and fails
+    // closed here.
+    enum : uint32_t { PragmaPieceClass = 0 };
+    SmallVector<SourceGapProofPiece, 4> proofPieces;
+    proofPieces.reserve(pragmas.size());
+    for (size_t pieceIndex = 0; pieceIndex < pragmas.size(); ++pieceIndex) {
+      const TUPositionPreservedDirective &piece = pragmas[pieceIndex];
+      proofPieces.push_back(SourceGapProofPiece{
+          piece.begin, piece.end, piece.id, PragmaPieceClass, PragmaPieceClass,
+          0, pieceIndex});
+    }
+
+    std::string gapReason;
+    std::optional<SourceGapProofResult> gapProof =
+        proveSourceGapWithIndexedTrivia(preprocessingStructureIndex_, gapBegin,
+                                        gapEnd, proofPieces, &gapReason);
+    if (!gapProof) {
+      REFOLD_LOG_TRACE(
+          "fallback",
+          "TU/include closure rejected position-preserved TU pragma gap "
+          "source=[{0},{1}): {2}",
+          gapBegin, gapEnd, gapReason);
+      return false;
+    }
+    if (gapProof->outerPiecePayloadIndices.size() != pragmas.size()) {
+      REFOLD_LOG_TRACE(
+          "fallback",
+          "TU/include closure rejected position-preserved TU pragma gap "
+          "source=[{0},{1}): {2} of {3} directives survived normalization",
+          gapBegin, gapEnd, gapProof->outerPiecePayloadIndices.size(),
+          pragmas.size());
+      return false;
+    }
+
+    for (size_t payloadIndex : gapProof->outerPiecePayloadIndices) {
+      const TUPositionPreservedDirective &piece = pragmas[payloadIndex];
+      REFOLD_LOG_TRACE(
+          "fallback",
+          "TU/include closure preserving TU directive id={0} in place "
+          "source=[{1},{2}) aFrontier={3} gap=[{4},{5})",
+          piece.id, piece.begin, piece.end, piece.aFrontier, gapBegin, gapEnd);
+      out.push_back(piece);
+    }
+    return true;
+  }
+
+private:
+  using MacroDirectiveSourceInterval = MacroStateDirectiveLineInterval;
+
+  /// Recover the full physical source interval for a TU-spelled macro-state
+  /// directive, or std::nullopt when the producer facts do not determine it.
+  std::optional<MacroStateDirectiveLineInterval>
+  MacroDirectiveFullSourceInterval(
+      const RefoldModel::MacroDirective &directive) const {
+    return macroStateProof_.RecoverMacroStateDirectiveLineInterval(
+        directive, tuPath_, tuBytes_, std::nullopt);
+  }
+
+  /// Return a TU-spelled pragma wholly contained in the physical source line
+  /// [lineBegin, lineEnd], if the refold map recorded one there.
+  ///
+  /// Diagnostic-only: pragmas are never consumed as source-neutral artifacts,
+  /// so this only lets a rejection name the pragma that blocked the closure.
+  const RefoldModel::PragmaDirective *
+  FindTUPragmaOnSourceLine(uint64_t lineBegin, uint64_t lineEnd) const {
+    for (const auto &pragma : model_.GetPragmas()) {
+      if (!paths_.PathsEqual(pragma.sitePath, tuPath_))
+        continue;
+      if (lineBegin <= pragma.siteB && pragma.siteE <= lineEnd &&
+          pragma.siteB < pragma.siteE)
+        return &pragma;
+    }
+    return nullptr;
+  }
+
+  /// Return whether the include directive may stay inside a preserved
+  /// conditional island without needing a new raw-B fallback authority.
+  bool IncludeIsPreservableConditionalStateInclude(
+      const RefoldModel::IncludeItem &inc) const {
+    return conditionalStateIncludePreservationResolver_.IsPreservable(inc);
+  }
+
+  /// Recursively prove that a zero-token macro invocation is source-neutral.
+  ///
+  /// The shared adapter owns the replacement-list recursion and TU-specific
+  /// policy wiring; this fallback path only supplies the current TU surface.
+  bool MacroInvocationIsSourceNeutralZeroToken(
+      const RefoldModel::MacroInvocation &m) const {
+    return RefoldSourceNeutralityProof::MacroInvocationIsSourceNeutralZeroToken(
+        tuSourceNeutrality_, m);
+  }
+
+  std::optional<MacroDirectiveSourceInterval>
+  /// Return the full source interval of a TU-spelled macro-state directive
+  /// when it lies wholly inside [begin, end), or std::nullopt otherwise.
+  ///
+  /// A directive only partly inside the envelope is not consumable: half a
+  /// directive line is not a proved source closure.
+  MacroDirectiveIsConsumableStateGap(
+      const RefoldModel::MacroDirective &directive, uint64_t begin,
+      uint64_t end) const {
+    std::optional<MacroDirectiveSourceInterval> interval =
+        MacroDirectiveFullSourceInterval(directive);
+    if (!interval)
+      return std::nullopt;
+    if (interval->begin < begin || end < interval->end)
+      return std::nullopt;
+    return interval;
+  }
+
+  /// Return true iff a recorded TU conditional group may be preserved as
+  /// inert inter-include source in a pure include-closure replacement.
+  ///
+  /// This is the preservation-side counterpart to the mixed-envelope
+  /// conditional consumption proof below.  The static textual parser
+  /// intentionally accepts only a tiny literal grammar (`#if 0`, `#if 1`, ...),
+  /// because it has no preprocessor state.  For source forms such as `#ifdef
+  /// ENABLE_GAP`, the refold map already gives us the deterministic proof
+  /// object: a complete conditional-group byte interval and the PP spans
+  /// materialized by each arm.
+  ///
+  /// Pure include closure does not delete these bytes.  It projects the touched
+  /// include material into B and carries source-neutral inter-include control
+  /// structure forward verbatim.  Therefore a recorded conditional group is
+  /// preservable when it is complete, TU-spelled, wholly inside the gap, and no
+  /// arm materialized PP tokens in A.  Active source-bearing artifacts inside
+  /// the group remain outside this proof; they require their own
+  /// preservation/repair model rather than being hidden inside an opaque
+  /// conditional gap.
+  bool ConditionalGroupIsPreservableIncludeClosureGap(
+      const RefoldModel::CondGroup &group, uint64_t gapBegin,
+      uint64_t gapEnd) const {
+    auto includeIsNeutral = [&](const RefoldModel::IncludeItem &inc) {
+      return (!inc.cover.IsValid() && !IncludeHasRecordedSideEffects(inc)) ||
+             IncludeIsPreservableConditionalStateInclude(inc);
+    };
+    NeutralConditionalIslandContext islandContext{
+        /*requireGroupBeginAtLineStart=*/true,
+        NeutralConditionalArmSpanMode::AllArms};
+    return RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
+        tuSourceNeutrality_, group, gapBegin, gapEnd, islandContext,
+        includeIsNeutral);
+  }
+
+  /// Build the tokenless-projection surfaces on first use.  See their
+  /// declarations below for why they are memoized rather than eager.
+  void EnsureTUTokenlessProjectionSurfaces() const {
+    if (tuTokenlessProjectionSurfacesReady_)
+      return;
+    tuTokenlessProjectionSurfacesReady_ = true;
+    for (const auto &entry : model_.GetTokmap()) {
+      if (entry.pp < aToks_.size() && paths_.PathsEqual(entry.file, tuPath_))
+        tuMappedATokens_.push_back(&entry);
+    }
+    for (const auto &inc : model_.GetIncludes()) {
+      if (!inc.parent && inc.cover.IsValid() &&
+          inc.cover.end <= aToks_.size() &&
+          paths_.PathsEqual(inc.sitePath, tuPath_))
+        tuChildIncludes_.push_back(&inc);
+    }
+  }
+
+  const RefoldModel &model_;
+  const RefoldPathIdentity &paths_;
+  const RefoldMacroStateProof &macroStateProof_;
+  const RefoldPreprocessingStructureIndex &preprocessingStructureIndex_;
+  llvm::ArrayRef<PPTok> aToks_;
+  const clang::LangOptions &lexLang_;
+  StringRef tuPath_;
+  StringRef tuBytes_;
+  /// The planner's ordered touched-include run, aliased for the call.
+  ArrayRef<const RefoldModel::IncludeItem *> touched_;
+
+  const RecordedIncludeSideEffectResolver recordedIncludeSideEffectResolver_;
+  const ConditionalStateIncludePreservationResolver
+      conditionalStateIncludePreservationResolver_;
+  const TUSourceNeutralityContext tuSourceNeutrality_;
+
+  // Producer coordinate surfaces for projecting a tokenless TU directive onto
+  // the A stream.  They mirror the direct-TU surfaces the alignment's
+  // protected-boundary collector projects against: tokmap entries spelled by
+  // this TU, and the include occurrences this TU entered directly.  Both are
+  // run constants, so they are built once, but only on first use: a closure gap
+  // that needs them is rare and building them walks the whole tokmap.
+  mutable bool tuTokenlessProjectionSurfacesReady_ = false;
+  mutable SmallVector<const RefoldModel::TokMapEntry *, 32> tuMappedATokens_;
+  mutable SmallVector<const RefoldModel::IncludeItem *, 8> tuChildIncludes_;
+};
 } // namespace
 
 bool RefoldExpansionFallbackPlanner::RangeHasForeignTokenDiff(
@@ -1096,27 +2095,6 @@ bool RefoldExpansionFallbackPlanner::IncludeSubtreeOwnsOutlivingPragma(
     }
   }
   return false;
-}
-
-std::optional<MacroStateDirectiveLineInterval>
-RefoldExpansionFallbackPlanner::MacroDirectiveFullSourceInterval(
-    StringRef tuPath, StringRef tuBytes,
-    const RefoldModel::MacroDirective &directive) const {
-  return macroStateProof_.RecoverMacroStateDirectiveLineInterval(
-      directive, tuPath, tuBytes, std::nullopt);
-}
-
-const RefoldModel::PragmaDirective *
-RefoldExpansionFallbackPlanner::FindTUPragmaOnSourceLine(
-    StringRef tuPath, uint64_t lineBegin, uint64_t lineEnd) const {
-  for (const auto &pragma : model_.GetPragmas()) {
-    if (!paths_.PathsEqual(pragma.sitePath, tuPath))
-      continue;
-    if (lineBegin <= pragma.siteB && pragma.siteE <= lineEnd &&
-        pragma.siteB < pragma.siteE)
-      return &pragma;
-  }
-  return nullptr;
 }
 
 std::optional<std::string>
@@ -1298,917 +2276,14 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   uint64_t sourceBegin = first->siteB;
   uint64_t sourceEnd = last->siteE;
 
-  // Return true iff the PP token is part of one of the include expansions that
-  // this closure is explicitly consuming.
-  auto tokenCoveredByTouchedInclude = [&](uint64_t pp) -> bool {
-    for (const RefoldModel::IncludeItem *inc : touched)
-      if (inc->cover.begin <= pp && pp < inc->cover.end)
-        return true;
-    return false;
-  };
-
-  // Return true iff this include directive belongs to the touched include run
-  // whose expansion participates in the closure proof.
-  auto includeIsTouched = [&](const RefoldModel::IncludeItem &inc) -> bool {
-    for (const RefoldModel::IncludeItem *touchedInc : touched)
-      if (touchedInc->id == inc.id)
-        return true;
-    return false;
-  };
-
-  // Return true iff the macro invocation is part of the source spelling of a
-  // touched include directive.  Macro-expanded include targets, for example
-  //
-  //   #define HDR "two.inc"
-  //   #include HDR
-  //
-  // are control spelling for the include directive, not independent TU
-  // material. When the closure consumes the touched include site, complete
-  // macro calls wholly inside that site are consumed with it.  Partial overlaps
-  // remain rejected by the ordinary macro-overlap guard below.
-  auto macroInvocationIsInsideTouchedIncludeDirective =
-      [&](const RefoldModel::MacroInvocation &m) -> bool {
-    if (!m.invFile || m.invFile->empty() ||
-        !paths_.PathsEqual(*m.invFile, tuPath))
-      return false;
-    if (!m.invB || !m.invE || *m.invB >= *m.invE)
-      return false;
-
-    for (const RefoldModel::IncludeItem *inc : touched) {
-      if (!paths_.PathsEqual(inc->sitePath, tuPath))
-        continue;
-      if (inc->siteB <= *m.invB && *m.invE <= inc->siteE)
-        return true;
-    }
-    return false;
-  };
-
-  const RecordedIncludeSideEffectResolver recordedIncludeSideEffectResolver(
-      model_, paths_, pragmaIsConsumableIncludeLocalState);
-
-  auto includeRecordedSideEffectReason =
-      [&](const RefoldModel::IncludeItem &inc) -> std::optional<std::string> {
-    return recordedIncludeSideEffectResolver.FindReason(inc);
-  };
-
-  auto includeHasRecordedSideEffects =
-      [&](const RefoldModel::IncludeItem &inc) -> bool {
-    return recordedIncludeSideEffectResolver.HasReason(inc);
-  };
-
-  const ConditionalStateIncludePreservationResolver
-      conditionalStateIncludePreservationResolver(
-          model_, paths_, macroStateProof_, sourceMapper_, h,
-          pragmaIsConsumableIncludeLocalState);
-
-  auto includeIsPreservableConditionalStateInclude =
-      [&](const RefoldModel::IncludeItem &inc) -> bool {
-    return conditionalStateIncludePreservationResolver.IsPreservable(inc);
-  };
-
-  // Recursively prove that a zero-token macro invocation is source-neutral.
-  // The shared adapter owns the replacement-list recursion and TU-specific
-  // policy wiring; this fallback path only supplies the current TU surface.
-  const TUSourceNeutralityContext tuSourceNeutrality =
-      RefoldSourceNeutralityProof::BuildTUSourceNeutralityContext(
-          model_, macroStateProof_, paths_, tuBytes, tuPath,
-          isWsOrCompleteCommentTrivia);
-
-  auto macroInvocationIsSourceNeutralZeroToken =
-      [&](const RefoldModel::MacroInvocation &m) -> bool {
-    return RefoldSourceNeutralityProof::MacroInvocationIsSourceNeutralZeroToken(
-        tuSourceNeutrality, m);
-  };
-
-  // Return true iff the macro invocation is a complete zero-token TU callsite
-  // inside the candidate replacement envelope.  Partial overlaps remain
-  // non-refoldable here because deleting only part of a macro call would not be
-  // a proved source closure.
-  auto macroInvocationIsConsumableZeroTokenGap =
-      [&](const RefoldModel::MacroInvocation &m, uint64_t begin,
-          uint64_t end) -> bool {
-    if (m.invFile && !m.invFile->empty() &&
-        !paths_.PathsEqual(*m.invFile, tuPath))
-      return false;
-    if (!m.invB || !m.invE || *m.invB >= *m.invE)
-      return false;
-    if (*m.invB < begin || end < *m.invE)
-      return false;
-    return macroInvocationIsSourceNeutralZeroToken(m);
-  };
-
-  using MacroDirectiveSourceInterval = MacroStateDirectiveLineInterval;
-
-  auto macroDirectiveIsConsumableStateGap =
-      [&](const RefoldModel::MacroDirective &directive, uint64_t begin,
-          uint64_t end) -> std::optional<MacroDirectiveSourceInterval> {
-    std::optional<MacroDirectiveSourceInterval> interval =
-        MacroDirectiveFullSourceInterval(tuPath, tuBytes, directive);
-    if (!interval)
-      return std::nullopt;
-    if (interval->begin < begin || end < interval->end)
-      return std::nullopt;
-    return interval;
-  };
-
-  // Return true iff a recorded TU conditional group may be preserved as
-  // inert inter-include source in a pure include-closure replacement.
-  //
-  // This is the preservation-side counterpart to the mixed-envelope conditional
-  // consumption proof below.  The static textual parser intentionally accepts
-  // only a tiny literal grammar (`#if 0`, `#if 1`, ...), because it has no
-  // preprocessor state.  For source forms such as `#ifdef ENABLE_GAP`, the
-  // refold map already gives us the deterministic proof object: a complete
-  // conditional-group byte interval and the PP spans materialized by each arm.
-  //
-  // Pure include closure does not delete these bytes.  It projects the touched
-  // include material into B and carries source-neutral inter-include control
-  // structure forward verbatim.  Therefore a recorded conditional group is
-  // preservable when it is complete, TU-spelled, wholly inside the gap, and no
-  // arm materialized PP tokens in A.  Active source-bearing artifacts inside
-  // the group remain outside this proof; they require their own
-  // preservation/repair model rather than being hidden inside an opaque
-  // conditional gap.
-  auto conditionalGroupIsPreservableIncludeClosureGap =
-      [&](const RefoldModel::CondGroup &group, uint64_t gapBegin,
-          uint64_t gapEnd) -> bool {
-    auto includeIsNeutral = [&](const RefoldModel::IncludeItem &inc) {
-      return (!inc.cover.IsValid() && !includeHasRecordedSideEffects(inc)) ||
-             includeIsPreservableConditionalStateInclude(inc);
-    };
-    NeutralConditionalIslandContext islandContext{
-        /*requireGroupBeginAtLineStart=*/true,
-        NeutralConditionalArmSpanMode::AllArms};
-    return RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
-        tuSourceNeutrality, group, gapBegin, gapEnd, islandContext,
-        includeIsNeutral);
-  };
-
-  // Return true iff a pure include-closure inter-include gap can be preserved
-  // verbatim by tiling it with lexical trivia and complete recorded zero-token
-  // conditional groups.
-  //
-  // This extends `isPreservableIncludeClosureGapTrivia()` without weakening its
-  // no-heuristics contract.  The directive spelling inside each conditional
-  // group can be macro-dependent (`#ifdef`, `#ifndef`, `#if defined(...)`, ...)
-  // because the producer has already recorded the complete group boundaries and
-  // which arms materialized A tokens for this preprocessing run.  We preserve
-  // the original bytes rather than consuming them, so this helper is used only
-  // by the pure include-closure gap path.
-  auto gapIsPreservableRecordedConditionalIncludeClosure =
-      [&](uint64_t gapBegin, uint64_t gapEnd) -> bool {
-    if (gapBegin >= gapEnd || gapEnd > tuBytes.size())
-      return false;
-
-    struct ConditionalPiece {
-      uint64_t begin;
-      uint64_t end;
-      uint64_t id;
-    };
-
-    SmallVector<ConditionalPiece, 8> pieces;
-    for (const auto &group : model_.GetConds()) {
-      if (!conditionalGroupIsPreservableIncludeClosureGap(
-              group, gapBegin, gapEnd)) {
-        continue;
-      }
-      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
-          findSourceGapConditionalGroupRange(preprocessingStructureIndex_,
-                                             group.id);
-      if (!exactRange || exactRange->first < gapBegin ||
-          exactRange->second > gapEnd) {
-        continue;
-      }
-      pieces.push_back({exactRange->first, exactRange->second, group.id});
-    }
-
-    if (pieces.empty())
-      return false;
-
-    SmallVector<SourceGapProofPiece, 8> proofPieces;
-    proofPieces.reserve(pieces.size());
-    for (size_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
-      const ConditionalPiece &piece = pieces[pieceIndex];
-      proofPieces.push_back(SourceGapProofPiece{
-          piece.begin, piece.end, piece.id,
-          /*kindOrder=*/0, /*nestingClass=*/0,
-          /*absorbedNestingClasses=*/uint64_t{1}, pieceIndex});
-    }
-
-    std::string gapReason;
-    std::optional<SourceGapProofResult> gapProof =
-        proveSourceGapWithIndexedTrivia(preprocessingStructureIndex_,
-                                        gapBegin, gapEnd, proofPieces,
-                                        &gapReason);
-    if (!gapProof) {
-      REFOLD_LOG_TRACE(
-          "fallback",
-          "TU include-closure rejected recorded conditional gap "
-          "source=[{0},{1}): {2}",
-          gapBegin, gapEnd, gapReason);
-      return false;
-    }
-
-    REFOLD_LOG_TRACE("fallback",
-                     "TU include-closure preserving recorded conditional gap "
-                     "source=[{0},{1}) conditionalGroups={2}",
-                     gapBegin, gapEnd,
-                     gapProof->outerPiecePayloadIndices.size());
-    return true;
-  };
-
-  // Return true iff a complete TU conditional group is source-neutral
-  // inside a mixed TU/include source envelope.
-  //
-  // This is the recorded-structure proof for conditional islands that produce
-  // no A-side tokens.  Unlike the literal textual #if/#endif scanner, it does
-  // not try to evaluate the condition.  The producer has already recorded the
-  // selected arm and the arm token spans; this proof only checks that replaying
-  // the complete group verbatim is a neutral source gap.  Macro invocations in
-  // conditional-control lines are therefore allowed because they remain inside
-  // the preserved group.  Recorded artifacts in arm bodies still fail closed:
-  // those may carry source tokens, macro state, include effects, or pragmas
-  // that require their own proof.
-  auto conditionalGroupIsConsumableZeroTokenGap =
-      [&](const RefoldModel::CondGroup &group, uint64_t begin,
-          uint64_t end) -> bool {
-    auto includeIsNeutral = [&](const RefoldModel::IncludeItem &inc) {
-      return (!inc.cover.IsValid() && !includeHasRecordedSideEffects(inc)) ||
-             includeIsPreservableConditionalStateInclude(inc);
-    };
-    NeutralConditionalIslandContext islandContext{
-        /*requireGroupBeginAtLineStart=*/false,
-        NeutralConditionalArmSpanMode::SelectedArmsOnly};
-    return RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
-        tuSourceNeutrality, group, begin, end, islandContext, includeIsNeutral);
-  };
-
-  // Prove that a source gap inside a replacement envelope consists only of
-  // lexical trivia plus complete source-neutral artifacts: zero-token include
-  // trees, source-neutral zero-token macro invocation trees, and TU-spelled
-  // macro-state directives whose later liveness obligations are handled by the
-  // macro-state repair pass.
-  //
-  // These artifacts have no PP tokens, so token overlap alone cannot make them
-  // part of the touched hunk.  If they lie physically between required source
-  // pieces of a proved mixed closure, however, they are inside the source
-  // interval being replaced and may be consumed with the B-side material.
-  //
-  // The conditional-control proof is deliberately mode-sensitive.  Mixed
-  // whole-envelope closures may consume complete TU conditional groups because
-  // their surrounding source interval is itself replaced.  Pure include-closure
-  // inter-include gaps, however, project include material and preserve inert
-  // source gaps; they must not delete an otherwise-preservable empty #if/#endif
-  // island just because it has no PP tokens.
-  auto gapIsConsumableZeroTokenSourceClosure =
-      [&](uint64_t gapBegin, uint64_t gapEnd,
-          bool allowTUConditionalControl) -> bool {
-    if (gapBegin >= gapEnd || gapEnd > tuBytes.size())
-      return false;
-
-    struct GapPiece {
-      uint64_t begin;
-      uint64_t end;
-      uint64_t id;
-      StringRef kind;
-    };
-
-    SmallVector<GapPiece, 8> pieces;
-    for (const auto &inc : model_.GetIncludes()) {
-      if (!paths_.PathsEqual(inc.sitePath, tuPath) || includeIsTouched(inc))
-        continue;
-      if (inc.cover.IsValid() || includeHasRecordedSideEffects(inc))
-        continue;
-      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
-          findSourceGapProducerInterval(
-              preprocessingStructureIndex_,
-              PreprocessingStructureModelKind::IncludeDirective, inc.id);
-      if (exactRange && gapBegin <= exactRange->first &&
-          exactRange->second <= gapEnd) {
-        pieces.push_back(
-            {exactRange->first, exactRange->second, inc.id, "include"});
-      }
-    }
-
-    for (const auto &m : model_.GetMacroInvocations())
-      if (macroInvocationIsConsumableZeroTokenGap(m, gapBegin, gapEnd))
-        pieces.push_back({*m.invB, *m.invE, m.id, "macro"});
-
-    for (const auto &directive : model_.GetMacroDirectives())
-      if (std::optional<MacroDirectiveSourceInterval> interval =
-              macroDirectiveIsConsumableStateGap(directive, gapBegin, gapEnd))
-        pieces.push_back(
-            {interval->begin, interval->end, directive.id, "macro-directive"});
-
-    if (allowTUConditionalControl)
-      for (const auto &group : model_.GetConds())
-        if (conditionalGroupIsConsumableZeroTokenGap(group, gapBegin,
-                                                       gapEnd)) {
-          std::optional<std::pair<uint64_t, uint64_t>> exactRange =
-              findSourceGapConditionalGroupRange(
-                  preprocessingStructureIndex_, group.id);
-          if (exactRange && gapBegin <= exactRange->first &&
-              exactRange->second <= gapEnd) {
-            pieces.push_back({exactRange->first, exactRange->second, group.id,
-                              "conditional"});
-          }
-        }
-
-    uint64_t scanCursor = gapBegin;
-    uint64_t includeCount = 0;
-    uint64_t macroCount = 0;
-    uint64_t macroDirectiveCount = 0;
-    uint64_t conditionalGroupCount = 0;
-    uint64_t conditionalDirectiveCount = 0;
-    unsigned conditionalDepth = 0;
-
-    // Scan source bytes that are not covered by recorded zero-token artifacts.
-    // These interstitial bytes may contain ordinary lexical trivia and literal
-    // conditional-control directives.  The conditional depth is carried across
-    // consumed artifacts, which is what admits shapes such as:
-    //
-    //   #if 1
-    //   #define GAP_VALUE 99
-    //   #endif
-    //
-    // when the #define line is itself a proved consumable macro-state artifact.
-    bool atLineStart = stringutils::beginsLineAfterWs(tuBytes, gapBegin);
-    auto scanNeutralControlTrivia = [&](uint64_t begin,
-                                        uint64_t limit) -> bool {
-      scanCursor = begin;
-      while (scanCursor < limit) {
-        char ch = tuBytes[scanCursor];
-        if (stringutils::isWs(ch)) {
-          atLineStart = ch == '\n' || ch == '\r';
-          ++scanCursor;
-          continue;
-        }
-
-        if (ch == '/') {
-          const uint64_t before = scanCursor;
-          StringRef rest = tuBytes.drop_front(scanCursor);
-          if (rest.starts_with("/*")) {
-            scanCursor += 2;
-            bool closed = false;
-            while (scanCursor + 1 < limit) {
-              if (tuBytes[scanCursor] == '*' &&
-                  tuBytes[scanCursor + 1] == '/') {
-                scanCursor += 2;
-                closed = true;
-                break;
-              }
-              ++scanCursor;
-            }
-            if (!closed)
-              return false;
-            StringRef skipped = tuBytes.slice(before, scanCursor);
-            atLineStart = skipped.ends_with("\n") || skipped.ends_with("\r");
-            continue;
-          }
-
-          if (rest.starts_with("//")) {
-            scanCursor += 2;
-            while (scanCursor < limit && tuBytes[scanCursor] != '\n' &&
-                   tuBytes[scanCursor] != '\r')
-              ++scanCursor;
-
-            // A line comment may end at the end of the whole gap, but it may
-            // not run into a following recorded artifact.  In that case the
-            // artifact's spelling would be inside the comment, contradicting
-            // the proof that it is an independently recorded source artifact.
-            if (scanCursor >= limit)
-              return limit == gapEnd;
-
-            ++scanCursor;
-            atLineStart = true;
-            continue;
-          }
-        }
-
-        // Literal conditional-control directives are source-neutral only at a
-        // physical directive boundary.  Any other directive or token spelling
-        // is real source that this closure has not proved safe to erase.
-        if (ch != '#' || !atLineStart)
-          return false;
-
-        uint64_t lineEnd = scanCursor;
-        while (lineEnd < limit && tuBytes[lineEnd] != '\n')
-          ++lineEnd;
-        if (lineEnd < limit)
-          ++lineEnd;
-
-        if (!allowTUConditionalControl ||
-            !parseLiteralEmptyConditionalDirectiveLine(
-                tuBytes.slice(scanCursor, lineEnd), conditionalDepth)) {
-          if (const RefoldModel::PragmaDirective *pragma =
-                  FindTUPragmaOnSourceLine(tuPath, scanCursor, lineEnd)) {
-            REFOLD_LOG_TRACE(
-                "fallback",
-                "TU/include closure rejected: source gap [{0},{1}) contains "
-                "non-consumable TU pragma id={2} site=[{3},{4}) text='{5}'",
-                gapBegin, gapEnd, pragma->id, pragma->siteB, pragma->siteE,
-                stringutils::showWsWithClip(pragma->text, 120));
-          }
-          return false;
-        }
-
-        ++conditionalDirectiveCount;
-        scanCursor = lineEnd;
-        atLineStart = true;
-      }
-      return scanCursor == limit;
-    };
-
-    if (pieces.empty())
-      return false;
-
-    enum : uint32_t {
-      ConditionalPieceClass = 0,
-      IncludePieceClass = 1,
-      MacroPieceClass = 2,
-      MacroDirectivePieceClass = 3,
-    };
-
-    SmallVector<SourceGapProofPiece, 8> proofPieces;
-    proofPieces.reserve(pieces.size());
-    for (size_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
-      const GapPiece &piece = pieces[pieceIndex];
-      uint32_t pieceClass = MacroDirectivePieceClass;
-      uint64_t absorbedClasses = 0;
-      if (piece.kind == "conditional") {
-        pieceClass = ConditionalPieceClass;
-        absorbedClasses = uint64_t{1} << ConditionalPieceClass;
-      } else if (piece.kind == "include") {
-        pieceClass = IncludePieceClass;
-      } else if (piece.kind == "macro") {
-        pieceClass = MacroPieceClass;
-        absorbedClasses = uint64_t{1} << MacroPieceClass;
-      }
-      proofPieces.push_back(SourceGapProofPiece{
-          piece.begin, piece.end, piece.id, pieceClass, pieceClass,
-          absorbedClasses, pieceIndex});
-    }
-
-    const uint64_t uncoveredConditionalKinds =
-        allowTUConditionalControl ? sourceGapConditionalDirectiveKindMask() : 0;
-
-    std::string gapReason;
-    std::optional<SourceGapProofResult> gapProof = proveSourceGapWithPolicy(
-        preprocessingStructureIndex_, gapBegin, gapEnd, proofPieces,
-        [&](uint64_t begin, uint64_t end) {
-          return scanNeutralControlTrivia(begin, end);
-        },
-        [&](size_t payloadIndex) {
-          const GapPiece &piece = pieces[payloadIndex];
-
-          // The artifact itself has already been independently proved
-          // zero-token and complete. Consume it as one opaque source-neutral
-          // piece, then continue scanning surrounding control/trivia bytes at
-          // the same conditional depth.
-          StringRef pieceBytes = tuBytes.slice(piece.begin, piece.end);
-          atLineStart =
-              pieceBytes.ends_with("\n") || pieceBytes.ends_with("\r");
-          if (piece.kind == "include")
-            ++includeCount;
-          else if (piece.kind == "macro")
-            ++macroCount;
-          else if (piece.kind == "macro-directive")
-            ++macroDirectiveCount;
-          else
-            ++conditionalGroupCount;
-        },
-        uncoveredConditionalKinds, &gapReason);
-    if (!gapProof || conditionalDepth != 0) {
-      REFOLD_LOG_TRACE(
-          "fallback",
-          "TU/include closure rejected zero-token source gap "
-          "source=[{0},{1}): {2}",
-          gapBegin, gapEnd,
-          gapProof ? StringRef("unbalanced literal conditional controls")
-                   : StringRef(gapReason));
-      return false;
-    }
-
-    REFOLD_LOG_TRACE(
-        "fallback",
-        "TU/include closure consuming zero-token source gap "
-        "source=[{0},{1}) includes={2} macros={3} macroDirectives={4} "
-        "conditionalGroups={5} conditionalDirectives={6}",
-        gapBegin, gapEnd, includeCount, macroCount, macroDirectiveCount,
-        conditionalGroupCount, conditionalDirectiveCount);
-    return true;
-  };
-
-  struct TUPreservedGapPiece {
-    enum class Kind {
-      ZeroTokenMacroInvocation,
-      ZeroTokenConditionalGroup,
-      BalancedPragmaStateIsland
-    };
-
-    Kind kind = Kind::ZeroTokenMacroInvocation;
-    uint64_t begin = 0;
-    uint64_t end = 0;
-    uint64_t id = 0;
-  };
-
-  auto preservedTUGapPieceText = [&](const TUPreservedGapPiece &piece) {
-    if (piece.end <= tuBytes.size() && piece.begin <= piece.end)
-      return tuBytes.slice(piece.begin, piece.end).str();
-    return std::string();
-  };
-
-  auto collectPreservableZeroTokenGapPieces =
-      [&](uint64_t gapBegin, uint64_t gapEnd,
-          SmallVectorImpl<TUPreservedGapPiece> &out) -> bool {
-    if (gapBegin >= gapEnd || gapEnd > tuBytes.size())
-      return false;
-
-    struct GapPiece {
-      uint64_t begin;
-      uint64_t end;
-      uint64_t id;
-      TUPreservedGapPiece::Kind kind;
-    };
-
-    SmallVector<GapPiece, 8> pieces;
-    for (const auto &m : model_.GetMacroInvocations()) {
-      if (macroInvocationIsConsumableZeroTokenGap(m, gapBegin, gapEnd)) {
-        pieces.push_back({*m.invB, *m.invE, m.id,
-                          TUPreservedGapPiece::Kind::ZeroTokenMacroInvocation});
-      }
-    }
-
-    for (const auto &group : model_.GetConds()) {
-      if (conditionalGroupIsConsumableZeroTokenGap(group, gapBegin, gapEnd)) {
-        std::optional<std::pair<uint64_t, uint64_t>> exactRange =
-            findSourceGapConditionalGroupRange(preprocessingStructureIndex_,
-                                               group.id);
-        if (exactRange && gapBegin <= exactRange->first &&
-            exactRange->second <= gapEnd) {
-          pieces.push_back(
-              {exactRange->first, exactRange->second, group.id,
-               TUPreservedGapPiece::Kind::ZeroTokenConditionalGroup});
-        }
-      }
-    }
-
-    // Pragma/state proof: a complete diagnostic push/settings/pop sequence that
-    // is wholly inside this owner gap and crosses only trivia has identity net
-    // state at both boundaries.  Preserve the original pragma bytes as an
-    // explicit gap piece instead of treating the gap as opaque trivia; unknown
-    // or unbalanced pragmas remain non-consumable and will still force the
-    // ordinary fail-closed path below.
-    SmallVector<BalancedDiagnosticPragmaStateIsland, 4> pragmaIslands;
-    collectBalancedDiagnosticPragmaStateIslands(
-        model_, tuBytes, gapBegin, gapEnd,
-        [&](const RefoldModel::PragmaDirective &pragma) {
-          return paths_.PathsEqual(pragma.sitePath, tuPath);
-        },
-        pragmaIslands, lexLang_);
-    for (const BalancedDiagnosticPragmaStateIsland &island : pragmaIslands) {
-      pieces.push_back({island.begin, island.end, island.id,
-                        TUPreservedGapPiece::Kind::BalancedPragmaStateIsland});
-    }
-
-    if (pieces.empty())
-      return false;
-
-    SmallVector<SourceGapProofPiece, 8> proofPieces;
-    proofPieces.reserve(pieces.size());
-    for (size_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
-      const GapPiece &piece = pieces[pieceIndex];
-      const uint32_t pieceClass = static_cast<uint32_t>(piece.kind);
-      uint64_t absorbedClasses = 0;
-      if (piece.kind ==
-          TUPreservedGapPiece::Kind::ZeroTokenMacroInvocation) {
-        absorbedClasses = uint64_t{1} << pieceClass;
-      } else if (piece.kind ==
-                 TUPreservedGapPiece::Kind::ZeroTokenConditionalGroup) {
-        // The independently proved complete conditional island owns nested
-        // macro invocations, nested conditional records, and balanced pragma
-        // islands in its source bytes.
-        absorbedClasses =
-            (uint64_t{1}
-             << static_cast<uint32_t>(
-                    TUPreservedGapPiece::Kind::ZeroTokenMacroInvocation)) |
-            (uint64_t{1}
-             << static_cast<uint32_t>(
-                    TUPreservedGapPiece::Kind::ZeroTokenConditionalGroup)) |
-            (uint64_t{1}
-             << static_cast<uint32_t>(
-                    TUPreservedGapPiece::Kind::BalancedPragmaStateIsland));
-      }
-      proofPieces.push_back(SourceGapProofPiece{
-          piece.begin, piece.end, piece.id, pieceClass, pieceClass,
-          absorbedClasses, pieceIndex});
-    }
-
-    std::string gapReason;
-    std::optional<SourceGapProofResult> gapProof =
-        proveSourceGapWithIndexedTrivia(preprocessingStructureIndex_,
-                                        gapBegin, gapEnd, proofPieces,
-                                        &gapReason);
-    if (!gapProof) {
-      REFOLD_LOG_TRACE(
-          "fallback",
-          "TU/include closure rejected preserved zero-token gap "
-          "source=[{0},{1}): {2}",
-          gapBegin, gapEnd, gapReason);
-      return false;
-    }
-
-    SmallVector<TUPreservedGapPiece, 8> accepted;
-    for (size_t payloadIndex : gapProof->outerPiecePayloadIndices) {
-      const GapPiece &piece = pieces[payloadIndex];
-      accepted.push_back({piece.kind, piece.begin, piece.end, piece.id});
-    }
-
-    out.append(accepted.begin(), accepted.end());
-    REFOLD_LOG_TRACE("fallback",
-                     "TU/include closure preserving zero-token source gap "
-                     "source=[{0},{1}) pieces={2}",
-                     gapBegin, gapEnd, accepted.size());
-    return true;
-  };
-
-  // One TU directive that a closure preserves at its original position inside
-  // the replacement instead of consuming or relocating it.
-  //
-  // `aFrontier` is the producer-backed A-token index the directive sits at; the
-  // B payload is cut there so the directive keeps the same position relative to
-  // surviving material.
-  //
-  // Two directive kinds qualify, for the same reason.  A pragma's state is not
-  // identity and cannot be moved, and a zero-token `#include` whose header owns
-  // such a pragma carries that state transitively: consuming either would drop
-  // it.  Preserving the directive keeps the transition at its original
-  // position, which is sound where deleting it is not -- and strictly better
-  // than refusing the closure, since refusing surrenders every directive in the
-  // translation unit rather than this one.
-  struct TUPositionPreservedDirective {
-    enum class Kind { Pragma, Include, MacroDirective };
-
-    Kind kind = Kind::Pragma;
-    uint64_t begin = 0;
-    uint64_t end = 0;
-    uint64_t id = 0;
-    uint64_t aFrontier = 0;
-    /// Every state effect this directive establishes, for placing edited
-    /// material the alignment cannot place.  StringRefs point into `tuBytes`
-    /// for a pragma, or into the model's pragma text for an include.
-    SmallVector<PragmaClassification, 2> classifications;
-    /// Macro definitions a preserved `#define`/`#undef` binds.  Empty for the
-    /// other kinds.  Each binding points into the model's directive record.
-    SmallVector<MacroStateBinding, 2> macroBindings;
-  };
-
-  // Producer coordinate surfaces for projecting a tokenless TU directive onto
-  // the A stream.  They mirror the direct-TU surfaces the alignment's
-  // protected-boundary collector projects against: tokmap entries spelled by
-  // this TU, and the include occurrences this TU entered directly.  Both are
-  // run constants, so they are built once, but only on first use: a closure gap
-  // that needs them is rare and building them walks the whole tokmap.
-  bool tuTokenlessProjectionSurfacesReady = false;
-  SmallVector<const RefoldModel::TokMapEntry *, 32> tuMappedATokens;
-  SmallVector<const RefoldModel::IncludeItem *, 8> tuChildIncludes;
-  auto ensureTUTokenlessProjectionSurfaces = [&]() {
-    if (tuTokenlessProjectionSurfacesReady)
-      return;
-    tuTokenlessProjectionSurfacesReady = true;
-    for (const auto &entry : model_.GetTokmap()) {
-      if (entry.pp < aToks_.size() && paths_.PathsEqual(entry.file, tuPath))
-        tuMappedATokens.push_back(&entry);
-    }
-    for (const auto &inc : model_.GetIncludes()) {
-      if (!inc.parent && inc.cover.IsValid() &&
-          inc.cover.end <= aToks_.size() &&
-          paths_.PathsEqual(inc.sitePath, tuPath))
-        tuChildIncludes.push_back(&inc);
-    }
-  };
-
-  // Prove that an owner gap is exactly trivia plus complete TU pragma
-  // directives, and project each of those directives onto the A stream.
-  //
-  // A pragma is neither consumable nor relocatable: its net state is not
-  // identity, so deleting it drops a state transition and moving it changes
-  // where that transition happens.  The remaining sound realization is to keep
-  // it in place and split the replacement's B payload around it, which needs
-  // exactly one extra fact per directive -- the A-token frontier it sits at.
-  // The projection supplies that fact from producer coordinates and fails
-  // closed when the directive is not tokenless or its position is not
-  // determined; the gap proof separately guarantees that no other protected
-  // structure hides in the same gap.
-  auto collectPositionPreservedTUDirectiveGapPieces =
-      [&](uint64_t gapBegin, uint64_t gapEnd,
-          SmallVectorImpl<TUPositionPreservedDirective> &out) -> bool {
-    if (gapBegin >= gapEnd || gapEnd > tuBytes.size())
-      return false;
-
-    // Recover the exact directive extents first.  The indexed lexical extent,
-    // not the recorded site, is what gets copied verbatim: the index owns the
-    // complete logical directive line.
-    SmallVector<TUPositionPreservedDirective, 4> pragmas;
-    for (const auto &pragma : model_.GetPragmas()) {
-      if (!paths_.PathsEqual(pragma.sitePath, tuPath))
-        continue;
-      if (pragma.siteB >= pragma.siteE || pragma.siteB < gapBegin ||
-          gapEnd < pragma.siteE)
-        continue;
-
-      // Only a directive-spelled pragma owns a complete logical line that can
-      // be copied verbatim.  A `_Pragma("...")` operator is an expression whose
-      // bytes may live inside a macro replacement list, so re-emitting them at
-      // a derived split would move source that belongs to another owner.
-      if (pragma.viaPragmaOperator) {
-        REFOLD_LOG_TRACE(
-            "fallback",
-            "TU/include closure cannot preserve pragma id={0} in place: "
-            "operator-spelled pragmas have no preservable directive line",
-            pragma.id);
-        return false;
-      }
-
-      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
-          findSourceGapProducerInterval(
-              preprocessingStructureIndex_,
-              PreprocessingStructureModelKind::PragmaDirective, pragma.id);
-      if (!exactRange || exactRange->first >= exactRange->second ||
-          exactRange->first < gapBegin || gapEnd < exactRange->second) {
-        REFOLD_LOG_TRACE(
-            "fallback",
-            "TU/include closure cannot preserve TU pragma id={0} in place: "
-            "no exact indexed directive interval inside gap [{1},{2})",
-            pragma.id, gapBegin, gapEnd);
-        return false;
-      }
-
-      SmallVector<PragmaClassification, 2> classifications;
-      classifications.push_back(classifyPragmaDirective(
-          tuBytes.slice(exactRange->first, exactRange->second)));
-      pragmas.push_back({TUPositionPreservedDirective::Kind::Pragma,
-                         exactRange->first, exactRange->second, pragma.id,
-                         /*aFrontier=*/0, std::move(classifications),
-                         /*macroBindings=*/{}});
-    }
-
-    // A macro directive in the gap is preserved on the same terms.  It is
-    // tokenless and it is meaningful source, so consuming it would drop a
-    // macro-state transition the gap theorem would otherwise report as an
-    // unowned protected interval -- which is what refused the whole closure
-    // before, costing every directive in the translation unit to avoid
-    // dropping this one.
-    for (const auto &directive : model_.GetMacroDirectives()) {
-      if (!directive.IsMacroStateDirective())
-        continue;
-      if (!paths_.PathsEqual(directive.sitePath, tuPath))
-        continue;
-      if (directive.ownerIncludeId)
-        continue;
-
-      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
-          findSourceGapProducerInterval(
-              preprocessingStructureIndex_,
-              PreprocessingStructureModelKind::MacroDirective, directive.id);
-      if (!exactRange || exactRange->first >= exactRange->second)
-        continue;
-      if (exactRange->first < gapBegin || gapEnd < exactRange->second)
-        continue;
-
-      SmallVector<MacroStateBinding, 2> macroBindings;
-      if (!directive.name.empty())
-        macroBindings.push_back(MacroStateBinding{directive.name, &directive});
-
-      pragmas.push_back({TUPositionPreservedDirective::Kind::MacroDirective,
-                         exactRange->first, exactRange->second, directive.id,
-                         /*aFrontier=*/0,
-                         /*classifications=*/{}, std::move(macroBindings)});
-    }
-
-    // A zero-token include whose header owns non-consumable state is the same
-    // problem one level down: the state is not the include's own text, but
-    // deleting the directive drops it just the same.  Preserve the directive
-    // and the header is re-entered at its original position, which re-runs
-    // every transition it owns exactly where it ran before.  This is only for
-    // includes the closure would otherwise have to absorb: a touched include is
-    // part of the realized material, and one that produces tokens is not
-    // tokenless and has no frontier.
-    for (const auto &inc : model_.GetIncludes()) {
-      if (!paths_.PathsEqual(inc.sitePath, tuPath) || inc.parent)
-        continue;
-      if (inc.siteB >= inc.siteE || inc.siteB < gapBegin || gapEnd < inc.siteE)
-        continue;
-      if (includeIsTouched(inc) || inc.cover.IsValid())
-        continue;
-      if (!includeHasRecordedSideEffects(inc))
-        continue;
-
-      std::optional<std::pair<uint64_t, uint64_t>> exactRange =
-          findSourceGapProducerInterval(
-              preprocessingStructureIndex_,
-              PreprocessingStructureModelKind::IncludeDirective, inc.id);
-      if (!exactRange || exactRange->first >= exactRange->second ||
-          exactRange->first < gapBegin || gapEnd < exactRange->second) {
-        REFOLD_LOG_TRACE(
-            "fallback",
-            "TU/include closure cannot preserve include id={0} in place: no "
-            "exact indexed directive interval inside gap [{1},{2})",
-            inc.id, gapBegin, gapEnd);
-        return false;
-      }
-
-      // The header's own pragmas are the state a payload could observe by
-      // landing on the far side of the preserved directive.  An include whose
-      // header records none is still preserved; it then has no classification
-      // and any ambiguous payload beside it fails closed.
-      SmallVector<PragmaClassification, 2> classifications;
-      if (inc.resolvedPath)
-        for (const auto &pragma : model_.GetPragmas())
-          if (paths_.PathsEqual(pragma.sitePath, *inc.resolvedPath))
-            classifications.push_back(classifyPragmaDirective(pragma.text));
-
-      pragmas.push_back({TUPositionPreservedDirective::Kind::Include,
-                         exactRange->first, exactRange->second, inc.id,
-                         /*aFrontier=*/0, std::move(classifications),
-                         /*macroBindings=*/{}});
-    }
-
-    if (pragmas.empty())
-      return false;
-
-    llvm::sort(pragmas, [](const TUPositionPreservedDirective &lhs,
-                           const TUPositionPreservedDirective &rhs) {
-      if (lhs.begin != rhs.begin)
-        return lhs.begin < rhs.begin;
-      return lhs.id < rhs.id;
-    });
-
-    ensureTUTokenlessProjectionSurfaces();
-    for (TUPositionPreservedDirective &piece : pragmas) {
-      std::optional<uint64_t> aFrontier =
-          projectTokenlessSourceIntervalToATokenFrontier(
-              tuMappedATokens, tuChildIncludes, aToks_.size(), piece.begin,
-              piece.end);
-      if (!aFrontier) {
-        REFOLD_LOG_TRACE(
-            "fallback",
-            "TU/include closure cannot preserve TU pragma id={0} in place: "
-            "source=[{1},{2}) has no unique A-token frontier",
-            piece.id, piece.begin, piece.end);
-        return false;
-      }
-      piece.aFrontier = *aFrontier;
-    }
-
-    // Submit the directives as opaque preserved pieces so the shared gap
-    // theorem proves the complete byte coverage of the gap.  Every protected
-    // interval in the gap must be one of these pieces: an unrelated directive
-    // hiding beside the pragma is not preserved by this composition and fails
-    // closed here.
-    enum : uint32_t { PragmaPieceClass = 0 };
-    SmallVector<SourceGapProofPiece, 4> proofPieces;
-    proofPieces.reserve(pragmas.size());
-    for (size_t pieceIndex = 0; pieceIndex < pragmas.size(); ++pieceIndex) {
-      const TUPositionPreservedDirective &piece = pragmas[pieceIndex];
-      proofPieces.push_back(SourceGapProofPiece{
-          piece.begin, piece.end, piece.id, PragmaPieceClass, PragmaPieceClass,
-          0, pieceIndex});
-    }
-
-    std::string gapReason;
-    std::optional<SourceGapProofResult> gapProof =
-        proveSourceGapWithIndexedTrivia(preprocessingStructureIndex_, gapBegin,
-                                        gapEnd, proofPieces, &gapReason);
-    if (!gapProof) {
-      REFOLD_LOG_TRACE(
-          "fallback",
-          "TU/include closure rejected position-preserved TU pragma gap "
-          "source=[{0},{1}): {2}",
-          gapBegin, gapEnd, gapReason);
-      return false;
-    }
-    if (gapProof->outerPiecePayloadIndices.size() != pragmas.size()) {
-      REFOLD_LOG_TRACE(
-          "fallback",
-          "TU/include closure rejected position-preserved TU pragma gap "
-          "source=[{0},{1}): {2} of {3} directives survived normalization",
-          gapBegin, gapEnd, gapProof->outerPiecePayloadIndices.size(),
-          pragmas.size());
-      return false;
-    }
-
-    for (size_t payloadIndex : gapProof->outerPiecePayloadIndices) {
-      const TUPositionPreservedDirective &piece = pragmas[payloadIndex];
-      REFOLD_LOG_TRACE(
-          "fallback",
-          "TU/include closure preserving TU directive id={0} in place "
-          "source=[{1},{2}) aFrontier={3} gap=[{4},{5})",
-          piece.id, piece.begin, piece.end, piece.aFrontier, gapBegin, gapEnd);
-      out.push_back(piece);
-    }
-    return true;
-  };
+  // Every source-gap obligation below is discharged against this run's
+  // touched-include set, hunk and TU surface, so the prover is built once here
+  // and holds those per-call facts.  `touched` is aliased, so it must not be
+  // modified after this point; it is only read from here on.
+  const TUIncludeClosureSourceGapProver gapProver(
+      model_, paths_, macroStateProof_, sourceMapper_,
+      preprocessingStructureIndex_, aToks_, lexLang_, h, tuPath, tuBytes,
+      touched);
 
   std::string mixedPreservedConditionalControlTrivia;
   SmallVector<TUPositionPreservedDirective, 4> mixedPositionPreservedTUDirectives;
@@ -2269,7 +2344,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       // include covers.  Otherwise this is not a TU/include closure; it would
       // be a mixed-owner edit involving some third artifact that this proof
       // does not know how to realize soundly.
-      if (!tokenCoveredByTouchedInclude(pp)) {
+      if (!gapProver.TokenCoveredByTouchedInclude(pp)) {
         REFOLD_LOG_TRACE(
             "fallback",
             "TU/include closure rejected: A token {0} maps to file={1} "
@@ -2603,7 +2678,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     auto includeIsInsidePreservableZeroTokenConditionalGap =
         [&](const RefoldModel::IncludeItem &inc) -> bool {
       for (const auto &group : model_.GetConds()) {
-        if (!conditionalGroupIsConsumableZeroTokenGap(group, sourceBegin,
+        if (!gapProver.ConditionalGroupIsConsumableZeroTokenGap(group, sourceBegin,
                                                       sourceEnd))
           continue;
         if (group.groupB <= inc.siteB && inc.siteB < inc.siteE &&
@@ -2642,7 +2717,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (inc.siteB >= sourceEnd || sourceBegin >= inc.siteE)
         continue;
       std::optional<std::string> sideEffectReason =
-          includeRecordedSideEffectReason(inc);
+          gapProver.IncludeRecordedSideEffectReason(inc);
 
       // A *touched* include is consumed because this closure realizes its
       // expansion, and that accounts for its tokens.  It does not account for
@@ -2654,7 +2729,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       // the side-effect resolver decides.  Otherwise leave the closure
       // unformed so the realization lattice materializes the include instead,
       // where the directive survives where it was written.
-      if (includeIsTouched(inc)) {
+      if (gapProver.IncludeIsTouched(inc)) {
         if (!IncludeSubtreeOwnsOutlivingPragma(inc))
           continue;
         REFOLD_LOG_TRACE(
@@ -2761,7 +2836,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
         return false;
 
       for (const auto &group : model_.GetConds()) {
-        if (!conditionalGroupIsConsumableZeroTokenGap(group, sourceBegin,
+        if (!gapProver.ConditionalGroupIsConsumableZeroTokenGap(group, sourceBegin,
                                                       sourceEnd))
           continue;
         if (group.groupB <= *macro.invB && *macro.invB < *macro.invE &&
@@ -2791,8 +2866,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (!m.invB || !m.invE)
         continue;
       if (*m.invB < sourceEnd && sourceBegin < *m.invE) {
-        if (macroInvocationIsInsideTouchedIncludeDirective(m) ||
-            macroInvocationIsConsumableZeroTokenGap(m, sourceBegin,
+        if (gapProver.MacroInvocationIsInsideTouchedIncludeDirective(m) ||
+            gapProver.MacroInvocationIsConsumableZeroTokenGap(m, sourceBegin,
                                                     sourceEnd) ||
             macroInvocationMaterialIsConsumed(m, sourceBegin, sourceEnd) ||
             mixedSourceLineDirectiveMacroIds.contains(m.id) ||
@@ -2835,7 +2910,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
             return true;
 
           SmallVector<TUPreservedGapPiece, 4> preservedZeroTokenPieces;
-          if (collectPreservableZeroTokenGapPieces(gapBegin, gapEnd,
+          if (gapProver.CollectPreservableZeroTokenGapPieces(gapBegin, gapEnd,
                                                    preservedZeroTokenPieces)) {
             mixedPreservedZeroTokenGapPieces.append(
                 preservedZeroTokenPieces.begin(),
@@ -2843,7 +2918,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
             return true;
           }
 
-          if (gapIsConsumableZeroTokenSourceClosure(
+          if (gapProver.GapIsConsumableZeroTokenSourceClosure(
                   gapBegin, gapEnd,
                   /*allowTUConditionalControl=*/true))
             return true;
@@ -2892,7 +2967,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
           // the ordinary rejection; the split itself is derived later, once
           // the B material range is known, and refuses there if it is not
           // determined.
-          if (collectPositionPreservedTUDirectiveGapPieces(
+          if (gapProver.CollectPositionPreservedTUDirectiveGapPieces(
                   gapBegin, gapEnd, mixedPositionPreservedTUDirectives))
             return true;
 
@@ -3042,7 +3117,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
           return std::nullopt;
         }
       } else if (!gap.empty()) {
-        if (gapIsConsumableZeroTokenSourceClosure(
+        if (gapProver.GapIsConsumableZeroTokenSourceClosure(
                 sourceCursor, inc->siteB,
                 /*allowTUConditionalControl=*/false)) {
           REFOLD_LOG_TRACE(
@@ -3052,7 +3127,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
               inc->id, stringutils::showWsWithClip(gap, 120));
         } else if (!GapIsIndexedPreservableIncludeClosureTrivia(
                        tuBytes, sourceCursor, inc->siteB) &&
-                   !gapIsPreservableRecordedConditionalIncludeClosure(
+                   !gapProver.GapIsPreservableRecordedConditionalIncludeClosure(
                        sourceCursor, inc->siteB)) {
           REFOLD_LOG_TRACE(
               "fallback",
@@ -3305,7 +3380,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   if (!mixedPreservedZeroTokenGapPieces.empty()) {
     bool insertedSeparator = false;
     for (const TUPreservedGapPiece &piece : mixedPreservedZeroTokenGapPieces) {
-      std::string pieceText = preservedTUGapPieceText(piece);
+      std::string pieceText = gapProver.PreservedTUGapPieceText(piece);
       if (pieceText.empty())
         continue;
 
@@ -3634,7 +3709,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
         // on that include instance.  This repair is only for the pure
         // `#pragma once` reactivation case where the directive was token-empty
         // because a prior include had already entered the header.
-        if (includeHasRecordedSideEffects(inc))
+        if (gapProver.IncludeHasRecordedSideEffects(inc))
           continue;
         if (!next || inc.siteB < next->siteB ||
             (inc.siteB == next->siteB && inc.id < next->id))

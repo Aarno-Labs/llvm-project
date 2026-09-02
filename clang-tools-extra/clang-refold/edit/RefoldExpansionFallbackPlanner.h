@@ -153,22 +153,6 @@ private:
   bool
   IncludeSubtreeOwnsOutlivingPragma(const RefoldModel::IncludeItem &root) const;
 
-  /// Recover the full physical source interval for a TU-spelled macro-state
-  /// directive, or std::nullopt when the producer facts do not determine it.
-  std::optional<MacroStateDirectiveLineInterval>
-  MacroDirectiveFullSourceInterval(
-      llvm::StringRef tuPath, llvm::StringRef tuBytes,
-      const RefoldModel::MacroDirective &directive) const;
-
-  /// Return a TU-spelled pragma wholly contained in the physical source line
-  /// [lineBegin, lineEnd], if the refold map recorded one there.
-  ///
-  /// Diagnostic-only: pragmas are never consumed as source-neutral artifacts,
-  /// so this only lets a rejection name the pragma that blocked the closure.
-  const RefoldModel::PragmaDirective *
-  FindTUPragmaOnSourceLine(llvm::StringRef tuPath, uint64_t lineBegin,
-                           uint64_t lineEnd) const;
-
   /// Return a concrete rejection reason when a TU gap contains a recorded
   /// pragma that blocks closure, or std::nullopt when none does.
   std::optional<std::string>
