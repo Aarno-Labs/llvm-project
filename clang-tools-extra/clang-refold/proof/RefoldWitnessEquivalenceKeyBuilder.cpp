@@ -945,30 +945,36 @@ std::string macroRepairReplayStateNeutralityValue(
       .str();
 }
 
-} // namespace
+/// Wrap a labelled payload hash as a Known equivalence dimension.
+WitnessEquivalenceDimension knownHash(llvm::StringRef label,
+                                      llvm::StringRef text) {
+  return WitnessEquivalenceDimension::Known(
+      llvm::formatv("{0}:{1}", label,
+                    RefoldWitnessTrace::FormatWitnessTraceHash(text))
+          .str());
+}
 
-::clang::refold::WitnessEquivalenceKey
-RefoldWitnessEquivalenceKeyBuilder::Build(
-    const AcceptedResultCandidate &candidate) const {
-  WitnessEquivalenceKey key;
-  const ProofSummary &summary = candidate.proofSummary;
-  const AcceptedPathKind path = summary.inventory.currentPath;
+/// Wrap a labelled B-byte range and its payload hash as a Known dimension.
+WitnessEquivalenceDimension knownRangeHash(const RefoldSourceMapper &mapper,
+                                           llvm::StringRef label,
+                                           uint64_t begin, uint64_t end) {
+  return WitnessEquivalenceDimension::Known(
+      llvm::formatv("{0}:[{1},{2}):{3}", label, begin, end,
+                    RefoldWitnessTrace::FormatWitnessTraceHash(
+                        mapper.SliceBSource(begin, end)))
+          .str());
+}
 
-  auto knownHash = [&](llvm::StringRef label, llvm::StringRef text) {
-    return WitnessEquivalenceDimension::Known(
-        llvm::formatv("{0}:{1}", label,
-                      RefoldWitnessTrace::FormatWitnessTraceHash(text))
-            .str());
-  };
-
-  auto knownRangeHash = [&](llvm::StringRef label, uint64_t begin,
-                            uint64_t end) {
-    return WitnessEquivalenceDimension::Known(
-        llvm::formatv("{0}:[{1},{2}):{3}", label, begin, end,
-                      RefoldWitnessTrace::FormatWitnessTraceHash(
-                          deps_.sourceMapper.SliceBSource(begin, end)))
-            .str());
-  };
+/// Decide the target-preprocessed-token dimension.
+///
+/// Known only when an accepted proof already carries a B-token envelope or a
+/// zero-token B anchor.  Source-spelling previews are deliberately not treated
+/// as token-stream proof: a later resolver pass must never merge two witnesses
+/// by comparing edited source bytes in place of produced PP tokens.
+void computeTargetPPTokensDimension(
+    WitnessEquivalenceKey &key, const AcceptedResultCandidate &candidate,
+    const ProofSummary &summary, AcceptedPathKind path,
+    const RefoldWitnessEquivalenceKeyBuilder::Dependencies &deps) {
 
   // keeps the target-preprocessed-token dimension conservative.  It is
   // known only when an accepted proof already carries a B-token envelope or a
@@ -978,7 +984,7 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
   // tokens.
   if (candidate.hasTargetBTokenRange &&
       candidate.targetBTokStart <= candidate.targetBTokEnd &&
-      candidate.targetBTokEnd <= deps_.bToks.size()) {
+      candidate.targetBTokEnd <= deps.bToks.size()) {
     const char *label =
         candidate.hasZeroTokenBoundaryWitness &&
                 !candidate.hasGeneratedCalleeReplayWitness &&
@@ -997,45 +1003,61 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
                                         : (candidate.hasMacroActualRepairWitness
                                                ? "macro_actual_b_tokens"
                                                : "candidate_b_tokens")))));
-    key.targetPPTokens = knownRangeHash(label, candidate.targetBTokStart,
-                                        candidate.targetBTokEnd);
+    key.targetPPTokens =
+        knownRangeHash(deps.sourceMapper, label, candidate.targetBTokStart,
+                       candidate.targetBTokEnd);
   } else if (candidate.hasZeroTokenBoundaryWitness &&
              candidate.zeroTokenBoundaryWitness.hasBTokenRange &&
              candidate.zeroTokenBoundaryWitness.bTokStart <=
                  candidate.zeroTokenBoundaryWitness.bTokEnd &&
-             candidate.zeroTokenBoundaryWitness.bTokEnd <= deps_.bToks.size()) {
+             candidate.zeroTokenBoundaryWitness.bTokEnd <= deps.bToks.size()) {
     // Zero-token include/boundary witnesses already carry the exact B-token
     // gap/envelope from the modified preprocessed stream.  Promote that
     // producer-recorded envelope into the target-PP equivalence dimension
     // instead of treating the absence of replacement text as unknown output.
-    key.targetPPTokens = knownRangeHash(
-        "zero_token_b_tokens", candidate.zeroTokenBoundaryWitness.bTokStart,
-        candidate.zeroTokenBoundaryWitness.bTokEnd);
+    key.targetPPTokens =
+        knownRangeHash(deps.sourceMapper, "zero_token_b_tokens",
+                       candidate.zeroTokenBoundaryWitness.bTokStart,
+                       candidate.zeroTokenBoundaryWitness.bTokEnd);
   } else if (summary.hasOwnerRealizationWitness &&
              summary.ownerRealizationWitness.closure.IsComplete()) {
     const OwnerTokenRange bTokens =
         summary.ownerRealizationWitness.closure.bTokens;
-    key.targetPPTokens = knownRangeHash("b_tokens", bTokens.begin, bTokens.end);
+    key.targetPPTokens = knownRangeHash(deps.sourceMapper, "b_tokens",
+                                        bTokens.begin, bTokens.end);
   } else if (summary.hasMixedOwnerTilingWitness) {
     const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
     if (tiling.originalBStart <= tiling.originalBEnd)
-      key.targetPPTokens = knownRangeHash(
-          "mixed_owner_b_tokens", tiling.originalBStart, tiling.originalBEnd);
+      key.targetPPTokens =
+          knownRangeHash(deps.sourceMapper, "mixed_owner_b_tokens",
+                         tiling.originalBStart, tiling.originalBEnd);
   } else if (summary.hasIncludeAnchorWitness &&
              summary.includeAnchorWitness.hasFirstPP &&
              summary.includeAnchorWitness.hasLastPP &&
              summary.includeAnchorWitness.firstPP <=
                  summary.includeAnchorWitness.lastPP) {
-    key.targetPPTokens = knownRangeHash(
-        "include_anchor_b_tokens", summary.includeAnchorWitness.firstPP,
-        summary.includeAnchorWitness.lastPP + 1);
+    key.targetPPTokens =
+        knownRangeHash(deps.sourceMapper, "include_anchor_b_tokens",
+                       summary.includeAnchorWitness.firstPP,
+                       summary.includeAnchorWitness.lastPP + 1);
   } else if (summary.hasTUAnchorWitness && summary.tuAnchorWitness.hasPPGap) {
     key.targetPPTokens = WitnessEquivalenceDimension::Known(
         llvm::formatv("empty_b_gap:{0}", summary.tuAnchorWitness.ppGap).str());
   } else if (path == AcceptedPathKind::TerminalEmitEditedPreprocessedStream) {
-    key.targetPPTokens = knownHash("terminal_full_b", deps_.bSource);
+    key.targetPPTokens = knownHash("terminal_full_b", deps.bSource);
   }
+}
 
+/// Decide the suffix-state dimension, then apply the line-control overlay.
+///
+/// The witness priority here is this dimension's own.  It shares its first five
+/// steps with the preserved-observer and counter-state orders and then diverges
+/// on purpose, because the three dimensions do not draw on the same evidence;
+/// they are deliberately not merged into one table.
+void computeSuffixStateDimension(
+    WitnessEquivalenceKey &key, const AcceptedResultCandidate &candidate,
+    const ProofSummary &summary, AcceptedPathKind path,
+    const RefoldWitnessEquivalenceKeyBuilder::Dependencies &deps) {
   if (candidate.hasGeneratedCalleeReplayWitness) {
     const GeneratedCalleeReplayWitness &generatedCallee =
         candidate.generatedCalleeReplayWitness;
@@ -1146,11 +1168,11 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
                       candidate.macroActualArityStable ? 1 : 0)
             .str());
   } else if (canUseMacroRepairReplayStateNeutrality(candidate, summary, path,
-                                                    deps_.bToks)) {
+                                                    deps.bToks)) {
     key.suffixState = WitnessEquivalenceDimension::Known(
         llvm::formatv("macro_repair_replay_state_neutral:{0}",
                       macroRepairReplayStateNeutralityValue(
-                          candidate, summary, path, deps_.sourceMapper))
+                          candidate, summary, path, deps.sourceMapper))
             .str());
   } else if (summary.hasSuffixStabilityWitness) {
     const SuffixStabilityWitness &suffix = summary.suffixStabilityWitness;
@@ -1252,7 +1274,17 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
               .str());
     }
   }
+}
 
+/// Decide the preserved-observer dimension, then apply the line-control
+/// overlay.
+///
+/// This order reaches TU-anchor and include-anchor evidence, which the
+/// suffix-state order does not consult at all.
+void computePreservedObserversDimension(
+    WitnessEquivalenceKey &key, const AcceptedResultCandidate &candidate,
+    const ProofSummary &summary, AcceptedPathKind path,
+    const RefoldWitnessEquivalenceKeyBuilder::Dependencies &deps) {
   if (candidate.hasGeneratedCalleeReplayWitness) {
     const GeneratedCalleeReplayWitness &generatedCallee =
         candidate.generatedCalleeReplayWitness;
@@ -1322,11 +1354,11 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
                       candidate.targetBTokEnd)
             .str());
   } else if (canUseMacroRepairReplayStateNeutrality(candidate, summary, path,
-                                                    deps_.bToks)) {
+                                                    deps.bToks)) {
     key.preservedObservers = WitnessEquivalenceDimension::Known(
         llvm::formatv("macro_repair_replay_observers_neutral:{0}",
                       macroRepairReplayStateNeutralityValue(
-                          candidate, summary, path, deps_.sourceMapper))
+                          candidate, summary, path, deps.sourceMapper))
             .str());
   } else if (summary.hasTUAnchorWitness) {
     const TUAnchorWitness &w = summary.tuAnchorWitness;
@@ -1414,7 +1446,17 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
           WitnessEquivalenceDimension::Known(observerValue);
     }
   }
+}
 
+/// Decide the counter-state dimension.
+///
+/// The explicit counter witness leads here, ahead of the macro witnesses that
+/// lead the other dimensions, and mixed-owner tiling is consulted before the
+/// macro-actual repair witness rather than after it.
+void computeCounterStateDimension(
+    WitnessEquivalenceKey &key, const AcceptedResultCandidate &candidate,
+    const ProofSummary &summary, AcceptedPathKind path,
+    const RefoldWitnessEquivalenceKeyBuilder::Dependencies &deps) {
   if (candidate.hasCounterStateWitness) {
     const CounterStateWitness &counter = candidate.counterStateWitness;
     const std::string value =
@@ -1503,7 +1545,14 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
     key.counterState = WitnessEquivalenceDimension::Known(
         "owner-realization-no-preserved-counter-observer");
   }
+}
 
+/// Decide the producer-kind set, then fold in the line-control and counter
+/// producers when the base set is already known.
+void computeProducerKindsDimension(
+    WitnessEquivalenceKey &key, const AcceptedResultCandidate &candidate,
+    const ProofSummary &summary, AcceptedPathKind path,
+    const RefoldWitnessEquivalenceKeyBuilder::Dependencies &deps) {
   if (candidate.hasGeneratedCalleeReplayWitness) {
     const GeneratedCalleeReplayWitness &generatedCallee =
         candidate.generatedCalleeReplayWitness;
@@ -1591,7 +1640,13 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
         counter.hasExpectedBValues)
       key.producerKinds.Add(WitnessProducerKind::BuiltinMaterialization);
   }
+}
 
+/// Decide the boundary, diagnostic and composition classes.
+void computeClassificationDimensions(
+    WitnessEquivalenceKey &key, const AcceptedResultCandidate &candidate,
+    const ProofSummary &summary, AcceptedPathKind path,
+    const RefoldWitnessEquivalenceKeyBuilder::Dependencies &deps) {
   key.boundaryClass = candidate.hasZeroTokenBoundaryWitness
                           ? WitnessBoundaryClass::ZeroTokenBoundary
                           : witnessBoundaryClassForAcceptedCandidate(candidate);
@@ -1615,6 +1670,26 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
   else if (key.compositionClass == WitnessCompositionClass::Unknown &&
            candidate.kind != AcceptedResultCandidateKind::Unknown)
     key.compositionClass = WitnessCompositionClass::LocalOnly;
+}
+
+} // namespace
+
+::clang::refold::WitnessEquivalenceKey
+RefoldWitnessEquivalenceKeyBuilder::Build(
+    const AcceptedResultCandidate &candidate) const {
+  WitnessEquivalenceKey key;
+  const ProofSummary &summary = candidate.proofSummary;
+  const AcceptedPathKind path = summary.inventory.currentPath;
+
+  // Each dimension is decided independently and in this order; only the
+  // line-control and counter overlays inside a dimension read a value the same
+  // dimension has already set.
+  computeTargetPPTokensDimension(key, candidate, summary, path, deps_);
+  computeSuffixStateDimension(key, candidate, summary, path, deps_);
+  computePreservedObserversDimension(key, candidate, summary, path, deps_);
+  computeCounterStateDimension(key, candidate, summary, path, deps_);
+  computeProducerKindsDimension(key, candidate, summary, path, deps_);
+  computeClassificationDimensions(key, candidate, summary, path, deps_);
 
   return key;
 }
