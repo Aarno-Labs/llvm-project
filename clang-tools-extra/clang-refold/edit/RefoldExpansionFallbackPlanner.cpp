@@ -457,6 +457,15 @@ struct IncludeTreeAdjacency {
   DenseMap<uint64_t, SmallVector<const RefoldModel::IncludeItem *, 4>>
       childrenByParent;
   bool parentGraphIsAcyclic = true;
+
+  /// Return the direct children of \p inc in producer include order.
+  ArrayRef<const RefoldModel::IncludeItem *>
+  ChildrenOf(const RefoldModel::IncludeItem &inc) const {
+    auto it = childrenByParent.find(inc.id);
+    if (it == childrenByParent.end())
+      return {};
+    return it->second;
+  }
 };
 
 /// Build the include-tree adjacency facts for \p model.
@@ -595,7 +604,7 @@ private:
     // its own expansion is empty and its descendants/directives are consumable
     // by the same zero-token include-gap proof.  Record which child blocked the
     // proof so the mixed-closure rejection points at the real source structure.
-    for (const RefoldModel::IncludeItem *child : ChildrenOf(inc)) {
+    for (const RefoldModel::IncludeItem *child : adjacency_.ChildrenOf(inc)) {
       if (child->cover.IsValid())
         return finish(Rejected(wantReason, [&] {
           return llvm::formatv("child include id={0} path='{1}' "
@@ -709,15 +718,6 @@ private:
     return inc.resolvedPath ? *inc.resolvedPath : inc.target;
   }
 
-  /// Return the direct children of \p inc in producer include order.
-  ArrayRef<const RefoldModel::IncludeItem *>
-  ChildrenOf(const RefoldModel::IncludeItem &inc) const {
-    auto it = adjacency_.childrenByParent.find(inc.id);
-    if (it == adjacency_.childrenByParent.end())
-      return {};
-    return it->second;
-  }
-
   /// Return true iff the include has structure other than an explicitly
   /// consumable pragma.  This keeps the pragma-once exception fail-closed when
   /// the include also owns macro state, conditional structure, children, or
@@ -728,7 +728,7 @@ private:
     if (!inc.decls.empty())
       return true;
 
-    if (!ChildrenOf(inc).empty())
+    if (!adjacency_.ChildrenOf(inc).empty())
       return true;
 
     for (const auto &directive : model_.GetMacroDirectives())
@@ -813,7 +813,7 @@ private:
     if (!inc.decls.empty())
       return finish(false);
 
-    for (const RefoldModel::IncludeItem *child : ChildrenOf(inc)) {
+    for (const RefoldModel::IncludeItem *child : adjacency_.ChildrenOf(inc)) {
       if (!IsPreservableImpl(*child, visiting))
         return finish(false);
     }
@@ -867,15 +867,6 @@ private:
     return macroStateProof_.ReplacementObservesMacroStateDirective(
         directive, sourceMapper_.SliceBSource(h_.bStart, h_.bEnd),
         /*unprovenObserves=*/true);
-  }
-
-  /// Return the direct children of \p inc in producer include order.
-  ArrayRef<const RefoldModel::IncludeItem *>
-  ChildrenOf(const RefoldModel::IncludeItem &inc) const {
-    auto it = adjacency_.childrenByParent.find(inc.id);
-    if (it == adjacency_.childrenByParent.end())
-      return {};
-    return it->second;
   }
 
   /// Return true iff \p ownerIncludeId names \p inc itself or a recorded

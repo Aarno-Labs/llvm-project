@@ -1415,9 +1415,7 @@ RefoldMacroPatchPlanner::BuildPasteAwareArgsOnlyPatch(
 
 std::optional<MacroPatch>
 RefoldMacroPatchPlanner::TryBuildTupleSiblingTerminalReplayPatch(
-    const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-    StringRef baseInvText) const {
-  (void)h;
+    const RefoldModel::MacroInvocation &m, StringRef baseInvText) const {
   if (m.subkind != "func" || !m.invB || !m.invE || !deps_.abTokHunks)
     return std::nullopt;
 

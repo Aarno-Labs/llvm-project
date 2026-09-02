@@ -782,7 +782,7 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
   // partial root rewrite.
   if (m.subkind == "func") {
     if (std::optional<MacroPatch> siblingTerminalPatch =
-            planner_->TryBuildTupleSiblingTerminalReplayPatch(m, h,
+            planner_->TryBuildTupleSiblingTerminalReplayPatch(m,
                                                               baseInvText)) {
       REFOLD_LOG_TRACE(
           "macro/whole-cover",

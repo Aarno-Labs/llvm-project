@@ -208,7 +208,7 @@ public:
   /// stringification, or paste evidence that maps back to exact slices of the
   /// same source-spelled root tuple.
   std::optional<MacroPatch> TryBuildTupleSiblingTerminalReplayPatch(
-      const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
+      const RefoldModel::MacroInvocation &m,
       llvm::StringRef baseInvocationText) const;
 
   /// Build a structure-preserving invocation patch by rewriting only the

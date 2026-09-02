@@ -68,25 +68,13 @@ public:
       const SelectedMacroSelectionCandidate &selectedCandidate,
       MacroPatch &selectedPatch) const;
 
-  /// Install the whole-cover macro realization proof carrier on the patch.
-  /// Delegates to the lattice's `CertifyMacroWholeCoverRealizationPatch`.
-  void AttachWholeCoverProofCarrier(
-      MacroPatch &patch, const WholeCoverPlan &plan,
-      const RefoldModel::MacroInvocation &invocation) const;
-
-  /// Certify a whole-cover accepted candidate.  Atomic with
-  /// `AttachWholeCoverProofCarrier`: whole-cover realization has exactly one
-  /// certifying operation, so this routes through the same proof-carrier
-  /// helper.
+  /// Certify a whole-cover accepted candidate.  Whole-cover realization has
+  /// exactly one certifying operation, so this is the single entry point for
+  /// it: it installs the realization proof carrier and records the B-payload
+  /// partition together.
   void CertifyWholeCoverAcceptedCandidate(
       MacroPatch &patch, const WholeCoverPlan &plan,
       const RefoldModel::MacroInvocation &invocation) const;
-
-  /// Certify a reused macro-patch accepted candidate.  Intentionally a no-op
-  /// at the proof level: reuse must not manufacture a fresh theorem carrier,
-  /// so the existing same-span patch's proof kind, proof-root id,
-  /// materialized range, and owner certificate are preserved unchanged.
-  void CertifyReusedMacroPatchAcceptedCandidate(MacroPatch &patch) const;
 
   /// Build and install the standard args-only macro proof on the patch,
   /// optionally enriched with a whole-envelope replay witness.

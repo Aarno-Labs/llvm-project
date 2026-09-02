@@ -807,19 +807,11 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
     break;
   }
 
+  // Every origin carries its patch through unchanged.  A reuse origin in
+  // particular must not manufacture a fresh theorem carrier: the selected
+  // patch is an already accepted same-span patch, so its proof kind,
+  // proof-root id, materialized range, and owner certificate are preserved.
   MacroPatch selectedPatch = selected.patch;
-  switch (selected.origin) {
-  case FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp:
-  case FinalMacroCandidateOrigin::ReuseExistingCallsiteSkipWholeCover:
-  case FinalMacroCandidateOrigin::ReuseExistingExpanded:
-    deps_.proofCertifier.CertifyReusedMacroPatchAcceptedCandidate(
-        selectedPatch);
-    break;
-  case FinalMacroCandidateOrigin::DirectArgsOnly:
-  case FinalMacroCandidateOrigin::DagRootReplay:
-  case FinalMacroCandidateOrigin::WholeCoverRealization:
-    break;
-  }
   deps_.proofCertifier.CertifySelectedFinalMacroCandidate(m, *selectedCandidate,
                                                           selectedPatch);
   return selectedPatch;

@@ -53,20 +53,13 @@ void RefoldMacroPatchProofCertifier::CertifySelectedFinalMacroCandidate(
       selectedCandidate.candidate.selectorOnly ? 1 : 0);
 }
 
-void RefoldMacroPatchProofCertifier::AttachWholeCoverProofCarrier(
-    MacroPatch &patch, const WholeCoverPlan &plan,
-    const RefoldModel::MacroInvocation &invocation) const {
-  deps_.lattice.CertifyMacroWholeCoverRealizationPatch(patch, plan, invocation);
-}
-
 void RefoldMacroPatchProofCertifier::CertifyWholeCoverAcceptedCandidate(
     MacroPatch &patch, const WholeCoverPlan &plan,
     const RefoldModel::MacroInvocation &invocation) const {
   // Whole-cover realization has a single certifying operation: it records the
   // materialized B-token envelope, whole-cover diagnostics, proof kind, proof
-  // root, and owner-realization witness together.  Keep that operation atomic
-  // by routing through the named proof-carrier helper.
-  AttachWholeCoverProofCarrier(patch, plan, invocation);
+  // root, and owner-realization witness together.
+  deps_.lattice.CertifyMacroWholeCoverRealizationPatch(patch, plan, invocation);
 
   // The whole-cover replacement is `WholeCoverPlan::clippedText`, which is the
   // trimmed material of the cover's own B tokens and nothing else.  This is the
@@ -74,14 +67,6 @@ void RefoldMacroPatchProofCertifier::CertifyWholeCoverAcceptedCandidate(
   // replacement is B-derived payload, and no byte of the original callsite
   // spelling survives in it.
   patch.materialized.replacementIsWhollyBPayload = true;
-}
-
-void RefoldMacroPatchProofCertifier::CertifyReusedMacroPatchAcceptedCandidate(
-    MacroPatch &patch) const {
-  (void)patch;
-  // Reuse must not manufacture a fresh theorem carrier.  The selected patch
-  // is an already accepted same-span patch, so its proof kind, proof-root id,
-  // materialized range, and owner certificate are intentionally preserved.
 }
 
 void RefoldMacroPatchProofCertifier::SetArgsOnlyStandardProof(
