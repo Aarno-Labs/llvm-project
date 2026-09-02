@@ -129,22 +129,6 @@ private:
   bool RangeHasForeignTokenDiff(const diffutils::Hunk &realizedHunk,
                                 uint64_t begin, uint64_t end) const;
 
-  /// True when the source gap [begin, end) is exactly indexed lexer trivia.
-  ///
-  /// Exact lexical trivia and literal conditional-control preservation are
-  /// submitted through the shared source-gap theorem.  This predicate and the
-  /// one below remain narrow semantic policies; neither keeps a second
-  /// preprocessing inventory or byte-cover implementation beside structural
-  /// hunk tiling.
-  bool GapIsIndexedLexerTrivia(uint64_t begin, uint64_t end) const;
-
-  /// True when the source gap [begin, end) is trivia that a pure include
-  /// closure may carry forward verbatim between two touched include
-  /// directives.
-  bool GapIsIndexedPreservableIncludeClosureTrivia(llvm::StringRef tuBytes,
-                                                   uint64_t begin,
-                                                   uint64_t end) const;
-
   /// Does \p root's include subtree own a pragma whose effect outlives it?
   ///
   /// Consuming a touched include is justified by the closure realizing its
@@ -158,14 +142,6 @@ private:
   std::optional<std::string>
   NonConsumableTUPragmaGapReason(llvm::StringRef tuPath, uint64_t gapBegin,
                                  uint64_t gapEnd) const;
-
-  /// True when the resolved header at \p resolvedPath carries `#pragma once`.
-  ///
-  /// The recorded pragma table is used instead of guessing from include
-  /// emptiness: an empty later include can have other causes, but a recorded
-  /// `#pragma once` gives the exact source-order state transition the
-  /// reactivation repair must preserve.
-  bool PathHasPragmaOnce(llvm::StringRef resolvedPath) const;
 
   const RefoldModel &model_;
   llvm::StringRef bSource_;
