@@ -148,7 +148,7 @@ bool RefoldAcceptedResultRanker::LatticePrefers(const ProofSummary &lhs,
   // The remaining tie-breakers are deterministic enum orderings. They should
   // only be reached after the explicit lattice preferences above agree.  Use
   // the final theorem class here; AcceptedProofClass remains available only as
-  // construction provenance and no longer orders selectable proofs.
+  // construction provenance and does not order selectable proofs.
   if (lhs.theoremClass != rhs.theoremClass)
     return static_cast<uint8_t>(lhs.theoremClass) <
            static_cast<uint8_t>(rhs.theoremClass);

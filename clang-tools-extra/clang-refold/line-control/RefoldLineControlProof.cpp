@@ -136,12 +136,10 @@ bool RefoldLineControlProof::SourcePrefixHasProducerActiveLineControl(
       if (!group.ContainsByte(hashOffset))
         continue;
 
-      bool sawSelectedArm = false;
       bool selectedArmContainsDirective = false;
       for (const RefoldModel::CondArm &arm : group.arms) {
         if (!arm.selected)
           continue;
-        sawSelectedArm = true;
         if (arm.ContainsByte(hashOffset)) {
           selectedArmContainsDirective = true;
           break;
@@ -155,8 +153,8 @@ bool RefoldLineControlProof::SourcePrefixHasProducerActiveLineControl(
       // directive, the directive is proven inactive.  If no selected arm
       // exists, the active branch may have produced only directive effects,
       // which is unproven from CondArm::selected alone; keep the synthetic
-      // wrapper in that case as well.
-      (void)sawSelectedArm;
+      // wrapper in that case as well.  Whether any selected arm was seen at
+      // all does not change that answer, so it is not tracked.
       return false;
     }
     return true;

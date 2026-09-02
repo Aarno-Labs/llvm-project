@@ -512,7 +512,7 @@ void RefoldOwnerRealizationProofBuilder::
                                                   uint64_t aEnd,
                                                   uint64_t bStart,
                                                   uint64_t bEnd) const {
-  // Keeps mixed-owner splitting as a normalization step, but it no longer lets
+  // Keeps mixed-owner splitting as a normalization step without letting
   // path-local binding order decide which proof wins.  Every matching durable
   // segment is converted into a candidate ProofSummary and the shared lattice
   // chooses both whether the mixed-owner overlay beats the owner-specific
@@ -586,9 +586,9 @@ RefoldOwnerRealizationProofBuilder::TryBuildOwnerRealizationImpl(
   result.detail = detail.str();
 
   // The shared realization gate is deliberately owner-polymorphic: callers may
-  // still know how to spell a macro callsite, inline an include body, or write
-  // a direct TU byte edit, but they no longer get to invent separate proof
-  // rules for the common closure facts below.
+  // know how to spell a macro callsite, inline an include body, or write a
+  // direct TU byte edit, but none of them invents its own proof rules for the
+  // common closure facts below.
   const bool hasOwner = result.witness.closure.owner.IsKnown();
   const bool hasSourceInterval = result.witness.closure.source.IsComplete();
   const bool hasATokenCover = result.witness.closure.aTokens.IsValid();

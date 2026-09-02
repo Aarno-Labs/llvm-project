@@ -9,9 +9,9 @@
 // Definitions for the logging surface declared in RefoldLog.h.
 //
 // The engine logs from nearly every translation unit, so `LogLevelOpt` must be
-// defined by the engine itself rather than by whichever program links it.  It
-// previously lived in the tool's main, which left the library with an undefined
-// reference that only a `main` could satisfy -- invisible while the tool was the
+// defined by the engine itself rather than by whichever program links it.
+// Defining it in a program's `main` leaves the library with an undefined
+// reference that only a `main` can satisfy -- invisible while the tool is the
 // sole consumer, and a link error for anything else.
 //
 // The option category lives here for the same reason and because `LogLevelOpt`

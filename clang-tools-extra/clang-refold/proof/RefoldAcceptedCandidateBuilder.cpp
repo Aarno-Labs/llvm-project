@@ -570,7 +570,7 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedIncludeCandidate(
   candidate.kind = AcceptedResultCandidateKind::IncludePatch;
 
   // Include-preserving candidates carry include-anchor proof metadata only.
-  // Include realization is no longer a parallel include-specific proof family;
+  // Include realization is not a parallel include-specific proof family;
   // materialized/inline include output uses
   // BuildAcceptedIncludeRealizationCandidate() so the generic
   // OwnerRealizationWitness is the theorem-facing closure proof.

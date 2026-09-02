@@ -992,9 +992,9 @@ struct OwnerRealizationWitness {
   OwnerRealizationEvidenceKind evidence = OwnerRealizationEvidenceKind::Unknown;
   OwnerClosure closure;
 
-  // Typed state witnesses for the realized owner. Each witness names
-  // the exact state component it discharges, so owner realization no longer
-  // stores a coarse legacy enum such as "closure widened" as theorem proof.
+  // Typed state witnesses for the realized owner. Each witness names the exact
+  // state component it discharges, so no coarse enum such as "closure widened"
+  // stands in for theorem proof.
   std::vector<SuffixStabilityWitness> stateWitnesses;
 
   /// Present only for `TUByteSpan` evidence. Specialized TU repair/closure
@@ -1710,9 +1710,9 @@ struct ProofDischargeAccumulator {
     record.status = initialStatus;
   }
 
-  /// Record a satisfied obligation.
-  void Satisfy(ProofObligationKind obligation) {
-    (void)obligation;
+  /// Record a satisfied obligation.  The kind names the obligation for the
+  /// caller's own readability; the accumulator keeps only the counts.
+  void Satisfy(ProofObligationKind /*obligation*/) {
     ++record.obligationsEvaluated;
     ++record.obligationsSatisfied;
     if (record.status == ProofDischargeStatus::Unknown)

@@ -170,18 +170,18 @@ std::optional<SmallVector<StringRef, 4>> splitPastedCoreByDelimiters(
 /// Rebuilds exact original nested paste syntax from already-certified DAG
 /// evidence.
 ///
-/// This resolver owns the recursive preservation search that was previously a
-/// local self-capturing lambda in `BuildStructuredLiftCertificate`. Its trusted
-/// inputs are the caller's DAG lifting context, the topology/text/proof services
-/// borrowed through Dependencies, and a direct-paste derivation callback that
-/// has already preserved delimiter splitting, sibling-surface checks, and
-/// parent-constraint proof construction. The resolver preserves child traversal
-/// order from `MacroChildrenOf`, keeps derived formal constraints in their
-/// existing sorted order, and fails closed whenever direct-child selection is
-/// ambiguous or a nested child/formal certificate cannot uniquely rebuild the
-/// original paste shape. It does not rank candidates or admit edits; it only
-/// returns replay syntax after the existing wrapper-placeholder proof gate
-/// accepts the reconstructed invocation.
+/// This resolver owns the recursive preservation search for
+/// `BuildStructuredLiftCertificate`. Its trusted
+/// inputs are the caller's DAG lifting context, the topology/text/proof
+/// services borrowed through Dependencies, and a direct-paste derivation
+/// callback that has already preserved delimiter splitting, sibling-surface
+/// checks, and parent-constraint proof construction. The resolver preserves
+/// child traversal order from `MacroChildrenOf`, keeps derived formal
+/// constraints in their existing sorted order, and fails closed whenever
+/// direct-child selection is ambiguous or a nested child/formal certificate
+/// cannot uniquely rebuild the original paste shape. It does not rank
+/// candidates or admit edits; it only returns replay syntax after the existing
+/// wrapper-placeholder proof gate accepts the reconstructed invocation.
 class ExactOriginalShapePasteReplayResolver {
 public:
   using DerivedConstraintList =

@@ -33,18 +33,14 @@ using namespace llvm;
 namespace clang {
 namespace refold {
 
-RefoldMacroTopology::RefoldMacroTopology(const RefoldModel &model,
-                                         ArrayRef<PPTok> aToks,
-                                         ArrayRef<PPTok> bToks,
-                                         const RefoldSourceMapper &sourceMapper,
-                                         const RefoldPathIdentity &paths)
+RefoldMacroTopology::RefoldMacroTopology(
+    const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> /*bToks*/,
+    const RefoldSourceMapper & /*sourceMapper*/,
+    const RefoldPathIdentity &paths)
     : model_(model), aToks_(aToks), paths_(paths) {
-  // The constructor receives the complete dependency set for the topology
-  // service.  The current indices use the A-token stream and path service; keep
-  // the remaining parameters explicit for object-graph consistency while
-  // avoiding unused-parameter warnings.
-  (void)bToks;
-  (void)sourceMapper;
+  // The constructor takes the complete dependency set for the topology service
+  // so the object graph is uniform; the current indices are built from the
+  // A-token stream and the path service alone.
   BuildMacroInvocationGraph();
 }
 

@@ -461,11 +461,8 @@ RefoldAcceptancePathClassifier::BuildAcceptedPathProofSummary(
 
 ::clang::refold::ProofSummary
 RefoldAcceptancePathClassifier::BuildIncludePatchProofSummary(
-    bool realizedSurface, AcceptedPathKind currentPath,
+    bool /*realizedSurface*/, AcceptedPathKind currentPath,
     const IncludePatch *patch) const {
-  (void)realizedSurface;
-  (void)patch;
-
   // IncludePatch is a pre-materialization working object. By default it does
   // not claim any normalized accepted path at all; only the later
   // witness-backed materialization step may mint theorem-facing include

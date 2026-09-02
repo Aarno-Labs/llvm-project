@@ -392,12 +392,11 @@ RefoldEngine::~RefoldEngine() = default;
 /// Attach the edited-stream token an assembly check disagreed at.
 ///
 /// The failed obligation is about preprocessor state, so the state component
-/// stays exactly as the proof recorded it.  What the check additionally knows,
-/// and previously discarded, is *where* the two streams parted: a single edited
-/// token index.  That is the difference between "this translation unit is out
-/// of domain" and "the edit geometry around this token is", and the retry ladder
-/// needs it to tell a failure a different alignment could repair from one it
-/// could not.
+/// stays exactly as the proof recorded it.  What the check additionally knows
+/// is *where* the two streams parted: a single edited token index.  That is the
+/// difference between "this translation unit is out of domain" and "the edit
+/// geometry around this token is", and the retry ladder needs it to tell a
+/// failure a different alignment could repair from one it could not.
 static TerminalFallbackProofFailure
 withDivergingEditedToken(TerminalFallbackProofFailure failure,
                          std::size_t mismatchTokenIndex) {
@@ -718,7 +717,6 @@ takeTerminalCarrier(std::string carrier,
   //
   // The census above names every request that led here, so the failure carries
   // its own attribution.
-  (void)carrier;
   return createStringError(
       std::make_error_code(std::errc::illegal_byte_sequence),
       "no admissible refold: %llu terminal request(s) reached the seam and "

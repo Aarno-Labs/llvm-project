@@ -466,9 +466,6 @@ RefoldMacroPatchPlanner::OccurrenceProofValidator() const {
       {deps_.model, deps_.macroTopology});
 }
 
-// `BuildGeneratedLeafReplayCandidate` no longer has a planner-side
-// forwarder; callers go through `GeneratedLeafReplayEngine()`.
-
 bool RefoldMacroPatchPlanner::MacroArgReplacementMatchesAllOccurrencesInB(
     const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
     StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks) const {

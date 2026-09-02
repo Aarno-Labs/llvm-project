@@ -943,8 +943,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   }
 
   // Exact lexical trivia and literal conditional-control preservation are
-  // submitted through the shared source-gap theorem.  The old text predicates
-  // remain narrow semantic policies, but they no longer maintain a second
+  // submitted through the shared source-gap theorem.  The text predicates
+  // below remain narrow semantic policies; none of them keeps a second
   // preprocessing inventory or byte-cover implementation beside structural
   // hunk tiling.
   auto gapIsIndexedLexerTrivia = [&](uint64_t begin, uint64_t end) {

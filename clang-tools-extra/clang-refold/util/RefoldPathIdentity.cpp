@@ -18,16 +18,12 @@ using namespace llvm;
 namespace clang {
 namespace refold {
 
-RefoldPathIdentity::RefoldPathIdentity(const RefoldModel &model,
-                                       StringRef originalWorkingDirectory,
-                                       bool emitAbsPaths) {
-  // The current path-identity predicates are intentionally limited to
-  // canonical path comparison and include-edge metadata.  Keep the constructor
-  // shape aligned with the future service boundary without introducing unused
-  // member state or changing behavior.
-  (void)model;
-  (void)originalWorkingDirectory;
-  (void)emitAbsPaths;
+RefoldPathIdentity::RefoldPathIdentity(const RefoldModel & /*model*/,
+                                       StringRef /*originalWorkingDirectory*/,
+                                       bool /*emitAbsPaths*/) {
+  // The path-identity predicates are limited to canonical path comparison and
+  // include-edge metadata, neither of which needs per-run state.  The
+  // constructor keeps the service's dependency shape without holding any.
 }
 
 void RefoldPathIdentity::CacheCanonicalPath(StringRef path) const {

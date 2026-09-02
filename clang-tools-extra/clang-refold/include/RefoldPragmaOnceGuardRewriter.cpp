@@ -1020,7 +1020,7 @@ RefoldPragmaOnceGuardRewriter::ActiveGuardedHeaderPaths() const {
 
 bool RefoldPragmaOnceGuardRewriter::AppendRealizedFromBIncludeGuardRestoration(
     ArrayRef<uint64_t> enteredSubtreeIncludeIds, std::string &realizedBody,
-    std::string *unrestoredPath) const {
+    std::string * /*unrestoredPath*/) const {
   // Collect one restoration per physical header, in canonical-path order, so
   // repeated instances of a header do not emit the define twice and the output
   // does not depend on include traversal order.
@@ -1086,7 +1086,6 @@ bool RefoldPragmaOnceGuardRewriter::AppendRealizedFromBIncludeGuardRestoration(
   if (!realizedBody.empty() && realizedBody.back() != '\n')
     realizedBody += "\n";
   realizedBody += restorations;
-  (void)unrestoredPath;
   return true;
 }
 

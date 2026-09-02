@@ -11,7 +11,7 @@
 // External callers see only the public surface declared in
 // RefoldNeutralityProof.h.  Everything else lives in the anonymous
 // namespace so the single-TU inlining behavior is preserved and the header
-// no longer drags a raw-lexer/state-directive dependency into every caller.
+// does not drag a raw-lexer/state-directive dependency into every caller.
 //
 //===----------------------------------------------------------------------===//
 

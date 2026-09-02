@@ -1104,8 +1104,6 @@ RefoldMacroArgsOnlyTemplateSolver::TryTemplateSolvedArgsOnlyPatch(
       patch.materialized.hasOutputByteRange = true;
       certifyMacroPatchWholeExpansionBRange(*deps_.sourceMapper,
                                             templateInvocation, patch);
-      // Inlined AttachArgsOnlyProofCarrier (proof attached directly via
-      // lattice).
       {
         MacroPatchProof proof =
             (*deps_.proofLattice)
@@ -1509,8 +1507,8 @@ RefoldMacroArgsOnlyTemplateSolver::TryTemplateSolvedArgsOnlyPatch(
 
   MacroPatch patch{*templateInvocation.invB, *templateInvocation.invE,
                    std::move(uniqueRewrite->text), templateInvocation.id};
-  // Inlined CertifyArgsOnlyAcceptedCandidate: record materialized output bytes
-  // and certify the materialized B-token envelope.
+  // Record the materialized output bytes and certify the materialized B-token
+  // envelope.
   patch.materialized.hasOutputByteRange = true;
   patch.materialized.outputByteStart =
       uniqueRewrite->materializedOutputByteStart;
@@ -1518,7 +1516,6 @@ RefoldMacroArgsOnlyTemplateSolver::TryTemplateSolvedArgsOnlyPatch(
   certifyMacroPatchMaterializedBTokenRange(patch,
                                            static_cast<uint64_t>(bEnv->first),
                                            static_cast<uint64_t>(bEnv->second));
-  // Inlined AttachArgsOnlyProofCarrier (proof attached directly via lattice).
   {
     MacroPatchProof proof =
         (*deps_.proofLattice)

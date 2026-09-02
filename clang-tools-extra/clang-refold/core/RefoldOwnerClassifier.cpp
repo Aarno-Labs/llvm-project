@@ -41,9 +41,7 @@ Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
   // Otherwise, if both sides of the gap are unambiguously within the same
   // include's PP coverage, treat the insertion as include-owned.
   if (a0 == a1) {
-    if (auto slotAnchor =
-            deps_.tuEdits.FindExactSlotBoundaryFromPPGap(tuPath, a0)) {
-      (void)slotAnchor;
+    if (deps_.tuEdits.FindExactSlotBoundaryFromPPGap(tuPath, a0)) {
       std::optional<uint64_t> leftInc =
           (a0 > 0) ? deps_.model.InnermostIncludeAtPP(a0 - 1) : std::nullopt;
       const uint64_t maxPP = deps_.model.GetTokensCountA();

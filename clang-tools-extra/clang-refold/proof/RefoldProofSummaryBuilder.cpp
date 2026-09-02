@@ -61,7 +61,7 @@ void RefoldProofSummaryBuilder::ConfigureProofSummary(
 
 bool RefoldProofSummaryBuilder::ProofSummaryRequiresOwnerRealizationWitness(
     const ProofSummary &summary) const {
-  // audit guard: these accepted paths are no longer independent
+  // audit guard: these accepted paths are not independent
   // proof families.  Their theorem-facing proof is the generic
   // OwnerRealizationProof, represented concretely by OwnerRealizationWitness.
   // Keep this list path-specific so unrelated realization classes, such as the

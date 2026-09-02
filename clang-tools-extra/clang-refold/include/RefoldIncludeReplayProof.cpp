@@ -866,15 +866,13 @@ IncludeReplayProofContext::ComputeProducerIncludeReplayCandidate(
 
 std::optional<IncludeReplayProofContext::IncludeNextReplayCandidate>
 IncludeReplayProofContext::ComputeIncludeNextReplayCandidate(
-    StringRef operand, const IncludeReplaySurface &surface,
+    StringRef operand, const IncludeReplaySurface & /*surface*/,
     const RefoldModel::IncludeLookupProvenance &containingFile) const {
-  // The replay surface is part of the public helper shape because the caller
-  // will usually derive containing-file provenance from a replayed include on
-  // that surface.  The include_next lookup itself does not use direct
-  // source-relative probing; once the containing-file cursor is known, lookup
-  // resumes only through pp_ctx.include_search_chain.
-  (void)surface;
-
+  // The replay surface stays in the public helper shape because the caller will
+  // usually derive containing-file provenance from a replayed include on that
+  // surface.  The include_next lookup itself does not probe source-relative;
+  // once the containing-file cursor is known, lookup resumes only through
+  // pp_ctx.include_search_chain, so the surface is not read here.
   if (operand.empty())
     return std::nullopt;
 

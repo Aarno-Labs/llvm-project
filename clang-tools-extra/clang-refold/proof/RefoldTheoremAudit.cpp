@@ -762,7 +762,7 @@ bool RefoldTheoremAudit::RejectMissingSelectedMacroPatchCarrier(
                               detail),
       failure);
 
-  // Missing selectedAcceptedCandidate is no longer recoverable proof state.
+  // A missing selectedAcceptedCandidate is not recoverable proof state.
   // Strict engine runs must fail closed instead of rebuilding authority from
   // the raw MacroPatch.
   if (!strictAuditRejected) {

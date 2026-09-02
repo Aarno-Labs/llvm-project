@@ -185,7 +185,7 @@ public:
   ///
   /// Packages an already constructed include patch with its normalized accepted
   /// path, proof-discharge inventory, and optional include-anchor witness.
-  /// Include realization no longer carries a parallel include-specific closure
+  /// Include realization carries no parallel include-specific closure
   /// witness; realized include output is routed through OwnerRealizationWitness
   /// by BuildAcceptedIncludeRealizationCandidate().
   AcceptedResultCandidate BuildAcceptedIncludeCandidate(

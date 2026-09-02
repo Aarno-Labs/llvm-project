@@ -5,8 +5,8 @@
 // This service owns derived indices over the producer-recorded macro invocation
 // graph and small macro/conditional containment predicates that are shared by
 // proof and planning modules.  The indices are built once from the immutable
-// RefoldModel and then borrowed read-only by callers, so services no longer
-// need privileged RefoldEngine access for macro lookup, root traversal, child
+// RefoldModel and then borrowed read-only by callers, so no service needs
+// privileged RefoldEngine access for macro lookup, root traversal, child
 // traversal, conditional containment, or __COUNTER__ event normalization.
 //
 //===----------------------------------------------------------------------===//

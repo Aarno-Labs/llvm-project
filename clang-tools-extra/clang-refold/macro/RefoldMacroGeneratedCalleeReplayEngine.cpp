@@ -1449,8 +1449,8 @@ std::optional<GeneratedCallShape> findGeneratedCallShape(
 /// inline loop: alias hops are recorded immediately after callee resolution,
 /// proof flags are set by generated-argument instantiation, and depth advances
 /// only after a fully admissible generated-call step is accepted.  Returning
-/// false represents the same fail-closed exits that previously returned
-/// `std::nullopt` from the public builder.
+/// false is a fail-closed exit; the public builder reports it as
+/// `std::nullopt`.
 class ReplayTapeBuilder {
 public:
   explicit ReplayTapeBuilder(
