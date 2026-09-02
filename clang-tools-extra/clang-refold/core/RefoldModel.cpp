@@ -1232,6 +1232,12 @@ parseMacroDirectiveItem(const json::Object &obj, StringRef skStr,
     return textOrErr.takeError();
   md.text = *textOrErr;
 
+  // Load-bearing guard, not a parsing convenience: `functionLike` is assigned
+  // only for a `#define`, which is what lets roughly two dozen call sites read
+  // the field directly and still mean `IsFunctionLikeDefine()`.  A
+  // `function_like` on any other subkind is deliberately ignored, so the field
+  // stays false and those sites fail closed.  See
+  // `RefoldModel::MacroDirective::IsFunctionLikeDefine`.
   if (skStr == "#define") {
     auto functionLikeOrErr =
         applyToField(asBool, obj, "function_like", ctxItem);
@@ -2252,7 +2258,6 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         "model",
         "pp byte begin/end spans size does not match the A-side token count");
   }
-
 
   // tokmap
   {

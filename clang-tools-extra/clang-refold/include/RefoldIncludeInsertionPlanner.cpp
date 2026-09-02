@@ -63,12 +63,12 @@ RefoldIncludeInsertionPlanner::ResolveIncludeRealizationBTokenEnvelope(
     return !sourceMapper_.SliceBSource(env->first, env->second).trim().empty();
   };
 
-  // Two projections, not three.  A whole-cover mapper used to be consulted
-  // here as a third opinion, but it computed the preserve-boundary projection
-  // byte for byte, so it could only ever agree with `preserveBoundary` and the
-  // consensus counted one projection twice.  Restoring a genuine third opinion
-  // -- the token-diff mapper is the candidate -- would strengthen this proof
-  // and needs its own gate and regression.
+  // Two boundary-stable projections establish the consensus.  A third mapper
+  // used to be consulted here, but it computed the preserve-boundary projection
+  // byte for byte, so it could only ever agree and the consensus counted one
+  // projection twice.  The genuine third opinion is added below as a *checker*
+  // rather than a contributor -- see the token-diff cross-check after the
+  // consensus is fixed.
   const auto preserveBoundary =
       sourceMapper_.MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
           beginTok, endTok);
@@ -100,9 +100,31 @@ RefoldIncludeInsertionPlanner::ResolveIncludeRealizationBTokenEnvelope(
   consider(preserveBoundary);
   consider(trimEdge);
 
+  // Cross-check the fixed consensus against a projection computed on a
+  // different basis.  `preserveBoundary` and `trimEdge` both project through
+  // the BYTE diff; `MapATokRangeToBTokenEnvelopeByTokenDiff` projects through
+  // the TOKEN diff, which its own documentation notes cannot misalign across
+  // repeated byte substrings the way the byte diff can.  A disagreement between
+  // the two bases means the B envelope is not determined, so it is a domain
+  // wall.
+  //
+  // Deliberately a checker and not a `consider()` participant: this projection
+  // may only *reject* a consensus the boundary-stable projections already
+  // established, never establish one itself.  Feeding it into the consensus
+  // would let it supply an envelope in the case where both boundary-stable
+  // projections are unusable, converting a fail-closed refusal into an
+  // acceptance -- the opposite of what this gate is for.  An unusable
+  // token-diff envelope carries no opinion and is ignored, exactly as an
+  // unusable boundary-stable projection is.
+  if (consensus) {
+    const auto byTokenDiff =
+        sourceMapper_.MapATokRangeToBTokenEnvelopeByTokenDiff(beginTok, endTok);
+    if (isUsableEnvelope(byTokenDiff) && *byTokenDiff != *consensus)
+      conflict = true;
+  }
+
   // Fail closed if no deterministic boundary-stable proof produced material
-  // text, or if the boundary-stable projections disagree about the B-side
-  // envelope.
+  // text, or if any usable projection disagrees about the B-side envelope.
   if (!sawUsableBoundaryStableProjection || conflict || !consensus)
     return std::nullopt;
 

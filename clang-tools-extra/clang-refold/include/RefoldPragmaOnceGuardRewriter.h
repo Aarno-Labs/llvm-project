@@ -375,15 +375,32 @@ public:
   /// producer (`controlling_macro`), which reads them from HeaderSearch; they
   /// are never guessed from the header text.
   ///
-  /// \p enteredSubtreeIncludeIds must be the include instances whose content the
-  /// realized body absorbed.  Headers with no recorded controlling macro are
-  /// reported through \p unrestoredPath so the caller can fail closed: a
-  /// `#pragma once` header has no guard macro to restore and is instead covered
-  /// by the synthetic guard, while a header with no protection at all needs
-  /// none.
+  /// \p enteredSubtreeIncludeIds must be the include instances whose content
+  /// the realized body absorbed.
+  ///
+  /// Restoration is deliberately partial, and this method does not fail closed
+  /// on the headers it skips -- that obligation is discharged elsewhere, by
+  /// `RefoldIncludeMaterializationScheduler::ProveNoReentryIntoUnprotected-
+  /// InlinedHeaders()`.  Three kinds of header are skipped here:
+  ///
+  ///   * a `#pragma once` header has no guard macro to restore, and its inlined
+  ///     body is covered by the synthetic guard instead;
+  ///   * a header that was never self-protecting needs no restoration, because
+  ///     the original preprocessing would have re-entered it too;
+  ///   * a header whose own macro state is still observed outside it must stay
+  ///     re-enterable, since priming its guard would remove the only remaining
+  ///     source of that state.
+  ///
+  /// Only the third is a residual re-entry hazard, and the scheduler decides it
+  /// with the *same* predicate this method uses -- a header it cannot prime
+  /// here is exactly a header the scheduler counts as unprotected, and any
+  /// surviving edge that re-enters one forces the emitting include to be
+  /// materialized from source.  Reporting it a second time through an
+  /// out-parameter would duplicate a proof that already exists, so the return
+  /// value carries no rejection and is always true.
   bool AppendRealizedFromBIncludeGuardRestoration(
       llvm::ArrayRef<uint64_t> enteredSubtreeIncludeIds,
-      std::string &realizedBody, std::string *unrestoredPath = nullptr) const;
+      std::string &realizedBody) const;
 
   /// Return every usable guard, ordered by canonical physical path.
   ///

@@ -826,8 +826,22 @@ public:
     bool IsMacroStateDirective() const { return IsDefine() || IsUndef(); }
 
     /// True iff this directive is a function-like `#define`, the `NAME(...)`
-    /// shape rather than `NAME`.  `functionLike` is producer-owned and is
-    /// meaningful only on a `#define`, so it is never read alone.
+    /// shape rather than `NAME`.
+    ///
+    /// This is equivalent to reading `functionLike` alone, and deliberately so.
+    /// `FromJson` assigns `functionLike` *only* inside its `subkind ==
+    /// "#define"` branch, so the field keeps its `false` default on every other
+    /// directive kind.  A true `functionLike` therefore implies `IsDefine()`,
+    /// and the two spellings agree on every directive.  The invariant also
+    /// fails closed under a producer regression: a `function_like` emitted on
+    /// an `#undef` is never read, leaving the field false, so a caller gating
+    /// on it rejects rather than mistaking the `#undef` for a definition.
+    ///
+    /// Both spellings are consequently live in the tree -- the predicate where
+    /// the directive kind is part of what the caller is proving, the bare field
+    /// where the caller has already established a `#define` and is only asking
+    /// about arity.  Do not "fix" one into the other on the assumption that the
+    /// bare read is unguarded; it is guarded by the parser.
     bool IsFunctionLikeDefine() const { return IsDefine() && functionLike; }
 
     /// True iff this directive is an object-like `#define`.

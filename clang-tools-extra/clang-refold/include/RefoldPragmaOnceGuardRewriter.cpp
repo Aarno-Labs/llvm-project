@@ -1019,8 +1019,8 @@ RefoldPragmaOnceGuardRewriter::ActiveGuardedHeaderPaths() const {
 }
 
 bool RefoldPragmaOnceGuardRewriter::AppendRealizedFromBIncludeGuardRestoration(
-    ArrayRef<uint64_t> enteredSubtreeIncludeIds, std::string &realizedBody,
-    std::string * /*unrestoredPath*/) const {
+    ArrayRef<uint64_t> enteredSubtreeIncludeIds,
+    std::string &realizedBody) const {
   // Collect one restoration per physical header, in canonical-path order, so
   // repeated instances of a header do not emit the define twice and the output
   // does not depend on include traversal order.
@@ -1055,10 +1055,14 @@ bool RefoldPragmaOnceGuardRewriter::AppendRealizedFromBIncludeGuardRestoration(
       }
     }
 
-    // No controlling macro and no once-state means the header was never
-    // self-protecting, so the original preprocessing would have re-entered it
-    // too and there is nothing to restore.  Only a header that *was* protected
-    // but whose protection cannot be named is unrestorable.
+    // Reaching here means the header is not restorable at this site: either it
+    // was never self-protecting -- no controlling macro and no once-state, so
+    // the original preprocessing would have re-entered it too and there is
+    // nothing to restore -- or its macro state is observed outside it and the
+    // prime above was refused.  Neither is failed closed here; the empty marker
+    // only reserves the path so a later instance of the same header cannot
+    // overwrite a restoration already chosen for it.  The residual re-entry
+    // hazard of the second case is proven by the materialization scheduler.
     if (!guardByPath.count(*canonical))
       guardByPath.emplace(*canonical, std::string());
   }

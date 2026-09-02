@@ -1664,6 +1664,8 @@ bool RefoldIncludeMaterializer::TryRecordInlineIncludeRealizationFromB(
     // is skipped exactly as it was originally.
     SmallVector<uint64_t, 16> enteredSubtree;
     CollectEnteredIncludeSubtree(include.id, enteredSubtree);
+    // Always true: restoration is best-effort here, and the headers it cannot
+    // prime are failed closed by the scheduler's no-re-entry proof instead.
     (void)pragmaOnceGuards_.AppendRealizedFromBIncludeGuardRestoration(
         enteredSubtree, *realized);
 
