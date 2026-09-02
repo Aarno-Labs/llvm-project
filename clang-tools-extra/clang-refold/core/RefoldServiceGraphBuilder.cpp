@@ -322,32 +322,12 @@ const RefoldLineObserverLayout &RefoldEngine::LineObserverLayout() const {
 }
 
 void RefoldEngine::InitializeTheoremAudit() {
-  RefoldTheoremAudit::Hooks hooks;
-  hooks.normalizeAcceptedProof =
-      [this](const AcceptedResultCandidate &candidate) {
-        return ProofLattice().ProofSummaryBuilder().NormalizeAcceptedProof(
-            candidate);
-      };
-  hooks.classifyMacroPatchProof = [this](const MacroPatch &patch) {
-    return ProofLattice().MacroPatchProofClassifier().ClassifyMacroPatchProof(
-        patch);
-  };
-  hooks.getWitnessResolverMode = [this]() {
-    return ProofLattice().WitnessTrace().GetWitnessResolverMode();
-  };
-  hooks.buildTerminalFallbackWitness = [this]() {
-    return ProofLattice().BuildTerminalFallbackWitness();
-  };
-  hooks.buildAcceptedTerminalCandidate =
-      [this](const TerminalFallbackWitness &witness) {
-        return ProofLattice()
-            .AcceptedCandidateBuilder()
-            .BuildAcceptedTerminalCandidate(witness);
-      };
-
+  // The audit is built before the lattice because the lattice takes the audit
+  // by reference.  The reverse edge -- the audit's five lattice queries -- is
+  // bound by BindProofLattice() once InitializeProofLattice() has run.
   theoremAudit_ = std::make_unique<RefoldTheoremAudit>(
       lastTheoremAudit_, terminalSink_, strict_,
-      alignmentSemanticTheoremActive_, std::move(hooks));
+      alignmentSemanticTheoremActive_);
 }
 
 RefoldTheoremAudit &RefoldEngine::TheoremAudit() const {
@@ -396,6 +376,9 @@ void RefoldEngine::InitializeProofLattice() {
       proofAuditMode_, alignmentSemanticTheoremActive_,
       mixedOwnerTilingSegmentBindings_,
       mixedOwnerTilingWitnesses_, std::move(hooks));
+
+  // Close the audit/lattice construction cycle now that both services exist.
+  TheoremAudit().BindProofLattice(*proofLattice_);
 }
 
 RefoldProofLattice &RefoldEngine::ProofLattice() { return *proofLattice_; }

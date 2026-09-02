@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "proof/RefoldTheoremAudit.h"
+#include "proof/RefoldProofLattice.h"
 
 #include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
@@ -25,10 +26,13 @@ namespace refold {
 
 RefoldTheoremAudit::RefoldTheoremAudit(
     TheoremAuditStats &audit, const RefoldTerminalProofSink &terminalSink,
-    bool strict, const bool &alignmentSemanticTheoremActive, Hooks hooks)
+    bool strict, const bool &alignmentSemanticTheoremActive)
     : audit_(audit), terminalSink_(terminalSink), strict_(strict),
-      alignmentSemanticTheoremActive_(alignmentSemanticTheoremActive),
-      hooks_(std::move(hooks)) {}
+      alignmentSemanticTheoremActive_(alignmentSemanticTheoremActive) {}
+
+void RefoldTheoremAudit::BindProofLattice(const RefoldProofLattice &lattice) {
+  proofLattice_ = &lattice;
+}
 
 bool RefoldTheoremAudit::IsNoLegacyAuditEnabled() const {
   // The no-legacy audit is active for an explicitly strict run and for the
@@ -143,8 +147,8 @@ void RefoldTheoremAudit::EnforceTheoremAuditInvariants() const {
         "state-transition gateway audit found an undischarged or malformed "
         "state proof");
   }
-  if (hooks_.getWitnessResolverMode &&
-      hooks_.getWitnessResolverMode() == WitnessResolverMode::Strict) {
+  if (proofLattice_ && proofLattice_->WitnessTrace().GetWitnessResolverMode() ==
+                           WitnessResolverMode::Strict) {
     if (audit_.resolverPotentiallyMissingProof != 0) {
       NoteTheoremAuditViolation(
           "strict resolver audit found a potentially in-domain missing proof");
@@ -495,8 +499,9 @@ bool RefoldTheoremAudit::AuditAcceptedResultCandidateForLegacyAuthority(
   AuditProofSummaryForLegacyAuthority(candidate.proofSummary, role);
 
   std::optional<TheoremProofClass> theoremClass;
-  if (hooks_.normalizeAcceptedProof)
-    theoremClass = hooks_.normalizeAcceptedProof(candidate);
+  if (proofLattice_)
+    theoremClass =
+        proofLattice_->ProofSummaryBuilder().NormalizeAcceptedProof(candidate);
   if (!theoremClass) {
     ReportNoLegacyAuditFinding(MakeLegacyAuditEvidence(
         LegacyPathKind::PostSummaryProofKindDecision, role,
@@ -542,9 +547,11 @@ bool RefoldTheoremAudit::AuditMacroPatchProofForLegacyAuthority(
       !patch.proof.preservesInvocationStructure)
     return true;
 
-  const ProofSummary expected = hooks_.classifyMacroPatchProof
-                                    ? hooks_.classifyMacroPatchProof(patch)
-                                    : ProofSummary{};
+  const ProofSummary expected =
+      proofLattice_
+          ? proofLattice_->MacroPatchProofClassifier().ClassifyMacroPatchProof(
+                patch)
+          : ProofSummary{};
   const bool missingSummary =
       patch.proofSummary.theoremClass == TheoremProofClass::Unknown &&
       patch.proofSummary.inventory.currentPath == AcceptedPathKind::Unknown;
@@ -840,9 +847,16 @@ void RefoldTheoremAudit::RecordTerminalFallbackTheoremAudit() const {
   if (!terminalSink_.HasRequest())
     return;
 
-  const TerminalFallbackWitness witness = hooks_.buildTerminalFallbackWitness();
+  // Both facts below are lattice-derived.  An unbound lattice means the service
+  // graph never completed, so there is no terminal carrier to audit.
+  if (!proofLattice_)
+    return;
+
+  const TerminalFallbackWitness witness =
+      proofLattice_->BuildTerminalFallbackWitness();
   const AcceptedResultCandidate candidate =
-      hooks_.buildAcceptedTerminalCandidate(witness);
+      proofLattice_->AcceptedCandidateBuilder().BuildAcceptedTerminalCandidate(
+          witness);
   AuditAcceptedResultCandidateForLegacyAuthority(
       candidate, "RecordTerminalFallbackTheoremAudit");
   const ProofSummary &summary = candidate.proofSummary;

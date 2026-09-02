@@ -23,49 +23,33 @@
 
 #include "llvm/ADT/StringRef.h"
 
-#include <functional>
 #include <optional>
 #include <string>
 
 namespace clang {
 namespace refold {
 
+class RefoldProofLattice;
+
 class RefoldModel;
 
 /// Centralized theorem-audit service.
 class RefoldTheoremAudit {
 public:
-  /// Exceptional callback set for theorem queries that are still owned by
-  /// the proof lattice.  RefoldTheoremAudit is constructed before the
-  /// lattice and the lattice calls back into the audit service, so these
-  /// remain late-bound query hooks until that construction cycle is split.
-  struct Hooks {
-    /// Return the normalized final theorem class for an accepted candidate.
-    std::function<std::optional<TheoremProofClass>(
-        const AcceptedResultCandidate &)>
-        normalizeAcceptedProof;
-
-    /// Rebuild the expected normalized proof summary for a macro patch.
-    std::function<ProofSummary(const MacroPatch &)> classifyMacroPatchProof;
-
-    /// Return the current witness-resolver mode used by invariant
-    /// enforcement.
-    std::function<WitnessResolverMode()> getWitnessResolverMode;
-
-    /// Build terminal fallback proof data from the current terminal sink
-    /// ledger.
-    std::function<TerminalFallbackWitness()> buildTerminalFallbackWitness;
-
-    /// Normalize a terminal witness into the shared accepted-candidate
-    /// carrier.
-    std::function<AcceptedResultCandidate(const TerminalFallbackWitness &)>
-        buildAcceptedTerminalCandidate;
-  };
-
   RefoldTheoremAudit(TheoremAuditStats &audit,
                      const RefoldTerminalProofSink &terminalSink, bool strict,
-                     const bool &alignmentSemanticTheoremActive,
-                     Hooks hooks);
+                     const bool &alignmentSemanticTheoremActive);
+
+  /// Bind the proof lattice this audit queries, completing the service graph.
+  ///
+  /// The audit is constructed before the lattice because the lattice takes the
+  /// audit by reference; the reverse edge is therefore bound in a second phase,
+  /// once both services exist.  Splitting the cycle this way is what lets the
+  /// five lattice queries below be direct calls rather than a late-bound
+  /// callback bundle.  Every query site tolerates an unbound lattice, so an
+  /// audit that is never bound degrades to "no lattice-derived facts" instead
+  /// of dereferencing null.
+  void BindProofLattice(const RefoldProofLattice &lattice);
 
   /// Return whether semantic no-legacy auditing is active for this run.
   ///
@@ -224,7 +208,7 @@ private:
   const RefoldTerminalProofSink &terminalSink_;
   bool strict_ = false;
   const bool &alignmentSemanticTheoremActive_;
-  Hooks hooks_;
+  const RefoldProofLattice *proofLattice_ = nullptr;
 };
 
 //===----------------------------------------------------------------------===//
