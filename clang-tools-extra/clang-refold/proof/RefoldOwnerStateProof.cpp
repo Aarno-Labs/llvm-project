@@ -931,84 +931,110 @@ conditionalArmIdentityFromArm(const RefoldModel::CondGroup &group,
   identity.reverseSolvedDirectiveRequired = reverseSolvedDirectiveRequired;
   return identity;
 }
-} // namespace
 
-OwnerStateDelta
-RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
-  OwnerStateFacts facts;
-  const bool auditDirectState = theoremAudit_.IsNoLegacyAuditEnabled();
+/// Accumulates one owner's producer state facts on the way to its canonical
+/// OwnerStateDelta.
+///
+/// BuildOwnerStateDelta() decides *which* producer records belong to an owner;
+/// this recorder owns everything that happens to a record once it does.  It
+/// holds the growing OwnerStateFacts, so the walk itself carries no mutable
+/// state and every write to the fact set, recorded fact or explicit
+/// MissingStateFact marker alike, happens in one place.
+class OwnerStateFactRecorder {
+public:
+  OwnerStateFactRecorder(const RefoldOwnerStateProof &proof,
+                         bool auditDirectState,
+                         const RefoldTokenTextAnalysis &tokenText,
+                         ArrayRef<PPTok> aToks,
+                         const RefoldMacroTopology &macroTopology,
+                         const clang::LangOptions &lexLang)
+      : proof_(proof), auditDirectState(auditDirectState),
+        tokenText_(tokenText), aToks_(aToks), macroTopology_(macroTopology),
+        lexLang_(lexLang) {}
 
-  auto auditDeltaFact = [&](DirectStateCheckKind checkKind,
-                            OwnerStateComponent component, StringRef detail) {
+  /// Record one owner-state-delta item in the direct-check inventory.
+  ///
+  /// Audit-only: the inventory is read by the no-legacy audit and never
+  /// influences which facts are recorded.
+  void auditDeltaFact(DirectStateCheckKind checkKind,
+                      OwnerStateComponent component, StringRef detail) {
     if (!auditDirectState)
       return;
-    AuditDirectStateCheckClosure(
+    proof_.AuditDirectStateCheckClosure(
         checkKind, component, DirectStateCheckClosureKind::OwnerStateDeltaFact,
         StateMutationKind::Unknown, "owner-state-delta", detail);
-  };
+  }
 
-  auto markMissing = [&](MissingStateFactKind kind, StringRef detail) {
+  /// Record one component-specific missing producer fact.
+  ///
+  /// Every absent fact is named here rather than left as an empty delta, so
+  /// a downstream proof can fail closed on the precise component.
+  void markMissing(MissingStateFactKind kind, StringRef detail) {
     facts.AddMissingStateFact(kind, detail);
-    auditDeltaFact(DirectStateCheckKind::UnmodeledStateFact,
-                   StateComponentForMissingStateFact(kind), detail);
-  };
+    auditDeltaFact(
+        DirectStateCheckKind::UnmodeledStateFact,
+        RefoldOwnerStateProof::StateComponentForMissingStateFact(kind), detail);
+  }
 
-  auto finalize = [&]() {
-    // There is no OwnerStateSummary compatibility bridge.  Build the canonical
-    // theorem delta directly from precise producer facts and explicit
-    // MissingStateFact markers, so missing facts cannot disappear as an empty
-    // flat summary.
+  /// Project the recorded facts into the canonical theorem delta.
+  ///
+  /// There is no OwnerStateSummary compatibility bridge.  Build the canonical
+  /// theorem delta directly from precise producer facts and explicit
+  /// MissingStateFact markers, so missing facts cannot disappear as an empty
+  /// flat summary.
+  OwnerStateDelta finalize() {
     OwnerStateDelta theoremDelta =
-        BuildTheoremStateDelta(facts, OwnerStateDelta());
+        RefoldOwnerStateProof::BuildTheoremStateDelta(facts, OwnerStateDelta());
     if (facts.HasMissingStateFacts() && theoremDelta.Empty()) {
       facts.AddMissingStateFact(
           MissingStateFactKind::MissingOwnerOrderingFacts,
           "missing producer facts failed to project into theorem delta");
-      theoremDelta = BuildTheoremStateDelta(facts, OwnerStateDelta());
+      theoremDelta = RefoldOwnerStateProof::BuildTheoremStateDelta(
+          facts, OwnerStateDelta());
     }
     return theoremDelta;
-  };
-  if (!owner.IsKnown()) {
-    markMissing(MissingStateFactKind::MissingOwnerOrderingFacts,
-                            "unknown owner identity");
-    return finalize();
   }
 
-  auto recordBuiltinLocationObservation =
-      [&](BuiltinLocationObservationKind kind,
-          std::optional<uint64_t> ownerIncludeId = std::nullopt,
-          std::optional<uint64_t> sourceBegin = std::nullopt,
-          std::optional<uint64_t> sourceEnd = std::nullopt,
-          std::optional<uint64_t> aTokenBegin = std::nullopt,
-          std::optional<uint64_t> aTokenEnd = std::nullopt) {
-        switch (kind) {
-        case BuiltinLocationObservationKind::LineState:
-          auditDeltaFact(DirectStateCheckKind::BuiltinLineObserver,
-                         OwnerStateComponent::LineNumber,
-                         "producer/textual __LINE__ observation");
-          break;
-        case BuiltinLocationObservationKind::FileState:
-          auditDeltaFact(DirectStateCheckKind::BuiltinFileObserver,
-                         OwnerStateComponent::FileState,
-                         "producer/textual __FILE__ observation");
-          break;
-        case BuiltinLocationObservationKind::FileNameState:
-          auditDeltaFact(DirectStateCheckKind::BuiltinFileNameObserver,
-                         OwnerStateComponent::FileName,
-                         "producer/textual __FILE_NAME__ observation");
-          break;
-        }
-        BuiltinLocationObservation observation;
-        observation.kind = kind;
-        observation.ownerIncludeId = ownerIncludeId;
-        observation.sourceBegin = sourceBegin;
-        observation.sourceEnd = sourceEnd;
-        observation.aTokenBegin = aTokenBegin;
-        observation.aTokenEnd = aTokenEnd;
-        facts.AddBuiltinLocationObservation(observation);
-      };
+  /// Record one location-builtin observation and its optional spans.
+  void recordBuiltinLocationObservation(
+      BuiltinLocationObservationKind kind,
+      std::optional<uint64_t> ownerIncludeId = std::nullopt,
+      std::optional<uint64_t> sourceBegin = std::nullopt,
+      std::optional<uint64_t> sourceEnd = std::nullopt,
+      std::optional<uint64_t> aTokenBegin = std::nullopt,
+      std::optional<uint64_t> aTokenEnd = std::nullopt) {
+    switch (kind) {
+    case BuiltinLocationObservationKind::LineState:
+      auditDeltaFact(DirectStateCheckKind::BuiltinLineObserver,
+                     OwnerStateComponent::LineNumber,
+                     "producer/textual __LINE__ observation");
+      break;
+    case BuiltinLocationObservationKind::FileState:
+      auditDeltaFact(DirectStateCheckKind::BuiltinFileObserver,
+                     OwnerStateComponent::FileState,
+                     "producer/textual __FILE__ observation");
+      break;
+    case BuiltinLocationObservationKind::FileNameState:
+      auditDeltaFact(DirectStateCheckKind::BuiltinFileNameObserver,
+                     OwnerStateComponent::FileName,
+                     "producer/textual __FILE_NAME__ observation");
+      break;
+    }
+    BuiltinLocationObservation observation;
+    observation.kind = kind;
+    observation.ownerIncludeId = ownerIncludeId;
+    observation.sourceBegin = sourceBegin;
+    observation.sourceEnd = sourceEnd;
+    observation.aTokenBegin = aTokenBegin;
+    observation.aTokenEnd = aTokenEnd;
+    facts.AddBuiltinLocationObservation(observation);
+  }
 
-  auto scanTextForBuiltins = [&](StringRef text) {
+  /// Record the location-builtin observations spelled in \p text.
+  ///
+  /// Textual `__COUNTER__` is not an event identity, so it is marked missing
+  /// rather than recorded as one.
+  void scanTextForBuiltins(StringRef text) {
     if (text.empty())
       return;
     if (tokenText_.RawIdentifierAppearsInText("__LINE__", text))
@@ -1029,9 +1055,13 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
       markMissing(MissingStateFactKind::MissingCounterFacts,
                   "textual __COUNTER__ without producer counter event");
     }
-  };
+  }
 
-  auto scanPPSpanForBuiltins = [&](const RefoldModel::PPSpan &span) {
+  /// Record the location-builtin observations spelled in an A-token span.
+  ///
+  /// A span reaching past the A-token stream is a missing ordering fact, not
+  /// a truncated scan.
+  void scanPPSpanForBuiltins(const RefoldModel::PPSpan &span) {
     if (!span.IsValid())
       return;
     const uint64_t end = std::min<uint64_t>(span.end, aToks_.size());
@@ -1056,11 +1086,12 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     }
     if (span.end > aToks_.size())
       markMissing(MissingStateFactKind::MissingOwnerOrderingFacts,
-                              "producer PP span extends past A-token stream");
-  };
+                  "producer PP span extends past A-token stream");
+  }
 
-  auto recordMacroObservation = [&](MacroObservationKind kind,
-                                    const MacroStateIdentity &identity) {
+  /// Record one macro-state observation: an expansion or a `defined` operand.
+  void recordMacroObservation(MacroObservationKind kind,
+                              const MacroStateIdentity &identity) {
     auditDeltaFact(kind == MacroObservationKind::DefinedOperator
                        ? DirectStateCheckKind::MacroDefinitionDirective
                        : DirectStateCheckKind::MacroExpansionState,
@@ -1072,36 +1103,40 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     observation.kind = kind;
     observation.identity = identity;
     facts.AddMacroObservation(observation);
-  };
+  }
 
-  auto recordCounterInvocationEvents =
-      [&](const RefoldModel::MacroInvocation &macro) {
-        if (macro.name != "__COUNTER__")
-          return;
+  /// Record the producer's `__COUNTER__` output ranges for one invocation.
+  ///
+  /// An invocation with no producer range yields no event identity and is
+  /// marked missing instead.
+  void
+  recordCounterInvocationEvents(const RefoldModel::MacroInvocation &macro) {
+    if (macro.name != "__COUNTER__")
+      return;
 
-        auditDeltaFact(DirectStateCheckKind::CounterEvent,
-                       OwnerStateComponent::Counter,
-                       "producer __COUNTER__ invocation events");
+    auditDeltaFact(DirectStateCheckKind::CounterEvent,
+                   OwnerStateComponent::Counter,
+                   "producer __COUNTER__ invocation events");
 
-        uint64_t ordinal = 0;
-        for (const auto &range :
-             macroTopology_.CounterOutputRangesForInvocation(macro)) {
-          facts.AddCounterEvent(macroTopology_.BuildCounterEventIdentity(
-              macro, ordinal++, range.first, range.second));
-        }
+    uint64_t ordinal = 0;
+    for (const auto &range :
+         macroTopology_.CounterOutputRangesForInvocation(macro)) {
+      facts.AddCounterEvent(macroTopology_.BuildCounterEventIdentity(
+          macro, ordinal++, range.first, range.second));
+    }
 
-        if (ordinal == 0)
-          markMissing(
-              MissingStateFactKind::MissingCounterFacts,
-              "__COUNTER__ invocation has no producer output range");
-      };
+    if (ordinal == 0)
+      markMissing(MissingStateFactKind::MissingCounterFacts,
+                  "__COUNTER__ invocation has no producer output range");
+  }
 
-  auto scanConditionalMacroState = [&](StringRef conditionText) {
-    // distinguishes `defined(NAME)` from ordinary conditional macro
-    // dependencies.  This scanner is deliberately conservative and
-    // deterministic: it recognizes preprocessor identifiers while skipping
-    // string/character literals and comments.  If a `defined` operand is
-    // malformed or absent, the owner is marked unmodeled rather than guessed.
+  /// Record the macro-state observations read by one conditional expression,
+  /// distinguishing `defined(NAME)` from ordinary conditional macro
+  /// dependencies.  This scanner is deliberately conservative and
+  /// deterministic: it recognizes preprocessor identifiers while skipping
+  /// string/character literals and comments.  If a `defined` operand is
+  /// malformed or absent, the owner is marked unmodeled rather than guessed.
+  void scanConditionalMacroState(StringRef conditionText) {
     const std::string text = conditionText.str();
     size_t i = 0;
 
@@ -1126,9 +1161,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         if (text[i++] == quote)
           return;
       }
-      markMissing(
-          MissingStateFactKind::MissingConditionalFacts,
-          "unterminated conditional string/character literal");
+      markMissing(MissingStateFactKind::MissingConditionalFacts,
+                  "unterminated conditional string/character literal");
     };
     auto readIdentifier = [&]() -> std::optional<StringRef> {
       if (i >= text.size() ||
@@ -1159,7 +1193,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         const size_t end = text.find("*/", i);
         if (end == std::string::npos) {
           markMissing(MissingStateFactKind::MissingConditionalFacts,
-                                  "unterminated conditional block comment");
+                      "unterminated conditional block comment");
           break;
         }
         i = end + 2;
@@ -1182,7 +1216,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         std::optional<StringRef> operand = readIdentifier();
         if (!operand) {
           markMissing(MissingStateFactKind::MissingConditionalFacts,
-                                  "malformed defined() operand");
+                      "malformed defined() operand");
           continue;
         }
         recordMacroObservation(MacroObservationKind::DefinedOperator,
@@ -1192,9 +1226,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
           if (i < text.size() && text[i] == ')')
             ++i;
           else
-            markMissing(
-                MissingStateFactKind::MissingConditionalFacts,
-                "malformed defined() closing parenthesis");
+            markMissing(MissingStateFactKind::MissingConditionalFacts,
+                        "malformed defined() closing parenthesis");
         }
         continue;
       }
@@ -1202,34 +1235,37 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
       recordMacroObservation(MacroObservationKind::ConditionalEvaluation,
                              identityFromMacroName(*identifier));
     }
-  };
+  }
 
-  auto recordMacroDirective =
-      [&](const RefoldModel::MacroDirective &directive) {
-        const MacroStateIdentity identity = identityFromDirective(directive);
-        if (directive.IsDefine()) {
-          auditDeltaFact(DirectStateCheckKind::MacroDefinitionDirective,
-                         OwnerStateComponent::MacroState,
-                         "#define directive state fact");
-          facts.AddMacroDefinition(identity);
-        } else if (directive.IsUndef()) {
-          auditDeltaFact(DirectStateCheckKind::MacroUndefDirective,
-                         OwnerStateComponent::MacroState,
-                         "#undef directive state fact");
-          facts.AddMacroUndefinition(identity);
-        } else
-          markMissing(MissingStateFactKind::MissingMacroFacts,
-                                  "unknown macro directive kind");
+  /// Record a #define/#undef macro-state mutation.
+  ///
+  /// A directive that is neither, or that lacks a name or directive text,
+  /// is marked missing rather than classified by guess.
+  void recordMacroDirective(const RefoldModel::MacroDirective &directive) {
+    const MacroStateIdentity identity = identityFromDirective(directive);
+    if (directive.IsDefine()) {
+      auditDeltaFact(DirectStateCheckKind::MacroDefinitionDirective,
+                     OwnerStateComponent::MacroState,
+                     "#define directive state fact");
+      facts.AddMacroDefinition(identity);
+    } else if (directive.IsUndef()) {
+      auditDeltaFact(DirectStateCheckKind::MacroUndefDirective,
+                     OwnerStateComponent::MacroState,
+                     "#undef directive state fact");
+      facts.AddMacroUndefinition(identity);
+    } else
+      markMissing(MissingStateFactKind::MissingMacroFacts,
+                  "unknown macro directive kind");
 
-        if (directive.name.empty() || directive.text.empty())
-          markMissing(MissingStateFactKind::MissingMacroFacts,
-                                  "macro directive missing name or text");
-      };
+    if (directive.name.empty() || directive.text.empty())
+      markMissing(MissingStateFactKind::MissingMacroFacts,
+                  "macro directive missing name or text");
+  }
 
-  auto recordPragma = [&](const RefoldModel::PragmaDirective &pragma) {
-    // record a component-specific pragma event.  Unknown pragmas still
-    // fail closed through the event classification, while known diagnostic
-    // pragma state can later be discharged by balanced/local pragma proofs.
+  /// Record a component-specific pragma event.  Unknown pragmas still
+  /// fail closed through the event classification, while known diagnostic
+  /// pragma state can later be discharged by balanced/local pragma proofs.
+  void recordPragma(const RefoldModel::PragmaDirective &pragma) {
     auditDeltaFact(DirectStateCheckKind::PragmaDirective,
                    OwnerStateComponent::PragmaState,
                    "#pragma directive state fact");
@@ -1240,12 +1276,12 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         PragmaStateClassification::UnknownPragmaState)
       markMissing(MissingStateFactKind::MissingPragmaFacts,
                   "unknown pragma semantics");
-  };
+  }
 
-  auto recordLineControl = [&](const RefoldModel::LineControlEvent &event) {
-    // model #line as a zero-token state mutation whose operands were evaluated
-    // by the producer.  The component-specific event identity is the only
-    // line-control mutation fact consumed by theorem-facing code.
+  /// Model #line as a zero-token state mutation whose operands were evaluated
+  /// by the producer.  The component-specific event identity is the only
+  /// line-control mutation fact consumed by theorem-facing code.
+  void recordLineControl(const RefoldModel::LineControlEvent &event) {
     auditDeltaFact(DirectStateCheckKind::LineControlDirective,
                    OwnerStateComponent::LineNumber,
                    "#line directive line-number state fact");
@@ -1259,22 +1295,20 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         lineControlIdentityFromEvent(event);
     facts.AddLineControlEvent(identity);
     if (!event.active || !event.producerProven) {
-      markMissing(
-          MissingStateFactKind::MissingLineControlFacts,
-          "line-control event inactive or not producer-proven");
+      markMissing(MissingStateFactKind::MissingLineControlFacts,
+                  "line-control event inactive or not producer-proven");
     }
     if (event.text.empty() || !event.siteB || !event.siteE) {
-      markMissing(
-          MissingStateFactKind::MissingLineControlFacts,
-          "line-control event missing directive text or source span");
+      markMissing(MissingStateFactKind::MissingLineControlFacts,
+                  "line-control event missing directive text or source span");
     }
-  };
+  }
 
-  auto recordIncludeTransition = [&](const RefoldModel::IncludeItem &include) {
-    // include identity and include-guard state are recorded as separate
-    // component facts.  The guard macro remains absent unless the producer
-    // supplies a dedicated guard oracle; this is deliberately conservative and
-    // avoids pattern-matching header guards in the consumer.
+  /// Include identity and include-guard state are recorded as separate
+  /// component facts.  The guard macro remains absent unless the producer
+  /// supplies a dedicated guard oracle; this is deliberately conservative and
+  /// avoids pattern-matching header guards in the consumer.
+  void recordIncludeTransition(const RefoldModel::IncludeItem &include) {
     auditDeltaFact(DirectStateCheckKind::IncludeDirectiveState,
                    OwnerStateComponent::IncludeState,
                    "#include directive state fact");
@@ -1292,16 +1326,16 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
                   "include has no producer token cover; guard skip versus "
                   "empty header is unknown");
     }
-  };
+  }
 
-  auto recordConditionalArm = [&](const RefoldModel::CondGroup &group,
-                                  const RefoldModel::CondArm &arm,
-                                  bool requireActiveOwner) {
-    // Record branch-selection state from the producer's active path.  A repair
-    // may use a conditional arm as a source witness only when that arm is the
-    // producer-selected arm; inactive-arm repair would reverse-solve
-    // source-only conditional text from downstream B tokens and therefore
-    // remains outside theorem authority.
+  /// Record branch-selection state from the producer's active path.  A repair
+  /// may use a conditional arm as a source witness only when that arm is the
+  /// producer-selected arm; inactive-arm repair would reverse-solve
+  /// source-only conditional text from downstream B tokens and therefore
+  /// remains outside theorem authority.
+  void recordConditionalArm(const RefoldModel::CondGroup &group,
+                            const RefoldModel::CondArm &arm,
+                            bool requireActiveOwner) {
     auditDeltaFact(DirectStateCheckKind::ConditionalDirectiveState,
                    OwnerStateComponent::ConditionalState,
                    "conditional arm state fact");
@@ -1312,9 +1346,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         group, arm, reverseSolvedDirectiveRequired));
 
     if (!conditionalArmSelectionTruthProducerProven(group, arm)) {
-      markMissing(
-          MissingStateFactKind::MissingConditionalFacts,
-          "conditional arm selection was not producer-proven");
+      markMissing(MissingStateFactKind::MissingConditionalFacts,
+                  "conditional arm selection was not producer-proven");
     }
     if (reverseSolvedDirectiveRequired) {
       markMissing(
@@ -1326,14 +1359,14 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
       scanTextForBuiltins(*arm.cond);
       scanConditionalMacroState(*arm.cond);
     }
-  };
+  }
 
-  auto recordConditionalGroup = [&](const RefoldModel::CondGroup &group) {
-    // A conditional group is the zero-token state owner for branch selection:
-    // the directive island observes macro/conditional state, selects one arm,
-    // and mutates the conditional-state context seen by nested owners. This
-    // records only the arm predicates the producer actually evaluated; #elif
-    // conditions after the selected arm are source text but not state reads.
+  /// A conditional group is the zero-token state owner for branch selection:
+  /// the directive island observes macro/conditional state, selects one arm,
+  /// and mutates the conditional-state context seen by nested owners. This
+  /// records only the arm predicates the producer actually evaluated; #elif
+  /// conditions after the selected arm are source text but not state reads.
+  void recordConditionalGroup(const RefoldModel::CondGroup &group) {
     auditDeltaFact(DirectStateCheckKind::ConditionalDirectiveState,
                    OwnerStateComponent::ConditionalState,
                    "conditional group state fact");
@@ -1354,30 +1387,29 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
       if (arm.selected)
         reachedSelectedArm = true;
     }
-  };
+  }
 
-  auto recordMacroInvocation = [&](const RefoldModel::MacroInvocation &macro) {
+  /// Record one macro invocation: its requirement, expansion, counter events
+  /// and every location-builtin spelled in its name, text or spans.
+  void recordMacroInvocation(const RefoldModel::MacroInvocation &macro) {
     const MacroStateIdentity identity = identityFromInvocation(macro);
     facts.AddMacroRequirement(identity);
     recordMacroObservation(MacroObservationKind::Expansion, identity);
     recordCounterInvocationEvents(macro);
     if (macro.name.empty() ||
         (macro.subkind != "obj" && macro.subkind != "func"))
-      markMissing(
-          MissingStateFactKind::MissingMacroFacts,
-          "macro invocation missing name or recognized kind");
+      markMissing(MissingStateFactKind::MissingMacroFacts,
+                  "macro invocation missing name or recognized kind");
     if (macro.subkind == "func" && !macro.definitionDirectiveId)
-      markMissing(
-          MissingStateFactKind::MissingMacroFacts,
-          "function-like macro invocation missing definition id");
+      markMissing(MissingStateFactKind::MissingMacroFacts,
+                  "function-like macro invocation missing definition id");
 
     scanTextForBuiltins(macro.name);
     if (macro.invText)
       scanTextForBuiltins(*macro.invText);
     else if (macro.subkind == "func")
-      markMissing(
-          MissingStateFactKind::MissingMacroFacts,
-          "function-like macro invocation missing invocation text");
+      markMissing(MissingStateFactKind::MissingMacroFacts,
+                  "function-like macro invocation missing invocation text");
 
     for (const RefoldModel::PPSpan &span : macro.spans)
       scanPPSpanForBuiltins(span);
@@ -1389,7 +1421,30 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
       scanPPSpanForBuiltins(span);
     for (const RefoldModel::PPSpan &span : macro.bodySpans)
       scanPPSpanForBuiltins(span);
-  };
+  }
+
+private:
+  const RefoldOwnerStateProof &proof_;
+  /// Accumulating owner-local fact set; the only mutable state here.
+  OwnerStateFacts facts;
+  const bool auditDirectState;
+  const RefoldTokenTextAnalysis &tokenText_;
+  ArrayRef<PPTok> aToks_;
+  const RefoldMacroTopology &macroTopology_;
+  const clang::LangOptions &lexLang_;
+};
+
+} // namespace
+
+OwnerStateDelta
+RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
+  OwnerStateFactRecorder recorder(*this, theoremAudit_.IsNoLegacyAuditEnabled(),
+                                  tokenText_, aToks_, macroTopology_, lexLang_);
+  if (!owner.IsKnown()) {
+    recorder.markMissing(MissingStateFactKind::MissingOwnerOrderingFacts,
+                         "unknown owner identity");
+    return recorder.finalize();
+  }
 
   const OwnerStateFactIndex &stateIndex = GetOwnerStateFactIndex();
 
@@ -1401,12 +1456,12 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         directive = it->second;
     }
     if (directive)
-      recordMacroDirective(*directive);
+      recorder.recordMacroDirective(*directive);
     else
-      markMissing(
+      recorder.markMissing(
           MissingStateFactKind::MissingMacroFacts,
           "macro directive owner id not found in producer map");
-    return finalize();
+    return recorder.finalize();
   }
 
   if (owner.IsLineControlIsland()) {
@@ -1417,12 +1472,11 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         event = it->second;
     }
     if (event)
-      recordLineControl(*event);
+      recorder.recordLineControl(*event);
     else
-      markMissing(
-          MissingStateFactKind::MissingLineControlFacts,
-          "line-control owner id not found in producer map");
-    return finalize();
+      recorder.markMissing(MissingStateFactKind::MissingLineControlFacts,
+                           "line-control owner id not found in producer map");
+    return recorder.finalize();
   }
 
   if (owner.IsPragmaIsland()) {
@@ -1433,11 +1487,11 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         pragma = it->second;
     }
     if (pragma)
-      recordPragma(*pragma);
+      recorder.recordPragma(*pragma);
     else
-      markMissing(MissingStateFactKind::MissingPragmaFacts,
-                              "pragma owner id not found in producer map");
-    return finalize();
+      recorder.markMissing(MissingStateFactKind::MissingPragmaFacts,
+                           "pragma owner id not found in producer map");
+    return recorder.finalize();
   }
 
   if (owner.IsMacroInvocation()) {
@@ -1448,28 +1502,28 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         macro = it->second;
     }
     if (macro)
-      recordMacroInvocation(*macro);
+      recorder.recordMacroInvocation(*macro);
     else
-      markMissing(
+      recorder.markMissing(
           MissingStateFactKind::MissingMacroFacts,
           "macro invocation owner id not found in producer map");
-    return finalize();
+    return recorder.finalize();
   }
 
   if (owner.IsConditionalArm()) {
     if (owner.condArmId) {
       if (const std::optional<RefoldModel::ArmRef> armRef =
               model_.GetArmRefById(*owner.condArmId)) {
-        recordConditionalArm(*armRef->group, *armRef->arm,
-                             /*requireActiveOwner=*/true);
+        recorder.recordConditionalArm(*armRef->group, *armRef->arm,
+                                      /*requireActiveOwner=*/true);
       } else {
-        markMissing(
+        recorder.markMissing(
             MissingStateFactKind::MissingConditionalFacts,
             "conditional arm owner id not found in producer map");
       }
     } else {
-      markMissing(MissingStateFactKind::MissingConditionalFacts,
-                              "conditional arm owner missing arm id");
+      recorder.markMissing(MissingStateFactKind::MissingConditionalFacts,
+                           "conditional arm owner missing arm id");
     }
   }
 
@@ -1478,22 +1532,22 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     if (owner.condGroupId) {
       if (const RefoldModel::CondGroup *group =
               model_.GetCondGroupById(*owner.condGroupId)) {
-        recordConditionalGroup(*group);
+        recorder.recordConditionalGroup(*group);
         found = true;
       }
     }
     if (!found)
-      markMissing(
+      recorder.markMissing(
           MissingStateFactKind::MissingConditionalFacts,
           "conditional group owner id not found in producer map");
-    return finalize();
+    return recorder.finalize();
   }
 
   bool exactIncludeOwnerFound = false;
   if (owner.IsInclude() && owner.includeId) {
     if (const RefoldModel::IncludeItem *include =
             model_.GetIncludeById(*owner.includeId)) {
-      recordIncludeTransition(*include);
+      recorder.recordIncludeTransition(*include);
       exactIncludeOwnerFound = true;
     }
   }
@@ -1519,7 +1573,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
          lookupBucket(stateIndex.includesByParentIncludeKey, *sourceBucket)) {
       if (OwnerMatchesSourceSite(owner, include->sitePath, include->parent,
                                  include->siteB, include->siteE))
-        recordIncludeTransition(*include);
+        recorder.recordIncludeTransition(*include);
     }
 
     for (const RefoldModel::MacroDirective *directive : lookupBucket(
@@ -1527,7 +1581,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
       if (OwnerMatchesSourceSite(owner, directive->sitePath,
                                  directive->ownerIncludeId, directive->siteB,
                                  directive->siteE))
-        recordMacroDirective(*directive);
+        recorder.recordMacroDirective(*directive);
     }
 
     for (const RefoldModel::LineControlEvent *event : lookupBucket(
@@ -1536,7 +1590,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
         if (OwnerMatchesSourceSite(owner, event->physicalFile,
                                    event->ownerIncludeId, *event->siteB,
                                    *event->siteE))
-          recordLineControl(*event);
+          recorder.recordLineControl(*event);
         continue;
       }
 
@@ -1549,8 +1603,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
           (owner.IsInclude() && owner.includeId && event->ownerIncludeId &&
            *owner.includeId == *event->ownerIncludeId);
       if (ownerMatchesByInclude) {
-        recordLineControl(*event);
-        markMissing(
+        recorder.recordLineControl(*event);
+        recorder.markMissing(
             MissingStateFactKind::MissingLineControlFacts,
             "line-control event matched by owner but lacks source span");
       }
@@ -1576,7 +1630,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
           OwnerMatchesSourceSite(owner, pragma->sitePath, pragmaOwnerIncludeId,
                                  pragma->siteB, pragma->siteE);
       if (pragmaBelongs)
-        recordPragma(*pragma);
+        recorder.recordPragma(*pragma);
     }
 
     for (const RefoldModel::CondGroup *group :
@@ -1584,7 +1638,7 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
       if (!OwnerMatchesSourceSite(owner, group->file, group->parentIncludeId,
                                   group->groupB, group->groupE))
         continue;
-      recordConditionalGroup(*group);
+      recorder.recordConditionalGroup(*group);
     }
 
     for (const RefoldModel::MacroInvocation *macro : lookupBucket(
@@ -1592,15 +1646,15 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
       if (macro->invFile && macro->invB && macro->invE &&
           OwnerMatchesSourceSite(owner, *macro->invFile, macro->ownerIncludeId,
                                  *macro->invB, *macro->invE))
-        recordMacroInvocation(*macro);
+        recorder.recordMacroInvocation(*macro);
     }
   }
 
   if (owner.IsInclude() && owner.includeId && !exactIncludeOwnerFound)
-    markMissing(MissingStateFactKind::MissingOwnerOrderingFacts,
-                            "include owner id not found in producer map");
+    recorder.markMissing(MissingStateFactKind::MissingOwnerOrderingFacts,
+                         "include owner id not found in producer map");
 
-  return finalize();
+  return recorder.finalize();
 }
 
 bool RefoldOwnerStateProof::OwnerObserverSummaryObservesComponent(
