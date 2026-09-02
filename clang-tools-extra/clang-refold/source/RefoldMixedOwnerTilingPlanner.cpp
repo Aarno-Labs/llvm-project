@@ -306,6 +306,243 @@ struct ProtectedGapFacts {
   SmallVector<const PreprocessingStructureInterval *, 2> intervals;
 };
 
+enum class HunkRealizerKind {
+  Unknown,
+  TU,
+  Include,
+  Macro,
+};
+
+struct HunkRealizer {
+  HunkRealizerKind kind = HunkRealizerKind::Unknown;
+  uint64_t id = 0;
+
+  bool operator==(const HunkRealizer &other) const {
+    return kind == other.kind && id == other.id;
+  }
+
+  bool operator!=(const HunkRealizer &other) const { return !(*this == other); }
+
+  bool operator<(const HunkRealizer &other) const {
+    if (kind != other.kind)
+      return static_cast<unsigned>(kind) < static_cast<unsigned>(other.kind);
+    return id < other.id;
+  }
+};
+
+enum class PartitionEdgeKind {
+  /// A normal token-producing segment.  These are the only edges that
+  /// become emitted token hunks after normalization.
+  TokenSegment,
+  /// A zero-token source-state owner that sits between two token segments.
+  /// These edges never become token hunks; they are proof-carrying
+  /// separators used to show that the source gap between neighboring
+  /// owners is closed rather than silently skipped.
+  StateGap,
+};
+
+struct PartitionEdge {
+  PartitionEdgeKind kind = PartitionEdgeKind::TokenSegment;
+  uint64_t aStart = 0;
+  uint64_t aEnd = 0;
+  uint64_t bStart = 0;
+  uint64_t bEnd = 0;
+  HunkRealizer realizer;
+  /// True when this token segment is permitted to carry an empty B
+  /// envelope.  Every delete fragment uses the parent's shared empty
+  /// boundary.  A replacement fragment may be empty only when two adjacent
+  /// uniquely projected structural boundaries collapse onto the same B
+  /// boundary.  Arbitrary subranges and insert-only tilings cannot use this
+  /// escape hatch.
+  bool allowEmptyBEnvelope = false;
+  /// Typed physical treatment of a proof-only source gap.  Token segments
+  /// retain `Unknown`; a state gap becomes `PreservedInPlace` only after
+  /// exact lexical ownership, complete byte coverage, and source-order
+  /// separation from both neighboring token segments have all been proved.
+  StructuralGapDisposition gapDisposition = StructuralGapDisposition::Unknown;
+  /// True only for a proof-only gap edge whose exact source interval covers
+  /// protected preprocessing structure.  Ordinary zero-token owners and
+  /// lexer trivia do not satisfy the same-realizer split theorem.
+  bool protectedPreprocessingStructure = false;
+  /// Exact lexical identity carried into the durable generalized witness.
+  /// Token edges leave these fields empty. A producer-unbound directive is
+  /// still recorded with kind `None`; its exact source range remains the
+  /// preservation authority.
+  bool protectedStructureIdentityRecorded = false;
+  StructuralProtectedStructureKind protectedStructureKind =
+      StructuralProtectedStructureKind::Unknown;
+  StructuralProducerIdentityKind producerIdentityKind =
+      StructuralProducerIdentityKind::None;
+  std::optional<uint64_t> producerItemId;
+  std::optional<uint64_t> producerConditionalGroupId;
+  std::optional<uint64_t> producerConditionalArmId;
+  /// Placement proof for a preserved `#define`/`#undef` seam.  See
+  /// `StructuralHunkTilingEdgeWitness::macroStatePlacementInsensitiveProven`
+  /// for what it establishes and where it is validated.
+  bool macroStatePlacementInsensitiveProven = false;
+  std::optional<OwnerClosure> closure;
+
+  bool IsTokenSegment() const {
+    return kind == PartitionEdgeKind::TokenSegment;
+  }
+
+  bool IsStateGap() const { return kind == PartitionEdgeKind::StateGap; }
+};
+
+struct PartitionStateKey {
+  uint64_t bPos = 0;
+  HunkRealizer firstRealizer;
+  HunkRealizer lastRealizer;
+  size_t lastTokenEdgeIndex = std::numeric_limits<size_t>::max();
+  bool mixedRealizers = false;
+  bool preservedPreprocessingStructure = false;
+
+  bool operator<(const PartitionStateKey &other) const {
+    if (bPos != other.bPos)
+      return bPos < other.bPos;
+    if (firstRealizer != other.firstRealizer)
+      return firstRealizer < other.firstRealizer;
+    if (lastRealizer != other.lastRealizer)
+      return lastRealizer < other.lastRealizer;
+    if (lastTokenEdgeIndex != other.lastTokenEdgeIndex)
+      return lastTokenEdgeIndex < other.lastTokenEdgeIndex;
+    if (mixedRealizers != other.mixedRealizers)
+      return mixedRealizers < other.mixedRealizers;
+    return preservedPreprocessingStructure <
+           other.preservedPreprocessingStructure;
+  }
+};
+
+struct PartitionParent {
+  bool valid = false;
+  size_t edgeIndex = 0;
+  PartitionStateKey prev;
+  unsigned cost = 0;
+  // State-gap edges are part of the searched proof graph.  Because they do
+  // not advance A or B token coordinates, they are stored on the transition
+  // that reaches the following token segment rather than as standalone DP
+  // states that would create zero-length cycles.
+  SmallVector<PartitionEdge, 4> stateGapsBeforeEdge;
+  // True once the same DP state can be reached by two distinct minimal
+  // parent chains.  The mixed-owner proof requires a deterministic tiling,
+  // not merely a deterministic tie-breaker, so equal-cost ambiguity is
+  // rejected.
+  bool ambiguous = false;
+};
+
+struct ClosedStateGapTransition {
+  SmallVector<PartitionEdge, 4> gaps;
+  /// True only when the exact preprocessing-structure index found at least
+  /// one protected interval in the physical gap and that interval had one
+  /// unique modeled state-gap owner.
+  bool hasProtectedPreprocessingStructure = false;
+};
+
+struct StructuralPartition {
+  SmallVector<PartitionEdge, 8> edges;
+  StructuralTilingReason reason = StructuralTilingReason::Unknown;
+  /// The partition search or canonical physical-run derivation found one
+  /// and only one admissible minimum-cost path. Equal-cost alternatives
+  /// are rejected before this record is constructed.
+  bool uniquePartition = false;
+  /// Number of canonical maximal physical source runs derived directly
+  /// from the original hunk's A-token mappings. This is nonzero for every
+  /// replacement or deletion whose partition preserves protected source
+  /// structure; historical mixed-realizer tilings with no such seam retain
+  /// zero because they need not be one monotone physical-source cover.
+  uint32_t physicalSourceRunCount = 0;
+  /// Every A token was mapped exactly once, in preprocessing-token order,
+  /// to a complete raw source token, and those mappings formed the
+  /// canonical maximal runs recorded by `physicalSourceRunCount`.
+  bool physicalSourceRunsProven = false;
+  /// The emitted token segments are exactly those maximal runs. Because a
+  /// run boundary exists only at an exact byte-complete protected source
+  /// gap, no partition with fewer emitted fragments can preserve all such
+  /// gaps outside the edits. A combined mixed-realizer partition may carry
+  /// additional token segments inside a run and therefore leave this false.
+  bool uniqueMinimumFragmentPartition = false;
+  /// Ordered unique-boundary projection proofs for each interior canonical
+  /// source-run boundary of a structure-preserving replacement. Delete-only
+  /// partitions use the shared empty-B theorem below instead.
+  SmallVector<StructuralBoundaryProjectionWitness, 8> boundaryProjections;
+  bool uniqueBoundaryProjectionProven = false;
+  /// Every emitted token segment of a delete-only partition carries the
+  /// same empty B-token envelope `[q,q)`.  This is a theorem result, not an
+  /// incidental consequence of initializing edge coordinates from the
+  /// parent hunk.
+  bool sharedEmptyBEnvelopeProven = false;
+  uint64_t sharedEmptyBBoundary = 0;
+  /// Every proof-only state edge in a delete-only partition is an exact
+  /// `PreservedInPlace` interval, and those intervals compose in the same
+  /// physical source order between the emitted token runs.
+  bool preservedStateChainComposed = false;
+  /// Complete physical source-byte cover of the min/max token carrier.
+  /// This is stronger than token-stream composition and is required before
+  /// a later TU segment may use this witness as structural authority.
+  bool sourceByteCoverComplete = false;
+  /// Every proof-only source gap remains physically ordered between the
+  /// same two emitted token carriers that surrounded it in the input.
+  bool preservedGapSourceOrderProven = false;
+  /// No emitted token carrier intersects a gap classified as
+  /// `PreservedInPlace`.
+  bool preservedGapsDisjointFromTokenSegments = false;
+};
+
+/// One maximal A-token run whose mapped spellings occupy one monotone
+/// physical source interval without crossing protected preprocessing
+/// structure.
+struct PhysicalSourceRun {
+  uint64_t aStart = 0;
+  uint64_t aEnd = 0;
+  OwnerSourceRange source;
+  /// Conditional arm owning this run's A tokens, or nullopt when the run is
+  /// not inside any conditional arm.  The run contributed A tokens, so a
+  /// payload committed to it lands in text the producer reached; recording
+  /// the arm is what lets a later theorem check that against the producer's
+  /// own selection fact instead of assuming it.
+  std::optional<uint64_t> condArmId;
+};
+
+/// Canonical physical source partition for one original hunk.
+///
+/// The partition is not a search result.  It is derived by one left-to-
+/// right pass over every A token.  Adjacent tokens remain in the same run
+/// across exact lexer trivia; an exact byte-complete preprocessing-
+/// structure gap terminates the run.  Missing, duplicate, overlapping, or
+/// nonmonotone mappings make this direct structural theorem unavailable.
+struct PhysicalSourceRunPlan {
+  SmallVector<PhysicalSourceRun, 8> runs;
+  /// Exact source gap between `runs[i]` and `runs[i + 1]`.
+  SmallVector<OwnerSourceRange, 8> protectedGaps;
+  /// Producer-recorded content of `protectedGaps[i]`, in source order.
+  ///
+  /// The gap proof establishes that each of these intervals lies wholly
+  /// inside the gap, so this is the complete preprocessing content of that
+  /// gap.  Carrying it forward lets a later theorem ask what a gap contains
+  /// without re-reading source bytes, which is the only form of the
+  /// question that stays correct when the gap belongs to an included header
+  /// rather than to the translation unit.
+  SmallVector<ProtectedGapFacts, 8> protectedGapFacts;
+  /// Exact lower/upper B-token projection for each interior run boundary.
+  /// These records are populated only for replacement hunks and remain in
+  /// the same order as `protectedGaps`.
+  SmallVector<StructuralBoundaryProjectionWitness, 8> boundaryProjections;
+  /// Whether everything committed after `protectedGaps[i]` was proved
+  /// unable to observe the macro-definition state that gap changes.
+  ///
+  /// Populated only for replacement hunks, in the same order as
+  /// `protectedGaps`.  This is the one fact that lets a `#define`/`#undef`
+  /// separator be split rather than handed to the macro-state liveness
+  /// planner, so it is recorded where it is proved and read where the
+  /// deferral is decided, instead of being derived twice.
+  SmallVector<bool, 8> macroStatePlacementProven;
+};
+
+struct SourceOwnerIdentity {
+  std::optional<uint64_t> includeId;
+  std::optional<uint64_t> condArmId;
+};
+
 } // namespace
 
 RefoldMixedOwnerTilingPlanner::RefoldMixedOwnerTilingPlanner(Dependencies deps)
@@ -455,32 +692,6 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
   // the searched graph: they are attached to token-to-token DP transitions,
   // counted in the proof cost, and included in ambiguity detection even though
   // they are not emitted as hunks.
-  enum class HunkRealizerKind {
-    Unknown,
-    TU,
-    Include,
-    Macro,
-  };
-
-  struct HunkRealizer {
-    HunkRealizerKind kind = HunkRealizerKind::Unknown;
-    uint64_t id = 0;
-
-    bool operator==(const HunkRealizer &other) const {
-      return kind == other.kind && id == other.id;
-    }
-
-    bool operator!=(const HunkRealizer &other) const {
-      return !(*this == other);
-    }
-
-    bool operator<(const HunkRealizer &other) const {
-      if (kind != other.kind)
-        return static_cast<unsigned>(kind) < static_cast<unsigned>(other.kind);
-      return id < other.id;
-    }
-  };
-
   auto classifyHunkRealizer = [&](uint64_t aStart,
                                   uint64_t aEnd) -> HunkRealizer {
     if (aEnd <= aStart)
@@ -504,115 +715,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
     return {};
   };
 
-  enum class PartitionEdgeKind {
-    /// A normal token-producing segment.  These are the only edges that
-    /// become emitted token hunks after normalization.
-    TokenSegment,
-    /// A zero-token source-state owner that sits between two token segments.
-    /// These edges never become token hunks; they are proof-carrying
-    /// separators used to show that the source gap between neighboring
-    /// owners is closed rather than silently skipped.
-    StateGap,
-  };
-
-  struct PartitionEdge {
-    PartitionEdgeKind kind = PartitionEdgeKind::TokenSegment;
-    uint64_t aStart = 0;
-    uint64_t aEnd = 0;
-    uint64_t bStart = 0;
-    uint64_t bEnd = 0;
-    HunkRealizer realizer;
-    /// True when this token segment is permitted to carry an empty B
-    /// envelope.  Every delete fragment uses the parent's shared empty
-    /// boundary.  A replacement fragment may be empty only when two adjacent
-    /// uniquely projected structural boundaries collapse onto the same B
-    /// boundary.  Arbitrary subranges and insert-only tilings cannot use this
-    /// escape hatch.
-    bool allowEmptyBEnvelope = false;
-    /// Typed physical treatment of a proof-only source gap.  Token segments
-    /// retain `Unknown`; a state gap becomes `PreservedInPlace` only after
-    /// exact lexical ownership, complete byte coverage, and source-order
-    /// separation from both neighboring token segments have all been proved.
-    StructuralGapDisposition gapDisposition = StructuralGapDisposition::Unknown;
-    /// True only for a proof-only gap edge whose exact source interval covers
-    /// protected preprocessing structure.  Ordinary zero-token owners and
-    /// lexer trivia do not satisfy the same-realizer split theorem.
-    bool protectedPreprocessingStructure = false;
-    /// Exact lexical identity carried into the durable generalized witness.
-    /// Token edges leave these fields empty. A producer-unbound directive is
-    /// still recorded with kind `None`; its exact source range remains the
-    /// preservation authority.
-    bool protectedStructureIdentityRecorded = false;
-    StructuralProtectedStructureKind protectedStructureKind =
-        StructuralProtectedStructureKind::Unknown;
-    StructuralProducerIdentityKind producerIdentityKind =
-        StructuralProducerIdentityKind::None;
-    std::optional<uint64_t> producerItemId;
-    std::optional<uint64_t> producerConditionalGroupId;
-    std::optional<uint64_t> producerConditionalArmId;
-    /// Placement proof for a preserved `#define`/`#undef` seam.  See
-    /// `StructuralHunkTilingEdgeWitness::macroStatePlacementInsensitiveProven`
-    /// for what it establishes and where it is validated.
-    bool macroStatePlacementInsensitiveProven = false;
-    std::optional<OwnerClosure> closure;
-
-    bool IsTokenSegment() const {
-      return kind == PartitionEdgeKind::TokenSegment;
-    }
-
-    bool IsStateGap() const { return kind == PartitionEdgeKind::StateGap; }
-  };
-
   const size_t noTokenEdgeIndex = std::numeric_limits<size_t>::max();
-
-  struct PartitionStateKey {
-    uint64_t bPos = 0;
-    HunkRealizer firstRealizer;
-    HunkRealizer lastRealizer;
-    size_t lastTokenEdgeIndex = std::numeric_limits<size_t>::max();
-    bool mixedRealizers = false;
-    bool preservedPreprocessingStructure = false;
-
-    bool operator<(const PartitionStateKey &other) const {
-      if (bPos != other.bPos)
-        return bPos < other.bPos;
-      if (firstRealizer != other.firstRealizer)
-        return firstRealizer < other.firstRealizer;
-      if (lastRealizer != other.lastRealizer)
-        return lastRealizer < other.lastRealizer;
-      if (lastTokenEdgeIndex != other.lastTokenEdgeIndex)
-        return lastTokenEdgeIndex < other.lastTokenEdgeIndex;
-      if (mixedRealizers != other.mixedRealizers)
-        return mixedRealizers < other.mixedRealizers;
-      return preservedPreprocessingStructure <
-             other.preservedPreprocessingStructure;
-    }
-  };
-
-  struct PartitionParent {
-    bool valid = false;
-    size_t edgeIndex = 0;
-    PartitionStateKey prev;
-    unsigned cost = 0;
-    // State-gap edges are part of the searched proof graph.  Because they do
-    // not advance A or B token coordinates, they are stored on the transition
-    // that reaches the following token segment rather than as standalone DP
-    // states that would create zero-length cycles.
-    SmallVector<PartitionEdge, 4> stateGapsBeforeEdge;
-    // True once the same DP state can be reached by two distinct minimal
-    // parent chains.  The mixed-owner proof requires a deterministic tiling,
-    // not merely a deterministic tie-breaker, so equal-cost ambiguity is
-    // rejected.
-    bool ambiguous = false;
-  };
-
-  struct ClosedStateGapTransition {
-    SmallVector<PartitionEdge, 4> gaps;
-    /// True only when the exact preprocessing-structure index found at least
-    /// one protected interval in the physical gap and that interval had one
-    /// unique modeled state-gap owner.
-    bool hasProtectedPreprocessingStructure = false;
-  };
 
   /// Return whether a preserved transition contains a #define or #undef.
   ///
@@ -643,106 +746,6 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
                      StructuralProtectedStructureKind::MacroUndef;
         });
       };
-
-  struct StructuralPartition {
-    SmallVector<PartitionEdge, 8> edges;
-    StructuralTilingReason reason = StructuralTilingReason::Unknown;
-    /// The partition search or canonical physical-run derivation found one
-    /// and only one admissible minimum-cost path. Equal-cost alternatives
-    /// are rejected before this record is constructed.
-    bool uniquePartition = false;
-    /// Number of canonical maximal physical source runs derived directly
-    /// from the original hunk's A-token mappings. This is nonzero for every
-    /// replacement or deletion whose partition preserves protected source
-    /// structure; historical mixed-realizer tilings with no such seam retain
-    /// zero because they need not be one monotone physical-source cover.
-    uint32_t physicalSourceRunCount = 0;
-    /// Every A token was mapped exactly once, in preprocessing-token order,
-    /// to a complete raw source token, and those mappings formed the
-    /// canonical maximal runs recorded by `physicalSourceRunCount`.
-    bool physicalSourceRunsProven = false;
-    /// The emitted token segments are exactly those maximal runs. Because a
-    /// run boundary exists only at an exact byte-complete protected source
-    /// gap, no partition with fewer emitted fragments can preserve all such
-    /// gaps outside the edits. A combined mixed-realizer partition may carry
-    /// additional token segments inside a run and therefore leave this false.
-    bool uniqueMinimumFragmentPartition = false;
-    /// Ordered unique-boundary projection proofs for each interior canonical
-    /// source-run boundary of a structure-preserving replacement. Delete-only
-    /// partitions use the shared empty-B theorem below instead.
-    SmallVector<StructuralBoundaryProjectionWitness, 8> boundaryProjections;
-    bool uniqueBoundaryProjectionProven = false;
-    /// Every emitted token segment of a delete-only partition carries the
-    /// same empty B-token envelope `[q,q)`.  This is a theorem result, not an
-    /// incidental consequence of initializing edge coordinates from the
-    /// parent hunk.
-    bool sharedEmptyBEnvelopeProven = false;
-    uint64_t sharedEmptyBBoundary = 0;
-    /// Every proof-only state edge in a delete-only partition is an exact
-    /// `PreservedInPlace` interval, and those intervals compose in the same
-    /// physical source order between the emitted token runs.
-    bool preservedStateChainComposed = false;
-    /// Complete physical source-byte cover of the min/max token carrier.
-    /// This is stronger than token-stream composition and is required before
-    /// a later TU segment may use this witness as structural authority.
-    bool sourceByteCoverComplete = false;
-    /// Every proof-only source gap remains physically ordered between the
-    /// same two emitted token carriers that surrounded it in the input.
-    bool preservedGapSourceOrderProven = false;
-    /// No emitted token carrier intersects a gap classified as
-    /// `PreservedInPlace`.
-    bool preservedGapsDisjointFromTokenSegments = false;
-  };
-
-  /// One maximal A-token run whose mapped spellings occupy one monotone
-  /// physical source interval without crossing protected preprocessing
-  /// structure.
-  struct PhysicalSourceRun {
-    uint64_t aStart = 0;
-    uint64_t aEnd = 0;
-    OwnerSourceRange source;
-    /// Conditional arm owning this run's A tokens, or nullopt when the run is
-    /// not inside any conditional arm.  The run contributed A tokens, so a
-    /// payload committed to it lands in text the producer reached; recording
-    /// the arm is what lets a later theorem check that against the producer's
-    /// own selection fact instead of assuming it.
-    std::optional<uint64_t> condArmId;
-  };
-
-  /// Canonical physical source partition for one original hunk.
-  ///
-  /// The partition is not a search result.  It is derived by one left-to-
-  /// right pass over every A token.  Adjacent tokens remain in the same run
-  /// across exact lexer trivia; an exact byte-complete preprocessing-
-  /// structure gap terminates the run.  Missing, duplicate, overlapping, or
-  /// nonmonotone mappings make this direct structural theorem unavailable.
-  struct PhysicalSourceRunPlan {
-    SmallVector<PhysicalSourceRun, 8> runs;
-    /// Exact source gap between `runs[i]` and `runs[i + 1]`.
-    SmallVector<OwnerSourceRange, 8> protectedGaps;
-    /// Producer-recorded content of `protectedGaps[i]`, in source order.
-    ///
-    /// The gap proof establishes that each of these intervals lies wholly
-    /// inside the gap, so this is the complete preprocessing content of that
-    /// gap.  Carrying it forward lets a later theorem ask what a gap contains
-    /// without re-reading source bytes, which is the only form of the
-    /// question that stays correct when the gap belongs to an included header
-    /// rather than to the translation unit.
-    SmallVector<ProtectedGapFacts, 8> protectedGapFacts;
-    /// Exact lower/upper B-token projection for each interior run boundary.
-    /// These records are populated only for replacement hunks and remain in
-    /// the same order as `protectedGaps`.
-    SmallVector<StructuralBoundaryProjectionWitness, 8> boundaryProjections;
-    /// Whether everything committed after `protectedGaps[i]` was proved
-    /// unable to observe the macro-definition state that gap changes.
-    ///
-    /// Populated only for replacement hunks, in the same order as
-    /// `protectedGaps`.  This is the one fact that lets a `#define`/`#undef`
-    /// separator be split rather than handed to the macro-state liveness
-    /// planner, so it is recorded where it is proved and read where the
-    /// deferral is decided, instead of being derived twice.
-    SmallVector<bool, 8> macroStatePlacementProven;
-  };
 
   std::set<uint64_t> duplicateTokmapPP;
   std::set<uint64_t> seenTokmapPP;
@@ -853,11 +856,6 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
                                       uint64_t end) {
     return gap.IsComplete() && deps_.pathIdentity.PathsEqual(gap.path, file) &&
            gap.begin <= begin && begin <= end && end <= gap.end;
-  };
-
-  struct SourceOwnerIdentity {
-    std::optional<uint64_t> includeId;
-    std::optional<uint64_t> condArmId;
   };
 
   auto resolveSourceOwnerIdentity =
