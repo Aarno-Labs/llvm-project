@@ -9,6 +9,7 @@
 #include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
 #include "edit/RefoldTUEditPlanner.h"
+#include "proof/RefoldAcceptedResultPredicates.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldStructuralHunkTilingProof.h"
 #include "proof/RefoldWitnessTrace.h"
@@ -300,6 +301,13 @@ void RefoldOwnerRealizationProofBuilder::AttachLineControlObserverWitness(
 
   candidate.hasLineControlObserverWitness = true;
   candidate.lineControlObserverWitness = std::move(witness);
+}
+
+void RefoldOwnerRealizationProofBuilder::AttachStandardWitnesses(
+    AcceptedResultCandidate &candidate) const {
+  AttachLineControlObserverWitness(candidate);
+  AttachCounterStateWitness(candidate);
+  RefreshAcceptedCandidateEmissionPathInventory(candidate);
 }
 
 void RefoldOwnerRealizationProofBuilder::AttachCounterStateWitness(

@@ -3986,11 +3986,8 @@ RefoldTextEditAssembler::BuildDirectTUHunkTextEdit(
       .AttachMixedOwnerTilingWitnessForTokenEnvelope(
           candidate.proofSummary, plan->hunk.aStart, plan->hunk.aEnd,
           plan->hunk.bStart, plan->hunk.bEnd);
-  proofLattice_.OwnerRealizationProofBuilder().AttachLineControlObserverWitness(
+  proofLattice_.OwnerRealizationProofBuilder().AttachStandardWitnesses(
       candidate);
-  proofLattice_.OwnerRealizationProofBuilder().AttachCounterStateWitness(
-      candidate);
-  RefreshAcceptedCandidateEmissionPathInventory(candidate);
   AttachAcceptedResultCarrier(edit, candidate);
   return edit;
 }

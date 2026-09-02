@@ -154,23 +154,6 @@ public:
   size_t MaterializedIncludeCount() const;
 
 private:
-  /// Kind of realized work contributed by a TU-root include subtree.
-  ///
-  /// Only genuinely sideband-only owner replay may suppress the ordinary
-  /// line-control wrappers that --with-lines include materialization would
-  /// emit. If the include contributes ordinary PP tokens, macro edits,
-  /// layout-only obligations, or nested ordinary work, replacing its directive
-  /// with header bytes is a real logical file transition and keeps the
-  /// enter/exit wrapper.
-  enum class TUIncludeMaterializationWorkClass {
-    /// The subtree contributes no realized work.
-    None,
-    /// The subtree contributes only sideband pragma replay.
-    SidebandPragmaOnly,
-    /// The subtree contributes ordinary header bytes or layout/proof work.
-    Ordinary
-  };
-
   /// Build parent-to-child include edges once for recursive materialization.
   void BuildChildrenIndex();
 
@@ -310,22 +293,6 @@ private:
 
   /// Refreshes the public expanded-include result set from realized expansions.
   void RebuildExpandedIncludeIds();
-
-  /// Returns whether sideband work in this include forces ordinary #line
-  /// wrappers rather than sideband-only suppression.
-  bool IncludeHasLineDirectiveForcingSidebandWork(uint64_t includeId) const;
-
-  /// Returns whether the include contributes ordinary replay tokens.
-  bool IncludeHasOrdinaryReplayTokens(uint64_t includeId) const;
-
-  /// Returns whether an include subtree's materialized B envelope comes only
-  /// from sideband pragma replay.
-  bool IncludeUsesOnlySidebandReplayEnvelope(uint64_t includeId) const;
-
-  /// Classifies the kind of realized work in an include subtree for final
-  /// line-control wrapper policy.
-  TUIncludeMaterializationWorkClass
-  ClassifyTUIncludeMaterializationWork(uint64_t includeId) const;
 
   /// Returns whether the include subtree contains a layout-only materialization
   /// obligation that source-graph sidecar preservation cannot discharge.

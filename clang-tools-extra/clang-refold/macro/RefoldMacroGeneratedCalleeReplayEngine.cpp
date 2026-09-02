@@ -1652,7 +1652,8 @@ public:
       if (tok.spelling == "##")
         return false;
       if (tok.spelling == "__VA_OPT__") {
-        std::optional<size_t> close = FindVaOptPayloadClose(i, end);
+        std::optional<size_t> close =
+            findVaOptPayloadClose(definition_, i, end);
         if (!close)
           return false;
         GeneratedReplayElem elem;
@@ -1694,37 +1695,6 @@ private:
     piece.isParam = false;
     piece.literal = tok.spelling.str();
     return true;
-  }
-
-  /// Finds the close parenthesis for a canonical `__VA_OPT__(...)` payload.
-  ///
-  /// Generated-callee replay accepts `__VA_OPT__` only as the ordinary
-  /// replacement-list operator recorded by the producer.  The payload is parsed
-  /// recursively by `Parse`, so malformed payload parentheses or unterminated
-  /// payloads reject the generated-callee proof instead of falling through to a
-  /// whole-cover expansion.
-  std::optional<size_t> FindVaOptPayloadClose(size_t vaOptIdx,
-                                              size_t end) const {
-    if (vaOptIdx + 1 >= end ||
-        definition_.replacementTokens[vaOptIdx + 1].kind !=
-            RefoldModel::MacroReplacementTokenKind::Literal ||
-        definition_.replacementTokens[vaOptIdx + 1].spelling != "(")
-      return std::nullopt;
-
-    unsigned depth = 1;
-    size_t close = vaOptIdx + 2;
-    for (; close < end; ++close) {
-      const auto &inner = definition_.replacementTokens[close];
-      if (inner.kind != RefoldModel::MacroReplacementTokenKind::Literal)
-        continue;
-      if (inner.spelling == "(") {
-        ++depth;
-        continue;
-      }
-      if (inner.spelling == ")" && --depth == 0)
-        return close;
-    }
-    return std::nullopt;
   }
 
   const RefoldModel::MacroDirective &definition_;
@@ -3242,7 +3212,8 @@ public:
       if (tok.spelling == "##")
         return false;
       if (tok.spelling == "__VA_OPT__") {
-        std::optional<size_t> close = FindVaOptPayloadClose(i, end);
+        std::optional<size_t> close =
+            findVaOptPayloadClose(definition_, i, end);
         if (!close)
           return false;
         TupleCalleeReplayElem elem;
@@ -3287,37 +3258,6 @@ private:
     piece.isParam = false;
     piece.literal = tok.spelling.str();
     return true;
-  }
-
-  /// Finds the close parenthesis for a canonical `__VA_OPT__(...)` payload.
-  ///
-  /// Tuple replay permits `__VA_OPT__` only as the ordinary replacement-list
-  /// operator recorded by the producer.  The payload is parsed recursively by
-  /// `Parse`, so malformed payload parentheses or unterminated payloads reject
-  /// the tuple-generated proof rather than falling through to whole-cover
-  /// preservation.
-  std::optional<size_t> FindVaOptPayloadClose(size_t vaOptIdx,
-                                              size_t end) const {
-    if (vaOptIdx + 1 >= end ||
-        definition_.replacementTokens[vaOptIdx + 1].kind !=
-            RefoldModel::MacroReplacementTokenKind::Literal ||
-        definition_.replacementTokens[vaOptIdx + 1].spelling != "(")
-      return std::nullopt;
-
-    unsigned depth = 1;
-    size_t close = vaOptIdx + 2;
-    for (; close < end; ++close) {
-      const auto &inner = definition_.replacementTokens[close];
-      if (inner.kind != RefoldModel::MacroReplacementTokenKind::Literal)
-        continue;
-      if (inner.spelling == "(") {
-        ++depth;
-        continue;
-      }
-      if (inner.spelling == ")" && --depth == 0)
-        return close;
-    }
-    return std::nullopt;
   }
 
   const RefoldModel::MacroDirective &definition_;

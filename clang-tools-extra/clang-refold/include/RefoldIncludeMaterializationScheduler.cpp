@@ -10,6 +10,7 @@
 #include "edit/RefoldTextEditAssembler.h"
 #include "include/RefoldIncludeInsertionPlanner.h"
 #include "include/RefoldIncludeMaterializer.h"
+#include "include/RefoldIncludeSubtreeWorkClassifier.h"
 #include "include/RefoldPragmaOnceGuardRewriter.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineObserverLayout.h"
@@ -884,81 +885,6 @@ void RefoldIncludeMaterializationScheduler::RebuildExpandedIncludeIds() {
 }
 
 bool RefoldIncludeMaterializationScheduler::
-    IncludeHasLineDirectiveForcingSidebandWork(uint64_t includeId) const {
-  return llvm::any_of(sidebandPragmaEdits_,
-                      [&](const SidebandPragmaEdit &edit) {
-                        return edit.TargetsInclude(includeId) &&
-                               edit.ForcesIncludeLineDirectiveWrappers();
-                      });
-}
-
-bool RefoldIncludeMaterializationScheduler::IncludeHasOrdinaryReplayTokens(
-    uint64_t includeId) const {
-  if (const RefoldModel::IncludeItem *item = model_.GetIncludeById(includeId))
-    return item->cover.end > item->cover.begin;
-  return false;
-}
-
-bool RefoldIncludeMaterializationScheduler::
-    IncludeUsesOnlySidebandReplayEnvelope(uint64_t includeId) const {
-  bool sawSideband =
-      llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &edit) {
-        return edit.TargetsInclude(includeId);
-      });
-  if (IncludeHasOrdinaryReplayTokens(includeId))
-    return false;
-  if (structuralHunkDispatcher_.HasIncludePatchesFor(includeId))
-    return false;
-  if (structuralHunkDispatcher_.HasFinalMacroPatchesForOwner(
-          std::optional<uint64_t>(includeId)))
-    return false;
-  if (auto childIt = children_.find(includeId); childIt != children_.end()) {
-    for (const RefoldModel::IncludeItem *child : childIt->second) {
-      if (!IncludeUsesOnlySidebandReplayEnvelope(child->id))
-        return false;
-      sawSideband = true;
-    }
-  }
-  return sawSideband;
-}
-
-RefoldIncludeMaterializationScheduler::TUIncludeMaterializationWorkClass
-RefoldIncludeMaterializationScheduler::ClassifyTUIncludeMaterializationWork(
-    uint64_t includeId) const {
-  if (layoutOnlyIncludeMaterializationSeeds_.contains(includeId))
-    return TUIncludeMaterializationWorkClass::Ordinary;
-
-  bool sawSideband =
-      llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &edit) {
-        return edit.TargetsInclude(includeId);
-      });
-  if (IncludeHasLineDirectiveForcingSidebandWork(includeId))
-    return TUIncludeMaterializationWorkClass::Ordinary;
-  if (sawSideband && IncludeHasOrdinaryReplayTokens(includeId))
-    return TUIncludeMaterializationWorkClass::Ordinary;
-  if (structuralHunkDispatcher_.HasIncludePatchesFor(includeId))
-    return TUIncludeMaterializationWorkClass::Ordinary;
-  if (structuralHunkDispatcher_.HasFinalMacroPatchesForOwner(
-          std::optional<uint64_t>(includeId)))
-    return TUIncludeMaterializationWorkClass::Ordinary;
-  if (auto childIt = children_.find(includeId); childIt != children_.end()) {
-    for (const RefoldModel::IncludeItem *child : childIt->second) {
-      switch (ClassifyTUIncludeMaterializationWork(child->id)) {
-      case TUIncludeMaterializationWorkClass::Ordinary:
-        return TUIncludeMaterializationWorkClass::Ordinary;
-      case TUIncludeMaterializationWorkClass::SidebandPragmaOnly:
-        sawSideband = true;
-        break;
-      case TUIncludeMaterializationWorkClass::None:
-        break;
-      }
-    }
-  }
-  return sawSideband ? TUIncludeMaterializationWorkClass::SidebandPragmaOnly
-                     : TUIncludeMaterializationWorkClass::None;
-}
-
-bool RefoldIncludeMaterializationScheduler::
     IncludeSubtreeHasLayoutOnlyMaterializationSeed(uint64_t includeId) const {
   if (layoutOnlyIncludeMaterializationSeeds_.contains(includeId))
     return true;
@@ -1035,9 +961,20 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
   LineDirectiveLocation parentResume =
       LineDirectiveInserter::LogicalLocationAtOffset(
           request_.tuBytes, siteEnd, request_.tuPath, model_, request_.tuPath);
+  // The TU-root wrapper policy asks exactly the questions the include-subtree
+  // work classifier answers, over the same staging buckets the materializer is
+  // handed.  At TU scope the layout-only seeds play the "must expand" role:
+  // such a seed carries no edit of its own, so it is invisible to every other
+  // work source here and still forces ordinary work.
+  const RefoldIncludeSubtreeWorkClassifier subtreeWork(
+      model_,
+      structuralHunkDispatcher_.MutableIncludeEditBucketsForMaterialization(),
+      structuralHunkDispatcher_.FinalMacroPatchesByOwnerForMaterialization(),
+      children_, sidebandPragmaEdits_, &layoutOnlyIncludeMaterializationSeeds_);
   const bool sidebandOnly =
-      ClassifyTUIncludeMaterializationWork(include->id) ==
-      TUIncludeMaterializationWorkClass::SidebandPragmaOnly;
+      subtreeWork.ClassifyMaterializationWork(include->id) ==
+      RefoldIncludeSubtreeWorkClassifier::MaterializationWorkClass::
+          SidebandPragmaOnly;
   const size_t childEntryLineNo =
       includeExpansionStartLineNos_.lookup(include->id);
 
@@ -1092,7 +1029,7 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
   // certify the narrower sideband pragma replay range.
   auto acceptedIt = includeExpansionAcceptedResults_.find(includeId);
   std::optional<std::pair<uint64_t, uint64_t>> sidebandBRange;
-  if (sidebandOnly || IncludeUsesOnlySidebandReplayEnvelope(include->id))
+  if (sidebandOnly || subtreeWork.UsesOnlySidebandReplayEnvelope(include->id))
     sidebandBRange =
         textEditAssembler_.SidebandPragmaMaterializedBByteRangeForInclude(
             include->id);

@@ -249,6 +249,42 @@ isMacroDirectiveVariadicParam(const RefoldModel::MacroDirective &definition,
          definition.defParams[paramIdx].variadic;
 }
 
+/// Return the index of the `)` closing a `__VA_OPT__(...)` payload, or
+/// `std::nullopt` when the operator is not followed by a balanced payload
+/// within `[vaOptIdx, end)`.
+///
+/// `vaOptIdx` indexes the `__VA_OPT__` token itself in
+/// `definition.replacementTokens`; the payload therefore starts at
+/// `vaOptIdx + 2`.  Only literal tokens can open or close the payload, so a
+/// parameter reference spelled `(` cannot alter the nesting depth.
+///
+/// Every generated-callee replay family shares this scan, so a malformed or
+/// unterminated payload rejects that family's proof identically rather than
+/// being read as an operator by one parser and as ordinary text by another.
+inline std::optional<size_t>
+findVaOptPayloadClose(const RefoldModel::MacroDirective &definition,
+                      size_t vaOptIdx, size_t end) {
+  if (vaOptIdx + 1 >= end ||
+      definition.replacementTokens[vaOptIdx + 1].kind !=
+          RefoldModel::MacroReplacementTokenKind::Literal ||
+      definition.replacementTokens[vaOptIdx + 1].spelling != "(")
+    return std::nullopt;
+
+  unsigned depth = 1;
+  for (size_t close = vaOptIdx + 2; close < end; ++close) {
+    const auto &inner = definition.replacementTokens[close];
+    if (inner.kind != RefoldModel::MacroReplacementTokenKind::Literal)
+      continue;
+    if (inner.spelling == "(") {
+      ++depth;
+      continue;
+    }
+    if (inner.spelling == ")" && --depth == 0)
+      return close;
+  }
+  return std::nullopt;
+}
+
 /// Return true when a macro definition accepts a written actual count.
 inline bool
 macroDefinitionAcceptsActualCount(const RefoldModel::MacroDirective &definition,

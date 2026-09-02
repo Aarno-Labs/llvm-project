@@ -24,6 +24,9 @@
 //     observer/state witness on an accepted candidate from the
 //     `ProofSummary` and owner-state facts.
 //   * `AttachCounterStateWitness` — same, for counter-state facts.
+//   * `AttachStandardWitnesses` — both of the above plus the
+//     emission-path inventory refresh they feed, the block every
+//     accepted carrier builder runs once its summary is final.
 //   * `AttachMixedOwnerTilingWitnessForTokenEnvelope` — attach the
 //     strongest matching mixed-owner tiling witness for a token
 //     envelope, folding through the lattice-level preference gate.
@@ -106,6 +109,16 @@ public:
   /// Attach `__COUNTER__` consumption/observer witness facts to an accepted
   /// candidate using only existing proof-summary state.
   void AttachCounterStateWitness(AcceptedResultCandidate &candidate) const;
+
+  /// Attach the observer witnesses every accepted carrier builder recovers from
+  /// its finished proof summary, then refresh the emission-path inventory those
+  /// witnesses feed.
+  ///
+  /// The refresh must follow the attachments: a witness attached late — mixed
+  /// owner tiling after owner realization, for example — adds an overlay path
+  /// the inventory would otherwise miss.  Builders that deliberately recover no
+  /// carrier-local witness state call the refresh alone instead.
+  void AttachStandardWitnesses(AcceptedResultCandidate &candidate) const;
 
   /// Attach the strongest matching mixed-owner tiling witness for the requested
   /// token envelope, folding through the lattice-level preference gate.

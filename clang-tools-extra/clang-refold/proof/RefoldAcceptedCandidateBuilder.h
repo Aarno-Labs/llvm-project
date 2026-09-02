@@ -236,6 +236,16 @@ public:
   BuildAcceptedTerminalCandidate(const TerminalFallbackWitness &witness) const;
 
 private:
+  /// Attach the standard witnesses, then record the finished candidate under
+  /// its builder name in the legacy-authority audit and the witness trace.
+  ///
+  /// Every carrier builder whose candidate is complete at return ends here, so
+  /// the audit name and the trace name cannot drift apart.  Both trailing calls
+  /// are observation-only and must stay that way: per CLAUDE.md a diagnostic
+  /// may expose proof state but never influence it.
+  void FinalizeAcceptedCandidate(AcceptedResultCandidate &candidate,
+                                 llvm::StringRef builderName) const;
+
   Dependencies deps_;
 };
 

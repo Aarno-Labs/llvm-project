@@ -463,10 +463,7 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedMacroCandidate(
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview =
       stringutils::showWsWithClip(patch.replacement, 120);
-  deps_.ownerRealizationProofBuilder.AttachLineControlObserverWitness(
-      candidate);
-  deps_.ownerRealizationProofBuilder.AttachCounterStateWitness(candidate);
-  RefreshAcceptedCandidateEmissionPathInventory(candidate);
+  deps_.ownerRealizationProofBuilder.AttachStandardWitnesses(candidate);
   deps_.theoremAudit.AuditMacroPatchProofForLegacyAuthority(
       patch, "BuildAcceptedMacroCandidate");
   deps_.witnessTrace.TraceWitnessEmitted(
@@ -491,10 +488,7 @@ RefoldAcceptedCandidateBuilder::RecertifyAcceptedMacroCandidateForEmission(
         deps_.macroPatchProofClassifier
             .ValidateEmittedInvocationPreservingProof(patch);
     deps_.proofSummaryBuilder.FinalizeProofSummary(candidate.proofSummary);
-    deps_.ownerRealizationProofBuilder.AttachLineControlObserverWitness(
-        candidate);
-    deps_.ownerRealizationProofBuilder.AttachCounterStateWitness(candidate);
-    RefreshAcceptedCandidateEmissionPathInventory(candidate);
+    deps_.ownerRealizationProofBuilder.AttachStandardWitnesses(candidate);
   }
 
   return candidate;
@@ -654,15 +648,7 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedIncludeCandidate(
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview =
       stringutils::showWsWithClip(patch.insertBytes, 120);
-  deps_.ownerRealizationProofBuilder.AttachLineControlObserverWitness(
-      candidate);
-  deps_.ownerRealizationProofBuilder.AttachCounterStateWitness(candidate);
-  RefreshAcceptedCandidateEmissionPathInventory(candidate);
-  deps_.theoremAudit.AuditAcceptedResultCandidateForLegacyAuthority(
-      candidate, "BuildAcceptedIncludeCandidate");
-  deps_.witnessTrace.TraceWitnessEmitted(
-      deps_.witnessResolver.BuildRefoldWitness(
-          candidate, "BuildAcceptedIncludeCandidate"));
+  FinalizeAcceptedCandidate(candidate, "BuildAcceptedIncludeCandidate");
   return candidate;
 }
 
@@ -693,15 +679,7 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedIncludeRealizationCandidate(
 
   candidate.hasOwnerIncludeId = true;
   candidate.ownerIncludeId = include.id;
-  deps_.ownerRealizationProofBuilder.AttachLineControlObserverWitness(
-      candidate);
-  deps_.ownerRealizationProofBuilder.AttachCounterStateWitness(candidate);
-  RefreshAcceptedCandidateEmissionPathInventory(candidate);
-  deps_.theoremAudit.AuditAcceptedResultCandidateForLegacyAuthority(
-      candidate, "BuildAcceptedIncludeRealizationCandidate");
-  deps_.witnessTrace.TraceWitnessEmitted(
-      deps_.witnessResolver.BuildRefoldWitness(
-          candidate, "BuildAcceptedIncludeRealizationCandidate"));
+  FinalizeAcceptedCandidate(candidate, "BuildAcceptedIncludeRealizationCandidate");
   return candidate;
 }
 
@@ -723,15 +701,7 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedTUTextEditCandidate(
   candidate.end = spanPlan.tuByteEnd;
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview = payloadPreview.str();
-  deps_.ownerRealizationProofBuilder.AttachLineControlObserverWitness(
-      candidate);
-  deps_.ownerRealizationProofBuilder.AttachCounterStateWitness(candidate);
-  RefreshAcceptedCandidateEmissionPathInventory(candidate);
-  deps_.theoremAudit.AuditAcceptedResultCandidateForLegacyAuthority(
-      candidate, "BuildAcceptedTUTextEditCandidate");
-  deps_.witnessTrace.TraceWitnessEmitted(
-      deps_.witnessResolver.BuildRefoldWitness(
-          candidate, "BuildAcceptedTUTextEditCandidate"));
+  FinalizeAcceptedCandidate(candidate, "BuildAcceptedTUTextEditCandidate");
   return candidate;
 }
 
@@ -751,15 +721,7 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedSpecializedTUTextEditCandidate(
   candidate.end = end;
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview = payloadPreview.str();
-  deps_.ownerRealizationProofBuilder.AttachLineControlObserverWitness(
-      candidate);
-  deps_.ownerRealizationProofBuilder.AttachCounterStateWitness(candidate);
-  RefreshAcceptedCandidateEmissionPathInventory(candidate);
-  deps_.theoremAudit.AuditAcceptedResultCandidateForLegacyAuthority(
-      candidate, "BuildAcceptedSpecializedTUTextEditCandidate");
-  deps_.witnessTrace.TraceWitnessEmitted(
-      deps_.witnessResolver.BuildRefoldWitness(
-          candidate, "BuildAcceptedSpecializedTUTextEditCandidate"));
+  FinalizeAcceptedCandidate(candidate, "BuildAcceptedSpecializedTUTextEditCandidate");
   return candidate;
 }
 
@@ -776,16 +738,17 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedTerminalCandidate(
           AcceptedPathKind::TerminalEmitEditedPreprocessedStream,
           /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
           /*includeAnchorWitness=*/nullptr, &witness);
-  deps_.ownerRealizationProofBuilder.AttachLineControlObserverWitness(
-      candidate);
-  deps_.ownerRealizationProofBuilder.AttachCounterStateWitness(candidate);
-  RefreshAcceptedCandidateEmissionPathInventory(candidate);
-  deps_.theoremAudit.AuditAcceptedResultCandidateForLegacyAuthority(
-      candidate, "BuildAcceptedTerminalCandidate");
-  deps_.witnessTrace.TraceWitnessEmitted(
-      deps_.witnessResolver.BuildRefoldWitness(
-          candidate, "BuildAcceptedTerminalCandidate"));
+  FinalizeAcceptedCandidate(candidate, "BuildAcceptedTerminalCandidate");
   return candidate;
+}
+
+void RefoldAcceptedCandidateBuilder::FinalizeAcceptedCandidate(
+    AcceptedResultCandidate &candidate, StringRef builderName) const {
+  deps_.ownerRealizationProofBuilder.AttachStandardWitnesses(candidate);
+  deps_.theoremAudit.AuditAcceptedResultCandidateForLegacyAuthority(candidate,
+                                                                   builderName);
+  deps_.witnessTrace.TraceWitnessEmitted(
+      deps_.witnessResolver.BuildRefoldWitness(candidate, builderName));
 }
 
 } // namespace refold
