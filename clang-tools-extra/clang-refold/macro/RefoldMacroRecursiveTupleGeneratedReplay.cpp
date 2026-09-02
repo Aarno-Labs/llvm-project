@@ -2931,20 +2931,13 @@ RefoldMacroRecursiveTupleGeneratedReplay::BuildObjectSelectorTupleCandidate(
       !rootInvocation.pasteSpans.empty())
     return std::nullopt;
 
-  if (!request.rootDefinition.IsFunctionLikeDefine() ||
-      request.rootDefinition.replacementTokens.size() != 2)
-    return std::nullopt;
-
-  const RefoldModel::MacroReplacementToken &selectorToken =
-      request.rootDefinition.replacementTokens.front();
-  const RefoldModel::MacroReplacementToken &tupleToken =
-      request.rootDefinition.replacementTokens.back();
-  if (selectorToken.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
-      tupleToken.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
-      !selectorToken.paramIndex || !tupleToken.paramIndex ||
-      *selectorToken.paramIndex == *tupleToken.paramIndex ||
-      *selectorToken.paramIndex >= request.invocationArgRanges.size() ||
-      *tupleToken.paramIndex >= request.invocationArgRanges.size())
+  // The root shape is the theorem's own domain claim, so ask the theorem rather
+  // than re-deriving it here.
+  std::optional<ObjectSelectorTupleRootClaim> claim =
+      deps_.generatedCalleeReplayEngine.ClaimObjectSelectorTupleRoot(
+          request.rootDefinition, request.baseInvocationText,
+          request.invocationArgRanges);
+  if (!claim)
     return std::nullopt;
 
   ObjectSelectorTupleGeneratedCalleeReplayContext objectSelectorContext{
@@ -2954,8 +2947,7 @@ RefoldMacroRecursiveTupleGeneratedReplay::BuildObjectSelectorTupleCandidate(
       request.wholeCoverATokens,
       request.bTokenEnvelope,
       request.rootDefinition,
-      *selectorToken.paramIndex,
-      *tupleToken.paramIndex};
+      *claim};
   return deps_.generatedCalleeReplayEngine
       .BuildObjectSelectorTupleGeneratedCalleeReplayCandidate(
           objectSelectorContext);

@@ -320,13 +320,20 @@ private:
 /// Probes generated replay candidates before ordinary occurrence collection.
 ///
 /// The probe owns the higher-order ranking sequence used before ordinary
-/// occurrence collection: direct generated-callee replay, object-selector
-/// tuple replay, paste-derived tuple replay, direct tuple-generated-callee
-/// replay, recursive tuple-generated-callee replay, and finally generated-leaf
-/// fallback.  A miss remains non-terminal and returns
-/// nullopt; ambiguity, unsupported shapes, and unprovable B envelopes continue
-/// to fail closed through the delegated replay engines rather than introducing a
-/// fallback candidate.
+/// occurrence collection, in this order: object-selector tuple replay,
+/// function-selector tuple replay, paste-derived tuple replay, direct
+/// tuple-generated-callee replay, recursive tuple-generated-callee replay,
+/// direct generated-callee replay, paste-derived generated-callee replay, and
+/// finally generated-leaf fallback.
+///
+/// A miss returns nullopt; ambiguity, unsupported shapes, and unprovable B
+/// envelopes continue to fail closed through the delegated replay engines
+/// rather than introducing a fallback candidate.  A miss is *not* by itself a
+/// statement that no theorem owned the root: a theorem that admits a root and
+/// then fails to solve it also returns nullopt here, and the caller separately
+/// consults that theorem's domain claim -- see
+/// `RefoldMacroGeneratedCalleeReplayEngine::ClaimObjectSelectorTupleRoot` --
+/// before letting ordinary args-only replay take the case.
 /// Root facts shared by the higher-order generated-replay theorems.
 ///
 /// Every theorem in the probe needs the same four producer facts before it may

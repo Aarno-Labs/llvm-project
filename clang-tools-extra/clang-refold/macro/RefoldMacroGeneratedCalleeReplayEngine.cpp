@@ -3027,7 +3027,7 @@ bool addObjectSelectorReplacement(
   if (oldAliasHops == 0) {
     if (oldSelector.trim() == candidateDefinition.name)
       return true;
-    candidate.replacementsByRootArgIdx[ctx.selectorArgIdx] =
+    candidate.replacementsByRootArgIdx[ctx.rootClaim.selectorArgIdx] =
         candidateDefinition.name.str();
     return true;
   }
@@ -3062,7 +3062,7 @@ bool addObjectSelectorReplacement(
   if (!uniqueSelector)
     return false;
   candidate.objectAliasHopCount += uniqueAliasHops;
-  candidate.replacementsByRootArgIdx[ctx.selectorArgIdx] =
+  candidate.replacementsByRootArgIdx[ctx.rootClaim.selectorArgIdx] =
       std::move(*uniqueSelector);
   return true;
 }
@@ -5559,15 +5559,75 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
   return patch;
 }
 
+std::optional<ObjectSelectorTupleRootClaim>
+RefoldMacroGeneratedCalleeReplayEngine::ClaimObjectSelectorTupleRoot(
+    const RefoldModel::MacroDirective &rootDefinition,
+    StringRef baseInvocationText,
+    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const {
+  if (!rootDefinition.IsFunctionLikeDefine() ||
+      rootDefinition.replacementTokens.size() != 2)
+    return std::nullopt;
+
+  const RefoldModel::MacroReplacementToken &selectorToken =
+      rootDefinition.replacementTokens.front();
+  const RefoldModel::MacroReplacementToken &tupleToken =
+      rootDefinition.replacementTokens.back();
+  if (selectorToken.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+      tupleToken.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+      !selectorToken.paramIndex || !tupleToken.paramIndex ||
+      *selectorToken.paramIndex == *tupleToken.paramIndex)
+    return std::nullopt;
+
+  ObjectSelectorTupleRootClaim claim;
+  claim.selectorArgIdx = *selectorToken.paramIndex;
+  claim.tupleArgIdx = *tupleToken.paramIndex;
+  if (claim.selectorArgIdx >= invocationArgRanges.size() ||
+      claim.tupleArgIdx >= invocationArgRanges.size())
+    return std::nullopt;
+
+  const auto selectorRange = invocationArgRanges[claim.selectorArgIdx];
+  const auto tupleRange = invocationArgRanges[claim.tupleArgIdx];
+  if (selectorRange.second < selectorRange.first ||
+      selectorRange.second > baseInvocationText.size() ||
+      tupleRange.second < tupleRange.first ||
+      tupleRange.second > baseInvocationText.size())
+    return std::nullopt;
+
+  StringRef selectorText =
+      baseInvocationText.slice(selectorRange.first, selectorRange.second)
+          .trim();
+  if (selectorText.empty())
+    return std::nullopt;
+
+  StringRef tupleText =
+      baseInvocationText.slice(tupleRange.first, tupleRange.second).trim();
+  // A one-character actual cannot both open and close the tuple, so the size
+  // guard is implied here; it is restated so the solver's `drop_front()` /
+  // `drop_back()` precondition is visible at the claim that establishes it.
+  if (!tupleText.starts_with("(") || !tupleText.ends_with(")") ||
+      tupleText.size() < 2)
+    return std::nullopt;
+
+  claim.selectorCalleeDefinition =
+      deps_.resolveFunctionLikeMacroThroughAliasesWithHops(
+          selectorText, &claim.selectorAliasHops);
+  if (!claim.selectorCalleeDefinition ||
+      !claim.selectorCalleeDefinition->functionLike)
+    return std::nullopt;
+
+  return claim;
+}
 
 std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
     BuildObjectSelectorTupleGeneratedCalleeReplayCandidate(
         const ObjectSelectorTupleGeneratedCalleeReplayContext &ctx) const {
+  // Admission is already discharged: `ctx.rootClaim` was established by
+  // `ClaimObjectSelectorTupleRoot` at the ranking site, so this method owns
+  // only solving obligations.  A miss below means the theorem owns this root
+  // and could not prove a patch for it; the caller turns that into a
+  // fail-closed refusal rather than a fall-through.
   if (ctx.wholeCoverATokens.first >= ctx.wholeCoverATokens.second ||
-      ctx.bTokenEnvelope.first >= ctx.bTokenEnvelope.second ||
-      ctx.selectorArgIdx >= ctx.invocationArgRanges.size() ||
-      ctx.tupleArgIdx >= ctx.invocationArgRanges.size() ||
-      ctx.selectorArgIdx == ctx.tupleArgIdx)
+      ctx.bTokenEnvelope.first >= ctx.bTokenEnvelope.second)
     return std::nullopt;
 
   SmallVector<std::string, 8> rootActuals;
@@ -5580,25 +5640,17 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
         ctx.baseInvocationText.slice(range.first, range.second).trim().str());
   }
 
-  StringRef oldSelector = StringRef(rootActuals[ctx.selectorArgIdx]).trim();
-  if (oldSelector.empty())
-    return std::nullopt;
-
-  uint32_t oldAliasHops = 0;
+  StringRef oldSelector =
+      StringRef(rootActuals[ctx.rootClaim.selectorArgIdx]).trim();
+  const uint32_t oldAliasHops = ctx.rootClaim.selectorAliasHops;
   const RefoldModel::MacroDirective *oldCalleeDefinition =
-      deps_.resolveFunctionLikeMacroThroughAliasesWithHops(oldSelector,
-                                                           &oldAliasHops);
-  if (!oldCalleeDefinition || !oldCalleeDefinition->functionLike ||
-      oldCalleeDefinition->defParams.empty())
+      ctx.rootClaim.selectorCalleeDefinition;
+  if (oldCalleeDefinition->defParams.empty())
     return std::nullopt;
 
-  const auto tupleRange = ctx.invocationArgRanges[ctx.tupleArgIdx];
-  StringRef tupleArgText = ctx.baseInvocationText
-                               .slice(tupleRange.first, tupleRange.second)
-                               .trim();
-  if (!tupleArgText.starts_with("(") || !tupleArgText.ends_with(")") ||
-      tupleArgText.size() < 2)
-    return std::nullopt;
+  const auto tupleRange = ctx.invocationArgRanges[ctx.rootClaim.tupleArgIdx];
+  StringRef tupleArgText =
+      ctx.baseInvocationText.slice(tupleRange.first, tupleRange.second).trim();
 
   StringRef tuplePayload = tupleArgText.drop_front().drop_back();
   SmallVector<TupleElementSlice, 8> tupleElements;
@@ -5690,7 +5742,7 @@ std::optional<MacroPatch> RefoldMacroGeneratedCalleeReplayEngine::
       continue;
 
     if (tupleArgText.trim() != StringRef(*rewrittenTupleArg).trim()) {
-      candidate.replacementsByRootArgIdx[ctx.tupleArgIdx] =
+      candidate.replacementsByRootArgIdx[ctx.rootClaim.tupleArgIdx] =
           StringRef(*rewrittenTupleArg).trim().str();
     }
 

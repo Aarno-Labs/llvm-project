@@ -100,34 +100,6 @@ makeOriginalDefinitionReplayedStandardArgSpanRepair(
   return result;
 }
 
-
-/// Return true when `definition` is the direct selector/tuple forwarder shape
-/// whose replacement list is exactly two distinct formals: a generated-callee
-/// selector followed by one tuple actual.  This helper is deliberately limited
-/// to the same source-level shape as object-selector tuple replay, so ordinary
-/// standard args-only replay is not restricted for unrelated macros.
-bool isDirectSelectorTupleForwarder(
-    const RefoldModel::MacroDirective &definition, uint32_t &selectorArgIdx,
-    uint32_t &tupleArgIdx) {
-  if (!definition.IsFunctionLikeDefine() ||
-      definition.replacementTokens.size() != 2)
-    return false;
-
-  const RefoldModel::MacroReplacementToken &selectorToken =
-      definition.replacementTokens.front();
-  const RefoldModel::MacroReplacementToken &tupleToken =
-      definition.replacementTokens.back();
-  if (selectorToken.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
-      tupleToken.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
-      !selectorToken.paramIndex || !tupleToken.paramIndex ||
-      *selectorToken.paramIndex == *tupleToken.paramIndex)
-    return false;
-
-  selectorArgIdx = *selectorToken.paramIndex;
-  tupleArgIdx = *tupleToken.paramIndex;
-  return true;
-}
-
 /// Return a trimmed invocation argument slice from an already parsed invocation
 /// layout.  The byte ranges are relative to `baseInvocationText`.
 std::optional<StringRef> sliceInvocationArgumentText(
@@ -829,50 +801,23 @@ std::optional<MacroPatch> tryBuildGeneratedVaOptStringifyPayloadActivationPatch(
       /*decodedStringLiteralEvidenceOnly=*/true);
   return patch;
 }
-
-/// Return true when `child` is the generated function-like callee that consumes
-/// the root selector formal and obtains its terminal actuals from the root tuple
-/// formal.  Object-selector replay has already had first right of refusal; this
-/// predicate only identifies the situation where ordinary args-only replay would
-/// otherwise preserve a stale selector after an unhandled generated-callee body
-/// edit.
-bool isSelectorTupleGeneratedCalleeChild(
-    const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
-    const RefoldModel::MacroInvocation &child, uint32_t selectorArgIdx,
-    uint32_t tupleArgIdx) {
-  if (child.subkind != "func" ||
-      child.calleeOrigin.kind != MacroCalleeOriginKind::CallerParam ||
-      !llvm::is_contained(child.calleeOrigin.callerParamIndices,
-                          selectorArgIdx) ||
-      child.argTupleRefs.empty())
-    return false;
-
-  const RefoldModel::MacroDirective *definition =
-      getDefinitionDirectiveForInvocation(deps.model, child);
-  if (!definition || !definition->functionLike)
-    return false;
-
-  bool sawTupleActualRef = false;
-  for (ArrayRef<RefoldModel::TupleArgRef> refs : child.argTupleRefs) {
-    if (refs.empty())
-      return false;
-    for (const RefoldModel::TupleArgRef &ref : refs) {
-      if (ref.callerParamIndex != tupleArgIdx)
-        return false;
-      sawTupleActualRef = true;
-    }
-  }
-  return sawTupleActualRef;
-}
-
 /// Return true if a token hunk inside the root whole-cover is outside the
 /// tuple-formal occurrences that ordinary args-only replay can update.
 ///
-/// For `f t` generated-callee roots, such a hunk is a callee-body or callee
-/// identity effect, not a tuple payload edit.  If object-selector tuple replay
-/// has already failed to prove a replacement selector for that effect, allowing
-/// ordinary args-only replay to continue would preserve the old selector and
-/// silently emit a source spelling that preprocesses to the wrong stream.
+/// This is the residual *solving-side* question that survives the
+/// admission/solving split, and it is deliberately not part of the theorem's
+/// domain claim.  Once the object-selector/tuple theorem has admitted a root
+/// and failed to prove a patch, ordinary args-only replay may still take the
+/// case -- but only when every edit inside the whole cover lands in the tuple
+/// formal it is able to rewrite.  A hunk outside that formal is a callee-body
+/// or callee-identity effect, so args-only would preserve the old selector and
+/// emit source that preprocesses to the wrong stream.
+///
+/// Removing this check does not merely refuse more: it refuses roots whose
+/// edits are entirely attributable to the tuple actual, where args-only
+/// produces a correct, selector-preserving fold.  See
+/// selector_tuple_contained_tuple_edit_still_folds.c, which fails when this
+/// condition is dropped.
 bool hasWholeCoverHunkOutsideTupleArgument(
     const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
     const RefoldModel::MacroInvocation &invocation, uint32_t tupleArgIdx,
@@ -901,63 +846,6 @@ bool hasWholeCoverHunkOutsideTupleArgument(
       return true;
   }
   return false;
-}
-
-/// After higher-order selector/tuple replay declines, reject ordinary
-/// args-only replay for selector-generated callees when the edited whole-cover
-/// still contains a non-tuple hunk.
-///
-/// This is a narrow fail-closed soundness gate, not the broad hunk-coverage
-/// guard that previously regressed unrelated tests.  It applies only to roots
-/// shaped like `f t`, where `f` resolves to a generated function-like callee and
-/// the child callee records tuple-element provenance from `t`.  In that shape,
-/// an unhandled non-tuple hunk means no visible selector macro could reproduce
-/// the edited generated-callee body.  The only sound result is therefore to let
-/// the existing whole-cover fallback materialize the expansion.
-bool shouldRejectOrdinaryArgsOnlyAfterSelectorTupleReplayMiss(
-    const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
-    const RefoldModel::MacroInvocation &invocation,
-    const RefoldModel::MacroDirective &rootDefinition,
-    StringRef baseInvocationText,
-    ArrayRef<std::pair<size_t, size_t>> invocationArgRanges,
-    ArrayRef<RefoldModel::PPArgSpan> standardArgSpans) {
-  uint32_t selectorArgIdx = 0;
-  uint32_t tupleArgIdx = 0;
-  if (!isDirectSelectorTupleForwarder(rootDefinition, selectorArgIdx,
-                                      tupleArgIdx) ||
-      selectorArgIdx >= invocationArgRanges.size() ||
-      tupleArgIdx >= invocationArgRanges.size())
-    return false;
-
-  std::optional<StringRef> selectorText = sliceInvocationArgumentText(
-      baseInvocationText, invocationArgRanges, selectorArgIdx);
-  std::optional<StringRef> tupleText = sliceInvocationArgumentText(
-      baseInvocationText, invocationArgRanges, tupleArgIdx);
-  if (!selectorText || selectorText->empty() || !tupleText ||
-      !tupleText->starts_with("(") || !tupleText->ends_with(")"))
-    return false;
-
-  uint32_t selectorAliasHops = 0;
-  const RefoldModel::MacroDirective *oldCallee =
-      deps.resolveFunctionLikeMacroThroughAliasesWithHops(*selectorText,
-                                                          &selectorAliasHops);
-  if (!oldCallee || !oldCallee->functionLike)
-    return false;
-
-  bool sawSelectorTupleGeneratedCallee = false;
-  for (const RefoldModel::MacroInvocation *child :
-       deps.macroTopology.MacroChildrenOf(invocation.id)) {
-    if (child && isSelectorTupleGeneratedCalleeChild(
-                     deps, *child, selectorArgIdx, tupleArgIdx)) {
-      sawSelectorTupleGeneratedCallee = true;
-      break;
-    }
-  }
-  if (!sawSelectorTupleGeneratedCallee)
-    return false;
-
-  return hasWholeCoverHunkOutsideTupleArgument(deps, invocation, tupleArgIdx,
-                                               standardArgSpans);
 }
 
 /// Repairs recorded standard arg-span formal indices through the immutable
@@ -1164,12 +1052,32 @@ RefoldMacroStandardArgsOnlyPatchBuilder::BuildStandardArgsOnlyPatch(
                                                           invArgRanges))
     return higherOrderGeneratedPatch;
 
+  // A theorem that admits a root and then fails to prove a patch for it owns
+  // that root, and ordinary args-only replay must not silently take it over.
+  // For an object-selector/tuple forwarder `f t`, args-only would rewrite the
+  // tuple actual while preserving the old selector spelling, emitting source
+  // that preprocesses to a stream the edit never asked for.
+  //
+  // The claim consulted is the theorem's own, not a second coding of it: the
+  // gate this replaced re-derived the shape independently -- a distinct root
+  // parse, alias walk and topology scan -- and could disagree with the theorem
+  // about which roots were in scope.  Admission is now stated once.
+  //
+  // Ownership alone is not the whole rule, though.  `hasWholeCoverHunkOutside-
+  // TupleArgument` is the residual solving-side condition: when every edit in
+  // the whole cover lands inside the tuple formal args-only can rewrite, the
+  // old selector is still correct and args-only produces a sound, tight fold.
+  // Refusing those too costs real refolds and buys no soundness -- see
+  // selector_tuple_contained_tuple_edit_still_folds.c.
   if (const RefoldModel::MacroDirective *rootDefinition =
           getDefinitionDirectiveForInvocation(deps_.model, m)) {
-    if (shouldRejectOrdinaryArgsOnlyAfterSelectorTupleReplayMiss(
-            deps_, m, *rootDefinition, baseInvText, invArgRanges,
-            standardArgSpans))
-      return std::nullopt;
+    if (std::optional<ObjectSelectorTupleRootClaim> selectorTupleClaim =
+            deps_.generatedCalleeReplayEngine.ClaimObjectSelectorTupleRoot(
+                *rootDefinition, baseInvText, invArgRanges)) {
+      if (hasWholeCoverHunkOutsideTupleArgument(
+              deps_, m, selectorTupleClaim->tupleArgIdx, standardArgSpans))
+        return std::nullopt;
+    }
   }
 
   RefoldMacroOccurrenceReplay occurrenceReplay = OccurrenceReplay();

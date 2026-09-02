@@ -233,6 +233,24 @@ struct FunctionSelectorTupleGeneratedCalleeReplayContext {
   /// Macro definition at the function-selector/tuple replay root.
   const RefoldModel::MacroDirective &rootDefinition;
 };
+/// Root facts that place an invocation inside the object-selector/tuple
+/// generated-callee theorem's domain.
+///
+/// The claim is the theorem's answer to "is this case mine?", separately from
+/// "here is the proven patch."  It is deliberately shallow: it names the source
+/// surface the theorem would edit and the callee that surface selects, and it
+/// proves nothing about whether that edit is realizable.
+struct ObjectSelectorTupleRootClaim {
+  /// Root formal index holding the selector actual.
+  uint32_t selectorArgIdx = 0;
+  /// Root formal index holding the parenthesized tuple actual.
+  uint32_t tupleArgIdx = 0;
+  /// Visible function-like definition the selector actual resolves to.  Never
+  /// null in a returned claim.
+  const RefoldModel::MacroDirective *selectorCalleeDefinition = nullptr;
+  /// Object-like alias hops consumed while resolving the selector actual.
+  uint32_t selectorAliasHops = 0;
+};
 
 /// Explicit root state for object-selector tuple generated-callee replay.
 ///
@@ -255,10 +273,12 @@ struct ObjectSelectorTupleGeneratedCalleeReplayContext {
   const std::pair<size_t, size_t> &bTokenEnvelope;
   /// Macro definition at the object-selector/tuple replay root.
   const RefoldModel::MacroDirective &rootDefinition;
-  /// Root formal index containing the selector actual.
-  uint32_t selectorArgIdx = 0;
-  /// Root formal index containing the parenthesized tuple actual.
-  uint32_t tupleArgIdx = 0;
+  /// Admission facts for this root, established once by
+  /// `ClaimObjectSelectorTupleRoot` before the context is built.  Carrying the
+  /// claim rather than re-deriving it keeps the selector alias walk to one per
+  /// root and removes any chance of the ranking site and the solver disagreeing
+  /// about which formals they are talking about.
+  ObjectSelectorTupleRootClaim rootClaim;
 };
 
 /// Request for solving one already-composed terminal generated callee.
@@ -374,6 +394,38 @@ public:
   std::optional<MacroPatch>
   BuildFunctionSelectorTupleGeneratedCalleeReplayCandidate(
       const FunctionSelectorTupleGeneratedCalleeReplayContext &ctx) const;
+
+  /// Claim \p rootDefinition for the object-selector/tuple generated-callee
+  /// theorem, or return nullopt when the root is outside its domain.
+  ///
+  /// This is the theorem's domain claim, stated once and consulted by three
+  /// parties: the theorem's own candidate builder, the recursive-tuple family
+  /// entry point that ranks it, and ordinary standard args-only replay, which
+  /// must not take a case this theorem owns.  Stating it once is what keeps
+  /// those three from drifting apart.
+  ///
+  /// The domain is exactly the source-level shape the theorem edits:
+  ///
+  ///   * \p rootDefinition is a function-like `#define` whose replacement list
+  ///     is exactly two parameter references to distinct formals -- the `f t`
+  ///     selector/tuple forwarder;
+  ///   * both formals index a recorded invocation argument range;
+  ///   * the selector actual is non-empty and resolves, through the replay-safe
+  ///     object-like alias chain, to a visible function-like `#define`;
+  ///   * the tuple actual is parenthesized.
+  ///
+  /// Everything else this theorem needs -- a non-degenerate whole cover and B
+  /// envelope, a callee arity matching the tuple element count, a solvable old
+  /// expansion, and a unique replacement callee -- is a *solving* obligation,
+  /// discharged in
+  /// `BuildObjectSelectorTupleGeneratedCalleeReplayCandidate`.  Those are
+  /// deliberately outside the claim: failing one of them means this theorem
+  /// owns the case and could not prove it, which must fail closed rather than
+  /// release the root to a theorem that would preserve the old selector.
+  std::optional<ObjectSelectorTupleRootClaim> ClaimObjectSelectorTupleRoot(
+      const RefoldModel::MacroDirective &rootDefinition,
+      llvm::StringRef baseInvocationText,
+      llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
 
   /// Build the object-selector tuple generated-callee replay candidate. Returns
   /// nullopt for a non-terminal miss.
