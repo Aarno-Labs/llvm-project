@@ -12,12 +12,10 @@
 
 #include "edit/RefoldTUAnchorProof.h"
 
+#include "proof/RefoldAcceptedResultPredicates.h"
 #include "proof/RefoldTheoremAudit.h"
 
 #include "llvm/Support/FormatVariadic.h"
-
-#include <cassert>
-#include <utility>
 
 using namespace llvm;
 
@@ -180,169 +178,28 @@ validateTUAnchorProof(AcceptedPathKind currentPath,
 
 namespace {
 
-void configureTUAnchorProofSummary(ProofSummary &summary) {
-  summary.theoremClass = TheoremProofClass::DirectivePreservingProof;
-  summary.acceptedClass = AcceptedProofClass::TUAnchor;
-  summary.realizationMode = RealizationMode::PreserveOriginalStructure;
-  summary.preference = SelectionPreference::PreferExactAnchoring;
-  summary.surfaceDisposition = SurfaceDisposition::None;
-  summary.structurePreserving = true;
-  summary.primaryProofClassExplicit = true;
-}
-
-GlobalSelectionLattice
-buildTUAnchorSelectionLattice(const ProofSummary &summary) {
-  GlobalSelectionLattice lattice;
-  switch (summary.inventory.currentPath) {
-  case AcceptedPathKind::TUExactSlotBoundary:
-  case AcceptedPathKind::TUProvableInsertionAnchor:
-    lattice.domain = LatticeConflictDomain::TUAnchorPoint;
-    lattice.mergeLaw = LatticeMergeLaw::SelectSingleWitness;
-    lattice.conflictLaw = LatticeConflictLaw::PreferExactAnchorWitness;
-    break;
-  case AcceptedPathKind::Unknown:
-  case AcceptedPathKind::MacroArgsOnlyStandard:
-  case AcceptedPathKind::MacroArgsOnlyPasteSingle:
-  case AcceptedPathKind::MacroArgsOnlyPasteMulti:
-  case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
-  case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
-  case AcceptedPathKind::MacroDirectCalleeSubstitution:
-  case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
-  case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
-  case AcceptedPathKind::MacroDagSubtreeRoot:
-  case AcceptedPathKind::MacroCallChainSuffix:
-  case AcceptedPathKind::MacroCounterLiteral:
-  case AcceptedPathKind::MacroWholeCoverRealization:
-  case AcceptedPathKind::IncludePatchPendingMaterialization:
-  case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
-  case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
-  case AcceptedPathKind::IncludeInsertChildBoundary:
-  case AcceptedPathKind::IncludeInsertRightNeighborPP:
-  case AcceptedPathKind::IncludeInsertLeftNeighborPP:
-  case AcceptedPathKind::IncludeInsertDeclBoundary:
-  case AcceptedPathKind::IncludeRealizationInlineFromB:
-  case AcceptedPathKind::IncludeMaterializedExpansion:
-  case AcceptedPathKind::TUByteSpanMappedEdit:
-  case AcceptedPathKind::TUByteSpanConservativeEdit:
-  case AcceptedPathKind::TUIncludeClosureEdit:
-  case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
-    break;
-  }
-  return lattice;
-}
-
-CompletenessContract
-buildTUAnchorCompletenessContract(const ProofSummary &summary) {
-  CompletenessContract contract;
-  if (summary.inventory.futureTarget != FutureProofTarget::Unknown &&
-      summary.inventory.support == AcceptanceSupportKind::ExplicitProofBacked) {
-    contract.coverage = CompletenessCoverageKind::DeclaredProofClass;
-    contract.expectation =
-        CompletenessExpectationKind::MustDiscoverDeclaredOrStrongerCompatible;
-    contract.declaredTarget = summary.inventory.futureTarget;
-    contract.countsTowardDeclaredCoverage = true;
-    return contract;
-  }
-  if (summary.inventory.currentPath != AcceptedPathKind::Unknown) {
-    contract.coverage = CompletenessCoverageKind::TransitionalGap;
-    contract.expectation =
-        CompletenessExpectationKind::NoClaimPendingClassClosure;
-    contract.declaredTarget = summary.inventory.futureTarget;
-  }
-  return contract;
-}
-
-TheoremDomainContract
-buildTUAnchorTheoremDomainContract(const ProofSummary &summary) {
-  TheoremDomainContract contract;
-  switch (summary.completeness.coverage) {
-  case CompletenessCoverageKind::DeclaredProofClass:
-    contract.kind = TheoremDomainKind::DeclaredInDomainClass;
-    contract.inDeclaredDomain = true;
-    contract.countsTowardCompleteness =
-        summary.completeness.countsTowardDeclaredCoverage;
-    contract.declaredTarget = summary.completeness.declaredTarget;
-    break;
-  case CompletenessCoverageKind::TransitionalGap:
-    contract.kind = TheoremDomainKind::TransitionalGap;
-    contract.declaredTarget = summary.completeness.declaredTarget;
-    break;
-  case CompletenessCoverageKind::ExplicitOutOfDomainClass:
-    contract.kind = TheoremDomainKind::ExplicitOutOfDomainClass;
-    contract.hasExplicitExclusion = summary.completeness.hasExplicitExclusion;
-    contract.explicitExclusion = summary.completeness.explicitExclusion;
-    contract.declaredTarget = summary.completeness.declaredTarget;
-    break;
-  case CompletenessCoverageKind::Unknown:
-    break;
-  }
-  return contract;
-}
-
-EmittedProof
-buildEmittedProofFromTUAnchorSummary(TheoremProofClass theoremClass,
-                                     const ProofSummary &summary) {
-  EmittedProof proof;
-  proof.theoremClass = theoremClass;
-  proof.discharge = summary.discharge;
-  if (summary.hasTUAnchorWitness)
-    proof.tuAnchor = summary.tuAnchorWitness;
-  return proof;
-}
-
-std::optional<EmittedProof>
-buildCanonicalEmittedTUAnchorProof(const ProofSummary &summary) {
-  if (summary.inventory.currentPath == AcceptedPathKind::Unknown)
-    return std::nullopt;
-  if (summary.inventory.support != AcceptanceSupportKind::ExplicitProofBacked)
-    return std::nullopt;
-  if (summary.theoremClass != TheoremProofClass::DirectivePreservingProof ||
-      !summary.primaryProofClassExplicit)
-    return std::nullopt;
-  if (summary.discharge.status != ProofDischargeStatus::Discharged)
-    return std::nullopt;
-  if (summary.completeness.coverage !=
-          CompletenessCoverageKind::DeclaredProofClass ||
-      summary.theoremDomain.kind != TheoremDomainKind::DeclaredInDomainClass ||
-      !summary.theoremDomain.inDeclaredDomain)
-    return std::nullopt;
-  return buildEmittedProofFromTUAnchorSummary(summary.theoremClass, summary);
-}
-
-void finalizeTUAnchorProofSummary(ProofSummary &summary) {
-  const bool theoremFacing =
-      summary.inventory.currentPath != AcceptedPathKind::Unknown;
-  if (theoremFacing) {
-    const bool hasDeclaredPrimaryClass =
-        summary.theoremClass != TheoremProofClass::Unknown &&
-        summary.primaryProofClassExplicit;
-    if (!hasDeclaredPrimaryClass) {
-      ++summary.discharge.obligationsEvaluated;
-      if (summary.discharge.failedObligation == ProofObligationKind::Unknown)
-        summary.discharge.failedObligation =
-            ProofObligationKind::PrimaryProofClassDeclared;
-      if (summary.discharge.failureReason == ProofFailureReason::None)
-        summary.discharge.failureReason =
-            ProofFailureReason::MissingPrimaryProofClass;
-      summary.discharge.status = ProofDischargeStatus::Rejected;
-    }
-  }
-
-  summary.lattice = buildTUAnchorSelectionLattice(summary);
-  summary.completeness = buildTUAnchorCompletenessContract(summary);
-  summary.theoremDomain = buildTUAnchorTheoremDomainContract(summary);
-  summary.emittedProof = buildCanonicalEmittedTUAnchorProof(summary);
-}
-
-ProofSummary buildAcceptedTUAnchorProofSummary(AcceptedPathKind currentPath,
-                                               const TUAnchorWitness &witness) {
+/// Build the normalized proof summary for a TU insertion anchor.
+///
+/// Only TUExactSlotBoundary and TUProvableInsertionAnchor are TU-anchor paths;
+/// any other path leaves the summary unconfigured, so the shared finalizer
+/// records the missing primary-proof-class obligation and the summary fails
+/// closed with no emitted proof.
+ProofSummary
+buildAcceptedTUAnchorProofSummary(const RefoldProofSummaryBuilder &builder,
+                                  AcceptedPathKind currentPath,
+                                  const TUAnchorWitness &witness) {
   ProofSummary summary;
   summary.inventory = buildTUAnchorAcceptancePathInventory(currentPath);
 
   switch (currentPath) {
   case AcceptedPathKind::TUExactSlotBoundary:
   case AcceptedPathKind::TUProvableInsertionAnchor:
-    configureTUAnchorProofSummary(summary);
+    builder.ConfigureProofSummary(
+        summary, TheoremProofClass::DirectivePreservingProof,
+        AcceptedProofClass::TUAnchor,
+        RealizationMode::PreserveOriginalStructure,
+        SelectionPreference::PreferExactAnchoring, SurfaceDisposition::None,
+        /*structurePreserving=*/true);
     summary.hasTUAnchorWitness = true;
     summary.tuAnchorWitness = witness;
     summary.discharge =
@@ -377,20 +234,16 @@ ProofSummary buildAcceptedTUAnchorProofSummary(AcceptedPathKind currentPath,
     break;
   }
 
-  finalizeTUAnchorProofSummary(summary);
+  builder.FinalizeProofSummary(summary);
   return summary;
-}
-
-void refreshTUAnchorEmissionPathInventory(AcceptedResultCandidate &candidate) {
-  EmissionPathInventory inventory;
-  inventory.Add(EmissionPathKind::TUAnchor);
-  candidate.emissionPaths = std::move(inventory);
 }
 
 } // namespace
 
-RefoldTUAnchorProof::RefoldTUAnchorProof(const RefoldTheoremAudit &theoremAudit)
-    : theoremAudit_(theoremAudit) {}
+RefoldTUAnchorProof::RefoldTUAnchorProof(const RefoldTheoremAudit &theoremAudit,
+                                         ArrayRef<PPTok> bToks)
+    : theoremAudit_(theoremAudit),
+      proofSummaryBuilder_(RefoldProofSummaryBuilder::Dependencies{bToks}) {}
 
 AcceptedResultCandidate RefoldTUAnchorProof::BuildAcceptedTUAnchorCandidate(
     AcceptedPathKind currentPath, const TUAnchorWitness &witness) const {
@@ -400,8 +253,8 @@ AcceptedResultCandidate RefoldTUAnchorProof::BuildAcceptedTUAnchorCandidate(
   // TU anchors are selector candidates for insertion/frontier proofs. Preserve
   // the witness-derived gap/byte position so later diagnostics can report the
   // exact anchor that discharged the path.
-  candidate.proofSummary =
-      buildAcceptedTUAnchorProofSummary(currentPath, witness);
+  candidate.proofSummary = buildAcceptedTUAnchorProofSummary(
+      proofSummaryBuilder_, currentPath, witness);
 
   if (witness.hasPPGap)
     candidate.begin = candidate.end = witness.ppGap;
@@ -457,7 +310,7 @@ AcceptedResultCandidate RefoldTUAnchorProof::BuildAcceptedTUAnchorCandidate(
   // proof summaries that explicitly own those facts, so this builder does not
   // synthesize additional carrier-local witness state while recertifying the
   // selector-visible TU-anchor candidate.
-  refreshTUAnchorEmissionPathInventory(candidate);
+  RefreshAcceptedCandidateEmissionPathInventory(candidate);
   theoremAudit_.AuditAcceptedResultCandidateForLegacyAuthority(
       candidate, "BuildAcceptedTUAnchorCandidate");
   return candidate;

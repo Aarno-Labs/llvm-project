@@ -21,8 +21,6 @@
 //     equivalents (preservation vs. realization).
 //   * `BuildAcceptedTUTextEditCandidate` — TU byte-edit factory.
 //   * `BuildAcceptedTerminalCandidate` — terminal-fallback carrier.
-//   * `RefreshAcceptedCandidateEmissionPathInventory` — refresh the
-//     emission-path inventory on an already-built candidate.
 //   * `BuildMacroSelectionCandidate` /
 //     `FinalizeSelectedMacroPatchForEmission` /
 //     `CertifySelectedMacroPatchCandidate` — selector-carrier
@@ -127,16 +125,6 @@ public:
   MacroSelectionCandidate
   BuildMacroSelectionCandidate(const MacroPatch &patch,
                                bool allowNonTopLevelMacroSelectorFailure) const;
-
-  /// Rebuild the emission-path inventory for one candidate.
-  ///
-  /// The function is intentionally deterministic and side-effect free except
-  /// for the candidate's inventory field. It is called after each builder
-  /// finishes mutating ProofSummary so overlay paths cannot go stale when a
-  /// witness is attached late, such as mixed-owner tiling after owner
-  /// realization.
-  void RefreshAcceptedCandidateEmissionPathInventory(
-      AcceptedResultCandidate &candidate) const;
 
   /// Build an accepted-result candidate for a macro patch.
   ///

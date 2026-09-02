@@ -113,9 +113,11 @@ void RefoldEngine::InitializePreprocessingStructureIndexProvider() {
 
 void RefoldEngine::InitializeTUAnchorProof() {
   // TU-anchor accepted-result construction is a narrow proof service.  Audit
-  // flows through the shared theorem/audit service, while the anchor proof
-  // builder owns only TU-anchor carrier construction.
-  tuAnchorProof_ = std::make_unique<RefoldTUAnchorProof>(TheoremAudit());
+  // flows through the shared theorem/audit service and summary construction
+  // through the shared proof-summary builder, while the anchor proof builder
+  // owns only TU-anchor carrier construction.
+  tuAnchorProof_ =
+      std::make_unique<RefoldTUAnchorProof>(TheoremAudit(), bToks_);
 }
 
 RefoldTUAnchorProof &RefoldEngine::TUAnchorProof() {

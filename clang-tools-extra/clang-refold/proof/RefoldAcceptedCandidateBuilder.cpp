@@ -85,32 +85,6 @@ RefoldAcceptedCandidateBuilder::BuildMacroSelectionCandidate(
   return candidate;
 }
 
-void RefoldAcceptedCandidateBuilder::
-    RefreshAcceptedCandidateEmissionPathInventory(
-        AcceptedResultCandidate &candidate) const {
-  EmissionPathInventory inventory;
-  inventory.Add(PrimaryEmissionPathForCandidateKind(candidate.kind));
-
-  // Mixed-owner tiling and owner realization are theorem/proof overlays that
-  // can be carried by a macro, include, or TU primary emitted surface.  Record
-  // them explicitly so the proof model can force those surviving paths through
-  // the accepted-result gate without treating them as separate primary
-  // surfaces.
-  if (candidate.proofSummary.hasMixedOwnerTilingWitness ||
-      candidate.proofSummary.theoremClass ==
-          TheoremProofClass::MixedOwnerTilingProof) {
-    inventory.Add(EmissionPathKind::MixedOwnerTilingSegment);
-  }
-
-  if (candidate.proofSummary.hasOwnerRealizationWitness ||
-      candidate.proofSummary.theoremClass ==
-          TheoremProofClass::OwnerRealizationProof) {
-    inventory.Add(EmissionPathKind::OwnerRealizationMaterialization);
-  }
-
-  candidate.emissionPaths = std::move(inventory);
-}
-
 ::clang::refold::AcceptedResultCandidate
 RefoldAcceptedCandidateBuilder::BuildAcceptedMacroCandidate(
     const MacroPatch &patch) const {

@@ -19,6 +19,7 @@
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlProof.h"
 #include "macro/RefoldMacroStateProof.h"
+#include "proof/RefoldAcceptedResultPredicates.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofLattice.h"
 #include "proof/RefoldSidebandReplayProof.h"
@@ -3989,8 +3990,7 @@ RefoldTextEditAssembler::BuildDirectTUHunkTextEdit(
       candidate);
   proofLattice_.OwnerRealizationProofBuilder().AttachCounterStateWitness(
       candidate);
-  proofLattice_.AcceptedCandidateBuilder()
-      .RefreshAcceptedCandidateEmissionPathInventory(candidate);
+  RefreshAcceptedCandidateEmissionPathInventory(candidate);
   AttachAcceptedResultCarrier(edit, candidate);
   return edit;
 }

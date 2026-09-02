@@ -7,7 +7,9 @@
 // anchors, classify owners, plan TU byte spans, or participate in
 // accepted-result selection.  Keeping this builder separate lets
 // RefoldTUEditPlanner mint the same TU-anchor proof carriers without depending
-// on RefoldProofLattice.
+// on RefoldProofLattice; the summary/contract construction itself is the
+// shared RefoldProofSummaryBuilder, which is a leaf service and creates no
+// planner/lattice cycle.
 //
 //===----------------------------------------------------------------------===//
 
@@ -15,7 +17,10 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDTUANCHORPROOF_H
 
 #include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldProofSummaryBuilder.h"
+#include "source/RefoldToken.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <optional>
@@ -52,7 +57,10 @@ validateTUAnchorProof(AcceptedPathKind currentPath,
 /// responsible for ranking and theorem-selection behavior.
 class RefoldTUAnchorProof {
 public:
-  explicit RefoldTUAnchorProof(const RefoldTheoremAudit &theoremAudit);
+  /// \p bToks is forwarded to the shared proof-summary builder, whose only
+  /// hard input it is.
+  RefoldTUAnchorProof(const RefoldTheoremAudit &theoremAudit,
+                      llvm::ArrayRef<PPTok> bToks);
 
   /// Build the normalized carrier for a proven TU insertion anchor.
   ///
@@ -66,6 +74,7 @@ public:
 
 private:
   const RefoldTheoremAudit &theoremAudit_;
+  RefoldProofSummaryBuilder proofSummaryBuilder_;
 };
 
 } // namespace refold
