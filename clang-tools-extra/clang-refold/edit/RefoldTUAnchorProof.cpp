@@ -17,6 +17,8 @@
 
 #include "llvm/Support/FormatVariadic.h"
 
+#include <utility>
+
 using namespace llvm;
 
 namespace clang {
@@ -268,31 +270,31 @@ AcceptedResultCandidate RefoldTUAnchorProof::BuildAcceptedTUAnchorCandidate(
   // anchor proof and expose the boundary dimensions to the common witness key
   // without changing anchor selection.
   if (witness.hasPPGap && witness.hasTUByte) {
-    candidate.hasZeroTokenBoundaryWitness = true;
-    candidate.zeroTokenOwnerKind = "tu";
-    candidate.zeroTokenOwnerId = 0;
-    candidate.zeroTokenHasPPGap = true;
-    candidate.zeroTokenPPGap = witness.ppGap;
-    candidate.zeroTokenHasSourceAnchor = true;
-    candidate.zeroTokenSourceAnchor = witness.tuByte;
-    candidate.zeroTokenHasBTokenRange = true;
-    candidate.zeroTokenBTokStart = witness.ppGap;
-    candidate.zeroTokenBTokEnd = witness.ppGap;
-    candidate.zeroTokenProducerProven =
+    ZeroTokenBoundaryWitness zeroToken;
+    zeroToken.ownerKind = "tu";
+    zeroToken.ownerId = 0;
+    zeroToken.hasPPGap = true;
+    zeroToken.ppGap = witness.ppGap;
+    zeroToken.hasSourceAnchor = true;
+    zeroToken.sourceAnchor = witness.tuByte;
+    zeroToken.hasBTokenRange = true;
+    zeroToken.bTokStart = witness.ppGap;
+    zeroToken.bTokEnd = witness.ppGap;
+    zeroToken.producerProven =
         tuAnchorWitnessHasProvableEvidence(witness) || witness.exactPPMatch;
-    candidate.zeroTokenOwnerClosed = true;
-    candidate.zeroTokenLayoutStable = true;
-    candidate.zeroTokenObserversStable = witness.ownerDepthStable ||
-                                         witness.outsideIncludeCoverage ||
-                                         witness.exactPPMatch;
-    candidate.zeroTokenCounterStable = true;
-    candidate.zeroTokenFromTUAnchor = true;
-    candidate.zeroTokenFromIncludeBoundary =
+    zeroToken.ownerClosed = true;
+    zeroToken.layoutStable = true;
+    zeroToken.observersStable = witness.ownerDepthStable ||
+                                witness.outsideIncludeCoverage ||
+                                witness.exactPPMatch;
+    zeroToken.counterStable = true;
+    zeroToken.fromTUAnchor = true;
+    zeroToken.fromIncludeBoundary =
         witness.evidence == TUAnchorEvidenceKind::ZeroTokenIncludeBoundary ||
         witness.evidence == TUAnchorEvidenceKind::IncludeDirectiveBoundary;
-    candidate.zeroTokenFromDirectiveLayoutGap =
+    zeroToken.fromDirectiveLayoutGap =
         witness.evidence == TUAnchorEvidenceKind::ExactSlotBoundary;
-    candidate.zeroTokenBoundarySignature =
+    zeroToken.boundarySignature =
         llvm::formatv("tu-anchor:evidence={0}:slot={1}:{2}:pp_gap={3}:"
                       "byte={4}:left={5}:{6}:right={7}:{8}:outside_include={9}:"
                       "owner_depth={10}",
@@ -303,6 +305,9 @@ AcceptedResultCandidate RefoldTUAnchorProof::BuildAcceptedTUAnchorCandidate(
                       witness.outsideIncludeCoverage ? 1 : 0,
                       witness.ownerDepthStable ? 1 : 0)
             .str();
+
+    candidate.hasZeroTokenBoundaryWitness = true;
+    candidate.zeroTokenBoundaryWitness = std::move(zeroToken);
   }
 
   // TU-anchor candidates preserve only the local zero-token boundary fields.

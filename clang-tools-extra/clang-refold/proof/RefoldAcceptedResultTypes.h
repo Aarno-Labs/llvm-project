@@ -1966,6 +1966,97 @@ struct CounterStateWitness {
   }
 };
 
+/// \brief Producer-path evidence for generated-callee / higher-order replay.
+///
+/// Generated-callee proofs are not ordinary forwarding even when their final
+/// emitted source edit is a root invocation argument rewrite.  The proof
+/// follows a deterministic generated-call chain, optionally through
+/// object-like aliases, then replays the final callee replacement list as a
+/// producer-aware transducer.  Decoded string-literal payloads are recorded
+/// as comparison evidence only; they are never treated as replacement text
+/// unless the path also carries an explicit stringification producer.
+struct GeneratedCalleeReplayWitness {
+  uint64_t rootMacroId = 0;
+  uint64_t finalDirectiveId = 0;
+  uint32_t generatedCallDepth = 0;
+  uint32_t objectAliasHops = 0;
+  bool calleeChainDeterministic = false;
+  bool replacementReplayValidated = false;
+  bool solvedActualsMappedToRoot = false;
+  bool usesForwarding = false;
+  bool usesStringification = false;
+  bool usesPaste = false;
+  bool usesVariadicForwarding = false;
+  bool usesObjectAlias = false;
+  bool decodedStringLiteralEvidenceOnly = false;
+};
+
+/// \brief Producer-path evidence for variadic / comma-elision replay.
+///
+/// Variadic macro repairs are not ordinary forwarding. The same final token
+/// stream can arise by absorbing text into a fixed formal, by making an
+/// omitted pack explicit, by deleting or inserting the source-level separating
+/// comma, or by activating/deactivating an `__VA_OPT__` payload.  This witness
+/// records those distinctions so the common equivalence key never merges
+/// missing, empty, comma-elided, and VA_OPT-mediated repairs by source spelling
+/// alone.
+struct VariadicCommaWitness {
+  uint64_t rootMacroId = 0;
+  uint32_t variadicFormalIndex = 0;
+  bool arityStable = false;
+  bool originalMissing = false;
+  bool originalExplicitEmpty = false;
+  bool originalNonEmpty = false;
+  bool resultMissing = false;
+  bool resultExplicitEmpty = false;
+  bool resultNonEmpty = false;
+  bool literalCommaInActual = false;
+  bool commaInserted = false;
+  bool commaDeleted = false;
+  bool gnuCommaElision = false;
+  bool vaOptPresent = false;
+  bool vaOptOriginallyActive = false;
+  bool vaOptResultActive = false;
+  bool vaOptCommaIntroduced = false;
+  bool vaOptCommaDeleted = false;
+  uint32_t vaOptNodeCount = 0;
+  uint32_t vaOptIncludedCount = 0;
+  std::string producerSignature;
+  std::string packStateSignature;
+};
+
+/// \brief Producer-path evidence for zero-token insertion and boundary-gap
+/// repairs.
+///
+/// A zero-token repair is not justified by nearest-token guessing.  The
+/// anchor must name a producer-proven owner boundary, and the witness records
+/// whether layout, preserved observers, and counter state are known stable.
+/// Different zero-width anchors remain non-equivalent unless these semantic
+/// dimensions match.
+struct ZeroTokenBoundaryWitness {
+  uint64_t ownerId = 0;
+  std::string ownerKind;
+  bool hasPPGap = false;
+  uint64_t ppGap = 0;
+  bool hasSourceAnchor = false;
+  uint64_t sourceAnchor = 0;
+  bool hasBTokenRange = false;
+  uint64_t bTokStart = 0;
+  uint64_t bTokEnd = 0;
+  bool producerProven = false;
+  bool ownerClosed = false;
+  bool layoutStable = false;
+  bool observersStable = false;
+  bool counterStable = false;
+  bool fromEmptyActual = false;
+  bool fromReplacementGap = false;
+  bool fromPairedInsertion = false;
+  bool fromTUAnchor = false;
+  bool fromIncludeBoundary = false;
+  bool fromDirectiveLayoutGap = false;
+  std::string boundarySignature;
+};
+
 /// \brief Normalized wrapper for a concrete accepted result.
 ///
 /// The carrier stays intentionally small and explicit. It holds the
@@ -2016,19 +2107,7 @@ struct AcceptedResultCandidate {
   // root invocation.  They refine witness equivalence without changing the
   // legacy theorem class or selector ordering.
   bool hasGeneratedCalleeReplayWitness = false;
-  uint64_t generatedCalleeRootMacroId = 0;
-  uint64_t generatedCalleeFinalDirectiveId = 0;
-  uint32_t generatedCalleeDepth = 0;
-  uint32_t generatedCalleeObjectAliasHops = 0;
-  bool generatedCalleeChainDeterministic = false;
-  bool generatedCalleeReplacementReplayValidated = false;
-  bool generatedCalleeSolvedActualsMappedToRoot = false;
-  bool generatedCalleeUsesForwarding = false;
-  bool generatedCalleeUsesStringification = false;
-  bool generatedCalleeUsesPaste = false;
-  bool generatedCalleeUsesVariadicForwarding = false;
-  bool generatedCalleeUsesObjectAlias = false;
-  bool generatedCalleeDecodedStringLiteralEvidenceOnly = false;
+  GeneratedCalleeReplayWitness generatedCalleeReplayWitness;
 
   // direct stringification proof facts. These fields are populated only from
   // producer-recorded stringify spans on an already accepted
@@ -2068,28 +2147,7 @@ struct AcceptedResultCandidate {
   // materialization, GNU comma elision, and literal commas inside the
   // variadic actual are separate equivalence dimensions.
   bool hasVariadicCommaWitness = false;
-  uint64_t variadicRootMacroId = 0;
-  uint32_t variadicFormalIndex = 0;
-  bool variadicArityStable = false;
-  bool variadicOriginalMissing = false;
-  bool variadicOriginalExplicitEmpty = false;
-  bool variadicOriginalNonEmpty = false;
-  bool variadicResultMissing = false;
-  bool variadicResultExplicitEmpty = false;
-  bool variadicResultNonEmpty = false;
-  bool variadicLiteralCommaInActual = false;
-  bool variadicCommaInserted = false;
-  bool variadicCommaDeleted = false;
-  bool variadicGnuCommaElision = false;
-  bool variadicVaOptPresent = false;
-  bool variadicVaOptOriginallyActive = false;
-  bool variadicVaOptResultActive = false;
-  bool variadicVaOptCommaIntroduced = false;
-  bool variadicVaOptCommaDeleted = false;
-  uint32_t variadicVaOptNodeCount = 0;
-  uint32_t variadicVaOptIncludedCount = 0;
-  std::string variadicProducerSignature;
-  std::string variadicPackStateSignature;
+  VariadicCommaWitness variadicCommaWitness;
 
   // zero-token / boundary-gap proof facts.  These facts are producer-anchored
   // ownership evidence for insertions whose A-side source width is zero:
@@ -2099,27 +2157,7 @@ struct AcceptedResultCandidate {
   // dimensions rather than treating all zero-width anchors as
   // interchangeable.
   bool hasZeroTokenBoundaryWitness = false;
-  uint64_t zeroTokenOwnerId = 0;
-  std::string zeroTokenOwnerKind;
-  bool zeroTokenHasPPGap = false;
-  uint64_t zeroTokenPPGap = 0;
-  bool zeroTokenHasSourceAnchor = false;
-  uint64_t zeroTokenSourceAnchor = 0;
-  bool zeroTokenHasBTokenRange = false;
-  uint64_t zeroTokenBTokStart = 0;
-  uint64_t zeroTokenBTokEnd = 0;
-  bool zeroTokenProducerProven = false;
-  bool zeroTokenOwnerClosed = false;
-  bool zeroTokenLayoutStable = false;
-  bool zeroTokenObserversStable = false;
-  bool zeroTokenCounterStable = false;
-  bool zeroTokenFromEmptyActual = false;
-  bool zeroTokenFromReplacementGap = false;
-  bool zeroTokenFromPairedInsertion = false;
-  bool zeroTokenFromTUAnchor = false;
-  bool zeroTokenFromIncludeBoundary = false;
-  bool zeroTokenFromDirectiveLayoutGap = false;
-  std::string zeroTokenBoundarySignature;
+  ZeroTokenBoundaryWitness zeroTokenBoundaryWitness;
 
   // line-control / builtin-location observer facts.  These fields are
   // attached after the normal proof summary has been built, and are used only
@@ -2308,31 +2346,6 @@ struct CallChainWitness {
   uint64_t callsiteMacroId = 0;
 };
 
-/// \brief Producer-path evidence for generated-callee / higher-order replay.
-///
-/// Generated-callee proofs are not ordinary forwarding even when their final
-/// emitted source edit is a root invocation argument rewrite.  The proof
-/// follows a deterministic generated-call chain, optionally through
-/// object-like aliases, then replays the final callee replacement list as a
-/// producer-aware transducer.  Decoded string-literal payloads are recorded
-/// as comparison evidence only; they are never treated as replacement text
-/// unless the path also carries an explicit stringification producer.
-struct GeneratedCalleeReplayWitness {
-  uint64_t rootMacroId = 0;
-  uint64_t finalDirectiveId = 0;
-  uint32_t generatedCallDepth = 0;
-  uint32_t objectAliasHops = 0;
-  bool calleeChainDeterministic = false;
-  bool replacementReplayValidated = false;
-  bool solvedActualsMappedToRoot = false;
-  bool usesForwarding = false;
-  bool usesStringification = false;
-  bool usesPaste = false;
-  bool usesVariadicForwarding = false;
-  bool usesObjectAlias = false;
-  bool decodedStringLiteralEvidenceOnly = false;
-};
-
 /// \brief One terminal generated-callee actual bound to a root tuple slice.
 ///
 /// The byte offsets are relative to the source-spelled tuple payload, not the
@@ -2401,72 +2414,6 @@ struct WholeEnvelopeReplayWitness {
   // transducer.  That stronger proof can discharge fixed-body tokens that
   // have no stable A->B token map after a variadic tail becomes empty.
   bool definitionTapeReplayValidated = false;
-};
-
-/// \brief Producer-path evidence for variadic / comma-elision replay.
-///
-/// Variadic macro repairs are not ordinary forwarding. The same final token
-/// stream can arise by absorbing text into a fixed formal, by making an
-/// omitted pack explicit, by deleting or inserting the source-level separating
-/// comma, or by activating/deactivating an `__VA_OPT__` payload.  This witness
-/// records those distinctions so the common equivalence key never merges
-/// missing, empty, comma-elided, and VA_OPT-mediated repairs by source spelling
-/// alone.
-struct VariadicCommaWitness {
-  uint64_t rootMacroId = 0;
-  uint32_t variadicFormalIndex = 0;
-  bool arityStable = false;
-  bool originalMissing = false;
-  bool originalExplicitEmpty = false;
-  bool originalNonEmpty = false;
-  bool resultMissing = false;
-  bool resultExplicitEmpty = false;
-  bool resultNonEmpty = false;
-  bool literalCommaInActual = false;
-  bool commaInserted = false;
-  bool commaDeleted = false;
-  bool gnuCommaElision = false;
-  bool vaOptPresent = false;
-  bool vaOptOriginallyActive = false;
-  bool vaOptResultActive = false;
-  bool vaOptCommaIntroduced = false;
-  bool vaOptCommaDeleted = false;
-  uint32_t vaOptNodeCount = 0;
-  uint32_t vaOptIncludedCount = 0;
-  std::string producerSignature;
-  std::string packStateSignature;
-};
-
-/// \brief Producer-path evidence for zero-token insertion and boundary-gap
-/// repairs.
-///
-/// A zero-token repair is not justified by nearest-token guessing.  The
-/// anchor must name a producer-proven owner boundary, and the witness records
-/// whether layout, preserved observers, and counter state are known stable.
-/// Different zero-width anchors remain non-equivalent unless these semantic
-/// dimensions match.
-struct ZeroTokenBoundaryWitness {
-  uint64_t ownerId = 0;
-  std::string ownerKind;
-  bool hasPPGap = false;
-  uint64_t ppGap = 0;
-  bool hasSourceAnchor = false;
-  uint64_t sourceAnchor = 0;
-  bool hasBTokenRange = false;
-  uint64_t bTokStart = 0;
-  uint64_t bTokEnd = 0;
-  bool producerProven = false;
-  bool ownerClosed = false;
-  bool layoutStable = false;
-  bool observersStable = false;
-  bool counterStable = false;
-  bool fromEmptyActual = false;
-  bool fromReplacementGap = false;
-  bool fromPairedInsertion = false;
-  bool fromTUAnchor = false;
-  bool fromIncludeBoundary = false;
-  bool fromDirectiveLayoutGap = false;
-  std::string boundarySignature;
 };
 
 /// \brief Canonical MacroPatch-local proof carrier.

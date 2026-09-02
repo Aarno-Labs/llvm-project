@@ -265,11 +265,13 @@ void RefoldOwnerRealizationProofBuilder::AttachLineControlObserverWitness(
   // zero-width/layout witness.  Unknown layout is kept witness-specific in the
   // signature so it cannot collapse unrelated line-control candidates.
   if (candidate.hasZeroTokenBoundaryWitness) {
+    const ZeroTokenBoundaryWitness &zeroToken =
+        candidate.zeroTokenBoundaryWitness;
     witness.physicalLayoutKnown = true;
-    witness.physicalLayoutStable = candidate.zeroTokenLayoutStable;
-    if (candidate.zeroTokenFromIncludeBoundary)
+    witness.physicalLayoutStable = zeroToken.layoutStable;
+    if (zeroToken.fromIncludeBoundary)
       witness.includeReturnResyncCount += 1;
-    if (candidate.zeroTokenFromDirectiveLayoutGap)
+    if (zeroToken.fromDirectiveLayoutGap)
       witness.syntheticResyncCount += 1;
   }
 
@@ -458,7 +460,8 @@ void RefoldOwnerRealizationProofBuilder::AttachCounterStateWitness(
     appendSig(witness.suffixObserverSignature, "macro-counter-literal-path");
   }
 
-  if (candidate.hasZeroTokenBoundaryWitness && candidate.zeroTokenCounterStable)
+  if (candidate.hasZeroTokenBoundaryWitness &&
+      candidate.zeroTokenBoundaryWitness.counterStable)
     appendSig(witness.suffixObserverSignature, "zero-token-counter-stable");
 
   if (!orderedEvents.empty()) {

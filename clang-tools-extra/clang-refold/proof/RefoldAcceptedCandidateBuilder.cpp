@@ -129,53 +129,15 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedMacroCandidate(
       patch.proof.generatedCalleeReplay->replacementReplayValidated &&
       patch.proof.generatedCalleeReplay->solvedActualsMappedToRoot &&
       patch.materialized.hasBTokenRange) {
-    const GeneratedCalleeReplayWitness &w = *patch.proof.generatedCalleeReplay;
     candidate.hasGeneratedCalleeReplayWitness = true;
-    candidate.generatedCalleeRootMacroId = w.rootMacroId;
-    candidate.generatedCalleeFinalDirectiveId = w.finalDirectiveId;
-    candidate.generatedCalleeDepth = w.generatedCallDepth;
-    candidate.generatedCalleeObjectAliasHops = w.objectAliasHops;
-    candidate.generatedCalleeChainDeterministic = w.calleeChainDeterministic;
-    candidate.generatedCalleeReplacementReplayValidated =
-        w.replacementReplayValidated;
-    candidate.generatedCalleeSolvedActualsMappedToRoot =
-        w.solvedActualsMappedToRoot;
-    candidate.generatedCalleeUsesForwarding = w.usesForwarding;
-    candidate.generatedCalleeUsesStringification = w.usesStringification;
-    candidate.generatedCalleeUsesPaste = w.usesPaste;
-    candidate.generatedCalleeUsesVariadicForwarding = w.usesVariadicForwarding;
-    candidate.generatedCalleeUsesObjectAlias = w.usesObjectAlias;
-    candidate.generatedCalleeDecodedStringLiteralEvidenceOnly =
-        w.decodedStringLiteralEvidenceOnly;
+    candidate.generatedCalleeReplayWitness = *patch.proof.generatedCalleeReplay;
   }
 
   if (patch.proof.variadicCommaReplay && patch.materialized.hasBTokenRange &&
       patch.proof.preservesInvocationStructure &&
       !candidate.hasGeneratedCalleeReplayWitness) {
-    const VariadicCommaWitness &w = *patch.proof.variadicCommaReplay;
     candidate.hasVariadicCommaWitness = true;
-    candidate.variadicRootMacroId = w.rootMacroId;
-    candidate.variadicFormalIndex = w.variadicFormalIndex;
-    candidate.variadicArityStable = w.arityStable;
-    candidate.variadicOriginalMissing = w.originalMissing;
-    candidate.variadicOriginalExplicitEmpty = w.originalExplicitEmpty;
-    candidate.variadicOriginalNonEmpty = w.originalNonEmpty;
-    candidate.variadicResultMissing = w.resultMissing;
-    candidate.variadicResultExplicitEmpty = w.resultExplicitEmpty;
-    candidate.variadicResultNonEmpty = w.resultNonEmpty;
-    candidate.variadicLiteralCommaInActual = w.literalCommaInActual;
-    candidate.variadicCommaInserted = w.commaInserted;
-    candidate.variadicCommaDeleted = w.commaDeleted;
-    candidate.variadicGnuCommaElision = w.gnuCommaElision;
-    candidate.variadicVaOptPresent = w.vaOptPresent;
-    candidate.variadicVaOptOriginallyActive = w.vaOptOriginallyActive;
-    candidate.variadicVaOptResultActive = w.vaOptResultActive;
-    candidate.variadicVaOptCommaIntroduced = w.vaOptCommaIntroduced;
-    candidate.variadicVaOptCommaDeleted = w.vaOptCommaDeleted;
-    candidate.variadicVaOptNodeCount = w.vaOptNodeCount;
-    candidate.variadicVaOptIncludedCount = w.vaOptIncludedCount;
-    candidate.variadicProducerSignature = w.producerSignature;
-    candidate.variadicPackStateSignature = w.packStateSignature;
+    candidate.variadicCommaWitness = *patch.proof.variadicCommaReplay;
   }
 
   std::optional<ZeroTokenBoundaryWitness> synthesizedZeroTokenBoundary;
@@ -216,29 +178,8 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedMacroCandidate(
   if (zeroTokenWitnessForCandidate && patch.materialized.hasBTokenRange &&
       patch.proof.preservesInvocationStructure &&
       !candidate.hasGeneratedCalleeReplayWitness) {
-    const ZeroTokenBoundaryWitness &w = *zeroTokenWitnessForCandidate;
     candidate.hasZeroTokenBoundaryWitness = true;
-    candidate.zeroTokenOwnerId = w.ownerId;
-    candidate.zeroTokenOwnerKind = w.ownerKind;
-    candidate.zeroTokenHasPPGap = w.hasPPGap;
-    candidate.zeroTokenPPGap = w.ppGap;
-    candidate.zeroTokenHasSourceAnchor = w.hasSourceAnchor;
-    candidate.zeroTokenSourceAnchor = w.sourceAnchor;
-    candidate.zeroTokenHasBTokenRange = w.hasBTokenRange;
-    candidate.zeroTokenBTokStart = w.bTokStart;
-    candidate.zeroTokenBTokEnd = w.bTokEnd;
-    candidate.zeroTokenProducerProven = w.producerProven;
-    candidate.zeroTokenOwnerClosed = w.ownerClosed;
-    candidate.zeroTokenLayoutStable = w.layoutStable;
-    candidate.zeroTokenObserversStable = w.observersStable;
-    candidate.zeroTokenCounterStable = w.counterStable;
-    candidate.zeroTokenFromEmptyActual = w.fromEmptyActual;
-    candidate.zeroTokenFromReplacementGap = w.fromReplacementGap;
-    candidate.zeroTokenFromPairedInsertion = w.fromPairedInsertion;
-    candidate.zeroTokenFromTUAnchor = w.fromTUAnchor;
-    candidate.zeroTokenFromIncludeBoundary = w.fromIncludeBoundary;
-    candidate.zeroTokenFromDirectiveLayoutGap = w.fromDirectiveLayoutGap;
-    candidate.zeroTokenBoundarySignature = w.boundarySignature;
+    candidate.zeroTokenBoundaryWitness = *zeroTokenWitnessForCandidate;
   }
 
   // Expose direct stringification and token-paste producer semantics in the
@@ -670,41 +611,44 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedIncludeCandidate(
   // witness/equivalence vocabulary.
   if (includeAnchorWitness && patch.aStart == patch.aEnd &&
       includeAnchorWitness->hasAnchorByte) {
-    candidate.hasZeroTokenBoundaryWitness = true;
-    candidate.zeroTokenOwnerKind = "include";
-    candidate.zeroTokenOwnerId = patch.include ? patch.include->id : 0;
-    candidate.zeroTokenHasPPGap = true;
-    candidate.zeroTokenPPGap = patch.aStart;
-    candidate.zeroTokenHasSourceAnchor = true;
-    candidate.zeroTokenSourceAnchor = includeAnchorWitness->anchorByte;
-    candidate.zeroTokenHasBTokenRange = true;
-    candidate.zeroTokenBTokStart = patch.bStart;
-    candidate.zeroTokenBTokEnd = patch.bEnd;
-    candidate.zeroTokenProducerProven = true;
-    candidate.zeroTokenOwnerClosed = true;
-    candidate.zeroTokenLayoutStable = true;
-    candidate.zeroTokenObserversStable = true;
-    candidate.zeroTokenCounterStable = true;
-    candidate.zeroTokenFromIncludeBoundary = true;
-    candidate.zeroTokenFromDirectiveLayoutGap =
+    ZeroTokenBoundaryWitness zeroToken;
+    zeroToken.ownerKind = "include";
+    zeroToken.ownerId = patch.include ? patch.include->id : 0;
+    zeroToken.hasPPGap = true;
+    zeroToken.ppGap = patch.aStart;
+    zeroToken.hasSourceAnchor = true;
+    zeroToken.sourceAnchor = includeAnchorWitness->anchorByte;
+    zeroToken.hasBTokenRange = true;
+    zeroToken.bTokStart = patch.bStart;
+    zeroToken.bTokEnd = patch.bEnd;
+    zeroToken.producerProven = true;
+    zeroToken.ownerClosed = true;
+    zeroToken.layoutStable = true;
+    zeroToken.observersStable = true;
+    zeroToken.counterStable = true;
+    zeroToken.fromIncludeBoundary = true;
+    zeroToken.fromDirectiveLayoutGap =
         includeAnchorWitness->evidence ==
             IncludeAnchorEvidenceKind::SelectedConditionalBoundary ||
         includeAnchorWitness->evidence ==
             IncludeAnchorEvidenceKind::DeclBoundary;
-    candidate.zeroTokenBoundarySignature =
+    zeroToken.boundarySignature =
         llvm::formatv("include-anchor:evidence={0}:include={1}:pp_gap={2}:"
                       "byte={3}:b=[{4},{5}):cond={6}:{7}:child={8}:{9}:"
                       "neighbor={10}:{11}",
-                      includeAnchorWitness->evidence,
-                      candidate.zeroTokenOwnerId, patch.aStart,
-                      includeAnchorWitness->anchorByte, patch.bStart,
-                      patch.bEnd, includeAnchorWitness->hasCondArmId ? 1 : 0,
+                      includeAnchorWitness->evidence, zeroToken.ownerId,
+                      patch.aStart, includeAnchorWitness->anchorByte,
+                      patch.bStart, patch.bEnd,
+                      includeAnchorWitness->hasCondArmId ? 1 : 0,
                       includeAnchorWitness->condArmId,
                       includeAnchorWitness->hasChildIncludeId ? 1 : 0,
                       includeAnchorWitness->childIncludeId,
                       includeAnchorWitness->hasNeighborPP ? 1 : 0,
                       includeAnchorWitness->neighborPP)
             .str();
+
+    candidate.hasZeroTokenBoundaryWitness = true;
+    candidate.zeroTokenBoundaryWitness = std::move(zeroToken);
   }
 
   candidate.hasPayloadPreview = true;

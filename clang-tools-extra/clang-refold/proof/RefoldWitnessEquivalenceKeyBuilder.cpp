@@ -1000,16 +1000,17 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
     key.targetPPTokens = knownRangeHash(label, candidate.targetBTokStart,
                                         candidate.targetBTokEnd);
   } else if (candidate.hasZeroTokenBoundaryWitness &&
-             candidate.zeroTokenHasBTokenRange &&
-             candidate.zeroTokenBTokStart <= candidate.zeroTokenBTokEnd &&
-             candidate.zeroTokenBTokEnd <= deps_.bToks.size()) {
+             candidate.zeroTokenBoundaryWitness.hasBTokenRange &&
+             candidate.zeroTokenBoundaryWitness.bTokStart <=
+                 candidate.zeroTokenBoundaryWitness.bTokEnd &&
+             candidate.zeroTokenBoundaryWitness.bTokEnd <= deps_.bToks.size()) {
     // Zero-token include/boundary witnesses already carry the exact B-token
     // gap/envelope from the modified preprocessed stream.  Promote that
     // producer-recorded envelope into the target-PP equivalence dimension
     // instead of treating the absence of replacement text as unknown output.
-    key.targetPPTokens =
-        knownRangeHash("zero_token_b_tokens", candidate.zeroTokenBTokStart,
-                       candidate.zeroTokenBTokEnd);
+    key.targetPPTokens = knownRangeHash(
+        "zero_token_b_tokens", candidate.zeroTokenBoundaryWitness.bTokStart,
+        candidate.zeroTokenBoundaryWitness.bTokEnd);
   } else if (summary.hasOwnerRealizationWitness &&
              summary.ownerRealizationWitness.closure.IsComplete()) {
     const OwnerTokenRange bTokens =
@@ -1036,47 +1037,47 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
   }
 
   if (candidate.hasGeneratedCalleeReplayWitness) {
+    const GeneratedCalleeReplayWitness &generatedCallee =
+        candidate.generatedCalleeReplayWitness;
     key.suffixState = WitnessEquivalenceDimension::Known(
         llvm::formatv(
             "generated_callee_replay:root={0}:final_def={1}:depth={2}:"
             "aliases={3}:chain={4}:replay={5}:mapped={6}:"
             "decoded_payload_evidence_only={7}",
-            candidate.generatedCalleeRootMacroId,
-            candidate.generatedCalleeFinalDirectiveId,
-            candidate.generatedCalleeDepth,
-            candidate.generatedCalleeObjectAliasHops,
-            candidate.generatedCalleeChainDeterministic ? 1 : 0,
-            candidate.generatedCalleeReplacementReplayValidated ? 1 : 0,
-            candidate.generatedCalleeSolvedActualsMappedToRoot ? 1 : 0,
-            candidate.generatedCalleeDecodedStringLiteralEvidenceOnly ? 1 : 0)
+            generatedCallee.rootMacroId, generatedCallee.finalDirectiveId,
+            generatedCallee.generatedCallDepth, generatedCallee.objectAliasHops,
+            generatedCallee.calleeChainDeterministic ? 1 : 0,
+            generatedCallee.replacementReplayValidated ? 1 : 0,
+            generatedCallee.solvedActualsMappedToRoot ? 1 : 0,
+            generatedCallee.decodedStringLiteralEvidenceOnly ? 1 : 0)
             .str());
   } else if (candidate.hasVariadicCommaWitness) {
+    const VariadicCommaWitness &variadicComma = candidate.variadicCommaWitness;
     key.suffixState = WitnessEquivalenceDimension::Known(
-        llvm::formatv("variadic:root={0}:formal={1}:arity={2}:orig_missing={3}:"
-                      "orig_empty={4}:orig_nonempty={5}:result_missing={6}:"
-                      "result_empty={7}:result_nonempty={8}:comma_inserted={9}:"
-                      "comma_deleted={10}:gnu_elision={11}:vaopt={12}:"
-                      "vaopt_orig={13}:vaopt_result={14}:vaopt_comma_ins={15}:"
-                      "vaopt_comma_del={16}:producer={17}:pack={18}",
-                      candidate.variadicRootMacroId,
-                      candidate.variadicFormalIndex,
-                      candidate.variadicArityStable ? 1 : 0,
-                      candidate.variadicOriginalMissing ? 1 : 0,
-                      candidate.variadicOriginalExplicitEmpty ? 1 : 0,
-                      candidate.variadicOriginalNonEmpty ? 1 : 0,
-                      candidate.variadicResultMissing ? 1 : 0,
-                      candidate.variadicResultExplicitEmpty ? 1 : 0,
-                      candidate.variadicResultNonEmpty ? 1 : 0,
-                      candidate.variadicCommaInserted ? 1 : 0,
-                      candidate.variadicCommaDeleted ? 1 : 0,
-                      candidate.variadicGnuCommaElision ? 1 : 0,
-                      candidate.variadicVaOptPresent ? 1 : 0,
-                      candidate.variadicVaOptOriginallyActive ? 1 : 0,
-                      candidate.variadicVaOptResultActive ? 1 : 0,
-                      candidate.variadicVaOptCommaIntroduced ? 1 : 0,
-                      candidate.variadicVaOptCommaDeleted ? 1 : 0,
-                      candidate.variadicProducerSignature,
-                      candidate.variadicPackStateSignature)
+        llvm::formatv(
+            "variadic:root={0}:formal={1}:arity={2}:orig_missing={3}:"
+            "orig_empty={4}:orig_nonempty={5}:result_missing={6}:"
+            "result_empty={7}:result_nonempty={8}:comma_inserted={9}:"
+            "comma_deleted={10}:gnu_elision={11}:vaopt={12}:"
+            "vaopt_orig={13}:vaopt_result={14}:vaopt_comma_ins={15}:"
+            "vaopt_comma_del={16}:producer={17}:pack={18}",
+            variadicComma.rootMacroId, variadicComma.variadicFormalIndex,
+            variadicComma.arityStable ? 1 : 0,
+            variadicComma.originalMissing ? 1 : 0,
+            variadicComma.originalExplicitEmpty ? 1 : 0,
+            variadicComma.originalNonEmpty ? 1 : 0,
+            variadicComma.resultMissing ? 1 : 0,
+            variadicComma.resultExplicitEmpty ? 1 : 0,
+            variadicComma.resultNonEmpty ? 1 : 0,
+            variadicComma.commaInserted ? 1 : 0,
+            variadicComma.commaDeleted ? 1 : 0,
+            variadicComma.gnuCommaElision ? 1 : 0,
+            variadicComma.vaOptPresent ? 1 : 0,
+            variadicComma.vaOptOriginallyActive ? 1 : 0,
+            variadicComma.vaOptResultActive ? 1 : 0,
+            variadicComma.vaOptCommaIntroduced ? 1 : 0,
+            variadicComma.vaOptCommaDeleted ? 1 : 0,
+            variadicComma.producerSignature, variadicComma.packStateSignature)
             .str());
   } else if (candidate.hasTokenPasteWitness) {
     key.suffixState = WitnessEquivalenceDimension::Known(
@@ -1110,32 +1111,29 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
             candidate.stringificationCanonicalPayloadSignature)
             .str());
   } else if (candidate.hasZeroTokenBoundaryWitness) {
+    const ZeroTokenBoundaryWitness &zeroToken =
+        candidate.zeroTokenBoundaryWitness;
     key.suffixState = WitnessEquivalenceDimension::Known(
-        llvm::formatv("zero_token:owner={0}:{1}:pp_gap={2}:{3}:anchor={4}:{5}:"
-                      "b=[{6},{7}):producer={8}:owner_closed={9}:layout={10}:"
-                      "observers={11}:counter={12}:empty_actual={13}:"
-                      "replacement_gap={14}:"
-                      "paired={15}:tu_anchor={16}:include_boundary={17}:"
-                      "directive_gap={18}:"
-                      "signature={19}",
-                      candidate.zeroTokenOwnerKind, candidate.zeroTokenOwnerId,
-                      candidate.zeroTokenHasPPGap ? 1 : 0,
-                      candidate.zeroTokenPPGap,
-                      candidate.zeroTokenHasSourceAnchor ? 1 : 0,
-                      candidate.zeroTokenSourceAnchor,
-                      candidate.zeroTokenBTokStart, candidate.zeroTokenBTokEnd,
-                      candidate.zeroTokenProducerProven ? 1 : 0,
-                      candidate.zeroTokenOwnerClosed ? 1 : 0,
-                      candidate.zeroTokenLayoutStable ? 1 : 0,
-                      candidate.zeroTokenObserversStable ? 1 : 0,
-                      candidate.zeroTokenCounterStable ? 1 : 0,
-                      candidate.zeroTokenFromEmptyActual ? 1 : 0,
-                      candidate.zeroTokenFromReplacementGap ? 1 : 0,
-                      candidate.zeroTokenFromPairedInsertion ? 1 : 0,
-                      candidate.zeroTokenFromTUAnchor ? 1 : 0,
-                      candidate.zeroTokenFromIncludeBoundary ? 1 : 0,
-                      candidate.zeroTokenFromDirectiveLayoutGap ? 1 : 0,
-                      candidate.zeroTokenBoundarySignature)
+        llvm::formatv(
+            "zero_token:owner={0}:{1}:pp_gap={2}:{3}:anchor={4}:{5}:"
+            "b=[{6},{7}):producer={8}:owner_closed={9}:layout={10}:"
+            "observers={11}:counter={12}:empty_actual={13}:"
+            "replacement_gap={14}:"
+            "paired={15}:tu_anchor={16}:include_boundary={17}:"
+            "directive_gap={18}:"
+            "signature={19}",
+            zeroToken.ownerKind, zeroToken.ownerId, zeroToken.hasPPGap ? 1 : 0,
+            zeroToken.ppGap, zeroToken.hasSourceAnchor ? 1 : 0,
+            zeroToken.sourceAnchor, zeroToken.bTokStart, zeroToken.bTokEnd,
+            zeroToken.producerProven ? 1 : 0, zeroToken.ownerClosed ? 1 : 0,
+            zeroToken.layoutStable ? 1 : 0, zeroToken.observersStable ? 1 : 0,
+            zeroToken.counterStable ? 1 : 0, zeroToken.fromEmptyActual ? 1 : 0,
+            zeroToken.fromReplacementGap ? 1 : 0,
+            zeroToken.fromPairedInsertion ? 1 : 0,
+            zeroToken.fromTUAnchor ? 1 : 0,
+            zeroToken.fromIncludeBoundary ? 1 : 0,
+            zeroToken.fromDirectiveLayoutGap ? 1 : 0,
+            zeroToken.boundarySignature)
             .str());
   } else if (candidate.hasMacroActualRepairWitness) {
     key.suffixState = WitnessEquivalenceDimension::Known(
@@ -1256,28 +1254,30 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
   }
 
   if (candidate.hasGeneratedCalleeReplayWitness) {
+    const GeneratedCalleeReplayWitness &generatedCallee =
+        candidate.generatedCalleeReplayWitness;
     key.preservedObservers = WitnessEquivalenceDimension::Known(
         llvm::formatv(
             "generated_callee_replay:root={0}:final_def={1}:target=[{2},{3}):"
             "reexpanded-target-pp",
-            candidate.generatedCalleeRootMacroId,
-            candidate.generatedCalleeFinalDirectiveId,
+            generatedCallee.rootMacroId, generatedCallee.finalDirectiveId,
             candidate.targetBTokStart, candidate.targetBTokEnd)
             .str());
   } else if (candidate.hasVariadicCommaWitness) {
+    const VariadicCommaWitness &variadicComma = candidate.variadicCommaWitness;
     key.preservedObservers = WitnessEquivalenceDimension::Known(
         llvm::formatv(
             "variadic:root={0}:target=[{1},{2}):formal={3}:"
             "missing={4}:empty={5}:nonempty={6}:literal_comma={7}:"
             "vaopt_result={8}:vaopt_included={9}:reexpanded-target-pp",
-            candidate.variadicRootMacroId, candidate.targetBTokStart,
-            candidate.targetBTokEnd, candidate.variadicFormalIndex,
-            candidate.variadicResultMissing ? 1 : 0,
-            candidate.variadicResultExplicitEmpty ? 1 : 0,
-            candidate.variadicResultNonEmpty ? 1 : 0,
-            candidate.variadicLiteralCommaInActual ? 1 : 0,
-            candidate.variadicVaOptResultActive ? 1 : 0,
-            candidate.variadicVaOptIncludedCount)
+            variadicComma.rootMacroId, candidate.targetBTokStart,
+            candidate.targetBTokEnd, variadicComma.variadicFormalIndex,
+            variadicComma.resultMissing ? 1 : 0,
+            variadicComma.resultExplicitEmpty ? 1 : 0,
+            variadicComma.resultNonEmpty ? 1 : 0,
+            variadicComma.literalCommaInActual ? 1 : 0,
+            variadicComma.vaOptResultActive ? 1 : 0,
+            variadicComma.vaOptIncludedCount)
             .str());
   } else if (candidate.hasTokenPasteWitness) {
     key.preservedObservers = WitnessEquivalenceDimension::Known(
@@ -1301,20 +1301,18 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
                       candidate.stringificationCanonicalPayloadSignature)
             .str());
   } else if (candidate.hasZeroTokenBoundaryWitness) {
+    const ZeroTokenBoundaryWitness &zeroToken =
+        candidate.zeroTokenBoundaryWitness;
     key.preservedObservers = WitnessEquivalenceDimension::Known(
         llvm::formatv(
             "zero_token:owner={0}:{1}:target=[{2},{3}):pp_gap={4}:{5}:"
             "source_anchor={6}:{7}:layout={8}:observers={9}:counter={10}:"
             "boundary={11}",
-            candidate.zeroTokenOwnerKind, candidate.zeroTokenOwnerId,
-            candidate.zeroTokenBTokStart, candidate.zeroTokenBTokEnd,
-            candidate.zeroTokenHasPPGap ? 1 : 0, candidate.zeroTokenPPGap,
-            candidate.zeroTokenHasSourceAnchor ? 1 : 0,
-            candidate.zeroTokenSourceAnchor,
-            candidate.zeroTokenLayoutStable ? 1 : 0,
-            candidate.zeroTokenObserversStable ? 1 : 0,
-            candidate.zeroTokenCounterStable ? 1 : 0,
-            candidate.zeroTokenBoundarySignature)
+            zeroToken.ownerKind, zeroToken.ownerId, zeroToken.bTokStart,
+            zeroToken.bTokEnd, zeroToken.hasPPGap ? 1 : 0, zeroToken.ppGap,
+            zeroToken.hasSourceAnchor ? 1 : 0, zeroToken.sourceAnchor,
+            zeroToken.layoutStable ? 1 : 0, zeroToken.observersStable ? 1 : 0,
+            zeroToken.counterStable ? 1 : 0, zeroToken.boundarySignature)
             .str());
   } else if (candidate.hasMacroActualRepairWitness) {
     key.preservedObservers = WitnessEquivalenceDimension::Known(
@@ -1443,14 +1441,17 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
             .str();
     key.counterState = WitnessEquivalenceDimension::Known(value);
   } else if (candidate.hasGeneratedCalleeReplayWitness) {
+    const GeneratedCalleeReplayWitness &generatedCallee =
+        candidate.generatedCalleeReplayWitness;
     key.counterState = WitnessEquivalenceDimension::Known(
         llvm::formatv("generated_callee_replay:root={0}:counter-stable",
-                      candidate.generatedCalleeRootMacroId)
+                      generatedCallee.rootMacroId)
             .str());
   } else if (candidate.hasVariadicCommaWitness) {
+    const VariadicCommaWitness &variadicComma = candidate.variadicCommaWitness;
     key.counterState = WitnessEquivalenceDimension::Known(
         llvm::formatv("variadic:root={0}:counter-stable",
-                      candidate.variadicRootMacroId)
+                      variadicComma.rootMacroId)
             .str());
   } else if (candidate.hasTokenPasteWitness) {
     key.counterState = WitnessEquivalenceDimension::Known(
@@ -1463,12 +1464,13 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
                       candidate.stringificationRootMacroId)
             .str());
   } else if (candidate.hasZeroTokenBoundaryWitness) {
+    const ZeroTokenBoundaryWitness &zeroToken =
+        candidate.zeroTokenBoundaryWitness;
     key.counterState =
-        candidate.zeroTokenCounterStable
+        zeroToken.counterStable
             ? WitnessEquivalenceDimension::Known(
                   llvm::formatv("zero_token:owner={0}:{1}:counter-stable",
-                                candidate.zeroTokenOwnerKind,
-                                candidate.zeroTokenOwnerId)
+                                zeroToken.ownerKind, zeroToken.ownerId)
                       .str())
             : WitnessEquivalenceDimension::Unknown(
                   "zero-token-counter-stability-not-proven");
@@ -1503,40 +1505,42 @@ RefoldWitnessEquivalenceKeyBuilder::Build(
   }
 
   if (candidate.hasGeneratedCalleeReplayWitness) {
+    const GeneratedCalleeReplayWitness &generatedCallee =
+        candidate.generatedCalleeReplayWitness;
     WitnessProducerKindSet producers;
     producers.Add(WitnessProducerKind::GeneratedCallee);
-    if (candidate.generatedCalleeUsesForwarding)
+    if (generatedCallee.usesForwarding)
       producers.Add(WitnessProducerKind::Forward);
-    if (candidate.generatedCalleeUsesStringification)
+    if (generatedCallee.usesStringification)
       producers.Add(WitnessProducerKind::Stringify);
-    if (candidate.generatedCalleeUsesPaste) {
+    if (generatedCallee.usesPaste) {
       producers.Add(WitnessProducerKind::PasteLeft);
       producers.Add(WitnessProducerKind::PasteRight);
       producers.Add(WitnessProducerKind::PasteResult);
     }
-    if (candidate.generatedCalleeUsesVariadicForwarding)
+    if (generatedCallee.usesVariadicForwarding)
       producers.Add(WitnessProducerKind::VariadicForward);
-    if (candidate.generatedCalleeUsesObjectAlias)
+    if (generatedCallee.usesObjectAlias)
       producers.Add(WitnessProducerKind::ObjectAlias);
     if (candidate.hasZeroTokenBoundaryWitness)
       producers.Add(WitnessProducerKind::ZeroTokenAnchor);
     key.producerKinds = std::move(producers);
   } else if (candidate.hasVariadicCommaWitness) {
+    const VariadicCommaWitness &variadicComma = candidate.variadicCommaWitness;
     WitnessProducerKindSet producers;
     producers.Add(WitnessProducerKind::Forward);
     producers.Add(WitnessProducerKind::VariadicForward);
-    if (candidate.variadicResultMissing)
+    if (variadicComma.resultMissing)
       producers.Add(WitnessProducerKind::VariadicMissing);
-    if (candidate.variadicResultExplicitEmpty)
+    if (variadicComma.resultExplicitEmpty)
       producers.Add(WitnessProducerKind::VariadicEmpty);
-    if (candidate.variadicCommaInserted ||
-        candidate.variadicVaOptCommaIntroduced)
+    if (variadicComma.commaInserted || variadicComma.vaOptCommaIntroduced)
       producers.Add(WitnessProducerKind::VariadicCommaInsertion);
-    if (candidate.variadicCommaDeleted || candidate.variadicGnuCommaElision ||
-        candidate.variadicVaOptCommaDeleted)
+    if (variadicComma.commaDeleted || variadicComma.gnuCommaElision ||
+        variadicComma.vaOptCommaDeleted)
       producers.Add(WitnessProducerKind::VariadicCommaElision);
-    if (candidate.variadicVaOptPresent) {
-      if (candidate.variadicVaOptResultActive)
+    if (variadicComma.vaOptPresent) {
+      if (variadicComma.vaOptResultActive)
         producers.Add(WitnessProducerKind::VaOptActivation);
       else
         producers.Add(WitnessProducerKind::VaOptErasure);
