@@ -146,6 +146,12 @@ public:
   MixedOwnerTilingPlan Plan(std::vector<diffutils::Hunk> hunks);
 
 private:
+  /// Publish \p hunks as the finished plan and refresh the borrowed caches.
+  ///
+  /// Both exits of Plan() end here, so the empty-input early return and the
+  /// completed tiling pass report the witness and binding counts the same way.
+  MixedOwnerTilingPlan FinishPlan(std::vector<diffutils::Hunk> hunks);
+
   /// Borrowed service graph and output ledgers for one refold engine instance.
   Dependencies deps_;
 };
