@@ -177,6 +177,18 @@ bool lineStartsWithDirectiveKeyword(StringRef line, StringRef keyword) {
   return i >= line.size() || !isIdentPart(line[i]);
 }
 
+bool lineSpellingIsLineControlDirective(StringRef line) {
+  const size_t to = line.size();
+  size_t p = 0;
+  if (!consumeDirectiveHash(line, p, to))
+    return false;
+
+  if (directiveKeywordAt(line, p, to, "line"))
+    return true;
+
+  return p < to && isDigit(line[p]);
+}
+
 bool physicalLineEndsWithSplice(StringRef bytes, uint64_t lineBegin,
                                 uint64_t lineEnd) {
   if (lineEnd <= lineBegin)

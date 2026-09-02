@@ -264,6 +264,23 @@ inline bool consumeDirectiveHash(StringRef text, size_t &pos, size_t end) {
   return true;
 }
 
+/// True iff \p keyword occupies `[pos, pos + keyword.size())` in \p text and is
+/// followed by preprocessing whitespace or by \p end.
+///
+/// This is the directive-keyword boundary rule the line-control scanners use.
+/// It deliberately requires whitespace rather than merely a non-identifier
+/// byte, so a spelling such as `#line/*c*/1` is *not* recognized here and the
+/// caller falls through to its own fail-closed path.  Callers must pass
+/// `end <= text.size()`.
+inline bool directiveKeywordAt(StringRef text, size_t pos, size_t end,
+                               StringRef keyword) {
+  end = std::min(end, text.size());
+  if (pos + keyword.size() > end || text.substr(pos, keyword.size()) != keyword)
+    return false;
+  const size_t after = pos + keyword.size();
+  return after == end || isWs(text[after]);
+}
+
 /// Copy or skip one C/C++ string/character literal at \p pos.
 bool copyQuotedLiteral(StringRef text, size_t &pos, std::string &out);
 inline bool skipQuotedLiteral(StringRef text, size_t &pos) {
@@ -305,6 +322,16 @@ inline bool startsAfterLineIndent(StringRef text, size_t pos) {
 
 bool containsAtLineStartAfterIndent(StringRef text, StringRef needle);
 bool lineStartsWithDirectiveKeyword(StringRef line, StringRef keyword);
+
+/// True iff \p line spells a line-control directive: the standard
+/// `#line <pp-tokens>` or the Clang/GCC numeric line-marker `# 123 "file"`.
+///
+/// Only the directive class is decided here, never the operands: a digit after
+/// the introducer is enough, because the numeric operand may itself be
+/// macro-produced and is validated by the line-directive parser instead.  The
+/// scan is horizontal only, so \p line must be one physical or already-spliced
+/// logical directive line.
+bool lineSpellingIsLineControlDirective(StringRef line);
 bool physicalLineEndsWithSplice(StringRef bytes, uint64_t lineBegin,
                                 uint64_t lineEnd);
 uint64_t lineBeginContainingOffset(StringRef bytes, uint64_t byte);

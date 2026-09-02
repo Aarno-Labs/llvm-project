@@ -21,7 +21,6 @@
 #include "llvm/Support/MemoryBuffer.h"
 
 #include <algorithm>
-#include <cctype>
 #include <optional>
 #include <string>
 
@@ -45,30 +44,6 @@ RefoldLineControlProof::LineStateObservableMacroSite(
     site = caller;
   }
   return site;
-}
-
-/// Return true iff a physical source line is lexically a line-control
-/// directive.  This intentionally recognizes only the directive class, not the
-/// expanded operands: for entry-wrapper minimization it is enough to know that
-/// the emitted child text will overwrite any synthetic entry #line before a
-/// later observer can consume it.
-static bool refoldLineSpellingIsLineControlDirective(StringRef line) {
-  const size_t to = line.size();
-  size_t p = 0;
-  while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
-    ++p;
-  if (p >= to || line[p] != '#')
-    return false;
-  ++p;
-  while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
-    ++p;
-
-  if (p + 4 <= to && line.substr(p, 4) == "line" &&
-      (p + 4 == to || stringutils::isWs(line[p + 4])))
-    return true;
-
-  // Clang/GCC numeric line-control spelling: # 123 "file".
-  return p < to && std::isdigit(static_cast<unsigned char>(line[p]));
 }
 
 /// Return the original-source byte offset of the directive-introducing '#'
@@ -196,7 +171,10 @@ bool RefoldLineControlProof::SourcePrefixHasProducerActiveLineControl(
     const uint64_t clampedEnd = std::min<uint64_t>(lineEnd, limit);
     if (std::optional<uint64_t> hash =
             refoldFindDirectiveHashOffset(src, lineBegin, clampedEnd)) {
-      if (refoldLineSpellingIsLineControlDirective(
+      // Only the directive class matters for entry-wrapper minimization: it is
+      // enough to know that the emitted child text will overwrite any
+      // synthetic entry #line before a later observer can consume it.
+      if (stringutils::lineSpellingIsLineControlDirective(
               src.slice(*hash, clampedEnd)) &&
           directiveIsProducerActive(*hash)) {
         return true;

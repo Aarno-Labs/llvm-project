@@ -550,11 +550,6 @@ static std::string expandLineControlMacros(StringRef text,
                                  activeFileSpelling);
 }
 
-static bool lineKeywordAt(StringRef line, size_t pos, size_t to) {
-  return pos + 4 <= to && line.substr(pos, 4) == "line" &&
-         (pos + 4 == to || stringutils::isWs(line[pos + 4]));
-}
-
 static bool readLineControlDirectiveAndOperand(StringRef line,
                                                StringRef &directive,
                                                StringRef &operand) {
@@ -566,23 +561,6 @@ static bool readLineControlDirectiveAndOperand(StringRef line,
     return false;
   operand = line.substr(p);
   return true;
-}
-
-static bool lineControlSpellingIsLineDirective(StringRef line) {
-  const size_t to = line.size();
-  size_t p = 0;
-  if (!stringutils::consumeDirectiveHash(line, p, to))
-    return false;
-
-  // Standard spelling: #line <pp-tokens>.  Require a token boundary after
-  // "line" so ordinary directives with longer names are not misclassified.
-  if (lineKeywordAt(line, p, to))
-    return true;
-
-  // GCC/Clang numeric line-control form: # <digits> ["file"].  The actual
-  // numeric operand may be macro-produced, but a digit here is enough to
-  // classify the directive as line-control for proof gating.
-  return p < to && std::isdigit(static_cast<unsigned char>(line[p]));
 }
 
 // Update the owner-local macro environment from source directives that precede
@@ -960,7 +938,7 @@ parseLineDirectiveForLineControl(StringRef src, size_t from, size_t to) {
   stringutils::skipWsNoLF(src, p, to);
 
   bool usedLineKeyword = false;
-  if (lineKeywordAt(src, p, to)) {
+  if (stringutils::directiveKeywordAt(src, p, to, "line")) {
     usedLineKeyword = true;
     p += 4;
     stringutils::skipWsNoLF(src, p, to);
@@ -1050,7 +1028,7 @@ static std::string expandSourceLineControlDirective(
   // The parser later validates that expansion produced a line number and an
   // optional filename string literal.
   size_t operandBegin = p;
-  if (lineKeywordAt(line, p, to))
+  if (stringutils::directiveKeywordAt(line, p, to, "line"))
     operandBegin = p + 4;
 
   std::string expanded;
@@ -1298,7 +1276,8 @@ logicalLocationAtOffsetImpl(StringRef src, uint64_t offset,
     const bool isMacroStateDirective =
         hasNamedDirective && (directive == "define" || directive == "undef");
     const bool isLineControlDirectiveSpelling =
-        lineControlSpellingIsLineDirective(StringRef(directiveLogicalLine));
+        stringutils::lineSpellingIsLineControlDirective(
+            StringRef(directiveLogicalLine));
 
     bool directiveEffectsAreActive = false;
     LineControlDirectiveActivity lineDirectiveActivity =
