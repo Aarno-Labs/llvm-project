@@ -694,6 +694,245 @@ RefoldOwnerStateProof::AttachCanonicalStateSummary(OwnerClosure closure) const {
   return closure;
 }
 
+namespace {
+
+std::string macroReplacementTokenFingerprint(
+    ArrayRef<RefoldModel::MacroReplacementToken> tokens) {
+  std::string fingerprint;
+  llvm::raw_string_ostream os(fingerprint);
+  for (const RefoldModel::MacroReplacementToken &token : tokens) {
+    // This is a deterministic producer-fact fingerprint, not a cryptographic
+    // hash.  It is intentionally textual so theorem-audit logs can expose the
+    // exact definition-shape evidence without reparsing the directive body.
+    os << static_cast<unsigned>(token.kind) << ':' << token.spelling.size()
+       << ':' << token.spelling << ':';
+    if (token.paramIndex)
+      os << 'P' << *token.paramIndex;
+    else
+      os << '-';
+    os << ';';
+  }
+  return os.str();
+}
+
+bool anyVariadicParam(ArrayRef<RefoldModel::MacroDefParam> params) {
+  return llvm::any_of(params, [](const RefoldModel::MacroDefParam &param) {
+    return param.variadic;
+  });
+}
+
+MacroStateIdentity
+identityFromDirective(const RefoldModel::MacroDirective &directive) {
+  MacroStateIdentity identity;
+  identity.macroName = directive.name.str();
+  if (directive.IsDefine())
+    identity.definitionDirectiveId = directive.id;
+  else if (directive.IsUndef())
+    identity.undefDirectiveId = directive.id;
+  identity.functionLike = directive.functionLike;
+  identity.arity = static_cast<uint32_t>(directive.defParams.size());
+  identity.variadic = anyVariadicParam(directive.defParams);
+  identity.replacementTokenHash =
+      macroReplacementTokenFingerprint(directive.replacementTokens);
+  return identity;
+}
+
+MacroStateIdentity
+identityFromInvocation(const RefoldModel::MacroInvocation &macro) {
+  MacroStateIdentity identity;
+  identity.macroName = macro.name.str();
+  identity.definitionDirectiveId = macro.definitionDirectiveId;
+  identity.functionLike = macro.subkind == "func";
+  identity.arity = static_cast<uint32_t>(macro.defParams.size());
+  identity.variadic = anyVariadicParam(macro.defParams);
+  return identity;
+}
+
+MacroStateIdentity identityFromMacroName(StringRef name) {
+  MacroStateIdentity identity;
+  identity.macroName = name.str();
+  return identity;
+}
+
+LineControlStateIdentity
+lineControlIdentityFromEvent(const RefoldModel::LineControlEvent &event) {
+  LineControlStateIdentity identity;
+  identity.eventId = event.id;
+  identity.physicalFile = event.physicalFile.str();
+  identity.siteBegin = event.siteB;
+  identity.siteEnd = event.siteE;
+  identity.active = event.active;
+  identity.producerProven = event.producerProven;
+  identity.logicalLineAfter = event.logicalLineAfter;
+  identity.logicalFileAfter = event.logicalFileAfter.str();
+  identity.ownerIncludeId = event.ownerIncludeId;
+  if (event.active && event.producerProven)
+    identity.operandProvenance =
+        LineDirectiveOperandProvenance::ProducerEvaluatedOperands;
+  else if (!event.active)
+    identity.operandProvenance =
+        LineDirectiveOperandProvenance::InactiveDirective;
+  else if (!event.producerProven)
+    identity.operandProvenance =
+        LineDirectiveOperandProvenance::MissingProducerOperands;
+  else
+    identity.operandProvenance = LineDirectiveOperandProvenance::Unknown;
+  return identity;
+}
+
+IncludeStateIdentity
+includeStateIdentityFromInclude(const RefoldModel::IncludeItem &include) {
+  IncludeStateIdentity identity;
+  identity.includeId = include.id;
+  identity.directiveKind = include.subkind.str();
+  identity.sitePath = include.sitePath.str();
+  identity.siteBegin = include.siteB;
+  identity.siteEnd = include.siteE;
+  identity.target = include.target.str();
+  if (include.resolvedPath)
+    identity.resolvedPath = include.resolvedPath->str();
+  identity.angled = include.angled;
+  identity.parentIncludeId = include.parent;
+  identity.hasTokenMaterialization = include.cover.IsValid();
+  return identity;
+}
+
+IncludeGuardStateIdentity
+includeGuardIdentityFromInclude(const RefoldModel::IncludeItem &include) {
+  IncludeGuardStateIdentity identity;
+  identity.includeId = include.id;
+  identity.headerPath =
+      include.resolvedPath ? include.resolvedPath->str() : include.target.str();
+  identity.parentIncludeId = include.parent;
+  // The current producer map records include identity and conditional/macro
+  // events, but not a first-class include-guard oracle.  Keep the guard macro
+  // absent and producerProvenGuard=false rather than inferring a guard
+  // pattern from source text.  A zero-token include may be a skipped guard
+  // include, but it may also be an empty header, so classify it as unknown
+  // guard state unless a future producer record proves the reason.
+  identity.kind = include.cover.IsValid()
+                      ? IncludeGuardObservationKind::ActiveIncludeMayMutateGuard
+                      : IncludeGuardObservationKind::UnknownGuardEffect;
+  identity.producerProvenGuard = false;
+  return identity;
+}
+
+PragmaStateClassification
+pragmaClassificationFromText(StringRef text, const LangOptions &lexLang) {
+  std::optional<ParsedDiagnosticPragmaStateDirective> parsed =
+      parseDiagnosticPragmaStateDirective(text, lexLang);
+  if (!parsed)
+    return PragmaStateClassification::UnknownPragmaState;
+  switch (parsed->action) {
+  case DiagnosticPragmaStateAction::Setting:
+    return PragmaStateClassification::KnownLocalPragmaState;
+  case DiagnosticPragmaStateAction::Push:
+  case DiagnosticPragmaStateAction::Pop:
+    return PragmaStateClassification::KnownBalancedPragmaState;
+  }
+  llvm_unreachable("Invalid diagnostic pragma action");
+}
+
+PragmaStateIdentity
+pragmaIdentityFromPragma(const RefoldModel::PragmaDirective &pragma,
+                         const LangOptions &lexLang) {
+  PragmaStateIdentity identity;
+  identity.pragmaId = pragma.id;
+  identity.sitePath = pragma.sitePath.str();
+  identity.siteBegin = pragma.siteB;
+  identity.siteEnd = pragma.siteE;
+  identity.ownerIncludeId = pragma.ownerIncludeId;
+  identity.classification = pragmaClassificationFromText(pragma.text, lexLang);
+  // Deterministic textual fingerprint.  This is not a semantic parser; it
+  // keeps theorem logs anchored to the producer-supplied directive bytes.
+  identity.directiveFingerprint =
+      llvm::formatv("{0}:{1}", pragma.text.size(), pragma.text).str();
+  return identity;
+}
+
+uint64_t conditionalSelectedArmCount(const RefoldModel::CondGroup &group) {
+  uint64_t selectedCount = 0;
+  for (const RefoldModel::CondArm &arm : group.arms)
+    if (arm.selected)
+      ++selectedCount;
+  return selectedCount;
+}
+
+bool conditionalGroupHasUniqueSelectedArm(const RefoldModel::CondGroup &group) {
+  return conditionalSelectedArmCount(group) == 1;
+}
+
+bool conditionalArmConditionWasProducerEvaluated(
+    const RefoldModel::CondGroup &group,
+    const RefoldModel::CondArm &queriedArm) {
+  // Only conditions reached by the producer's selected branch path are
+  // semantic observations.  For an #if/#elif/#else chain, conditions are
+  // evaluated until the selected arm is reached.  Later #elif conditions
+  // are source text, but they were not queried by the preprocessor and
+  // cannot be used as suffix-state proof.
+  bool reachedByProducer = true;
+  for (const RefoldModel::CondArm &arm : group.arms) {
+    if (arm.id == queriedArm.id)
+      return reachedByProducer && arm.cond.has_value();
+    if (arm.selected)
+      reachedByProducer = false;
+  }
+  return false;
+}
+
+bool conditionalArmSelectionTruthProducerProven(
+    const RefoldModel::CondGroup &group, const RefoldModel::CondArm &arm) {
+  if (!conditionalGroupHasUniqueSelectedArm(group))
+    return false;
+  if (arm.selected)
+    return true;
+  return conditionalArmConditionWasProducerEvaluated(group, arm);
+}
+
+ConditionalStateIdentity
+conditionalGroupIdentityFromGroup(const RefoldModel::CondGroup &group) {
+  ConditionalStateIdentity identity;
+  identity.role = ConditionalStateRole::ConditionalGroup;
+  identity.groupId = group.id;
+  identity.file = group.file.str();
+  identity.groupBegin = group.groupB;
+  identity.groupEnd = group.groupE;
+  identity.parentArmId = group.parentArmId;
+  identity.parentIncludeId = group.parentIncludeId;
+  identity.conditionTruthProducerProven =
+      conditionalGroupHasUniqueSelectedArm(group);
+  return identity;
+}
+
+ConditionalStateIdentity
+conditionalArmIdentityFromArm(const RefoldModel::CondGroup &group,
+                              const RefoldModel::CondArm &arm,
+                              bool reverseSolvedDirectiveRequired) {
+  ConditionalStateIdentity identity;
+  identity.role = arm.selected ? ConditionalStateRole::ActiveArm
+                               : ConditionalStateRole::InactiveArm;
+  identity.groupId = group.id;
+  identity.armId = arm.id;
+  identity.file = group.file.str();
+  identity.groupBegin = group.groupB;
+  identity.groupEnd = group.groupE;
+  identity.parentArmId = group.parentArmId;
+  identity.parentIncludeId = group.parentIncludeId;
+  identity.armKind = arm.kind.str();
+  if (arm.cond)
+    identity.conditionText = arm.cond->str();
+  identity.selected = arm.selected;
+  if (arm.span) {
+    identity.aTokenBegin = arm.span->begin;
+    identity.aTokenEnd = arm.span->end;
+  }
+  identity.conditionTruthProducerProven =
+      conditionalArmSelectionTruthProducerProven(group, arm);
+  identity.reverseSolvedDirectiveRequired = reverseSolvedDirectiveRequired;
+  return identity;
+}
+} // namespace
+
 OwnerStateDelta
 RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
   OwnerStateFacts facts;
@@ -820,64 +1059,6 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
                               "producer PP span extends past A-token stream");
   };
 
-  auto macroReplacementTokenFingerprint =
-      [&](ArrayRef<RefoldModel::MacroReplacementToken> tokens) -> std::string {
-    std::string fingerprint;
-    llvm::raw_string_ostream os(fingerprint);
-    for (const RefoldModel::MacroReplacementToken &token : tokens) {
-      // This is a deterministic producer-fact fingerprint, not a cryptographic
-      // hash.  It is intentionally textual so theorem-audit logs can expose the
-      // exact definition-shape evidence without reparsing the directive body.
-      os << static_cast<unsigned>(token.kind) << ':' << token.spelling.size()
-         << ':' << token.spelling << ':';
-      if (token.paramIndex)
-        os << 'P' << *token.paramIndex;
-      else
-        os << '-';
-      os << ';';
-    }
-    return os.str();
-  };
-
-  auto anyVariadicParam = [](ArrayRef<RefoldModel::MacroDefParam> params) {
-    return llvm::any_of(params, [](const RefoldModel::MacroDefParam &param) {
-      return param.variadic;
-    });
-  };
-
-  auto identityFromDirective =
-      [&](const RefoldModel::MacroDirective &directive) -> MacroStateIdentity {
-    MacroStateIdentity identity;
-    identity.macroName = directive.name.str();
-    if (directive.IsDefine())
-      identity.definitionDirectiveId = directive.id;
-    else if (directive.IsUndef())
-      identity.undefDirectiveId = directive.id;
-    identity.functionLike = directive.functionLike;
-    identity.arity = static_cast<uint32_t>(directive.defParams.size());
-    identity.variadic = anyVariadicParam(directive.defParams);
-    identity.replacementTokenHash =
-        macroReplacementTokenFingerprint(directive.replacementTokens);
-    return identity;
-  };
-
-  auto identityFromInvocation =
-      [&](const RefoldModel::MacroInvocation &macro) -> MacroStateIdentity {
-    MacroStateIdentity identity;
-    identity.macroName = macro.name.str();
-    identity.definitionDirectiveId = macro.definitionDirectiveId;
-    identity.functionLike = macro.subkind == "func";
-    identity.arity = static_cast<uint32_t>(macro.defParams.size());
-    identity.variadic = anyVariadicParam(macro.defParams);
-    return identity;
-  };
-
-  auto identityFromMacroName = [](StringRef name) -> MacroStateIdentity {
-    MacroStateIdentity identity;
-    identity.macroName = name.str();
-    return identity;
-  };
-
   auto recordMacroObservation = [&](MacroObservationKind kind,
                                     const MacroStateIdentity &identity) {
     auditDeltaFact(kind == MacroObservationKind::DefinedOperator
@@ -891,188 +1072,6 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     observation.kind = kind;
     observation.identity = identity;
     facts.AddMacroObservation(observation);
-  };
-
-  auto lineControlIdentityFromEvent =
-      [&](const RefoldModel::LineControlEvent &event)
-      -> LineControlStateIdentity {
-    LineControlStateIdentity identity;
-    identity.eventId = event.id;
-    identity.physicalFile = event.physicalFile.str();
-    identity.siteBegin = event.siteB;
-    identity.siteEnd = event.siteE;
-    identity.active = event.active;
-    identity.producerProven = event.producerProven;
-    identity.logicalLineAfter = event.logicalLineAfter;
-    identity.logicalFileAfter = event.logicalFileAfter.str();
-    identity.ownerIncludeId = event.ownerIncludeId;
-    if (event.active && event.producerProven)
-      identity.operandProvenance =
-          LineDirectiveOperandProvenance::ProducerEvaluatedOperands;
-    else if (!event.active)
-      identity.operandProvenance =
-          LineDirectiveOperandProvenance::InactiveDirective;
-    else if (!event.producerProven)
-      identity.operandProvenance =
-          LineDirectiveOperandProvenance::MissingProducerOperands;
-    else
-      identity.operandProvenance = LineDirectiveOperandProvenance::Unknown;
-    return identity;
-  };
-
-  auto includeStateIdentityFromInclude =
-      [&](const RefoldModel::IncludeItem &include) -> IncludeStateIdentity {
-    IncludeStateIdentity identity;
-    identity.includeId = include.id;
-    identity.directiveKind = include.subkind.str();
-    identity.sitePath = include.sitePath.str();
-    identity.siteBegin = include.siteB;
-    identity.siteEnd = include.siteE;
-    identity.target = include.target.str();
-    if (include.resolvedPath)
-      identity.resolvedPath = include.resolvedPath->str();
-    identity.angled = include.angled;
-    identity.parentIncludeId = include.parent;
-    identity.hasTokenMaterialization = include.cover.IsValid();
-    return identity;
-  };
-
-  auto includeGuardIdentityFromInclude =
-      [&](const RefoldModel::IncludeItem &include)
-      -> IncludeGuardStateIdentity {
-    IncludeGuardStateIdentity identity;
-    identity.includeId = include.id;
-    identity.headerPath = include.resolvedPath ? include.resolvedPath->str()
-                                               : include.target.str();
-    identity.parentIncludeId = include.parent;
-    // The current producer map records include identity and conditional/macro
-    // events, but not a first-class include-guard oracle.  Keep the guard macro
-    // absent and producerProvenGuard=false rather than inferring a guard
-    // pattern from source text.  A zero-token include may be a skipped guard
-    // include, but it may also be an empty header, so classify it as unknown
-    // guard state unless a future producer record proves the reason.
-    identity.kind =
-        include.cover.IsValid()
-            ? IncludeGuardObservationKind::ActiveIncludeMayMutateGuard
-            : IncludeGuardObservationKind::UnknownGuardEffect;
-    identity.producerProvenGuard = false;
-    return identity;
-  };
-
-  auto pragmaClassificationFromText =
-      [&](StringRef text) -> PragmaStateClassification {
-    std::optional<ParsedDiagnosticPragmaStateDirective> parsed =
-        parseDiagnosticPragmaStateDirective(text, lexLang_);
-    if (!parsed)
-      return PragmaStateClassification::UnknownPragmaState;
-    switch (parsed->action) {
-    case DiagnosticPragmaStateAction::Setting:
-      return PragmaStateClassification::KnownLocalPragmaState;
-    case DiagnosticPragmaStateAction::Push:
-    case DiagnosticPragmaStateAction::Pop:
-      return PragmaStateClassification::KnownBalancedPragmaState;
-    }
-    llvm_unreachable("Invalid diagnostic pragma action");
-  };
-
-  auto pragmaIdentityFromPragma =
-      [&](const RefoldModel::PragmaDirective &pragma) -> PragmaStateIdentity {
-    PragmaStateIdentity identity;
-    identity.pragmaId = pragma.id;
-    identity.sitePath = pragma.sitePath.str();
-    identity.siteBegin = pragma.siteB;
-    identity.siteEnd = pragma.siteE;
-    identity.ownerIncludeId = pragma.ownerIncludeId;
-    identity.classification = pragmaClassificationFromText(pragma.text);
-    // Deterministic textual fingerprint.  This is not a semantic parser; it
-    // keeps theorem logs anchored to the producer-supplied directive bytes.
-    identity.directiveFingerprint =
-        llvm::formatv("{0}:{1}", pragma.text.size(), pragma.text).str();
-    return identity;
-  };
-
-  auto conditionalSelectedArmCount =
-      [](const RefoldModel::CondGroup &group) -> uint64_t {
-    uint64_t selectedCount = 0;
-    for (const RefoldModel::CondArm &arm : group.arms)
-      if (arm.selected)
-        ++selectedCount;
-    return selectedCount;
-  };
-
-  auto conditionalGroupHasUniqueSelectedArm =
-      [&](const RefoldModel::CondGroup &group) {
-        return conditionalSelectedArmCount(group) == 1;
-      };
-
-  auto conditionalArmConditionWasProducerEvaluated =
-      [](const RefoldModel::CondGroup &group,
-         const RefoldModel::CondArm &queriedArm) {
-        // Only conditions reached by the producer's selected branch path are
-        // semantic observations.  For an #if/#elif/#else chain, conditions are
-        // evaluated until the selected arm is reached.  Later #elif conditions
-        // are source text, but they were not queried by the preprocessor and
-        // cannot be used as suffix-state proof.
-        bool reachedByProducer = true;
-        for (const RefoldModel::CondArm &arm : group.arms) {
-          if (arm.id == queriedArm.id)
-            return reachedByProducer && arm.cond.has_value();
-          if (arm.selected)
-            reachedByProducer = false;
-        }
-        return false;
-      };
-
-  auto conditionalArmSelectionTruthProducerProven =
-      [&](const RefoldModel::CondGroup &group,
-          const RefoldModel::CondArm &arm) {
-        if (!conditionalGroupHasUniqueSelectedArm(group))
-          return false;
-        if (arm.selected)
-          return true;
-        return conditionalArmConditionWasProducerEvaluated(group, arm);
-      };
-
-  auto conditionalGroupIdentityFromGroup =
-      [&](const RefoldModel::CondGroup &group) -> ConditionalStateIdentity {
-    ConditionalStateIdentity identity;
-    identity.role = ConditionalStateRole::ConditionalGroup;
-    identity.groupId = group.id;
-    identity.file = group.file.str();
-    identity.groupBegin = group.groupB;
-    identity.groupEnd = group.groupE;
-    identity.parentArmId = group.parentArmId;
-    identity.parentIncludeId = group.parentIncludeId;
-    identity.conditionTruthProducerProven =
-        conditionalGroupHasUniqueSelectedArm(group);
-    return identity;
-  };
-
-  auto conditionalArmIdentityFromArm =
-      [&](const RefoldModel::CondGroup &group, const RefoldModel::CondArm &arm,
-          bool reverseSolvedDirectiveRequired) -> ConditionalStateIdentity {
-    ConditionalStateIdentity identity;
-    identity.role = arm.selected ? ConditionalStateRole::ActiveArm
-                                 : ConditionalStateRole::InactiveArm;
-    identity.groupId = group.id;
-    identity.armId = arm.id;
-    identity.file = group.file.str();
-    identity.groupBegin = group.groupB;
-    identity.groupEnd = group.groupE;
-    identity.parentArmId = group.parentArmId;
-    identity.parentIncludeId = group.parentIncludeId;
-    identity.armKind = arm.kind.str();
-    if (arm.cond)
-      identity.conditionText = arm.cond->str();
-    identity.selected = arm.selected;
-    if (arm.span) {
-      identity.aTokenBegin = arm.span->begin;
-      identity.aTokenEnd = arm.span->end;
-    }
-    identity.conditionTruthProducerProven =
-        conditionalArmSelectionTruthProducerProven(group, arm);
-    identity.reverseSolvedDirectiveRequired = reverseSolvedDirectiveRequired;
-    return identity;
   };
 
   auto recordCounterInvocationEvents =
@@ -1234,7 +1233,8 @@ RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
     auditDeltaFact(DirectStateCheckKind::PragmaDirective,
                    OwnerStateComponent::PragmaState,
                    "#pragma directive state fact");
-    const PragmaStateIdentity identity = pragmaIdentityFromPragma(pragma);
+    const PragmaStateIdentity identity =
+        pragmaIdentityFromPragma(pragma, lexLang_);
     facts.AddPragmaStateEvent(identity);
     if (identity.classification ==
         PragmaStateClassification::UnknownPragmaState)
