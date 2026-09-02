@@ -389,6 +389,10 @@ struct PartitionEdge {
   bool IsStateGap() const { return kind == PartitionEdgeKind::StateGap; }
 };
 
+/// Sentinel `PartitionStateKey::lastTokenEdgeIndex` for a DP state that no
+/// token segment has reached yet.
+constexpr size_t noTokenEdgeIndex = std::numeric_limits<size_t>::max();
+
 struct PartitionStateKey {
   uint64_t bPos = 0;
   HunkRealizer firstRealizer;
@@ -664,7 +668,9 @@ class StructuralTilingProver {
 public:
   explicit StructuralTilingProver(
       RefoldMixedOwnerTilingPlanner::Dependencies &deps)
-      : deps_(deps) {
+      : deps_(deps),
+        gapCrossingProver_(RefoldStructuralGapCrossingProver::Dependencies{
+            deps.model, deps.macroStateProof, deps.tokenText, deps.lexLang}) {
     std::set<uint64_t> seenTokmapPP;
     for (const RefoldModel::TokMapEntry &entry : deps_.model.GetTokmap()) {
       if (!seenTokmapPP.insert(entry.pp).second)
@@ -1744,6 +1750,1029 @@ public:
     }
     return true;
   }
+  // boundary: failures while *searching* for a structural
+  // partition are non-applicability, not terminal proof failures.  Until a
+  // partition has been accepted and durable segment witnesses have been
+  // emitted, the ordinary macro/include/TU owner-realization paths still own
+  // the hunk.  Returning std::nullopt here therefore preserves the existing
+  // lattice ordering instead of prematurely forcing raw-B terminal output.
+  std::optional<StructuralPartition>
+  TryBuildStructuralPartition(const diffutils::Hunk &h) const {
+    const bool replaceHunk = h.isReplace();
+    const bool deleteOnlyHunk = h.isDeleteOnly();
+
+    // extends deterministic mixed-owner tiling beyond non-empty
+    // replacements only where the theorem obligations are still meaningful.
+    // Delete-only hunks have an A-side owner cover and an empty B envelope,
+    // so they can be partitioned by the same owner-closure proof. Insert-only
+    // hunks have no A-side owner cover; they require insertion-anchor proofs
+    // handled by the existing insertion/macro/include machinery, not by this
+    // mixed-owner tiler.  Equal/state-only hunks are likewise classified as
+    // outside this normalizer instead of being silently interpreted as token
+    // partitions.
+    if (!replaceHunk && !deleteOnlyHunk)
+      return std::nullopt;
+    if (h.aEnd <= h.aStart || (replaceHunk && h.bEnd <= h.bStart) ||
+        (deleteOnlyHunk && h.bEnd != h.bStart))
+      return std::nullopt;
+    if (h.aEnd - h.aStart < 2)
+      return std::nullopt;
+
+    // If the whole hunk is already a patchable macro invocation, leave it as
+    // one hunk. Splitting inside an already-proven whole macro candidate
+    // would make this normalization pass compete with the macro lattice
+    // rather than merely exposing otherwise independent owners.
+    Owner wholeOwner =
+        deps_.ownerClassifier.ClassifyOwnerWithSegments(deps_.tuPath, h);
+    if (auto *wholeMacro = deps_.macroTopology.SmallestCoveringPatchableMacro(
+            h.aStart, h.aEnd, wholeOwner.includeId)) {
+      if (wholeMacro->invB && wholeMacro->invE)
+        return std::nullopt;
+    }
+
+    // Derive the canonical physical-source topology before constructing the
+    // candidate edge graph. The historical mixed-realizer theorem may still
+    // proceed when this direct topology is unavailable, but no partition may
+    // claim preserved preprocessing structure without matching these exact
+    // maximal runs.
+    std::optional<PhysicalSourceRunPlan> physicalSourceRuns =
+        BuildPhysicalSourceRunPlan(h);
+
+    // The boundary-projection theorem binds every canonical physical
+    // source-run boundary to one exact B-token boundary before the DP may
+    // construct a replacement partition. Projection disagreement is terminal
+    // for this normalization attempt. Retaining the physical plan only for
+    // same-realizer paths while allowing the historical mixed-realizer search
+    // to continue would let an
+    // alternate partition assign the same ambiguous payload indirectly.
+    //
+    // `ProjectATokenBoundaryToBTokenBounds()` now reports the minimum and
+    // maximum B frontiers reached by all maximum-length local token
+    // alignments. A strict range therefore means the B expression is
+    // inseparable at this A
+    // seam.  Do not choose an alignment, discard the structure witness, or put
+    // the payload on a preferred side; preserve the original hunk for the
+    // ordinary macro/include/expansion/fallback lattice.
+    if (replaceHunk && physicalSourceRuns &&
+        physicalSourceRuns->runs.size() >= 2) {
+      bool projectionsComplete = true;
+      physicalSourceRuns->boundaryProjections.clear();
+      physicalSourceRuns->macroStatePlacementProven.clear();
+      for (size_t runIndex = 0; runIndex + 1 < physicalSourceRuns->runs.size();
+           ++runIndex) {
+        const uint64_t aBoundary = physicalSourceRuns->runs[runIndex].aEnd;
+        std::optional<RefoldSourceMapper::ATokenBoundaryProjection> projection =
+            deps_.sourceMapper.ProjectATokenBoundaryToBTokenBounds(
+                h.aStart, h.aEnd, h.bStart, h.bEnd, aBoundary);
+        bool macroStatePlacementProven = false;
+        // A strict range means the payload cannot be split at this seam by
+        // alignment alone. That is not the end of the question: when the
+        // preserved gap changes state the payload provably cannot observe,
+        // both placements re-preprocess to the same tokens and are
+        // equivalent refolds, so committing one is a proof rather than a
+        // preference. Refusing instead surrenders the translation unit and
+        // deletes the very directive the refusal was protecting.
+        //
+        // The question is asked of every structure in the gap separately and
+        // the answers composed, so a gap holding two kinds is admitted
+        // exactly when both are.  Each rule defaults to observable, so an
+        // unclassified pragma, an unrecognized directive, or any structure
+        // with no rule keeps the whole gap refusing here.
+        if (projection && !projection->IsUnique() &&
+            runIndex < physicalSourceRuns->protectedGaps.size() &&
+            runIndex < physicalSourceRuns->protectedGapFacts.size()) {
+          const OwnerSourceRange &gap =
+              physicalSourceRuns->protectedGaps[runIndex];
+          if (gap.IsValid() && gap.begin <= gap.end) {
+            std::optional<std::pair<uint64_t, uint64_t>> payloadBytes =
+                deps_.sourceMapper.BTokenRangeToByteRange(
+                    projection->lowerBTokenBoundary,
+                    projection->upperBTokenBoundary);
+            const bool payloadBytesUsable =
+                payloadBytes && payloadBytes->second <= deps_.bSource.size() &&
+                payloadBytes->first <= payloadBytes->second;
+
+            // Committing a side is decided by `[lower,upper)` alone, because
+            // every token outside that range has a forced alignment and keeps
+            // the side it already had.  Everything from the committed
+            // boundary to the end of the hunk nevertheless lands after the
+            // structure, so a rule that asks the question of that whole
+            // suffix is deliberately wider than the placement obligation
+            // rather than weaker than it.
+            std::optional<std::pair<uint64_t, uint64_t>> committedSuffixBytes =
+                deps_.sourceMapper.BTokenRangeToByteRange(
+                    projection->lowerBTokenBoundary, h.bEnd);
+            const bool committedSuffixUsable =
+                committedSuffixBytes &&
+                committedSuffixBytes->second <= deps_.bSource.size() &&
+                committedSuffixBytes->first <= committedSuffixBytes->second;
+
+            if (payloadBytesUsable && committedSuffixUsable) {
+              RefoldStructuralGapCrossingProver::Query crossingQuery;
+              crossingQuery.structures =
+                  physicalSourceRuns->protectedGapFacts[runIndex].intervals;
+              crossingQuery.payload = deps_.bSource.slice(payloadBytes->first,
+                                                          payloadBytes->second);
+              crossingQuery.committedSuffix = deps_.bSource.slice(
+                  committedSuffixBytes->first, committedSuffixBytes->second);
+              crossingQuery.committedArmId =
+                  physicalSourceRuns->runs[runIndex + 1].condArmId;
+
+              const GapCrossingProof crossing =
+                  gapCrossingProver_.Prove(crossingQuery);
+              // A macro-state seam the liveness planner still owns is not
+              // taken here even when the crossing is proven: that planner is
+              // the only stage modelling resurrection, undef/restore, and
+              // replay ordering for a consumed directive.
+              const bool crossable =
+                  crossing.Crossable() &&
+                  (!crossing.carriesMacroStateDirective ||
+                   !MacroStateGapBelongsToLivenessPlanner(gap, crossing));
+
+              if (crossable) {
+                // Equivalent placements: commit the lower frontier, which
+                // leaves the undetermined payload after the preserved
+                // structure. The side is arbitrary precisely because
+                // equivalence is proved; the witness below records which side
+                // was taken so it is not a bare tie-break.
+                REFOLD_LOG_TRACE(
+                    "tiling/structural",
+                    "payload B=[{0},{1}) cannot observe any of the {2} "
+                    "structure(s) preserved at source='{3}'[{4},{5}); "
+                    "committing it after them rather than surrendering the "
+                    "translation unit",
+                    projection->lowerBTokenBoundary,
+                    projection->upperBTokenBoundary, crossing.structures.size(),
+                    gap.path, gap.begin, gap.end);
+                projection->upperBTokenBoundary =
+                    projection->lowerBTokenBoundary;
+                macroStatePlacementProven = crossing.carriesMacroStateDirective;
+              }
+            }
+          }
+        }
+
+        if (!projection || !projection->IsUnique()) {
+          if (inTraceMode()) {
+            REFOLD_LOG_TRACE("tiling/structural",
+                             "structural replacement rejected:");
+            REFOLD_LOG_TRACE("tiling/structural",
+                             "original A=[{0},{1}) B=[{2},{3})", h.aStart,
+                             h.aEnd, h.bStart, h.bEnd);
+            REFOLD_LOG_TRACE("tiling/structural",
+                             "reason=non-unique B partition");
+            if (projection) {
+              REFOLD_LOG_TRACE("tiling/structural",
+                               "ambiguous boundary A={0} lowerB={1} upperB={2}",
+                               aBoundary, projection->lowerBTokenBoundary,
+                               projection->upperBTokenBoundary);
+            } else {
+              REFOLD_LOG_TRACE("tiling/structural",
+                               "ambiguous boundary A={0} projection="
+                               "<incomplete>",
+                               aBoundary);
+            }
+          }
+          projectionsComplete = false;
+          break;
+        }
+
+        const uint64_t bBoundary = projection->lowerBTokenBoundary;
+        if (bBoundary < h.bStart || bBoundary > h.bEnd ||
+            (!physicalSourceRuns->boundaryProjections.empty() &&
+             bBoundary < physicalSourceRuns->boundaryProjections.back()
+                             .bTokenBoundary)) {
+          projectionsComplete = false;
+          break;
+        }
+
+        StructuralBoundaryProjectionWitness boundaryWitness;
+        boundaryWitness.aTokenBoundary = aBoundary;
+        boundaryWitness.lowerBTokenBoundary = projection->lowerBTokenBoundary;
+        boundaryWitness.upperBTokenBoundary = projection->upperBTokenBoundary;
+        boundaryWitness.bTokenBoundary = bBoundary;
+        boundaryWitness.uniqueProjection = true;
+        physicalSourceRuns->boundaryProjections.push_back(boundaryWitness);
+        physicalSourceRuns->macroStatePlacementProven.push_back(
+            macroStatePlacementProven);
+      }
+
+      if (!projectionsComplete ||
+          physicalSourceRuns->boundaryProjections.size() + 1 !=
+              physicalSourceRuns->runs.size() ||
+          physicalSourceRuns->macroStatePlacementProven.size() !=
+              physicalSourceRuns->boundaryProjections.size())
+        return std::nullopt;
+    }
+
+    const uint64_t aLen = h.aEnd - h.aStart;
+    std::vector<PartitionEdge> edges;
+    std::vector<std::vector<size_t>> edgesByAOffset(static_cast<size_t>(aLen) +
+                                                    1);
+
+    for (uint64_t aLo = h.aStart; aLo < h.aEnd; ++aLo) {
+      // Prefer wider segments when several partitions have the same number of
+      // pieces. This keeps source structure maximally coarse while remaining
+      // deterministic.
+      for (uint64_t aHi = h.aEnd; aHi > aLo; --aHi) {
+        HunkRealizer realizer = ClassifyHunkRealizer(aLo, aHi);
+        if (realizer.kind == HunkRealizerKind::Unknown)
+          continue;
+
+        std::optional<size_t> exactPhysicalRunIndex;
+        if (physicalSourceRuns) {
+          for (size_t runIndex = 0; runIndex < physicalSourceRuns->runs.size();
+               ++runIndex) {
+            const PhysicalSourceRun &run = physicalSourceRuns->runs[runIndex];
+            if (run.aStart != aLo || run.aEnd != aHi)
+              continue;
+            if (exactPhysicalRunIndex) {
+              exactPhysicalRunIndex.reset();
+              break;
+            }
+            exactPhysicalRunIndex = runIndex;
+          }
+        }
+
+        uint64_t edgeBStart = h.bStart;
+        uint64_t edgeBEnd = h.bStart;
+        if (!deleteOnlyHunk) {
+          if (exactPhysicalRunIndex && physicalSourceRuns &&
+              physicalSourceRuns->boundaryProjections.size() + 1 ==
+                  physicalSourceRuns->runs.size()) {
+            const size_t runIndex = *exactPhysicalRunIndex;
+            edgeBStart = runIndex == 0 ? h.bStart
+                                       : physicalSourceRuns
+                                             ->boundaryProjections[runIndex - 1]
+                                             .bTokenBoundary;
+            edgeBEnd = runIndex + 1 == physicalSourceRuns->runs.size()
+                           ? h.bEnd
+                           : physicalSourceRuns->boundaryProjections[runIndex]
+                                 .bTokenBoundary;
+            if (edgeBEnd < edgeBStart)
+              continue;
+          } else {
+            auto env =
+                deps_.sourceMapper
+                    .MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(aLo, aHi);
+            if (!env)
+              continue;
+            if (env->first < static_cast<size_t>(h.bStart) ||
+                env->second > static_cast<size_t>(h.bEnd) ||
+                env->first >= env->second) {
+              continue;
+            }
+            edgeBStart = static_cast<uint64_t>(env->first);
+            edgeBEnd = static_cast<uint64_t>(env->second);
+          }
+        }
+
+        PartitionEdge edge;
+        edge.aStart = aLo;
+        edge.aEnd = aHi;
+        edge.bStart = edgeBStart;
+        edge.bEnd = edgeBEnd;
+        edge.realizer = realizer;
+        // A nonempty parent replacement may contain a uniquely projected
+        // delete fragment.  Such an empty B envelope is authorized only for
+        // one exact canonical physical run; arbitrary subrange envelopes
+        // retain the historical nonempty requirement.
+        edge.allowEmptyBEnvelope =
+            deleteOnlyHunk ||
+            (replaceHunk && exactPhysicalRunIndex && edgeBStart == edgeBEnd);
+        edge.closure = BuildTokenSegmentClosure(edge);
+        if (!edge.closure)
+          continue;
+
+        const size_t edgeIndex = edges.size();
+        edges.push_back(edge);
+        edgesByAOffset[static_cast<size_t>(aLo - h.aStart)].push_back(
+            edgeIndex);
+      }
+    }
+
+    auto physicalRunIndexForEdge =
+        [&](const PartitionEdge &candidate) -> std::optional<size_t> {
+      if (!physicalSourceRuns || !candidate.IsTokenSegment() ||
+          !candidate.closure || !candidate.closure->source.IsComplete()) {
+        return std::nullopt;
+      }
+
+      std::optional<size_t> match;
+      for (size_t runIndex = 0; runIndex < physicalSourceRuns->runs.size();
+           ++runIndex) {
+        const PhysicalSourceRun &run = physicalSourceRuns->runs[runIndex];
+        if (candidate.aStart != run.aStart || candidate.aEnd != run.aEnd ||
+            !SourceSitesComparable(candidate.closure->source, run.source) ||
+            candidate.closure->source.begin != run.source.begin ||
+            candidate.closure->source.end != run.source.end) {
+          continue;
+        }
+
+        if (match)
+          return std::nullopt;
+        match = runIndex;
+      }
+      return match;
+    };
+
+    std::vector<std::map<PartitionStateKey, PartitionParent>> dp(
+        static_cast<size_t>(aLen) + 1);
+    PartitionStateKey startKey;
+    startKey.bPos = h.bStart;
+    startKey.lastTokenEdgeIndex = noTokenEdgeIndex;
+
+    PartitionParent startParent;
+    startParent.valid = true;
+    startParent.cost = 0;
+    dp[0][startKey] = std::move(startParent);
+
+    for (uint64_t aOff = 0; aOff < aLen; ++aOff) {
+      auto &states = dp[static_cast<size_t>(aOff)];
+      if (states.empty())
+        continue;
+
+      for (const auto &state : states) {
+        const PartitionStateKey &key = state.first;
+        const unsigned curCost = state.second.cost;
+
+        for (size_t edgeIndex : edgesByAOffset[static_cast<size_t>(aOff)]) {
+          const PartitionEdge &edge = edges[edgeIndex];
+          if (edge.bStart != key.bPos)
+            continue;
+
+          const PartitionEdge *prevEdge = nullptr;
+          if (key.lastTokenEdgeIndex != noTokenEdgeIndex) {
+            if (key.lastTokenEdgeIndex >= edges.size())
+              continue;
+            prevEdge = &edges[key.lastTokenEdgeIndex];
+          }
+
+          // state gaps are part of the searched proof graph.  They are
+          // computed on the transition from the previous token segment to
+          // this token segment, so an unsafe or uncovered source gap prevents
+          // this DP edge from existing at all.  This lets cost and ambiguity
+          // account for the real token+state proof graph instead of adding
+          // state gaps as an after-the-fact annotation.
+          auto transitionGaps = BuildClosedStateGapTransition(prevEdge, edge);
+          if (!transitionGaps)
+            continue;
+
+          // Protected preprocessing structure may justify a partition only
+          // at one canonical maximal-run boundary. This prevents the DP from
+          // manufacturing a split from arbitrary token subranges merely
+          // because they surround the same directive. The predecessor and
+          // successor must be the complete runs immediately adjacent to the
+          // exact byte-complete physical gap.
+          bool protectedReplacementBoundaryProven = false;
+          if (transitionGaps->hasProtectedPreprocessingStructure && prevEdge) {
+            if (replaceHunk) {
+              // Every replacement transition across protected source bytes,
+              // including a transition between different realizers, needs the
+              // same canonical source-run and unique B-frontier authority.
+              // Otherwise a mixed-owner path could bypass the required
+              // ambiguity rejection that applies to a same-owner path.
+              if (!physicalSourceRuns)
+                continue;
+
+              std::optional<size_t> boundaryIndex;
+              for (size_t runIndex = 0;
+                   runIndex + 1 < physicalSourceRuns->runs.size(); ++runIndex) {
+                const PhysicalSourceRun &leftRun =
+                    physicalSourceRuns->runs[runIndex];
+                const PhysicalSourceRun &rightRun =
+                    physicalSourceRuns->runs[runIndex + 1];
+                if (leftRun.aEnd != prevEdge->aEnd ||
+                    rightRun.aStart != edge.aStart)
+                  continue;
+                if (boundaryIndex) {
+                  boundaryIndex.reset();
+                  break;
+                }
+                boundaryIndex = runIndex;
+              }
+              if (!boundaryIndex ||
+                  *boundaryIndex >= physicalSourceRuns->protectedGaps.size() ||
+                  *boundaryIndex >=
+                      physicalSourceRuns->boundaryProjections.size()) {
+                continue;
+              }
+
+              const OwnerSourceRange &provedGap =
+                  physicalSourceRuns->protectedGaps[*boundaryIndex];
+              if (!SourceSitesComparable(prevEdge->closure->source,
+                                         provedGap) ||
+                  provedGap.begin != prevEdge->closure->source.end ||
+                  provedGap.end != edge.closure->source.begin) {
+                continue;
+              }
+
+              // A complete #define/#undef line is not an ordinary preserved
+              // separator in the direct TU pipeline.  The whole-hunk path is
+              // allowed to consume it precisely so the dedicated macro-state
+              // liveness planner can decide whether the directive must remain
+              // before, move after, or be replayed around the replacement.
+              // Splitting here would make that planner observe two narrow
+              // edits and no consumed macro-state transition, thereby
+              // replacing its established ordering theorem with an unrelated
+              // byte/token alignment.  Defer instead of stealing the hunk.
+              //
+              // The exception is a seam where that decision is already
+              // empty.  Everything committed after the separator was proved
+              // to name no identifier, so no B payload can reach the
+              // definition the directive binds: there is no order to choose
+              // and nothing to undefine and restore.  Deferring then buys
+              // the planner no authority it can use, and costs the directive
+              // its place in the source -- the planner's remaining move is
+              // to relocate it past the replacement.  Every seam without
+              // that proof still defers.
+              const bool macroStatePlacementProven =
+                  *boundaryIndex <
+                      physicalSourceRuns->macroStatePlacementProven.size() &&
+                  physicalSourceRuns->macroStatePlacementProven[*boundaryIndex];
+              if (transitionContainsMacroStateDirective(*transitionGaps) &&
+                  !macroStatePlacementProven) {
+                continue;
+              }
+
+              const StructuralBoundaryProjectionWitness &projection =
+                  physicalSourceRuns->boundaryProjections[*boundaryIndex];
+              if (!projection.uniqueProjection ||
+                  projection.aTokenBoundary != prevEdge->aEnd ||
+                  projection.aTokenBoundary != edge.aStart ||
+                  projection.lowerBTokenBoundary !=
+                      projection.upperBTokenBoundary ||
+                  projection.bTokenBoundary != projection.lowerBTokenBoundary ||
+                  prevEdge->bEnd != projection.bTokenBoundary ||
+                  edge.bStart != projection.bTokenBoundary) {
+                continue;
+              }
+              protectedReplacementBoundaryProven = true;
+            } else if (prevEdge->realizer == edge.realizer) {
+              // Delete-only same-realizer tiling retains the protected-gap
+              // theorem:
+              // both token edges must be the exact maximal runs surrounding
+              // the proved protected gap.  Mixed-realizer deletion behavior is
+              // intentionally unchanged.
+              if (!physicalSourceRuns)
+                continue;
+              std::optional<size_t> previousRun =
+                  physicalRunIndexForEdge(*prevEdge);
+              std::optional<size_t> currentRun = physicalRunIndexForEdge(edge);
+              if (!previousRun || !currentRun ||
+                  *currentRun != *previousRun + 1 ||
+                  *previousRun >= physicalSourceRuns->protectedGaps.size()) {
+                continue;
+              }
+
+              const OwnerSourceRange &provedGap =
+                  physicalSourceRuns->protectedGaps[*previousRun];
+              if (!SourceSitesComparable(prevEdge->closure->source,
+                                         provedGap) ||
+                  provedGap.begin != prevEdge->closure->source.end ||
+                  provedGap.end != edge.closure->source.begin) {
+                continue;
+              }
+            }
+          }
+
+          if (replaceHunk &&
+              transitionGaps->hasProtectedPreprocessingStructure &&
+              !protectedReplacementBoundaryProven) {
+            continue;
+          }
+
+          PartitionStateKey nextKey;
+          nextKey.bPos = edge.bEnd;
+          nextKey.lastRealizer = edge.realizer;
+          nextKey.lastTokenEdgeIndex = edgeIndex;
+
+          if (key.firstRealizer.kind == HunkRealizerKind::Unknown) {
+            nextKey.firstRealizer = edge.realizer;
+            nextKey.mixedRealizers = false;
+            nextKey.preservedPreprocessingStructure = false;
+          } else {
+            // Adjacent equal realizers are never split merely because the
+            // subrange search found two candidates.  Delete-only hunks require
+            // one exact protected source gap.  Replacement hunks additionally
+            // require the unique-boundary projection theorem for that
+            // canonical run boundary:
+            // the independently derived lower and upper A-to-B projections
+            // must agree with both neighboring edge envelopes.  This preserves
+            // directive order without assigning replacement payload by
+            // traversal order, textual proximity, or a preferred side.
+            if (key.lastRealizer == edge.realizer) {
+              const bool deleteBoundaryProven =
+                  deleteOnlyHunk &&
+                  transitionGaps->hasProtectedPreprocessingStructure;
+              const bool replacementBoundaryProven =
+                  replaceHunk &&
+                  transitionGaps->hasProtectedPreprocessingStructure &&
+                  protectedReplacementBoundaryProven;
+              if (!deleteBoundaryProven && !replacementBoundaryProven)
+                continue;
+            }
+            nextKey.firstRealizer = key.firstRealizer;
+            nextKey.mixedRealizers =
+                key.mixedRealizers || edge.realizer != key.firstRealizer;
+            nextKey.preservedPreprocessingStructure =
+                key.preservedPreprocessingStructure ||
+                transitionGaps->hasProtectedPreprocessingStructure;
+          }
+
+          auto &dst = dp[static_cast<size_t>(edge.aEnd - h.aStart)];
+          const unsigned gapEdgeCost =
+              static_cast<unsigned>(transitionGaps->gaps.size());
+          const unsigned nextCost = curCost + 1 + gapEdgeCost;
+          auto existing = dst.find(nextKey);
+          if (existing == dst.end() || nextCost < existing->second.cost) {
+            PartitionParent parent;
+            parent.valid = true;
+            parent.edgeIndex = edgeIndex;
+            parent.prev = key;
+            parent.cost = nextCost;
+            parent.stateGapsBeforeEdge = transitionGaps->gaps;
+            parent.ambiguous = state.second.ambiguous;
+            dst[nextKey] = std::move(parent);
+          } else if (nextCost == existing->second.cost) {
+            // Two minimal chains prove the same next state. Do not choose
+            // between them by map/edge iteration order; mark the state as
+            // ambiguous so the final tiling proof fails closed.
+            existing->second.ambiguous = true;
+          }
+        }
+      }
+    }
+
+    const auto &finalStates = dp[static_cast<size_t>(aLen)];
+    auto bestFinal = finalStates.end();
+    unsigned bestCost = std::numeric_limits<unsigned>::max();
+    bool ambiguousBest = false;
+    for (auto it = finalStates.begin(); it != finalStates.end(); ++it) {
+      const PartitionStateKey &key = it->first;
+      if (key.bPos != h.bEnd ||
+          (!key.mixedRealizers && !key.preservedPreprocessingStructure)) {
+        continue;
+      }
+
+      const unsigned candidateCost = it->second.cost;
+      if (candidateCost < bestCost) {
+        bestFinal = it;
+        bestCost = candidateCost;
+        ambiguousBest = it->second.ambiguous;
+      } else if (candidateCost == bestCost) {
+        ambiguousBest = true;
+      }
+    }
+    if (bestFinal == finalStates.end())
+      return std::nullopt;
+
+    if (ambiguousBest) {
+      if (inTraceMode()) {
+        unsigned tiedCount = 0;
+        for (auto it = finalStates.begin(); it != finalStates.end(); ++it) {
+          const PartitionStateKey &key = it->first;
+          if (key.bPos != h.bEnd ||
+              (!key.mixedRealizers && !key.preservedPreprocessingStructure))
+            continue;
+          if (it->second.cost != bestCost)
+            continue;
+          ++tiedCount;
+          // Reconstruct this tied state's edge chain so the dump shows the
+          // actual tiling, not just the DP bookkeeping that reached it.
+          {
+            std::string chain;
+            uint64_t aPos2 = h.aEnd;
+            PartitionStateKey k2 = it->first;
+            unsigned guard = 0;
+            while (aPos2 != h.aStart && guard++ < 64) {
+              const uint64_t aOff2 = aPos2 - h.aStart;
+              const auto s2 = dp[static_cast<size_t>(aOff2)].find(k2);
+              if (s2 == dp[static_cast<size_t>(aOff2)].end() ||
+                  !s2->second.valid)
+                break;
+              const PartitionEdge &e2 = edges[s2->second.edgeIndex];
+              chain = llvm::formatv(
+                          "[{0},{1})->[{2},{3}) r={4}/{5} gaps={6} | ",
+                          e2.aStart, e2.aEnd, e2.bStart, e2.bEnd,
+                          static_cast<int>(e2.realizer.kind), e2.realizer.id,
+                          s2->second.stateGapsBeforeEdge.size())
+                          .str() +
+                      chain;
+              aPos2 = e2.aStart;
+              k2 = s2->second.prev;
+            }
+            REFOLD_LOG_TRACE("tiling/partition", "    chain: {0}", chain);
+          }
+          REFOLD_LOG_TRACE(
+              "tiling/partition",
+              "  tied final state: cost={0} selfAmbiguous={1} edgeIndex={2} "
+              "firstRealizer={3}/{4} lastRealizer={5}/{6} "
+              "lastTokenEdgeIndex={7} mixed={8} preserved={9}",
+              it->second.cost, it->second.ambiguous, it->second.edgeIndex,
+              static_cast<int>(key.firstRealizer.kind), key.firstRealizer.id,
+              static_cast<int>(key.lastRealizer.kind), key.lastRealizer.id,
+              key.lastTokenEdgeIndex, key.mixedRealizers,
+              key.preservedPreprocessingStructure);
+        }
+        REFOLD_LOG_TRACE("tiling/partition",
+                         "  tiedFinalStates={0} bestCost={1}", tiedCount,
+                         bestCost);
+      }
+      // The hunk *can* be tiled -- the DP reached a minimum-cost partition --
+      // but two or more partitions tie there, so no single tiling is proven.
+      // Report it: an ambiguous tie is a different situation from a hunk that
+      // admits no partition at all, and only the former has a fix available
+      // (a proof-backed criterion that makes one tiling uniquely admissible,
+      // not a cost tiebreak, which would be ordering mistaken for proof).
+      REFOLD_LOG_TRACE("tiling/partition",
+                       "ambiguous: hunk A=[{0},{1}) B=[{2},{3}) has multiple "
+                       "minimum-cost partitions; declining to choose",
+                       h.aStart, h.aEnd, h.bStart, h.bEnd);
+      return std::nullopt;
+    }
+
+    // Reconstruct the unique lowest-cost structural path.  The DP tracks both
+    // mixed-realizer and protected-structure obligations as state, rather
+    // than
+    // choosing the cheapest token cover first and classifying it afterwards.
+    // This prevents a coarse TU edge from swallowing a smaller macro/include
+    // segment or a preprocessing-structure boundary.  Equal-cost alternatives
+    // are rejected instead of being hidden behind map/edge iteration order.
+    SmallVector<PartitionEdge, 8> reversePath;
+    uint64_t aPos = h.aEnd;
+    PartitionStateKey stateKey = bestFinal->first;
+    while (aPos != h.aStart) {
+      const uint64_t aOff = aPos - h.aStart;
+      const auto stateIt = dp[static_cast<size_t>(aOff)].find(stateKey);
+      if (stateIt == dp[static_cast<size_t>(aOff)].end() ||
+          !stateIt->second.valid) {
+        return std::nullopt;
+      }
+
+      const PartitionParent &parent = stateIt->second;
+      const PartitionEdge &edge = edges[parent.edgeIndex];
+      reversePath.push_back(edge);
+      // Gaps are stored before the token edge in forward order.  During
+      // backward reconstruction, append them in reverse so the final reverse
+      // below yields: previous token, gap..., current token.
+      for (auto gapIt = parent.stateGapsBeforeEdge.rbegin();
+           gapIt != parent.stateGapsBeforeEdge.rend(); ++gapIt) {
+        reversePath.push_back(*gapIt);
+      }
+
+      aPos = edge.aStart;
+      stateKey = parent.prev;
+    }
+
+    SmallVector<PartitionEdge, 8> path;
+    path.reserve(reversePath.size());
+    for (auto it = reversePath.rbegin(); it != reversePath.rend(); ++it)
+      path.push_back(*it);
+
+    size_t tokenSegmentCount = 0;
+    for (const PartitionEdge &edge : path) {
+      if (edge.IsTokenSegment())
+        ++tokenSegmentCount;
+    }
+    if (tokenSegmentCount < 2)
+      return std::nullopt;
+
+    // Re-validate the reconstructed partition as a true structural tiling.
+    // The dynamic-programming search already found a path, but the proof
+    // obligation is stronger: each edge must start exactly where the previous
+    // edge ended on both A and B, must consume a non-empty A-token envelope,
+    // and must have a known realizer.  Same-realizer adjacency additionally
+    // requires an intervening gap edge that carries exact protected
+    // preprocessing structure; otherwise the split is artificial.
+    uint64_t expectedA = h.aStart;
+    uint64_t expectedB = h.bStart;
+    std::optional<HunkRealizer> firstRealizer;
+    std::optional<HunkRealizer> previousRealizer;
+    bool sawDifferentRealizer = false;
+    bool sawProtectedStructure = false;
+    bool protectedStructureSincePreviousToken = false;
+    bool sawProtectedReplacementBoundary = false;
+    for (const PartitionEdge &edge : path) {
+      if (edge.IsStateGap()) {
+        if (edge.aStart != expectedA || edge.aEnd != expectedA ||
+            edge.bStart != expectedB || edge.bEnd != expectedB ||
+            !edge.closure || !edge.closure->IsComplete()) {
+          return std::nullopt;
+        }
+        sawProtectedStructure |= edge.protectedPreprocessingStructure;
+        protectedStructureSincePreviousToken |=
+            edge.protectedPreprocessingStructure;
+        continue;
+      }
+
+      if (edge.aStart != expectedA || edge.bStart != expectedB ||
+          edge.aEnd <= edge.aStart || edge.bEnd < edge.bStart ||
+          (!edge.allowEmptyBEnvelope && edge.bEnd <= edge.bStart) ||
+          edge.realizer.kind == HunkRealizerKind::Unknown || !edge.closure ||
+          !edge.closure->IsComplete()) {
+        return std::nullopt;
+      }
+
+      if (!firstRealizer)
+        firstRealizer = edge.realizer;
+      else
+        sawDifferentRealizer |= edge.realizer != *firstRealizer;
+
+      if (previousRealizer && *previousRealizer == edge.realizer) {
+        if (!protectedStructureSincePreviousToken)
+          return std::nullopt;
+      }
+      sawProtectedReplacementBoundary |=
+          replaceHunk && protectedStructureSincePreviousToken;
+      previousRealizer = edge.realizer;
+      protectedStructureSincePreviousToken = false;
+      expectedA = edge.aEnd;
+      expectedB = edge.bEnd;
+    }
+
+    // A structural tiling is theorem-relevant only when the complete token
+    // envelope is covered and at least one of the two explicit split reasons
+    // is present.  A same-realizer path with no protected structure remains
+    // the ordinary single-owner case and is rejected here.
+    if (expectedA != h.aEnd || expectedB != h.bEnd ||
+        (!sawDifferentRealizer && !sawProtectedStructure)) {
+      return std::nullopt;
+    }
+
+    const StructuralTilingReason reason = classifyStructuralTilingReason(
+        sawDifferentRealizer, sawProtectedStructure);
+    if (reason == StructuralTilingReason::Unknown)
+      return std::nullopt;
+
+    // A pure same-realizer preservation partition always requires the
+    // canonical physical-run theorem. The ambiguity-rejection rule extends
+    // that requirement to every replacement containing a protected seam,
+    // including mixed-realizer paths: owner diversity cannot authorize a B
+    // split that the token
+    // alignment itself leaves ambiguous.
+    const bool requiresCanonicalPhysicalRunProof =
+        reason == StructuralTilingReason::PreservedPreprocessingStructure ||
+        sawProtectedReplacementBoundary;
+
+    uint32_t physicalSourceRunCount = 0;
+    bool physicalSourceRunsProven = false;
+    bool uniqueMinimumFragmentPartition = false;
+    if (requiresCanonicalPhysicalRunProof) {
+      if (!physicalSourceRuns || physicalSourceRuns->runs.size() < 2 ||
+          physicalSourceRuns->protectedGaps.size() + 1 !=
+              physicalSourceRuns->runs.size()) {
+        return std::nullopt;
+      }
+
+      size_t expectedRunIndex = 0;
+      size_t tokenSegmentsInRuns = 0;
+      for (const PartitionEdge &edge : path) {
+        if (edge.IsStateGap())
+          continue;
+        while (expectedRunIndex < physicalSourceRuns->runs.size() &&
+               edge.aStart == physicalSourceRuns->runs[expectedRunIndex].aEnd) {
+          ++expectedRunIndex;
+        }
+        if (expectedRunIndex >= physicalSourceRuns->runs.size())
+          return std::nullopt;
+        const PhysicalSourceRun &run =
+            physicalSourceRuns->runs[expectedRunIndex];
+        if (edge.aStart < run.aStart || edge.aEnd > run.aEnd)
+          return std::nullopt;
+        ++tokenSegmentsInRuns;
+      }
+      if (expectedRunIndex + 1 != physicalSourceRuns->runs.size() ||
+          path.empty())
+        return std::nullopt;
+
+      // Each run is maximal across exact lexer trivia and terminates only at
+      // one byte-complete protected gap. Emitting exactly one token segment
+      // per run is therefore the unique minimum-fragment partition that
+      // leaves every protected interval outside the edit set.
+      physicalSourceRunCount =
+          static_cast<uint32_t>(physicalSourceRuns->runs.size());
+      physicalSourceRunsProven = true;
+      uniqueMinimumFragmentPartition =
+          tokenSegmentsInRuns == physicalSourceRuns->runs.size();
+    }
+
+    SmallVector<StructuralBoundaryProjectionWitness, 8> boundaryProjections;
+    bool uniqueBoundaryProjectionProven = false;
+    if (replaceHunk && requiresCanonicalPhysicalRunProof) {
+      if (!physicalSourceRuns ||
+          physicalSourceRuns->boundaryProjections.size() + 1 !=
+              physicalSourceRuns->runs.size()) {
+        return std::nullopt;
+      }
+
+      const PartitionEdge *previousToken = nullptr;
+      bool protectedStructureSincePreviousToken = false;
+      size_t projectionIndex = 0;
+      for (const PartitionEdge &edge : path) {
+        if (edge.IsStateGap()) {
+          protectedStructureSincePreviousToken |=
+              edge.protectedPreprocessingStructure;
+          continue;
+        }
+        if (!previousToken) {
+          previousToken = &edge;
+          protectedStructureSincePreviousToken = false;
+          continue;
+        }
+        if (!protectedStructureSincePreviousToken) {
+          previousToken = &edge;
+          continue;
+        }
+        if (projectionIndex >= physicalSourceRuns->boundaryProjections.size()) {
+          return std::nullopt;
+        }
+
+        const StructuralBoundaryProjectionWitness &projection =
+            physicalSourceRuns->boundaryProjections[projectionIndex++];
+        if (!projection.uniqueProjection ||
+            projection.lowerBTokenBoundary != projection.upperBTokenBoundary ||
+            projection.bTokenBoundary != projection.lowerBTokenBoundary ||
+            projection.aTokenBoundary != previousToken->aEnd ||
+            projection.aTokenBoundary != edge.aStart ||
+            projection.bTokenBoundary != previousToken->bEnd ||
+            projection.bTokenBoundary != edge.bStart) {
+          return std::nullopt;
+        }
+        boundaryProjections.push_back(projection);
+        previousToken = &edge;
+        protectedStructureSincePreviousToken = false;
+      }
+
+      if (projectionIndex != physicalSourceRuns->boundaryProjections.size()) {
+        return std::nullopt;
+      }
+      uniqueBoundaryProjectionProven = true;
+    }
+
+    const bool sourceByteCoverComplete =
+        StructuralPartitionSourceCoverComplete(path);
+    if (requiresCanonicalPhysicalRunProof && !sourceByteCoverComplete) {
+      return std::nullopt;
+    }
+
+    const bool hasPreservedInPlaceGap =
+        llvm::any_of(path, [](const PartitionEdge &edge) {
+          return edge.IsStateGap() &&
+                 edge.gapDisposition ==
+                     StructuralGapDisposition::PreservedInPlace;
+        });
+    const bool preservedGapSourceOrderProven =
+        hasPreservedInPlaceGap && PreservedInPlaceGapSourceOrderIsProven(path);
+    const bool preservedGapsDisjointFromTokenSegments =
+        hasPreservedInPlaceGap &&
+        PreservedInPlaceGapsAreDisjointFromAllTokenSegments(path);
+    if (hasPreservedInPlaceGap && (!preservedGapSourceOrderProven ||
+                                   !preservedGapsDisjointFromTokenSegments)) {
+      return std::nullopt;
+    }
+
+    bool sharedEmptyBEnvelopeProven = false;
+    uint64_t sharedEmptyBBoundary = 0;
+    bool preservedStateChainComposed = false;
+    if (deleteOnlyHunk) {
+      // A delete-only hunk gives every emitted token segment the same empty B
+      // boundary.  Prove that fact edge-by-edge instead of relying on the
+      // candidate builder having initialized every edge from `h.bStart`.
+      // This makes the durable witness independently reject a malformed
+      // partition that distributes a deletion over different B gaps.
+      const uint64_t sharedBoundary = h.bStart;
+      bool sawStateGap = false;
+      for (const PartitionEdge &edge : path) {
+        if (!edge.closure || edge.bStart != sharedBoundary ||
+            edge.bEnd != sharedBoundary) {
+          return std::nullopt;
+        }
+
+        if (edge.IsStateGap()) {
+          sawStateGap = true;
+          // A proof-only state edge is admissible for deletion only when its
+          // complete physical bytes remain in the source stream.  A gap that
+          // is unknown, materialized by an owner, or repaired by a state
+          // planner would be consumed, moved, reconstructed, or replayed by
+          // some other theorem and therefore cannot justify this split.
+          if (edge.gapDisposition !=
+                  StructuralGapDisposition::PreservedInPlace ||
+              !edge.closure->source.IsComplete() ||
+              edge.closure->source.end <= edge.closure->source.begin) {
+            return std::nullopt;
+          }
+          continue;
+        }
+
+        // A pure same-realizer preserved-structure partition is
+        // admitted by the canonical physical-run theorem, not by the coarse
+        // state census attached to its realizer.  A TU closure, for example,
+        // summarizes mutations across the complete translation unit and can
+        // therefore report directives that are wholly outside this narrow
+        // token run.  Treating that owner-wide summary as segment-local
+        // evidence would reject every valid TU deletion around untouched
+        // preprocessing structure.
+        //
+        // The segment-local proof is stronger: exact monotone token mappings
+        // form maximal physical runs, every intervening protected byte is a
+        // `PreservedInPlace` gap, `PlanTUByteSpan()` revalidates each emitted
+        // carrier, and the final assembler audit keeps every preserved gap
+        // disjoint from every normalized `TextEdit`.  Retain the historical
+        // mutation check for mixed-realizer deletion tilings, where owner
+        // state remains part of that older composition theorem.
+        if (!edge.allowEmptyBEnvelope ||
+            (reason !=
+                 StructuralTilingReason::PreservedPreprocessingStructure &&
+             (deps_.ownerStateProof.OwnerStateDeltaMutatesAnyState(
+                  edge.closure->stateIn) ||
+              deps_.ownerStateProof.OwnerStateDeltaMutatesAnyState(
+                  edge.closure->stateOut)))) {
+          return std::nullopt;
+        }
+      }
+
+      // Value-level state interpretation is intentionally unnecessary for a
+      // preserved gap: the exact source transition continues to execute in
+      // place.  The complete ordered chain is composed only when the physical
+      // source cover, gap order, and global token-segment disjointness proofs
+      // all agree.  With no state gaps the chain is vacuously composed.
+      preservedStateChainComposed =
+          !sawStateGap ||
+          (sourceByteCoverComplete && preservedGapSourceOrderProven &&
+           preservedGapsDisjointFromTokenSegments);
+      if (!preservedStateChainComposed)
+        return std::nullopt;
+
+      sharedEmptyBEnvelopeProven = true;
+      sharedEmptyBBoundary = sharedBoundary;
+    }
+
+    std::string stateCompositionReason;
+    if (!MixedOwnerTilingStateSummariesCompose(h, path,
+                                               &stateCompositionReason)) {
+      return std::nullopt;
+    }
+
+    // Carry the seam proof from the boundary-projection theorem onto the
+    // preserved gap edges that will hold it in the durable witness.  The
+    // projection recorded its verdict per canonical run boundary, while the
+    // gap edges are normalized to the exact directive lines inside that
+    // boundary's source gap, so the two are matched by containment rather
+    // than by position.
+    //
+    // The flag names one specific fact -- that the macro-state liveness
+    // repair theorem has no ordering left to decide -- so it belongs only on
+    // the `#define`/`#undef` edges.  A boundary's gap may preserve several
+    // kinds of structure, each admitted by its own rule; putting the
+    // macro-state proof on an edge that binds no macro name would be a claim
+    // about a directive that has none, and the durable theorem rejects it as
+    // a misplaced proof.
+    if (physicalSourceRuns) {
+      for (size_t gapIndex = 0;
+           gapIndex < physicalSourceRuns->protectedGaps.size() &&
+           gapIndex < physicalSourceRuns->macroStatePlacementProven.size();
+           ++gapIndex) {
+        if (!physicalSourceRuns->macroStatePlacementProven[gapIndex])
+          continue;
+        const OwnerSourceRange &provenGap =
+            physicalSourceRuns->protectedGaps[gapIndex];
+        for (PartitionEdge &gapEdge : path) {
+          if (!gapEdge.IsStateGap() || !gapEdge.closure ||
+              !SourceSitesComparable(gapEdge.closure->source, provenGap) ||
+              gapEdge.closure->source.begin < provenGap.begin ||
+              gapEdge.closure->source.end > provenGap.end) {
+            continue;
+          }
+          if (gapEdge.protectedStructureKind !=
+                  StructuralProtectedStructureKind::MacroDefine &&
+              gapEdge.protectedStructureKind !=
+                  StructuralProtectedStructureKind::MacroUndef) {
+            continue;
+          }
+          gapEdge.macroStatePlacementInsensitiveProven = true;
+        }
+      }
+    }
+
+    StructuralPartition partition;
+    partition.edges = std::move(path);
+    partition.reason = reason;
+    partition.uniquePartition = true;
+    partition.physicalSourceRunCount = physicalSourceRunCount;
+    partition.physicalSourceRunsProven = physicalSourceRunsProven;
+    partition.uniqueMinimumFragmentPartition = uniqueMinimumFragmentPartition;
+    partition.boundaryProjections = std::move(boundaryProjections);
+    partition.uniqueBoundaryProjectionProven = uniqueBoundaryProjectionProven;
+    partition.sharedEmptyBEnvelopeProven = sharedEmptyBEnvelopeProven;
+    partition.sharedEmptyBBoundary = sharedEmptyBBoundary;
+    partition.preservedStateChainComposed = preservedStateChainComposed;
+    partition.sourceByteCoverComplete = sourceByteCoverComplete;
+    partition.preservedGapSourceOrderProven = preservedGapSourceOrderProven;
+    partition.preservedGapsDisjointFromTokenSegments =
+        preservedGapsDisjointFromTokenSegments;
+    return partition;
+  }
 
 private:
   // All structural proofs use the shared occurrence-local index provider. The
@@ -2505,6 +3534,11 @@ private:
 
   RefoldMixedOwnerTilingPlanner::Dependencies &deps_;
 
+  /// Per-structure placement proofs for a preserved structural gap.  The
+  /// prover reads producer records only, so one instance answers gaps in the
+  /// TU and in any included header alike.
+  const RefoldStructuralGapCrossingProver gapCrossingProver_;
+
   /// Preprocessed-token indices claimed by more than one tokmap entry.  Such a
   /// token has no unique physical source position, so a canonical source run
   /// cannot be derived through it.
@@ -2530,13 +3564,6 @@ RefoldMixedOwnerTilingPlanner::FinishPlan(std::vector<diffutils::Hunk> hunks) {
 
 RefoldMixedOwnerTilingPlanner::MixedOwnerTilingPlan
 RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
-  // Per-structure placement proofs for a preserved structural gap.  The prover
-  // reads producer records only, so one instance answers gaps in the TU and in
-  // any included header alike.
-  const RefoldStructuralGapCrossingProver gapCrossingProver(
-      RefoldStructuralGapCrossingProver::Dependencies{
-          deps_.model, deps_.macroStateProof, deps_.tokenText, deps_.lexLang});
-
   // Structural witnesses are rebuilt from the current token diff and attached
   // to later accepted candidates by exact A/B token-envelope binding.  The
   // legacy ledger type names are retained temporarily to avoid unrelated API
@@ -2550,1036 +3577,9 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
   if (hunks.empty())
     return FinishPlan(std::move(hunks));
 
-  const size_t noTokenEdgeIndex = std::numeric_limits<size_t>::max();
-
   // Every predicate the tiling proof needs reads producer facts and its own
   // arguments only, so one instance answers every hunk of this pass.
   const StructuralTilingProver prover(deps_);
-
-  // boundary: failures while *searching* for a structural
-  // partition are non-applicability, not terminal proof failures.  Until a
-  // partition has been accepted and durable segment witnesses have been
-  // emitted, the ordinary macro/include/TU owner-realization paths still own
-  // the hunk.  Returning std::nullopt here therefore preserves the existing
-  // lattice ordering instead of prematurely forcing raw-B terminal output.
-
-  auto tryBuildStructuralPartition =
-      [&](const diffutils::Hunk &h) -> std::optional<StructuralPartition> {
-    const bool replaceHunk = h.isReplace();
-    const bool deleteOnlyHunk = h.isDeleteOnly();
-
-    // extends deterministic mixed-owner tiling beyond non-empty
-    // replacements only where the theorem obligations are still meaningful.
-    // Delete-only hunks have an A-side owner cover and an empty B envelope,
-    // so they can be partitioned by the same owner-closure proof. Insert-only
-    // hunks have no A-side owner cover; they require insertion-anchor proofs
-    // handled by the existing insertion/macro/include machinery, not by this
-    // mixed-owner tiler.  Equal/state-only hunks are likewise classified as
-    // outside this normalizer instead of being silently interpreted as token
-    // partitions.
-    if (!replaceHunk && !deleteOnlyHunk)
-      return std::nullopt;
-    if (h.aEnd <= h.aStart || (replaceHunk && h.bEnd <= h.bStart) ||
-        (deleteOnlyHunk && h.bEnd != h.bStart))
-      return std::nullopt;
-    if (h.aEnd - h.aStart < 2)
-      return std::nullopt;
-
-    // If the whole hunk is already a patchable macro invocation, leave it as
-    // one hunk. Splitting inside an already-proven whole macro candidate
-    // would make this normalization pass compete with the macro lattice
-    // rather than merely exposing otherwise independent owners.
-    Owner wholeOwner =
-        deps_.ownerClassifier.ClassifyOwnerWithSegments(deps_.tuPath, h);
-    if (auto *wholeMacro = deps_.macroTopology.SmallestCoveringPatchableMacro(
-            h.aStart, h.aEnd, wholeOwner.includeId)) {
-      if (wholeMacro->invB && wholeMacro->invE)
-        return std::nullopt;
-    }
-
-    // Derive the canonical physical-source topology before constructing the
-    // candidate edge graph. The historical mixed-realizer theorem may still
-    // proceed when this direct topology is unavailable, but no partition may
-    // claim preserved preprocessing structure without matching these exact
-    // maximal runs.
-    std::optional<PhysicalSourceRunPlan> physicalSourceRuns =
-        prover.BuildPhysicalSourceRunPlan(h);
-
-    // The boundary-projection theorem binds every canonical physical
-    // source-run boundary to one exact B-token boundary before the DP may
-    // construct a replacement partition. Projection disagreement is terminal
-    // for this normalization attempt. Retaining the physical plan only for
-    // same-realizer paths while allowing the historical mixed-realizer search
-    // to continue would let an
-    // alternate partition assign the same ambiguous payload indirectly.
-    //
-    // `ProjectATokenBoundaryToBTokenBounds()` now reports the minimum and
-    // maximum B frontiers reached by all maximum-length local token
-    // alignments. A strict range therefore means the B expression is
-    // inseparable at this A
-    // seam.  Do not choose an alignment, discard the structure witness, or put
-    // the payload on a preferred side; preserve the original hunk for the
-    // ordinary macro/include/expansion/fallback lattice.
-    if (replaceHunk && physicalSourceRuns &&
-        physicalSourceRuns->runs.size() >= 2) {
-      bool projectionsComplete = true;
-      physicalSourceRuns->boundaryProjections.clear();
-      physicalSourceRuns->macroStatePlacementProven.clear();
-      for (size_t runIndex = 0; runIndex + 1 < physicalSourceRuns->runs.size();
-           ++runIndex) {
-        const uint64_t aBoundary = physicalSourceRuns->runs[runIndex].aEnd;
-        std::optional<RefoldSourceMapper::ATokenBoundaryProjection> projection =
-            deps_.sourceMapper.ProjectATokenBoundaryToBTokenBounds(
-                h.aStart, h.aEnd, h.bStart, h.bEnd, aBoundary);
-        bool macroStatePlacementProven = false;
-        // A strict range means the payload cannot be split at this seam by
-        // alignment alone. That is not the end of the question: when the
-        // preserved gap changes state the payload provably cannot observe,
-        // both placements re-preprocess to the same tokens and are
-        // equivalent refolds, so committing one is a proof rather than a
-        // preference. Refusing instead surrenders the translation unit and
-        // deletes the very directive the refusal was protecting.
-        //
-        // The question is asked of every structure in the gap separately and
-        // the answers composed, so a gap holding two kinds is admitted
-        // exactly when both are.  Each rule defaults to observable, so an
-        // unclassified pragma, an unrecognized directive, or any structure
-        // with no rule keeps the whole gap refusing here.
-        if (projection && !projection->IsUnique() &&
-            runIndex < physicalSourceRuns->protectedGaps.size() &&
-            runIndex < physicalSourceRuns->protectedGapFacts.size()) {
-          const OwnerSourceRange &gap =
-              physicalSourceRuns->protectedGaps[runIndex];
-          if (gap.IsValid() && gap.begin <= gap.end) {
-            std::optional<std::pair<uint64_t, uint64_t>> payloadBytes =
-                deps_.sourceMapper.BTokenRangeToByteRange(
-                    projection->lowerBTokenBoundary,
-                    projection->upperBTokenBoundary);
-            const bool payloadBytesUsable =
-                payloadBytes && payloadBytes->second <= deps_.bSource.size() &&
-                payloadBytes->first <= payloadBytes->second;
-
-            // Committing a side is decided by `[lower,upper)` alone, because
-            // every token outside that range has a forced alignment and keeps
-            // the side it already had.  Everything from the committed
-            // boundary to the end of the hunk nevertheless lands after the
-            // structure, so a rule that asks the question of that whole
-            // suffix is deliberately wider than the placement obligation
-            // rather than weaker than it.
-            std::optional<std::pair<uint64_t, uint64_t>> committedSuffixBytes =
-                deps_.sourceMapper.BTokenRangeToByteRange(
-                    projection->lowerBTokenBoundary, h.bEnd);
-            const bool committedSuffixUsable =
-                committedSuffixBytes &&
-                committedSuffixBytes->second <= deps_.bSource.size() &&
-                committedSuffixBytes->first <= committedSuffixBytes->second;
-
-            if (payloadBytesUsable && committedSuffixUsable) {
-              RefoldStructuralGapCrossingProver::Query crossingQuery;
-              crossingQuery.structures =
-                  physicalSourceRuns->protectedGapFacts[runIndex].intervals;
-              crossingQuery.payload = deps_.bSource.slice(payloadBytes->first,
-                                                          payloadBytes->second);
-              crossingQuery.committedSuffix = deps_.bSource.slice(
-                  committedSuffixBytes->first, committedSuffixBytes->second);
-              crossingQuery.committedArmId =
-                  physicalSourceRuns->runs[runIndex + 1].condArmId;
-
-              const GapCrossingProof crossing =
-                  gapCrossingProver.Prove(crossingQuery);
-              // A macro-state seam the liveness planner still owns is not
-              // taken here even when the crossing is proven: that planner is
-              // the only stage modelling resurrection, undef/restore, and
-              // replay ordering for a consumed directive.
-              const bool crossable =
-                  crossing.Crossable() &&
-                  (!crossing.carriesMacroStateDirective ||
-                   !prover.MacroStateGapBelongsToLivenessPlanner(gap, crossing));
-
-              if (crossable) {
-                // Equivalent placements: commit the lower frontier, which
-                // leaves the undetermined payload after the preserved
-                // structure. The side is arbitrary precisely because
-                // equivalence is proved; the witness below records which side
-                // was taken so it is not a bare tie-break.
-                REFOLD_LOG_TRACE(
-                    "tiling/structural",
-                    "payload B=[{0},{1}) cannot observe any of the {2} "
-                    "structure(s) preserved at source='{3}'[{4},{5}); "
-                    "committing it after them rather than surrendering the "
-                    "translation unit",
-                    projection->lowerBTokenBoundary,
-                    projection->upperBTokenBoundary, crossing.structures.size(),
-                    gap.path, gap.begin, gap.end);
-                projection->upperBTokenBoundary =
-                    projection->lowerBTokenBoundary;
-                macroStatePlacementProven = crossing.carriesMacroStateDirective;
-              }
-            }
-          }
-        }
-
-        if (!projection || !projection->IsUnique()) {
-          if (inTraceMode()) {
-            REFOLD_LOG_TRACE("tiling/structural",
-                             "structural replacement rejected:");
-            REFOLD_LOG_TRACE("tiling/structural",
-                             "original A=[{0},{1}) B=[{2},{3})", h.aStart,
-                             h.aEnd, h.bStart, h.bEnd);
-            REFOLD_LOG_TRACE("tiling/structural",
-                             "reason=non-unique B partition");
-            if (projection) {
-              REFOLD_LOG_TRACE("tiling/structural",
-                               "ambiguous boundary A={0} lowerB={1} upperB={2}",
-                               aBoundary, projection->lowerBTokenBoundary,
-                               projection->upperBTokenBoundary);
-            } else {
-              REFOLD_LOG_TRACE("tiling/structural",
-                               "ambiguous boundary A={0} projection="
-                               "<incomplete>",
-                               aBoundary);
-            }
-          }
-          projectionsComplete = false;
-          break;
-        }
-
-        const uint64_t bBoundary = projection->lowerBTokenBoundary;
-        if (bBoundary < h.bStart || bBoundary > h.bEnd ||
-            (!physicalSourceRuns->boundaryProjections.empty() &&
-             bBoundary < physicalSourceRuns->boundaryProjections.back()
-                             .bTokenBoundary)) {
-          projectionsComplete = false;
-          break;
-        }
-
-        StructuralBoundaryProjectionWitness boundaryWitness;
-        boundaryWitness.aTokenBoundary = aBoundary;
-        boundaryWitness.lowerBTokenBoundary = projection->lowerBTokenBoundary;
-        boundaryWitness.upperBTokenBoundary = projection->upperBTokenBoundary;
-        boundaryWitness.bTokenBoundary = bBoundary;
-        boundaryWitness.uniqueProjection = true;
-        physicalSourceRuns->boundaryProjections.push_back(boundaryWitness);
-        physicalSourceRuns->macroStatePlacementProven.push_back(
-            macroStatePlacementProven);
-      }
-
-      if (!projectionsComplete ||
-          physicalSourceRuns->boundaryProjections.size() + 1 !=
-              physicalSourceRuns->runs.size() ||
-          physicalSourceRuns->macroStatePlacementProven.size() !=
-              physicalSourceRuns->boundaryProjections.size())
-        return std::nullopt;
-    }
-
-    const uint64_t aLen = h.aEnd - h.aStart;
-    std::vector<PartitionEdge> edges;
-    std::vector<std::vector<size_t>> edgesByAOffset(static_cast<size_t>(aLen) +
-                                                    1);
-
-    for (uint64_t aLo = h.aStart; aLo < h.aEnd; ++aLo) {
-      // Prefer wider segments when several partitions have the same number of
-      // pieces. This keeps source structure maximally coarse while remaining
-      // deterministic.
-      for (uint64_t aHi = h.aEnd; aHi > aLo; --aHi) {
-        HunkRealizer realizer = prover.ClassifyHunkRealizer(aLo, aHi);
-        if (realizer.kind == HunkRealizerKind::Unknown)
-          continue;
-
-        std::optional<size_t> exactPhysicalRunIndex;
-        if (physicalSourceRuns) {
-          for (size_t runIndex = 0; runIndex < physicalSourceRuns->runs.size();
-               ++runIndex) {
-            const PhysicalSourceRun &run = physicalSourceRuns->runs[runIndex];
-            if (run.aStart != aLo || run.aEnd != aHi)
-              continue;
-            if (exactPhysicalRunIndex) {
-              exactPhysicalRunIndex.reset();
-              break;
-            }
-            exactPhysicalRunIndex = runIndex;
-          }
-        }
-
-        uint64_t edgeBStart = h.bStart;
-        uint64_t edgeBEnd = h.bStart;
-        if (!deleteOnlyHunk) {
-          if (exactPhysicalRunIndex && physicalSourceRuns &&
-              physicalSourceRuns->boundaryProjections.size() + 1 ==
-                  physicalSourceRuns->runs.size()) {
-            const size_t runIndex = *exactPhysicalRunIndex;
-            edgeBStart = runIndex == 0 ? h.bStart
-                                       : physicalSourceRuns
-                                             ->boundaryProjections[runIndex - 1]
-                                             .bTokenBoundary;
-            edgeBEnd = runIndex + 1 == physicalSourceRuns->runs.size()
-                           ? h.bEnd
-                           : physicalSourceRuns->boundaryProjections[runIndex]
-                                 .bTokenBoundary;
-            if (edgeBEnd < edgeBStart)
-              continue;
-          } else {
-            auto env =
-                deps_.sourceMapper
-                    .MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(aLo, aHi);
-            if (!env)
-              continue;
-            if (env->first < static_cast<size_t>(h.bStart) ||
-                env->second > static_cast<size_t>(h.bEnd) ||
-                env->first >= env->second) {
-              continue;
-            }
-            edgeBStart = static_cast<uint64_t>(env->first);
-            edgeBEnd = static_cast<uint64_t>(env->second);
-          }
-        }
-
-        PartitionEdge edge;
-        edge.aStart = aLo;
-        edge.aEnd = aHi;
-        edge.bStart = edgeBStart;
-        edge.bEnd = edgeBEnd;
-        edge.realizer = realizer;
-        // A nonempty parent replacement may contain a uniquely projected
-        // delete fragment.  Such an empty B envelope is authorized only for
-        // one exact canonical physical run; arbitrary subrange envelopes
-        // retain the historical nonempty requirement.
-        edge.allowEmptyBEnvelope =
-            deleteOnlyHunk ||
-            (replaceHunk && exactPhysicalRunIndex && edgeBStart == edgeBEnd);
-        edge.closure = prover.BuildTokenSegmentClosure(edge);
-        if (!edge.closure)
-          continue;
-
-        const size_t edgeIndex = edges.size();
-        edges.push_back(edge);
-        edgesByAOffset[static_cast<size_t>(aLo - h.aStart)].push_back(
-            edgeIndex);
-      }
-    }
-
-    auto physicalRunIndexForEdge =
-        [&](const PartitionEdge &candidate) -> std::optional<size_t> {
-      if (!physicalSourceRuns || !candidate.IsTokenSegment() ||
-          !candidate.closure || !candidate.closure->source.IsComplete()) {
-        return std::nullopt;
-      }
-
-      std::optional<size_t> match;
-      for (size_t runIndex = 0; runIndex < physicalSourceRuns->runs.size();
-           ++runIndex) {
-        const PhysicalSourceRun &run = physicalSourceRuns->runs[runIndex];
-        if (candidate.aStart != run.aStart || candidate.aEnd != run.aEnd ||
-            !prover.SourceSitesComparable(candidate.closure->source, run.source) ||
-            candidate.closure->source.begin != run.source.begin ||
-            candidate.closure->source.end != run.source.end) {
-          continue;
-        }
-
-        if (match)
-          return std::nullopt;
-        match = runIndex;
-      }
-      return match;
-    };
-
-    std::vector<std::map<PartitionStateKey, PartitionParent>> dp(
-        static_cast<size_t>(aLen) + 1);
-    PartitionStateKey startKey;
-    startKey.bPos = h.bStart;
-    startKey.lastTokenEdgeIndex = noTokenEdgeIndex;
-
-    PartitionParent startParent;
-    startParent.valid = true;
-    startParent.cost = 0;
-    dp[0][startKey] = std::move(startParent);
-
-    for (uint64_t aOff = 0; aOff < aLen; ++aOff) {
-      auto &states = dp[static_cast<size_t>(aOff)];
-      if (states.empty())
-        continue;
-
-      for (const auto &state : states) {
-        const PartitionStateKey &key = state.first;
-        const unsigned curCost = state.second.cost;
-
-        for (size_t edgeIndex : edgesByAOffset[static_cast<size_t>(aOff)]) {
-          const PartitionEdge &edge = edges[edgeIndex];
-          if (edge.bStart != key.bPos)
-            continue;
-
-          const PartitionEdge *prevEdge = nullptr;
-          if (key.lastTokenEdgeIndex != noTokenEdgeIndex) {
-            if (key.lastTokenEdgeIndex >= edges.size())
-              continue;
-            prevEdge = &edges[key.lastTokenEdgeIndex];
-          }
-
-          // state gaps are part of the searched proof graph.  They are
-          // computed on the transition from the previous token segment to
-          // this token segment, so an unsafe or uncovered source gap prevents
-          // this DP edge from existing at all.  This lets cost and ambiguity
-          // account for the real token+state proof graph instead of adding
-          // state gaps as an after-the-fact annotation.
-          auto transitionGaps = prover.BuildClosedStateGapTransition(prevEdge, edge);
-          if (!transitionGaps)
-            continue;
-
-          // Protected preprocessing structure may justify a partition only
-          // at one canonical maximal-run boundary. This prevents the DP from
-          // manufacturing a split from arbitrary token subranges merely
-          // because they surround the same directive. The predecessor and
-          // successor must be the complete runs immediately adjacent to the
-          // exact byte-complete physical gap.
-          bool protectedReplacementBoundaryProven = false;
-          if (transitionGaps->hasProtectedPreprocessingStructure && prevEdge) {
-            if (replaceHunk) {
-              // Every replacement transition across protected source bytes,
-              // including a transition between different realizers, needs the
-              // same canonical source-run and unique B-frontier authority.
-              // Otherwise a mixed-owner path could bypass the required
-              // ambiguity rejection that applies to a same-owner path.
-              if (!physicalSourceRuns)
-                continue;
-
-              std::optional<size_t> boundaryIndex;
-              for (size_t runIndex = 0;
-                   runIndex + 1 < physicalSourceRuns->runs.size(); ++runIndex) {
-                const PhysicalSourceRun &leftRun =
-                    physicalSourceRuns->runs[runIndex];
-                const PhysicalSourceRun &rightRun =
-                    physicalSourceRuns->runs[runIndex + 1];
-                if (leftRun.aEnd != prevEdge->aEnd ||
-                    rightRun.aStart != edge.aStart)
-                  continue;
-                if (boundaryIndex) {
-                  boundaryIndex.reset();
-                  break;
-                }
-                boundaryIndex = runIndex;
-              }
-              if (!boundaryIndex ||
-                  *boundaryIndex >= physicalSourceRuns->protectedGaps.size() ||
-                  *boundaryIndex >=
-                      physicalSourceRuns->boundaryProjections.size()) {
-                continue;
-              }
-
-              const OwnerSourceRange &provedGap =
-                  physicalSourceRuns->protectedGaps[*boundaryIndex];
-              if (!prover.SourceSitesComparable(prevEdge->closure->source,
-                                         provedGap) ||
-                  provedGap.begin != prevEdge->closure->source.end ||
-                  provedGap.end != edge.closure->source.begin) {
-                continue;
-              }
-
-              // A complete #define/#undef line is not an ordinary preserved
-              // separator in the direct TU pipeline.  The whole-hunk path is
-              // allowed to consume it precisely so the dedicated macro-state
-              // liveness planner can decide whether the directive must remain
-              // before, move after, or be replayed around the replacement.
-              // Splitting here would make that planner observe two narrow
-              // edits and no consumed macro-state transition, thereby
-              // replacing its established ordering theorem with an unrelated
-              // byte/token alignment.  Defer instead of stealing the hunk.
-              //
-              // The exception is a seam where that decision is already
-              // empty.  Everything committed after the separator was proved
-              // to name no identifier, so no B payload can reach the
-              // definition the directive binds: there is no order to choose
-              // and nothing to undefine and restore.  Deferring then buys
-              // the planner no authority it can use, and costs the directive
-              // its place in the source -- the planner's remaining move is
-              // to relocate it past the replacement.  Every seam without
-              // that proof still defers.
-              const bool macroStatePlacementProven =
-                  *boundaryIndex <
-                      physicalSourceRuns->macroStatePlacementProven.size() &&
-                  physicalSourceRuns->macroStatePlacementProven[*boundaryIndex];
-              if (transitionContainsMacroStateDirective(*transitionGaps) &&
-                  !macroStatePlacementProven) {
-                continue;
-              }
-
-              const StructuralBoundaryProjectionWitness &projection =
-                  physicalSourceRuns->boundaryProjections[*boundaryIndex];
-              if (!projection.uniqueProjection ||
-                  projection.aTokenBoundary != prevEdge->aEnd ||
-                  projection.aTokenBoundary != edge.aStart ||
-                  projection.lowerBTokenBoundary !=
-                      projection.upperBTokenBoundary ||
-                  projection.bTokenBoundary != projection.lowerBTokenBoundary ||
-                  prevEdge->bEnd != projection.bTokenBoundary ||
-                  edge.bStart != projection.bTokenBoundary) {
-                continue;
-              }
-              protectedReplacementBoundaryProven = true;
-            } else if (prevEdge->realizer == edge.realizer) {
-              // Delete-only same-realizer tiling retains the protected-gap
-              // theorem:
-              // both token edges must be the exact maximal runs surrounding
-              // the proved protected gap.  Mixed-realizer deletion behavior is
-              // intentionally unchanged.
-              if (!physicalSourceRuns)
-                continue;
-              std::optional<size_t> previousRun =
-                  physicalRunIndexForEdge(*prevEdge);
-              std::optional<size_t> currentRun = physicalRunIndexForEdge(edge);
-              if (!previousRun || !currentRun ||
-                  *currentRun != *previousRun + 1 ||
-                  *previousRun >= physicalSourceRuns->protectedGaps.size()) {
-                continue;
-              }
-
-              const OwnerSourceRange &provedGap =
-                  physicalSourceRuns->protectedGaps[*previousRun];
-              if (!prover.SourceSitesComparable(prevEdge->closure->source,
-                                         provedGap) ||
-                  provedGap.begin != prevEdge->closure->source.end ||
-                  provedGap.end != edge.closure->source.begin) {
-                continue;
-              }
-            }
-          }
-
-          if (replaceHunk &&
-              transitionGaps->hasProtectedPreprocessingStructure &&
-              !protectedReplacementBoundaryProven) {
-            continue;
-          }
-
-          PartitionStateKey nextKey;
-          nextKey.bPos = edge.bEnd;
-          nextKey.lastRealizer = edge.realizer;
-          nextKey.lastTokenEdgeIndex = edgeIndex;
-
-          if (key.firstRealizer.kind == HunkRealizerKind::Unknown) {
-            nextKey.firstRealizer = edge.realizer;
-            nextKey.mixedRealizers = false;
-            nextKey.preservedPreprocessingStructure = false;
-          } else {
-            // Adjacent equal realizers are never split merely because the
-            // subrange search found two candidates.  Delete-only hunks require
-            // one exact protected source gap.  Replacement hunks additionally
-            // require the unique-boundary projection theorem for that
-            // canonical run boundary:
-            // the independently derived lower and upper A-to-B projections
-            // must agree with both neighboring edge envelopes.  This preserves
-            // directive order without assigning replacement payload by
-            // traversal order, textual proximity, or a preferred side.
-            if (key.lastRealizer == edge.realizer) {
-              const bool deleteBoundaryProven =
-                  deleteOnlyHunk &&
-                  transitionGaps->hasProtectedPreprocessingStructure;
-              const bool replacementBoundaryProven =
-                  replaceHunk &&
-                  transitionGaps->hasProtectedPreprocessingStructure &&
-                  protectedReplacementBoundaryProven;
-              if (!deleteBoundaryProven && !replacementBoundaryProven)
-                continue;
-            }
-            nextKey.firstRealizer = key.firstRealizer;
-            nextKey.mixedRealizers =
-                key.mixedRealizers || edge.realizer != key.firstRealizer;
-            nextKey.preservedPreprocessingStructure =
-                key.preservedPreprocessingStructure ||
-                transitionGaps->hasProtectedPreprocessingStructure;
-          }
-
-          auto &dst = dp[static_cast<size_t>(edge.aEnd - h.aStart)];
-          const unsigned gapEdgeCost =
-              static_cast<unsigned>(transitionGaps->gaps.size());
-          const unsigned nextCost = curCost + 1 + gapEdgeCost;
-          auto existing = dst.find(nextKey);
-          if (existing == dst.end() || nextCost < existing->second.cost) {
-            PartitionParent parent;
-            parent.valid = true;
-            parent.edgeIndex = edgeIndex;
-            parent.prev = key;
-            parent.cost = nextCost;
-            parent.stateGapsBeforeEdge = transitionGaps->gaps;
-            parent.ambiguous = state.second.ambiguous;
-            dst[nextKey] = std::move(parent);
-          } else if (nextCost == existing->second.cost) {
-            // Two minimal chains prove the same next state. Do not choose
-            // between them by map/edge iteration order; mark the state as
-            // ambiguous so the final tiling proof fails closed.
-            existing->second.ambiguous = true;
-          }
-        }
-      }
-    }
-
-    const auto &finalStates = dp[static_cast<size_t>(aLen)];
-    auto bestFinal = finalStates.end();
-    unsigned bestCost = std::numeric_limits<unsigned>::max();
-    bool ambiguousBest = false;
-    for (auto it = finalStates.begin(); it != finalStates.end(); ++it) {
-      const PartitionStateKey &key = it->first;
-      if (key.bPos != h.bEnd ||
-          (!key.mixedRealizers && !key.preservedPreprocessingStructure)) {
-        continue;
-      }
-
-      const unsigned candidateCost = it->second.cost;
-      if (candidateCost < bestCost) {
-        bestFinal = it;
-        bestCost = candidateCost;
-        ambiguousBest = it->second.ambiguous;
-      } else if (candidateCost == bestCost) {
-        ambiguousBest = true;
-      }
-    }
-    if (bestFinal == finalStates.end())
-      return std::nullopt;
-
-    if (ambiguousBest) {
-      if (inTraceMode()) {
-        unsigned tiedCount = 0;
-        for (auto it = finalStates.begin(); it != finalStates.end(); ++it) {
-          const PartitionStateKey &key = it->first;
-          if (key.bPos != h.bEnd ||
-              (!key.mixedRealizers && !key.preservedPreprocessingStructure))
-            continue;
-          if (it->second.cost != bestCost)
-            continue;
-          ++tiedCount;
-          // Reconstruct this tied state's edge chain so the dump shows the
-          // actual tiling, not just the DP bookkeeping that reached it.
-          {
-            std::string chain;
-            uint64_t aPos2 = h.aEnd;
-            PartitionStateKey k2 = it->first;
-            unsigned guard = 0;
-            while (aPos2 != h.aStart && guard++ < 64) {
-              const uint64_t aOff2 = aPos2 - h.aStart;
-              const auto s2 = dp[static_cast<size_t>(aOff2)].find(k2);
-              if (s2 == dp[static_cast<size_t>(aOff2)].end() ||
-                  !s2->second.valid)
-                break;
-              const PartitionEdge &e2 = edges[s2->second.edgeIndex];
-              chain = llvm::formatv(
-                          "[{0},{1})->[{2},{3}) r={4}/{5} gaps={6} | ",
-                          e2.aStart, e2.aEnd, e2.bStart, e2.bEnd,
-                          static_cast<int>(e2.realizer.kind), e2.realizer.id,
-                          s2->second.stateGapsBeforeEdge.size())
-                          .str() +
-                      chain;
-              aPos2 = e2.aStart;
-              k2 = s2->second.prev;
-            }
-            REFOLD_LOG_TRACE("tiling/partition", "    chain: {0}", chain);
-          }
-          REFOLD_LOG_TRACE(
-              "tiling/partition",
-              "  tied final state: cost={0} selfAmbiguous={1} edgeIndex={2} "
-              "firstRealizer={3}/{4} lastRealizer={5}/{6} "
-              "lastTokenEdgeIndex={7} mixed={8} preserved={9}",
-              it->second.cost, it->second.ambiguous, it->second.edgeIndex,
-              static_cast<int>(key.firstRealizer.kind), key.firstRealizer.id,
-              static_cast<int>(key.lastRealizer.kind), key.lastRealizer.id,
-              key.lastTokenEdgeIndex, key.mixedRealizers,
-              key.preservedPreprocessingStructure);
-        }
-        REFOLD_LOG_TRACE("tiling/partition",
-                         "  tiedFinalStates={0} bestCost={1}", tiedCount,
-                         bestCost);
-      }
-      // The hunk *can* be tiled -- the DP reached a minimum-cost partition --
-      // but two or more partitions tie there, so no single tiling is proven.
-      // Report it: an ambiguous tie is a different situation from a hunk that
-      // admits no partition at all, and only the former has a fix available
-      // (a proof-backed criterion that makes one tiling uniquely admissible,
-      // not a cost tiebreak, which would be ordering mistaken for proof).
-      REFOLD_LOG_TRACE("tiling/partition",
-                       "ambiguous: hunk A=[{0},{1}) B=[{2},{3}) has multiple "
-                       "minimum-cost partitions; declining to choose",
-                       h.aStart, h.aEnd, h.bStart, h.bEnd);
-      return std::nullopt;
-    }
-
-    // Reconstruct the unique lowest-cost structural path.  The DP tracks both
-    // mixed-realizer and protected-structure obligations as state, rather
-    // than
-    // choosing the cheapest token cover first and classifying it afterwards.
-    // This prevents a coarse TU edge from swallowing a smaller macro/include
-    // segment or a preprocessing-structure boundary.  Equal-cost alternatives
-    // are rejected instead of being hidden behind map/edge iteration order.
-    SmallVector<PartitionEdge, 8> reversePath;
-    uint64_t aPos = h.aEnd;
-    PartitionStateKey stateKey = bestFinal->first;
-    while (aPos != h.aStart) {
-      const uint64_t aOff = aPos - h.aStart;
-      const auto stateIt = dp[static_cast<size_t>(aOff)].find(stateKey);
-      if (stateIt == dp[static_cast<size_t>(aOff)].end() ||
-          !stateIt->second.valid) {
-        return std::nullopt;
-      }
-
-      const PartitionParent &parent = stateIt->second;
-      const PartitionEdge &edge = edges[parent.edgeIndex];
-      reversePath.push_back(edge);
-      // Gaps are stored before the token edge in forward order.  During
-      // backward reconstruction, append them in reverse so the final reverse
-      // below yields: previous token, gap..., current token.
-      for (auto gapIt = parent.stateGapsBeforeEdge.rbegin();
-           gapIt != parent.stateGapsBeforeEdge.rend(); ++gapIt) {
-        reversePath.push_back(*gapIt);
-      }
-
-      aPos = edge.aStart;
-      stateKey = parent.prev;
-    }
-
-    SmallVector<PartitionEdge, 8> path;
-    path.reserve(reversePath.size());
-    for (auto it = reversePath.rbegin(); it != reversePath.rend(); ++it)
-      path.push_back(*it);
-
-    size_t tokenSegmentCount = 0;
-    for (const PartitionEdge &edge : path) {
-      if (edge.IsTokenSegment())
-        ++tokenSegmentCount;
-    }
-    if (tokenSegmentCount < 2)
-      return std::nullopt;
-
-    // Re-validate the reconstructed partition as a true structural tiling.
-    // The dynamic-programming search already found a path, but the proof
-    // obligation is stronger: each edge must start exactly where the previous
-    // edge ended on both A and B, must consume a non-empty A-token envelope,
-    // and must have a known realizer.  Same-realizer adjacency additionally
-    // requires an intervening gap edge that carries exact protected
-    // preprocessing structure; otherwise the split is artificial.
-    uint64_t expectedA = h.aStart;
-    uint64_t expectedB = h.bStart;
-    std::optional<HunkRealizer> firstRealizer;
-    std::optional<HunkRealizer> previousRealizer;
-    bool sawDifferentRealizer = false;
-    bool sawProtectedStructure = false;
-    bool protectedStructureSincePreviousToken = false;
-    bool sawProtectedReplacementBoundary = false;
-    for (const PartitionEdge &edge : path) {
-      if (edge.IsStateGap()) {
-        if (edge.aStart != expectedA || edge.aEnd != expectedA ||
-            edge.bStart != expectedB || edge.bEnd != expectedB ||
-            !edge.closure || !edge.closure->IsComplete()) {
-          return std::nullopt;
-        }
-        sawProtectedStructure |= edge.protectedPreprocessingStructure;
-        protectedStructureSincePreviousToken |=
-            edge.protectedPreprocessingStructure;
-        continue;
-      }
-
-      if (edge.aStart != expectedA || edge.bStart != expectedB ||
-          edge.aEnd <= edge.aStart || edge.bEnd < edge.bStart ||
-          (!edge.allowEmptyBEnvelope && edge.bEnd <= edge.bStart) ||
-          edge.realizer.kind == HunkRealizerKind::Unknown || !edge.closure ||
-          !edge.closure->IsComplete()) {
-        return std::nullopt;
-      }
-
-      if (!firstRealizer)
-        firstRealizer = edge.realizer;
-      else
-        sawDifferentRealizer |= edge.realizer != *firstRealizer;
-
-      if (previousRealizer && *previousRealizer == edge.realizer) {
-        if (!protectedStructureSincePreviousToken)
-          return std::nullopt;
-      }
-      sawProtectedReplacementBoundary |=
-          replaceHunk && protectedStructureSincePreviousToken;
-      previousRealizer = edge.realizer;
-      protectedStructureSincePreviousToken = false;
-      expectedA = edge.aEnd;
-      expectedB = edge.bEnd;
-    }
-
-    // A structural tiling is theorem-relevant only when the complete token
-    // envelope is covered and at least one of the two explicit split reasons
-    // is present.  A same-realizer path with no protected structure remains
-    // the ordinary single-owner case and is rejected here.
-    if (expectedA != h.aEnd || expectedB != h.bEnd ||
-        (!sawDifferentRealizer && !sawProtectedStructure)) {
-      return std::nullopt;
-    }
-
-    const StructuralTilingReason reason = classifyStructuralTilingReason(
-        sawDifferentRealizer, sawProtectedStructure);
-    if (reason == StructuralTilingReason::Unknown)
-      return std::nullopt;
-
-    // A pure same-realizer preservation partition always requires the
-    // canonical physical-run theorem. The ambiguity-rejection rule extends
-    // that requirement to every replacement containing a protected seam,
-    // including mixed-realizer paths: owner diversity cannot authorize a B
-    // split that the token
-    // alignment itself leaves ambiguous.
-    const bool requiresCanonicalPhysicalRunProof =
-        reason == StructuralTilingReason::PreservedPreprocessingStructure ||
-        sawProtectedReplacementBoundary;
-
-    uint32_t physicalSourceRunCount = 0;
-    bool physicalSourceRunsProven = false;
-    bool uniqueMinimumFragmentPartition = false;
-    if (requiresCanonicalPhysicalRunProof) {
-      if (!physicalSourceRuns || physicalSourceRuns->runs.size() < 2 ||
-          physicalSourceRuns->protectedGaps.size() + 1 !=
-              physicalSourceRuns->runs.size()) {
-        return std::nullopt;
-      }
-
-      size_t expectedRunIndex = 0;
-      size_t tokenSegmentsInRuns = 0;
-      for (const PartitionEdge &edge : path) {
-        if (edge.IsStateGap())
-          continue;
-        while (expectedRunIndex < physicalSourceRuns->runs.size() &&
-               edge.aStart == physicalSourceRuns->runs[expectedRunIndex].aEnd) {
-          ++expectedRunIndex;
-        }
-        if (expectedRunIndex >= physicalSourceRuns->runs.size())
-          return std::nullopt;
-        const PhysicalSourceRun &run =
-            physicalSourceRuns->runs[expectedRunIndex];
-        if (edge.aStart < run.aStart || edge.aEnd > run.aEnd)
-          return std::nullopt;
-        ++tokenSegmentsInRuns;
-      }
-      if (expectedRunIndex + 1 != physicalSourceRuns->runs.size() ||
-          path.empty())
-        return std::nullopt;
-
-      // Each run is maximal across exact lexer trivia and terminates only at
-      // one byte-complete protected gap. Emitting exactly one token segment
-      // per run is therefore the unique minimum-fragment partition that
-      // leaves every protected interval outside the edit set.
-      physicalSourceRunCount =
-          static_cast<uint32_t>(physicalSourceRuns->runs.size());
-      physicalSourceRunsProven = true;
-      uniqueMinimumFragmentPartition =
-          tokenSegmentsInRuns == physicalSourceRuns->runs.size();
-    }
-
-    SmallVector<StructuralBoundaryProjectionWitness, 8> boundaryProjections;
-    bool uniqueBoundaryProjectionProven = false;
-    if (replaceHunk && requiresCanonicalPhysicalRunProof) {
-      if (!physicalSourceRuns ||
-          physicalSourceRuns->boundaryProjections.size() + 1 !=
-              physicalSourceRuns->runs.size()) {
-        return std::nullopt;
-      }
-
-      const PartitionEdge *previousToken = nullptr;
-      bool protectedStructureSincePreviousToken = false;
-      size_t projectionIndex = 0;
-      for (const PartitionEdge &edge : path) {
-        if (edge.IsStateGap()) {
-          protectedStructureSincePreviousToken |=
-              edge.protectedPreprocessingStructure;
-          continue;
-        }
-        if (!previousToken) {
-          previousToken = &edge;
-          protectedStructureSincePreviousToken = false;
-          continue;
-        }
-        if (!protectedStructureSincePreviousToken) {
-          previousToken = &edge;
-          continue;
-        }
-        if (projectionIndex >= physicalSourceRuns->boundaryProjections.size()) {
-          return std::nullopt;
-        }
-
-        const StructuralBoundaryProjectionWitness &projection =
-            physicalSourceRuns->boundaryProjections[projectionIndex++];
-        if (!projection.uniqueProjection ||
-            projection.lowerBTokenBoundary != projection.upperBTokenBoundary ||
-            projection.bTokenBoundary != projection.lowerBTokenBoundary ||
-            projection.aTokenBoundary != previousToken->aEnd ||
-            projection.aTokenBoundary != edge.aStart ||
-            projection.bTokenBoundary != previousToken->bEnd ||
-            projection.bTokenBoundary != edge.bStart) {
-          return std::nullopt;
-        }
-        boundaryProjections.push_back(projection);
-        previousToken = &edge;
-        protectedStructureSincePreviousToken = false;
-      }
-
-      if (projectionIndex != physicalSourceRuns->boundaryProjections.size()) {
-        return std::nullopt;
-      }
-      uniqueBoundaryProjectionProven = true;
-    }
-
-    const bool sourceByteCoverComplete =
-        prover.StructuralPartitionSourceCoverComplete(path);
-    if (requiresCanonicalPhysicalRunProof && !sourceByteCoverComplete) {
-      return std::nullopt;
-    }
-
-    const bool hasPreservedInPlaceGap =
-        llvm::any_of(path, [](const PartitionEdge &edge) {
-          return edge.IsStateGap() &&
-                 edge.gapDisposition ==
-                     StructuralGapDisposition::PreservedInPlace;
-        });
-    const bool preservedGapSourceOrderProven =
-        hasPreservedInPlaceGap && prover.PreservedInPlaceGapSourceOrderIsProven(path);
-    const bool preservedGapsDisjointFromTokenSegments =
-        hasPreservedInPlaceGap &&
-        prover.PreservedInPlaceGapsAreDisjointFromAllTokenSegments(path);
-    if (hasPreservedInPlaceGap && (!preservedGapSourceOrderProven ||
-                                   !preservedGapsDisjointFromTokenSegments)) {
-      return std::nullopt;
-    }
-
-    bool sharedEmptyBEnvelopeProven = false;
-    uint64_t sharedEmptyBBoundary = 0;
-    bool preservedStateChainComposed = false;
-    if (deleteOnlyHunk) {
-      // A delete-only hunk gives every emitted token segment the same empty B
-      // boundary.  Prove that fact edge-by-edge instead of relying on the
-      // candidate builder having initialized every edge from `h.bStart`.
-      // This makes the durable witness independently reject a malformed
-      // partition that distributes a deletion over different B gaps.
-      const uint64_t sharedBoundary = h.bStart;
-      bool sawStateGap = false;
-      for (const PartitionEdge &edge : path) {
-        if (!edge.closure || edge.bStart != sharedBoundary ||
-            edge.bEnd != sharedBoundary) {
-          return std::nullopt;
-        }
-
-        if (edge.IsStateGap()) {
-          sawStateGap = true;
-          // A proof-only state edge is admissible for deletion only when its
-          // complete physical bytes remain in the source stream.  A gap that
-          // is unknown, materialized by an owner, or repaired by a state
-          // planner would be consumed, moved, reconstructed, or replayed by
-          // some other theorem and therefore cannot justify this split.
-          if (edge.gapDisposition !=
-                  StructuralGapDisposition::PreservedInPlace ||
-              !edge.closure->source.IsComplete() ||
-              edge.closure->source.end <= edge.closure->source.begin) {
-            return std::nullopt;
-          }
-          continue;
-        }
-
-        // A pure same-realizer preserved-structure partition is
-        // admitted by the canonical physical-run theorem, not by the coarse
-        // state census attached to its realizer.  A TU closure, for example,
-        // summarizes mutations across the complete translation unit and can
-        // therefore report directives that are wholly outside this narrow
-        // token run.  Treating that owner-wide summary as segment-local
-        // evidence would reject every valid TU deletion around untouched
-        // preprocessing structure.
-        //
-        // The segment-local proof is stronger: exact monotone token mappings
-        // form maximal physical runs, every intervening protected byte is a
-        // `PreservedInPlace` gap, `PlanTUByteSpan()` revalidates each emitted
-        // carrier, and the final assembler audit keeps every preserved gap
-        // disjoint from every normalized `TextEdit`.  Retain the historical
-        // mutation check for mixed-realizer deletion tilings, where owner
-        // state remains part of that older composition theorem.
-        if (!edge.allowEmptyBEnvelope ||
-            (reason !=
-                 StructuralTilingReason::PreservedPreprocessingStructure &&
-             (deps_.ownerStateProof.OwnerStateDeltaMutatesAnyState(
-                  edge.closure->stateIn) ||
-              deps_.ownerStateProof.OwnerStateDeltaMutatesAnyState(
-                  edge.closure->stateOut)))) {
-          return std::nullopt;
-        }
-      }
-
-      // Value-level state interpretation is intentionally unnecessary for a
-      // preserved gap: the exact source transition continues to execute in
-      // place.  The complete ordered chain is composed only when the physical
-      // source cover, gap order, and global token-segment disjointness proofs
-      // all agree.  With no state gaps the chain is vacuously composed.
-      preservedStateChainComposed =
-          !sawStateGap ||
-          (sourceByteCoverComplete && preservedGapSourceOrderProven &&
-           preservedGapsDisjointFromTokenSegments);
-      if (!preservedStateChainComposed)
-        return std::nullopt;
-
-      sharedEmptyBEnvelopeProven = true;
-      sharedEmptyBBoundary = sharedBoundary;
-    }
-
-    std::string stateCompositionReason;
-    if (!prover.MixedOwnerTilingStateSummariesCompose(h, path,
-                                               &stateCompositionReason)) {
-      return std::nullopt;
-    }
-
-    // Carry the seam proof from the boundary-projection theorem onto the
-    // preserved gap edges that will hold it in the durable witness.  The
-    // projection recorded its verdict per canonical run boundary, while the
-    // gap edges are normalized to the exact directive lines inside that
-    // boundary's source gap, so the two are matched by containment rather
-    // than by position.
-    //
-    // The flag names one specific fact -- that the macro-state liveness
-    // repair theorem has no ordering left to decide -- so it belongs only on
-    // the `#define`/`#undef` edges.  A boundary's gap may preserve several
-    // kinds of structure, each admitted by its own rule; putting the
-    // macro-state proof on an edge that binds no macro name would be a claim
-    // about a directive that has none, and the durable theorem rejects it as
-    // a misplaced proof.
-    if (physicalSourceRuns) {
-      for (size_t gapIndex = 0;
-           gapIndex < physicalSourceRuns->protectedGaps.size() &&
-           gapIndex < physicalSourceRuns->macroStatePlacementProven.size();
-           ++gapIndex) {
-        if (!physicalSourceRuns->macroStatePlacementProven[gapIndex])
-          continue;
-        const OwnerSourceRange &provenGap =
-            physicalSourceRuns->protectedGaps[gapIndex];
-        for (PartitionEdge &gapEdge : path) {
-          if (!gapEdge.IsStateGap() || !gapEdge.closure ||
-              !prover.SourceSitesComparable(gapEdge.closure->source, provenGap) ||
-              gapEdge.closure->source.begin < provenGap.begin ||
-              gapEdge.closure->source.end > provenGap.end) {
-            continue;
-          }
-          if (gapEdge.protectedStructureKind !=
-                  StructuralProtectedStructureKind::MacroDefine &&
-              gapEdge.protectedStructureKind !=
-                  StructuralProtectedStructureKind::MacroUndef) {
-            continue;
-          }
-          gapEdge.macroStatePlacementInsensitiveProven = true;
-        }
-      }
-    }
-
-    StructuralPartition partition;
-    partition.edges = std::move(path);
-    partition.reason = reason;
-    partition.uniquePartition = true;
-    partition.physicalSourceRunCount = physicalSourceRunCount;
-    partition.physicalSourceRunsProven = physicalSourceRunsProven;
-    partition.uniqueMinimumFragmentPartition = uniqueMinimumFragmentPartition;
-    partition.boundaryProjections = std::move(boundaryProjections);
-    partition.uniqueBoundaryProjectionProven = uniqueBoundaryProjectionProven;
-    partition.sharedEmptyBEnvelopeProven = sharedEmptyBEnvelopeProven;
-    partition.sharedEmptyBBoundary = sharedEmptyBBoundary;
-    partition.preservedStateChainComposed = preservedStateChainComposed;
-    partition.sourceByteCoverComplete = sourceByteCoverComplete;
-    partition.preservedGapSourceOrderProven = preservedGapSourceOrderProven;
-    partition.preservedGapsDisjointFromTokenSegments =
-        preservedGapsDisjointFromTokenSegments;
-    return partition;
-  };
 
   // An edge emitted by a proven partition is a minimal proven segment, and a
   // binding was recorded naming exactly it.  Splitting it again in a later
@@ -3599,7 +3599,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         splitHunks.push_back(h);
         continue;
       }
-      auto partition = tryBuildStructuralPartition(h);
+      auto partition = prover.TryBuildStructuralPartition(h);
       if (!partition) {
         splitHunks.push_back(h);
         continue;
