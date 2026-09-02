@@ -286,7 +286,7 @@ bool RefoldMacroSubtreeReplayValidator::
   // proof kinds are either already owner-wide or are handled by their own
   // final replay-stability gates.
   if (patch.proof.kind != MacroPatchProofKind::DagSubtreeRoot ||
-      !patch.subtree.backed || patch.proof.proofRootMacroId != root.id ||
+      !subtreeCertificateOf(patch).backed || patch.proof.proofRootMacroId != root.id ||
       !patch.proof.preservesInvocationStructure)
     return true;
   if (!RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(

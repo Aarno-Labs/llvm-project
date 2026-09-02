@@ -159,7 +159,6 @@ public:
 
   /// Read-only access to the macro-patch proof classifier.  Owns
   /// `ClassifyMacroPatchProof`,
-  /// `RefreshMacroPatchDerivedProofWitnesses`,
   /// `SyncMacroPatchProofSummary`,
   /// `MacroInvocationHasWellFormedPasteWitnesses`, and the three
   /// invocation-preserving / realization `Validate*Proof` methods.

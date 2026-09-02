@@ -766,11 +766,10 @@ std::optional<MacroPatch> RefoldMacroDAGLiftingPhase::Run(
     // are audit metadata for the accepted result; the proof itself has
     // already been checked by the subtree/root validation certificates.
     rootPatchCert.patch->macroId = m.id;
-    deps_.proofLattice.SetMacroPatchProof(
-        *rootPatchCert.patch, deps_.proofLattice.MakeMacroPatchProof(
-                                  MacroPatchProofKind::DagSubtreeRoot,
-                                  /*preservesInvocationStructure=*/true, m.id));
-    SubtreeCertificate &cert = rootPatchCert.patch->subtree;
+    MacroPatchProof dagProof = deps_.proofLattice.MakeMacroPatchProof(
+        MacroPatchProofKind::DagSubtreeRoot,
+        /*preservesInvocationStructure=*/true, m.id);
+    SubtreeCertificate &cert = dagProof.subtree.emplace();
     cert.backed = true;
     cert.leafMacroId = leaf.id;
     cert.witnessCount = 1;
@@ -816,11 +815,11 @@ std::optional<MacroPatch> RefoldMacroDAGLiftingPhase::Run(
         candidateValidator_.FormatBridgeSensitiveFormalSignatureMap(
             subtreeValidation.bridgeSensitiveFormalSignatures);
 
-    // The subtree certificate is filled after the primary proof certify so
-    // the classifier must see a refreshed MacroPatchProof carrier
-    // before this candidate is merged, selected, or emitted.
-    deps_.proofLattice.MacroPatchProofClassifier().SyncMacroPatchProofSummary(
-        *rootPatchCert.patch);
+    // The subtree certificate is part of the proof carrier, so installing the
+    // proof once is what publishes it: the normalized summary is rebuilt inside
+    // SetMacroPatchProof before this candidate is merged, selected, or emitted.
+    deps_.proofLattice.SetMacroPatchProof(*rootPatchCert.patch,
+                                          std::move(dagProof));
 
     // Finally, merge this subtree-backed root patch with any previously
     // accepted DAG candidate for the same root invocation.

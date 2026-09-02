@@ -1200,13 +1200,11 @@ RefoldMacroPatchPlanner::BuildPasteAwareArgsOnlyPatch(
         patch, rewrite->materializedOutputByteStart,
         rewrite->materializedOutputByteEnd);
     CertifyMacroPatchWholeExpansionBRange(m, patch);
-    GetProofLattice().SetMacroPatchProof(
-        patch, GetProofLattice().MakeMacroPatchProof(
-                   MacroPatchProofKind::ArgsOnlyPasteMulti,
-                   /*preservesInvocationStructure=*/true, m.id));
-    patch.pasteReplayValidated = true;
-    GetProofLattice().MacroPatchProofClassifier().SyncMacroPatchProofSummary(
-        patch);
+    MacroPatchProof proof = GetProofLattice().MakeMacroPatchProof(
+        MacroPatchProofKind::ArgsOnlyPasteMulti,
+        /*preservesInvocationStructure=*/true, m.id);
+    proof.paste->replayValidated = true;
+    GetProofLattice().SetMacroPatchProof(patch, std::move(proof));
     return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
   }
 
@@ -1315,18 +1313,15 @@ RefoldMacroPatchPlanner::BuildPasteAwareArgsOnlyPatch(
         // source argument rewrite regenerates, not merely the first changed
         // pasted-token hunk.
         CertifyMacroPatchWholeExpansionBRange(m, patch);
-        GetProofLattice().SetMacroPatchProof(
-            patch, GetProofLattice().MakeMacroPatchProof(
-                       MacroPatchProofKind::ArgsOnlyPasteMulti,
-                       /*preservesInvocationStructure=*/true, m.id));
+        MacroPatchProof proof = GetProofLattice().MakeMacroPatchProof(
+            MacroPatchProofKind::ArgsOnlyPasteMulti,
+            /*preservesInvocationStructure=*/true, m.id);
         // The builder already proved this rewrite by replaying the rewritten
         // invocation arguments against every pasted token occurrence in B.
         // Carry that proof source onto the accepted patch for converted
         // selector-site discharge.
-        patch.pasteReplayValidated = true;
-        GetProofLattice()
-            .MacroPatchProofClassifier()
-            .SyncMacroPatchProofSummary(patch);
+        proof.paste->replayValidated = true;
+        GetProofLattice().SetMacroPatchProof(patch, std::move(proof));
         return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
       }
     }
@@ -1392,16 +1387,14 @@ RefoldMacroPatchPlanner::BuildPasteAwareArgsOnlyPatch(
       // compact representation of the macro's replayed expansion surface.
       // Keep the B-side map anchored to that whole expansion envelope.
       CertifyMacroPatchWholeExpansionBRange(m, patch);
-      GetProofLattice().SetMacroPatchProof(
-          patch, GetProofLattice().MakeMacroPatchProof(
-                     MacroPatchProofKind::ArgsOnlyPasteSingle,
-                     /*preservesInvocationStructure=*/true, m.id));
+      MacroPatchProof proof = GetProofLattice().MakeMacroPatchProof(
+          MacroPatchProofKind::ArgsOnlyPasteSingle,
+          /*preservesInvocationStructure=*/true, m.id);
       // Single-segment paste rewrites are admitted only after direct replay
       // validation against all touched occurrences in B. Record that proof
       // source explicitly for converted selector-site discharge.
-      patch.pasteReplayValidated = true;
-      GetProofLattice().MacroPatchProofClassifier().SyncMacroPatchProofSummary(
-          patch);
+      proof.paste->replayValidated = true;
+      GetProofLattice().SetMacroPatchProof(patch, std::move(proof));
       return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
     }
   }

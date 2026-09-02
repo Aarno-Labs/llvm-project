@@ -424,15 +424,16 @@ std::optional<MacroPatch> tryBuildDirectVaOptPasteTokenPatch(
   wholeEnvelopeWitness.replayValidated = true;
   wholeEnvelopeWitness.definitionTapeReplayValidated = true;
   proof.wholeEnvelopeReplay = wholeEnvelopeWitness;
-  deps.proofLattice.SetMacroPatchProof(patch, std::move(proof));
 
   // The producer did not provide a paste-span interval for the VA_OPT paste
-  // token, so this path carries its own replay proof.  Mark the patch after the
-  // primary proof is installed and resync so the canonical paste witness is
-  // derived from this completed carrier.
-  patch.pasteReplayValidated = true;
-  deps.proofLattice.MacroPatchProofClassifier().SyncMacroPatchProofSummary(
-      patch);
+  // token, so this path carries its own replay proof rather than one the
+  // producer's paste spans require.
+  PasteWitness pasteWitness;
+  pasteWitness.rootMacroId = invocation.id;
+  pasteWitness.requiresProducerPasteSpans = false;
+  pasteWitness.replayValidated = true;
+  proof.paste = pasteWitness;
+  deps.proofLattice.SetMacroPatchProof(patch, std::move(proof));
   return patch;
 }
 

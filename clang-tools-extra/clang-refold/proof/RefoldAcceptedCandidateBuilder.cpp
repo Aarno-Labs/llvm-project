@@ -345,7 +345,7 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedMacroCandidate(
     }
 
     const bool pasteProofPresent =
-        patch.proof.paste.has_value() || patch.pasteReplayValidated ||
+        patch.proof.paste.has_value() ||
         patch.proof.kind == MacroPatchProofKind::ArgsOnlyPasteSingle ||
         patch.proof.kind == MacroPatchProofKind::ArgsOnlyPasteMulti ||
         patch.proof.kind == MacroPatchProofKind::ArgsOnlyPurePasteOnly ||
@@ -436,10 +436,9 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedMacroCandidate(
       }
 
       candidate.tokenPasteResultValidated =
-          patch.pasteReplayValidated ||
-          (patch.proof.paste &&
-           (patch.proof.paste->requiresProducerPasteSpans ||
-            patch.proof.paste->replayValidated));
+          patch.proof.paste &&
+          (patch.proof.paste->requiresProducerPasteSpans ||
+           patch.proof.paste->replayValidated);
       candidate.tokenPasteDiagnosticSafe = candidate.tokenPasteResultValidated;
       candidate.tokenPasteProducerSignature = std::move(producerSig);
       candidate.tokenPasteResultSignature =

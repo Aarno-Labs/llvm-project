@@ -781,7 +781,7 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
     break;
 
   case FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp:
-    if (selected.patch.subtree.backed)
+    if (subtreeCertificateOf(selected.patch).backed)
       REFOLD_LOG_TRACE(
           "macro/proof",
           "subtree continuity probe: reused subtree-backed callsite patch "
@@ -790,7 +790,7 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
     break;
 
   case FinalMacroCandidateOrigin::ReuseExistingCallsiteSkipWholeCover:
-    if (selected.patch.subtree.backed) {
+    if (subtreeCertificateOf(selected.patch).backed) {
       REFOLD_LOG_TRACE(
           "macro/proof",
           "subtree continuity probe: reused subtree-backed callsite patch "

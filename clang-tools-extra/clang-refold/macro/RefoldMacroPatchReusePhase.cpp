@@ -84,13 +84,13 @@ bool RefoldMacroPatchReusePhase::ValidateMergedDirectAndDagRootReplacement(
 
 bool RefoldMacroPatchReusePhase::IsConcreteSubtreeWitnessCohort(
     const MacroPatch &patch) const {
-  if (!patch.subtree.backed)
+  if (!subtreeCertificateOf(patch).backed)
     return false;
-  if (patch.subtree.usesLexicalBridge)
+  if (subtreeCertificateOf(patch).usesLexicalBridge)
     return false;
-  if (patch.subtree.hasPassthroughFlatten)
+  if (subtreeCertificateOf(patch).hasPassthroughFlatten)
     return false;
-  if (patch.subtree.deferredRootArgCount != 0)
+  if (subtreeCertificateOf(patch).deferredRootArgCount != 0)
     return false;
   return true;
 }
@@ -98,23 +98,23 @@ bool RefoldMacroPatchReusePhase::IsConcreteSubtreeWitnessCohort(
 bool RefoldMacroPatchReusePhase::ConflictingConcreteSubtreeWitnesses(
     const RefoldModel::MacroInvocation &m, const MacroPatch &existing,
     const MacroPatch &candidate) const {
-  if (!existing.subtree.backed || !candidate.subtree.backed)
+  if (!subtreeCertificateOf(existing).backed || !subtreeCertificateOf(candidate).backed)
     return false;
   if (existing.proof.proofRootMacroId != m.id ||
       candidate.proof.proofRootMacroId != m.id)
     return false;
-  if (!existing.subtree.leafMacroId || !candidate.subtree.leafMacroId)
+  if (!subtreeCertificateOf(existing).leafMacroId || !subtreeCertificateOf(candidate).leafMacroId)
     return false;
-  if (existing.subtree.leafMacroId == candidate.subtree.leafMacroId)
+  if (subtreeCertificateOf(existing).leafMacroId == subtreeCertificateOf(candidate).leafMacroId)
     return false;
   if (!IsConcreteSubtreeWitnessCohort(existing) ||
       !IsConcreteSubtreeWitnessCohort(candidate))
     return false;
 
   const auto existingFormals = parseExpectedRootFormalSummary(
-      existing.subtree.expectedRootFormalSummary);
+      subtreeCertificateOf(existing).expectedRootFormalSummary);
   const auto candidateFormals = parseExpectedRootFormalSummary(
-      candidate.subtree.expectedRootFormalSummary);
+      subtreeCertificateOf(candidate).expectedRootFormalSummary);
   for (const auto &kvLocal : existingFormals) {
     auto it = candidateFormals.find(kvLocal.first);
     if (it == candidateFormals.end())

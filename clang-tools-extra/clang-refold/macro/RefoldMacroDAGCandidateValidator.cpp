@@ -1128,7 +1128,7 @@ RefoldMacroDAGCandidateValidator::AcceptOrMergeDAGCandidatePatch(
   if (accCtx.uniquePatch->replacement == candPatch.replacement) {
     auto mergedValidation = this->MergeDagCandidateValidationMetadata(
         ctx, accCtx.uniquePatchValidation, candidateValidation);
-    if (accCtx.uniquePatch->subtree.backed || candPatch.subtree.backed) {
+    if (subtreeCertificateOf(*accCtx.uniquePatch).backed || subtreeCertificateOf(candPatch).backed) {
       REFOLD_LOG_TRACE(
           "macro/proof",
           "DAG equivalent subtree-plan probe: root id={0} name={1} "
@@ -1137,12 +1137,12 @@ RefoldMacroDAGCandidateValidator::AcceptOrMergeDAGCandidatePatch(
           "candidateDeferredArgs={6}",
           ctx.rootInvocation.id, ctx.rootInvocation.name, traceStage,
           stringutils::showWsWithClip(
-              accCtx.uniquePatch->subtree.expectedRootFormalSummary, 160),
+              subtreeCertificateOf(*accCtx.uniquePatch).expectedRootFormalSummary, 160),
           stringutils::showWsWithClip(
-              candPatch.subtree.expectedRootFormalSummary, 160),
+              subtreeCertificateOf(candPatch).expectedRootFormalSummary, 160),
           stringutils::showWsWithClip(
-              accCtx.uniquePatch->subtree.deferredRootArgSummary, 160),
-          stringutils::showWsWithClip(candPatch.subtree.deferredRootArgSummary,
+              subtreeCertificateOf(*accCtx.uniquePatch).deferredRootArgSummary, 160),
+          stringutils::showWsWithClip(subtreeCertificateOf(candPatch).deferredRootArgSummary,
                                       160));
     }
     if (!mergedValidation) {
@@ -1169,7 +1169,7 @@ RefoldMacroDAGCandidateValidator::AcceptOrMergeDAGCandidatePatch(
       return cert;
     }
 
-    if (accCtx.uniquePatch->subtree.backed || candPatch.subtree.backed) {
+    if (subtreeCertificateOf(*accCtx.uniquePatch).backed || subtreeCertificateOf(candPatch).backed) {
       REFOLD_LOG_TRACE(
           "macro/proof",
           "DAG equivalent subtree-plan merged: root id={0} name={1} "
@@ -1218,16 +1218,16 @@ RefoldMacroDAGCandidateValidator::AcceptOrMergeDAGCandidatePatch(
   int preferredStructured = this->ChoosePreferredStructuredDagCandidate(
       ctx, accCtx.uniquePatchValidation, candidateValidation);
   if (preferredStructured < 0) {
-    if (accCtx.uniquePatch->subtree.backed || candPatch.subtree.backed) {
+    if (subtreeCertificateOf(*accCtx.uniquePatch).backed || subtreeCertificateOf(candPatch).backed) {
       REFOLD_LOG_TRACE(
           "macro/proof",
           "DAG structured subtree-choice kept existing: root id={0} "
           "name={1} stage={2} existingExpRoot={3} candidateExpRoot={4}",
           ctx.rootInvocation.id, ctx.rootInvocation.name, traceStage,
           stringutils::showWsWithClip(
-              accCtx.uniquePatch->subtree.expectedRootFormalSummary, 160),
+              subtreeCertificateOf(*accCtx.uniquePatch).expectedRootFormalSummary, 160),
           stringutils::showWsWithClip(
-              candPatch.subtree.expectedRootFormalSummary, 160));
+              subtreeCertificateOf(candPatch).expectedRootFormalSummary, 160));
     }
     cert.accepted = true;
     cert.detail =
@@ -1245,16 +1245,16 @@ RefoldMacroDAGCandidateValidator::AcceptOrMergeDAGCandidatePatch(
       deps_.proofLattice.MacroPatchProofClassifier().SyncMacroPatchProofSummary(
           candPatch);
     }
-    if (accCtx.uniquePatch->subtree.backed || candPatch.subtree.backed) {
+    if (subtreeCertificateOf(*accCtx.uniquePatch).backed || subtreeCertificateOf(candPatch).backed) {
       REFOLD_LOG_TRACE(
           "macro/proof",
           "DAG structured subtree-choice replaced existing: root id={0} "
           "name={1} stage={2} existingExpRoot={3} candidateExpRoot={4}",
           ctx.rootInvocation.id, ctx.rootInvocation.name, traceStage,
           stringutils::showWsWithClip(
-              accCtx.uniquePatch->subtree.expectedRootFormalSummary, 160),
+              subtreeCertificateOf(*accCtx.uniquePatch).expectedRootFormalSummary, 160),
           stringutils::showWsWithClip(
-              candPatch.subtree.expectedRootFormalSummary, 160));
+              subtreeCertificateOf(candPatch).expectedRootFormalSummary, 160));
     }
     accCtx.uniquePatch = std::move(candPatch);
     accCtx.uniquePatchBaseText = baseText.str();
@@ -1289,15 +1289,15 @@ RefoldMacroDAGCandidateValidator::AcceptOrMergeDAGCandidatePatch(
 
   auto mergedValidation = this->MergeDagCandidateValidationMetadata(
       ctx, accCtx.uniquePatchValidation, candidateValidation);
-  if (accCtx.uniquePatch->subtree.backed || candPatch.subtree.backed) {
+  if (subtreeCertificateOf(*accCtx.uniquePatch).backed || subtreeCertificateOf(candPatch).backed) {
     REFOLD_LOG_TRACE(
         "macro/proof",
         "DAG merge subtree-plan probe: root id={0} name={1} stage={2} "
         "existingExpRoot={3} candidateExpRoot={4}",
         ctx.rootInvocation.id, ctx.rootInvocation.name, traceStage,
         stringutils::showWsWithClip(
-            accCtx.uniquePatch->subtree.expectedRootFormalSummary, 160),
-        stringutils::showWsWithClip(candPatch.subtree.expectedRootFormalSummary,
+            subtreeCertificateOf(*accCtx.uniquePatch).expectedRootFormalSummary, 160),
+        stringutils::showWsWithClip(subtreeCertificateOf(candPatch).expectedRootFormalSummary,
                                     160));
   }
   if (!mergedValidation) {
@@ -1311,7 +1311,7 @@ RefoldMacroDAGCandidateValidator::AcceptOrMergeDAGCandidatePatch(
     return cert;
   }
 
-  if (accCtx.uniquePatch->subtree.backed || candPatch.subtree.backed) {
+  if (subtreeCertificateOf(*accCtx.uniquePatch).backed || subtreeCertificateOf(candPatch).backed) {
     REFOLD_LOG_TRACE(
         "macro/proof",
         "DAG merge subtree-plan merged: root id={0} name={1} stage={2} "

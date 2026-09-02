@@ -106,6 +106,21 @@ RefoldProofLattice::MakeMacroPatchProof(MacroPatchProofKind kind,
   proof.kind = kind;
   proof.proofRootMacroId = proofRootMacroId;
   proof.preservesInvocationStructure = preservesInvocationStructure;
+
+  // A paste-kind proof always carries a paste witness: the kind itself asserts
+  // that the producer recorded paste spans for this rewrite.  Seeding it here
+  // keeps that invariant with the kind rather than leaving it to each builder,
+  // which is what previously required a post-install refresh pass to reconstruct
+  // the witness from a patch-local flag.  Builders that additionally proved
+  // replay against B set `replayValidated` before installing the proof.
+  if (kind == MacroPatchProofKind::ArgsOnlyPasteSingle ||
+      kind == MacroPatchProofKind::ArgsOnlyPasteMulti ||
+      kind == MacroPatchProofKind::ArgsOnlyPurePasteOnly) {
+    PasteWitness witness;
+    witness.rootMacroId = proofRootMacroId;
+    witness.requiresProducerPasteSpans = true;
+    proof.paste = witness;
+  }
   return proof;
 }
 

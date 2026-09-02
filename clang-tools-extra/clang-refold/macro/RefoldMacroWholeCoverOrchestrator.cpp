@@ -940,11 +940,18 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
                   out.append(covered, cur, covered.size() - cur);
                   {
                     MacroPatch patch{minB, maxE, std::move(out), m.id};
-                    planner_->GetProofLattice().SetMacroPatchProof(
-                        patch,
+                    MacroPatchProof proof =
                         planner_->GetProofLattice().MakeMacroPatchProof(
                             MacroPatchProofKind::CallChainSuffix,
-                            /*preservesInvocationStructure=*/true, m.id));
+                            /*preservesInvocationStructure=*/true, m.id);
+                    // This suffix patch rewrites the root invocation itself,
+                    // so the callsite and the proof root are the same macro.
+                    CallChainWitness callChainWitness;
+                    callChainWitness.rootMacroId = m.id;
+                    callChainWitness.callsiteMacroId = m.id;
+                    proof.callChain = callChainWitness;
+                    planner_->GetProofLattice().SetMacroPatchProof(
+                        patch, std::move(proof));
                     return patch;
                   }
                 }

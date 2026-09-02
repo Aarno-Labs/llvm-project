@@ -224,44 +224,11 @@ RefoldMacroPatchProofClassifier::ClassifyMacroPatchProof(
   return summary;
 }
 
-void RefoldMacroPatchProofClassifier::RefreshMacroPatchDerivedProofWitnesses(
-    MacroPatch &patch) const {
-  // This helper does not reconstruct primary proof identity from side fields.
-  // It only enriches the canonical carrier with witnesses whose raw evidence is
-  // stored as patch-local construction metadata: paste replay status, DAG
-  // subtree certificates, and root/callsite call-chain identity.
-  MacroPatchProof proof = patch.proof;
-
-  const bool proofKindRequiresPasteWitness =
-      proof.kind == MacroPatchProofKind::ArgsOnlyPasteSingle ||
-      proof.kind == MacroPatchProofKind::ArgsOnlyPasteMulti ||
-      proof.kind == MacroPatchProofKind::ArgsOnlyPurePasteOnly;
-  if (proofKindRequiresPasteWitness || patch.pasteReplayValidated) {
-    PasteWitness witness;
-    witness.rootMacroId = proof.proofRootMacroId;
-    witness.requiresProducerPasteSpans = proofKindRequiresPasteWitness;
-    witness.replayValidated = patch.pasteReplayValidated;
-    proof.paste = std::move(witness);
-  }
-
-  if (proof.kind == MacroPatchProofKind::DagSubtreeRoot ||
-      patch.subtree.backed) {
-    proof.subtree = patch.subtree;
-  }
-
-  if (proof.kind == MacroPatchProofKind::CallChainSuffix) {
-    CallChainWitness witness;
-    witness.rootMacroId = proof.proofRootMacroId;
-    witness.callsiteMacroId = patch.macroId;
-    proof.callChain = witness;
-  }
-
-  patch.proof = std::move(proof);
-}
-
 void RefoldMacroPatchProofClassifier::SyncMacroPatchProofSummary(
     MacroPatch &patch) const {
-  RefreshMacroPatchDerivedProofWitnesses(patch);
+  // Every witness now reaches the carrier through its own builder, so the
+  // summary is a pure function of the installed proof.  Nothing is rebuilt from
+  // patch-local construction metadata here.
   patch.proofSummary = ClassifyMacroPatchProof(patch);
 }
 

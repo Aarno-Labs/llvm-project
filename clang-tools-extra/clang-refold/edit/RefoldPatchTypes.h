@@ -211,21 +211,25 @@ struct MacroPatch {
   /// present.
   WholeCoverCertificate wholeCover = {};
 
-  /// Subtree-composition audit metadata. This is instrumentation only and does
-  /// not participate in admissibility yet. The proof carrier's proof.subtree is
-  /// the canonical theorem-facing copy; this field is the patch-local
-  /// construction record that the proof refresh synthesizes from.
-  SubtreeCertificate subtree = {};
-
-  /// Direct args-only paste replay proof metadata.
-  bool pasteReplayValidated = false;
-
   /// Materialized B-token and replacement-text byte provenance, when certified.
   MaterializedSurface materialized = {};
 
   /// Owner/conditional-arm certificate for the patch surface, when proven.
   OwnerCertificate ownerCert = {};
 };
+
+/// Return the patch's subtree certificate, or an empty certificate when the
+/// patch carries no subtree proof.
+///
+/// Subtree facts live on the proof carrier, where absence is a disengaged
+/// optional.  Readers previously saw a default-constructed patch-local record
+/// for an unproven subtree, and several of them read fields under a guard that
+/// only establishes that *one* of two patches is backed.  Returning an empty
+/// certificate keeps that exact view instead of making those reads undefined.
+inline const SubtreeCertificate &subtreeCertificateOf(const MacroPatch &patch) {
+  static const SubtreeCertificate kNoSubtreeCertificate{};
+  return patch.proof.subtree ? *patch.proof.subtree : kNoSubtreeCertificate;
+}
 
 /// Drop every byte-level claim about a patch replacement that rewriting its
 /// text invalidates.

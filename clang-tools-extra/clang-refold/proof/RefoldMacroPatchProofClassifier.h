@@ -11,9 +11,9 @@
 //     starter `ProofSummary` for a proof-carrying macro patch and
 //     dispatches to the invocation-preserving or realization
 //     validator.
-//   * `RefreshMacroPatchDerivedProofWitnesses` /
-//     `SyncMacroPatchProofSummary` — refresh derived witnesses and
-//     re-run classification on an in-place patch.
+//   * `SyncMacroPatchProofSummary` — re-run classification on an
+//     in-place patch.  Witnesses are installed by their builders, so
+//     nothing is derived from patch-local metadata here.
 //   * `MacroInvocationHasWellFormedPasteWitnesses` — precondition
 //     check for paste-touching proof carriers.
 //   * `ValidateInvocationPreservingProof` /
@@ -80,9 +80,6 @@ public:
   /// starter `ProofSummary` (theorem class + discharge record).
   ProofSummary ClassifyMacroPatchProof(const MacroPatch &patch) const;
 
-  /// Refresh the derived paste/subtree/call-chain witnesses on the
-  /// patch's proof carrier.
-  void RefreshMacroPatchDerivedProofWitnesses(MacroPatch &patch) const;
 
   /// Refresh derived witnesses and re-run classification into
   /// `patch.selectedProofSummary`.
