@@ -757,6 +757,1389 @@ Expected<std::string> RefoldModel::ParseSourcePath(const json::Object &root) {
   return s->str();
 }
 
+// Short names for the model's own nested record types, so the per-section
+// parse helpers below read the way they did as blocks inside FromJson.  These
+// are aliases, not new types; member functions of RefoldModel are unaffected
+// because class scope already wins for them.
+using CalleeOriginPart = RefoldModel::CalleeOriginPart;
+using CalleeOriginPartKind = RefoldModel::CalleeOriginPartKind;
+using CondArm = RefoldModel::CondArm;
+using CondGroup = RefoldModel::CondGroup;
+using FileItem = RefoldModel::FileItem;
+using HeaderDecl = RefoldModel::HeaderDecl;
+using IncludeItem = RefoldModel::IncludeItem;
+using IncludeLookupProvenance = RefoldModel::IncludeLookupProvenance;
+using IncludeNextProvenance = RefoldModel::IncludeNextProvenance;
+using IncludeSearchEntry = RefoldModel::IncludeSearchEntry;
+using LineControlEvent = RefoldModel::LineControlEvent;
+using MacroDefParam = RefoldModel::MacroDefParam;
+using MacroDirective = RefoldModel::MacroDirective;
+using MacroInvocation = RefoldModel::MacroInvocation;
+using MacroReplacementToken = RefoldModel::MacroReplacementToken;
+using MacroReplacementTokenKind = RefoldModel::MacroReplacementTokenKind;
+using PPArgSpan = RefoldModel::PPArgSpan;
+using PPSpan = RefoldModel::PPSpan;
+using PragmaDirective = RefoldModel::PragmaDirective;
+using Slot = RefoldModel::Slot;
+using TokMapEntry = RefoldModel::TokMapEntry;
+
+/// Parse a macro directive's formal-parameter list from \p fieldName.
+///
+/// An absent or null array is an empty formal list, which is the correct
+/// reading for an object-like `#define`.  Every other shape is a malformed
+/// producer record and stops the run.
+static std::vector<MacroDefParam>
+parseMacroDefParams(const json::Object &ownerObj, StringRef fieldName,
+                    const std::string &ctxItem) {
+  std::vector<MacroDefParam> params;
+  if (auto paramsArr = asOptArray(ownerObj, fieldName, /*canBeNull=*/true)) {
+    params.reserve((**paramsArr).size());
+    for (const json::Value &Elem : **paramsArr) {
+      auto objOrErrLocal =
+          asObject(Elem, (Twine(ctxItem) + ": " + fieldName + "[]").str());
+      if (!objOrErrLocal)
+        REFOLD_LOG_FATAL("model", "{0}: {1} element is not an object", ctxItem,
+                         fieldName);
+      const json::Object &ParamObj = **objOrErrLocal;
+
+      const json::Value *NameVal = ParamObj.get("name");
+      if (!NameVal)
+        REFOLD_LOG_FATAL("model", "{0}: {1} element missing name", ctxItem,
+                         fieldName);
+      auto nameOrErrLocal = asString(
+          *NameVal, (Twine(ctxItem) + ": " + fieldName + ".name").str());
+      if (!nameOrErrLocal)
+        REFOLD_LOG_FATAL("model", "{0}: {1}.name is not a string", ctxItem,
+                         fieldName);
+
+      const json::Value *VarVal = ParamObj.get("variadic");
+      if (!VarVal)
+        REFOLD_LOG_FATAL("model", "{0}: {1} element missing variadic", ctxItem,
+                         fieldName);
+      auto varOrErr = asBool(
+          *VarVal, (Twine(ctxItem) + ": " + fieldName + ".variadic").str());
+      if (!varOrErr)
+        REFOLD_LOG_FATAL("model", "{0}: {1}.variadic is not a bool", ctxItem,
+                         fieldName);
+
+      params.emplace_back(*nameOrErrLocal, *varOrErr);
+    }
+  }
+  return params;
+}
+
+/// Parse a macro directive's replacement-list replay tokens.
+///
+/// Each `param_ref` token is checked against \p defParams: the index must name
+/// an existing formal and the token's spelling must equal that formal's name,
+/// so a replacement list can never be replayed against a formal it does not
+/// actually reference.
+static std::vector<MacroReplacementToken>
+parseMacroReplacementTokens(const json::Object &ownerObj,
+                            ArrayRef<MacroDefParam> defParams,
+                            const std::string &ctxItem) {
+  std::vector<MacroReplacementToken> tokens;
+  if (auto tokensArr = asOptArray(ownerObj, "replacement_tokens",
+                                  /*canBeNull=*/true)) {
+    tokens.reserve((**tokensArr).size());
+    for (const json::Value &Elem : **tokensArr) {
+      auto objOrErrLocal =
+          asObject(Elem, (Twine(ctxItem) + ": replacement_tokens[]").str());
+      if (!objOrErrLocal)
+        REFOLD_LOG_FATAL("model",
+                         "{0}: replacement_tokens element is not an object",
+                         ctxItem);
+      const json::Object &TokObj = **objOrErrLocal;
+
+      const json::Value *KindVal = TokObj.get("kind");
+      if (!KindVal)
+        REFOLD_LOG_FATAL(
+            "model", "{0}: replacement_tokens element missing kind", ctxItem);
+      auto kindOrErrLocal = asString(
+          *KindVal, (Twine(ctxItem) + ": replacement_tokens.kind").str());
+      if (!kindOrErrLocal)
+        REFOLD_LOG_FATAL(
+            "model", "{0}: replacement_tokens.kind is not a string", ctxItem);
+
+      const json::Value *SpellingVal = TokObj.get("spelling");
+      if (!SpellingVal)
+        REFOLD_LOG_FATAL("model",
+                         "{0}: replacement_tokens element missing spelling",
+                         ctxItem);
+      auto spellingOrErr =
+          asString(*SpellingVal,
+                   (Twine(ctxItem) + ": replacement_tokens.spelling").str());
+      if (!spellingOrErr)
+        REFOLD_LOG_FATAL("model",
+                         "{0}: replacement_tokens.spelling is not a string",
+                         ctxItem);
+
+      MacroReplacementToken token;
+      token.spelling = *spellingOrErr;
+      if (*kindOrErrLocal == "literal") {
+        token.kind = MacroReplacementTokenKind::Literal;
+        if (TokObj.get("param_index"))
+          REFOLD_LOG_FATAL(
+              "model",
+              "{0}: literal replacement_tokens element has param_index",
+              ctxItem);
+      } else if (*kindOrErrLocal == "param_ref") {
+        token.kind = MacroReplacementTokenKind::ParamRef;
+        const json::Value *ParamVal = TokObj.get("param_index");
+        if (!ParamVal)
+          REFOLD_LOG_FATAL("model",
+                           "{0}: param_ref replacement_tokens element missing "
+                           "param_index",
+                           ctxItem);
+        auto paramOrErr = asUInt32(
+            *ParamVal,
+            (Twine(ctxItem) + ": replacement_tokens.param_index").str());
+        if (!paramOrErr)
+          REFOLD_LOG_FATAL("model",
+                           "{0}: replacement_tokens.param_index is invalid",
+                           ctxItem);
+        if (*paramOrErr >= defParams.size())
+          REFOLD_LOG_FATAL(
+              "model",
+              "{0}: replacement_tokens.param_index references missing "
+              "macro formal",
+              ctxItem);
+        if (defParams[*paramOrErr].name != token.spelling)
+          REFOLD_LOG_FATAL(
+              "model",
+              "{0}: replacement_tokens param_ref spelling does not match "
+              "the referenced macro formal",
+              ctxItem);
+        token.paramIndex = *paramOrErr;
+      } else {
+        REFOLD_LOG_FATAL("model", "{0}: invalid replacement_tokens.kind '{1}'",
+                         ctxItem, *kindOrErrLocal);
+      }
+
+      tokens.push_back(std::move(token));
+    }
+  }
+  return tokens;
+}
+
+/// Parse the tiled provenance of a generated callee spelling.
+///
+/// The parts must tile \p finalSpelling exactly; a set that does not
+/// reconstruct the recorded spelling is not provenance for it and stops the
+/// run rather than being used as replay evidence.
+static std::vector<CalleeOriginPart>
+parseCalleeOriginParts(const json::Object &originObj, StringRef finalSpelling,
+                       const std::string &ctxItem) {
+  std::vector<CalleeOriginPart> parts;
+  auto partsArr = asOptArray(originObj, "parts", /*canBeNull=*/true);
+  if (!partsArr)
+    return parts;
+
+  parts.reserve((**partsArr).size());
+  std::string tiled;
+  for (const json::Value &Elem : **partsArr) {
+    auto objOrErrLocal =
+        asObject(Elem, (Twine(ctxItem) + ": callee_origin.parts[]").str());
+    if (!objOrErrLocal)
+      REFOLD_LOG_FATAL("model",
+                       "{0}: callee_origin.parts element is not an object",
+                       ctxItem);
+    const json::Object &PartObj = **objOrErrLocal;
+
+    const json::Value *KindVal = PartObj.get("kind");
+    if (!KindVal)
+      REFOLD_LOG_FATAL("model", "{0}: callee_origin.parts element missing kind",
+                       ctxItem);
+    auto kindOrErrLocal = asString(
+        *KindVal, (Twine(ctxItem) + ": callee_origin.parts.kind").str());
+    if (!kindOrErrLocal)
+      REFOLD_LOG_FATAL("model", "{0}: callee_origin.parts.kind is not a string",
+                       ctxItem);
+
+    const json::Value *SpellingVal = PartObj.get("spelling");
+    if (!SpellingVal)
+      REFOLD_LOG_FATAL("model",
+                       "{0}: callee_origin.parts element missing spelling",
+                       ctxItem);
+    auto spellingOrErr =
+        asString(*SpellingVal,
+                 (Twine(ctxItem) + ": callee_origin.parts.spelling").str());
+    if (!spellingOrErr)
+      REFOLD_LOG_FATAL("model",
+                       "{0}: callee_origin.parts.spelling is not a string",
+                       ctxItem);
+
+    CalleeOriginPart part;
+    part.spelling = *spellingOrErr;
+    if (*kindOrErrLocal == "literal") {
+      part.kind = CalleeOriginPartKind::Literal;
+      if (PartObj.get("root_macro_id") || PartObj.get("root_param_index") ||
+          PartObj.get("byte_begin") || PartObj.get("byte_end"))
+        REFOLD_LOG_FATAL(
+            "model",
+            "{0}: literal callee_origin part carries selector-slice fields",
+            ctxItem);
+    } else if (*kindOrErrLocal == "caller_arg_slice") {
+      part.kind = CalleeOriginPartKind::CallerArgSlice;
+      auto rootOrErr =
+          applyToField(asUInt64, PartObj, "root_macro_id",
+                       (Twine(ctxItem) + ": callee_origin.parts").str());
+      if (!rootOrErr)
+        REFOLD_LOG_FATAL("model",
+                         "{0}: callee_origin.parts.root_macro_id is invalid",
+                         ctxItem);
+      auto paramOrErr =
+          applyToField(asUInt32, PartObj, "root_param_index",
+                       (Twine(ctxItem) + ": callee_origin.parts").str());
+      if (!paramOrErr)
+        REFOLD_LOG_FATAL("model",
+                         "{0}: callee_origin.parts.root_param_index is invalid",
+                         ctxItem);
+      auto beginOrErrLocal =
+          applyToField(asUInt32, PartObj, "byte_begin",
+                       (Twine(ctxItem) + ": callee_origin.parts").str());
+      if (!beginOrErrLocal)
+        REFOLD_LOG_FATAL(
+            "model", "{0}: callee_origin.parts.byte_begin is invalid", ctxItem);
+      auto endOrErrLocal =
+          applyToField(asUInt32, PartObj, "byte_end",
+                       (Twine(ctxItem) + ": callee_origin.parts").str());
+      if (!endOrErrLocal)
+        REFOLD_LOG_FATAL(
+            "model", "{0}: callee_origin.parts.byte_end is invalid", ctxItem);
+      if (*endOrErrLocal < *beginOrErrLocal)
+        REFOLD_LOG_FATAL("model",
+                         "{0}: callee_origin selector slice range is invalid",
+                         ctxItem);
+      part.rootMacroId = *rootOrErr;
+      part.rootParamIndex = *paramOrErr;
+      part.byteBegin = *beginOrErrLocal;
+      part.byteEnd = *endOrErrLocal;
+    } else {
+      REFOLD_LOG_FATAL("model", "{0}: invalid callee_origin.parts.kind '{1}'",
+                       ctxItem, *kindOrErrLocal);
+    }
+
+    tiled.append(part.spelling.begin(), part.spelling.end());
+    parts.push_back(std::move(part));
+  }
+
+  if (tiled != finalSpelling)
+    REFOLD_LOG_FATAL(
+        "model",
+        "{0}: callee_origin.parts do not tile the final callee spelling",
+        ctxItem);
+  return parts;
+}
+
+/// Parse one `#include` / `#include_next` item.
+///
+/// \p includeSearchChain is the producer's recorded search chain; the lookup
+/// and include-next provenance fields are validated against it, so the chain
+/// must already be parsed when this runs.
+static Expected<IncludeItem>
+parseIncludeItem(const json::Object &obj, StringRef skStr,
+                 const std::string &ctxItem,
+                 ArrayRef<IncludeSearchEntry> includeSearchChain) {
+  // required
+  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
+  if (!idOrErr)
+    return idOrErr.takeError();
+  int id = *idOrErr;
+
+  auto textOrErr = applyToField(asString, obj, "text", ctxItem);
+  if (!textOrErr)
+    return textOrErr.takeError();
+  StringRef text = *textOrErr;
+
+  auto spOrErr = applyToField(asString, obj, "site_path", ctxItem);
+  if (!spOrErr)
+    return spOrErr.takeError();
+  StringRef sitePath = *spOrErr;
+
+  auto tgtOrErr = applyToField(asString, obj, "target", ctxItem);
+  if (!tgtOrErr)
+    return tgtOrErr.takeError();
+  StringRef target = *tgtOrErr;
+
+  auto angledOrErr = applyToField(asBool, obj, "angled", ctxItem);
+  if (!angledOrErr)
+    return angledOrErr.takeError();
+  bool angled = *angledOrErr;
+
+  // not really optional, but can be string or null (null values will
+  // produce a fatal error)
+  uint64_t siteB = *asOptUInt64(obj, "site_b");
+  uint64_t siteE = *asOptUInt64(obj, "site_e");
+
+  // optional
+  std::optional<StringRef> resolved = asOptString(obj, "resolved_path");
+  std::optional<StringRef> openedPath = asOptString(obj, "opened_path");
+  std::optional<StringRef> enteredFileSpelling =
+      asOptString(obj, "entered_file_spelling");
+  std::optional<StringRef> enteredFileName =
+      asOptString(obj, "entered_file_name");
+  std::optional<StringRef> controllingMacro =
+      asOptString(obj, "controlling_macro");
+
+  auto lookupOrErr = parseOptionalIncludeLookupProvenance(
+      obj, "lookup", ctxItem, includeSearchChain);
+  if (!lookupOrErr)
+    return lookupOrErr.takeError();
+  std::optional<IncludeLookupProvenance> lookup = std::move(*lookupOrErr);
+
+  auto includeNextOrErr = parseOptionalIncludeNextProvenance(
+      obj, skStr, ctxItem, includeSearchChain);
+  if (!includeNextOrErr)
+    return includeNextOrErr.takeError();
+  std::optional<IncludeNextProvenance> includeNext =
+      std::move(*includeNextOrErr);
+
+  std::optional<uint64_t> parent = asOptUInt64(obj, "parent");
+
+  std::vector<PPSpan> spans;
+  if (const json::Value *spansVal = obj.get("spans")) {
+    auto sp = parseSpans(*spansVal, "include.spans");
+    if (!sp)
+      return sp.takeError();
+    spans = std::move(*sp);
+  }
+
+  std::vector<RefoldModel::HeaderDecl> decls;
+  if (auto declArr = asOptArray(obj, "decls")) {
+    decls.reserve((*declArr)->size());
+    for (std::size_t di = 0; di < (*declArr)->size(); ++di) {
+      const std::string ctxDecl =
+          (Twine("include.decls[") + Twine(di) + "]").str();
+      auto declObjOrErr = asObject((**declArr)[di], ctxDecl);
+      if (!declObjOrErr)
+        return declObjOrErr.takeError();
+      const json::Object &declObj = **declObjOrErr;
+
+      auto kindOrErr = applyToField(asString, declObj, "kind", ctxDecl);
+      if (!kindOrErr)
+        return kindOrErr.takeError();
+      auto nameOrErr = applyToField(asString, declObj, "name", ctxDecl);
+      if (!nameOrErr)
+        return nameOrErr.takeError();
+
+      const std::string headerCtxDecl = ctxDecl + ".header_span";
+      auto hsValOrErr = requireField(declObj, "header_span", ctxDecl);
+      if (!hsValOrErr)
+        return hsValOrErr.takeError();
+      auto hsObjOrErr = asObject(**hsValOrErr, headerCtxDecl);
+      if (!hsObjOrErr)
+        return hsObjOrErr.takeError();
+      const json::Object &hsObj = **hsObjOrErr;
+
+      // header_span.file is optional; when omitted, the header file is
+      // implied by the enclosing include's new opened_path when
+      // present, otherwise by legacy resolved_path. This avoids
+      // repeating the same path string for every decl while preserving
+      // old-map compatibility.
+      std::optional<StringRef> hsFileOpt = asOptString(hsObj, "file");
+      StringRef hsFile;
+      if (hsFileOpt) {
+        hsFile = *hsFileOpt;
+      } else if (openedPath) {
+        hsFile = *openedPath;
+      } else if (resolved) {
+        hsFile = *resolved;
+      } else {
+        return createStringError(
+            inconvertibleErrorCode(),
+            "Missing required field 'header_span.file' at %s (and "
+            "include has neither opened_path nor resolved_path)",
+            headerCtxDecl.c_str());
+      }
+
+      auto hsBOrErr = applyToField(asUInt64, hsObj, "b", headerCtxDecl);
+      if (!hsBOrErr)
+        return hsBOrErr.takeError();
+      auto hsEOrErr = applyToField(asUInt64, hsObj, "e", headerCtxDecl);
+      if (!hsEOrErr)
+        return hsEOrErr.takeError();
+
+      auto psValOrErr = requireField(declObj, "pp_span", ctxDecl);
+      if (!psValOrErr)
+        return psValOrErr.takeError();
+      auto psObjOrErr = asObject(**psValOrErr, ctxDecl + ".pp_span");
+      if (!psObjOrErr)
+        return psObjOrErr.takeError();
+      const json::Object &psObj = **psObjOrErr;
+      auto psBOrErr = applyToField(asUInt64, psObj, "begin", ctxDecl);
+      if (!psBOrErr)
+        return psBOrErr.takeError();
+      auto psEOrErr = applyToField(asUInt64, psObj, "end", ctxDecl);
+      if (!psEOrErr)
+        return psEOrErr.takeError();
+
+      RefoldModel::HeaderDecl decl;
+      decl.kind = *kindOrErr;
+      decl.name = *nameOrErr;
+      decl.file = hsFile;
+      decl.headerB = *hsBOrErr;
+      decl.headerE = *hsEOrErr;
+      decl.span = PPSpan{*psBOrErr, *psEOrErr};
+      decls.push_back(std::move(decl));
+    }
+  }
+
+  IncludeItem inc(/*id*/ id,
+                  /*subkind*/ skStr,
+                  /*text*/ text,
+                  /*sitePath*/ sitePath,
+                  /*siteB*/ siteB,
+                  /*siteE*/ siteE,
+                  /*target*/ target,
+                  /*resolvedPath*/ resolved,
+                  /*openedPath*/ openedPath,
+                  /*enteredFileSpelling*/ enteredFileSpelling,
+                  /*enteredFileName*/ enteredFileName,
+                  /*controllingMacro*/ controllingMacro,
+                  /*lookup*/ std::move(lookup),
+                  /*includeNext*/ std::move(includeNext),
+                  /*angled*/ angled,
+                  /*parent*/ parent,
+                  /*spans*/ std::move(spans),
+                  /*decls*/ std::move(decls));
+
+  return inc;
+}
+
+/// Parse one `#define` / `#undef` item.
+///
+/// The formal list and replacement-list replay tokens are read only for a
+/// `#define`; an `#undef` carries neither, and its record keeps them empty.
+static Expected<MacroDirective>
+parseMacroDirectiveItem(const json::Object &obj, StringRef skStr,
+                        const std::string &ctxItem) {
+  MacroDirective md;
+
+  // required
+  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
+  if (!idOrErr)
+    return idOrErr.takeError();
+  md.id = *idOrErr;
+
+  auto nameOrErr = applyToField(asString, obj, "name", ctxItem);
+  if (!nameOrErr)
+    return nameOrErr.takeError();
+  md.name = *nameOrErr;
+
+  auto textOrErr = applyToField(asString, obj, "text", ctxItem);
+  if (!textOrErr)
+    return textOrErr.takeError();
+  md.text = *textOrErr;
+
+  if (skStr == "#define") {
+    auto functionLikeOrErr =
+        applyToField(asBool, obj, "function_like", ctxItem);
+    if (!functionLikeOrErr)
+      return functionLikeOrErr.takeError();
+    md.functionLike = *functionLikeOrErr;
+  }
+
+  auto spOrErr = applyToField(asString, obj, "site_path", ctxItem);
+  if (!spOrErr)
+    return spOrErr.takeError();
+  md.sitePath = *spOrErr;
+
+  auto spansOrErr = requireField(obj, "spans", ctxItem);
+  if (!spansOrErr)
+    return spansOrErr.takeError();
+  auto spans = parseSpans(**spansOrErr, "macro.directive.spans");
+  if (!spans)
+    return spans.takeError();
+  md.spans = std::move(*spans);
+
+  // not really optional, but can be string or null (null values will
+  // produce a fatal error)
+  md.siteB = *asOptUInt64(obj, "site_b");
+  md.siteE = *asOptUInt64(obj, "site_e");
+
+  // Optional producer-recorded physical extent of the whole directive
+  // spelling.  Accept it only as a well-formed pair that also contains
+  // the name-anchored site range: those are two independent producer
+  // measurements of one directive, and a map where they disagree is not
+  // evidence of anything.  A partial or inconsistent record is dropped
+  // rather than repaired, which leaves the pre-existing text-based
+  // recovery path in charge.
+  std::optional<uint64_t> directiveLineB = asOptUInt64(obj, "directive_line_b");
+  std::optional<uint64_t> directiveLineE = asOptUInt64(obj, "directive_line_e");
+  if (directiveLineB && directiveLineE && *directiveLineB < *directiveLineE &&
+      *directiveLineB <= md.siteB && md.siteE <= *directiveLineE) {
+    md.directiveLineB = directiveLineB;
+    md.directiveLineE = directiveLineE;
+  }
+
+  // Optional producer-owned replay data for #define directives.
+  // #undef records intentionally keep these vectors empty: their only
+  // semantic payload is the macro-state transition, not
+  // replacement-list replay.
+  if (skStr == "#define") {
+    md.defParams = parseMacroDefParams(obj, "def_params", ctxItem);
+    md.replacementTokens =
+        parseMacroReplacementTokens(obj, md.defParams, ctxItem);
+  }
+
+  // optional
+  md.ownerIncludeId = asOptUInt64(obj, "owner_include_id");
+
+  md.subkind = skStr;
+  return md;
+}
+
+/// Parse one `#pragma` item.
+static Expected<PragmaDirective>
+parsePragmaDirectiveItem(const json::Object &obj, const std::string &ctxItem) {
+  PragmaDirective pd;
+
+  // required
+  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
+  if (!idOrErr)
+    return idOrErr.takeError();
+  pd.id = *idOrErr;
+
+  auto textOrErr = applyToField(asString, obj, "text", ctxItem);
+  if (!textOrErr)
+    return textOrErr.takeError();
+  pd.text = *textOrErr;
+
+  auto spOrErr = applyToField(asString, obj, "site_path", ctxItem);
+  if (!spOrErr)
+    return spOrErr.takeError();
+  pd.sitePath = *spOrErr;
+
+  // not really optional, but can be string or null (null values will
+  // produce a fatal error)
+  pd.siteB = *asOptUInt64(obj, "site_b");
+  pd.siteE = *asOptUInt64(obj, "site_e");
+
+  // Optional in older maps.  When present, this is the preferred
+  // repeated-header disambiguator for zero-token pragma owners.
+  pd.ownerIncludeId = asOptUInt64(obj, "owner_include_id");
+
+  // Preserve producer-owned `_Pragma` source provenance in the typed
+  // model.  Sideband replay already consumes these fields directly
+  // from JSON; the preprocessing-structure census also needs them so a
+  // mid-line pragma operator cannot disappear behind an ordinary token
+  // byte envelope.  Missing or partial ranges remain unbound and are
+  // rejected by the interval index rather than guessed here.
+  pd.viaPragmaOperator = obj.getBoolean("via_pragma_operator").value_or(false);
+  pd.operatorB = asOptUInt64(obj, "operator_b");
+  pd.operatorE = asOptUInt64(obj, "operator_e");
+  // Image of the directive in the preprocessed stream A.  Present only
+  // when the preprocessor re-emitted the pragma, so absence is a fact
+  // and not missing data: it says clang printed nothing for this
+  // spelling.  A partial pair is treated as absent rather than
+  // repaired, because half a range proves neither.
+  pd.ppByteBegin = asOptUInt64(obj, "pp_byte_begin");
+  pd.ppByteEnd = asOptUInt64(obj, "pp_byte_end");
+  if (!pd.ppByteBegin || !pd.ppByteEnd || *pd.ppByteEnd <= *pd.ppByteBegin) {
+    pd.ppByteBegin.reset();
+    pd.ppByteEnd.reset();
+  }
+  // Stringified-argument provenance. Both fields are producer-emitted
+  // together; a partial pair is treated as absent rather than repaired,
+  // so a truncated record cannot authorize an argument-site edit.
+  pd.stringifiedFromMacroId = asOptUInt64(obj, "stringified_from_macro_id");
+  if (std::optional<uint64_t> argIndex =
+          asOptUInt64(obj, "stringified_from_arg_index"))
+    pd.stringifiedFromArgIndex = static_cast<uint32_t>(*argIndex);
+  if (!pd.stringifiedFromMacroId || !pd.stringifiedFromArgIndex) {
+    pd.stringifiedFromMacroId.reset();
+    pd.stringifiedFromArgIndex.reset();
+  }
+
+  return pd;
+}
+
+/// Parse one macro-invocation item.
+///
+/// This is the largest producer record: invocation geometry, argument and
+/// body spans, paste/stringify/variadic provenance, generated-callee origin,
+/// and tuple-forwarding edges.  Every optional group is admitted only as a
+/// whole, so a half-recorded fact never reaches a proof as if it were
+/// complete.
+static Expected<MacroInvocation>
+parseMacroInvocationItem(const json::Object &obj, const std::string &ctxItem) {
+  // required
+  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
+  if (!idOrErr)
+    return idOrErr.takeError();
+  int id = *idOrErr;
+
+  auto skOrErr = applyToField(asString, obj, "subkind", ctxItem);
+  if (!skOrErr)
+    return skOrErr.takeError();
+  StringRef subkind = *skOrErr;
+
+  auto nameOrErr = applyToField(asString, obj, "name", ctxItem);
+  if (!nameOrErr)
+    return nameOrErr.takeError();
+  StringRef name = *nameOrErr;
+
+  auto invTextValOrErr = requireField(obj, "inv_text", ctxItem);
+  if (!invTextValOrErr)
+    return invTextValOrErr.takeError();
+  std::optional<StringRef> invText;
+  if (!(*invTextValOrErr)->getAsNull()) {
+    auto invTextOrErr = asString(**invTextValOrErr, ctxItem + ": inv_text");
+    if (!invTextOrErr)
+      return invTextOrErr.takeError();
+    invText = *invTextOrErr;
+  }
+  std::optional<StringRef> normalizedInvText =
+      asOptString(obj, "normalized_inv_text", /*canBeNull=*/true);
+
+  auto spansOrErr = requireField(obj, "spans", ctxItem);
+  if (!spansOrErr)
+    return spansOrErr.takeError();
+  auto spans = parseSpans(**spansOrErr, "macro.spans");
+  if (!spans)
+    return spans.takeError();
+
+  // optional
+  std::optional<StringRef> invFile = asOptString(obj, "inv_file");
+  std::optional<uint64_t> invB = asOptUInt64(obj, "inv_b");
+  std::optional<uint64_t> invE = asOptUInt64(obj, "inv_e");
+  std::optional<uint64_t> invPPByteBegin =
+      asOptUInt64(obj, "inv_pp_byte_begin");
+  std::optional<uint64_t> invPPByteEnd = asOptUInt64(obj, "inv_pp_byte_end");
+  std::optional<uint64_t> ownerIncludeId = asOptUInt64(obj, "owner_include_id");
+  std::optional<uint64_t> definitionDirectiveId =
+      asOptUInt64(obj, "definition_directive_id",
+                  /*canBeNull=*/true);
+  std::vector<MacroDefParam> defParams =
+      parseMacroDefParams(obj, "def_params", ctxItem);
+
+  auto parseOptByteRanges =
+      [&](StringRef fieldName,
+          std::vector<MacroInvocation::OptByteRange> &out) {
+        // These ranges intentionally preserve nullable endpoints from older
+        // producer schemas; downstream proof code decides whether null ranges
+        // are sufficient for the specific certificate being built.
+        if (auto arr = asOptArray(obj, fieldName, /*canBeNull=*/true)) {
+          for (const auto &elem : **arr) {
+            auto *rObj = elem.getAsObject();
+            if (!rObj) {
+              REFOLD_LOG_FATAL(
+                  "model",
+                  "invalid json value type on field '%s': expected object "
+                  "value",
+                  fieldName.str().c_str());
+            }
+
+            const json::Value *bVal = rObj->get("b");
+            const json::Value *eVal = rObj->get("e");
+            if (!bVal || !eVal) {
+              REFOLD_LOG_FATAL(
+                  "model",
+                  "missing required fields on '%s' element: expected {b,e}",
+                  fieldName.str().c_str());
+            }
+
+            std::optional<uint64_t> b;
+            std::optional<uint64_t> e;
+            if (!bVal->getAsNull())
+              b = bVal->getAsUINT64();
+            if (!eVal->getAsNull())
+              e = eVal->getAsUINT64();
+
+            out.emplace_back(b, e);
+          }
+        }
+      };
+
+  std::vector<MacroInvocation::OptByteRange> invArgRanges;
+  parseOptByteRanges("inv_arg_ranges", invArgRanges);
+
+  std::vector<MacroInvocation::OptByteRange> normalizedInvArgTextRanges;
+  parseOptByteRanges("normalized_inv_arg_text_ranges",
+                     normalizedInvArgTextRanges);
+
+  std::vector<PPArgSpan> argSpans;
+  if (const json::Value *spansVal = obj.get("arg_spans")) {
+    auto sp = parseSpans<PPArgSpan>(*spansVal, "macro.arg_spans",
+                                    PPArgSpanKind::Standard);
+    if (!sp)
+      return sp.takeError();
+    argSpans = std::move(*sp);
+  }
+
+  std::vector<PPArgSpan> stringifySpans;
+  if (const json::Value *spansVal = obj.get("stringify_spans")) {
+    auto sp = parseSpans<PPArgSpan>(*spansVal, "macro.stringify_spans",
+                                    PPArgSpanKind::Stringify);
+    if (!sp)
+      return sp.takeError();
+    stringifySpans = std::move(*sp);
+  }
+
+  std::vector<PPArgSpan> pasteSpans;
+  if (const json::Value *spansVal = obj.get("paste_spans")) {
+    auto sp = parseSpans<PPArgSpan>(*spansVal, "macro.paste_spans",
+                                    PPArgSpanKind::Paste);
+    if (!sp)
+      return sp.takeError();
+    pasteSpans = std::move(*sp);
+  }
+
+  std::vector<PPSpan> bodySpans;
+  if (const json::Value *spansVal = obj.get("body_spans")) {
+    auto sp = parseSpans(*spansVal, "macro.body_spans");
+    if (!sp)
+      return sp.takeError();
+    bodySpans = std::move(*sp);
+  }
+
+  // `paste_tokens` preserves the producer's exact `##` witnesses in the
+  // order they were synthesized for this invocation. Loading the data
+  // into the model lets later proof classes consume it without
+  // reconstructing paste decomposition from spans alone.
+  std::vector<RefoldModel::PasteToken> pasteTokens;
+  if (auto tokensArr = asOptArray(obj, "paste_tokens", /*allowNull=*/true)) {
+    pasteTokens.reserve((**tokensArr).size());
+    for (const json::Value &Entry : **tokensArr) {
+      auto objOrErrLocal = asObject(Entry, ctxItem);
+      if (!objOrErrLocal)
+        REFOLD_LOG_FATAL("model", "{0}: paste_tokens entry is not an object",
+                         ctxItem);
+      const json::Object &TokObj = **objOrErrLocal;
+
+      const json::Value *SpellingVal = TokObj.get("spelling");
+      if (!SpellingVal)
+        REFOLD_LOG_FATAL("model", "{0}: paste_tokens entry missing spelling",
+                         ctxItem);
+      auto spellingOrErr =
+          asString(*SpellingVal, ctxItem + ": paste_tokens.spelling");
+      if (!spellingOrErr)
+        REFOLD_LOG_FATAL("model", "{0}: paste_tokens.spelling is not a string",
+                         ctxItem);
+
+      const json::Value *PartsVal = TokObj.get("parts");
+      if (!PartsVal)
+        REFOLD_LOG_FATAL("model", "{0}: paste_tokens entry missing parts",
+                         ctxItem);
+      auto partsArrOrErr = asArray(*PartsVal, ctxItem + ": paste_tokens.parts");
+      if (!partsArrOrErr)
+        REFOLD_LOG_FATAL("model", "{0}: paste_tokens.parts is not an array",
+                         ctxItem);
+
+      std::vector<RefoldModel::PastePart> parts;
+      parts.reserve((**partsArrOrErr).size());
+      for (const json::Value &PartVal : **partsArrOrErr) {
+        auto partObjOrErr = asObject(PartVal, ctxItem);
+        if (!partObjOrErr)
+          REFOLD_LOG_FATAL("model", "{0}: paste_tokens part is not an object",
+                           ctxItem);
+        const json::Object &PartObj = **partObjOrErr;
+
+        std::optional<uint32_t> argIndex =
+            asOptUInt32(PartObj, "arg_index", /*canBeNull=*/true);
+
+        std::optional<StringRef> kindText =
+            asOptString(PartObj, "kind", /*canBeNull=*/true);
+        // Older maps can omit `kind`; infer it from arg_index, then
+        // verify any explicit spelling agrees with the inferred payload
+        // shape.
+        RefoldModel::PastePartKind kindLocal =
+            argIndex ? RefoldModel::PastePartKind::Arg
+                     : RefoldModel::PastePartKind::Literal;
+        if (kindText) {
+          if (*kindText == "arg")
+            kindLocal = RefoldModel::PastePartKind::Arg;
+          else if (*kindText == "literal")
+            kindLocal = RefoldModel::PastePartKind::Literal;
+          else
+            REFOLD_LOG_FATAL("model",
+                             "{0}: paste_tokens.part.kind is invalid: {1}",
+                             ctxItem, *kindText);
+        }
+        if (kindLocal == RefoldModel::PastePartKind::Arg && !argIndex)
+          REFOLD_LOG_FATAL(
+              "model", "{0}: arg paste_tokens part missing arg_index", ctxItem);
+        if (kindLocal == RefoldModel::PastePartKind::Literal && argIndex)
+          REFOLD_LOG_FATAL(
+              "model", "{0}: literal paste_tokens part has arg_index", ctxItem);
+
+        const json::Value *ByteBVal = PartObj.get("byte_begin");
+        if (!ByteBVal)
+          REFOLD_LOG_FATAL("model", "{0}: paste_tokens part missing byte_begin",
+                           ctxItem);
+        auto byteBOrErr =
+            asUInt32(*ByteBVal, ctxItem + ": paste_tokens.part.byte_begin");
+        if (!byteBOrErr)
+          REFOLD_LOG_FATAL("model",
+                           "{0}: paste_tokens.part.byte_begin is not a uint32",
+                           ctxItem);
+
+        const json::Value *ByteEVal = PartObj.get("byte_end");
+        if (!ByteEVal)
+          REFOLD_LOG_FATAL("model", "{0}: paste_tokens part missing byte_end",
+                           ctxItem);
+        auto byteEOrErr =
+            asUInt32(*ByteEVal, ctxItem + ": paste_tokens.part.byte_end");
+        if (!byteEOrErr)
+          REFOLD_LOG_FATAL("model",
+                           "{0}: paste_tokens.part.byte_end is not a uint32",
+                           ctxItem);
+        if (*byteEOrErr < *byteBOrErr || *byteEOrErr > spellingOrErr->size())
+          REFOLD_LOG_FATAL(
+              "model", "{0}: paste_tokens part byte range is invalid", ctxItem);
+
+        std::optional<StringRef> partSpelling =
+            asOptString(PartObj, "spelling", /*canBeNull=*/true);
+        // The byte range is authoritative. A redundant part spelling is
+        // accepted only when it exactly matches that slice.
+        StringRef derivedSpelling =
+            spellingOrErr->slice(*byteBOrErr, *byteEOrErr);
+        if (partSpelling && *partSpelling != derivedSpelling)
+          REFOLD_LOG_FATAL(
+              "model",
+              "{0}: paste_tokens.part.spelling does not match byte range",
+              ctxItem);
+        StringRef storedSpelling =
+            partSpelling ? *partSpelling : derivedSpelling;
+
+        std::optional<uint32_t> argByteBegin =
+            asOptUInt32(PartObj, "arg_byte_begin", /*canBeNull=*/true);
+        std::optional<uint32_t> argByteEnd =
+            asOptUInt32(PartObj, "arg_byte_end", /*canBeNull=*/true);
+        if (argByteBegin.has_value() != argByteEnd.has_value())
+          REFOLD_LOG_FATAL("model",
+                           "{0}: paste_tokens arg byte range is incomplete",
+                           ctxItem);
+        if (argByteBegin && *argByteEnd < *argByteBegin)
+          REFOLD_LOG_FATAL(
+              "model", "{0}: paste_tokens arg byte range is invalid", ctxItem);
+        if (kindLocal == RefoldModel::PastePartKind::Literal && argByteBegin)
+          REFOLD_LOG_FATAL("model",
+                           "{0}: literal paste_tokens part has arg byte range",
+                           ctxItem);
+
+        parts.push_back(RefoldModel::PastePart{kindLocal, argIndex, *byteBOrErr,
+                                               *byteEOrErr, storedSpelling,
+                                               argByteBegin, argByteEnd});
+      }
+
+      pasteTokens.push_back(
+          RefoldModel::PasteToken{*spellingOrErr, std::move(parts)});
+    }
+  }
+
+  std::optional<uint64_t> callerMacroId =
+      asOptUInt64(obj, "caller_macro_id", /*canBeNull=*/true);
+
+  RefoldModel::MacroCalleeOrigin calleeOrigin;
+  if (const json::Value *OriginVal = obj.get("callee_origin")) {
+    auto originObjOrErr = asObject(*OriginVal, ctxItem);
+    if (!originObjOrErr)
+      REFOLD_LOG_FATAL("model", "{0}: callee_origin is not an object", ctxItem);
+    const json::Object &OriginObj = **originObjOrErr;
+
+    auto kindOrErrLocal =
+        applyToField(asString, OriginObj, "kind", ctxItem + ": callee_origin");
+    if (!kindOrErrLocal)
+      return kindOrErrLocal.takeError();
+
+    if (*kindOrErrLocal == "literal_macro_name") {
+      calleeOrigin.kind = MacroCalleeOriginKind::LiteralMacroName;
+    } else if (*kindOrErrLocal == "caller_param") {
+      calleeOrigin.kind = MacroCalleeOriginKind::CallerParam;
+    } else if (*kindOrErrLocal == "paste") {
+      calleeOrigin.kind = MacroCalleeOriginKind::Paste;
+    } else if (*kindOrErrLocal == "opaque") {
+      calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
+    } else {
+      REFOLD_LOG_FATAL("model", "{0}: invalid callee_origin.kind '{1}'",
+                       ctxItem, *kindOrErrLocal);
+    }
+
+    if (auto idxsArr = asOptArray(OriginObj, "caller_param_indices",
+                                  /*allowNull=*/true)) {
+      for (const json::Value &Elem : **idxsArr) {
+        auto uOrErr =
+            asUInt32(Elem, ctxItem + ": callee_origin.caller_param_indices");
+        if (!uOrErr)
+          REFOLD_LOG_FATAL(
+              "model",
+              "{0}: callee_origin.caller_param_indices element is not "
+              "a uint32",
+              ctxItem);
+        calleeOrigin.callerParamIndices.push_back(*uOrErr);
+      }
+    }
+
+    // New producer maps can carry a direct decomposition of the final
+    // callee token spelling.  Keep this proof material on the origin
+    // record so selector substitution can consume producer-owned
+    // paste/caller-slice evidence instead of reconstructing it from raw
+    // source text.
+    calleeOrigin.spelling =
+        asOptString(OriginObj, "spelling", /*canBeNull=*/true);
+    if (calleeOrigin.spelling)
+      calleeOrigin.parts =
+          parseCalleeOriginParts(OriginObj, *calleeOrigin.spelling, ctxItem);
+
+    if (calleeOrigin.kind == MacroCalleeOriginKind::Paste &&
+        (!calleeOrigin.spelling || calleeOrigin.parts.empty())) {
+      REFOLD_LOG_FATAL(
+          "model",
+          "{0}: paste callee_origin is missing producer-owned spelling "
+          "or parts",
+          ctxItem);
+    }
+  } else if (callerMacroId) {
+    // Nested invocations from older producer maps lack precise callee
+    // provenance, so classify them as opaque instead of assuming a
+    // literal macro-name owner.
+    calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
+  } else {
+    calleeOrigin.kind = MacroCalleeOriginKind::LiteralMacroName;
+  }
+
+  std::vector<std::vector<uint32_t>> argDeps;
+  if (auto depsArr = asOptArray(obj, "arg_deps", /*allowNull=*/true)) {
+    for (const json::Value &Entry : **depsArr) {
+      auto aOrErr = asArray(Entry, ctxItem);
+      if (!aOrErr)
+        REFOLD_LOG_FATAL("model", "{0}: arg_deps entry is not an array",
+                         ctxItem);
+      const json::Array &a = **aOrErr;
+
+      std::vector<uint32_t> deps;
+      deps.reserve(a.size());
+      for (const json::Value &Elem : a) {
+        auto uOrErr = asUInt32(Elem, ctxItem);
+        if (!uOrErr)
+          REFOLD_LOG_FATAL("model", "{0}: arg_deps element is not a uint32",
+                           ctxItem);
+        deps.push_back(*uOrErr);
+      }
+      argDeps.push_back(std::move(deps));
+    }
+  }
+
+  std::vector<std::vector<RefoldModel::InvArgRef>> argRefs;
+  if (auto refsArr = asOptArray(obj, "arg_refs", /*allowNull=*/true)) {
+    for (const json::Value &Entry : **refsArr) {
+      auto aOrErr = asArray(Entry, ctxItem);
+      if (!aOrErr)
+        REFOLD_LOG_FATAL("model", "{0}: arg_refs entry is not an array",
+                         ctxItem);
+      const json::Array &a = **aOrErr;
+
+      std::vector<RefoldModel::InvArgRef> refs;
+      refs.reserve(a.size());
+      for (const json::Value &Elem : a) {
+        auto objOrErrLocal = asObject(Elem, ctxItem);
+        if (!objOrErrLocal)
+          REFOLD_LOG_FATAL("model", "{0}: arg_refs element is not an object",
+                           ctxItem);
+        const json::Object &RefObj = **objOrErrLocal;
+
+        const json::Value *CallerIdxVal = RefObj.get("caller_param_index");
+        if (!CallerIdxVal)
+          REFOLD_LOG_FATAL("model",
+                           "{0}: arg_refs element missing caller_param_index",
+                           ctxItem);
+        auto callerIdxOrErr =
+            asUInt32(*CallerIdxVal, ctxItem + ": arg_refs.caller_param_index");
+        if (!callerIdxOrErr)
+          REFOLD_LOG_FATAL("model",
+                           "{0}: arg_refs.caller_param_index is not a uint32",
+                           ctxItem);
+
+        const json::Value *ByteBVal = RefObj.get("byte_begin");
+        if (!ByteBVal)
+          REFOLD_LOG_FATAL("model", "{0}: arg_refs element missing byte_begin",
+                           ctxItem);
+        auto byteBOrErr =
+            asUInt32(*ByteBVal, ctxItem + ": arg_refs.byte_begin");
+        if (!byteBOrErr)
+          REFOLD_LOG_FATAL("model", "{0}: arg_refs.byte_begin is not a uint32",
+                           ctxItem);
+
+        const json::Value *ByteEVal = RefObj.get("byte_end");
+        if (!ByteEVal)
+          REFOLD_LOG_FATAL("model", "{0}: arg_refs element missing byte_end",
+                           ctxItem);
+        auto byteEOrErr = asUInt32(*ByteEVal, ctxItem + ": arg_refs.byte_end");
+        if (!byteEOrErr)
+          REFOLD_LOG_FATAL("model", "{0}: arg_refs.byte_end is not a uint32",
+                           ctxItem);
+
+        refs.push_back(
+            RefoldModel::InvArgRef{*callerIdxOrErr, *byteBOrErr, *byteEOrErr});
+      }
+      argRefs.push_back(std::move(refs));
+    }
+  }
+
+  std::vector<std::vector<RefoldModel::TupleArgRef>> argTupleRefs;
+  if (auto refsArr = asOptArray(obj, "arg_tuple_refs", /*allowNull=*/true)) {
+    for (const json::Value &Entry : **refsArr) {
+      auto aOrErr = asArray(Entry, ctxItem);
+      if (!aOrErr) {
+        REFOLD_LOG_FATAL("model", "{0}: arg_tuple_refs entry is not an array",
+                         ctxItem);
+      }
+      const json::Array &a = **aOrErr;
+
+      std::vector<RefoldModel::TupleArgRef> refs;
+      refs.reserve(a.size());
+      for (const json::Value &Elem : a) {
+        auto objOrErrLocal = asObject(Elem, ctxItem);
+        if (!objOrErrLocal) {
+          REFOLD_LOG_FATAL(
+              "model", "{0}: arg_tuple_refs element is not an object", ctxItem);
+        }
+        const json::Object &RefObj = **objOrErrLocal;
+
+        const json::Value *CallerIdxVal = RefObj.get("caller_param_index");
+        if (!CallerIdxVal) {
+          REFOLD_LOG_FATAL(
+              "model", "{0}: arg_tuple_refs element missing caller_param_index",
+              ctxItem);
+        }
+        auto callerIdxOrErr = asUInt32(
+            *CallerIdxVal, ctxItem + ": arg_tuple_refs.caller_param_index");
+        if (!callerIdxOrErr) {
+          REFOLD_LOG_FATAL(
+              "model", "{0}: arg_tuple_refs.caller_param_index is not a uint32",
+              ctxItem);
+        }
+
+        const json::Value *ByteBVal = RefObj.get("caller_byte_begin");
+        if (!ByteBVal) {
+          REFOLD_LOG_FATAL(
+              "model", "{0}: arg_tuple_refs element missing caller_byte_begin",
+              ctxItem);
+        }
+        auto byteBOrErr =
+            asUInt32(*ByteBVal, ctxItem + ": arg_tuple_refs.caller_byte_begin");
+        if (!byteBOrErr) {
+          REFOLD_LOG_FATAL(
+              "model", "{0}: arg_tuple_refs.caller_byte_begin is not a uint32",
+              ctxItem);
+        }
+
+        const json::Value *ByteEVal = RefObj.get("caller_byte_end");
+        if (!ByteEVal) {
+          REFOLD_LOG_FATAL(
+              "model", "{0}: arg_tuple_refs element missing caller_byte_end",
+              ctxItem);
+        }
+        auto byteEOrErr =
+            asUInt32(*ByteEVal, ctxItem + ": arg_tuple_refs.caller_byte_end");
+        if (!byteEOrErr) {
+          REFOLD_LOG_FATAL(
+              "model", "{0}: arg_tuple_refs.caller_byte_end is not a uint32",
+              ctxItem);
+        }
+
+        refs.push_back(RefoldModel::TupleArgRef{*callerIdxOrErr, *byteBOrErr,
+                                                *byteEOrErr});
+      }
+      argTupleRefs.push_back(std::move(refs));
+    }
+  }
+
+  MacroInvocation mi(/*id*/ id,
+                     /*subkind*/ subkind,
+                     /*name*/ name,
+                     /*invText*/ invText,
+                     /*normalizedInvText*/ normalizedInvText,
+                     /*invFile*/ invFile,
+                     /*invB*/ invB,
+                     /*invE*/ invE,
+                     /*invPPByteBegin*/ invPPByteBegin,
+                     /*invPPByteEnd*/ invPPByteEnd,
+                     /*ownerIncludeId*/ ownerIncludeId,
+                     /*definitionDirectiveId*/ definitionDirectiveId,
+                     /*defParams*/ std::move(defParams),
+                     /*invArgRanges*/ std::move(invArgRanges),
+                     /*normalizedInvArgTextRanges*/
+                     std::move(normalizedInvArgTextRanges),
+                     /*spans*/ std::move(*spans),
+                     /*argSpans*/ std::move(argSpans),
+                     /*stringifySpans*/ std::move(stringifySpans),
+                     /*pasteSpans*/ std::move(pasteSpans),
+                     /*pasteTokens*/ std::move(pasteTokens),
+                     /*bodySpans*/ std::move(bodySpans),
+                     /*callerMacroId*/ callerMacroId,
+                     /*calleeOrigin*/ std::move(calleeOrigin),
+                     /*argDeps*/ std::move(argDeps),
+                     /*argRefs*/ std::move(argRefs),
+                     /*argTupleRefs*/ std::move(argTupleRefs));
+
+  return mi;
+}
+
+/// Parse one `file` item.
+static Expected<FileItem> parseFileItem(const json::Object &obj,
+                                        const std::string &ctxItem) {
+  FileItem fi;
+
+  // required
+  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
+  if (!idOrErr)
+    return idOrErr.takeError();
+  fi.id = *idOrErr;
+
+  auto pathOrErr = applyToField(asString, obj, "path", ctxItem);
+  if (!pathOrErr)
+    return pathOrErr.takeError();
+  fi.path = *pathOrErr;
+
+  auto spansOrErr = requireField(obj, "spans", ctxItem);
+  if (!spansOrErr)
+    return spansOrErr.takeError();
+  auto spans = parseSpans(**spansOrErr, "file.spans");
+  if (!spans)
+    return spans.takeError();
+  fi.spans = std::move(*spans);
+
+  return fi;
+}
+
+/// Parse one conditional-directive group and its arms.
+static Expected<CondGroup> parseCondGroup(const json::Object &obj,
+                                          const std::string &ctxItem) {
+
+  CondGroup group;
+
+  // required
+  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
+  if (!idOrErr)
+    return idOrErr.takeError();
+  group.id = *idOrErr;
+
+  auto fileOrErr = applyToField(asString, obj, "file", ctxItem);
+  if (!fileOrErr)
+    return fileOrErr.takeError();
+  group.file = *fileOrErr;
+
+  auto gbOrErr = applyToField(asUInt64, obj, "group_b", ctxItem);
+  if (!gbOrErr)
+    return gbOrErr.takeError();
+  group.groupB = *gbOrErr;
+
+  auto geOrErr = applyToField(asUInt64, obj, "group_e", ctxItem);
+  if (!geOrErr)
+    return geOrErr.takeError();
+  group.groupE = *geOrErr;
+
+  // optional
+  group.parentArmId = asOptUInt64(obj, "parent_arm_id");
+  group.parentIncludeId = asOptUInt64(obj, "parent_include_id");
+
+  // arms
+  auto armsOrErr = applyToField(asArray, obj, "arms", ctxItem);
+  if (!armsOrErr)
+    return armsOrErr.takeError();
+  const json::Array *arms = *armsOrErr;
+
+  group.arms.reserve(arms->size());
+  for (std::size_t ai = 0; ai < arms->size(); ++ai) {
+    const std::string ctxItem = (Twine("arm[") + Twine(ai) + "]").str();
+
+    auto objOrErr = arrayObjElemAt(*arms, ai, ctxItem);
+    if (!objOrErr)
+      return objOrErr.takeError();
+    const json::Object *armObj = *objOrErr;
+
+    CondArm arm;
+    arm.groupId = group.id;
+
+    // required
+    auto idOrErr = applyToField(asUInt64, *armObj, "id", ctxItem);
+    if (!idOrErr)
+      return idOrErr.takeError();
+    arm.id = *idOrErr;
+
+    auto kindOrErr = applyToField(asString, *armObj, "kind", ctxItem);
+    if (!kindOrErr)
+      return kindOrErr.takeError();
+    arm.kind = *kindOrErr;
+
+    auto bbOrErr = applyToField(asUInt64, *armObj, "body_b", ctxItem);
+    if (!bbOrErr)
+      return bbOrErr.takeError();
+    arm.bodyB = *bbOrErr;
+
+    auto beOrErr = applyToField(asUInt64, *armObj, "body_e", ctxItem);
+    if (!beOrErr)
+      return beOrErr.takeError();
+    arm.bodyE = *beOrErr;
+
+    auto selOrErr = applyToField(asBool, *armObj, "selected", ctxItem);
+    if (!selOrErr)
+      return selOrErr.takeError();
+    arm.selected = *selOrErr;
+
+    // optional
+    arm.cond = asOptString(*armObj, "cond");
+
+    // Optional; absent means the producer did not observe a lookup-context
+    // sensitive `__has_include` in this arm's condition, so it defaults
+    // false and older maps remain compatible.
+    if (std::optional<bool> usesHasInc =
+            armObj->getBoolean("cond_uses_has_include"))
+      arm.condUsesHasInclude = *usesHasInc;
+
+    if (const json::Value *ppSpanVal = armObj->get("pp_span")) {
+      if (!ppSpanVal->getAsNull()) {
+        auto ppSpanObjOrErr = asObject(*ppSpanVal, ctxItem + ".pp_span");
+        if (!ppSpanObjOrErr)
+          return ppSpanObjOrErr.takeError();
+        const json::Object &ppSpanObj = **ppSpanObjOrErr;
+
+        auto beginOrErr =
+            applyToField(asUInt64, ppSpanObj, "begin", ctxItem + ".pp_span");
+        if (!beginOrErr)
+          return beginOrErr.takeError();
+        auto endOrErr =
+            applyToField(asUInt64, ppSpanObj, "end", ctxItem + ".pp_span");
+        if (!endOrErr)
+          return endOrErr.takeError();
+        arm.span = PPSpan{*beginOrErr, *endOrErr};
+      }
+    }
+
+    group.arms.push_back(std::move(arm));
+  }
+
+  return group;
+}
+
+/// Parse one producer-recorded line-control event.
+static Expected<LineControlEvent>
+parseLineControlEvent(const json::Object &obj, const std::string &ctxItem) {
+  LineControlEvent event;
+
+  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
+  if (!idOrErr)
+    return idOrErr.takeError();
+  event.id = *idOrErr;
+
+  auto fileOrErr = applyToField(asString, obj, "physical_file", ctxItem);
+  if (!fileOrErr)
+    return fileOrErr.takeError();
+  event.physicalFile = *fileOrErr;
+
+  event.siteB = asOptUInt64(obj, "site_b", /*canBeNull=*/true);
+  event.siteE = asOptUInt64(obj, "site_e", /*canBeNull=*/true);
+
+  auto activeOrErr = applyToField(asBool, obj, "active", ctxItem);
+  if (!activeOrErr)
+    return activeOrErr.takeError();
+  event.active = *activeOrErr;
+
+  auto provenOrErr = applyToField(asBool, obj, "producer_proven", ctxItem);
+  if (!provenOrErr)
+    return provenOrErr.takeError();
+  event.producerProven = *provenOrErr;
+
+  auto lineOrErr = applyToField(asUInt64, obj, "logical_line_after", ctxItem);
+  if (!lineOrErr)
+    return lineOrErr.takeError();
+  event.logicalLineAfter = *lineOrErr;
+
+  auto logicalFileOrErr =
+      applyToField(asString, obj, "logical_file_after", ctxItem);
+  if (!logicalFileOrErr)
+    return logicalFileOrErr.takeError();
+  event.logicalFileAfter = *logicalFileOrErr;
+
+  event.ownerIncludeId = asOptUInt64(obj, "owner_include_id");
+  if (auto text = asOptString(obj, "text"))
+    event.text = *text;
+
+  if (event.siteB && event.siteE && *event.siteE < *event.siteB)
+    return createStringError(inconvertibleErrorCode(),
+                             "Invalid line-control site range at %s",
+                             ctxItem.c_str());
+
+  return event;
+}
+
+/// Parse one file/conditional/arm slot record.
+static Expected<Slot> parseSlot(const json::Object &obj,
+                                const std::string &ctxItem) {
+
+  Slot slot;
+
+  // required
+  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
+  if (!idOrErr)
+    return idOrErr.takeError();
+  slot.id = *idOrErr;
+
+  auto fileOrErr = applyToField(asString, obj, "file", ctxItem);
+  if (!fileOrErr)
+    return fileOrErr.takeError();
+  slot.file = *fileOrErr;
+
+  auto kindOrErr = applyToField(asString, obj, "kind", ctxItem);
+  if (!kindOrErr)
+    return kindOrErr.takeError();
+  slot.kind = *kindOrErr;
+
+  auto bOrErr = applyToField(asUInt64, obj, "b", ctxItem);
+  if (!bOrErr)
+    return bOrErr.takeError();
+  slot.b = *bOrErr;
+
+  auto eOrErr = applyToField(asUInt64, obj, "e", ctxItem);
+  if (!eOrErr)
+    return eOrErr.takeError();
+  slot.e = *eOrErr;
+
+  // optionals
+  slot.pp = asOptUInt64(obj, "pp");
+  slot.ref = asOptUInt64(obj, "ref");
+  slot.ownerIncludeId = asOptUInt64(obj, "owner_include_id");
+
+  return slot;
+}
+
+/// Parse one token-map entry binding an A-token index to a source range.
+static Expected<TokMapEntry> parseTokMapEntry(const json::Object &obj,
+                                              const std::string &ctxItem) {
+  TokMapEntry entry;
+
+  // required
+  auto fileOrErr = applyToField(asString, obj, "file", ctxItem);
+  if (!fileOrErr)
+    return fileOrErr.takeError();
+  entry.file = *fileOrErr;
+
+  auto bOrErr = applyToField(asUInt64, obj, "b", ctxItem);
+  if (!bOrErr)
+    return bOrErr.takeError();
+  entry.b = *bOrErr;
+
+  auto eOrErr = applyToField(asUInt64, obj, "e", ctxItem);
+  if (!eOrErr)
+    return eOrErr.takeError();
+  entry.e = *eOrErr;
+
+  // `pp` (the A-token index this range maps to) is a required provenance
+  // fact.  It must be read from the producer, never synthesized from stream
+  // order: a positional index would fabricate provenance and could collide
+  // with an explicit `pp` from another entry, silently corrupting
+  // token->byte resolution.  Fail closed when it is absent.
+  auto ppOrErr = applyToField(asUInt64, obj, "pp", ctxItem);
+  if (!ppOrErr)
+    return ppOrErr.takeError();
+  entry.pp = *ppOrErr;
+
+  return entry;
+}
+
 Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
   RefoldModel model;
   model.root_ = &root;
@@ -870,240 +2253,6 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         "pp byte begin/end spans size does not match the A-side token count");
   }
 
-  auto parseMacroDefParams =
-      [&](const json::Object &ownerObj, StringRef fieldName,
-          const std::string &ctxItem) -> std::vector<MacroDefParam> {
-    std::vector<MacroDefParam> params;
-    if (auto paramsArr = asOptArray(ownerObj, fieldName, /*canBeNull=*/true)) {
-      params.reserve((**paramsArr).size());
-      for (const json::Value &Elem : **paramsArr) {
-        auto objOrErrLocal =
-            asObject(Elem, (Twine(ctxItem) + ": " + fieldName + "[]").str());
-        if (!objOrErrLocal)
-          REFOLD_LOG_FATAL("model", "{0}: {1} element is not an object",
-                           ctxItem, fieldName);
-        const json::Object &ParamObj = **objOrErrLocal;
-
-        const json::Value *NameVal = ParamObj.get("name");
-        if (!NameVal)
-          REFOLD_LOG_FATAL("model", "{0}: {1} element missing name", ctxItem,
-                           fieldName);
-        auto nameOrErrLocal = asString(
-            *NameVal, (Twine(ctxItem) + ": " + fieldName + ".name").str());
-        if (!nameOrErrLocal)
-          REFOLD_LOG_FATAL("model", "{0}: {1}.name is not a string", ctxItem,
-                           fieldName);
-
-        const json::Value *VarVal = ParamObj.get("variadic");
-        if (!VarVal)
-          REFOLD_LOG_FATAL("model", "{0}: {1} element missing variadic",
-                           ctxItem, fieldName);
-        auto varOrErr = asBool(
-            *VarVal, (Twine(ctxItem) + ": " + fieldName + ".variadic").str());
-        if (!varOrErr)
-          REFOLD_LOG_FATAL("model", "{0}: {1}.variadic is not a bool", ctxItem,
-                           fieldName);
-
-        params.emplace_back(*nameOrErrLocal, *varOrErr);
-      }
-    }
-    return params;
-  };
-
-  auto parseMacroReplacementTokens =
-      [&](const json::Object &ownerObj, ArrayRef<MacroDefParam> defParams,
-          const std::string &ctxItem) -> std::vector<MacroReplacementToken> {
-    std::vector<MacroReplacementToken> tokens;
-    if (auto tokensArr = asOptArray(ownerObj, "replacement_tokens",
-                                    /*canBeNull=*/true)) {
-      tokens.reserve((**tokensArr).size());
-      for (const json::Value &Elem : **tokensArr) {
-        auto objOrErrLocal =
-            asObject(Elem, (Twine(ctxItem) + ": replacement_tokens[]").str());
-        if (!objOrErrLocal)
-          REFOLD_LOG_FATAL("model",
-                           "{0}: replacement_tokens element is not an object",
-                           ctxItem);
-        const json::Object &TokObj = **objOrErrLocal;
-
-        const json::Value *KindVal = TokObj.get("kind");
-        if (!KindVal)
-          REFOLD_LOG_FATAL(
-              "model", "{0}: replacement_tokens element missing kind", ctxItem);
-        auto kindOrErrLocal = asString(
-            *KindVal, (Twine(ctxItem) + ": replacement_tokens.kind").str());
-        if (!kindOrErrLocal)
-          REFOLD_LOG_FATAL(
-              "model", "{0}: replacement_tokens.kind is not a string", ctxItem);
-
-        const json::Value *SpellingVal = TokObj.get("spelling");
-        if (!SpellingVal)
-          REFOLD_LOG_FATAL("model",
-                           "{0}: replacement_tokens element missing spelling",
-                           ctxItem);
-        auto spellingOrErr =
-            asString(*SpellingVal,
-                     (Twine(ctxItem) + ": replacement_tokens.spelling").str());
-        if (!spellingOrErr)
-          REFOLD_LOG_FATAL("model",
-                           "{0}: replacement_tokens.spelling is not a string",
-                           ctxItem);
-
-        MacroReplacementToken token;
-        token.spelling = *spellingOrErr;
-        if (*kindOrErrLocal == "literal") {
-          token.kind = MacroReplacementTokenKind::Literal;
-          if (TokObj.get("param_index"))
-            REFOLD_LOG_FATAL(
-                "model",
-                "{0}: literal replacement_tokens element has param_index",
-                ctxItem);
-        } else if (*kindOrErrLocal == "param_ref") {
-          token.kind = MacroReplacementTokenKind::ParamRef;
-          const json::Value *ParamVal = TokObj.get("param_index");
-          if (!ParamVal)
-            REFOLD_LOG_FATAL(
-                "model",
-                "{0}: param_ref replacement_tokens element missing "
-                "param_index",
-                ctxItem);
-          auto paramOrErr = asUInt32(
-              *ParamVal,
-              (Twine(ctxItem) + ": replacement_tokens.param_index").str());
-          if (!paramOrErr)
-            REFOLD_LOG_FATAL("model",
-                             "{0}: replacement_tokens.param_index is invalid",
-                             ctxItem);
-          if (*paramOrErr >= defParams.size())
-            REFOLD_LOG_FATAL(
-                "model",
-                "{0}: replacement_tokens.param_index references missing "
-                "macro formal",
-                ctxItem);
-          if (defParams[*paramOrErr].name != token.spelling)
-            REFOLD_LOG_FATAL(
-                "model",
-                "{0}: replacement_tokens param_ref spelling does not match "
-                "the referenced macro formal",
-                ctxItem);
-          token.paramIndex = *paramOrErr;
-        } else {
-          REFOLD_LOG_FATAL("model",
-                           "{0}: invalid replacement_tokens.kind '{1}'",
-                           ctxItem, *kindOrErrLocal);
-        }
-
-        tokens.push_back(std::move(token));
-      }
-    }
-    return tokens;
-  };
-
-  auto parseCalleeOriginParts =
-      [&](const json::Object &originObj, StringRef finalSpelling,
-          const std::string &ctxItem) -> std::vector<CalleeOriginPart> {
-    std::vector<CalleeOriginPart> parts;
-    auto partsArr = asOptArray(originObj, "parts", /*canBeNull=*/true);
-    if (!partsArr)
-      return parts;
-
-    parts.reserve((**partsArr).size());
-    std::string tiled;
-    for (const json::Value &Elem : **partsArr) {
-      auto objOrErrLocal =
-          asObject(Elem, (Twine(ctxItem) + ": callee_origin.parts[]").str());
-      if (!objOrErrLocal)
-        REFOLD_LOG_FATAL("model",
-                         "{0}: callee_origin.parts element is not an object",
-                         ctxItem);
-      const json::Object &PartObj = **objOrErrLocal;
-
-      const json::Value *KindVal = PartObj.get("kind");
-      if (!KindVal)
-        REFOLD_LOG_FATAL(
-            "model", "{0}: callee_origin.parts element missing kind", ctxItem);
-      auto kindOrErrLocal = asString(
-          *KindVal, (Twine(ctxItem) + ": callee_origin.parts.kind").str());
-      if (!kindOrErrLocal)
-        REFOLD_LOG_FATAL(
-            "model", "{0}: callee_origin.parts.kind is not a string", ctxItem);
-
-      const json::Value *SpellingVal = PartObj.get("spelling");
-      if (!SpellingVal)
-        REFOLD_LOG_FATAL("model",
-                         "{0}: callee_origin.parts element missing spelling",
-                         ctxItem);
-      auto spellingOrErr =
-          asString(*SpellingVal,
-                   (Twine(ctxItem) + ": callee_origin.parts.spelling").str());
-      if (!spellingOrErr)
-        REFOLD_LOG_FATAL("model",
-                         "{0}: callee_origin.parts.spelling is not a string",
-                         ctxItem);
-
-      CalleeOriginPart part;
-      part.spelling = *spellingOrErr;
-      if (*kindOrErrLocal == "literal") {
-        part.kind = CalleeOriginPartKind::Literal;
-        if (PartObj.get("root_macro_id") || PartObj.get("root_param_index") ||
-            PartObj.get("byte_begin") || PartObj.get("byte_end"))
-          REFOLD_LOG_FATAL(
-              "model",
-              "{0}: literal callee_origin part carries selector-slice fields",
-              ctxItem);
-      } else if (*kindOrErrLocal == "caller_arg_slice") {
-        part.kind = CalleeOriginPartKind::CallerArgSlice;
-        auto rootOrErr =
-            applyToField(asUInt64, PartObj, "root_macro_id",
-                         (Twine(ctxItem) + ": callee_origin.parts").str());
-        if (!rootOrErr)
-          REFOLD_LOG_FATAL("model",
-                           "{0}: callee_origin.parts.root_macro_id is invalid",
-                           ctxItem);
-        auto paramOrErr =
-            applyToField(asUInt32, PartObj, "root_param_index",
-                         (Twine(ctxItem) + ": callee_origin.parts").str());
-        if (!paramOrErr)
-          REFOLD_LOG_FATAL(
-              "model", "{0}: callee_origin.parts.root_param_index is invalid",
-              ctxItem);
-        auto beginOrErrLocal =
-            applyToField(asUInt32, PartObj, "byte_begin",
-                         (Twine(ctxItem) + ": callee_origin.parts").str());
-        if (!beginOrErrLocal)
-          REFOLD_LOG_FATAL("model",
-                           "{0}: callee_origin.parts.byte_begin is invalid",
-                           ctxItem);
-        auto endOrErrLocal =
-            applyToField(asUInt32, PartObj, "byte_end",
-                         (Twine(ctxItem) + ": callee_origin.parts").str());
-        if (!endOrErrLocal)
-          REFOLD_LOG_FATAL(
-              "model", "{0}: callee_origin.parts.byte_end is invalid", ctxItem);
-        if (*endOrErrLocal < *beginOrErrLocal)
-          REFOLD_LOG_FATAL("model",
-                           "{0}: callee_origin selector slice range is invalid",
-                           ctxItem);
-        part.rootMacroId = *rootOrErr;
-        part.rootParamIndex = *paramOrErr;
-        part.byteBegin = *beginOrErrLocal;
-        part.byteEnd = *endOrErrLocal;
-      } else {
-        REFOLD_LOG_FATAL("model", "{0}: invalid callee_origin.parts.kind '{1}'",
-                         ctxItem, *kindOrErrLocal);
-      }
-
-      tiled.append(part.spelling.begin(), part.spelling.end());
-      parts.push_back(std::move(part));
-    }
-
-    if (tiled != finalSpelling)
-      REFOLD_LOG_FATAL(
-          "model",
-          "{0}: callee_origin.parts do not tile the final callee spelling",
-          ctxItem);
-    return parts;
-  };
 
   // tokmap
   {
@@ -1119,38 +2268,12 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
       auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
       if (!objOrErr)
         return objOrErr.takeError();
-      const json::Object *obj = *objOrErr;
 
-      TokMapEntry entry;
-
-      // required
-      auto fileOrErr = applyToField(asString, *obj, "file", ctxItem);
-      if (!fileOrErr)
-        return fileOrErr.takeError();
-      entry.file = *fileOrErr;
-
-      auto bOrErr = applyToField(asUInt64, *obj, "b", ctxItem);
-      if (!bOrErr)
-        return bOrErr.takeError();
-      entry.b = *bOrErr;
-
-      auto eOrErr = applyToField(asUInt64, *obj, "e", ctxItem);
-      if (!eOrErr)
-        return eOrErr.takeError();
-      entry.e = *eOrErr;
-
-      // `pp` (the A-token index this range maps to) is a required provenance
-      // fact.  It must be read from the producer, never synthesized from stream
-      // order: a positional index would fabricate provenance and could collide
-      // with an explicit `pp` from another entry, silently corrupting
-      // token->byte resolution.  Fail closed when it is absent.
-      auto ppOrErr = applyToField(asUInt64, *obj, "pp", ctxItem);
-      if (!ppOrErr)
-        return ppOrErr.takeError();
-      entry.pp = *ppOrErr;
-
-      model.tokmap_.push_back(entry);
-      model.tokmapByPP_[entry.pp] = entry;
+      auto entryOrErr = parseTokMapEntry(**objOrErr, ctxItem);
+      if (!entryOrErr)
+        return entryOrErr.takeError();
+      model.tokmap_.push_back(*entryOrErr);
+      model.tokmapByPP_[entryOrErr->pp] = *entryOrErr;
     }
   }
 
@@ -1183,323 +2306,25 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         StringRef skStr = *skOrErr;
 
         if (skStr == "#include" || skStr == "#include_next") {
-          const std::string ctxItem =
-              (Twine("include items[") + Twine(i) + "]").str();
-
-          // required
-          auto idOrErr = applyToField(asUInt64, *obj, "id", ctxItem);
-          if (!idOrErr)
-            return idOrErr.takeError();
-          int id = *idOrErr;
-
-          auto textOrErr = applyToField(asString, *obj, "text", ctxItem);
-          if (!textOrErr)
-            return textOrErr.takeError();
-          StringRef text = *textOrErr;
-
-          auto spOrErr = applyToField(asString, *obj, "site_path", ctxItem);
-          if (!spOrErr)
-            return spOrErr.takeError();
-          StringRef sitePath = *spOrErr;
-
-          auto tgtOrErr = applyToField(asString, *obj, "target", ctxItem);
-          if (!tgtOrErr)
-            return tgtOrErr.takeError();
-          StringRef target = *tgtOrErr;
-
-          auto angledOrErr = applyToField(asBool, *obj, "angled", ctxItem);
-          if (!angledOrErr)
-            return angledOrErr.takeError();
-          bool angled = *angledOrErr;
-
-          // not really optional, but can be string or null (null values will
-          // produce a fatal error)
-          uint64_t siteB = *asOptUInt64(*obj, "site_b");
-          uint64_t siteE = *asOptUInt64(*obj, "site_e");
-
-          // optional
-          std::optional<StringRef> resolved =
-              asOptString(*obj, "resolved_path");
-          std::optional<StringRef> openedPath =
-              asOptString(*obj, "opened_path");
-          std::optional<StringRef> enteredFileSpelling =
-              asOptString(*obj, "entered_file_spelling");
-          std::optional<StringRef> enteredFileName =
-              asOptString(*obj, "entered_file_name");
-          std::optional<StringRef> controllingMacro =
-              asOptString(*obj, "controlling_macro");
-
-          auto lookupOrErr = parseOptionalIncludeLookupProvenance(
-              *obj, "lookup", ctxItem, model.includeSearchChain_);
-          if (!lookupOrErr)
-            return lookupOrErr.takeError();
-          std::optional<IncludeLookupProvenance> lookup =
-              std::move(*lookupOrErr);
-
-          auto includeNextOrErr = parseOptionalIncludeNextProvenance(
-              *obj, skStr, ctxItem, model.includeSearchChain_);
-          if (!includeNextOrErr)
-            return includeNextOrErr.takeError();
-          std::optional<IncludeNextProvenance> includeNext =
-              std::move(*includeNextOrErr);
-
-          std::optional<uint64_t> parent = asOptUInt64(*obj, "parent");
-
-          std::vector<PPSpan> spans;
-          if (const json::Value *spansVal = obj->get("spans")) {
-            auto sp = parseSpans(*spansVal, "include.spans");
-            if (!sp)
-              return sp.takeError();
-            spans = std::move(*sp);
-          }
-
-          std::vector<RefoldModel::HeaderDecl> decls;
-          if (auto declArr = asOptArray(*obj, "decls")) {
-            decls.reserve((*declArr)->size());
-            for (std::size_t di = 0; di < (*declArr)->size(); ++di) {
-              const std::string ctxDecl =
-                  (Twine("include.decls[") + Twine(di) + "]").str();
-              auto declObjOrErr = asObject((**declArr)[di], ctxDecl);
-              if (!declObjOrErr)
-                return declObjOrErr.takeError();
-              const json::Object &declObj = **declObjOrErr;
-
-              auto kindOrErr = applyToField(asString, declObj, "kind", ctxDecl);
-              if (!kindOrErr)
-                return kindOrErr.takeError();
-              auto nameOrErr = applyToField(asString, declObj, "name", ctxDecl);
-              if (!nameOrErr)
-                return nameOrErr.takeError();
-
-              const std::string headerCtxDecl = ctxDecl + ".header_span";
-              auto hsValOrErr = requireField(declObj, "header_span", ctxDecl);
-              if (!hsValOrErr)
-                return hsValOrErr.takeError();
-              auto hsObjOrErr = asObject(**hsValOrErr, headerCtxDecl);
-              if (!hsObjOrErr)
-                return hsObjOrErr.takeError();
-              const json::Object &hsObj = **hsObjOrErr;
-
-              // header_span.file is optional; when omitted, the header file is
-              // implied by the enclosing include's new opened_path when
-              // present, otherwise by legacy resolved_path. This avoids
-              // repeating the same path string for every decl while preserving
-              // old-map compatibility.
-              std::optional<StringRef> hsFileOpt = asOptString(hsObj, "file");
-              StringRef hsFile;
-              if (hsFileOpt) {
-                hsFile = *hsFileOpt;
-              } else if (openedPath) {
-                hsFile = *openedPath;
-              } else if (resolved) {
-                hsFile = *resolved;
-              } else {
-                return createStringError(
-                    inconvertibleErrorCode(),
-                    "Missing required field 'header_span.file' at %s (and "
-                    "include has neither opened_path nor resolved_path)",
-                    headerCtxDecl.c_str());
-              }
-
-              auto hsBOrErr = applyToField(asUInt64, hsObj, "b", headerCtxDecl);
-              if (!hsBOrErr)
-                return hsBOrErr.takeError();
-              auto hsEOrErr = applyToField(asUInt64, hsObj, "e", headerCtxDecl);
-              if (!hsEOrErr)
-                return hsEOrErr.takeError();
-
-              auto psValOrErr = requireField(declObj, "pp_span", ctxDecl);
-              if (!psValOrErr)
-                return psValOrErr.takeError();
-              auto psObjOrErr = asObject(**psValOrErr, ctxDecl + ".pp_span");
-              if (!psObjOrErr)
-                return psObjOrErr.takeError();
-              const json::Object &psObj = **psObjOrErr;
-              auto psBOrErr = applyToField(asUInt64, psObj, "begin", ctxDecl);
-              if (!psBOrErr)
-                return psBOrErr.takeError();
-              auto psEOrErr = applyToField(asUInt64, psObj, "end", ctxDecl);
-              if (!psEOrErr)
-                return psEOrErr.takeError();
-
-              RefoldModel::HeaderDecl decl;
-              decl.kind = *kindOrErr;
-              decl.name = *nameOrErr;
-              decl.file = hsFile;
-              decl.headerB = *hsBOrErr;
-              decl.headerE = *hsEOrErr;
-              decl.span = PPSpan{*psBOrErr, *psEOrErr};
-              decls.push_back(std::move(decl));
-            }
-          }
-
-          IncludeItem inc(/*id*/ id,
-                          /*subkind*/ skStr,
-                          /*text*/ text,
-                          /*sitePath*/ sitePath,
-                          /*siteB*/ siteB,
-                          /*siteE*/ siteE,
-                          /*target*/ target,
-                          /*resolvedPath*/ resolved,
-                          /*openedPath*/ openedPath,
-                          /*enteredFileSpelling*/ enteredFileSpelling,
-                          /*enteredFileName*/ enteredFileName,
-                          /*controllingMacro*/ controllingMacro,
-                          /*lookup*/ std::move(lookup),
-                          /*includeNext*/ std::move(includeNext),
-                          /*angled*/ angled,
-                          /*parent*/ parent,
-                          /*spans*/ std::move(spans),
-                          /*decls*/ std::move(decls));
-
-          model.includes_.push_back(std::move(inc));
+          auto incOrErr = parseIncludeItem(
+              *obj, skStr, (Twine("include items[") + Twine(i) + "]").str(),
+              model.includeSearchChain_);
+          if (!incOrErr)
+            return incOrErr.takeError();
+          model.includes_.push_back(std::move(*incOrErr));
         } else if (skStr == "#define" || skStr == "#undef") {
-          MacroDirective md;
-
-          const std::string ctxItem =
-              (Twine("define/undef items[") + Twine(i) + "]").str();
-
-          // required
-          auto idOrErr = applyToField(asUInt64, *obj, "id", ctxItem);
-          if (!idOrErr)
-            return idOrErr.takeError();
-          md.id = *idOrErr;
-
-          auto nameOrErr = applyToField(asString, *obj, "name", ctxItem);
-          if (!nameOrErr)
-            return nameOrErr.takeError();
-          md.name = *nameOrErr;
-
-          auto textOrErr = applyToField(asString, *obj, "text", ctxItem);
-          if (!textOrErr)
-            return textOrErr.takeError();
-          md.text = *textOrErr;
-
-          if (skStr == "#define") {
-            auto functionLikeOrErr =
-                applyToField(asBool, *obj, "function_like", ctxItem);
-            if (!functionLikeOrErr)
-              return functionLikeOrErr.takeError();
-            md.functionLike = *functionLikeOrErr;
-          }
-
-          auto spOrErr = applyToField(asString, *obj, "site_path", ctxItem);
-          if (!spOrErr)
-            return spOrErr.takeError();
-          md.sitePath = *spOrErr;
-
-          auto spansOrErr = requireField(*obj, "spans", ctxItem);
-          if (!spansOrErr)
-            return spansOrErr.takeError();
-          auto spans = parseSpans(**spansOrErr, "macro.directive.spans");
-          if (!spans)
-            return spans.takeError();
-          md.spans = std::move(*spans);
-
-          // not really optional, but can be string or null (null values will
-          // produce a fatal error)
-          md.siteB = *asOptUInt64(*obj, "site_b");
-          md.siteE = *asOptUInt64(*obj, "site_e");
-
-          // Optional producer-recorded physical extent of the whole directive
-          // spelling.  Accept it only as a well-formed pair that also contains
-          // the name-anchored site range: those are two independent producer
-          // measurements of one directive, and a map where they disagree is not
-          // evidence of anything.  A partial or inconsistent record is dropped
-          // rather than repaired, which leaves the pre-existing text-based
-          // recovery path in charge.
-          std::optional<uint64_t> directiveLineB =
-              asOptUInt64(*obj, "directive_line_b");
-          std::optional<uint64_t> directiveLineE =
-              asOptUInt64(*obj, "directive_line_e");
-          if (directiveLineB && directiveLineE &&
-              *directiveLineB < *directiveLineE &&
-              *directiveLineB <= md.siteB && md.siteE <= *directiveLineE) {
-            md.directiveLineB = directiveLineB;
-            md.directiveLineE = directiveLineE;
-          }
-
-          // Optional producer-owned replay data for #define directives.
-          // #undef records intentionally keep these vectors empty: their only
-          // semantic payload is the macro-state transition, not
-          // replacement-list replay.
-          if (skStr == "#define") {
-            md.defParams = parseMacroDefParams(*obj, "def_params", ctxItem);
-            md.replacementTokens =
-                parseMacroReplacementTokens(*obj, md.defParams, ctxItem);
-          }
-
-          // optional
-          md.ownerIncludeId = asOptUInt64(*obj, "owner_include_id");
-
-          md.subkind = skStr;
-          model.macroDirs_.push_back(std::move(md));
+          auto mdOrErr = parseMacroDirectiveItem(
+              *obj, skStr,
+              (Twine("define/undef items[") + Twine(i) + "]").str());
+          if (!mdOrErr)
+            return mdOrErr.takeError();
+          model.macroDirs_.push_back(std::move(*mdOrErr));
         } else if (skStr == "#pragma") {
-          PragmaDirective pd;
-
-          const std::string ctxItem =
-              (Twine("pragma items[") + Twine(i) + "]").str();
-
-          // required
-          auto idOrErr = applyToField(asUInt64, *obj, "id", ctxItem);
-          if (!idOrErr)
-            return idOrErr.takeError();
-          pd.id = *idOrErr;
-
-          auto textOrErr = applyToField(asString, *obj, "text", ctxItem);
-          if (!textOrErr)
-            return textOrErr.takeError();
-          pd.text = *textOrErr;
-
-          auto spOrErr = applyToField(asString, *obj, "site_path", ctxItem);
-          if (!spOrErr)
-            return spOrErr.takeError();
-          pd.sitePath = *spOrErr;
-
-          // not really optional, but can be string or null (null values will
-          // produce a fatal error)
-          pd.siteB = *asOptUInt64(*obj, "site_b");
-          pd.siteE = *asOptUInt64(*obj, "site_e");
-
-          // Optional in older maps.  When present, this is the preferred
-          // repeated-header disambiguator for zero-token pragma owners.
-          pd.ownerIncludeId = asOptUInt64(*obj, "owner_include_id");
-
-          // Preserve producer-owned `_Pragma` source provenance in the typed
-          // model.  Sideband replay already consumes these fields directly
-          // from JSON; the preprocessing-structure census also needs them so a
-          // mid-line pragma operator cannot disappear behind an ordinary token
-          // byte envelope.  Missing or partial ranges remain unbound and are
-          // rejected by the interval index rather than guessed here.
-          pd.viaPragmaOperator =
-              obj->getBoolean("via_pragma_operator").value_or(false);
-          pd.operatorB = asOptUInt64(*obj, "operator_b");
-          pd.operatorE = asOptUInt64(*obj, "operator_e");
-          // Image of the directive in the preprocessed stream A.  Present only
-          // when the preprocessor re-emitted the pragma, so absence is a fact
-          // and not missing data: it says clang printed nothing for this
-          // spelling.  A partial pair is treated as absent rather than
-          // repaired, because half a range proves neither.
-          pd.ppByteBegin = asOptUInt64(*obj, "pp_byte_begin");
-          pd.ppByteEnd = asOptUInt64(*obj, "pp_byte_end");
-          if (!pd.ppByteBegin || !pd.ppByteEnd || *pd.ppByteEnd <= *pd.ppByteBegin) {
-            pd.ppByteBegin.reset();
-            pd.ppByteEnd.reset();
-          }
-          // Stringified-argument provenance. Both fields are producer-emitted
-          // together; a partial pair is treated as absent rather than repaired,
-          // so a truncated record cannot authorize an argument-site edit.
-          pd.stringifiedFromMacroId =
-              asOptUInt64(*obj, "stringified_from_macro_id");
-          if (std::optional<uint64_t> argIndex =
-                  asOptUInt64(*obj, "stringified_from_arg_index"))
-            pd.stringifiedFromArgIndex = static_cast<uint32_t>(*argIndex);
-          if (!pd.stringifiedFromMacroId || !pd.stringifiedFromArgIndex) {
-            pd.stringifiedFromMacroId.reset();
-            pd.stringifiedFromArgIndex.reset();
-          }
-
-          model.pragmas_.push_back(std::move(pd));
+          auto pdOrErr = parsePragmaDirectiveItem(
+              *obj, (Twine("pragma items[") + Twine(i) + "]").str());
+          if (!pdOrErr)
+            return pdOrErr.takeError();
+          model.pragmas_.push_back(std::move(*pdOrErr));
         } else if (skStr == "#import") {
           // `#import` is a Clang extension that includes a header and marks it
           // as imported, so a later `#include` of the same file is skipped.
@@ -1522,580 +2347,17 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
               skStr.str().c_str(), i);
         }
       } else if (kindStr == "macro") {
-        const std::string ctxItem =
-            (Twine("macro items[") + Twine(i) + "]").str();
-
-        // required
-        auto idOrErr = applyToField(asUInt64, *obj, "id", ctxItem);
-        if (!idOrErr)
-          return idOrErr.takeError();
-        int id = *idOrErr;
-
-        auto skOrErr = applyToField(asString, *obj, "subkind", ctxItem);
-        if (!skOrErr)
-          return skOrErr.takeError();
-        StringRef subkind = *skOrErr;
-
-        auto nameOrErr = applyToField(asString, *obj, "name", ctxItem);
-        if (!nameOrErr)
-          return nameOrErr.takeError();
-        StringRef name = *nameOrErr;
-
-        auto invTextValOrErr = requireField(*obj, "inv_text", ctxItem);
-        if (!invTextValOrErr)
-          return invTextValOrErr.takeError();
-        std::optional<StringRef> invText;
-        if (!(*invTextValOrErr)->getAsNull()) {
-          auto invTextOrErr =
-              asString(**invTextValOrErr, ctxItem + ": inv_text");
-          if (!invTextOrErr)
-            return invTextOrErr.takeError();
-          invText = *invTextOrErr;
-        }
-        std::optional<StringRef> normalizedInvText =
-            asOptString(*obj, "normalized_inv_text", /*canBeNull=*/true);
-
-        auto spansOrErr = requireField(*obj, "spans", ctxItem);
-        if (!spansOrErr)
-          return spansOrErr.takeError();
-        auto spans = parseSpans(**spansOrErr, "macro.spans");
-        if (!spans)
-          return spans.takeError();
-
-        // optional
-        std::optional<StringRef> invFile = asOptString(*obj, "inv_file");
-        std::optional<uint64_t> invB = asOptUInt64(*obj, "inv_b");
-        std::optional<uint64_t> invE = asOptUInt64(*obj, "inv_e");
-        std::optional<uint64_t> invPPByteBegin =
-            asOptUInt64(*obj, "inv_pp_byte_begin");
-        std::optional<uint64_t> invPPByteEnd =
-            asOptUInt64(*obj, "inv_pp_byte_end");
-        std::optional<uint64_t> ownerIncludeId =
-            asOptUInt64(*obj, "owner_include_id");
-        std::optional<uint64_t> definitionDirectiveId =
-            asOptUInt64(*obj, "definition_directive_id",
-                        /*canBeNull=*/true);
-        std::vector<MacroDefParam> defParams =
-            parseMacroDefParams(*obj, "def_params", ctxItem);
-
-        auto parseOptByteRanges = [&](StringRef fieldName,
-                                      std::vector<MacroInvocation::OptByteRange>
-                                          &out) {
-          // These ranges intentionally preserve nullable endpoints from older
-          // producer schemas; downstream proof code decides whether null ranges
-          // are sufficient for the specific certificate being built.
-          if (auto arr = asOptArray(*obj, fieldName, /*canBeNull=*/true)) {
-            for (const auto &elem : **arr) {
-              auto *rObj = elem.getAsObject();
-              if (!rObj) {
-                REFOLD_LOG_FATAL(
-                    "model",
-                    "invalid json value type on field '%s': expected object "
-                    "value",
-                    fieldName.str().c_str());
-              }
-
-              const json::Value *bVal = rObj->get("b");
-              const json::Value *eVal = rObj->get("e");
-              if (!bVal || !eVal) {
-                REFOLD_LOG_FATAL(
-                    "model",
-                    "missing required fields on '%s' element: expected {b,e}",
-                    fieldName.str().c_str());
-              }
-
-              std::optional<uint64_t> b;
-              std::optional<uint64_t> e;
-              if (!bVal->getAsNull())
-                b = bVal->getAsUINT64();
-              if (!eVal->getAsNull())
-                e = eVal->getAsUINT64();
-
-              out.emplace_back(b, e);
-            }
-          }
-        };
-
-        std::vector<MacroInvocation::OptByteRange> invArgRanges;
-        parseOptByteRanges("inv_arg_ranges", invArgRanges);
-
-        std::vector<MacroInvocation::OptByteRange> normalizedInvArgTextRanges;
-        parseOptByteRanges("normalized_inv_arg_text_ranges",
-                           normalizedInvArgTextRanges);
-
-        std::vector<PPArgSpan> argSpans;
-        if (const json::Value *spansVal = obj->get("arg_spans")) {
-          auto sp = parseSpans<PPArgSpan>(*spansVal, "macro.arg_spans",
-                                          PPArgSpanKind::Standard);
-          if (!sp)
-            return sp.takeError();
-          argSpans = std::move(*sp);
-        }
-
-        std::vector<PPArgSpan> stringifySpans;
-        if (const json::Value *spansVal = obj->get("stringify_spans")) {
-          auto sp = parseSpans<PPArgSpan>(*spansVal, "macro.stringify_spans",
-                                          PPArgSpanKind::Stringify);
-          if (!sp)
-            return sp.takeError();
-          stringifySpans = std::move(*sp);
-        }
-
-        std::vector<PPArgSpan> pasteSpans;
-        if (const json::Value *spansVal = obj->get("paste_spans")) {
-          auto sp = parseSpans<PPArgSpan>(*spansVal, "macro.paste_spans",
-                                          PPArgSpanKind::Paste);
-          if (!sp)
-            return sp.takeError();
-          pasteSpans = std::move(*sp);
-        }
-
-        std::vector<PPSpan> bodySpans;
-        if (const json::Value *spansVal = obj->get("body_spans")) {
-          auto sp = parseSpans(*spansVal, "macro.body_spans");
-          if (!sp)
-            return sp.takeError();
-          bodySpans = std::move(*sp);
-        }
-
-        // `paste_tokens` preserves the producer's exact `##` witnesses in the
-        // order they were synthesized for this invocation. Loading the data
-        // into the model lets later proof classes consume it without
-        // reconstructing paste decomposition from spans alone.
-        std::vector<RefoldModel::PasteToken> pasteTokens;
-        if (auto tokensArr =
-                asOptArray(*obj, "paste_tokens", /*allowNull=*/true)) {
-          pasteTokens.reserve((**tokensArr).size());
-          for (const json::Value &Entry : **tokensArr) {
-            auto objOrErrLocal = asObject(Entry, ctxItem);
-            if (!objOrErrLocal)
-              REFOLD_LOG_FATAL(
-                  "model", "{0}: paste_tokens entry is not an object", ctxItem);
-            const json::Object &TokObj = **objOrErrLocal;
-
-            const json::Value *SpellingVal = TokObj.get("spelling");
-            if (!SpellingVal)
-              REFOLD_LOG_FATAL(
-                  "model", "{0}: paste_tokens entry missing spelling", ctxItem);
-            auto spellingOrErr =
-                asString(*SpellingVal, ctxItem + ": paste_tokens.spelling");
-            if (!spellingOrErr)
-              REFOLD_LOG_FATAL("model",
-                               "{0}: paste_tokens.spelling is not a string",
-                               ctxItem);
-
-            const json::Value *PartsVal = TokObj.get("parts");
-            if (!PartsVal)
-              REFOLD_LOG_FATAL("model", "{0}: paste_tokens entry missing parts",
-                               ctxItem);
-            auto partsArrOrErr =
-                asArray(*PartsVal, ctxItem + ": paste_tokens.parts");
-            if (!partsArrOrErr)
-              REFOLD_LOG_FATAL(
-                  "model", "{0}: paste_tokens.parts is not an array", ctxItem);
-
-            std::vector<RefoldModel::PastePart> parts;
-            parts.reserve((**partsArrOrErr).size());
-            for (const json::Value &PartVal : **partsArrOrErr) {
-              auto partObjOrErr = asObject(PartVal, ctxItem);
-              if (!partObjOrErr)
-                REFOLD_LOG_FATAL("model",
-                                 "{0}: paste_tokens part is not an object",
-                                 ctxItem);
-              const json::Object &PartObj = **partObjOrErr;
-
-              std::optional<uint32_t> argIndex =
-                  asOptUInt32(PartObj, "arg_index", /*canBeNull=*/true);
-
-              std::optional<StringRef> kindText =
-                  asOptString(PartObj, "kind", /*canBeNull=*/true);
-              // Older maps can omit `kind`; infer it from arg_index, then
-              // verify any explicit spelling agrees with the inferred payload
-              // shape.
-              RefoldModel::PastePartKind kindLocal =
-                  argIndex ? RefoldModel::PastePartKind::Arg
-                           : RefoldModel::PastePartKind::Literal;
-              if (kindText) {
-                if (*kindText == "arg")
-                  kindLocal = RefoldModel::PastePartKind::Arg;
-                else if (*kindText == "literal")
-                  kindLocal = RefoldModel::PastePartKind::Literal;
-                else
-                  REFOLD_LOG_FATAL(
-                      "model", "{0}: paste_tokens.part.kind is invalid: {1}",
-                      ctxItem, *kindText);
-              }
-              if (kindLocal == RefoldModel::PastePartKind::Arg && !argIndex)
-                REFOLD_LOG_FATAL("model",
-                                 "{0}: arg paste_tokens part missing arg_index",
-                                 ctxItem);
-              if (kindLocal == RefoldModel::PastePartKind::Literal && argIndex)
-                REFOLD_LOG_FATAL("model",
-                                 "{0}: literal paste_tokens part has arg_index",
-                                 ctxItem);
-
-              const json::Value *ByteBVal = PartObj.get("byte_begin");
-              if (!ByteBVal)
-                REFOLD_LOG_FATAL("model",
-                                 "{0}: paste_tokens part missing byte_begin",
-                                 ctxItem);
-              auto byteBOrErr = asUInt32(
-                  *ByteBVal, ctxItem + ": paste_tokens.part.byte_begin");
-              if (!byteBOrErr)
-                REFOLD_LOG_FATAL(
-                    "model",
-                    "{0}: paste_tokens.part.byte_begin is not a uint32",
-                    ctxItem);
-
-              const json::Value *ByteEVal = PartObj.get("byte_end");
-              if (!ByteEVal)
-                REFOLD_LOG_FATAL("model",
-                                 "{0}: paste_tokens part missing byte_end",
-                                 ctxItem);
-              auto byteEOrErr =
-                  asUInt32(*ByteEVal, ctxItem + ": paste_tokens.part.byte_end");
-              if (!byteEOrErr)
-                REFOLD_LOG_FATAL(
-                    "model", "{0}: paste_tokens.part.byte_end is not a uint32",
-                    ctxItem);
-              if (*byteEOrErr < *byteBOrErr ||
-                  *byteEOrErr > spellingOrErr->size())
-                REFOLD_LOG_FATAL("model",
-                                 "{0}: paste_tokens part byte range is invalid",
-                                 ctxItem);
-
-              std::optional<StringRef> partSpelling =
-                  asOptString(PartObj, "spelling", /*canBeNull=*/true);
-              // The byte range is authoritative. A redundant part spelling is
-              // accepted only when it exactly matches that slice.
-              StringRef derivedSpelling =
-                  spellingOrErr->slice(*byteBOrErr, *byteEOrErr);
-              if (partSpelling && *partSpelling != derivedSpelling)
-                REFOLD_LOG_FATAL(
-                    "model",
-                    "{0}: paste_tokens.part.spelling does not match byte range",
-                    ctxItem);
-              StringRef storedSpelling =
-                  partSpelling ? *partSpelling : derivedSpelling;
-
-              std::optional<uint32_t> argByteBegin =
-                  asOptUInt32(PartObj, "arg_byte_begin", /*canBeNull=*/true);
-              std::optional<uint32_t> argByteEnd =
-                  asOptUInt32(PartObj, "arg_byte_end", /*canBeNull=*/true);
-              if (argByteBegin.has_value() != argByteEnd.has_value())
-                REFOLD_LOG_FATAL(
-                    "model", "{0}: paste_tokens arg byte range is incomplete",
-                    ctxItem);
-              if (argByteBegin && *argByteEnd < *argByteBegin)
-                REFOLD_LOG_FATAL("model",
-                                 "{0}: paste_tokens arg byte range is invalid",
-                                 ctxItem);
-              if (kindLocal == RefoldModel::PastePartKind::Literal &&
-                  argByteBegin)
-                REFOLD_LOG_FATAL(
-                    "model",
-                    "{0}: literal paste_tokens part has arg byte range",
-                    ctxItem);
-
-              parts.push_back(RefoldModel::PastePart{
-                  kindLocal, argIndex, *byteBOrErr, *byteEOrErr, storedSpelling,
-                  argByteBegin, argByteEnd});
-            }
-
-            pasteTokens.push_back(
-                RefoldModel::PasteToken{*spellingOrErr, std::move(parts)});
-          }
-        }
-
-        std::optional<uint64_t> callerMacroId =
-            asOptUInt64(*obj, "caller_macro_id", /*canBeNull=*/true);
-
-        RefoldModel::MacroCalleeOrigin calleeOrigin;
-        if (const json::Value *OriginVal = obj->get("callee_origin")) {
-          auto originObjOrErr = asObject(*OriginVal, ctxItem);
-          if (!originObjOrErr)
-            REFOLD_LOG_FATAL("model", "{0}: callee_origin is not an object",
-                             ctxItem);
-          const json::Object &OriginObj = **originObjOrErr;
-
-          auto kindOrErrLocal = applyToField(asString, OriginObj, "kind",
-                                             ctxItem + ": callee_origin");
-          if (!kindOrErrLocal)
-            return kindOrErrLocal.takeError();
-
-          if (*kindOrErrLocal == "literal_macro_name") {
-            calleeOrigin.kind = MacroCalleeOriginKind::LiteralMacroName;
-          } else if (*kindOrErrLocal == "caller_param") {
-            calleeOrigin.kind = MacroCalleeOriginKind::CallerParam;
-          } else if (*kindOrErrLocal == "paste") {
-            calleeOrigin.kind = MacroCalleeOriginKind::Paste;
-          } else if (*kindOrErrLocal == "opaque") {
-            calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
-          } else {
-            REFOLD_LOG_FATAL("model", "{0}: invalid callee_origin.kind '{1}'",
-                             ctxItem, *kindOrErrLocal);
-          }
-
-          if (auto idxsArr = asOptArray(OriginObj, "caller_param_indices",
-                                        /*allowNull=*/true)) {
-            for (const json::Value &Elem : **idxsArr) {
-              auto uOrErr = asUInt32(
-                  Elem, ctxItem + ": callee_origin.caller_param_indices");
-              if (!uOrErr)
-                REFOLD_LOG_FATAL(
-                    "model",
-                    "{0}: callee_origin.caller_param_indices element is not "
-                    "a uint32",
-                    ctxItem);
-              calleeOrigin.callerParamIndices.push_back(*uOrErr);
-            }
-          }
-
-          // New producer maps can carry a direct decomposition of the final
-          // callee token spelling.  Keep this proof material on the origin
-          // record so selector substitution can consume producer-owned
-          // paste/caller-slice evidence instead of reconstructing it from raw
-          // source text.
-          calleeOrigin.spelling =
-              asOptString(OriginObj, "spelling", /*canBeNull=*/true);
-          if (calleeOrigin.spelling)
-            calleeOrigin.parts = parseCalleeOriginParts(
-                OriginObj, *calleeOrigin.spelling, ctxItem);
-
-          if (calleeOrigin.kind == MacroCalleeOriginKind::Paste &&
-              (!calleeOrigin.spelling || calleeOrigin.parts.empty())) {
-            REFOLD_LOG_FATAL(
-                "model",
-                "{0}: paste callee_origin is missing producer-owned spelling "
-                "or parts",
-                ctxItem);
-          }
-        } else if (callerMacroId) {
-          // Nested invocations from older producer maps lack precise callee
-          // provenance, so classify them as opaque instead of assuming a
-          // literal macro-name owner.
-          calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
-        } else {
-          calleeOrigin.kind = MacroCalleeOriginKind::LiteralMacroName;
-        }
-
-        std::vector<std::vector<uint32_t>> argDeps;
-        if (auto depsArr = asOptArray(*obj, "arg_deps", /*allowNull=*/true)) {
-          for (const json::Value &Entry : **depsArr) {
-            auto aOrErr = asArray(Entry, ctxItem);
-            if (!aOrErr)
-              REFOLD_LOG_FATAL("model", "{0}: arg_deps entry is not an array",
-                               ctxItem);
-            const json::Array &a = **aOrErr;
-
-            std::vector<uint32_t> deps;
-            deps.reserve(a.size());
-            for (const json::Value &Elem : a) {
-              auto uOrErr = asUInt32(Elem, ctxItem);
-              if (!uOrErr)
-                REFOLD_LOG_FATAL(
-                    "model", "{0}: arg_deps element is not a uint32", ctxItem);
-              deps.push_back(*uOrErr);
-            }
-            argDeps.push_back(std::move(deps));
-          }
-        }
-
-        std::vector<std::vector<RefoldModel::InvArgRef>> argRefs;
-        if (auto refsArr = asOptArray(*obj, "arg_refs", /*allowNull=*/true)) {
-          for (const json::Value &Entry : **refsArr) {
-            auto aOrErr = asArray(Entry, ctxItem);
-            if (!aOrErr)
-              REFOLD_LOG_FATAL("model", "{0}: arg_refs entry is not an array",
-                               ctxItem);
-            const json::Array &a = **aOrErr;
-
-            std::vector<RefoldModel::InvArgRef> refs;
-            refs.reserve(a.size());
-            for (const json::Value &Elem : a) {
-              auto objOrErrLocal = asObject(Elem, ctxItem);
-              if (!objOrErrLocal)
-                REFOLD_LOG_FATAL(
-                    "model", "{0}: arg_refs element is not an object", ctxItem);
-              const json::Object &RefObj = **objOrErrLocal;
-
-              const json::Value *CallerIdxVal =
-                  RefObj.get("caller_param_index");
-              if (!CallerIdxVal)
-                REFOLD_LOG_FATAL(
-                    "model", "{0}: arg_refs element missing caller_param_index",
-                    ctxItem);
-              auto callerIdxOrErr = asUInt32(
-                  *CallerIdxVal, ctxItem + ": arg_refs.caller_param_index");
-              if (!callerIdxOrErr)
-                REFOLD_LOG_FATAL(
-                    "model", "{0}: arg_refs.caller_param_index is not a uint32",
-                    ctxItem);
-
-              const json::Value *ByteBVal = RefObj.get("byte_begin");
-              if (!ByteBVal)
-                REFOLD_LOG_FATAL("model",
-                                 "{0}: arg_refs element missing byte_begin",
-                                 ctxItem);
-              auto byteBOrErr =
-                  asUInt32(*ByteBVal, ctxItem + ": arg_refs.byte_begin");
-              if (!byteBOrErr)
-                REFOLD_LOG_FATAL("model",
-                                 "{0}: arg_refs.byte_begin is not a uint32",
-                                 ctxItem);
-
-              const json::Value *ByteEVal = RefObj.get("byte_end");
-              if (!ByteEVal)
-                REFOLD_LOG_FATAL(
-                    "model", "{0}: arg_refs element missing byte_end", ctxItem);
-              auto byteEOrErr =
-                  asUInt32(*ByteEVal, ctxItem + ": arg_refs.byte_end");
-              if (!byteEOrErr)
-                REFOLD_LOG_FATAL(
-                    "model", "{0}: arg_refs.byte_end is not a uint32", ctxItem);
-
-              refs.push_back(RefoldModel::InvArgRef{*callerIdxOrErr,
-                                                    *byteBOrErr, *byteEOrErr});
-            }
-            argRefs.push_back(std::move(refs));
-          }
-        }
-
-        std::vector<std::vector<RefoldModel::TupleArgRef>> argTupleRefs;
-        if (auto refsArr =
-                asOptArray(*obj, "arg_tuple_refs", /*allowNull=*/true)) {
-          for (const json::Value &Entry : **refsArr) {
-            auto aOrErr = asArray(Entry, ctxItem);
-            if (!aOrErr) {
-              REFOLD_LOG_FATAL("model",
-                               "{0}: arg_tuple_refs entry is not an array",
-                               ctxItem);
-            }
-            const json::Array &a = **aOrErr;
-
-            std::vector<RefoldModel::TupleArgRef> refs;
-            refs.reserve(a.size());
-            for (const json::Value &Elem : a) {
-              auto objOrErrLocal = asObject(Elem, ctxItem);
-              if (!objOrErrLocal) {
-                REFOLD_LOG_FATAL("model",
-                                 "{0}: arg_tuple_refs element is not an object",
-                                 ctxItem);
-              }
-              const json::Object &RefObj = **objOrErrLocal;
-
-              const json::Value *CallerIdxVal =
-                  RefObj.get("caller_param_index");
-              if (!CallerIdxVal) {
-                REFOLD_LOG_FATAL(
-                    "model",
-                    "{0}: arg_tuple_refs element missing caller_param_index",
-                    ctxItem);
-              }
-              auto callerIdxOrErr =
-                  asUInt32(*CallerIdxVal,
-                           ctxItem + ": arg_tuple_refs.caller_param_index");
-              if (!callerIdxOrErr) {
-                REFOLD_LOG_FATAL(
-                    "model",
-                    "{0}: arg_tuple_refs.caller_param_index is not a uint32",
-                    ctxItem);
-              }
-
-              const json::Value *ByteBVal = RefObj.get("caller_byte_begin");
-              if (!ByteBVal) {
-                REFOLD_LOG_FATAL(
-                    "model",
-                    "{0}: arg_tuple_refs element missing caller_byte_begin",
-                    ctxItem);
-              }
-              auto byteBOrErr = asUInt32(
-                  *ByteBVal, ctxItem + ": arg_tuple_refs.caller_byte_begin");
-              if (!byteBOrErr) {
-                REFOLD_LOG_FATAL(
-                    "model",
-                    "{0}: arg_tuple_refs.caller_byte_begin is not a uint32",
-                    ctxItem);
-              }
-
-              const json::Value *ByteEVal = RefObj.get("caller_byte_end");
-              if (!ByteEVal) {
-                REFOLD_LOG_FATAL(
-                    "model",
-                    "{0}: arg_tuple_refs element missing caller_byte_end",
-                    ctxItem);
-              }
-              auto byteEOrErr = asUInt32(
-                  *ByteEVal, ctxItem + ": arg_tuple_refs.caller_byte_end");
-              if (!byteEOrErr) {
-                REFOLD_LOG_FATAL(
-                    "model",
-                    "{0}: arg_tuple_refs.caller_byte_end is not a uint32",
-                    ctxItem);
-              }
-
-              refs.push_back(RefoldModel::TupleArgRef{
-                  *callerIdxOrErr, *byteBOrErr, *byteEOrErr});
-            }
-            argTupleRefs.push_back(std::move(refs));
-          }
-        }
-
-        MacroInvocation mi(/*id*/ id,
-                           /*subkind*/ subkind,
-                           /*name*/ name,
-                           /*invText*/ invText,
-                           /*normalizedInvText*/ normalizedInvText,
-                           /*invFile*/ invFile,
-                           /*invB*/ invB,
-                           /*invE*/ invE,
-                           /*invPPByteBegin*/ invPPByteBegin,
-                           /*invPPByteEnd*/ invPPByteEnd,
-                           /*ownerIncludeId*/ ownerIncludeId,
-                           /*definitionDirectiveId*/ definitionDirectiveId,
-                           /*defParams*/ std::move(defParams),
-                           /*invArgRanges*/ std::move(invArgRanges),
-                           /*normalizedInvArgTextRanges*/
-                           std::move(normalizedInvArgTextRanges),
-                           /*spans*/ std::move(*spans),
-                           /*argSpans*/ std::move(argSpans),
-                           /*stringifySpans*/ std::move(stringifySpans),
-                           /*pasteSpans*/ std::move(pasteSpans),
-                           /*pasteTokens*/ std::move(pasteTokens),
-                           /*bodySpans*/ std::move(bodySpans),
-                           /*callerMacroId*/ callerMacroId,
-                           /*calleeOrigin*/ std::move(calleeOrigin),
-                           /*argDeps*/ std::move(argDeps),
-                           /*argRefs*/ std::move(argRefs),
-                           /*argTupleRefs*/ std::move(argTupleRefs));
-
-        model.macroInvs_.push_back(std::move(mi));
+        auto miOrErr = parseMacroInvocationItem(
+            *obj, (Twine("macro items[") + Twine(i) + "]").str());
+        if (!miOrErr)
+          return miOrErr.takeError();
+        model.macroInvs_.push_back(std::move(*miOrErr));
       } else if (kindStr == "file") {
-        FileItem fi;
-
-        const std::string ctxItem =
-            (Twine("file items[") + Twine(i) + "]").str();
-
-        // required
-        auto idOrErr = applyToField(asUInt64, *obj, "id", ctxItem);
-        if (!idOrErr)
-          return idOrErr.takeError();
-        fi.id = *idOrErr;
-
-        auto pathOrErr = applyToField(asString, *obj, "path", ctxItem);
-        if (!pathOrErr)
-          return pathOrErr.takeError();
-        fi.path = *pathOrErr;
-
-        auto spansOrErr = requireField(*obj, "spans", ctxItem);
-        if (!spansOrErr)
-          return spansOrErr.takeError();
-        auto spans = parseSpans(**spansOrErr, "file.spans");
-        if (!spans)
-          return spans.takeError();
-        fi.spans = std::move(*spans);
-
-        model.fileItems_.push_back(std::move(fi));
+        auto fiOrErr =
+            parseFileItem(*obj, (Twine("file items[") + Twine(i) + "]").str());
+        if (!fiOrErr)
+          return fiOrErr.takeError();
+        model.fileItems_.push_back(std::move(*fiOrErr));
       } else {
         return createStringError(inconvertibleErrorCode(),
                                  "Unknown item.kind '%s' at items[%zu]",
@@ -2118,42 +2380,11 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
       auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
       if (!objOrErr)
         return objOrErr.takeError();
-      const json::Object *obj = *objOrErr;
 
-      Slot slot;
-
-      // required
-      auto idOrErr = applyToField(asUInt64, *obj, "id", ctxItem);
-      if (!idOrErr)
-        return idOrErr.takeError();
-      slot.id = *idOrErr;
-
-      auto fileOrErr = applyToField(asString, *obj, "file", ctxItem);
-      if (!fileOrErr)
-        return fileOrErr.takeError();
-      slot.file = *fileOrErr;
-
-      auto kindOrErr = applyToField(asString, *obj, "kind", ctxItem);
-      if (!kindOrErr)
-        return kindOrErr.takeError();
-      slot.kind = *kindOrErr;
-
-      auto bOrErr = applyToField(asUInt64, *obj, "b", ctxItem);
-      if (!bOrErr)
-        return bOrErr.takeError();
-      slot.b = *bOrErr;
-
-      auto eOrErr = applyToField(asUInt64, *obj, "e", ctxItem);
-      if (!eOrErr)
-        return eOrErr.takeError();
-      slot.e = *eOrErr;
-
-      // optionals
-      slot.pp = asOptUInt64(*obj, "pp");
-      slot.ref = asOptUInt64(*obj, "ref");
-      slot.ownerIncludeId = asOptUInt64(*obj, "owner_include_id");
-
-      model.slots_.push_back(std::move(slot));
+      auto slotOrErr = parseSlot(**objOrErr, ctxItem);
+      if (!slotOrErr)
+        return slotOrErr.takeError();
+      model.slots_.push_back(std::move(*slotOrErr));
     }
   }
 
@@ -2167,55 +2398,11 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
       auto objOrErr = arrayObjElemAt(**arr, i, ctxItem);
       if (!objOrErr)
         return objOrErr.takeError();
-      const json::Object *obj = *objOrErr;
 
-      LineControlEvent event;
-
-      auto idOrErr = applyToField(asUInt64, *obj, "id", ctxItem);
-      if (!idOrErr)
-        return idOrErr.takeError();
-      event.id = *idOrErr;
-
-      auto fileOrErr = applyToField(asString, *obj, "physical_file", ctxItem);
-      if (!fileOrErr)
-        return fileOrErr.takeError();
-      event.physicalFile = *fileOrErr;
-
-      event.siteB = asOptUInt64(*obj, "site_b", /*canBeNull=*/true);
-      event.siteE = asOptUInt64(*obj, "site_e", /*canBeNull=*/true);
-
-      auto activeOrErr = applyToField(asBool, *obj, "active", ctxItem);
-      if (!activeOrErr)
-        return activeOrErr.takeError();
-      event.active = *activeOrErr;
-
-      auto provenOrErr = applyToField(asBool, *obj, "producer_proven", ctxItem);
-      if (!provenOrErr)
-        return provenOrErr.takeError();
-      event.producerProven = *provenOrErr;
-
-      auto lineOrErr =
-          applyToField(asUInt64, *obj, "logical_line_after", ctxItem);
-      if (!lineOrErr)
-        return lineOrErr.takeError();
-      event.logicalLineAfter = *lineOrErr;
-
-      auto logicalFileOrErr =
-          applyToField(asString, *obj, "logical_file_after", ctxItem);
-      if (!logicalFileOrErr)
-        return logicalFileOrErr.takeError();
-      event.logicalFileAfter = *logicalFileOrErr;
-
-      event.ownerIncludeId = asOptUInt64(*obj, "owner_include_id");
-      if (auto text = asOptString(*obj, "text"))
-        event.text = *text;
-
-      if (event.siteB && event.siteE && *event.siteE < *event.siteB)
-        return createStringError(inconvertibleErrorCode(),
-                                 "Invalid line-control site range at %s",
-                                 ctxItem.c_str());
-
-      model.lineControls_.push_back(std::move(event));
+      auto eventOrErr = parseLineControlEvent(**objOrErr, ctxItem);
+      if (!eventOrErr)
+        return eventOrErr.takeError();
+      model.lineControls_.push_back(std::move(*eventOrErr));
     }
 
     std::sort(model.lineControls_.begin(), model.lineControls_.end(),
@@ -2246,112 +2433,11 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
       auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
       if (!objOrErr)
         return objOrErr.takeError();
-      const json::Object *obj = *objOrErr;
 
-      CondGroup group;
-
-      // required
-      auto idOrErr = applyToField(asUInt64, *obj, "id", ctxItem);
-      if (!idOrErr)
-        return idOrErr.takeError();
-      group.id = *idOrErr;
-
-      auto fileOrErr = applyToField(asString, *obj, "file", ctxItem);
-      if (!fileOrErr)
-        return fileOrErr.takeError();
-      group.file = *fileOrErr;
-
-      auto gbOrErr = applyToField(asUInt64, *obj, "group_b", ctxItem);
-      if (!gbOrErr)
-        return gbOrErr.takeError();
-      group.groupB = *gbOrErr;
-
-      auto geOrErr = applyToField(asUInt64, *obj, "group_e", ctxItem);
-      if (!geOrErr)
-        return geOrErr.takeError();
-      group.groupE = *geOrErr;
-
-      // optional
-      group.parentArmId = asOptUInt64(*obj, "parent_arm_id");
-      group.parentIncludeId = asOptUInt64(*obj, "parent_include_id");
-
-      // arms
-      auto armsOrErr = applyToField(asArray, *obj, "arms", ctxItem);
-      if (!armsOrErr)
-        return armsOrErr.takeError();
-      const json::Array *arms = *armsOrErr;
-
-      group.arms.reserve(arms->size());
-      for (std::size_t ai = 0; ai < arms->size(); ++ai) {
-        const std::string ctxItem = (Twine("arm[") + Twine(ai) + "]").str();
-
-        auto objOrErr = arrayObjElemAt(*arms, ai, ctxItem);
-        if (!objOrErr)
-          return objOrErr.takeError();
-        const json::Object *armObj = *objOrErr;
-
-        CondArm arm;
-        arm.groupId = group.id;
-
-        // required
-        auto idOrErr = applyToField(asUInt64, *armObj, "id", ctxItem);
-        if (!idOrErr)
-          return idOrErr.takeError();
-        arm.id = *idOrErr;
-
-        auto kindOrErr = applyToField(asString, *armObj, "kind", ctxItem);
-        if (!kindOrErr)
-          return kindOrErr.takeError();
-        arm.kind = *kindOrErr;
-
-        auto bbOrErr = applyToField(asUInt64, *armObj, "body_b", ctxItem);
-        if (!bbOrErr)
-          return bbOrErr.takeError();
-        arm.bodyB = *bbOrErr;
-
-        auto beOrErr = applyToField(asUInt64, *armObj, "body_e", ctxItem);
-        if (!beOrErr)
-          return beOrErr.takeError();
-        arm.bodyE = *beOrErr;
-
-        auto selOrErr = applyToField(asBool, *armObj, "selected", ctxItem);
-        if (!selOrErr)
-          return selOrErr.takeError();
-        arm.selected = *selOrErr;
-
-        // optional
-        arm.cond = asOptString(*armObj, "cond");
-
-        // Optional; absent means the producer did not observe a lookup-context
-        // sensitive `__has_include` in this arm's condition, so it defaults
-        // false and older maps remain compatible.
-        if (std::optional<bool> usesHasInc =
-                armObj->getBoolean("cond_uses_has_include"))
-          arm.condUsesHasInclude = *usesHasInc;
-
-        if (const json::Value *ppSpanVal = armObj->get("pp_span")) {
-          if (!ppSpanVal->getAsNull()) {
-            auto ppSpanObjOrErr = asObject(*ppSpanVal, ctxItem + ".pp_span");
-            if (!ppSpanObjOrErr)
-              return ppSpanObjOrErr.takeError();
-            const json::Object &ppSpanObj = **ppSpanObjOrErr;
-
-            auto beginOrErr = applyToField(asUInt64, ppSpanObj, "begin",
-                                           ctxItem + ".pp_span");
-            if (!beginOrErr)
-              return beginOrErr.takeError();
-            auto endOrErr =
-                applyToField(asUInt64, ppSpanObj, "end", ctxItem + ".pp_span");
-            if (!endOrErr)
-              return endOrErr.takeError();
-            arm.span = PPSpan{*beginOrErr, *endOrErr};
-          }
-        }
-
-        group.arms.push_back(std::move(arm));
-      }
-
-      model.conds_.push_back(std::move(group));
+      auto groupOrErr = parseCondGroup(**objOrErr, ctxItem);
+      if (!groupOrErr)
+        return groupOrErr.takeError();
+      model.conds_.push_back(std::move(*groupOrErr));
     }
   }
 
