@@ -13,6 +13,7 @@ add_extra_unittest(ClangRefoldTests
   RefoldSourceLinePredicateTests.cpp
   RefoldOutputVerificationPolicyTests.cpp
   RefoldRepairIdentityTests.cpp
+  RefoldWitnessCompositionTests.cpp
   RefoldTerminalObligationTests.cpp
   )
 

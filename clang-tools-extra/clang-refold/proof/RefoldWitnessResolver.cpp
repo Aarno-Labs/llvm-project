@@ -456,17 +456,15 @@ void RefoldWitnessResolver::PopulateWitnessClosureLedger(
 }
 
 ::clang::refold::WitnessCompositionDecision
-RefoldWitnessResolver::ResolveWitnessComposition(
-    llvm::StringRef role,
+RefoldWitnessResolver::ClassifyWitnessComposition(
     ArrayRef<std::pair<size_t, RefoldWitness>> selectableWitnesses,
-    bool hasSingleConcreteRepairIdentity) const {
+    bool hasSingleConcreteRepairIdentity) {
   WitnessCompositionDecision decision;
   decision.computed = true;
   decision.candidateTupleCount = selectableWitnesses.size();
 
   if (selectableWitnesses.empty()) {
     decision.reason = "no-selectable-composition-tuples";
-    deps_.witnessTrace.TraceWitnessCompositionDecision(role, decision);
     return decision;
   }
 
@@ -498,6 +496,19 @@ RefoldWitnessResolver::ResolveWitnessComposition(
     // durable mixed-owner tiling; in both cases the global composition class is
     // the ordered target stream plus the suffix/observer/counter state that the
     // tuple leaves for its neighbors.
+    //
+    // This key also carries proof *provenance*, and that limits what a class
+    // count can be read to mean.  Each proof family authors its own
+    // target/suffix/observer/counter spellings and stamps its own name on
+    // them, so a stringification and a token-paste certificate describing one
+    // edit produce different strings for the same facts; `boundaryClass` and
+    // `producerKinds` likewise say which anchor and which producer records a
+    // certificate used, not what state the edit leaves.  Two classes
+    // therefore mean "these certificates are not textually the same
+    // certificate", which is weaker than "these certificates disagree".
+    // Anything inferring a contradiction from `globalClassCount` alone would
+    // be reading provenance as semantics -- see the identical-repair rule
+    // below, which is why that inference is not made here.
     std::string classKey =
         llvm::formatv(
             "target={0}|suffix={1}|observers={2}|counter={3}|boundary={4}|"
@@ -521,13 +532,38 @@ RefoldWitnessResolver::ResolveWitnessComposition(
     decision.compatible = true;
     decision.reason = "single-global-composition-class";
   } else if (hasSingleConcreteRepairIdentity) {
+    // Every tuple emits one identical repair, so they compose identically.
+    //
+    // This is a theorem, not a tolerance.  The state a tuple leaves for its
+    // neighbors is a function of the bytes it emits over the range it
+    // replaces -- not of the theorem that proved them admissible.  Tuples
+    // sharing an `EmittedRepairIdentity` therefore write the same source text
+    // over the same span, so whichever is selected leaves its neighbors in
+    // the same state, and the composition classes that differ above differ in
+    // provenance only.
+    //
+    // The premise has to be exact for that to hold, and it is: the identity
+    // is the emitted bytes themselves, established by the builder that
+    // produced them.  A tuple whose bytes are unknown carries no identity and
+    // makes `hasSingleConcreteRepairIdentity` false, so it can never reach
+    // this arm.
     decision.compatible = true;
-    decision.reason = "single-source-repair-multiple-composition-classes";
+    decision.reason = "identical-repair-composes-identically";
   } else {
     decision.reason = "multiple-non-equivalent-composition-classes";
     decision.failureIsFatal = true;
   }
 
+  return decision;
+}
+
+::clang::refold::WitnessCompositionDecision
+RefoldWitnessResolver::ResolveWitnessComposition(
+    llvm::StringRef role,
+    ArrayRef<std::pair<size_t, RefoldWitness>> selectableWitnesses,
+    bool hasSingleConcreteRepairIdentity) const {
+  const WitnessCompositionDecision decision = ClassifyWitnessComposition(
+      selectableWitnesses, hasSingleConcreteRepairIdentity);
   deps_.witnessTrace.TraceWitnessCompositionDecision(role, decision);
   return decision;
 }

@@ -116,14 +116,54 @@ public:
                      llvm::StringRef role, uint64_t witnessId = 0) const;
 
   /// Decide tuple-level composition compatibility for `selectableWitnesses`.
-  /// Composition is independent of source-spelling: it partitions tuples by
-  /// the (target, suffix, observer, counter, boundary, diagnostic,
-  /// composition, producer) signature and rejects multi-class compositions
-  /// unless the same source repair is the underlying identity.
+  ///
+  /// Tuples are partitioned by the (target, suffix, observer, counter,
+  /// boundary, diagnostic, composition, producer) signature, and a multi-class
+  /// composition is rejected unless every tuple emits one identical repair.
+  ///
+  /// That exception is a theorem rather than a tolerance: the state a tuple
+  /// leaves for its neighbors follows from the bytes it emits, so tuples
+  /// sharing an `EmittedRepairIdentity` compose identically whichever is
+  /// selected.  It is needed because the signature also carries provenance --
+  /// each proof family authors its own spellings for the same facts, and
+  /// `boundaryClass` / `producerKinds` describe the certificate rather than
+  /// the resulting state -- so a class count above one means the certificates
+  /// are not textually identical, which is weaker than a disagreement.
+  ///
+  /// \param hasSingleConcreteRepairIdentity whether every selectable tuple
+  ///        carries the same known `EmittedRepairIdentity`.  False when any
+  ///        tuple's emitted bytes are unknown, which fails closed.
+  ///
+  /// Thin wrapper: `ClassifyWitnessComposition` decides, this traces.
   ::clang::refold::WitnessCompositionDecision ResolveWitnessComposition(
       llvm::StringRef role,
       llvm::ArrayRef<std::pair<size_t, RefoldWitness>> selectableWitnesses,
       bool hasSingleConcreteRepairIdentity) const;
+
+  /// Decide tuple-level composition compatibility, without tracing it.
+  ///
+  /// This is the whole decision, and it is deliberately a pure function of
+  /// the tuples and the repair-identity flag: no instance state, no trace
+  /// handle, no role.  A classifier that cannot reach the tracer cannot be
+  /// influenced by whether tracing is on, which is the property the refolder
+  /// requires of every diagnostic and which is otherwise only reviewable by
+  /// reading.  `ResolveWitnessComposition` adds the trace record.
+  ///
+  /// The refusals are not interchangeable, and their order is part of the
+  /// contract rather than an artifact:
+  ///
+  ///   * an incomplete key withholds compatibility without being fatal --
+  ///     the composition is unproven, not disproven;
+  ///   * a terminal tuple is fatal, and outranks the repair-identity rule
+  ///     below: that rule answers "which certificate describes this
+  ///     repair?", never "may this compose at all?";
+  ///   * one class composes on the key alone, needing no repair identity;
+  ///   * several classes compose only under the identical-repair theorem;
+  ///   * anything else fails closed.
+  static ::clang::refold::WitnessCompositionDecision
+  ClassifyWitnessComposition(
+      llvm::ArrayRef<std::pair<size_t, RefoldWitness>> selectableWitnesses,
+      bool hasSingleConcreteRepairIdentity);
 
   /// Resolve witnesses for one selector role.  Builds equivalence-key
   /// partitions, runs composition resolution, records the strict-domain
