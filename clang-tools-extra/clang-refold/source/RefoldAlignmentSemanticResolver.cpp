@@ -42,6 +42,19 @@ constexpr size_t MaxUniqueMapsPerForcedWindow = 256;
 constexpr size_t MaxGlobalSemanticCandidateMaps = 256;
 constexpr size_t MaxProposalCounterfactuals = 256;
 
+/// Largest complete candidate set a window may realize in order to decide the
+/// least-source-mutation rule on its own.
+///
+/// Unlike the other two commit rules, that rule admits no denial from a prefix
+/// of the enumeration: a least element must compare against every accepted map,
+/// so a prefix that contains none proves nothing about the maps still
+/// unrealized (see the enumeration loop below).  Deciding it therefore costs
+/// one whole-translation-unit realization for every enumerated map, and this
+/// budget is the point past which a single window may not spend them.  It is a
+/// cost bound, not a proof: exceeding it retains the forced-only map, exactly
+/// as every other budget here does.
+constexpr size_t MaxContainmentOnlyCandidateMaps = 32;
+
 struct ForcedAnchor {
   uint64_t aToken = 0;
   uint64_t bToken = 0;
@@ -362,53 +375,6 @@ bool noMoreSourceDestructive(
          sortedSetIsSubset<uint64_t>(lhs.expandedMacroRootIds,
                                      rhs.expandedMacroRootIds);
 }
-
-/// Running least-element tracker for the exact source-transformation
-/// containment preorder used by the least-source-mutation commit rule.
-///
-/// That rule keeps the accepted maps that are no more destructive than *every*
-/// accepted map.  Because the test is universally quantified over the ground
-/// set, admitting a further map can only remove least elements, never add one:
-/// the least set over a prefix of the accepted maps therefore contains the
-/// least set over all of them.  An empty prefix result is consequently a proof
-/// that the completed rule finds no least element -- which is what allows a
-/// window to stop realizing candidates before the enumeration is exhausted.
-///
-/// Indices refer to the caller's simulation vector, which is supplied on every
-/// call so that the tracker never holds a reference into storage the caller may
-/// still be growing.
-class SourceContainmentMinimaTracker {
-public:
-  /// Admit the accepted simulation at \p index into the ground set and update
-  /// the least set to account for it.
-  void Admit(size_t index,
-             ArrayRef<AlignmentSemanticSimulationResult> simulations) {
-    ground_.push_back(index);
-    llvm::erase_if(minima_, [&](size_t least) {
-      return !noMoreSourceDestructive(simulations[least], simulations[index]);
-    });
-    // The ground set already contains `index`, matching the completed rule's
-    // self-comparison exactly.
-    const bool noMoreDestructiveThanEveryAdmitted =
-        llvm::all_of(ground_, [&](size_t other) {
-          return noMoreSourceDestructive(simulations[index],
-                                         simulations[other]);
-        });
-    if (noMoreDestructiveThanEveryAdmitted)
-      minima_.push_back(index);
-  }
-
-  /// True while the completed containment rule may still find a least element.
-  /// An empty ground set has admitted no evidence either way.
-  bool MayStillHaveLeastElement() const {
-    return ground_.empty() || !minima_.empty();
-  }
-
-private:
-  std::vector<size_t> ground_;
-  std::vector<size_t> minima_;
-};
-
 
 [[maybe_unused]] StringRef basisName(AlignmentSemanticAnchorBasis basis) {
   switch (basis) {
@@ -739,21 +705,44 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
       proposal.lexemesAgree && proposal.jointlyCoreOptimal;
 
   // Realizing one candidate costs a complete refold of the translation unit, so
-  // the loop below tracks whether either simulation-dependent commit rule can
-  // still fire and stops once neither can.  Both tests are monotone -- a rule
-  // ruled out by a realized prefix stays ruled out however the enumeration
-  // continues -- so stopping returns exactly the result the exhausted loop
-  // would have returned, namely this window's core-forced anchors.
+  // the loop below tracks which commit rules a prefix of the enumeration has
+  // already denied, and stops as soon as no rule can still fire.
+  //
+  // Only denials that carry from the prefix to the completed rule may be
+  // recorded here.  Two do:
   //
   //   observational irrelevance: needs every candidate accepted with one shared
   //     concrete-output class, so a second class or one unaccepted candidate
-  //     ends it;
-  //   least source mutation: needs a least element under containment, so an
-  //     empty running least set ends it (see SourceContainmentMinimaTracker).
+  //     ends it.  Either fact holds of every superset of the prefix that
+  //     produced it, so the completed rule declines too;
+  //   least source mutation: skipped outright by the completed rule when any
+  //     simulation is proof-incomplete, so one proof-incomplete candidate in
+  //     the prefix denies it for the whole ground set.
+  //
+  // The least-source-mutation rule admits no other prefix denial.  It commits
+  // on a map that is no more destructive than *every* accepted map, a test
+  // quantified over the whole ground set, so writing L(S) for the least set
+  // over S the exact relation between a prefix P and the ground set G is
+  //
+  //     L(G) INTERSECT P  is a subset of  L(P),
+  //
+  // and an empty L(P) says only that no map *already realized* is a global
+  // least element.  A map still unrealized may be one:
+  // semantic_alignment_counter_argument_growth_two_windows.c empties its
+  // running least set inside the first 13 of 54 enumerated maps and the
+  // completed rule commits on map 14, the unique least element, preserving that
+  // window's LEFT_COUNTED/RIGHT_COUNTED invocations.  A running least set is
+  // therefore not tracked at all: it would only invite being read as a denial
+  // it cannot support.
+  //
+  // What bounds this rule instead is cost.  Once it is the last rule alive,
+  // deciding it costs one realization per enumerated map, so a candidate set
+  // over MaxContainmentOnlyCandidateMaps declines on budget without realizing
+  // the remainder.  That decline keeps the window's core-forced anchors, which
+  // is the same fail-closed answer every other exhausted budget here gives.
   bool observationalRuleReachable = true;
   bool containmentRuleReachable = true;
   std::optional<std::string> soleConcreteOutputKey;
-  SourceContainmentMinimaTracker containmentMinima;
 
   std::vector<AlignmentSemanticSimulationResult> simulations;
   simulations.reserve(globalMaps.size());
@@ -791,28 +780,31 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
       }
     }
 
-    if (containmentRuleReachable) {
-      // The completed rule stops admitting maps at the first proof-incomplete
-      // candidate and skips itself entirely when one exists, so mirror both.
-      if (realized.disposition ==
-          AlignmentSemanticSimulationDisposition::ProofIncomplete) {
-        containmentRuleReachable = false;
-      } else {
-        if (realizedIsCompleteAccepted &&
-            !realized.realizationEquivalenceKey.empty())
-          containmentMinima.Admit(realizedIndex, simulations);
-        containmentRuleReachable = containmentMinima.MayStillHaveLeastElement();
-      }
-    }
+    // The completed rule skips itself entirely when any simulation is
+    // proof-incomplete, so one such candidate denies it for the ground set.
+    if (realized.disposition ==
+        AlignmentSemanticSimulationDisposition::ProofIncomplete)
+      containmentRuleReachable = false;
 
-    if (!observationalRuleReachable && !containmentRuleReachable &&
-        !legacyProposalRuleReachable) {
-      REFOLD_LOG_TRACE(
-          "lcs/semantic-resolver",
-          "window {0} keeps core-forced anchors: no commit rule remains "
-          "reachable after realizing {1} of {2} enumerated map(s)",
-          windowIndex, simulations.size(), globalMaps.size());
-      return WindowResolution{};
+    if (!observationalRuleReachable && !legacyProposalRuleReachable) {
+      if (!containmentRuleReachable) {
+        REFOLD_LOG_TRACE(
+            "lcs/semantic-resolver",
+            "window {0} keeps core-forced anchors: no commit rule remains "
+            "reachable after realizing {1} of {2} enumerated map(s)",
+            windowIndex, simulations.size(), globalMaps.size());
+        return WindowResolution{};
+      }
+      if (globalMaps.size() > MaxContainmentOnlyCandidateMaps) {
+        REFOLD_LOG_TRACE(
+            "lcs/semantic-resolver",
+            "window {0} keeps core-forced anchors: only the least-source-"
+            "mutation rule remains after realizing {1} map(s) and its {2} "
+            "enumerated map(s) exceed the containment realization budget ({3})",
+            windowIndex, simulations.size(), globalMaps.size(),
+            MaxContainmentOnlyCandidateMaps);
+        return WindowResolution{};
+      }
     }
   }
 
