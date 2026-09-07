@@ -870,30 +870,49 @@ private:
   RefoldLineObserverLayout &LineObserverLayout();
   const RefoldLineObserverLayout &LineObserverLayout() const;
 
+  /// Move hunk edges off macro expansions the hunk only partially owns.
+  ///
+  /// A realizer reconstructs source by re-emitting a callsite, so an expansion
+  /// must be wholly inside a hunk or wholly outside it.  When an edge lands
+  /// strictly inside one, no owner can realize the hunk: the source projection
+  /// widens to the complete invocation spelling while the replacement carries
+  /// only the fragment of expanded tokens inside the hunk.  Either the
+  /// difference is dropped silently -- `return NULL;` became `return );` when
+  /// an alignment boundary fell one token inside `NULL`'s `((void*)0)`
+  /// expansion -- or every owner refuses and the whole translation unit
+  /// escalates to raw B.
+  ///
+  /// The token objective admits such a boundary because it scores lexemes, not
+  /// expansions: matching two tokens of `((void*)0)` against a `0` and a `)`
+  /// that an edit newly wrote is one match richer than leaving them unmatched,
+  /// and can be forced on every optimal path.
+  ///
+  /// Exactly two moves resolve a split expansion, and this tries them in
+  /// preference order.  *Retraction* walks the edge inward across tokens that
+  /// are identical on both sides, giving the expansion back to the untouched
+  /// region beside the hunk; it keeps the invocation preserved, so it is
+  /// preferred, and it is what restores a match the certifier left unforced
+  /// because a repeated spelling made it ambiguous.  *Widening* walks the edge
+  /// outward to the expansion's own boundary, taking the rest of the expansion
+  /// into the hunk; it gives up that one callsite's spelling and is the only
+  /// move available when the tokens at the edge differ between A and B, which
+  /// is what an edit that rewrites the expression around a callsite produces.
+  ///
+  /// Widening is sound because an absorbed token pair sits in the untouched run
+  /// between two hunks, matched to each other by the selected alignment: moving
+  /// such a pair across the edge leaves the edit script producing exactly the
+  /// same B.  It is admitted only on the A->B map's own evidence and only short
+  /// of the neighbouring hunk, for reasons the helper documents.  An edge that
+  /// cannot reach a whole-expansion boundary inside its own untouched run is
+  /// left alone for the ordinary realizer lattice, which refuses a partial
+  /// cover -- so this repair never trades a refusal for a guess.
+  void RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
+      std::vector<diffutils::Hunk> &hunks) const;
+
   /// Allocate the include materializer after include insertion, line-observer
   /// layout, proof, and final text-edit services are available.  The
   /// materializer owns recursive include realization; RefoldEngine owns only
   /// construction order and final orchestration.
-  /// Retract hunk edges out of macro expansions the hunk only partially owns.
-  ///
-  /// A realizer reconstructs source by re-emitting a callsite, so an expansion
-  /// must be wholly inside a hunk or wholly outside it.  When an edge lands
-  /// strictly inside one, the source projection widens to the complete
-  /// invocation spelling while the replacement carries only the fragment of
-  /// expanded tokens inside the hunk, and the difference is dropped silently:
-  /// `return NULL;` became `return );` when an alignment boundary fell one
-  /// token inside `NULL`'s `((void*)0)` expansion.
-  ///
-  /// The edge is walked outward one token at a time, and only across tokens
-  /// that are identical on both sides -- restoring a match the certifier left
-  /// unforced because a repeated spelling made it ambiguous.  This keeps the
-  /// repair local: the expansion rejoins the untouched region beside the hunk
-  /// and every other hunk in the translation unit is unaffected.  An edge that
-  /// cannot be walked out is left alone for the ordinary realizer lattice
-  /// rather than escalating the whole translation unit to raw B.
-  void RetractHunkEdgesOutOfPartiallyOwnedMacroExpansions(
-      std::vector<diffutils::Hunk> &hunks) const;
-
   void InitializeIncludeMaterializer();
 
   /// Allocate and access the synthetic `#pragma once` guard rewriter.
