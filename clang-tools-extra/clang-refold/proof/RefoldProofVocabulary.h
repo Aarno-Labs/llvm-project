@@ -9,7 +9,7 @@
 //   - terminal-fallback proof vocabulary used by owner-state and
 //     accepted-result carriers.
 //
-// `ProofDischargeAccumulator` lives in `RefoldAcceptedResultTypes.h`
+// `ProofDischargeAccumulator` lives in `RefoldProofDischargeTypes.h`
 // because it operates directly on the `ProofDischargeRecord` defined
 // there; placing it here would create a header cycle
 // (vocabulary ⇄ accepted-result types).  The mutable terminal request
@@ -47,7 +47,7 @@ namespace refold {
 using llvm::StringRef;
 
 /// Opaque forward declaration of the accepted-path discriminator.  The full
-/// definition lives in RefoldAcceptedResultTypes.h, which includes this header,
+/// definition lives in RefoldProofDischargeTypes.h, which includes this header,
 /// so it cannot be included back here without a cycle.  A fixed-underlying-type
 /// enum can be named by value, which is all `RefoldWitness` needs to carry the
 /// path kind as a typed discriminator alongside its trace-only spelling.

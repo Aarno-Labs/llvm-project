@@ -9,10 +9,12 @@
 #include "proof/RefoldAcceptedResultRanker.h"
 
 #include "proof/RefoldAcceptedResultPredicates.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldOwnerStateTypes.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldTheoremAudit.h"
+#include "proof/RefoldTheoremTypes.h"
+#include "proof/RefoldTilingWitnessTypes.h"
 #include "proof/RefoldWitnessResolver.h"
 #include "proof/RefoldWitnessTrace.h"
 

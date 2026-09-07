@@ -18,8 +18,9 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDWITNESSCLASSIFIER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDWITNESSCLASSIFIER_H
 
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldProofVocabulary.h"
+#include "proof/RefoldTheoremTypes.h"
 
 #include "llvm/ADT/StringRef.h"
 

@@ -8,10 +8,16 @@
 
 #include "proof/RefoldProofSummaryBuilder.h"
 
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldAcceptancePathTypes.h"
+#include "proof/RefoldAnchorWitnessTypes.h"
+#include "proof/RefoldCandidateTypes.h"
+#include "proof/RefoldCompletenessTypes.h"
+#include "proof/RefoldProofDischargeTypes.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldStructuralHunkTilingProof.h"
 #include "proof/RefoldTheoremAudit.h"
+#include "proof/RefoldTheoremTypes.h"
+#include "proof/RefoldTilingWitnessTypes.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"

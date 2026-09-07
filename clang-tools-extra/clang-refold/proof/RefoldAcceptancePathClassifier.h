@@ -44,10 +44,15 @@
 
 #include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldAcceptancePathTypes.h"
+#include "proof/RefoldAnchorWitnessTypes.h"
+#include "proof/RefoldCandidateTypes.h"
+#include "proof/RefoldMacroPatchTypes.h"
 #include "proof/RefoldOwnerRealizationProofBuilder.h"
+#include "proof/RefoldProofDischargeTypes.h"
 #include "proof/RefoldProofSummaryBuilder.h"
 #include "proof/RefoldProofVocabulary.h"
+#include "proof/RefoldTheoremTypes.h"
 
 #include <functional>
 

@@ -14,7 +14,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_MACRO_REFOLDMACROREPLAY_H
 
 #include "core/RefoldModel.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldMacroPatchTypes.h"
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldToken.h"
 

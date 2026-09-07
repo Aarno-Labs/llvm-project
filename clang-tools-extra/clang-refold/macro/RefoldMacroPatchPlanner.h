@@ -29,7 +29,7 @@
 #include "macro/RefoldMacroStandardArgsOnlyPatchBuilder.h"
 #include "macro/RefoldMacroSubtreeReplayValidator.h"
 #include "macro/RefoldMacroWholeCoverOrchestrator.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldMacroPatchTypes.h"
 #include "proof/RefoldOwnerStateTypes.h"
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldToken.h"

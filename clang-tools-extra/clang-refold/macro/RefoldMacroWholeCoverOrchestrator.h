@@ -30,7 +30,7 @@
 #include "macro/RefoldMacroFinalCandidateSelector.h"
 #include "macro/RefoldMacroPatchReusePhase.h"
 #include "macro/RefoldMacroSelectorSubstitutionPhase.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldMacroPatchTypes.h"
 #include "source/DiffAlgorithms.h"
 
 #include "llvm/ADT/DenseMap.h"

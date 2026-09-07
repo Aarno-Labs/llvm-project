@@ -35,8 +35,9 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDACCEPTEDRESULTRANKER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDACCEPTEDRESULTRANKER_H
 
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldProofVocabulary.h"
+#include "proof/RefoldTheoremTypes.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLFunctionalExtras.h"

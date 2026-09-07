@@ -15,7 +15,7 @@
 
 #include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldAnchorWitnessTypes.h"
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldToken.h"
 

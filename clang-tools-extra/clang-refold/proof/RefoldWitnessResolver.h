@@ -30,7 +30,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDWITNESSRESOLVER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDWITNESSRESOLVER_H
 
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldProofVocabulary.h"
 
 #include "llvm/ADT/ArrayRef.h"

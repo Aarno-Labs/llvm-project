@@ -19,7 +19,7 @@
 #include "edit/RefoldPatchTypes.h"
 #include "line-control/FinalLineControlModel.h"
 #include "macro/RefoldMacroStateRepairPlanner.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldCandidateTypes.h"
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldToken.h"
 #include "util/RefoldDenseMapInfo.h"

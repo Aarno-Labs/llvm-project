@@ -30,7 +30,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDWITNESSEQUIVALENCEKEYBUILDER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDWITNESSEQUIVALENCEKEYBUILDER_H
 
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "source/RefoldToken.h"
 

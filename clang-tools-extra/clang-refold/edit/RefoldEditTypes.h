@@ -14,7 +14,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDEDITTYPES_H
 
 #include "line-control/FinalLineControlModel.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldCandidateTypes.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
 
 #include "llvm/ADT/StringRef.h"

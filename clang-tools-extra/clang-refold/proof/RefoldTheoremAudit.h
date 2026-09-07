@@ -16,7 +16,8 @@
 
 #include "core/RefoldLog.h"
 #include "edit/RefoldPatchTypes.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldAcceptancePathTypes.h"
+#include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldOwnerStateTypes.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldTerminalProofSink.h"

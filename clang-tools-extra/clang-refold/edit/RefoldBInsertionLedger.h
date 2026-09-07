@@ -13,7 +13,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_EDIT_REFOLDBINSERTIONLEDGER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_EDIT_REFOLDBINSERTIONLEDGER_H
 
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldTheoremTypes.h"
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldToken.h"
 

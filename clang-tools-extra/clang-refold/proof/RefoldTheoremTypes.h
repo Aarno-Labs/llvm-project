@@ -13,6 +13,27 @@
 // no other accepted-result carrier, which is what lets every layer above
 // include them without acquiring the rest of the lattice.
 //
+// This file is the base of the accepted-result carrier stack, which was split
+// out of a single 2,400-line header so that a translation unit needing one
+// proof concept does not see all of them.  The layering is a strict DAG --
+// each header depends only on ones above it -- and every consumer includes
+// the layers it directly uses rather than an umbrella over all of them:
+//
+//   RefoldTheoremTypes         -                     (this file)
+//   RefoldAcceptancePathTypes  Theorem
+//   RefoldCompletenessTypes    AcceptancePath
+//   RefoldAnchorWitnessTypes   -
+//   RefoldTilingWitnessTypes   -
+//   RefoldProofDischargeTypes  Theorem, AnchorWitness, TilingWitness
+//   RefoldCandidateTypes       all six above
+//   RefoldMacroPatchTypes      AnchorWitness, Candidate
+//
+// Each header is self-contained: it compiles alone as a translation unit and
+// includes what it directly uses.  Do not rely on a sibling to supply a
+// declaration, and do not prune an include merely because the build still
+// succeeds without it -- transitive satisfaction through a sibling is the
+// hidden dependency this layering exists to prevent.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDTHEOREMTYPES_H

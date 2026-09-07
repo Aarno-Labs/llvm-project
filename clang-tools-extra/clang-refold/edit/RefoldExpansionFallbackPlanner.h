@@ -19,7 +19,7 @@
 #include "line-control/RefoldLineControlProof.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroTopology.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/RefoldToken.h"

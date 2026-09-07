@@ -18,8 +18,10 @@
 #include "edit/RefoldPatchTypes.h"
 #include "edit/RefoldSourceEnvelopeTiling.h"
 #include "line-control/SourceLineDirectiveHelpers.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldAnchorWitnessTypes.h"
+#include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldSidebandReplayProof.h"
+#include "proof/RefoldTheoremTypes.h"
 #include "source/RefoldToken.h"
 #include "util/RefoldPathIdentity.h"
 

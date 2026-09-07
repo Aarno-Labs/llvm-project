@@ -26,7 +26,8 @@
 
 #include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldCandidateTypes.h"
+#include "proof/RefoldMacroPatchTypes.h"
 
 
 #include <cstdint>

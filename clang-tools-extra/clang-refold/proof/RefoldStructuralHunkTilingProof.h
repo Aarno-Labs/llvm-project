@@ -7,7 +7,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_PROOF_REFOLDSTRUCTURALHUNKTILINGPROOF_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_PROOF_REFOLDSTRUCTURALHUNKTILINGPROOF_H
 
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldTilingWitnessTypes.h"
 
 namespace clang {
 namespace refold {

@@ -26,7 +26,7 @@
 #include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
 #include "macro/RefoldMacroOccurrenceProofValidator.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldMacroPatchTypes.h"
 
 #include "llvm/ADT/StringRef.h"
 

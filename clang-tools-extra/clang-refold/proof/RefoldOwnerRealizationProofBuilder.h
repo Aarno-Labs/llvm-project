@@ -44,10 +44,14 @@
 #include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
 #include "proof/RefoldAcceptedResultRanker.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldAnchorWitnessTypes.h"
+#include "proof/RefoldCandidateTypes.h"
+#include "proof/RefoldMacroPatchTypes.h"
 #include "proof/RefoldOwnerStateTypes.h"
 #include "proof/RefoldProofSummaryBuilder.h"
 #include "proof/RefoldProofVocabulary.h"
+#include "proof/RefoldTheoremTypes.h"
+#include "proof/RefoldTilingWitnessTypes.h"
 
 #include "llvm/ADT/StringRef.h"
 

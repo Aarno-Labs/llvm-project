@@ -17,7 +17,7 @@
 #include "core/RefoldOwnerClassifier.h"
 #include "edit/RefoldPatchTypes.h"
 #include "macro/RefoldMacroTopology.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldMacroPatchTypes.h"
 #include "proof/RefoldOwnerStateTypes.h"
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldToken.h"

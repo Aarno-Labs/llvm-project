@@ -38,8 +38,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "proof/RefoldAcceptedResultRanker.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldProofVocabulary.h"
+#include "proof/RefoldTheoremTypes.h"
 
 #include "llvm/ADT/ArrayRef.h"
 

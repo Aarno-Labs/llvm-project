@@ -18,7 +18,9 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDACCEPTEDRESULTPREDICATES_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDACCEPTEDRESULTPREDICATES_H
 
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldCandidateTypes.h"
+#include "proof/RefoldProofDischargeTypes.h"
+#include "proof/RefoldTheoremTypes.h"
 
 #include <utility>
 

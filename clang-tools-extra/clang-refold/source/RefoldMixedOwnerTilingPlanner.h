@@ -20,7 +20,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMIXEDOWNERTILINGPLANNER_H
 
 #include "clang/Basic/LangOptions.h"
-#include "proof/RefoldAcceptedResultTypes.h"
+#include "proof/RefoldTilingWitnessTypes.h"
 #include "source/DiffAlgorithms.h"
 
 #include "llvm/ADT/StringRef.h"
