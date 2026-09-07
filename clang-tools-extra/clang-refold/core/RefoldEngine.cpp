@@ -2184,15 +2184,19 @@ bool RefoldEngine::DispatchStructuralHunks(
         TheoremSelectionTieBreakerKind::
             ExactTUArgumentEditOverEquivalentMacroArgsOnly;
 
-    const bool latticePrefersTU =
+    // Everything above discharges the obligation the named tie-breaker needs
+    // and the proof order cannot see: these two candidates realize the same
+    // edit, differing only in whether the argument's original spelling is
+    // preserved.  Only a caller holding that proof may consult the named
+    // preference, so the composite is asked for here rather than folded into
+    // the order that every other selection site scans.
+    const bool prefersExactTUArgumentEdit =
         ProofLattice()
             .AcceptedResultRanker()
             .IsSelectableAcceptedResultCandidate(tuCandidate) &&
-        ProofLattice().AcceptedResultRanker().LatticePrefers(
-            tuCandidate.proofSummary, macroAccepted.proofSummary) &&
-        !ProofLattice().AcceptedResultRanker().LatticePrefers(
-            macroAccepted.proofSummary, tuCandidate.proofSummary);
-    if (!latticePrefersTU)
+        RefoldAcceptedResultRanker::ProvenEquivalentArtifactPrefers(
+            tuCandidate.proofSummary, macroAccepted.proofSummary);
+    if (!prefersExactTUArgumentEdit)
       return false;
 
     return true;

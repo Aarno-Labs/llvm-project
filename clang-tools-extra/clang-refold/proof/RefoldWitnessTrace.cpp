@@ -311,6 +311,19 @@ void RefoldWitnessTrace::TraceWitnessChosen(const RefoldWitness &witness,
                              witness.owner, witness.cost));
 }
 
+void RefoldWitnessTrace::TraceSelectionOrderViolation(
+    StringRef role, const SelectionOrderViolation &violation,
+    uint64_t selectableCount) const {
+  if (!ShouldEmitProofLog())
+    return;
+
+  logProofLine(llvm::formatv("REFOLD-SELECTION-ORDER role={0} selectable={1} "
+                             "law={2} first={3} second={4} third={5}\n",
+                             role, selectableCount, toString(violation.law),
+                             violation.first, violation.second,
+                             violation.third));
+}
+
 void RefoldWitnessTrace::TraceWitnessFallback(
     const TerminalFallbackRequest &request) const {
   if (!ShouldEmitProofLog())

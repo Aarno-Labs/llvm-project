@@ -1005,10 +1005,10 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
         // law rather than by an ad hoc direct-vs-DAG heuristic.
         if (directValid && dagValid) {
           const bool preferDirect =
-              planner_->GetProofLattice().AcceptedResultRanker().LatticePrefers(
+              planner_->GetProofLattice().AcceptedResultRanker().ProofDominates(
                   argsOnlyCandidate->proofSummary, dag->proofSummary);
           const bool preferDag =
-              planner_->GetProofLattice().AcceptedResultRanker().LatticePrefers(
+              planner_->GetProofLattice().AcceptedResultRanker().ProofDominates(
                   dag->proofSummary, argsOnlyCandidate->proofSummary);
           preferDirectRootCandidate = preferDirect || !preferDag;
         }

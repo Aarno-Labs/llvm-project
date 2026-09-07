@@ -77,6 +77,14 @@ public:
   void TraceWitnessChosen(const RefoldWitness &witness,
                           uint64_t selectedIndex) const;
 
+  /// Report a candidate triple that breaks one of the strict-order laws the
+  /// representative selector depends on.  The record names the offending
+  /// candidate indices so the defective comparison can be reproduced without
+  /// re-running an approximate ranking.
+  void TraceSelectionOrderViolation(llvm::StringRef role,
+                                    const SelectionOrderViolation &violation,
+                                    uint64_t selectableCount) const;
+
   void TraceWitnessFallback(const TerminalFallbackRequest &request) const;
 
 private:

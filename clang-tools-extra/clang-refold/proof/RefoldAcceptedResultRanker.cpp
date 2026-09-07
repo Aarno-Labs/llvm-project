@@ -16,7 +16,9 @@
 #include "proof/RefoldWitnessResolver.h"
 #include "proof/RefoldWitnessTrace.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
 #include <optional>
@@ -30,36 +32,56 @@ namespace refold {
 RefoldAcceptedResultRanker::RefoldAcceptedResultRanker(Dependencies deps)
     : deps_(std::move(deps)) {}
 
-bool RefoldAcceptedResultRanker::LatticePrefers(const ProofSummary &lhs,
-                                                const ProofSummary &rhs) const {
-  auto theoremTieBreakerPrefers =
-      [](const ProofSummary &candidate,
-         const ProofSummary &other) -> std::optional<bool> {
-    // Explicit named theorem tie-breakers are the only permitted way to express
-    // source-shape preferences that are not derivable from the generic summary
-    // ranks below.  They do not discharge proof obligations by themselves; they
-    // only order two already-normalized accepted summaries after the builder
-    // has proved the witness-specific preconditions for the named rule.
-    switch (candidate.selectionTieBreaker) {
-    case TheoremSelectionTieBreakerKind::
-        ExactTUArgumentEditOverEquivalentMacroArgsOnly:
-      return other.inventory.currentPath ==
-             AcceptedPathKind::MacroArgsOnlyStandard;
-    case TheoremSelectionTieBreakerKind::Unknown:
-      return std::nullopt;
-    }
+namespace {
+
+/// Return whether \p candidate names a theorem tie-breaker that applies
+/// against \p other.
+///
+/// This is one direction of a named preference, not an order: it reads a
+/// coordinate of \p other that no summary rank consults, so composing it with
+/// the ranks would make the combined relation depend on which pair happens to
+/// be compared first.  `NamedTheoremTieBreakerPrefers` calls it in both
+/// directions and keeps only a decision the two directions agree on.
+bool namedTieBreakerApplies(const ProofSummary &candidate,
+                            const ProofSummary &other) {
+  switch (candidate.selectionTieBreaker) {
+  case TheoremSelectionTieBreakerKind::
+      ExactTUArgumentEditOverEquivalentMacroArgsOnly:
+    // An exact TU byte edit inside the original argument spelling preserves
+    // callsite trivia that args-only macro reconstruction discards.  The
+    // caller owns the obligation that the two spellings realize the same
+    // edit; this predicate only recognizes the shape.
+    return other.inventory.currentPath ==
+           AcceptedPathKind::MacroArgsOnlyStandard;
+  case TheoremSelectionTieBreakerKind::Unknown:
+    return false;
+  }
+  return false;
+}
+
+} // namespace
+
+std::optional<bool> RefoldAcceptedResultRanker::NamedTheoremTieBreakerPrefers(
+    const ProofSummary &lhs, const ProofSummary &rhs) {
+  const bool lhsNames = namedTieBreakerApplies(lhs, rhs);
+  const bool rhsNames = namedTieBreakerApplies(rhs, lhs);
+  // Both sides naming a preference against the other orders nothing, and
+  // answering either way would break asymmetry.  Report that no named
+  // tie-breaker decided, so the caller falls back to the proof order.
+  if (lhsNames == rhsNames)
     return std::nullopt;
-  };
+  return lhsNames;
+}
 
-  if (std::optional<bool> lhsTie = theoremTieBreakerPrefers(lhs, rhs)) {
-    if (*lhsTie)
-      return true;
-  }
-  if (std::optional<bool> rhsTie = theoremTieBreakerPrefers(rhs, lhs)) {
-    if (*rhsTie)
-      return false;
-  }
+bool RefoldAcceptedResultRanker::ProvenEquivalentArtifactPrefers(
+    const ProofSummary &lhs, const ProofSummary &rhs) {
+  if (std::optional<bool> named = NamedTheoremTieBreakerPrefers(lhs, rhs))
+    return *named;
+  return ProofDominates(lhs, rhs) && !ProofDominates(rhs, lhs);
+}
 
+bool RefoldAcceptedResultRanker::ProofDominates(const ProofSummary &lhs,
+                                                const ProofSummary &rhs) {
   auto preferenceRank = [](SelectionPreference preference) -> uint8_t {
     // Lower rank means stronger selection preference. These are lattice-level
     // policy categories, not local heuristics.
@@ -121,12 +143,23 @@ bool RefoldAcceptedResultRanker::LatticePrefers(const ProofSummary &lhs,
 
   const bool lhsMixedOwner = hasMixedOwnerTilingProof(lhs);
   const bool rhsMixedOwner = hasMixedOwnerTilingProof(rhs);
-  if (lhsMixedOwner != rhsMixedOwner &&
-      lhs.inventory.currentPath == rhs.inventory.currentPath) {
+  if (lhsMixedOwner != rhsMixedOwner) {
     // A segment proven by a durable mixed-owner tiling is strictly stronger
-    // than the owner-specific realization/preservation summary for the same
-    // emitted artifact, but that ordering belongs here in the lattice rather
-    // than in the path-local witness attachment code.
+    // than the owner-specific realization/preservation summary it competes
+    // with, and that ordering belongs here rather than in the path-local
+    // witness attachment code.
+    //
+    // The rule used to apply only when the two summaries also agreed on
+    // `inventory.currentPath`, which stood in for "the same emitted
+    // artifact".  A comparison that switches on whether a third coordinate
+    // matches is not transitive: with the guard in place, a mixed-owner
+    // summary could beat a same-path competitor while losing to a
+    // different-path one by the theorem-class fallback below, and the winner
+    // of the resulting cycle depended on candidate push order.  The guard is
+    // gone because the ranks above already restrict this comparison to
+    // summaries in the same structural class, and a proof strength ordering
+    // must not depend on which enum value labeled the builder that produced
+    // the summary.
     return lhsMixedOwner;
   }
 
@@ -167,20 +200,25 @@ bool RefoldAcceptedResultRanker::IsSelectableAcceptedResultCandidate(
   return deps_.normalizeAcceptedProof(candidate).has_value();
 }
 
+ProofDominanceOrder
+RefoldAcceptedResultRanker::CompareAcceptedResultCandidateProofs(
+    const AcceptedResultCandidate &lhs, const AcceptedResultCandidate &rhs) {
+  if (ProofDominates(lhs.proofSummary, rhs.proofSummary))
+    return ProofDominanceOrder::LeftDominates;
+  if (ProofDominates(rhs.proofSummary, lhs.proofSummary))
+    return ProofDominanceOrder::RightDominates;
+  return ProofDominanceOrder::Incomparable;
+}
+
 bool RefoldAcceptedResultRanker::AcceptedResultCandidateProofPrefers(
-    const AcceptedResultCandidate &lhs,
-    const AcceptedResultCandidate &rhs) const {
-  if (LatticePrefers(lhs.proofSummary, rhs.proofSummary))
-    return true;
-  if (LatticePrefers(rhs.proofSummary, lhs.proofSummary))
-    return false;
-  return false;
+    const AcceptedResultCandidate &lhs, const AcceptedResultCandidate &rhs) {
+  return CompareAcceptedResultCandidateProofs(lhs, rhs) ==
+         ProofDominanceOrder::LeftDominates;
 }
 
 bool RefoldAcceptedResultRanker::AcceptedResultCandidateCanonicalPrefers(
-    const AcceptedResultCandidate &lhs,
-    const AcceptedResultCandidate &rhs) const {
-  // The lattice intentionally stays coarse. When two summaries tie, prefer the
+    const AcceptedResultCandidate &lhs, const AcceptedResultCandidate &rhs) {
+  // The proof order intentionally stays coarse. When two summaries tie, prefer
   // candidate that is more specific about the concrete artifact it will emit.
   // This is a named canonical preference step rather than a proof validity
   // test.  It is reached only after both candidates are selectable and neither
@@ -212,17 +250,91 @@ bool RefoldAcceptedResultRanker::AcceptedResultCandidateCanonicalPrefers(
 }
 
 bool RefoldAcceptedResultRanker::AcceptedResultCandidatePrefers(
-    const AcceptedResultCandidate &lhs,
-    const AcceptedResultCandidate &rhs) const {
-  if (AcceptedResultCandidateProofPrefers(lhs, rhs))
+    const AcceptedResultCandidate &lhs, const AcceptedResultCandidate &rhs) {
+  // Only incomparability reaches the canonical tie-break.  Asking the proof
+  // order once, and acting on all three of its answers, is what keeps a
+  // dominated candidate from being re-examined as if it had merely tied.
+  switch (CompareAcceptedResultCandidateProofs(lhs, rhs)) {
+  case ProofDominanceOrder::LeftDominates:
     return true;
-  if (AcceptedResultCandidateProofPrefers(rhs, lhs))
+  case ProofDominanceOrder::RightDominates:
     return false;
+  case ProofDominanceOrder::Incomparable:
+    break;
+  }
   return AcceptedResultCandidateCanonicalPrefers(lhs, rhs);
 }
 
+std::optional<SelectionOrderViolation>
+RefoldAcceptedResultRanker::FindSelectionOrderViolation(
+    ArrayRef<size_t> indices, function_ref<bool(size_t, size_t)> prefers) {
+  // Irreflexivity first: a candidate that outranks itself makes every later
+  // answer meaningless, so report it before any pair or triple.
+  for (size_t i = 0; i < indices.size(); ++i) {
+    if (prefers(indices[i], indices[i])) {
+      return SelectionOrderViolation{SelectionOrderLaw::Irreflexivity,
+                                     indices[i], indices[i], indices[i]};
+    }
+  }
+
+  for (size_t i = 0; i < indices.size(); ++i) {
+    for (size_t j = i + 1; j < indices.size(); ++j) {
+      if (prefers(indices[i], indices[j]) && prefers(indices[j], indices[i])) {
+        return SelectionOrderViolation{SelectionOrderLaw::Asymmetry, indices[i],
+                                       indices[j], indices[j]};
+      }
+    }
+  }
+
+  // Transitivity is the law a max scan actually consumes: it is what lets the
+  // scan discard a candidate permanently after one comparison.
+  for (size_t i = 0; i < indices.size(); ++i) {
+    for (size_t j = 0; j < indices.size(); ++j) {
+      if (i == j || !prefers(indices[i], indices[j]))
+        continue;
+      for (size_t k = 0; k < indices.size(); ++k) {
+        if (k == i || k == j || !prefers(indices[j], indices[k]))
+          continue;
+        if (!prefers(indices[i], indices[k])) {
+          return SelectionOrderViolation{SelectionOrderLaw::Transitivity,
+                                         indices[i], indices[j], indices[k]};
+        }
+      }
+    }
+  }
+
+  return std::nullopt;
+}
+
+bool RefoldAcceptedResultRanker::AuditSelectionOrder(
+    StringRef role, ArrayRef<size_t> selectableIndices,
+    function_ref<bool(size_t, size_t)> prefers) const {
+  // With fewer than two selectable candidates the max scan never invokes the
+  // relation, so no order defect can change the answer.
+  if (selectableIndices.size() < 2)
+    return false;
+  if (!deps_.witnessTrace.ShouldEmitProofLog())
+    return false;
+
+  ++deps_.lastTheoremAudit.selectorOrderAudits;
+  std::optional<SelectionOrderViolation> violation =
+      FindSelectionOrderViolation(selectableIndices, prefers);
+  if (!violation)
+    return false;
+
+  ++deps_.lastTheoremAudit.selectorOrderViolations;
+  deps_.witnessTrace.TraceSelectionOrderViolation(role, *violation,
+                                                  selectableIndices.size());
+  // A violation is a defect in the preference relation, not in any candidate.
+  // Strict mode refuses the competition rather than emitting a winner that a
+  // different candidate push order would not have produced.
+  return deps_.witnessTrace.GetWitnessResolverMode() ==
+         WitnessResolverMode::Strict;
+}
+
 std::optional<size_t> RefoldAcceptedResultRanker::SelectPreferredCandidateIndex(
-    size_t candidateCount, function_ref<bool(size_t)> isSelectable,
+    StringRef role, size_t candidateCount,
+    function_ref<bool(size_t)> isSelectable,
     function_ref<bool(size_t, size_t)> prefers) const {
   SmallVector<size_t, 8> selectableIndices;
 
@@ -239,6 +351,16 @@ std::optional<size_t> RefoldAcceptedResultRanker::SelectPreferredCandidateIndex(
   for (size_t i = 0; i < candidateCount; ++i)
     if (isSelectable(i))
       selectableIndices.push_back(i);
+
+  // The scan below keeps a single running best and never reconsiders a
+  // discarded candidate, so its winner is push-order independent only when the
+  // supplied relation is a strict order.  Check that precondition before
+  // relying on it; an unaudited competition is accounted the same way an
+  // unresolved one is.
+  if (AuditSelectionOrder(role, selectableIndices, prefers)) {
+    ++deps_.lastTheoremAudit.selectorUnresolvedCompetitions;
+    return std::nullopt;
+  }
 
   std::optional<size_t> bestIdx;
   for (size_t idx : selectableIndices) {
@@ -279,8 +401,7 @@ bool RefoldAcceptedResultRanker::IsSelectableMacroSelectionCandidate(
 }
 
 bool RefoldAcceptedResultRanker::MacroSelectionCandidatePrefers(
-    const MacroSelectionCandidate &lhs,
-    const MacroSelectionCandidate &rhs) const {
+    const MacroSelectionCandidate &lhs, const MacroSelectionCandidate &rhs) {
   return AcceptedResultCandidatePrefers(lhs.selectorCandidate,
                                         rhs.selectorCandidate);
 }
@@ -297,7 +418,8 @@ RefoldAcceptedResultRanker::SelectPreferredMacroSelectionCandidate(
   };
 
   std::optional<size_t> legacyBestIdx =
-      SelectPreferredCandidateIndex(candidates.size(), isSelectable, prefers);
+      SelectPreferredCandidateIndex(kSelectPreferredMacroSelectionRole,
+                                    candidates.size(), isSelectable, prefers);
 
   WitnessResolverDecision resolverDecision =
       deps_.witnessResolver.ResolveWitnessesForSelection(
@@ -360,7 +482,8 @@ RefoldAcceptedResultRanker::SelectPreferredAcceptedResultCandidate(
   };
 
   std::optional<size_t> legacyBestIdx =
-      SelectPreferredCandidateIndex(candidates.size(), isSelectable, prefers);
+      SelectPreferredCandidateIndex("SelectPreferredAcceptedResultCandidate",
+                                    candidates.size(), isSelectable, prefers);
 
   WitnessResolverDecision resolverDecision =
       deps_.witnessResolver.ResolveWitnessesForSelection(

@@ -268,12 +268,22 @@ inline StringRef toString(SurfaceDisposition value) {
 }
 #undef REFOLD_SURFACE_DISPOSITION_LIST
 
-/// \brief Named theorem-lattice tie-breakers for otherwise local choices.
+/// \brief Named theorem preferences for otherwise local choices.
 ///
-/// Accepted-result ordering stays out of path-specific code.  A
-/// builder may attach one of these names only when it has already proved the
-/// corresponding witness preconditions; the shared lattice selector then owns
-/// the actual preference decision.  Unknown means no special tie-breaker.
+/// Accepted-result ordering stays out of path-specific code.  A builder may
+/// attach one of these names only when it has already proved the
+/// corresponding witness preconditions, including that the two candidates
+/// realize the same edit; a named preference between candidates realizing
+/// different edits means nothing.
+///
+/// These are deliberately *not* part of the proof order.  A named preference
+/// is decided by reading a coordinate of the opposing summary that no summary
+/// rank consults, so composing it with the ranks yields a relation that is not
+/// transitive.  It is consumed pairwise, by the caller that discharged the
+/// equivalence obligation, through
+/// `RefoldAcceptedResultRanker::ProvenEquivalentArtifactPrefers`.
+///
+/// Unknown means no named preference applies.
 #define REFOLD_THEOREM_SELECTION_TIE_BREAKER_LIST(REFOLD_X)                    \
   REFOLD_X(Unknown)                                                            \
   REFOLD_X(ExactTUArgumentEditOverEquivalentMacroArgsOnly)

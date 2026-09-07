@@ -138,6 +138,11 @@ void RefoldTheoremAudit::EnforceTheoremAuditInvariants() const {
     NoteTheoremAuditViolation(
         "selector competition ended without a lattice-selected winner");
   }
+  if (audit_.selectorOrderViolations != 0) {
+    NoteTheoremAuditViolation(
+        "selector preference relation was not a strict order over its "
+        "selectable candidates");
+  }
   if (audit_.nonExplicitTerminalExclusions != 0) {
     NoteTheoremAuditViolation("terminal fallback was not classified as an "
                               "explicit out-of-domain theorem result");
@@ -1042,11 +1047,13 @@ void emitTheoremAuditSummary(const TheoremAuditStats &audit) {
                    audit.emittedUncomposedCompositeEdits);
   REFOLD_LOG_DEBUG("theorem/selector",
                    "selector resolution: competitions={0} resolved={1} "
-                   "noSelectable={2} unresolved={3} directBypass={4}",
+                   "noSelectable={2} unresolved={3} directBypass={4} "
+                   "orderAudits={5} orderViolations={6}",
                    audit.selectorCompetitions, audit.selectorResolutions,
                    audit.selectorNoSelectable,
                    audit.selectorUnresolvedCompetitions,
-                   audit.selectorDirectBypasses);
+                   audit.selectorDirectBypasses, audit.selectorOrderAudits,
+                   audit.selectorOrderViolations);
   REFOLD_LOG_DEBUG(
       "theorem/terminal",
       "terminal fallback audit: explicitExclusions={0} "

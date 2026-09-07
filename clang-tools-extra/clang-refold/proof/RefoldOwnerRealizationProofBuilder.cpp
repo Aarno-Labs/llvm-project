@@ -551,11 +551,11 @@ void RefoldOwnerRealizationProofBuilder::
     candidate.primaryProofClassExplicit = true;
     deps_.proofSummaryBuilder.FinalizeProofSummary(candidate);
 
-    if (deps_.acceptedResultRanker.LatticePrefers(summary, candidate))
+    if (deps_.acceptedResultRanker.ProofDominates(summary, candidate))
       continue;
 
     if (!selectedSummary ||
-        deps_.acceptedResultRanker.LatticePrefers(candidate, *selectedSummary))
+        deps_.acceptedResultRanker.ProofDominates(candidate, *selectedSummary))
       selectedSummary = std::move(candidate);
   }
 

@@ -1033,6 +1033,52 @@ struct WitnessResolverDecision {
   }
 };
 
+//===----------------------------------------------------------------------===//
+// Selection-order audit vocabulary.
+//
+// Representative selection is a single left-to-right max scan.  Such a scan
+// returns the same winner for every candidate push order only when the
+// relation it scans is a strict order, so the three laws below are
+// preconditions of selection rather than style properties of a comparator.
+//===----------------------------------------------------------------------===//
+
+/// \brief Order law that a selection preference relation must satisfy.
+#define REFOLD_SELECTION_ORDER_LAW_LIST(REFOLD_X)                              \
+  REFOLD_X(Irreflexivity)                                                      \
+  REFOLD_X(Asymmetry)                                                          \
+  REFOLD_X(Transitivity)
+
+enum class SelectionOrderLaw : uint8_t {
+#define REFOLD_X(name) name,
+  REFOLD_SELECTION_ORDER_LAW_LIST(REFOLD_X)
+#undef REFOLD_X
+};
+
+inline StringRef toString(SelectionOrderLaw value) {
+  switch (value) {
+#define REFOLD_X(name)                                                         \
+  case SelectionOrderLaw::name:                                                \
+    return #name;
+    REFOLD_SELECTION_ORDER_LAW_LIST(REFOLD_X)
+#undef REFOLD_X
+  }
+  return "Irreflexivity";
+}
+#undef REFOLD_SELECTION_ORDER_LAW_LIST
+
+/// \brief A concrete counterexample to one selection-order law.
+///
+/// The members are candidate indices in the caller's candidate vector, so a
+/// violation names the exact competitors that produced it instead of only
+/// reporting that the relation is defective.  `third` carries meaning only for
+/// `Transitivity`; the two-candidate laws leave it equal to `second`.
+struct SelectionOrderViolation {
+  SelectionOrderLaw law = SelectionOrderLaw::Irreflexivity;
+  size_t first = 0;
+  size_t second = 0;
+  size_t third = 0;
+};
+
 /// Per-run theorem/proof accounting counters.
 ///
 /// The engine and proof services update these counters while normalizing
@@ -1086,6 +1132,13 @@ struct TheoremAuditStats {
   uint64_t selectorNoSelectable = 0;
   uint64_t selectorUnresolvedCompetitions = 0;
   uint64_t selectorDirectBypasses = 0;
+
+  // Selection-order audit.  `selectorOrderAudits` counts the competitions
+  // whose preference relation was checked against the strict-order laws;
+  // `selectorOrderViolations` counts those that failed, which is a defect in
+  // the preference relation rather than in any candidate.
+  uint64_t selectorOrderAudits = 0;
+  uint64_t selectorOrderViolations = 0;
 
   // 4: no-legacy audit findings are theorem-audit data, not
   // ad hoc stderr-only diagnostics.  The aggregate count covers every

@@ -259,10 +259,10 @@ bool theoremLatticeStructureCandidateDominatesRealization(
     if (!lattice.AcceptedResultRanker().IsSelectableAcceptedResultCandidate(
             candidate.selectionCandidate.selectorCandidate))
       continue;
-    if (lattice.AcceptedResultRanker().LatticePrefers(
+    if (lattice.AcceptedResultRanker().ProofDominates(
             candidate.selectionCandidate.selectorCandidate.proofSummary,
             realizationCandidate.proofSummary) &&
-        !lattice.AcceptedResultRanker().LatticePrefers(
+        !lattice.AcceptedResultRanker().ProofDominates(
             realizationCandidate.proofSummary,
             candidate.selectionCandidate.selectorCandidate.proofSummary))
       return true;
@@ -532,11 +532,11 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
             // Defer to the proof lattice rather than letting the direct replay
             // win merely because it was produced in this local path.
             const bool preferDirect =
-                deps_.proofLattice.AcceptedResultRanker().LatticePrefers(
+                deps_.proofLattice.AcceptedResultRanker().ProofDominates(
                     argsOnlyCandidate->proofSummary,
                     existingPatch->proofSummary);
             const bool preferExisting =
-                deps_.proofLattice.AcceptedResultRanker().LatticePrefers(
+                deps_.proofLattice.AcceptedResultRanker().ProofDominates(
                     existingPatch->proofSummary,
                     argsOnlyCandidate->proofSummary);
             if (preferExisting && !preferDirect) {
