@@ -89,6 +89,7 @@
 #include "macro/RefoldMacroPatchPlanner.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroStateRepairPlanner.h"
+#include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "proof/RefoldNeutralityProof.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofLattice.h"
@@ -448,6 +449,7 @@ RefoldEngine::RefoldEngine(
   InitializeOwnerClassifier();
   InitializeMixedOwnerTilingPlanner();
   InitializeBInsertionLedger();
+  InitializeWholeCoverPlanBuilder();
   InitializeCounterStabilization();
   InitializeProofLattice();
   InitializeMacroPatchPlanner();

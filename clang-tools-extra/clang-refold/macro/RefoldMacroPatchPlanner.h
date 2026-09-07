@@ -58,6 +58,7 @@ class RefoldBInsertionLedger;
 class RefoldArgTextRecovery;
 class RefoldMacroStateProof;
 class RefoldMacroTopology;
+class RefoldMacroWholeCoverPlanBuilder;
 class RefoldOwnerClassifier;
 class RefoldOwnerStateProof;
 class RefoldPathIdentity;
@@ -109,6 +110,11 @@ public:
     const RefoldPathIdentity *pathIdentity = nullptr;
     const RefoldSourceMapper *sourceMapper = nullptr;
     const RefoldOwnerClassifier *ownerClassifier = nullptr;
+
+    /// Whole-cover plan computation.  It depends on neither the planner nor
+    /// the proof lattice, so the service graph constructs it before both and
+    /// the planner borrows it rather than owning the query.
+    const RefoldMacroWholeCoverPlanBuilder *wholeCoverPlanBuilder = nullptr;
     bool strict = false;
 
     /// Root invocations the caller has ruled out preserving, or null when no
@@ -219,15 +225,11 @@ public:
                                     llvm::StringRef baseInvocationText) const;
 
   /// Compute the claim-aware B-side replacement surface for whole-cover macro
-  /// realization at a callsite.
+  /// realization at a callsite.  Forwards to the borrowed
+  /// `RefoldMacroWholeCoverPlanBuilder`; kept on the planner because
+  /// RefoldEngine and RefoldMacroStateRepairPlanner reach it here.
   std::optional<WholeCoverPlan>
   ComputeWholeCoverPlan(const RefoldModel::MacroInvocation &m) const;
-
-  /// Check whether an existing whole-cover patch still matches the currently
-  /// computed whole-cover replacement plan for the same proof root.
-  bool WholeCoverPatchMatchesPlan(const MacroPatch &patch,
-                                  const WholeCoverPlan &plan,
-                                  uint64_t rootMacroId) const;
 
   /// Normalize a classified hunk owner into the stable owner certificate stored
   /// on macro patches.

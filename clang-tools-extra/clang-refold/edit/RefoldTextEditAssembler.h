@@ -50,6 +50,7 @@ namespace refold {
 
 class LineDirectiveInserter;
 class RefoldMacroStateProof;
+class RefoldMacroWholeCoverPlanBuilder;
 class RefoldOwnerStateProof;
 class RefoldPathIdentity;
 class RefoldPreprocessingStructureIndex;
@@ -100,14 +101,10 @@ public:
       ::clang::refold::TerminalFallbackProofFailure;
 
   /// Exceptional callback bundle for cycle-breaking orchestration queries.
-  /// Whole-cover planning currently lives behind the macro planner/lattice
-  /// cycle, and line-resync deferral is owned by RefoldLineObserverLayout,
-  /// which depends on this assembler for emitted layout edits.  Theorem/audit
-  /// policy is owned by RefoldTheoremAudit.
+  /// Line-resync deferral is owned by RefoldLineObserverLayout, which depends
+  /// on this assembler for emitted layout edits.  Theorem/audit policy is
+  /// owned by RefoldTheoremAudit.
   struct Hooks {
-    std::function<std::optional<WholeCoverPlan>(
-        const RefoldModel::MacroInvocation &)>
-        computeWholeCoverPlan;
     std::function<bool(llvm::StringRef, std::optional<uint64_t>, uint64_t)>
         lineResyncShouldDeferToConditionalJoin;
   };
@@ -125,6 +122,7 @@ public:
       const clang::LangOptions &lexLang,
       const RefoldPreprocessingStructureIndex &tuPreprocessingStructureIndex,
       const RefoldProofLattice &proofLattice,
+      const RefoldMacroWholeCoverPlanBuilder &wholeCoverPlanBuilder,
       const RefoldOwnerStateProof &ownerStateProof,
       const RefoldMacroTopology &macroTopology,
       const RefoldLineControlProof &lineControlProof,
@@ -141,9 +139,11 @@ public:
         pathIdentity_(pathIdentity), macroStateProof_(macroStateProof),
         lexLang_(lexLang),
         tuPreprocessingStructureIndex_(tuPreprocessingStructureIndex),
-        proofLattice_(proofLattice), ownerStateProof_(ownerStateProof),
-        macroTopology_(macroTopology), lineControlProof_(lineControlProof),
-        lineDirs_(lineDirs), terminalSink_(terminalSink), tuEdits_(tuEdits),
+        proofLattice_(proofLattice),
+        wholeCoverPlanBuilder_(wholeCoverPlanBuilder),
+        ownerStateProof_(ownerStateProof), macroTopology_(macroTopology),
+        lineControlProof_(lineControlProof), lineDirs_(lineDirs),
+        terminalSink_(terminalSink), tuEdits_(tuEdits),
         theoremAuditService_(theoremAuditService),
         sidebandPragmaEdits_(sidebandPragmaEdits),
         mixedOwnerTilingWitnesses_(mixedOwnerTilingWitnesses),
@@ -504,6 +504,10 @@ private:
   const clang::LangOptions &lexLang_;
   const RefoldPreprocessingStructureIndex &tuPreprocessingStructureIndex_;
   const RefoldProofLattice &proofLattice_;
+  /// Whole-cover plan computation.  Borrowed directly: the builder depends on
+  /// neither the proof lattice nor the macro patch planner, so it is
+  /// constructed before both and needs no late binding here.
+  const RefoldMacroWholeCoverPlanBuilder &wholeCoverPlanBuilder_;
   const RefoldOwnerStateProof &ownerStateProof_;
   const RefoldMacroTopology &macroTopology_;
   const RefoldLineControlProof &lineControlProof_;

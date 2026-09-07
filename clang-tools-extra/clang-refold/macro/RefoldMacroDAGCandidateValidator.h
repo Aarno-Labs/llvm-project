@@ -73,6 +73,7 @@ namespace refold {
 
 class RefoldArgTextRecovery;
 class RefoldMacroTopology;
+class RefoldMacroWholeCoverPlanBuilder;
 class RefoldProofLattice;
 class RefoldSourceMapper;
 
@@ -210,11 +211,10 @@ public:
         const RefoldModel::MacroInvocation &, llvm::StringRef)>
         getMacroInvocationFormalArgContentRanges;
 
-    /// Delegates to
-    /// `RefoldMacroWholeCoverOrchestrator::ComputeWholeCoverPlan`.
-    std::function<std::optional<WholeCoverPlan>(
-        const RefoldModel::MacroInvocation &)>
-        computeWholeCoverPlan;
+    /// Whole-cover plan computation, used as target-PP proof for a DAG
+    /// subtree-root repair whose rewritten formal has no direct
+    /// PPArgSpan -> B-token envelope of its own.
+    const RefoldMacroWholeCoverPlanBuilder &wholeCoverPlanBuilder;
   };
 
   explicit RefoldMacroDAGCandidateValidator(Dependencies deps);

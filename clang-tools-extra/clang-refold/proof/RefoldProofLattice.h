@@ -3,7 +3,7 @@
 // Composition boundary for clang-refold's accepted-result proof stack.
 //
 // `RefoldProofLattice` is primarily a composition boundary: it owns the
-// shared construction context (`Hooks`, borrowed model/mapper/topology
+// shared construction context (borrowed model/mapper/topology/whole-cover
 // inputs, mixed-owner tiling storage) and holds the sub-services callers
 // reach through named accessors:
 //
@@ -92,6 +92,7 @@ namespace clang {
 namespace refold {
 
 class RefoldArgTextRecovery;
+class RefoldMacroWholeCoverPlanBuilder;
 class RefoldOwnerStateProof;
 class RefoldTUEditPlanner;
 class RefoldTheoremAudit;
@@ -103,17 +104,6 @@ class RefoldTheoremAudit;
 /// normalizes their evidence into theorem-facing proof records.
 class RefoldProofLattice {
 public:
-  /// Exceptional callback set for proof-lattice operations that still break a
-  /// construction cycle.  Whole-cover planning is owned by the macro patch
-  /// planner, which itself depends on the lattice for proof classification, so
-  /// this remains a late-bound query until that arbitration surface is split.
-  /// Theorem/audit policy is owned by RefoldTheoremAudit.
-  struct Hooks {
-    std::function<std::optional<WholeCoverPlan>(
-        const RefoldModel::MacroInvocation &)>
-        computeWholeCoverPlan;
-  };
-
   /// Read-only access to the witness-trace subsystem for proof diagnostics
   /// such as `TraceWitnessFallback(...)`.
   const RefoldWitnessTrace &WitnessTrace() const { return witnessTrace_; }
@@ -193,7 +183,7 @@ public:
       std::vector<MixedOwnerTilingSegmentBinding>
           &mixedOwnerTilingSegmentBindings,
       std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses,
-      Hooks hooks);
+      const RefoldMacroWholeCoverPlanBuilder &wholeCoverPlanBuilder);
 
   /// Build the canonical proof carrier for a macro patch.
   ///
@@ -294,7 +284,10 @@ public:
   BuildWholeCoverReplacementText(const RefoldModel::MacroInvocation &m) const;
 
 private:
-  Hooks hooks_;
+  /// Whole-cover plan computation.  Borrowed directly rather than late-bound:
+  /// the builder depends on neither the lattice nor the macro patch planner,
+  /// so the service graph constructs it first.
+  const RefoldMacroWholeCoverPlanBuilder &wholeCoverPlanBuilder_;
   const RefoldModel &model_;
   /// Retained so an owner-unresolved diagnostic can ask whether a producer
   /// invocation covers the hunk instead of asserting the search was exhausted.

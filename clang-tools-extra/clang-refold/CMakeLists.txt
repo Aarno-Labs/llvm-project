@@ -75,6 +75,7 @@ add_clang_library(clangRefold STATIC
   macro/RefoldMacroGeneratedCalleeReplayEngine.cpp
   macro/RefoldMacroTupleHelpers.cpp
   macro/RefoldMacroWholeCoverOrchestrator.cpp
+  macro/RefoldMacroWholeCoverPlanBuilder.cpp
   macro/RefoldMacroStateRepairPlanner.cpp
   core/RefoldOwnerClassifier.cpp
   edit/RefoldTUEditPlanner.cpp

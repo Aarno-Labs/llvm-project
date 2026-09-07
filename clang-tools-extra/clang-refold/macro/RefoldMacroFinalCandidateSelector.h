@@ -45,6 +45,7 @@ class RefoldMacroPatchProofCertifier;
 class RefoldMacroPatchReusePhase;
 class RefoldMacroReplayStabilityValidator;
 class RefoldMacroTopology;
+class RefoldMacroWholeCoverPlanBuilder;
 class RefoldProofLattice;
 
 /// Final whole-cover-family candidate selector.
@@ -68,17 +69,9 @@ public:
     /// none are.  Borrowed from the planner's dependency bundle.
     const llvm::DenseSet<uint64_t> *ownersMustExpand = nullptr;
 
-    /// Compute the whole-cover replacement plan for an invocation.
-    /// Wraps `RefoldMacroWholeCoverOrchestrator::ComputeWholeCoverPlan`.
-    std::function<std::optional<WholeCoverPlan>(
-        const RefoldModel::MacroInvocation &)>
-        computeWholeCoverPlan;
-
-    /// Confirm that an existing whole-cover patch still matches the
-    /// currently computed plan for the same proof root.  Wraps
-    /// `RefoldMacroWholeCoverOrchestrator::WholeCoverPatchMatchesPlan`.
-    std::function<bool(const MacroPatch &, const WholeCoverPlan &, uint64_t)>
-        wholeCoverPatchMatchesPlan;
+    /// Whole-cover plan computation, and the plan/patch consistency check
+    /// that gates reuse of an existing whole-cover patch for the same root.
+    const RefoldMacroWholeCoverPlanBuilder &wholeCoverPlanBuilder;
 
     /// Delegates to `RefoldMacroPatchPlanner::MacroPatchOwnerMatches`.
     std::function<bool(const MacroPatch &, const Owner &)>

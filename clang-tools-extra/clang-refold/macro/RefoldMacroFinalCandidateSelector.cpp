@@ -15,6 +15,7 @@
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplayStabilityValidator.h"
 #include "macro/RefoldMacroTopology.h"
+#include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
 #include "proof/RefoldAcceptedResultRanker.h"
 #include "proof/RefoldProofLattice.h"
@@ -598,10 +599,11 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
         canReuseExistingExpanded = true;
       } else if (existingExpandedPatch->proof.kind ==
                  MacroPatchProofKind::WholeCoverRealization) {
-        wholeCoverPlan = deps_.computeWholeCoverPlan(m);
+        wholeCoverPlan = deps_.wholeCoverPlanBuilder.ComputeWholeCoverPlan(m);
         if (wholeCoverPlan)
-          canReuseExistingExpanded = deps_.wholeCoverPatchMatchesPlan(
-              *existingExpandedPatch, *wholeCoverPlan, m.id);
+          canReuseExistingExpanded =
+              RefoldMacroWholeCoverPlanBuilder::WholeCoverPatchMatchesPlan(
+                  *existingExpandedPatch, *wholeCoverPlan, m.id);
       }
     }
   }
@@ -609,7 +611,7 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
   // Ensure the whole-cover plan is available for later selector logic,
   // even when no existing expanded patch was eligible for reuse.
   if (!wholeCoverPlan)
-    wholeCoverPlan = deps_.computeWholeCoverPlan(m);
+    wholeCoverPlan = deps_.wholeCoverPlanBuilder.ComputeWholeCoverPlan(m);
 
   // Rebuild the root ancestry index used by the final DAG/subtree
   // stability gate.  The gate only borrows this local storage and does

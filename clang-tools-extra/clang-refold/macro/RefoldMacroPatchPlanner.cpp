@@ -20,6 +20,7 @@
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroTupleHelpers.h"
+#include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofLattice.h"
 #include "source/TokenTextHelpers.h"
@@ -1809,23 +1810,17 @@ void RefoldMacroPatchPlanner::CertifyMacroPatchOwnerWitness(
   }
 }
 
-// === Whole-cover orchestrator delegation seam ===
+// === Whole-cover delegation seam ===
 //
-// Whole-cover planning is implemented by RefoldMacroWholeCoverOrchestrator.
-// These adapter methods preserve the planner-facing API used by RefoldEngine,
-// RefoldServiceGraphBuilder, and RefoldMacroStateRepairPlanner while keeping
-// whole-cover policy inside the macro orchestration service.
+// Whole-cover *orchestration* is implemented by
+// RefoldMacroWholeCoverOrchestrator; whole-cover *plan computation* is
+// implemented by RefoldMacroWholeCoverPlanBuilder, which the service graph
+// constructs before the planner.  This adapter preserves the planner-facing
+// API used by RefoldEngine and RefoldMacroStateRepairPlanner.
 
 std::optional<WholeCoverPlan> RefoldMacroPatchPlanner::ComputeWholeCoverPlan(
     const RefoldModel::MacroInvocation &m) const {
-  return RefoldMacroWholeCoverOrchestrator(this).ComputeWholeCoverPlan(m);
-}
-
-bool RefoldMacroPatchPlanner::WholeCoverPatchMatchesPlan(
-    const MacroPatch &patch, const WholeCoverPlan &plan,
-    uint64_t rootMacroId) const {
-  return RefoldMacroWholeCoverOrchestrator(this).WholeCoverPatchMatchesPlan(
-      patch, plan, rootMacroId);
+  return deps_.wholeCoverPlanBuilder->ComputeWholeCoverPlan(m);
 }
 
 std::optional<MacroPatch>

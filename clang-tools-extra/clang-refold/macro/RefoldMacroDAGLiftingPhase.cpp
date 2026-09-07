@@ -81,7 +81,7 @@ RefoldMacroDAGLiftingPhase::RefoldMacroDAGLiftingPhase(Dependencies deps)
           subtreeCertifier_, deps_.sourceMapper, deps_.bToks,
           deps_.argTextRecovery, deps_.macroTopology, deps_.proofLattice,
           deps_.lexLang, deps_.getMacroInvocationFormalArgContentRanges,
-          deps_.computeWholeCoverPlan}) {}
+          deps_.wholeCoverPlanBuilder}) {}
 
 RefoldMacroPasteArgumentBuilder
 RefoldMacroDAGLiftingPhase::pasteArgumentBuilder() const {

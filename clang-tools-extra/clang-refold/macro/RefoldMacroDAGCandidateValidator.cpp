@@ -20,6 +20,7 @@
 #include "macro/RefoldMacroDAGSharedHelpers.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroTopology.h"
+#include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "proof/RefoldProofLattice.h"
 #include "source/RefoldSourceMapper.h"
 #include "util/StringUtils.h"
@@ -231,7 +232,7 @@ RefoldMacroDAGCandidateValidator::BuildRootPatchConstructionCertificate(
     patch.materialized.bTokStart = materializedBTokenRange->first;
     patch.materialized.bTokEnd = materializedBTokenRange->second;
   } else if (std::optional<WholeCoverPlan> plan =
-                 deps_.computeWholeCoverPlan(ctx.m)) {
+                 deps_.wholeCoverPlanBuilder.ComputeWholeCoverPlan(ctx.m)) {
     // A DAG subtree-root repair may rewrite a root actual whose
     // final B-side tokens are produced only by descendant generated
     // callee/stringify/paste expansions.  Such roots have no direct

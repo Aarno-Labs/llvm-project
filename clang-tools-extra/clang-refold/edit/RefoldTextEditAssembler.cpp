@@ -19,6 +19,7 @@
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlProof.h"
 #include "macro/RefoldMacroStateProof.h"
+#include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "proof/RefoldAcceptedResultPredicates.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofLattice.h"
@@ -2327,7 +2328,7 @@ RefoldTextEditAssembler::MacroPatchMaterializedBByteRange(
   if (!macro)
     return std::nullopt;
 
-  if (auto plan = hooks_.computeWholeCoverPlan(*macro))
+  if (auto plan = wholeCoverPlanBuilder_.ComputeWholeCoverPlan(*macro))
     return sourceMapper_.BTokenRangeToByteRange(plan->bTokStart, plan->bTokEnd);
 
   if (auto env =

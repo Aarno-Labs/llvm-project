@@ -3,12 +3,16 @@
 // Whole-cover macro patch orchestrator for clang-refold.
 //
 // Owns whole-cover macro construction orchestration:
-//   - ComputeWholeCoverPlan / WholeCoverPatchMatchesPlan: plan computation
-//     and plan/patch consistency checks for reuse admission.
 //   - TryCounterLiteralWholeCoverPatch: counter-state replay specialization.
 //   - BuildMacroInvocationPatchWholeCover: the entry point coordinating
 //     args-only replay, DAG-subtree lifting, existing-patch reuse, selector
 //     substitution, whole-cover realization, and final selection.
+//
+// Plan computation itself is not here: it is
+// `RefoldMacroWholeCoverPlanBuilder`, which depends on neither the planner
+// nor the proof lattice and is therefore constructible before both.  The
+// orchestrator forwards the engine-owned builder to the phase services that
+// need a plan.
 //
 // The orchestrator borrows a back-reference to RefoldMacroPatchPlanner so
 // it can access planner-owned sub-services and the public planner helpers
@@ -70,13 +74,6 @@ public:
   /// public accessor.
   explicit RefoldMacroWholeCoverOrchestrator(
       const RefoldMacroPatchPlanner *planner);
-
-  std::optional<WholeCoverPlan>
-  ComputeWholeCoverPlan(const RefoldModel::MacroInvocation &m) const;
-
-  bool WholeCoverPatchMatchesPlan(const MacroPatch &patch,
-                                  const WholeCoverPlan &plan,
-                                  uint64_t rootMacroId) const;
 
   std::optional<MacroPatch> TryCounterLiteralWholeCoverPatch(
       const RefoldModel::MacroInvocation &invocation,

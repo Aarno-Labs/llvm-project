@@ -64,6 +64,7 @@ struct RefoldMacroWholeCoverPlanningContext;
 class LineDirectiveInserter;
 class RefoldArgTextRecovery;
 class RefoldMacroTopology;
+class RefoldMacroWholeCoverPlanBuilder;
 class RefoldProofLattice;
 class RefoldSourceMapper;
 
@@ -104,12 +105,9 @@ public:
                        llvm::ArrayRef<diffutils::Hunk>)>
         macroArgReplacementMatchesAllOccurrencesInBIgnorePasteSemanticProof;
 
-    /// Delegates to `RefoldMacroWholeCoverOrchestrator::ComputeWholeCoverPlan`.
-    /// Used to compute the whole-cover plan for a candidate lifted
-    /// invocation during selector-replacement reasoning.
-    std::function<std::optional<WholeCoverPlan>(
-        const RefoldModel::MacroInvocation &)>
-        computeWholeCoverPlan;
+    /// Whole-cover plan computation, relayed unchanged to the candidate
+    /// validator this phase owns.  The lifting phase asks it nothing itself.
+    const RefoldMacroWholeCoverPlanBuilder &wholeCoverPlanBuilder;
   };
 
   explicit RefoldMacroDAGLiftingPhase(Dependencies deps);

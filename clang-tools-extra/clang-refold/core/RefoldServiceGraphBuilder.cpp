@@ -28,6 +28,7 @@
 #include "macro/RefoldMacroPatchPlanner.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroStateRepairPlanner.h"
+#include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofLattice.h"
 #include "proof/RefoldTheoremAudit.h"
@@ -94,6 +95,24 @@ void RefoldEngine::InitializeBInsertionLedger() {
 RefoldBInsertionLedger &RefoldEngine::BInsertionLedger() {
   assert(bInsertionLedger_ && "B insertion ledger service not initialized");
   return *bInsertionLedger_;
+}
+
+void RefoldEngine::InitializeWholeCoverPlanBuilder() {
+  // Whole-cover plan computation reads only the A->B source mapper and the
+  // B-insertion claim ledger.  It is deliberately constructed here, ahead of
+  // the proof lattice and the macro patch planner, because both of those --
+  // and the text-edit assembler -- consume plans.  Computing the plan inside
+  // the planner is what previously forced the lattice and the assembler to
+  // reach it through a late-bound std::function installed after construction.
+  wholeCoverPlanBuilder_ = std::make_unique<RefoldMacroWholeCoverPlanBuilder>(
+      RefoldMacroWholeCoverPlanBuilder::Dependencies{sourceMapper_,
+                                                     BInsertionLedger()});
+}
+
+const RefoldMacroWholeCoverPlanBuilder &
+RefoldEngine::WholeCoverPlanBuilder() const {
+  assert(wholeCoverPlanBuilder_ && "whole-cover plan builder not initialized");
+  return *wholeCoverPlanBuilder_;
 }
 
 const RefoldBInsertionLedger &RefoldEngine::BInsertionLedger() const {
@@ -358,24 +377,17 @@ const RefoldOwnerStateProof &RefoldEngine::OwnerStateProof() const {
 }
 
 void RefoldEngine::InitializeProofLattice() {
-  // The proof lattice receives only the inputs and callbacks it needs.  TU
-  // owner/anchor diagnostics use RefoldTUEditPlanner through constructor
-  // injection, which keeps TU planning out of the callback bundle and makes the
-  // late-bound planner/lattice dependency explicit.
-  RefoldProofLattice::Hooks hooks;
-  // Non-audit orchestration hook.
-  hooks.computeWholeCoverPlan =
-      [this](const RefoldModel::MacroInvocation &macro) {
-        return MacroPatchPlanner().ComputeWholeCoverPlan(macro);
-      };
-
+  // The proof lattice receives only the inputs it needs, all by constructor
+  // injection.  TU owner/anchor diagnostics use RefoldTUEditPlanner, and
+  // whole-cover replacement text uses RefoldMacroWholeCoverPlanBuilder; both
+  // are constructed before the lattice, so neither is late-bound.
   proofLattice_ = std::make_unique<RefoldProofLattice>(
       model_, bSource_, bToks_, sourceMapper_, tokenTextAnalysis_,
       argTextRecovery_, macroTopology_, OwnerStateProof(), terminalSink_,
       TUEditPlanner(), TheoremAudit(), lastTheoremAudit_, strict_,
       proofAuditMode_, alignmentSemanticTheoremActive_,
-      mixedOwnerTilingSegmentBindings_,
-      mixedOwnerTilingWitnesses_, std::move(hooks));
+      mixedOwnerTilingSegmentBindings_, mixedOwnerTilingWitnesses_,
+      WholeCoverPlanBuilder());
 
   // Close the audit/lattice construction cycle now that both services exist.
   TheoremAudit().BindProofLattice(*proofLattice_);
@@ -407,6 +419,7 @@ void RefoldEngine::InitializeMacroPatchPlanner() {
   deps.pathIdentity = &pathIdentity_;
   deps.sourceMapper = &sourceMapper_;
   deps.ownerClassifier = &OwnerClassifier();
+  deps.wholeCoverPlanBuilder = &WholeCoverPlanBuilder();
   deps.strict = strict_;
   deps.ownersMustExpand = &ownersMustExpand_;
 
@@ -467,12 +480,7 @@ RefoldEngine::MacroStateRepairPlanner() const {
 
 void RefoldEngine::InitializeTextEditAssembler() {
   RefoldTextEditAssembler::Hooks hooks;
-  // Non-audit orchestration hooks.
-  hooks.computeWholeCoverPlan =
-      [this](const RefoldModel::MacroInvocation &macro)
-      -> std::optional<WholeCoverPlan> {
-    return MacroPatchPlanner().ComputeWholeCoverPlan(macro);
-  };
+  // Non-audit orchestration hook.
   hooks.lineResyncShouldDeferToConditionalJoin =
       [this](StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
              uint64_t resumeOffset) {
@@ -483,9 +491,9 @@ void RefoldEngine::InitializeTextEditAssembler() {
   textEditAssembler_ = std::make_unique<RefoldTextEditAssembler>(
       model_, bSource_, aToks_, bToks_, bTokOff_, abTokHunks_, abTokMapA2B_,
       abTokMapB2A_, sourceMapper_, pathIdentity_, MacroStateProof(), lexLang_,
-      *preprocessingStructureIndex_, ProofLattice(), OwnerStateProof(),
-      macroTopology_, lineControlProof_, lineDirs_, terminalSink_,
-      TUEditPlanner(), TheoremAudit(), sidebandPragmaEdits_,
+      *preprocessingStructureIndex_, ProofLattice(), WholeCoverPlanBuilder(),
+      OwnerStateProof(), macroTopology_, lineControlProof_, lineDirs_,
+      terminalSink_, TUEditPlanner(), TheoremAudit(), sidebandPragmaEdits_,
       mixedOwnerTilingWitnesses_, lastTheoremAudit_, std::move(hooks));
 }
 

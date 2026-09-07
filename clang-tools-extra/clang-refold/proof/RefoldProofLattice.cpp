@@ -13,6 +13,7 @@
 #include "edit/RefoldTUAnchorProof.h"
 #include "edit/RefoldTUEditPlanner.h"
 #include "macro/RefoldArgTextRecovery.h"
+#include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "proof/RefoldAcceptedResultPredicates.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofVocabulary.h"
@@ -33,13 +34,12 @@ RefoldProofLattice::RefoldProofLattice(
     const RefoldTerminalProofSink &terminalSink,
     const RefoldTUEditPlanner &tuEdits, const RefoldTheoremAudit &theoremAudit,
     TheoremAuditStats &lastTheoremAudit, bool strict,
-    ProofAuditMode &proofAuditMode,
-    const bool &alignmentSemanticTheoremActive,
+    ProofAuditMode &proofAuditMode, const bool &alignmentSemanticTheoremActive,
     std::vector<MixedOwnerTilingSegmentBinding>
         &mixedOwnerTilingSegmentBindings,
     std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses,
-    Hooks hooks)
-    : hooks_(std::move(hooks)), model_(model),
+    const RefoldMacroWholeCoverPlanBuilder &wholeCoverPlanBuilder)
+    : wholeCoverPlanBuilder_(wholeCoverPlanBuilder), model_(model),
       macroTopology_(macroTopology), bSource_(bSource), bToks_(bToks),
       witnessTrace_(strict, proofAuditMode, alignmentSemanticTheoremActive),
       equivalenceKeyBuilder_(RefoldWitnessEquivalenceKeyBuilder::Dependencies{
@@ -536,7 +536,7 @@ std::optional<std::string> RefoldProofLattice::BuildWholeCoverReplacementText(
     const RefoldModel::MacroInvocation &m) const {
   // Reuse the same whole-cover planning path used by patch construction so the
   // returned replacement text obeys the same clipping/envelope policy.
-  auto plan = hooks_.computeWholeCoverPlan(m);
+  auto plan = wholeCoverPlanBuilder_.ComputeWholeCoverPlan(m);
   if (!plan)
     return std::nullopt;
   return plan->clippedText;

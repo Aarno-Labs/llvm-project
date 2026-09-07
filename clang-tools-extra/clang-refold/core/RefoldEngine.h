@@ -154,6 +154,7 @@ class RefoldPragmaOnceGuardRewriter;
 class RefoldLineObserverLayout;
 class RefoldMixedOwnerTilingPlanner;
 class RefoldMacroPatchPlanner;
+class RefoldMacroWholeCoverPlanBuilder;
 class RefoldMacroStateRepairPlanner;
 class RefoldMacroStateProof;
 class RefoldOwnerClassifier;
@@ -637,6 +638,14 @@ private:
   /// service instead of borrowing raw insertion state from RefoldEngine.
   std::unique_ptr<RefoldBInsertionLedger> bInsertionLedger_;
 
+  /// Whole-cover replacement plan computation for this refold run.
+  ///
+  /// Constructed after the B-insertion ledger and before every consumer: the
+  /// proof lattice, the macro patch planner, and the text-edit assembler all
+  /// borrow it directly.  Keeping plan computation out of the planner is what
+  /// lets those three stop reaching it through a late-bound callback.
+  std::unique_ptr<RefoldMacroWholeCoverPlanBuilder> wholeCoverPlanBuilder_;
+
   /// Translation-unit edit planning service.
   ///
   /// This owns TU insertion-anchor, TU byte-span, direct TU edit-plan, and
@@ -809,6 +818,10 @@ private:
   void InitializeBInsertionLedger();
   RefoldBInsertionLedger &BInsertionLedger();
   const RefoldBInsertionLedger &BInsertionLedger() const;
+
+  /// Allocate and access the whole-cover plan builder.
+  void InitializeWholeCoverPlanBuilder();
+  const RefoldMacroWholeCoverPlanBuilder &WholeCoverPlanBuilder() const;
 
   /// Allocate and access the TU-anchor proof builder.
   void InitializeTUAnchorProof();
