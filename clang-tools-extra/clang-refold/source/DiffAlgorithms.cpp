@@ -2618,7 +2618,9 @@ bool certifyLcsWindow(
     ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
     ArrayRef<LcsAGapProvenance> gapProvenance,
     unsigned long long maxBytes, LcsWindowCertificationResult &result,
-    LcsCertificationDiagnosticEvidence *diagnosticEvidence) {
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence,
+    std::shared_ptr<OptimalTokenAlignmentOracle::Storage>
+        *retainedOracleStorage) {
   canonicalizeDiagnosticIdentityRequests(diagnosticEvidence);
   result = LcsWindowCertificationResult{};
   result.window = LcsCertificationWindow{
@@ -2651,12 +2653,18 @@ bool certifyLcsWindow(
       copyOwnerDepthGaps(gapProvenance, absoluteABegin,
                          absoluteABegin + aWidth);
 
+  // Retention keeps a second owner-gap copy alive for the lifetime of the
+  // oracle, so it is charged the complete-oracle payload exactly as
+  // `retainCertifiedWindowOracle()` charges it. Proving that requirement
+  // affordable is the caller's obligation; charging it identically here is what
+  // keeps the two retention paths from drifting in byte accounting.
+  const size_t ownerDepthGapCopyCount = retainedOracleStorage ? 2 : 1;
   return certifyLcsWindowCore(
       a.slice(absoluteABegin, aWidth),
       b.slice(absoluteBBegin, bWidth), ownerDepthGap, aBegin, bBegin,
       /*globalATokenCount=*/a.size(), /*globalBTokenCount=*/b.size(), maxBytes,
-      /*ownerDepthGapCopyCount=*/1, result, diagnosticEvidence,
-      /*retainedOracleStorage=*/nullptr);
+      ownerDepthGapCopyCount, result, diagnosticEvidence,
+      retainedOracleStorage);
 }
 
 bool retainCertifiedWindowOracle(
@@ -3077,6 +3085,101 @@ static bool mergeLocalWindowCertification(
   return true;
 }
 
+/// Return whether a certified window's local forced map leaves a competing
+/// optimal map possible inside its own rectangle.
+///
+/// This is `RefoldAlignmentSemanticResolver::WindowCarriesAmbiguity()` stated
+/// against the window-local map, and it is exactly the question that decides
+/// whether semantic resolution will ever ask this window for pair facts. An A
+/// token the core theorem left unmatched is the only way two optimal maps can
+/// differ inside the rectangle, so a window that forced every one of them
+/// admits a single map and needs no oracle.
+static bool windowForcedMapCarriesAmbiguity(ArrayRef<int64_t> forcedMap) {
+  for (int64_t bToken : forcedMap)
+    if (bToken < 0)
+      return true;
+  return false;
+}
+
+/// Return whether this pass may keep one window's all-optimal oracle, and set
+/// the checked byte payload that keeping it is charged.
+///
+/// Two obligations. The rectangle must be affordable at the complete-oracle
+/// requirement, because asking `certifyLcsWindow()` to retain raises the
+/// payload it checks, and a window that would otherwise certify must never
+/// record `BudgetExceeded` because of a retention this routine chose. And the
+/// oracles already kept, plus this one, must still fit the same budget:
+/// certifying windows sequentially bounds peak quadratic storage by the largest
+/// window, so holding several alive at once is sound only while their total
+/// stays inside the budget the caller already applies to one.
+///
+/// The charge is the construction peak rather than the smaller retained
+/// payload, because that is the figure `getLcsCertificationRequiredBytes()`
+/// reports. Over-charging can only decline a retention, never admit one, so the
+/// budget stays an upper bound.
+static bool windowOracleRetentionIsAffordable(
+    const LcsCertificationWindow &window, unsigned long long maxBytes,
+    uint64_t retainedBytesSoFar, uint64_t &windowBytes) {
+  windowBytes = 0;
+  if (window.aEnd < window.aBegin || window.bEnd < window.bBegin)
+    return false;
+
+  uint64_t requiredBytes = 0;
+  if (!getLcsCertificationRequiredBytes(window.aEnd - window.aBegin,
+                                        window.bEnd - window.bBegin,
+                                        /*retainCompleteOracle=*/true,
+                                        requiredBytes) ||
+      requiredBytes > maxBytes)
+    return false;
+
+  uint64_t total = retainedBytesSoFar;
+  if (!addBytesChecked(requiredBytes, total) || total > maxBytes)
+    return false;
+  windowBytes = requiredBytes;
+  return true;
+}
+
+/// Publish the oracles one certification pass kept, dropping any the per-window
+/// query contract will not accept.
+///
+/// Installation is deliberately last. `GetSemanticOracleForWindow()` validates
+/// an oracle against the published window extents and the global map sizes, and
+/// those are final only once every window has merged. An oracle failing that
+/// contract is discarded rather than published, which leaves its window
+/// authorized for its core-forced anchors and nothing more -- the exact state it
+/// would have had if this pass had never retained anything.
+static void installRetainedWindowOracles(
+    std::vector<std::shared_ptr<OptimalTokenAlignmentOracle::Storage>>
+        &retainedOracles,
+    CertifiedLcsResult &result) {
+  if (retainedOracles.size() != result.certificationWindows.size())
+    return;
+
+  bool anyRetained = false;
+  for (const std::shared_ptr<OptimalTokenAlignmentOracle::Storage> &storage :
+       retainedOracles)
+    anyRetained = anyRetained || storage != nullptr;
+  if (!anyRetained)
+    return;
+
+  result.windowOracles.resize(result.certificationWindows.size());
+  for (size_t windowIndex = 0; windowIndex < retainedOracles.size();
+       ++windowIndex) {
+    if (!retainedOracles[windowIndex])
+      continue;
+    result.windowOracles[windowIndex] =
+        OptimalTokenAlignmentOracle(std::move(retainedOracles[windowIndex]));
+    if (result.GetSemanticOracleForWindow(windowIndex))
+      continue;
+    result.windowOracles[windowIndex] = OptimalTokenAlignmentOracle{};
+    REFOLD_LOG_TRACE(
+        "lcs/oracle",
+        "certification-pass window oracle dropped: window={0} did not satisfy "
+        "the per-window query contract",
+        windowIndex);
+  }
+}
+
 /// Certify one already-proved ordered window partition.
 ///
 /// Both the exhaustive diagnostic partitioner and the budget-driven production
@@ -3107,16 +3210,44 @@ static bool certifyPartitionWindows(
 
   LcsObjective composedObjective;
   int64_t lastPublishedB = -1;
-  for (const LcsCertificationWindow &partitionWindow : partitionWindows) {
+  // Oracles kept by this pass, indexed like `partitionWindows`. They are
+  // installed after the loop, once the published window vector is final.
+  std::vector<std::shared_ptr<OptimalTokenAlignmentOracle::Storage>>
+      retainedOracles(partitionWindows.size());
+  uint64_t retainedOracleBytes = 0;
+  for (size_t windowIndex = 0; windowIndex < partitionWindows.size();
+       ++windowIndex) {
+    const LcsCertificationWindow &partitionWindow =
+        partitionWindows[windowIndex];
+
+    // Keep this window's quadratic pair facts when they are affordable, rather
+    // than releasing them and certifying the identical rectangle again the
+    // first time semantic resolution asks for them. The facts are the same
+    // either way -- `retainCertifiedWindowOracle()` recertifies precisely in
+    // order to reproduce the forced anchors this pass publishes, and admits its
+    // result only on that agreement -- so keeping them here removes a duplicate
+    // dynamic program without adding any proof surface.
+    //
+    // Whether this window will be asked cannot be known until its forced map
+    // exists, so the request is speculative and the storage is dropped below
+    // once the window turns out to be determined. Speculating is cheap: the
+    // pair-fact payload is built either way, and retention only decides whether
+    // it lives in the oracle or in the certifier's own scratch buffer.
+    uint64_t windowOracleBytes = 0;
+    const bool retainWindowOracle = windowOracleRetentionIsAffordable(
+        partitionWindow, maxBytes, retainedOracleBytes, windowOracleBytes);
+
     // The local result is deliberately scoped to one iteration. Its quadratic
-    // tables, pair facts, and dominator state have already been destroyed when
+    // tables and dominator state have already been destroyed when
     // `certifyLcsWindow()` returns; its remaining linear maps are released at
     // the end of this iteration after publication.
     LcsWindowCertificationResult localResult;
+    std::shared_ptr<OptimalTokenAlignmentOracle::Storage> windowOracleStorage;
     (void)certifyLcsWindow(
         a, partitionWindow.aBegin, partitionWindow.aEnd, b,
         partitionWindow.bBegin, partitionWindow.bEnd, gapProvenance, maxBytes,
-        localResult, diagnosticEvidence);
+        localResult, diagnosticEvidence,
+        retainWindowOracle ? &windowOracleStorage : nullptr);
     LcsObjective nextComposedObjective;
     if (!localResult.objectiveIsExact ||
         !addObjectivesChecked(composedObjective, localResult.objective,
@@ -3126,6 +3257,16 @@ static bool certifyPartitionWindows(
       result = CertifiedLcsResult{};
       return false;
     }
+
+    // Keep the oracle only for a window resolution could act on. A window whose
+    // A tokens the core theorem forced admits exactly one optimal map, so its
+    // pair facts would never be read and holding them would raise peak storage
+    // to answer a question no caller can ask.
+    if (windowOracleStorage && localResult.window.IsCertified() &&
+        windowForcedMapCarriesAmbiguity(localResult.forcedMap) &&
+        addBytesChecked(windowOracleBytes, retainedOracleBytes))
+      retainedOracles[windowIndex] = std::move(windowOracleStorage);
+
     composedObjective = nextComposedObjective;
     result.allWindowsCertified &= localResult.window.IsCertified();
     result.certificationWindows.push_back(localResult.window);
@@ -3136,6 +3277,7 @@ static bool certifyPartitionWindows(
     result = CertifiedLcsResult{};
     return false;
   }
+  installRetainedWindowOracles(retainedOracles, result);
   return true;
 }
 
@@ -3381,8 +3523,10 @@ bool certifyLcsWindowsWithinBudget(
   // Preserve the historical complete-stream byte threshold when no exact
   // seam was proved. The complete compatibility theorem retains one extra
   // owner-gap copy for its oracle, and existing budget tests intentionally
-  // account for that payload. A genuinely partitioned result uses the smaller
-  // local-window accounting because no complete oracle is retained.
+  // account for that payload. A genuinely partitioned result is charged the
+  // same complete-oracle payload only for the windows it actually keeps an
+  // oracle for, and per window rather than for the whole stream; every other
+  // window still uses the smaller local-window accounting.
   if (plan.certifiedBoundaries.empty() && plan.windows.size() == 1) {
     if (!certifyFullStreamFromProvenance(a, b, gapProvenance, maxBytes,
                                          result, runEvidence))

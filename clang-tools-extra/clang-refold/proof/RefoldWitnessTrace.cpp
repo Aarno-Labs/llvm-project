@@ -57,7 +57,7 @@ template <typename FormatObject> void logProofLine(const FormatObject &line) {
   std::string text = line.str();
   while (!text.empty() && text.back() == '\n')
     text.pop_back();
-  REFOLD_LOG_INFO("proof", "{0}", text);
+  REFOLD_LOG_DEBUG("proof", "{0}", text);
 }
 
 } // namespace

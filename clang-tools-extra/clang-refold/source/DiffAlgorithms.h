@@ -631,11 +631,11 @@ private:
 /// map without another coordinate-conversion theorem.
 ///
 /// The core window certifier initializes `selectedMap` from `forcedMap`; it
-/// does not perform semantic restoration. Quadratic all-optimal state is
-/// deliberately not retained here, so it is released when
-/// `certifyLcsWindow()` returns. The complete-stream compatibility path may
-/// retain that state separately in its `OptimalTokenAlignmentOracle` to
-/// preserve existing behavior.
+/// does not perform semantic restoration. Quadratic all-optimal state is not
+/// retained in this result, so it is released when `certifyLcsWindow()`
+/// returns unless that caller asked for the oracle storage separately. The
+/// complete-stream compatibility path may retain that state in its
+/// `OptimalTokenAlignmentOracle` to preserve existing behavior.
 struct LcsWindowCertificationResult {
   LcsCertificationWindow window;
   LcsObjective objective;
@@ -873,14 +873,29 @@ struct LcsAGapProvenance {
 /// unrepresentable local state space produce `PartitionUnresolved`.
 ///
 /// Quadratic tables, pair facts, and dominator state are local to this call and
-/// are destroyed before it returns. This permits callers to certify windows
-/// sequentially with peak quadratic storage determined by the largest window.
+/// are destroyed before it returns unless `retainedOracleStorage` is supplied.
+/// This permits callers to certify windows sequentially with peak quadratic
+/// storage determined by the largest window.
+///
+/// A caller that will need this window's all-optimal pair facts may pass
+/// `retainedOracleStorage` to keep the ones this pass already built, instead of
+/// certifying the identical rectangle a second time through
+/// `retainCertifiedWindowOracle()`. Retention only decides where the pair-fact
+/// payload lives; it does not change the dynamic program, the forced anchors,
+/// the objective, or the published window. It does raise the checked payload by
+/// one owner-gap copy, so a caller must first confirm the rectangle affordable
+/// at the complete-oracle requirement -- `getLcsCertificationRequiredBytes()`
+/// with `retainCompleteOracle` true -- or a window that would have certified
+/// can record `BudgetExceeded` for a retention the caller chose. The storage is
+/// left null whenever the window does not certify.
 bool certifyLcsWindow(
     ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
     ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd,
     ArrayRef<LcsAGapProvenance> gapProvenance,
     unsigned long long maxBytes, LcsWindowCertificationResult &result,
-    LcsCertificationDiagnosticEvidence *diagnosticEvidence = nullptr);
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence = nullptr,
+    std::shared_ptr<OptimalTokenAlignmentOracle::Storage>
+        *retainedOracleStorage = nullptr);
 
 /// Retain the all-optimal oracle for one already-certified window on demand.
 ///
