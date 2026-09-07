@@ -187,7 +187,7 @@ classifyResolverFallbackReason(llvm::StringRef reason,
   if (reason == "incomplete-witness-key")
     return FallbackClass::IncompleteWitnessKey;
   if (reason == "single-equivalence-class" ||
-      reason == "single-source-repair-multiple-proof-classes")
+      reason == "joined-certificates-authorize-one-repair")
     return FallbackClass::Unknown;
 
   return FallbackClass::Unknown;

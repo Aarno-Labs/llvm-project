@@ -726,6 +726,60 @@ struct WitnessProducerKindSet {
   }
 };
 
+/// \brief Family-independent identity of the B-stream objective a candidate
+/// realizes: the half-open B-token envelope plus a hash of the B source over
+/// it.
+///
+/// This is the same fact `targetPPTokens` carries, minus the provenance.
+/// `targetPPTokens` prefixes its value with the proof family that authored it
+/// (`token_paste_b_tokens:`, `macro_actual_b_tokens:`, `candidate_b_tokens:`,
+/// ...), so two families certifying one objective spell it two ways and
+/// compare unequal.  That labelling is deliberate -- it keeps the partition
+/// able to tell certificates apart -- so this field records the unlabelled
+/// objective alongside it rather than replacing it.
+///
+/// It is deliberately **not** part of `PartitionString` and **not** part of
+/// `HasUnknownDimensions`.  Adding it to either would repartition every
+/// candidate in the tool, which is the provenance-free-key change that is
+/// still owed its own justification; this field exists so a *join* can ask
+/// whether two certificates are about one objective without that repartition.
+struct WitnessTargetEnvelope {
+  bool known = false;
+  /// Half-open B-token range, valid only when `known`.
+  uint64_t bTokBegin = 0;
+  uint64_t bTokEnd = 0;
+  /// Hash of the B source spanned by the range, valid only when `known`.
+  std::string contentHash;
+
+  static WitnessTargetEnvelope Known(uint64_t begin, uint64_t end,
+                                     llvm::StringRef hash) {
+    WitnessTargetEnvelope envelope;
+    envelope.known = true;
+    envelope.bTokBegin = begin;
+    envelope.bTokEnd = end;
+    envelope.contentHash = hash.str();
+    return envelope;
+  }
+
+  /// Two envelopes are equal only when both are known and describe the same
+  /// range and content.  An unknown envelope is equal to nothing, including
+  /// another unknown one: "not carried" is not evidence of agreement.
+  bool operator==(const WitnessTargetEnvelope &other) const {
+    return known && other.known && bTokBegin == other.bTokBegin &&
+           bTokEnd == other.bTokEnd && contentHash == other.contentHash;
+  }
+  bool operator!=(const WitnessTargetEnvelope &other) const {
+    return !(*this == other);
+  }
+
+  std::string ToString() const {
+    if (!known)
+      return "unknown";
+    return llvm::formatv("[{0},{1}):{2}", bTokBegin, bTokEnd, contentHash)
+        .str();
+  }
+};
+
 struct WitnessEquivalenceKey {
   WitnessEquivalenceDimension targetPPTokens =
       WitnessEquivalenceDimension::Unknown("target-pp-tokens-not-carried");
@@ -740,6 +794,11 @@ struct WitnessEquivalenceKey {
   WitnessBoundaryClass boundaryClass = WitnessBoundaryClass::Unknown;
   WitnessDiagnosticClass diagnosticClass = WitnessDiagnosticClass::Unknown;
   WitnessCompositionClass compositionClass = WitnessCompositionClass::Unknown;
+
+  /// The unlabelled B objective behind `targetPPTokens`.  Carried for the
+  /// certificate join only; see `WitnessTargetEnvelope` for why it is
+  /// excluded from the partition and from the completeness test below.
+  WitnessTargetEnvelope targetEnvelope;
 
   bool HasUnknownDimensions() const {
     return !targetPPTokens.known || !suffixState.known ||
@@ -943,6 +1002,64 @@ struct WitnessCompositionDecision {
   std::string reason;
 };
 
+/// \brief The composed certificate several proof certificates form when they
+/// jointly authorize one emitted repair.
+///
+/// The resolver reaches this when a selector carries more than one complete
+/// certificate for what is really one edit -- a macro invocation certified by
+/// both a stringification and a paste witness, an actual-repair certificate
+/// beside a zero-token-boundary one, and so on.  The certificates are not
+/// textually the same certificate, but that is a statement about provenance,
+/// not a disagreement (see `ClassifyWitnessComposition`).
+///
+/// What the join asserts is exactly what it checks, and no more:
+///
+///   * every certificate emits the same bytes over the same source range
+///     (`repair`) -- the premise W1 made concrete and W2 proved composes;
+///   * every certificate realizes the same B objective (`objective`);
+///   * every certificate agrees on the diagnostic and composition classes;
+///   * the composed producer obligation is the union of theirs.
+///
+/// What it deliberately does **not** join is the suffix-state, observer,
+/// counter and boundary dimensions.  Those disagree textually in every
+/// joined competition the suite produces, because each proof family
+/// describes them in its own vocabulary, and there is no common normal form
+/// to compare them in.  Asserting agreement there would be asserting
+/// something unchecked; the join stays silent about them, and they remain
+/// per-certificate provenance.
+struct WitnessJoinDecision {
+  bool computed = false;
+  /// True when the certificates below jointly authorize `repair`.
+  bool authorized = false;
+  /// How many certificates were joined.
+  uint64_t certificateCount = 0;
+  /// The repair every joined certificate emits.  Set only when `authorized`.
+  std::optional<EmittedRepairIdentity> repair;
+  /// The B objective every joined certificate realizes.
+  WitnessTargetEnvelope objective;
+  /// Union of the producer obligations the joined certificates discharge.
+  WitnessProducerKindSet producerKinds =
+      WitnessProducerKindSet::Unknown("no-joined-certificate");
+  /// The diagnostic and composition classes all joined certificates agree on.
+  WitnessDiagnosticClass diagnosticClass = WitnessDiagnosticClass::Unknown;
+  WitnessCompositionClass compositionClass = WitnessCompositionClass::Unknown;
+  /// Why the join succeeded or failed.
+  std::string reason;
+  /// Fallback class to charge when the join is refused.
+  WitnessFallbackClass failureClass = WitnessFallbackClass::Unknown;
+
+  std::string ToString() const {
+    return llvm::formatv("computed={0} authorized={1} certificates={2} "
+                         "objective={3} producers={4} diagnostics={5} "
+                         "composition={6} reason={7}",
+                         computed ? 1 : 0, authorized ? 1 : 0, certificateCount,
+                         objective.ToString(), producerKinds.ToString(),
+                         toString(diagnosticClass), toString(compositionClass),
+                         reason.empty() ? std::string("<none>") : reason)
+        .str();
+  }
+};
+
 /// \brief One machine-readable C1 closure-ledger row.
 ///
 /// A row is emitted only for decisions classified as
@@ -1011,6 +1128,9 @@ struct WitnessResolverDecision {
   uint64_t resolverAuthoritativeWitnessCount = 0;
   uint64_t resolverUnconvertedWitnessCount = 0;
   WitnessCompositionDecision composition;
+  /// Set when several complete certificates were joined into one for this
+  /// selection; `computed` is false on every other path.
+  WitnessJoinDecision join;
   std::optional<size_t> legacyIndex;
   std::optional<size_t> resolverIndex;
   bool resolverComputed = false;

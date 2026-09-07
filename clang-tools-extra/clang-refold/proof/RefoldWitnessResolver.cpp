@@ -557,6 +557,105 @@ RefoldWitnessResolver::ClassifyWitnessComposition(
   return decision;
 }
 
+::clang::refold::WitnessJoinDecision RefoldWitnessResolver::ClassifyWitnessJoin(
+    ArrayRef<std::pair<size_t, RefoldWitness>> selectableWitnesses) {
+  WitnessJoinDecision join;
+  join.computed = true;
+  join.certificateCount = selectableWitnesses.size();
+
+  if (selectableWitnesses.empty()) {
+    join.reason = "no-certificate-to-join";
+    join.failureClass = WitnessFallbackClass::NoSelectableWitness;
+    return join;
+  }
+
+  std::optional<EmittedRepairIdentity> repair;
+  WitnessTargetEnvelope objective;
+  WitnessProducerKindSet producers;
+  std::optional<WitnessDiagnosticClass> diagnosticClass;
+  std::optional<WitnessCompositionClass> compositionClass;
+
+  for (const std::pair<size_t, RefoldWitness> &entry : selectableWitnesses) {
+    const RefoldWitness &witness = entry.second;
+    const WitnessEquivalenceKey &key = witness.key;
+
+    // An incomplete key cannot contribute to a join: a dimension that is not
+    // carried is not a dimension that agrees.
+    if (key.HasUnknownDimensions()) {
+      join.reason = "join-incomplete-witness-key";
+      join.failureClass = WitnessFallbackClass::IncompleteWitnessKey;
+      return join;
+    }
+
+    // One edit.  A certificate whose builder did not record the bytes it
+    // emits denies the join its premise rather than weakening it.
+    if (!witness.emittedRepair) {
+      join.reason = "join-unknown-emitted-repair";
+      join.failureClass = WitnessFallbackClass::IncompleteWitnessKey;
+      return join;
+    }
+    if (!repair) {
+      repair = *witness.emittedRepair;
+    } else if (*repair != *witness.emittedRepair) {
+      join.reason = "join-distinct-emitted-repairs";
+      join.failureClass =
+          WitnessFallbackClass::MultipleNonEquivalentWitnessClasses;
+      return join;
+    }
+
+    // One B objective.  Identical bytes over an identical source range do not
+    // by themselves establish that two certificates realize the same part of
+    // the modified stream, and a join that skipped this would be asserting it.
+    if (!key.targetEnvelope.known) {
+      join.reason = "join-unknown-target-envelope";
+      join.failureClass = WitnessFallbackClass::UnknownTargetPreprocessedTokens;
+      return join;
+    }
+    if (!objective.known) {
+      objective = key.targetEnvelope;
+    } else if (objective != key.targetEnvelope) {
+      join.reason = "join-distinct-target-envelopes";
+      join.failureClass =
+          WitnessFallbackClass::MultipleNonEquivalentWitnessClasses;
+      return join;
+    }
+
+    // Agreement on what the edit leaves observable.  Unlike the suffix and
+    // observer dimensions, these two are family-independent enumerations, so
+    // disagreement here is disagreement rather than dialect.
+    if (!diagnosticClass) {
+      diagnosticClass = key.diagnosticClass;
+    } else if (*diagnosticClass != key.diagnosticClass) {
+      join.reason = "join-distinct-diagnostic-classes";
+      join.failureClass =
+          WitnessFallbackClass::MultipleNonEquivalentWitnessClasses;
+      return join;
+    }
+    if (!compositionClass) {
+      compositionClass = key.compositionClass;
+    } else if (*compositionClass != key.compositionClass) {
+      join.reason = "join-distinct-composition-classes";
+      join.failureClass =
+          WitnessFallbackClass::MultipleNonEquivalentWitnessClasses;
+      return join;
+    }
+
+    // The composed producer obligation is the union: each certificate
+    // discharges its own, and the joined certificate discharges all of them.
+    for (WitnessProducerKind kind : key.producerKinds.kinds)
+      producers.Add(kind);
+  }
+
+  join.authorized = true;
+  join.repair = repair;
+  join.objective = objective;
+  join.producerKinds = producers;
+  join.diagnosticClass = *diagnosticClass;
+  join.compositionClass = *compositionClass;
+  join.reason = "joined-certificates-authorize-one-repair";
+  return join;
+}
+
 ::clang::refold::WitnessCompositionDecision
 RefoldWitnessResolver::ResolveWitnessComposition(
     llvm::StringRef role,
@@ -770,32 +869,48 @@ RefoldWitnessResolver::ResolveWitnessesForSelection(
   } else if (decision.equivalenceClassCount != 1) {
     decision.resolverImplemented = true;
 
-    if (hasConcreteRepairIdentity && singleConcreteRepairIdentity) {
-      // Multiple complete proof keys can certify the same emitted source edit.
-      // That is proof-certificate ambiguity, not source-repair ambiguity. Keep
-      // the semantic classes distinct for tracing, but allow strict mode to use
-      // the caller-supplied compatibility index for the concrete repair until
-      // proof normalization can compose proof certificates directly.
+    // Multiple complete proof keys can certify the same emitted source edit.
+    // That is proof-certificate ambiguity, not source-repair ambiguity: the
+    // classes differ because each proof family authors its own spellings for
+    // the same facts, not because the certificates disagree.  Compose them
+    // into one certificate and let selection proceed from that.
+    //
+    // The classes stay distinct in `equivalenceClassCount` and in the trace.
+    // Collapsing them would require the partition key to be provenance-free,
+    // which it is not; the join answers "are these certificates about one
+    // edit?" without needing it to be.
+    decision.join = ClassifyWitnessJoin(selectableWitnesses);
+
+    if (decision.join.authorized) {
       decision.strictUseResolver = true;
-      decision.failureReason = "single-source-repair-multiple-proof-classes";
+      decision.failureReason = decision.join.reason;
       decision.fallbackClass = WitnessFallbackClass::Unknown;
-      if (legacyIndex) {
-        decision.resolverIndex = legacyIndex;
-      } else {
-        for (size_t idx : selectableIndices) {
-          if (!decision.resolverIndex ||
-              canonicalPrefers(idx, *decision.resolverIndex))
-            decision.resolverIndex = idx;
-        }
+
+      // The representative is the canonical maximum over the resolver's own
+      // selectable set, and deliberately not `legacyIndex`.  Deferring to the
+      // caller's index made the resolver's answer a restatement of the answer
+      // it was auditing, and the two sets are not even always the same: the
+      // caller ranks every selectable candidate, while this set has had any
+      // dominated whole-cover realization removed, so the caller's index could
+      // name a candidate the resolver had just rejected.
+      for (size_t idx : selectableIndices) {
+        if (!decision.resolverIndex ||
+            canonicalPrefers(idx, *decision.resolverIndex))
+          decision.resolverIndex = idx;
       }
     } else {
-      // All selectable candidates have complete keys, and they describe
-      // different concrete source repairs.  This is the real fail-closed case
-      // for converted selector families.
+      // The certificates describe different edits, different objectives, or
+      // disagree about what the edit leaves observable.  This is the real
+      // fail-closed case for converted selector families.
       decision.strictFailClosed = true;
-      decision.failureReason = "multiple-non-equivalent-classes";
+      decision.failureReason =
+          decision.join.reason.empty()
+              ? std::string("multiple-non-equivalent-classes")
+              : decision.join.reason;
       decision.fallbackClass =
-          WitnessFallbackClass::MultipleNonEquivalentWitnessClasses;
+          decision.join.failureClass == WitnessFallbackClass::Unknown
+              ? WitnessFallbackClass::MultipleNonEquivalentWitnessClasses
+              : decision.join.failureClass;
     }
   } else {
     decision.resolverImplemented = true;

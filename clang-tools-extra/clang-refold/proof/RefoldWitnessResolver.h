@@ -165,6 +165,38 @@ public:
       llvm::ArrayRef<std::pair<size_t, RefoldWitness>> selectableWitnesses,
       bool hasSingleConcreteRepairIdentity);
 
+  /// Decide whether several complete proof certificates jointly authorize one
+  /// emitted repair, and compose them into one certificate when they do.
+  ///
+  /// Like `ClassifyWitnessComposition`, this is a pure function of the tuples:
+  /// no instance state, no trace handle, no role, and no access to the
+  /// caller's own answer.  That last point is the item's purpose.  The site
+  /// this replaces took the caller-supplied index whenever one existed, so the
+  /// resolver's answer was the caller's answer re-labelled as a proof --
+  /// including, had the dominance filter removed a candidate, a candidate the
+  /// resolver had just rejected.  Selection is now derived from the joined
+  /// certificate and the canonical preference alone.
+  ///
+  /// The obligations, all of which must hold:
+  ///
+  ///   * every tuple's key is complete;
+  ///   * every tuple carries a known `EmittedRepairIdentity`, and they are
+  ///     equal -- one edit, not several (W1 made this concrete, W2 proved it
+  ///     composes);
+  ///   * every tuple carries a known target envelope, and they are equal --
+  ///     one B objective.  Identical bytes over an identical range is not by
+  ///     itself evidence that two certificates are about the same thing;
+  ///   * every tuple agrees on `diagnosticClass` and `compositionClass`.
+  ///
+  /// The composed producer obligation is the union of the tuples'.  The
+  /// suffix, observer, counter and boundary dimensions are **not** joined:
+  /// each family spells them in its own vocabulary, there is no common normal
+  /// form, and the join says nothing about what it cannot check.
+  ///
+  /// Any unmet obligation fails closed, with `failureClass` naming which.
+  static ::clang::refold::WitnessJoinDecision ClassifyWitnessJoin(
+      llvm::ArrayRef<std::pair<size_t, RefoldWitness>> selectableWitnesses);
+
   /// Resolve witnesses for one selector role.  Builds equivalence-key
   /// partitions, runs composition resolution, records the strict-domain
   /// decision, populates the closure ledger when the result is potentially in

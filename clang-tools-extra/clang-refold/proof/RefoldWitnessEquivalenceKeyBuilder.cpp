@@ -954,15 +954,24 @@ WitnessEquivalenceDimension knownHash(llvm::StringRef label,
           .str());
 }
 
-/// Wrap a labelled B-byte range and its payload hash as a Known dimension.
-WitnessEquivalenceDimension knownRangeHash(const RefoldSourceMapper &mapper,
-                                           llvm::StringRef label,
-                                           uint64_t begin, uint64_t end) {
-  return WitnessEquivalenceDimension::Known(
-      llvm::formatv("{0}:[{1},{2}):{3}", label, begin, end,
-                    RefoldWitnessTrace::FormatWitnessTraceHash(
-                        mapper.SliceBSource(begin, end)))
-          .str());
+/// Record a B-token envelope as the target dimension, in both spellings the
+/// resolver needs.
+///
+/// `targetPPTokens` keeps the family label, so the partition can still tell a
+/// paste certificate from an actual-repair one covering the same tokens.
+/// `targetEnvelope` drops it, so a join can ask whether the two certificates
+/// are about one B objective -- a question the labelled value cannot answer,
+/// because the label differs whenever the families do.  Both are derived here
+/// from one range and one hash so they cannot drift apart.
+void setTargetFromBTokenRange(WitnessEquivalenceKey &key,
+                              const RefoldSourceMapper &mapper,
+                              llvm::StringRef label, uint64_t begin,
+                              uint64_t end) {
+  const std::string hash = RefoldWitnessTrace::FormatWitnessTraceHash(
+      mapper.SliceBSource(begin, end));
+  key.targetPPTokens = WitnessEquivalenceDimension::Known(
+      llvm::formatv("{0}:[{1},{2}):{3}", label, begin, end, hash).str());
+  key.targetEnvelope = WitnessTargetEnvelope::Known(begin, end, hash);
 }
 
 /// Decide the target-preprocessed-token dimension.
@@ -1003,9 +1012,9 @@ void computeTargetPPTokensDimension(
                                         : (candidate.hasMacroActualRepairWitness
                                                ? "macro_actual_b_tokens"
                                                : "candidate_b_tokens")))));
-    key.targetPPTokens =
-        knownRangeHash(deps.sourceMapper, label, candidate.targetBTokStart,
-                       candidate.targetBTokEnd);
+    setTargetFromBTokenRange(key, deps.sourceMapper, label,
+                             candidate.targetBTokStart,
+                             candidate.targetBTokEnd);
   } else if (candidate.hasZeroTokenBoundaryWitness &&
              candidate.zeroTokenBoundaryWitness.hasBTokenRange &&
              candidate.zeroTokenBoundaryWitness.bTokStart <=
@@ -1015,31 +1024,28 @@ void computeTargetPPTokensDimension(
     // gap/envelope from the modified preprocessed stream.  Promote that
     // producer-recorded envelope into the target-PP equivalence dimension
     // instead of treating the absence of replacement text as unknown output.
-    key.targetPPTokens =
-        knownRangeHash(deps.sourceMapper, "zero_token_b_tokens",
-                       candidate.zeroTokenBoundaryWitness.bTokStart,
-                       candidate.zeroTokenBoundaryWitness.bTokEnd);
+    setTargetFromBTokenRange(key, deps.sourceMapper, "zero_token_b_tokens",
+                             candidate.zeroTokenBoundaryWitness.bTokStart,
+                             candidate.zeroTokenBoundaryWitness.bTokEnd);
   } else if (summary.hasOwnerRealizationWitness &&
              summary.ownerRealizationWitness.closure.IsComplete()) {
     const OwnerTokenRange bTokens =
         summary.ownerRealizationWitness.closure.bTokens;
-    key.targetPPTokens = knownRangeHash(deps.sourceMapper, "b_tokens",
-                                        bTokens.begin, bTokens.end);
+    setTargetFromBTokenRange(key, deps.sourceMapper, "b_tokens", bTokens.begin,
+                             bTokens.end);
   } else if (summary.hasMixedOwnerTilingWitness) {
     const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
     if (tiling.originalBStart <= tiling.originalBEnd)
-      key.targetPPTokens =
-          knownRangeHash(deps.sourceMapper, "mixed_owner_b_tokens",
-                         tiling.originalBStart, tiling.originalBEnd);
+      setTargetFromBTokenRange(key, deps.sourceMapper, "mixed_owner_b_tokens",
+                               tiling.originalBStart, tiling.originalBEnd);
   } else if (summary.hasIncludeAnchorWitness &&
              summary.includeAnchorWitness.hasFirstPP &&
              summary.includeAnchorWitness.hasLastPP &&
              summary.includeAnchorWitness.firstPP <=
                  summary.includeAnchorWitness.lastPP) {
-    key.targetPPTokens =
-        knownRangeHash(deps.sourceMapper, "include_anchor_b_tokens",
-                       summary.includeAnchorWitness.firstPP,
-                       summary.includeAnchorWitness.lastPP + 1);
+    setTargetFromBTokenRange(key, deps.sourceMapper, "include_anchor_b_tokens",
+                             summary.includeAnchorWitness.firstPP,
+                             summary.includeAnchorWitness.lastPP + 1);
   } else if (summary.hasTUAnchorWitness && summary.tuAnchorWitness.hasPPGap) {
     key.targetPPTokens = WitnessEquivalenceDimension::Known(
         llvm::formatv("empty_b_gap:{0}", summary.tuAnchorWitness.ppGap).str());
