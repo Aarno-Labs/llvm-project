@@ -823,22 +823,47 @@ struct WitnessEquivalenceKey {
   }
 };
 
+/// \brief The concrete source repair an accepted candidate will emit.
+///
+/// Two candidates carry the same repair exactly when they replace the same
+/// source range with the same bytes.  This is the question "are these two
+/// proof certificates about one edit or two?", and it is answered by the code
+/// that produced the bytes rather than reconstructed downstream from a
+/// diagnostic rendering of them.
+struct EmittedRepairIdentity {
+  /// Half-open source byte range the repair replaces.
+  uint64_t begin = 0;
+  uint64_t end = 0;
+
+  /// The replacement bytes exactly as they will be emitted.  Not clipped,
+  /// escaped, or normalized: any of those can map two different repairs onto
+  /// one spelling, and this value's whole purpose is to tell them apart.
+  std::string text;
+
+  bool operator==(const EmittedRepairIdentity &other) const {
+    return begin == other.begin && end == other.end && text == other.text;
+  }
+  bool operator!=(const EmittedRepairIdentity &other) const {
+    return !(*this == other);
+  }
+};
+
+/// Canonical cost used to order otherwise-equivalent witnesses in traces.
+///
+/// Trace-only.  Nothing here participates in admissibility: a candidate's
+/// repair identity lives in `EmittedRepairIdentity`, and its proof identity
+/// in `WitnessEquivalenceKey`.
 struct WitnessCanonicalCost {
   uint64_t preserveOriginalPenalty = 0;
   uint64_t sourceRangeBytes = 0;
-  uint64_t argumentBoundaryChangePenalty = 0;
   uint64_t ownerBoundaryChangePenalty = 0;
-  uint64_t spellingChangePenalty = 0;
   uint64_t sourceOrder = 0;
 
   std::string ToString() const {
     return llvm::formatv("preserve_penalty={0} range_bytes={1} "
-                         "arg_boundary_penalty={2} owner_boundary_penalty={3} "
-                         "spelling_penalty={4} source_order={5}",
+                         "owner_boundary_penalty={2} source_order={3}",
                          preserveOriginalPenalty, sourceRangeBytes,
-                         argumentBoundaryChangePenalty,
-                         ownerBoundaryChangePenalty, spellingChangePenalty,
-                         sourceOrder)
+                         ownerBoundaryChangePenalty, sourceOrder)
         .str();
   }
 };
@@ -869,7 +894,12 @@ struct RefoldWitness {
   AcceptedPathKind sourcePathKind{};
   WitnessEquivalenceKey key;
   WitnessCanonicalCost cost;
+  /// Clipped, escaped rendering of the emitted surface, for traces only.
   std::string payloadPreview;
+  /// The concrete source repair this witness's candidate will emit, when its
+  /// builder knew the bytes.  Disengaged means the repair is unidentified,
+  /// which the resolver treats as "not known to be the same repair".
+  std::optional<EmittedRepairIdentity> emittedRepair;
 
   std::string ToString() const {
     return llvm::formatv("id={0} family={1} owner={2} detail={3}", witnessId,

@@ -1993,10 +1993,40 @@ struct AcceptedResultCandidate {
   bool hasAnchorByte = false;
   uint64_t anchorByte = 0;
 
-  // Human-readable preview of the selected surface. This is tracing-only and
-  // never participates in admissibility or ordering.
+  /// Rendering of the selected surface.
+  ///
+  /// This field is NOT trace-only, despite what it looks like, and the
+  /// difference is load-bearing per candidate kind:
+  ///
+  ///   * a macro or include carrier stores a clipped, whitespace-escaped
+  ///     rendering, which is only ever displayed;
+  ///   * a direct-TU carrier stores the exact replacement bytes, because the
+  ///     emission audit in `RefoldTextEditAssembler` reconstructs the
+  ///     carrier's proven source surface from this field, and the macro-state
+  ///     repair planner compares it against the edit text it authorized.
+  ///
+  /// So never clip what a TU carrier puts here, and never compare this field
+  /// to decide whether two candidates emit the same repair: for the kinds
+  /// that clip, two different surfaces can render identically. Compare
+  /// `emittedRepair` for that question.
   bool hasPayloadPreview = false;
   std::string payloadPreview;
+
+  /// Identity of the concrete source repair this candidate will emit, when
+  /// the builder knows it.
+  ///
+  /// This is proof-facing.  The witness resolver compares it to decide
+  /// whether two complete proof certificates describe one source repair or
+  /// two, and that decision is what lets strict mode treat the disagreement
+  /// as proof-certificate ambiguity rather than failing closed.  It must
+  /// therefore be exact: the bytes as they will be emitted, not a rendering
+  /// of them.
+  ///
+  /// A builder that does not know the emitted bytes leaves this disengaged,
+  /// which denies the candidate a repair identity and fails closed.  That is
+  /// the conservative direction and is deliberate -- an unknown repair is not
+  /// evidence that two certificates agree.
+  std::optional<EmittedRepairIdentity> emittedRepair;
 
   // witness-equivalence surface for structure-preserving macro actual repair.
   // These fields are copied from MacroPatch only after theexisting macro

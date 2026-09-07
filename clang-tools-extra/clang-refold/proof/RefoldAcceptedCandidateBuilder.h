@@ -215,7 +215,7 @@ public:
       AcceptedPathKind currentPath, const diffutils::Hunk &hunk,
       const TUByteSpanPlan &spanPlan,
       const StructuralHunkSegmentBinding *structuralBinding,
-      llvm::StringRef payloadPreview) const;
+      llvm::StringRef repairText) const;
 
   /// Build an accepted-result carrier for an explicitly specialized TU edit.
   ///
@@ -224,7 +224,7 @@ public:
   /// prevents future direct callers from dropping their hunk/span proof inputs.
   AcceptedResultCandidate BuildAcceptedSpecializedTUTextEditCandidate(
       AcceptedPathKind currentPath, uint64_t begin, uint64_t end,
-      llvm::StringRef payloadPreview) const;
+      llvm::StringRef repairText) const;
 
   /// Build an accepted-result candidate for terminal fallback.
   ///

@@ -97,8 +97,6 @@ RefoldWitnessResolver::BuildWitnessCanonicalCost(
   cost.ownerBoundaryChangePenalty =
       candidate.kind == AcceptedResultCandidateKind::TerminalOutOfDomain ? 1
                                                                          : 0;
-  cost.spellingChangePenalty =
-      candidate.hasPayloadPreview ? candidate.payloadPreview.size() : 0;
   cost.sourceOrder = candidate.begin;
   return cost;
 }
@@ -190,6 +188,7 @@ RefoldWitnessResolver::BuildWitnessCanonicalCost(
   witness.cost = BuildWitnessCanonicalCost(candidate);
   if (candidate.hasPayloadPreview)
     witness.payloadPreview = candidate.payloadPreview;
+  witness.emittedRepair = candidate.emittedRepair;
   return witness;
 }
 
@@ -570,17 +569,26 @@ RefoldWitnessResolver::ResolveWitnessesForSelection(
   bool hasConcreteRepairIdentity = false;
   bool singleConcreteRepairIdentity = true;
 
+  // Identify the concrete source repair, or nothing.
+  //
+  // This must be exact.  An empty result means "this repair is not
+  // identified", which denies the caller the multiple-certificates-one-repair
+  // reading and fails closed; that is the safe direction, and a candidate
+  // whose builder did not know its emitted bytes gets it.  What is not safe
+  // is the opposite error, and it is the one the previous implementation
+  // made: it compared `payloadPreview`, a rendering clipped to 120 bytes and
+  // whitespace-escaped, so two replacements agreeing on their first 120 bytes
+  // and sharing a length compared equal and one was silently chosen for the
+  // other.  The trailing length prefix below keeps the free-form byte text
+  // from being confusable with the fields in front of it.
   auto repairIdentityForWitness = [](const RefoldWitness &witness) {
-    if (witness.payloadPreview.empty())
+    if (!witness.emittedRepair)
       return std::string();
 
-    return llvm::formatv("owner={0}|source_order={1}|range_bytes={2}|"
-                         "arg_boundary={3}|owner_boundary={4}|payload={5}",
-                         witness.owner, witness.cost.sourceOrder,
-                         witness.cost.sourceRangeBytes,
-                         witness.cost.argumentBoundaryChangePenalty,
-                         witness.cost.ownerBoundaryChangePenalty,
-                         witness.payloadPreview)
+    const EmittedRepairIdentity &repair = *witness.emittedRepair;
+    return llvm::formatv("owner={0}|range=[{1},{2})|repair_bytes={3}|repair={4}",
+                         witness.owner, repair.begin, repair.end,
+                         repair.text.size(), repair.text)
         .str();
   };
 

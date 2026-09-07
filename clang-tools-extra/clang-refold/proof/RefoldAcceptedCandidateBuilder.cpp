@@ -463,6 +463,8 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedMacroCandidate(
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview =
       stringutils::showWsWithClip(patch.replacement, 120);
+  candidate.emittedRepair = EmittedRepairIdentity{
+      candidate.begin, candidate.end, patch.replacement};
   deps_.ownerRealizationProofBuilder.AttachStandardWitnesses(candidate);
   deps_.theoremAudit.AuditMacroPatchProofForLegacyAuthority(
       patch, "BuildAcceptedMacroCandidate");
@@ -648,6 +650,8 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedIncludeCandidate(
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview =
       stringutils::showWsWithClip(patch.insertBytes, 120);
+  candidate.emittedRepair = EmittedRepairIdentity{
+      candidate.begin, candidate.end, patch.insertBytes};
   FinalizeAcceptedCandidate(candidate, "BuildAcceptedIncludeCandidate");
   return candidate;
 }
@@ -667,6 +671,11 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedIncludeRealizationCandidate(
           currentPath, ownerRealization);
   candidate.begin = include.siteB;
   candidate.end = include.siteE;
+  // Deliberately no `emittedRepair`: this carrier names the realization path
+  // it selected, not the bytes it will emit, so it has no repair identity to
+  // compare.  A resolver that cannot identify the repair fails closed, which
+  // is the correct direction -- a shared path-kind name is not evidence that
+  // two certificates describe one edit.
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview = formatv("{0}", currentPath).str();
 
@@ -688,7 +697,7 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedTUTextEditCandidate(
     AcceptedPathKind currentPath, const diffutils::Hunk &hunk,
     const TUByteSpanPlan &spanPlan,
     const StructuralHunkSegmentBinding *structuralBinding,
-    StringRef payloadPreview) const {
+    StringRef repairText) const {
   const OwnerRealizationResult ownerRealization =
       deps_.ownerRealizationProofBuilder.BuildTUOwnerRealization(
           currentPath, hunk, spanPlan, structuralBinding);
@@ -699,8 +708,13 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedTUTextEditCandidate(
           currentPath, ownerRealization);
   candidate.begin = spanPlan.tuByteBegin;
   candidate.end = spanPlan.tuByteEnd;
+  // Not clipped: the emission audit in RefoldTextEditAssembler reconstructs
+  // this carrier's proven source surface from `payloadPreview`, so for a
+  // direct-TU carrier it must stay the exact bytes.
   candidate.hasPayloadPreview = true;
-  candidate.payloadPreview = payloadPreview.str();
+  candidate.payloadPreview = repairText.str();
+  candidate.emittedRepair = EmittedRepairIdentity{
+      candidate.begin, candidate.end, repairText.str()};
   FinalizeAcceptedCandidate(candidate, "BuildAcceptedTUTextEditCandidate");
   return candidate;
 }
@@ -708,7 +722,7 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedTUTextEditCandidate(
 ::clang::refold::AcceptedResultCandidate
 RefoldAcceptedCandidateBuilder::BuildAcceptedSpecializedTUTextEditCandidate(
     AcceptedPathKind currentPath, uint64_t begin, uint64_t end,
-    StringRef payloadPreview) const {
+    StringRef repairText) const {
   const OwnerRealizationResult ownerRealization =
       deps_.ownerRealizationProofBuilder.BuildSpecializedTUOwnerRealization(
           currentPath, begin, end);
@@ -719,8 +733,13 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedSpecializedTUTextEditCandidate(
           currentPath, ownerRealization);
   candidate.begin = begin;
   candidate.end = end;
+  // Not clipped, for the same reason as the ordinary direct-TU carrier: the
+  // macro-state repair planner compares this against the edit text it
+  // authorized.
   candidate.hasPayloadPreview = true;
-  candidate.payloadPreview = payloadPreview.str();
+  candidate.payloadPreview = repairText.str();
+  candidate.emittedRepair =
+      EmittedRepairIdentity{begin, end, repairText.str()};
   FinalizeAcceptedCandidate(candidate, "BuildAcceptedSpecializedTUTextEditCandidate");
   return candidate;
 }
