@@ -1149,18 +1149,39 @@ Expected<std::string> RefoldEngine::Refold(
     // Only a proven divergence names a region to narrow, so only `Diverged`
     // reaches the repair ladder below.
     if (verdict.kind != FinalAssemblyVerdictKind::Diverged) {
-      if (verdict.kind == FinalAssemblyVerdictKind::Inconclusive)
-        // An inconclusive verdict is not a rejection, but it does mean this
-        // assembly ships unverified.  Say so where a run that asked for
+      if (verdict.kind == FinalAssemblyVerdictKind::Inconclusive) {
+        // `fatal` asks for an assembly the closing check has verified, and a
+        // comparison that could not be performed does not produce one.  "I
+        // could not check" is not "it checked out", so failing is the only
+        // answer that reports what actually happened; shipping here would
+        // hand back a result whose verification never ran under the very
+        // option asking for it.  This is the option's contract, not a
+        // soundness claim: the check is defense in depth, and its absence
+        // leaves the proof paths exactly as they would be with the check off.
+        if (DispositionForVerdict(verifyMode, verdict.kind) ==
+            FinalAssemblyDisposition::Fail)
+          return createStringError(
+              std::make_error_code(std::errc::illegal_byte_sequence),
+              "refolded source could not be preprocessed for verification, so "
+              "--verify-output=fatal has nothing to compare it against and "
+              "cannot report it as verified. Re-run with "
+              "--verify-output=repair to take the unchecked result, or with "
+              "--verify-output=off to skip the check");
+
+        // `repair` keeps it.  An inconclusive verdict names no diverging
+        // region, so there is nothing for the ladder to expand, and rejecting
+        // it would trade a real refold for a missing measurement rather than
+        // for a proven defect.  Say so where a run that asked for
         // verification will see it: at debug level the one signal that the
         // check did not happen is indistinguishable from the check passing.
         REFOLD_LOG_WARN("assembly-verify",
                         "assembly NOT verified: the final source could not be "
                         "preprocessed for checking, so --verify-output has "
                         "nothing to compare and the result stands unchecked");
-      else if (attempt > 0)
+      } else if (attempt > 0) {
         REFOLD_LOG_INFO("assembly-verify",
                         "verified after {0} narrowing step(s)", attempt);
+      }
       return out;
     }
 
@@ -1184,7 +1205,8 @@ Expected<std::string> RefoldEngine::Refold(
     // realizes is a defect, and repairing it silently costs completeness in a
     // way nothing observes -- the output stays correct, so the broken theorem
     // survives.  `repair` opts into the conservative repair instead.
-    if (verifyMode != OutputVerificationMode::Repair) {
+    if (DispositionForVerdict(verifyMode, verdict.kind) ==
+        FinalAssemblyDisposition::Fail) {
       std::string owned = "<unattributed>";
       if (owner)
         owned = engine.DescribeOwner(*owner);

@@ -356,7 +356,7 @@ static cl::opt<OutputVerificationMode> VerifyOutput(
                clEnumValN(OutputVerificationMode::Repair, "repair",
                           "Expand the smallest diverging region and retry"),
                clEnumValN(OutputVerificationMode::Fatal, "fatal",
-                          "Report the divergence and fail")),
+                          "Fail unless the refolded source verifies")),
     cl::cat(RefoldCategory));
 
 static cl::list<std::string> VerifyIncludeDirs(

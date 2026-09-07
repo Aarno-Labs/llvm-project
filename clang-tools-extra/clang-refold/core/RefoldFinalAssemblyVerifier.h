@@ -53,11 +53,19 @@ enum class OutputVerificationMode {
   /// Run the check and repair a divergence: rule out preserving the smallest
   /// region that owns it, re-assemble, and repeat until the result replays or
   /// nothing narrower is left.
+  ///
+  /// A verdict this mode cannot reach at all is kept rather than repaired: an
+  /// inconclusive check names no region to rule out, so there is nothing to
+  /// re-assemble around, and rejecting would trade a real refold for a
+  /// missing measurement rather than for a proven defect.
   Repair,
 
-  /// Run the check and fail the refold on a divergence.  Repairing silently
-  /// would cost completeness in a way nothing observes -- the output stays
-  /// correct, so the defective theorem survives.
+  /// Run the check and fail the refold unless it verifies.  A divergence
+  /// fails because repairing silently would cost completeness in a way
+  /// nothing observes -- the output stays correct, so the defective theorem
+  /// survives.  An inconclusive check fails too: this mode asks for a
+  /// verified assembly, and a comparison that could not be performed does not
+  /// produce one.
   Fatal
 };
 
@@ -84,6 +92,54 @@ enum class FinalAssemblyVerdictKind : uint8_t {
   /// condemning it would trade a real refold for a missing measurement.
   Inconclusive
 };
+
+/// What a run must do with one closing-check verdict.
+enum class FinalAssemblyDisposition : uint8_t {
+  /// Take the assembly as it stands.
+  Accept,
+
+  /// Rule out preserving the smallest region owning the divergence and
+  /// re-assemble.  Only a `Diverged` verdict names such a region.
+  Repair,
+
+  /// Fail the refold.
+  Fail
+};
+
+/// Return what \p mode requires for \p kind.
+///
+/// The option's whole contract is this one table, so a caller cannot state
+/// half of it.  Two cells carry the reasoning:
+///
+///   * `Repair` + `Inconclusive` accepts.  An unperformed comparison names no
+///     region to rule out, so there is nothing to re-assemble around, and
+///     rejecting would trade a real refold for a missing measurement rather
+///     than for a proven defect.
+///   * `Fatal` + `Inconclusive` fails.  That mode asks for an assembly the
+///     check has verified, and a comparison that could not be performed does
+///     not produce one.  This is the option's contract rather than a
+///     soundness claim: the check is defense in depth, and its absence leaves
+///     the proof paths exactly as they would be with the check off.
+constexpr FinalAssemblyDisposition
+DispositionForVerdict(OutputVerificationMode mode,
+                      FinalAssemblyVerdictKind kind) {
+  if (kind == FinalAssemblyVerdictKind::Verified)
+    return FinalAssemblyDisposition::Accept;
+
+  switch (mode) {
+  case OutputVerificationMode::Off:
+    // The check is not built in this mode, so no verdict exists to dispose
+    // of.  Answer for completeness of the table, not because it is reached.
+    return FinalAssemblyDisposition::Accept;
+  case OutputVerificationMode::Repair:
+    return kind == FinalAssemblyVerdictKind::Diverged
+               ? FinalAssemblyDisposition::Repair
+               : FinalAssemblyDisposition::Accept;
+  case OutputVerificationMode::Fatal:
+    return FinalAssemblyDisposition::Fail;
+  }
+  return FinalAssemblyDisposition::Accept;
+}
 
 /// Result of checking one assembled final source against the edited stream.
 struct FinalAssemblyVerdict {
