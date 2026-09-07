@@ -61,31 +61,47 @@ enum class OutputVerificationMode {
   Fatal
 };
 
+/// What one closing check established about an assembly.
+///
+/// The three outcomes are mutually exclusive by construction.  A comparison
+/// that could not be performed is its own answer and must not be spelled as a
+/// positive result: "I could not check" is not "it checked out", and a caller
+/// that reads only a `verified` flag would not be able to tell them apart.
+enum class FinalAssemblyVerdictKind : uint8_t {
+  /// The assembly replays the edited stream under the run's mode.
+  Verified,
+
+  /// The assembly and the edited stream were both preprocessed and they
+  /// differ.  This is the only outcome carrying divergence evidence.
+  Diverged,
+
+  /// The check could not be run at all -- the assembly could not be
+  /// preprocessed, for instance.
+  ///
+  /// Inconclusive is not a rejection under `Repair`: an assembly this check
+  /// cannot read names no region to narrow, so it is left to the proof paths
+  /// that produced it, exactly as it would be if the check did not exist, and
+  /// condemning it would trade a real refold for a missing measurement.
+  Inconclusive
+};
+
 /// Result of checking one assembled final source against the edited stream.
 struct FinalAssemblyVerdict {
-  /// True when the assembly replays the edited stream under the run's mode.
-  bool verified = false;
-
-  /// True when the check could not be run at all -- the preprocessor could not
-  /// be invoked, for instance.
-  ///
-  /// Inconclusive is never a rejection.  An assembly this check cannot read is
-  /// left to the proof paths that produced it, exactly as it would be if the
-  /// check did not exist; condemning it would trade a real refold for a missing
-  /// measurement.
-  bool inconclusive = false;
+  /// Which of the three outcomes this check reached.  Defaults to
+  /// `Inconclusive` so a verdict that was never filled in claims nothing.
+  FinalAssemblyVerdictKind kind = FinalAssemblyVerdictKind::Inconclusive;
 
   /// First divergence, described in the same terms `--check` reports.  Empty
-  /// unless the assembly was rejected.
+  /// unless `kind` is `Diverged`.
   std::string reason;
 
   /// Index of the first diverging token in the preprocessed edited stream.
-  /// Only meaningful when the assembly was rejected; this is the anchor a
-  /// caller uses to find the region responsible.
+  /// Only meaningful when `kind` is `Diverged`; this is the anchor a caller
+  /// uses to find the region responsible.
   std::size_t mismatchTokenIndex = 0;
 
   /// Every diverging run, as half-open ranges of preprocessed edited-stream
-  /// token indices, in ascending order.
+  /// token indices, in ascending order.  Empty unless `kind` is `Diverged`.
   ///
   /// Reporting only the first divergence forces the caller to re-assemble once
   /// per diverging region, which is one whole refold per region and, past any

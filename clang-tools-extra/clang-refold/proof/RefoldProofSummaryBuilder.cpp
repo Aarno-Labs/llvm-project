@@ -136,7 +136,6 @@ void RefoldProofSummaryBuilder::FinalizeProofSummary(
     }
   }
 
-  summary.lattice = BuildGlobalSelectionLattice(summary);
   summary.completeness = BuildCompletenessContract(summary);
   summary.theoremDomain = BuildTheoremDomainContract(summary);
 
@@ -603,86 +602,6 @@ RefoldProofSummaryBuilder::NormalizeAcceptedProof(
   if (!proof)
     return std::nullopt;
   return proof->theoremClass;
-}
-
-::clang::refold::GlobalSelectionLattice
-RefoldProofSummaryBuilder::BuildGlobalSelectionLattice(
-    const ProofSummary &summary) const {
-  GlobalSelectionLattice lattice;
-
-  // The normalized summary keeps AcceptedProofClass out of lattice authority.
-  // The conflict domain is still path provenance because macro, include, TU,
-  // and terminal artifacts occupy different owner spaces; the final proof
-  // family remains summary.theoremClass and is checked separately by the
-  // emitted-proof gate.
-  switch (summary.inventory.currentPath) {
-  case AcceptedPathKind::MacroArgsOnlyStandard:
-  case AcceptedPathKind::MacroArgsOnlyPasteSingle:
-  case AcceptedPathKind::MacroArgsOnlyPasteMulti:
-  case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
-  case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
-  case AcceptedPathKind::MacroDirectCalleeSubstitution:
-  case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
-  case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
-  case AcceptedPathKind::MacroDagSubtreeRoot:
-  case AcceptedPathKind::MacroCallChainSuffix:
-  case AcceptedPathKind::MacroCounterLiteral:
-  case AcceptedPathKind::MacroWholeCoverRealization:
-    lattice.domain = LatticeConflictDomain::MacroInvocationRootSpan;
-    lattice.mergeLaw = LatticeMergeLaw::NestedOuterShadowsInner;
-    lattice.conflictLaw =
-        summary.realizationMode == RealizationMode::PreserveOriginalStructure
-            ? LatticeConflictLaw::PreferStructurePreservation
-            : LatticeConflictLaw::RejectPartialOverlap;
-    break;
-
-  case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
-  case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
-  case AcceptedPathKind::IncludeInsertChildBoundary:
-  case AcceptedPathKind::IncludeInsertRightNeighborPP:
-  case AcceptedPathKind::IncludeInsertLeftNeighborPP:
-  case AcceptedPathKind::IncludeInsertDeclBoundary:
-    lattice.domain = LatticeConflictDomain::IncludeOwnerRegion;
-    lattice.mergeLaw = LatticeMergeLaw::DisjointCompose;
-    lattice.conflictLaw =
-        LatticeConflictLaw::PreferOwnerPreservingBeforeRealization;
-    break;
-
-  case AcceptedPathKind::IncludeRealizationInlineFromB:
-  case AcceptedPathKind::IncludeMaterializedExpansion:
-    lattice.domain = LatticeConflictDomain::IncludeOwnerRegion;
-    lattice.mergeLaw = LatticeMergeLaw::SelectSingleWitness;
-    lattice.conflictLaw =
-        LatticeConflictLaw::PreferOwnerPreservingBeforeRealization;
-    break;
-
-  case AcceptedPathKind::TUExactSlotBoundary:
-  case AcceptedPathKind::TUProvableInsertionAnchor:
-    lattice.domain = LatticeConflictDomain::TUAnchorPoint;
-    lattice.mergeLaw = LatticeMergeLaw::SelectSingleWitness;
-    lattice.conflictLaw = LatticeConflictLaw::PreferExactAnchorWitness;
-    break;
-
-  case AcceptedPathKind::TUByteSpanMappedEdit:
-  case AcceptedPathKind::TUByteSpanConservativeEdit:
-  case AcceptedPathKind::TUIncludeClosureEdit:
-    lattice.domain = LatticeConflictDomain::WholeTranslationUnit;
-    lattice.mergeLaw = LatticeMergeLaw::DisjointCompose;
-    lattice.conflictLaw = LatticeConflictLaw::RejectPartialOverlap;
-    break;
-
-  case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
-    lattice.domain = LatticeConflictDomain::WholeTranslationUnit;
-    lattice.mergeLaw = LatticeMergeLaw::TerminalReplacesAll;
-    lattice.conflictLaw = LatticeConflictLaw::ExplicitOutOfDomainTerminalResult;
-    break;
-
-  case AcceptedPathKind::Unknown:
-  case AcceptedPathKind::IncludePatchPendingMaterialization:
-    break;
-  }
-
-  return lattice;
 }
 
 ::clang::refold::CompletenessContract

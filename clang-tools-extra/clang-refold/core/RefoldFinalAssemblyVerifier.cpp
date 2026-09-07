@@ -128,8 +128,7 @@ RefoldFinalAssemblyVerifier::Verify(StringRef finalSource) const {
   std::vector<std::size_t> assemblyOffsets;
   if (!preprocessAndLex(preprocess, ctx_.lang, finalSource, assemblyTokens,
                         assemblyOffsets)) {
-    verdict.inconclusive = true;
-    verdict.verified = true;
+    verdict.kind = FinalAssemblyVerdictKind::Inconclusive;
     return verdict;
   }
 
@@ -138,11 +137,11 @@ RefoldFinalAssemblyVerifier::Verify(StringRef finalSource) const {
                   : compareTokensNoLinesAware(assemblyTokens, editedTokens_,
                                               ignoreMask_);
   if (!err) {
-    verdict.verified = true;
+    verdict.kind = FinalAssemblyVerdictKind::Verified;
     return verdict;
   }
 
-  verdict.verified = false;
+  verdict.kind = FinalAssemblyVerdictKind::Diverged;
   verdict.reason = toString(std::move(err));
   AppendDivergentRanges(assemblyTokens, verdict.divergentRanges);
   verdict.mismatchTokenIndex = verdict.divergentRanges.empty()

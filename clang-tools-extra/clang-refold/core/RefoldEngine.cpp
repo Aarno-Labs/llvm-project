@@ -559,13 +559,43 @@ static std::optional<OwnerAlignedDeletionSlide>
 buildOwnerAlignedDeletionSlide(const RefoldModel &model, ArrayRef<PPTok> aToks,
                                ArrayRef<int64_t> baseMap,
                                ArrayRef<TerminalFallbackRequest> requests) {
-  // A slide is only ever a small correction: the run is being nudged back onto
-  // a cover it already overlaps, not searched for across the stream.
-  constexpr uint64_t maxSlideDistance = 64;
-
   auto spellingsEqual = [&](uint64_t lhs, uint64_t rhs) {
     return lhs < aToks.size() && rhs < aToks.size() &&
            aToks[lhs].spelling == aToks[rhs].spelling;
+  };
+
+  // Return how far the run `[aBegin, aEnd)` may slide in one direction.
+  //
+  // A slide of distance d is admissible exactly when each of its d steps
+  // exchanges two identically spelled tokens, so admissibility is prefix
+  // monotone: distance d requires everything distance d-1 requires, plus one
+  // further exchange. The admissible distances are therefore a contiguous
+  // prefix, and its length is the extent of the adjacent run of
+  // period-`(aEnd - aBegin)` spelling repetition, bounded by the end of the
+  // stream. That is the exact finite bound the streams themselves impose;
+  // walking outward until the first exchange fails computes it directly, so no
+  // fixed search window is needed. None would be sound to impose either: an
+  // owner-closing slide one position past an arbitrary cutoff is exactly as
+  // admissible as one inside it, and refusing it would fail a run whose repair
+  // the streams prove.
+  auto maxAdmissibleSlideDistance = [&](uint64_t aBegin, uint64_t aEnd,
+                                        bool left) {
+    uint64_t distance = 0;
+    while (true) {
+      const uint64_t next = distance + 1;
+      // The step must stay inside the stream: sliding left past its start or
+      // right past its end has no token to exchange.
+      if (left ? aBegin < next : aEnd + next > baseMap.size())
+        break;
+      const bool exchangeable = left
+                                    ? spellingsEqual(aBegin - next, aEnd - next)
+                                    : spellingsEqual(aBegin + distance,
+                                                     aEnd + distance);
+      if (!exchangeable)
+        break;
+      distance = next;
+    }
+    return distance;
   };
 
   for (const TerminalFallbackRequest &request : requests) {
@@ -588,30 +618,28 @@ buildOwnerAlignedDeletionSlide(const RefoldModel &model, ArrayRef<PPTok> aToks,
       continue;
 
     const uint64_t runLength = aEnd - aBegin;
-    for (uint64_t distance = 1; distance <= maxSlideDistance; ++distance) {
+    const uint64_t maxLeft =
+        maxAdmissibleSlideDistance(aBegin, aEnd, /*left=*/true);
+    const uint64_t maxRight =
+        maxAdmissibleSlideDistance(aBegin, aEnd, /*left=*/false);
+    const uint64_t maxDistance = maxLeft > maxRight ? maxLeft : maxRight;
+
+    // Nearest admissible position first, so a run is nudged the shortest
+    // distance that reaches a cover.
+    for (uint64_t distance = 1; distance <= maxDistance; ++distance) {
       // Left first, then right, so the choice does not depend on iteration
       // order anywhere else.
       for (int direction : {-1, 1}) {
         const bool left = direction < 0;
-        if (left && aBegin < distance)
-          continue;
-        if (!left && aEnd + distance > baseMap.size())
+        // Past this direction's admissible prefix the exchange fails; the
+        // other direction may still reach further.
+        if (distance > (left ? maxLeft : maxRight))
           continue;
 
         const uint64_t movedBegin =
             left ? aBegin - distance : aBegin + distance;
         const uint64_t movedEnd = movedBegin + runLength;
 
-        // Every step of the slide must exchange two identically spelled
-        // tokens, or the map would stop agreeing with the streams.
-        bool admissible = true;
-        for (uint64_t step = 0; step < distance && admissible; ++step) {
-          admissible = left ? spellingsEqual(aBegin - 1 - step,
-                                             aEnd - 1 - step)
-                            : spellingsEqual(aBegin + step, aEnd + step);
-        }
-        if (!admissible)
-          continue;
         if (!runHasOneOwner(model, movedBegin, movedEnd))
           continue;
 
@@ -1118,8 +1146,10 @@ Expected<std::string> RefoldEngine::Refold(
       return out;
 
     const FinalAssemblyVerdict verdict = assemblyVerifier->Verify(out);
-    if (verdict.verified || verdict.inconclusive) {
-      if (verdict.inconclusive)
+    // Only a proven divergence names a region to narrow, so only `Diverged`
+    // reaches the repair ladder below.
+    if (verdict.kind != FinalAssemblyVerdictKind::Diverged) {
+      if (verdict.kind == FinalAssemblyVerdictKind::Inconclusive)
         // An inconclusive verdict is not a rejection, but it does mean this
         // assembly ships unverified.  Say so where a run that asked for
         // verification will see it: at debug level the one signal that the
@@ -1308,7 +1338,7 @@ std::string RefoldEngine::Refold() {
   if (finalLinePrune.changed && finalAssemblyVerifier_) {
     const FinalAssemblyVerdict prunedVerdict =
         finalAssemblyVerifier_->Verify(out);
-    if (!prunedVerdict.verified && !prunedVerdict.inconclusive) {
+    if (prunedVerdict.kind == FinalAssemblyVerdictKind::Diverged) {
       // Being the first check to run is not evidence of having caused what it
       // found.  Nothing verifies the pre-prune assembly on this path: the
       // driver's verifier is positioned after `Refold()` returns and is skipped
@@ -1324,9 +1354,10 @@ std::string RefoldEngine::Refold() {
       // inconclusive pre-prune verdict is its own answer: the comparison could
       // not be made, which is neither evidence for the prune nor against it,
       // and reporting it as either is the defect being repaired.
-      const bool pruneIntroducedDivergence = prePruneVerdict.verified;
+      const bool pruneIntroducedDivergence =
+          prePruneVerdict.kind == FinalAssemblyVerdictKind::Verified;
       const bool divergencePredatesPrune =
-          !prePruneVerdict.verified && !prePruneVerdict.inconclusive;
+          prePruneVerdict.kind == FinalAssemblyVerdictKind::Diverged;
 
       if (pruneIntroducedDivergence)
         REFOLD_LOG_WARN(

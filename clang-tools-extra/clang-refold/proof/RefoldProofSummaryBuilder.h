@@ -6,8 +6,8 @@
 // `ProofSummary` / `EmittedProof` carrier:
 //
 //   * `ConfigureProofSummary` / `FinalizeProofSummary` — set the theorem class,
-//     realization mode, lattice / completeness / theorem-domain contracts, and
-//     the canonical emitted-proof carrier on a summary.
+//     realization mode, completeness / theorem-domain contracts, and the
+//     canonical emitted-proof carrier on a summary.
 //   * `BuildEmittedProof{,FromSummary}` and
 //   `BuildCanonicalEmittedProofFromSummary`
 //     — build the theorem-facing `EmittedProof` from a summary or candidate,
@@ -15,9 +15,8 @@
 //     owner-realization witness presence, terminal-fallback domain, etc.).
 //   * `NormalizeAcceptedProof` — convenience accessor returning just the
 //     theorem class for an accepted-result candidate.
-//   * `BuildGlobalSelectionLattice` / `BuildCompletenessContract` /
-//     `BuildTheoremDomainContract` — derive the secondary contract carriers
-//     a finalized summary needs.
+//   * `BuildCompletenessContract` / `BuildTheoremDomainContract` — derive the
+//     secondary contract carriers a finalized summary needs.
 //   * `ProofSummaryRequiresOwnerRealizationWitness` — the per-path predicate
 //     that gates the owner-realization witness requirement.
 //
@@ -110,11 +109,6 @@ public:
   /// over `BuildEmittedProof`.
   std::optional<::clang::refold::TheoremProofClass>
   NormalizeAcceptedProof(const AcceptedResultCandidate &candidate) const;
-
-  /// Derive the global-selection-lattice contract for `summary`: conflict
-  /// domain, merge law, and conflict-resolution law per accepted path.
-  ::clang::refold::GlobalSelectionLattice
-  BuildGlobalSelectionLattice(const ProofSummary &summary) const;
 
   /// Derive the completeness contract for `summary`: coverage class,
   /// declared target, and explicit-out-of-domain exclusion record when

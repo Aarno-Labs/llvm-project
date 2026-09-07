@@ -537,105 +537,17 @@ inline StringRef toString(FutureProofTarget value) {
 }
 #undef REFOLD_FUTURE_PROOF_TARGET_LIST
 
-/// \brief Inventory record that maps a current acceptance path onto the proof
-/// lattice.
+/// \brief Construction inventory for one accepted result: which acceptance
+/// path built it, what kind of support that path claims, and which proof
+/// class it is being migrated toward.
+///
+/// This is provenance, not authority.  Selection and emission consume
+/// `ProofSummary::theoremClass` and the canonical `EmittedProof`; the fields
+/// here only record how the carrier was constructed.
 struct AcceptancePathInventory {
   AcceptedPathKind currentPath = AcceptedPathKind::Unknown;
   AcceptanceSupportKind support = AcceptanceSupportKind::Unknown;
   FutureProofTarget futureTarget = FutureProofTarget::Unknown;
-};
-
-/// \brief Conflict domain used by the global accepted-result lattice.
-///
-/// This does not change how candidates are chosen. It names the owner
-/// domain in which two accepted artifacts may interact so the current global
-/// selection and overlap rules can be described explicitly and audited in one
-/// place.
-#define REFOLD_LATTICE_CONFLICT_DOMAIN_LIST(REFOLD_X)                          \
-  REFOLD_X(Unknown)                                                            \
-  REFOLD_X(MacroInvocationRootSpan)                                            \
-  REFOLD_X(IncludeOwnerRegion)                                                 \
-  REFOLD_X(TUAnchorPoint)                                                      \
-  REFOLD_X(WholeTranslationUnit)
-
-enum class LatticeConflictDomain : uint8_t {
-#define REFOLD_X(name) name,
-  REFOLD_LATTICE_CONFLICT_DOMAIN_LIST(REFOLD_X)
-#undef REFOLD_X
-};
-
-inline StringRef toString(LatticeConflictDomain value) {
-  switch (value) {
-#define REFOLD_X(name)                                                         \
-  case LatticeConflictDomain::name:                                            \
-    return #name;
-    REFOLD_LATTICE_CONFLICT_DOMAIN_LIST(REFOLD_X)
-#undef REFOLD_X
-  }
-  return "Unknown";
-}
-#undef REFOLD_LATTICE_CONFLICT_DOMAIN_LIST
-
-/// \brief Merge law used when two artifacts in the same lattice domain are
-/// compatible.
-#define REFOLD_LATTICE_MERGE_LAW_LIST(REFOLD_X)                                \
-  REFOLD_X(Unknown)                                                            \
-  REFOLD_X(DisjointCompose)                                                    \
-  REFOLD_X(NestedOuterShadowsInner)                                            \
-  REFOLD_X(SelectSingleWitness)                                                \
-  REFOLD_X(TerminalReplacesAll)
-
-enum class LatticeMergeLaw : uint8_t {
-#define REFOLD_X(name) name,
-  REFOLD_LATTICE_MERGE_LAW_LIST(REFOLD_X)
-#undef REFOLD_X
-};
-
-inline StringRef toString(LatticeMergeLaw value) {
-  switch (value) {
-#define REFOLD_X(name)                                                         \
-  case LatticeMergeLaw::name:                                                  \
-    return #name;
-    REFOLD_LATTICE_MERGE_LAW_LIST(REFOLD_X)
-#undef REFOLD_X
-  }
-  return "Unknown";
-}
-#undef REFOLD_LATTICE_MERGE_LAW_LIST
-
-/// \brief Conflict law used when two artifacts in the same lattice domain
-/// are not simultaneously admissible.
-#define REFOLD_LATTICE_CONFLICT_LAW_LIST(REFOLD_X)                             \
-  REFOLD_X(Unknown)                                                            \
-  REFOLD_X(RejectPartialOverlap)                                               \
-  REFOLD_X(PreferStructurePreservation)                                        \
-  REFOLD_X(PreferExactAnchorWitness)                                           \
-  REFOLD_X(PreferOwnerPreservingBeforeRealization)                             \
-  REFOLD_X(ExplicitOutOfDomainTerminalResult)
-
-enum class LatticeConflictLaw : uint8_t {
-#define REFOLD_X(name) name,
-  REFOLD_LATTICE_CONFLICT_LAW_LIST(REFOLD_X)
-#undef REFOLD_X
-};
-
-inline StringRef toString(LatticeConflictLaw value) {
-  switch (value) {
-#define REFOLD_X(name)                                                         \
-  case LatticeConflictLaw::name:                                               \
-    return #name;
-    REFOLD_LATTICE_CONFLICT_LAW_LIST(REFOLD_X)
-#undef REFOLD_X
-  }
-  return "Unknown";
-}
-#undef REFOLD_LATTICE_CONFLICT_LAW_LIST
-
-/// \brief Normalized description of the current global lattice law.
-struct GlobalSelectionLattice {
-  LatticeConflictDomain domain = LatticeConflictDomain::Unknown;
-  LatticeMergeLaw mergeLaw = LatticeMergeLaw::Unknown;
-  LatticeConflictLaw conflictLaw = LatticeConflictLaw::Unknown;
 };
 
 /// \brief Whether an accepted path currently participates in the declared
@@ -1792,7 +1704,6 @@ struct ProofSummary {
   TheoremSelectionTieBreakerKind selectionTieBreaker =
       TheoremSelectionTieBreakerKind::Unknown;
   AcceptancePathInventory inventory;
-  GlobalSelectionLattice lattice;
   CompletenessContract completeness;
   TheoremDomainContract theoremDomain;
   ProofDischargeRecord discharge;
