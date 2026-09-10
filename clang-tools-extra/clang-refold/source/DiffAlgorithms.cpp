@@ -69,6 +69,8 @@
 #include "util/StringUtils.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringMap.h"
 
 #include <algorithm>
@@ -123,6 +125,16 @@ public:
     matchedTokenCounts_[index] = objective.matchedTokenCount;
     ownerDepthCosts_[index] = objective.ownerDepthCost;
   }
+
+  /// Direct component storage, for the quadratic table fill alone.
+  ///
+  /// `Get()` and `Set()` reassemble an `LcsObjective` per access, which is the
+  /// right interface everywhere the tables are read a few states at a time.
+  /// The fill below reads three predecessors and writes one state for every
+  /// cell of the rectangle, so it walks the two component arrays with running
+  /// row pointers instead; the values written are identical either way.
+  uint32_t *MatchedData() { return matchedTokenCounts_.data(); }
+  uint64_t *CostData() { return ownerDepthCosts_.data(); }
 
 private:
   std::vector<uint32_t> matchedTokenCounts_;
@@ -365,80 +377,114 @@ static bool buildWeightedWindowDp(size_t aBegin, size_t aEnd, size_t bBegin,
   out.forward.Assign(stateCount);
   out.suffix.Assign(stateCount);
 
-  auto idx = [&](size_t i, size_t j) -> size_t {
-    return i * out.stride + j;
-  };
-  auto better = [](const LcsObjective &candidate,
-                   const LcsObjective &best) {
-    return isCoreBetter(candidate.matchedTokenCount,
-                        candidate.ownerDepthCost, best.matchedTokenCount,
-                        best.ownerDepthCost);
-  };
-
+  // Prefix fill.  Both gap transitions into row `i` pay `ownerDepthGap[aBegin +
+  // i]`, which is invariant across the row, and the horizontal predecessor is
+  // the state this loop wrote on its previous iteration -- so the gap cost is
+  // hoisted and the left neighbour is carried rather than reloaded.  The
+  // remaining two predecessors sit in the previous row, reached through a row
+  // pointer instead of a multiply per access.  Transition order is unchanged,
+  // so equal-objective ties still keep the first considered transition.
+  uint32_t *const forwardMatched = out.forward.MatchedData();
+  uint64_t *const forwardCost = out.forward.CostData();
   for (size_t i = 0; i <= n; ++i) {
+    const size_t rowBase = i * out.stride;
+    const size_t previousRowBase = rowBase - out.stride;
+    const uint32_t gapCost = ownerDepthGap[aBegin + i];
+    uint32_t leftMatched = 0;
+    uint64_t leftCost = 0;
     for (size_t j = 0; j <= m; ++j) {
-      if (i == 0 && j == 0)
+      if (i == 0 && j == 0) {
+        // The origin keeps the zero objective `Assign()` established.
+        leftMatched = forwardMatched[rowBase];
+        leftCost = forwardCost[rowBase];
         continue;
+      }
 
-      LcsObjective best{0, std::numeric_limits<uint64_t>::max()};
-      if (i > 0 && j > 0 &&
-          tokensEqual(aBegin + i - 1, bBegin + j - 1)) {
-        LcsObjective candidate = out.forward.Get(idx(i - 1, j - 1));
-        ++candidate.matchedTokenCount;
-        if (better(candidate, best))
-          best = candidate;
+      uint32_t bestMatched = 0;
+      uint64_t bestCost = std::numeric_limits<uint64_t>::max();
+      if (i > 0 && j > 0 && tokensEqual(aBegin + i - 1, bBegin + j - 1)) {
+        bestMatched = forwardMatched[previousRowBase + j - 1] + 1;
+        bestCost = forwardCost[previousRowBase + j - 1];
       }
       if (i > 0) {
-        LcsObjective candidate = out.forward.Get(idx(i - 1, j));
-        if (addCostChecked(candidate.ownerDepthCost,
-                           ownerDepthGap[aBegin + i],
-                           candidate.ownerDepthCost) &&
-            better(candidate, best))
-          best = candidate;
+        const uint32_t candidateMatched = forwardMatched[previousRowBase + j];
+        uint64_t candidateCost = 0;
+        if (addCostChecked(forwardCost[previousRowBase + j], gapCost,
+                           candidateCost) &&
+            isCoreBetter(candidateMatched, candidateCost, bestMatched,
+                         bestCost)) {
+          bestMatched = candidateMatched;
+          bestCost = candidateCost;
+        }
       }
       if (j > 0) {
-        LcsObjective candidate = out.forward.Get(idx(i, j - 1));
-        if (addCostChecked(candidate.ownerDepthCost,
-                           ownerDepthGap[aBegin + i],
-                           candidate.ownerDepthCost) &&
-            better(candidate, best))
-          best = candidate;
+        uint64_t candidateCost = 0;
+        if (addCostChecked(leftCost, gapCost, candidateCost) &&
+            isCoreBetter(leftMatched, candidateCost, bestMatched, bestCost)) {
+          bestMatched = leftMatched;
+          bestCost = candidateCost;
+        }
       }
-      out.forward.Set(idx(i, j), best);
+      forwardMatched[rowBase + j] = bestMatched;
+      forwardCost[rowBase + j] = bestCost;
+      leftMatched = bestMatched;
+      leftCost = bestCost;
     }
   }
 
+  // Suffix fill, the same shape reversed.  Here the two gap transitions pay
+  // different rows -- the vertical one `ownerDepthGap[aBegin + i + 1]` and the
+  // horizontal one `ownerDepthGap[aBegin + i]` -- but both are invariant across
+  // the row, and the horizontal predecessor is again the previously written
+  // state.
+  uint32_t *const suffixMatched = out.suffix.MatchedData();
+  uint64_t *const suffixCost = out.suffix.CostData();
   for (size_t ii = n + 1; ii > 0; --ii) {
     const size_t i = ii - 1;
+    const size_t rowBase = i * out.stride;
+    const size_t nextRowBase = rowBase + out.stride;
+    const uint32_t verticalGapCost = i < n ? ownerDepthGap[aBegin + i + 1] : 0;
+    const uint32_t horizontalGapCost = ownerDepthGap[aBegin + i];
+    uint32_t rightMatched = 0;
+    uint64_t rightCost = 0;
     for (size_t jj = m + 1; jj > 0; --jj) {
       const size_t j = jj - 1;
-      if (i == n && j == m)
+      if (i == n && j == m) {
+        // The far corner keeps the zero objective `Assign()` established.
+        rightMatched = suffixMatched[rowBase + m];
+        rightCost = suffixCost[rowBase + m];
         continue;
+      }
 
-      LcsObjective best{0, std::numeric_limits<uint64_t>::max()};
+      uint32_t bestMatched = 0;
+      uint64_t bestCost = std::numeric_limits<uint64_t>::max();
       if (i < n && j < m && tokensEqual(aBegin + i, bBegin + j)) {
-        LcsObjective candidate = out.suffix.Get(idx(i + 1, j + 1));
-        ++candidate.matchedTokenCount;
-        if (better(candidate, best))
-          best = candidate;
+        bestMatched = suffixMatched[nextRowBase + j + 1] + 1;
+        bestCost = suffixCost[nextRowBase + j + 1];
       }
       if (i < n) {
-        LcsObjective candidate = out.suffix.Get(idx(i + 1, j));
-        if (addCostChecked(candidate.ownerDepthCost,
-                           ownerDepthGap[aBegin + i + 1],
-                           candidate.ownerDepthCost) &&
-            better(candidate, best))
-          best = candidate;
+        const uint32_t candidateMatched = suffixMatched[nextRowBase + j];
+        uint64_t candidateCost = 0;
+        if (addCostChecked(suffixCost[nextRowBase + j], verticalGapCost,
+                           candidateCost) &&
+            isCoreBetter(candidateMatched, candidateCost, bestMatched,
+                         bestCost)) {
+          bestMatched = candidateMatched;
+          bestCost = candidateCost;
+        }
       }
       if (j < m) {
-        LcsObjective candidate = out.suffix.Get(idx(i, j + 1));
-        if (addCostChecked(candidate.ownerDepthCost,
-                           ownerDepthGap[aBegin + i],
-                           candidate.ownerDepthCost) &&
-            better(candidate, best))
-          best = candidate;
+        uint64_t candidateCost = 0;
+        if (addCostChecked(rightCost, horizontalGapCost, candidateCost) &&
+            isCoreBetter(rightMatched, candidateCost, bestMatched, bestCost)) {
+          bestMatched = rightMatched;
+          bestCost = candidateCost;
+        }
       }
-      out.suffix.Set(idx(i, j), best);
+      suffixMatched[rowBase + j] = bestMatched;
+      suffixCost[rowBase + j] = bestCost;
+      rightMatched = bestMatched;
+      rightCost = bestCost;
     }
   }
 
@@ -1045,16 +1091,56 @@ static bool addCostChecked(uint64_t base, uint32_t extra, uint64_t &out) {
 /// A gap pays ownerDepthGap[i]. Keeping those costs identical makes the
 /// admissibility check a real certificate for the same objective used to build
 /// the production map.
+/// Intern two token sequences into dense ids so that a quadratic fill can test
+/// token equality with an integer compare.
+///
+/// Ids are assigned by lexeme content, so two ids are equal exactly when the
+/// lexemes they were interned from compare equal.  This changes what an inner
+/// loop costs and never what it decides.  A B token whose lexeme occurs nowhere
+/// in A is given a distinct id no A token carries, which is the same answer the
+/// string compare gives for it.
+///
+/// The sequences are read through accessors so that the plain window arrays and
+/// the reversible `SpanView` used by the linear-space rows share one
+/// implementation.  An accessor is called once per token, never once per state.
+static void
+internTokenSequences(size_t aCount, llvm::function_ref<StringRef(size_t)> aAt,
+                     size_t bCount, llvm::function_ref<StringRef(size_t)> bAt,
+                     std::vector<uint32_t> &aIds, std::vector<uint32_t> &bIds) {
+  llvm::DenseMap<StringRef, uint32_t> idByLexeme;
+  aIds.resize(aCount);
+  bIds.resize(bCount);
+  uint32_t nextId = 0;
+  for (size_t aToken = 0; aToken < aCount; ++aToken) {
+    auto inserted = idByLexeme.try_emplace(aAt(aToken), nextId);
+    if (inserted.second)
+      ++nextId;
+    aIds[aToken] = inserted.first->second;
+  }
+  for (size_t bToken = 0; bToken < bCount; ++bToken) {
+    auto found = idByLexeme.find(bAt(bToken));
+    bIds[bToken] = found == idByLexeme.end()
+                       ? std::numeric_limits<uint32_t>::max()
+                       : found->second;
+  }
+}
+
 static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                                  ArrayRef<uint32_t> ownerDepthGap,
                                  ObjectiveTable &forward,
                                  ObjectiveTable &suffix,
                                  size_t &stride) {
+  std::vector<uint32_t> aIds;
+  std::vector<uint32_t> bIds;
+  internTokenSequences(
+      a.size(), [&](size_t aToken) { return a[aToken]; }, b.size(),
+      [&](size_t bToken) { return b[bToken]; }, aIds, bIds);
+
   OracleWindowDp window;
   if (!buildWeightedWindowDp(
           0, a.size(), 0, b.size(), ownerDepthGap,
           [&](size_t aToken, size_t bToken) {
-            return a[aToken] == b[bToken];
+            return aIds[aToken] == bIds[bToken];
           },
           window))
     return false;
@@ -2036,37 +2122,54 @@ static std::vector<Score> computeRowWeighted(const SpanView &aV,
   if (gapV.size() != n + 1)
     REFOLD_LOG_FATAL("lcs/map", "internal: gap view length must be A.len+1");
 
+  // Both gap transitions into row `i` pay `gapV.at(i)`, and the A token the
+  // diagonal tests is `aV.at(i - 1)`; both are invariant across the row, so
+  // they are read once per row rather than once per state.  The insert
+  // predecessor `ndp[j - 1]` is the state this loop wrote on its previous
+  // iteration and is carried instead of reloaded.  Transition order is
+  // unchanged, so equal-objective ties still keep the first considered
+  // transition.
+  std::vector<uint32_t> aIds;
+  std::vector<uint32_t> bIds;
+  internTokenSequences(
+      n, [&](size_t aToken) { return aV.at(aToken); }, m,
+      [&](size_t bToken) { return bV.at(bToken); }, aIds, bIds);
+
   std::vector<Score> dp(m + 1);
   std::vector<Score> ndp(m + 1);
 
   dp[0] = Score{0, 0};
   // Row 0: only insertions, charged at boundary 0.
+  const uint64_t firstRowGapCost = static_cast<uint64_t>(gapV.at(0));
   for (size_t j = 1; j <= m; ++j) {
     dp[j] = dp[j - 1];
-    dp[j].cost += static_cast<uint64_t>(gapV.at(0));
+    dp[j].cost += firstRowGapCost;
   }
 
   for (size_t i = 1; i <= n; ++i) {
+    const uint64_t gapCost = static_cast<uint64_t>(gapV.at(i));
+    const uint32_t aId = aIds[i - 1];
+
     // Col 0: only deletions, charged at boundary i.
     ndp[0] = dp[0];
-    ndp[0].cost += static_cast<uint64_t>(gapV.at(i));
+    ndp[0].cost += gapCost;
 
     Score diagPrev = dp[0];
+    Score insertPrev = ndp[0];
     for (size_t j = 1; j <= m; ++j) {
       Score best;
       best.len = 0;
       best.cost = std::numeric_limits<uint64_t>::max();
       // 1) Match (diag)
-      if (aV.at(i - 1) == bV.at(j - 1)) {
-        Score cand = diagPrev;
-        cand.len += 1U;
-        best = cand;
+      if (aId == bIds[j - 1]) {
+        best = diagPrev;
+        best.len += 1U;
       }
 
       // 2) Delete A (from dp[j])
       {
         Score cand = dp[j];
-        cand.cost += static_cast<uint64_t>(gapV.at(i));
+        cand.cost += gapCost;
         if (isCoreBetter(cand.len, cand.cost, best.len, best.cost)) {
           best = cand;
         }
@@ -2074,8 +2177,8 @@ static std::vector<Score> computeRowWeighted(const SpanView &aV,
 
       // 3) Insert B (from ndp[j-1])
       {
-        Score cand = ndp[j - 1];
-        cand.cost += static_cast<uint64_t>(gapV.at(i));
+        Score cand = insertPrev;
+        cand.cost += gapCost;
         if (isCoreBetter(cand.len, cand.cost, best.len, best.cost)) {
           best = cand;
         }
@@ -2083,6 +2186,7 @@ static std::vector<Score> computeRowWeighted(const SpanView &aV,
 
       diagPrev = dp[j];
       ndp[j] = best;
+      insertPrev = best;
     }
 
     dp.swap(ndp);
@@ -2106,43 +2210,59 @@ static std::vector<Score> computeSuffixRowWeighted(const SpanView &aV,
   if (gapV.size() != n + 1)
     REFOLD_LOG_FATAL("lcs/map", "internal: gap view length must be A.len+1");
 
+  // The same row-invariant hoists as the prefix row, with the two gap
+  // transitions paying different boundaries: the delete pays `gapV.at(i + 1)`
+  // and the insert `gapV.at(i)`.  The insert predecessor `current[j + 1]` is
+  // the state this loop wrote on its previous iteration.
+  std::vector<uint32_t> aIds;
+  std::vector<uint32_t> bIds;
+  internTokenSequences(
+      n, [&](size_t aToken) { return aV.at(aToken); }, m,
+      [&](size_t bToken) { return bV.at(bToken); }, aIds, bIds);
+
   std::vector<Score> next(m + 1);
   std::vector<Score> current(m + 1);
 
   // S[n][j]: only B insertions remain, all charged at the terminal A gap.
   next[m] = Score{0, 0};
+  const uint64_t terminalGapCost = static_cast<uint64_t>(gapV.at(n));
   for (size_t jj = m; jj > 0; --jj) {
     const size_t j = jj - 1;
     next[j] = next[j + 1];
-    next[j].cost += static_cast<uint64_t>(gapV.at(n));
+    next[j].cost += terminalGapCost;
   }
 
   for (size_t ii = n; ii > 0; --ii) {
     const size_t i = ii - 1;
-    current[m] = next[m];
-    current[m].cost += static_cast<uint64_t>(gapV.at(i + 1));
+    const uint64_t deleteGapCost = static_cast<uint64_t>(gapV.at(i + 1));
+    const uint64_t insertGapCost = static_cast<uint64_t>(gapV.at(i));
+    const uint32_t aId = aIds[i];
 
+    current[m] = next[m];
+    current[m].cost += deleteGapCost;
+
+    Score insertPrev = current[m];
     for (size_t jj = m; jj > 0; --jj) {
       const size_t j = jj - 1;
       Score best{0, std::numeric_limits<uint64_t>::max()};
 
-      if (aV.at(i) == bV.at(j)) {
-        Score candidate = next[j + 1];
-        ++candidate.len;
-        best = candidate;
+      if (aId == bIds[j]) {
+        best = next[j + 1];
+        ++best.len;
       }
 
       Score deleteA = next[j];
-      deleteA.cost += static_cast<uint64_t>(gapV.at(i + 1));
+      deleteA.cost += deleteGapCost;
       if (isCoreBetter(deleteA.len, deleteA.cost, best.len, best.cost))
         best = deleteA;
 
-      Score insertB = current[j + 1];
-      insertB.cost += static_cast<uint64_t>(gapV.at(i));
+      Score insertB = insertPrev;
+      insertB.cost += insertGapCost;
       if (isCoreBetter(insertB.len, insertB.cost, best.len, best.cost))
         best = insertB;
 
       current[j] = best;
+      insertPrev = best;
     }
     next.swap(current);
   }
