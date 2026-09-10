@@ -829,6 +829,78 @@ bool protectedSourceAuthorizationCoversEdit(
          coverage->second <= edit.end;
 }
 
+/// Drop every edit whose source bytes another edit wholly replaces.
+///
+/// Two edits can be individually proven and still collide, when one realizes a
+/// range that strictly contains the other.  A header materialized into the TU
+/// is the case that produces it: the cover edit realizes the whole body from B,
+/// and a nested `#include`/`#include_next` inside that body separately stages
+/// its own directive rewrite.  Neither is wrong, and there is no order that
+/// applies both, because the inner edit's bytes are not in the output at all --
+/// the cover replaced them.
+///
+/// So the inner edit is not composed, it is *subsumed*: every byte it would
+/// rewrite is replaced by the container, so removing it cannot change a single
+/// emitted byte.  That is what makes this a composition law rather than a
+/// preference between two edits.  Three conditions keep it one:
+///
+///   * containment must be strict on at least one side.  Two edits with the
+///     same range are a genuine ambiguity about which text to emit, and are
+///     left for the overlap check below to refuse;
+///   * both edits must replace bytes.  A zero-width insertion owns no byte the
+///     container can be said to replace, so dropping it would silently discard
+///     text somebody meant to add;
+///   * containment is decided against every edit, so the outermost container
+///     never has one and always survives.
+///
+/// Returns how many edits were dropped.
+size_t dropSubsumedNormalizedTextEdits(SmallVectorImpl<TextEdit> &norm,
+                                       StringRef emissionOwner) {
+  SmallVector<bool, 8> subsumed(norm.size(), false);
+  for (size_t inner = 0; inner < norm.size(); ++inner) {
+    const TextEdit &innerEdit = norm[inner];
+    if (innerEdit.start >= innerEdit.end)
+      continue;
+    for (size_t outer = 0; outer < norm.size(); ++outer) {
+      if (outer == inner)
+        continue;
+      const TextEdit &outerEdit = norm[outer];
+      if (outerEdit.start >= outerEdit.end)
+        continue;
+      if (outerEdit.start > innerEdit.start || innerEdit.end > outerEdit.end)
+        continue;
+      if (outerEdit.start == innerEdit.start && outerEdit.end == innerEdit.end)
+        continue;
+
+      REFOLD_LOG_TRACE(
+          "edits/apply",
+          "dropping edit [{0},{1}) in {2}: wholly replaced by edit [{3},{4})",
+          innerEdit.start, innerEdit.end, emissionOwner, outerEdit.start,
+          outerEdit.end);
+      subsumed[inner] = true;
+      break;
+    }
+  }
+
+  // Decide before moving anything.  Rebuilding unconditionally and assigning
+  // back only when something was dropped would leave `norm` holding moved-from
+  // edits in the common case, which reads downstream as an edit with no text,
+  // no carriers and no authorizations.
+  const size_t dropped = llvm::count(subsumed, true);
+  if (dropped == 0)
+    return 0;
+
+  SmallVector<TextEdit, 8> kept;
+  kept.reserve(norm.size() - dropped);
+  for (size_t i = 0; i < norm.size(); ++i) {
+    if (subsumed[i])
+      continue;
+    kept.push_back(std::move(norm[i]));
+  }
+  norm = std::move(kept);
+  return dropped;
+}
+
 bool sourceEditInterferesWithProtectedInterval(
     const TextEdit &edit, const PreprocessingStructureInterval &interval,
     StringRef sourceBytes, const LangOptions &lexLang) {
@@ -3170,6 +3242,12 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
 
     return true;
   };
+
+  // Remove edits the emitted bytes cannot contain before looking for an
+  // overlap.  A subsumed edit is not an overlap to be resolved: its bytes are
+  // replaced wholesale by the edit containing it, so it has no effect on the
+  // output and no composition question to answer.
+  dropSubsumedNormalizedTextEdits(norm, emissionOwner);
 
   // Some token-LCS tie choices can split one logical B-side TU realization
   // around stable punctuation tokens. If the resulting direct TU hunk edits
