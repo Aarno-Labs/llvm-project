@@ -23,7 +23,7 @@
 // prefix standing in for it, is what declines the window.  The two maps whose
 // incomparability once ended the enumeration decide nothing on their own.
 //
-// CHECK: candidate census: enumerated=14 accepted=14
+// CHECK: candidate census: enumerated=14 realized=14 accepted=14
 // CHECK: has no unique least source-mutation class: accepted=14
 #define NIL ((void*)0)
 

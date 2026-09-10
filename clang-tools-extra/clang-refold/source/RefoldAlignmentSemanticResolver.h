@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -217,6 +218,22 @@ private:
   WindowResolution
   ResolveCertificationWindow(size_t windowIndex,
                              llvm::ArrayRef<int64_t> baseMap) const;
+
+  /// Realize \p candidateMap through one complete planning simulation, reusing
+  /// \p slot when it already holds this map's result.
+  ///
+  /// A simulation is a function of its candidate map alone: it plans a fresh
+  /// engine over the run's fixed A and B streams under that alignment and reads
+  /// nothing a sibling simulation writes.  Which commit rule asks for a map
+  /// first, and whether a rule denied earlier would also have asked, therefore
+  /// change only how many whole-translation-unit refolds the window pays for --
+  /// never what any rule decides.
+  ///
+  /// Realizing on demand is what lets a rule whose set is small be reached
+  /// without first paying for the sets of the rules that were already denied.
+  const AlignmentSemanticSimulationResult &RealizeCandidateMap(
+      llvm::ArrayRef<int64_t> candidateMap,
+      std::optional<AlignmentSemanticSimulationResult> &slot) const;
 
   /// Return whether one certification window can carry alignment ambiguity.
   ///

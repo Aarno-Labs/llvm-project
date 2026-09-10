@@ -42,18 +42,38 @@ constexpr size_t MaxUniqueMapsPerForcedWindow = 256;
 constexpr size_t MaxGlobalSemanticCandidateMaps = 256;
 constexpr size_t MaxProposalCounterfactuals = 256;
 
-/// Largest complete candidate set a window may realize in order to decide the
-/// least-source-mutation rule on its own.
+/// Largest set of candidate maps a single commit rule may realize in order to
+/// decide itself.
 ///
-/// Unlike the other two commit rules, that rule admits no denial from a prefix
-/// of the enumeration: a least element must compare against every accepted map,
-/// so a prefix that contains none proves nothing about the maps still
-/// unrealized (see the enumeration loop below).  Deciding it therefore costs
-/// one whole-translation-unit realization for every enumerated map, and this
-/// budget is the point past which a single window may not spend them.  It is a
-/// cost bound, not a proof: exceeding it retains the forced-only map, exactly
-/// as every other budget here does.
-constexpr size_t MaxContainmentOnlyCandidateMaps = 32;
+/// Realizing one map costs a complete refold of the translation unit.  Two of
+/// the three commit rules below name the set they must realize before they can
+/// decide, and neither set admits a denial from a prefix of itself:
+///
+///   least source mutation: a least element must compare against every accepted
+///     map, so a prefix that contains none proves nothing about the maps still
+///     unrealized (see the enumeration loop below).  Its set is the complete
+///     enumeration;
+///   legacy boundary proposal: its uniqueness test spans every map that carries
+///     the anchors its counterfactuals proved necessary, so a prefix that spans
+///     one realization class proves nothing about the survivors still
+///     unrealized.  Its set is the surviving maps.
+///
+/// This budget is the point past which a single rule may not spend them.  It is
+/// a cost bound, not a proof: a rule that exceeds it declines, and a window
+/// with no rule left retains the forced-only map, exactly as every other budget
+/// here does.
+///
+/// The bound applies per rule rather than per window so that a window over it
+/// still reaches the rules whose set is small.  A window whose enumeration fits
+/// inside the budget is unaffected in every case: no rule's set is larger than
+/// the enumeration, so none of them can decline on cost.
+///
+/// The value must leave room for the largest enumeration on which a rule is
+/// known to commit, because declining costs resolution the window would
+/// otherwise have kept.  The binding case is
+/// `semantic_alignment_counter_argument_growth_two_windows.c`, whose window
+/// enumerates 54 maps and commits the least-source-mutation rule on map 14.
+constexpr size_t MaxRealizedMapsPerCommitRule = 64;
 
 struct ForcedAnchor {
   uint64_t aToken = 0;
@@ -571,6 +591,16 @@ bool RefoldAlignmentSemanticResolver::WindowCarriesAmbiguity(
   return aEnd != window.aEnd;
 }
 
+const AlignmentSemanticSimulationResult &
+RefoldAlignmentSemanticResolver::RealizeCandidateMap(
+    ArrayRef<int64_t> candidateMap,
+    std::optional<AlignmentSemanticSimulationResult> &slot) const {
+  if (!slot)
+    slot.emplace(deps_.simulate(
+        buildSimulationSelection(candidateMap, deps_.coreAlignment)));
+  return *slot;
+}
+
 RefoldAlignmentSemanticResolver::WindowResolution
 RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     size_t windowIndex, ArrayRef<int64_t> baseMap) const {
@@ -706,7 +736,10 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
 
   // Realizing one candidate costs a complete refold of the translation unit, so
   // the loop below tracks which commit rules a prefix of the enumeration has
-  // already denied, and stops as soon as no rule can still fire.
+  // already denied, and stops realizing as soon as the rules that read the
+  // whole ground set are gone.  It is not the end of the window: the legacy
+  // boundary proposal reads named maps rather than the set, so it is reached
+  // from a stopped enumeration and realizes what it names.
   //
   // Only denials that carry from the prefix to the completed rule may be
   // recorded here.  Two do:
@@ -735,34 +768,48 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   // therefore not tracked at all: it would only invite being read as a denial
   // it cannot support.
   //
-  // What bounds this rule instead is cost.  Once it is the last rule alive,
-  // deciding it costs one realization per enumerated map, so a candidate set
-  // over MaxContainmentOnlyCandidateMaps declines on budget without realizing
-  // the remainder.  That decline keeps the window's core-forced anchors, which
-  // is the same fail-closed answer every other exhausted budget here gives.
+  // What bounds this rule instead is cost.  Deciding it costs one realization
+  // per enumerated map, so an enumeration over MaxRealizedMapsPerCommitRule
+  // declines the rule without realizing the remainder.  Declining a rule is not
+  // declining the window: a rule whose set is small is still reached below, and
+  // a window with no rule left keeps its core-forced anchors, which is the same
+  // fail-closed answer every other exhausted budget here gives.
   bool observationalRuleReachable = true;
   bool containmentRuleReachable = true;
   std::optional<std::string> soleConcreteOutputKey;
 
-  std::vector<AlignmentSemanticSimulationResult> simulations;
-  simulations.reserve(globalMaps.size());
+  // Structural validity is a fail-closed guard over the whole ground set -- one
+  // invalid map abandons the window -- so it is decided before anything is
+  // realized.  Leaving it inside the realization loop would make the guard
+  // depend on how far that loop happens to walk, and a loop that stops early
+  // would pass a window an exhaustive one rejects.
   for (const std::vector<int64_t> &candidateMap : globalMaps) {
-    if (!isStrictlyMonotoneMap(candidateMap, deps_.bLexemes.size()) ||
-        !mapLexemesAgree(candidateMap, deps_.aLexemes, deps_.bLexemes)) {
-      REFOLD_LOG_TRACE(
-          "lcs/semantic-resolver",
-          "window {0} keeps core-forced anchors: an enumerated map is not a "
-          "monotone lexeme-agreeing alignment",
-          windowIndex);
-      return WindowResolution{};
-    }
-    simulations.push_back(
-        deps_.simulate(buildSimulationSelection(candidateMap,
-                                                deps_.coreAlignment)));
+    if (isStrictlyMonotoneMap(candidateMap, deps_.bLexemes.size()) &&
+        mapLexemesAgree(candidateMap, deps_.aLexemes, deps_.bLexemes))
+      continue;
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "window {0} keeps core-forced anchors: an enumerated map is not a "
+        "monotone lexeme-agreeing alignment",
+        windowIndex);
+    return WindowResolution{};
+  }
 
-    const size_t realizedIndex = simulations.size() - 1;
+  // Realized candidate maps, indexed by position in `globalMaps`.  A map is
+  // realized when a commit rule first reads it and never realized twice; see
+  // `RealizeCandidateMap()` for why the order the rules ask in cannot change
+  // any answer.
+  std::vector<std::optional<AlignmentSemanticSimulationResult>> realizedMaps(
+      globalMaps.size());
+
+  // Whether every enumerated map was realized.  The two rules that quantify
+  // over the complete ground set may be decided only when this holds; the loop
+  // below stops early exactly when both of them have already been denied.
+  bool everyMapRealized = true;
+
+  for (size_t mapIndex = 0; mapIndex < globalMaps.size(); ++mapIndex) {
     const AlignmentSemanticSimulationResult &realized =
-        simulations[realizedIndex];
+        RealizeCandidateMap(globalMaps[mapIndex], realizedMaps[mapIndex]);
     const bool realizedIsCompleteAccepted =
         realized.disposition ==
             AlignmentSemanticSimulationDisposition::Accepted &&
@@ -786,26 +833,46 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         AlignmentSemanticSimulationDisposition::ProofIncomplete)
       containmentRuleReachable = false;
 
-    if (!observationalRuleReachable && !legacyProposalRuleReachable) {
-      if (!containmentRuleReachable) {
-        REFOLD_LOG_TRACE(
-            "lcs/semantic-resolver",
-            "window {0} keeps core-forced anchors: no commit rule remains "
-            "reachable after realizing {1} of {2} enumerated map(s)",
-            windowIndex, simulations.size(), globalMaps.size());
-        return WindowResolution{};
-      }
-      if (globalMaps.size() > MaxContainmentOnlyCandidateMaps) {
-        REFOLD_LOG_TRACE(
-            "lcs/semantic-resolver",
-            "window {0} keeps core-forced anchors: only the least-source-"
-            "mutation rule remains after realizing {1} map(s) and its {2} "
-            "enumerated map(s) exceed the containment realization budget ({3})",
-            windowIndex, simulations.size(), globalMaps.size(),
-            MaxContainmentOnlyCandidateMaps);
-        return WindowResolution{};
-      }
+    // Observational irrelevance still needs the rest of the ground set.
+    if (observationalRuleReachable)
+      continue;
+
+    // The least-source-mutation rule needs it too, and no prefix can deny it,
+    // so cost is what decides whether it may have it.  The test is on the
+    // enumeration rather than on the prefix realized so far: the rule's set is
+    // the whole ground set however few of it has been paid for, and declining
+    // on the first candidate spends one realization instead of the budget.
+    if (containmentRuleReachable &&
+        globalMaps.size() > MaxRealizedMapsPerCommitRule) {
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "window {0} declines the least-source-mutation rule after realizing "
+          "{1} map(s): its {2} enumerated map(s) exceed the containment "
+          "realization budget ({3})",
+          windowIndex, mapIndex + 1, globalMaps.size(),
+          MaxRealizedMapsPerCommitRule);
+      containmentRuleReachable = false;
     }
+
+    if (containmentRuleReachable)
+      continue;
+
+    // Neither rule that reads the whole ground set can still fire.
+    if (!legacyProposalRuleReachable) {
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "window {0} keeps core-forced anchors: no commit rule remains "
+          "reachable after realizing {1} of {2} enumerated map(s)",
+          windowIndex, mapIndex + 1, globalMaps.size());
+      return WindowResolution{};
+    }
+
+    // The legacy boundary proposal is the only rule left, and it reads the
+    // proposal's own realization, its leave-one-out counterfactuals, and the
+    // maps that survive the anchors those prove necessary -- never the ground
+    // set as such.  Stop realizing here and let it ask for what it needs.
+    everyMapRealized = false;
+    break;
   }
 
   auto commitRealizationClass =
@@ -861,17 +928,23 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     return committed;
   };
 
-  // Permanent census of the simulated candidate set. Every commit rule below
-  // is a statement about these counts, so reporting them makes a declined
-  // window explain itself instead of failing silently. Reading finished
-  // simulation records cannot affect candidate order or any proof decision.
+  // Permanent census of the realized candidate set. Every commit rule below is
+  // a statement about these counts, so reporting them makes a declined window
+  // explain itself instead of failing silently. Reading finished simulation
+  // records cannot affect candidate order or any proof decision.
   if (inTraceMode()) {
+    size_t realizedCount = 0;
     size_t acceptedCount = 0;
     size_t terminalFallbackCount = 0;
     size_t proofIncompleteCount = 0;
     std::set<StringRef> concreteOutputKeys;
     std::set<StringRef> realizationKeys;
-    for (const AlignmentSemanticSimulationResult &simulation : simulations) {
+    for (const std::optional<AlignmentSemanticSimulationResult> &realized :
+         realizedMaps) {
+      if (!realized)
+        continue;
+      ++realizedCount;
+      const AlignmentSemanticSimulationResult &simulation = *realized;
       switch (simulation.disposition) {
       case AlignmentSemanticSimulationDisposition::Accepted:
         ++acceptedCount;
@@ -890,133 +963,142 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     }
     REFOLD_LOG_TRACE(
         "lcs/semantic-resolver",
-        "window {0} candidate census: enumerated={1} accepted={2} "
-        "terminalFallback={3} proofIncomplete={4} distinctConcreteOutputs={5} "
-        "distinctRealizations={6}",
-        windowIndex, simulations.size(), acceptedCount, terminalFallbackCount,
-        proofIncompleteCount, concreteOutputKeys.size(),
+        "window {0} candidate census: enumerated={1} realized={2} accepted={3} "
+        "terminalFallback={4} proofIncomplete={5} distinctConcreteOutputs={6} "
+        "distinctRealizations={7}",
+        windowIndex, globalMaps.size(), realizedCount, acceptedCount,
+        terminalFallbackCount, proofIncompleteCount, concreteOutputKeys.size(),
         realizationKeys.size());
   }
 
-  // The strongest equivalence theorem needs no historical boundary proposal:
-  // when every complete core-optimal map independently satisfies the full
-  // theorem audit and all maps produce one exact concrete output plan, the
-  // alignment ambiguity is observationally irrelevant.  Internal accepted-
-  // carrier provenance is intentionally excluded here: different hunk
-  // partitions may select different proof paths while emitting identical
-  // source bytes, mappings, source-graph artifacts, and line-pruning inputs.
-  // Those proof paths remain available in the stricter realization key below
-  // whenever the concrete plans differ.
-  std::map<std::string, std::vector<size_t>> completeOutputClasses;
-  bool everyCompleteMapAccepted = true;
-  for (size_t mapIndex = 0; mapIndex < simulations.size(); ++mapIndex) {
-    const AlignmentSemanticSimulationResult &simulation =
-        simulations[mapIndex];
-    if (simulation.disposition !=
-            AlignmentSemanticSimulationDisposition::Accepted ||
-        !simulation.accepted ||
-        simulation.concreteOutputEquivalenceKey.empty()) {
-      everyCompleteMapAccepted = false;
-      break;
-    }
-    completeOutputClasses[simulation.concreteOutputEquivalenceKey]
-        .push_back(mapIndex);
-  }
-  if (everyCompleteMapAccepted && completeOutputClasses.size() == 1) {
-    const auto &onlyClass = *completeOutputClasses.begin();
-    return commitRealizationClass(onlyClass.first, onlyClass.second,
-                                  ArrayRef<RequiredAnchor>());
-  }
-  REFOLD_LOG_TRACE(
-      "lcs/semantic-resolver",
-      "window {0} is not observationally irrelevant: everyMapAccepted={1} "
-      "distinctConcreteOutputClasses={2}",
-      windowIndex, everyCompleteMapAccepted, completeOutputClasses.size());
-
-  // A complete accepted simulation is an independent proof that its source
-  // realization reproduces the requested B stream and preserves every tracked
-  // preprocessing postcondition.  Carrier-specific witness spellings may still
-  // separate two such simulations even when one changes a strict subset of the
-  // other's original source carriers.  Select a map only when exhaustive
-  // enumeration proves a global least element under exact source-
-  // transformation containment. Incomparable minima, incomplete proofs, and
-  // multiple realization classes remain ambiguous and retain the forced-only
-  // map.
-  bool hasProofIncompleteMap = false;
-  std::vector<size_t> acceptedMaps;
-  for (size_t mapIndex = 0; mapIndex < simulations.size(); ++mapIndex) {
-    const AlignmentSemanticSimulationResult &simulation =
-        simulations[mapIndex];
-    if (simulation.disposition ==
-        AlignmentSemanticSimulationDisposition::ProofIncomplete) {
-      hasProofIncompleteMap = true;
-      break;
-    }
-    if (simulation.disposition ==
-            AlignmentSemanticSimulationDisposition::Accepted &&
-        simulation.accepted &&
-        !simulation.realizationEquivalenceKey.empty())
-      acceptedMaps.push_back(mapIndex);
-  }
-
-  if (!hasProofIncompleteMap && !acceptedMaps.empty()) {
-    std::vector<size_t> leastDestructiveMaps;
-    for (size_t candidateIndex : acceptedMaps) {
-      const bool noMoreDestructiveThanEveryAccepted = llvm::all_of(
-          acceptedMaps, [&](size_t otherIndex) {
-            return noMoreSourceDestructive(simulations[candidateIndex],
-                                           simulations[otherIndex]);
-          });
-      if (noMoreDestructiveThanEveryAccepted)
-        leastDestructiveMaps.push_back(candidateIndex);
-    }
-
-    // Class the surviving minima by their concrete emitted artifact, not by
-    // internal proof-carrier provenance. Every member of `acceptedMaps` has
-    // already passed the complete end-to-end theorem audit independently, which
-    // is exactly the precondition `concreteOutputEquivalenceKey` documents for
-    // itself: at that point the authoritative question is whether alignment
-    // ambiguity changes the emitted source and the deterministic post-emission
-    // pruning inputs, not which carrier proved the same bytes. Two minima that
-    // differ only in the structural-tiling witness spelling emit identical
-    // source, so separating them here would manufacture ambiguity the output
-    // does not have. The stricter realization key still governs the
-    // counterfactual path below, where members have not all been audited.
-    std::map<std::string, std::vector<size_t>> leastRealizationClasses;
-    for (size_t mapIndex : leastDestructiveMaps) {
+  // Both rules below are statements about the complete ground set, so both are
+  // reached only when every enumerated map was realized.  The enumeration stops
+  // short only after each has been denied -- observational irrelevance by a
+  // second concrete-output class or an unaccepted candidate, least source
+  // mutation by a proof-incomplete candidate or by its realization budget --
+  // and a denied rule cannot revive, so skipping them here decides nothing that
+  // realizing the remainder would have decided differently.
+  if (everyMapRealized) {
+    // The strongest equivalence theorem needs no historical boundary proposal:
+    // when every complete core-optimal map independently satisfies the full
+    // theorem audit and all maps produce one exact concrete output plan, the
+    // alignment ambiguity is observationally irrelevant.  Internal accepted-
+    // carrier provenance is intentionally excluded here: different hunk
+    // partitions may select different proof paths while emitting identical
+    // source bytes, mappings, source-graph artifacts, and line-pruning inputs.
+    // Those proof paths remain available in the stricter realization key below
+    // whenever the concrete plans differ.
+    std::map<std::string, std::vector<size_t>> completeOutputClasses;
+    bool everyCompleteMapAccepted = true;
+    for (size_t mapIndex = 0; mapIndex < globalMaps.size(); ++mapIndex) {
       const AlignmentSemanticSimulationResult &simulation =
-          simulations[mapIndex];
-      if (simulation.concreteOutputEquivalenceKey.empty()) {
-        leastRealizationClasses.clear();
+          *realizedMaps[mapIndex];
+      if (simulation.disposition !=
+              AlignmentSemanticSimulationDisposition::Accepted ||
+          !simulation.accepted ||
+          simulation.concreteOutputEquivalenceKey.empty()) {
+        everyCompleteMapAccepted = false;
         break;
       }
-      leastRealizationClasses[simulation.concreteOutputEquivalenceKey]
-          .push_back(mapIndex);
+      completeOutputClasses[simulation.concreteOutputEquivalenceKey].push_back(
+          mapIndex);
     }
-
-    if (leastRealizationClasses.size() == 1) {
-      const auto &onlyClass = *leastRealizationClasses.begin();
-      REFOLD_LOG_TRACE(
-          "lcs/semantic-resolver",
-          "window {0} committing globally least source-mutation class: "
-          "accepted={1} least={2} classMembers={3}",
-          windowIndex, acceptedMaps.size(), leastDestructiveMaps.size(),
-          formatMapIndices(onlyClass.second));
+    if (everyCompleteMapAccepted && completeOutputClasses.size() == 1) {
+      const auto &onlyClass = *completeOutputClasses.begin();
       return commitRealizationClass(onlyClass.first, onlyClass.second,
                                     ArrayRef<RequiredAnchor>());
     }
     REFOLD_LOG_TRACE(
         "lcs/semantic-resolver",
-        "window {0} has no unique least source-mutation class: accepted={1} "
-        "leastDestructive={2} leastRealizationClasses={3}",
-        windowIndex, acceptedMaps.size(), leastDestructiveMaps.size(),
-        leastRealizationClasses.size());
-  } else {
-    REFOLD_LOG_TRACE(
-        "lcs/semantic-resolver",
-        "window {0} skips source-mutation containment: proofIncomplete={1} "
-        "accepted={2}",
-        windowIndex, hasProofIncompleteMap, acceptedMaps.size());
+        "window {0} is not observationally irrelevant: everyMapAccepted={1} "
+        "distinctConcreteOutputClasses={2}",
+        windowIndex, everyCompleteMapAccepted, completeOutputClasses.size());
+
+    // A complete accepted simulation is an independent proof that its source
+    // realization reproduces the requested B stream and preserves every tracked
+    // preprocessing postcondition.  Carrier-specific witness spellings may
+    // still separate two such simulations even when one changes a strict subset
+    // of the other's original source carriers.  Select a map only when
+    // exhaustive enumeration proves a global least element under exact source-
+    // transformation containment. Incomparable minima, incomplete proofs, and
+    // multiple realization classes remain ambiguous and retain the forced-only
+    // map.
+    bool hasProofIncompleteMap = false;
+    std::vector<size_t> acceptedMaps;
+    for (size_t mapIndex = 0; mapIndex < globalMaps.size(); ++mapIndex) {
+      const AlignmentSemanticSimulationResult &simulation =
+          *realizedMaps[mapIndex];
+      if (simulation.disposition ==
+          AlignmentSemanticSimulationDisposition::ProofIncomplete) {
+        hasProofIncompleteMap = true;
+        break;
+      }
+      if (simulation.disposition ==
+              AlignmentSemanticSimulationDisposition::Accepted &&
+          simulation.accepted && !simulation.realizationEquivalenceKey.empty())
+        acceptedMaps.push_back(mapIndex);
+    }
+
+    if (!hasProofIncompleteMap && !acceptedMaps.empty()) {
+      std::vector<size_t> leastDestructiveMaps;
+      for (size_t candidateIndex : acceptedMaps) {
+        const bool noMoreDestructiveThanEveryAccepted =
+            llvm::all_of(acceptedMaps, [&](size_t otherIndex) {
+              return noMoreSourceDestructive(*realizedMaps[candidateIndex],
+                                             *realizedMaps[otherIndex]);
+            });
+        if (noMoreDestructiveThanEveryAccepted)
+          leastDestructiveMaps.push_back(candidateIndex);
+      }
+
+      // Class the surviving minima by their concrete emitted artifact, not by
+      // internal proof-carrier provenance. Every member of `acceptedMaps` has
+      // already passed the complete end-to-end theorem audit independently,
+      // which is exactly the precondition `concreteOutputEquivalenceKey`
+      // documents for itself: at that point the authoritative question is
+      // whether alignment ambiguity changes the emitted source and the
+      // deterministic post-emission pruning inputs, not which carrier proved
+      // the same bytes. Two minima that differ only in the structural-tiling
+      // witness spelling emit identical source, so separating them here would
+      // manufacture ambiguity the output does not have. The stricter
+      // realization key still governs the counterfactual path below, where
+      // members have not all been audited.
+      std::map<std::string, std::vector<size_t>> leastRealizationClasses;
+      for (size_t mapIndex : leastDestructiveMaps) {
+        const AlignmentSemanticSimulationResult &simulation =
+            *realizedMaps[mapIndex];
+        if (simulation.concreteOutputEquivalenceKey.empty()) {
+          leastRealizationClasses.clear();
+          break;
+        }
+        leastRealizationClasses[simulation.concreteOutputEquivalenceKey]
+            .push_back(mapIndex);
+      }
+
+      if (leastRealizationClasses.size() == 1) {
+        const auto &onlyClass = *leastRealizationClasses.begin();
+        REFOLD_LOG_TRACE(
+            "lcs/semantic-resolver",
+            "window {0} committing globally least source-mutation class: "
+            "accepted={1} least={2} classMembers={3}",
+            windowIndex, acceptedMaps.size(), leastDestructiveMaps.size(),
+            formatMapIndices(onlyClass.second));
+        return commitRealizationClass(onlyClass.first, onlyClass.second,
+                                      ArrayRef<RequiredAnchor>());
+      }
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "window {0} has no unique least source-mutation class: accepted={1} "
+          "leastDestructive={2} leastRealizationClasses={3}",
+          windowIndex, acceptedMaps.size(), leastDestructiveMaps.size(),
+          leastRealizationClasses.size());
+    } else {
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "window {0} skips source-mutation containment: proofIncomplete={1} "
+          "accepted={2}",
+          windowIndex, hasProofIncompleteMap, acceptedMaps.size());
+    }
   }
 
   // The old boundary map is held strictly as a proposal. The old balance and
@@ -1060,16 +1142,18 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           windowIndex, proposalNonForcedCount, MaxProposalCounterfactuals);
       return WindowResolution{};
     }
-    // The historical proposal is commonly one of the already simulated
-    // complete maps. Reuse that byte-identical theorem result instead of
-    // cloning and refolding the entire translation unit a second time.
+    // The historical proposal is commonly one of the enumerated complete maps.
+    // Realize it through that map's slot, so a proposal the enumeration already
+    // paid for is reused instead of cloning and refolding the entire
+    // translation unit a second time.
     const auto proposalMap = std::lower_bound(
         globalMaps.begin(), globalMaps.end(), proposal.selectedMap);
     if (proposalMap != globalMaps.end() &&
         *proposalMap == proposal.selectedMap) {
       const size_t proposalIndex =
           static_cast<size_t>(proposalMap - globalMaps.begin());
-      proposalSimulation = &simulations[proposalIndex];
+      proposalSimulation = &RealizeCandidateMap(globalMaps[proposalIndex],
+                                                realizedMaps[proposalIndex]);
     } else {
       ownedProposalSimulation.emplace(deps_.simulate(
           buildSimulationSelection(proposal.selectedMap,
@@ -1151,17 +1235,34 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     return WindowResolution{};
   }
 
+  // The uniqueness test below spans every surviving map, so this rule's own
+  // realization set is that survivor set, and it is bounded exactly as the
+  // least-source-mutation rule's ground set is.  A window whose enumeration
+  // fits inside the budget can never reach this decline: the survivors are a
+  // subset of the enumeration.
+  if (survivingMaps.size() > MaxRealizedMapsPerCommitRule) {
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "window {0} keeps core-forced anchors: {1} map(s) surviving the {2} "
+        "required anchor(s) exceed the realization budget ({3})",
+        windowIndex, survivingMaps.size(), requiredAnchors.size(),
+        MaxRealizedMapsPerCommitRule);
+    return WindowResolution{};
+  }
+
   // Unknown witness dimensions are not semantic rejections. If a surviving
   // core-optimal map is proof-incomplete, uniqueness has not been established
   // and the resolver must retain only forced anchors.
   for (size_t mapIndex : survivingMaps) {
-    if (simulations[mapIndex].disposition ==
+    const AlignmentSemanticSimulationResult &simulation =
+        RealizeCandidateMap(globalMaps[mapIndex], realizedMaps[mapIndex]);
+    if (simulation.disposition ==
         AlignmentSemanticSimulationDisposition::ProofIncomplete) {
       REFOLD_LOG_TRACE(
           "lcs/semantic-resolver",
           "window {0} keeps core-forced anchors: surviving map {1} has "
           "incomplete proof ('{2}')",
-          windowIndex, mapIndex, simulations[mapIndex].rejectionReason);
+          windowIndex, mapIndex, simulation.rejectionReason);
       return WindowResolution{};
     }
   }
@@ -1169,7 +1270,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   std::map<std::string, std::vector<size_t>> realizationClasses;
   for (size_t mapIndex : survivingMaps) {
     const AlignmentSemanticSimulationResult &simulation =
-        simulations[mapIndex];
+        *realizedMaps[mapIndex];
     if (simulation.disposition ==
         AlignmentSemanticSimulationDisposition::TerminalFallback)
       continue;

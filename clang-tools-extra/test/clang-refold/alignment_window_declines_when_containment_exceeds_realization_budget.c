@@ -7,24 +7,26 @@
 //
 // The inserted wrappers repeat the `) ; }` tail that `first` already ends
 // with, so core certification cannot force the window's anchors and the
-// all-optimal enumeration returns 55 complete maps.  Each realizes a different
+// all-optimal enumeration returns 91 complete maps.  Each realizes a different
 // source edit, so the observational-irrelevance rule dies at the second
 // distinct concrete output, and it dies for good: an unaccepted candidate or a
 // second concrete-output class holds of every superset of the prefix that
 // produced it.  Reachability of the legacy boundary proposal is decided from
 // the lexemes, the gap provenance, and the core alignment alone, so it too is
-// known before any candidate is realized.
+// known before any candidate is realized, and here it is unreachable.
 //
 // That leaves the least-source-mutation rule, and nothing the prefix contains
 // can deny it.  Its least element must be no more destructive than *every*
 // accepted map, so a prefix holding no such map says only that none already
 // realized is one; a map still unrealized may be, and then the completed rule
-// commits.  Deciding the rule therefore means realizing all 55.
+// commits.  Deciding the rule therefore means realizing all 91.
 //
-// This asserts that the window declines on the stated realization budget
-// instead, after two maps rather than 55.  The decline keeps the window's
-// core-forced anchors, so what a budget costs is resolution, never a wrong
-// output.
+// This asserts that the rule declines on the stated realization budget
+// instead, after two maps rather than 91, and that a window left with no other
+// rule then keeps its core-forced anchors.  What a budget costs is resolution,
+// never a wrong output.  For a window over the same budget whose legacy
+// proposal *is* reachable, see
+// alignment_window_over_budget_still_reaches_the_legacy_proposal.c.
 //
 // Regression for the dbcc `mpc.c` refold, whose two ambiguous windows
 // enumerate 90 and 45 candidates and decline after two.
