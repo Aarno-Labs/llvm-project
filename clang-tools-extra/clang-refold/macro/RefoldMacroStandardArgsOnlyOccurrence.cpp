@@ -238,11 +238,51 @@ TouchedFormalHunkCollector::Collect(TouchedFormalHunkCollection collection,
   SmallVector<diffutils::Hunk, 8> &tokenHunks = collection.tokenHunks;
   tokenHunks.push_back(primaryHunk);
 
+  // A-token bounds of the occurrences of the formals this hunk touched.  Both
+  // arms of `HunkTouchesFormalOccurrence()` confine a touching candidate to
+  // these bounds: a candidate with A width touches only by overlapping an
+  // occurrence, and a pure insertion is owned by one only at a position inside
+  // it, immediately before its first token, or exactly at its end.  A candidate
+  // outside the bounds therefore cannot touch any touched formal, whichever arm
+  // applies, so skipping it is a proof rather than a filter.
+  //
+  // The scan is over every hunk in the stream and runs once per args-only
+  // candidate, so on a macro-dense unit it is quadratic in the hunk count --
+  // 3292 hunks against 18000 calls on uxnmin.  Deciding the cheap bound first
+  // keeps the expensive arm, which maps an occurrence into B, for candidates
+  // that can still qualify.
+  std::optional<uint64_t> touchedOccBegin;
+  std::optional<uint64_t> touchedOccEnd;
+  for (const auto &sp : occs) {
+    if (sp.argIdx >= touched.size() || !touched[sp.argIdx])
+      continue;
+    touchedOccBegin = touchedOccBegin
+                          ? std::min(*touchedOccBegin, sp.begin)
+                          : sp.begin;
+    touchedOccEnd = touchedOccEnd ? std::max(*touchedOccEnd, sp.end) : sp.end;
+  }
+
+  auto candidateCanTouchTouchedFormal =
+      [&](const diffutils::Hunk &cand) -> bool {
+    if (!touchedOccBegin || !touchedOccEnd)
+      return false;
+    if (cand.aStart == cand.aEnd) {
+      // A pure insertion at `aPos` is owned only for
+      // `sp.begin - 1 <= aPos <= sp.end`; the addition avoids underflowing at
+      // an occurrence that begins at token zero.
+      return cand.aStart + 1 >= *touchedOccBegin &&
+             cand.aStart <= *touchedOccEnd;
+    }
+    return cand.aEnd > *touchedOccBegin && cand.aStart < *touchedOccEnd;
+  };
+
   // Add sibling token hunks that also touch the same formal arguments. The
   // eventual argument replacement must explain the complete set of token edits
   // for those formals, otherwise we could accept a partial rewrite.
   for (const auto &cand : deps_.abTokHunks) {
     if (sameTokenHunk(cand, primaryHunk))
+      continue;
+    if (!candidateCanTouchTouchedFormal(cand))
       continue;
     if (!HunkTouchesTouchedFormal(cand, occs, touched))
       continue;
