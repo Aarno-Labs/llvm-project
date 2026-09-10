@@ -83,42 +83,73 @@ constexpr size_t MaxProposalCounterfactuals = 256;
 /// run with the budget injected below set low enough to deny the rule, and it
 /// asserts that what is lost is the resolution and never the output.
 ///
+/// The budget counts *cost*, not maps.  One realization is a complete refold of
+/// the translation unit, so what a rule spends is its map count multiplied by
+/// the size of the unit each of those maps is realized over -- and a bound on
+/// the count alone means two entirely different things at the two ends of the
+/// corpus.  Under a pure count of 64, `piotrl/c_markdown` `stack.c` realizes
+/// 193 maps over a 166-token stream in 0.05 s and commits, while `lemon.c`
+/// realizes 64 maps over a 48686-token stream and spends 410 s to decline.  The
+/// second is the case this budget exists to stop, and a count could not
+/// separate them: the cheap window enumerates three times as many maps as the
+/// expensive one.
+///
 /// The value must leave room for the largest enumeration on which a rule is
 /// known to commit, because declining costs resolution the window would
-/// otherwise have kept.  The binding case is
-/// `semantic_alignment_counter_argument_growth_two_windows.c`, whose window
-/// enumerates 54 maps and commits the least-source-mutation rule on map 14.
-constexpr size_t DefaultMaxRealizedMapsPerCommitRule = 64;
+/// otherwise have kept.  Measured over the tenjin corpus, the most expensive
+/// window that commits is `assorted_guidance` at 64 maps over 1061 A tokens
+/// (67904, whole run 1.15 s), and the cheapest that spends its realizations
+/// only to decline is `uxnmin` window 7 at 7 maps over 37858 A tokens (265006,
+/// 50 s of a 82 s run).  This sits between them, near the geometric middle of
+/// that band, so each side keeps a factor of about two.
+///
+/// `semantic_alignment_counter_argument_growth_two_windows.c` remains the
+/// binding *lit* case, and it is well inside: its window enumerates 54 maps and
+/// commits the least-source-mutation rule on map 14.
+constexpr uint64_t DefaultMaxRealizationCostPerCommitRule = 131072;
 
 constexpr StringLiteral TestOnlyRealizationBudgetEnvironment =
-    "CLANG_REFOLD_TEST_ONLY_SEMANTIC_REALIZATION_BUDGET";
+    "CLANG_REFOLD_TEST_ONLY_SEMANTIC_REALIZATION_COST_BUDGET";
+
+/// Return the realization cost of \p maps candidate maps over \p aTokens.
+///
+/// Cost is the map count times the A-token length because one realization
+/// plans the whole stream regardless of how small the window that varies is.
+/// Both factors are bounded -- enumeration by `MaxGlobalSemanticCandidateMaps`,
+/// the stream by the input -- so the product is computed in 64 bits and cannot
+/// wrap on any input the enumeration admits.
+uint64_t realizationCost(size_t maps, size_t aTokens) {
+  return static_cast<uint64_t>(maps) * static_cast<uint64_t>(aTokens);
+}
 
 /// Return the production realization budget unless a test injects one.
 ///
 /// The hook is test-only and has no default effect.  It exists because the
 /// budget is a completeness policy rather than a proof: what a decline costs is
 /// resolution, and asserting that requires driving a rule past the budget on an
-/// input small enough to read, rather than one large enough to exceed 64
-/// realizations on its own.
-size_t maxRealizedMapsPerCommitRule() {
+/// input small enough to read, rather than one large enough to exceed the
+/// production cost bound on its own.
+uint64_t maxRealizationCostPerCommitRule() {
   // Read once.  The enumeration loop asks for the budget per candidate map, and
   // a process's environment does not change under it, so re-reading would cost
   // a lookup per realization and could not answer differently.
-  static const size_t budget = [] {
+  static const uint64_t budget = [] {
     const char *injected =
         std::getenv(TestOnlyRealizationBudgetEnvironment.data());
     if (injected == nullptr)
-      return DefaultMaxRealizedMapsPerCommitRule;
+      return DefaultMaxRealizationCostPerCommitRule;
 
     uint64_t parsed = 0;
     if (StringRef(injected).getAsInteger(10, parsed)) {
       REFOLD_LOG_FATAL("lcs/semantic-resolver",
-                       "invalid test-only semantic realization budget '{0}'",
+                       "invalid test-only semantic realization cost budget "
+                       "'{0}'",
                        injected);
     }
-    REFOLD_LOG_TRACE("lcs/semantic-resolver",
-                     "using test-only semantic realization budget={0}", parsed);
-    return static_cast<size_t>(parsed);
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "using test-only semantic realization cost budget={0}", parsed);
+    return parsed;
   }();
   return budget;
 }
@@ -974,14 +1005,16 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     // the whole ground set however few of it has been paid for, and declining
     // on the first candidate spends one realization instead of the budget.
     if (containmentRuleReachable &&
-        globalMaps.size() > maxRealizedMapsPerCommitRule()) {
+        realizationCost(globalMaps.size(), deps_.aLexemes.size()) >
+            maxRealizationCostPerCommitRule()) {
       REFOLD_LOG_TRACE(
           "lcs/semantic-resolver",
           "window {0} declines the least-source-mutation rule after realizing "
-          "{1} map(s): its {2} enumerated map(s) exceed the containment "
-          "realization budget ({3})",
-          windowIndex, mapIndex + 1, globalMaps.size(),
-          maxRealizedMapsPerCommitRule());
+          "{1} map(s): realizing its {2} enumerated map(s) over {3} A token(s) "
+          "costs {4}, over the containment realization budget ({5})",
+          windowIndex, mapIndex + 1, globalMaps.size(), deps_.aLexemes.size(),
+          realizationCost(globalMaps.size(), deps_.aLexemes.size()),
+          maxRealizationCostPerCommitRule());
       containmentRuleReachable = false;
     }
 
@@ -1389,13 +1422,17 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   // least-source-mutation rule's ground set is.  A window whose enumeration
   // fits inside the budget can never reach this decline: the survivors are a
   // subset of the enumeration.
-  if (survivingMaps.size() > maxRealizedMapsPerCommitRule()) {
+  if (realizationCost(survivingMaps.size(), deps_.aLexemes.size()) >
+      maxRealizationCostPerCommitRule()) {
     REFOLD_LOG_TRACE(
         "lcs/semantic-resolver",
-        "window {0} keeps core-forced anchors: {1} map(s) surviving the {2} "
-        "required anchor(s) exceed the realization budget ({3})",
+        "window {0} keeps core-forced anchors: realizing the {1} map(s) "
+        "surviving the {2} required anchor(s) over {3} A token(s) costs {4}, "
+        "over the realization budget ({5})",
         windowIndex, survivingMaps.size(), requiredAnchors.size(),
-        maxRealizedMapsPerCommitRule());
+        deps_.aLexemes.size(),
+        realizationCost(survivingMaps.size(), deps_.aLexemes.size()),
+        maxRealizationCostPerCommitRule());
     return result;
   }
 

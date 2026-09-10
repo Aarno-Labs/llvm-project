@@ -1,4 +1,4 @@
-// RUN: env CLANG_REFOLD_TEST_ONLY_SEMANTIC_REALIZATION_BUDGET=0 %clang-refold-tester alignment_window_legacy_proposal_declines_on_realization_budget
+// RUN: env CLANG_REFOLD_TEST_ONLY_SEMANTIC_REALIZATION_COST_BUDGET=0 %clang-refold-tester alignment_window_legacy_proposal_declines_on_realization_budget
 // RUN: FileCheck --input-file=%t/outputs/alignment_window_legacy_proposal_declines_on_realization_budget.out %s
 //
 // The realization budget is a completeness policy, not a proof, and this pins
@@ -26,8 +26,8 @@
 // fewer.  Neither direction can change a committed answer, which is why the
 // value is a tuning decision rather than a theorem.
 //
-// CHECK: declines the least-source-mutation rule after realizing 2 map(s): its 91 enumerated map(s) exceed the containment realization budget (0)
-// CHECK: keeps core-forced anchors: 1 map(s) surviving the 3 required anchor(s) exceed the realization budget (0)
+// CHECK: declines the least-source-mutation rule after realizing 2 map(s): realizing its 91 enumerated map(s) over 79 A token(s) costs 7189, over the containment realization budget (0)
+// CHECK: keeps core-forced anchors: realizing the 1 map(s) surviving the 3 required anchor(s) over 79 A token(s) costs 79, over the realization budget (0)
 #define NIL ((void*)0)
 
 void push(char c);

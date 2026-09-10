@@ -1,4 +1,4 @@
-// RUN: env CLANG_REFOLD_TEST_ONLY_LCS_CERTIFICATION_BYTE_BUDGET=200000 %clang-refold-tester alignment_window_declines_when_containment_exceeds_realization_budget
+// RUN: env CLANG_REFOLD_TEST_ONLY_LCS_CERTIFICATION_BYTE_BUDGET=200000 CLANG_REFOLD_TEST_ONLY_SEMANTIC_REALIZATION_COST_BUDGET=536 %clang-refold-tester alignment_window_declines_when_containment_exceeds_realization_budget
 // RUN: FileCheck --input-file=%t/outputs/alignment_window_declines_when_containment_exceeds_realization_budget.out %s
 //
 // Realizing one enumerated alignment costs a complete refold of the
@@ -28,10 +28,16 @@
 // proposal *is* reachable, see
 // alignment_window_over_budget_still_reaches_the_legacy_proposal.c.
 //
+// The budget is injected because it bounds realization *cost* -- enumerated
+// maps times the A tokens each is realized over -- and this input is
+// deliberately small enough to read, so no map count it can reach would exceed
+// the production bound.  536 is two realizations' worth of this 268-token
+// stream, against the 24388 that deciding the rule would cost.
+//
 // Regression for the dbcc `mpc.c` refold, whose two ambiguous windows
 // enumerate 90 and 45 candidates and decline after two.
 //
-// CHECK: exceed the containment realization budget
+// CHECK: declines the least-source-mutation rule after realizing 2 map(s): realizing its 91 enumerated map(s) over 268 A token(s) costs 24388, over the containment realization budget (536)
 #define NIL ((void*)0)
 
 int lead_0 = 5000;

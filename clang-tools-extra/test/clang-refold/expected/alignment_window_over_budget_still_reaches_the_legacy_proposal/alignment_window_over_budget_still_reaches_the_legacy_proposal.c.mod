@@ -1,4 +1,4 @@
-// RUN: %clang-refold-tester alignment_window_over_budget_still_reaches_the_legacy_proposal
+// RUN: env CLANG_REFOLD_TEST_ONLY_SEMANTIC_REALIZATION_COST_BUDGET=158 %clang-refold-tester alignment_window_over_budget_still_reaches_the_legacy_proposal
 // RUN: FileCheck --input-file=%t/outputs/alignment_window_over_budget_still_reaches_the_legacy_proposal.out %s
 //
 // A realization budget bounds one commit rule, not the window that rule sits
@@ -24,7 +24,15 @@
 // maps were realized so that two rules that could not fire could be asked, and
 // the rule that committed read one of them.
 //
-// CHECK: declines the least-source-mutation rule after realizing 2 map(s): its 91 enumerated map(s)
+// The budget is injected because it bounds realization *cost* -- enumerated
+// maps times the A tokens each is realized over -- and this input is
+// deliberately small enough to read, so no map count it can reach would exceed
+// the production bound.  158 is two realizations' worth of this 79-token
+// stream: deciding containment would cost 7189 and is declined, while the
+// legacy proposal's single surviving map costs 79 and is still afforded.  That
+// separation is the whole point of the bound being per rule.
+//
+// CHECK: declines the least-source-mutation rule after realizing 2 map(s): realizing its 91 enumerated map(s) over 79 A token(s) costs 7189, over the containment realization budget (158)
 // CHECK: candidate census: enumerated=91 realized=2
 // CHECK: committing realized-source class: candidates=91 classMembers=[20]
 #define NIL ((void*)0)
