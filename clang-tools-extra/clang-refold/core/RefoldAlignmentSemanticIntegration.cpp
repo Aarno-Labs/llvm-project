@@ -786,6 +786,8 @@ RefoldEngine::SimulateSemanticAlignmentCandidate(
       sidebandPragmaEdits_, candidateMaterializedMappings,
       FinalLineControlValidationCallback(), selection, /*alignmentSemanticResolverEnabled=*/false,
       StringRef(tuSourceBytes_));
+  candidate.SetPassRole("alignment candidate map simulation");
+  ++alignmentCandidateSimulationCount_;
 
   // A candidate is handed a different alignment, but it diffs the same A and B
   // buffers this engine did, so the raw byte hunks are shared rather than

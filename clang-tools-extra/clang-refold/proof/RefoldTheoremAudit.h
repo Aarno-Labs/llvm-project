@@ -226,17 +226,22 @@ void resetRefoldAttemptStats(RefoldStats &stats, const RefoldModel &model);
 /// Reports how many includes and top-level macro invocations remained
 /// expanded relative to the model's totals.  \p hasTerminalRequest annotates
 /// the summary when the attempt fell back to the explicit terminal raw-B
-/// carrier.
+/// carrier.  \p passRole names which of one run's nested passes produced these
+/// numbers -- a production attempt, or one realized candidate alignment map --
+/// because every such pass emits this line and they are otherwise identical.
 void emitRefoldAttemptStatsSummary(const RefoldStats &stats,
-                                   bool hasTerminalRequest);
+                                   bool hasTerminalRequest,
+                                   llvm::StringRef passRole);
 
 /// Emit a readable theorem-audit summary for the current attempt.
 ///
 /// The first line answers the operational question: did the emitted result
 /// satisfy the strict theorem audit?  Follow-up debug lines group the dense
 /// counters by proof obligation so a failure can be diagnosed without
-/// decoding one very long ledger row.
-void emitTheoremAuditSummary(const TheoremAuditStats &audit);
+/// decoding one very long ledger row.  \p passRole attributes the line to one
+/// of the run's nested passes, as for `emitRefoldAttemptStatsSummary()`.
+void emitTheoremAuditSummary(const TheoremAuditStats &audit,
+                             llvm::StringRef passRole);
 
 } // namespace refold
 } // namespace clang

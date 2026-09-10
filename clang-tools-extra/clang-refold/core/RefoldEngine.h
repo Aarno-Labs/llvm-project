@@ -460,6 +460,23 @@ private:
   /// assembles nothing, and emits nothing; its whole output is the memo.
   bool stopAfterAlignmentResolution_ = false;
 
+  /// Which of one run's nested passes this engine is, for logging alone.
+  ///
+  /// One invocation plans the translation unit many times over: once per
+  /// production attempt, once for the resolution probe, and once for every
+  /// enumerated candidate alignment map the probe realizes.  Each of those is a
+  /// complete pass that logs the same per-pass lines, so without a role they
+  /// are indistinguishable from a loop repeating itself.  This is diagnostic
+  /// state only: no proof reads it, and it enters no equivalence key.
+  std::string passRole_ = "production attempt";
+
+  /// Number of candidate alignment maps this engine realized as complete
+  /// refolds, for logging alone.  Mutable because
+  /// `SimulateSemanticAlignmentCandidate()` is const: a simulation reads this
+  /// engine and writes only its own nested one, and this counter preserves
+  /// that by recording nothing a proof can observe.
+  mutable uint64_t alignmentCandidateSimulationCount_ = 0;
+
   /// The core theorem's forced A-to-B map for this attempt, retained after
   /// token-diff planning.
   ///
@@ -963,6 +980,12 @@ private:
       std::optional<llvm::StringRef> tuSourceBytesOverride = std::nullopt);
 
   ~RefoldEngine();
+
+  /// Name this engine's role among the passes one run nests, for logging.
+  ///
+  /// Purely descriptive: it changes which pass a log line is attributed to and
+  /// nothing else.  See `passRole_`.
+  void SetPassRole(std::string role) { passRole_ = std::move(role); }
 
   /// \brief Run the full refolding pipeline for the current inputs.
   ///

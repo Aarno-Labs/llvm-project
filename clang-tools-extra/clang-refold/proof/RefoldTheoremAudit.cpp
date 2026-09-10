@@ -979,16 +979,19 @@ void resetRefoldAttemptStats(RefoldStats &stats, const RefoldModel &model) {
 }
 
 void emitRefoldAttemptStatsSummary(const RefoldStats &stats,
-                                   bool hasTerminalRequest) {
+                                   bool hasTerminalRequest,
+                                   StringRef passRole) {
   REFOLD_LOG_INFO(
       "stats",
-      "refold summary: expandedIncludes={0}/{1} expandedRootMacros={2}/{3} "
-      "terminalFallback={4}",
-      stats.expandedIncludes, stats.totalIncludes, stats.expandedMacros,
-      stats.totalMacros, hasTerminalRequest ? "yes(raw-B)" : "no");
+      "refold summary [{0}]: expandedIncludes={1}/{2} "
+      "expandedRootMacros={3}/{4} terminalFallback={5}",
+      passRole, stats.expandedIncludes, stats.totalIncludes,
+      stats.expandedMacros, stats.totalMacros,
+      hasTerminalRequest ? "yes(raw-B)" : "no");
 }
 
-void emitTheoremAuditSummary(const TheoremAuditStats &audit) {
+void emitTheoremAuditSummary(const TheoremAuditStats &audit,
+                             StringRef passRole) {
   const bool satisfied = audit.theoremSatisfied;
   const uint64_t unresolvedSelectorWork =
       audit.selectorNoSelectable + audit.selectorUnresolvedCompetitions;
@@ -1008,17 +1011,17 @@ void emitTheoremAuditSummary(const TheoremAuditStats &audit) {
   if (satisfied) {
     REFOLD_LOG_INFO(
         "theorem",
-        "audit passed: emittedEdits={0} carriers={1} resolverAudits={2} "
-        "terminalFailures={3} closureLedgerRows={4}",
-        audit.emittedNonTerminalEdits, audit.emittedCarriers,
+        "audit passed [{0}]: emittedEdits={1} carriers={2} resolverAudits={3} "
+        "terminalFailures={4} closureLedgerRows={5}",
+        passRole, audit.emittedNonTerminalEdits, audit.emittedCarriers,
         audit.resolverDomainAudits, audit.terminalFailureObligations,
         audit.resolverClosureLedgerRows);
   } else {
     REFOLD_LOG_WARN("theorem",
-                    "audit failed: invalidCarriers={0} unresolvedSelectors={1} "
-                    "resolverOpenObligations={2} terminalAuditProblems={3} "
-                    "closureLedgerRows={4}",
-                    invalidCarrierCount, unresolvedSelectorWork,
+                    "audit failed [{0}]: invalidCarriers={1} "
+                    "unresolvedSelectors={2} resolverOpenObligations={3} "
+                    "terminalAuditProblems={4} closureLedgerRows={5}",
+                    passRole, invalidCarrierCount, unresolvedSelectorWork,
                     resolverOpenObligations, terminalAuditProblems,
                     audit.resolverClosureLedgerRows);
     if (!audit.firstViolation.empty()) {

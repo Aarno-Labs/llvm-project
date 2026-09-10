@@ -996,6 +996,7 @@ Expected<std::string> RefoldEngine::Refold(
         // callback would silently disable final line-control validation for
         // every attempt after the first.
         finalLineControlValidationCallback, ownerAlignedSlideOverride);
+    engine.SetPassRole(("production attempt " + Twine(attempt)).str());
     engine.finalAssemblyVerifier_ = assemblyVerifier;
     engine.ownersMustExpand_ = ownersMustExpand;
     engine.resolveAlignmentAmbiguity_ = resolveAlignmentAmbiguity;
@@ -1050,6 +1051,26 @@ Expected<std::string> RefoldEngine::Refold(
             "to commit and this result stands",
             attempt);
       } else {
+        // Say what the run is about to spend before it spends it.  Everything
+        // between here and the probe's verdict is one complete replan of this
+        // translation unit followed by one more per enumerated candidate
+        // alignment map, each logging the same per-pass lines as the attempt
+        // above -- so without this the log reads as a loop repeating itself
+        // rather than as distinct alignments being realized and compared.
+        uint64_t ambiguousWindows = 0;
+        for (const std::pair<uint64_t, uint64_t> &range :
+             engine.certificationWindowARanges_)
+          if (engine.CertificationWindowCarriesAmbiguity(range))
+            ++ambiguousWindows;
+        REFOLD_LOG_INFO(
+            "fallback",
+            "attempt {0} is limited by alignment ambiguity, and {1} of {2} "
+            "certified window(s) carry it; probing resolution, which replans "
+            "this translation unit once and then realizes each window's "
+            "enumerated candidate maps as a complete refold apiece",
+            attempt, ambiguousWindows,
+            static_cast<uint64_t>(engine.certificationWindowARanges_.size()));
+
         // The probe must present the same optional output surfaces as the
         // attempt it stands in for, because a candidate simulation mirrors its
         // parent's surfaces and two alignments may otherwise be separated by
@@ -1067,6 +1088,7 @@ Expected<std::string> RefoldEngine::Refold(
             // only consumer, and a candidate simulation is handed an empty one
             // regardless -- so resolution cannot observe its absence.
             FinalLineControlValidationCallback());
+        probe.SetPassRole("alignment resolution probe");
         probe.ownersMustExpand_ = ownersMustExpand;
         probe.resolveAlignmentAmbiguity_ = true;
         probe.alignmentResolutionMemo_ = &alignmentResolutionMemo;
@@ -1351,6 +1373,14 @@ void RefoldEngine::ProbeAlignmentResolution() {
   resetRefoldAttemptStats(lastStats_, model_);
   TheoremAudit().Reset();
   (void)RunRefoldPass();
+
+  // A probe emits nothing, so this line is the only account of what it cost.
+  // Every simulation counted here was one complete refold of the translation
+  // unit run to decide one enumerated alignment.
+  REFOLD_LOG_INFO("fallback",
+                  "alignment resolution probe finished: realized {0} candidate "
+                  "map(s) as complete refolds",
+                  alignmentCandidateSimulationCount_);
 }
 
 std::string RefoldEngine::Refold() {
@@ -1537,8 +1567,9 @@ std::string RefoldEngine::Refold() {
       materializedEditMappings_->clear();
   }
 
-  emitRefoldAttemptStatsSummary(lastStats_, terminalSink_.HasRequest());
-  emitTheoremAuditSummary(lastTheoremAudit_);
+  emitRefoldAttemptStatsSummary(lastStats_, terminalSink_.HasRequest(),
+                                passRole_);
+  emitTheoremAuditSummary(lastTheoremAudit_, passRole_);
   return out;
 }
 
@@ -3756,9 +3787,10 @@ std::string RefoldEngine::RunRefoldPass() {
   StringRef tuPath = model_.GetSourcePath();
   REFOLD_LOG_INFO(
       "plan",
-      "starting refold: tu={0} ppBytes={1} ppModBytes={2} ppTokens={3} "
-      "ppModTokens={4}",
-      tuPath, aSource_.size(), bSource_.size(), aToks_.size(), bToks_.size());
+      "starting refold [{0}]: tu={1} ppBytes={2} ppModBytes={3} ppTokens={4} "
+      "ppModTokens={5}",
+      passRole_, tuPath, aSource_.size(), bSource_.size(), aToks_.size(),
+      bToks_.size());
 
   // Reset the structural planning phase and run-local token diff caches before
   // any stage repopulates them for this pass.  PlanTokenDiff() advances the

@@ -19,12 +19,16 @@
 //
 // `refold model loaded` is logged once per completed token-diff plan.  Two
 // passes start here and only one plan completes, which is exactly the claim:
-// the probe returned at the publication point.
+// the probe returned at the publication point.  Each pass names its own role,
+// so the second start is asserted to be the probe rather than inferred from
+// its position.
 //
-// CHECK: starting refold:
+// CHECK: starting refold [production attempt 0]:
 // CHECK: refold model loaded:
-// CHECK: starting refold:
+// CHECK: attempt 0 is limited by alignment ambiguity, and {{[0-9]+}} of {{[0-9]+}} certified window(s) carry it
+// CHECK: starting refold [alignment resolution probe]:
 // CHECK-NOT: refold model loaded:
-// CHECK: attempt 0 is limited by alignment ambiguity
+// CHECK: alignment resolution probe finished:
+// CHECK: attempt 0 is limited by alignment ambiguity, but
 #define SPAN (7 + 13)
 int width = SPAN;

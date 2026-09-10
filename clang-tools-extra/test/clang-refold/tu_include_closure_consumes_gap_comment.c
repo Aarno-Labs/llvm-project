@@ -40,7 +40,7 @@
 // change: this test's expected output would then keep both, under review.
 //
 // CHECK: TU include-closure accepted
-// CHECK: refold summary: {{.*}} terminalFallback=no
+// CHECK: refold summary [production attempt 0]: {{.*}} terminalFallback=no
 int arr[] = { 1,
 // GAP_COMMENT_ERASED_BY_THE_CLOSURE
 #include "closure_gap_comment.inc"

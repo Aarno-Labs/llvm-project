@@ -30,7 +30,7 @@
 // CHECK: B-payload-free edit in {{.*}} emits {{[0-9]+}} byte(s) of preprocessor state and is omitted from the materialized edit map
 
 // The unit refolds rather than emitting the edited stream verbatim.
-// CHECK: refold summary: {{.*}} terminalFallback=no
+// CHECK: refold summary [production attempt 0]: {{.*}} terminalFallback=no
 
 #ifndef __CLANG_REFOLD_ONCE_2
 #define __CLANG_REFOLD_ONCE_2

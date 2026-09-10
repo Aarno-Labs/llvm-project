@@ -200,6 +200,14 @@ private:
     std::vector<int64_t> selectedMap;
     std::vector<AlignmentSemanticAnchorEvidence> anchorEvidence;
     std::string equivalenceKey;
+    /// Number of distinct complete optimal maps enumerated through the window.
+    ///
+    /// Recorded whether or not the window commits, because it is what separates
+    /// the three ways a window can end: an enumeration that never completed
+    /// (zero), a window the core theorem had already determined (one), and real
+    /// ambiguity that no commit rule closed (more than one).  A verdict log
+    /// that could not tell those apart would report a decline where nothing was
+    /// declined.
     uint64_t enumeratedMapCount = 0;
     uint64_t acceptedMapCount = 0;
     uint64_t rejectedMapCount = 0;
@@ -231,7 +239,13 @@ private:
   ///
   /// Realizing on demand is what lets a rule whose set is small be reached
   /// without first paying for the sets of the rules that were already denied.
+  ///
+  /// \p windowIndex, \p mapIndex and \p mapCount name the realization in the
+  /// log and are read for nothing else.  A realization is the most expensive
+  /// step this tool takes, so each one reports itself rather than appearing as
+  /// an unexplained repeat of the whole planning pipeline.
   const AlignmentSemanticSimulationResult &RealizeCandidateMap(
+      size_t windowIndex, size_t mapIndex, size_t mapCount,
       llvm::ArrayRef<int64_t> candidateMap,
       std::optional<AlignmentSemanticSimulationResult> &slot) const;
 

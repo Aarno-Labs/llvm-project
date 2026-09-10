@@ -520,7 +520,7 @@ RefoldAlignmentSemanticResolver::Resolve() const {
     if (deps_.retainWindowOracle)
       (void)deps_.retainWindowOracle(windowIndex);
     if (!deps_.coreAlignment.HasCompleteSemanticOracleForWindow(windowIndex)) {
-      REFOLD_LOG_TRACE(
+      REFOLD_LOG_INFO(
           "lcs/semantic-resolver",
           "window {0} keeps core-forced anchors: no retained all-optimal "
           "pair facts",
@@ -532,8 +532,37 @@ RefoldAlignmentSemanticResolver::Resolve() const {
         ResolveCertificationWindow(windowIndex, baseMap);
     if (deps_.releaseWindowOracle)
       deps_.releaseWindowOracle(windowIndex);
-    if (!resolution.committed)
+    if (!resolution.committed) {
+      // One verdict line per window, and it must say which of the three ways
+      // this window ended.  Only the last of them is a decline; reporting the
+      // other two as one would claim a rule refused something it was never
+      // offered.  Which rule declined, and on what evidence, stays at trace
+      // level: the rules each report themselves there, and repeating one of
+      // them here would be a second, weaker account of the same fact.
+      if (resolution.enumeratedMapCount == 0)
+        REFOLD_LOG_INFO("lcs/semantic-resolver",
+                        "window {0} keeps its core-forced anchors: its optimal "
+                        "maps could not be enumerated within the proof budget",
+                        windowIndex);
+      else if (resolution.enumeratedMapCount == 1)
+        REFOLD_LOG_INFO("lcs/semantic-resolver",
+                        "window {0} needs no resolution: enumeration found "
+                        "exactly one complete core-optimal map",
+                        windowIndex);
+      else
+        REFOLD_LOG_INFO("lcs/semantic-resolver",
+                        "window {0} keeps its core-forced anchors: no commit "
+                        "rule proved one admissible realization among its {1} "
+                        "enumerated map(s)",
+                        windowIndex, resolution.enumeratedMapCount);
       continue;
+    }
+    REFOLD_LOG_INFO(
+        "lcs/semantic-resolver",
+        "window {0} committed one realized-source class: {1} of {2} "
+        "enumerated map(s) share it, {3} anchor(s) proved",
+        windowIndex, resolution.acceptedMapCount, resolution.enumeratedMapCount,
+        static_cast<uint64_t>(resolution.anchorEvidence.size()));
     baseMap = resolution.selectedMap;
     committedWindows.push_back(std::move(resolution));
   }
@@ -639,19 +668,55 @@ bool RefoldAlignmentSemanticResolver::WindowCarriesAmbiguity(
   return aEnd != window.aEnd;
 }
 
+/// Name one simulation disposition for the log.
+static StringRef describeSimulationDisposition(
+    AlignmentSemanticSimulationDisposition disposition) {
+  switch (disposition) {
+  case AlignmentSemanticSimulationDisposition::Accepted:
+    return "accepted";
+  case AlignmentSemanticSimulationDisposition::TerminalFallback:
+    return "requested terminal fallback";
+  case AlignmentSemanticSimulationDisposition::ProofIncomplete:
+    return "proof incomplete";
+  }
+  return "unknown";
+}
+
 const AlignmentSemanticSimulationResult &
 RefoldAlignmentSemanticResolver::RealizeCandidateMap(
+    size_t windowIndex, size_t mapIndex, size_t mapCount,
     ArrayRef<int64_t> candidateMap,
     std::optional<AlignmentSemanticSimulationResult> &slot) const {
-  if (!slot)
-    slot.emplace(deps_.simulate(
-        buildSimulationSelection(candidateMap, deps_.coreAlignment)));
+  // A map already in its slot was realized by an earlier rule and is replayed,
+  // not re-planned.  Reporting it again would double-count the run's most
+  // expensive step.
+  if (slot)
+    return *slot;
+
+  REFOLD_LOG_INFO("lcs/semantic-resolver",
+                  "window {0}: realizing candidate map {1} of {2} as a "
+                  "complete refold",
+                  windowIndex, mapIndex + 1, mapCount);
+  slot.emplace(deps_.simulate(
+      buildSimulationSelection(candidateMap, deps_.coreAlignment)));
+  REFOLD_LOG_INFO("lcs/semantic-resolver",
+                  "window {0}: candidate map {1} of {2} realized: {3}{4}{5}",
+                  windowIndex, mapIndex + 1, mapCount,
+                  describeSimulationDisposition(slot->disposition),
+                  slot->rejectionReason.empty() ? "" : " -- ",
+                  stringutils::showWsWithClip(slot->rejectionReason, 160));
   return *slot;
 }
 
 RefoldAlignmentSemanticResolver::WindowResolution
 RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     size_t windowIndex, ArrayRef<int64_t> baseMap) const {
+  // Every path that declines this window returns `result` rather than a fresh
+  // value.  A commit is built and returned by `commitRealizationClass()`, so
+  // `result` carries nothing but the enumeration census recorded below -- and
+  // returning it keeps that census attached to the decline, which is what the
+  // caller's verdict log reads to tell an incomplete enumeration apart from
+  // real ambiguity that no rule closed.
   WindowResolution result;
 
   const diffutils::OptimalTokenAlignmentOracle *oraclePtr =
@@ -755,6 +820,12 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
              });
   globalMaps.erase(std::unique(globalMaps.begin(), globalMaps.end()),
                    globalMaps.end());
+
+  // Record the enumeration on the result before any verdict, so that a window
+  // that goes on to decline is still distinguishable from one whose
+  // enumeration never completed.  Every return above this point leaves the
+  // count at zero, which is exactly what "did not complete" means.
+  result.enumeratedMapCount = globalMaps.size();
   if (globalMaps.size() <= 1) {
     REFOLD_LOG_TRACE(
         "lcs/semantic-resolver",
@@ -763,6 +834,17 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         windowIndex);
     return result;
   }
+
+  // Enumeration is where this window's cost becomes knowable, and it is the
+  // last point before the run starts spending it.  Every map counted here is a
+  // distinct optimal alignment of the same rectangle, and deciding between them
+  // is what the realizations below pay for.
+  REFOLD_LOG_INFO(
+      "lcs/semantic-resolver",
+      "window {0} carries alignment ambiguity over A=[{1},{2}) B=[{3},{4}): "
+      "{5} distinct core-optimal map(s) enumerated",
+      windowIndex, window.aBegin, window.aEnd, window.bBegin, window.bEnd,
+      static_cast<uint64_t>(globalMaps.size()));
 
   // Reachability of the legacy-proposal theorem is the one commit rule that no
   // simulation can influence: its proposal is reconstructed from the lexemes,
@@ -840,7 +922,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         "window {0} keeps core-forced anchors: an enumerated map is not a "
         "monotone lexeme-agreeing alignment",
         windowIndex);
-    return WindowResolution{};
+    return result;
   }
 
   // Realized candidate maps, indexed by position in `globalMaps`.  A map is
@@ -857,7 +939,8 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
 
   for (size_t mapIndex = 0; mapIndex < globalMaps.size(); ++mapIndex) {
     const AlignmentSemanticSimulationResult &realized =
-        RealizeCandidateMap(globalMaps[mapIndex], realizedMaps[mapIndex]);
+        RealizeCandidateMap(windowIndex, mapIndex, globalMaps.size(),
+                            globalMaps[mapIndex], realizedMaps[mapIndex]);
     const bool realizedIsCompleteAccepted =
         realized.disposition ==
             AlignmentSemanticSimulationDisposition::Accepted &&
@@ -912,7 +995,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0} keeps core-forced anchors: no commit rule remains "
           "reachable after realizing {1} of {2} enumerated map(s)",
           windowIndex, mapIndex + 1, globalMaps.size());
-      return WindowResolution{};
+      return result;
     }
 
     // The legacy boundary proposal is the only rule left, and it reads the
@@ -980,7 +1063,14 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   // a statement about these counts, so reporting them makes a declined window
   // explain itself instead of failing silently. Reading finished simulation
   // records cannot affect candidate order or any proof decision.
-  if (inTraceMode()) {
+  //
+  // Reported at `info` alongside the realizations it accounts for: this window
+  // has just paid one complete refold per enumerated map, and the counts here
+  // are what say whether that bought a commit.  It is bounded by the same
+  // realization budget the rules are, so it cannot outgrow the cost it
+  // explains -- at most one census, and one verdict per rule, per window that
+  // enumerated ambiguity at all.
+  if (inInfoMode()) {
     size_t realizedCount = 0;
     size_t acceptedCount = 0;
     size_t terminalFallbackCount = 0;
@@ -1009,7 +1099,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
       if (!simulation.realizationEquivalenceKey.empty())
         realizationKeys.insert(simulation.realizationEquivalenceKey);
     }
-    REFOLD_LOG_TRACE(
+    REFOLD_LOG_INFO(
         "lcs/semantic-resolver",
         "window {0} candidate census: enumerated={1} realized={2} accepted={3} "
         "terminalFallback={4} proofIncomplete={5} distinctConcreteOutputs={6} "
@@ -1056,7 +1146,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
       return commitRealizationClass(onlyClass.first, onlyClass.second,
                                     ArrayRef<RequiredAnchor>());
     }
-    REFOLD_LOG_TRACE(
+    REFOLD_LOG_INFO(
         "lcs/semantic-resolver",
         "window {0} is not observationally irrelevant: everyMapAccepted={1} "
         "distinctConcreteOutputClasses={2}",
@@ -1134,14 +1224,14 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         return commitRealizationClass(onlyClass.first, onlyClass.second,
                                       ArrayRef<RequiredAnchor>());
       }
-      REFOLD_LOG_TRACE(
+      REFOLD_LOG_INFO(
           "lcs/semantic-resolver",
           "window {0} has no unique least source-mutation class: accepted={1} "
           "leastDestructive={2} leastRealizationClasses={3}",
           windowIndex, acceptedMaps.size(), leastDestructiveMaps.size(),
           leastRealizationClasses.size());
     } else {
-      REFOLD_LOG_TRACE(
+      REFOLD_LOG_INFO(
           "lcs/semantic-resolver",
           "window {0} skips source-mutation containment: proofIncomplete={1} "
           "accepted={2}",
@@ -1156,14 +1246,14 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   // this rule could still fire; the reachability decision recorded there is
   // the one this rule reaches here.
   if (!gapProvenanceCoversStreams)
-    return WindowResolution{};
+    return result;
   if (!legacyProposalRuleReachable) {
-    REFOLD_LOG_TRACE(
+    REFOLD_LOG_INFO(
         "lcs/semantic-resolver",
         "window {0} keeps core-forced anchors: legacy boundary proposal is "
         "not a complete jointly core-optimal map",
         windowIndex);
-    return WindowResolution{};
+    return result;
   }
 
   // Only anchors inside this window are counterfactual candidates. A proposal
@@ -1188,7 +1278,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0} keeps core-forced anchors: {1} proposal anchors exceed "
           "the counterfactual budget ({2})",
           windowIndex, proposalNonForcedCount, MaxProposalCounterfactuals);
-      return WindowResolution{};
+      return result;
     }
     // The historical proposal is commonly one of the enumerated complete maps.
     // Realize it through that map's slot, so a proposal the enumeration already
@@ -1200,13 +1290,24 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         *proposalMap == proposal.selectedMap) {
       const size_t proposalIndex =
           static_cast<size_t>(proposalMap - globalMaps.begin());
-      proposalSimulation = &RealizeCandidateMap(globalMaps[proposalIndex],
-                                                realizedMaps[proposalIndex]);
+      proposalSimulation = &RealizeCandidateMap(
+          windowIndex, proposalIndex, globalMaps.size(),
+          globalMaps[proposalIndex], realizedMaps[proposalIndex]);
     } else {
+      // The proposal is not one of the enumerated maps, so it has no slot and
+      // costs a refold of its own.  Report it like any other realization.
+      REFOLD_LOG_INFO("lcs/semantic-resolver",
+                      "window {0}: realizing the legacy boundary proposal as a "
+                      "complete refold; it is not among the {1} enumerated map(s)",
+                      windowIndex, globalMaps.size());
       ownedProposalSimulation.emplace(deps_.simulate(
           buildSimulationSelection(proposal.selectedMap,
                                    deps_.coreAlignment)));
       proposalSimulation = &*ownedProposalSimulation;
+      REFOLD_LOG_INFO(
+          "lcs/semantic-resolver",
+          "window {0}: legacy boundary proposal realized: {1}", windowIndex,
+          describeSimulationDisposition(ownedProposalSimulation->disposition));
     }
     if (!proposalSimulation->accepted) {
       REFOLD_LOG_TRACE(
@@ -1214,7 +1315,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0} keeps core-forced anchors: the legacy proposal's own "
           "simulation was not accepted ('{1}')",
           windowIndex, proposalSimulation->rejectionReason);
-      return WindowResolution{};
+      return result;
     }
 
     for (size_t aToken = 0; aToken < proposal.selectedMap.size(); ++aToken) {
@@ -1280,7 +1381,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         "window {0} keeps core-forced anchors: no enumerated map contains "
         "every one of the {1} required anchors",
         windowIndex, requiredAnchors.size());
-    return WindowResolution{};
+    return result;
   }
 
   // The uniqueness test below spans every surviving map, so this rule's own
@@ -1295,7 +1396,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         "required anchor(s) exceed the realization budget ({3})",
         windowIndex, survivingMaps.size(), requiredAnchors.size(),
         maxRealizedMapsPerCommitRule());
-    return WindowResolution{};
+    return result;
   }
 
   // Unknown witness dimensions are not semantic rejections. If a surviving
@@ -1303,7 +1404,8 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   // and the resolver must retain only forced anchors.
   for (size_t mapIndex : survivingMaps) {
     const AlignmentSemanticSimulationResult &simulation =
-        RealizeCandidateMap(globalMaps[mapIndex], realizedMaps[mapIndex]);
+        RealizeCandidateMap(windowIndex, mapIndex, globalMaps.size(),
+                            globalMaps[mapIndex], realizedMaps[mapIndex]);
     if (simulation.disposition ==
         AlignmentSemanticSimulationDisposition::ProofIncomplete) {
       REFOLD_LOG_TRACE(
@@ -1311,7 +1413,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0} keeps core-forced anchors: surviving map {1} has "
           "incomplete proof ('{2}')",
           windowIndex, mapIndex, simulation.rejectionReason);
-      return WindowResolution{};
+      return result;
     }
   }
 
@@ -1329,7 +1431,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0} keeps core-forced anchors: surviving map {1} carries no "
           "realization key ('{2}')",
           windowIndex, mapIndex, simulation.rejectionReason);
-      return WindowResolution{};
+      return result;
     }
     realizationClasses[simulation.realizationEquivalenceKey].push_back(
         mapIndex);
@@ -1341,7 +1443,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         "distinct realization classes after {3} required anchor(s)",
         windowIndex, survivingMaps.size(), realizationClasses.size(),
         requiredAnchors.size());
-    return WindowResolution{};
+    return result;
   }
 
   const auto &onlyClass = *realizationClasses.begin();
