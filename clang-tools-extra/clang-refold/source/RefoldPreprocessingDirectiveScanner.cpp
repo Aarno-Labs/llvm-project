@@ -10,6 +10,7 @@
 
 #include "source/RefoldPreprocessingDirectiveScanner.h"
 
+#include "clang/Basic/CharInfo.h"
 #include "clang/Basic/LangOptions.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TokenKinds.h"
@@ -17,9 +18,11 @@
 #include "clang/Lex/Token.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FormatVariadic.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -55,38 +58,123 @@ static bool sourceRangeValid(StringRef sourceBytes, uint64_t begin,
 
 /// Return the first byte after a phase-two escaped newline at `begin`.
 ///
-/// Clang accepts horizontal whitespace between a backslash and the physical
-/// newline as an extension.  Enabled trigraph `??/` is the equivalent phase-one
-/// backslash spelling and is recognized under the active language mode.
+/// Only the backslash *spelling* is decoded here -- a literal `\` or, under an
+/// enabled trigraph mode, `??/`.  What follows it is Clang's own rule, taken
+/// from `Lexer::getEscapedNewLineSize`: horizontal white-space is permitted
+/// between the backslash and the newline as an extension, and `\r\n` *and*
+/// `\n\r` each count as one newline.  That second pairing is the reason this
+/// does not spell the rule out again -- a hand-written copy here paired only
+/// `\r\n`, so a `\`-`\n\r` splice was under-consumed and the continuation read
+/// as a fresh logical line.
+///
+/// Clang's helper scans forward to the first newline and looks one byte past
+/// it, so it is handed a NUL-terminated copy of exactly the leading white-space
+/// run plus that lookahead rather than the caller's slice, which carries no
+/// terminator of its own.
 static std::optional<size_t>
 escapedNewlineEnd(StringRef sourceBytes, size_t begin,
                   const LangOptions &lexLang) {
-  size_t cursor = begin;
-  if (cursor < sourceBytes.size() && sourceBytes[cursor] == '\\') {
-    ++cursor;
-  } else if (lexLang.Trigraphs && cursor + 2 < sourceBytes.size() &&
-             sourceBytes[cursor] == '?' && sourceBytes[cursor + 1] == '?' &&
-             sourceBytes[cursor + 2] == '/') {
-    cursor += 3;
+  size_t afterBackslash = 0;
+  if (begin < sourceBytes.size() && sourceBytes[begin] == '\\') {
+    afterBackslash = begin + 1;
+  } else if (lexLang.Trigraphs && begin + 2 < sourceBytes.size() &&
+             sourceBytes[begin] == '?' && sourceBytes[begin + 1] == '?' &&
+             sourceBytes[begin + 2] == '/') {
+    afterBackslash = begin + 3;
   } else {
     return std::nullopt;
   }
 
-  while (cursor < sourceBytes.size() &&
-         (sourceBytes[cursor] == ' ' || sourceBytes[cursor] == '\t' ||
-          sourceBytes[cursor] == '\v' || sourceBytes[cursor] == '\f')) {
-    ++cursor;
-  }
+  size_t whitespaceEnd = afterBackslash;
+  while (whitespaceEnd < sourceBytes.size() &&
+         isWhitespace(sourceBytes[whitespaceEnd]))
+    ++whitespaceEnd;
 
-  if (cursor < sourceBytes.size() && sourceBytes[cursor] == '\n')
-    return cursor + 1;
-  if (cursor < sourceBytes.size() && sourceBytes[cursor] == '\r') {
-    ++cursor;
-    if (cursor < sourceBytes.size() && sourceBytes[cursor] == '\n')
-      ++cursor;
-    return cursor;
+  // One byte past the run covers the `\r\n` / `\n\r` lookahead; two keeps the
+  // bound obviously sufficient when the run ends at the buffer.
+  const size_t probeEnd =
+      std::min<size_t>(whitespaceEnd + 2, sourceBytes.size());
+  SmallString<32> probe(sourceBytes.slice(afterBackslash, probeEnd));
+  probe.push_back('\0');
+
+  const unsigned escapedSize = Lexer::getEscapedNewLineSize(probe.data());
+  if (escapedSize == 0)
+    return std::nullopt;
+  return std::min<size_t>(afterBackslash + escapedSize, sourceBytes.size());
+}
+
+/// Return whether a token written after `text`, separated from it by nothing
+/// but horizontal white-space, stands at the beginning of a translated logical
+/// line.
+///
+/// The answer is Clang's own.  A raw `Lexer` runs over `text` followed by a
+/// one-character sentinel, and the sentinel's `Token::isAtStartOfLine()` is
+/// returned: that flag is set exactly when the lexer crossed a newline that
+/// survived phase two.  Every splice spelling is therefore handled by the
+/// compiler rather than enumerated here -- the backslash, the enabled trigraph
+/// `??/`, white-space between either and the newline, and both the `\r\n` and
+/// `\n\r` pairings.
+///
+/// Enumerating them by hand is what this replaces, and it had missed one every
+/// time: `??/` until the language options started carrying `Trigraphs`, and
+/// `\n\r` until this.  A directive placed on the strength of a wrong answer is
+/// emitted into the middle of a spliced line, where it is not a directive.
+///
+/// The sentinel is separated by a space so it cannot glue onto a token `text`
+/// ends with, and the space is also what makes this the "logical line
+/// beginning" question rather than the stricter "ends in a newline" one: C
+/// permits horizontal white-space before a directive introducer.  Text ending
+/// inside an unterminated comment or literal swallows the sentinel, which
+/// yields no token at the expected offset and is reported as "not at a line
+/// beginning" -- the conservative answer.
+///
+/// A second token leads the probe, and it is load-bearing rather than
+/// decorative.  A lexer starts its buffer already at the beginning of a line,
+/// so without something occupying that line first, text holding no newline at
+/// all -- white-space only, or a comment -- would answer "yes" on the strength
+/// of the buffer start rather than on anything the text contains.  The leading
+/// `;` puts the probe mid-line, so only a newline inside `text` can move the
+/// sentinel to a line of its own.  `;` glues to nothing, so it cannot change
+/// how the first token of `text` lexes.
+static bool sentinelAfterTextIsAtLogicalLineStart(StringRef text,
+                                                  const LangOptions &lexLang) {
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  const uint64_t maximumRepresentableOffset =
+      std::numeric_limits<unsigned>::max() - baseLoc.getRawEncoding();
+  if (text.size() + 3 > maximumRepresentableOffset)
+    return false;
+
+  const uint64_t sentinelOffset = text.size() + 2;
+
+  std::string scratch = ";";
+  scratch += text;
+  scratch += " x";
+  const size_t scratchSize = scratch.size();
+  scratch.push_back('\0');
+
+  const char *bufferStart = scratch.data();
+  Lexer lexer(baseLoc, lexLang, bufferStart, bufferStart,
+              bufferStart + scratchSize);
+
+  Token token;
+  while (true) {
+    lexer.LexFromRawLexer(token);
+    if (token.is(tok::eof))
+      return false;
+
+    const unsigned tokenEncoding = token.getLocation().getRawEncoding();
+    if (tokenEncoding < baseLoc.getRawEncoding())
+      return false;
+    const uint64_t tokenBegin = tokenEncoding - baseLoc.getRawEncoding();
+    if (tokenBegin < sentinelOffset)
+      continue;
+    // The sentinel must arrive as its own whole token.  Anything else means
+    // `text` ended inside a construct that consumed it, and no claim about
+    // line position can be made.
+    if (tokenBegin != sentinelOffset || token.getLength() != 1)
+      return false;
+    return token.isAtStartOfLine();
   }
-  return std::nullopt;
 }
 
 /// Lex one physical source buffer into exact raw-token byte intervals.
@@ -723,52 +811,25 @@ findPragmaOperators(StringRef sourceBytes, ArrayRef<RawSourceToken> tokens,
 
 bool sourceTextEndsWithNonSplicedPhysicalNewline(
     StringRef sourceBytes, const LangOptions &lexLang) {
-  if (sourceBytes.empty())
+  // Two independent conditions, and the split is deliberate.  Whether the last
+  // byte is a newline at all is a plain byte question.  Whether that newline
+  // survived phase two is not, and is answered by Clang: a sentinel written
+  // after this text stands at the beginning of a logical line exactly when it
+  // did.
+  const char last = sourceBytes.empty() ? '\0' : sourceBytes.back();
+  if (last != '\n' && last != '\r')
     return false;
-
-  size_t newlineBegin = sourceBytes.size() - 1;
-  const char last = sourceBytes.back();
-  if (last == '\n' && newlineBegin > 0 && sourceBytes[newlineBegin - 1] == '\r')
-    --newlineBegin;
-  else if (last != '\n' && last != '\r')
-    return false;
-
-  size_t cursor = newlineBegin;
-  while (cursor > 0 &&
-         (sourceBytes[cursor - 1] == ' ' ||
-          sourceBytes[cursor - 1] == '\t' ||
-          sourceBytes[cursor - 1] == '\v' ||
-          sourceBytes[cursor - 1] == '\f')) {
-    --cursor;
-  }
-
-  std::optional<size_t> introducer;
-  if (cursor > 0 && sourceBytes[cursor - 1] == '\\') {
-    introducer = cursor - 1;
-  } else if (lexLang.Trigraphs && cursor >= 3 &&
-             sourceBytes[cursor - 3] == '?' &&
-             sourceBytes[cursor - 2] == '?' &&
-             sourceBytes[cursor - 1] == '/') {
-    introducer = cursor - 3;
-  }
-
-  if (!introducer)
-    return true;
-  std::optional<size_t> spliceEnd =
-      escapedNewlineEnd(sourceBytes, *introducer, lexLang);
-  return !spliceEnd || *spliceEnd != sourceBytes.size();
+  return sentinelAfterTextIsAtLogicalLineStart(sourceBytes, lexLang);
 }
 
 bool sourceTextEndsAtLogicalLineBeginning(StringRef sourceBytes,
                                           const LangOptions &lexLang) {
-  size_t end = sourceBytes.size();
-  while (end > 0 &&
-         (sourceBytes[end - 1] == ' ' || sourceBytes[end - 1] == '\t' ||
-          sourceBytes[end - 1] == '\v' || sourceBytes[end - 1] == '\f')) {
-    --end;
-  }
-  return sourceTextEndsWithNonSplicedPhysicalNewline(
-      sourceBytes.take_front(end), lexLang);
+  // The weaker form drops the "last byte is a newline" half, which is exactly
+  // the horizontal-white-space allowance C makes before a directive
+  // introducer.  The sentinel probe already carries that allowance: it is
+  // separated from this text by a space, so a trailing space/tab/vertical-tab/
+  // form-feed run in front of it changes nothing about where its line began.
+  return sentinelAfterTextIsAtLogicalLineStart(sourceBytes, lexLang);
 }
 
 bool insertionBeginsWithNonSplicedPhysicalNewline(
@@ -776,22 +837,13 @@ bool insertionBeginsWithNonSplicedPhysicalNewline(
   if (insertion.empty() ||
       (insertion.front() != '\n' && insertion.front() != '\r'))
     return false;
-
-  size_t cursor = sourcePrefix.size();
-  while (cursor > 0 &&
-         (sourcePrefix[cursor - 1] == ' ' ||
-          sourcePrefix[cursor - 1] == '\t' ||
-          sourcePrefix[cursor - 1] == '\v' ||
-          sourcePrefix[cursor - 1] == '\f')) {
-    --cursor;
-  }
-  if (cursor > 0 && sourcePrefix[cursor - 1] == '\\')
-    return false;
-  if (lexLang.Trigraphs && cursor >= 3 && sourcePrefix[cursor - 3] == '?' &&
-      sourcePrefix[cursor - 2] == '?' && sourcePrefix[cursor - 1] == '/') {
-    return false;
-  }
-  return true;
+  // One newline byte is enough to ask the question: if the prefix ends in a
+  // backslash spelling, that byte is consumed as the splice and the sentinel
+  // stays on the prefix's line; if it does not, the byte opens a line whatever
+  // follows it in the insertion.
+  SmallString<64> probe(sourcePrefix);
+  probe.push_back(insertion.front());
+  return sentinelAfterTextIsAtLogicalLineStart(probe, lexLang);
 }
 
 PreprocessingDirectiveScanResult

@@ -101,6 +101,24 @@ bool structuralOwnerIdentitiesAgree(const Owner &lhs, const Owner &rhs) {
          lhs.condArmId == rhs.condArmId;
 }
 
+/// Return whether an authority is one of the two complete-source-closure
+/// kinds.
+///
+/// These are the authorities minted only after a shared source-gap theorem
+/// proved a complete indexed preprocessing interval as one source piece, which
+/// is why they own `[begin,end)` exactly rather than a directive spelling.
+/// Both the coverage rule and the subsumption discharge below ask this
+/// question, so they ask it in one place.
+bool authorizationIsCompleteSourceClosure(
+    ProtectedSourceEditAuthorityKind authority) {
+  return authority ==
+             ProtectedSourceEditAuthorityKind::IncludePreservingSourceClosure ||
+         authority == ProtectedSourceEditAuthorityKind::TUIncludeClosure;
+}
+
+void appendUniqueProtectedSourceAuthorizations(TextEdit &destination,
+                                               const TextEdit &source);
+
 /// Return whether a protected structure kind occupies a directive line.
 ///
 /// `PragmaOperator` is an exact directly spelled raw-token interval. Every
@@ -711,14 +729,17 @@ bool protectedSourceAuthorityAcceptsKind(
     // state the directive does, and the producer records it, so the only thing
     // that ever separated the two was whether the site's own bytes can carry
     // `#define <guard>`: an operator is an expression and may share its line,
-    // where the replacement would not begin a logical line.  That is now
-    // decided at the site by `OnceSiteInPlaceReplacement`, which opens a
-    // physical line for the directive when the operator does not own one and
-    // declines the site outright when an enclosing construct owns its bytes.
-    // Keeping the kind out of this table instead made every operator-spelled
-    // header depend on the B-realized path, whose top-of-body define is not
-    // equivalent for a conditional site -- and so refused those headers
-    // entirely.
+    // where the replacement would not begin a logical line.  That is decided at
+    // the site by `OnceSiteInPlaceReplacement`, which opens a line for the
+    // directive when the operator does not begin a translated logical line and
+    // declines the site outright when it cannot place one there at all -- and
+    // it is decided again, independently, by
+    // `operatorReplacementOwnsItsDirectiveLine` in the authorization below,
+    // which is what keeps admitting the kind here from resting on the planner's
+    // word.  Keeping the kind out of this table instead made every
+    // operator-spelled header depend on the B-realized path, whose top-of-body
+    // define is not equivalent for a conditional site -- and so refused those
+    // headers entirely.
     return kind == PreprocessingStructureKind::Pragma ||
            kind == PreprocessingStructureKind::PragmaOperator ||
            kind == PreprocessingStructureKind::Include ||
@@ -784,11 +805,7 @@ bool protectedSourceAuthorizationMatchesInterval(
 std::optional<std::pair<uint64_t, uint64_t>>
 requiredProtectedCoverage(ProtectedSourceEditAuthorityKind authority,
                           const PreprocessingStructureInterval &interval) {
-  const bool isCompleteSourceClosure =
-      authority ==
-          ProtectedSourceEditAuthorityKind::IncludePreservingSourceClosure ||
-      authority == ProtectedSourceEditAuthorityKind::TUIncludeClosure;
-  if (isCompleteSourceClosure) {
+  if (authorizationIsCompleteSourceClosure(authority)) {
     // A source-closure authority is minted only after the shared source-gap
     // theorem proves the complete indexed preprocessing interval as one
     // source piece.  Requiring `[begin,end)` here preserves that theorem at
@@ -815,6 +832,76 @@ requiredProtectedCoverage(ProtectedSourceEditAuthorityKind authority,
                         interval.structureSpellingEnd);
 }
 
+/// Return whether an edit that writes a directive over `_Pragma` operator bytes
+/// leaves that directive at the beginning of a translated logical line, and
+/// ends the line it opens.
+///
+/// Every other protected kind this firewall admits occupies a directive line
+/// already, so a replacement written over one inherits that position.  A pragma
+/// operator does not: it is an expression, the bytes before it on its physical
+/// line and the newline after it are ordinary source, and the physical line it
+/// begins can itself be the continuation of the line above through an escaped
+/// newline.  A `#` emitted over those bytes introduces a directive only if a
+/// line was opened for it, and this is the emission boundary deciding that for
+/// itself rather than trusting the planner that staged the edit.
+///
+/// The replacement grammar is closed, because the operation is: a planner
+/// either deletes the operator or writes exactly one directive over it,
+/// optionally opening a line before it and closing one after.  A replacement
+/// outside that grammar -- more than one directive, a backslash that could
+/// splice the following source into the directive, an enabled trigraph
+/// introducer that could do the same -- is refused rather than analyzed.
+bool operatorReplacementOwnsItsDirectiveLine(const TextEdit &edit,
+                                             StringRef sourceBytes,
+                                             const LangOptions &lexLang) {
+  const StringRef text(edit.text);
+
+  // Deleting the operator writes no directive at all.
+  if (text.empty())
+    return true;
+  if (edit.start > sourceBytes.size() || edit.end > sourceBytes.size())
+    return false;
+  if (text.contains('\\') || (lexLang.Trigraphs && text.contains('?')))
+    return false;
+
+  const size_t hash = text.find('#');
+  if (hash == StringRef::npos || text.find('#', hash + 1) != StringRef::npos)
+    return false;
+
+  // Opening a line is the only thing that may precede the directive.
+  const StringRef head = text.take_front(hash);
+  if (head.empty()) {
+    if (edit.start != 0 &&
+        !sourceTextEndsAtLogicalLineBeginning(sourceBytes.take_front(edit.start),
+                                              lexLang))
+      return false;
+  } else if (head == "\n") {
+    // The opened newline is a boundary only if the source it follows does not
+    // end in an escaped newline that would consume it.
+    if (!insertionBeginsWithNonSplicedPhysicalNewline(
+            sourceBytes.take_front(edit.start), text, lexLang))
+      return false;
+  } else {
+    return false;
+  }
+
+  // The directive's line must end before ordinary source resumes.  Either the
+  // replacement closes it, in which case nothing may follow that newline in the
+  // replacement, or the source the edit did not consume closes it with nothing
+  // but horizontal white-space in between.
+  const StringRef directive = text.drop_front(hash);
+  const size_t newline = directive.find_first_of("\n\r");
+  if (newline != StringRef::npos)
+    return directive.drop_front(newline).ltrim("\r\n").empty();
+
+  for (char byte : sourceBytes.drop_front(edit.end)) {
+    if (byte == ' ' || byte == '\t' || byte == '\v' || byte == '\f')
+      continue;
+    return byte == '\n' || byte == '\r';
+  }
+  return true;
+}
+
 /// Return whether `edit` owns every byte required by one exact capability.
 bool protectedSourceAuthorizationCoversEdit(
     const ProtectedSourceEditAuthorization &authorization,
@@ -829,38 +916,145 @@ bool protectedSourceAuthorizationCoversEdit(
          coverage->second <= edit.end;
 }
 
-/// Drop every edit whose source bytes another edit wholly replaces.
+/// Return the one protected construct an edit exists solely to rewrite in
+/// place, or nothing when the edit is not that.
 ///
-/// Two edits can be individually proven and still collide, when one realizes a
-/// range that strictly contains the other.  A header materialized into the TU
-/// is the case that produces it: the cover edit realizes the whole body from B,
-/// and a nested `#include`/`#include_next` inside that body separately stages
-/// its own directive rewrite.  Neither is wrong, and there is no order that
-/// applies both, because the inner edit's bytes are not in the output at all --
-/// the cover replaced them.
+/// This is a typed classification, not a shape test.  The edit must carry
+/// exactly one emission capability, it must be the include-directive rewrite
+/// authority, and the edit's own byte range must be exactly the construct that
+/// authority names.  An edit doing anything else in addition -- a wider range,
+/// a second capability, a macro-state carry -- is not classified, because then
+/// dropping it would discard work no other edit was shown to do.
+std::optional<ProtectedSourceEditAuthorization>
+soleIncludeDirectiveRewriteObligation(const TextEdit &edit) {
+  if (edit.protectedSourceAuthorizations.size() != 1)
+    return std::nullopt;
+  const ProtectedSourceEditAuthorization &authorization =
+      edit.protectedSourceAuthorizations.front();
+  if (authorization.authority !=
+      ProtectedSourceEditAuthorityKind::IncludeDirectiveRewrite)
+    return std::nullopt;
+  if (authorization.begin != edit.start || authorization.end != edit.end)
+    return std::nullopt;
+  return authorization;
+}
+
+/// Return whether `edit` proved it realizes `construct` away rather than
+/// re-emitting it.
 ///
-/// So the inner edit is not composed, it is *subsumed*: every byte it would
-/// rewrite is replaced by the container, so removing it cannot change a single
-/// emitted byte.  That is what makes this a composition law rather than a
-/// preference between two edits.  Three conditions keep it one:
+/// The evidence is the planner-minted elimination witness, matched on exact
+/// construct identity.  An edit that recorded none -- because its planner could
+/// not say, construct by construct, what its replacement carries through --
+/// answers no, which is the direction that keeps another edit's obligation
+/// alive rather than silently dropping it.
+bool editEliminatesProtectedConstruct(
+    const TextEdit &edit, const ProtectedSourceEditAuthorization &construct) {
+  return llvm::any_of(edit.eliminatedProtectedConstructs,
+                      [&](const EliminatedProtectedConstruct &eliminated) {
+                        return eliminated.kind == construct.structureKind &&
+                               eliminated.begin == construct.begin &&
+                               eliminated.end == construct.end;
+                      });
+}
+
+/// Return whether `text` spells any include-family directive.
 ///
-///   * containment must be strict on at least one side.  Two edits with the
-///     same range are a genuine ambiguity about which text to emit, and are
-///     left for the overlap check below to refuse;
-///   * both edits must replace bytes.  A zero-width insertion owns no byte the
-///     container can be said to replace, so dropping it would silently discard
-///     text somebody meant to add;
-///   * containment is decided against every edit, so the outermost container
-///     never has one and always survives.
+/// This reads the bytes that will actually be emitted, which is what makes it
+/// a check rather than a second opinion about a claim.  An elimination witness
+/// says the planner realized a construct away; enumerating the ways a
+/// replacement can re-emit one is the planner's own bookkeeping, and
+/// bookkeeping falls behind the code it describes.  Scanning the replacement
+/// cannot: a mechanism that puts an include back, however it arrives, is
+/// visible here.
+///
+/// An incomplete scan answers "yes".  Absence has to be proven to be useful,
+/// and a scanner that could not account for the whole text has proven nothing.
+bool textSpellsAnyIncludeDirective(StringRef text,
+                                   const LangOptions &lexLang) {
+  const PreprocessingDirectiveScanResult scan =
+      scanPreprocessingDirectives(text, lexLang);
+  if (!scan.IsComplete())
+    return true;
+  for (const PreprocessingDirectiveLine &directive : scan.directives) {
+    if (directive.headKind != PreprocessingDirectiveHeadKind::Identifier)
+      continue;
+    // The scanner normalizes escaped newlines out of the head token, so these
+    // comparisons see `inc\<newline>lude` as `include`.
+    if (directive.keyword == "include" || directive.keyword == "include_next" ||
+        directive.keyword == "import")
+      return true;
+  }
+  return false;
+}
+
+/// Drop every include-directive rewrite whose construct another edit proved it
+/// realizes away.
+///
+/// Two edits can be individually proven and still collide, when one replaces a
+/// range that strictly contains the other.  A header materialized into its
+/// parent is the case that produces it: a cover edit realizes a run of the body
+/// and a nested `#include`/`#include_next` inside that run separately stages a
+/// rewrite of its own directive, because a child include cannot be replayed
+/// from a materialized parent with the original search stack.  Neither is
+/// wrong, and there is no order that applies both.
+///
+/// This is a *named* discharge, restricted to that one pair of theorems, and
+/// deliberately not a general law about nested edits.  Source containment
+/// proves only that the two edits cannot both be applied, which is a statement
+/// about the applicator; it says nothing about the surviving payload.  Nor does
+/// the outer edit's complete-source-closure authority settle it on its own:
+/// that authority proves the outer accounted for every construct it crossed,
+/// and re-emitting a construct's source accounts for it just as realizing its
+/// tokens does.  Only the second discharges a rewrite obligation, so the two
+/// are told apart by the planner's own elimination witness:
+///
+/// \code
+///   inner's sole capability is IncludeDirectiveRewrite over construct C,
+///     and inner replaces exactly C
+///   outer holds a complete-source-closure capability over that same C
+///   outer's elimination witness names C: its replacement realized C away
+///     rather than carrying C's source through
+///   outer strictly contains inner in source bytes
+///   ------------------------------------------------------------------
+///   the rewritten directive is not emitted at all, and the obligation to
+///   rewrite it is discharged by the outer closure theorem
+/// \endcode
+///
+/// The elimination witness is then checked rather than believed.  It is the
+/// complement of the ranges the planner says its replacement re-emits, so it is
+/// only as complete as that enumeration -- and an enumeration maintained beside
+/// the code that builds the replacement is exactly the kind of invariant that
+/// goes stale silently.  So the outer's replacement is scanned, and the
+/// discharge is refused unless it spells no include directive at all.  A future
+/// mechanism that puts an include back into that payload therefore stops the
+/// discharge instead of quietly invalidating it.
+///
+/// The construct is matched by exact identity, never by containment, so the
+/// outer must own the very interval the inner was authorized over.  The inner's
+/// capability is then moved onto the outer, because the outer really does
+/// consume those protected bytes and the emission audit must still see an
+/// authority for them: the obligation is transferred, not deleted.
+///
+/// Everything else keeps failing closed.  A zero-width insertion owns no byte
+/// another edit can be said to replace; two edits claiming the same range are a
+/// genuine ambiguity; an edit whose planner minted no elimination witness is
+/// never treated as having eliminated anything.
 ///
 /// Returns how many edits were dropped.
 size_t dropSubsumedNormalizedTextEdits(SmallVectorImpl<TextEdit> &norm,
-                                       StringRef emissionOwner) {
+                                       StringRef emissionOwner,
+                                       const LangOptions &lexLang) {
   SmallVector<bool, 8> subsumed(norm.size(), false);
+  SmallVector<int, 8> dischargedBy(norm.size(), -1);
   for (size_t inner = 0; inner < norm.size(); ++inner) {
     const TextEdit &innerEdit = norm[inner];
     if (innerEdit.start >= innerEdit.end)
       continue;
+    const std::optional<ProtectedSourceEditAuthorization> obligation =
+        soleIncludeDirectiveRewriteObligation(innerEdit);
+    if (!obligation)
+      continue;
+
     for (size_t outer = 0; outer < norm.size(); ++outer) {
       if (outer == inner)
         continue;
@@ -871,13 +1065,30 @@ size_t dropSubsumedNormalizedTextEdits(SmallVectorImpl<TextEdit> &norm,
         continue;
       if (outerEdit.start == innerEdit.start && outerEdit.end == innerEdit.end)
         continue;
+      if (!editEliminatesProtectedConstruct(outerEdit, *obligation))
+        continue;
+      const bool outerOwnsConstruct = llvm::any_of(
+          outerEdit.protectedSourceAuthorizations,
+          [&](const ProtectedSourceEditAuthorization &authorization) {
+            return authorizationIsCompleteSourceClosure(authorization.authority) &&
+                   authorization.structureKind == obligation->structureKind &&
+                   authorization.begin == obligation->begin &&
+                   authorization.end == obligation->end;
+          });
+      if (!outerOwnsConstruct)
+        continue;
+      if (textSpellsAnyIncludeDirective(outerEdit.text, lexLang))
+        continue;
 
       REFOLD_LOG_TRACE(
           "edits/apply",
-          "dropping edit [{0},{1}) in {2}: wholly replaced by edit [{3},{4})",
+          "discharging include-directive rewrite [{0},{1}) in {2}: edit "
+          "[{3},{4}) holds a source-closure capability over the same {5} "
+          "construct and proved it realized away",
           innerEdit.start, innerEdit.end, emissionOwner, outerEdit.start,
-          outerEdit.end);
+          outerEdit.end, toString(obligation->structureKind));
       subsumed[inner] = true;
+      dischargedBy[inner] = static_cast<int>(outer);
       break;
     }
   }
@@ -889,6 +1100,16 @@ size_t dropSubsumedNormalizedTextEdits(SmallVectorImpl<TextEdit> &norm,
   const size_t dropped = llvm::count(subsumed, true);
   if (dropped == 0)
     return 0;
+
+  // Move each discharged edit's capability onto the edit that discharged it.
+  // The outer edit consumes those protected bytes whether or not the inner one
+  // survives, so the authority for them has to survive with it.
+  for (size_t i = 0; i < norm.size(); ++i) {
+    if (!subsumed[i] || dischargedBy[i] < 0)
+      continue;
+    appendUniqueProtectedSourceAuthorizations(
+        norm[static_cast<size_t>(dischargedBy[i])], norm[i]);
+  }
 
   SmallVector<TextEdit, 8> kept;
   kept.reserve(norm.size() - dropped);
@@ -1243,6 +1464,22 @@ bool RefoldTextEditAssembler::AuthorizeExactProtectedSourceInterval(
                   "by the emitted edit");
   }
 
+  // The guard rewrite is the one authority that writes a directive over the
+  // bytes of an expression, so it is the one that has to establish separately
+  // that the directive it writes is a directive at all.  The other authorities
+  // admitting a pragma operator carry their own replacement grammars and are
+  // deliberately left to their own planners.
+  if (authority == ProtectedSourceEditAuthorityKind::PragmaOnceGuardRewrite &&
+      matched->kind == PreprocessingStructureKind::PragmaOperator &&
+      !operatorReplacementOwnsItsDirectiveLine(edit, sourceBytes, lexLang_)) {
+    return reject(llvm::formatv(
+                      "once-guard rewrite of pragma operator [{0},{1}) emits a "
+                      "directive that does not begin a translated logical line",
+                      matched->structureSpellingBegin,
+                      matched->structureSpellingEnd)
+                      .str());
+  }
+
   ProtectedSourceEditAuthorization authorization;
   authorization.authority = authority;
   authorization.structureKind = matched->kind;
@@ -1316,7 +1553,9 @@ bool RefoldTextEditAssembler::AuthorizeCompleteProtectedSourceClosure(
     TextEdit &edit, ProtectedSourceEditAuthorityKind authority,
     StringRef sourcePath, std::optional<uint64_t> ownerIncludeId,
     StringRef sourceBytes, uint64_t begin, uint64_t end,
-    bool requireProtectedInterval, bool requestTerminalOnFailure) const {
+    bool requireProtectedInterval, bool requestTerminalOnFailure,
+    std::optional<ArrayRef<std::pair<uint64_t, uint64_t>>>
+        preservedSourcePieces) const {
   if (authority !=
           ProtectedSourceEditAuthorityKind::IncludePreservingSourceClosure &&
       authority != ProtectedSourceEditAuthorityKind::TUIncludeClosure) {
@@ -1332,10 +1571,35 @@ bool RefoldTextEditAssembler::AuthorizeCompleteProtectedSourceClosure(
     }
     return false;
   }
-  return AuthorizeProtectedSourceIntervals(
-      edit, authority, sourcePath, ownerIncludeId, sourceBytes, begin, end,
-      allProtectedStructureKinds(), requireProtectedInterval,
-      requestTerminalOnFailure);
+  const size_t authorizationsBefore = edit.protectedSourceAuthorizations.size();
+  if (!AuthorizeProtectedSourceIntervals(
+          edit, authority, sourcePath, ownerIncludeId, sourceBytes, begin, end,
+          allProtectedStructureKinds(), requireProtectedInterval,
+          requestTerminalOnFailure))
+    return false;
+
+  // Only a caller that named its preserved pieces may have eliminations
+  // recorded for it.  Silence is not evidence that nothing was preserved.
+  if (!preservedSourcePieces)
+    return true;
+
+
+  for (size_t i = authorizationsBefore;
+       i < edit.protectedSourceAuthorizations.size(); ++i) {
+    const ProtectedSourceEditAuthorization &authorization =
+        edit.protectedSourceAuthorizations[i];
+    const bool preserved = llvm::any_of(
+        *preservedSourcePieces, [&](const std::pair<uint64_t, uint64_t> &piece) {
+          return authorization.begin < piece.second &&
+                 piece.first < authorization.end;
+        });
+    if (preserved)
+      continue;
+    edit.eliminatedProtectedConstructs.push_back(
+        EliminatedProtectedConstruct{authorization.structureKind,
+                                     authorization.begin, authorization.end});
+  }
+  return true;
 }
 
 bool RefoldTextEditAssembler::OrdinaryEditAvoidsProtectedPreprocessingStructure(
@@ -3247,7 +3511,7 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
   // overlap.  A subsumed edit is not an overlap to be resolved: its bytes are
   // replaced wholesale by the edit containing it, so it has no effect on the
   // output and no composition question to answer.
-  dropSubsumedNormalizedTextEdits(norm, emissionOwner);
+  dropSubsumedNormalizedTextEdits(norm, emissionOwner, lexLang_);
 
   // Some token-LCS tie choices can split one logical B-side TU realization
   // around stable punctuation tokens. If the resulting direct TU hunk edits

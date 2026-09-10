@@ -697,7 +697,7 @@ static bool
 preprocessedTokensEqualForLinePrune(StringRef currentPP, StringRef candidatePP,
                                     const RefoldModel::PreprocessContext &ctx,
                                     std::string &reason) {
-  const LangOptions lexLang = makeRefoldLexLangOptions(ctx.lang);
+  const LangOptions lexLang = makeRefoldLexLangOptions(ctx.lang, ctx.argv);
   std::vector<PPTok> currentTokens;
   std::vector<PPTok> candidateTokens;
   std::vector<std::size_t> currentOffsets;

@@ -498,7 +498,7 @@ int main(int argc, char **argv) {
     });
   }
   const PPCtx ctx = *ctxOrErr;
-  const LangOptions lexLang = makeRefoldLexLangOptions(ctx.lang);
+  const LangOptions lexLang = makeRefoldLexLangOptions(ctx.lang, ctx.argv);
 
   std::optional<PPCtx> checkCtx;
   if (onlyCheck) {

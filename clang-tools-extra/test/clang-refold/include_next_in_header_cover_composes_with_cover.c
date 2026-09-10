@@ -13,14 +13,41 @@
 // are not in the output at all: the cover replaced them.  The applicator used
 // to see only "overlapping normalized edits" and refuse the translation unit.
 //
-// The composition law is subsumption rather than ordering.  An edit whose
-// source range another edit wholly replaces contributes nothing to the emitted
-// bytes, so removing it cannot change a single one -- which is what makes this
-// a law and not a preference between two proven edits.  It is kept narrow:
-// containment must be strict on at least one side, so two edits claiming the
-// same range stay a genuine ambiguity and are still refused; and both must
-// replace bytes, so a zero-width insertion is never dropped on the grounds
-// that something replaced the bytes it does not own.
+// The composition law is a named discharge between two specific theorems, not
+// a general rule about nested edits.  Source containment proves only that the
+// two edits cannot both be applied, which is a statement about the applicator;
+// it says nothing about what the surviving payload emits.  Nor is the cover's
+// complete-source-closure authority enough on its own: that authority proves
+// the cover accounted for every construct its range crossed, and re-emitting a
+// construct's source accounts for it exactly as realizing its tokens does.
+// Only the second discharges a rewrite obligation.
+//
+// So the two are told apart by evidence minted where the difference is known.
+// The header planner hands its preserved-source pieces to the assembler when
+// the closure capabilities are created, and every authorized construct outside
+// that set is recorded on the edit as eliminated -- realized away rather than
+// carried through.  Here the cover holds a source-closure capability over the
+// exact `#include_next` construct [17,54) that the inner edit is authorized to
+// rewrite, and names that construct as eliminated, so the rewritten directive
+// is never emitted and the obligation to rewrite it is discharged.
+//
+// The inner edit's capability is moved onto the cover rather than deleted: the
+// cover really does consume those protected bytes, so the emission audit must
+// still find an authority for them.
+//
+// Every premise is load-bearing.  Suppressing just the elimination witness --
+// having the planner decline to state its preserved pieces -- makes this test
+// fail closed with an uncomposable edit set rather than silently keep working,
+// and the witness is not vacuous: elsewhere in this suite a closure edit
+// authorizes a construct it *preserves*, and that construct is correctly not
+// recorded as eliminated.
+//
+// The rule stays narrow in three further ways: the inner edit must carry
+// exactly one capability, the include-directive rewrite, over exactly its own
+// range, so an edit that also does something else is never dropped; the
+// construct is matched by exact identity rather than containment; and a
+// zero-width insertion, or two edits claiming the same range, are still
+// refused.
 //
 // The expected refold is the composition: the outer include replaced by the
 // materialized body with the payload already in it, and the inner include gone

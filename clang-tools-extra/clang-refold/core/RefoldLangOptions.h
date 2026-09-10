@@ -15,17 +15,27 @@
 
 #include "clang/Basic/LangOptions.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
+
+#include <string>
 
 namespace clang {
 namespace refold {
 
 /// Construct the LangOptions used by all raw-lexer helper paths.
 ///
-/// The producer records the language spelling that was used to preprocess the
-/// TU.  Replaying that spelling through CompilerInvocation keeps tokenization
-/// decisions, especially literal and comment handling, aligned with the map.
-clang::LangOptions makeRefoldLexLangOptions(llvm::StringRef langName);
+/// The producer records both the language spelling and the exact cc1 command
+/// line it preprocessed with.  Replaying that command line through
+/// CompilerInvocation, with the recorded language spelling re-asserted on top,
+/// keeps every tokenization decision aligned with the map -- literal and
+/// comment handling, and equally the options that decide where a logical line
+/// ends, such as `-std=` and `-ftrigraphs`.
+///
+/// `producerArgv` may be empty, which reproduces the language token alone.
+clang::LangOptions
+makeRefoldLexLangOptions(llvm::StringRef langName,
+                         llvm::ArrayRef<std::string> producerArgv);
 
 } // namespace refold
 } // namespace clang

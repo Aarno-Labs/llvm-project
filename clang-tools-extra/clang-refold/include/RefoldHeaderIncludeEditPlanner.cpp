@@ -2877,6 +2877,43 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
       // exact structure pieces plus lexical trivia.  Translate that independent
       // closure theorem into exact per-interval emission capabilities; the path
       // name alone is not authority.
+      //
+      // Hand over every range this replacement re-emits, so the capabilities
+      // can record the rest as constructs it realized away.  Only here is that
+      // difference known: downstream a reader can see that this edit owns a
+      // construct's bytes, but not whether the construct survived in them.
+      //
+      // Two sources of re-emission, and both must be listed or the complement
+      // is a false claim of elimination:
+      //
+      //   * `headerGapPreservations` -- structure copied through as source;
+      //   * `carriedHeaderMacroStateTransitions` -- macro directives *moved*
+      //     after the payload, which are re-emitted just as literally even
+      //     though they are not gap pieces.
+      //
+      // A gap piece carrying `sourceText` names offsets in the file that
+      // declared it rather than in this header, so its range cannot be compared
+      // against capabilities minted in this header's coordinates.  Rather than
+      // compare them anyway and risk calling a preserved construct eliminated,
+      // the whole claim is withheld: no pieces are offered, and nothing this
+      // edit crosses may be treated as eliminated.
+      bool preservedPiecesAreComparable = true;
+      SmallVector<std::pair<uint64_t, uint64_t>, 4> preservedSourcePieces;
+      preservedSourcePieces.reserve(headerGapPreservations.size() +
+                                    carriedHeaderMacroStateTransitions.size());
+      for (const HeaderPreservedGapPiece &piece : headerGapPreservations) {
+        if (!piece.sourceText.empty()) {
+          preservedPiecesAreComparable = false;
+          break;
+        }
+        preservedSourcePieces.emplace_back(piece.begin, piece.end);
+      }
+      if (preservedPiecesAreComparable) {
+        for (const HeaderMacroStateCarryCandidate &carried :
+             carriedHeaderMacroStateTransitions)
+          preservedSourcePieces.emplace_back(carried.begin, carried.end);
+      }
+
       sourceAuthorityAccepted =
           textEditAssembler_.AuthorizeCompleteProtectedSourceClosure(
               edit,
@@ -2884,7 +2921,11 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
                   IncludePreservingSourceClosure,
               file, ie.include->id, headerText, *startByte, *endByte,
               /*requireProtectedInterval=*/false,
-              /*requestTerminalOnFailure=*/false);
+              /*requestTerminalOnFailure=*/false,
+              preservedPiecesAreComparable
+                  ? std::optional<ArrayRef<std::pair<uint64_t, uint64_t>>>(
+                        preservedSourcePieces)
+                  : std::nullopt);
     }
 
     if (sourceAuthorityAccepted && carriedHeaderMacroState) {

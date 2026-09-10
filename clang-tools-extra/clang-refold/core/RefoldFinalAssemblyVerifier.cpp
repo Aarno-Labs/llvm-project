@@ -28,7 +28,8 @@ namespace {
 /// language options -- a difference in any of those would show up as a token
 /// divergence and be mistaken for an unsound refold.
 bool preprocessAndLex(const FinalSourcePreprocessCallback &preprocess,
-                      StringRef lang, StringRef bytes, std::vector<PPTok> &toks,
+                      const RefoldModel::PreprocessContext &ctx,
+                      StringRef bytes, std::vector<PPTok> &toks,
                       std::vector<std::size_t> &offsets) {
   const std::optional<std::string> preprocessed = preprocess(bytes);
   if (!preprocessed)
@@ -36,7 +37,8 @@ bool preprocessAndLex(const FinalSourcePreprocessCallback &preprocess,
 
   toks.clear();
   offsets.clear();
-  lexPPTokens(*preprocessed, toks, offsets, makeRefoldLexLangOptions(lang));
+  lexPPTokens(*preprocessed, toks, offsets,
+              makeRefoldLexLangOptions(ctx.lang, ctx.argv));
   return true;
 }
 
@@ -77,7 +79,7 @@ std::optional<RefoldFinalAssemblyVerifier> RefoldFinalAssemblyVerifier::Create(
   // Preprocess the edited stream once.  This is the fixed side of every later
   // comparison, and it is what makes the relation idempotence rather than
   // equality against the stream as written.
-  if (!preprocessAndLex(preprocess, ctx.lang, editedStreamBytes,
+  if (!preprocessAndLex(preprocess, ctx, editedStreamBytes,
                         verifier.editedTokens_, verifier.editedTokenOffsets_)) {
     REFOLD_LOG_DEBUG("assembly-verify",
                      "unavailable: the edited stream could not be preprocessed");
@@ -126,7 +128,7 @@ RefoldFinalAssemblyVerifier::Verify(StringRef finalSource) const {
 
   std::vector<PPTok> assemblyTokens;
   std::vector<std::size_t> assemblyOffsets;
-  if (!preprocessAndLex(preprocess, ctx_.lang, finalSource, assemblyTokens,
+  if (!preprocessAndLex(preprocess, ctx_, finalSource, assemblyTokens,
                         assemblyOffsets)) {
     verdict.kind = FinalAssemblyVerdictKind::Inconclusive;
     return verdict;

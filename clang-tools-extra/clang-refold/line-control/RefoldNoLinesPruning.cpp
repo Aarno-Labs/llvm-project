@@ -550,7 +550,7 @@ buildNoLinesIgnoreMask(const json::Object &rootJson, const PPCtx &ctx,
 
   std::vector<PPTok> a0Toks;
   std::vector<std::size_t> a0Off;
-  const LangOptions lexLang = makeRefoldLexLangOptions(ctx.lang);
+  const LangOptions lexLang = makeRefoldLexLangOptions(ctx.lang, ctx.argv);
   lexPPTokens(a0Bytes, a0Toks, a0Off, lexLang);
 
   std::vector<uint8_t> a0Sensitive(a0Toks.size(), 0);
@@ -605,7 +605,7 @@ buildRelaxedStringifyIgnoreMask(const json::Object &rootJson, const PPCtx &ctx,
 
   std::vector<PPTok> a0Toks;
   std::vector<std::size_t> a0Off;
-  const LangOptions lexLang = makeRefoldLexLangOptions(ctx.lang);
+  const LangOptions lexLang = makeRefoldLexLangOptions(ctx.lang, ctx.argv);
   lexPPTokens(a0Bytes, a0Toks, a0Off, lexLang);
 
   // Mark every A token produced by argument stringification (`#x`).  In relaxed

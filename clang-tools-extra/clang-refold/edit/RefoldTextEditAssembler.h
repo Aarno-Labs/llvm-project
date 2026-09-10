@@ -239,12 +239,20 @@ public:
   /// Only the two named closure authorities are accepted.  The method expands
   /// their closed domain to every indexed preprocessing kind and records one
   /// exact capability per interval; it does not itself prove source closure.
+  /// `preservedSourcePieces`, when engaged, is the caller's construct-by-
+  /// construct statement of which crossed source ranges its replacement
+  /// carries through as preserved source.  Supplying it lets this routine
+  /// record every other authorized construct as eliminated, which is what a
+  /// later subsumption theorem needs and what the closure authority alone
+  /// cannot say.  Leaving it disengaged makes no claim and records nothing.
   bool AuthorizeCompleteProtectedSourceClosure(
       TextEdit &edit, ProtectedSourceEditAuthorityKind authority,
       llvm::StringRef sourcePath, std::optional<uint64_t> ownerIncludeId,
       llvm::StringRef sourceBytes, uint64_t begin, uint64_t end,
-      bool requireProtectedInterval = false,
-      bool requestTerminalOnFailure = true) const;
+      bool requireProtectedInterval = true,
+      bool requestTerminalOnFailure = true,
+      std::optional<llvm::ArrayRef<std::pair<uint64_t, uint64_t>>>
+          preservedSourcePieces = std::nullopt) const;
 
   /// Return whether an ordinary token-derived edit avoids every protected
   /// preprocessing interval in its exact physical source-owner domain.

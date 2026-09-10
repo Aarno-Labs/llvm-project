@@ -206,6 +206,31 @@ struct ProtectedSourceEditAuthorization {
   }
 };
 
+/// One protected preprocessing construct that an edit's replacement provably
+/// does not re-emit.
+///
+/// This is an affirmative, planner-minted fact, and only a planner that knows
+/// its replacement construct by construct may mint one: it must be able to say
+/// which of the protected intervals its range crossed were carried through as
+/// preserved source and which were realized away.  A closure planner that
+/// cannot say so records nothing, and nothing downstream may then treat any
+/// construct it crossed as eliminated.
+///
+/// It exists because owning a construct's bytes is not the same as removing
+/// it.  A complete-source-closure authority proves an edit accounted for every
+/// crossed construct; it does not distinguish accounting for one by re-emitting
+/// its source from accounting for it by realizing its tokens.  Only the second
+/// discharges another edit's obligation to rewrite that construct, so the two
+/// have to be told apart by evidence rather than inferred from the authority.
+struct EliminatedProtectedConstruct {
+  PreprocessingStructureKind kind =
+      PreprocessingStructureKind::OtherDirective;
+  /// Inclusive begin of the eliminated construct in the emitting owner's bytes.
+  uint64_t begin = 0;
+  /// Exclusive end of the eliminated construct in the emitting owner's bytes.
+  uint64_t end = 0;
+};
+
 /// One byte edit selected for final source emission.
 struct TextEdit {
   /// Half-open TU source-byte range replaced by this edit.
@@ -287,6 +312,14 @@ struct TextEdit {
   /// Exclusive byte offset inside this edit's replacement `text` to report as
   /// the refolded-output side of the materialized edit map.
   std::optional<uint64_t> materializedOutputTextEnd = std::nullopt;
+
+  /// Protected constructs this edit's replacement provably does not re-emit.
+  ///
+  /// Populated only by a closure planner that supplied its preserved-source
+  /// pieces when the closure capabilities were minted, so an empty vector means
+  /// "no claim", never "nothing was eliminated".  Consumed by the named
+  /// subsumption theorem in `RefoldTextEditAssembler`.
+  std::vector<EliminatedProtectedConstruct> eliminatedProtectedConstructs = {};
 
   /// True when a producer of this edit proved that its replacement realizes no
   /// bytes of the edited preprocessed stream B at all.

@@ -78,6 +78,39 @@ bool IntervalIsEnclosedByAnotherStructure(
   return false;
 }
 
+/// Return whether \p offset in \p bytes is the beginning of a translated
+/// logical line.
+///
+/// A directive introducer is recognized only there, and "there" is decided
+/// after phase-two escaped-newline deletion, not on physical lines: the newline
+/// that appears to start a line is no boundary at all when the line before it
+/// ends in a backslash -- or, with trigraphs enabled, in `??/`.  The first byte
+/// of the file begins a logical line with no newline of its own.
+bool offsetBeginsLogicalLine(StringRef bytes, uint64_t offset,
+                             const LangOptions &lexLang) {
+  return offset == 0 ||
+         sourceTextEndsAtLogicalLineBeginning(bytes.take_front(offset), lexLang);
+}
+
+/// Return whether the logical line containing \p offset is terminated at
+/// \p offset by nothing but horizontal white-space and a surviving newline.
+///
+/// This is the closing half of the same question: a directive written at
+/// \p offset ends where its logical line does, so no ordinary source may follow
+/// it there -- and neither may an escaped newline, which would continue the
+/// directive onto the next physical line.  Only horizontal white-space is
+/// skipped, so the newline this accepts is reached with no backslash and no
+/// trigraph introducer between it and \p offset, and therefore survives
+/// phase two.  End of file terminates the line with no newline at all.
+bool logicalLineEndsAtOffset(StringRef bytes, uint64_t offset) {
+  for (char byte : bytes.drop_front(std::min<size_t>(offset, bytes.size()))) {
+    if (byte == ' ' || byte == '\t' || byte == '\v' || byte == '\f')
+      continue;
+    return byte == '\n' || byte == '\r';
+  }
+  return true;
+}
+
 /// Return the text that replaces one once site's spelling with \p directive,
 /// or nothing when the site's bytes may not carry a directive.
 ///
@@ -86,15 +119,34 @@ bool IntervalIsEnclosedByAnotherStructure(
 /// ends it.  A `_Pragma("once")` operator is an expression and may share its
 /// line, so the replacement opens a line for the directive and, when source
 /// follows on the same line, closes one after it.  Each opened line is one
-/// physical line of drift in the emitted body, which is admissible here only
-/// under the same suffix line-observer proof the `#ifndef` prologue needs.
+/// physical line of drift in the emitted body, admissible here only under the
+/// same suffix line-observer proof the `#ifndef` prologue needs.
+///
+/// Both decisions are translated-logical-line questions, which is why neither
+/// is a search for `'\n'`.  An operator can sit at the start of a physical line
+/// that is the continuation of the one before it, as in
+///
+/// \code
+///   int value = 0 + \
+///     _Pragma("once")
+///   1;
+/// \endcode
+///
+/// where nothing precedes the operator on its physical line, yet a `#define`
+/// written over its bytes would be spliced into the middle of `int value = 0 +
+/// #define ...` and would not introduce a directive at all.  A line opened
+/// before it repairs exactly that: the original escaped newline consumes the
+/// physical newline it was already consuming, and the newline this adds becomes
+/// the logical-line terminator.
 ///
 /// Nothing is returned for an operator the index reports as contained by
 /// another protected construct: those bytes belong to that construct's exact
-/// transition and rewriting them would break it.
+/// transition and rewriting them would break it.  Nothing is returned either
+/// when the opened line would itself be consumed by an escaped newline, which
+/// leaves the site with no position a directive can occupy.
 std::optional<std::string>
 OnceSiteInPlaceReplacement(const PragmaOnceSite &site, StringRef bytes,
-                           StringRef directive) {
+                           StringRef directive, const LangOptions &lexLang) {
   if (!site.viaPragmaOperator)
     return directive.str();
   if (site.enclosedByProtectedStructure)
@@ -108,25 +160,15 @@ OnceSiteInPlaceReplacement(const PragmaOnceSite &site, StringRef bytes,
   if (directive.empty())
     return std::string();
 
-  // Bytes of the site's own physical line on each side of the spelling.  The
-  // leading side is computed from the last newline explicitly rather than with
-  // `rsplit`, which reports the whole prefix as its first element when the
-  // string holds no separator at all: a site on the header's first line has no
-  // preceding newline, and reading that as "nothing precedes it" would claim
-  // the site owns a line it in fact shares.
-  const StringRef beforeSpelling = bytes.substr(0, site.spellingBegin);
-  const size_t lineBegin = beforeSpelling.rfind('\n');
-  const StringRef beforeOnLine = lineBegin == StringRef::npos
-                                     ? beforeSpelling
-                                     : beforeSpelling.substr(lineBegin + 1);
-  const StringRef afterOnLine =
-      bytes.substr(site.spellingEnd).split('\n').first;
-
   std::string replacement;
-  if (!beforeOnLine.trim().empty())
+  if (!offsetBeginsLogicalLine(bytes, site.spellingBegin, lexLang)) {
     replacement += "\n";
+    if (!insertionBeginsWithNonSplicedPhysicalNewline(
+            bytes.take_front(site.spellingBegin), replacement, lexLang))
+      return std::nullopt;
+  }
   replacement += directive;
-  if (!afterOnLine.trim().empty())
+  if (!logicalLineEndsAtOffset(bytes, site.spellingEnd))
     replacement += "\n";
   return replacement;
 }
@@ -1309,15 +1351,18 @@ RefoldPragmaOnceGuardRewriter::StageMaterializedBodyGuardEdits(
     const std::string directive =
         emitGuard ? (Twine("#define ") + guard->macroName).str() : std::string();
     const std::optional<std::string> replacementOrNone =
-        OnceSiteInPlaceReplacement(site, headerBytes, directive);
+        OnceSiteInPlaceReplacement(site, headerBytes, directive,
+                                   deps_.lexLang);
     if (!replacementOrNone) {
-      // The site's bytes belong to an enclosing construct.  Declining the
-      // in-place rewrite leaves the header's once-state to the B-realized
-      // path, which places its define at the top of the body instead.
+      // The site's bytes cannot carry the directive: either an enclosing
+      // construct owns them, or no line the replacement could open survives
+      // phase two at this position.  Declining the in-place rewrite leaves the
+      // header's once-state to the B-realized path, which places its define at
+      // the top of the body instead.
       return PragmaOnceGuardEditResult::Reject(
           PragmaOnceGuardRejection::PragmaOperatorOnce,
-          formatv("inc#{0} once operator at [{1},{2}) in '{3}' is enclosed by "
-                  "another protected construct and cannot be rewritten in place",
+          formatv("inc#{0} once operator at [{1},{2}) in '{3}' cannot carry the "
+                  "guard directive in place",
                   include.id, site.spellingBegin, site.spellingEnd, headerPath)
               .str());
     }

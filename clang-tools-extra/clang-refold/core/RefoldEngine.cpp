@@ -403,7 +403,7 @@ RefoldEngine::RefoldEngine(
       lineDirs_(!noLines, model_.GetPPCwd()),
       pathIdentity_(model_, model_.GetPPCwd(), /*emitAbsPaths=*/false),
       strict_(strict), proofAuditMode_(proofAuditMode),
-      lexLang_(makeRefoldLexLangOptions(model_.GetPPLang())),
+      lexLang_(makeRefoldLexLangOptions(model_.GetPPLang(), model_.GetPPArgv())),
       argTextRecovery_(lexLang_), tokenTextAnalysis_(lexLang_),
       terminalSink_(RefoldTerminalProofSinkCallbacks{
           [this](const TerminalFallbackProofFailure &failure, StringRef role) {
@@ -3217,7 +3217,7 @@ bool RefoldEngine::AuditPreservedLineObserversInFinalOutput(
   std::vector<PPTok> replayedToks;
   std::vector<size_t> replayedOff;
   lexPPTokens(*replayed, replayedToks, replayedOff,
-              makeRefoldLexLangOptions(model_.GetPPLang()));
+              makeRefoldLexLangOptions(model_.GetPPLang(), model_.GetPPArgv()));
 
   const size_t common = std::min(replayedToks.size(), bToks_.size());
   for (size_t index = 0; index < common; ++index) {

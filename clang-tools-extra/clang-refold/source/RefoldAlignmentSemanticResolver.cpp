@@ -23,6 +23,7 @@
 #include "llvm/Support/FormatVariadic.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <optional>
@@ -68,12 +69,59 @@ constexpr size_t MaxProposalCounterfactuals = 256;
 /// inside the budget is unaffected in every case: no rule's set is larger than
 /// the enumeration, so none of them can decline on cost.
 ///
+/// It is deliberately a *completeness* budget, and completeness under it is not
+/// monotone in the value.  A window whose surviving set is larger than the
+/// budget declines a rule it would have committed had it been allowed to spend
+/// the realizations, and the anchors that rule would have contributed are lost
+/// with it -- the window keeps only what core certification forced.  Raising
+/// the value therefore resolves strictly more windows and costs strictly more
+/// whole-translation-unit refolds, and lowering it does the reverse; neither
+/// direction can change a committed answer, only whether one is reached.
+/// `alignment_window_legacy_proposal_declines_on_realization_budget.c` pins
+/// that: it is the input
+/// `alignment_window_over_budget_still_reaches_the_legacy_proposal.c` commits,
+/// run with the budget injected below set low enough to deny the rule, and it
+/// asserts that what is lost is the resolution and never the output.
+///
 /// The value must leave room for the largest enumeration on which a rule is
 /// known to commit, because declining costs resolution the window would
 /// otherwise have kept.  The binding case is
 /// `semantic_alignment_counter_argument_growth_two_windows.c`, whose window
 /// enumerates 54 maps and commits the least-source-mutation rule on map 14.
-constexpr size_t MaxRealizedMapsPerCommitRule = 64;
+constexpr size_t DefaultMaxRealizedMapsPerCommitRule = 64;
+
+constexpr StringLiteral TestOnlyRealizationBudgetEnvironment =
+    "CLANG_REFOLD_TEST_ONLY_SEMANTIC_REALIZATION_BUDGET";
+
+/// Return the production realization budget unless a test injects one.
+///
+/// The hook is test-only and has no default effect.  It exists because the
+/// budget is a completeness policy rather than a proof: what a decline costs is
+/// resolution, and asserting that requires driving a rule past the budget on an
+/// input small enough to read, rather than one large enough to exceed 64
+/// realizations on its own.
+size_t maxRealizedMapsPerCommitRule() {
+  // Read once.  The enumeration loop asks for the budget per candidate map, and
+  // a process's environment does not change under it, so re-reading would cost
+  // a lookup per realization and could not answer differently.
+  static const size_t budget = [] {
+    const char *injected =
+        std::getenv(TestOnlyRealizationBudgetEnvironment.data());
+    if (injected == nullptr)
+      return DefaultMaxRealizedMapsPerCommitRule;
+
+    uint64_t parsed = 0;
+    if (StringRef(injected).getAsInteger(10, parsed)) {
+      REFOLD_LOG_FATAL("lcs/semantic-resolver",
+                       "invalid test-only semantic realization budget '{0}'",
+                       injected);
+    }
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "using test-only semantic realization budget={0}", parsed);
+    return static_cast<size_t>(parsed);
+  }();
+  return budget;
+}
 
 struct ForcedAnchor {
   uint64_t aToken = 0;
@@ -769,7 +817,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   // it cannot support.
   //
   // What bounds this rule instead is cost.  Deciding it costs one realization
-  // per enumerated map, so an enumeration over MaxRealizedMapsPerCommitRule
+  // per enumerated map, so an enumeration over the realization budget
   // declines the rule without realizing the remainder.  Declining a rule is not
   // declining the window: a rule whose set is small is still reached below, and
   // a window with no rule left keeps its core-forced anchors, which is the same
@@ -843,14 +891,14 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     // the whole ground set however few of it has been paid for, and declining
     // on the first candidate spends one realization instead of the budget.
     if (containmentRuleReachable &&
-        globalMaps.size() > MaxRealizedMapsPerCommitRule) {
+        globalMaps.size() > maxRealizedMapsPerCommitRule()) {
       REFOLD_LOG_TRACE(
           "lcs/semantic-resolver",
           "window {0} declines the least-source-mutation rule after realizing "
           "{1} map(s): its {2} enumerated map(s) exceed the containment "
           "realization budget ({3})",
           windowIndex, mapIndex + 1, globalMaps.size(),
-          MaxRealizedMapsPerCommitRule);
+          maxRealizedMapsPerCommitRule());
       containmentRuleReachable = false;
     }
 
@@ -1240,13 +1288,13 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   // least-source-mutation rule's ground set is.  A window whose enumeration
   // fits inside the budget can never reach this decline: the survivors are a
   // subset of the enumeration.
-  if (survivingMaps.size() > MaxRealizedMapsPerCommitRule) {
+  if (survivingMaps.size() > maxRealizedMapsPerCommitRule()) {
     REFOLD_LOG_TRACE(
         "lcs/semantic-resolver",
         "window {0} keeps core-forced anchors: {1} map(s) surviving the {2} "
         "required anchor(s) exceed the realization budget ({3})",
         windowIndex, survivingMaps.size(), requiredAnchors.size(),
-        MaxRealizedMapsPerCommitRule);
+        maxRealizedMapsPerCommitRule());
     return WindowResolution{};
   }
 
