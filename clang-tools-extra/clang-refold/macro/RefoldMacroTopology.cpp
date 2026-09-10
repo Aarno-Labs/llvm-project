@@ -11,6 +11,7 @@
 
 #include "macro/RefoldMacroTopology.h"
 
+#include "core/RefoldLog.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroReplay.h"
 #include "util/StringUtils.h"
@@ -369,6 +370,87 @@ RefoldMacroTopology::WholeCoverForRepeatedSourceSpelling(
   return cover;
 }
 
+void RefoldMacroTopology::BuildMacroStabIndex() const {
+  if (macroStabIndexBuilt_)
+    return;
+  macroStabIndexBuilt_ = true;
+
+  ArrayRef<RefoldModel::MacroInvocation> invocations =
+      model_.GetMacroInvocations();
+  if (invocations.empty())
+    return;
+
+  // The envelope of one invocation spans every range selection can fire on:
+  // its body spans, its argument/stringify/paste spans, and the broad cover
+  // that `MacroInvocation::Covers()` tests.  Those five are the complete set
+  // `SmallestCoveringPatchableMacro()` ranks over, which is what makes a bucket
+  // miss a proof that no range of this invocation stabs the query point rather
+  // than a guess that none does.
+  //
+  // This union is therefore an obligation on that routine, not an optimization
+  // detail: a selection path that learns to fire on a further range -- the
+  // separate `spans` field, say, which nothing here consults today -- must add
+  // it below, or the index will silently stop offering candidates it should.
+  auto envelopeOf =
+      [](const RefoldModel::MacroInvocation &m)
+      -> std::optional<std::pair<uint64_t, uint64_t>> {
+    std::optional<std::pair<uint64_t, uint64_t>> envelope;
+    auto include = [&](uint64_t begin, uint64_t end) {
+      if (end <= begin)
+        return;
+      if (!envelope) {
+        envelope = std::make_pair(begin, end);
+        return;
+      }
+      envelope->first = std::min(envelope->first, begin);
+      envelope->second = std::max(envelope->second, end);
+    };
+    if (m.cover.IsValid())
+      include(m.cover.begin, m.cover.end);
+    for (const RefoldModel::PPSpan &span : m.bodySpans)
+      include(span.begin, span.end);
+    for (const auto &span : m.argSpans)
+      include(span.begin, span.end);
+    for (const auto &span : m.stringifySpans)
+      include(span.begin, span.end);
+    for (const auto &span : m.pasteSpans)
+      include(span.begin, span.end);
+    return envelope;
+  };
+
+  uint64_t highestEnd = 0;
+  std::vector<std::optional<std::pair<uint64_t, uint64_t>>> envelopes(
+      invocations.size());
+  for (size_t i = 0; i < invocations.size(); ++i) {
+    envelopes[i] = envelopeOf(invocations[i]);
+    if (envelopes[i])
+      highestEnd = std::max(highestEnd, envelopes[i]->second);
+  }
+
+  const size_t bucketCount =
+      static_cast<size_t>(highestEnd / MacroStabBucketWidth) + 1;
+  macroStabBuckets_.assign(bucketCount, {});
+  uint64_t registrations = 0;
+  for (size_t i = 0; i < invocations.size(); ++i) {
+    if (!envelopes[i])
+      continue;
+    const uint64_t first = envelopes[i]->first / MacroStabBucketWidth;
+    const uint64_t last = (envelopes[i]->second - 1) / MacroStabBucketWidth;
+    for (uint64_t bucket = first; bucket <= last; ++bucket) {
+      macroStabBuckets_[static_cast<size_t>(bucket)].push_back(
+          static_cast<uint32_t>(i));
+      ++registrations;
+    }
+  }
+
+  REFOLD_LOG_DEBUG("macro/topology",
+                   "invocation stabbing index: invocations={0} buckets={1} "
+                   "width={2} registrations={3}",
+                   static_cast<uint64_t>(invocations.size()),
+                   static_cast<uint64_t>(bucketCount), MacroStabBucketWidth,
+                   registrations);
+}
+
 const RefoldModel::MacroInvocation *
 RefoldMacroTopology::SmallestCoveringPatchableMacro(
     uint64_t aStart, uint64_t aEnd,
@@ -442,7 +524,20 @@ RefoldMacroTopology::SmallestCoveringPatchableMacro(
   // body-span cover first, then argument-derived cover, then broad cover as a
   // fallback. Ties are broken by smaller covering span, then lower macro id,
   // for deterministic selection.
-  for (const auto &m : model_.GetMacroInvocations()) {
+  // Selection fires only on a range with `begin <= aStart < end`, so only
+  // invocations whose envelope stabs `aStart` can be selected at all, and those
+  // are exactly the ones registered in `aStart`'s bucket.  Scanning that bucket
+  // therefore considers every candidate the exhaustive scan would have accepted
+  // and no fewer; ranking below is unchanged.
+  BuildMacroStabIndex();
+  const uint64_t stabBucket = aStart / MacroStabBucketWidth;
+  if (stabBucket >= macroStabBuckets_.size())
+    return nullptr;
+  ArrayRef<RefoldModel::MacroInvocation> invocations =
+      model_.GetMacroInvocations();
+
+  for (uint32_t candidateIndex : macroStabBuckets_[stabBucket]) {
+    const RefoldModel::MacroInvocation &m = invocations[candidateIndex];
     // Owner filter (when known): avoids selecting a macro record that belongs
     // to a different include instance.
     if (ownerIncludeId) {

@@ -191,6 +191,26 @@ private:
 
   /// True after the lazy #define containment index has been built for this run.
   mutable bool definesIndexBuilt_ = false;
+
+  /// Bucket width, in A tokens, of the invocation stabbing index below.
+  static constexpr uint64_t MacroStabBucketWidth = 64;
+
+  /// Invocation indices bucketed by A-token position, for
+  /// `SmallestCoveringPatchableMacro()`.
+  ///
+  /// Every range that routine can select an invocation on -- a body span, an
+  /// argument/stringify/paste span, or the broad cover -- must satisfy
+  /// `begin <= aStart < end`, so selection is a stabbing query at `aStart`.  An
+  /// invocation is therefore a candidate only when the envelope of all those
+  /// ranges stabs `aStart`, and it is registered in every bucket its envelope
+  /// spans.  A query scans one bucket instead of every invocation.
+  mutable std::vector<std::vector<uint32_t>> macroStabBuckets_;
+
+  /// True after the lazy invocation stabbing index has been built for this run.
+  mutable bool macroStabIndexBuilt_ = false;
+
+  /// Build the lazy invocation stabbing index for this run.
+  void BuildMacroStabIndex() const;
 };
 
 } // namespace refold
