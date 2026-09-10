@@ -45,10 +45,90 @@ namespace {
 constexpr StringRef kGuardMacroPrefix = "__CLANG_REFOLD_ONCE_";
 
 /// Preprocessing kinds a pragma-once guard rewrite may consume at a pragma site.
+///
+/// `PragmaOperator` is admitted because `_Pragma("once")` establishes exactly
+/// the once-state a `#pragma once` directive does.  It differs only in being an
+/// expression rather than a directive, which bears on whether its bytes may be
+/// rewritten in place, not on what it establishes; `OnceSiteInPlaceReplacement`
+/// below decides that separately and declines the site when it cannot.
 ArrayRef<PreprocessingStructureKind> pragmaGuardKinds() {
   static constexpr PreprocessingStructureKind kinds[] = {
-      PreprocessingStructureKind::Pragma};
+      PreprocessingStructureKind::Pragma,
+      PreprocessingStructureKind::PragmaOperator};
   return kinds;
+}
+
+/// Return whether another indexed interval strictly contains \p interval.
+///
+/// Containment is what makes a site's bytes unavailable: the containing
+/// construct owns them as part of its own exact transition, so replacing a
+/// sub-range of it would break that construct rather than the site.  A
+/// directive can never be contained, so in practice this only ever answers for
+/// a `_Pragma` operator.
+bool IntervalIsEnclosedByAnotherStructure(
+    const RefoldPreprocessingStructureIndex &index,
+    const PreprocessingStructureInterval &interval) {
+  for (const PreprocessingStructureInterval &other : index.GetIntervals()) {
+    if (&other == &interval)
+      continue;
+    if (other.begin <= interval.begin && interval.end <= other.end &&
+        (other.begin < interval.begin || interval.end < other.end))
+      return true;
+  }
+  return false;
+}
+
+/// Return the text that replaces one once site's spelling with \p directive,
+/// or nothing when the site's bytes may not carry a directive.
+///
+/// A `#pragma once` directive already owns its logical line, so the directive
+/// text alone is the replacement and the site's own terminating newline still
+/// ends it.  A `_Pragma("once")` operator is an expression and may share its
+/// line, so the replacement opens a line for the directive and, when source
+/// follows on the same line, closes one after it.  Each opened line is one
+/// physical line of drift in the emitted body, which is admissible here only
+/// under the same suffix line-observer proof the `#ifndef` prologue needs.
+///
+/// Nothing is returned for an operator the index reports as contained by
+/// another protected construct: those bytes belong to that construct's exact
+/// transition and rewriting them would break it.
+std::optional<std::string>
+OnceSiteInPlaceReplacement(const PragmaOnceSite &site, StringRef bytes,
+                           StringRef directive) {
+  if (!site.viaPragmaOperator)
+    return directive.str();
+  if (site.enclosedByProtectedStructure)
+    return std::nullopt;
+  if (site.spellingBegin > bytes.size() || site.spellingEnd > bytes.size() ||
+      site.spellingBegin > site.spellingEnd)
+    return std::nullopt;
+
+  // Deleting an operator never needs a line of its own: removing an expression
+  // leaves the rest of the line exactly as it was.
+  if (directive.empty())
+    return std::string();
+
+  // Bytes of the site's own physical line on each side of the spelling.  The
+  // leading side is computed from the last newline explicitly rather than with
+  // `rsplit`, which reports the whole prefix as its first element when the
+  // string holds no separator at all: a site on the header's first line has no
+  // preceding newline, and reading that as "nothing precedes it" would claim
+  // the site owns a line it in fact shares.
+  const StringRef beforeSpelling = bytes.substr(0, site.spellingBegin);
+  const size_t lineBegin = beforeSpelling.rfind('\n');
+  const StringRef beforeOnLine = lineBegin == StringRef::npos
+                                     ? beforeSpelling
+                                     : beforeSpelling.substr(lineBegin + 1);
+  const StringRef afterOnLine =
+      bytes.substr(site.spellingEnd).split('\n').first;
+
+  std::string replacement;
+  if (!beforeOnLine.trim().empty())
+    replacement += "\n";
+  replacement += directive;
+  if (!afterOnLine.trim().empty())
+    replacement += "\n";
+  return replacement;
 }
 
 /// Preprocessing kinds a pragma-once guard rewrite may consume at an include
@@ -323,6 +403,9 @@ bool RefoldPragmaOnceGuardRewriter::DiscoverPragmaOnceSites(
       site.modelItemId = interval.modelItemId;
       site.enclosingArmId =
           InnermostEnclosingArm(sourcePath, ownerIncludeId, interval.begin);
+      site.viaPragmaOperator = true;
+      site.enclosedByProtectedStructure =
+          IntervalIsEnclosedByAnotherStructure(index, interval);
       sites.push_back(site);
       continue;
     }
@@ -638,14 +721,8 @@ void RefoldPragmaOnceGuardRewriter::BuildCandidateCatalog() {
     // Prefer the instance that the producer actually entered, because that is
     // the one whose pragma records exist.  Producer pragma records always bind
     // to the entering instance; a skipped instance has none.
-    std::optional<uint64_t> ownerIncludeId;
-    for (uint64_t id : candidate.includeIds) {
-      const RefoldModel::IncludeItem *edge = deps_.model.GetIncludeById(id);
-      if (edge && edge->enteredFileName) {
-        ownerIncludeId = id;
-        break;
-      }
-    }
+    const std::optional<uint64_t> ownerIncludeId =
+        ProducerEnteredIncludeIdForPath(entry.first);
 
     const std::string loadPath =
         representative->openedPath ? representative->openedPath->str()
@@ -841,6 +918,20 @@ RefoldPragmaOnceGuardRewriter::FindGuardForPath(StringRef physicalPath) const {
   if (!candidate || !candidate->active || !candidate->guard.IsUsable())
     return nullptr;
   return &candidate->guard;
+}
+
+std::optional<uint64_t>
+RefoldPragmaOnceGuardRewriter::ProducerEnteredIncludeIdForPath(
+    StringRef canonicalPath) const {
+  const HeaderCandidate *candidate = FindCandidate(canonicalPath);
+  if (!candidate)
+    return std::nullopt;
+  for (uint64_t id : candidate->includeIds) {
+    const RefoldModel::IncludeItem *edge = deps_.model.GetIncludeById(id);
+    if (edge && edge->enteredFileName)
+      return id;
+  }
+  return std::nullopt;
 }
 
 const PragmaOnceGuard *RefoldPragmaOnceGuardRewriter::FindGuardForInclude(
@@ -1132,11 +1223,22 @@ RefoldPragmaOnceGuardRewriter::StageMaterializedBodyGuardEdits(
   // Re-prove the pragma inventory against the bytes actually being emitted.  A
   // caller may preseed a materialized body with text that differs from the file
   // on disk, so catalog offsets are candidates rather than authority here.
+  // Re-prove in the domain of the occurrence the producer entered, not this
+  // one.  Materializing a *suppressed* occurrence is ordinary -- it is the body
+  // the guard makes conditional -- but that occurrence entered nothing, so its
+  // own domain carries no pragma record and every once site in it would look
+  // unbound.  The inventory belongs to the header's bytes; only the binding
+  // evidence belongs to an occurrence, and this names the one that has it.
+  const std::optional<uint64_t> bindingOwnerIncludeId =
+      ProducerEnteredIncludeIdForPath(guard->physicalHeaderPath)
+          .value_or(include.id);
+
   SmallVector<PragmaOnceSite, 2> sites;
   PragmaOnceGuardRejection rejection = PragmaOnceGuardRejection::None;
   std::string detail;
-  if (!DiscoverPragmaOnceSites(guard->physicalHeaderPath, headerPath, include.id,
-                               headerBytes, sites, rejection, detail)) {
+  if (!DiscoverPragmaOnceSites(guard->physicalHeaderPath, headerPath,
+                               bindingOwnerIncludeId, headerBytes, sites,
+                               rejection, detail)) {
     return PragmaOnceGuardEditResult::Reject(rejection, std::move(detail));
   }
   if (sites.empty()) {
@@ -1152,10 +1254,16 @@ RefoldPragmaOnceGuardRewriter::StageMaterializedBodyGuardEdits(
 
   // The `#ifndef`/`#endif` pair adds two physical lines to the body.  With
   // `#line` injection unavailable that drift is permanent, so it is admissible
-  // only when nothing in the shifted suffix observes line state.  The pragma
-  // replacements themselves are line-neutral: only the directive spelling is
-  // replaced, so the terminating newline survives and a deleted pragma leaves a
-  // blank line behind.
+  // only when nothing in the shifted suffix observes line state.
+  //
+  // Replacing a `#pragma once` directive is line-neutral on top of that: only
+  // the spelling is replaced, so the terminating newline survives and a deleted
+  // pragma leaves a blank line behind.  Replacing a `_Pragma("once")` operator
+  // that shares its line is not -- it opens a line for the directive -- but the
+  // check below already quantifies over the whole body from offset zero,
+  // because the prologue shifts every byte of it, and a site's own drift shifts
+  // only the suffix after that site.  Both are therefore covered by the same
+  // proof.
   if (emitGuard && !GuardLineDriftIsRepairable(include.id, headerPath, 0)) {
     return PragmaOnceGuardEditResult::Reject(
         PragmaOnceGuardRejection::UnrepairableLineDrift,
@@ -1198,8 +1306,22 @@ RefoldPragmaOnceGuardRewriter::StageMaterializedBodyGuardEdits(
     // `DeletePragma` replaces the spelling with nothing.  The pragma is inert in
     // the main file, and removing it keeps `-Wpragma-once-outside-header` out of
     // every refolded TU that inlines a once-header.
-    const std::string replacement =
+    const std::string directive =
         emitGuard ? (Twine("#define ") + guard->macroName).str() : std::string();
+    const std::optional<std::string> replacementOrNone =
+        OnceSiteInPlaceReplacement(site, headerBytes, directive);
+    if (!replacementOrNone) {
+      // The site's bytes belong to an enclosing construct.  Declining the
+      // in-place rewrite leaves the header's once-state to the B-realized
+      // path, which places its define at the top of the body instead.
+      return PragmaOnceGuardEditResult::Reject(
+          PragmaOnceGuardRejection::PragmaOperatorOnce,
+          formatv("inc#{0} once operator at [{1},{2}) in '{3}' is enclosed by "
+                  "another protected construct and cannot be rewritten in place",
+                  include.id, site.spellingBegin, site.spellingEnd, headerPath)
+              .str());
+    }
+    const std::string &replacement = *replacementOrNone;
     ResyncOutcome ro = deps_.textEditAssembler.ApplyResyncOrPend(
         headerBytes, site.spellingBegin, site.spellingEnd, replacement,
         headerPath, include.id);

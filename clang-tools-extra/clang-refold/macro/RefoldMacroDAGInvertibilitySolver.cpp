@@ -46,6 +46,156 @@ RefoldMacroDAGInvertibilitySolver::RefoldMacroDAGInvertibilitySolver(
     Dependencies deps)
     : deps_(std::move(deps)) {}
 
+namespace {
+
+/// Saturation point for the completion counts below.  The caller distinguishes
+/// only "no realization", "exactly one", and "more than one", so a third
+/// completion is never counted.
+constexpr unsigned MaxCountedCompletions = 2;
+
+/// Exact decision procedure for an arg-ref template that references each
+/// caller parameter at most once.
+///
+/// With no parameter repeated, the text assigned to one placeholder constrains
+/// nothing downstream: no later placeholder has to re-match it.  How many ways
+/// the rest of the template completes therefore depends only on which
+/// placeholder comes next and where in the observed text it starts, which
+/// makes `(placeholder, offset)` a sufficient state and the whole decision
+/// polynomial in the template length times the observed length.
+///
+/// The general case has no such state.  A parameter bound at one placeholder
+/// and re-matched at a later one is pattern matching with variables, whose
+/// membership problem is NP-complete, and it is left to the bounded search in
+/// the caller.  Splitting the two is what lets a template of any width be
+/// decided exactly here instead of being declined on cost.
+class NonRepeatingArgRefTemplateSolver {
+public:
+  /// `literals` holds the fixed text around each placeholder, so that
+  /// `literals[i]` precedes placeholder `i` and `literals.back()` trails the
+  /// last one.  `obs` is the observed text the template must realize.
+  NonRepeatingArgRefTemplateSolver(ArrayRef<StringRef> literals, StringRef obs)
+      : literals_(literals), obs_(obs) {
+    // Bytes of fixed text from `literals[i]` to the end, used to reject a
+    // split that cannot leave room for the literals still to be matched.
+    suffixLiteralBytes_.assign(literals_.size() + 1, 0);
+    for (size_t i = literals_.size(); i > 0; --i)
+      suffixLiteralBytes_[i - 1] =
+          suffixLiteralBytes_[i] + literals_[i - 1].size();
+    memo_.assign(literals_.size() * (obs_.size() + 1), kUnknown);
+  }
+
+  /// Return how many ways the template completes from placeholder `refIdx`
+  /// with the observed text consumed up to `obsPos`, saturated at
+  /// `MaxCountedCompletions`.
+  unsigned Count(size_t refIdx, size_t obsPos) {
+    const size_t slot = refIdx * (obs_.size() + 1) + obsPos;
+    if (memo_[slot] != kUnknown)
+      return memo_[slot];
+
+    // Guard against re-entering a state while it is being computed.  The
+    // recursion below always advances `refIdx`, so this cannot happen; seeding
+    // the slot keeps that an invariant of the table rather than of the reader.
+    memo_[slot] = 0;
+
+    unsigned total = 0;
+    std::optional<size_t> afterLiteral = matchLiteral(refIdx, obsPos);
+    if (afterLiteral) {
+      if (refIdx + 1 == literals_.size()) {
+        // Every placeholder is consumed; this is a completion only if the
+        // trailing literal ended exactly at the end of the observed text.
+        total = *afterLiteral == obs_.size() ? 1 : 0;
+      } else {
+        forEachSplit(refIdx, *afterLiteral, [&](size_t nextPos) {
+          total = std::min(MaxCountedCompletions,
+                           total + Count(refIdx + 1, nextPos));
+          return total < MaxCountedCompletions;
+        });
+      }
+    }
+
+    memo_[slot] = static_cast<uint8_t>(total);
+    return total;
+  }
+
+  /// Record the observed slice assigned to each placeholder of the single
+  /// completion.  Valid only when `Count(0, 0)` is exactly one.
+  void Reconstruct(SmallVectorImpl<StringRef> &assignedByPlaceholder) {
+    assignedByPlaceholder.assign(literals_.size() - 1, StringRef());
+    size_t obsPos = 0;
+    for (size_t refIdx = 0; refIdx + 1 < literals_.size(); ++refIdx) {
+      const std::optional<size_t> afterLiteral = matchLiteral(refIdx, obsPos);
+      assert(afterLiteral && "unique completion must match every literal");
+      std::optional<size_t> chosen;
+      forEachSplit(refIdx, *afterLiteral, [&](size_t nextPos) {
+        if (Count(refIdx + 1, nextPos) == 0)
+          return true;
+        chosen = nextPos;
+        return false;
+      });
+      assert(chosen && "unique completion must have a surviving split");
+      assignedByPlaceholder[refIdx] =
+          obs_.slice(*afterLiteral, *chosen);
+      obsPos = *chosen;
+    }
+  }
+
+private:
+  static constexpr uint8_t kUnknown = 0xff;
+
+  /// Consume `literals[refIdx]` at `obsPos`, or return nothing when the
+  /// observed text does not carry it there.
+  std::optional<size_t> matchLiteral(size_t refIdx, size_t obsPos) const {
+    const StringRef literal = literals_[refIdx];
+    if (obsPos > obs_.size() ||
+        !obs_.drop_front(obsPos).starts_with(literal))
+      return std::nullopt;
+    return obsPos + literal.size();
+  }
+
+  /// Call `visit` with each observed offset at which placeholder `refIdx`,
+  /// starting at `varBegin`, may end.  Iteration stops early when `visit`
+  /// returns false.
+  template <typename VisitFn>
+  void forEachSplit(size_t refIdx, size_t varBegin, VisitFn visit) {
+    // The literals after this placeholder must still fit.  A later placeholder
+    // may be empty, so it contributes nothing to this lower bound.
+    const size_t minRemaining = suffixLiteralBytes_[refIdx + 1];
+    if (varBegin + minRemaining > obs_.size())
+      return;
+    const size_t maxLen = obs_.size() - varBegin - minRemaining;
+    const StringRef rest = obs_.drop_front(varBegin);
+    const StringRef nextLiteral = literals_[refIdx + 1];
+
+    if (nextLiteral.empty()) {
+      // Nothing delimits this placeholder, so every remaining length is a
+      // candidate and uniqueness is what decides whether that is usable.
+      for (size_t len = 0; len <= maxLen; ++len)
+        if (!visit(varBegin + len))
+          return;
+      return;
+    }
+
+    // A delimited placeholder may end only where the following literal
+    // actually occurs.  Each occurrence is visited once: searching from the
+    // previous match plus one is what keeps this linear in the observed text
+    // rather than quadratic in it.
+    for (size_t pos = rest.find(nextLiteral); pos != StringRef::npos;
+         pos = rest.find(nextLiteral, pos + 1)) {
+      if (pos > maxLen)
+        return;
+      if (!visit(varBegin + pos))
+        return;
+    }
+  }
+
+  ArrayRef<StringRef> literals_;
+  StringRef obs_;
+  SmallVector<size_t, 16> suffixLiteralBytes_;
+  SmallVector<uint8_t, 256> memo_;
+};
+
+} // namespace
+
 RefoldMacroPasteArgumentBuilder
 RefoldMacroDAGInvertibilitySolver::pasteArgumentBuilder() const {
   return RefoldMacroPasteArgumentBuilder(
@@ -68,13 +218,19 @@ RefoldMacroDAGInvertibilitySolver::BuildArgRefInvertibilityCertificate(
     const ArgRefTemplate &tpl, StringRef observed) const {
   ArgRefInvertibilityCertificate cert;
 
-  constexpr size_t maxDistinctCallerParams = 8;
+  /// Inline capacity for the per-caller-parameter assignment vectors.  This is
+  /// a sizing hint only; the vectors below grow past it.
+  constexpr size_t expectedDistinctCallerParams = 8;
 
-  // Empty templates do not prove forwarding, and very wide templates are
-  // kept out of this local DFS to avoid turning malformed metadata into
-  // an expensive search problem.
-  if (tpl.refs.empty() || tpl.distinctCallerParams.empty() ||
-      tpl.distinctCallerParams.size() > maxDistinctCallerParams)
+  // Empty templates do not prove forwarding.
+  //
+  // Template *width* is deliberately not a rejection.  What costs here is
+  // backtracking over a caller parameter that must be matched again at a later
+  // placeholder, not how many parameters a template names: a template that
+  // names each parameter once is decided exactly, in polynomial time, by
+  // `NonRepeatingArgRefTemplateSolver` below, however wide it is.  Only a
+  // repeating template reaches the bounded search after it.
+  if (tpl.refs.empty() || tpl.distinctCallerParams.empty())
     return cert;
 
   // Decompose the template into:
@@ -112,19 +268,74 @@ RefoldMacroDAGInvertibilitySolver::BuildArgRefInvertibilityCertificate(
 
   StringRef obs = observed.trim();
 
+  // A template that names each caller parameter once is decided exactly, with
+  // no search budget, at any width.  `varOrdinals` is a permutation of the
+  // distinct parameters in that case, so a placeholder's assignment is the
+  // assignment of the parameter it names.
+  if (tpl.refs.size() == tpl.distinctCallerParams.size()) {
+    NonRepeatingArgRefTemplateSolver solver(literals, obs);
+    const unsigned completions = solver.Count(0, 0);
+    if (completions == 0) {
+      cert.kind = ArgRefInvertibilityKind::NoMatch;
+      return cert;
+    }
+    if (completions > 1) {
+      cert.kind = ArgRefInvertibilityKind::Ambiguous;
+      return cert;
+    }
+
+    SmallVector<StringRef, expectedDistinctCallerParams> assignedByPlaceholder;
+    solver.Reconstruct(assignedByPlaceholder);
+    cert.kind = ArgRefInvertibilityKind::Unique;
+    for (size_t refIdx = 0; refIdx < varOrdinals.size(); ++refIdx)
+      cert.derivedTextByCallerParam[tpl.distinctCallerParams[varOrdinals
+                                                                 [refIdx]]] =
+          assignedByPlaceholder[refIdx].str();
+    return cert;
+  }
+
   // `assigns[i]` is the candidate observed text for
   // `tpl.distinctCallerParams[i]`. It remains empty until the DFS first
   // reaches that caller parameter placeholder.
-  SmallVector<std::optional<StringRef>, maxDistinctCallerParams> assigns(
+  SmallVector<std::optional<StringRef>, expectedDistinctCallerParams> assigns(
       tpl.distinctCallerParams.size());
+
+  // Node-expansion budget for the search below.
+  //
+  // Only a template that binds one caller parameter and re-matches it at a
+  // later placeholder reaches here, and deciding one is pattern matching with
+  // variables: its membership problem is NP-complete, so no exact procedure
+  // bounded in the template's size exists to fall back on and the search is
+  // bounded instead.  The bound is stated in the problem's own terms --
+  // `(placeholders x observed bytes)`, the state count the non-repeating case
+  // would need -- so that it scales with the input rather than declining a
+  // template for being large, and only genuine backtracking consumes it.
+  //
+  // Reaching the budget is a cost cutoff, not a proof.  It yields
+  // `SearchBudgetExhausted`, and the caller treats that exactly as it treats
+  // `Unsupported` -- the lifted parent rewrite is not certified and a narrower
+  // derivation or the lexical bridge is used instead.
+  //
+  // The absolute clamp bounds pathological producer metadata, where the
+  // scaled term itself could be large enough to matter.
+  constexpr uint64_t inversionStepsPerCell = 64;
+  constexpr uint64_t maxInversionSearchSteps = 1ULL << 22;
+  const uint64_t searchStepBudget = std::min<uint64_t>(
+      maxInversionSearchSteps,
+      inversionStepsPerCell *
+          (static_cast<uint64_t>(tpl.refs.size()) + 1) *
+          (static_cast<uint64_t>(observed.size()) + 1));
+  uint64_t searchSteps = 0;
+  bool searchBudgetExhausted = false;
 
   // Keep at most enough distinct solutions to distinguish Unique from
   // Ambiguous. Duplicate assignment vectors can arise through equivalent
   // split paths and are ignored.
-  SmallVector<SmallVector<std::string, maxDistinctCallerParams>, 2> solutions;
+  SmallVector<SmallVector<std::string, expectedDistinctCallerParams>, 2>
+      solutions;
 
   auto addSolution = [&](ArrayRef<std::optional<StringRef>> aLocal) {
-    SmallVector<std::string, maxDistinctCallerParams> sLocal;
+    SmallVector<std::string, expectedDistinctCallerParams> sLocal;
     sLocal.reserve(tpl.distinctCallerParams.size());
     for (size_t i = 0; i < tpl.distinctCallerParams.size(); ++i)
       sLocal.push_back(aLocal[i] ? aLocal[i]->str() : std::string());
@@ -141,6 +352,15 @@ RefoldMacroDAGInvertibilitySolver::BuildArgRefInvertibilityCertificate(
     // prove ambiguity, so stop exploring once ambiguity is known.
     if (solutions.size() > 1)
       return;
+
+    // Charge the expansion before doing any of its work, so an abandoned
+    // search cannot be mistaken for a completed one below.
+    if (searchBudgetExhausted)
+      return;
+    if (++searchSteps > searchStepBudget) {
+      searchBudgetExhausted = true;
+      return;
+    }
 
     // Each placeholder is preceded by a fixed literal. The observed text
     // must match that literal exactly at the current position before the
@@ -199,9 +419,15 @@ RefoldMacroDAGInvertibilitySolver::BuildArgRefInvertibilityCertificate(
     if (!nextLit.empty()) {
       // When the next literal is known, only split at occurrences of that
       // literal. This avoids enumerating equivalent impossible lengths.
-      for (size_t searchPos = 0;; ++searchPos) {
-        const size_t pos = rest.find(nextLit, searchPos);
-        if (pos == StringRef::npos || pos > maxLen)
+      //
+      // Each occurrence is tried once.  Resuming the scan from the previous
+      // match plus one, rather than from the previous start plus one, is what
+      // keeps that so: the latter re-finds the same occurrence once per
+      // intervening byte, which duplicate solutions hide but the step budget
+      // above would still be charged for.
+      for (size_t pos = rest.find(nextLit); pos != StringRef::npos;
+           pos = rest.find(nextLit, pos + 1)) {
+        if (pos > maxLen)
           break;
         tryLen(pos);
         if (solutions.size() > 1)
@@ -221,15 +447,26 @@ RefoldMacroDAGInvertibilitySolver::BuildArgRefInvertibilityCertificate(
 
   dfs(dfs, 0, 0);
 
-  // Exactly one assignment vector is required. Zero solutions means this
-  // observed text does not realize the template; multiple means
-  // ambiguous.
-  if (solutions.empty()) {
-    cert.kind = ArgRefInvertibilityKind::NoMatch;
-    return cert;
-  }
+  // Two distinct solutions prove ambiguity outright: they were both found, so
+  // the verdict stands whether or not the remaining branches were explored.
   if (solutions.size() > 1) {
     cert.kind = ArgRefInvertibilityKind::Ambiguous;
+    return cert;
+  }
+
+  // Every other verdict quantifies over the whole search space, so an
+  // abandoned search establishes none of them.  A single solution is not
+  // unique unless the branches that could hold a second one were examined,
+  // and no solution is not `NoMatch` unless every branch was.
+  if (searchBudgetExhausted) {
+    cert.kind = ArgRefInvertibilityKind::SearchBudgetExhausted;
+    return cert;
+  }
+
+  // Exactly one assignment vector is required. Zero solutions means this
+  // observed text does not realize the template.
+  if (solutions.empty()) {
+    cert.kind = ArgRefInvertibilityKind::NoMatch;
     return cert;
   }
 

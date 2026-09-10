@@ -467,8 +467,26 @@ private:
   void RestageConservativeTUEdit(
       TextEdit &edit, uint64_t start, uint64_t end, StringRef replacement,
       ArrayRef<ProvenMacroStateSourceTransition> repairedTransitions = {});
+  /// Structural-segment key a repaired edit inherits from the direct-TU
+  /// carrier its repair replaced.
+  struct InheritedStructuralSegmentKey {
+    uint64_t witnessId = 0;
+    uint32_t segmentIndex = 0;
+  };
+
+  /// Return the structural-segment key held by the ordinary direct-TU carriers
+  /// on \p edit, or nothing when they hold none or disagree.
+  ///
+  /// Disagreement yields nothing rather than a choice: two carriers naming
+  /// different segments for one edit is not a fact the repair may pick from,
+  /// and dropping the key leaves the emission audit to reject the edit.
+  std::optional<InheritedStructuralSegmentKey>
+  DirectTUStructuralSegmentKey(const TextEdit &edit) const;
+
   /// Attaches conservative TU proof carrier metadata to a repaired edit.
-  void AttachConservativeTUCarrier(TextEdit &edit);
+  void AttachConservativeTUCarrier(
+      TextEdit &edit,
+      std::optional<InheritedStructuralSegmentKey> inherited = std::nullopt);
 
   /// Advances consumed undef transitions before replacements that observe the
   /// prior definition state.
@@ -1615,17 +1633,91 @@ StringRef MacroStateRepairContext::MacroStatePreservationPlacementName(
   return "unknown";
 }
 
-void MacroStateRepairContext::AttachConservativeTUCarrier(TextEdit &edit) {
-  TextEditAssembler().AttachAcceptedResultCarrier(
-      edit, ProofLattice()
-                .AcceptedCandidateBuilder()
-                .BuildAcceptedSpecializedTUTextEditCandidate(
-                    AcceptedPathKind::TUByteSpanConservativeEdit, edit.start,
-                    edit.end, StringRef(edit.text)));
+std::optional<MacroStateRepairContext::InheritedStructuralSegmentKey>
+MacroStateRepairContext::DirectTUStructuralSegmentKey(
+    const TextEdit &edit) const {
+  std::optional<InheritedStructuralSegmentKey> key;
+  for (const std::shared_ptr<const AcceptedResultCandidate> &candidate :
+       edit.acceptedResults) {
+    if (!candidate ||
+        candidate->kind != AcceptedResultCandidateKind::TUTextEdit ||
+        !AcceptedResultIsOrdinaryDirectTUCarrier(*candidate)) {
+      continue;
+    }
+    // A direct-TU carrier can name its segment two ways, and which one it uses
+    // depends on how the planner bound it: the mixed-owner overlay stores the
+    // witness inline, while the owner-realization path stores a validated
+    // witness-id/segment key.  Both are read, because a repair must not lose
+    // the binding merely because of which form the carrier happened to hold.
+    const ProofSummary &summary = candidate->proofSummary;
+    std::optional<InheritedStructuralSegmentKey> found;
+
+    if (summary.hasMixedOwnerTilingWitness &&
+        summary.hasMixedOwnerTilingSegmentSelection &&
+        summary.mixedOwnerTilingWitness.witnessId != 0) {
+      found = InheritedStructuralSegmentKey{
+          summary.mixedOwnerTilingWitness.witnessId,
+          summary.mixedOwnerTilingSegmentIndex};
+    }
+
+    if (summary.hasOwnerRealizationWitness &&
+        summary.ownerRealizationWitness.hasTUCarrierWitness) {
+      const TUOwnerRealizationCarrierWitness &tuCarrier =
+          summary.ownerRealizationWitness.tuCarrierWitness;
+      if (tuCarrier.hasStructuralSegmentBinding &&
+          tuCarrier.structuralSegmentBindingValidated &&
+          tuCarrier.structuralWitnessId != 0) {
+        const InheritedStructuralSegmentKey fromTUCarrier{
+            tuCarrier.structuralWitnessId, tuCarrier.structuralSegmentIndex};
+        if (found && (found->witnessId != fromTUCarrier.witnessId ||
+                      found->segmentIndex != fromTUCarrier.segmentIndex))
+          return std::nullopt;
+        found = fromTUCarrier;
+      }
+    }
+
+    if (!found)
+      continue;
+    if (!key) {
+      key = found;
+      continue;
+    }
+    if (key->witnessId != found->witnessId ||
+        key->segmentIndex != found->segmentIndex)
+      return std::nullopt;
+  }
+  return key;
+}
+
+void MacroStateRepairContext::AttachConservativeTUCarrier(
+    TextEdit &edit, std::optional<InheritedStructuralSegmentKey> inherited) {
+  AcceptedResultCandidate candidate =
+      ProofLattice()
+          .AcceptedCandidateBuilder()
+          .BuildAcceptedSpecializedTUTextEditCandidate(
+              AcceptedPathKind::TUByteSpanConservativeEdit, edit.start,
+              edit.end, StringRef(edit.text));
+  if (inherited) {
+    candidate.proofSummary.hasInheritedStructuralSegmentBinding = true;
+    candidate.proofSummary.inheritedStructuralWitnessId = inherited->witnessId;
+    candidate.proofSummary.inheritedStructuralSegmentIndex =
+        inherited->segmentIndex;
+  }
+  TextEditAssembler().AttachAcceptedResultCarrier(edit, std::move(candidate));
 }
 
 void MacroStateRepairContext::PromoteToSpecializedMacroStateRepairCarrier(
     TextEdit &edit) {
+  // Read the structural-segment key before the carriers holding it are removed.
+  //
+  // The repair invalidates the byte-span theorem, not the partition: this edit
+  // still realizes the same token segment of the same structural tiling, and
+  // the emission audit requires every planned segment to be present.  Losing
+  // the key here made a repaired edit vanish from that census and refused the
+  // whole assembly as uncomposable.
+  const std::optional<InheritedStructuralSegmentKey> inheritedSegmentKey =
+      DirectTUStructuralSegmentKey(edit);
+
   // A repaired source surface is no longer justified by the ordinary token
   // hunk theorem.  Remove only carriers whose canonical owner-realization
   // evidence is TUByteSpan; independently discharged macro/include carriers
@@ -1672,7 +1764,7 @@ void MacroStateRepairContext::PromoteToSpecializedMacroStateRepairCarrier(
             *candidate, AcceptedPathKind::TUByteSpanConservativeEdit);
       });
   if (!alreadySpecialized)
-    AttachConservativeTUCarrier(edit);
+    AttachConservativeTUCarrier(edit, inheritedSegmentKey);
 }
 
 void MacroStateRepairContext::RestageConservativeTUEdit(

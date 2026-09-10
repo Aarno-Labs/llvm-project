@@ -8,26 +8,28 @@
 // to refuse the header outright on the grounds that a `#define` written over
 // those bytes would not begin a logical line.
 //
-// That refusal was in the wrong place.  It is true of one rewrite -- replacing
-// the operator's own bytes -- but the catalog decides whether the header's
-// once-state is usable at all, so refusing there discarded it for every path.
-// An operator-spelled site is never rewritten in place anyway: the emission
-// firewall does not admit `PragmaOperator` to the guard-rewrite authority.  The
-// path that actually guards such a header is the B-realized one, which wraps the
-// body in `#ifndef`/`#define` at its top and proves what that placement needs --
-// the pragma fires on entry to the body, and the header does not include itself,
-// a self-include being the only construct that can observe once-state between
-// the body's first byte and the site.  None of that cares whether the operator
-// owns its line.
+// That refusal was in the wrong place.  It is true of one *spelling* of the
+// rewrite -- writing `#define` over the operator's bytes and nothing else --
+// but the catalog decides whether the header's once-state is usable at all, so
+// refusing there discarded it for every path.
 //
-// So the fix is a deletion: the line-ownership test is gone, and the pre-existing
-// proof does the work.  Note what that preserves -- `int from_midline_op` keeps
-// its place on the line the operator shared, the header on disk is untouched,
-// and the second include survives under the same guard instead of being dropped.
+// Line ownership is decided at the site instead, where it is a question about
+// one edit rather than about the header.  An operator that shares its line has
+// a physical line opened for the directive, which is what the replacement below
+// does: `int from_midline_op` keeps its place on the line it had, and the
+// `#define` follows on a line of its own.  That costs one line of drift in the
+// emitted body, admissible under the same suffix line-observer proof the
+// `#ifndef` prologue already needs, because the prologue shifts the whole body
+// and a site shifts only the suffix after it.
 //
-// pragma_once_operator_midline_conditional_refuses_hoist.c pins the case this
-// does not reach: a conditional operator, where top-of-body placement is not
-// equivalent and no other placement is available.
+// Note what the in-place rewrite preserves that a body realized from B does
+// not: the header's own `#define MIDLINE_OP_V 4` and `int mid_op_use` survive
+// as source.  The header on disk is untouched -- every edit lands in the copy
+// spliced into the TU -- and the second include survives under the same guard
+// instead of being dropped.
+//
+// pragma_once_operator_midline_conditional_guards_inside_arm.c carries the same
+// operator inside a conditional arm, where the define must stay in the arm.
 #include "guard_once_operator_midline.h"
 
 int mid = 0;

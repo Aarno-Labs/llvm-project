@@ -76,6 +76,19 @@ enum class ArgRefInvertibilityKind {
   NoMatch,
   Ambiguous,
   Unsupported,
+
+  /// The inversion search was cut off before it had explored every
+  /// assignment, so neither `Unique` nor `NoMatch` was established.
+  ///
+  /// Distinct from `Unsupported`, which denotes a template this solver
+  /// cannot express at all. Exhaustion says the question was well posed and
+  /// the answer was not paid for; only a template with a repeated caller
+  /// parameter can reach it, because a template that references each
+  /// parameter once never backtracks. Consumers must treat it exactly as
+  /// they treat every other non-`Unique` kind -- it proves nothing -- but
+  /// keeping it separate stops a cost cutoff from being read as a proof
+  /// that the observed text does not realize the template.
+  SearchBudgetExhausted,
 };
 
 struct ArgRefInvertibilityCertificate {

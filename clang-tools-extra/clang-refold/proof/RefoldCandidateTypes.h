@@ -88,6 +88,27 @@ struct ProofSummary {
   bool hasMixedOwnerTilingSegmentSelection = false;
   uint32_t mixedOwnerTilingSegmentIndex = 0;
 
+  /// Structural segment binding inherited by a specialized repair carrier from
+  /// the ordinary direct-TU carrier it replaced.
+  ///
+  /// A macro-state repair rewrites the source surface, so the replaced carrier's
+  /// direct byte-span theorem no longer describes the edit and the carrier is
+  /// removed.  Which *segment* of the structural tiling that edit realizes is a
+  /// different fact, and the repair does not change it: it adds directive lines
+  /// to the same edit and may widen it to a line boundary, and the final audit
+  /// independently rechecks the widened edit against every `PreservedInPlace`
+  /// gap, so an edit that grew into a neighbouring gap is rejected there rather
+  /// than smuggled through on this binding.
+  ///
+  /// Only the key is inherited, never a copy of the witness: it resolves
+  /// through the durable planner ledger exactly as the direct-TU key does, so a
+  /// repair cannot carry a partition proof the planner no longer holds.  This
+  /// deliberately does not set `hasMixedOwnerTilingWitness`, which selects a
+  /// theorem class the repair has not earned.
+  bool hasInheritedStructuralSegmentBinding = false;
+  uint64_t inheritedStructuralWitnessId = 0;
+  uint32_t inheritedStructuralSegmentIndex = 0;
+
   // State-stabilization witness carried by proof summaries that discharge a
   // suffix/state theorem directly rather than through owner realization.
   // EmittedProof exposes the same witness slot so the remaining MacroPatch

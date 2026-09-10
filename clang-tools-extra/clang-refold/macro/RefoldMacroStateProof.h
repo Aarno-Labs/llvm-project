@@ -61,6 +61,42 @@ struct MacroStateBinding {
   const RefoldModel::MacroDirective *directive = nullptr;
 };
 
+/// Who answers for a payload identifier that is itself a live macro.
+///
+/// Such an identifier does not stand for itself: it expands, and its
+/// replacement list may name a bound macro the payload never spells.  Two
+/// stages can be responsible for that, and only one of them may be at a time.
+enum class PayloadIdentifierExpansionPolicy {
+  /// Nothing downstream constrains the identifier, so expanding it is a real
+  /// possibility and the reachability closure must answer for it here.
+  ///
+  /// This is the default, and the only correct choice for a caller whose
+  /// replacement may carry preserved source: a name there can be an expansion
+  /// the source requires, which no later stage is entitled to neutralise.
+  Unconstrained,
+
+  /// The payload is wholly B-derived and its replacement is a translation-unit
+  /// edit, so `RequireEveryObservedGapDefinitionRepaired` answers for it.
+  ///
+  /// B is already preprocessed, so a macro name in it is an identifier and the
+  /// refold must keep it one.  That audit enforces exactly this: it walks every
+  /// TU edit whose replacement is wholly mapped B payload, and for every
+  /// recorded `#define` live where the replacement lands it requires a repair
+  /// that leaves the name unbound there -- carrying the definition past the
+  /// replacement, or undefining it before -- and fails closed otherwise.
+  ///
+  /// So at the point such a payload is emitted, no identifier in it expands:
+  /// either its definition was never live there, or a repair unbound it, or
+  /// nothing was emitted at all.  Expansion-reachability therefore says nothing
+  /// about which *side* of a preserved directive the payload belongs on, which
+  /// is the only question being asked; leaving it in conflates the placement
+  /// question with a neutralisation obligation that is not this proof's, and
+  /// refuses placements that are in fact equivalent.
+  ///
+  /// The direct-spelling obligation is unaffected and still decided here.
+  NeutralisedByLivenessAudit,
+};
+
 /// Exact source-line interval for a producer-recorded macro-state directive.
 ///
 /// MacroDirective::siteB is anchored at the macro name, not necessarily at the
@@ -208,9 +244,12 @@ public:
   /// An empty binding list reports observed: a placement question is asked only
   /// because something was preserved, so no bindings means the names were never
   /// recovered rather than that nothing is bound.
+  ///
+  /// \p policy says whether the second obligation is this proof's to discharge.
   bool PayloadObservesMacroStateBindings(
-      llvm::ArrayRef<MacroStateBinding> bindings,
-      llvm::StringRef payload) const;
+      llvm::ArrayRef<MacroStateBinding> bindings, llvm::StringRef payload,
+      PayloadIdentifierExpansionPolicy policy =
+          PayloadIdentifierExpansionPolicy::Unconstrained) const;
 
   /// Return whether \p directive defines an object-like macro whose whole
   /// replacement list is its own name, as in `#define stderr stderr`.

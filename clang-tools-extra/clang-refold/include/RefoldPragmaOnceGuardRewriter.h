@@ -174,6 +174,23 @@ struct PragmaOnceSite {
   /// which is what makes a top-of-body `#define` equivalent for a body realized
   /// from the edited preprocessed stream.
   std::optional<uint64_t> enclosingArmId;
+  /// True when the site is spelled `_Pragma("once")` rather than as a directive.
+  ///
+  /// An operator is an expression, so unlike a directive it does not own a
+  /// physical line and may sit inside another protected construct.  Both facts
+  /// bear only on rewriting the site's own bytes; the state it establishes is
+  /// the same either way.
+  bool viaPragmaOperator = false;
+  /// True when another indexed preprocessing interval strictly contains this
+  /// site.
+  ///
+  /// Only an operator can be contained -- a directive owns its logical line --
+  /// and the containing construct is what makes its bytes unrewritable: a
+  /// `_Pragma("once")` in a macro replacement list is part of that `#define`'s
+  /// exact transition, so opening a line through it would destroy the
+  /// definition.  Such a site is still a real once site, so it is recorded
+  /// rather than rejected; only the in-place rewrite declines on it.
+  bool enclosedByProtectedStructure = false;
 };
 
 /// Immutable synthetic-once record for one physical header.
@@ -523,6 +540,18 @@ private:
                                llvm::SmallVectorImpl<PragmaOnceSite> &sites,
                                PragmaOnceGuardRejection &rejection,
                                std::string &detail) const;
+
+  /// Return the include occurrence the producer actually entered for one
+  /// physical header, or nullopt when no recorded occurrence entered it.
+  ///
+  /// A header's once inventory is a property of its bytes, but the producer
+  /// records that bind those bytes exist only for the occurrence that was
+  /// entered: a later occurrence is suppressed by the very once-state being
+  /// catalogued and records nothing.  Every query about that inventory must
+  /// therefore name the entering occurrence, whichever occurrence prompted the
+  /// query, or a suppressed one would appear to have no once site at all.
+  std::optional<uint64_t>
+  ProducerEnteredIncludeIdForPath(llvm::StringRef canonicalPath) const;
 
   /// Return the innermost conditional arm containing \p byteOffset for one
   /// owner occurrence, or nullopt when the offset is unconditional there.

@@ -350,50 +350,80 @@ bool resolveStructuralTilingCarrier(
     resolvedSegmentIndex = summary.mixedOwnerTilingSegmentIndex;
   }
 
+  // Resolve one witness-id/segment key through the durable planner ledger and
+  // fold it into whatever an earlier source already resolved.  Shared by the
+  // direct-TU key and the key a macro-state repair inherits from it, so the two
+  // cannot drift apart in how strictly they resolve.
+  auto resolveLedgerKey = [&](uint64_t witnessId, uint32_t segmentIndex,
+                              StringRef source) -> bool {
+    const MixedOwnerTilingWitness *ledgerWitness = nullptr;
+    for (const MixedOwnerTilingWitness &candidate : durableWitnesses) {
+      if (candidate.witnessId != witnessId)
+        continue;
+      if (ledgerWitness) {
+        failure = (source + " structural witness id is not unique in the "
+                            "durable tiling ledger")
+                      .str();
+        return false;
+      }
+      ledgerWitness = &candidate;
+    }
+    if (!ledgerWitness || segmentIndex >= ledgerWitness->edges.size()) {
+      failure = (source + " structural-segment key does not resolve through "
+                          "the durable tiling ledger")
+                    .str();
+      return false;
+    }
+
+    if (resolvedWitness &&
+        (resolvedSegmentIndex != segmentIndex ||
+         !structuralTilingWitnessesAgree(*resolvedWitness, *ledgerWitness))) {
+      failure = (source + " structural segment binding conflicts with the "
+                          "binding another carrier source resolved")
+                    .str();
+      return false;
+    }
+
+    resolvedWitness = ledgerWitness;
+    resolvedSegmentIndex = segmentIndex;
+    return true;
+  };
+
   const bool hasStructuralTUCarrier =
       summary.hasOwnerRealizationWitness &&
       summary.ownerRealizationWitness.hasTUCarrierWitness &&
       summary.ownerRealizationWitness.tuCarrierWitness
           .hasStructuralSegmentBinding;
-  if (!hasStructuralTUCarrier)
-    return true;
-
-  const TUOwnerRealizationCarrierWitness &tuCarrier =
-      summary.ownerRealizationWitness.tuCarrierWitness;
-  if (!tuCarrier.structuralSegmentBindingValidated ||
-      tuCarrier.structuralWitnessId == 0) {
-    failure = "TU carrier names an incomplete structural-segment binding";
-    return false;
-  }
-
-  const MixedOwnerTilingWitness *ledgerWitness = nullptr;
-  for (const MixedOwnerTilingWitness &candidate : durableWitnesses) {
-    if (candidate.witnessId != tuCarrier.structuralWitnessId)
-      continue;
-    if (ledgerWitness) {
-      failure = "TU carrier structural witness id is not unique in the durable "
-                "tiling ledger";
+  if (hasStructuralTUCarrier) {
+    const TUOwnerRealizationCarrierWitness &tuCarrier =
+        summary.ownerRealizationWitness.tuCarrierWitness;
+    if (!tuCarrier.structuralSegmentBindingValidated ||
+        tuCarrier.structuralWitnessId == 0) {
+      failure = "TU carrier names an incomplete structural-segment binding";
       return false;
     }
-    ledgerWitness = &candidate;
-  }
-  if (!ledgerWitness ||
-      tuCarrier.structuralSegmentIndex >= ledgerWitness->edges.size()) {
-    failure = "TU carrier structural-segment key does not resolve through the "
-              "durable tiling ledger";
-    return false;
+    if (!resolveLedgerKey(tuCarrier.structuralWitnessId,
+                          tuCarrier.structuralSegmentIndex, "TU carrier"))
+      return false;
   }
 
-  if (resolvedWitness &&
-      (resolvedSegmentIndex != tuCarrier.structuralSegmentIndex ||
-       !structuralTilingWitnessesAgree(*resolvedWitness, *ledgerWitness))) {
-    failure = "one carrier contains conflicting inline and TU structural "
-              "segment bindings";
-    return false;
+  // A specialized repair carrier that replaced a direct-TU carrier keeps that
+  // carrier's segment key.  The repair changed the edit's text and may have
+  // widened it to a line boundary, which is why it no longer claims the
+  // byte-span theorem -- but the segment it realizes is the same one, and the
+  // caller rechecks the widened edit against every preserved gap.
+  if (summary.hasInheritedStructuralSegmentBinding) {
+    if (summary.inheritedStructuralWitnessId == 0) {
+      failure = "repair carrier names an incomplete inherited "
+                "structural-segment binding";
+      return false;
+    }
+    if (!resolveLedgerKey(summary.inheritedStructuralWitnessId,
+                          summary.inheritedStructuralSegmentIndex,
+                          "inherited repair carrier"))
+      return false;
   }
 
-  resolvedWitness = ledgerWitness;
-  resolvedSegmentIndex = tuCarrier.structuralSegmentIndex;
   return true;
 }
 
@@ -673,21 +703,24 @@ bool protectedSourceAuthorityAcceptsKind(
   case ProtectedSourceEditAuthorityKind::LineControlRepair:
     return kind == PreprocessingStructureKind::LineControl;
   case ProtectedSourceEditAuthorityKind::PragmaOnceGuardRewrite:
-    // Deliberately excludes Import and PragmaOperator: `#import` establishes
-    // once-state with no pragma at all, and the producer records nothing for
-    // `_Pragma("once")`.  Neither is modeled by the guard catalog, so omitting
-    // them here makes both fail closed at the emission firewall.
+    // Deliberately excludes Import: `#import` establishes once-state with no
+    // pragma at all, so the guard catalog does not model it and omitting it
+    // here makes it fail closed at the emission firewall.
     //
-    // The producer now does record the operator, and an operator-spelled once
-    // header is guarded through the B-realized path instead, which places the
-    // define at the top of the body rather than over the operator's own bytes.
-    // Admitting PragmaOperator here would route it back through that byte
-    // rewrite, which writes `#define <guard>` over the site and is well formed
-    // only where the site owns its physical line -- a `_Pragma("once")` sharing
-    // its line with other source is a legal expression, and the replacement
-    // would not begin a logical line.  Add that line-ownership check before
-    // admitting this kind.
+    // PragmaOperator is admitted.  `_Pragma("once")` establishes exactly the
+    // state the directive does, and the producer records it, so the only thing
+    // that ever separated the two was whether the site's own bytes can carry
+    // `#define <guard>`: an operator is an expression and may share its line,
+    // where the replacement would not begin a logical line.  That is now
+    // decided at the site by `OnceSiteInPlaceReplacement`, which opens a
+    // physical line for the directive when the operator does not own one and
+    // declines the site outright when an enclosing construct owns its bytes.
+    // Keeping the kind out of this table instead made every operator-spelled
+    // header depend on the B-realized path, whose top-of-body define is not
+    // equivalent for a conditional site -- and so refused those headers
+    // entirely.
     return kind == PreprocessingStructureKind::Pragma ||
+           kind == PreprocessingStructureKind::PragmaOperator ||
            kind == PreprocessingStructureKind::Include ||
            kind == PreprocessingStructureKind::IncludeNext;
   case ProtectedSourceEditAuthorityKind::IncludePreservingSourceClosure:

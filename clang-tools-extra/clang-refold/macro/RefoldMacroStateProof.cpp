@@ -176,7 +176,8 @@ static bool macroExpansionCanReachBoundName(const RefoldModel &model,
 }
 
 bool RefoldMacroStateProof::PayloadObservesMacroStateBindings(
-    ArrayRef<MacroStateBinding> bindings, StringRef payload) const {
+    ArrayRef<MacroStateBinding> bindings, StringRef payload,
+    PayloadIdentifierExpansionPolicy policy) const {
   // A placement question is asked only because a directive was preserved, so an
   // empty list means the bindings were never recovered.
   if (bindings.empty())
@@ -216,6 +217,23 @@ bool RefoldMacroStateProof::PayloadObservesMacroStateBindings(
   // so an identifier no record binds cannot be live and stands for itself; one
   // that is bound expands, and its expansion may name a bound macro the payload
   // never spells.
+  //
+  // A caller under `NeutralisedByLivenessAudit` has already said this leg is
+  // not its question: every identifier that could expand there is separately
+  // required to be unbound where the payload lands, so none of them expands and
+  // none reaches a binding.  The leg is skipped whole rather than per
+  // identifier, because "has a recorded definition" is precisely the condition
+  // under which the walk can report anything at all -- an identifier with no
+  // record terminates it immediately -- so filtering by it would leave nothing
+  // behind while implying a distinction the audit does not make.
+  if (policy == PayloadIdentifierExpansionPolicy::NeutralisedByLivenessAudit) {
+    REFOLD_LOG_TRACE("macro/state",
+                     "payload expansion-reachability deferred to the "
+                     "macro-liveness audit for {0} binding(s)",
+                     static_cast<uint64_t>(boundNames.size()));
+    return false;
+  }
+
   SmallVector<StringRef, 16> identifiers;
   tokenText_.CollectRawIdentifiersInText(payload, identifiers);
   for (StringRef identifier : identifiers) {
