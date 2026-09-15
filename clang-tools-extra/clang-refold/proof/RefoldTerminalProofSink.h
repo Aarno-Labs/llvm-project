@@ -3,8 +3,8 @@
 // Mutable per-refold-request terminal fallback sink.
 //
 // The sink owns request normalization and storage.  The caller wires the
-// hooks below to the current proof/audit services at construction time; the
-// sink itself has no back-reference to the theorem-audit ledger.  Data-only
+// hooks below to the theorem audit at construction time; the sink itself has
+// no back-reference to the theorem-audit ledger.  Data-only
 // terminal vocabulary (obligation/reason enums, failure context, witness,
 // and request carriers) lives in RefoldProofVocabulary.h.
 //
@@ -25,22 +25,21 @@
 namespace clang {
 namespace refold {
 
-/// Terminal-specific callbacks used by RefoldTerminalProofSink.
+class RefoldWitnessTrace;
+
+/// Theorem-audit callbacks used by RefoldTerminalProofSink.
 ///
-/// The sink owns request normalization and storage.  The caller wires these
-/// hooks to the current proof/audit services at construction time.  Each
-/// hook is intentionally terminal-specific; this is not a generic service
-/// locator.
+/// These close a genuine cycle: the theorem audit records terminal requests
+/// into this sink, and the sink audits every request it receives, before
+/// normalizing it.  Each hook is intentionally terminal-specific; this is not
+/// a generic service locator.
 struct RefoldTerminalProofSinkCallbacks {
   using AuditLegacyAuthorityFn = std::function<void(
       const TerminalFallbackProofFailure &, llvm::StringRef)>;
   using NoteTheoremAuditViolationFn = std::function<void(llvm::StringRef)>;
-  using TraceTerminalRequestFn =
-      std::function<void(const TerminalFallbackRequest &)>;
 
   AuditLegacyAuthorityFn auditLegacyAuthority;
   NoteTheoremAuditViolationFn noteTheoremAuditViolation;
-  TraceTerminalRequestFn traceTerminalRequest;
 };
 
 /// Mutable terminal fallback request sink.
@@ -51,7 +50,9 @@ struct RefoldTerminalProofSinkCallbacks {
 /// callers retain top-level control over final fallback emission.
 class RefoldTerminalProofSink {
 public:
-  explicit RefoldTerminalProofSink(RefoldTerminalProofSinkCallbacks callbacks);
+  /// \p witnessTrace receives a proof-trace line for every recorded request.
+  RefoldTerminalProofSink(RefoldTerminalProofSinkCallbacks callbacks,
+                          const RefoldWitnessTrace &witnessTrace);
 
   /// Record that the current run escaped the declared proof domain.
   ///
@@ -97,6 +98,7 @@ public:
 
 private:
   RefoldTerminalProofSinkCallbacks callbacks_;
+  const RefoldWitnessTrace &witnessTrace_;
   mutable std::vector<TerminalFallbackRequest> requests_;
 };
 

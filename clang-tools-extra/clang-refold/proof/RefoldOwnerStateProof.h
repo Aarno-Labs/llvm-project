@@ -311,20 +311,6 @@ public:
   FindSuffixObservers(const OwnerStateBoundary &boundary,
                       OwnerStateComponent component) const;
 
-  /// Use \p memo as this run's recorded owner-state graph.
-  ///
-  /// The service graph is built before the narrowing loop that owns the memo
-  /// can hand it out, and no census is taken during construction, so the memo
-  /// is attached afterwards.  Attaching one after a graph has already been
-  /// built for this engine is refused: the engine would then answer from its
-  /// own census while recording nothing, which hides the memo from every later
-  /// consumer.
-  void SetOwnerStateGraphMemo(OwnerStateGraphMemo *memo) {
-    assert(!ownerStateGraphCache_ &&
-           "owner-state graph memo attached after this engine built a census");
-    ownerStateGraphMemo_ = memo;
-  }
-
   /// Replay the direct-state-check inventory a graph build would have recorded.
   ///
   /// Building the census records one inventory item per graph node as it is

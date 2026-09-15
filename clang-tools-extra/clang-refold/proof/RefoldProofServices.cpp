@@ -7,8 +7,8 @@
 //===----------------------------------------------------------------------===//
 //
 // Construction of clang-refold's accepted-result proof services.  Every
-// dependency below is a direct reference to a service built earlier in the
-// member-initializer list; none is a callback.
+// dependency below is a direct reference to a service built earlier, here or
+// by the caller; none is a callback.
 //
 //===----------------------------------------------------------------------===//
 
@@ -30,12 +30,11 @@ RefoldProofServices::RefoldProofServices(
     const RefoldTUEditPlanner &tuEdits,
     const RefoldProofSummaryBuilder &proofSummaryBuilder,
     const RefoldTheoremAudit &theoremAudit, TheoremAuditStats &lastTheoremAudit,
-    bool strict, ProofAuditMode &proofAuditMode,
-    const bool &alignmentSemanticTheoremActive,
+    const RefoldWitnessTrace &witnessTrace,
     const std::vector<MixedOwnerTilingSegmentBinding>
         &mixedOwnerTilingSegmentBindings,
     const std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses)
-    : witnessTrace_(strict, proofAuditMode, alignmentSemanticTheoremActive),
+    : witnessTrace_(witnessTrace),
       equivalenceKeyBuilder_(RefoldWitnessEquivalenceKeyBuilder::Dependencies{
           sourceMapper, bSource, bToks}),
       witnessResolver_(RefoldWitnessResolver::Dependencies{

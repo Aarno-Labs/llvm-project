@@ -76,12 +76,13 @@
 //
 // Public Surface
 // --------------
-//   • Refold(...): constructs a run-scoped engine and returns the refolded TU
-//     text.
-//   • Refold(): runs the single engine instance.
-//   • The remaining declarations are orchestration seams between the engine and
-//     proof/planning services; carrier definitions live in focused subsystem
-//     headers rather than in RefoldEngine.h.
+//   • refoldTranslationUnit(...): the run controller (RefoldRunController.cpp).
+//     It builds one RefoldEngine per pass, walks the narrowing and alignment
+//     ladders across passes, and reads each finished pass only through the
+//     engine's post-pass queries.
+//   • RefoldEngine: one refold pass, fixed at construction by a
+//     RefoldPassConfig.  Its services are built by BuildServiceGraph() in
+//     RefoldServiceGraphBuilder.cpp.
 //
 // Notes
 // -----
@@ -113,6 +114,7 @@
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "proof/RefoldTilingWitnessTypes.h"
+#include "proof/RefoldWitnessTrace.h"
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldAlignmentSemanticResolver.h"
 #include "source/RefoldSourceMapper.h"
@@ -168,6 +170,45 @@ class RefoldTextEditAssembler;
 class RefoldTokenDiffPlanner;
 class RefoldTUAnchorProof;
 class RefoldTUEditPlanner;
+
+/// Per-pass policy and borrowed run state, fixed when a pass is built.
+///
+/// Every nested pass one run builds -- a production attempt, the alignment
+/// resolution probe, a candidate-map simulation -- is described completely by
+/// one of these, so no caller assigns a pass member after construction.  Which
+/// run memos a pass borrows is itself behavior: a candidate simulation borrows
+/// only the raw-byte-hunk and owner-state-graph memos.  Each memo's type
+/// documents why one answer serves every pass that borrows it.
+struct RefoldPassConfig {
+  /// Which of one run's nested passes this is.  Logging only: no proof reads
+  /// it and it enters no equivalence key.
+  std::string role = "production attempt";
+  bool noLines = false;
+  bool strict = false;
+  ProofAuditMode proofAuditMode = ProofAuditMode::Default;
+  StringRef finalOutputPath;
+  ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits;
+  std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr;
+  FinalLineControlValidationCallback finalLineControlValidationCallback;
+  /// Closing assembly check; absent for probes and candidate simulations.
+  std::optional<RefoldFinalAssemblyVerifier> finalAssemblyVerifier;
+  ArrayRef<std::string> verifyIncludeDirs;
+  /// Root invocations the run has ruled out preserving.
+  llvm::DenseSet<uint64_t> ownersMustExpand;
+  /// Whether this pass resolves alignment ambiguity at all.
+  bool resolveAlignmentAmbiguity = false;
+  /// Exact alignment to plan from, for a candidate simulation or a ladder
+  /// repair; absent otherwise.
+  std::optional<AlignmentSelectionOverride> alignmentSelectionOverride;
+  /// False only for candidate simulations, preventing recursive resolution.
+  bool alignmentSemanticResolverEnabled = true;
+  /// The outer run's TU bytes, reused by candidate simulations.
+  std::optional<StringRef> tuSourceBytesOverride;
+  AlignmentSemanticResolutionMemo *alignmentResolutionMemo = nullptr;
+  AlignmentCertificationMemo *alignmentCertificationMemo = nullptr;
+  RawByteHunkMemo *rawByteHunkMemo = nullptr;
+  OwnerStateGraphMemo *ownerStateGraphMemo = nullptr;
+};
 
 /// \brief Deterministic refolder that projects edits made to raw preprocessed
 /// C back onto the original translation unit (TU) without re-running the
@@ -247,59 +288,177 @@ class RefoldTUEditPlanner;
 /// \author jeikenberry
 class RefoldEngine {
 public:
-  /// \brief Perform the end-to-end refolding process for a translation unit.
+  /// Build one refold pass over the run's inputs.  \p config fixes every
+  /// per-pass policy and borrowed run memo; nothing is assigned after
+  /// construction.
   ///
-  /// This method takes the original preprocessed text *A* (e.g. `test.c.i`),
-  /// the edited preprocessed text *B* (e.g. `test.c.i.mod`), and the refold
-  /// map JSON produced by the modified Clang preprocessor. It re-lexes the
-  /// edited text, aligns A↔B token streams, projects edits back through the
-  /// preprocessor structure (macros, includes, and conditional arms) using
-  /// the refold map, and emits a partially expanded C source file that
-  /// preserves the original semantics while incorporating edits
-  /// deterministically.
+  /// Defined out-of-line: `RefoldEngine` owns `std::unique_ptr` subsystem
+  /// services, and libc++ must see each service's complete type when
+  /// generating constructor cleanup paths.
+  RefoldEngine(RefoldModel model, StringRef aSource, ArrayRef<PPTok> aToks,
+               ArrayRef<size_t> aTokOff, StringRef bSource,
+               ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff,
+               RefoldPassConfig config);
+
+  ~RefoldEngine();
+
+  /// \brief Run the full refolding pipeline for the current inputs.
   ///
-  /// #### Determinism
-  /// * All decisions are derived from explicit byte/token spans in the refold
-  ///   map; no heuristics cross physical newlines.
-  /// * Ambiguities are treated as hard errors with precise diagnostics.
+  /// This is the main instance entry point. It classifies token hunks, plans
+  /// TU/include/macro edits under the structural policy, materializes the
+  /// refolded translation unit, and either returns that structural result or
+  /// falls back to the explicit terminal edited-preprocessed-stream outcome.
   ///
-  /// #### Behavioral Guarantees
-  /// * Macro edits are applied at the *invocation site*, never at the
-  ///   definition.
-  /// * `#include` / `#include_next` edits are realized *in place* within the
-  ///   included file and recursively folded back.
-  /// * Conditional blocks are re-emitted with the correct selected arm, and
-  ///   edits land in the corresponding arm.
-  /// * Token boundary hygiene prevents “glued” tokens; spaces are inserted only
-  ///   when required by maximal-munch rules.
+  /// \returns The refolded C/C++ source text for the translation unit.
+  std::string Refold();
+
+  /// Publish this run's alignment-resolution theorem into
+  /// `alignmentResolutionMemo_` without planning or emitting anything.
   ///
-  /// \param root       Parsed refold map JSON (immutable model root).
-  /// \param aSource    Original preprocessed text A (e.g., `test.c.i`).
-  /// \param aToks      Tokens of A.
-  /// \param aTokOff    Byte offsets for A tokens (size = |A| + 1).
-  /// \param bSource    Edited preprocessed text B (e.g., `test.c.i.mod`).
-  /// \param bToks      Tokens of B.
-  /// \param bTokOff    Byte offsets for B tokens (size = |B| + 1).
-  /// \param noLines    If true, then do not inject #line.
-  /// \param strict     If true, then make stringified args significant.
-  /// \param finalOutputPath
-  ///                  Path of the source file that will be emitted to `--out`
-  ///                  and later passed to `--check`. Include replay proofs use
-  ///                  this path, not the producer TU path, as their direct
-  ///                  quoted-lookup surface.
-  /// \returns          The refolded, partially expanded C source.
-  static Expected<std::string> Refold(
-      const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
-      ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
-      ArrayRef<size_t> bTokOff, bool noLines, bool strict,
-      ProofAuditMode proofAuditMode = ProofAuditMode::Default,
-      StringRef finalOutputPath = StringRef(),
-      ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits = {},
-      std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr,
-      FinalLineControlValidationCallback finalLineControlValidationCallback =
-          FinalLineControlValidationCallback(),
-      OutputVerificationMode verifyMode = OutputVerificationMode::Off,
-      llvm::ArrayRef<std::string> verifyIncludeDirs = {});
+  /// The narrowing loop calls this when an attempt's evidence says alignment
+  /// ambiguity is what limited it.  Resolution either commits a window, in
+  /// which case the loop re-plans against the recorded answer, or commits none,
+  /// in which case the resolved attempt would retain exactly the core-forced
+  /// anchors the finished attempt already planned from and would therefore
+  /// reproduce its output byte for byte.  Asking here costs the alignment work
+  /// that attempt would have started with; running the attempt to find out
+  /// costs a complete pass.
+  void ProbeAlignmentResolution();
+
+  //===--------------------------------------------------------------------===//
+  // Post-pass queries.  The run controller reads a finished pass only through
+  // these; it never touches pass state directly.
+  //===--------------------------------------------------------------------===//
+
+  /// The ordered terminal-fallback requests this pass recorded.
+  const RefoldTerminalProofSink &TerminalSink() const { return terminalSink_; }
+
+  /// A ranges of this pass's certified alignment windows, in window order.
+  llvm::ArrayRef<std::pair<uint64_t, uint64_t>>
+  CertificationWindowARanges() const {
+    return certificationWindowARanges_;
+  }
+
+  /// Return whether this attempt showed that alignment ambiguity is what
+  /// limited it, so the next attempt should resolve and re-plan.
+  ///
+  /// Two kinds of evidence count, matching the two ways a run falls short:
+  ///
+  ///   * it gave up, and a terminal request localized the failure to a range of
+  ///     A tokens -- the coordinates the resolver actually moves; or
+  ///   * it emitted source but expanded a macro root or materialized an
+  ///     include, which is the preservation loss forced-only anchors cause and
+  ///     resolution repairs.
+  ///
+  /// A terminal request that names no A-token range is not evidence.  Such a
+  /// failure is a fact about producer or preprocessor state, and it recurs
+  /// unchanged under every alignment, so simulating candidates against it buys
+  /// a complete refold of the translation unit per candidate and no proof.
+  /// That is an attribution rule, not a budget: a request that does name tokens
+  /// is honoured however expensive its window turns out to be.
+  bool AlignmentResolutionIsDemanded() const;
+
+  /// Return whether one certified window's A range can carry alignment
+  /// ambiguity, given the forced map this attempt retained.
+  ///
+  /// This restates the resolver's `WindowCarriesAmbiguity()` theorem against
+  /// `alignmentForcedMap_` and `certificationWindowARanges_`, which hold
+  /// exactly the certified windows the resolver would consider.
+  bool CertificationWindowCarriesAmbiguity(
+      const std::pair<uint64_t, uint64_t> &aRange) const;
+
+  /// Return whether any certified window can carry alignment ambiguity.
+  ///
+  /// When none can, resolution would pass over every window and commit nothing,
+  /// so the alignment it publishes is the core-forced map the attempt already
+  /// planned from.  Answering this costs one linear scan of the forced map; the
+  /// alternative is a complete resolution pass that reaches the same
+  /// conclusion.
+  bool AnyCertificationWindowCarriesAmbiguity() const;
+
+  /// Narrow a replacement hunk whose B payload is reproduced by tokens at its
+  /// own edges, when exactly one narrowing preserves source line numbering.
+  ///
+  /// Suppressing a non-forced anchor widens a hunk: the tokens the anchor would
+  /// have matched fall inside it, and the hunk becomes a replacement whose B
+  /// payload is spelled identically to A tokens at its own edges. Every way of
+  /// re-anchoring those payload tokens is an equally optimal alignment; they
+  /// differ only in where the surviving deletion lands.
+  ///
+  /// The narrowings are separated by what they do to newlines. A deletion that
+  /// removes one renumbers every line after it, and `__LINE__`, `#line` and the
+  /// other location observers are semantic, so that is a real change to the
+  /// surviving source rather than a matter of layout. A deletion that removes
+  /// none cannot move any observer. This also subsumes the preprocessing
+  /// firewall for this shape: a directive occupies its own logical line, so a
+  /// range crossing one necessarily takes the newlines bounding it.
+  ///
+  /// Returns the sole newline-preserving narrowing. When none or several
+  /// qualify it returns nullopt and the ladder proceeds unchanged, so the
+  /// repair never chooses between equals. Runs only after an attempt has
+  /// requested the terminal carrier.
+  std::optional<AlignmentSelectionOverride> BuildLineAlignedHunkNarrowing(
+      const diffutils::CertifiedLcsResult &coreAlignment) const;
+
+  /// Collect every region named by this run's terminal-fallback requests that
+  /// has not already been given up.
+  ///
+  /// Returns false when at least one request names no such region.  That is
+  /// reported for diagnostics only: the caller narrows the regions that *were*
+  /// named regardless, because the alternative to a partial refold is a
+  /// verbatim copy of the whole translation unit, not a marginally larger one.
+  ///
+  /// A terminal request records the region whose proof failed when the site
+  /// knows it.  Recovering that region is what lets the ladder expand one
+  /// macro or one include instead of emitting the edited stream for the whole
+  /// translation unit.  Requests naming no region yield nothing, which leaves
+  /// the terminal carrier in place.
+  bool AppendNarrowableOwnersForTerminalRequests(
+      const llvm::DenseSet<uint64_t> &alreadyExpanded,
+      llvm::SmallVectorImpl<uint64_t> &owners) const;
+
+  /// Identify the smallest region that owns a diverging edited-stream token,
+  /// so an unsound region can be narrowed instead of condemning the whole
+  /// translation unit.
+  ///
+  /// A region is a macro invocation or an include instance, named by producer
+  /// id.  Both live in one id space, so the result identifies an owner without
+  /// saying which kind it is -- which is the point: the caller records it in a
+  /// single set, and each subsystem's existing expansion path acts on the
+  /// owners belonging to it.  Narrowing adds no expansion machinery of its own.
+  ///
+  /// The verifier reports its mismatch in *preprocessed* edited-stream token
+  /// numbering, while the producer's maps are expressed in the edited stream as
+  /// written.  Those coincide only when re-preprocessing the edited stream is a
+  /// no-op, which is the ordinary case -- it is already `-E -P` output -- but
+  /// is not guaranteed: a stream carrying comments loses them on replay.  The
+  /// correspondence is therefore checked rather than assumed, and an
+  /// unverifiable one yields no owner, leaving the caller to escalate.
+  ///
+  /// The *smallest* covering region is returned.  Expanding it costs the least
+  /// source structure, and it is the first rung of a ladder walked by
+  /// `FindEnclosingOwner()`.
+  std::optional<uint64_t>
+  FindSmallestOwnerForEditedToken(std::size_t editedTokenIndex) const;
+
+  /// Return the region that encloses \p ownerId, for widening a narrowing step
+  /// that did not suffice.
+  ///
+  /// Ancestry is producer-recorded, never inferred from source overlap: an
+  /// invocation widens to its caller and then to the include instance owning
+  /// its callsite, and an include widens to the include that entered it.  No
+  /// enclosing region means the translation unit is all that is left.
+  std::optional<uint64_t> FindEnclosingOwner(uint64_t ownerId) const;
+
+  /// Return a human-readable description of one owner, for diagnostics.
+  std::string DescribeOwner(uint64_t ownerId) const;
+
+  /// Record a terminal request for a closing-check divergence at edited token
+  /// \p mismatchTokenIndex that no region is left to narrow.
+  void RecordUnnarrowableDivergence(std::size_t mismatchTokenIndex) const;
+
+  /// Build this pass's post-structural fallback result from its requests.
+  std::string ResolvePostStructuralFallback();
 
 private:
   const RefoldModel model_;
@@ -366,6 +525,10 @@ private:
   /// so proof services can reason about arbitrary replacement text without
   /// calling back into RefoldEngine.
   RefoldTokenTextAnalysis tokenTextAnalysis_;
+
+  /// Proof-trace service for this pass.  Built ahead of the terminal sink,
+  /// which traces every request through it; `RefoldProofServices` borrows it.
+  RefoldWitnessTrace witnessTrace_;
 
   /// Terminal fallback request sink for the current refold attempt.
   ///
@@ -445,13 +608,6 @@ private:
   /// the same producer owners over the same A stream, so the graph it would
   /// build is the same one.  See `OwnerStateGraphMemo`.
   OwnerStateGraphMemo *ownerStateGraphMemo_ = nullptr;
-
-  /// Adopt \p memo as this engine's owner-state graph memo.
-  ///
-  /// The owner-state proof service is constructed with the service graph,
-  /// before the narrowing loop can hand out its memo, so this forwards to the
-  /// already-built service rather than only recording the pointer.
-  void AdoptOwnerStateGraphMemo(OwnerStateGraphMemo *memo);
 
   /// Whether this engine exists only to publish the alignment-resolution
   /// theorem.
@@ -796,111 +952,10 @@ private:
   /// instead of borrowing RefoldEngine or requiring friend access.
   std::unique_ptr<RefoldExpansionFallbackPlanner> expansionFallbackPlanner_;
 
-  /// Allocate and access the centralized theorem/audit service.
-  void InitializeTheoremAudit();
-  RefoldTheoremAudit &TheoremAudit() const;
-
-  /// Allocate the owner-state proof service after the engine's immutable model
-  /// and source/token inputs have been constructed.  This stays out-of-line so
-  /// RefoldEngine.h does not need the service's full definition.
-  void InitializeOwnerStateProof();
-
-  /// Return the owned owner-state proof service.
-  RefoldOwnerStateProof &OwnerStateProof();
-  const RefoldOwnerStateProof &OwnerStateProof() const;
-
-  /// Allocate the macro-state proof service after owner-state proof exists.
-  void InitializeMacroStateProof();
-
-  /// Return the owned macro-state proof service.
-  RefoldMacroStateProof &MacroStateProof();
-  const RefoldMacroStateProof &MacroStateProof() const;
-
-  /// Allocate the proof services after all borrowed engine members have been
-  /// constructed.  This stays out-of-line so RefoldEngine.h does not need
-  /// their full definitions.
-  void InitializeProofServices();
-
-  /// Return the owned proof services.
-  const RefoldProofServices &ProofServices() const;
-
-  /// Allocate and access the owner/TU classification service.
-  ///
-  /// The service is initialized after RefoldTUEditPlanner so owner
-  /// classification can use the planner by constructor reference.
-  void InitializeOwnerClassifier();
-  RefoldOwnerClassifier &OwnerClassifier();
-  const RefoldOwnerClassifier &OwnerClassifier() const;
-
-  /// Allocate and access the B-insertion claim ledger.
-  void InitializeBInsertionLedger();
-  RefoldBInsertionLedger &BInsertionLedger();
-  const RefoldBInsertionLedger &BInsertionLedger() const;
-
-  /// Allocate and access the whole-cover plan builder.
-  void InitializeWholeCoverPlanBuilder();
-  const RefoldMacroWholeCoverPlanBuilder &WholeCoverPlanBuilder() const;
-
-  /// Allocate and access the TU-anchor proof builder.
-  void InitializeTUAnchorProof();
-  RefoldTUAnchorProof &TUAnchorProof();
-  const RefoldTUAnchorProof &TUAnchorProof() const;
-
-  /// Allocate the initial A/B token-diff planning service.
-  void InitializeTokenDiffPlanner();
-
-  /// Allocate the generalized structural tiler that normalizes token hunks
-  /// after the initial token-diff pass.
-  void InitializeMixedOwnerTilingPlanner();
-
-  /// Allocate and access the translation-unit edit planning service.
-  ///
-  /// The planner depends on RefoldTUAnchorProof for accepted TU-anchor carrier
-  /// construction, not on the proof services.  Final TextEdit assembly remains
-  /// outside this service.
-  void InitializeTUEditPlanner();
-  RefoldTUEditPlanner &TUEditPlanner();
-  const RefoldTUEditPlanner &TUEditPlanner() const;
-
-  /// Load the physical TU bytes and build the exact preprocessing-structure
-  /// census consumed by direct TU byte-span planning.
-  void InitializePreprocessingStructureIndex();
-
-  /// Allocate the shared occurrence-local preprocessing-structure provider.
-  void InitializePreprocessingStructureIndexProvider();
-
-  /// Allocate and access the macro patch planner after the proof services
-  /// exist. Macro-planning orchestration calls this service directly.
-  void InitializeMacroPatchPlanner();
-  RefoldMacroPatchPlanner &MacroPatchPlanner();
-  const RefoldMacroPatchPlanner &MacroPatchPlanner() const;
-
-  /// Allocate and access the macro-state repair planner after macro patch
-  /// planning and final text-edit assembly services exist.
-  void InitializeMacroStateRepairPlanner();
-  RefoldMacroStateRepairPlanner &MacroStateRepairPlanner();
-  const RefoldMacroStateRepairPlanner &MacroStateRepairPlanner() const;
-
-  /// Allocate and access the counter-stabilization planner.
-  void InitializeCounterStabilization();
-  RefoldCounterStabilization &CounterStabilization();
-  const RefoldCounterStabilization &CounterStabilization() const;
-
-  /// Allocate and access the include-insertion planner after the proof
-  /// services exist.  This keeps include patch construction and
-  /// include-realization B-envelope proof out of RefoldEngine while preserving
-  /// construction order.
-  void InitializeIncludeInsertionPlanner();
-  RefoldIncludeInsertionPlanner &IncludeInsertionPlanner();
-  const RefoldIncludeInsertionPlanner &IncludeInsertionPlanner() const;
-
-  /// Allocate and access the line-observer layout realization service after the
-  /// final text-edit assembler exists.  The layout service emits concrete
-  /// observer-preserving materialization edits and include wrappers;
-  /// RefoldEngine only coordinates when those edits are requested.
-  void InitializeLineObserverLayout();
-  RefoldLineObserverLayout &LineObserverLayout();
-  const RefoldLineObserverLayout &LineObserverLayout() const;
+  /// Construct every planning, proof and emission service in dependency order.
+  /// Each service receives explicit inputs and services; none stores the
+  /// engine.  Defined in RefoldServiceGraphBuilder.cpp, the composition root.
+  void BuildServiceGraph();
 
   /// Move hunk edges off macro expansions the hunk only partially owns.
   ///
@@ -941,76 +996,10 @@ private:
   void RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
       std::vector<diffutils::Hunk> &hunks) const;
 
-  /// Allocate the include materializer after include insertion, line-observer
-  /// layout, proof, and final text-edit services are available.  The
-  /// materializer owns recursive include realization; RefoldEngine owns only
-  /// construction order and final orchestration.
-  void InitializeIncludeMaterializer();
 
-  /// Allocate and access the synthetic `#pragma once` guard rewriter.
-  void InitializePragmaOnceGuardRewriter();
-  RefoldPragmaOnceGuardRewriter &PragmaOnceGuardRewriter();
-  const RefoldPragmaOnceGuardRewriter &PragmaOnceGuardRewriter() const;
 
-  /// Allocate the final text-edit assembler after all borrowed engine
-  /// members have been constructed.  This stays out-of-line so RefoldEngine.h
-  /// does not need to include the assembler's full definition.
-  void InitializeTextEditAssembler();
 
-  /// Allocate the expansion-fallback planner after the source mapper and
-  /// downstream materialization/assembly services are available.
-  void InitializeExpansionFallbackPlanner();
 
-  /// Construct an engine from concrete inputs. The instance method `Refold()`
-  /// runs the full pipeline using these captured members.
-  ///
-  /// This constructor is intentionally defined out-of-line: `RefoldEngine` owns
-  /// `std::unique_ptr` subsystem services, and libc++ must see each service's
-  /// complete type when generating constructor cleanup paths.
-  RefoldEngine(
-      RefoldModel model, StringRef aSource, ArrayRef<PPTok> aToks,
-      ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
-      ArrayRef<size_t> bTokOff, bool noLines, bool strict,
-      ProofAuditMode proofAuditMode, StringRef finalOutputPath,
-      ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
-      std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr,
-      FinalLineControlValidationCallback finalLineControlValidationCallback =
-          FinalLineControlValidationCallback(),
-      std::optional<AlignmentSelectionOverride> alignmentSelectionOverride =
-          std::nullopt,
-      bool alignmentSemanticResolverEnabled = true,
-      std::optional<llvm::StringRef> tuSourceBytesOverride = std::nullopt);
-
-  ~RefoldEngine();
-
-  /// Name this engine's role among the passes one run nests, for logging.
-  ///
-  /// Purely descriptive: it changes which pass a log line is attributed to and
-  /// nothing else.  See `passRole_`.
-  void SetPassRole(std::string role) { passRole_ = std::move(role); }
-
-  /// \brief Run the full refolding pipeline for the current inputs.
-  ///
-  /// This is the main instance entry point. It classifies token hunks, plans
-  /// TU/include/macro edits under the structural policy, materializes the
-  /// refolded translation unit, and either returns that structural result or
-  /// falls back to the explicit terminal edited-preprocessed-stream outcome.
-  ///
-  /// \returns The refolded C/C++ source text for the translation unit.
-  std::string Refold();
-
-  /// Publish this run's alignment-resolution theorem into
-  /// `alignmentResolutionMemo_` without planning or emitting anything.
-  ///
-  /// The narrowing loop calls this when an attempt's evidence says alignment
-  /// ambiguity is what limited it.  Resolution either commits a window, in which
-  /// case the loop re-plans against the recorded answer, or commits none, in
-  /// which case the resolved attempt would retain exactly the core-forced
-  /// anchors the finished attempt already planned from and would therefore
-  /// reproduce its output byte for byte.  Asking here costs the alignment work
-  /// that attempt would have started with; running the attempt to find out costs
-  /// a complete pass.
-  void ProbeAlignmentResolution();
 
   /// Validate that the producer-recorded A token count still matches the
   /// re-lexed A stream for the current refold attempt.
@@ -1113,29 +1102,6 @@ private:
   /// which replays every observer by construction.
   bool AuditPreservedLineObserversInFinalOutput(llvm::StringRef finalSource);
 
-  /// Identify the smallest region that owns a diverging edited-stream token,
-  /// so an unsound region can be narrowed instead of condemning the whole
-  /// translation unit.
-  ///
-  /// A region is a macro invocation or an include instance, named by producer
-  /// id.  Both live in one id space, so the result identifies an owner without
-  /// saying which kind it is -- which is the point: the caller records it in a
-  /// single set, and each subsystem's existing expansion path acts on the
-  /// owners belonging to it.  Narrowing adds no expansion machinery of its own.
-  ///
-  /// The verifier reports its mismatch in *preprocessed* edited-stream token
-  /// numbering, while the producer's maps are expressed in the edited stream as
-  /// written.  Those coincide only when re-preprocessing the edited stream is a
-  /// no-op, which is the ordinary case -- it is already `-E -P` output -- but is
-  /// not guaranteed: a stream carrying comments loses them on replay.  The
-  /// correspondence is therefore checked rather than assumed, and an
-  /// unverifiable one yields no owner, leaving the caller to escalate.
-  ///
-  /// The *smallest* covering region is returned.  Expanding it costs the least
-  /// source structure, and it is the first rung of a ladder walked by
-  /// `FindEnclosingOwner()`.
-  std::optional<uint64_t>
-  FindSmallestOwnerForEditedToken(std::size_t editedTokenIndex) const;
 
   /// Name the smallest region owning one *edited stream* token, given an index
   /// already known to address that stream.
@@ -1148,82 +1114,9 @@ private:
   /// `FindSmallestOwnerForEditedToken()` exists to check it.
   std::optional<uint64_t> FindSmallestOwnerForBToken(uint64_t bToken) const;
 
-  /// Return whether this attempt showed that alignment ambiguity is what
-  /// limited it, so the next attempt should resolve and re-plan.
-  ///
-  /// Two kinds of evidence count, matching the two ways a run falls short:
-  ///
-  ///   * it gave up, and a terminal request localized the failure to a range of
-  ///     A tokens -- the coordinates the resolver actually moves; or
-  ///   * it emitted source but expanded a macro root or materialized an
-  ///     include, which is the preservation loss forced-only anchors cause and
-  ///     resolution repairs.
-  ///
-  /// A terminal request that names no A-token range is not evidence.  Such a
-  /// failure is a fact about producer or preprocessor state, and it recurs
-  /// unchanged under every alignment, so simulating candidates against it buys
-  /// a complete refold of the translation unit per candidate and no proof.
-  /// That is an attribution rule, not a budget: a request that does name tokens
-  /// is honoured however expensive its window turns out to be.
-  bool AlignmentResolutionIsDemanded() const;
 
-  /// Return whether one certified window's A range can carry alignment
-  /// ambiguity, given the forced map this attempt retained.
-  ///
-  /// This restates the resolver's `WindowCarriesAmbiguity()` theorem against
-  /// `alignmentForcedMap_` and `certificationWindowARanges_`, which hold exactly
-  /// the certified windows the resolver would consider.
-  bool CertificationWindowCarriesAmbiguity(
-      const std::pair<uint64_t, uint64_t> &aRange) const;
 
-  /// Return whether any certified window can carry alignment ambiguity.
-  ///
-  /// When none can, resolution would pass over every window and commit nothing,
-  /// so the alignment it publishes is the core-forced map the attempt already
-  /// planned from.  Answering this costs one linear scan of the forced map; the
-  /// alternative is a complete resolution pass that reaches the same conclusion.
-  bool AnyCertificationWindowCarriesAmbiguity() const;
 
-  /// Collect every region named by this run's terminal-fallback requests that
-  /// has not already been given up.
-  ///
-  /// Returns false when at least one request names no such region.  That is
-  /// reported for diagnostics only: the caller narrows the regions that *were*
-  /// named regardless, because the alternative to a partial refold is a
-  /// verbatim copy of the whole translation unit, not a marginally larger one.
-  ///
-  /// A terminal request records the region whose proof failed when the site
-  /// knows it.  Recovering that region is what lets the ladder expand one
-  /// macro or one include instead of emitting the edited stream for the whole
-  /// translation unit.  Requests naming no region yield nothing, which leaves
-  /// the terminal carrier in place.
-  /// Narrow a replacement hunk whose B payload is reproduced by tokens at its
-  /// own edges, when exactly one narrowing preserves source line numbering.
-  ///
-  /// Suppressing a non-forced anchor widens a hunk: the tokens the anchor would
-  /// have matched fall inside it, and the hunk becomes a replacement whose B
-  /// payload is spelled identically to A tokens at its own edges. Every way of
-  /// re-anchoring those payload tokens is an equally optimal alignment; they
-  /// differ only in where the surviving deletion lands.
-  ///
-  /// The narrowings are separated by what they do to newlines. A deletion that
-  /// removes one renumbers every line after it, and `__LINE__`, `#line` and the
-  /// other location observers are semantic, so that is a real change to the
-  /// surviving source rather than a matter of layout. A deletion that removes
-  /// none cannot move any observer. This also subsumes the preprocessing
-  /// firewall for this shape: a directive occupies its own logical line, so a
-  /// range crossing one necessarily takes the newlines bounding it.
-  ///
-  /// Returns the sole newline-preserving narrowing. When none or several
-  /// qualify it returns nullopt and the ladder proceeds unchanged, so the
-  /// repair never chooses between equals. Runs only after an attempt has
-  /// requested the terminal carrier.
-  std::optional<AlignmentSelectionOverride> BuildLineAlignedHunkNarrowing(
-      const diffutils::CertifiedLcsResult &coreAlignment) const;
-
-  bool AppendNarrowableOwnersForTerminalRequests(
-      const llvm::DenseSet<uint64_t> &alreadyExpanded,
-      llvm::SmallVectorImpl<uint64_t> &owners) const;
 
   /// Return the smallest region covering one *original*-stream token.
   ///
@@ -1251,17 +1144,7 @@ private:
       uint64_t aBegin, uint64_t aEnd,
       llvm::SmallVectorImpl<uint64_t> &owners) const;
 
-  /// Return a human-readable description of one owner, for diagnostics.
-  std::string DescribeOwner(uint64_t ownerId) const;
 
-  /// Return the region that encloses \p ownerId, for widening a narrowing step
-  /// that did not suffice.
-  ///
-  /// Ancestry is producer-recorded, never inferred from source overlap: an
-  /// invocation widens to its caller and then to the include instance owning
-  /// its callsite, and an include widens to the include that entered it.  No
-  /// enclosing region means the translation unit is all that is left.
-  std::optional<uint64_t> FindEnclosingOwner(uint64_t ownerId) const;
 
   /// Build the ordinary direct-TU byte-span edit realizing one token hunk over
   /// \p span, the TU byte range a direct-TU proof has already accepted.
@@ -1288,6 +1171,60 @@ private:
   /// selecting the explicit terminal fallback result.
   std::string RunRefoldPass();
 };
+
+/// \brief Perform the end-to-end refolding process for a translation unit.
+///
+/// This method takes the original preprocessed text *A* (e.g. `test.c.i`),
+/// the edited preprocessed text *B* (e.g. `test.c.i.mod`), and the refold
+/// map JSON produced by the modified Clang preprocessor. It re-lexes the
+/// edited text, aligns A↔B token streams, projects edits back through the
+/// preprocessor structure (macros, includes, and conditional arms) using
+/// the refold map, and emits a partially expanded C source file that
+/// preserves the original semantics while incorporating edits
+/// deterministically.
+///
+/// #### Determinism
+/// * All decisions are derived from explicit byte/token spans in the refold
+///   map; no heuristics cross physical newlines.
+/// * Ambiguities are treated as hard errors with precise diagnostics.
+///
+/// #### Behavioral Guarantees
+/// * Macro edits are applied at the *invocation site*, never at the
+///   definition.
+/// * `#include` / `#include_next` edits are realized *in place* within the
+///   included file and recursively folded back.
+/// * Conditional blocks are re-emitted with the correct selected arm, and
+///   edits land in the corresponding arm.
+/// * Token boundary hygiene prevents “glued” tokens; spaces are inserted only
+///   when required by maximal-munch rules.
+///
+/// \param root       Parsed refold map JSON (immutable model root).
+/// \param aSource    Original preprocessed text A (e.g., `test.c.i`).
+/// \param aToks      Tokens of A.
+/// \param aTokOff    Byte offsets for A tokens (size = |A| + 1).
+/// \param bSource    Edited preprocessed text B (e.g., `test.c.i.mod`).
+/// \param bToks      Tokens of B.
+/// \param bTokOff    Byte offsets for B tokens (size = |B| + 1).
+/// \param noLines    If true, then do not inject #line.
+/// \param strict     If true, then make stringified args significant.
+/// \param finalOutputPath
+///                  Path of the source file that will be emitted to `--out`
+///                  and later passed to `--check`. Include replay proofs use
+///                  this path, not the producer TU path, as their direct
+///                  quoted-lookup surface.
+/// \returns          The refolded, partially expanded C source.
+Expected<std::string> refoldTranslationUnit(
+    const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
+    ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
+    ArrayRef<size_t> bTokOff, bool noLines, bool strict,
+    ProofAuditMode proofAuditMode = ProofAuditMode::Default,
+    StringRef finalOutputPath = StringRef(),
+    ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits = {},
+    std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr,
+    FinalLineControlValidationCallback finalLineControlValidationCallback =
+        FinalLineControlValidationCallback(),
+    OutputVerificationMode verifyMode = OutputVerificationMode::Off,
+    llvm::ArrayRef<std::string> verifyIncludeDirs = {});
 
 } // namespace refold
 } // namespace clang

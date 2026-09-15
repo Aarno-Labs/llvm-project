@@ -780,20 +780,23 @@ RefoldEngine::SimulateSemanticAlignmentCandidate(
   std::vector<MaterializedEditMapping> *candidateMaterializedMappings =
       materializedEditMappings_ ? &materializedMappings : nullptr;
 
-  RefoldEngine candidate(
-      model_.CloneForReadOnlyConsumer(), aSource_, aToks_, aTokOff_, bSource_,
-      bToks_, bTokOff_, noLines_, strict_, proofAuditMode_, finalOutputPath_,
-      sidebandPragmaEdits_, candidateMaterializedMappings,
-      FinalLineControlValidationCallback(), selection, /*alignmentSemanticResolverEnabled=*/false,
-      StringRef(tuSourceBytes_));
-  candidate.SetPassRole("alignment candidate map simulation");
-  ++alignmentCandidateSimulationCount_;
+  RefoldPassConfig config;
+  config.role = "alignment candidate map simulation";
+  config.noLines = noLines_;
+  config.strict = strict_;
+  config.proofAuditMode = proofAuditMode_;
+  config.finalOutputPath = finalOutputPath_;
+  config.sidebandPragmaEdits = sidebandPragmaEdits_;
+  config.materializedEditMappings = candidateMaterializedMappings;
+  config.alignmentSelectionOverride = selection;
+  config.alignmentSemanticResolverEnabled = false;
+  config.tuSourceBytesOverride = StringRef(tuSourceBytes_);
 
   // A candidate is handed a different alignment, but it diffs the same A and B
   // buffers this engine did, so the raw byte hunks are shared rather than
   // rebuilt once per enumerated map.  The memo is keyed on those bytes, so a
   // candidate can only ever replay a result built from exactly them.
-  candidate.rawByteHunkMemo_ = rawByteHunkMemo_;
+  config.rawByteHunkMemo = rawByteHunkMemo_;
 
   // A candidate censuses the same producer owners over the same A stream this
   // engine did -- the alignment it is handed selects anchors, it does not
@@ -801,7 +804,12 @@ RefoldEngine::SimulateSemanticAlignmentCandidate(
   // shared rather than rebuilt once per enumerated map.  The memo is keyed on
   // the producer document and that stream, so a candidate can only ever replay
   // a census built from exactly them.
-  candidate.AdoptOwnerStateGraphMemo(ownerStateGraphMemo_);
+  config.ownerStateGraphMemo = ownerStateGraphMemo_;
+
+  RefoldEngine candidate(model_.CloneForReadOnlyConsumer(), aSource_, aToks_,
+                         aTokOff_, bSource_, bToks_, bTokOff_,
+                         std::move(config));
+  ++alignmentCandidateSimulationCount_;
 
   // Run the same complete structural pipeline with the outer planner policy.
   // The alignment override activates the dedicated semantic theorem boundary,

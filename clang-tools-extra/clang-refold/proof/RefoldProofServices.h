@@ -59,6 +59,8 @@ public:
   ///
   /// \p proofSummaryBuilder and \p theoremAudit are constructed before this
   /// object because the audit itself borrows the summary builder.  The
+  /// \p witnessTrace is built earlier still, because the terminal sink the
+  /// audit borrows traces through it.  The
   /// mixed-owner tiling vectors are per-pass state owned by the caller and
   /// read by the owner-realization builder as tiling witnesses accumulate.
   RefoldProofServices(
@@ -71,14 +73,12 @@ public:
       const RefoldTUEditPlanner &tuEdits,
       const RefoldProofSummaryBuilder &proofSummaryBuilder,
       const RefoldTheoremAudit &theoremAudit,
-      TheoremAuditStats &lastTheoremAudit, bool strict,
-      ProofAuditMode &proofAuditMode,
-      const bool &alignmentSemanticTheoremActive,
+      TheoremAuditStats &lastTheoremAudit,
+      const RefoldWitnessTrace &witnessTrace,
       const std::vector<MixedOwnerTilingSegmentBinding>
           &mixedOwnerTilingSegmentBindings,
       const std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses);
 
-  const RefoldWitnessTrace &WitnessTrace() const { return witnessTrace_; }
   const RefoldWitnessEquivalenceKeyBuilder &EquivalenceKeyBuilder() const {
     return equivalenceKeyBuilder_;
   }
@@ -106,7 +106,7 @@ private:
   // Declaration order is construction order, and it is load-bearing: each
   // service holds a direct reference to every service declared above it that
   // it uses.
-  RefoldWitnessTrace witnessTrace_;
+  const RefoldWitnessTrace &witnessTrace_;
   RefoldWitnessEquivalenceKeyBuilder equivalenceKeyBuilder_;
   RefoldWitnessResolver witnessResolver_;
   RefoldAcceptedResultRanker acceptedResultRanker_;

@@ -20,6 +20,7 @@ add_clang_library(clangRefold STATIC
   edit/RefoldBInsertionLedger.cpp
   edit/RefoldFinalAssemblyVerifier.cpp
   core/RefoldEngine.cpp
+  core/RefoldRunController.cpp
   core/RefoldAlignmentSemanticIntegration.cpp
   support/RefoldLangOptions.cpp
   source/RefoldPreprocessRecheck.cpp

@@ -4,63 +4,10 @@
 // edits made to a raw preprocessed stream (B) back onto the original, partially
 // expanded translation unit (TU) described by the refold map.
 //
-// Overview
-// --------
-// RefoldEngine consumes:
-//   • A: original preprocessed bytes and tokens
-//   • B: edited preprocessed bytes and tokens
-//   • M: RefoldModel (parsed from the JSON refold map)
-//
-// It aligns A↔B token streams, derives edit hunks, classifies each hunk as
-// TU-owned / include-owned / macro-invocation–owned, and materializes a new
-// TU that incorporates edits while preserving original structure and semantics.
-//
-// Strict-Domain Theorem
-// ---------------------
-// The implementation is organized around the theorem vocabulary declared in the
-// focused proof/witness carrier headers.  An emitted edit is either an
-// in-domain accepted result with a declared AcceptedProofClass, or an explicit
-// terminal out-of-domain result with a named TerminalFallbackProofFailure.  No
-// implementation-origin “fallback worked” path is allowed to stand in for a
-// theorem-facing proof.
-//
-// In-domain completeness is restricted to finite deterministic owner-closed
-// edit tilings whose state-transition summaries compose and whose preserved
-// suffix observers are state-equivalent to B.  All other edits must fail closed
-// by materializing a closed owner surface when possible or by emitting the
-// named terminal out-of-domain carrier.
-//
-// Responsibilities
-// ----------------
-//   • Compute LCS-based A→B anchors and contiguous edit hunks.
-//   • Attribute hunks to includes or macro call sites using M’s coverage data.
-//   • Normalize and coalesce include insertions (line-local, boundary safe).
-//   • Realize include expansions bottom-up, applying macro patches in-owner.
-//   • Apply TU-level replacements with boundary hygiene (no token gluing).
-//
-// Determinism & Policy
-// --------------------
-//   • All iteration and sorting are stable; edits apply high→low to avoid
-//     byte-offset drift.
-//   • Boundary padding inserts at most one space locally when needed by
-//     maximal-munch rules; internal whitespace is preserved verbatim.
-//   • Errors are reported via the Logging subsystem (`fatal()/error()/...`).
-//
-// Public Surface
-// --------------
-//   • std::string Refold(...): orchestrates the end-to-end refolding and
-//     returns the refolded TU text.
-//   • Helper utilities: token/byte mapping, hunk builders, include realization,
-//     macro-patch construction, and line-local boundary checks.
-//
-// Notes
-// -----
-//   • No RTTI or exceptions required; mirrors LLVM/Clang style.
-//   • Paths are compared via the RefoldPathIdentity canonicalization service.
-//   • All indices are half-open where applicable: tokens [lo,hi), bytes [b,e).
-//
-// Author:
-//   jeikenberry
+// This file holds one refold pass: planning, realization and final assembly.
+// The theorem contract, the responsibilities split and the determinism policy
+// are documented in RefoldEngine.h.  No implementation-origin "fallback
+// worked" path may stand in for a theorem-facing proof.
 //
 //===----------------------------------------------------------------------===//
 
@@ -386,43 +333,53 @@ bool structuralTilingLedgersMatchNormalizedHunks(
 
 } // namespace
 
-RefoldEngine::RefoldEngine(
-    RefoldModel model, StringRef aSource, ArrayRef<PPTok> aToks,
-    ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
-    ArrayRef<size_t> bTokOff, bool noLines, bool strict,
-    ProofAuditMode proofAuditMode, StringRef finalOutputPath,
-    ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
-    std::vector<MaterializedEditMapping> *materializedEditMappings,
-    FinalLineControlValidationCallback finalLineControlValidationCallback,
-    std::optional<AlignmentSelectionOverride> alignmentSelectionOverride,
-    bool alignmentSemanticResolverEnabled,
-    std::optional<StringRef> tuSourceBytesOverride)
+RefoldEngine::RefoldEngine(RefoldModel model, StringRef aSource,
+                           ArrayRef<PPTok> aToks, ArrayRef<size_t> aTokOff,
+                           StringRef bSource, ArrayRef<PPTok> bToks,
+                           ArrayRef<size_t> bTokOff, RefoldPassConfig config)
     : model_(std::move(model)), aSource_(aSource), bSource_(bSource),
       aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff),
-      noLines_(noLines), finalOutputPath_(finalOutputPath.str()),
-      lineDirs_(!noLines, model_.GetPPCwd()),
+      noLines_(config.noLines), finalOutputPath_(config.finalOutputPath.str()),
+      lineDirs_(!config.noLines, model_.GetPPCwd()),
       pathIdentity_(model_, model_.GetPPCwd(), /*emitAbsPaths=*/false),
-      strict_(strict), proofAuditMode_(proofAuditMode),
+      strict_(config.strict), proofAuditMode_(config.proofAuditMode),
       lexLang_(
           makeRefoldLexLangOptions(model_.GetPPLang(), model_.GetPPArgv())),
       argTextRecovery_(lexLang_), tokenTextAnalysis_(lexLang_),
-      terminalSink_(RefoldTerminalProofSinkCallbacks{
-          [this](const TerminalFallbackProofFailure &failure, StringRef role) {
-            TheoremAudit().AuditTerminalFallbackForLegacyAuthority(failure,
-                                                                   role);
-          },
-          [this](StringRef detail) {
-            TheoremAudit().NoteTheoremAuditViolation(detail);
-          },
-          [this](const TerminalFallbackRequest &request) {
-            ProofServices().WitnessTrace().TraceWitnessFallback(request);
-          }}),
-      finalReplaySurface_(buildFinalReplaySurface(model_, finalOutputPath)),
-      materializedEditMappings_(materializedEditMappings),
+      witnessTrace_(strict_, proofAuditMode_, alignmentSemanticTheoremActive_),
+      terminalSink_(
+          RefoldTerminalProofSinkCallbacks{
+              [this](const TerminalFallbackProofFailure &failure,
+                     StringRef role) {
+                theoremAudit_->AuditTerminalFallbackForLegacyAuthority(failure,
+                                                                       role);
+              },
+              [this](StringRef detail) {
+                theoremAudit_->NoteTheoremAuditViolation(detail);
+              }},
+          witnessTrace_),
+      finalReplaySurface_(
+          buildFinalReplaySurface(model_, config.finalOutputPath)),
+      materializedEditMappings_(config.materializedEditMappings),
       finalLineControlValidationCallback_(
-          std::move(finalLineControlValidationCallback)),
-      sidebandPragmaEdits_(sidebandPragmaEdits.begin(),
-                           sidebandPragmaEdits.end()),
+          std::move(config.finalLineControlValidationCallback)),
+      finalAssemblyVerifier_(std::move(config.finalAssemblyVerifier)),
+      verifyIncludeDirs_(config.verifyIncludeDirs.begin(),
+                         config.verifyIncludeDirs.end()),
+      ownersMustExpand_(std::move(config.ownersMustExpand)),
+      resolveAlignmentAmbiguity_(config.resolveAlignmentAmbiguity),
+      alignmentResolutionMemo_(config.alignmentResolutionMemo),
+      alignmentCertificationMemo_(config.alignmentCertificationMemo),
+      rawByteHunkMemo_(config.rawByteHunkMemo),
+      ownerStateGraphMemo_(config.ownerStateGraphMemo),
+      passRole_(std::move(config.role)),
+      sidebandPragmaEdits_(config.sidebandPragmaEdits.begin(),
+                           config.sidebandPragmaEdits.end()),
+      alignmentSelectionOverride_(std::move(config.alignmentSelectionOverride)),
+      alignmentSemanticResolverEnabled_(
+          config.alignmentSemanticResolverEnabled),
+      alignmentSemanticTheoremActive_(alignmentSelectionOverride_.has_value()),
+      tuSourceBytesOverride_(config.tuSourceBytesOverride),
       sourceMapper_(model_, pathIdentity_, aSource_, bSource_, aToks_, bToks_,
                     aTokOff_, bTokOff_, abTokHunks_, abByteHunks_,
                     abByteHunkPrefixDelta_, strict_),
@@ -431,36 +388,7 @@ RefoldEngine::RefoldEngine(
                              lexLang_),
       lineControlProof_(model_, pathIdentity_, macroTopology_, lineDirs_,
                         aToks_, bToks_, abTokMapA2B_, abTokMapB2A_) {
-  alignmentSelectionOverride_ = std::move(alignmentSelectionOverride);
-  alignmentSemanticResolverEnabled_ = alignmentSemanticResolverEnabled;
-  alignmentSemanticTheoremActive_ = alignmentSelectionOverride_.has_value();
-  tuSourceBytesOverride_ = std::move(tuSourceBytesOverride);
-
-  // Build the object graph in dependency order.  Each service receives
-  // explicit inputs/services and, where orchestration remains engine-owned, a
-  // narrow hook bundle; no service stores RefoldEngine itself.
-  InitializeTheoremAudit();
-  InitializeOwnerStateProof();
-  InitializeMacroStateProof();
-  InitializePreprocessingStructureIndex();
-  InitializePreprocessingStructureIndexProvider();
-  InitializeTokenDiffPlanner();
-  InitializeTUAnchorProof();
-  InitializeTUEditPlanner();
-  InitializeOwnerClassifier();
-  InitializeMixedOwnerTilingPlanner();
-  InitializeBInsertionLedger();
-  InitializeWholeCoverPlanBuilder();
-  InitializeCounterStabilization();
-  InitializeProofServices();
-  InitializeMacroPatchPlanner();
-  InitializeIncludeInsertionPlanner();
-  InitializeTextEditAssembler();
-  InitializeMacroStateRepairPlanner();
-  InitializeLineObserverLayout();
-  InitializePragmaOnceGuardRewriter();
-  InitializeIncludeMaterializer();
-  InitializeExpansionFallbackPlanner();
+  BuildServiceGraph();
 }
 
 RefoldEngine::~RefoldEngine() = default;
@@ -483,886 +411,19 @@ withDivergingEditedToken(TerminalFallbackProofFailure failure,
   return failure;
 }
 
-/// Describe which attribution surfaces one terminal request carries.
-///
-/// A region-scoped realization needs somewhere to put the payload it cannot
-/// prove, and the fields the narrowing ladder reads are `ownerId`, the A token
-/// range, and -- for a check that runs against the assembled source and knows
-/// only where the two streams parted -- the B token range.  Reporting the whole
-/// surface, the hunk and the source span included, is what turns "does every
-/// request name a region" into a question with an observable answer rather than
-/// an audit.
-static std::string describeTerminalRequestAttribution(
-    const TerminalFallbackFailureContext &context) {
-  std::string text;
-  llvm::raw_string_ostream os(text);
-  auto field = [&os](StringRef name, const std::optional<uint64_t> &value) {
-    os << ' ' << name << '=';
-    if (value)
-      os << *value;
-    else
-      os << '-';
-  };
-
-  field("ownerId", context.ownerId);
-  field("hunk", context.hunk);
-  os << " source=";
-  if (context.sourcePath && context.sourceBegin && context.sourceEnd)
-    os << *context.sourcePath << '[' << *context.sourceBegin << ','
-       << *context.sourceEnd << ')';
-  else
-    os << '-';
-  os << " aTokens=";
-  if (context.aTokenBegin && context.aTokenEnd)
-    os << '[' << *context.aTokenBegin << ',' << *context.aTokenEnd << ')';
-  else
-    os << '-';
-  os << " bTokens=";
-  if (context.bTokenBegin && context.bTokenEnd)
-    os << '[' << *context.bTokenBegin << ',' << *context.bTokenEnd << ')';
-  else
-    os << '-';
-  return text;
+void RefoldEngine::RecordUnnarrowableDivergence(
+    std::size_t mismatchTokenIndex) const {
+  terminalSink_.RequestTerminalFallback(
+      withDivergingEditedToken(
+          RefoldOwnerStateProof::SuffixStabilityTerminalFailureForComponent(
+              OwnerStateComponent::LineNumber),
+          mismatchTokenIndex),
+      "assembly-verify",
+      "assembled source does not replay the edited preprocessed stream");
 }
 
-/// Return whether a terminal request names any region at all.
-///
-/// This is the precondition a region-scoped realization needs from every
-/// request. It is deliberately weaker than what such a realization will
-/// ultimately require -- a named region must additionally be placeable between
-/// preserved directives -- so a run reporting every request attributed is
-/// necessary, not sufficient.
-static bool terminalRequestNamesRegion(
-    const TerminalFallbackFailureContext &context) {
-  return context.ownerId.has_value() || context.hunk.has_value() ||
-         (context.sourceBegin.has_value() && context.sourceEnd.has_value()) ||
-         (context.aTokenBegin.has_value() && context.aTokenEnd.has_value());
-}
-
-/// Take the raw-B terminal carrier as this run's final answer.
-///
-/// This is the one seam where the driver gives up the entire translation unit:
-/// either the narrowing ladder is spent and every region a terminal request
-/// named is already expanded, or the closing assembly check could not attribute
-/// its divergence to any region that is not. Both callers have already produced
-/// the carrier text; routing them through here makes "this run emitted raw B" a
-/// single observable fact instead of two returns that must be kept in step.
-///
-/// It is deliberately not the per-attempt summary in
-/// `emitRefoldAttemptStatsSummary()`. That runs once per attempt *and* once per
-/// candidate simulation, so it reports terminal requests the ladder went on to
-/// repair: a run that recovers still prints `terminalFallback=yes(raw-B)` there,
-/// and a run that surrenders can print `terminalFallback=no`. Only the driver
-/// frame knows which attempt was the last one, and candidate simulations never
-/// reach it -- they call the instance `Refold()` directly.
-///
-/// This is also where whole-file surrender is meant to be replaced by a
-/// region-scoped realization, which is why the attribution census below reports
-/// what each request left behind to work from.
-/// One boundary-straddling deletion run moved onto its owner's cover.
-struct OwnerAlignedDeletionSlide {
-  std::vector<int64_t> map;
-  /// The run before and after the move, and the signed token distance.
-  uint64_t originalABegin = 0;
-  uint64_t originalAEnd = 0;
-  uint64_t repairedABegin = 0;
-  uint64_t repairedAEnd = 0;
-  int64_t offset = 0;
-  /// A tokens whose anchor the move created; they are no longer core-forced.
-  SmallVector<uint64_t, 4> movedAnchors;
-};
-
-/// Return the innermost include owning one A token, or nullopt for the TU.
-static std::optional<uint64_t> innermostOwnerForAToken(const RefoldModel &model,
-                                                       uint64_t aToken) {
-  return model.InnermostIncludeAtPP(aToken);
-}
-
-/// Return whether every A token of `[aBegin, aEnd)` has the same owner.
-///
-/// This is the property that lets a single owner realize the run. A run failing
-/// it is exactly the shape whose `OwnerClosedCover` obligation cannot be
-/// discharged, because no owner covers all of its tokens.
-static bool runHasOneOwner(const RefoldModel &model, uint64_t aBegin,
-                           uint64_t aEnd) {
-  if (aEnd <= aBegin)
-    return false;
-  const std::optional<uint64_t> owner =
-      innermostOwnerForAToken(model, aBegin);
-  for (uint64_t aToken = aBegin + 1; aToken < aEnd; ++aToken) {
-    if (innermostOwnerForAToken(model, aToken) != owner)
-      return false;
-  }
-  return true;
-}
-
-/// Return whether `[aBegin, aEnd)` is a maximal unmapped run of `map`.
-static bool isMaximalDeletionRun(ArrayRef<int64_t> map, uint64_t aBegin,
-                                 uint64_t aEnd) {
-  if (aEnd <= aBegin || aEnd > map.size())
-    return false;
-  for (uint64_t aToken = aBegin; aToken < aEnd; ++aToken) {
-    if (map[aToken] >= 0)
-      return false;
-  }
-  if (aBegin > 0 && map[aBegin - 1] < 0)
-    return false;
-  if (aEnd < map.size() && map[aEnd] < 0)
-    return false;
-  return true;
-}
-
-/// Move a straddling deletion run onto a single owner, when the tokens allow.
-///
-/// A deletion run `[s, e)` may slide one position left when `A[s-1]` and
-/// `A[e-1]` have the same spelling, and one position right when `A[s]` and
-/// `A[e]` do. Either move keeps the map strictly monotone and preserves the
-/// exact matched-token count, so the result is still a maximum-length common
-/// subsequence -- it is a different optimal alignment, not a worse one.
-///
-/// It is not optimal under the owner-depth tie-break, and that is the whole
-/// point: that tie-break is an additive per-deleted-token cost, so it rewards a
-/// run for swallowing a shallow token in place of a deep one. At an include
-/// boundary that reward is exactly what pulls a run off its owner's cover and
-/// onto a straddle no owner can realize. Correcting the tie-break globally is
-/// not sound -- a run that crosses a boundary while *fully consuming* the
-/// include on the far side realizes perfectly well, and penalizing it relocates
-/// includes across conditional boundaries. So the correction is applied here,
-/// scoped to a run whose proof has already failed.
-///
-/// Returns nullopt when no request names a straddling run, or when no admissible
-/// slide makes one owner-uniform. The caller then proceeds to the existing
-/// narrowing ladder unchanged.
-static std::optional<OwnerAlignedDeletionSlide>
-buildOwnerAlignedDeletionSlide(const RefoldModel &model, ArrayRef<PPTok> aToks,
-                               ArrayRef<int64_t> baseMap,
-                               ArrayRef<TerminalFallbackRequest> requests) {
-  auto spellingsEqual = [&](uint64_t lhs, uint64_t rhs) {
-    return lhs < aToks.size() && rhs < aToks.size() &&
-           aToks[lhs].spelling == aToks[rhs].spelling;
-  };
-
-  // Return how far the run `[aBegin, aEnd)` may slide in one direction.
-  //
-  // A slide of distance d is admissible exactly when each of its d steps
-  // exchanges two identically spelled tokens, so admissibility is prefix
-  // monotone: distance d requires everything distance d-1 requires, plus one
-  // further exchange. The admissible distances are therefore a contiguous
-  // prefix, and its length is the extent of the adjacent run of
-  // period-`(aEnd - aBegin)` spelling repetition, bounded by the end of the
-  // stream. That is the exact finite bound the streams themselves impose;
-  // walking outward until the first exchange fails computes it directly, so no
-  // fixed search window is needed. None would be sound to impose either: an
-  // owner-closing slide one position past an arbitrary cutoff is exactly as
-  // admissible as one inside it, and refusing it would fail a run whose repair
-  // the streams prove.
-  auto maxAdmissibleSlideDistance = [&](uint64_t aBegin, uint64_t aEnd,
-                                        bool left) {
-    uint64_t distance = 0;
-    while (true) {
-      const uint64_t next = distance + 1;
-      // The step must stay inside the stream: sliding left past its start or
-      // right past its end has no token to exchange.
-      if (left ? aBegin < next : aEnd + next > baseMap.size())
-        break;
-      const bool exchangeable = left
-                                    ? spellingsEqual(aBegin - next, aEnd - next)
-                                    : spellingsEqual(aBegin + distance,
-                                                     aEnd + distance);
-      if (!exchangeable)
-        break;
-      distance = next;
-    }
-    return distance;
-  };
-
-  for (const TerminalFallbackRequest &request : requests) {
-    const TerminalFallbackFailureContext &context = request.failure.context;
-    if (!context.aTokenBegin || !context.aTokenEnd || !context.bTokenBegin ||
-        !context.bTokenEnd)
-      continue;
-    // Only a pure deletion slides: a replacement's B payload is anchored to the
-    // A interval it replaces, so moving the interval would change what the
-    // payload realizes.
-    if (*context.bTokenBegin != *context.bTokenEnd)
-      continue;
-
-    const uint64_t aBegin = *context.aTokenBegin;
-    const uint64_t aEnd = *context.aTokenEnd;
-    if (!isMaximalDeletionRun(baseMap, aBegin, aEnd))
-      continue;
-    // A run already covered by one owner is not this defect.
-    if (runHasOneOwner(model, aBegin, aEnd))
-      continue;
-
-    const uint64_t runLength = aEnd - aBegin;
-    const uint64_t maxLeft =
-        maxAdmissibleSlideDistance(aBegin, aEnd, /*left=*/true);
-    const uint64_t maxRight =
-        maxAdmissibleSlideDistance(aBegin, aEnd, /*left=*/false);
-    const uint64_t maxDistance = maxLeft > maxRight ? maxLeft : maxRight;
-
-    // Nearest admissible position first, so a run is nudged the shortest
-    // distance that reaches a cover.
-    for (uint64_t distance = 1; distance <= maxDistance; ++distance) {
-      // Left first, then right, so the choice does not depend on iteration
-      // order anywhere else.
-      for (int direction : {-1, 1}) {
-        const bool left = direction < 0;
-        // Past this direction's admissible prefix the exchange fails; the
-        // other direction may still reach further.
-        if (distance > (left ? maxLeft : maxRight))
-          continue;
-
-        const uint64_t movedBegin =
-            left ? aBegin - distance : aBegin + distance;
-        const uint64_t movedEnd = movedBegin + runLength;
-
-        if (!runHasOneOwner(model, movedBegin, movedEnd))
-          continue;
-
-        OwnerAlignedDeletionSlide slide;
-        slide.map.assign(baseMap.begin(), baseMap.end());
-        slide.originalABegin = aBegin;
-        slide.originalAEnd = aEnd;
-        slide.repairedABegin = movedBegin;
-        slide.repairedAEnd = movedEnd;
-        slide.offset = left ? -static_cast<int64_t>(distance)
-                            : static_cast<int64_t>(distance);
-        for (uint64_t step = 0; step < distance; ++step) {
-          const uint64_t vacated = left ? aBegin - 1 - step : aEnd + step;
-          const uint64_t claimed = left ? aEnd - 1 - step : aBegin + step;
-          slide.map[claimed] = slide.map[vacated];
-          slide.map[vacated] = -1;
-          slide.movedAnchors.push_back(claimed);
-        }
-        return slide;
-      }
-    }
-  }
-  return std::nullopt;
-}
-
-/// Build the alignment override that realizes one owner-alignment repair.
-///
-/// Anchors the core theorem forced keep that proof. The anchors the slide
-/// created carry `OwnerAlignedDeletionSlide` instead, because they are not on
-/// every core-optimal path -- the map is match-count optimal but deliberately
-/// not depth-optimal.
-static AlignmentSelectionOverride buildOwnerAlignedSlideOverride(
-    const OwnerAlignedDeletionSlide &slide,
-    const diffutils::CertifiedLcsResult &coreAlignment) {
-  AlignmentSelectionOverride selection;
-  selection.selectedMap = slide.map;
-  selection.selectedAnchorProofs.assign(slide.map.size(),
-                                        diffutils::LcsAnchorProof{});
-  selection.globalObjective = coreAlignment.globalObjective;
-  selection.globalObjectiveIsExact = coreAlignment.globalObjectiveIsExact;
-  selection.allWindowsCertified = coreAlignment.allWindowsCertified;
-  selection.certifiedBoundaries = coreAlignment.certifiedBoundaries;
-  selection.certificationWindows = coreAlignment.certificationWindows;
-
-  for (size_t aToken = 0; aToken < slide.map.size(); ++aToken) {
-    if (slide.map[aToken] < 0)
-      continue;
-    if (llvm::is_contained(slide.movedAnchors, aToken)) {
-      selection.selectedAnchorProofs[aToken] = diffutils::LcsAnchorProof{
-          diffutils::LcsAnchorProofKind::OwnerAlignedDeletionSlide, 0};
-      continue;
-    }
-    if (aToken < coreAlignment.selectedAnchorProofs.size()) {
-      selection.selectedAnchorProofs[aToken] =
-          coreAlignment.selectedAnchorProofs[aToken];
-      continue;
-    }
-    selection.selectedAnchorProofs[aToken] = diffutils::LcsAnchorProof{
-        diffutils::LcsAnchorProofKind::OwnerAlignedDeletionSlide, 0};
-  }
-  return selection;
-}
-
-static llvm::Error
-takeTerminalCarrier(std::string carrier,
-                    ArrayRef<TerminalFallbackRequest> requests) {
-  uint64_t attributed = 0;
-  for (const TerminalFallbackRequest &request : requests) {
-    const bool namesRegion = terminalRequestNamesRegion(request.failure.context);
-    attributed += namesRegion ? 1 : 0;
-    REFOLD_LOG_WARN("fallback/carrier",
-                    "  request obligation={0} reason={1} stage={2} "
-                    "namesRegion={3}{4}",
-                    request.failure.obligation, request.failure.reason,
-                    request.stage.empty() ? StringRef("<unspecified>")
-                                          : StringRef(request.stage),
-                    namesRegion ? "yes" : "no",
-                    describeTerminalRequestAttribution(request.failure.context));
-  }
-
-  REFOLD_LOG_WARN("fallback/carrier",
-                  "emitting the raw edited preprocessed stream for the whole "
-                  "translation unit ({0} bytes): requests={1} attributed={2} "
-                  "unattributed={3}",
-                  static_cast<uint64_t>(carrier.size()),
-                  static_cast<uint64_t>(requests.size()), attributed,
-                  static_cast<uint64_t>(requests.size()) - attributed);
-
-  // Fail rather than emit the edited preprocessed stream.
-  //
-  // Surrendering looks safe to the closing check -- the carrier *is* B, so it
-  // replays B exactly -- while deleting every comment and directive in the
-  // file. That is the one outcome the refolder may never produce, so the
-  // absence of a proof is reported as the absence of an answer.
-  //
-  // Reaching here means no admissible realization was found for some region and
-  // no ladder rung could repair it. That can be correct: a payload whose side
-  // of a preserved directive is genuinely undetermined has no sound placement,
-  // because a pragma may change compiled meaning without changing the
-  // preprocessed tokens, so both placements pass the closing check while
-  // differing in what they mean. The right answer there is to say so, not to
-  // silently drop the directive along with the rest of the file's structure.
-  //
-  // The census above names every request that led here, so the failure carries
-  // its own attribution.
-  return createStringError(
-      std::make_error_code(std::errc::illegal_byte_sequence),
-      "no admissible refold: %llu terminal request(s) reached the seam and "
-      "none could be narrowed; emitting the edited preprocessed stream would "
-      "drop every comment and directive in the translation unit. See the "
-      "fallback/carrier census above for the failing obligations",
-      static_cast<unsigned long long>(requests.size()));
-}
-
-Expected<std::string> RefoldEngine::Refold(
-    const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
-    ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
-    ArrayRef<size_t> bTokOff, bool noLines, bool strict,
-    ProofAuditMode proofAuditMode, StringRef finalOutputPath,
-    ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
-    std::vector<MaterializedEditMapping> *materializedEditMappings,
-    FinalLineControlValidationCallback finalLineControlValidationCallback,
-    OutputVerificationMode verifyMode,
-    ArrayRef<std::string> verifyIncludeDirs) {
-  // Build the refold model based on the parsed JSON object.
-  auto mOrErr = RefoldModel::FromJson(rootJson);
-  if (!mOrErr)
-    return mOrErr.takeError();
-
-  // Build the closing assembly check before the engine runs.  Everything it
-  // needs is already here: the producer context, the edited stream, and this
-  // run's relaxation mode.  A verifier that cannot be built simply leaves the
-  // check absent.
-  //
-  // `Off` builds nothing at all: constructing the verifier preprocesses the
-  // edited stream, so a caller that does not want the check should not pay for
-  // it.
-  //
-  // The assembly is re-preprocessed beside the *producer's* source, never
-  // beside the refold output: a quoted include resolves against the including
-  // file's own directory first, so an output directory holding a later copy of
-  // the same header would answer the check against headers the producer never
-  // read.  Without that anchor the check is left absent rather than answered
-  // wrongly.
-  std::optional<RefoldFinalAssemblyVerifier> assemblyVerifier;
-  if (verifyMode != OutputVerificationMode::Off) {
-    if (auto ctxOrErr = RefoldModel::ParsePreprocessContext(rootJson)) {
-      if (auto sourceOrErr = RefoldModel::ParseSourcePath(rootJson)) {
-        if (std::optional<std::string> anchor =
-                producerSourceAnchorPath(*sourceOrErr, *ctxOrErr))
-          assemblyVerifier = RefoldFinalAssemblyVerifier::Create(
-              rootJson, *ctxOrErr, bSource, noLines, strict, *anchor,
-              verifyIncludeDirs);
-      } else {
-        consumeError(sourceOrErr.takeError());
-      }
-    } else {
-      consumeError(ctxOrErr.takeError());
-    }
-  }
-
-  // Narrowing loop.  Each attempt gets a *fresh* engine rather than re-running
-  // the pass in place: planning services are built once per engine and several
-  // are deliberately single-shot -- the pragma-once guard catalog records its
-  // active header set exactly once, for instance -- so a second pass through
-  // the same engine is not a supported operation.  Rebuilding is also what the
-  // alignment resolver already does for its candidate probes, so the model
-  // carries a read-only clone for exactly this purpose.
-  //
-  // The set of owners ruled out from keeping their callsite is carried across
-  // attempts and only grows, which is what makes this terminate: every round
-  // either verifies or gives up one more owner, ending at the translation unit.
-  llvm::DenseSet<uint64_t> ownersMustExpand;
-
-  // Test-only seed for the narrowing set, with no default effect.
-  //
-  // Reaching an include through the owner search needs an assembly that
-  // diverges at a token no macro invocation covers, which means a live defect.
-  // This hook instead states the conclusion the search would have reached, so a
-  // test can exercise what marking an owner *does*: the include is expanded by
-  // the ordinary materialization path and nothing else in the file moves.  The
-  // value is an include target spelling, matched as a substring, because
-  // producer ids shift as a map is regenerated while `"leaf.h"` does not.
-  if (const char *forcedTarget =
-          std::getenv("CLANG_REFOLD_TEST_ONLY_FORCE_EXPAND_INCLUDE")) {
-    const StringRef wanted(forcedTarget);
-    for (const RefoldModel::IncludeItem &include : (*mOrErr).GetIncludes()) {
-      if (!include.target.contains(wanted))
-        continue;
-      REFOLD_LOG_INFO("assembly-verify",
-                      "test-only: marking include {0} (target={1}) must-expand",
-                      include.id, include.target);
-      ownersMustExpand.insert(include.id);
-    }
-  }
-
-  // Every diverging region is given up in one attempt, so a further attempt is
-  // only ever needed to *widen*: a region that was expanded and still diverges
-  // escalates to the region enclosing it.  That is bounded by nesting depth,
-  // not by how many regions diverged.
-  //
-  // There is deliberately no ceiling on the ladder.  A constant bound is not a
-  // proof, and it can itself force the whole-translation-unit carrier: a unit
-  // whose ladder was still naming fresh regions would stop mid-descent and emit
-  // the edited stream for the entire file with narrowing still available.
-  // Termination comes from the set instead -- `ownersMustExpand` only grows,
-  // every retry must add at least one region that is not already in it, and the
-  // number of producer regions is finite -- so the loop below stops when a round
-  // makes no progress rather than when a counter runs out.
-  //
-  // The ladder is still counted separately from the loop, because a
-  // resolve-and-re-plan attempt must not be mistaken for a narrowing step: the
-  // count is what the closing diagnostics report, and folding resolution into it
-  // would misreport how far the ladder actually descended.
-  unsigned narrowingAttempts = 0;
-
-  // Alignment ambiguity is resolved on demand.  Every candidate map a window
-  // enumerates is realized by a complete refold of the translation unit, so the
-  // first attempt plans on the core theorem's forced anchors alone and resolves
-  // nothing; only an attempt that produces evidence ambiguity is what limited
-  // it turns this on, and then the next attempt resolves every window that can
-  // carry ambiguity.
-  //
-  // It is deliberately one flag rather than a set of windows.  A committed
-  // window contributes its anchors to the base map the next window is compared
-  // against, so resolving windows {1,3} is not a less complete version of
-  // resolving {1,2,3} -- it is a different alignment.  All-or-nothing keeps the
-  // resolved attempt byte-identical to what whole-stream resolution produced.
-  //
-  // Nothing here weighs cost.  The flag is set by evidence and cleared never,
-  // so no input is declined into the terminal carrier for being expensive.
-  bool resolveAlignmentAmbiguity = false;
-
-  // Resolution is asked once per run and replayed by every attempt after that.
-  // See `AlignmentSemanticResolutionMemo`: the question every attempt puts to
-  // the resolver is the same one, and answering it costs a complete refold of
-  // the translation unit per enumerated candidate map.
-  AlignmentSemanticResolutionMemo alignmentResolutionMemo;
-
-  // The core alignment is likewise certified once per run.  See
-  // `AlignmentCertificationMemo`: every attempt certifies the identical lexeme
-  // streams under the identical budget, and that theorem is the quadratic
-  // dynamic program window partitioning exists to bound.
-  AlignmentCertificationMemo alignmentCertificationMemo;
-
-  // The raw byte diff is likewise one answer per run.  See `RawByteHunkMemo`:
-  // it reads the A and B buffers alone, and an attempt changes neither, so an
-  // attempt, a candidate simulation, and the resolution probe all build the
-  // identical hunks from the identical bytes.
-  RawByteHunkMemo rawByteHunkMemo;
-
-  // The owner-state census is likewise one answer per run.  See
-  // `OwnerStateGraphMemo`: it reads the producer model and the A stream alone,
-  // and every attempt clones that model from this one parse, so an attempt, a
-  // candidate simulation, and the resolution probe all census identical owners.
-  OwnerStateGraphMemo ownerStateGraphMemo;
-
-  // Set once, by the owner-alignment repair below, and then carried by every
-  // later attempt: the repaired alignment is the one the run planned from from
-  // that point on.
-  std::optional<AlignmentSelectionOverride> ownerAlignedSlideOverride;
-  bool attemptedOwnerAlignedSlide = false;
-
-  for (unsigned attempt = 0;; ++attempt) {
-    // Each attempt needs its own model.  Moving the parsed one in would leave
-    // every later attempt building an engine from a moved-from model -- no
-    // includes, no macro invocations, no directives -- so a marked region would
-    // have nothing to be marked against and the ladder would appear to make no
-    // progress.  `CloneForReadOnlyConsumer` exists for this: a plain copy would
-    // leave the clone's lookup tables pointing into the original's storage.
-    RefoldEngine engine(
-        mOrErr->CloneForReadOnlyConsumer(), aSource, aToks, aTokOff, bSource,
-        bToks, bTokOff,
-        noLines, strict, proofAuditMode, finalOutputPath, sidebandPragmaEdits,
-        materializedEditMappings,
-        // Copied, not moved: this runs once per attempt, and a moved-from
-        // callback would silently disable final line-control validation for
-        // every attempt after the first.
-        finalLineControlValidationCallback, ownerAlignedSlideOverride);
-    engine.SetPassRole(("production attempt " + Twine(attempt)).str());
-    engine.finalAssemblyVerifier_ = assemblyVerifier;
-    engine.ownersMustExpand_ = ownersMustExpand;
-    engine.resolveAlignmentAmbiguity_ = resolveAlignmentAmbiguity;
-    engine.alignmentResolutionMemo_ = &alignmentResolutionMemo;
-    engine.alignmentCertificationMemo_ = &alignmentCertificationMemo;
-    engine.rawByteHunkMemo_ = &rawByteHunkMemo;
-    engine.AdoptOwnerStateGraphMemo(&ownerStateGraphMemo);
-    engine.verifyIncludeDirs_.assign(verifyIncludeDirs.begin(),
-                                     verifyIncludeDirs.end());
-
-    std::string out = engine.Refold();
-
-    // Turn resolution on and re-plan when this attempt showed that alignment
-    // ambiguity is what limited it.  This happens at most once per run: the
-    // resolved attempt already resolves every window that can carry ambiguity,
-    // so a further request would ask the identical question of the identical
-    // alignment.
-    //
-    // It runs before the narrowing ladders below because resolving ambiguity
-    // gives up nothing, while expanding a region trades away a preserved macro
-    // or include permanently.  The ladders keep their full allowance: `attempt`
-    // is not what bounds them.
-    if (!resolveAlignmentAmbiguity && engine.AlignmentResolutionIsDemanded()) {
-      // The evidence asks for resolution, so resolve -- but only a resolution
-      // that commits a window changes what the next attempt would plan.  When
-      // every ambiguous window keeps its core-forced anchors,
-      // `ResolveSemanticAlignment()` retains exactly the map this attempt
-      // planned from, so the re-planned attempt would re-derive this attempt's
-      // output byte for byte.
-      //
-      // So publish the theorem first and re-plan only when an anchor actually
-      // moved.  The probe is not additional work: it is the resolution the next
-      // attempt would have run, recorded so that attempt -- and every narrowing
-      // attempt after it -- replays the answer instead of realizing every
-      // candidate map again.
-      resolveAlignmentAmbiguity = true;
-
-      // Resolution moves an anchor only inside a window that carries ambiguity.
-      // When the core theorem forced every A token of every certified window,
-      // resolution passes over all of them and commits nothing, so the map it
-      // publishes is the one this attempt already planned from.  That is
-      // knowable from the retained forced map in one linear scan, and it is the
-      // common shape: a unit can demand resolution because it conceded a macro
-      // root while carrying no ambiguity for resolution to spend itself on.
-      if (!engine.AnyCertificationWindowCarriesAmbiguity()) {
-        // Falls through to this attempt's terminal and verification handling:
-        // the result stands, so it must still be judged like any other.
-        REFOLD_LOG_INFO(
-            "fallback",
-            "attempt {0} is limited by alignment ambiguity, but the core "
-            "theorem determined every certified window; resolution has nothing "
-            "to commit and this result stands",
-            attempt);
-      } else {
-        // Say what the run is about to spend before it spends it.  Everything
-        // between here and the probe's verdict is one complete replan of this
-        // translation unit followed by one more per enumerated candidate
-        // alignment map, each logging the same per-pass lines as the attempt
-        // above -- so without this the log reads as a loop repeating itself
-        // rather than as distinct alignments being realized and compared.
-        uint64_t ambiguousWindows = 0;
-        for (const std::pair<uint64_t, uint64_t> &range :
-             engine.certificationWindowARanges_)
-          if (engine.CertificationWindowCarriesAmbiguity(range))
-            ++ambiguousWindows;
-        REFOLD_LOG_INFO(
-            "fallback",
-            "attempt {0} is limited by alignment ambiguity, and {1} of {2} "
-            "certified window(s) carry it; probing resolution, which replans "
-            "this translation unit once and then realizes each window's "
-            "enumerated candidate maps as a complete refold apiece",
-            attempt, ambiguousWindows,
-            static_cast<uint64_t>(engine.certificationWindowARanges_.size()));
-
-        // The probe must present the same optional output surfaces as the
-        // attempt it stands in for, because a candidate simulation mirrors its
-        // parent's surfaces and two alignments may otherwise be separated by
-        // provenance production was never asked for.  Only whether the sidecar
-        // exists is observable, so scratch storage answers it without
-        // disturbing the mappings that belong to the attempt that will be
-        // emitted.
-        std::vector<MaterializedEditMapping> probeMaterializedEditMappings;
-        RefoldEngine probe(
-            mOrErr->CloneForReadOnlyConsumer(), aSource, aToks, aTokOff,
-            bSource, bToks, bTokOff, noLines, strict, proofAuditMode,
-            finalOutputPath, sidebandPragmaEdits,
-            materializedEditMappings ? &probeMaterializedEditMappings : nullptr,
-            // A probe stops before final line-control pruning, the callback's
-            // only consumer, and a candidate simulation is handed an empty one
-            // regardless -- so resolution cannot observe its absence.
-            FinalLineControlValidationCallback());
-        probe.SetPassRole("alignment resolution probe");
-        probe.ownersMustExpand_ = ownersMustExpand;
-        probe.resolveAlignmentAmbiguity_ = true;
-        probe.alignmentResolutionMemo_ = &alignmentResolutionMemo;
-        // The probe certifies nothing new: this attempt already recorded the
-        // alignment, so the probe replays it and spends its time only on the
-        // resolution the next attempt would otherwise have paid for.
-        probe.alignmentCertificationMemo_ = &alignmentCertificationMemo;
-        // The probe reaches the end of token-diff planning, which is where the
-        // raw byte diff is built, so without this it would rebuild the hunks
-        // the attempt it stands in for has already published.
-        probe.rawByteHunkMemo_ = &rawByteHunkMemo;
-        // The probe drives the same candidate simulations the resolver would,
-        // and each of those censuses owners, so without this the probe and its
-        // candidates would rebuild the census this attempt already published.
-        probe.AdoptOwnerStateGraphMemo(&ownerStateGraphMemo);
-        probe.verifyIncludeDirs_.assign(verifyIncludeDirs.begin(),
-                                        verifyIncludeDirs.end());
-        probe.ProbeAlignmentResolution();
-
-        if (alignmentResolutionMemo.resolution.committedEquivalentClass) {
-          REFOLD_LOG_INFO(
-              "fallback",
-              "attempt {0} is limited by alignment ambiguity; resolution "
-              "committed {1} window witness(es), re-planning against them",
-              attempt,
-              static_cast<uint64_t>(
-                  alignmentResolutionMemo.resolution.witnesses.size()));
-          continue;
-        }
-
-        if (!alignmentResolutionMemo.recorded) {
-          // The probe stopped before token-diff planning published a theorem,
-          // so nothing was proved either way.  A re-planned attempt would reach
-          // the same stopping point, so this attempt's result stands.
-          REFOLD_LOG_WARN("fallback",
-                          "attempt {0} is limited by alignment ambiguity, but "
-                          "the resolution probe published no theorem; this "
-                          "result stands",
-                          attempt);
-        } else {
-          REFOLD_LOG_INFO("fallback",
-                          "attempt {0} is limited by alignment ambiguity, but "
-                          "every ambiguous certification window kept its "
-                          "core-forced anchors; re-planning would reproduce "
-                          "this attempt, so this result stands",
-                          attempt);
-        }
-      }
-    }
-
-    // A terminal request means the run gave up and `out` is the edited stream
-    // for the whole file.  Before accepting that, see whether any request named
-    // the region whose proof failed: ruling that one region out and assembling
-    // again is strictly less than giving up the file, and it costs nothing when
-    // no request names a region -- which is every run that never fell back.
-    //
-    // This is deliberately not gated on the verification mode.  It repairs the
-    // fallback ladder, not a verification verdict, and a caller that asked for
-    // no verification still wants the smaller answer.
-    if (engine.terminalSink_.HasRequest()) {
-      // Before giving any region up, see whether a request failed only because
-      // its deletion run sits across an owner boundary rather than on one.
-      //
-      // This runs ahead of the narrowing ladder for the same reason resolution
-      // does: moving a run costs nothing -- the alignment keeps its exact
-      // matched-token count -- while expanding a region trades away a preserved
-      // include or macro permanently. It is attempted once per run, because a
-      // second attempt would put the identical question to the identical
-      // alignment.
-      if (!attemptedOwnerAlignedSlide &&
-          alignmentCertificationMemo.recorded) {
-        attemptedOwnerAlignedSlide = true;
-        if (std::optional<OwnerAlignedDeletionSlide> slide =
-                buildOwnerAlignedDeletionSlide(
-                    *mOrErr, aToks,
-                    alignmentCertificationMemo.facts.alignment.selectedMap,
-                    engine.terminalSink_.Requests())) {
-          REFOLD_LOG_INFO(
-              "fallback",
-              "terminal fallback names a deletion run A=[{0},{1}) that "
-              "straddles an owner boundary; moving it by {2} token(s) to "
-              "A=[{3},{4}), where one owner covers it, and re-planning",
-              slide->originalABegin, slide->originalAEnd, slide->offset,
-              slide->repairedABegin, slide->repairedAEnd);
-          ownerAlignedSlideOverride = buildOwnerAlignedSlideOverride(
-              *slide, alignmentCertificationMemo.facts.alignment);
-          continue;
-        }
-
-        // A suppressed anchor widens a hunk into a replacement whose payload is
-        // spelled by A tokens at its own edges. Re-anchoring them narrows it
-        // back to a deletion, and the candidate narrowings differ in whether
-        // the surviving deletion renumbers the lines after it.
-        if (std::optional<AlignmentSelectionOverride> narrowing =
-                engine.BuildLineAlignedHunkNarrowing(
-                    alignmentCertificationMemo.facts.alignment)) {
-          ownerAlignedSlideOverride = std::move(narrowing);
-          continue;
-        }
-      }
-
-      // Give up every region that any request names, and take the carrier only
-      // when *no* request names one.
-      //
-      // This deliberately no longer waits for every request to be narrowable.
-      // That rule was a cost policy -- it avoided re-assemblies that might not
-      // reach a smaller answer -- but the two outcomes it chooses between are
-      // not a whole answer and a slightly smaller one: they are a partial
-      // refold and a verbatim copy of the entire file.  One unattributable
-      // request among fifty would surrender every include, macro and directive
-      // in the unit alongside it.  A request naming nothing still contributes
-      // nothing here; it simply no longer vetoes the regions that others named.
-      llvm::SmallVector<uint64_t, 8> owners;
-      const bool everyRequestNarrowable =
-          engine.AppendNarrowableOwnersForTerminalRequests(ownersMustExpand,
-                                                          owners);
-      if (!everyRequestNarrowable)
-        REFOLD_LOG_INFO("fallback",
-                        "some terminal requests name no region; narrowing the "
-                        "{0} region(s) that were named and re-planning",
-                        static_cast<uint64_t>(owners.size()));
-      if (!owners.empty()) {
-        // Progress, not a counter, is what bounds this.  Record only regions
-        // the set did not already hold: a round that names nothing new would
-        // re-plan the identical input and reach the identical verdict, so it
-        // must fall through to the carrier rather than loop.
-        bool expandedNewOwner = false;
-        for (uint64_t owner : owners) {
-          if (!ownersMustExpand.insert(owner).second)
-            continue;
-          expandedNewOwner = true;
-          REFOLD_LOG_INFO("fallback",
-                          "terminal fallback names {0}; expanding it and "
-                          "retrying instead of the whole translation unit",
-                          engine.DescribeOwner(owner));
-        }
-        if (expandedNewOwner) {
-          ++narrowingAttempts;
-          continue;
-        }
-        REFOLD_LOG_WARN("fallback",
-                        "terminal fallback named only regions already given "
-                        "up after {0} narrowing step(s); taking the carrier",
-                        narrowingAttempts);
-      }
-      // `out` is already the carrier: this attempt's own `Refold()` replaced it
-      // when it saw the request.  Nothing narrower is left to give up.
-      return takeTerminalCarrier(std::move(out), engine.terminalSink_.Requests());
-    }
-
-    // Without a verifier the result stands exactly as it would without this
-    // loop.
-    if (!assemblyVerifier)
-      return out;
-
-    const FinalAssemblyVerdict verdict = assemblyVerifier->Verify(out);
-    // Only a proven divergence names a region to narrow, so only `Diverged`
-    // reaches the repair ladder below.
-    if (verdict.kind != FinalAssemblyVerdictKind::Diverged) {
-      if (verdict.kind == FinalAssemblyVerdictKind::Inconclusive) {
-        // `fatal` asks for an assembly the closing check has verified, and a
-        // comparison that could not be performed does not produce one.  "I
-        // could not check" is not "it checked out", so failing is the only
-        // answer that reports what actually happened; shipping here would
-        // hand back a result whose verification never ran under the very
-        // option asking for it.  This is the option's contract, not a
-        // soundness claim: the check is defense in depth, and its absence
-        // leaves the proof paths exactly as they would be with the check off.
-        if (DispositionForVerdict(verifyMode, verdict.kind) ==
-            FinalAssemblyDisposition::Fail)
-          return createStringError(
-              std::make_error_code(std::errc::illegal_byte_sequence),
-              "refolded source could not be preprocessed for verification, so "
-              "--verify-output=fatal has nothing to compare it against and "
-              "cannot report it as verified. Re-run with "
-              "--verify-output=repair to take the unchecked result, or with "
-              "--verify-output=off to skip the check");
-
-        // `repair` keeps it.  An inconclusive verdict names no diverging
-        // region, so there is nothing for the ladder to expand, and rejecting
-        // it would trade a real refold for a missing measurement rather than
-        // for a proven defect.  Say so where a run that asked for
-        // verification will see it: at debug level the one signal that the
-        // check did not happen is indistinguishable from the check passing.
-        REFOLD_LOG_WARN("assembly-verify",
-                        "assembly NOT verified: the final source could not be "
-                        "preprocessed for checking, so --verify-output has "
-                        "nothing to compare and the result stands unchecked");
-      } else if (attempt > 0) {
-        REFOLD_LOG_INFO("assembly-verify",
-                        "verified after {0} narrowing step(s)", attempt);
-      }
-      return out;
-    }
-
-    // Name the smallest region owning each diverging region and rule out
-    // preserving it.  An owner already ruled out means expanding it was not
-    // enough, so widen to the region enclosing it.
-    llvm::SmallVector<uint64_t, 8> owners;
-    for (const std::pair<std::size_t, std::size_t> &range :
-         verdict.divergentRanges) {
-      std::optional<uint64_t> candidate =
-          engine.FindSmallestOwnerForEditedToken(range.first);
-      while (candidate && ownersMustExpand.count(*candidate))
-        candidate = engine.FindEnclosingOwner(*candidate);
-      if (candidate && !llvm::is_contained(owners, *candidate))
-        owners.push_back(*candidate);
-    }
-    const std::optional<uint64_t> owner =
-        owners.empty() ? std::nullopt : std::optional<uint64_t>(owners.front());
-
-    // `fatal`: report and fail.  A theorem that mis-states which tokens it
-    // realizes is a defect, and repairing it silently costs completeness in a
-    // way nothing observes -- the output stays correct, so the broken theorem
-    // survives.  `repair` opts into the conservative repair instead.
-    if (DispositionForVerdict(verifyMode, verdict.kind) ==
-        FinalAssemblyDisposition::Fail) {
-      std::string owned = "<unattributed>";
-      if (owner)
-        owned = engine.DescribeOwner(*owner);
-      return createStringError(
-          std::make_error_code(std::errc::illegal_byte_sequence),
-          "refolded source does not replay the edited preprocessed stream: "
-          "%s; smallest region owning the divergence: %s. "
-          "Re-run with --verify-output=repair to expand that region "
-          "instead of failing",
-          verdict.reason.c_str(), owned.c_str());
-    }
-
-    if (!owners.empty()) {
-      // Same progress rule as the terminal ladder above: only a round that
-      // gives up a region not already given up can change the next assembly.
-      bool expandedNewOwner = false;
-      for (uint64_t candidate : owners) {
-        if (!ownersMustExpand.insert(candidate).second)
-          continue;
-        expandedNewOwner = true;
-        REFOLD_LOG_INFO("assembly-verify", "  expanding {0}",
-                        engine.DescribeOwner(candidate));
-      }
-      if (expandedNewOwner) {
-        REFOLD_LOG_INFO("assembly-verify",
-                        "unsound assembly: {0} diverging region(s), expanded "
-                        "{1} owner(s) and retrying: {2}",
-                        verdict.divergentRanges.size(), owners.size(),
-                        verdict.reason);
-        ++narrowingAttempts;
-        continue;
-      }
-    }
-
-    // Nothing narrower is left to give up: the divergence could not be
-    // attributed, every enclosing owner is already expanded, or the ladder is
-    // spent.  Take the carrier that reproduces the edited stream by
-    // construction.
-    REFOLD_LOG_WARN("assembly-verify",
-                    "unsound assembly at edited token {0} could not be "
-                    "narrowed further; expanding the translation unit: {1}",
-                    static_cast<uint64_t>(verdict.mismatchTokenIndex),
-                    verdict.reason);
-    engine.terminalSink_.RequestTerminalFallback(
-        withDivergingEditedToken(
-            RefoldOwnerStateProof::SuffixStabilityTerminalFailureForComponent(
-                OwnerStateComponent::LineNumber),
-            verdict.mismatchTokenIndex),
-        "assembly-verify",
-        "assembled source does not replay the edited preprocessed stream");
-    // The request recorded just above is part of this census, which is why the
-    // carrier is taken after it rather than before.
-    return takeTerminalCarrier(
-        engine.expansionFallbackPlanner_->ResolvePostStructuralFallback(),
-        engine.terminalSink_.Requests());
-  }
+std::string RefoldEngine::ResolvePostStructuralFallback() {
+  return expansionFallbackPlanner_->ResolvePostStructuralFallback();
 }
 
 void RefoldEngine::ProbeAlignmentResolution() {
@@ -1372,7 +433,7 @@ void RefoldEngine::ProbeAlignmentResolution() {
   stopAfterAlignmentResolution_ = true;
   terminalSink_.Reset();
   resetRefoldAttemptStats(lastStats_, model_);
-  TheoremAudit().Reset();
+  theoremAudit_->Reset();
   (void)RunRefoldPass();
 
   // A probe emits nothing, so this line is the only account of what it cost.
@@ -1395,15 +456,15 @@ std::string RefoldEngine::Refold() {
   // the explicit raw-B terminal carrier when proof discharge requests fallback.
   terminalSink_.Reset();
   resetRefoldAttemptStats(lastStats_, model_);
-  TheoremAudit().Reset();
+  theoremAudit_->Reset();
 
   std::string out = RunRefoldPass();
 
   // Once the structural pass finishes, any surviving theorem-audit violation
   // must be converted into the one explicit terminal fallback rather than
   // merely being reported.
-  TheoremAudit().EnforceTheoremAuditInvariants(
-      ProofServices().WitnessTrace().GetWitnessResolverMode());
+  theoremAudit_->EnforceTheoremAuditInvariants(
+      witnessTrace_.GetWitnessResolverMode());
 
   if (terminalSink_.HasRequest()) {
     out = expansionFallbackPlanner_->ResolvePostStructuralFallback();
@@ -1416,14 +477,14 @@ std::string RefoldEngine::Refold() {
   // the compact obligation/removal proof records consumed by the pruner below.
 
   AuditFinalLineControlRemovalProofPopulation(
-      TheoremAudit(), finalLineControlPruneCandidates_,
+      *theoremAudit_, finalLineControlPruneCandidates_,
       "final-line-control-prune-candidates");
 
   FinalLineControlPruneResult finalLinePrune =
       PruneFinalLineControlDirectives(out, finalLineControlPruneCandidates_,
                                       finalLineControlValidationCallback_);
   AuditFinalLineControlAuthorityContract(
-      TheoremAudit(), finalLinePrune.authority, "final-line-control-prune");
+      *theoremAudit_, finalLinePrune.authority, "final-line-control-prune");
 
   if (finalLinePrune.changed) {
     auto mapPointAfterDeletion = [](uint64_t point, uint64_t begin,
@@ -1856,8 +917,8 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
                      "insertion provenance requested before structural "
                      "tiling completed");
   }
-  BInsertionLedger().BuildProvenance(hunks);
-  BInsertionLedger().PreclaimStandaloneInsertions(tuPath, hunks);
+  bInsertionLedger_->BuildProvenance(hunks);
+  bInsertionLedger_->PreclaimStandaloneInsertions(tuPath, hunks);
   structuralHunkPlanningPhase_ =
       StructuralHunkPlanningPhase::InsertionLedgerReady;
   return hunks;
@@ -1927,7 +988,7 @@ bool RefoldEngine::StageSidebandEdits(
   // sideband replay bytes from ordinary hunk replacements.
   return appendSidebandPragmaSourceEdits(
       sidebandPragmaEdits_, model_, tuPath, tuBytes, pathIdentity_,
-      *textEditAssembler_, ProofServices().AcceptedCandidateBuilder(),
+      *textEditAssembler_, proofServices_->AcceptedCandidateBuilder(),
       terminalSink_, structuralHunkDispatcher);
 }
 
@@ -2079,10 +1140,9 @@ bool RefoldEngine::DispatchStructuralHunks(
       return false;
 
     const AcceptedResultCandidate macroAccepted =
-        ProofServices().AcceptedCandidateBuilder().BuildAcceptedMacroCandidate(
+        proofServices_->AcceptedCandidateBuilder().BuildAcceptedMacroCandidate(
             macroCandidate);
-    if (!ProofServices()
-             .AcceptedResultRanker()
+    if (!proofServices_->AcceptedResultRanker()
              .IsSelectableAcceptedResultCandidate(macroAccepted))
       return false;
 
@@ -2102,11 +1162,11 @@ bool RefoldEngine::DispatchStructuralHunks(
     // The PP hunk must map back to a concrete TU token range. This prevents
     // choosing a TU-byte edit for tokens that only exist through macro body
     // spelling, include materialization, or another non-TU source.
-    if (!OwnerClassifier().HunkMapsToTU(hunk.aStart, hunk.aEnd, tuPath))
+    if (!ownerClassifier_->HunkMapsToTU(hunk.aStart, hunk.aEnd, tuPath))
       return false;
 
     auto spanPlan =
-        TUEditPlanner().PlanTUByteSpan(hunk.aStart, hunk.aEnd, tuPath);
+        tuEditPlanner_->PlanTUByteSpan(hunk.aStart, hunk.aEnd, tuPath);
     if (!spanPlan || spanPlan->tuByteBegin >= spanPlan->tuByteEnd)
       return false;
     auto span = spanPlan->byteRange();
@@ -2211,8 +1271,7 @@ bool RefoldEngine::DispatchStructuralHunks(
     }
 
     AcceptedResultCandidate tuCandidate =
-        ProofServices()
-            .AcceptedCandidateBuilder()
+        proofServices_->AcceptedCandidateBuilder()
             .BuildAcceptedTUTextEditCandidate(
                 AcceptedPathKind::TUByteSpanMappedEdit, hunk, *spanPlan,
                 /*structuralBinding=*/nullptr, replacement);
@@ -2227,8 +1286,7 @@ bool RefoldEngine::DispatchStructuralHunks(
     // preference, so the composite is asked for here rather than folded into
     // the order that every other selection site scans.
     const bool prefersExactTUArgumentEdit =
-        ProofServices()
-            .AcceptedResultRanker()
+        proofServices_->AcceptedResultRanker()
             .IsSelectableAcceptedResultCandidate(tuCandidate) &&
         RefoldAcceptedResultRanker::ProvenEquivalentArtifactPrefers(
             tuCandidate.proofSummary, macroAccepted.proofSummary);
@@ -2249,7 +1307,7 @@ bool RefoldEngine::DispatchStructuralHunks(
 
     // a) Segment-aware owner classification: this decides TU vs include vs “no
     // segment”.
-    Owner owner = OwnerClassifier().ClassifyOwnerWithSegments(tuPath, h);
+    Owner owner = ownerClassifier_->ClassifyOwnerWithSegments(tuPath, h);
 
     // b) Macro call-site still has priority over TU/include.  Half-open
     // boundary insertions are not macro-owned by default; macro-domain boundary
@@ -2284,7 +1342,7 @@ bool RefoldEngine::DispatchStructuralHunks(
           // invocation. If successful, install/replace the callsite patch for
           // this macro id and stop climbing the caller chain.
           auto updated =
-              MacroPatchPlanner().BuildMacroInvocationPatchWholeCover(
+              macroPatchPlanner_->BuildMacroInvocationPatchWholeCover(
                   *target, h, stagingSlot.currentInvocationText,
                   structuralHunkDispatcher.MacroPatchMergeBucketsForPlanner(),
                   existingPatchContext);
@@ -2296,13 +1354,13 @@ bool RefoldEngine::DispatchStructuralHunks(
             }
 
             const Owner currentPatchOwner =
-                MacroPatchPlanner().NormalizeHunkOwnerForPatch(tuPath, h);
+                macroPatchPlanner_->NormalizeHunkOwnerForPatch(tuPath, h);
             if (stagingSlot.existingPatch)
-              MacroPatchPlanner().CarryMacroPatchOwnerCertificate(
+              macroPatchPlanner_->CarryMacroPatchOwnerCertificate(
                   *updated, *stagingSlot.existingPatch);
             structuralHunkDispatcher.MergeMaterializedBTokenRangeFromSlot(
                 *updated, stagingSlot, h);
-            MacroPatchPlanner().CertifyMacroPatchOwnerWitness(
+            macroPatchPlanner_->CertifyMacroPatchOwnerWitness(
                 *updated, currentPatchOwner);
             updated->macroId = stagingSlot.patchKey;
             structuralHunkDispatcher.StageMacroPatch(stagingSlot,
@@ -2336,11 +1394,11 @@ bool RefoldEngine::DispatchStructuralHunks(
     if (isIns) {
       const RefoldModel::IncludeItem *parentBoundaryInc = nullptr;
       if (auto boundaryPlan =
-              TUEditPlanner().FindBoundaryParentIncludeForPureInsertion(h))
+              tuEditPlanner_->FindBoundaryParentIncludeForPureInsertion(h))
         parentBoundaryInc = model_.GetIncludeById(boundaryPlan->includeId);
       if (parentBoundaryInc) {
         IncludePatch patch =
-            IncludeInsertionPlanner().BuildIncludeInsertionPatch(
+            includeInsertionPlanner_->BuildIncludeInsertionPatch(
                 *parentBoundaryInc, h);
         patch.condArm.present = owner.condArmId.has_value();
         patch.condArm.armId = owner.condArmId.value_or(0);
@@ -2357,7 +1415,7 @@ bool RefoldEngine::DispatchStructuralHunks(
               model_.GetIncludeById(*owner.includeId);
           // NOTE: `inc` cannot be null if owner has an `includeId`
           IncludePatch patch =
-              IncludeInsertionPlanner().BuildIncludeInsertionPatch(*inc, h);
+              includeInsertionPlanner_->BuildIncludeInsertionPatch(*inc, h);
           patch.condArm.present = owner.condArmId.has_value();
           patch.condArm.armId = owner.condArmId.value_or(0);
           structuralHunkDispatcher.AddIncludePatch(inc, std::move(patch));
@@ -2373,7 +1431,7 @@ bool RefoldEngine::DispatchStructuralHunks(
           model_.GetIncludeById(*owner.includeId);
       // NOTE: `inc` cannot be null if owner has an `includeId`
       IncludePatch patch =
-          IncludeInsertionPlanner().BuildIncludeInsertionPatch(*inc, h);
+          includeInsertionPlanner_->BuildIncludeInsertionPatch(*inc, h);
       patch.condArm.present = owner.condArmId.has_value();
       patch.condArm.armId = owner.condArmId.value_or(0);
       structuralHunkDispatcher.AddIncludePatch(inc, std::move(patch));
@@ -2385,7 +1443,7 @@ bool RefoldEngine::DispatchStructuralHunks(
     // Segment classification is only used to detect include-owned edits; it
     // should not force a hunk into the TU if any mapped token belongs to a
     // header. So only treat it as TU when the hunk map says so.
-    bool mapsToTU = OwnerClassifier().HunkMapsToTU(h.aStart, h.aEnd, tuPath);
+    bool mapsToTU = ownerClassifier_->HunkMapsToTU(h.aStart, h.aEnd, tuPath);
 
     if (owner.kind == OwnerKind::TU && !mapsToTU) {
       // Deterministic rule: TU ownership must be supported by provenance. If
@@ -2397,7 +1455,7 @@ bool RefoldEngine::DispatchStructuralHunks(
 
     if (mapsToTU) {
       auto spanPlan =
-          TUEditPlanner().PlanTUByteSpan(h.aStart, h.aEnd, tuPath); // [b,e)
+          tuEditPlanner_->PlanTUByteSpan(h.aStart, h.aEnd, tuPath); // [b,e)
       if (spanPlan) {
         auto span = spanPlan->byteRange();
 
@@ -2482,12 +1540,12 @@ bool RefoldEngine::DispatchStructuralHunks(
                   replayAttachesLeftInB, lexLang_);
         }
 
-        TUEditPlanner().MaybeExtendTUSpanOverClosedTrailingCallSuffix(
+        tuEditPlanner_->MaybeExtendTUSpanOverClosedTrailingCallSuffix(
             h, tuPath, tuBytes, repl, span);
 
         bool advancedOverSourceLineControlPrefix =
             maybeAdvanceTUInsertionPastSourceLineControlPrefix(
-                TUEditPlanner(), lineControlProof_, h, tuPath, tuBytes, span);
+                *tuEditPlanner_, lineControlProof_, h, tuPath, tuBytes, span);
         std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment;
         if (advancedOverSourceLineControlPrefix) {
           insertionAnchorAdjustment = TUInsertionAnchorAdjustment{
@@ -2531,7 +1589,7 @@ bool RefoldEngine::DispatchStructuralHunks(
 
         const bool skipLocalResync =
             tuInsertionBeforeMaterializedInclude(
-                TUEditPlanner(), model_, sidebandPragmaEdits_, h, tuPath, span,
+                *tuEditPlanner_, model_, sidebandPragmaEdits_, h, tuPath, span,
                 /*requireVisibleReplayText=*/true) ||
             lineControlProof_.TUInsertionCanDeferResyncToConditionalJoin(
                 advancedOverSourceLineControlPrefix, tuPath, span.second);
@@ -2603,12 +1661,12 @@ bool RefoldEngine::DispatchStructuralHunks(
               TerminalFallbackFailureContext::ForHunkTokenEnvelope(
                   i, h.aStart, h.aEnd, h.bStart, h.bEnd)),
           "classify",
-          TUEditPlanner().BuildOwnerUnresolvedNoTUAnchorDetail(
+          tuEditPlanner_->BuildOwnerUnresolvedNoTUAnchorDetail(
               i, h, tuPath, owner, mapsToTU));
       continue;
     }
 
-    if (auto spanPlan = TUEditPlanner().PlanTUByteSpan(h.aStart, h.aEnd,
+    if (auto spanPlan = tuEditPlanner_->PlanTUByteSpan(h.aStart, h.aEnd,
                                                        tuPath)) { // [b, e)
       if (std::optional<TextEdit> directEdit = BuildDirectTUByteSpanEditForHunk(
               h, i, isDel, tuPath, tuBytes, spanPlan->byteRange())) {
@@ -2653,15 +1711,14 @@ bool RefoldEngine::DispatchStructuralHunks(
                 macroTopology_.FindMacroInvocationById(*failingOwner)) {
           if (invocation->invB && invocation->invE) {
             if (std::optional<WholeCoverPlan> wholeCoverPlan =
-                    MacroPatchPlanner().ComputeWholeCoverPlan(*invocation)) {
+                    macroPatchPlanner_->ComputeWholeCoverPlan(*invocation)) {
               MacroPatch wholeCoverPatch{*invocation->invB, *invocation->invE,
                                          wholeCoverPlan->clippedText,
                                          invocation->id};
-              ProofServices()
-                  .MacroPatchProofClassifier()
+              proofServices_->MacroPatchProofClassifier()
                   .CertifyMacroWholeCoverRealizationPatch(
                       wholeCoverPatch, *wholeCoverPlan, *invocation);
-              MacroPatchPlanner().CertifyMacroPatchOwnerWitness(
+              macroPatchPlanner_->CertifyMacroPatchOwnerWitness(
                   wholeCoverPatch,
                   invocation->ownerIncludeId
                       ? Owner::Include(*invocation->ownerIncludeId)
@@ -2699,7 +1756,7 @@ bool RefoldEngine::DispatchStructuralHunks(
             TerminalFallbackFailureContext::ForHunkTokenEnvelope(
                 i, h.aStart, h.aEnd, h.bStart, h.bEnd)),
         "classify",
-        TUEditPlanner().BuildOwnerUnresolvedNoTUAnchorDetail(i, h, tuPath,
+        tuEditPlanner_->BuildOwnerUnresolvedNoTUAnchorDetail(i, h, tuPath,
                                                              owner, mapsToTU));
     continue;
   }
@@ -2796,12 +1853,12 @@ std::optional<TextEdit> RefoldEngine::BuildDirectTUByteSpanEditForHunk(
                 replayAttachesLeftInB, lexLang_);
       }
 
-      TUEditPlanner().MaybeExtendTUSpanOverClosedTrailingCallSuffix(
+      tuEditPlanner_->MaybeExtendTUSpanOverClosedTrailingCallSuffix(
           h, tuPath, tuBytes, repl, span);
 
       bool advancedOverSourceLineControlPrefix =
           maybeAdvanceTUInsertionPastSourceLineControlPrefix(
-              TUEditPlanner(), lineControlProof_, h, tuPath, tuBytes, span);
+              *tuEditPlanner_, lineControlProof_, h, tuPath, tuBytes, span);
       std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment;
       if (advancedOverSourceLineControlPrefix) {
         insertionAnchorAdjustment = TUInsertionAnchorAdjustment{
@@ -2844,7 +1901,7 @@ std::optional<TextEdit> RefoldEngine::BuildDirectTUByteSpanEditForHunk(
 
       const bool skipLocalResync =
           tuInsertionBeforeMaterializedInclude(
-              TUEditPlanner(), model_, sidebandPragmaEdits_, h, tuPath, span,
+              *tuEditPlanner_, model_, sidebandPragmaEdits_, h, tuPath, span,
               /*requireVisibleReplayText=*/false) ||
           lineControlProof_.TUInsertionCanDeferResyncToConditionalJoin(
               advancedOverSourceLineControlPrefix, tuPath, span.second);
@@ -2887,7 +1944,7 @@ std::string RefoldEngine::FinalizeStructuralResult(
       macroStateRepairRequest{tuPath, tuBytes, &structuralHunkDispatcher,
                               &tuEdits, &ownersMustExpand_};
   RefoldMacroStateRepairPlanner::MacroStateRepairPlan macroStateRepairPlan =
-      MacroStateRepairPlanner().Plan(macroStateRepairRequest);
+      macroStateRepairPlanner_->Plan(macroStateRepairRequest);
   if (!macroStateRepairPlan.success)
     return std::string();
 
@@ -2895,19 +1952,19 @@ std::string RefoldEngine::FinalizeStructuralResult(
   // This may create macro patches even when no diff hunk touched the invocation
   // (required to prevent later __COUNTER__ values from shifting after an edit).
   auto forcedCounters =
-      CounterStabilization().ComputeForcedCounterPatches(tuPath, abTokMapA2B_);
+      counterStabilization_->ComputeForcedCounterPatches(tuPath, abTokMapA2B_);
   auto forcedCountersFromExpanded =
-      CounterStabilization().ComputeForcedCounterPatchesFromExpandedMacros(
+      counterStabilization_->ComputeForcedCounterPatchesFromExpandedMacros(
           tuPath, structuralHunkDispatcher.MacroPatchMergeBucketsForPlanner());
   if (!forcedCountersFromExpanded.empty())
     forcedCounters.append(forcedCountersFromExpanded.begin(),
                           forcedCountersFromExpanded.end());
   if (!forcedCounters.empty())
     applyForcedCounterPatches(forcedCounters, bToks_, sourceMapper_,
-                              macroTopology_, MacroPatchPlanner(),
-                              WholeCoverPlanBuilder(),
-                              ProofServices().MacroPatchProofClassifier(),
-                              OwnerStateProof(), structuralHunkDispatcher);
+                              macroTopology_, *macroPatchPlanner_,
+                              *wholeCoverPlanBuilder_,
+                              proofServices_->MacroPatchProofClassifier(),
+                              *ownerStateProof_, structuralHunkDispatcher);
 
   auto sourceAuthoredLineControlDominatesSite =
       [&](const RefoldModel::MacroInvocation &site) -> bool {
@@ -3012,7 +2069,7 @@ std::string RefoldEngine::FinalizeStructuralResult(
         continue;
 
       std::optional<WholeCoverPlan> plan =
-          MacroPatchPlanner().ComputeWholeCoverPlan(*site);
+          macroPatchPlanner_->ComputeWholeCoverPlan(*site);
       if (!plan) {
         terminalSink_.RequestTerminalFallback(
             MakeTerminalFallbackProofFailure(
@@ -3036,12 +2093,11 @@ std::string RefoldEngine::FinalizeStructuralResult(
 
       MacroPatch patch{*invStart, *invEnd, plan->clippedText, site->id};
       if (stagingSlot.existingPatch)
-        MacroPatchPlanner().CarryMacroPatchOwnerCertificate(
+        macroPatchPlanner_->CarryMacroPatchOwnerCertificate(
             patch, *stagingSlot.existingPatch);
-      ProofServices()
-          .MacroPatchProofClassifier()
+      proofServices_->MacroPatchProofClassifier()
           .CertifyMacroWholeCoverRealizationPatch(patch, *plan, *site);
-      MacroPatchPlanner().CertifyMacroPatchOwnerWitness(
+      macroPatchPlanner_->CertifyMacroPatchOwnerWitness(
           patch, site->ownerIncludeId ? Owner::Include(*site->ownerIncludeId)
                                       : Owner::TU());
       structuralHunkDispatcher.StageMacroPatch(stagingSlot, std::move(patch));
@@ -3063,10 +2119,10 @@ std::string RefoldEngine::FinalizeStructuralResult(
   // planning passes. The dispatcher owns the DenseMap merge buckets and
   // flattens them deterministically before final include/TU emission.
   structuralHunkDispatcher.FinalizeMacroPatchBuckets(
-      ProofServices().AcceptedCandidateBuilder());
+      proofServices_->AcceptedCandidateBuilder());
 
   if (!structuralHunkDispatcher.AppendLineObserverRealizationEdits(
-          LineObserverLayout(), tuPath, tuBytes))
+          *lineObserverLayout_, tuPath, tuBytes))
     return std::string();
 
   // Normalize/coalesce include-side insertions.
@@ -3086,7 +2142,7 @@ std::string RefoldEngine::FinalizeStructuralResult(
   includeSchedulerDeps.macroStateRepairPlanner = macroStateRepairPlanner_.get();
   includeSchedulerDeps.textEditAssembler = textEditAssembler_.get();
   includeSchedulerDeps.acceptedCandidateBuilder =
-      &ProofServices().AcceptedCandidateBuilder();
+      &proofServices_->AcceptedCandidateBuilder();
   includeSchedulerDeps.pragmaOnceGuards = pragmaOnceGuardRewriter_.get();
   includeSchedulerDeps.terminalSink = &terminalSink_;
   includeSchedulerDeps.sidebandPragmaEdits = &sidebandPragmaEdits_;
@@ -3127,7 +2183,7 @@ std::string RefoldEngine::FinalizeStructuralResult(
   finalEmissionDeps.macroStateRepairPlanner = macroStateRepairPlanner_.get();
   finalEmissionDeps.textEditAssembler = textEditAssembler_.get();
   finalEmissionDeps.acceptedCandidateBuilder =
-      &ProofServices().AcceptedCandidateBuilder();
+      &proofServices_->AcceptedCandidateBuilder();
   finalEmissionDeps.terminalSink = &terminalSink_;
   finalEmissionDeps.materializedEditMappings = materializedEditMappings_;
   finalEmissionDeps.finalLineControlPruneCandidates =
@@ -3156,7 +2212,7 @@ std::string RefoldEngine::FinalizeStructuralResult(
   // and is consumed only by isolated alignment simulations.
   AlignmentSemanticTopologyKeyResult topologyKey =
       structuralHunkDispatcher.BuildAlignmentSemanticTopologyKey(
-          ProofServices().EquivalenceKeyBuilder(), tuBytes);
+          proofServices_->EquivalenceKeyBuilder(), tuBytes);
   for (uint64_t includeId :
        includeMaterializationScheduler.ExpandedIncludeIds())
     topologyKey.preservationFootprint.expandedIncludeIds.push_back(includeId);

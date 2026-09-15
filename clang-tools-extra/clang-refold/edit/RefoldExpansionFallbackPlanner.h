@@ -72,7 +72,6 @@ public:
     std::function<bool(TextEdit &, llvm::StringRef, llvm::StringRef, uint64_t,
                        uint64_t)>
         authorizeTUIncludeClosure;
-    std::function<void()> resetAttemptStats;
   };
 
   RefoldExpansionFallbackPlanner(

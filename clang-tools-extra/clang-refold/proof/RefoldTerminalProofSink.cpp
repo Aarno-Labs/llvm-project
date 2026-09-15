@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "proof/RefoldTerminalProofSink.h"
+#include "proof/RefoldWitnessTrace.h"
 
 #include "support/RefoldLog.h"
 #include "support/StringUtils.h"
@@ -339,8 +340,9 @@ MakeTerminalFallbackRequest(TerminalFallbackProofFailure failure,
 //===----------------------------------------------------------------------===//
 
 RefoldTerminalProofSink::RefoldTerminalProofSink(
-    RefoldTerminalProofSinkCallbacks callbacks)
-    : callbacks_(std::move(callbacks)) {}
+    RefoldTerminalProofSinkCallbacks callbacks,
+    const RefoldWitnessTrace &witnessTrace)
+    : callbacks_(std::move(callbacks)), witnessTrace_(witnessTrace) {}
 
 void RefoldTerminalProofSink::RequestTerminalFallback(
     TerminalFallbackProofFailure failure, StringRef stage,
@@ -409,7 +411,7 @@ void RefoldTerminalProofSink::RequestTerminalFallback(
 
   requests_.push_back(request);
 
-  callbacks_.traceTerminalRequest(request);
+  witnessTrace_.TraceWitnessFallback(request);
   REFOLD_LOG_DEBUG("fallback", "{0}", request);
 }
 

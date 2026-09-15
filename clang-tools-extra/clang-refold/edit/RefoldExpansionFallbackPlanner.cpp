@@ -3946,7 +3946,7 @@ std::string RefoldExpansionFallbackPlanner::ResolvePostStructuralFallback() {
 
   // The raw-B terminal carrier is the fully expanded surface, so every include
   // and every top-level macro root remains expanded in the final result.
-  hooks_.resetAttemptStats();
+  resetRefoldAttemptStats(lastStats_, model_);
   lastStats_.expandedIncludes = lastStats_.totalIncludes;
   lastStats_.expandedMacros = lastStats_.totalMacros;
   if (materializedEditMappings_) {

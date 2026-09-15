@@ -57,7 +57,7 @@
 //     --log-level=debug
 //
 // See also:
-//   RefoldEngine
+//   refoldTranslationUnit, RefoldEngine
 //   RefoldModel
 //
 // Author:
@@ -675,7 +675,7 @@ int main(int argc, char **argv) {
 
   // Default behavior: single refold.
   std::vector<MaterializedEditMapping> materializedEditMappings;
-  auto refoldedOrErr = RefoldEngine::Refold(
+  auto refoldedOrErr = refoldTranslationUnit(
       rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff, NoLines,
       StrictMode, proofAuditMode, ModifiedSrcPath, sidebandPragmaEdits,
       emitEditMap ? &materializedEditMappings : nullptr,

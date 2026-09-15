@@ -324,7 +324,7 @@ FinalLineControlPruneResult PruneFinalLineControlDirectives(
 /// Build the executable oracle that validates one proposed final-stream
 /// `#line` deletion.
 ///
-/// The returned callback is consumed by `RefoldEngine::Refold` and ultimately
+/// The returned callback is consumed by `refoldTranslationUnit` and ultimately
 /// by the final-line-control pruner.  It re-invokes the producer-recorded
 /// preprocessor on the current accepted final source and the candidate final
 /// source using one stable temporary path located beside \p outputPath, so
