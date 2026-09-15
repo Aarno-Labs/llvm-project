@@ -59,7 +59,7 @@ class LangOptions;
 namespace refold {
 
 class RefoldArgTextRecovery;
-class RefoldProofLattice;
+class RefoldMacroWholeCoverPlanBuilder;
 class RefoldSourceMapper;
 
 /// Argument-ref placeholder rebased into a trimmed parent argument's
@@ -138,7 +138,7 @@ public:
     const RefoldSourceMapper &sourceMapper;
     const clang::LangOptions &lexLang;
     const RefoldArgTextRecovery &argTextRecovery;
-    RefoldProofLattice &proofLattice;
+    const RefoldMacroWholeCoverPlanBuilder &wholeCoverPlanBuilder;
 
     /// Delegates to
     /// `RefoldMacroPatchPlanner::GetMacroInvocationFormalArgContentRanges`.

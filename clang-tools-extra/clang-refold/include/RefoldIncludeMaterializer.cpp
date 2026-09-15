@@ -26,9 +26,9 @@
 #include "line-control/RefoldLineObserverLayout.h"
 #include "line-control/SourceLineDirectiveHelpers.h"
 #include "macro/RefoldMacroStateProof.h"
+#include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldNeutralityProof.h"
 #include "proof/RefoldOwnerStateProof.h"
-#include "proof/RefoldProofLattice.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldSourceMapper.h"
@@ -536,10 +536,9 @@ RefoldIncludeMaterializer::BuildInlineIncludeRealizationFromB(
   // owner-realization proof path instead of being copied into a parallel
   // include-specific closure witness.
   AcceptedResultCandidate realizationCandidate =
-      proofLattice_.AcceptedCandidateBuilder()
-          .BuildAcceptedIncludeRealizationCandidate(
-              AcceptedPathKind::IncludeRealizationInlineFromB, inc,
-              evidenceKind, *bEnvOpt);
+      acceptedCandidateBuilder_.BuildAcceptedIncludeRealizationCandidate(
+          AcceptedPathKind::IncludeRealizationInlineFromB, inc, evidenceKind,
+          *bEnvOpt);
   if (acceptedCandidate)
     *acceptedCandidate = realizationCandidate;
 
@@ -760,9 +759,9 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
       return;
     }
     textEditAssembler_.AttachAcceptedResultCarrier(
-        edit, proofLattice_.AcceptedCandidateBuilder()
-                  .BuildAcceptedIncludeRealizationCandidate(
-                      AcceptedPathKind::IncludeMaterializedExpansion, *inc));
+        edit,
+        acceptedCandidateBuilder_.BuildAcceptedIncludeRealizationCandidate(
+            AcceptedPathKind::IncludeMaterializedExpansion, *inc));
     edits.push_back(std::move(edit));
   }
 
@@ -853,8 +852,8 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
         }
       }
       textEditAssembler_.AttachAcceptedResultCarrier(
-          edit, proofLattice_.AcceptedCandidateBuilder()
-                    .BuildAcceptedEmittedMacroCandidate(mp));
+          edit,
+          acceptedCandidateBuilder_.BuildAcceptedEmittedMacroCandidate(mp));
 
       StagedMacroPatchEdit staged;
       staged.editIndex = edits.size();
@@ -1238,7 +1237,7 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
         } else {
           textEditAssembler_.AttachAcceptedResultCarrier(
               edit,
-              proofLattice_.AcceptedCandidateBuilder()
+              acceptedCandidateBuilder_
                   .BuildAcceptedIncludeRealizationCandidate(
                       AcceptedPathKind::IncludeMaterializedExpansion, *child));
         }
@@ -1370,9 +1369,8 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
       std::move(appliedLineControlSourceMappings);
   includeExpansionStartLineNos[includeId] = firstEmittedHeaderLine;
   includeExpansionAcceptedResults[includeId] =
-      proofLattice_.AcceptedCandidateBuilder()
-          .BuildAcceptedIncludeRealizationCandidate(
-              AcceptedPathKind::IncludeMaterializedExpansion, *inc);
+      acceptedCandidateBuilder_.BuildAcceptedIncludeRealizationCandidate(
+          AcceptedPathKind::IncludeMaterializedExpansion, *inc);
 }
 
 void RefoldIncludeMaterializer::CollectEnteredIncludeSubtree(
@@ -1754,10 +1752,9 @@ RefoldIncludeMaterializer::MakeCleanChildIncludeOperandRewriteEdit(
           /*requestTerminalOnFailure=*/false))
     return std::nullopt;
   textEditAssembler_.AttachAcceptedResultCarrier(
-      edit,
-      proofLattice_.AcceptedCandidateBuilder().BuildAcceptedIncludeCandidate(
-          AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, patch,
-          &witness));
+      edit, acceptedCandidateBuilder_.BuildAcceptedIncludeCandidate(
+                AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, patch,
+                &witness));
   return edit;
 }
 
@@ -1773,8 +1770,8 @@ RefoldIncludeMaterializer::ComputeIncludeTextEdits(
   RefoldHeaderIncludeEditPlanner planner(
       model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, lineDirs_,
       sourceMapper_, paths_, macroStateProof_, lineControlProof_,
-      ownerStateProof_, proofLattice_, textEditAssembler_,
-      sidebandPragmaEdits_, lexLang_);
+      ownerStateProof_, acceptedCandidateBuilder_, acceptedResultRanker_,
+      textEditAssembler_, sidebandPragmaEdits_, lexLang_);
   return planner.Compute(ie, std::move(headerText));
 }
 
@@ -1785,8 +1782,8 @@ RefoldIncludeMaterializer::ComputeChildBoundaryInsertByte(
   RefoldHeaderIncludeEditPlanner planner(
       model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, lineDirs_,
       sourceMapper_, paths_, macroStateProof_, lineControlProof_,
-      ownerStateProof_, proofLattice_, textEditAssembler_,
-      sidebandPragmaEdits_, lexLang_);
+      ownerStateProof_, acceptedCandidateBuilder_, acceptedResultRanker_,
+      textEditAssembler_, sidebandPragmaEdits_, lexLang_);
   return planner.ComputeChildBoundaryInsertByte(p, file, witness);
 }
 

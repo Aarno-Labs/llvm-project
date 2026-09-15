@@ -37,7 +37,8 @@ namespace refold {
 
 class RefoldMacroPatchPlanner;
 class RefoldOwnerStateProof;
-class RefoldProofLattice;
+class RefoldMacroPatchProofClassifier;
+class RefoldMacroWholeCoverPlanBuilder;
 class RefoldSourceMapper;
 class RefoldStructuralHunkDispatcher;
 
@@ -108,7 +109,8 @@ void applyForcedCounterPatches(
     const RefoldSourceMapper &sourceMapper,
     const RefoldMacroTopology &macroTopology,
     const RefoldMacroPatchPlanner &macroPatchPlanner,
-    const RefoldProofLattice &proofLattice,
+    const RefoldMacroWholeCoverPlanBuilder &wholeCoverPlanBuilder,
+    const RefoldMacroPatchProofClassifier &macroPatchProofClassifier,
     const RefoldOwnerStateProof &ownerStateProof,
     RefoldStructuralHunkDispatcher &structuralHunkDispatcher);
 

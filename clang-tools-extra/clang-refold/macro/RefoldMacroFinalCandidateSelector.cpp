@@ -17,8 +17,8 @@
 #include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
+#include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldAcceptedResultRanker.h"
-#include "proof/RefoldProofLattice.h"
 #include "util/StringUtils.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -141,8 +141,8 @@ void noteFinalMacroCandidateOrigin(FinalMacroCandidateAdmissionContext &ctx,
 /// callsite replay cannot suppress realization.
 bool addFinalMacroCandidate(
     const RefoldMacroReplayStabilityValidator &replayStabilityValidator,
-    RefoldProofLattice &lattice, FinalMacroCandidateAdmissionContext &ctx,
-    FinalMacroCandidate candidate) {
+    const RefoldAcceptedCandidateBuilder &candidateBuilder,
+    FinalMacroCandidateAdmissionContext &ctx, FinalMacroCandidate candidate) {
   REFOLD_LOG_TRACE(
       "macro/final-candidate",
       "consider inv id={0} name={1} origin={2} proof={3} preserves={4} "
@@ -225,9 +225,8 @@ bool addFinalMacroCandidate(
     return false;
   }
 
-  candidate.selectionCandidate =
-      lattice.AcceptedCandidateBuilder().BuildMacroSelectionCandidate(
-          candidate.patch, ctx.allowNonTopLevelMacroSelectorFailure);
+  candidate.selectionCandidate = candidateBuilder.BuildMacroSelectionCandidate(
+      candidate.patch, ctx.allowNonTopLevelMacroSelectorFailure);
   ctx.candidates.push_back(std::move(candidate));
   noteFinalMacroCandidateOrigin(ctx, ctx.candidates.back().origin);
   REFOLD_LOG_TRACE(
@@ -244,26 +243,26 @@ bool addFinalMacroCandidate(
 /// is intentionally over the caller-owned candidate vector so this
 /// preserves the existing realization-suppression rule exactly.
 bool theoremLatticeStructureCandidateDominatesRealization(
-    RefoldProofLattice &lattice, const FinalMacroCandidateAdmissionContext &ctx,
+    const RefoldAcceptedCandidateBuilder &candidateBuilder,
+    const RefoldAcceptedResultRanker &ranker,
+    const FinalMacroCandidateAdmissionContext &ctx,
     const MacroPatch &realizationPatch) {
   AcceptedResultCandidate realizationCandidate =
-      lattice.AcceptedCandidateBuilder().BuildAcceptedMacroCandidate(
-          realizationPatch);
-  if (!lattice.AcceptedResultRanker().IsSelectableAcceptedResultCandidate(
-          realizationCandidate))
+      candidateBuilder.BuildAcceptedMacroCandidate(realizationPatch);
+  if (!ranker.IsSelectableAcceptedResultCandidate(realizationCandidate))
     return false;
 
   for (const FinalMacroCandidate &candidate : ctx.candidates) {
     if (!candidate.patch.proof.preservesInvocationStructure ||
         candidate.patch.proof.proofRootMacroId != ctx.invocation.id)
       continue;
-    if (!lattice.AcceptedResultRanker().IsSelectableAcceptedResultCandidate(
+    if (!ranker.IsSelectableAcceptedResultCandidate(
             candidate.selectionCandidate.selectorCandidate))
       continue;
-    if (lattice.AcceptedResultRanker().ProofDominates(
+    if (ranker.ProofDominates(
             candidate.selectionCandidate.selectorCandidate.proofSummary,
             realizationCandidate.proofSummary) &&
-        !lattice.AcceptedResultRanker().ProofDominates(
+        !ranker.ProofDominates(
             realizationCandidate.proofSummary,
             candidate.selectionCandidate.selectorCandidate.proofSummary))
       return true;
@@ -276,14 +275,13 @@ bool theoremLatticeStructureCandidateDominatesRealization(
 /// continues to refer to the caller-owned final-candidate vector.
 std::optional<SelectedMacroSelectionCandidate>
 selectPreferredFinalMacroCandidate(
-    RefoldProofLattice &lattice,
+    const RefoldAcceptedResultRanker &ranker,
     const FinalMacroCandidateAdmissionContext &ctx) {
   SmallVector<MacroSelectionCandidate, 5> selectionCandidates;
   selectionCandidates.reserve(ctx.candidates.size());
   for (const FinalMacroCandidate &candidate : ctx.candidates)
     selectionCandidates.push_back(candidate.selectionCandidate);
-  return lattice.AcceptedResultRanker().SelectPreferredMacroSelectionCandidate(
-      selectionCandidates);
+  return ranker.SelectPreferredMacroSelectionCandidate(selectionCandidates);
 }
 
 /// Materialize one whole-cover realization candidate and attach its
@@ -532,12 +530,10 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
             // Both candidates are individually viable but not merge-compatible.
             // Defer to the proof lattice rather than letting the direct replay
             // win merely because it was produced in this local path.
-            const bool preferDirect =
-                deps_.proofLattice.AcceptedResultRanker().ProofDominates(
-                    argsOnlyCandidate->proofSummary,
-                    existingPatch->proofSummary);
+            const bool preferDirect = deps_.acceptedResultRanker.ProofDominates(
+                argsOnlyCandidate->proofSummary, existingPatch->proofSummary);
             const bool preferExisting =
-                deps_.proofLattice.AcceptedResultRanker().ProofDominates(
+                deps_.acceptedResultRanker.ProofDominates(
                     existingPatch->proofSummary,
                     argsOnlyCandidate->proofSummary);
             if (preferExisting && !preferDirect) {
@@ -642,21 +638,24 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
 
   if (argsOnlyCandidate) {
     addFinalMacroCandidate(
-        deps_.replayStabilityValidator, deps_.proofLattice, finalAdmissionCtx,
+        deps_.replayStabilityValidator, deps_.acceptedCandidateBuilder,
+        finalAdmissionCtx,
         FinalMacroCandidate{*argsOnlyCandidate, MacroSelectionCandidate{},
                             FinalMacroCandidateOrigin::DirectArgsOnly});
   }
 
   if (dagRootCandidate) {
     addFinalMacroCandidate(
-        deps_.replayStabilityValidator, deps_.proofLattice, finalAdmissionCtx,
+        deps_.replayStabilityValidator, deps_.acceptedCandidateBuilder,
+        finalAdmissionCtx,
         FinalMacroCandidate{*dagRootCandidate, MacroSelectionCandidate{},
                             FinalMacroCandidateOrigin::DagRootReplay});
   }
 
   if (canReuseExistingCallsiteNoOp && existingPatch) {
     addFinalMacroCandidate(
-        deps_.replayStabilityValidator, deps_.proofLattice, finalAdmissionCtx,
+        deps_.replayStabilityValidator, deps_.acceptedCandidateBuilder,
+        finalAdmissionCtx,
         FinalMacroCandidate{
             *existingPatch, MacroSelectionCandidate{},
             FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp});
@@ -664,7 +663,8 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
 
   if (canReuseExistingCallsiteSkipWholeCover && existingPatch) {
     addFinalMacroCandidate(
-        deps_.replayStabilityValidator, deps_.proofLattice, finalAdmissionCtx,
+        deps_.replayStabilityValidator, deps_.acceptedCandidateBuilder,
+        finalAdmissionCtx,
         FinalMacroCandidate{
             *existingPatch, MacroSelectionCandidate{},
             FinalMacroCandidateOrigin::ReuseExistingCallsiteSkipWholeCover});
@@ -672,13 +672,15 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
 
   if (canReuseExistingExpanded && existingExpandedPatch &&
       !theoremLatticeStructureCandidateDominatesRealization(
-          deps_.proofLattice, finalAdmissionCtx, *existingExpandedPatch)) {
+          deps_.acceptedCandidateBuilder, deps_.acceptedResultRanker,
+          finalAdmissionCtx, *existingExpandedPatch)) {
     // Reuse of an already-expanded same-owner patch is a realization
     // carrier.  Structure-vs-realization preference is expressed through
     // the shared lattice selector instead of a path-local origin
     // comparison.
     addFinalMacroCandidate(
-        deps_.replayStabilityValidator, deps_.proofLattice, finalAdmissionCtx,
+        deps_.replayStabilityValidator, deps_.acceptedCandidateBuilder,
+        finalAdmissionCtx,
         FinalMacroCandidate{*existingExpandedPatch, MacroSelectionCandidate{},
                             FinalMacroCandidateOrigin::ReuseExistingExpanded});
   }
@@ -724,7 +726,8 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
         materializeWholeCoverPatch(deps_.proofCertifier, wholeCoverCandidate);
     const bool structureCandidateDominatesWholeCover =
         theoremLatticeStructureCandidateDominatesRealization(
-            deps_.proofLattice, finalAdmissionCtx, patch);
+            deps_.acceptedCandidateBuilder, deps_.acceptedResultRanker,
+            finalAdmissionCtx, patch);
     REFOLD_LOG_TRACE(
         "macro/final-candidate",
         "whole-cover-candidate inv id={0} name={1} dominatedByStructure={2} replacement='{3}'",
@@ -732,7 +735,8 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
         stringutils::showWsWithClip(patch.replacement, 220));
     if (!structureCandidateDominatesWholeCover)
       addFinalMacroCandidate(
-          deps_.replayStabilityValidator, deps_.proofLattice, finalAdmissionCtx,
+          deps_.replayStabilityValidator, deps_.acceptedCandidateBuilder,
+          finalAdmissionCtx,
           FinalMacroCandidate{
               patch, MacroSelectionCandidate{},
               FinalMacroCandidateOrigin::WholeCoverRealization});
@@ -754,7 +758,8 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
   // preserving the parallel final-admission candidate array for
   // recovering the selected patch.
   const std::optional<SelectedMacroSelectionCandidate> selectedCandidate =
-      selectPreferredFinalMacroCandidate(deps_.proofLattice, finalAdmissionCtx);
+      selectPreferredFinalMacroCandidate(deps_.acceptedResultRanker,
+                                         finalAdmissionCtx);
   if (!selectedCandidate) {
     REFOLD_LOG_TRACE(
         "macro/proof",

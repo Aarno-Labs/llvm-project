@@ -30,7 +30,8 @@
 #include "macro/RefoldMacroStateRepairPlanner.h"
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "proof/RefoldOwnerStateProof.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldProofServices.h"
+#include "proof/RefoldProofSummaryBuilder.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldMixedOwnerTilingPlanner.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
@@ -100,8 +101,8 @@ RefoldBInsertionLedger &RefoldEngine::BInsertionLedger() {
 void RefoldEngine::InitializeWholeCoverPlanBuilder() {
   // Whole-cover plan computation reads only the A->B source mapper and the
   // B-insertion claim ledger.  It is deliberately constructed here, ahead of
-  // the proof lattice and the macro patch planner, because both of those --
-  // and the text-edit assembler -- consume plans.  Computing the plan inside
+  // the macro patch planner and the text-edit assembler, because both of those
+  // consume plans.  Computing the plan inside
   // the planner is what previously forced the lattice and the assembler to
   // reach it through a late-bound std::function installed after construction.
   wholeCoverPlanBuilder_ = std::make_unique<RefoldMacroWholeCoverPlanBuilder>(
@@ -307,7 +308,8 @@ void RefoldEngine::InitializeMacroStateProof() {
 
 void RefoldEngine::InitializeIncludeInsertionPlanner() {
   includeInsertionPlanner_ = std::make_unique<RefoldIncludeInsertionPlanner>(
-      bSource_, bToks_, bTokOff_, sourceMapper_, ProofLattice());
+      bSource_, bToks_, bTokOff_, sourceMapper_,
+      ProofServices().AcceptancePathClassifier());
 }
 
 RefoldIncludeInsertionPlanner &RefoldEngine::IncludeInsertionPlanner() {
@@ -326,8 +328,9 @@ RefoldEngine::IncludeInsertionPlanner() const {
 void RefoldEngine::InitializeLineObserverLayout() {
   lineObserverLayout_ = std::make_unique<RefoldLineObserverLayout>(
       model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, abTokMapB2A_,
-      pathIdentity_, lineControlProof_, OwnerStateProof(), ProofLattice(),
-      *textEditAssembler_, lineDirs_);
+      pathIdentity_, lineControlProof_, OwnerStateProof(),
+      ProofServices().AcceptedCandidateBuilder(), *textEditAssembler_,
+      lineDirs_);
 }
 
 RefoldLineObserverLayout &RefoldEngine::LineObserverLayout() {
@@ -341,11 +344,14 @@ const RefoldLineObserverLayout &RefoldEngine::LineObserverLayout() const {
 }
 
 void RefoldEngine::InitializeTheoremAudit() {
-  // The audit is built before the lattice because the lattice takes the audit
-  // by reference.  The reverse edge -- the audit's five lattice queries -- is
-  // bound by BindProofLattice() once InitializeProofLattice() has run.
+  // The audit is built before the proof services, which take it by reference.
+  // It borrows only the proof-summary builder, which depends on B alone and is
+  // therefore built first; every other fact it audits is supplied by the
+  // caller that holds it.
+  proofSummaryBuilder_ = std::make_unique<RefoldProofSummaryBuilder>(
+      RefoldProofSummaryBuilder::Dependencies{bToks_});
   theoremAudit_ = std::make_unique<RefoldTheoremAudit>(
-      lastTheoremAudit_, terminalSink_, strict_,
+      lastTheoremAudit_, terminalSink_, *proofSummaryBuilder_, strict_,
       alignmentSemanticTheoremActive_);
 }
 
@@ -376,27 +382,20 @@ const RefoldOwnerStateProof &RefoldEngine::OwnerStateProof() const {
   return *ownerStateProof_;
 }
 
-void RefoldEngine::InitializeProofLattice() {
-  // The proof lattice receives only the inputs it needs, all by constructor
-  // injection.  TU owner/anchor diagnostics use RefoldTUEditPlanner, and
-  // whole-cover replacement text uses RefoldMacroWholeCoverPlanBuilder; both
-  // are constructed before the lattice, so neither is late-bound.
-  proofLattice_ = std::make_unique<RefoldProofLattice>(
+void RefoldEngine::InitializeProofServices() {
+  // Every input is constructed before this point and passed by reference, so
+  // no proof service is late-bound.
+  proofServices_ = std::make_unique<RefoldProofServices>(
       model_, bSource_, bToks_, sourceMapper_, tokenTextAnalysis_,
-      argTextRecovery_, macroTopology_, OwnerStateProof(), terminalSink_,
-      TUEditPlanner(), TheoremAudit(), lastTheoremAudit_, strict_,
+      argTextRecovery_, macroTopology_, OwnerStateProof(), TUEditPlanner(),
+      *proofSummaryBuilder_, TheoremAudit(), lastTheoremAudit_, strict_,
       proofAuditMode_, alignmentSemanticTheoremActive_,
-      mixedOwnerTilingSegmentBindings_, mixedOwnerTilingWitnesses_,
-      WholeCoverPlanBuilder());
-
-  // Close the audit/lattice construction cycle now that both services exist.
-  TheoremAudit().BindProofLattice(*proofLattice_);
+      mixedOwnerTilingSegmentBindings_, mixedOwnerTilingWitnesses_);
 }
 
-RefoldProofLattice &RefoldEngine::ProofLattice() { return *proofLattice_; }
-
-const RefoldProofLattice &RefoldEngine::ProofLattice() const {
-  return *proofLattice_;
+const RefoldProofServices &RefoldEngine::ProofServices() const {
+  assert(proofServices_ && "proof services not initialized");
+  return *proofServices_;
 }
 
 void RefoldEngine::InitializeMacroPatchPlanner() {
@@ -425,7 +424,10 @@ void RefoldEngine::InitializeMacroPatchPlanner() {
 
   deps.macroStateProof = &MacroStateProof();
   deps.ownerStateProof = &OwnerStateProof();
-  deps.proofLattice = &ProofLattice();
+  deps.macroPatchProofClassifier = &ProofServices().MacroPatchProofClassifier();
+  deps.acceptedCandidateBuilder = &ProofServices().AcceptedCandidateBuilder();
+  deps.acceptedResultRanker = &ProofServices().AcceptedResultRanker();
+  deps.witnessTrace = &ProofServices().WitnessTrace();
   macroPatchPlanner_ =
       std::make_unique<RefoldMacroPatchPlanner>(std::move(deps));
 }
@@ -448,7 +450,8 @@ void RefoldEngine::InitializeMacroStateRepairPlanner() {
   deps.tokenTextAnalysis = &tokenTextAnalysis_;
   deps.macroStateProof = &MacroStateProof();
   deps.ownerStateProof = &OwnerStateProof();
-  deps.proofLattice = &ProofLattice();
+  deps.macroPatchProofClassifier = &ProofServices().MacroPatchProofClassifier();
+  deps.acceptedCandidateBuilder = &ProofServices().AcceptedCandidateBuilder();
   deps.macroPatchPlanner = &MacroPatchPlanner();
   deps.textEditAssembler = textEditAssembler_.get();
   deps.terminalSink = &terminalSink_;
@@ -491,7 +494,9 @@ void RefoldEngine::InitializeTextEditAssembler() {
   textEditAssembler_ = std::make_unique<RefoldTextEditAssembler>(
       model_, bSource_, aToks_, bToks_, bTokOff_, abTokHunks_, abTokMapA2B_,
       abTokMapB2A_, sourceMapper_, pathIdentity_, MacroStateProof(), lexLang_,
-      *preprocessingStructureIndex_, ProofLattice(), WholeCoverPlanBuilder(),
+      *preprocessingStructureIndex_, *proofSummaryBuilder_,
+      ProofServices().AcceptedCandidateBuilder(),
+      ProofServices().OwnerRealizationProofBuilder(), WholeCoverPlanBuilder(),
       OwnerStateProof(), macroTopology_, lineControlProof_, lineDirs_,
       terminalSink_, TUEditPlanner(), TheoremAudit(), sidebandPragmaEdits_,
       mixedOwnerTilingWitnesses_, lastTheoremAudit_, std::move(hooks));
@@ -512,8 +517,9 @@ void RefoldEngine::InitializeIncludeMaterializer() {
       lineDirs_, finalReplaySurface_, sidebandPragmaEdits_, sourceMapper_,
       pathIdentity_, macroTopology_, lineControlProof_, LineObserverLayout(),
       MacroStateProof(), OwnerStateProof(), IncludeInsertionPlanner(),
-      ProofLattice(), *textEditAssembler_, PragmaOnceGuardRewriter(),
-      terminalSink_, lexLang_);
+      ProofServices().AcceptedCandidateBuilder(),
+      ProofServices().AcceptedResultRanker(), *textEditAssembler_,
+      PragmaOnceGuardRewriter(), terminalSink_, lexLang_);
 }
 
 //===----------------------------------------------------------------------===//
@@ -521,16 +527,17 @@ void RefoldEngine::InitializeIncludeMaterializer() {
 //===----------------------------------------------------------------------===//
 //
 // The catalog is built from producer include/pragma facts and the physical
-// header bytes, so it must follow the text-edit assembler and proof lattice it
-// authorizes edits through.  The set of headers actually inlined is recorded
-// later, by include-materialization scheduling.
+// header bytes, so it must follow the text-edit assembler and
+// accepted-candidate builder it authorizes and certifies edits through.  The
+// set of headers actually inlined is recorded later, by include-materialization
+// scheduling.
 
 void RefoldEngine::InitializePragmaOnceGuardRewriter() {
   pragmaOnceGuardRewriter_ = std::make_unique<RefoldPragmaOnceGuardRewriter>(
       RefoldPragmaOnceGuardRewriter::Dependencies{
           model_, pathIdentity_, MacroStateProof(), lineDirs_,
-          lineControlProof_, *textEditAssembler_, ProofLattice(),
-          terminalSink_, lexLang_},
+          lineControlProof_, *textEditAssembler_,
+          ProofServices().AcceptedCandidateBuilder(), terminalSink_, lexLang_},
       RefoldPragmaOnceGuardRewriter::GuardNameInputs{
           model_.GetSourcePath(), tuSourceBytes_, aSource_, bSource_});
 }
@@ -598,8 +605,9 @@ void RefoldEngine::InitializeExpansionFallbackPlanner() {
       model_, bSource_, aToks_, abTokHunks_, abTokMapB2A_, abTokAnchorProofs_,
       lineDirs_, sourceMapper_, pathIdentity_, macroTopology_,
       lineControlProof_, MacroStateProof(), *preprocessingStructureIndex_,
-      terminalSink_, lexLang_, IncludeInsertionPlanner(), ProofLattice(),
-      TheoremAudit(), lastStats_, materializedEditMappings_, std::move(hooks));
+      terminalSink_, lexLang_, IncludeInsertionPlanner(),
+      ProofServices().AcceptedCandidateBuilder(), TheoremAudit(), lastStats_,
+      materializedEditMappings_, std::move(hooks));
 }
 
 } // namespace refold

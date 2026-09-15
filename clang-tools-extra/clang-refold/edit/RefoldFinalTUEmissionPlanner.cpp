@@ -11,7 +11,7 @@
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlProof.h"
 #include "macro/RefoldMacroTopology.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldTerminalProofSink.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
 #include "util/StringUtils.h"
@@ -229,8 +229,8 @@ FinalTUEmissionContext::BuildTUMacroPatchEdit(const MacroPatch &patch,
   }
 
   textEditAssembler_.AttachAcceptedResultCarrier(
-      edit, deps_.proofLattice->AcceptedCandidateBuilder()
-                .BuildAcceptedEmittedMacroCandidate(patch));
+      edit, deps_.acceptedCandidateBuilder->BuildAcceptedEmittedMacroCandidate(
+                patch));
   return edit;
 }
 

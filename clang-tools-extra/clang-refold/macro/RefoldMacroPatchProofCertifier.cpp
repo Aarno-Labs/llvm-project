@@ -10,7 +10,8 @@
 
 #include "core/RefoldLog.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldAcceptedCandidateBuilder.h"
+#include "proof/RefoldMacroPatchProofClassifier.h"
 
 #include <utility>
 
@@ -35,7 +36,7 @@ void RefoldMacroPatchProofCertifier::CertifySelectedFinalMacroCandidate(
     const SelectedMacroSelectionCandidate &selectedCandidate,
     MacroPatch &selectedPatch) const {
   if (selectedCandidate.candidate.emittedCandidate) {
-    deps_.lattice.AcceptedCandidateBuilder().CertifySelectedMacroPatchCandidate(
+    deps_.acceptedCandidateBuilder.CertifySelectedMacroPatchCandidate(
         selectedPatch, *selectedCandidate.candidate.emittedCandidate,
         "macro/final-selector");
     return;
@@ -59,7 +60,8 @@ void RefoldMacroPatchProofCertifier::CertifyWholeCoverAcceptedCandidate(
   // Whole-cover realization has a single certifying operation: it records the
   // materialized B-token envelope, whole-cover diagnostics, proof kind, proof
   // root, and owner-realization witness together.
-  deps_.lattice.CertifyMacroWholeCoverRealizationPatch(patch, plan, invocation);
+  deps_.macroPatchProofClassifier.CertifyMacroWholeCoverRealizationPatch(
+      patch, plan, invocation);
 
   // The whole-cover replacement is `WholeCoverPlan::clippedText`, which is the
   // trimmed material of the cover's own B tokens and nothing else.  This is the
@@ -73,9 +75,9 @@ void RefoldMacroPatchProofCertifier::SetArgsOnlyStandardProof(
     MacroPatch &patch, const RefoldModel::MacroInvocation &m,
     bool wholeEnvelopeReplayValidated,
     bool definitionTapeReplayValidated) const {
-  MacroPatchProof proof = deps_.lattice.MakeMacroPatchProof(
-      MacroPatchProofKind::ArgsOnlyStandard,
-      /*preservesInvocationStructure=*/true, m.id);
+  MacroPatchProof proof =
+      makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyStandard,
+                          /*preservesInvocationStructure=*/true, m.id);
   if (wholeEnvelopeReplayValidated) {
     WholeEnvelopeReplayWitness witness;
     witness.rootMacroId = m.id;
@@ -83,7 +85,7 @@ void RefoldMacroPatchProofCertifier::SetArgsOnlyStandardProof(
     witness.definitionTapeReplayValidated = definitionTapeReplayValidated;
     proof.wholeEnvelopeReplay = witness;
   }
-  deps_.lattice.SetMacroPatchProof(patch, std::move(proof));
+  deps_.macroPatchProofClassifier.SetMacroPatchProof(patch, std::move(proof));
 }
 
 void RefoldMacroPatchProofCertifier::CertifyGeneratedCalleeReplayProof(
@@ -110,7 +112,7 @@ void RefoldMacroPatchProofCertifier::CertifyGeneratedCalleeReplayProof(
   witness.decodedStringLiteralEvidenceOnly =
       decodedStringLiteralEvidenceOnly || usesStringification;
   proof.generatedCalleeReplay = std::move(witness);
-  deps_.lattice.SetMacroPatchProof(patch, std::move(proof));
+  deps_.macroPatchProofClassifier.SetMacroPatchProof(patch, std::move(proof));
 }
 
 void RefoldMacroPatchProofCertifier::
@@ -121,12 +123,12 @@ void RefoldMacroPatchProofCertifier::
   // distinct proof kind so proof summaries, diagnostics, and accepted-path
   // ranking can audit the recursive path instead of merging it with direct
   // current-level argument replay.
-  MacroPatchProof proof = deps_.lattice.MakeMacroPatchProof(
+  MacroPatchProof proof = makeMacroPatchProof(
       MacroPatchProofKind::RecursiveTupleGeneratedCalleeReplay,
       /*preservesInvocationStructure=*/true, rootInvocation.id);
   witness.rootInvocationId = rootInvocation.id;
   proof.recursiveTupleGeneratedCalleeReplay = std::move(witness);
-  deps_.lattice.SetMacroPatchProof(patch, std::move(proof));
+  deps_.macroPatchProofClassifier.SetMacroPatchProof(patch, std::move(proof));
 }
 
 void RefoldMacroPatchProofCertifier::AttachArgsOnlyProofCarrier(

@@ -74,7 +74,7 @@ namespace refold {
 class RefoldArgTextRecovery;
 class RefoldMacroTopology;
 class RefoldMacroWholeCoverPlanBuilder;
-class RefoldProofLattice;
+class RefoldMacroPatchProofClassifier;
 class RefoldSourceMapper;
 
 // ---- DAG-candidate validation types -----------------------------------------
@@ -202,7 +202,7 @@ public:
     llvm::ArrayRef<PPTok> bToks;
     const RefoldArgTextRecovery &argTextRecovery;
     const RefoldMacroTopology &macroTopology;
-    RefoldProofLattice &proofLattice;
+    const RefoldMacroPatchProofClassifier &macroPatchProofClassifier;
     const clang::LangOptions &lexLang;
 
     /// Delegates to

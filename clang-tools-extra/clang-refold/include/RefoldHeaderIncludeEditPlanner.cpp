@@ -21,9 +21,10 @@
 #include "line-control/RefoldLineControlProof.h"
 #include "line-control/SourceLineDirectiveHelpers.h"
 #include "macro/RefoldMacroStateProof.h"
+#include "proof/RefoldAcceptedCandidateBuilder.h"
+#include "proof/RefoldAcceptedResultRanker.h"
 #include "proof/RefoldNeutralityProof.h"
 #include "proof/RefoldOwnerStateProof.h"
-#include "proof/RefoldProofLattice.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldSourceGapProof.h"
@@ -198,7 +199,8 @@ RefoldHeaderIncludeEditPlanner::RefoldHeaderIncludeEditPlanner(
     const RefoldMacroStateProof &macroStateProof,
     const RefoldLineControlProof &lineControlProof,
     const RefoldOwnerStateProof &ownerStateProof,
-    const RefoldProofLattice &proofLattice,
+    const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
+    const RefoldAcceptedResultRanker &acceptedResultRanker,
     const RefoldTextEditAssembler &textEditAssembler,
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     const clang::LangOptions &lexLang)
@@ -206,7 +208,9 @@ RefoldHeaderIncludeEditPlanner::RefoldHeaderIncludeEditPlanner(
       bTokOff_(bTokOff), abTokMapA2B_(abTokMapA2B), lineDirs_(lineDirs),
       sourceMapper_(sourceMapper), paths_(paths),
       macroStateProof_(macroStateProof), lineControlProof_(lineControlProof),
-      ownerStateProof_(ownerStateProof), proofLattice_(proofLattice),
+      ownerStateProof_(ownerStateProof),
+      acceptedCandidateBuilder_(acceptedCandidateBuilder),
+      acceptedResultRanker_(acceptedResultRanker),
       textEditAssembler_(textEditAssembler),
       sidebandPragmaEdits_(sidebandPragmaEdits), lexLang_(lexLang) {}
 
@@ -2042,13 +2046,13 @@ RefoldHeaderIncludeEditPlanner::SelectBestInsertCandidate(
   acceptedCandidates.reserve(candidates.size());
   for (const InsertAnchorCandidate &candidate : candidates) {
     acceptedCandidates.push_back(
-        proofLattice_.AcceptedCandidateBuilder().BuildAcceptedIncludeCandidate(
+        acceptedCandidateBuilder_.BuildAcceptedIncludeCandidate(
             candidate.path, patch, &candidate.witness));
   }
 
   const std::optional<SelectedAcceptedResultCandidate> selected =
-      proofLattice_.AcceptedResultRanker()
-          .SelectPreferredAcceptedResultCandidate(acceptedCandidates);
+      acceptedResultRanker_.SelectPreferredAcceptedResultCandidate(
+          acceptedCandidates);
   if (!selected)
     return std::nullopt;
 
@@ -2539,11 +2543,9 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
         return plan;
       }
       textEditAssembler_.AttachAcceptedResultCarrier(
-          edit,
-          proofLattice_.AcceptedCandidateBuilder()
-              .BuildAcceptedIncludeCandidate(
-                  AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, p,
-                  &directWitness));
+          edit, acceptedCandidateBuilder_.BuildAcceptedIncludeCandidate(
+                    AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, p,
+                    &directWitness));
       plan.edits.push_back(std::move(edit));
       continue;
     }
@@ -2967,10 +2969,9 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
       return plan;
     }
     textEditAssembler_.AttachAcceptedResultCarrier(
-        edit,
-        proofLattice_.AcceptedCandidateBuilder().BuildAcceptedIncludeCandidate(
-            AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, p,
-            &mappedHeaderWitness));
+        edit, acceptedCandidateBuilder_.BuildAcceptedIncludeCandidate(
+                  AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, p,
+                  &mappedHeaderWitness));
     plan.edits.push_back(std::move(edit));
   }
 

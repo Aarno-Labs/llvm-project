@@ -79,8 +79,8 @@
 #include "include/RefoldIncludeInsertionPlanner.h"
 #include "include/RefoldIncludeMaterializationScheduler.h"
 #include "include/RefoldIncludeMaterializer.h"
-#include "include/RefoldPragmaOnceGuardRewriter.h"
 #include "include/RefoldIncludeReplayProof.h"
+#include "include/RefoldPragmaOnceGuardRewriter.h"
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/RefoldLineControlProof.h"
 #include "line-control/RefoldLineObserverLayout.h"
@@ -92,7 +92,7 @@
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "proof/RefoldNeutralityProof.h"
 #include "proof/RefoldOwnerStateProof.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldProofServices.h"
 #include "sideband/RefoldSidebandPragmaEdits.h"
 #include "source/RefoldMixedOwnerTilingPlanner.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
@@ -403,7 +403,8 @@ RefoldEngine::RefoldEngine(
       lineDirs_(!noLines, model_.GetPPCwd()),
       pathIdentity_(model_, model_.GetPPCwd(), /*emitAbsPaths=*/false),
       strict_(strict), proofAuditMode_(proofAuditMode),
-      lexLang_(makeRefoldLexLangOptions(model_.GetPPLang(), model_.GetPPArgv())),
+      lexLang_(
+          makeRefoldLexLangOptions(model_.GetPPLang(), model_.GetPPArgv())),
       argTextRecovery_(lexLang_), tokenTextAnalysis_(lexLang_),
       terminalSink_(RefoldTerminalProofSinkCallbacks{
           [this](const TerminalFallbackProofFailure &failure, StringRef role) {
@@ -414,7 +415,7 @@ RefoldEngine::RefoldEngine(
             TheoremAudit().NoteTheoremAuditViolation(detail);
           },
           [this](const TerminalFallbackRequest &request) {
-            ProofLattice().WitnessTrace().TraceWitnessFallback(request);
+            ProofServices().WitnessTrace().TraceWitnessFallback(request);
           }}),
       finalReplaySurface_(buildFinalReplaySurface(model_, finalOutputPath)),
       materializedEditMappings_(materializedEditMappings),
@@ -451,7 +452,7 @@ RefoldEngine::RefoldEngine(
   InitializeBInsertionLedger();
   InitializeWholeCoverPlanBuilder();
   InitializeCounterStabilization();
-  InitializeProofLattice();
+  InitializeProofServices();
   InitializeMacroPatchPlanner();
   InitializeIncludeInsertionPlanner();
   InitializeTextEditAssembler();
@@ -1401,7 +1402,8 @@ std::string RefoldEngine::Refold() {
   // Once the structural pass finishes, any surviving theorem-audit violation
   // must be converted into the one explicit terminal fallback rather than
   // merely being reported.
-  TheoremAudit().EnforceTheoremAuditInvariants();
+  TheoremAudit().EnforceTheoremAuditInvariants(
+      ProofServices().WitnessTrace().GetWitnessResolverMode());
 
   if (terminalSink_.HasRequest()) {
     out = expansionFallbackPlanner_->ResolvePostStructuralFallback();
@@ -1924,8 +1926,9 @@ bool RefoldEngine::StageSidebandEdits(
   // TU/include/macro realization can strip or avoid any separately-owned
   // sideband replay bytes from ordinary hunk replacements.
   return appendSidebandPragmaSourceEdits(
-      sidebandPragmaEdits_, model_, tuPath, tuBytes, pathIdentity_, *textEditAssembler_,
-      ProofLattice(), terminalSink_, structuralHunkDispatcher);
+      sidebandPragmaEdits_, model_, tuPath, tuBytes, pathIdentity_,
+      *textEditAssembler_, ProofServices().AcceptedCandidateBuilder(),
+      terminalSink_, structuralHunkDispatcher);
 }
 
 void RefoldEngine::RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
@@ -2076,9 +2079,9 @@ bool RefoldEngine::DispatchStructuralHunks(
       return false;
 
     const AcceptedResultCandidate macroAccepted =
-        ProofLattice().AcceptedCandidateBuilder().BuildAcceptedMacroCandidate(
+        ProofServices().AcceptedCandidateBuilder().BuildAcceptedMacroCandidate(
             macroCandidate);
-    if (!ProofLattice()
+    if (!ProofServices()
              .AcceptedResultRanker()
              .IsSelectableAcceptedResultCandidate(macroAccepted))
       return false;
@@ -2208,7 +2211,7 @@ bool RefoldEngine::DispatchStructuralHunks(
     }
 
     AcceptedResultCandidate tuCandidate =
-        ProofLattice()
+        ProofServices()
             .AcceptedCandidateBuilder()
             .BuildAcceptedTUTextEditCandidate(
                 AcceptedPathKind::TUByteSpanMappedEdit, hunk, *spanPlan,
@@ -2224,7 +2227,7 @@ bool RefoldEngine::DispatchStructuralHunks(
     // preference, so the composite is asked for here rather than folded into
     // the order that every other selection site scans.
     const bool prefersExactTUArgumentEdit =
-        ProofLattice()
+        ProofServices()
             .AcceptedResultRanker()
             .IsSelectableAcceptedResultCandidate(tuCandidate) &&
         RefoldAcceptedResultRanker::ProvenEquivalentArtifactPrefers(
@@ -2600,8 +2603,8 @@ bool RefoldEngine::DispatchStructuralHunks(
               TerminalFallbackFailureContext::ForHunkTokenEnvelope(
                   i, h.aStart, h.aEnd, h.bStart, h.bEnd)),
           "classify",
-          ProofLattice().BuildOwnerUnresolvedNoTUAnchorDetail(i, h, tuPath,
-                                                              owner, mapsToTU));
+          TUEditPlanner().BuildOwnerUnresolvedNoTUAnchorDetail(
+              i, h, tuPath, owner, mapsToTU));
       continue;
     }
 
@@ -2654,8 +2657,10 @@ bool RefoldEngine::DispatchStructuralHunks(
               MacroPatch wholeCoverPatch{*invocation->invB, *invocation->invE,
                                          wholeCoverPlan->clippedText,
                                          invocation->id};
-              ProofLattice().CertifyMacroWholeCoverRealizationPatch(
-                  wholeCoverPatch, *wholeCoverPlan, *invocation);
+              ProofServices()
+                  .MacroPatchProofClassifier()
+                  .CertifyMacroWholeCoverRealizationPatch(
+                      wholeCoverPatch, *wholeCoverPlan, *invocation);
               MacroPatchPlanner().CertifyMacroPatchOwnerWitness(
                   wholeCoverPatch,
                   invocation->ownerIncludeId
@@ -2694,8 +2699,8 @@ bool RefoldEngine::DispatchStructuralHunks(
             TerminalFallbackFailureContext::ForHunkTokenEnvelope(
                 i, h.aStart, h.aEnd, h.bStart, h.bEnd)),
         "classify",
-        ProofLattice().BuildOwnerUnresolvedNoTUAnchorDetail(i, h, tuPath, owner,
-                                                            mapsToTU));
+        TUEditPlanner().BuildOwnerUnresolvedNoTUAnchorDetail(i, h, tuPath,
+                                                             owner, mapsToTU));
     continue;
   }
 
@@ -2900,8 +2905,9 @@ std::string RefoldEngine::FinalizeStructuralResult(
   if (!forcedCounters.empty())
     applyForcedCounterPatches(forcedCounters, bToks_, sourceMapper_,
                               macroTopology_, MacroPatchPlanner(),
-                              ProofLattice(), OwnerStateProof(),
-                              structuralHunkDispatcher);
+                              WholeCoverPlanBuilder(),
+                              ProofServices().MacroPatchProofClassifier(),
+                              OwnerStateProof(), structuralHunkDispatcher);
 
   auto sourceAuthoredLineControlDominatesSite =
       [&](const RefoldModel::MacroInvocation &site) -> bool {
@@ -3032,8 +3038,9 @@ std::string RefoldEngine::FinalizeStructuralResult(
       if (stagingSlot.existingPatch)
         MacroPatchPlanner().CarryMacroPatchOwnerCertificate(
             patch, *stagingSlot.existingPatch);
-      ProofLattice().CertifyMacroWholeCoverRealizationPatch(patch, *plan,
-                                                            *site);
+      ProofServices()
+          .MacroPatchProofClassifier()
+          .CertifyMacroWholeCoverRealizationPatch(patch, *plan, *site);
       MacroPatchPlanner().CertifyMacroPatchOwnerWitness(
           patch, site->ownerIncludeId ? Owner::Include(*site->ownerIncludeId)
                                       : Owner::TU());
@@ -3055,7 +3062,8 @@ std::string RefoldEngine::FinalizeStructuralResult(
   // Materialize merged macro patches into the list buckets expected by later
   // planning passes. The dispatcher owns the DenseMap merge buckets and
   // flattens them deterministically before final include/TU emission.
-  structuralHunkDispatcher.FinalizeMacroPatchBuckets(ProofLattice());
+  structuralHunkDispatcher.FinalizeMacroPatchBuckets(
+      ProofServices().AcceptedCandidateBuilder());
 
   if (!structuralHunkDispatcher.AppendLineObserverRealizationEdits(
           LineObserverLayout(), tuPath, tuBytes))
@@ -3077,7 +3085,8 @@ std::string RefoldEngine::FinalizeStructuralResult(
   includeSchedulerDeps.lineObserverLayout = lineObserverLayout_.get();
   includeSchedulerDeps.macroStateRepairPlanner = macroStateRepairPlanner_.get();
   includeSchedulerDeps.textEditAssembler = textEditAssembler_.get();
-  includeSchedulerDeps.proofLattice = proofLattice_.get();
+  includeSchedulerDeps.acceptedCandidateBuilder =
+      &ProofServices().AcceptedCandidateBuilder();
   includeSchedulerDeps.pragmaOnceGuards = pragmaOnceGuardRewriter_.get();
   includeSchedulerDeps.terminalSink = &terminalSink_;
   includeSchedulerDeps.sidebandPragmaEdits = &sidebandPragmaEdits_;
@@ -3117,7 +3126,8 @@ std::string RefoldEngine::FinalizeStructuralResult(
   finalEmissionDeps.lineDirs = &lineDirs_;
   finalEmissionDeps.macroStateRepairPlanner = macroStateRepairPlanner_.get();
   finalEmissionDeps.textEditAssembler = textEditAssembler_.get();
-  finalEmissionDeps.proofLattice = proofLattice_.get();
+  finalEmissionDeps.acceptedCandidateBuilder =
+      &ProofServices().AcceptedCandidateBuilder();
   finalEmissionDeps.terminalSink = &terminalSink_;
   finalEmissionDeps.materializedEditMappings = materializedEditMappings_;
   finalEmissionDeps.finalLineControlPruneCandidates =
@@ -3146,7 +3156,7 @@ std::string RefoldEngine::FinalizeStructuralResult(
   // and is consumed only by isolated alignment simulations.
   AlignmentSemanticTopologyKeyResult topologyKey =
       structuralHunkDispatcher.BuildAlignmentSemanticTopologyKey(
-          ProofLattice().EquivalenceKeyBuilder(), tuBytes);
+          ProofServices().EquivalenceKeyBuilder(), tuBytes);
   for (uint64_t includeId :
        includeMaterializationScheduler.ExpandedIncludeIds())
     topologyKey.preservationFootprint.expandedIncludeIds.push_back(includeId);

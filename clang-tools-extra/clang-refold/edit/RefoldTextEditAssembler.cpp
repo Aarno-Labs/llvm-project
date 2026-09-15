@@ -20,9 +20,11 @@
 #include "line-control/RefoldLineControlProof.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
+#include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldAcceptedResultPredicates.h"
+#include "proof/RefoldOwnerRealizationProofBuilder.h"
 #include "proof/RefoldOwnerStateProof.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldProofSummaryBuilder.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldStructuralHunkTilingProof.h"
 #include "proof/RefoldTheoremAudit.h"
@@ -2185,7 +2187,7 @@ bool RefoldTextEditAssembler::EmittedTextEditHasDischargedAcceptedResults(
     }
 
     const std::optional<TheoremProofClass> theoremProof =
-        proofLattice_.ProofSummaryBuilder().NormalizeAcceptedProof(carrier);
+        proofSummaryBuilder_.NormalizeAcceptedProof(carrier);
     if (!theoremProof) {
       if (carrier.proofSummary.theoremClass == TheoremProofClass::Unknown) {
         ++theoremAudit_.emittedUnknownClassCarriers;
@@ -2405,7 +2407,7 @@ bool RefoldTextEditAssembler::EmittedTextEditHasOrderedAcceptedProofComposition(
       return failComposition("composite edit carried a null proof segment");
 
     const std::optional<TheoremProofClass> theoremProof =
-        proofLattice_.ProofSummaryBuilder().NormalizeAcceptedProof(*carrierPtr);
+        proofSummaryBuilder_.NormalizeAcceptedProof(*carrierPtr);
     if (!theoremProof)
       return failComposition(
           "composite edit contained a carrier that did not normalize");
@@ -3001,11 +3003,10 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
         TUByteSpanPlan mergedSpan(mergedHunk.aStart, mergedHunk.aEnd, s,
                                   t, combinedBaseSpan->insertionAnchor);
         AttachAcceptedResultCarrier(
-            merged, proofLattice_.AcceptedCandidateBuilder()
-                        .BuildAcceptedTUTextEditCandidate(
-                            AcceptedPathKind::TUByteSpanConservativeEdit,
-                            mergedHunk, mergedSpan,
-                            /*structuralBinding=*/nullptr, replacement));
+            merged, acceptedCandidateBuilder_.BuildAcceptedTUTextEditCandidate(
+                        AcceptedPathKind::TUByteSpanConservativeEdit,
+                        mergedHunk, mergedSpan,
+                        /*structuralBinding=*/nullptr, replacement));
 
         return merged;
       };
@@ -3479,11 +3480,10 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     for (size_t editIndex : best->editIndices)
       appendUniqueProtectedSourceAuthorizations(closure, norm[editIndex]);
     AttachAcceptedResultCarrier(
-        closure, proofLattice_.AcceptedCandidateBuilder()
-                     .BuildAcceptedTUTextEditCandidate(
-                         AcceptedPathKind::TUByteSpanConservativeEdit,
-                         closedHunk, closedSpan,
-                         /*structuralBinding=*/nullptr, replacement));
+        closure, acceptedCandidateBuilder_.BuildAcceptedTUTextEditCandidate(
+                     AcceptedPathKind::TUByteSpanConservativeEdit, closedHunk,
+                     closedSpan,
+                     /*structuralBinding=*/nullptr, replacement));
 
     // Replace the absorbed direct edits with the single closed realization and
     // re-sort so downstream application sees a normal non-overlapping edit set.
@@ -4355,15 +4355,13 @@ RefoldTextEditAssembler::BuildDirectTUHunkTextEdit(
     CertifyTextEditMaterializedBByteRange(edit, *plan->materializedBByteBegin,
                                           *plan->materializedBByteEnd);
   AcceptedResultCandidate candidate =
-      proofLattice_.AcceptedCandidateBuilder().BuildAcceptedTUTextEditCandidate(
+      acceptedCandidateBuilder_.BuildAcceptedTUTextEditCandidate(
           plan->acceptedPath, plan->hunk, plan->span,
           /*structuralBinding=*/nullptr, plan->acceptedPayload);
-  proofLattice_.OwnerRealizationProofBuilder()
-      .AttachMixedOwnerTilingWitnessForTokenEnvelope(
-          candidate.proofSummary, plan->hunk.aStart, plan->hunk.aEnd,
-          plan->hunk.bStart, plan->hunk.bEnd);
-  proofLattice_.OwnerRealizationProofBuilder().AttachStandardWitnesses(
-      candidate);
+  ownerRealizationProofBuilder_.AttachMixedOwnerTilingWitnessForTokenEnvelope(
+      candidate.proofSummary, plan->hunk.aStart, plan->hunk.aEnd,
+      plan->hunk.bStart, plan->hunk.bEnd);
+  ownerRealizationProofBuilder_.AttachStandardWitnesses(candidate);
   AttachAcceptedResultCarrier(edit, candidate);
   return edit;
 }

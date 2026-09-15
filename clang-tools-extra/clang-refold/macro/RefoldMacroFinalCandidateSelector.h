@@ -46,7 +46,8 @@ class RefoldMacroPatchReusePhase;
 class RefoldMacroReplayStabilityValidator;
 class RefoldMacroTopology;
 class RefoldMacroWholeCoverPlanBuilder;
-class RefoldProofLattice;
+class RefoldAcceptedCandidateBuilder;
+class RefoldAcceptedResultRanker;
 
 /// Final whole-cover-family candidate selector.
 ///
@@ -60,7 +61,8 @@ public:
   struct Dependencies {
     const RefoldModel &model;
     const RefoldMacroTopology &topology;
-    RefoldProofLattice &proofLattice;
+    const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder;
+    const RefoldAcceptedResultRanker &acceptedResultRanker;
     const RefoldMacroReplayStabilityValidator &replayStabilityValidator;
     const RefoldMacroPatchProofCertifier &proofCertifier;
     const RefoldMacroPatchReusePhase &patchReusePhase;

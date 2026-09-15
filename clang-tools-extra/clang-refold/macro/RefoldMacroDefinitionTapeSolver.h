@@ -10,8 +10,8 @@
 // (the caller continues with paste-aware and standard-formal replay paths).
 //
 // Proof carrier attachment is performed inside this service through the
-// borrowed RefoldProofLattice; the planner does not need to certify anything
-// after the returned MacroPatch.
+// borrowed macro-patch proof classifier; the planner does not need to certify
+// anything after the returned MacroPatch.
 //
 //===----------------------------------------------------------------------===//
 
@@ -36,7 +36,8 @@
 namespace clang {
 namespace refold {
 
-class RefoldProofLattice;
+class RefoldMacroPatchProofClassifier;
+class RefoldWitnessTrace;
 class RefoldSourceMapper;
 
 /// Replays macro definition replacement-list text for definition-tape based
@@ -49,7 +50,8 @@ public:
     llvm::ArrayRef<PPTok> aToks;
     llvm::ArrayRef<PPTok> bToks;
     const RefoldSourceMapper *sourceMapper = nullptr;
-    RefoldProofLattice *proofLattice = nullptr;
+    const RefoldMacroPatchProofClassifier *macroPatchProofClassifier = nullptr;
+    const RefoldWitnessTrace *witnessTrace = nullptr;
     const clang::LangOptions *lexLang = nullptr;
   };
 

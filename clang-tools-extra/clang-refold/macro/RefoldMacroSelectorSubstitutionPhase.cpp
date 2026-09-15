@@ -19,7 +19,7 @@
 #include "macro/RefoldMacroDAGSharedHelpers.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldMacroPatchProofClassifier.h"
 #include "source/RefoldSourceMapper.h"
 #include "util/StringUtils.h"
 
@@ -725,15 +725,15 @@ RefoldMacroSelectorSubstitutionPhase::TryDirectCalleeSubstitution(
   patch.materialized.outputByteStart = calleeByteRange->first;
   patch.materialized.outputByteEnd =
       calleeByteRange->first + candidates.front().newCalleeSize;
-  MacroPatchProof proof = deps_.proofLattice.MakeMacroPatchProof(
-      MacroPatchProofKind::DirectCalleeSubstitution,
-      /*preservesInvocationStructure=*/true, m.id);
+  MacroPatchProof proof =
+      makeMacroPatchProof(MacroPatchProofKind::DirectCalleeSubstitution,
+                          /*preservesInvocationStructure=*/true, m.id);
   WholeEnvelopeReplayWitness wholeEnvelopeWitness;
   wholeEnvelopeWitness.rootMacroId = m.id;
   wholeEnvelopeWitness.replayValidated = true;
   wholeEnvelopeWitness.definitionTapeReplayValidated = true;
   proof.wholeEnvelopeReplay = wholeEnvelopeWitness;
-  deps_.proofLattice.SetMacroPatchProof(patch, std::move(proof));
+  deps_.macroPatchProofClassifier.SetMacroPatchProof(patch, std::move(proof));
   REFOLD_LOG_TRACE(
       "macro/direct-callee",
       "built-patch inv id={0} name={1} replacement='{2}' invBytes=[{3},{4}) "
@@ -1168,10 +1168,10 @@ std::optional<MacroPatch> RefoldMacroSelectorSubstitutionPhase::Run(
   patch.materialized.outputByteStart = candidates.front().selectorByteBegin;
   patch.materialized.outputByteEnd =
       candidates.front().selectorByteBegin + candidates.front().newSelectorSize;
-  deps_.proofLattice.SetMacroPatchProof(
-      patch, deps_.proofLattice.MakeMacroPatchProof(
-                 MacroPatchProofKind::PasteDerivedCalleeSelector,
-                 /*preservesInvocationStructure=*/true, m.id));
+  deps_.macroPatchProofClassifier.SetMacroPatchProof(
+      patch,
+      makeMacroPatchProof(MacroPatchProofKind::PasteDerivedCalleeSelector,
+                          /*preservesInvocationStructure=*/true, m.id));
   return patch;
 }
 

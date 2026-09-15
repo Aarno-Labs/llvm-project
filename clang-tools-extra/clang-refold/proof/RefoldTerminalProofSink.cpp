@@ -413,5 +413,34 @@ void RefoldTerminalProofSink::RequestTerminalFallback(
   REFOLD_LOG_DEBUG("fallback", "{0}", request);
 }
 
+TerminalFallbackWitness
+RefoldTerminalProofSink::BuildTerminalFallbackWitness() const {
+  TerminalFallbackWitness witness;
+
+  // Ordered typed requests are the single source of truth.  There is no
+  // branch-local fallback boolean, no primary failure scalar, and no separate
+  // proof-failure vector mirror.  The primary failed obligation is simply the
+  // first classified request failure copied into this witness.
+  witness.proofFailures.reserve(requests_.size());
+  for (const TerminalFallbackRequest &request : requests_) {
+    if (IsClassifiedTerminalFallbackProofFailure(request.failure))
+      witness.proofFailures.push_back(request.failure);
+  }
+
+  if (witness.proofFailures.empty()) {
+    // Do not derive the failed obligation from an aggregate terminal kind.  If
+    // this state is ever reached, the bug is the missing caller-supplied proof
+    // failure itself, so report a theorem-audit invariant violation rather than
+    // inventing an owner/state reason here.
+    witness.proofFailures.push_back(MakeTerminalFallbackProofFailure(
+        TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
+        TerminalFallbackFailureReason::TheoremAuditInvariantViolation,
+        TerminalFallbackFailureContext::ForStateComponent(
+            "terminalFallbackWitness")));
+  }
+
+  return witness;
+}
+
 } // namespace refold
 } // namespace clang

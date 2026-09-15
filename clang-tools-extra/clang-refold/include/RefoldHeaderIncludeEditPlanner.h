@@ -47,7 +47,8 @@ class RefoldLineControlProof;
 class RefoldMacroStateProof;
 class RefoldOwnerStateProof;
 class RefoldPreprocessingStructureIndex;
-class RefoldProofLattice;
+class RefoldAcceptedCandidateBuilder;
+class RefoldAcceptedResultRanker;
 class RefoldSourceMapper;
 class RefoldTerminalProofSink;
 class RefoldTextEditAssembler;
@@ -70,14 +71,14 @@ public:
   RefoldHeaderIncludeEditPlanner(
       const RefoldModel &model, llvm::StringRef bSource,
       llvm::ArrayRef<PPTok> aToks, llvm::ArrayRef<PPTok> bToks,
-      llvm::ArrayRef<size_t> bTokOff,
-      const std::vector<int64_t> &abTokMapA2B,
+      llvm::ArrayRef<size_t> bTokOff, const std::vector<int64_t> &abTokMapA2B,
       const LineDirectiveInserter &lineDirs,
       const RefoldSourceMapper &sourceMapper, const RefoldPathIdentity &paths,
       const RefoldMacroStateProof &macroStateProof,
       const RefoldLineControlProof &lineControlProof,
       const RefoldOwnerStateProof &ownerStateProof,
-      const RefoldProofLattice &proofLattice,
+      const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
+      const RefoldAcceptedResultRanker &acceptedResultRanker,
       const RefoldTextEditAssembler &textEditAssembler,
       llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
       const clang::LangOptions &lexLang);
@@ -751,7 +752,8 @@ private:
   const RefoldMacroStateProof &macroStateProof_;
   const RefoldLineControlProof &lineControlProof_;
   const RefoldOwnerStateProof &ownerStateProof_;
-  const RefoldProofLattice &proofLattice_;
+  const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder_;
+  const RefoldAcceptedResultRanker &acceptedResultRanker_;
   const RefoldTextEditAssembler &textEditAssembler_;
   llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits_;
   const clang::LangOptions &lexLang_;

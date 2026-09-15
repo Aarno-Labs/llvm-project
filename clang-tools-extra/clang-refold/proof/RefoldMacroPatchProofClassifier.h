@@ -22,8 +22,7 @@
 //     variant).  Share the private impl helper.
 //   * `ValidateInvocationRealizationProof` — the realization validator.
 //
-// The service has no back-reference to `RefoldProofLattice`.  The
-// three acceptance-path primitives it needs
+// The three acceptance-path primitives it needs
 // (`BuildTheoremProofClassForAcceptedPath`,
 // `InventoryMacroPatchProofAcceptancePath`,
 // `RequireAcceptedPathBaseline`) live on
@@ -57,7 +56,7 @@ class RefoldOwnerStateProof;
 class RefoldMacroPatchProofClassifier {
 public:
   /// Borrowed inputs.  Every reference must outlive the classifier;
-  /// the lattice owns the underlying storage.
+  /// `RefoldProofServices` owns the underlying storage.
   struct Dependencies {
     const RefoldMacroTopology &macroTopology;
     const RefoldOwnerStateProof &ownerStateProof;
@@ -85,6 +84,24 @@ public:
   /// Refresh derived witnesses and re-run classification into
   /// `patch.selectedProofSummary`.
   void SyncMacroPatchProofSummary(MacroPatch &patch) const;
+
+  /// Install the canonical macro proof carrier and refresh summaries.
+  ///
+  /// This is the only primary certification API for macro-patch proof
+  /// identity.  The normalized ProofSummary and its canonical EmittedProof are
+  /// rebuilt from MacroPatchProof immediately through
+  /// `SyncMacroPatchProofSummary()`.
+  void SetMacroPatchProof(MacroPatch &patch, MacroPatchProof proof) const;
+
+  /// Materialize the explicit whole-cover realization proof.
+  ///
+  /// Whole-cover output is not tracked as an anonymous fallback result.  This
+  /// helper certifies the accepted patch as a first-class
+  /// invocation-realization proof and copies the exact realization envelope
+  /// derived by the whole-cover plan into the patch-local certificate fields.
+  void CertifyMacroWholeCoverRealizationPatch(
+      MacroPatch &patch, const WholeCoverPlan &plan,
+      const RefoldModel::MacroInvocation &macro) const;
 
   /// Return whether \p m carries usable producer-side paste witnesses.
   ///

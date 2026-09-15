@@ -22,8 +22,7 @@
 // specific obligation.
 //
 // The builder is a pure function of the candidate, the source mapper,
-// and the B-token stream; it holds no per-attempt state.  It has no
-// back-reference to `RefoldProofLattice`.
+// and the B-token stream; it holds no per-attempt state.
 //
 //===----------------------------------------------------------------------===//
 

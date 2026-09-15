@@ -3,11 +3,10 @@
 // Small stateless predicates over `AcceptedResultCandidate` used by
 // several proof services.
 //
-// Kept as free functions in this dedicated leaf header (rather than as
-// static methods on `RefoldProofLattice`) so consumers like the
+// Kept as free functions in this dedicated leaf header so consumers like the
 // accepted-result ranker, witness equivalence-key builder, and
-// terminal-fallback sink can depend on them without pulling in the
-// full lattice façade.
+// terminal-fallback sink can depend on them without depending on any proof
+// service.
 //
 // Every entity here is a pure function of the candidate itself; none
 // touches lattice state, and all are defined inline to stay

@@ -3,11 +3,13 @@
 // Central theorem/audit ledger and legacy-authority audit service.
 //
 // The service owns audit policy and the mutable theorem-audit ledger.  It
-// does not own proof ranking or terminal-witness construction; those remain
-// with their producing services and are exposed through narrow query hooks
-// to avoid a service-construction cycle between RefoldProofLattice and the
-// audit ledger.  The per-attempt stats reporting helpers live here because
-// they read the same ledger and are only invoked at end-of-attempt.
+// depends only on services constructed before it -- the terminal sink and the
+// proof-summary builder.  Facts that only later proof services can produce (a
+// fresh macro-patch classification, the terminal carrier, the resolver mode)
+// are supplied by the caller that already holds them, so the audit never
+// reaches back into the proof services that report into it.  The per-attempt
+// stats reporting helpers live here because they read the same ledger and are
+// only invoked at end-of-attempt.
 //
 //===----------------------------------------------------------------------===//
 
@@ -30,7 +32,7 @@
 namespace clang {
 namespace refold {
 
-class RefoldProofLattice;
+class RefoldProofSummaryBuilder;
 
 class RefoldModel;
 
@@ -38,19 +40,9 @@ class RefoldModel;
 class RefoldTheoremAudit {
 public:
   RefoldTheoremAudit(TheoremAuditStats &audit,
-                     const RefoldTerminalProofSink &terminalSink, bool strict,
-                     const bool &alignmentSemanticTheoremActive);
-
-  /// Bind the proof lattice this audit queries, completing the service graph.
-  ///
-  /// The audit is constructed before the lattice because the lattice takes the
-  /// audit by reference; the reverse edge is therefore bound in a second phase,
-  /// once both services exist.  Splitting the cycle this way is what lets the
-  /// five lattice queries below be direct calls rather than a late-bound
-  /// callback bundle.  Every query site tolerates an unbound lattice, so an
-  /// audit that is never bound degrades to "no lattice-derived facts" instead
-  /// of dereferencing null.
-  void BindProofLattice(const RefoldProofLattice &lattice);
+                     const RefoldTerminalProofSink &terminalSink,
+                     const RefoldProofSummaryBuilder &proofSummaryBuilder,
+                     bool strict, const bool &alignmentSemanticTheoremActive);
 
   /// Return whether semantic no-legacy auditing is active for this run.
   ///
@@ -90,8 +82,10 @@ public:
   /// dashboard. This helper normalizes any surviving counter-based violations
   /// onto the theorem state and, in strict mode, requests the one explicit
   /// terminal fallback instead of allowing a structurally-refolded result to
-  /// escape with a violated theorem audit.
-  void EnforceTheoremAuditInvariants() const;
+  /// escape with a violated theorem audit.  \p resolverMode is the witness
+  /// resolver's mode for this run; the strict resolver criteria apply only
+  /// under `WitnessResolverMode::Strict`.
+  void EnforceTheoremAuditInvariants(WitnessResolverMode resolverMode) const;
 
   /// Record and enforce the final strict-domain resolver completion criteria.
   void RecordWitnessResolverTheoremAudit(
@@ -111,9 +105,16 @@ public:
   /// kind, construction order, or path-local fallback bits.
   bool AuditAcceptedResultCandidateForLegacyAuthority(
       const AcceptedResultCandidate &candidate, llvm::StringRef role) const;
+  /// Return whether `AuditMacroPatchProofForLegacyAuthority` inspects
+  /// \p patch.  Callers ask first so the fresh classification the audit
+  /// compares against is computed only when it will be read.
+  bool MacroPatchProofNeedsLegacyAudit(const MacroPatch &patch) const;
   /// Audit the selected macro-patch proof carrier for legacy-authority
   /// dependencies before the patch can act as an emitted artifact.
+  /// \p expected is a fresh classification of \p patch's proof carrier; the
+  /// audit reports the patch's recorded summary as stale when it disagrees.
   bool AuditMacroPatchProofForLegacyAuthority(const MacroPatch &patch,
+                                              const ProofSummary &expected,
                                               llvm::StringRef role) const;
   /// Audit one terminal fallback proof failure for legacy-authority
   /// dependencies.  Terminal fallback is allowed only as an explicit, named,
@@ -173,8 +174,11 @@ public:
                                          llvm::StringRef emissionOwner) const;
 
   /// Normalize terminal fallback ledger state onto the theorem-audit
-  /// carrier.
-  void RecordTerminalFallbackTheoremAudit() const;
+  /// carrier.  \p witness is the terminal witness the request ledger yields
+  /// and \p candidate the accepted terminal carrier built from it.
+  void RecordTerminalFallbackTheoremAudit(
+      const TerminalFallbackWitness &witness,
+      const AcceptedResultCandidate &candidate) const;
 
   /// Build the compact strict-mode invariant diagnostic string.
   std::string BuildTheoremAuditInvariantDetail() const;
@@ -209,7 +213,7 @@ private:
   const RefoldTerminalProofSink &terminalSink_;
   bool strict_ = false;
   const bool &alignmentSemanticTheoremActive_;
-  const RefoldProofLattice *proofLattice_ = nullptr;
+  const RefoldProofSummaryBuilder &proofSummaryBuilder_;
 };
 
 //===----------------------------------------------------------------------===//

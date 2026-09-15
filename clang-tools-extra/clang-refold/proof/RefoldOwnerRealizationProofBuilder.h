@@ -31,10 +31,10 @@
 //     strongest matching mixed-owner tiling witness for a token
 //     envelope, folding through the lattice-level preference gate.
 //
-// The service has no back-reference to `RefoldProofLattice`.  Every
-// primitive it needs is reached through the explicit `Dependencies`
-// bundle: owner-state proof, model, and the summary-builder / ranker
-// pair that arbitrate mixed-owner tiling candidates.
+// Every primitive it needs is reached through the explicit `Dependencies`
+// bundle: owner-state proof, model, the summary-builder / ranker pair that
+// arbitrate mixed-owner tiling candidates, and the acceptance-path classifier
+// that builds its starter summaries.
 //
 //===----------------------------------------------------------------------===//
 
@@ -56,13 +56,13 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
-#include <functional>
 #include <optional>
 #include <vector>
 
 namespace clang {
 namespace refold {
 
+class RefoldAcceptancePathClassifier;
 class RefoldOwnerStateProof;
 class RefoldTUEditPlanner;
 struct StructuralHunkSegmentBinding;
@@ -78,8 +78,8 @@ struct Hunk;
 /// proof summaries that represent macro, include, or TU realized output.
 class RefoldOwnerRealizationProofBuilder {
 public:
-  /// Borrowed inputs.  Every reference must outlive the builder; the
-  /// lattice owns the underlying storage.
+  /// Borrowed inputs.  Every reference must outlive the builder;
+  /// `RefoldProofServices` owns the underlying storage.
   struct Dependencies {
     const RefoldModel &model;
     const RefoldOwnerStateProof &ownerStateProof;
@@ -91,16 +91,10 @@ public:
         &mixedOwnerTilingSegmentBindings;
     const std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses;
 
-    /// Delegates to `RefoldProofLattice::BuildAcceptedPathProofSummary`.
-    /// `BuildOwnerRealizationProofSummary` uses this to initialize its starter
-    /// summary; full acceptance-path proof-summary construction stays on the
-    /// lattice.
-    std::function<ProofSummary(
-        AcceptedPathKind currentPath, const IncludePatch *patch,
-        const TUAnchorWitness *tuAnchorWitness,
-        const IncludeAnchorWitness *includeAnchorWitness,
-        const TerminalFallbackWitness *terminalFallbackWitness)>
-        buildAcceptedPathProofSummary;
+    /// `BuildOwnerRealizationProofSummary` starts from the accepted-path
+    /// summary this classifier builds.  The classifier depends on nothing
+    /// here, so it is constructed first and borrowed directly.
+    const RefoldAcceptancePathClassifier &acceptancePathClassifier;
   };
 
   explicit RefoldOwnerRealizationProofBuilder(Dependencies deps);

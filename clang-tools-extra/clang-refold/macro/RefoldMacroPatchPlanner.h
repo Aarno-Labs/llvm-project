@@ -62,7 +62,10 @@ class RefoldMacroWholeCoverPlanBuilder;
 class RefoldOwnerClassifier;
 class RefoldOwnerStateProof;
 class RefoldPathIdentity;
-class RefoldProofLattice;
+class RefoldAcceptedCandidateBuilder;
+class RefoldAcceptedResultRanker;
+class RefoldMacroPatchProofClassifier;
+class RefoldWitnessTrace;
 class RefoldSourceMapper;
 
 /// Orchestrates macro patch planning for one engine object graph.
@@ -112,7 +115,7 @@ public:
     const RefoldOwnerClassifier *ownerClassifier = nullptr;
 
     /// Whole-cover plan computation.  It depends on neither the planner nor
-    /// the proof lattice, so the service graph constructs it before both and
+    /// the proof services, so the service graph constructs it before both and
     /// the planner borrows it rather than owning the query.
     const RefoldMacroWholeCoverPlanBuilder *wholeCoverPlanBuilder = nullptr;
     bool strict = false;
@@ -127,7 +130,10 @@ public:
     // lazy engine accessors.
     RefoldMacroStateProof *macroStateProof = nullptr;
     RefoldOwnerStateProof *ownerStateProof = nullptr;
-    RefoldProofLattice *proofLattice = nullptr;
+    const RefoldMacroPatchProofClassifier *macroPatchProofClassifier = nullptr;
+    const RefoldAcceptedCandidateBuilder *acceptedCandidateBuilder = nullptr;
+    const RefoldAcceptedResultRanker *acceptedResultRanker = nullptr;
+    const RefoldWitnessTrace *witnessTrace = nullptr;
   };
 
   /// Recover per-formal argument content ranges for a function-like macro
@@ -279,12 +285,6 @@ public:
   /// Public so the whole-cover orchestrator can certify counter-literal
   /// patches without friend access.
   RefoldOwnerStateProof &GetOwnerStateProof() const;
-
-  /// Return the borrowed proof lattice used for macro-patch proof
-  /// construction, ranking, logging, and summary synchronization.  Public so
-  /// the whole-cover orchestrator and final candidate selector can build
-  /// proof carriers without friend access.
-  RefoldProofLattice &GetProofLattice() const;
 
   /// Compare expected token spellings against an A-token half-open range.
   /// Public so the selector-substitution phase can use it via callback.

@@ -27,8 +27,8 @@
 //     final index and emit the appropriate trace records.
 //
 // The ranker explicitly does NOT own proof-summary construction or witness
-// equivalence-key building; it consumes those through `RefoldProofLattice`
-// (via the `normalizeAcceptedProof` callback) and `RefoldWitnessResolver`.
+// equivalence-key building; it consumes those through
+// `RefoldProofSummaryBuilder` and `RefoldWitnessResolver`.
 //
 //===----------------------------------------------------------------------===//
 
@@ -44,12 +44,12 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <cstddef>
-#include <functional>
 #include <optional>
 
 namespace clang {
 namespace refold {
 
+class RefoldProofSummaryBuilder;
 class RefoldTheoremAudit;
 class RefoldWitnessResolver;
 class RefoldWitnessTrace;
@@ -86,15 +86,11 @@ public:
     /// by `SelectPreferredCandidateIndex` to attribute selector competitions
     /// and unresolved outcomes to the appropriate run.
     TheoremAuditStats &lastTheoremAudit;
-    /// Proof-summary normalization callback.
-    /// `IsSelectableAcceptedResultCandidate` admits a candidate exactly when
-    /// `normalizeAcceptedProof(candidate)` returns a non-empty theorem class.
-    /// Implementation lives on the lattice today
-    /// (`RefoldProofLattice::NormalizeAcceptedProof`) and will move to the
-    /// proof-summary builder service when that lands.
-    std::function<std::optional<TheoremProofClass>(
-        const AcceptedResultCandidate &)>
-        normalizeAcceptedProof;
+    /// Proof-summary normalization.  `IsSelectableAcceptedResultCandidate`
+    /// admits a candidate exactly when
+    /// `proofSummaryBuilder.NormalizeAcceptedProof(candidate)` returns a
+    /// non-empty theorem class.
+    const RefoldProofSummaryBuilder &proofSummaryBuilder;
   };
 
   explicit RefoldAcceptedResultRanker(Dependencies deps);

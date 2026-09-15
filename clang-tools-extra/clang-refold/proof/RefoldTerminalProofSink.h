@@ -88,6 +88,13 @@ public:
   /// Clear the per-attempt terminal-fallback ledger before a new pass starts.
   void Reset() const { requests_.clear(); }
 
+  /// Build the terminal-fallback witness for the current refold pass.
+  ///
+  /// Captures the ordered structured failures recorded in this ledger.  The
+  /// resulting witness makes terminal fallback explicit in accepted-result
+  /// selection, theorem audit, and proof-discharge reporting.
+  TerminalFallbackWitness BuildTerminalFallbackWitness() const;
+
 private:
   RefoldTerminalProofSinkCallbacks callbacks_;
   mutable std::vector<TerminalFallbackRequest> requests_;

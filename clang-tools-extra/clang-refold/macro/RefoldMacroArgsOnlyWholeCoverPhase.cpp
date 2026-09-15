@@ -15,7 +15,7 @@
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldMacroPatchProofClassifier.h"
 #include "source/RefoldSourceMapper.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -195,10 +195,10 @@ RefoldMacroArgsOnlyWholeCoverPhase::TryPairedPureInsertionRootArgsOnly(
     if (!patch)
       continue;
 
-    deps_.proofLattice.SetMacroPatchProof(
-        *patch, deps_.proofLattice.MakeMacroPatchProof(
-                    MacroPatchProofKind::ArgsOnlyPairedPureInsertion,
-                    /*preservesInvocationStructure=*/true, m.id));
+    deps_.macroPatchProofClassifier.SetMacroPatchProof(
+        *patch,
+        makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPairedPureInsertion,
+                            /*preservesInvocationStructure=*/true, m.id));
     return patch;
   }
 

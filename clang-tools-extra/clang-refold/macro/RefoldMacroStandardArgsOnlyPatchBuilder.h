@@ -56,7 +56,7 @@ class RefoldMacroGeneratedCalleeReplayEngine;
 class RefoldMacroGeneratedLeafReplayEngine;
 class RefoldMacroPatchProofCertifier;
 class RefoldMacroTopology;
-class RefoldProofLattice;
+class RefoldMacroPatchProofClassifier;
 class RefoldSourceMapper;
 
 // ArgsOnlyPlanningContext lives in RefoldMacroPlannerHelpers.h and is shared
@@ -89,7 +89,7 @@ public:
     llvm::ArrayRef<size_t> bTokOff;
     const std::vector<diffutils::Hunk> &abTokHunks;
     RefoldMacroPatchProofCertifier &proofCertifier;
-    RefoldProofLattice &proofLattice;
+    const RefoldMacroPatchProofClassifier &macroPatchProofClassifier;
     const RefoldMacroGeneratedCalleeReplayEngine &generatedCalleeReplayEngine;
     const RefoldMacroGeneratedLeafReplayEngine &generatedLeafReplayEngine;
     bool strict = false;

@@ -14,8 +14,8 @@
 #include "line-control/LineControlEditHelpers.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlProof.h"
+#include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldOwnerStateProof.h"
-#include "proof/RefoldProofLattice.h"
 #include "util/RefoldPathIdentity.h"
 #include "util/StringUtils.h"
 
@@ -753,10 +753,10 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
     textEditAssembler_.CertifyTextEditMaterializedBByteRange(edit, prevBEnd,
                                                              initialBEnd);
     textEditAssembler_.AttachAcceptedResultCarrier(
-        edit, proofLattice_.AcceptedCandidateBuilder()
-                  .BuildAcceptedSpecializedTUTextEditCandidate(
-                      AcceptedPathKind::TUByteSpanConservativeEdit, editBegin,
-                      editEnd, replacement));
+        edit,
+        acceptedCandidateBuilder_.BuildAcceptedSpecializedTUTextEditCandidate(
+            AcceptedPathKind::TUByteSpanConservativeEdit, editBegin, editEnd,
+            replacement));
     tuEdits.push_back(std::move(edit));
   }
 
@@ -873,10 +873,10 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
     textEditAssembler_.CertifyTextEditMaterializedBByteRange(
         edit, collapsedGap->leftBEnd, firstObserverBBegin);
     textEditAssembler_.AttachAcceptedResultCarrier(
-        edit, proofLattice_.AcceptedCandidateBuilder()
-                  .BuildAcceptedSpecializedTUTextEditCandidate(
-                      AcceptedPathKind::TUByteSpanConservativeEdit, editBegin,
-                      editEnd, replacement));
+        edit,
+        acceptedCandidateBuilder_.BuildAcceptedSpecializedTUTextEditCandidate(
+            AcceptedPathKind::TUByteSpanConservativeEdit, editBegin, editEnd,
+            replacement));
     tuEdits.push_back(std::move(edit));
   }
 

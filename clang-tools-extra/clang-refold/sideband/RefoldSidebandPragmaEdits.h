@@ -39,7 +39,7 @@ namespace refold {
 
 class RefoldModel;
 class RefoldPathIdentity;
-class RefoldProofLattice;
+class RefoldAcceptedCandidateBuilder;
 class RefoldStructuralHunkDispatcher;
 class RefoldTUEditPlanner;
 class RefoldTerminalProofSink;
@@ -132,7 +132,7 @@ bool appendSidebandPragmaSourceEdits(
     const RefoldModel &model, llvm::StringRef tuPath, llvm::StringRef tuBytes,
     const RefoldPathIdentity &pathIdentity,
     const RefoldTextEditAssembler &textEditAssembler,
-    const RefoldProofLattice &proofLattice,
+    const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
     const RefoldTerminalProofSink &terminalSink,
     RefoldStructuralHunkDispatcher &structuralHunkDispatcher);
 

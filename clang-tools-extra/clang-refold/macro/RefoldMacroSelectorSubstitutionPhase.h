@@ -52,7 +52,7 @@ namespace clang {
 namespace refold {
 
 struct RefoldMacroWholeCoverPlanningContext;
-class RefoldProofLattice;
+class RefoldMacroPatchProofClassifier;
 class RefoldSourceMapper;
 
 /// Attempts callee-substitution macro candidates for one whole-cover
@@ -70,7 +70,7 @@ public:
     const RefoldSourceMapper &sourceMapper;
     llvm::ArrayRef<PPTok> aToks;
     llvm::ArrayRef<PPTok> bToks;
-    RefoldProofLattice &proofLattice;
+    const RefoldMacroPatchProofClassifier &macroPatchProofClassifier;
 
     /// Delegates to
     /// `RefoldMacroPatchPlanner::GetMacroInvocationFormalArgContentRanges`.

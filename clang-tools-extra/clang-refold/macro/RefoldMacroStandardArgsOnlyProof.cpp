@@ -17,7 +17,7 @@
 
 #include "macro/RefoldMacroPatchProofCertifier.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldMacroPatchProofClassifier.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -144,13 +144,13 @@ std::optional<MacroPatch> PurePasteOnlyArgsOnlyCandidateBuilder::TryBuild(
   // smaller B-side surface. The proved replay unit is the full expansion cover
   // reconstructed from the rewritten invocation arguments.
   deps_.certifyMacroPatchWholeExpansionBRange(invocation, patch);
-  MacroPatchProof proof = deps_.proofLattice.MakeMacroPatchProof(
-      MacroPatchProofKind::ArgsOnlyPurePasteOnly,
-      /*preservesInvocationStructure=*/true, invocation.id);
+  MacroPatchProof proof =
+      makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPurePasteOnly,
+                          /*preservesInvocationStructure=*/true, invocation.id);
   // Pure-paste-only rewrites have no standard or stringify occurrences to lean
   // on, so successful all-paste replay is the decisive proof source.
   proof.paste->replayValidated = true;
-  deps_.proofLattice.SetMacroPatchProof(patch, std::move(proof));
+  deps_.macroPatchProofClassifier.SetMacroPatchProof(patch, std::move(proof));
   return patch;
 }
 

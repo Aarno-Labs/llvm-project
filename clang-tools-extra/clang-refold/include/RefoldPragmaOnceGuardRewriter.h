@@ -73,7 +73,7 @@ class RefoldLineControlProof;
 class RefoldMacroStateProof;
 class RefoldPathIdentity;
 class RefoldPreprocessingStructureIndex;
-class RefoldProofLattice;
+class RefoldAcceptedCandidateBuilder;
 class RefoldTerminalProofSink;
 class RefoldTextEditAssembler;
 
@@ -274,7 +274,7 @@ public:
     const LineDirectiveInserter &lineDirs;
     const RefoldLineControlProof &lineControlProof;
     const RefoldTextEditAssembler &textEditAssembler;
-    const RefoldProofLattice &proofLattice;
+    const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder;
     RefoldTerminalProofSink &terminalSink;
     const clang::LangOptions &lexLang;
   };

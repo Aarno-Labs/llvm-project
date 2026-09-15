@@ -16,7 +16,7 @@
 #include "core/RefoldModel.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroDAGSharedHelpers.h"
-#include "proof/RefoldProofLattice.h"
+#include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
 #include "util/StringUtils.h"
@@ -277,7 +277,7 @@ RefoldMacroDAGTextPrimitives::GetExpansionTextCandidates(
     const RefoldModel::MacroInvocation &inv, bool fromB) const {
   SmallVector<std::string, 4> out;
   std::optional<std::string> base =
-      fromB ? deps_.proofLattice.BuildWholeCoverReplacementText(inv)
+      fromB ? deps_.wholeCoverPlanBuilder.BuildWholeCoverReplacementText(inv)
             : GetInvocationCoverAText(inv);
   if (!base)
     return out;

@@ -7,6 +7,7 @@
 #include "macro/RefoldMacroWholeCoverOrchestrator.h"
 
 #include "edit/RefoldBInsertionLedger.h"
+#include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroDAGSharedHelpers.h"
@@ -16,8 +17,9 @@
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
+#include "proof/RefoldAcceptedResultRanker.h"
+#include "proof/RefoldMacroPatchProofClassifier.h"
 #include "proof/RefoldOwnerStateProof.h"
-#include "proof/RefoldProofLattice.h"
 #include "proof/RefoldWitnessTrace.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
@@ -137,7 +139,7 @@ RefoldMacroWholeCoverOrchestrator::RefoldMacroWholeCoverOrchestrator(
       argsOnlyPhase_(RefoldMacroArgsOnlyWholeCoverPhase::Dependencies{
           *planner_->Deps().sourceMapper, planner_->Deps().aToks,
           planner_->Deps().bToks, *planner_->Deps().abTokHunks,
-          *planner_->Deps().proofLattice,
+          *planner_->Deps().macroPatchProofClassifier,
           [planner](const RefoldModel::MacroInvocation &m,
                     const diffutils::Hunk &h, llvm::StringRef baseInvText) {
             return planner->BuildMacroInvocationPatchArgsOnly(m, h,
@@ -164,7 +166,7 @@ RefoldMacroWholeCoverOrchestrator::RefoldMacroWholeCoverOrchestrator(
           *planner_->Deps().lexLang, *planner_->Deps().lineDirs,
           *planner_->Deps().argTextRecovery, *planner_->Deps().macroTopology,
           planner_->Deps().aToks, planner_->Deps().bToks,
-          *planner_->Deps().proofLattice,
+          *planner_->Deps().macroPatchProofClassifier,
           [planner](const RefoldModel::MacroInvocation &m,
                     llvm::StringRef invText)
               -> std::optional<std::vector<std::pair<size_t, size_t>>> {
@@ -191,7 +193,7 @@ RefoldMacroWholeCoverOrchestrator::RefoldMacroWholeCoverOrchestrator(
           RefoldMacroSelectorSubstitutionPhase::Dependencies{
               *planner_->Deps().model, *planner_->Deps().sourceMapper,
               planner_->Deps().aToks, planner_->Deps().bToks,
-              *planner_->Deps().proofLattice,
+              *planner_->Deps().macroPatchProofClassifier,
               [planner](const RefoldModel::MacroInvocation &m,
                         llvm::StringRef invText)
                   -> std::optional<std::vector<std::pair<size_t, size_t>>> {
@@ -214,9 +216,10 @@ RefoldMacroWholeCoverOrchestrator::RefoldMacroWholeCoverOrchestrator(
               }}),
       finalCandidateSelector_(RefoldMacroFinalCandidateSelector::Dependencies{
           *planner_->Deps().model, *planner_->Deps().macroTopology,
-          *planner_->Deps().proofLattice, planner_->ReplayStabilityValidator(),
-          planner_->ProofCertifier(), patchReusePhase_,
-          planner_->Deps().ownersMustExpand,
+          *planner_->Deps().acceptedCandidateBuilder,
+          *planner_->Deps().acceptedResultRanker,
+          planner_->ReplayStabilityValidator(), planner_->ProofCertifier(),
+          patchReusePhase_, planner_->Deps().ownersMustExpand,
           *planner_->Deps().wholeCoverPlanBuilder,
           [planner](const MacroPatch &patch, const Owner &owner) {
             return planner->MacroPatchOwnerMatches(patch, owner);
@@ -311,9 +314,9 @@ RefoldMacroWholeCoverOrchestrator::TryCounterLiteralWholeCoverPatch(
     patch.materialized.bTokStart = counterBTokenRange->first;
     patch.materialized.bTokEnd = counterBTokenRange->second;
   }
-  MacroPatchProof proof = planner_->GetProofLattice().MakeMacroPatchProof(
-      MacroPatchProofKind::CounterLiteral,
-      /*preservesInvocationStructure=*/false, m.id);
+  MacroPatchProof proof =
+      makeMacroPatchProof(MacroPatchProofKind::CounterLiteral,
+                          /*preservesInvocationStructure=*/false, m.id);
   CounterStateWitness counterState;
   counterState.hasCounterEvents = true;
   counterState.counterOrderKnown = true;
@@ -340,7 +343,8 @@ RefoldMacroWholeCoverOrchestrator::TryCounterLiteralWholeCoverPatch(
       llvm::formatv("literalization:{0}", counterWitness.kind).str();
   proof.suffixStability = std::move(counterWitness);
   proof.counterState = std::move(counterState);
-  planner_->GetProofLattice().SetMacroPatchProof(patch, std::move(proof));
+  planner_->Deps().macroPatchProofClassifier->SetMacroPatchProof(
+      patch, std::move(proof));
   return patch;
 }
 
@@ -800,18 +804,18 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
                   out.append(covered, cur, covered.size() - cur);
                   {
                     MacroPatch patch{minB, maxE, std::move(out), m.id};
-                    MacroPatchProof proof =
-                        planner_->GetProofLattice().MakeMacroPatchProof(
-                            MacroPatchProofKind::CallChainSuffix,
-                            /*preservesInvocationStructure=*/true, m.id);
+                    MacroPatchProof proof = makeMacroPatchProof(
+                        MacroPatchProofKind::CallChainSuffix,
+                        /*preservesInvocationStructure=*/true, m.id);
                     // This suffix patch rewrites the root invocation itself,
                     // so the callsite and the proof root are the same macro.
                     CallChainWitness callChainWitness;
                     callChainWitness.rootMacroId = m.id;
                     callChainWitness.callsiteMacroId = m.id;
                     proof.callChain = callChainWitness;
-                    planner_->GetProofLattice().SetMacroPatchProof(
-                        patch, std::move(proof));
+                    planner_->Deps()
+                        .macroPatchProofClassifier->SetMacroPatchProof(
+                            patch, std::move(proof));
                     return patch;
                   }
                 }
@@ -865,10 +869,10 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
         // law rather than by an ad hoc direct-vs-DAG heuristic.
         if (directValid && dagValid) {
           const bool preferDirect =
-              planner_->GetProofLattice().AcceptedResultRanker().ProofDominates(
+              planner_->Deps().acceptedResultRanker->ProofDominates(
                   argsOnlyCandidate->proofSummary, dag->proofSummary);
           const bool preferDag =
-              planner_->GetProofLattice().AcceptedResultRanker().ProofDominates(
+              planner_->Deps().acceptedResultRanker->ProofDominates(
                   dag->proofSummary, argsOnlyCandidate->proofSummary);
           preferDirectRootCandidate = preferDirect || !preferDag;
         }

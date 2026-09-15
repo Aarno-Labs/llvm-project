@@ -26,8 +26,7 @@
 //     `CertifySelectedMacroPatchCandidate` — selector-carrier
 //     construction and final selection certifying.
 //
-// The service has no back-reference to `RefoldProofLattice`.  The
-// adjacent classifier services (`RefoldMacroPatchProofClassifier`,
+// The adjacent classifier services (`RefoldMacroPatchProofClassifier`,
 // `RefoldAcceptancePathClassifier`) are held as direct references in
 // `Dependencies` rather than `std::function` callbacks, keeping the
 // per-candidate factory path free of type-erased calls.
@@ -83,8 +82,8 @@ class RefoldTokenTextAnalysis;
 /// and terminal-fallback artifacts.
 class RefoldAcceptedCandidateBuilder {
 public:
-  /// Borrowed inputs.  Every reference must outlive the builder; the
-  /// lattice owns the underlying storage.
+  /// Borrowed inputs.  Every reference must outlive the builder;
+  /// `RefoldProofServices` owns the underlying storage.
   struct Dependencies {
     const RefoldModel &model;
     const RefoldTokenTextAnalysis &tokenText;

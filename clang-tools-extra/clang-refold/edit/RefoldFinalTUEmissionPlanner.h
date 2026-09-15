@@ -32,7 +32,7 @@ class RefoldIncludeMaterializationScheduler;
 class RefoldLineControlProof;
 class RefoldMacroTopology;
 class RefoldModel;
-class RefoldProofLattice;
+class RefoldAcceptedCandidateBuilder;
 class RefoldStructuralHunkDispatcher;
 class RefoldTerminalProofSink;
 class RefoldTextEditAssembler;
@@ -59,8 +59,8 @@ public:
     const RefoldMacroStateRepairPlanner *macroStateRepairPlanner = nullptr;
     /// Final byte-edit assembler used to lower staged edits into TU text.
     const RefoldTextEditAssembler *textEditAssembler = nullptr;
-    /// Proof lattice used for accepted-result carrier construction.
-    const RefoldProofLattice *proofLattice = nullptr;
+    /// Accepted-result carrier construction for emitted macro patches.
+    const RefoldAcceptedCandidateBuilder *acceptedCandidateBuilder = nullptr;
     /// Terminal fallback sink for fail-closed emission failures.
     RefoldTerminalProofSink *terminalSink = nullptr;
     /// Optional sidecar mapping output ledger.

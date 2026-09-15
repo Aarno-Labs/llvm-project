@@ -30,7 +30,7 @@
 namespace clang {
 namespace refold {
 
-class RefoldProofLattice;
+class RefoldAcceptancePathClassifier;
 class RefoldSourceMapper;
 
 /// Builds include-owned insertion patches and include-realization
@@ -42,11 +42,10 @@ class RefoldSourceMapper;
 /// making those systems include each other's orchestration surfaces.
 class RefoldIncludeInsertionPlanner {
 public:
-  RefoldIncludeInsertionPlanner(llvm::StringRef bSource,
-                                llvm::ArrayRef<PPTok> bToks,
-                                llvm::ArrayRef<size_t> bTokOff,
-                                const RefoldSourceMapper &sourceMapper,
-                                const RefoldProofLattice &proofLattice);
+  RefoldIncludeInsertionPlanner(
+      llvm::StringRef bSource, llvm::ArrayRef<PPTok> bToks,
+      llvm::ArrayRef<size_t> bTokOff, const RefoldSourceMapper &sourceMapper,
+      const RefoldAcceptancePathClassifier &acceptancePathClassifier);
 
   /// Resolve an include-realization B-token envelope from an A-token cover.
   ///
@@ -76,7 +75,7 @@ private:
   llvm::ArrayRef<PPTok> bToks_;
   llvm::ArrayRef<size_t> bTokOff_;
   const RefoldSourceMapper &sourceMapper_;
-  const RefoldProofLattice &proofLattice_;
+  const RefoldAcceptancePathClassifier &acceptancePathClassifier_;
 };
 
 } // namespace refold

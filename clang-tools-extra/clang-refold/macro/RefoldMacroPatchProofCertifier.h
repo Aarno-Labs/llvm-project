@@ -9,11 +9,12 @@
 // that construct candidate patches but should not depend on planner-private
 // methods.
 //
-// The certifier is intentionally a thin layer over `RefoldProofLattice`:
-// most methods either install a `MacroPatchProof` via `SetMacroPatchProof`,
-// attach a whole-cover or selected-candidate record via the lattice's macro
-// certifiers, or set materialized B-token / output-byte ranges directly on
-// the patch.  No proof-summary construction happens here.
+// The certifier is intentionally a thin layer over the macro-patch proof
+// classifier and the accepted-candidate builder: most methods either install a
+// `MacroPatchProof` via `SetMacroPatchProof`, certify a whole-cover realization
+// or a selected candidate through those services, or set materialized B-token
+// / output-byte ranges directly on the patch.  No proof-summary construction
+// happens here.
 //
 // Method signatures take only namespace-level types so the certifier never
 // depends on caller-local context carriers; callers unwrap admission records
@@ -35,7 +36,8 @@
 namespace clang {
 namespace refold {
 
-class RefoldProofLattice;
+class RefoldAcceptedCandidateBuilder;
+class RefoldMacroPatchProofClassifier;
 
 /// Certifies macro-patch proof carriers.
 ///
@@ -45,10 +47,11 @@ class RefoldProofLattice;
 class RefoldMacroPatchProofCertifier {
 public:
   /// Borrowed inputs needed to certify macro-patch proofs.
-  /// `lattice` is consumed for low-level `Make/Set/Certify*` operations on
-  /// MacroPatch.
   struct Dependencies {
-    RefoldProofLattice &lattice;
+    /// Installs proof carriers and certifies whole-cover realizations.
+    const RefoldMacroPatchProofClassifier &macroPatchProofClassifier;
+    /// Builds the accepted-result carrier a certified patch selects.
+    const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder;
   };
 
   explicit RefoldMacroPatchProofCertifier(Dependencies deps);

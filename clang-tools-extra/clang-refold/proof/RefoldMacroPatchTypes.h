@@ -222,6 +222,38 @@ struct MacroPatchProof {
   std::optional<CounterStateWitness> counterState;
 };
 
+/// Build the canonical proof carrier for a macro patch.
+///
+/// This small factory keeps call sites from open-coding the three primary
+/// proof facts while the proof model is carrier-first.  More specialized
+/// witnesses are attached to the returned MacroPatchProof before it is
+/// installed with RefoldMacroPatchProofClassifier::SetMacroPatchProof() when
+/// the construction site already owns them.
+inline MacroPatchProof makeMacroPatchProof(MacroPatchProofKind kind,
+                                           bool preservesInvocationStructure,
+                                           uint64_t proofRootMacroId) {
+  MacroPatchProof proof;
+  proof.kind = kind;
+  proof.proofRootMacroId = proofRootMacroId;
+  proof.preservesInvocationStructure = preservesInvocationStructure;
+
+  // A paste-kind proof always carries a paste witness: the kind itself asserts
+  // that the producer recorded paste spans for this rewrite.  Seeding it here
+  // keeps that invariant with the kind rather than leaving it to each builder
+  // and a post-install pass to reconstruct the witness from a patch-local flag.
+  // Builders that additionally proved
+  // replay against B set `replayValidated` before installing the proof.
+  if (kind == MacroPatchProofKind::ArgsOnlyPasteSingle ||
+      kind == MacroPatchProofKind::ArgsOnlyPasteMulti ||
+      kind == MacroPatchProofKind::ArgsOnlyPurePasteOnly) {
+    PasteWitness witness;
+    witness.rootMacroId = proofRootMacroId;
+    witness.requiresProducerPasteSpans = true;
+    proof.paste = witness;
+  }
+  return proof;
+}
+
 struct WholeCoverPlan {
   uint64_t covLoA = 0;
   uint64_t covHiA = 0;

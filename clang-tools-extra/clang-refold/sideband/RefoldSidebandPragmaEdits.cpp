@@ -16,7 +16,7 @@
 #include "edit/RefoldPatchTypes.h"
 #include "edit/RefoldTUEditPlanner.h"
 #include "edit/RefoldTextEditAssembler.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTerminalProofSink.h"
 #include "source/DiffAlgorithms.h"
@@ -2573,11 +2573,10 @@ bool buildSidebandPragmaSourceEdits(
 
 bool appendSidebandPragmaSourceEdits(
     llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
-    const RefoldModel &model,
-    llvm::StringRef tuPath, llvm::StringRef tuBytes,
+    const RefoldModel &model, llvm::StringRef tuPath, llvm::StringRef tuBytes,
     const RefoldPathIdentity &pathIdentity,
     const RefoldTextEditAssembler &textEditAssembler,
-    const RefoldProofLattice &proofLattice,
+    const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
     const RefoldTerminalProofSink &terminalSink,
     RefoldStructuralHunkDispatcher &structuralHunkDispatcher) {
   if (sidebandPragmaEdits.empty())
@@ -2744,10 +2743,9 @@ bool appendSidebandPragmaSourceEdits(
     }
     textEditAssembler.AttachAcceptedResultCarrier(
         edit,
-        proofLattice.AcceptedCandidateBuilder()
-            .BuildAcceptedSpecializedTUTextEditCandidate(
-                AcceptedPathKind::TUByteSpanConservativeEdit, sourceRange.first,
-                sourceRange.second, foldedReplacement));
+        acceptedCandidateBuilder.BuildAcceptedSpecializedTUTextEditCandidate(
+            AcceptedPathKind::TUByteSpanConservativeEdit, sourceRange.first,
+            sourceRange.second, foldedReplacement));
     structuralHunkDispatcher.AddTUEdit(std::move(edit));
   }
 

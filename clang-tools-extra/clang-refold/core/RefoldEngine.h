@@ -161,7 +161,8 @@ class RefoldOwnerClassifier;
 class RefoldOwnerStateProof;
 class RefoldPreprocessingStructureIndex;
 class RefoldPreprocessingStructureIndexProvider;
-class RefoldProofLattice;
+class RefoldProofServices;
+class RefoldProofSummaryBuilder;
 class RefoldStructuralHunkDispatcher;
 class RefoldTextEditAssembler;
 class RefoldTokenDiffPlanner;
@@ -658,9 +659,9 @@ private:
   /// Whole-cover replacement plan computation for this refold run.
   ///
   /// Constructed after the B-insertion ledger and before every consumer: the
-  /// proof lattice, the macro patch planner, and the text-edit assembler all
-  /// borrow it directly.  Keeping plan computation out of the planner is what
-  /// lets those three stop reaching it through a late-bound callback.
+  /// macro patch planner, the text-edit assembler, and counter stabilization
+  /// all borrow it directly.  Keeping plan computation out of the planner is
+  /// what lets them avoid reaching it through a late-bound callback.
   std::unique_ptr<RefoldMacroWholeCoverPlanBuilder> wholeCoverPlanBuilder_;
 
   /// Translation-unit edit planning service.
@@ -673,10 +674,9 @@ private:
   /// TU-anchor accepted-result proof builder.
   ///
   /// This service certifies proven TU insertion-anchor witnesses into
-  /// normalized accepted-result carriers.  It is separate from
-  /// RefoldProofLattice so the TU edit planner can build anchor candidates
-  /// without depending on the lattice service that will later query TU planning
-  /// diagnostics.
+  /// normalized accepted-result carriers.  It is separate from the accepted
+  /// candidate builder so the TU edit planner can build anchor candidates
+  /// without depending on the proof services, which depend on TU planning.
   std::unique_ptr<RefoldTUAnchorProof> tuAnchorProof_;
 
   /// Counter-stabilization planner over producer macro topology.
@@ -720,13 +720,15 @@ private:
   /// witnesses, instead of reaching back through RefoldEngine.
   std::unique_ptr<RefoldMacroStateProof> macroStateProof_;
 
-  /// Accepted-result proof lattice owned by the engine.
-  ///
-  /// The lattice owns theorem/proof-summary classification, witness resolver
-  /// decisions, accepted-result ranking, and proof carrier construction.  It
-  /// receives explicit services, ledgers, and narrow proof hooks instead of
-  /// borrowing RefoldEngine or requiring friend access.
-  std::unique_ptr<RefoldProofLattice> proofLattice_;
+  /// Proof-summary construction.  Depends on B alone; built before the theorem
+  /// audit, which borrows it.
+  std::unique_ptr<RefoldProofSummaryBuilder> proofSummaryBuilder_;
+
+  /// Accepted-result proof services owned by the engine: witness trace and
+  /// resolution, ranking, path and macro-patch classification, owner
+  /// realization, and accepted-candidate construction.  Feature services
+  /// borrow the individual services they use; nothing borrows this object.
+  std::unique_ptr<RefoldProofServices> proofServices_;
 
   /// Macro patch planner owned by the engine object graph.
   ///
@@ -814,14 +816,13 @@ private:
   RefoldMacroStateProof &MacroStateProof();
   const RefoldMacroStateProof &MacroStateProof() const;
 
-  /// Allocate the proof lattice after all borrowed engine members have been
-  /// constructed.  This stays out-of-line so RefoldEngine.h does not need to
-  /// include the lattice's full definition.
-  void InitializeProofLattice();
+  /// Allocate the proof services after all borrowed engine members have been
+  /// constructed.  This stays out-of-line so RefoldEngine.h does not need
+  /// their full definitions.
+  void InitializeProofServices();
 
-  /// Return the owned proof-lattice service.
-  RefoldProofLattice &ProofLattice();
-  const RefoldProofLattice &ProofLattice() const;
+  /// Return the owned proof services.
+  const RefoldProofServices &ProofServices() const;
 
   /// Allocate and access the owner/TU classification service.
   ///
@@ -855,7 +856,7 @@ private:
   /// Allocate and access the translation-unit edit planning service.
   ///
   /// The planner depends on RefoldTUAnchorProof for accepted TU-anchor carrier
-  /// construction, not on RefoldProofLattice.  Final TextEdit assembly remains
+  /// construction, not on the proof services.  Final TextEdit assembly remains
   /// outside this service.
   void InitializeTUEditPlanner();
   RefoldTUEditPlanner &TUEditPlanner();
@@ -868,8 +869,8 @@ private:
   /// Allocate the shared occurrence-local preprocessing-structure provider.
   void InitializePreprocessingStructureIndexProvider();
 
-  /// Allocate and access the macro patch planner after the proof lattice
-  /// exists. Macro-planning orchestration calls this service directly.
+  /// Allocate and access the macro patch planner after the proof services
+  /// exist. Macro-planning orchestration calls this service directly.
   void InitializeMacroPatchPlanner();
   RefoldMacroPatchPlanner &MacroPatchPlanner();
   const RefoldMacroPatchPlanner &MacroPatchPlanner() const;
@@ -885,9 +886,10 @@ private:
   RefoldCounterStabilization &CounterStabilization();
   const RefoldCounterStabilization &CounterStabilization() const;
 
-  /// Allocate and access the include-insertion planner after the proof lattice
-  /// exists.  This keeps include patch construction and include-realization
-  /// B-envelope proof out of RefoldEngine while preserving construction order.
+  /// Allocate and access the include-insertion planner after the proof
+  /// services exist.  This keeps include patch construction and
+  /// include-realization B-envelope proof out of RefoldEngine while preserving
+  /// construction order.
   void InitializeIncludeInsertionPlanner();
   RefoldIncludeInsertionPlanner &IncludeInsertionPlanner();
   const RefoldIncludeInsertionPlanner &IncludeInsertionPlanner() const;

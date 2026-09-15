@@ -91,7 +91,7 @@ add_clang_library(clangRefold STATIC
   proof/RefoldAcceptedResultRanker.cpp
   proof/RefoldMacroPatchProofClassifier.cpp
   proof/RefoldOwnerRealizationProofBuilder.cpp
-  proof/RefoldProofLattice.cpp
+  proof/RefoldProofServices.cpp
   proof/RefoldProofSummaryBuilder.cpp
   proof/RefoldStructuralGapCrossingProof.cpp
   proof/RefoldStructuralHunkTilingProof.cpp

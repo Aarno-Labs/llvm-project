@@ -13,6 +13,7 @@
 
 #include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
+#include "edit/RefoldTUAnchorProof.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -360,8 +361,8 @@ RefoldAcceptancePathClassifier::BuildAcceptedPathProofSummary(
       summary.hasIncludeAnchorWitness = true;
       summary.includeAnchorWitness = *includeAnchorWitness;
     }
-    summary.discharge = deps_.validateIncludePreservingProof(
-        currentPath, patch, includeAnchorWitness);
+    summary.discharge = ValidateIncludePreservingProof(currentPath, patch,
+                                                       includeAnchorWitness);
     break;
 
   case AcceptedPathKind::IncludeRealizationInlineFromB:
@@ -374,9 +375,9 @@ RefoldAcceptancePathClassifier::BuildAcceptedPathProofSummary(
         /*preservesInvocationStructure=*/false);
     // removes the last include-specific realization validator.  The
     // include path itself only needs the generic accepted-path baseline here;
-    // deps_.ownerRealizationProofBuilder.BuildIncludeOwnerRealization() and
-    // deps_.ownerRealizationProofBuilder.ApplyOwnerRealizationResultToProofSummary()
-    // attach the authoritative OwnerRealizationProof immediately after the
+    // RefoldOwnerRealizationProofBuilder::BuildIncludeOwnerRealization() and
+    // ApplyOwnerRealizationResultToProofSummary() attach the authoritative
+    // OwnerRealizationProof immediately after the
     // owner-specific include spelling has supplied its evidence.
     summary.discharge = BuildAcceptedPathBaselineDischarge(summary.inventory);
     break;
@@ -406,7 +407,8 @@ RefoldAcceptancePathClassifier::BuildAcceptedPathProofSummary(
       summary.tuAnchorWitness = *tuAnchorWitness;
     }
     summary.discharge =
-        deps_.validateTUAnchorProof(currentPath, tuAnchorWitness);
+        validateTUAnchorProof(currentPath, tuAnchorWitness,
+                              BuildAcceptancePathInventory(currentPath));
     break;
 
   case AcceptedPathKind::TUByteSpanMappedEdit:
@@ -473,6 +475,190 @@ RefoldAcceptancePathClassifier::BuildIncludePatchProofSummary(
     return ProofSummary{};
 
   return BuildAcceptedPathProofSummary(currentPath, patch);
+}
+
+::clang::refold::ProofDischargeRecord
+RefoldAcceptancePathClassifier::ValidateIncludePreservingProof(
+    AcceptedPathKind currentPath, const IncludePatch *patch,
+    const IncludeAnchorWitness *witness) const {
+  if (currentPath == AcceptedPathKind::IncludePatchPendingMaterialization) {
+    // Pending include materialization is internal-only. If some caller still
+    // tries to validate it as a theorem-facing include path, fail closed
+    // immediately rather than reporting a live transitional discharge state.
+    ProofDischargeAccumulator discharge;
+    discharge.Fail(ProofObligationKind::IncludePendingMaterializationClassified,
+                   ProofFailureReason::PendingMaterialization);
+    return discharge.Finish();
+  }
+
+  ProofDischargeAccumulator discharge;
+  const AcceptancePathInventory inventory =
+      BuildAcceptancePathInventory(currentPath);
+
+  // Common include-preserving baseline: the accepted path must be classified,
+  // mapped to a future proof target, and backed by an actual include patch
+  // shape before path-specific witness obligations are checked below.
+  RequireAcceptedPathBaseline(discharge, inventory);
+  discharge.Require(patch != nullptr,
+                    ProofObligationKind::IncludePatchShapeTracked,
+                    ProofFailureReason::MissingIncludePatchShape);
+  if (!patch)
+    return discharge.Finish();
+
+  // Every include-preserving path needs an anchor witness. The switch below
+  // refines this generic requirement into the exact witness kind and fields
+  // required by each accepted include path.
+  discharge.Require(witness &&
+                        witness->evidence != IncludeAnchorEvidenceKind::Unknown,
+                    ProofObligationKind::IncludeAnchorWitnessTracked,
+                    ProofFailureReason::MissingIncludeAnchorWitness);
+
+  switch (currentPath) {
+  case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
+    // Replacement/deletion over an existing include must be tied to concrete
+    // mapped header tokens and the corresponding source byte range.
+    discharge.Require(patch->aStart < patch->aEnd,
+                      ProofObligationKind::IncludeMappedHeaderRangeTracked,
+                      ProofFailureReason::MissingMappedHeaderRange);
+    discharge.Require(witness &&
+                          witness->evidence ==
+                              IncludeAnchorEvidenceKind::MappedHeaderTokens,
+                      ProofObligationKind::IncludeAnchorWitnessTracked,
+                      ProofFailureReason::MissingIncludeAnchorWitness);
+    discharge.Require(witness && witness->hasFirstPP && witness->hasLastPP &&
+                          witness->firstPP <= witness->lastPP,
+                      ProofObligationKind::IncludeMappedHeaderRangeTracked,
+                      ProofFailureReason::MissingMappedHeaderRange);
+    discharge.Require(witness && witness->hasByteRange &&
+                          witness->startByte <= witness->endByte,
+                      ProofObligationKind::IncludeMappedHeaderByteRangeTracked,
+                      ProofFailureReason::MissingMappedHeaderByteRange);
+    break;
+
+  case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
+    // Conditional-boundary insertion is zero-width in A and must be anchored to
+    // the selected conditional arm boundary byte.
+    RequireIncludeZeroWidthAnchor(
+        discharge, *patch, witness,
+        IncludeAnchorEvidenceKind::SelectedConditionalBoundary,
+        ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked,
+        ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness);
+    discharge.Require(
+        witness && witness->hasCondArmId,
+        ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked,
+        ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness);
+    break;
+
+  case AcceptedPathKind::IncludeInsertChildBoundary: {
+    // IncludeInsertionByChildBoundary is a declared include-preserving proof,
+    // not a legacy fallback.  The accepted patch must be a zero-width insertion
+    // owned by a concrete parent include, and the witness must name a direct
+    // child include whose spelled directive boundary is exactly the recorded
+    // anchor byte.  This keeps the theorem obligation owner-local and prevents
+    // an arbitrary child id from masquerading as a stable parent-header
+    // insertion point.
+    RequireIncludeZeroWidthAnchor(
+        discharge, *patch, witness, IncludeAnchorEvidenceKind::ChildBoundary,
+        ProofObligationKind::IncludeChildBoundaryWitnessTracked,
+        ProofFailureReason::MissingIncludeChildBoundaryWitness);
+    discharge.Require(patch->include != nullptr,
+                      ProofObligationKind::IncludeChildBoundaryWitnessTracked,
+                      ProofFailureReason::MissingIncludeChildBoundaryWitness);
+    discharge.Require(witness && witness->hasChildIncludeId,
+                      ProofObligationKind::IncludeChildBoundaryWitnessTracked,
+                      ProofFailureReason::MissingIncludeChildBoundaryWitness);
+
+    bool childBoundaryMatchesParent = false;
+    if (patch->include && witness && witness->hasChildIncludeId &&
+        witness->hasAnchorByte) {
+      for (const auto &child : deps_.model.GetIncludes()) {
+        if (child.id != witness->childIncludeId)
+          continue;
+        const bool directChildOfPatchOwner =
+            child.parent && *child.parent == patch->include->id;
+        const bool anchorIsSpelledChildBoundary =
+            witness->anchorByte == child.siteB ||
+            witness->anchorByte == child.siteE;
+        childBoundaryMatchesParent =
+            directChildOfPatchOwner && anchorIsSpelledChildBoundary;
+        break;
+      }
+    }
+    discharge.Require(childBoundaryMatchesParent,
+                      ProofObligationKind::IncludeChildBoundaryWitnessTracked,
+                      ProofFailureReason::MissingIncludeChildBoundaryWitness);
+    break;
+  }
+
+  case AcceptedPathKind::IncludeInsertRightNeighborPP:
+    // Right-neighbor insertion anchors before a known preprocessor token. The
+    // anchor byte and neighbor PP token together identify the stable insertion
+    // point.
+    RequireIncludeZeroWidthAnchor(
+        discharge, *patch, witness, IncludeAnchorEvidenceKind::RightNeighborPP,
+        ProofObligationKind::IncludeRightNeighborWitnessTracked,
+        ProofFailureReason::MissingIncludeRightNeighborWitness);
+    discharge.Require(witness && witness->hasNeighborPP,
+                      ProofObligationKind::IncludeRightNeighborWitnessTracked,
+                      ProofFailureReason::MissingIncludeRightNeighborWitness);
+    break;
+
+  case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+    // Left-neighbor insertion anchors after a known preprocessor token. As with
+    // the right-neighbor case, require both the byte anchor and the neighbor PP
+    // identity so the insertion point is theorem-facing.
+    RequireIncludeZeroWidthAnchor(
+        discharge, *patch, witness, IncludeAnchorEvidenceKind::LeftNeighborPP,
+        ProofObligationKind::IncludeLeftNeighborWitnessTracked,
+        ProofFailureReason::MissingIncludeLeftNeighborWitness);
+    discharge.Require(witness && witness->hasNeighborPP,
+                      ProofObligationKind::IncludeLeftNeighborWitnessTracked,
+                      ProofFailureReason::MissingIncludeLeftNeighborWitness);
+    break;
+
+  case AcceptedPathKind::IncludeInsertDeclBoundary:
+    // Declaration-boundary insertion is anchored at the end of the declaration
+    // header range. Requiring anchorByte == declHeaderE prevents a witness from
+    // naming the right range but anchoring at a different byte.
+    RequireIncludeZeroWidthAnchor(
+        discharge, *patch, witness, IncludeAnchorEvidenceKind::DeclBoundary,
+        ProofObligationKind::IncludeDeclBoundaryWitnessTracked,
+        ProofFailureReason::MissingIncludeDeclBoundaryWitness);
+    discharge.Require(witness && witness->hasDeclHeaderRange &&
+                          witness->anchorByte == witness->declHeaderE,
+                      ProofObligationKind::IncludeDeclBoundaryWitnessTracked,
+                      ProofFailureReason::MissingIncludeDeclBoundaryWitness);
+    break;
+
+  case AcceptedPathKind::IncludePatchPendingMaterialization:
+  case AcceptedPathKind::IncludeRealizationInlineFromB:
+  case AcceptedPathKind::IncludeMaterializedExpansion:
+  case AcceptedPathKind::Unknown:
+  case AcceptedPathKind::MacroArgsOnlyStandard:
+  case AcceptedPathKind::MacroArgsOnlyPasteSingle:
+  case AcceptedPathKind::MacroArgsOnlyPasteMulti:
+  case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
+  case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroRecursiveTupleGeneratedCalleeReplay:
+  case AcceptedPathKind::MacroDagSubtreeRoot:
+  case AcceptedPathKind::MacroCallChainSuffix:
+  case AcceptedPathKind::MacroCounterLiteral:
+  case AcceptedPathKind::MacroWholeCoverRealization:
+  case AcceptedPathKind::MacroDirectCalleeSubstitution:
+  case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
+  case AcceptedPathKind::TUExactSlotBoundary:
+  case AcceptedPathKind::TUProvableInsertionAnchor:
+  case AcceptedPathKind::TUByteSpanMappedEdit:
+  case AcceptedPathKind::TUByteSpanConservativeEdit:
+  case AcceptedPathKind::TUIncludeClosureEdit:
+  case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
+    // Non-include-preserving paths have no additional obligations in this
+    // validator. The common path-classification checks above still record any
+    // mismatch if such a path reaches this function unexpectedly.
+    break;
+  }
+
+  return discharge.Finish();
 }
 
 } // namespace refold

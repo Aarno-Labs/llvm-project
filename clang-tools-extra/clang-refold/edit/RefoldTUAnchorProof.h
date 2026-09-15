@@ -7,9 +7,8 @@
 // anchors, classify owners, plan TU byte spans, or participate in
 // accepted-result selection.  Keeping this builder separate lets
 // RefoldTUEditPlanner mint the same TU-anchor proof carriers without depending
-// on RefoldProofLattice; the summary/contract construction itself is the
-// shared RefoldProofSummaryBuilder, which is a leaf service and creates no
-// planner/lattice cycle.
+// on the proof services that depend on it; the summary/contract construction
+// itself is the shared RefoldProofSummaryBuilder, a leaf service.
 //
 //===----------------------------------------------------------------------===//
 
@@ -45,9 +44,9 @@ bool tuAnchorWitnessHasProvableEvidence(const TUAnchorWitness &witness);
 /// Validate the local obligations for a TU-anchor proof using the caller's
 /// already-computed accepted-path inventory.
 ///
-/// The inventory parameter lets RefoldProofLattice preserve its generic path
-/// classification semantics while RefoldTUAnchorProof can reuse the same
-/// validator with its narrower TU-anchor-only inventory.
+/// The inventory parameter lets RefoldAcceptancePathClassifier preserve its
+/// generic path classification semantics while RefoldTUAnchorProof can reuse
+/// the same validator with its narrower TU-anchor-only inventory.
 ProofDischargeRecord
 validateTUAnchorProof(AcceptedPathKind currentPath,
                       const TUAnchorWitness *witness,

@@ -22,7 +22,7 @@
 // (`GetMacroInvocationFormalArgContentRanges`,
 // `MacroArgReplacementMatchesAllOccurrencesInBIgnorePasteSemanticProof`)
 // are reached through std::function callbacks supplied at construction;
-// the proof lattice is passed by reference and the
+// the macro-patch proof classifier is passed by reference and the
 // `RefoldMacroPasteArgumentBuilder` is constructed on demand from the
 // phase's own dependencies.
 //
@@ -65,7 +65,7 @@ class LineDirectiveInserter;
 class RefoldArgTextRecovery;
 class RefoldMacroTopology;
 class RefoldMacroWholeCoverPlanBuilder;
-class RefoldProofLattice;
+class RefoldMacroPatchProofClassifier;
 class RefoldSourceMapper;
 
 /// Coordinates DAG leaf lifting from discovered nested candidates to root
@@ -85,7 +85,7 @@ public:
     const RefoldMacroTopology &macroTopology;
     llvm::ArrayRef<PPTok> aToks;
     llvm::ArrayRef<PPTok> bToks;
-    RefoldProofLattice &proofLattice;
+    const RefoldMacroPatchProofClassifier &macroPatchProofClassifier;
 
     /// Delegates to
     /// `RefoldMacroPatchPlanner::GetMacroInvocationFormalArgContentRanges`.

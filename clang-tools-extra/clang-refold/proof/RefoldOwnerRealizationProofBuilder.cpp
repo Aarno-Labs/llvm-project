@@ -6,6 +6,8 @@
 
 #include "proof/RefoldOwnerRealizationProofBuilder.h"
 
+#include "proof/RefoldAcceptancePathClassifier.h"
+
 #include "core/RefoldLog.h"
 #include "core/RefoldModel.h"
 #include "edit/RefoldTUEditPlanner.h"
@@ -1133,10 +1135,11 @@ RefoldOwnerRealizationProofBuilder::BuildOwnerRealizationProofSummary(
   // an already-built owner closure into the shared OwnerRealizationWitness and
   // leaves candidate kind, byte/token interval, payload preview, and owner-id
   // decoration to the caller that actually knows the emitted surface.
-  ProofSummary summary = deps_.buildAcceptedPathProofSummary(
-      currentPath, /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
-      /*includeAnchorWitness=*/nullptr,
-      /*terminalFallbackWitness=*/nullptr);
+  ProofSummary summary =
+      deps_.acceptancePathClassifier.BuildAcceptedPathProofSummary(
+          currentPath, /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
+          /*includeAnchorWitness=*/nullptr,
+          /*terminalFallbackWitness=*/nullptr);
   ApplyOwnerRealizationResultToProofSummary(summary, ownerRealization);
   return summary;
 }

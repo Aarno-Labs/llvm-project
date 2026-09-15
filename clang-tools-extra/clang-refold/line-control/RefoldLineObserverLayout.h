@@ -38,7 +38,7 @@ class LineDirectiveInserter;
 class RefoldLineControlProof;
 class RefoldOwnerStateProof;
 class RefoldPathIdentity;
-class RefoldProofLattice;
+class RefoldAcceptedCandidateBuilder;
 class RefoldTextEditAssembler;
 
 /// Concrete line-observer layout realization service.
@@ -59,22 +59,21 @@ public:
 
   /// Construct a layout realization service over immutable producer/model
   /// facts and the proof/edit services it composes.
-  RefoldLineObserverLayout(const RefoldModel &model, llvm::StringRef bSource,
-                           llvm::ArrayRef<PPTok> aToks,
-                           llvm::ArrayRef<PPTok> bToks,
-                           llvm::ArrayRef<size_t> bTokOff,
-                           const std::vector<int64_t> &abTokMapA2B,
-                           const std::vector<int64_t> &abTokMapB2A,
-                           const RefoldPathIdentity &paths,
-                           const RefoldLineControlProof &lineControlProof,
-                           const RefoldOwnerStateProof &ownerStateProof,
-                           const RefoldProofLattice &proofLattice,
-                           const RefoldTextEditAssembler &textEditAssembler,
-                           const LineDirectiveInserter &lineDirs)
+  RefoldLineObserverLayout(
+      const RefoldModel &model, llvm::StringRef bSource,
+      llvm::ArrayRef<PPTok> aToks, llvm::ArrayRef<PPTok> bToks,
+      llvm::ArrayRef<size_t> bTokOff, const std::vector<int64_t> &abTokMapA2B,
+      const std::vector<int64_t> &abTokMapB2A, const RefoldPathIdentity &paths,
+      const RefoldLineControlProof &lineControlProof,
+      const RefoldOwnerStateProof &ownerStateProof,
+      const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
+      const RefoldTextEditAssembler &textEditAssembler,
+      const LineDirectiveInserter &lineDirs)
       : model_(model), bSource_(bSource), aToks_(aToks), bToks_(bToks),
         bTokOff_(bTokOff), abTokMapA2B_(abTokMapA2B), abTokMapB2A_(abTokMapB2A),
         paths_(paths), lineControlProof_(lineControlProof),
-        ownerStateProof_(ownerStateProof), proofLattice_(proofLattice),
+        ownerStateProof_(ownerStateProof),
+        acceptedCandidateBuilder_(acceptedCandidateBuilder),
         textEditAssembler_(textEditAssembler), lineDirs_(lineDirs) {}
 
   /// Append TU-local materialization edits for preserved source-spelled
@@ -124,7 +123,7 @@ private:
   const RefoldPathIdentity &paths_;
   const RefoldLineControlProof &lineControlProof_;
   const RefoldOwnerStateProof &ownerStateProof_;
-  const RefoldProofLattice &proofLattice_;
+  const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder_;
   const RefoldTextEditAssembler &textEditAssembler_;
   const LineDirectiveInserter &lineDirs_;
 };

@@ -10,7 +10,8 @@
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldMacroPatchProofClassifier.h"
+#include "proof/RefoldWitnessTrace.h"
 #include "source/RefoldSourceMapper.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -1178,12 +1179,10 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
   for (const ScoredSolution &scored : validSolutions)
     equivalenceClasses[scored.equivalenceKey].push_back(&scored);
 
-  if ((*deps_.proofLattice).WitnessTrace().ShouldEmitProofLog()) {
-    (*deps_.proofLattice)
-        .WitnessTrace()
-        .TraceWitnessAmbiguity("MacroActualDefinitionTapeReplay",
-                               solutions.size(), validSolutions.size(),
-                               equivalenceClasses.size());
+  if (deps_.witnessTrace->ShouldEmitProofLog()) {
+    deps_.witnessTrace->TraceWitnessAmbiguity(
+        "MacroActualDefinitionTapeReplay", solutions.size(),
+        validSolutions.size(), equivalenceClasses.size());
   }
 
   // makes the variadic definition-tape partition authoritative when
@@ -1196,7 +1195,7 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
       (!hasVariadicFormal && !hasVaOpt) || equivalenceClasses.size() == 1;
   if (definitionTapeEquivalenceAuthoritative &&
       equivalenceClasses.size() != 1) {
-    if ((*deps_.proofLattice).WitnessTrace().ShouldEmitProofLog()) {
+    if (deps_.witnessTrace->ShouldEmitProofLog()) {
       RefoldWitness witness;
       witness.family = WitnessProofFamily::DefinitionTapeReplay;
       witness.owner = llvm::formatv("macro#{0}", m.id).str();
@@ -1204,11 +1203,9 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
                                      definition->id, bEnv->first, bEnv->second,
                                      equivalenceClasses.size())
                            .str();
-      (*deps_.proofLattice)
-          .WitnessTrace()
-          .TraceWitnessRejected(
-              witness, WitnessRejectReason::NonEquivalentAmbiguity,
-              "definition-tape replay produced multiple semantic classes");
+      deps_.witnessTrace->TraceWitnessRejected(
+          witness, WitnessRejectReason::NonEquivalentAmbiguity,
+          "definition-tape replay produced multiple semantic classes");
     }
     return std::nullopt;
   }
@@ -1247,25 +1244,27 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
   certifyMacroPatchMaterializedBTokenRange(patch,
                                            static_cast<uint64_t>(bEnv->first),
                                            static_cast<uint64_t>(bEnv->second));
-  // Attach the args-only standard proof directly through the proof lattice so
-  // this service does not depend on planner-owned proof certification helpers.
+  // Attach the args-only standard proof directly through the proof classifier
+  // so this service does not depend on planner-owned proof certification
+  // helpers.
   {
     MacroPatchProof proof =
-        (*deps_.proofLattice)
-            .MakeMacroPatchProof(MacroPatchProofKind::ArgsOnlyStandard,
-                                 /*preservesInvocationStructure=*/true, m.id);
+        makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyStandard,
+                            /*preservesInvocationStructure=*/true, m.id);
     WholeEnvelopeReplayWitness witness;
     witness.rootMacroId = m.id;
     witness.replayValidated = true;
     witness.definitionTapeReplayValidated = true;
     proof.wholeEnvelopeReplay = witness;
-    (*deps_.proofLattice).SetMacroPatchProof(patch, std::move(proof));
+    deps_.macroPatchProofClassifier->SetMacroPatchProof(patch,
+                                                        std::move(proof));
   }
   if (auto variadicWitness = makeVariadicCommaWitnessForSolution(
           best->sol, static_cast<unsigned>(best->vaOptIncludedCount))) {
     MacroPatchProof proof = patch.proof;
     proof.variadicCommaReplay = std::move(*variadicWitness);
-    (*deps_.proofLattice).SetMacroPatchProof(patch, std::move(proof));
+    deps_.macroPatchProofClassifier->SetMacroPatchProof(patch,
+                                                        std::move(proof));
   }
 
   // definition-tape replay is the producer proof for empty actuals
@@ -1305,7 +1304,8 @@ RefoldMacroDefinitionTapeSolver::TryDefinitionTapeReplayArgsOnlyPatch(
             producerObligationKeyForSolution(best->sol))
             .str();
     proof.zeroTokenBoundaryReplay = std::move(witness);
-    (*deps_.proofLattice).SetMacroPatchProof(patch, std::move(proof));
+    deps_.macroPatchProofClassifier->SetMacroPatchProof(patch,
+                                                        std::move(proof));
   }
   return patch;
 }

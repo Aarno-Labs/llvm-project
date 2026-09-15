@@ -19,7 +19,8 @@
 //     obligation checks used by every path-side validator.
 //   * `BuildAcceptedPathProofSummary` — the shared path-side proof-
 //     summary builder consumed by include/TU/terminal accepted-result
-//     construction and by `RefoldOwnerRealizationProofBuilder`.
+//     construction and by `RefoldOwnerRealizationProofBuilder`, which is
+//     why this classifier depends on neither of them.
 //   * `BuildIncludePatchProofSummary` — the include-specific composite
 //     that pairs an accepted-path summary with the include-preserving
 //     validator output.
@@ -30,12 +31,10 @@
 // so per-macro-invocation classification stays a plain method call
 // instead of ~4 type-erased calls per fire.
 //
-// The service has no back-reference to `RefoldProofLattice`.
-// `BuildAcceptedPathProofSummary` still calls two lattice-side
-// path-preservation validators (`ValidateIncludePreservingProof`,
-// `ValidateTUAnchorProof`); those are reached through two
-// `std::function` callbacks supplied at construction, and fire only
-// for include/TU paths (not the macro hot path).
+// The include-preserving and TU-anchor path validators that
+// `BuildAcceptedPathProofSummary` applies are owned here too: the first is
+// `ValidateIncludePreservingProof`, the second is the shared
+// `validateTUAnchorProof` theorem in `edit/RefoldTUAnchorProof.h`.
 //
 //===----------------------------------------------------------------------===//
 
@@ -48,13 +47,10 @@
 #include "proof/RefoldAnchorWitnessTypes.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldMacroPatchTypes.h"
-#include "proof/RefoldOwnerRealizationProofBuilder.h"
 #include "proof/RefoldProofDischargeTypes.h"
 #include "proof/RefoldProofSummaryBuilder.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldTheoremTypes.h"
-
-#include <functional>
 
 namespace clang {
 namespace refold {
@@ -62,24 +58,13 @@ namespace refold {
 /// Acceptance-path proof-summary classifier.
 class RefoldAcceptancePathClassifier {
 public:
-  /// Borrowed inputs.  All references must outlive the classifier; the
-  /// lattice owns the underlying storage.
+  /// Borrowed inputs.  All references must outlive the classifier;
+  /// `RefoldProofServices` owns the underlying storage.
   struct Dependencies {
+    /// Producer model; the include-preserving validator resolves the child
+    /// include a child-boundary witness names.
+    const RefoldModel &model;
     const RefoldProofSummaryBuilder &proofSummaryBuilder;
-    const RefoldOwnerRealizationProofBuilder &ownerRealizationProofBuilder;
-
-    /// Delegates to `RefoldProofLattice::ValidateIncludePreservingProof`.
-    /// Not on the macro hot path — fires only for include/TU paths.
-    std::function<ProofDischargeRecord(AcceptedPathKind currentPath,
-                                       const IncludePatch *patch,
-                                       const IncludeAnchorWitness *witness)>
-        validateIncludePreservingProof;
-
-    /// Delegates to `RefoldProofLattice::ValidateTUAnchorProof`.
-    /// Not on the macro hot path.
-    std::function<ProofDischargeRecord(AcceptedPathKind currentPath,
-                                       const TUAnchorWitness *witness)>
-        validateTUAnchorProof;
   };
 
   explicit RefoldAcceptancePathClassifier(Dependencies deps);
@@ -146,9 +131,7 @@ public:
                                              const IncludePatch *patch) const;
 
   /// Include zero-width anchor obligation helper used by
-  /// `BuildAcceptedPathProofSummary` internally and by the lattice's
-  /// `ValidateIncludePreservingProof`, which remains the include-specific
-  /// path-preservation validator.
+  /// `BuildAcceptedPathProofSummary` and `ValidateIncludePreservingProof`.
   void RequireIncludeZeroWidthAnchor(ProofDischargeAccumulator &discharge,
                                      const IncludePatch &patch,
                                      const IncludeAnchorWitness *witness,
@@ -157,6 +140,16 @@ public:
                                      ProofFailureReason witnessFailure) const;
 
 private:
+  /// Validate an include-preserving accepted path.
+  ///
+  /// Composes include-anchor evidence with the accepted-path inventory while
+  /// keeping include-specific proof details out of the macro and TU
+  /// validators.
+  ProofDischargeRecord
+  ValidateIncludePreservingProof(AcceptedPathKind currentPath,
+                                 const IncludePatch *patch,
+                                 const IncludeAnchorWitness *witness) const;
+
   Dependencies deps_;
 };
 

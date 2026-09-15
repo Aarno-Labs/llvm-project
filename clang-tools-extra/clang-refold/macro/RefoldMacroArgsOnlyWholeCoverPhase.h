@@ -48,7 +48,7 @@ namespace clang {
 namespace refold {
 
 struct RefoldMacroWholeCoverPlanningContext;
-class RefoldProofLattice;
+class RefoldMacroPatchProofClassifier;
 class RefoldSourceMapper;
 
 /// Runs the direct args-only whole-cover admission phase for one planning
@@ -67,7 +67,7 @@ public:
     llvm::ArrayRef<PPTok> aToks;
     llvm::ArrayRef<PPTok> bToks;
     const std::vector<diffutils::Hunk> &abTokHunks;
-    RefoldProofLattice &proofLattice;
+    const RefoldMacroPatchProofClassifier &macroPatchProofClassifier;
 
     /// Delegates to
     /// `RefoldMacroPatchPlanner::BuildMacroInvocationPatchArgsOnly`. That

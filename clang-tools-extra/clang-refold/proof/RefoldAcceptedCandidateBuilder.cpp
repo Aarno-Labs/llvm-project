@@ -466,8 +466,10 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedMacroCandidate(
   candidate.emittedRepair = EmittedRepairIdentity{
       candidate.begin, candidate.end, patch.replacement};
   deps_.ownerRealizationProofBuilder.AttachStandardWitnesses(candidate);
-  deps_.theoremAudit.AuditMacroPatchProofForLegacyAuthority(
-      patch, "BuildAcceptedMacroCandidate");
+  if (deps_.theoremAudit.MacroPatchProofNeedsLegacyAudit(patch))
+    deps_.theoremAudit.AuditMacroPatchProofForLegacyAuthority(
+        patch, deps_.macroPatchProofClassifier.ClassifyMacroPatchProof(patch),
+        "BuildAcceptedMacroCandidate");
   deps_.witnessTrace.TraceWitnessEmitted(
       deps_.witnessResolver.BuildRefoldWitness(candidate,
                                                "BuildAcceptedMacroCandidate"));

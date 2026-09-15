@@ -22,7 +22,7 @@
 //     `classifyResolverFallbackReason`).
 //
 // The resolver intentionally does NOT own candidate-ranking preferences;
-// those remain on `RefoldProofLattice`.  This service is the resolver
+// those belong to `RefoldAcceptedResultRanker`.  This service is the resolver
 // authority, not the canonical-preference authority.
 //
 //===----------------------------------------------------------------------===//

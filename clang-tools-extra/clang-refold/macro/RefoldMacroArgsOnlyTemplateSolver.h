@@ -35,7 +35,7 @@ namespace clang {
 namespace refold {
 
 class RefoldMacroTopology;
-class RefoldProofLattice;
+class RefoldMacroPatchProofClassifier;
 class RefoldSourceMapper;
 
 /// Template element over a macro whole-cover: either fixed body tokens or one
@@ -99,7 +99,7 @@ public:
     llvm::ArrayRef<size_t> bTokOff;
     const RefoldSourceMapper *sourceMapper = nullptr;
     const RefoldMacroTopology *macroTopology = nullptr;
-    RefoldProofLattice *proofLattice = nullptr;
+    const RefoldMacroPatchProofClassifier *macroPatchProofClassifier = nullptr;
     const clang::LangOptions *lexLang = nullptr;
   };
 

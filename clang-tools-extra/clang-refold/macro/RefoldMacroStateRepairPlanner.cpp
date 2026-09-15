@@ -17,11 +17,12 @@
 #include "macro/RefoldMacroPatchPlanner.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroTopology.h"
+#include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldCandidateTypes.h"
+#include "proof/RefoldMacroPatchProofClassifier.h"
 #include "proof/RefoldMacroPatchTypes.h"
 #include "proof/RefoldNeutralityProof.h"
 #include "proof/RefoldOwnerStateProof.h"
-#include "proof/RefoldProofLattice.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldTerminalProofSink.h"
 #include "proof/RefoldTheoremTypes.h"
@@ -234,8 +235,15 @@ private:
   RefoldOwnerStateProof &OwnerStateProof() const {
     return *deps_.ownerStateProof;
   }
-  /// Returns the proof lattice used when restaging conservative TU edits.
-  RefoldProofLattice &ProofLattice() const { return *deps_.proofLattice; }
+  /// Returns the classifier that certifies restaged whole-cover realizations.
+  const RefoldMacroPatchProofClassifier &MacroPatchProofClassifier() const {
+    return *deps_.macroPatchProofClassifier;
+  }
+  /// Returns the accepted-candidate builder used when restaging conservative
+  /// TU edits.
+  const RefoldAcceptedCandidateBuilder &AcceptedCandidateBuilder() const {
+    return *deps_.acceptedCandidateBuilder;
+  }
   /// Returns the macro patch planner used to detect existing macro surfaces.
   RefoldMacroPatchPlanner &MacroPatchPlanner() const {
     return *deps_.macroPatchPlanner;
@@ -1692,11 +1700,9 @@ MacroStateRepairContext::DirectTUStructuralSegmentKey(
 void MacroStateRepairContext::AttachConservativeTUCarrier(
     TextEdit &edit, std::optional<InheritedStructuralSegmentKey> inherited) {
   AcceptedResultCandidate candidate =
-      ProofLattice()
-          .AcceptedCandidateBuilder()
-          .BuildAcceptedSpecializedTUTextEditCandidate(
-              AcceptedPathKind::TUByteSpanConservativeEdit, edit.start,
-              edit.end, StringRef(edit.text));
+      AcceptedCandidateBuilder().BuildAcceptedSpecializedTUTextEditCandidate(
+          AcceptedPathKind::TUByteSpanConservativeEdit, edit.start, edit.end,
+          StringRef(edit.text));
   if (inherited) {
     candidate.proofSummary.hasInheritedStructuralSegmentBinding = true;
     candidate.proofSummary.inheritedStructuralWitnessId = inherited->witnessId;
@@ -2944,8 +2950,8 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
 
     MacroPatch patch{*invocation.invB, *invocation.invE, wholePlan->clippedText,
                      invocation.id};
-    ProofLattice().CertifyMacroWholeCoverRealizationPatch(patch, *wholePlan,
-                                                          invocation);
+    MacroPatchProofClassifier().CertifyMacroWholeCoverRealizationPatch(
+        patch, *wholePlan, invocation);
     MacroPatchPlanner().CertifyMacroPatchOwnerWitness(
         patch, invocation.ownerIncludeId
                    ? Owner::Include(*invocation.ownerIncludeId)

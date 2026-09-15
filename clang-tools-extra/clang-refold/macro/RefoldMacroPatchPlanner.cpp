@@ -21,8 +21,8 @@
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroTupleHelpers.h"
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
+#include "proof/RefoldMacroPatchProofClassifier.h"
 #include "proof/RefoldOwnerStateProof.h"
-#include "proof/RefoldProofLattice.h"
 #include "source/TokenTextHelpers.h"
 #include "util/StringUtils.h"
 
@@ -73,8 +73,8 @@ namespace refold {
 // back-reference planner internals.
 RefoldMacroPatchPlanner::RefoldMacroPatchPlanner(Dependencies deps)
     : deps_(std::move(deps)),
-      proofCertifier_(
-          RefoldMacroPatchProofCertifier::Dependencies{*deps_.proofLattice}),
+      proofCertifier_(RefoldMacroPatchProofCertifier::Dependencies{
+          *deps_.macroPatchProofClassifier, *deps_.acceptedCandidateBuilder}),
       subtreeReplayValidator_(RefoldMacroSubtreeReplayValidator::Dependencies{
           *deps_.model, *deps_.macroTopology, *deps_.sourceMapper,
           *deps_.argTextRecovery, *deps_.lexLang, *deps_.abTokHunks}),
@@ -130,7 +130,7 @@ RefoldMacroPatchPlanner::RefoldMacroPatchPlanner(Dependencies deps)
               *deps_.macroTopology, *deps_.argTextRecovery,
               *deps_.bInsertionLedger, deps_.aToks, deps_.bToks, deps_.bSource,
               deps_.bTokOff, *deps_.abTokHunks, proofCertifier_,
-              *deps_.proofLattice, generatedCalleeReplayEngine_,
+              *deps_.macroPatchProofClassifier, generatedCalleeReplayEngine_,
               generatedLeafReplayEngine_, deps_.strict,
               [this](llvm::StringRef name, uint32_t *aliasHops)
                   -> const RefoldModel::MacroDirective * {
@@ -161,7 +161,13 @@ RefoldMacroPatchPlanner::RefoldMacroPatchPlanner(Dependencies deps)
   assert(deps_.ownerClassifier && "macro planner requires owner/TU classifier");
   assert(deps_.macroStateProof && "macro planner requires macro-state proof");
   assert(deps_.ownerStateProof && "macro planner requires owner-state proof");
-  assert(deps_.proofLattice && "macro planner requires proof lattice");
+  assert(deps_.macroPatchProofClassifier &&
+         "macro planner requires the macro-patch proof classifier");
+  assert(deps_.acceptedCandidateBuilder &&
+         "macro planner requires the accepted-candidate builder");
+  assert(deps_.acceptedResultRanker &&
+         "macro planner requires the accepted-result ranker");
+  assert(deps_.witnessTrace && "macro planner requires the witness trace");
 }
 
 //===----------------------------------------------------------------------===//
@@ -176,11 +182,6 @@ RefoldMacroStateProof &RefoldMacroPatchPlanner::GetMacroStateProof() const {
 RefoldOwnerStateProof &RefoldMacroPatchPlanner::GetOwnerStateProof() const {
   assert(deps_.ownerStateProof && "macro planner requires owner-state proof");
   return *deps_.ownerStateProof;
-}
-
-RefoldProofLattice &RefoldMacroPatchPlanner::GetProofLattice() const {
-  assert(deps_.proofLattice && "macro planner requires proof lattice");
-  return *deps_.proofLattice;
 }
 
 //===----------------------------------------------------------------------===//
@@ -213,7 +214,7 @@ RefoldMacroDefinitionTapeSolver
 RefoldMacroPatchPlanner::DefinitionTapeSolver() const {
   return RefoldMacroDefinitionTapeSolver(
       {deps_.model, deps_.aToks, deps_.bToks, deps_.sourceMapper,
-       deps_.proofLattice, deps_.lexLang});
+       deps_.macroPatchProofClassifier, deps_.witnessTrace, deps_.lexLang});
 }
 
 
@@ -458,7 +459,7 @@ RefoldMacroArgsOnlyTemplateSolver
 RefoldMacroPatchPlanner::TemplateSolver() const {
   return RefoldMacroArgsOnlyTemplateSolver(
       {deps_.model, deps_.aToks, deps_.bToks, deps_.bTokOff, deps_.sourceMapper,
-       deps_.macroTopology, deps_.proofLattice, deps_.lexLang});
+       deps_.macroTopology, deps_.macroPatchProofClassifier, deps_.lexLang});
 }
 
 RefoldMacroOccurrenceProofValidator
@@ -1198,11 +1199,12 @@ RefoldMacroPatchPlanner::BuildPasteAwareArgsOnlyPatch(
         patch, rewrite->materializedOutputByteStart,
         rewrite->materializedOutputByteEnd);
     CertifyMacroPatchWholeExpansionBRange(m, patch);
-    MacroPatchProof proof = GetProofLattice().MakeMacroPatchProof(
-        MacroPatchProofKind::ArgsOnlyPasteMulti,
-        /*preservesInvocationStructure=*/true, m.id);
+    MacroPatchProof proof =
+        makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPasteMulti,
+                            /*preservesInvocationStructure=*/true, m.id);
     proof.paste->replayValidated = true;
-    GetProofLattice().SetMacroPatchProof(patch, std::move(proof));
+    deps_.macroPatchProofClassifier->SetMacroPatchProof(patch,
+                                                        std::move(proof));
     return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
   }
 
@@ -1311,15 +1313,16 @@ RefoldMacroPatchPlanner::BuildPasteAwareArgsOnlyPatch(
         // source argument rewrite regenerates, not merely the first changed
         // pasted-token hunk.
         CertifyMacroPatchWholeExpansionBRange(m, patch);
-        MacroPatchProof proof = GetProofLattice().MakeMacroPatchProof(
-            MacroPatchProofKind::ArgsOnlyPasteMulti,
-            /*preservesInvocationStructure=*/true, m.id);
+        MacroPatchProof proof =
+            makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPasteMulti,
+                                /*preservesInvocationStructure=*/true, m.id);
         // The builder already proved this rewrite by replaying the rewritten
         // invocation arguments against every pasted token occurrence in B.
         // Carry that proof source onto the accepted patch for converted
         // selector-site discharge.
         proof.paste->replayValidated = true;
-        GetProofLattice().SetMacroPatchProof(patch, std::move(proof));
+        deps_.macroPatchProofClassifier->SetMacroPatchProof(patch,
+                                                            std::move(proof));
         return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
       }
     }
@@ -1385,14 +1388,15 @@ RefoldMacroPatchPlanner::BuildPasteAwareArgsOnlyPatch(
       // compact representation of the macro's replayed expansion surface.
       // Keep the B-side map anchored to that whole expansion envelope.
       CertifyMacroPatchWholeExpansionBRange(m, patch);
-      MacroPatchProof proof = GetProofLattice().MakeMacroPatchProof(
-          MacroPatchProofKind::ArgsOnlyPasteSingle,
-          /*preservesInvocationStructure=*/true, m.id);
+      MacroPatchProof proof =
+          makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPasteSingle,
+                              /*preservesInvocationStructure=*/true, m.id);
       // Single-segment paste rewrites are admitted only after direct replay
       // validation against all touched occurrences in B. Record that proof
       // source explicitly for converted selector-site discharge.
       proof.paste->replayValidated = true;
-      GetProofLattice().SetMacroPatchProof(patch, std::move(proof));
+      deps_.macroPatchProofClassifier->SetMacroPatchProof(patch,
+                                                          std::move(proof));
       return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
     }
   }
@@ -1674,8 +1678,7 @@ RefoldMacroPatchPlanner::TryBuildTupleSiblingTerminalReplayPatch(
   proofCertifier_.SetArgsOnlyStandardProof(
       patch, m, /*wholeEnvelopeReplayValidated=*/true,
       /*definitionTapeReplayValidated=*/false);
-  GetProofLattice().MacroPatchProofClassifier().SyncMacroPatchProofSummary(
-      patch);
+  deps_.macroPatchProofClassifier->SyncMacroPatchProofSummary(patch);
   return patch;
 }
 

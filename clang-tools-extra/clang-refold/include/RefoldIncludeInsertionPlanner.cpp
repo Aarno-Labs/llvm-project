@@ -12,7 +12,7 @@
 #include "include/RefoldIncludeInsertionPlanner.h"
 
 #include "core/RefoldLog.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldAcceptancePathClassifier.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
 
@@ -32,9 +32,10 @@ namespace refold {
 RefoldIncludeInsertionPlanner::RefoldIncludeInsertionPlanner(
     StringRef bSource, ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff,
     const RefoldSourceMapper &sourceMapper,
-    const RefoldProofLattice &proofLattice)
+    const RefoldAcceptancePathClassifier &acceptancePathClassifier)
     : bSource_(bSource), bToks_(bToks), bTokOff_(bTokOff),
-      sourceMapper_(sourceMapper), proofLattice_(proofLattice) {}
+      sourceMapper_(sourceMapper),
+      acceptancePathClassifier_(acceptancePathClassifier) {}
 
 std::optional<std::pair<size_t, size_t>>
 RefoldIncludeInsertionPlanner::ResolveIncludeRealizationBTokenEnvelope(
@@ -181,9 +182,8 @@ IncludePatch RefoldIncludeInsertionPlanner::BuildIncludeInsertionPatch(
   // not certify a normalized accepted path here; the concrete preserving anchor
   // or realization class is chosen later during materialization, and only that
   // recertified result may cross a theorem-facing boundary.
-  patch.proofSummary =
-      proofLattice_.AcceptancePathClassifier().BuildIncludePatchProofSummary(
-          /*realizedSurface=*/false, AcceptedPathKind::Unknown, &patch);
+  patch.proofSummary = acceptancePathClassifier_.BuildIncludePatchProofSummary(
+      /*realizedSurface=*/false, AcceptedPathKind::Unknown, &patch);
 
   return patch;
 }

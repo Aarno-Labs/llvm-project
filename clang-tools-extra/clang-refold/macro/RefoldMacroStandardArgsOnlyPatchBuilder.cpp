@@ -27,7 +27,7 @@
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroTupleHelpers.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldMacroPatchProofClassifier.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/RefoldToken.h"
 #include "source/TokenTextHelpers.h"
@@ -58,8 +58,8 @@ RefoldMacroArgsOnlyTemplateSolver
 RefoldMacroStandardArgsOnlyPatchBuilder::TemplateSolver() const {
   return RefoldMacroArgsOnlyTemplateSolver(
       {&deps_.model, deps_.aToks, deps_.bToks, deps_.bTokOff,
-       &deps_.sourceMapper, &deps_.macroTopology, &deps_.proofLattice,
-       &deps_.lexLang});
+       &deps_.sourceMapper, &deps_.macroTopology,
+       &deps_.macroPatchProofClassifier, &deps_.lexLang});
 }
 
 RefoldMacroOccurrenceReplay
@@ -388,9 +388,9 @@ std::optional<MacroPatch> tryBuildDirectVaOptPasteTokenPatch(
       rewrite->materializedOutputByteEnd);
   deps.certifyMacroPatchWholeExpansionBRange(invocation, patch);
 
-  MacroPatchProof proof = deps.proofLattice.MakeMacroPatchProof(
-      MacroPatchProofKind::ArgsOnlyStandard,
-      /*preservesInvocationStructure=*/true, invocation.id);
+  MacroPatchProof proof =
+      makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyStandard,
+                          /*preservesInvocationStructure=*/true, invocation.id);
   WholeEnvelopeReplayWitness wholeEnvelopeWitness;
   wholeEnvelopeWitness.rootMacroId = invocation.id;
   wholeEnvelopeWitness.replayValidated = true;
@@ -405,7 +405,7 @@ std::optional<MacroPatch> tryBuildDirectVaOptPasteTokenPatch(
   pasteWitness.requiresProducerPasteSpans = false;
   pasteWitness.replayValidated = true;
   proof.paste = pasteWitness;
-  deps.proofLattice.SetMacroPatchProof(patch, std::move(proof));
+  deps.macroPatchProofClassifier.SetMacroPatchProof(patch, std::move(proof));
   return patch;
 }
 
@@ -586,17 +586,16 @@ std::optional<MacroPatch> tryBuildDirectVaOptStringifyDeactivationPatch(
       rewrite->materializedOutputByteEnd);
   deps.certifyMacroPatchWholeExpansionBRange(invocation, patch);
 
-  MacroPatchProof proof = deps.proofLattice.MakeMacroPatchProof(
-      MacroPatchProofKind::ArgsOnlyStandard,
-      /*preservesInvocationStructure=*/true, invocation.id);
+  MacroPatchProof proof =
+      makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyStandard,
+                          /*preservesInvocationStructure=*/true, invocation.id);
   WholeEnvelopeReplayWitness wholeEnvelopeWitness;
   wholeEnvelopeWitness.rootMacroId = invocation.id;
   wholeEnvelopeWitness.replayValidated = true;
   wholeEnvelopeWitness.definitionTapeReplayValidated = true;
   proof.wholeEnvelopeReplay = wholeEnvelopeWitness;
-  deps.proofLattice.SetMacroPatchProof(patch, std::move(proof));
-  deps.proofLattice.MacroPatchProofClassifier().SyncMacroPatchProofSummary(
-      patch);
+  deps.macroPatchProofClassifier.SetMacroPatchProof(patch, std::move(proof));
+  deps.macroPatchProofClassifier.SyncMacroPatchProofSummary(patch);
   return patch;
 }
 

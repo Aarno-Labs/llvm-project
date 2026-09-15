@@ -41,7 +41,7 @@ namespace clang {
 namespace refold {
 
 class LineDirectiveInserter;
-class RefoldProofLattice;
+class RefoldAcceptedCandidateBuilder;
 class RefoldIncludeInsertionPlanner;
 class RefoldPreprocessingStructureIndex;
 class RefoldTheoremAudit;
@@ -89,7 +89,7 @@ public:
       const RefoldTerminalProofSink &terminalSink,
       const clang::LangOptions &lexLang,
       const RefoldIncludeInsertionPlanner &includeInsertionPlanner,
-      RefoldProofLattice &proofLattice,
+      const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
       const RefoldTheoremAudit &theoremAuditService, RefoldStats &lastStats,
       std::vector<MaterializedEditMapping> *materializedEditMappings,
       Hooks hooks)
@@ -102,8 +102,8 @@ public:
         preprocessingStructureIndex_(preprocessingStructureIndex),
         terminalSink_(terminalSink), lexLang_(lexLang),
         includeInsertionPlanner_(includeInsertionPlanner),
-        proofLattice_(proofLattice), theoremAuditService_(theoremAuditService),
-        lastStats_(lastStats),
+        acceptedCandidateBuilder_(acceptedCandidateBuilder),
+        theoremAuditService_(theoremAuditService), lastStats_(lastStats),
         materializedEditMappings_(materializedEditMappings),
         hooks_(std::move(hooks)) {}
 
@@ -164,7 +164,7 @@ private:
   const RefoldTerminalProofSink &terminalSink_;
   const clang::LangOptions &lexLang_;
   const RefoldIncludeInsertionPlanner &includeInsertionPlanner_;
-  RefoldProofLattice &proofLattice_;
+  const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder_;
   const RefoldTheoremAudit &theoremAuditService_;
   RefoldStats &lastStats_;
   std::vector<MaterializedEditMapping> *materializedEditMappings_;

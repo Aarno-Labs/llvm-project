@@ -15,7 +15,6 @@
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/SourceLineDirectiveHelpers.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
-#include "proof/RefoldProofLattice.h"
 #include "proof/RefoldTerminalProofSink.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
 #include "util/RefoldPathIdentity.h"
@@ -1316,9 +1315,8 @@ RefoldPragmaOnceGuardRewriter::StageMaterializedBodyGuardEdits(
   }
 
   const AcceptedResultCandidate carrier =
-      deps_.proofLattice.AcceptedCandidateBuilder()
-          .BuildAcceptedIncludeRealizationCandidate(
-              AcceptedPathKind::IncludeMaterializedExpansion, include);
+      deps_.acceptedCandidateBuilder.BuildAcceptedIncludeRealizationCandidate(
+          AcceptedPathKind::IncludeMaterializedExpansion, include);
 
   std::vector<TextEdit> staged;
 
@@ -1616,9 +1614,9 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
   }
 
   deps_.textEditAssembler.AttachAcceptedResultCarrier(
-      edit, deps_.proofLattice.AcceptedCandidateBuilder()
-                .BuildAcceptedIncludeRealizationCandidate(
-                    AcceptedPathKind::IncludeMaterializedExpansion, include));
+      edit,
+      deps_.acceptedCandidateBuilder.BuildAcceptedIncludeRealizationCandidate(
+          AcceptedPathKind::IncludeMaterializedExpansion, include));
   edits.push_back(std::move(edit));
 
   REFOLD_LOG_TRACE("pragma/once/guard",

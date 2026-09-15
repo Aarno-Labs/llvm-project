@@ -51,7 +51,8 @@ namespace refold {
 
 class LineDirectiveInserter;
 class RefoldOwnerStateProof;
-class RefoldProofLattice;
+class RefoldAcceptedCandidateBuilder;
+class RefoldAcceptedResultRanker;
 class RefoldLineObserverLayout;
 class RefoldPragmaOnceGuardRewriter;
 class RefoldSourceMapper;
@@ -108,7 +109,8 @@ public:
       const RefoldMacroStateProof &macroStateProof,
       const RefoldOwnerStateProof &ownerStateProof,
       const RefoldIncludeInsertionPlanner &includeInsertionPlanner,
-      const RefoldProofLattice &proofLattice,
+      const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
+      const RefoldAcceptedResultRanker &acceptedResultRanker,
       const RefoldTextEditAssembler &textEditAssembler,
       const RefoldPragmaOnceGuardRewriter &pragmaOnceGuards,
       const RefoldTerminalProofSink &terminalSink,
@@ -122,7 +124,9 @@ public:
         lineObserverLayout_(lineObserverLayout),
         macroStateProof_(macroStateProof), ownerStateProof_(ownerStateProof),
         includeInsertionPlanner_(includeInsertionPlanner),
-        proofLattice_(proofLattice), textEditAssembler_(textEditAssembler),
+        acceptedCandidateBuilder_(acceptedCandidateBuilder),
+        acceptedResultRanker_(acceptedResultRanker),
+        textEditAssembler_(textEditAssembler),
         pragmaOnceGuards_(pragmaOnceGuards), terminalSink_(terminalSink),
         lexLang_(lexLang) {}
 
@@ -269,7 +273,9 @@ private:
   const RefoldMacroStateProof &macroStateProof_;
   const RefoldOwnerStateProof &ownerStateProof_;
   const RefoldIncludeInsertionPlanner &includeInsertionPlanner_;
-  const RefoldProofLattice &proofLattice_;
+  const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder_;
+  /// Borrowed only to hand to the header-local include edit planner.
+  const RefoldAcceptedResultRanker &acceptedResultRanker_;
   const RefoldTextEditAssembler &textEditAssembler_;
   const RefoldPragmaOnceGuardRewriter &pragmaOnceGuards_;
   const RefoldTerminalProofSink &terminalSink_;

@@ -15,7 +15,7 @@
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroStateRepairPlanner.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
@@ -70,8 +70,9 @@ RefoldIncludeMaterializationScheduler::RefoldIncludeMaterializationScheduler(
       pragmaOnceGuards_(
           requireNonNull(deps_.pragmaOnceGuards,
                          "include scheduler requires pragma-once guards")),
-      proofLattice_(requireNonNull(deps_.proofLattice,
-                                   "include scheduler requires proof lattice")),
+      acceptedCandidateBuilder_(requireNonNull(
+          deps_.acceptedCandidateBuilder,
+          "include scheduler requires accepted-candidate builder")),
       terminalSink_(requireNonNull(deps_.terminalSink,
                                    "include scheduler requires terminal sink")),
       sidebandPragmaEdits_(requireNonNull(
@@ -1063,9 +1064,8 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
   } else {
     textEditAssembler_.AttachAcceptedResultCarrier(
         edit,
-        proofLattice_.AcceptedCandidateBuilder()
-            .BuildAcceptedIncludeRealizationCandidate(
-                AcceptedPathKind::IncludeMaterializedExpansion, *include));
+        acceptedCandidateBuilder_.BuildAcceptedIncludeRealizationCandidate(
+            AcceptedPathKind::IncludeMaterializedExpansion, *include));
   }
 
   structuralHunkDispatcher_.AddTUEdit(std::move(edit));

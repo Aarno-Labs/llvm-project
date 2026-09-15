@@ -25,7 +25,7 @@
 #include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroTupleHelpers.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldMacroPatchProofClassifier.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
 #include "util/StringUtils.h"
@@ -62,7 +62,8 @@ RefoldMacroDAGLiftingPhase::RefoldMacroDAGLiftingPhase(Dependencies deps)
     : deps_(std::move(deps)),
       textPrimitives_(RefoldMacroDAGTextPrimitives::Dependencies{
           deps_.model, deps_.sourceMapper, deps_.lexLang, deps_.argTextRecovery,
-          deps_.proofLattice, deps_.getMacroInvocationFormalArgContentRanges}),
+          deps_.wholeCoverPlanBuilder,
+          deps_.getMacroInvocationFormalArgContentRanges}),
       invertibilitySolver_(RefoldMacroDAGInvertibilitySolver::Dependencies{
           textPrimitives_, deps_.sourceMapper, deps_.aToks, deps_.bToks,
           deps_.lexLang, deps_.argTextRecovery,
@@ -79,8 +80,9 @@ RefoldMacroDAGLiftingPhase::RefoldMacroDAGLiftingPhase(Dependencies deps)
       candidateValidator_(RefoldMacroDAGCandidateValidator::Dependencies{
           textPrimitives_, invertibilitySolver_, structuredLifter_,
           subtreeCertifier_, deps_.sourceMapper, deps_.bToks,
-          deps_.argTextRecovery, deps_.macroTopology, deps_.proofLattice,
-          deps_.lexLang, deps_.getMacroInvocationFormalArgContentRanges,
+          deps_.argTextRecovery, deps_.macroTopology,
+          deps_.macroPatchProofClassifier, deps_.lexLang,
+          deps_.getMacroInvocationFormalArgContentRanges,
           deps_.wholeCoverPlanBuilder}) {}
 
 RefoldMacroPasteArgumentBuilder
@@ -213,9 +215,9 @@ std::optional<MacroPatch> RefoldMacroDAGLiftingPhase::Run(
     // already established that this is a structure-preserving args-only
     // root rewrite.
     MacroPatch splitRootPatch = candidate.patch;
-    deps_.proofLattice.SetMacroPatchProof(
-        splitRootPatch, deps_.proofLattice.MakeMacroPatchProof(
-                            MacroPatchProofKind::ArgsOnlyPairedPureInsertion,
+    deps_.macroPatchProofClassifier.SetMacroPatchProof(
+        splitRootPatch,
+        makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPairedPureInsertion,
                             /*preservesInvocationStructure=*/true, m.id));
 
     // Feed the candidate through the shared DAG acceptance/merge logic so
@@ -766,9 +768,9 @@ std::optional<MacroPatch> RefoldMacroDAGLiftingPhase::Run(
     // are audit metadata for the accepted result; the proof itself has
     // already been checked by the subtree/root validation certificates.
     rootPatchCert.patch->macroId = m.id;
-    MacroPatchProof dagProof = deps_.proofLattice.MakeMacroPatchProof(
-        MacroPatchProofKind::DagSubtreeRoot,
-        /*preservesInvocationStructure=*/true, m.id);
+    MacroPatchProof dagProof =
+        makeMacroPatchProof(MacroPatchProofKind::DagSubtreeRoot,
+                            /*preservesInvocationStructure=*/true, m.id);
     SubtreeCertificate &cert = dagProof.subtree.emplace();
     cert.backed = true;
     cert.leafMacroId = leaf.id;
@@ -818,8 +820,8 @@ std::optional<MacroPatch> RefoldMacroDAGLiftingPhase::Run(
     // The subtree certificate is part of the proof carrier, so installing the
     // proof once is what publishes it: the normalized summary is rebuilt inside
     // SetMacroPatchProof before this candidate is merged, selected, or emitted.
-    deps_.proofLattice.SetMacroPatchProof(*rootPatchCert.patch,
-                                          std::move(dagProof));
+    deps_.macroPatchProofClassifier.SetMacroPatchProof(*rootPatchCert.patch,
+                                                       std::move(dagProof));
 
     // Finally, merge this subtree-backed root patch with any previously
     // accepted DAG candidate for the same root invocation.

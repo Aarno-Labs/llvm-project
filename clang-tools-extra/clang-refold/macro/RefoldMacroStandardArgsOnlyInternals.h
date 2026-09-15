@@ -178,7 +178,7 @@ struct ArgsOnlyFinalArgumentRewriteSet {
 /// it derives per-argument paste edits, requires every paste occurrence for the
 /// invocation to agree with the merged replacements, rebuilds the invocation,
 /// and certifies the same paste-only proof as the former inline path.  It
-/// mutates only the returned `MacroPatch` and the existing proof lattice /
+/// mutates only the returned `MacroPatch` and the existing proof classifier /
 /// certifier state.  It does not decide candidate ordering, does not relax the
 /// caller's pure-paste admission guard, and fails closed on every ambiguous
 /// segment split, arity-changing comma introduction, conflicting repeated paste

@@ -45,7 +45,7 @@ class RefoldIncludeMaterializer;
 class RefoldLineObserverLayout;
 class RefoldPathIdentity;
 class RefoldPragmaOnceGuardRewriter;
-class RefoldProofLattice;
+class RefoldAcceptedCandidateBuilder;
 class RefoldStructuralHunkDispatcher;
 class RefoldTerminalProofSink;
 class RefoldTextEditAssembler;
@@ -81,8 +81,8 @@ public:
     const RefoldMacroStateRepairPlanner *macroStateRepairPlanner = nullptr;
     /// Final text-edit assembler used for TU-root include edits.
     const RefoldTextEditAssembler *textEditAssembler = nullptr;
-    /// Proof lattice used to construct accepted-result carriers.
-    const RefoldProofLattice *proofLattice = nullptr;
+    /// Builds the accepted-result carriers for TU-root include edits.
+    const RefoldAcceptedCandidateBuilder *acceptedCandidateBuilder = nullptr;
     /// Synthetic `#pragma once` guard catalog.  Mutable because the scheduler is
     /// what learns which physical headers are actually inlined.
     RefoldPragmaOnceGuardRewriter *pragmaOnceGuards = nullptr;
@@ -322,7 +322,7 @@ private:
   const RefoldMacroStateRepairPlanner &macroStateRepairPlanner_;
   const RefoldTextEditAssembler &textEditAssembler_;
   RefoldPragmaOnceGuardRewriter &pragmaOnceGuards_;
-  const RefoldProofLattice &proofLattice_;
+  const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder_;
   RefoldTerminalProofSink &terminalSink_;
   const std::vector<SidebandPragmaEdit> &sidebandPragmaEdits_;
   RefoldStructuralHunkDispatcher &structuralHunkDispatcher_;

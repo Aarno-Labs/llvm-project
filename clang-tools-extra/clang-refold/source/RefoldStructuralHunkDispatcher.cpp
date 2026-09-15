@@ -9,7 +9,8 @@
 #include "core/RefoldModel.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroTopology.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldAcceptedCandidateBuilder.h"
+#include "proof/RefoldWitnessEquivalenceKeyBuilder.h"
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldToken.h"
 #include "source/TokenTextHelpers.h"
@@ -214,7 +215,7 @@ void RefoldStructuralHunkDispatcher::StageMacroPatchUnderKey(
 }
 
 void RefoldStructuralHunkDispatcher::FinalizeMacroPatchBuckets(
-    RefoldProofLattice &proofLattice) {
+    const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder) {
   macroPatchesByOwner_.clear();
 
   SmallVector<std::optional<uint64_t>, 16> ownerKeys;
@@ -253,9 +254,8 @@ void RefoldStructuralHunkDispatcher::FinalizeMacroPatchBuckets(
         continue;
 
       MacroPatch &patch = it->second;
-      if (!proofLattice.AcceptedCandidateBuilder()
-               .FinalizeSelectedMacroPatchForEmission(
-                   patch, "macro/final-emission-bucket"))
+      if (!acceptedCandidateBuilder.FinalizeSelectedMacroPatchForEmission(
+              patch, "macro/final-emission-bucket"))
         continue;
       finalPatches.push_back(std::move(patch));
     }

@@ -9,8 +9,8 @@
 // proof lattice, resolver, and trace subsystems.
 //
 // Every entry point is a stateless free function in `clang::refold`.  The
-// classifier owns proof-vocabulary policy independently of RefoldProofLattice,
-// so callers can classify witnesses without threading a lattice instance
+// classifier owns proof-vocabulary policy independently of any proof service,
+// so callers can classify witnesses without threading a service instance
 // through pure vocabulary checks.
 //
 //===----------------------------------------------------------------------===//

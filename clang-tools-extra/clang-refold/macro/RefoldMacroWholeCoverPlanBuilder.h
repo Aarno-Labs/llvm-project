@@ -13,7 +13,7 @@
 // A-token cover onto the B-token material that a whole-cover realization
 // would replay.  Computing it needs only the invocation, the static
 // whole-cover proof helpers (`RefoldMacroWholeCoverProof`), the A->B source
-// mapper, and the B-insertion ledger; it needs neither the proof lattice nor
+// mapper, and the B-insertion ledger; it needs neither the proof services nor
 // any part of the macro patch planner.
 //
 // That is why this is a service of its own.  The plan query has consumers on
@@ -79,6 +79,15 @@ public:
   /// one contiguous run.  Each refusal is documented at its check.
   std::optional<WholeCoverPlan>
   ComputeWholeCoverPlan(const RefoldModel::MacroInvocation &m) const;
+
+  /// Build the replacement text for a macro whole-cover realization.
+  ///
+  /// Computes the same whole-cover plan used by macro patch construction and
+  /// returns its clipped replacement text. This helper is for callers that need
+  /// the materialized whole-cover text without constructing a full
+  /// `MacroPatch`.
+  std::optional<std::string>
+  BuildWholeCoverReplacementText(const RefoldModel::MacroInvocation &m) const;
 
   /// Return true when \p patch is a whole-cover realization of
   /// \p rootMacroId whose recorded cover coordinates still equal those of

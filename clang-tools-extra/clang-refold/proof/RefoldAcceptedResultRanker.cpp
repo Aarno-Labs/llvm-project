@@ -11,6 +11,7 @@
 #include "proof/RefoldAcceptedResultPredicates.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldOwnerStateTypes.h"
+#include "proof/RefoldProofSummaryBuilder.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "proof/RefoldTheoremTypes.h"
@@ -199,7 +200,8 @@ bool RefoldAcceptedResultRanker::IsSelectableAcceptedResultCandidate(
   // AcceptedProofClass, but those are construction provenance only; a selector
   // may consider the result only after NormalizeAcceptedProof() proves that the
   // candidate maps to one final theorem class.
-  return deps_.normalizeAcceptedProof(candidate).has_value();
+  return deps_.proofSummaryBuilder.NormalizeAcceptedProof(candidate)
+      .has_value();
 }
 
 ProofDominanceOrder

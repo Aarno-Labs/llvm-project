@@ -21,7 +21,7 @@
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
-#include "proof/RefoldProofLattice.h"
+#include "proof/RefoldMacroPatchProofClassifier.h"
 #include "source/RefoldSourceMapper.h"
 #include "util/StringUtils.h"
 
@@ -1087,8 +1087,7 @@ RefoldMacroDAGCandidateValidator::AcceptOrMergeDAGCandidatePatch(
       candPatch.macroId = ctx.m.id;
     if (!candPatch.proof.proofRootMacroId) {
       candPatch.proof.proofRootMacroId = ctx.m.id;
-      deps_.proofLattice.MacroPatchProofClassifier().SyncMacroPatchProofSummary(
-          candPatch);
+      deps_.macroPatchProofClassifier.SyncMacroPatchProofSummary(candPatch);
     }
     accCtx.uniquePatch = std::move(candPatch);
     accCtx.uniquePatchBaseText = baseText.str();
@@ -1243,8 +1242,7 @@ RefoldMacroDAGCandidateValidator::AcceptOrMergeDAGCandidatePatch(
       candPatch.macroId = ctx.m.id;
     if (!candPatch.proof.proofRootMacroId) {
       candPatch.proof.proofRootMacroId = ctx.m.id;
-      deps_.proofLattice.MacroPatchProofClassifier().SyncMacroPatchProofSummary(
-          candPatch);
+      deps_.macroPatchProofClassifier.SyncMacroPatchProofSummary(candPatch);
     }
     if (subtreeCertificateOf(*accCtx.uniquePatch).backed || subtreeCertificateOf(candPatch).backed) {
       REFOLD_LOG_TRACE(

@@ -152,5 +152,16 @@ bool RefoldMacroWholeCoverPlanBuilder::WholeCoverPatchMatchesPlan(
          patch.wholeCover.bAdjHi == plan.bTokEnd;
 }
 
+std::optional<std::string>
+RefoldMacroWholeCoverPlanBuilder::BuildWholeCoverReplacementText(
+    const RefoldModel::MacroInvocation &m) const {
+  // Reuse the same whole-cover planning path used by patch construction so the
+  // returned replacement text obeys the same clipping/envelope policy.
+  auto plan = ComputeWholeCoverPlan(m);
+  if (!plan)
+    return std::nullopt;
+  return plan->clippedText;
+}
+
 } // namespace refold
 } // namespace clang

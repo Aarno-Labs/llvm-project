@@ -22,10 +22,10 @@
 #include "line-control/RefoldLineControlProof.h"
 #include "line-control/SourceLineDirectiveHelpers.h"
 #include "macro/RefoldMacroStateProof.h"
+#include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldNeutralityProof.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldPragmaTaxonomy.h"
-#include "proof/RefoldProofLattice.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
@@ -3871,10 +3871,9 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   // repair, and pragma-once/include-guard reactivation safety all had to be
   // discharged before this edit was created.
   AcceptedResultCandidate acceptedClosure =
-      proofLattice_.AcceptedCandidateBuilder()
-          .BuildAcceptedSpecializedTUTextEditCandidate(
-              AcceptedPathKind::TUIncludeClosureEdit, sourceBegin,
-              closureSourceEnd, StringRef(rawReplacement));
+      acceptedCandidateBuilder_.BuildAcceptedSpecializedTUTextEditCandidate(
+          AcceptedPathKind::TUIncludeClosureEdit, sourceBegin, closureSourceEnd,
+          StringRef(rawReplacement));
   theoremAuditService_.AuditExpansionFallbackAcceptedCandidate(
       fallbackBranch, acceptedClosure,
       "BuildTUIncludeClosureEditForUnresolvedHunk/accepted");
@@ -3899,7 +3898,7 @@ std::string RefoldExpansionFallbackPlanner::ResolvePostStructuralFallback() {
   // post-terminal owner search here; normalize directly onto the declared
   // TerminalOutOfDomain carrier.
   TerminalFallbackWitness terminalWitness =
-      proofLattice_.BuildTerminalFallbackWitness();
+      terminalSink_.BuildTerminalFallbackWitness();
   bool terminalAuditOk = true;
   for (size_t i = 0; i < terminalWitness.proofFailures.size(); ++i) {
     const llvm::StringRef role =
@@ -3921,10 +3920,16 @@ std::string RefoldExpansionFallbackPlanner::ResolvePostStructuralFallback() {
                 "terminalFallbackAudit")),
         "terminal/audit",
         "terminal fallback proof-failure audit rejected the raw-B carrier");
-    terminalWitness = proofLattice_.BuildTerminalFallbackWitness();
+    terminalWitness = terminalSink_.BuildTerminalFallbackWitness();
   }
 
-  theoremAuditService_.RecordTerminalFallbackTheoremAudit();
+  // The theorem audit judges the terminal carrier the request ledger yields
+  // now, so the witness is rebuilt here rather than reused from above.
+  const TerminalFallbackWitness auditedWitness =
+      terminalSink_.BuildTerminalFallbackWitness();
+  theoremAuditService_.RecordTerminalFallbackTheoremAudit(
+      auditedWitness,
+      acceptedCandidateBuilder_.BuildAcceptedTerminalCandidate(auditedWitness));
 
   REFOLD_LOG_DEBUG(
       "fallback",
@@ -3932,8 +3937,7 @@ std::string RefoldExpansionFallbackPlanner::ResolvePostStructuralFallback() {
       "stream (B). reasons={0} proofFailures={1}",
       terminalSink_.Requests().size(), terminalWitness.proofFailures.size());
   const AcceptedResultCandidate terminalCandidate =
-      proofLattice_.AcceptedCandidateBuilder().BuildAcceptedTerminalCandidate(
-          terminalWitness);
+      acceptedCandidateBuilder_.BuildAcceptedTerminalCandidate(terminalWitness);
   theoremAuditService_.AuditExpansionFallbackAcceptedCandidate(
       terminalBranch, terminalCandidate,
       "ResolvePostStructuralFallback/terminal");

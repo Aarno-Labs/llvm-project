@@ -494,6 +494,39 @@ public:
   std::optional<BoundaryParentIncludePlan>
   FindBoundaryParentIncludeForPureInsertion(const diffutils::Hunk &h) const;
 
+  /// Return whether the hunk lies on the explicit unresolved-owner /
+  /// no-TU-anchor theorem boundary.
+  ///
+  /// Use the conservative domain-wall interpretation for the last ownership
+  /// gap. This predicate does not search for any new witness. It only re-states
+  /// the evidence that has already been exhausted:
+  ///
+  /// * no resolved macro/TU/include owner remained,
+  /// * no exact include-boundary owner exists for a pure insertion,
+  /// * no truthful TU-owned mapped span exists for the A interval, and
+  /// * for pure insertions, no exact/provable TU insertion anchor exists.
+  ///
+  /// When all of those facts hold, the edit is explicitly outside the declared
+  /// structural refolding domain and must terminate via
+  /// `OwnerUnresolvedNoTUAnchor`.
+  bool IsOwnerUnresolvedNoTUAnchorOutOfDomain(const diffutils::Hunk &h,
+                                              llvm::StringRef tuPath,
+                                              const Owner &owner,
+                                              bool mapsToTU) const;
+
+  /// Build a detailed terminal-fallback reason for the unresolved-owner /
+  /// no-TU-anchor domain wall.
+  ///
+  /// This helper records the deterministic owner and TU-anchor searches that
+  /// were already exhausted before the engine concluded that no declared
+  /// macro/include/TU proof class could own the edit. It does not guess a new
+  /// owner or widen admissibility.
+  std::string BuildOwnerUnresolvedNoTUAnchorDetail(size_t hunkIndex,
+                                                   const diffutils::Hunk &h,
+                                                   llvm::StringRef tuPath,
+                                                   const Owner &owner,
+                                                   bool mapsToTU) const;
+
   /// Build the direct-TU hunk edit plan for an already-proved TU byte span.
   ///
   /// This method deliberately returns a plan, not an applied or globally

@@ -13,8 +13,9 @@
 
 #include "core/RefoldLog.h"
 #include "macro/RefoldMacroPatchPlanner.h"
+#include "macro/RefoldMacroWholeCoverPlanBuilder.h"
+#include "proof/RefoldMacroPatchProofClassifier.h"
 #include "proof/RefoldOwnerStateProof.h"
-#include "proof/RefoldProofLattice.h"
 #include "proof/RefoldWitnessTrace.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
@@ -477,7 +478,8 @@ void applyForcedCounterPatches(
     const RefoldSourceMapper &sourceMapper,
     const RefoldMacroTopology &macroTopology,
     const RefoldMacroPatchPlanner &macroPatchPlanner,
-    const RefoldProofLattice &proofLattice,
+    const RefoldMacroWholeCoverPlanBuilder &wholeCoverPlanBuilder,
+    const RefoldMacroPatchProofClassifier &macroPatchProofClassifier,
     const RefoldOwnerStateProof &ownerStateProof,
     RefoldStructuralHunkDispatcher &structuralHunkDispatcher) {
   struct CounterReplacementSurface {
@@ -549,7 +551,8 @@ void applyForcedCounterPatches(
     } else {
       // Other forced counter-related requests use the normal whole-cover text
       // builder so they remain aligned with whole macro invocation replay.
-      nonCounterReplacement = proofLattice.BuildWholeCoverReplacementText(m);
+      nonCounterReplacement =
+          wholeCoverPlanBuilder.BuildWholeCoverReplacementText(m);
     }
     if (!counterSurface && !nonCounterReplacement)
       continue;
@@ -637,9 +640,9 @@ void applyForcedCounterPatches(
     // the counter sequence consistent after an earlier counter occurrence was
     // realized, so certify every forced counter-stabilization patch with the
     // explicit counter proof class and its typed state-stability witness.
-    MacroPatchProof proof = proofLattice.MakeMacroPatchProof(
-        MacroPatchProofKind::CounterLiteral,
-        /*preservesInvocationStructure=*/false, m.id);
+    MacroPatchProof proof =
+        makeMacroPatchProof(MacroPatchProofKind::CounterLiteral,
+                            /*preservesInvocationStructure=*/false, m.id);
     CounterStateWitness counterState;
     counterState.hasCounterEvents = true;
     counterState.counterOrderKnown = true;
@@ -674,7 +677,7 @@ void applyForcedCounterPatches(
         llvm::formatv("forced-materialization:{0}", counterWitness.kind).str();
     proof.suffixStability = std::move(counterWitness);
     proof.counterState = std::move(counterState);
-    proofLattice.SetMacroPatchProof(patch, std::move(proof));
+    macroPatchProofClassifier.SetMacroPatchProof(patch, std::move(proof));
 
     // Use the coalesced key as the patch macro ID so later owner/macro maps see
     // one canonical patch per physical invocation span.

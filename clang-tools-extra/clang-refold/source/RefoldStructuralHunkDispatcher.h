@@ -45,7 +45,7 @@ class RefoldLineObserverLayout;
 class RefoldMacroTopology;
 class RefoldModel;
 class RefoldPathIdentity;
-class RefoldProofLattice;
+class RefoldAcceptedCandidateBuilder;
 class RefoldWitnessEquivalenceKeyBuilder;
 
 /// Exact staged-topology serialization used by the semantic alignment
@@ -130,10 +130,11 @@ public:
   /// Flatten per-owner macro-patch merge buckets into final patch vectors.
   ///
   /// The merge buckets use DenseMap storage while patches are discovered.
-  /// Finalization sorts owners and macro ids explicitly before asking the proof
-  /// lattice whether each patch is selectable for emission, preserving a
-  /// deterministic output order.
-  void FinalizeMacroPatchBuckets(RefoldProofLattice &proofLattice);
+  /// Finalization sorts owners and macro ids explicitly before asking the
+  /// accepted-candidate builder whether each patch is selectable for emission,
+  /// preserving a deterministic output order.
+  void FinalizeMacroPatchBuckets(
+      const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder);
 
   /// Return final macro patches for the given owner if the owner has any.
   std::vector<MacroPatch> *

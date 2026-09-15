@@ -10,16 +10,16 @@
 //
 // Plan computation itself is not here: it is
 // `RefoldMacroWholeCoverPlanBuilder`, which depends on neither the planner
-// nor the proof lattice and is therefore constructible before both.  The
+// nor the proof services and is therefore constructible before both.  The
 // orchestrator forwards the engine-owned builder to the phase services that
 // need a plan.
 //
 // The orchestrator borrows a back-reference to RefoldMacroPatchPlanner so
 // it can access planner-owned sub-services and the public planner helpers
-// its phase services need (`Deps()`, `GetProofLattice()`,
-// `GetOwnerStateProof()`, `RecoverWholeCoverReuseContext()`,
-// `IsParenthesizedTuple()`, `TokenSpellingsEqualToA/B()`, etc.).  No
-// friend-class relationship is used or needed.
+// its phase services need (`Deps()`, `GetOwnerStateProof()`,
+// `RecoverWholeCoverReuseContext()`, `IsParenthesizedTuple()`,
+// `TokenSpellingsEqualToA/B()`, etc.).  No friend-class relationship is used or
+// needed.
 //
 //===----------------------------------------------------------------------===//
 

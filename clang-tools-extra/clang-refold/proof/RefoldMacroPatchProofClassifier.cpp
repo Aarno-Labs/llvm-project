@@ -571,5 +571,48 @@ RefoldMacroPatchProofClassifier::ValidateInvocationRealizationProof(
   return discharge.Finish();
 }
 
+void RefoldMacroPatchProofClassifier::SetMacroPatchProof(
+    MacroPatch &patch, MacroPatchProof proof) const {
+  // MacroPatchProof is the only MacroPatch-local proof carrier.
+  // Install the caller-provided primary proof facts directly, then enrich the
+  // carrier with any paste/subtree/call-chain witnesses derived from durable
+  // patch metadata before rebuilding the normalized ProofSummary.
+  patch.proof = std::move(proof);
+  patch.selectedAcceptedCandidate.reset();
+  SyncMacroPatchProofSummary(patch);
+}
+
+void RefoldMacroPatchProofClassifier::CertifyMacroWholeCoverRealizationPatch(
+    MacroPatch &patch, const WholeCoverPlan &plan,
+    const RefoldModel::MacroInvocation &macro) const {
+  // Promote accepted whole-cover output into an explicit invocation
+  // realization proof. The plan already carries the exact A/B token envelope
+  // and containment facts, so certifying it here keeps the accepted patch
+  // deterministic and fully described without changing selection behavior.
+  patch.wholeCover.usedBodyRange = plan.usedBodyRange;
+  patch.wholeCover.selfContained = plan.selfContained;
+  patch.wholeCover.adjustedLeft = plan.adjustedLeft;
+  patch.wholeCover.adjustedRight = plan.adjustedRight;
+  patch.wholeCover.claimsClipped = plan.claimsClipped;
+  patch.wholeCover.aLo = plan.covLoA;
+  patch.wholeCover.aHi = plan.covHiA;
+  patch.wholeCover.bRawLo = plan.rawBTokStart;
+  patch.wholeCover.bRawHi = plan.rawBTokEnd;
+  patch.wholeCover.bAdjLo = plan.bTokStart;
+  patch.wholeCover.bAdjHi = plan.bTokEnd;
+  patch.materialized.hasBTokenRange = true;
+  patch.materialized.bTokStart = plan.bTokStart;
+  patch.materialized.bTokEnd = plan.bTokEnd;
+  const OwnerRealizationResult ownerRealization =
+      deps_.ownerRealizationProofBuilder.BuildMacroWholeCoverOwnerRealization(
+          macro, plan);
+  MacroPatchProof proof =
+      makeMacroPatchProof(MacroPatchProofKind::WholeCoverRealization,
+                          /*preservesInvocationStructure=*/false, macro.id);
+  if (ownerRealization.accepted)
+    proof.ownerRealization = ownerRealization.witness;
+  SetMacroPatchProof(patch, std::move(proof));
+}
+
 } // namespace refold
 } // namespace clang

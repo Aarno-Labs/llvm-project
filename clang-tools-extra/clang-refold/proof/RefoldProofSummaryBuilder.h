@@ -20,12 +20,11 @@
 //   * `ProofSummaryRequiresOwnerRealizationWitness` — the per-path predicate
 //     that gates the owner-realization witness requirement.
 //
-// The path-specific summary builders (`BuildAcceptedPathProofSummary`,
-// `BuildIncludePatchProofSummary`, `BuildOwnerRealizationProofSummary`) stay
-// on `RefoldProofLattice` because their bodies are thin switch-arms over
-// path-specific validators and inventory helpers that also live on the
-// lattice; lifting them out would force the builder to back-reference the
-// lattice for those helpers.
+// The path-specific summary builders live with the validators and inventory
+// helpers they switch over: `BuildAcceptedPathProofSummary` and
+// `BuildIncludePatchProofSummary` on `RefoldAcceptancePathClassifier`,
+// `BuildOwnerRealizationProofSummary` on `RefoldOwnerRealizationProofBuilder`.
+// Keeping them there leaves this builder a leaf service.
 //
 //===----------------------------------------------------------------------===//
 
