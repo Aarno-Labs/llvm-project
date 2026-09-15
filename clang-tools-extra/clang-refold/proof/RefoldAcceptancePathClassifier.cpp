@@ -2,9 +2,9 @@
 //
 // Acceptance-path proof-summary classifier — implementation.
 //
-// Lattice-side validators reached through `Dependencies` callbacks:
-//   * `validateIncludePreservingProof` — include-side preserving proof
-//   * `validateTUAnchorProof` — TU-anchor witness proof
+// Path-specific validators:
+//   * `ValidateIncludePreservingProof` — include-side preserving proof
+//   * `validateTUAnchorProof` — the shared TU-anchor witness theorem
 // Both fire only on include/TU paths and stay off the macro hot path.
 //
 //===----------------------------------------------------------------------===//

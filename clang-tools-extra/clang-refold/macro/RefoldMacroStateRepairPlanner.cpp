@@ -1505,7 +1505,8 @@ bool MacroStateRepairContext::EditHasMacroPatchSurfaceInBMacroState(
 
     const ProofSummary &summary = carrier->proofSummary;
     if ((summary.theoremClass == TheoremProofClass::OwnerRealizationProof ||
-         summary.theoremClass == TheoremProofClass::MixedOwnerTilingProof) &&
+         summary.theoremClass ==
+             TheoremProofClass::StructuralHunkTilingProof) &&
         summary.inventory.currentPath ==
             AcceptedPathKind::MacroWholeCoverRealization &&
         summary.realizationMode == RealizationMode::RealizeEditedSurface &&
@@ -1658,19 +1659,19 @@ MacroStateRepairContext::DirectTUStructuralSegmentKey(
       continue;
     }
     // A direct-TU carrier can name its segment two ways, and which one it uses
-    // depends on how the planner bound it: the mixed-owner overlay stores the
-    // witness inline, while the owner-realization path stores a validated
+    // depends on how the planner bound it: the structural-tiling overlay stores
+    // the witness inline, while the owner-realization path stores a validated
     // witness-id/segment key.  Both are read, because a repair must not lose
     // the binding merely because of which form the carrier happened to hold.
     const ProofSummary &summary = candidate->proofSummary;
     std::optional<InheritedStructuralSegmentKey> found;
 
-    if (summary.hasMixedOwnerTilingWitness &&
-        summary.hasMixedOwnerTilingSegmentSelection &&
-        summary.mixedOwnerTilingWitness.witnessId != 0) {
+    if (summary.hasStructuralHunkTilingWitness &&
+        summary.hasStructuralHunkTilingSegmentSelection &&
+        summary.structuralHunkTilingWitness.witnessId != 0) {
       found = InheritedStructuralSegmentKey{
-          summary.mixedOwnerTilingWitness.witnessId,
-          summary.mixedOwnerTilingSegmentIndex};
+          summary.structuralHunkTilingWitness.witnessId,
+          summary.structuralHunkTilingSegmentIndex};
     }
 
     if (summary.hasOwnerRealizationWitness &&

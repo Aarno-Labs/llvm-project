@@ -10,13 +10,12 @@
 // winner, returning the final `MacroPatch` or `std::nullopt` when no
 // candidate survives final admission.
 //
-// The selector reaches planner-side helpers exclusively through
-// `RefoldMacroPatchPlanner`'s public accessors (`Deps`, `GetProofLattice`,
-// `GetOwnerStateProof`, `RecoverWholeCoverReuseContext`,
-// `IsParenthesizedTuple`, `TokenSpellingsEqualToA/B`) plus the
-// orchestrator-owned `RefoldMacroPatchReusePhase`, proof certifier, and
-// replay-stability validator supplied through Dependencies.  No friend
-// access is used or needed.
+// The selector reaches everything it uses through `Dependencies`: the
+// borrowed proof services, the orchestrator-owned
+// `RefoldMacroPatchReusePhase`, proof certifier and replay-stability
+// validator, the whole-cover plan builder, and three planner-helper
+// callbacks.  It holds no reference to the planner, and no friend access is
+// used or needed.
 //
 //===----------------------------------------------------------------------===//
 

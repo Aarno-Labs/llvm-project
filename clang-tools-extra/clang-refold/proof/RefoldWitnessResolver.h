@@ -65,7 +65,8 @@ inline constexpr llvm::StringLiteral kSelectPreferredMacroSelectionRole =
 class RefoldWitnessResolver {
 public:
   /// Borrowed inputs needed to resolve witnesses across a candidate set.
-  /// Every reference must outlive the resolver; the lattice owns all three.
+  /// Every reference must outlive the resolver; the engine's composition root
+  /// owns all three.
   struct Dependencies {
     /// Witness trace + audit-log gating.
     const RefoldWitnessTrace &witnessTrace;

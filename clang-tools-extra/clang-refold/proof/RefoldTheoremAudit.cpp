@@ -477,14 +477,14 @@ bool RefoldTheoremAudit::AuditAcceptedResultCandidateForLegacyAuthority(
             .str()));
   }
 
-  if ((candidate.proofSummary.hasMixedOwnerTilingWitness ||
+  if ((candidate.proofSummary.hasStructuralHunkTilingWitness ||
        candidate.proofSummary.theoremClass ==
-           TheoremProofClass::MixedOwnerTilingProof) &&
+           TheoremProofClass::StructuralHunkTilingProof) &&
       !candidate.emissionPaths.Contains(
-          EmissionPathKind::MixedOwnerTilingSegment)) {
+          EmissionPathKind::StructuralHunkTilingSegment)) {
     ReportNoLegacyAuditFinding(MakeLegacyAuditEvidence(
         LegacyPathKind::PathSpecificProofMirror, role,
-        "mixed-owner tiling witness is not represented in the accepted-result "
+        "structural tiling witness is not represented in the accepted-result "
         "emission-path inventory"));
   }
 

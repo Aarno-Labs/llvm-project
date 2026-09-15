@@ -77,7 +77,7 @@ namespace refold {
 // Post-terminal macro expansion is classified through terminal carriers.
 //
 // This branch is rejected because the owner-closed macro whole-cover surface is
-// represented by the ordinary OwnerRealizationProof / MixedOwnerTilingProof
+// represented by the ordinary OwnerRealizationProof / StructuralHunkTilingProof
 // lattice before terminal fallback is requested.  A second post-terminal proof
 // search would reintroduce an independent fallback authority, even if it never
 // materialized bytes.  Terminal fallback goes directly to the declared
@@ -3896,10 +3896,10 @@ std::string RefoldExpansionFallbackPlanner::ResolvePostStructuralFallback() {
 
   // Reaching this point means every structural proof lattice candidate has
   // failed closed or has been classified out-of-domain.  A macro whole-cover
-  // case is in-domain only if OwnerRealizationProof or MixedOwnerTilingProof
-  // accepted it before fallback was requested.  Do not run a second
-  // post-terminal owner search here; normalize directly onto the declared
-  // TerminalOutOfDomain carrier.
+  // case is in-domain only if OwnerRealizationProof or
+  // StructuralHunkTilingProof accepted it before fallback was requested.  Do
+  // not run a second post-terminal owner search here; normalize directly onto
+  // the declared TerminalOutOfDomain carrier.
   TerminalFallbackWitness terminalWitness =
       terminalSink_.BuildTerminalFallbackWitness();
   bool terminalAuditOk = true;

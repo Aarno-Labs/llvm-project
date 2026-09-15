@@ -16,6 +16,7 @@
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroStateProof.h"
+#include "macro/RefoldMacroTupleHelpers.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
 #include "proof/RefoldAcceptedResultRanker.h"
 #include "proof/RefoldMacroPatchProofClassifier.h"
@@ -113,8 +114,8 @@ static uint64_t resolveGeneratedFunctionCallSourceEnd(
   if (invocationEnd > invocationFileText.size())
     return invocationEnd;
 
-  const uint64_t parsedSuffixEnd = stringutils::extendChainedCallEnd(
-      invocationFileText, invocationEnd, StringRef());
+  const uint64_t parsedSuffixEnd =
+      extendChainedCallEnd(invocationFileText, invocationEnd, StringRef());
   if (parsedSuffixEnd != *generatedFunctionChild->invE)
     return invocationEnd;
 
@@ -710,8 +711,8 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
           // Compute the source extent of the chained-call suffix after the
           // macro invocation. Only tokens that map into this suffix are
           // eligible for the local call-chain patch.
-          const uint64_t chainEndAbs = stringutils::extendChainedCallEnd(
-              invFileText, invEndAbs, StringRef());
+          const uint64_t chainEndAbs =
+              extendChainedCallEnd(invFileText, invEndAbs, StringRef());
           if (chainEndAbs > invEndAbs) {
             const uint64_t aLen = h.aEnd - h.aStart;
             const uint64_t bLen = h.bEnd - h.bStart;

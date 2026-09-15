@@ -14,8 +14,8 @@
 #include "edit/RefoldTUAnchorProof.h"
 #include "line-control/RefoldLineControlProof.h"
 #include "macro/RefoldMacroTopology.h"
+#include "macro/RefoldMacroTupleHelpers.h"
 #include "model/RefoldModel.h"
-#include "support/StringUtils.h"
 
 #include "llvm/Support/FormatVariadic.h"
 
@@ -153,8 +153,7 @@ RefoldTUEditPlanner::MaybeExtendTUSpanOverClosedTrailingCallSuffix(
     return std::nullopt;
 
   const uint64_t oldEnd = initialSpan.tuByteEnd;
-  const uint64_t extEnd =
-      stringutils::extendChainedCallEnd(tuBytes, oldEnd, replacement);
+  const uint64_t extEnd = extendChainedCallEnd(tuBytes, oldEnd, replacement);
 
   // Closed trailing call-suffix extension is not ordinary byte-span widening.
   // It is allowed only when the B-token suffix is independently closed and does

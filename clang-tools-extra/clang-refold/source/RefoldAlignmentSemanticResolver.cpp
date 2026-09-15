@@ -18,6 +18,7 @@
 #include "source/RefoldLegacyAlignmentDiagnostic.h"
 
 #include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FormatVariadic.h"

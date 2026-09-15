@@ -16,13 +16,10 @@
 // mapper, and the B-insertion ledger; it needs neither the proof services nor
 // any part of the macro patch planner.
 //
-// That is why this is a service of its own.  The plan query has consumers on
-// both sides of the planner/lattice construction cycle — the lattice's
-// `BuildWholeCoverReplacementText`, the text-edit assembler's emitted-range
-// recovery, and three macro-side phase services — and while it lived on
-// `RefoldMacroWholeCoverOrchestrator` every one of them had to reach it
-// through a late-bound `std::function` installed after construction.  Split
-// out, it is constructible before both the lattice and the planner, and each
+// That is why this is a service of its own.  Its consumers include the
+// macro patch planner, the text-edit assembler's emitted-range recovery,
+// counter stabilization, and several macro-side phase services.  Because the
+// builder needs none of them, it is constructed before all of them, and each
 // consumer holds a direct reference.
 //
 // Do not confuse this with `macro/RefoldMacroWholeCoverPlanningContext.h`,

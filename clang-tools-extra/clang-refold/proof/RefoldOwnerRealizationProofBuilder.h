@@ -27,13 +27,13 @@
 //   * `AttachStandardWitnesses` — both of the above plus the
 //     emission-path inventory refresh they feed, the block every
 //     accepted carrier builder runs once its summary is final.
-//   * `AttachMixedOwnerTilingWitnessForTokenEnvelope` — attach the
-//     strongest matching mixed-owner tiling witness for a token
+//   * `AttachStructuralHunkTilingWitnessForTokenEnvelope` — attach the
+//     strongest matching structural tiling witness for a token
 //     envelope, folding through the lattice-level preference gate.
 //
 // Every primitive it needs is reached through the explicit `Dependencies`
 // bundle: owner-state proof, model, the summary-builder / ranker pair that
-// arbitrate mixed-owner tiling candidates, and the acceptance-path classifier
+// arbitrate structural tiling candidates, and the acceptance-path classifier
 // that builds its starter summaries.
 //
 //===----------------------------------------------------------------------===//
@@ -87,9 +87,10 @@ public:
     uint64_t bTokenCount = 0;
     const RefoldProofSummaryBuilder &proofSummaryBuilder;
     const RefoldAcceptedResultRanker &acceptedResultRanker;
-    const std::vector<MixedOwnerTilingSegmentBinding>
-        &mixedOwnerTilingSegmentBindings;
-    const std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses;
+    const std::vector<StructuralHunkTilingSegmentBinding>
+        &structuralHunkTilingSegmentBindings;
+    const std::vector<StructuralHunkTilingWitness>
+        &structuralHunkTilingWitnesses;
 
     /// `BuildOwnerRealizationProofSummary` starts from the accepted-path
     /// summary this classifier builds.  The classifier depends on nothing
@@ -118,7 +119,7 @@ public:
   /// carrier-local witness state call the refresh alone instead.
   void AttachStandardWitnesses(AcceptedResultCandidate &candidate) const;
 
-  /// Attach the strongest matching mixed-owner tiling witness for the requested
+  /// Attach the strongest matching structural tiling witness for the requested
   /// token envelope, folding through the lattice-level preference gate.
   ///
   /// Include-realization input witnesses are intentionally not formatted as a
@@ -126,11 +127,11 @@ public:
   /// and TU output routes through `OwnerRealizationWitness` so audit logs
   /// expose one owner-polymorphic realization proof instead of parallel
   /// include-specific and owner-specific proof records.
-  void AttachMixedOwnerTilingWitnessForTokenEnvelope(ProofSummary &summary,
-                                                     uint64_t aStart,
-                                                     uint64_t aEnd,
-                                                     uint64_t bStart,
-                                                     uint64_t bEnd) const;
+  void AttachStructuralHunkTilingWitnessForTokenEnvelope(ProofSummary &summary,
+                                                         uint64_t aStart,
+                                                         uint64_t aEnd,
+                                                         uint64_t bStart,
+                                                         uint64_t bEnd) const;
 
   /// Discharge the common owner-realization obligations for a constructed
   /// closure.
@@ -224,7 +225,7 @@ private:
   ///
   /// The binding's local preservation flags are not accepted as self-authenticating
   /// booleans.  Its witness id and segment ordinal must resolve through the
-  /// engine-owned durable mixed-owner/structural-tiling records, and both the
+  /// engine-owned durable structural-tiling records, and both the
   /// original and segment token envelopes must agree byte-for-byte with the
   /// concrete carrier supplied by the caller.
   bool ValidateDurableStructuralSegmentBinding(

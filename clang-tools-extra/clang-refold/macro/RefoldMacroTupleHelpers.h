@@ -8,6 +8,9 @@
 // carrier used by generated-callee replay, tuple replay, and exact old/new
 // element comparison.
 //
+// It also owns chained-call suffix extension: how far a callsite patch must
+// reach past a macro invocation into the parenthesized groups that follow it.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROTUPLEHELPERS_H
@@ -19,6 +22,7 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace clang {
 namespace refold {
@@ -50,6 +54,20 @@ bool splitTopLevelTupleElementsWithLexer(
 bool splitTopLevelMacroActualsWithLexer(
     llvm::StringRef text, const clang::LangOptions &lang,
     llvm::SmallVectorImpl<TupleElementSlice> &out);
+
+/// Extend an invocation end offset over trailing chained-call suffix groups
+/// when the replacement is no longer directly callable.
+///
+/// A macro invocation immediately followed by parenthesized argument lists in
+/// the source file may be a chain of function-like macros evaluating to
+/// another function-like macro (e.g. `INC3()()()(10)`).  A callsite patch that
+/// replaced only the first invocation (`INC3()`) would leave a dangling
+/// `(...)` suffix.  So when \p replacement is neither an identifier nor a
+/// simple `IDENT(...)` call, the immediately following groups are consumed.
+/// The final group stays attached when \p replacement is itself a
+/// parenthesized callable head followed by call-suffix groups.
+uint64_t extendChainedCallEnd(llvm::StringRef fileText, uint64_t invEnd,
+                              llvm::StringRef replacement);
 
 } // namespace refold
 } // namespace clang

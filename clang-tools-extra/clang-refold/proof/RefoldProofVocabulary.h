@@ -235,7 +235,7 @@ struct LegacyAuditEvidence {
   REFOLD_X(TUAnchor)                                                           \
   REFOLD_X(TUTextEdit)                                                         \
   REFOLD_X(OwnerRealization)                                                   \
-  REFOLD_X(MixedOwnerTiling)                                                   \
+  REFOLD_X(StructuralHunkTiling)                                               \
   REFOLD_X(TerminalFallback)
 
 enum class WitnessProofFamily : uint8_t {
@@ -354,7 +354,7 @@ inline StringRef toString(WitnessDiagnosticClass value) {
   REFOLD_X(Unknown)                                                            \
   REFOLD_X(LocalOnly)                                                          \
   REFOLD_X(OwnerClosed)                                                        \
-  REFOLD_X(MixedOwnerTile)                                                     \
+  REFOLD_X(StructuralHunkTile)                                                 \
   REFOLD_X(Terminal)
 
 enum class WitnessCompositionClass : uint8_t {
@@ -890,7 +890,7 @@ struct RefoldWitness {
 /// globally valid source-repair tuple.
 ///
 /// This is a resolver-side proof object.  A selector candidate is either a
-/// one-tile tuple or a pre-composed mixed-owner tiling witness.  Unknown
+/// one-tile tuple or a pre-composed structural tiling witness.  Unknown
 /// composition facts never establish equivalence; strict mode may use a
 /// resolver result only when every selectable tuple has complete composition
 /// facts and the surviving tuples occupy one global composition class, or
@@ -1283,8 +1283,8 @@ llvm::StringRef toString(TerminalFallbackObligationKind obligation);
 enum class TerminalFallbackFailureReason : uint8_t {
   Unknown,
   NoOwnerClosedCover,
-  NoDeterministicMixedOwnerTiling,
-  AmbiguousMixedOwnerTiling,
+  NoDeterministicStructuralHunkTiling,
+  AmbiguousStructuralHunkTiling,
   StateTransitionConsumedAndObserved,
   UnknownPragmaCrossesBoundary,
   LineControlStateNotProducerProven,
@@ -1315,8 +1315,8 @@ llvm::StringRef toString(TerminalFallbackFailureReason reason);
 enum class TheoremFallbackFailureKind : uint8_t {
   Unknown,
   NoOwnerClosedCover,
-  NoDeterministicMixedOwnerTiling,
-  AmbiguousMixedOwnerTiling,
+  NoDeterministicStructuralHunkTiling,
+  AmbiguousStructuralHunkTiling,
   StateTransitionConsumedAndObserved,
   UnknownPragmaCrossesBoundary,
   LineControlStateNotProducerProven,

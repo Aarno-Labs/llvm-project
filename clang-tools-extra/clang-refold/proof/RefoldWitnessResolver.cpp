@@ -47,7 +47,7 @@ bool RefoldWitnessResolver::IsResolverAuthoritativeWitnessFamily(
   case WitnessProofFamily::ZeroTokenBoundary:
   case WitnessProofFamily::LineControlObserver:
   case WitnessProofFamily::CounterState:
-  case WitnessProofFamily::MixedOwnerTiling:
+  case WitnessProofFamily::StructuralHunkTiling:
     return true;
   case WitnessProofFamily::Unknown:
   case WitnessProofFamily::AcceptedResult:
@@ -130,14 +130,14 @@ RefoldWitnessResolver::BuildWitnessCanonicalCost(
   if (candidate.hasLineControlObserverWitness &&
       witness.family == WitnessProofFamily::AcceptedResult)
     witness.family = WitnessProofFamily::LineControlObserver;
-  if ((candidate.proofSummary.hasMixedOwnerTilingWitness ||
+  if ((candidate.proofSummary.hasStructuralHunkTilingWitness ||
        candidate.proofSummary.theoremClass ==
-           TheoremProofClass::MixedOwnerTilingProof) &&
+           TheoremProofClass::StructuralHunkTilingProof) &&
       (witness.family == WitnessProofFamily::Unknown ||
        witness.family == WitnessProofFamily::AcceptedResult ||
        witness.family == WitnessProofFamily::TUTextEdit ||
        witness.family == WitnessProofFamily::OwnerRealization))
-    witness.family = WitnessProofFamily::MixedOwnerTiling;
+    witness.family = WitnessProofFamily::StructuralHunkTiling;
 
   if (candidate.hasRootMacroId)
     witness.owner = llvm::formatv("macro#{0}", candidate.rootMacroId).str();
@@ -494,7 +494,7 @@ RefoldWitnessResolver::ClassifyWitnessComposition(
 
     // composition is intentionally tuple-level rather than
     // source-spelling based.  A candidate may be a one-tile local repair or a
-    // durable mixed-owner tiling; in both cases the global composition class is
+    // durable structural tiling; in both cases the global composition class is
     // the ordered target stream plus the suffix/observer/counter state that the
     // tuple leaves for its neighbors.
     //

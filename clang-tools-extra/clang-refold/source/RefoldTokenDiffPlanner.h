@@ -114,7 +114,7 @@ struct RawByteHunkMemo;
 /// This service maps `PPTok` streams into stable LCS lexemes, constructs
 /// owner/provenance profiles for token gaps, computes the certified A-to-B
 /// token map, normalizes insert-only hunks, and refreshes the shared token/byte
-/// diff caches.  It stops at the token/LCS boundary; mixed-owner splitting and
+/// diff caches.  It stops at the token/LCS boundary; structural hunk tiling and
 /// proof-class selection are separate services.
 class RefoldTokenDiffPlanner {
 public:

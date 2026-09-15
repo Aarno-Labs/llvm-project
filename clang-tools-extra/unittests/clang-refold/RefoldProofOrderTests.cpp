@@ -18,12 +18,13 @@
 // Two coordinates used to break that precondition, and neither is reachable
 // from a lit test:
 //
-//   * The mixed-owner tiling rule applied only when the two summaries also
+//   * The structural tiling rule applied only when the two summaries also
 //     agreed on `inventory.currentPath`.  Reaching a disagreement needs a
-//     `MixedOwnerTilingProof` summary competing against a differently-pathed
-//     one inside a single candidate vector.  Instrumenting every consult of
-//     the rule across the suite records 68 of them in 25 files, and the paths
-//     agree in all 68, so the guard never discriminates there.
+//     `StructuralHunkTilingProof` summary competing against a
+//     differently-pathed one inside a single candidate vector.  Instrumenting
+//     every consult of the rule across the suite records 68 of them in 25
+//     files, and the paths agree in all 68, so the guard never discriminates
+//     there.
 //   * `TheoremSelectionTieBreakerKind` is assigned at exactly one site, on a
 //     local candidate consumed pairwise and then discarded.  The same
 //     instrumentation records zero summaries carrying a non-Unknown
@@ -55,8 +56,8 @@ using namespace clang::refold;
 namespace {
 
 /// Base summary for the order triples: everything that would short-circuit the
-/// comparison before the mixed-owner rule is left at its default, so the two
-/// rank comparisons tie and control reaches the coordinates under test.
+/// comparison before the structural-tiling rule is left at its default, so the
+/// two rank comparisons tie and control reaches the coordinates under test.
 ProofSummary ownerRealizationSummary(AcceptedPathKind path) {
   ProofSummary summary;
   summary.theoremClass = TheoremProofClass::OwnerRealizationProof;
@@ -65,20 +66,20 @@ ProofSummary ownerRealizationSummary(AcceptedPathKind path) {
   return summary;
 }
 
-/// The same summary re-proved by a durable mixed-owner tiling.  This is the
-/// shape `AttachMixedOwnerTilingWitnessForTokenEnvelope` builds: the owner
+/// The same summary re-proved by a durable structural tiling.  This is the
+/// shape `AttachStructuralHunkTilingWitnessForTokenEnvelope` builds: the owner
 /// summary with a tiling witness attached and the theorem class raised.
-ProofSummary mixedOwnerTilingSummary(AcceptedPathKind path) {
+ProofSummary structuralHunkTilingSummary(AcceptedPathKind path) {
   ProofSummary summary = ownerRealizationSummary(path);
-  summary.theoremClass = TheoremProofClass::MixedOwnerTilingProof;
-  summary.hasMixedOwnerTilingWitness = true;
-  summary.mixedOwnerTilingWitness.witnessId = 1;
-  summary.mixedOwnerTilingWitness.originalAStart = 0;
-  summary.mixedOwnerTilingWitness.originalAEnd = 4;
-  summary.mixedOwnerTilingWitness.originalBStart = 0;
-  summary.mixedOwnerTilingWitness.originalBEnd = 4;
-  summary.mixedOwnerTilingWitness.tokenSegmentCount = 2;
-  summary.mixedOwnerTilingWitness.stateGapCount = 1;
+  summary.theoremClass = TheoremProofClass::StructuralHunkTilingProof;
+  summary.hasStructuralHunkTilingWitness = true;
+  summary.structuralHunkTilingWitness.witnessId = 1;
+  summary.structuralHunkTilingWitness.originalAStart = 0;
+  summary.structuralHunkTilingWitness.originalAEnd = 4;
+  summary.structuralHunkTilingWitness.originalBStart = 0;
+  summary.structuralHunkTilingWitness.originalBEnd = 4;
+  summary.structuralHunkTilingWitness.tokenSegmentCount = 2;
+  summary.structuralHunkTilingWitness.stateGapCount = 1;
   return summary;
 }
 
@@ -149,12 +150,12 @@ TEST(RefoldProofOrder, AuditRejectsTheCycleAMaxScanCannotResolve) {
 // The proof order over real summaries.
 //===----------------------------------------------------------------------===//
 
-TEST(RefoldProofOrder, MixedOwnerTilingDominanceDoesNotDependOnThePath) {
-  // A durable mixed-owner tiling is either a stronger proof than the
+TEST(RefoldProofOrder, StructuralHunkTilingDominanceDoesNotDependOnThePath) {
+  // A durable structural tiling is either a stronger proof than the
   // owner-specific summary it competes with or it is not.  Making the answer
   // depend on whether a third coordinate matches is what cost transitivity.
   const ProofSummary mixed =
-      mixedOwnerTilingSummary(AcceptedPathKind::MacroArgsOnlyStandard);
+      structuralHunkTilingSummary(AcceptedPathKind::MacroArgsOnlyStandard);
   const ProofSummary samePath =
       ownerRealizationSummary(AcceptedPathKind::MacroArgsOnlyStandard);
   const ProofSummary otherPath =
@@ -166,29 +167,31 @@ TEST(RefoldProofOrder, MixedOwnerTilingDominanceDoesNotDependOnThePath) {
   EXPECT_FALSE(RefoldAcceptedResultRanker::ProofDominates(otherPath, mixed));
 }
 
-TEST(RefoldProofOrder, MixedOwnerVersusWholeCoverTripleIsAcyclic) {
+TEST(RefoldProofOrder, StructuralTilingVersusWholeCoverTripleIsAcyclic) {
   // The exact triple that used to cycle.  With the path guard in place:
-  // A beat B because the paths matched and A was the mixed-owner proof; B beat
-  // C because the theorem classes tied at OwnerRealizationProof and the path
-  // enum fell 1 < 12; and C beat A because the differing paths skipped the
-  // mixed-owner rule and OwnerRealizationProof(5) < MixedOwnerTilingProof(6).
+  // A beat B because the paths matched and A was the structural-tiling proof; B
+  // beat C because the theorem classes tied at OwnerRealizationProof and the
+  // path enum fell 1 < 12; and C beat A because the differing paths skipped the
+  // structural-tiling rule and OwnerRealizationProof(5) <
+  // StructuralHunkTilingProof(6).
   const std::vector<ProofSummary> triple = {
-      mixedOwnerTilingSummary(AcceptedPathKind::MacroArgsOnlyStandard),
+      structuralHunkTilingSummary(AcceptedPathKind::MacroArgsOnlyStandard),
       ownerRealizationSummary(AcceptedPathKind::MacroArgsOnlyStandard),
       ownerRealizationSummary(AcceptedPathKind::MacroWholeCoverRealization),
   };
 
   EXPECT_FALSE(findProofOrderViolation(triple).has_value());
 
-  // And the cycle's third edge is the one that is now gone: the mixed-owner
-  // proof is no longer beaten by a differently-pathed owner realization.
+  // And the cycle's third edge is the one that is now gone: the
+  // structural-tiling proof is no longer beaten by a differently-pathed owner
+  // realization.
   EXPECT_FALSE(
       RefoldAcceptedResultRanker::ProofDominates(triple[2], triple[0]));
 }
 
 TEST(RefoldProofOrder, ProofOrderIsIrreflexive) {
   const ProofSummary mixed =
-      mixedOwnerTilingSummary(AcceptedPathKind::MacroArgsOnlyStandard);
+      structuralHunkTilingSummary(AcceptedPathKind::MacroArgsOnlyStandard);
   const ProofSummary owner =
       ownerRealizationSummary(AcceptedPathKind::TUByteSpanMappedEdit);
 
@@ -286,7 +289,7 @@ TEST(RefoldProofOrder, IncomparableSummariesAreReportedAsSuch) {
             ProofDominanceOrder::Incomparable);
 
   rhs.proofSummary =
-      mixedOwnerTilingSummary(AcceptedPathKind::TUByteSpanMappedEdit);
+      structuralHunkTilingSummary(AcceptedPathKind::TUByteSpanMappedEdit);
   EXPECT_EQ(RefoldAcceptedResultRanker::CompareAcceptedResultCandidateProofs(
                 lhs, rhs),
             ProofDominanceOrder::RightDominates);

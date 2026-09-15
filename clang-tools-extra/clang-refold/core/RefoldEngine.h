@@ -154,7 +154,7 @@ class RefoldIncludeInsertionPlanner;
 class RefoldIncludeMaterializer;
 class RefoldPragmaOnceGuardRewriter;
 class RefoldLineObserverLayout;
-class RefoldMixedOwnerTilingPlanner;
+class RefoldStructuralHunkTilingPlanner;
 class RefoldMacroPatchPlanner;
 class RefoldMacroWholeCoverPlanBuilder;
 class RefoldMacroStateRepairPlanner;
@@ -745,8 +745,9 @@ private:
   /// hunks so existing macro/include/TU classifiers can operate unchanged.
   /// These side tables preserve the theorem proof that created those hunks and
   /// map each emitted token segment back to the full ordered tiling path.
-  std::vector<MixedOwnerTilingWitness> mixedOwnerTilingWitnesses_;
-  std::vector<MixedOwnerTilingSegmentBinding> mixedOwnerTilingSegmentBindings_;
+  std::vector<StructuralHunkTilingWitness> structuralHunkTilingWitnesses_;
+  std::vector<StructuralHunkTilingSegmentBinding>
+      structuralHunkTilingSegmentBindings_;
 
   /// Cached token-level A/B maps for the current refold invocation.
   ///
@@ -789,8 +790,9 @@ private:
   ///
   /// The planner owns lexeme mapping, LCS provenance/profile construction,
   /// initial token-hunk derivation, token-map cache population, and raw
-  /// byte-hunk cache construction. Mixed-owner partitioning is handled by
-  /// RefoldMixedOwnerTilingPlanner after the initial token-diff plan is built.
+  /// byte-hunk cache construction. Structural hunk tiling is handled by
+  /// RefoldStructuralHunkTilingPlanner after the initial token-diff plan is
+  /// built.
   std::unique_ptr<RefoldTokenDiffPlanner> tokenDiffPlanner_;
 
   /// Macro-boundary selector for narrow A/B token insertion-at-cover-edge cases
@@ -868,7 +870,8 @@ private:
   /// provable owner boundaries or, for delete-only hunks, around exact
   /// preprocessing structure preserved in place.  It refreshes the durable
   /// structural witness ledgers before any owner-sensitive service executes.
-  std::unique_ptr<RefoldMixedOwnerTilingPlanner> mixedOwnerTilingPlanner_;
+  std::unique_ptr<RefoldStructuralHunkTilingPlanner>
+      structuralHunkTilingPlanner_;
 
   /// Macro-state proof service owned by the engine.
   ///

@@ -7,8 +7,8 @@
 // candidate) from a set of selectable proofs:
 //
 //   * `ProofDominates` — the strict order over proof summaries:
-//     selection-preference rank, surface-disposition rank, mixed-owner cover
-//     comparison, then deterministic enum fallbacks.  It is irreflexive,
+//     selection-preference rank, surface-disposition rank, structural-tiling
+//     cover comparison, then deterministic enum fallbacks.  It is irreflexive,
 //     asymmetric and transitive, which is what makes the selector's max scan
 //     independent of candidate push order.
 //   * `NamedTheoremTieBreakerPrefers` — a named theorem preference between two
@@ -19,9 +19,9 @@
 //   * `AcceptedResultCandidate*Prefers` and `MacroSelectionCandidatePrefers`
 //     — candidate-level comparators that compose `ProofDominates` with a
 //     canonical artifact-shape tie-breaker reached only on incomparability.
-//   * `IsSelectable*` — admission gates that delegate to the lattice's proof
-//     normalizer (via a borrowed callback) plus the static selector-only
-//     nested-macro failure detector.
+//   * `IsSelectable*` — admission gates that delegate to the borrowed
+//     `RefoldProofSummaryBuilder`'s proof normalizer plus the static
+//     selector-only nested-macro failure detector.
 //   * `SelectPreferred*` — orchestration entry points that run the legacy
 //     canonical selector AND the central witness resolver, then choose the
 //     final index and emit the appropriate trace records.
@@ -73,7 +73,8 @@ enum class ProofDominanceOrder : uint8_t {
 class RefoldAcceptedResultRanker {
 public:
   /// Borrowed inputs needed to rank and select accepted-result candidates.
-  /// Every reference must outlive the ranker; the lattice owns all of them.
+  /// Every reference must outlive the ranker; the engine's composition root
+  /// owns all of them.
   struct Dependencies {
     /// Witness trace + audit-log gating.
     const RefoldWitnessTrace &witnessTrace;

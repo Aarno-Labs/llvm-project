@@ -96,7 +96,7 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedMacroCandidate(
       patch.wholeCover.aLo <= patch.wholeCover.aHi &&
       patch.wholeCover.bAdjLo <= patch.wholeCover.bAdjHi) {
     deps_.ownerRealizationProofBuilder
-        .AttachMixedOwnerTilingWitnessForTokenEnvelope(
+        .AttachStructuralHunkTilingWitnessForTokenEnvelope(
             candidate.proofSummary, patch.wholeCover.aLo, patch.wholeCover.aHi,
             patch.wholeCover.bAdjLo, patch.wholeCover.bAdjHi);
   }
@@ -584,9 +584,9 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedIncludeCandidate(
           includeAnchorWitness,
           /*terminalFallbackWitness=*/nullptr);
   deps_.ownerRealizationProofBuilder
-      .AttachMixedOwnerTilingWitnessForTokenEnvelope(candidate.proofSummary,
-                                                     patch.aStart, patch.aEnd,
-                                                     patch.bStart, patch.bEnd);
+      .AttachStructuralHunkTilingWitnessForTokenEnvelope(
+          candidate.proofSummary, patch.aStart, patch.aEnd, patch.bStart,
+          patch.bEnd);
 
   candidate.begin = patch.aStart;
   candidate.end = patch.aEnd;
@@ -683,7 +683,7 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedIncludeRealizationCandidate(
 
   if (bTokenEnvelope) {
     deps_.ownerRealizationProofBuilder
-        .AttachMixedOwnerTilingWitnessForTokenEnvelope(
+        .AttachStructuralHunkTilingWitnessForTokenEnvelope(
             candidate.proofSummary, include.cover.begin, include.cover.end,
             bTokenEnvelope->first, bTokenEnvelope->second);
   }

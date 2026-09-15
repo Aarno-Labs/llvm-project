@@ -215,7 +215,7 @@ RefoldMacroPatchProofClassifier::ClassifyMacroPatchProof(
     // only through the generic summary/discharge gate below.
   case TheoremProofClass::DirectivePreservingProof:
   case TheoremProofClass::StateRepairProof:
-  case TheoremProofClass::MixedOwnerTilingProof:
+  case TheoremProofClass::StructuralHunkTilingProof:
   case TheoremProofClass::TerminalOutOfDomainProof:
     break;
   }

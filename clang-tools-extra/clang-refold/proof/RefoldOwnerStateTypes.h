@@ -1089,7 +1089,7 @@ struct OwnerObserverSummary {
 ///
 /// This is the normalization point for closed-domain owner proofs:
 /// TU edits, include/header realizations, macro invocation rewrites,
-/// conditional-arm islands, sideband line/pragmas, and future mixed-owner
+/// conditional-arm islands, sideband line/pragmas, and future structural
 /// tiling segments should all be expressible as an `OwnerClosure` before they
 /// are admitted by a proof gate.  The structure is intentionally passive in
 /// this representation; it gives the existing specialized machinery a common

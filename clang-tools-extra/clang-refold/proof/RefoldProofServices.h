@@ -61,23 +61,24 @@ public:
   /// object because the audit itself borrows the summary builder.  The
   /// \p witnessTrace is built earlier still, because the terminal sink the
   /// audit borrows traces through it.  The
-  /// mixed-owner tiling vectors are per-pass state owned by the caller and
+  /// structural tiling vectors are per-pass state owned by the caller and
   /// read by the owner-realization builder as tiling witnesses accumulate.
-  RefoldProofServices(
-      const RefoldModel &model, llvm::StringRef bSource,
-      llvm::ArrayRef<PPTok> bToks, RefoldSourceMapper &sourceMapper,
-      const RefoldTokenTextAnalysis &tokenText,
-      const RefoldArgTextRecovery &argTextRecovery,
-      const RefoldMacroTopology &macroTopology,
-      const RefoldOwnerStateProof &ownerStateProof,
-      const RefoldTUAnchorProof &tuAnchorProof,
-      const RefoldProofSummaryBuilder &proofSummaryBuilder,
-      const RefoldTheoremAudit &theoremAudit,
-      TheoremAuditStats &lastTheoremAudit,
-      const RefoldWitnessTrace &witnessTrace,
-      const std::vector<MixedOwnerTilingSegmentBinding>
-          &mixedOwnerTilingSegmentBindings,
-      const std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses);
+  RefoldProofServices(const RefoldModel &model, llvm::StringRef bSource,
+                      llvm::ArrayRef<PPTok> bToks,
+                      RefoldSourceMapper &sourceMapper,
+                      const RefoldTokenTextAnalysis &tokenText,
+                      const RefoldArgTextRecovery &argTextRecovery,
+                      const RefoldMacroTopology &macroTopology,
+                      const RefoldOwnerStateProof &ownerStateProof,
+                      const RefoldTUAnchorProof &tuAnchorProof,
+                      const RefoldProofSummaryBuilder &proofSummaryBuilder,
+                      const RefoldTheoremAudit &theoremAudit,
+                      TheoremAuditStats &lastTheoremAudit,
+                      const RefoldWitnessTrace &witnessTrace,
+                      const std::vector<StructuralHunkTilingSegmentBinding>
+                          &structuralHunkTilingSegmentBindings,
+                      const std::vector<StructuralHunkTilingWitness>
+                          &structuralHunkTilingWitnesses);
 
   const RefoldWitnessEquivalenceKeyBuilder &EquivalenceKeyBuilder() const {
     return equivalenceKeyBuilder_;

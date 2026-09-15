@@ -18,8 +18,6 @@
 //  • Identifier predicates (ASCII):
 //      - isIdentStart(char)          : '_' or ASCII letter
 //      - isIdentPart(char)           : start-char or digit
-//      - isIdentifierOnly(StringRef) : trimmed text is one identifier token
-//      - isIdentifierOrSimpleCallExpr(StringRef): identifier or IDENT(...)
 //  • Index scans:
 //      - firstNonWsIdx(StringRef)    : first non-WS index or nullopt
 //      - lastNonWsIdx(StringRef)     : last non-WS index or nullopt
@@ -66,7 +64,6 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -109,24 +106,6 @@ inline constexpr bool isIdentPart(char c) noexcept {
 
 // ----------------------- String predicates (ASCII only) ----------------------
 
-// If a macro invocation is immediately followed by one or more parenthesized
-// argument lists in the *source file*, it may be a chain of function-like
-// macros evaluating to another function-like macro (e.g. INC3()()()(10)).
-//
-// In that case, a callsite patch that replaces only the first invocation text
-// (INC3()) would leave a dangling "(…)" suffix, yielding invalid code.
-// When the replacement is not a bare identifier, conservatively consume any
-// immediately following "(...)" groups.
-/// True iff \p s trims to one identifier token spelling.
-bool isIdentifierOnly(StringRef s);
-
-/// True iff \p replacement is either an identifier or a simple callable head.
-///
-/// This is used by chained-call preservation: an identifier or `IDENT(...)`
-/// replacement can still receive following call-suffix groups without needing
-/// the refolder to consume them.
-bool isIdentifierOrSimpleCallExpr(StringRef replacement);
-
 /// True iff every byte in \p s is PP whitespace.
 inline bool isWs(StringRef s) noexcept {
   return all_of(s, [](char c) { return isWs(c); });
@@ -152,13 +131,6 @@ inline std::optional<size_t> lastNonWsIdx(StringRef s) noexcept {
   size_t idx = s.find_last_not_of(" \t\n\v\f\r");
   return (idx == StringRef::npos) ? std::nullopt : std::make_optional(idx);
 }
-
-/// Skip ASCII whitespace and complete C/C++ comments starting at \p i.
-size_t skipWsAndComments(StringRef s, size_t i);
-
-/// Find the matching right parenthesis for \p lParenIdx, ignoring comments and
-/// string/character literal contents.
-size_t findMatchingRParen(StringRef s, size_t lParenIdx);
 
 /// Advance `pos` over whitespace that does not cross a source-line boundary.
 inline constexpr void skipNonNewlineWs(StringRef text, size_t &pos) {
@@ -419,16 +391,6 @@ inline std::pair<size_t, size_t> trimWsRange(StringRef s, size_t b, size_t e) {
   return {b, e};
 }
 
-/// \brief Trim only ASCII space and tab from both ends.
-///
-/// This removes leading and trailing `' '` and `'\t'` characters and returns a
-/// view into the original string (no allocation). Newlines and other PP
-/// whitespace are intentionally preserved.
-///
-/// \param S The input string.
-/// \returns A StringRef with leading/trailing spaces and tabs removed.
-StringRef trimEdgeSpaces(StringRef s);
-
 inline StringRef trimHorizontal(StringRef text) {
   while (!text.empty() &&
          (text.front() == ' ' || text.front() == '\t' || text.front() == '\r' ||
@@ -624,15 +586,6 @@ inline bool endsLineBeforeWs(StringRef text, size_t offset) {
   return rangeContainsOnlyWs(text, offset, lineEndOffset(text, offset));
 }
 
-/// True iff \p replacement is a parenthesized callable head followed by one or
-/// more balanced call-suffix groups, with no trailing non-comment content.
-bool shouldPreserveFinalCallSuffixGroup(StringRef replacement);
-
-/// Extend an invocation end offset over trailing chained-call suffix groups
-/// when the replacement is no longer directly callable.
-uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
-                              StringRef replacement);
-
 /// Return true iff the first non-whitespace bytes of \p s start with \p lit.
 bool startsWithAfterWs(StringRef s, StringRef lit);
 
@@ -670,29 +623,6 @@ inline StringRef stripHeaderToken(StringRef token) {
   if (token.starts_with("\"") && token.ends_with("\""))
     return token.drop_front(1).drop_back(1);
   return token;
-}
-
-/// Format an unsigned value with left zero padding to \p width columns.
-inline std::string zpadUnsigned(size_t v, unsigned width) {
-  std::string s = formatv("{0}", v).str();
-  if (s.size() < width)
-    s.insert(s.begin(), width - s.size(), '0');
-  return s;
-}
-
-/// Convert supported scalar/logging element types to strings.
-template <typename T> std::string stringifyElement(const T &elem) {
-  if constexpr (std::is_same_v<T, std::string>) {
-    return elem;
-  } else if constexpr (std::is_same_v<T, StringRef>) {
-    return elem.str();
-  } else if constexpr (std::is_same_v<T, char>) {
-    return std::string(1, elem);
-  } else if constexpr (std::is_integral_v<T>) {
-    return formatv("{0}", elem).str();
-  } else {
-    static_assert(!sizeof(T), "Unsupported element type for logFormattedArray");
-  }
 }
 
 /// \brief Heuristically determines if a preprocessed token spelling looks like

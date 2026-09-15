@@ -69,9 +69,9 @@ PrimaryEmissionPathForCandidateKind(AcceptedResultCandidateKind kind) {
 /// Deterministic and side-effect free except for the candidate's inventory
 /// field.  Every accepted-carrier builder calls it after it finishes mutating
 /// the proof summary, so an overlay path cannot go stale when a witness is
-/// attached late — mixed-owner tiling after owner realization, for example.
+/// attached late — structural tiling after owner realization, for example.
 ///
-/// Mixed-owner tiling and owner realization are theorem/proof overlays that a
+/// Structural tiling and owner realization are theorem/proof overlays that a
 /// macro, include, or TU primary emitted surface can carry.  Recording them
 /// explicitly lets the proof model force those surviving paths through the
 /// accepted-result gate without treating them as separate primary surfaces.
@@ -80,10 +80,10 @@ inline void RefreshAcceptedCandidateEmissionPathInventory(
   EmissionPathInventory inventory;
   inventory.Add(PrimaryEmissionPathForCandidateKind(candidate.kind));
 
-  if (candidate.proofSummary.hasMixedOwnerTilingWitness ||
+  if (candidate.proofSummary.hasStructuralHunkTilingWitness ||
       candidate.proofSummary.theoremClass ==
-          TheoremProofClass::MixedOwnerTilingProof) {
-    inventory.Add(EmissionPathKind::MixedOwnerTilingSegment);
+          TheoremProofClass::StructuralHunkTilingProof) {
+    inventory.Add(EmissionPathKind::StructuralHunkTilingSegment);
   }
 
   if (candidate.proofSummary.hasOwnerRealizationWitness ||

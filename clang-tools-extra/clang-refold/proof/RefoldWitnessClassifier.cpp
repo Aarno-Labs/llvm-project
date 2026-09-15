@@ -132,9 +132,9 @@ classifyTerminalFallbackFailure(const TerminalFallbackProofFailure &failure) {
   case FailureReason::NoOwnerClosedCover:
   case FailureReason::NoTUAnchorForUnresolvedOwner:
     return FallbackClass::NoOwnerClosedWitness;
-  case FailureReason::AmbiguousMixedOwnerTiling:
+  case FailureReason::AmbiguousStructuralHunkTiling:
     return FallbackClass::MultipleNonEquivalentWitnessClasses;
-  case FailureReason::NoDeterministicMixedOwnerTiling:
+  case FailureReason::NoDeterministicStructuralHunkTiling:
   case FailureReason::UncomposableEmissionEditSet:
     return FallbackClass::CompositionFailure;
   case FailureReason::StateTransitionConsumedAndObserved:
@@ -336,11 +336,11 @@ classifyStrictDomainForTerminalFallback(
     result.domainClass = DomainClass::ExplicitOutOfDomain;
     break;
 
-  case FailureReason::AmbiguousMixedOwnerTiling:
+  case FailureReason::AmbiguousStructuralHunkTiling:
     result.domainClass = DomainClass::AmbiguousOutOfDomain;
     break;
 
-  case FailureReason::NoDeterministicMixedOwnerTiling:
+  case FailureReason::NoDeterministicStructuralHunkTiling:
   case FailureReason::UncomposableEmissionEditSet:
     result.domainClass = DomainClass::AmbiguousOutOfDomain;
     break;

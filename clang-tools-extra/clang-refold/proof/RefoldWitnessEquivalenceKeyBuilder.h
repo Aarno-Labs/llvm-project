@@ -50,7 +50,8 @@ class RefoldSourceMapper;
 class RefoldWitnessEquivalenceKeyBuilder {
 public:
   /// Borrowed inputs required to build a key.  Every reference must outlive
-  /// the builder; the lattice owns all three today.
+  /// the builder: the source mapper is an engine member, and both B views
+  /// are the pass's own inputs.
   struct Dependencies {
     /// Source mapper used to slice B-side bytes when hashing target-PP
     /// token ranges and macro-repair / replay state-neutral signatures.

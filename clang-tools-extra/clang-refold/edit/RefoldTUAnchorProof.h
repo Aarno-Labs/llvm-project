@@ -227,9 +227,9 @@ public:
   /// Build the normalized carrier for a proven TU insertion anchor.
   ///
   /// Only TUExactSlotBoundary and TUProvableInsertionAnchor are valid anchor
-  /// paths.  Other paths fail closed by producing the same undischarged summary
-  /// shape that the lattice-side builder would have produced for a misrouted
-  /// TU-anchor request.
+  /// paths.  Any other path fails closed: its summary is left unconfigured,
+  /// so the shared finalizer records the missing primary-proof-class
+  /// obligation and the candidate carries no emitted proof.
   AcceptedResultCandidate
   BuildAcceptedTUAnchorCandidate(AcceptedPathKind currentPath,
                                  const TUAnchorWitness &witness) const;

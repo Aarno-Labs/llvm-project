@@ -78,15 +78,15 @@ struct ProofSummary {
   // Durable structural hunk-tiling proof. A candidate produced by either a
   // historical mixed-realizer split or a preserved-structure split carries
   // the whole ordered path here, not merely its emitted token edge.
-  bool hasMixedOwnerTilingWitness = false;
-  StructuralHunkTilingWitness mixedOwnerTilingWitness;
-  /// Exact token-edge selection within `mixedOwnerTilingWitness` for this
+  bool hasStructuralHunkTilingWitness = false;
+  StructuralHunkTilingWitness structuralHunkTilingWitness;
+  /// Exact token-edge selection within `structuralHunkTilingWitness` for this
   /// accepted artifact.  The full witness proves the original hunk partition;
   /// this binding identifies which emitted segment the current carrier owns so
   /// the final byte-edit audit can check complete segment participation and
   /// preserved-gap disjointness against the actual emitted byte range.
-  bool hasMixedOwnerTilingSegmentSelection = false;
-  uint32_t mixedOwnerTilingSegmentIndex = 0;
+  bool hasStructuralHunkTilingSegmentSelection = false;
+  uint32_t structuralHunkTilingSegmentIndex = 0;
 
   /// Structural segment binding inherited by a specialized repair carrier from
   /// the ordinary direct-TU carrier it replaced.
@@ -103,8 +103,8 @@ struct ProofSummary {
   /// Only the key is inherited, never a copy of the witness: it resolves
   /// through the durable planner ledger exactly as the direct-TU key does, so a
   /// repair cannot carry a partition proof the planner no longer holds.  This
-  /// deliberately does not set `hasMixedOwnerTilingWitness`, which selects a
-  /// theorem class the repair has not earned.
+  /// deliberately does not set `hasStructuralHunkTilingWitness`, which selects
+  /// a theorem class the repair has not earned.
   bool hasInheritedStructuralSegmentBinding = false;
   uint64_t inheritedStructuralWitnessId = 0;
   uint32_t inheritedStructuralSegmentIndex = 0;

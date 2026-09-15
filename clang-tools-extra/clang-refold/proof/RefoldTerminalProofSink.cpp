@@ -71,10 +71,10 @@ StringRef toString(TerminalFallbackFailureReason reason) {
     return "Unknown";
   case TerminalFallbackFailureReason::NoOwnerClosedCover:
     return "NoOwnerClosedCover";
-  case TerminalFallbackFailureReason::NoDeterministicMixedOwnerTiling:
-    return "NoDeterministicMixedOwnerTiling";
-  case TerminalFallbackFailureReason::AmbiguousMixedOwnerTiling:
-    return "AmbiguousMixedOwnerTiling";
+  case TerminalFallbackFailureReason::NoDeterministicStructuralHunkTiling:
+    return "NoDeterministicStructuralHunkTiling";
+  case TerminalFallbackFailureReason::AmbiguousStructuralHunkTiling:
+    return "AmbiguousStructuralHunkTiling";
   case TerminalFallbackFailureReason::StateTransitionConsumedAndObserved:
     return "StateTransitionConsumedAndObserved";
   case TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary:
@@ -119,10 +119,10 @@ StringRef toString(TheoremFallbackFailureKind kind) {
     return "Unknown";
   case TheoremFallbackFailureKind::NoOwnerClosedCover:
     return "NoOwnerClosedCover";
-  case TheoremFallbackFailureKind::NoDeterministicMixedOwnerTiling:
-    return "NoDeterministicMixedOwnerTiling";
-  case TheoremFallbackFailureKind::AmbiguousMixedOwnerTiling:
-    return "AmbiguousMixedOwnerTiling";
+  case TheoremFallbackFailureKind::NoDeterministicStructuralHunkTiling:
+    return "NoDeterministicStructuralHunkTiling";
+  case TheoremFallbackFailureKind::AmbiguousStructuralHunkTiling:
+    return "AmbiguousStructuralHunkTiling";
   case TheoremFallbackFailureKind::StateTransitionConsumedAndObserved:
     return "StateTransitionConsumedAndObserved";
   case TheoremFallbackFailureKind::UnknownPragmaCrossesBoundary:
@@ -153,10 +153,10 @@ NormalizeTerminalFallbackFailureReason(TerminalFallbackFailureReason reason) {
   case TerminalFallbackFailureReason::NoOwnerClosedCover:
   case TerminalFallbackFailureReason::NoTUAnchorForUnresolvedOwner:
     return TheoremFallbackFailureKind::NoOwnerClosedCover;
-  case TerminalFallbackFailureReason::NoDeterministicMixedOwnerTiling:
-    return TheoremFallbackFailureKind::NoDeterministicMixedOwnerTiling;
-  case TerminalFallbackFailureReason::AmbiguousMixedOwnerTiling:
-    return TheoremFallbackFailureKind::AmbiguousMixedOwnerTiling;
+  case TerminalFallbackFailureReason::NoDeterministicStructuralHunkTiling:
+    return TheoremFallbackFailureKind::NoDeterministicStructuralHunkTiling;
+  case TerminalFallbackFailureReason::AmbiguousStructuralHunkTiling:
+    return TheoremFallbackFailureKind::AmbiguousStructuralHunkTiling;
   case TerminalFallbackFailureReason::StateTransitionConsumedAndObserved:
     return TheoremFallbackFailureKind::StateTransitionConsumedAndObserved;
   case TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary:
@@ -180,7 +180,7 @@ NormalizeTerminalFallbackFailureReason(TerminalFallbackFailureReason reason) {
   case TerminalFallbackFailureReason::TheoremAuditInvariantViolation:
     return TheoremFallbackFailureKind::MissingProducerFacts;
   case TerminalFallbackFailureReason::UncomposableEmissionEditSet:
-    return TheoremFallbackFailureKind::NoDeterministicMixedOwnerTiling;
+    return TheoremFallbackFailureKind::NoDeterministicStructuralHunkTiling;
   case TerminalFallbackFailureReason::ValidationFailure:
     return TheoremFallbackFailureKind::ValidationFailure;
   case TerminalFallbackFailureReason::Unknown:

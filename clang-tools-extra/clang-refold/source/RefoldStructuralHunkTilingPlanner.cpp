@@ -1,4 +1,4 @@
-//===--- RefoldMixedOwnerTilingPlanner.cpp ----------------------*- C++ -*-===//
+//===--- RefoldStructuralHunkTilingPlanner.cpp ------------------*- C++ -*-===//
 //
 // Structural token-hunk tiling service for clang-refold.
 //
@@ -19,7 +19,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "source/RefoldMixedOwnerTilingPlanner.h"
+#include "source/RefoldStructuralHunkTilingPlanner.h"
 
 #include "proof/RefoldPragmaTaxonomy.h"
 
@@ -426,8 +426,8 @@ struct PartitionParent {
   // states that would create zero-length cycles.
   SmallVector<PartitionEdge, 4> stateGapsBeforeEdge;
   // True once the same DP state can be reached by two distinct minimal
-  // parent chains.  The mixed-owner proof requires a deterministic tiling,
-  // not merely a deterministic tie-breaker, so equal-cost ambiguity is
+  // parent chains.  The structural tiling proof requires a deterministic
+  // tiling, not merely a deterministic tie-breaker, so equal-cost ambiguity is
   // rejected.
   bool ambiguous = false;
 };
@@ -660,12 +660,12 @@ classifyStructuralTilingReason(bool mixedRealizers,
 ///
 /// The layer is a class rather than a set of private planner members because
 /// the partition types above are file-local: a member function declared in
-/// `RefoldMixedOwnerTilingPlanner.h` could not name them in its signature.
+/// `RefoldStructuralHunkTilingPlanner.h` could not name them in its signature.
 /// `Dependencies` is public in that header and is held by reference here.
 class StructuralTilingProver {
 public:
   explicit StructuralTilingProver(
-      RefoldMixedOwnerTilingPlanner::Dependencies &deps)
+      RefoldStructuralHunkTilingPlanner::Dependencies &deps)
       : deps_(deps),
         gapCrossingProver_(RefoldStructuralGapCrossingProver::Dependencies{
             deps.model, deps.macroStateProof, deps.tokenText, deps.lexLang}) {
@@ -1089,9 +1089,9 @@ public:
     return plan;
   }
 
-  bool MixedOwnerTilingStateSummariesCompose(const diffutils::Hunk &h,
-                                             ArrayRef<PartitionEdge> path,
-                                             std::string *reason) const {
+  bool StructuralHunkTilingStateSummariesCompose(const diffutils::Hunk &h,
+                                                 ArrayRef<PartitionEdge> path,
+                                                 std::string *reason) const {
     // treats the reconstructed token/state-gap path as one ordered
     // state-composition proof.  Earlier checks prove that each individual
     // token segment has a closure and that each zero-token source gap is
@@ -1105,7 +1105,8 @@ public:
     for (const PartitionEdge &edge : path) {
       if (!edge.closure || !edge.closure->IsComplete()) {
         if (reason)
-          *reason = "mixed-owner state composition saw incomplete closure";
+          *reason =
+              "structural tiling state composition saw incomplete closure";
         return false;
       }
 
@@ -1161,12 +1162,12 @@ public:
     return true;
   }
 
-  MixedOwnerTilingWitness
+  StructuralHunkTilingWitness
   BuildStructuralTilingWitness(const diffutils::Hunk &h,
                                const StructuralPartition &partition,
                                uint64_t witnessId) const {
     ArrayRef<PartitionEdge> path = partition.edges;
-    MixedOwnerTilingWitness witness;
+    StructuralHunkTilingWitness witness;
     witness.witnessId = witnessId;
     witness.reason = partition.reason;
     witness.originalAStart = h.aStart;
@@ -1337,11 +1338,11 @@ public:
                     << '}';
     }
     for (const PartitionEdge &edge : path) {
-      const MixedOwnerTilingEdgeKind edgeKind =
-          edge.IsStateGap() ? MixedOwnerTilingEdgeKind::StateGap
-                            : MixedOwnerTilingEdgeKind::TokenSegment;
+      const StructuralHunkTilingEdgeKind edgeKind =
+          edge.IsStateGap() ? StructuralHunkTilingEdgeKind::StateGap
+                            : StructuralHunkTilingEdgeKind::TokenSegment;
 
-      MixedOwnerTilingSegmentWitness segmentWitness;
+      StructuralHunkTilingEdgeWitness segmentWitness;
       segmentWitness.parentTilingWitnessId = witnessId;
       segmentWitness.segmentIndex = segmentIndex;
       segmentWitness.sourceOrderPosition = segmentIndex;
@@ -1759,13 +1760,13 @@ public:
     const bool replaceHunk = h.isReplace();
     const bool deleteOnlyHunk = h.isDeleteOnly();
 
-    // extends deterministic mixed-owner tiling beyond non-empty
+    // extends deterministic structural tiling beyond non-empty
     // replacements only where the theorem obligations are still meaningful.
     // Delete-only hunks have an A-side owner cover and an empty B envelope,
     // so they can be partitioned by the same owner-closure proof. Insert-only
     // hunks have no A-side owner cover; they require insertion-anchor proofs
     // handled by the existing insertion/macro/include machinery, not by this
-    // mixed-owner tiler.  Equal/state-only hunks are likewise classified as
+    // structural tiler.  Equal/state-only hunks are likewise classified as
     // outside this normalizer instead of being silently interpreted as token
     // partitions.
     if (!replaceHunk && !deleteOnlyHunk)
@@ -2707,8 +2708,8 @@ public:
     }
 
     std::string stateCompositionReason;
-    if (!MixedOwnerTilingStateSummariesCompose(h, path,
-                                               &stateCompositionReason)) {
+    if (!StructuralHunkTilingStateSummariesCompose(h, path,
+                                                   &stateCompositionReason)) {
       return std::nullopt;
     }
 
@@ -3446,15 +3447,16 @@ private:
     // participate in any ordered composition proof. A modeled state mutation
     // followed by a later observer is not rejected here merely because it is
     // visible after the gap: the later token/state edge may be part of the
-    // same widened mixed-owner tiling closure.
+    // same widened structural tiling closure.
     return true;
   }
 
   SmallVector<OwnerStateComponent, 8>
   StateComponentsObservedBySummary(const OwnerStateDelta &summary) const {
-    // Mixed-owner proof consumes the canonical theorem-facing delta directly.
-    // composition is tied to precise Entry/Observes/Mutates/Exit facts and
-    // explicit missing-fact markers, not a flat owner-state projection.
+    // Structural tiling proof consumes the canonical theorem-facing delta
+    // directly. composition is tied to precise Entry/Observes/Mutates/Exit
+    // facts and explicit missing-fact markers, not a flat owner-state
+    // projection.
     const OwnerStateDelta theoremDelta = summary;
     const StateObservations &observations = theoremDelta.observes;
     SmallVector<OwnerStateComponent, 8> components;
@@ -3530,7 +3532,7 @@ private:
     return summary;
   }
 
-  RefoldMixedOwnerTilingPlanner::Dependencies &deps_;
+  RefoldStructuralHunkTilingPlanner::Dependencies &deps_;
 
   /// Per-structure placement proofs for a preserved structural gap.  The
   /// prover reads producer records only, so one instance answers gaps in the
@@ -3545,29 +3547,29 @@ private:
 
 } // namespace
 
-RefoldMixedOwnerTilingPlanner::RefoldMixedOwnerTilingPlanner(Dependencies deps)
+RefoldStructuralHunkTilingPlanner::RefoldStructuralHunkTilingPlanner(
+    Dependencies deps)
     : deps_(deps) {}
 
-RefoldMixedOwnerTilingPlanner::MixedOwnerTilingPlan
-RefoldMixedOwnerTilingPlanner::FinishPlan(std::vector<diffutils::Hunk> hunks) {
+RefoldStructuralHunkTilingPlanner::StructuralHunkTilingPlan
+RefoldStructuralHunkTilingPlanner::FinishPlan(
+    std::vector<diffutils::Hunk> hunks) {
   // Refresh the token-level hunk cache after normalization.
   deps_.abTokHunks = hunks;
 
-  MixedOwnerTilingPlan plan;
+  StructuralHunkTilingPlan plan;
   plan.hunks = std::move(hunks);
-  plan.mixedOwnerWitnessCount = deps_.mixedOwnerTilingWitnesses.size();
-  plan.segmentBindingCount = deps_.mixedOwnerTilingSegmentBindings.size();
+  plan.witnessCount = deps_.structuralHunkTilingWitnesses.size();
+  plan.segmentBindingCount = deps_.structuralHunkTilingSegmentBindings.size();
   return plan;
 }
 
-RefoldMixedOwnerTilingPlanner::MixedOwnerTilingPlan
-RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
+RefoldStructuralHunkTilingPlanner::StructuralHunkTilingPlan
+RefoldStructuralHunkTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
   // Structural witnesses are rebuilt from the current token diff and attached
-  // to later accepted candidates by exact A/B token-envelope binding.  The
-  // legacy ledger type names are retained temporarily to avoid unrelated API
-  // churn while same-realizer structure preservation is introduced.
-  deps_.mixedOwnerTilingWitnesses.clear();
-  deps_.mixedOwnerTilingSegmentBindings.clear();
+  // to later accepted candidates by exact A/B token-envelope binding.
+  deps_.structuralHunkTilingWitnesses.clear();
+  deps_.structuralHunkTilingSegmentBindings.clear();
 
   // Tiling only has work to do when there is at least one hunk to split; with
   // none, the plan is the unchanged input.  Returning early here keeps the
@@ -3608,10 +3610,11 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       // reverse binding to this witness so later macro/include/TU accepted
       // candidates can report the structural reason that justified the split,
       // including proof-only state-gap edges that are not emitted.
-      const size_t mixedWitnessIndex = deps_.mixedOwnerTilingWitnesses.size();
+      const size_t mixedWitnessIndex =
+          deps_.structuralHunkTilingWitnesses.size();
       const uint64_t mixedWitnessId =
           static_cast<uint64_t>(mixedWitnessIndex) + 1;
-      MixedOwnerTilingWitness witness =
+      StructuralHunkTilingWitness witness =
           prover.BuildStructuralTilingWitness(h, *partition, mixedWitnessId);
       const bool preservesStructure =
           partition->reason ==
@@ -3629,7 +3632,7 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
         continue;
       }
       logAcceptedStructuralTiling(witness);
-      deps_.mixedOwnerTilingWitnesses.push_back(std::move(witness));
+      deps_.structuralHunkTilingWitnesses.push_back(std::move(witness));
 
       uint32_t mixedSegmentIndex = 0;
       for (const PartitionEdge &edge : partition->edges) {
@@ -3638,8 +3641,8 @@ RefoldMixedOwnerTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
           continue;
         }
 
-        deps_.mixedOwnerTilingSegmentBindings.push_back(
-            MixedOwnerTilingSegmentBinding{
+        deps_.structuralHunkTilingSegmentBindings.push_back(
+            StructuralHunkTilingSegmentBinding{
                 edge.aStart, edge.aEnd, edge.bStart, edge.bEnd,
                 mixedWitnessIndex, mixedWitnessId, currentSegmentIndex});
         emittedEdges.insert(

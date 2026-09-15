@@ -133,20 +133,21 @@ bool RefoldAcceptedResultRanker::ProofDominates(const ProofSummary &lhs,
   if (lhsSurfaceDisposition != rhsSurfaceDisposition)
     return lhsSurfaceDisposition < rhsSurfaceDisposition;
 
-  auto hasMixedOwnerTilingProof = [](const ProofSummary &summary) {
-    return summary.hasMixedOwnerTilingWitness &&
-           summary.theoremClass == TheoremProofClass::MixedOwnerTilingProof;
+  auto hasStructuralHunkTilingProof = [](const ProofSummary &summary) {
+    return summary.hasStructuralHunkTilingWitness &&
+           summary.theoremClass == TheoremProofClass::StructuralHunkTilingProof;
   };
 
-  auto mixedOwnerCoverWidth = [](const MixedOwnerTilingWitness &witness) {
-    return (witness.originalAEnd - witness.originalAStart) +
-           (witness.originalBEnd - witness.originalBStart);
-  };
+  auto structuralTilingCoverWidth =
+      [](const StructuralHunkTilingWitness &witness) {
+        return (witness.originalAEnd - witness.originalAStart) +
+               (witness.originalBEnd - witness.originalBStart);
+      };
 
-  const bool lhsMixedOwner = hasMixedOwnerTilingProof(lhs);
-  const bool rhsMixedOwner = hasMixedOwnerTilingProof(rhs);
-  if (lhsMixedOwner != rhsMixedOwner) {
-    // A segment proven by a durable mixed-owner tiling is strictly stronger
+  const bool lhsStructuralTiling = hasStructuralHunkTilingProof(lhs);
+  const bool rhsStructuralTiling = hasStructuralHunkTilingProof(rhs);
+  if (lhsStructuralTiling != rhsStructuralTiling) {
+    // A segment proven by a durable structural tiling is strictly stronger
     // than the owner-specific realization/preservation summary it competes
     // with, and that ordering belongs here rather than in the path-local
     // witness attachment code.
@@ -154,7 +155,7 @@ bool RefoldAcceptedResultRanker::ProofDominates(const ProofSummary &lhs,
     // The rule used to apply only when the two summaries also agreed on
     // `inventory.currentPath`, which stood in for "the same emitted
     // artifact".  A comparison that switches on whether a third coordinate
-    // matches is not transitive: with the guard in place, a mixed-owner
+    // matches is not transitive: with the guard in place, a structural-tiling
     // summary could beat a same-path competitor while losing to a
     // different-path one by the theorem-class fallback below, and the winner
     // of the resulting cycle depended on candidate push order.  The guard is
@@ -162,14 +163,16 @@ bool RefoldAcceptedResultRanker::ProofDominates(const ProofSummary &lhs,
     // summaries in the same structural class, and a proof strength ordering
     // must not depend on which enum value labeled the builder that produced
     // the summary.
-    return lhsMixedOwner;
+    return lhsStructuralTiling;
   }
 
-  if (lhsMixedOwner && rhsMixedOwner) {
-    const MixedOwnerTilingWitness &lhsWitness = lhs.mixedOwnerTilingWitness;
-    const MixedOwnerTilingWitness &rhsWitness = rhs.mixedOwnerTilingWitness;
-    const uint64_t lhsWidth = mixedOwnerCoverWidth(lhsWitness);
-    const uint64_t rhsWidth = mixedOwnerCoverWidth(rhsWitness);
+  if (lhsStructuralTiling && rhsStructuralTiling) {
+    const StructuralHunkTilingWitness &lhsWitness =
+        lhs.structuralHunkTilingWitness;
+    const StructuralHunkTilingWitness &rhsWitness =
+        rhs.structuralHunkTilingWitness;
+    const uint64_t lhsWidth = structuralTilingCoverWidth(lhsWitness);
+    const uint64_t rhsWidth = structuralTilingCoverWidth(rhsWitness);
     if (lhsWidth != rhsWidth)
       return lhsWidth < rhsWidth;
     if (lhsWitness.tokenSegmentCount != rhsWitness.tokenSegmentCount)

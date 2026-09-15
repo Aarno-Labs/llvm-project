@@ -271,7 +271,7 @@ struct EmittedProof {
   ProofDischargeRecord discharge;
 
   std::optional<OwnerRealizationWitness> ownerRealization;
-  std::optional<StructuralHunkTilingWitness> mixedOwnerTiling;
+  std::optional<StructuralHunkTilingWitness> structuralHunkTiling;
   std::optional<TUAnchorWitness> tuAnchor;
   std::optional<IncludeAnchorWitness> includeAnchor;
   std::optional<SuffixStabilityWitness> suffixStability;

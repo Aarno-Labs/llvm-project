@@ -76,7 +76,7 @@ namespace {
 /// Pre-normalization and final carrier selections for one preserved-gap
 /// structural tiling witness in the current physical source owner.
 struct PreservedStructuralTilingObservation {
-  MixedOwnerTilingWitness witness;
+  StructuralHunkTilingWitness witness;
   std::set<uint32_t> plannedSegments;
   std::set<uint32_t> emittedSegments;
 };
@@ -84,7 +84,7 @@ struct PreservedStructuralTilingObservation {
 /// Return whether a durable structural segment belongs to the physical source
 /// currently being assembled.
 bool structuralSegmentBelongsToSource(
-    const MixedOwnerTilingSegmentWitness &segment,
+    const StructuralHunkTilingEdgeWitness &segment,
     const LineDirectiveInserter &lineDirs, StringRef absoluteSourceOwner,
     std::optional<uint64_t> ownerIncludeId) {
   if (!segment.sourceByteRangeKnown || segment.sourcePath.empty() ||
@@ -129,7 +129,7 @@ bool protectedStructureOccupiesDirectiveLine(
 /// whose complete scanner interval has no terminating newline.
 bool textEditInterferesWithPreservedSourceInterval(
     const TextEdit &edit,
-    const MixedOwnerTilingSegmentWitness &preservedSegment,
+    const StructuralHunkTilingEdgeWitness &preservedSegment,
     StringRef originalFileText, const LangOptions &lexLang) {
   const uint64_t sourceBegin = preservedSegment.sourceBegin;
   const uint64_t sourceEnd = preservedSegment.sourceEnd;
@@ -173,9 +173,8 @@ bool textEditInterferesWithPreservedSourceInterval(
 
 /// Return whether two copies name the same durable structural partition for
 /// final emission purposes.
-bool structuralTilingWitnessesAgree(
-    const MixedOwnerTilingWitness &lhs,
-    const MixedOwnerTilingWitness &rhs) {
+bool structuralTilingWitnessesAgree(const StructuralHunkTilingWitness &lhs,
+                                    const StructuralHunkTilingWitness &rhs) {
   const bool lhsPreservesStructure =
       lhs.reason == StructuralTilingReason::PreservedPreprocessingStructure ||
       lhs.reason ==
@@ -246,8 +245,8 @@ bool structuralTilingWitnessesAgree(
   }
 
   for (size_t i = 0; i < lhs.edges.size(); ++i) {
-    const MixedOwnerTilingSegmentWitness &left = lhs.edges[i];
-    const MixedOwnerTilingSegmentWitness &right = rhs.edges[i];
+    const StructuralHunkTilingEdgeWitness &left = lhs.edges[i];
+    const StructuralHunkTilingEdgeWitness &right = rhs.edges[i];
     if (left.parentTilingWitnessId != right.parentTilingWitnessId ||
         left.segmentIndex != right.segmentIndex ||
         left.sourceOrderPosition != right.sourceOrderPosition ||
@@ -296,7 +295,7 @@ bool structuralTilingWitnessesAgree(
 /// An already-observed witness id must retain the same durable partition.
 PreservedStructuralTilingObservation *findOrCreateStructuralTilingObservation(
     SmallVectorImpl<PreservedStructuralTilingObservation> &observations,
-    const MixedOwnerTilingWitness &witness, std::string &failure) {
+    const StructuralHunkTilingWitness &witness, std::string &failure) {
   for (PreservedStructuralTilingObservation &candidate : observations) {
     if (candidate.witness.witnessId != witness.witnessId)
       continue;
@@ -315,29 +314,30 @@ PreservedStructuralTilingObservation *findOrCreateStructuralTilingObservation(
 /// Resolve one structural carrier to its durable tiling witness and exact
 /// token-segment index.
 ///
-/// Mixed-owner theorem carriers store the witness directly. Ordinary TU owner
-/// realizations instead store the validated witness id/segment key in
+/// Structural-tiling theorem carriers store the witness directly. Ordinary TU
+/// owner realizations instead store the validated witness id/segment key in
 /// `TUOwnerRealizationCarrierWitness`; resolve that key through the durable
 /// planner ledger so final edit normalization cannot hide direct TU segments
 /// merely by retaining their owner-realization proof class.
 bool resolveStructuralTilingCarrier(
     const AcceptedResultCandidate &carrier,
-    ArrayRef<MixedOwnerTilingWitness> durableWitnesses,
-    const MixedOwnerTilingWitness *&resolvedWitness,
+    ArrayRef<StructuralHunkTilingWitness> durableWitnesses,
+    const StructuralHunkTilingWitness *&resolvedWitness,
     uint32_t &resolvedSegmentIndex, std::string &failure) {
   resolvedWitness = nullptr;
   resolvedSegmentIndex = 0;
   const ProofSummary &summary = carrier.proofSummary;
 
-  if (summary.hasMixedOwnerTilingWitness) {
-    if (!summary.hasMixedOwnerTilingSegmentSelection ||
-        summary.mixedOwnerTilingSegmentIndex >=
-            summary.mixedOwnerTilingWitness.edges.size()) {
-      failure = "mixed-owner carrier lacks an exact emitted-segment selection";
+  if (summary.hasStructuralHunkTilingWitness) {
+    if (!summary.hasStructuralHunkTilingSegmentSelection ||
+        summary.structuralHunkTilingSegmentIndex >=
+            summary.structuralHunkTilingWitness.edges.size()) {
+      failure =
+          "structural tiling carrier lacks an exact emitted-segment selection";
       return false;
     }
-    resolvedWitness = &summary.mixedOwnerTilingWitness;
-    resolvedSegmentIndex = summary.mixedOwnerTilingSegmentIndex;
+    resolvedWitness = &summary.structuralHunkTilingWitness;
+    resolvedSegmentIndex = summary.structuralHunkTilingSegmentIndex;
   }
 
   // Resolve one witness-id/segment key through the durable planner ledger and
@@ -346,8 +346,8 @@ bool resolveStructuralTilingCarrier(
   // cannot drift apart in how strictly they resolve.
   auto resolveLedgerKey = [&](uint64_t witnessId, uint32_t segmentIndex,
                               StringRef source) -> bool {
-    const MixedOwnerTilingWitness *ledgerWitness = nullptr;
-    for (const MixedOwnerTilingWitness &candidate : durableWitnesses) {
+    const StructuralHunkTilingWitness *ledgerWitness = nullptr;
+    for (const StructuralHunkTilingWitness &candidate : durableWitnesses) {
       if (candidate.witnessId != witnessId)
         continue;
       if (ledgerWitness) {
@@ -421,12 +421,12 @@ bool resolveStructuralTilingCarrier(
 /// Non-structural and non-preserved-gap carriers are intentionally ignored.
 bool observePreservedStructuralTilingCarrier(
     const AcceptedResultCandidate &carrier, bool planned,
-    ArrayRef<MixedOwnerTilingWitness> durableWitnesses,
+    ArrayRef<StructuralHunkTilingWitness> durableWitnesses,
     const LineDirectiveInserter &lineDirs, StringRef absoluteSourceOwner,
     std::optional<uint64_t> ownerIncludeId,
     SmallVectorImpl<PreservedStructuralTilingObservation> &observations,
     std::string &failure) {
-  const MixedOwnerTilingWitness *witness = nullptr;
+  const StructuralHunkTilingWitness *witness = nullptr;
   uint32_t segmentIndex = 0;
   if (!resolveStructuralTilingCarrier(carrier, durableWitnesses, witness,
                                       segmentIndex, failure)) {
@@ -441,11 +441,11 @@ bool observePreservedStructuralTilingCarrier(
 
   const bool deleteOnlyWitness =
       witness->originalBStart == witness->originalBEnd;
-  const MixedOwnerTilingSegmentWitness &selected =
+  const StructuralHunkTilingEdgeWitness &selected =
       witness->edges[segmentIndex];
-  if (selected.kind != MixedOwnerTilingEdgeKind::TokenSegment ||
-      !structuralSegmentBelongsToSource(selected, lineDirs,
-                                        absoluteSourceOwner, ownerIncludeId)) {
+  if (selected.kind != StructuralHunkTilingEdgeKind::TokenSegment ||
+      !structuralSegmentBelongsToSource(selected, lineDirs, absoluteSourceOwner,
+                                        ownerIncludeId)) {
     failure = "structural carrier selected a non-token or different-source "
               "segment";
     return false;
@@ -775,7 +775,7 @@ bool RefoldTextEditAssembler::PreservedStructuralGapsRemainOutsideEmittedEdits(
         continue;
       std::string failure;
       if (!observePreservedStructuralTilingCarrier(
-              *carrier, /*planned=*/true, mixedOwnerTilingWitnesses_,
+              *carrier, /*planned=*/true, structuralHunkTilingWitnesses_,
               lineDirs_, absoluteSourceOwner, ownerIncludeId, observedTilings,
               failure)) {
         return RejectPreservedStructuralGapAudit(emissionStage, failure);
@@ -793,7 +793,7 @@ bool RefoldTextEditAssembler::PreservedStructuralGapsRemainOutsideEmittedEdits(
         continue;
       std::string failure;
       if (!observePreservedStructuralTilingCarrier(
-              *carrier, /*planned=*/false, mixedOwnerTilingWitnesses_,
+              *carrier, /*planned=*/false, structuralHunkTilingWitnesses_,
               lineDirs_, absoluteSourceOwner, ownerIncludeId, observedTilings,
               failure)) {
         return RejectPreservedStructuralGapAudit(emissionStage, failure);
@@ -802,7 +802,7 @@ bool RefoldTextEditAssembler::PreservedStructuralGapsRemainOutsideEmittedEdits(
   }
 
   for (const PreservedStructuralTilingObservation &observed : observedTilings) {
-    const MixedOwnerTilingWitness &witness = observed.witness;
+    const StructuralHunkTilingWitness &witness = observed.witness;
     if (!witness.uniquePartition || !witness.stateTransitionsComposed ||
         !witness.targetTokenStreamComposed ||
         !witness.preservedGapSourceOrderProven ||
@@ -871,17 +871,17 @@ bool RefoldTextEditAssembler::PreservedStructuralGapsRemainOutsideEmittedEdits(
 
     std::set<uint32_t> expectedSegments;
     bool sawCurrentSourcePreservedGap = false;
-    for (const MixedOwnerTilingSegmentWitness &segment : witness.edges) {
+    for (const StructuralHunkTilingEdgeWitness &segment : witness.edges) {
       if (!structuralSegmentBelongsToSource(
               segment, lineDirs_, absoluteSourceOwner, ownerIncludeId)) {
         continue;
       }
 
-      if (segment.kind == MixedOwnerTilingEdgeKind::TokenSegment) {
+      if (segment.kind == StructuralHunkTilingEdgeKind::TokenSegment) {
         expectedSegments.insert(segment.segmentIndex);
         continue;
       }
-      if (segment.kind != MixedOwnerTilingEdgeKind::StateGap ||
+      if (segment.kind != StructuralHunkTilingEdgeKind::StateGap ||
           segment.gapDisposition !=
               StructuralGapDisposition::PreservedInPlace ||
           !segment.sourceBytesPreservedUnchanged ||
@@ -3076,9 +3076,10 @@ RefoldTextEditAssembler::BuildDirectTUHunkTextEdit(
       acceptedCandidateBuilder_.BuildAcceptedTUTextEditCandidate(
           plan->acceptedPath, plan->hunk, plan->span,
           /*structuralBinding=*/nullptr, plan->acceptedPayload);
-  ownerRealizationProofBuilder_.AttachMixedOwnerTilingWitnessForTokenEnvelope(
-      candidate.proofSummary, plan->hunk.aStart, plan->hunk.aEnd,
-      plan->hunk.bStart, plan->hunk.bEnd);
+  ownerRealizationProofBuilder_
+      .AttachStructuralHunkTilingWitnessForTokenEnvelope(
+          candidate.proofSummary, plan->hunk.aStart, plan->hunk.aEnd,
+          plan->hunk.bStart, plan->hunk.bEnd);
   ownerRealizationProofBuilder_.AttachStandardWitnesses(candidate);
   textEditCertifier_.AttachAcceptedResultCarrier(edit, candidate);
   return edit;

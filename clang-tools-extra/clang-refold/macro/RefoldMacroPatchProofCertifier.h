@@ -64,8 +64,8 @@ public:
 
   /// Certify the macro candidate that the final selector chose: if the
   /// selected candidate carries an emitted accepted candidate, attach it to
-  /// the patch via the lattice; otherwise leave the patch uncertified and
-  /// trace the selector-only outcome.
+  /// the patch through the accepted-candidate builder; otherwise leave the
+  /// patch uncertified and trace the selector-only outcome.
   void CertifySelectedFinalMacroCandidate(
       const RefoldModel::MacroInvocation &invocation,
       const SelectedMacroSelectionCandidate &selectedCandidate,
@@ -100,7 +100,7 @@ public:
   /// The caller must have already proven the recursive theorem obligations and
   /// populated the witness with durable producer-path and tuple-slice facts.
   /// This method only attaches the first-class proof identity and rebuilds the
-  /// normalized proof summary through the lattice.
+  /// normalized proof summary through the macro-patch proof classifier.
   void SetRecursiveTupleGeneratedCalleeReplayProof(
       MacroPatch &patch, const RefoldModel::MacroInvocation &rootInvocation,
       RecursiveTupleGeneratedCalleeReplayWitness witness) const;

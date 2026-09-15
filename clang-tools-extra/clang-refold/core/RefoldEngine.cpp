@@ -39,12 +39,12 @@
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofServices.h"
 #include "sideband/RefoldSidebandPragmaEdits.h"
-#include "source/RefoldMixedOwnerTilingPlanner.h"
 #include "source/RefoldOwnerClassifier.h"
 #include "source/RefoldPreprocessRecheck.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
 #include "source/RefoldPreprocessingStructureIndexProvider.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
+#include "source/RefoldStructuralHunkTilingPlanner.h"
 #include "source/RefoldTokenDiffPlanner.h"
 #include "source/TokenTextHelpers.h"
 #include "support/RefoldLangOptions.h"
@@ -238,9 +238,10 @@ static std::optional<uint64_t> rightEdgeWidenDistanceOutOfSplitExpansion(
 /// snapshot before downstream planning begins.
 bool structuralTilingLedgersMatchNormalizedHunks(
     ArrayRef<diffutils::Hunk> hunks,
-    ArrayRef<MixedOwnerTilingWitness> witnesses,
-    ArrayRef<MixedOwnerTilingSegmentBinding> bindings, std::string &failure) {
-  for (const MixedOwnerTilingSegmentBinding &binding : bindings) {
+    ArrayRef<StructuralHunkTilingWitness> witnesses,
+    ArrayRef<StructuralHunkTilingSegmentBinding> bindings,
+    std::string &failure) {
+  for (const StructuralHunkTilingSegmentBinding &binding : bindings) {
     if (binding.witnessIndex >= witnesses.size()) {
       failure = llvm::formatv(
                     "binding witness index {0} is outside ledger size {1}",
@@ -249,7 +250,7 @@ bool structuralTilingLedgersMatchNormalizedHunks(
       return false;
     }
 
-    const MixedOwnerTilingWitness &witness =
+    const StructuralHunkTilingWitness &witness =
         witnesses[binding.witnessIndex];
     if (witness.witnessId != binding.parentTilingWitnessId) {
       failure = llvm::formatv(
@@ -267,9 +268,9 @@ bool structuralTilingLedgersMatchNormalizedHunks(
       return false;
     }
 
-    const MixedOwnerTilingSegmentWitness &edge =
+    const StructuralHunkTilingEdgeWitness &edge =
         witness.edges[binding.segmentIndex];
-    if (edge.kind != MixedOwnerTilingEdgeKind::TokenSegment ||
+    if (edge.kind != StructuralHunkTilingEdgeKind::TokenSegment ||
         edge.aStart != binding.aStart || edge.aEnd != binding.aEnd ||
         edge.bStart != binding.bStart || edge.bEnd != binding.bEnd) {
       failure = llvm::formatv(
@@ -305,14 +306,14 @@ bool structuralTilingLedgersMatchNormalizedHunks(
   // without the structural authority that justified its split.
   for (size_t witnessIndex = 0; witnessIndex < witnesses.size();
        ++witnessIndex) {
-    const MixedOwnerTilingWitness &witness = witnesses[witnessIndex];
+    const StructuralHunkTilingWitness &witness = witnesses[witnessIndex];
     for (size_t edgeIndex = 0; edgeIndex < witness.edges.size(); ++edgeIndex) {
-      const MixedOwnerTilingSegmentWitness &edge = witness.edges[edgeIndex];
-      if (edge.kind != MixedOwnerTilingEdgeKind::TokenSegment)
+      const StructuralHunkTilingEdgeWitness &edge = witness.edges[edgeIndex];
+      if (edge.kind != StructuralHunkTilingEdgeKind::TokenSegment)
         continue;
 
       size_t matchingBindingCount = 0;
-      for (const MixedOwnerTilingSegmentBinding &binding : bindings) {
+      for (const StructuralHunkTilingSegmentBinding &binding : bindings) {
         if (binding.witnessIndex == witnessIndex &&
             binding.parentTilingWitnessId == witness.witnessId &&
             binding.segmentIndex == edgeIndex) {
@@ -709,7 +710,7 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   // resolution publishes its theorem into `alignmentResolutionMemo_` from
   // inside it, and that memo is the only state the narrowing loop reads back
   // from a probe engine.  Everything below -- the witness-ledger audit, hunk
-  // edge retraction, mixed-owner structural tiling, insertion provenance --
+  // edge retraction, structural tiling, insertion provenance --
   // builds the plan for an emission a probe never performs.
   //
   // Skipping the witness audit here loses no proof.  It validates this
@@ -854,10 +855,11 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   // built.  The generalized tiler may lower one structural deletion to several
   // ordinary token hunks, but downstream services continue to consume only the
   // normalized vector and its durable segment bindings.
-  assert(mixedOwnerTilingPlanner_ &&
+  assert(structuralHunkTilingPlanner_ &&
          "structural tiling planner service not initialized");
-  RefoldMixedOwnerTilingPlanner::MixedOwnerTilingPlan structuralTilingPlan =
-      mixedOwnerTilingPlanner_->Plan(std::move(hunks));
+  RefoldStructuralHunkTilingPlanner::StructuralHunkTilingPlan
+      structuralTilingPlan =
+          structuralHunkTilingPlanner_->Plan(std::move(hunks));
   hunks = std::move(structuralTilingPlan.hunks);
 
   // The planner writes the shared token-hunk cache and durable ledgers as part
@@ -867,13 +869,13 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   std::string structuralLedgerFailure;
   const bool structuralLedgersAgree =
       structuralTilingLedgersMatchNormalizedHunks(
-          hunks, mixedOwnerTilingWitnesses_,
-          mixedOwnerTilingSegmentBindings_, structuralLedgerFailure);
+          hunks, structuralHunkTilingWitnesses_,
+          structuralHunkTilingSegmentBindings_, structuralLedgerFailure);
   if (abTokHunks_ != hunks ||
-      structuralTilingPlan.mixedOwnerWitnessCount !=
-          mixedOwnerTilingWitnesses_.size() ||
+      structuralTilingPlan.witnessCount !=
+          structuralHunkTilingWitnesses_.size() ||
       structuralTilingPlan.segmentBindingCount !=
-          mixedOwnerTilingSegmentBindings_.size() ||
+          structuralHunkTilingSegmentBindings_.size() ||
       !structuralLedgersAgree) {
     REFOLD_LOG_FATAL(
         "plan/order",
@@ -881,11 +883,10 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
         "and ledgers: returnedHunks={0} cachedHunks={1} "
         "reportedWitnesses={2} durableWitnesses={3} "
         "reportedBindings={4} durableBindings={5} detail={6}",
-        hunks.size(), abTokHunks_.size(),
-        structuralTilingPlan.mixedOwnerWitnessCount,
-        mixedOwnerTilingWitnesses_.size(),
+        hunks.size(), abTokHunks_.size(), structuralTilingPlan.witnessCount,
+        structuralHunkTilingWitnesses_.size(),
         structuralTilingPlan.segmentBindingCount,
-        mixedOwnerTilingSegmentBindings_.size(), structuralLedgerFailure);
+        structuralHunkTilingSegmentBindings_.size(), structuralLedgerFailure);
   }
   structuralHunkPlanningPhase_ =
       StructuralHunkPlanningPhase::StructuralTilingComplete;
@@ -907,7 +908,7 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
           "token diff normalized: hunks={0} replacements={1} insertions={2} "
           "deletions={3} structuralTilingWitnesses={4}",
           hunks.size(), replaceHunks, insertOnlyHunks, deleteOnlyHunks,
-          mixedOwnerTilingWitnesses_.size());
+          structuralHunkTilingWitnesses_.size());
   }
 
   // 3) Build provenance from the normalized sequence only.  In particular, a

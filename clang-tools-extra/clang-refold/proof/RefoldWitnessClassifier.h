@@ -6,7 +6,7 @@
 // fallback failures, resolver fallback reasons, and witness composition state
 // onto the proof families, producer kinds, boundary classes, fallback classes,
 // strict-domain decisions, and strict-domain obligations consumed by the
-// proof lattice, resolver, and trace subsystems.
+// witness resolver, equivalence-key builder, and trace services.
 //
 // Every entry point is a stateless free function in `clang::refold`.  The
 // classifier owns proof-vocabulary policy independently of any proof service,

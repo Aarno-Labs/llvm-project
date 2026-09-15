@@ -26,6 +26,7 @@
 #include "line-control/RefoldLineObserverLayout.h"
 #include "line-control/SourceLineDirectiveHelpers.h"
 #include "macro/RefoldMacroStateProof.h"
+#include "macro/RefoldMacroTupleHelpers.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldNeutralityProof.h"
 #include "proof/RefoldOwnerStateProof.h"
@@ -791,8 +792,8 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
   if (auto it = macroPatchesByOwner.find(includeId);
       it != macroPatchesByOwner.end()) {
     for (const auto &mp : it->second) {
-      uint64_t mpEnd = stringutils::extendChainedCallEnd(
-          StringRef(bytes), mp.invRange.end, mp.replacement);
+      uint64_t mpEnd = extendChainedCallEnd(StringRef(bytes), mp.invRange.end,
+                                            mp.replacement);
       uint64_t editStart = mp.invRange.begin;
       uint64_t editEnd = mpEnd;
       std::string editReplacement = mp.replacement;

@@ -125,7 +125,8 @@ public:
       const RefoldTextEditCertifier &textEditCertifier,
       const RefoldLineObserverLayout &lineObserverLayout,
       const RefoldTheoremAudit &theoremAuditService,
-      const std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses,
+      const std::vector<StructuralHunkTilingWitness>
+          &structuralHunkTilingWitnesses,
       TheoremAuditStats &theoremAudit)
       : model_(model), bSource_(bSource), aToks_(aToks), bToks_(bToks),
         bTokOff_(bTokOff), abTokHunks_(abTokHunks), abTokMapA2B_(abTokMapA2B),
@@ -140,7 +141,7 @@ public:
         tuAnchorProof_(tuAnchorProof), textEditCertifier_(textEditCertifier),
         lineObserverLayout_(lineObserverLayout),
         theoremAuditService_(theoremAuditService),
-        mixedOwnerTilingWitnesses_(mixedOwnerTilingWitnesses),
+        structuralHunkTilingWitnesses_(structuralHunkTilingWitnesses),
         theoremAudit_(theoremAudit) {}
 
   /// \brief Audit the complete accepted-proof surface before bytes are emitted.
@@ -330,7 +331,8 @@ private:
   const RefoldTheoremAudit &theoremAuditService_;
   /// Durable structural partitions used to resolve validated TU carrier keys
   /// after later edit normalization has discarded path-local bindings.
-  const std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses_;
+  const std::vector<StructuralHunkTilingWitness>
+      &structuralHunkTilingWitnesses_;
   TheoremAuditStats &theoremAudit_;
 };
 

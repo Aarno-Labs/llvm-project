@@ -483,19 +483,19 @@ bool transitionHasStableCounterWitness(const StateTransitionProof &proof) {
       });
 }
 
-// --- mixed-owner / owner-realization predicates ---------------------------
+// --- structural-tiling / owner-realization predicates ---------------------
 
 /// True iff every segment in `tiling` either has no counter obligation or
 /// discharges its counter obligation via a stable counter witness on the
 /// segment's owner-transition proof.  Missing counter proofs anywhere along
 /// the tiling immediately disqualify the tiling.
-bool mixedOwnerTilingHasKnownCounterState(
-    const MixedOwnerTilingWitness &tiling) {
+bool structuralHunkTilingHasKnownCounterState(
+    const StructuralHunkTilingWitness &tiling) {
   if (!tiling.stateSummariesComposed || tiling.edges.empty())
     return false;
 
   bool sawCounterObligation = false;
-  for (const MixedOwnerTilingSegmentWitness &segment : tiling.edges) {
+  for (const StructuralHunkTilingEdgeWitness &segment : tiling.edges) {
     const StateTransitionProof &proof = segment.canonicalStateTransition;
     if (deltaHasMissingCounterProof(proof.before) ||
         deltaHasMissingCounterProof(proof.after))
@@ -663,10 +663,11 @@ std::string ownerStateDeltaSignature(const OwnerRealizationWitness &owner) {
   return RefoldWitnessTrace::FormatWitnessTraceHash(storage);
 }
 
-/// Build the deterministic signature for a mixed-owner tiling witness: the
+/// Build the deterministic signature for a structural tiling witness: the
 /// envelope facts, segment summaries (kind, A/B ranges, owner/source/producer
 /// signatures), per-segment owner-transition deltas, and suffix witnesses.
-std::string mixedOwnerTilingSignature(const MixedOwnerTilingWitness &tiling) {
+std::string
+structuralHunkTilingSignature(const StructuralHunkTilingWitness &tiling) {
   std::string storage;
   llvm::raw_string_ostream os(storage);
   os << "tiling=" << tiling.witnessId
@@ -716,7 +717,7 @@ std::string mixedOwnerTilingSignature(const MixedOwnerTilingWitness &tiling) {
        << ":B=" << projection.bTokenBoundary
        << ":unique=" << (projection.uniqueProjection ? 1 : 0) << '}';
   }
-  for (const MixedOwnerTilingSegmentWitness &segment : tiling.edges) {
+  for (const StructuralHunkTilingEdgeWitness &segment : tiling.edges) {
     os << ";edge" << segment.segmentIndex
        << "{source_order=" << segment.sourceOrderPosition
        << ":kind=" << toString(segment.kind) << ":A=[" << segment.aStart << ','
@@ -1033,10 +1034,12 @@ void computeTargetPPTokensDimension(
         summary.ownerRealizationWitness.closure.bTokens;
     setTargetFromBTokenRange(key, deps.sourceMapper, "b_tokens", bTokens.begin,
                              bTokens.end);
-  } else if (summary.hasMixedOwnerTilingWitness) {
-    const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
+  } else if (summary.hasStructuralHunkTilingWitness) {
+    const StructuralHunkTilingWitness &tiling =
+        summary.structuralHunkTilingWitness;
     if (tiling.originalBStart <= tiling.originalBEnd)
-      setTargetFromBTokenRange(key, deps.sourceMapper, "mixed_owner_b_tokens",
+      setTargetFromBTokenRange(key, deps.sourceMapper,
+                               "structural_tiling_b_tokens",
                                tiling.originalBStart, tiling.originalBEnd);
   } else if (summary.hasIncludeAnchorWitness &&
              summary.includeAnchorWitness.hasFirstPP &&
@@ -1237,14 +1240,16 @@ void computeSuffixStateDimension(
       key.suffixState = WitnessEquivalenceDimension::Unknown(
           "owner-realization-state-delta-not-summarized");
     }
-  } else if (summary.hasMixedOwnerTilingWitness &&
-             summary.mixedOwnerTilingWitness.stateSummariesComposed) {
-    const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
+  } else if (summary.hasStructuralHunkTilingWitness &&
+             summary.structuralHunkTilingWitness.stateSummariesComposed) {
+    const StructuralHunkTilingWitness &tiling =
+        summary.structuralHunkTilingWitness;
     key.suffixState = WitnessEquivalenceDimension::Known(
-        llvm::formatv("mixed_owner_composed:id={0}:segments={1}:state_gaps={2}:"
-                      "state={3}",
-                      tiling.witnessId, tiling.tokenSegmentCount,
-                      tiling.stateGapCount, mixedOwnerTilingSignature(tiling))
+        llvm::formatv(
+            "structural_tiling_composed:id={0}:segments={1}:state_gaps={2}:"
+            "state={3}",
+            tiling.witnessId, tiling.tokenSegmentCount, tiling.stateGapCount,
+            structuralHunkTilingSignature(tiling))
             .str());
   }
 
@@ -1390,15 +1395,16 @@ void computePreservedObserversDimension(
             w.condArmId, w.hasChildIncludeId, w.childIncludeId,
             w.hasDeclHeaderRange, w.declHeaderB, w.declHeaderE)
             .str());
-  } else if (summary.hasMixedOwnerTilingWitness &&
-             summary.mixedOwnerTilingWitness.stateSummariesComposed) {
-    const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
+  } else if (summary.hasStructuralHunkTilingWitness &&
+             summary.structuralHunkTilingWitness.stateSummariesComposed) {
+    const StructuralHunkTilingWitness &tiling =
+        summary.structuralHunkTilingWitness;
     key.preservedObservers = WitnessEquivalenceDimension::Known(
         llvm::formatv(
-            "mixed_owner_observers:id={0}:segments={1}:state_gaps={2}:"
+            "structural_tiling_observers:id={0}:segments={1}:state_gaps={2}:"
             "state={3}",
             tiling.witnessId, tiling.tokenSegmentCount, tiling.stateGapCount,
-            mixedOwnerTilingSignature(tiling))
+            structuralHunkTilingSignature(tiling))
             .str());
   } else if (summary.hasOwnerRealizationWitness) {
     const OwnerObserverSummary &observers =
@@ -1457,7 +1463,7 @@ void computePreservedObserversDimension(
 /// Decide the counter-state dimension.
 ///
 /// The explicit counter witness leads here, ahead of the macro witnesses that
-/// lead the other dimensions, and mixed-owner tiling is consulted before the
+/// lead the other dimensions, and structural tiling is consulted before the
 /// macro-actual repair witness rather than after it.
 void computeCounterStateDimension(
     WitnessEquivalenceKey &key, const AcceptedResultCandidate &candidate,
@@ -1522,17 +1528,18 @@ void computeCounterStateDimension(
                       .str())
             : WitnessEquivalenceDimension::Unknown(
                   "zero-token-counter-stability-not-proven");
-  } else if (summary.hasMixedOwnerTilingWitness) {
-    const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
+  } else if (summary.hasStructuralHunkTilingWitness) {
+    const StructuralHunkTilingWitness &tiling =
+        summary.structuralHunkTilingWitness;
     key.counterState =
-        mixedOwnerTilingHasKnownCounterState(tiling)
+        structuralHunkTilingHasKnownCounterState(tiling)
             ? WitnessEquivalenceDimension::Known(
-                  llvm::formatv("mixed_owner_counter_state:id={0}:state={1}",
-                                tiling.witnessId,
-                                mixedOwnerTilingSignature(tiling))
+                  llvm::formatv(
+                      "structural_tiling_counter_state:id={0}:state={1}",
+                      tiling.witnessId, structuralHunkTilingSignature(tiling))
                       .str())
             : WitnessEquivalenceDimension::Unknown(
-                  "mixed-owner-counter-state-not-proven");
+                  "structural-tiling-counter-state-not-proven");
   } else if (candidate.hasMacroActualRepairWitness) {
     key.counterState = WitnessEquivalenceDimension::Known(
         llvm::formatv("macro_actual_replay:root={0}:counter-stable",
@@ -1667,9 +1674,9 @@ void computeClassificationDimensions(
     key.diagnosticClass = WitnessDiagnosticClass::PreservesDiagnostics;
   }
 
-  if (summary.hasMixedOwnerTilingWitness ||
-      summary.theoremClass == TheoremProofClass::MixedOwnerTilingProof)
-    key.compositionClass = WitnessCompositionClass::MixedOwnerTile;
+  if (summary.hasStructuralHunkTilingWitness ||
+      summary.theoremClass == TheoremProofClass::StructuralHunkTilingProof)
+    key.compositionClass = WitnessCompositionClass::StructuralHunkTile;
   else if (summary.hasOwnerRealizationWitness ||
            summary.theoremClass == TheoremProofClass::OwnerRealizationProof)
     key.compositionClass = WitnessCompositionClass::OwnerClosed;

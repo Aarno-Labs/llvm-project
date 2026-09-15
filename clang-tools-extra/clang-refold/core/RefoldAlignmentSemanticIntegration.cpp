@@ -67,12 +67,12 @@ private:
 };
 
 void appendStructuralTilingWitness(ExactKeyBuilder &key,
-                                   const MixedOwnerTilingWitness &witness);
+                                   const StructuralHunkTilingWitness &witness);
 
 void appendStructuralTilingWitnesses(
-    ExactKeyBuilder &key, ArrayRef<MixedOwnerTilingWitness> witnesses) {
+    ExactKeyBuilder &key, ArrayRef<StructuralHunkTilingWitness> witnesses) {
   key.AddU64(witnesses.size());
-  for (const MixedOwnerTilingWitness &witness : witnesses)
+  for (const StructuralHunkTilingWitness &witness : witnesses)
     appendStructuralTilingWitness(key, witness);
 }
 
@@ -544,7 +544,7 @@ void appendStateTransitionProof(ExactKeyBuilder &key,
 }
 
 void appendStructuralTilingWitness(ExactKeyBuilder &key,
-                                   const MixedOwnerTilingWitness &witness) {
+                                   const StructuralHunkTilingWitness &witness) {
   // Deliberately omit run-local witness ids.  The surrounding vector order,
   // original hunk envelope, and complete witness payload identify the theorem
   // structurally; allocator order is not a semantic equivalence dimension.
@@ -590,7 +590,7 @@ void appendStructuralTilingWitness(ExactKeyBuilder &key,
   }
 
   key.AddU64(witness.edges.size());
-  for (const MixedOwnerTilingSegmentWitness &edge : witness.edges) {
+  for (const StructuralHunkTilingEdgeWitness &edge : witness.edges) {
     key.AddU64(edge.segmentIndex);
     key.AddU64(edge.sourceOrderPosition);
     key.AddU64(static_cast<uint64_t>(edge.kind));
@@ -835,7 +835,7 @@ RefoldEngine::SimulateSemanticAlignmentCandidate(
 
   ExactKeyBuilder structuralTilingKey;
   appendStructuralTilingWitnesses(structuralTilingKey,
-                                  candidate.mixedOwnerTilingWitnesses_);
+                                  candidate.structuralHunkTilingWitnesses_);
   components.structuralTilingWitnesses = structuralTilingKey.Take();
   components.stagedTopology =
       candidate.alignmentSimulationStagedTopologyKey_;
@@ -925,8 +925,8 @@ bool RefoldEngine::AlignmentSimulationProofComplete(std::string &failure) const 
     return false;
   }
 
-  for (const MixedOwnerTilingWitness &witness :
-       mixedOwnerTilingWitnesses_) {
+  for (const StructuralHunkTilingWitness &witness :
+       structuralHunkTilingWitnesses_) {
     if (!witness.uniquePartition || !witness.sourceByteCoverComplete ||
         !witness.targetTokenStreamComposed ||
         !witness.stateTransitionsComposed ||
@@ -941,7 +941,7 @@ bool RefoldEngine::AlignmentSimulationProofComplete(std::string &failure) const 
                     .str();
       return false;
     }
-    for (const MixedOwnerTilingSegmentWitness &edge : witness.edges) {
+    for (const StructuralHunkTilingEdgeWitness &edge : witness.edges) {
       if (!edge.ownerClosureComplete || !edge.ownerIdentityKnown ||
           !edge.ownerIdentity.IsKnown()) {
         failure = llvm::formatv(

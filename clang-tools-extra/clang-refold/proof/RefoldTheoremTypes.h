@@ -72,7 +72,7 @@ struct BInsertionProv {
 /// only "which concrete artifact surface can reach emission?" so the proof
 /// model can force every such surface through AcceptedResultCandidate without
 /// rediscovering path names by grep.  Some entries are primary artifact
-/// surfaces, while mixed-owner tiling and owner-realization materialization
+/// surfaces, while structural tiling and owner-realization materialization
 /// are proof overlays that can coexist with a macro/include/TU primary path.
 #define REFOLD_EMISSION_PATH_KIND_LIST(REFOLD_X)                               \
   REFOLD_X(Unknown)                                                            \
@@ -81,7 +81,7 @@ struct BInsertionProv {
   REFOLD_X(TUAnchor)                                                           \
   REFOLD_X(TUTextEdit)                                                         \
   REFOLD_X(TerminalOutOfDomain)                                                \
-  REFOLD_X(MixedOwnerTilingSegment)                                            \
+  REFOLD_X(StructuralHunkTilingSegment)                                        \
   REFOLD_X(OwnerRealizationMaterialization)
 
 enum class EmissionPathKind : uint8_t {
@@ -107,7 +107,7 @@ inline StringRef toString(EmissionPathKind value) {
 /// A normalized candidate always has at most one primary emitted surface
 /// (`MacroPatch`, `IncludePatch`, `TUAnchor`, `TUTextEdit`, or
 /// `TerminalOutOfDomain`).  It may also carry proof overlays, such as a
-/// mixed-owner segment witness or an owner-realization materialization
+/// structural-tiling segment witness or an owner-realization materialization
 /// witness.  Keeping those overlays in the same deduplicated inventory avoids
 /// another parallel family of booleans while preserving the distinction
 /// between construction provenance and theorem proof authority.
@@ -146,7 +146,7 @@ struct EmissionPathInventory {
   REFOLD_X(DirectivePreservingProof)                                           \
   REFOLD_X(StateRepairProof)                                                   \
   REFOLD_X(OwnerRealizationProof)                                              \
-  REFOLD_X(MixedOwnerTilingProof)                                              \
+  REFOLD_X(StructuralHunkTilingProof)                                          \
   REFOLD_X(SuffixStabilizationProof)                                           \
   REFOLD_X(TerminalOutOfDomainProof)
 

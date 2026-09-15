@@ -197,9 +197,10 @@ void RefoldOwnerRealizationProofBuilder::AttachLineControlObserverWitness(
     observeSummary(closure.observers, "owner.suffix");
   }
 
-  if (summary.hasMixedOwnerTilingWitness) {
-    const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
-    for (const MixedOwnerTilingSegmentWitness &segment : tiling.edges) {
+  if (summary.hasStructuralHunkTilingWitness) {
+    const StructuralHunkTilingWitness &tiling =
+        summary.structuralHunkTilingWitness;
+    for (const StructuralHunkTilingEdgeWitness &segment : tiling.edges) {
       collectDelta(segment.canonicalStateTransition.before,
                    "mixed.segment.before");
       collectDelta(segment.canonicalStateTransition.after,
@@ -436,9 +437,10 @@ void RefoldOwnerRealizationProofBuilder::AttachCounterStateWitness(
       recordSuffixWitness(suffix, "owner.state_witness");
   }
 
-  if (summary.hasMixedOwnerTilingWitness) {
-    const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
-    for (const MixedOwnerTilingSegmentWitness &segment : tiling.edges) {
+  if (summary.hasStructuralHunkTilingWitness) {
+    const StructuralHunkTilingWitness &tiling =
+        summary.structuralHunkTilingWitness;
+    for (const StructuralHunkTilingEdgeWitness &segment : tiling.edges) {
       collectDelta(
           segment.canonicalStateTransition.before,
           llvm::formatv("mixed.segment{0}.before", segment.segmentIndex).str());
@@ -509,47 +511,47 @@ void RefoldOwnerRealizationProofBuilder::AttachCounterStateWitness(
 }
 
 void RefoldOwnerRealizationProofBuilder::
-    AttachMixedOwnerTilingWitnessForTokenEnvelope(ProofSummary &summary,
-                                                  uint64_t aStart,
-                                                  uint64_t aEnd,
-                                                  uint64_t bStart,
-                                                  uint64_t bEnd) const {
+    AttachStructuralHunkTilingWitnessForTokenEnvelope(ProofSummary &summary,
+                                                      uint64_t aStart,
+                                                      uint64_t aEnd,
+                                                      uint64_t bStart,
+                                                      uint64_t bEnd) const {
   // Keeps mixed-owner splitting as a normalization step without letting
   // path-local binding order decide which proof wins.  Every matching durable
   // segment is converted into a candidate ProofSummary and the shared lattice
-  // chooses both whether the mixed-owner overlay beats the owner-specific
+  // chooses both whether the structural-tiling overlay beats the owner-specific
   // summary and which matching tiling witness is strongest.
   std::optional<ProofSummary> selectedSummary;
 
-  for (const MixedOwnerTilingSegmentBinding &binding :
-       deps_.mixedOwnerTilingSegmentBindings) {
+  for (const StructuralHunkTilingSegmentBinding &binding :
+       deps_.structuralHunkTilingSegmentBindings) {
     if (binding.aStart != aStart || binding.aEnd != aEnd ||
         binding.bStart != bStart || binding.bEnd != bEnd)
       continue;
-    if (binding.witnessIndex >= deps_.mixedOwnerTilingWitnesses.size())
+    if (binding.witnessIndex >= deps_.structuralHunkTilingWitnesses.size())
       continue;
 
-    const MixedOwnerTilingWitness &witness =
-        deps_.mixedOwnerTilingWitnesses[binding.witnessIndex];
+    const StructuralHunkTilingWitness &witness =
+        deps_.structuralHunkTilingWitnesses[binding.witnessIndex];
     if (witness.witnessId != binding.parentTilingWitnessId ||
         binding.segmentIndex >= witness.edges.size())
       continue;
 
-    const MixedOwnerTilingSegmentWitness &segment =
+    const StructuralHunkTilingEdgeWitness &segment =
         witness.edges[binding.segmentIndex];
     if (segment.parentTilingWitnessId != witness.witnessId ||
         segment.segmentIndex != binding.segmentIndex ||
-        segment.kind != MixedOwnerTilingEdgeKind::TokenSegment ||
+        segment.kind != StructuralHunkTilingEdgeKind::TokenSegment ||
         segment.aStart != aStart || segment.aEnd != aEnd ||
         segment.bStart != bStart || segment.bEnd != bEnd)
       continue;
 
     ProofSummary candidate = summary;
-    candidate.hasMixedOwnerTilingWitness = true;
-    candidate.mixedOwnerTilingWitness = witness;
-    candidate.hasMixedOwnerTilingSegmentSelection = true;
-    candidate.mixedOwnerTilingSegmentIndex = binding.segmentIndex;
-    candidate.theoremClass = TheoremProofClass::MixedOwnerTilingProof;
+    candidate.hasStructuralHunkTilingWitness = true;
+    candidate.structuralHunkTilingWitness = witness;
+    candidate.hasStructuralHunkTilingSegmentSelection = true;
+    candidate.structuralHunkTilingSegmentIndex = binding.segmentIndex;
+    candidate.theoremClass = TheoremProofClass::StructuralHunkTilingProof;
     candidate.primaryProofClassExplicit = true;
     deps_.proofSummaryBuilder.FinalizeProofSummary(candidate);
 
@@ -874,8 +876,8 @@ bool RefoldOwnerRealizationProofBuilder::
   }
 
   bool foundUniqueBinding = false;
-  for (const MixedOwnerTilingSegmentBinding &binding :
-       deps_.mixedOwnerTilingSegmentBindings) {
+  for (const StructuralHunkTilingSegmentBinding &binding :
+       deps_.structuralHunkTilingSegmentBindings) {
     if (binding.aStart != hunk.aStart || binding.aEnd != hunk.aEnd ||
         binding.bStart != hunk.bStart || binding.bEnd != hunk.bEnd ||
         binding.parentTilingWitnessId != structuralBinding.witnessId ||
@@ -886,12 +888,12 @@ bool RefoldOwnerRealizationProofBuilder::
     // Two durable ledger entries for the same structural segment are
     // ambiguous authority. Reject rather than relying on vector order.
     if (foundUniqueBinding ||
-        binding.witnessIndex >= deps_.mixedOwnerTilingWitnesses.size()) {
+        binding.witnessIndex >= deps_.structuralHunkTilingWitnesses.size()) {
       return false;
     }
 
-    const MixedOwnerTilingWitness &witness =
-        deps_.mixedOwnerTilingWitnesses[binding.witnessIndex];
+    const StructuralHunkTilingWitness &witness =
+        deps_.structuralHunkTilingWitnesses[binding.witnessIndex];
     if (witness.witnessId != structuralBinding.witnessId ||
         witness.originalAStart != structuralBinding.originalAStart ||
         witness.originalAEnd != structuralBinding.originalAEnd ||
@@ -965,9 +967,9 @@ bool RefoldOwnerRealizationProofBuilder::
       return false;
     }
 
-    for (const MixedOwnerTilingSegmentWitness &witnessSegment :
+    for (const StructuralHunkTilingEdgeWitness &witnessSegment :
          witness.edges) {
-      if (witnessSegment.kind == MixedOwnerTilingEdgeKind::TokenSegment) {
+      if (witnessSegment.kind == StructuralHunkTilingEdgeKind::TokenSegment) {
         if (witnessSegment.gapDisposition !=
             StructuralGapDisposition::Unknown) {
           return false;
@@ -975,7 +977,7 @@ bool RefoldOwnerRealizationProofBuilder::
         continue;
       }
 
-      if (witnessSegment.kind != MixedOwnerTilingEdgeKind::StateGap ||
+      if (witnessSegment.kind != StructuralHunkTilingEdgeKind::StateGap ||
           witnessSegment.gapDisposition !=
               StructuralGapDisposition::PreservedInPlace ||
           !witnessSegment.sourceBytesPreservedUnchanged ||
@@ -992,19 +994,18 @@ bool RefoldOwnerRealizationProofBuilder::
       }
     }
 
-    const MixedOwnerTilingSegmentWitness &segment =
+    const StructuralHunkTilingEdgeWitness &segment =
         witness.edges[structuralBinding.segmentIndex];
     if (segment.parentTilingWitnessId != witness.witnessId ||
         segment.segmentIndex != structuralBinding.segmentIndex ||
         segment.sourceOrderPosition != structuralBinding.segmentIndex ||
-        segment.kind != MixedOwnerTilingEdgeKind::TokenSegment ||
+        segment.kind != StructuralHunkTilingEdgeKind::TokenSegment ||
         segment.gapDisposition != StructuralGapDisposition::Unknown ||
         segment.aStart != hunk.aStart || segment.aEnd != hunk.aEnd ||
         segment.bStart != hunk.bStart || segment.bEnd != hunk.bEnd ||
-        (deleteOnlyWitness &&
-         (!segment.allowEmptyBEnvelope ||
-          segment.bStart != witness.sharedEmptyBBoundary ||
-          segment.bEnd != witness.sharedEmptyBBoundary)) ||
+        (deleteOnlyWitness && (!segment.allowEmptyBEnvelope ||
+                               segment.bStart != witness.sharedEmptyBBoundary ||
+                               segment.bEnd != witness.sharedEmptyBBoundary)) ||
         (!deleteOnlyWitness &&
          ((segment.bStart == segment.bEnd) != segment.allowEmptyBEnvelope ||
           (segment.allowEmptyBEnvelope &&
@@ -1015,8 +1016,7 @@ bool RefoldOwnerRealizationProofBuilder::
         segment.protectedStructureIdentityRecorded ||
         segment.protectedStructureKind !=
             StructuralProtectedStructureKind::Unknown ||
-        !segment.sourceByteRangeKnown ||
-        segment.sourcePath.empty() ||
+        !segment.sourceByteRangeKnown || segment.sourcePath.empty() ||
         segment.sourceBegin != spanPlan.tuByteBegin ||
         segment.sourceEnd != spanPlan.tuByteEnd ||
         !segment.protectedStructurePreservedOutsideSegment) {

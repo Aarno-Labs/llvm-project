@@ -282,7 +282,7 @@ enum class OccurrenceSupportMode {
   AllowGraphSupport,
 };
 
-// Counter-stabilization carrier records used by proof lattice APIs.
+// Counter-stabilization carrier records used by RefoldCounterStabilization.
 struct ForcedMacroPatchRequest {
   const RefoldModel::MacroInvocation *macro = nullptr;
   uint64_t aStart = 0;

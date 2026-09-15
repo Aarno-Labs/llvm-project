@@ -12,9 +12,6 @@
 // witness that says so.  Proof-only gap edges stay durable even though they
 // emit no tokens, so every emitted carrier resolves back to exactly one edge.
 //
-// The `MixedOwnerTiling*` aliases at the end preserve the historical names for
-// the mixed-realizer case, which is now one reason among several.
-//
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDTILINGWITNESSTYPES_H
@@ -523,16 +520,6 @@ struct StructuralHunkTilingSegmentBinding {
   /// Exact token-segment edge selected within the complete witness.
   uint32_t segmentIndex = 0;
 };
-
-/// Transitional aliases for APIs whose externally visible names still mention
-/// mixed-owner tiling.
-///
-/// The persisted types themselves are fully generalized. These aliases can be
-/// removed independently after the remaining consumers are renamed.
-using MixedOwnerTilingEdgeKind = StructuralHunkTilingEdgeKind;
-using MixedOwnerTilingSegmentWitness = StructuralHunkTilingEdgeWitness;
-using MixedOwnerTilingWitness = StructuralHunkTilingWitness;
-using MixedOwnerTilingSegmentBinding = StructuralHunkTilingSegmentBinding;
 
 } // namespace refold
 } // namespace clang

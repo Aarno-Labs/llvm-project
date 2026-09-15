@@ -51,8 +51,8 @@ constexpr OwnerStateComponent AllOwnerStateComponents[] = {
 constexpr TerminalFallbackFailureReason AllTerminalFailureReasons[] = {
     TerminalFallbackFailureReason::Unknown,
     TerminalFallbackFailureReason::NoOwnerClosedCover,
-    TerminalFallbackFailureReason::NoDeterministicMixedOwnerTiling,
-    TerminalFallbackFailureReason::AmbiguousMixedOwnerTiling,
+    TerminalFallbackFailureReason::NoDeterministicStructuralHunkTiling,
+    TerminalFallbackFailureReason::AmbiguousStructuralHunkTiling,
     TerminalFallbackFailureReason::StateTransitionConsumedAndObserved,
     TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary,
     TerminalFallbackFailureReason::LineControlStateNotProducerProven,

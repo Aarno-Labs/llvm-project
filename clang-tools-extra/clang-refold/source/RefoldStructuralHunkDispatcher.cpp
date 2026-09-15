@@ -473,10 +473,12 @@ RefoldStructuralHunkDispatcher::BuildAlignmentSemanticTopologyKey(
     appendBool(proof.structurePreserving);
     appendU64(proof.proofRootMacroId);
     appendBool(proof.hasOwnerRealizationWitness);
-    appendBool(proof.hasMixedOwnerTilingWitness);
-    if (proof.hasMixedOwnerTilingWitness) {
-      appendString(proof.mixedOwnerTilingWitness.globalTargetPPTokenSignature);
-      appendString(proof.mixedOwnerTilingWitness.globalCompositionSignature);
+    appendBool(proof.hasStructuralHunkTilingWitness);
+    if (proof.hasStructuralHunkTilingWitness) {
+      appendString(
+          proof.structuralHunkTilingWitness.globalTargetPPTokenSignature);
+      appendString(
+          proof.structuralHunkTilingWitness.globalCompositionSignature);
     }
   };
   auto appendAcceptedEquivalenceKey =

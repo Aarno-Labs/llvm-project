@@ -209,7 +209,7 @@ public:
   /// Return normalized expansion spellings that can legitimately
   /// represent this invocation when matching wrapper observations.  Each
   /// returned string is trimmed and de-duplicated.  When `fromB` is
-  /// true, the base spelling is the lattice's whole-cover B-side
+  /// true, the base spelling is the whole-cover plan builder's B-side
   /// replacement text; otherwise it is the A-side cover text.
   llvm::SmallVector<std::string, 4>
   GetExpansionTextCandidates(const RefoldModel::MacroInvocation &inv,

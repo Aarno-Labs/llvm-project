@@ -11,7 +11,7 @@
 //   * `BuildEmittedProof{,FromSummary}` and
 //   `BuildCanonicalEmittedProofFromSummary`
 //     — build the theorem-facing `EmittedProof` from a summary or candidate,
-//     including the per-class admission gates (mixed-owner tiling shape,
+//     including the per-class admission gates (structural tiling shape,
 //     owner-realization witness presence, terminal-fallback domain, etc.).
 //   * `NormalizeAcceptedProof` — convenience accessor returning just the
 //     theorem class for an accepted-result candidate.

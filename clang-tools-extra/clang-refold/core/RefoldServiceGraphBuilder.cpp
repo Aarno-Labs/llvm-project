@@ -31,10 +31,10 @@
 #include "proof/RefoldProofServices.h"
 #include "proof/RefoldProofSummaryBuilder.h"
 #include "proof/RefoldTheoremAudit.h"
-#include "source/RefoldMixedOwnerTilingPlanner.h"
 #include "source/RefoldOwnerClassifier.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
 #include "source/RefoldPreprocessingStructureIndexProvider.h"
+#include "source/RefoldStructuralHunkTilingPlanner.h"
 #include "source/RefoldTokenDiffPlanner.h"
 #include "support/RefoldLog.h"
 
@@ -184,17 +184,18 @@ void RefoldEngine::BuildServiceGraph() {
 
   // Structural tiling borrows the owner/proof services and exact preprocessing
   // census needed to prove deterministic token-hunk partitions.  The planner
-  // retains its historical type name while atomically publishing the normalized
-  // token-hunk cache and durable witness ledgers.  PlanTokenDiff() validates
-  // that publication before insertion provenance or owner dispatch can observe
-  // hunk indices.
-  mixedOwnerTilingPlanner_ = std::make_unique<RefoldMixedOwnerTilingPlanner>(
-      RefoldMixedOwnerTilingPlanner::Dependencies{
-          model_, model_.GetSourcePath(), pathIdentity_, macroTopology_,
-          *macroStateProof_, tokenTextAnalysis_, sourceMapper_, tuSourceBytes_,
-          bSource_, lexLang_, *ownerClassifier_, *ownerStateProof_,
-          *preprocessingStructureIndexProvider_, abTokHunks_,
-          mixedOwnerTilingWitnesses_, mixedOwnerTilingSegmentBindings_});
+  // atomically publishes the normalized token-hunk cache and durable witness
+  // ledgers.  PlanTokenDiff() validates that publication before insertion
+  // provenance or owner dispatch can observe hunk indices.
+  structuralHunkTilingPlanner_ =
+      std::make_unique<RefoldStructuralHunkTilingPlanner>(
+          RefoldStructuralHunkTilingPlanner::Dependencies{
+              model_, model_.GetSourcePath(), pathIdentity_, macroTopology_,
+              *macroStateProof_, tokenTextAnalysis_, sourceMapper_,
+              tuSourceBytes_, bSource_, lexLang_, *ownerClassifier_,
+              *ownerStateProof_, *preprocessingStructureIndexProvider_,
+              abTokHunks_, structuralHunkTilingWitnesses_,
+              structuralHunkTilingSegmentBindings_});
 
   // Pure B-token insertion ownership is a named edit-domain ledger.  The
   // ledger borrows the owner classifier and macro-boundary selector directly;
@@ -207,9 +208,7 @@ void RefoldEngine::BuildServiceGraph() {
   // Whole-cover plan computation reads only the A->B source mapper and the
   // B-insertion claim ledger.  It is deliberately constructed here, ahead of
   // the macro patch planner and the text-edit assembler, because both of those
-  // consume plans.  Computing the plan inside
-  // the planner is what previously forced the lattice and the assembler to
-  // reach it through a late-bound std::function installed after construction.
+  // consume plans.
   wholeCoverPlanBuilder_ = std::make_unique<RefoldMacroWholeCoverPlanBuilder>(
       RefoldMacroWholeCoverPlanBuilder::Dependencies{sourceMapper_,
                                                      *bInsertionLedger_});
@@ -223,7 +222,7 @@ void RefoldEngine::BuildServiceGraph() {
       model_, bSource_, bToks_, sourceMapper_, tokenTextAnalysis_,
       argTextRecovery_, macroTopology_, *ownerStateProof_, *tuAnchorProof_,
       *proofSummaryBuilder_, *theoremAudit_, lastTheoremAudit_, witnessTrace_,
-      mixedOwnerTilingSegmentBindings_, mixedOwnerTilingWitnesses_);
+      structuralHunkTilingSegmentBindings_, structuralHunkTilingWitnesses_);
 
   // The planner is constructed after the proof services it borrows.  The
   // dependency bundle is intentionally explicit: macro planning reads source
@@ -286,7 +285,7 @@ void RefoldEngine::BuildServiceGraph() {
       proofServices_->OwnerRealizationProofBuilder(), *wholeCoverPlanBuilder_,
       *ownerStateProof_, macroTopology_, lineControlProof_, lineDirs_,
       terminalSink_, *tuEditPlanner_, *tuAnchorProof_, *textEditCertifier_,
-      *lineObserverLayout_, *theoremAudit_, mixedOwnerTilingWitnesses_,
+      *lineObserverLayout_, *theoremAudit_, structuralHunkTilingWitnesses_,
       lastTheoremAudit_);
 
   RefoldMacroStateRepairPlanner::Dependencies repairDeps;

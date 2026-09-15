@@ -1,11 +1,11 @@
-//===--- RefoldMixedOwnerTilingPlanner.h ------------------------*- C++ -*-===//
+//===--- RefoldStructuralHunkTilingPlanner.h --------------------*- C++ -*-===//
 //
 // Deterministic structural token-hunk tiling for clang-refold.
 //
-// RefoldMixedOwnerTilingPlanner temporarily retains its historical name while
-// owning the broader normalization pass that may split one token-level
-// replacement/deletion hunk into a unique ordered partition of TU/include/
-// macro-owned token segments plus proof-only zero-token state-gap edges.  A
+// RefoldStructuralHunkTilingPlanner owns the normalization pass that may split
+// one token-level replacement/deletion hunk into a unique ordered partition of
+// TU/include/macro-owned token segments plus proof-only zero-token state-gap
+// edges.  A
 // partition may be required by different realizers for either hunk kind, or by
 // protected preprocessing structure between same-realizer segments.  Deletions
 // use one shared empty B boundary; replacements require an exact unique B-token
@@ -16,8 +16,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMIXEDOWNERTILINGPLANNER_H
-#define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMIXEDOWNERTILINGPLANNER_H
+#ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDSTRUCTURALHUNKTILINGPLANNER_H
+#define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDSTRUCTURALHUNKTILINGPLANNER_H
 
 #include "proof/RefoldTilingWitnessTypes.h"
 #include "source/RefoldDiffTypes.h"
@@ -73,7 +73,7 @@ class RefoldTokenTextAnalysis;
 /// while durable witnesses and segment bindings let later accepted candidates
 /// recover the full ordered proof path without duplicating state-gap edges in
 /// the byte-edit stream.
-class RefoldMixedOwnerTilingPlanner {
+class RefoldStructuralHunkTilingPlanner {
 public:
   /// Borrowed services and durable ledgers for structural tiling.
   struct Dependencies {
@@ -113,22 +113,22 @@ public:
     /// Shared A/B token-hunk cache refreshed after tiling.
     std::vector<diffutils::Hunk> &abTokHunks;
     /// Durable structural-tiling witnesses produced during tiling.
-    std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses;
+    std::vector<StructuralHunkTilingWitness> &structuralHunkTilingWitnesses;
     /// Bindings from emitted A/B token hunks back to durable witness segments.
-    std::vector<MixedOwnerTilingSegmentBinding>
-        &mixedOwnerTilingSegmentBindings;
+    std::vector<StructuralHunkTilingSegmentBinding>
+        &structuralHunkTilingSegmentBindings;
   };
 
-  struct MixedOwnerTilingPlan {
+  struct StructuralHunkTilingPlan {
     /// A/B token hunks after deterministic structural splitting.
     std::vector<diffutils::Hunk> hunks;
     /// Number of durable structural-tiling witnesses emitted during this pass.
-    size_t mixedOwnerWitnessCount = 0;
+    size_t witnessCount = 0;
     /// Number of emitted token-segment bindings across those witnesses.
     size_t segmentBindingCount = 0;
   };
 
-  explicit RefoldMixedOwnerTilingPlanner(Dependencies deps);
+  explicit RefoldStructuralHunkTilingPlanner(Dependencies deps);
 
   /// Split eligible token hunks into unique structural partitions.
   ///
@@ -143,14 +143,14 @@ public:
   /// they are explained by modeled zero-token state owners or lexer-ignorable
   /// trivia; otherwise the original hunk remains unsplit for the normal
   /// owner/fallback path.
-  MixedOwnerTilingPlan Plan(std::vector<diffutils::Hunk> hunks);
+  StructuralHunkTilingPlan Plan(std::vector<diffutils::Hunk> hunks);
 
 private:
   /// Publish \p hunks as the finished plan and refresh the borrowed caches.
   ///
   /// Both exits of Plan() end here, so the empty-input early return and the
   /// completed tiling pass report the witness and binding counts the same way.
-  MixedOwnerTilingPlan FinishPlan(std::vector<diffutils::Hunk> hunks);
+  StructuralHunkTilingPlan FinishPlan(std::vector<diffutils::Hunk> hunks);
 
   /// Borrowed service graph and output ledgers for one refold engine instance.
   Dependencies deps_;
@@ -159,4 +159,4 @@ private:
 } // namespace refold
 } // namespace clang
 
-#endif // LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMIXEDOWNERTILINGPLANNER_H
+#endif // LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDSTRUCTURALHUNKTILINGPLANNER_H

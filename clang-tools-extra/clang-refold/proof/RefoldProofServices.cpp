@@ -31,9 +31,10 @@ RefoldProofServices::RefoldProofServices(
     const RefoldProofSummaryBuilder &proofSummaryBuilder,
     const RefoldTheoremAudit &theoremAudit, TheoremAuditStats &lastTheoremAudit,
     const RefoldWitnessTrace &witnessTrace,
-    const std::vector<MixedOwnerTilingSegmentBinding>
-        &mixedOwnerTilingSegmentBindings,
-    const std::vector<MixedOwnerTilingWitness> &mixedOwnerTilingWitnesses)
+    const std::vector<StructuralHunkTilingSegmentBinding>
+        &structuralHunkTilingSegmentBindings,
+    const std::vector<StructuralHunkTilingWitness>
+        &structuralHunkTilingWitnesses)
     : witnessTrace_(witnessTrace),
       equivalenceKeyBuilder_(RefoldWitnessEquivalenceKeyBuilder::Dependencies{
           sourceMapper, bSource, bToks}),
@@ -48,8 +49,8 @@ RefoldProofServices::RefoldProofServices(
           RefoldOwnerRealizationProofBuilder::Dependencies{
               model, ownerStateProof, tuAnchorProof,
               static_cast<uint64_t>(bToks.size()), proofSummaryBuilder,
-              acceptedResultRanker_, mixedOwnerTilingSegmentBindings,
-              mixedOwnerTilingWitnesses, acceptancePathClassifier_}),
+              acceptedResultRanker_, structuralHunkTilingSegmentBindings,
+              structuralHunkTilingWitnesses, acceptancePathClassifier_}),
       macroPatchProofClassifier_(RefoldMacroPatchProofClassifier::Dependencies{
           macroTopology, ownerStateProof, proofSummaryBuilder,
           ownerRealizationProofBuilder_, acceptancePathClassifier_}),

@@ -161,8 +161,8 @@ RefoldProofSummaryBuilder::BuildEmittedProofFromSummary(
 
   if (summary.hasOwnerRealizationWitness)
     proof.ownerRealization = summary.ownerRealizationWitness;
-  if (summary.hasMixedOwnerTilingWitness)
-    proof.mixedOwnerTiling = summary.mixedOwnerTilingWitness;
+  if (summary.hasStructuralHunkTilingWitness)
+    proof.structuralHunkTiling = summary.structuralHunkTilingWitness;
   if (summary.hasTUAnchorWitness)
     proof.tuAnchor = summary.tuAnchorWitness;
   if (summary.hasIncludeAnchorWitness)
@@ -251,19 +251,19 @@ RefoldProofSummaryBuilder::BuildCanonicalEmittedProofFromSummary(
   }
   if (ProofSummaryRequiresOwnerRealizationWitness(summary) &&
       !summary.hasOwnerRealizationWitness &&
-      summary.theoremClass != TheoremProofClass::MixedOwnerTilingProof) {
+      summary.theoremClass != TheoremProofClass::StructuralHunkTilingProof) {
     return std::nullopt;
   }
 
   switch (summary.theoremClass) {
-  case TheoremProofClass::MixedOwnerTilingProof: {
-    if (!summary.hasMixedOwnerTilingWitness ||
-        !summary.hasMixedOwnerTilingSegmentSelection)
+  case TheoremProofClass::StructuralHunkTilingProof: {
+    if (!summary.hasStructuralHunkTilingWitness ||
+        !summary.hasStructuralHunkTilingSegmentSelection)
       return std::nullopt;
-    const MixedOwnerTilingWitness &witness = summary.mixedOwnerTilingWitness;
+    const StructuralHunkTilingWitness &witness =
+        summary.structuralHunkTilingWitness;
     if (!witness.uniquePartition || !witness.stateSummariesComposed ||
-        !witness.stateTransitionsComposed ||
-        !witness.ownerBoundariesComposed ||
+        !witness.stateTransitionsComposed || !witness.ownerBoundariesComposed ||
         !witness.targetTokenStreamComposed || !witness.compositionEdgesProven ||
         witness.reason == StructuralTilingReason::Unknown ||
         witness.tokenSegmentCount == 0 || witness.edges.empty() ||
@@ -272,7 +272,7 @@ RefoldProofSummaryBuilder::BuildCanonicalEmittedProofFromSummary(
         witness.originalAEnd < witness.originalAStart ||
         witness.originalBEnd < witness.originalBStart ||
         witness.originalBEnd > deps_.bToks.size() ||
-        summary.mixedOwnerTilingSegmentIndex >= witness.edges.size()) {
+        summary.structuralHunkTilingSegmentIndex >= witness.edges.size()) {
       return std::nullopt;
     }
 
@@ -288,7 +288,7 @@ RefoldProofSummaryBuilder::BuildCanonicalEmittedProofFromSummary(
     bool allTokenSegmentsPreserveProtectedStructure = true;
     uint32_t emptyBTokenSegmentCount = 0;
     for (size_t i = 0; i < witness.edges.size(); ++i) {
-      const MixedOwnerTilingSegmentWitness &segment = witness.edges[i];
+      const StructuralHunkTilingEdgeWitness &segment = witness.edges[i];
       if (segment.parentTilingWitnessId != witness.witnessId ||
           segment.segmentIndex != i || segment.sourceOrderPosition != i ||
           !segment.ownerClosureComplete || !segment.ownerIdentityKnown ||
@@ -304,7 +304,7 @@ RefoldProofSummaryBuilder::BuildCanonicalEmittedProofFromSummary(
       }
 
       switch (segment.kind) {
-      case MixedOwnerTilingEdgeKind::TokenSegment:
+      case StructuralHunkTilingEdgeKind::TokenSegment:
         if (segment.zeroTokenStateGap || segment.aStart != expectedA ||
             segment.bStart != expectedB || segment.aEnd <= segment.aStart ||
             segment.protectedPreprocessingStructure ||
@@ -336,7 +336,7 @@ RefoldProofSummaryBuilder::BuildCanonicalEmittedProofFromSummary(
         ++tokenSegmentCount;
         break;
 
-      case MixedOwnerTilingEdgeKind::StateGap:
+      case StructuralHunkTilingEdgeKind::StateGap:
         if (!segment.zeroTokenStateGap || segment.aStart != expectedA ||
             segment.aEnd != expectedA || segment.bStart != expectedB ||
             segment.bEnd != expectedB) {
@@ -396,14 +396,14 @@ RefoldProofSummaryBuilder::BuildCanonicalEmittedProofFromSummary(
         ++stateGapCount;
         break;
 
-      case MixedOwnerTilingEdgeKind::Unknown:
+      case StructuralHunkTilingEdgeKind::Unknown:
         return std::nullopt;
       }
     }
 
-    const MixedOwnerTilingSegmentWitness &selectedSegment =
-        witness.edges[summary.mixedOwnerTilingSegmentIndex];
-    if (selectedSegment.kind != MixedOwnerTilingEdgeKind::TokenSegment ||
+    const StructuralHunkTilingEdgeWitness &selectedSegment =
+        witness.edges[summary.structuralHunkTilingSegmentIndex];
+    if (selectedSegment.kind != StructuralHunkTilingEdgeKind::TokenSegment ||
         selectedSegment.zeroTokenStateGap)
       return std::nullopt;
 

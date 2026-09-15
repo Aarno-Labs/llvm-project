@@ -38,7 +38,7 @@ using llvm::StringRef;
 #define REFOLD_EXPANSION_FALLBACK_BRANCH_PROOF_CLASS_LIST(REFOLD_X)            \
   REFOLD_X(Unknown)                                                            \
   REFOLD_X(OwnerRealizationProof)                                              \
-  REFOLD_X(MixedOwnerTilingProof)                                              \
+  REFOLD_X(StructuralHunkTilingProof)                                          \
   REFOLD_X(DirectivePreservingProof)                                           \
   REFOLD_X(TUTextualEditProof)                                                 \
   REFOLD_X(TerminalOutOfDomainProof)

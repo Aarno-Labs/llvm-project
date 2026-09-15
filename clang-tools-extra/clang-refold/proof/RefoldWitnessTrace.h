@@ -5,8 +5,9 @@
 // Owns the proof-trace output that is gated by the configured witness resolver
 // mode.  The service is read-only: it formats and emits trace lines but does
 // not maintain any per-attempt state of its own.  The resolver mode is derived
-// from the same strict + ProofAuditMode inputs the lattice already consumes, so
-// the lattice and the trace service report the same gating decision.
+// here, from the strict + ProofAuditMode inputs, and every other consumer (the
+// witness resolver, the ranker, the engine) reads it from this service, so all
+// of them report the same gating decision.
 //
 //===----------------------------------------------------------------------===//
 

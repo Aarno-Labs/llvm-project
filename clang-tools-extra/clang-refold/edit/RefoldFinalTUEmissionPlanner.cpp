@@ -11,6 +11,7 @@
 #include "line-control/RefoldLineControlProof.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroTopology.h"
+#include "macro/RefoldMacroTupleHelpers.h"
 #include "model/RefoldModel.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldTerminalProofSink.h"
@@ -170,7 +171,7 @@ void FinalTUEmissionContext::StageTUMacroPatchEdits() {
 
   llvm::SmallVector<std::pair<uint64_t, uint64_t>, 16> accepted;
   for (const MacroPatch &patch : tuMacroPatches) {
-    const uint64_t patchEnd = stringutils::extendChainedCallEnd(
+    const uint64_t patchEnd = extendChainedCallEnd(
         request_.tuBytes, patch.invRange.end, patch.replacement);
 
     if (MacroPatchIsShadowedByAccepted(patch, patchEnd, accepted))
