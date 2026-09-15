@@ -13,14 +13,14 @@
 
 #include "macro/RefoldMacroRecursiveTupleGeneratedReplay.h"
 
+#include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroGeneratedCalleeReplayEngine.h"
 #include "macro/RefoldMacroPatchProofCertifier.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroTupleHelpers.h"
-#include "line-control/RefoldLineObserverLayout.h"
 #include "source/RefoldSourceMapper.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"

@@ -15,10 +15,10 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDTOKENDIFFPLANNER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDTOKENDIFFPLANNER_H
 
+#include "model/RefoldToken.h"
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldAlignmentDiagnostic.h"
 #include "source/RefoldAlignmentSemanticResolver.h"
-#include "source/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"

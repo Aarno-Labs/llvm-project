@@ -14,7 +14,6 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROPATCHPLANNER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROPATCHPLANNER_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
 #include "macro/RefoldMacroArgsOnlyTemplateSolver.h"
 #include "macro/RefoldMacroDefinitionTapeSolver.h"
@@ -29,11 +28,12 @@
 #include "macro/RefoldMacroStandardArgsOnlyPatchBuilder.h"
 #include "macro/RefoldMacroSubtreeReplayValidator.h"
 #include "macro/RefoldMacroWholeCoverOrchestrator.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldMacroPatchTypes.h"
 #include "proof/RefoldOwnerStateTypes.h"
-#include "source/DiffAlgorithms.h"
-#include "source/RefoldToken.h"
-#include "util/RefoldDenseMapInfo.h"
+#include "source/RefoldDiffTypes.h"
+#include "support/RefoldDenseMapInfo.h"
 
 #include "clang/Basic/LangOptions.h"
 

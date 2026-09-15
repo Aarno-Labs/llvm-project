@@ -6,16 +6,16 @@
 // `preprocessToBytes` (which drives Clang's preprocessor on a candidate
 // source) and `compareTokens` (byte-exact preprocessed-token comparison used
 // by `--check`).  The raw-lexer producer that turns `-E -P` bytes into a
-// `PPTok` stream lives next to `PPTok` itself in `source/RefoldToken.cpp`.
+// `PPTok` stream lives next to `PPTok` itself in `model/RefoldToken.cpp`.
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldPreprocessRecheck.h"
+#include "source/RefoldPreprocessRecheck.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
-#include "source/RefoldToken.h"
-#include "util/StringUtils.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"

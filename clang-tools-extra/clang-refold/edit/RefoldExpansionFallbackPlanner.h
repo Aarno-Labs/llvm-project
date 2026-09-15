@@ -13,16 +13,17 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDEXPANSIONFALLBACKPLANNER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDEXPANSIONFALLBACKPLANNER_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldEditTypes.h"
 #include "edit/RefoldPatchTypes.h"
 #include "line-control/RefoldLineControlProof.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldTheoremAudit.h"
+#include "source/DiffAlgorithms.h"
 #include "source/RefoldSourceMapper.h"
-#include "source/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"

@@ -18,11 +18,11 @@ add_clang_library(clangRefold STATIC
   line-control/RefoldNoLinesPruning.cpp
   edit/RefoldExpansionFallbackPlanner.cpp
   edit/RefoldBInsertionLedger.cpp
-  core/RefoldFinalAssemblyVerifier.cpp
+  edit/RefoldFinalAssemblyVerifier.cpp
   core/RefoldEngine.cpp
   core/RefoldAlignmentSemanticIntegration.cpp
-  core/RefoldLangOptions.cpp
-  core/RefoldPreprocessRecheck.cpp
+  support/RefoldLangOptions.cpp
+  source/RefoldPreprocessRecheck.cpp
   core/RefoldServiceGraphBuilder.cpp
   line-control/RefoldLineObserverLayout.cpp
   include/RefoldHeaderIncludeEditPlanner.cpp
@@ -32,11 +32,11 @@ add_clang_library(clangRefold STATIC
   include/RefoldIncludeMaterializationScheduler.cpp
   include/RefoldPragmaOnceGuardRewriter.cpp
   edit/RefoldTextEditAssembler.cpp
-  util/RefoldPathCanonicalization.cpp
-  util/RefoldPathIdentity.cpp
+  support/RefoldPathCanonicalization.cpp
+  model/RefoldPathIdentity.cpp
   source/RefoldTokenTextAnalysis.cpp
   source/RefoldSourceMapper.cpp
-  source/RefoldToken.cpp
+  model/RefoldToken.cpp
   source/RefoldTokenDiffPlanner.cpp
   source/RefoldTokenlessSourceProjection.cpp
   source/RefoldMixedOwnerTilingPlanner.cpp
@@ -77,7 +77,7 @@ add_clang_library(clangRefold STATIC
   macro/RefoldMacroWholeCoverOrchestrator.cpp
   macro/RefoldMacroWholeCoverPlanBuilder.cpp
   macro/RefoldMacroStateRepairPlanner.cpp
-  core/RefoldOwnerClassifier.cpp
+  source/RefoldOwnerClassifier.cpp
   edit/RefoldTUEditPlanner.cpp
   edit/RefoldFinalTUEmissionPlanner.cpp
   edit/RefoldTUAnchorProof.cpp
@@ -105,9 +105,9 @@ add_clang_library(clangRefold STATIC
   proof/RefoldSidebandReplayProof.cpp
   proof/RefoldNeutralityProof.cpp
   proof/RefoldPragmaTaxonomy.cpp
-  core/RefoldLog.cpp
-  core/RefoldModel.cpp
-  util/StringUtils.cpp
+  support/RefoldLog.cpp
+  model/RefoldModel.cpp
+  support/StringUtils.cpp
 
   # clang-refold.cpp is the tool's main and is deliberately not part of the
   # library, so this source list is intentionally partial.

@@ -11,8 +11,8 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_TOKENTEXTHELPERS_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_TOKENTEXTHELPERS_H
 
-#include "source/RefoldToken.h"
-#include "util/StringUtils.h"
+#include "model/RefoldToken.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/LangOptions.h"
 #include "clang/Basic/SourceLocation.h"

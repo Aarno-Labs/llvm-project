@@ -15,12 +15,12 @@
 
 #include "line-control/FinalLineControlModel.h"
 
-#include "core/RefoldLangOptions.h"
-#include "core/RefoldPreprocessRecheck.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldTheoremAudit.h"
-#include "source/RefoldToken.h"
-#include "util/StringUtils.h"
+#include "source/RefoldPreprocessRecheck.h"
+#include "support/RefoldLangOptions.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/LangOptions.h"
 

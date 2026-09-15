@@ -13,8 +13,8 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_MACRO_REFOLDMACROSTATEREPAIRPLANNER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_MACRO_REFOLDMACROSTATEREPAIRPLANNER_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldEditTypes.h"
+#include "model/RefoldModel.h"
 
 #include "clang/Basic/LangOptions.h"
 

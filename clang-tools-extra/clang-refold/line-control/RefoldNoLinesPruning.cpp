@@ -15,13 +15,13 @@
 
 #include "line-control/RefoldNoLinesPruning.h"
 
-#include "core/RefoldLangOptions.h"
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "line-control/FinalLineControlModel.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "source/DiffAlgorithms.h"
-#include "source/RefoldToken.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLangOptions.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"

@@ -10,7 +10,7 @@
 
 #include "macro/RefoldArgTextRecovery.h"
 
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TokenKinds.h"

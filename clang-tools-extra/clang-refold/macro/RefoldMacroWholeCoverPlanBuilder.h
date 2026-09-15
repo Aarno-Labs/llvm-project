@@ -35,8 +35,8 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROWHOLECOVERPLANBUILDER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROWHOLECOVERPLANBUILDER_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldMacroPatchTypes.h"
 
 #include <cstdint>

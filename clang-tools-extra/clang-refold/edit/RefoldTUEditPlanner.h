@@ -13,12 +13,12 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDTUEDITPLANNER_H
 
 #include "edit/RefoldEditTypes.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldAnchorWitnessTypes.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldTheoremTypes.h"
-#include "source/DiffAlgorithms.h"
+#include "source/RefoldDiffTypes.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
-#include "source/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"

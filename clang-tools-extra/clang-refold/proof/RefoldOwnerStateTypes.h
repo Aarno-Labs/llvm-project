@@ -13,7 +13,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDOWNERSTATETYPES_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDOWNERSTATETYPES_H
 
-#include "core/RefoldModel.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldProofVocabulary.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -198,14 +198,6 @@ struct Owner {
   }
 
   bool IsConditionalArm() const { return kind == OwnerKind::ConditionalArm; }
-
-  bool HasSameIdentity(const Owner &other) const {
-    return kind == other.kind && includeId == other.includeId &&
-           macroInvocationId == other.macroInvocationId &&
-           macroDirectiveId == other.macroDirectiveId &&
-           lineControlId == other.lineControlId && pragmaId == other.pragmaId &&
-           condGroupId == other.condGroupId && condArmId == other.condArmId;
-  }
 };
 
 /// Half-open token interval in either the original preprocessed token stream
@@ -770,18 +762,6 @@ struct OwnerStateFacts {
     return !conditionalStateEvents.empty();
   }
 
-  /// Return true if this bucket contains theorem-facing component facts.
-  bool HasTheoremStateFacts() const {
-    return HasMacroDefinitions() || HasMacroUndefinitions() ||
-           HasMacroRequirements() || HasMacroExpansionObservations() ||
-           HasDefinedOperatorObservations() ||
-           HasConditionalMacroObservations() || HasLineControlEvents() ||
-           HasBuiltinLocationObservations() || HasCounterEvents() ||
-           HasPragmaStateEvents() || HasIncludeStateEvents() ||
-           HasIncludeGuardStateEvents() || HasConditionalStateEvents() ||
-           HasMissingStateFacts();
-  }
-
   /// Copy theorem-facing component facts from `other`.
   OwnerStateFacts &MergeTheoremFactsFrom(const OwnerStateFacts &other) {
     for (const MacroStateIdentity &identity : other.macroDefinitions)
@@ -1154,10 +1134,6 @@ struct OwnerClosure {
 
   bool IsStateNeutral() const {
     return stateIn.Empty() && stateOut.Empty() && observers.Empty();
-  }
-
-  bool HasSameOwner(const OwnerClosure &other) const {
-    return owner.HasSameIdentity(other.owner);
   }
 };
 

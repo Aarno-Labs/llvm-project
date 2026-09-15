@@ -45,11 +45,11 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACRODAGSUBTREECERTIFIER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACRODAGSUBTREECERTIFIER_H
 
-#include "core/RefoldModel.h"
 #include "macro/RefoldMacroDAGInvertibilitySolver.h"
 #include "macro/RefoldMacroDAGLiftingContext.h"
 #include "macro/RefoldMacroDAGStructuredLifter.h"
 #include "macro/RefoldMacroDAGTextPrimitives.h"
+#include "model/RefoldModel.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"

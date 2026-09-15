@@ -35,14 +35,13 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROPATCHPROOFCLASSIFIER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROPATCHPROOFCLASSIFIER_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldAcceptancePathClassifier.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldOwnerRealizationProofBuilder.h"
 #include "proof/RefoldProofDischargeTypes.h"
 #include "proof/RefoldProofSummaryBuilder.h"
-#include "proof/RefoldProofVocabulary.h"
 
 namespace clang {
 namespace refold {

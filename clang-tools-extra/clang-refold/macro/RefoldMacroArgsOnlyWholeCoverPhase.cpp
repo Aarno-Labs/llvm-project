@@ -10,11 +10,11 @@
 
 #include "macro/RefoldMacroArgsOnlyWholeCoverPhase.h"
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldMacroPatchProofClassifier.h"
 #include "source/RefoldSourceMapper.h"
 

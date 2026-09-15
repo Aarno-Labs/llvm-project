@@ -14,15 +14,15 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_INCLUDE_REFOLDINCLUDEMATERIALIZATIONSCHEDULER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_INCLUDE_REFOLDINCLUDEMATERIALIZATIONSCHEDULER_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldEditTypes.h"
 #include "edit/RefoldPatchTypes.h"
 #include "line-control/FinalLineControlModel.h"
 #include "macro/RefoldMacroStateRepairPlanner.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldCandidateTypes.h"
-#include "source/DiffAlgorithms.h"
-#include "source/RefoldToken.h"
-#include "util/RefoldDenseMapInfo.h"
+#include "source/RefoldDiffTypes.h"
+#include "support/RefoldDenseMapInfo.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"

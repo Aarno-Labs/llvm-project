@@ -9,7 +9,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLangOptions.h"
+#include "support/RefoldLangOptions.h"
 
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"

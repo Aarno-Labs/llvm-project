@@ -18,16 +18,16 @@
 
 #include "macro/RefoldMacroGeneratedCalleeReplayEngine.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroPatchProofCertifier.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroTupleHelpers.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "source/RefoldSourceMapper.h"
-#include "source/RefoldToken.h"
 #include "source/TokenTextHelpers.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"

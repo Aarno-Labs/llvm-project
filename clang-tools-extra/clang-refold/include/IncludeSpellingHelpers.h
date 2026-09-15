@@ -11,8 +11,8 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_INCLUDESPELLINGHELPERS_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_INCLUDESPELLINGHELPERS_H
 
-#include "proof/RefoldProofVocabulary.h"
-#include "util/StringUtils.h"
+#include "model/RefoldPathIdentity.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"

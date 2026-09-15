@@ -30,12 +30,12 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROWHOLECOVERPLANNINGCONTEXT_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROWHOLECOVERPLANNINGCONTEXT_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
 #include "macro/RefoldMacroPatchPlanner.h"
 #include "macro/RefoldMacroWholeCoverOrchestrator.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldOwnerStateTypes.h"
-#include "source/DiffAlgorithms.h"
+#include "source/RefoldDiffTypes.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"

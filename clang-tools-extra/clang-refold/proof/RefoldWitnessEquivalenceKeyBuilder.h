@@ -29,9 +29,9 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDWITNESSEQUIVALENCEKEYBUILDER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDWITNESSEQUIVALENCEKEYBUILDER_H
 
+#include "model/RefoldToken.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldProofVocabulary.h"
-#include "source/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 

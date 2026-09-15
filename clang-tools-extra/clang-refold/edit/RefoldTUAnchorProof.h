@@ -15,13 +15,13 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDTUANCHORPROOF_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDTUANCHORPROOF_H
 
+#include "model/RefoldToken.h"
 #include "proof/RefoldAcceptancePathTypes.h"
 #include "proof/RefoldAnchorWitnessTypes.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldProofDischargeTypes.h"
 #include "proof/RefoldProofSummaryBuilder.h"
 #include "proof/RefoldTheoremTypes.h"
-#include "source/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"

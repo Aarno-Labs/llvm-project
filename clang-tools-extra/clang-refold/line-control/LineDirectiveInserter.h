@@ -14,7 +14,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_LINEDIRECTIVEINSERTER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_LINEDIRECTIVEINSERTER_H
 
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Path.h>

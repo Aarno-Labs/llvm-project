@@ -6,16 +6,16 @@
 
 #include "source/RefoldStructuralHunkDispatcher.h"
 
-#include "core/RefoldModel.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldPathIdentity.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldWitnessEquivalenceKeyBuilder.h"
-#include "source/DiffAlgorithms.h"
-#include "source/RefoldToken.h"
+#include "source/RefoldDiffTypes.h"
 #include "source/TokenTextHelpers.h"
-#include "util/RefoldPathIdentity.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FormatVariadic.h"
 

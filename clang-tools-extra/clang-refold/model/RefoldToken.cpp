@@ -4,10 +4,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "source/RefoldToken.h"
+#include "model/RefoldToken.h"
 
-#include "core/RefoldLog.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"

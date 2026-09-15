@@ -19,9 +19,9 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMIXEDOWNERTILINGPLANNER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMIXEDOWNERTILINGPLANNER_H
 
-#include "clang/Basic/LangOptions.h"
 #include "proof/RefoldTilingWitnessTypes.h"
-#include "source/DiffAlgorithms.h"
+#include "source/RefoldDiffTypes.h"
+#include "clang/Basic/LangOptions.h"
 
 #include "llvm/ADT/StringRef.h"
 

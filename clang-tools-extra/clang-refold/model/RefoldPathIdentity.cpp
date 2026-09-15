@@ -4,11 +4,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "util/RefoldPathIdentity.h"
+#include "model/RefoldPathIdentity.h"
 
-#include "util/RefoldPathCanonicalization.h"
-
-#include "proof/RefoldProofVocabulary.h"
+#include "support/RefoldPathCanonicalization.h"
 
 #include <filesystem>
 #include <system_error>
@@ -24,10 +22,6 @@ RefoldPathIdentity::RefoldPathIdentity(const RefoldModel & /*model*/,
   // The path-identity predicates are limited to canonical path comparison and
   // include-edge metadata, neither of which needs per-run state.  The
   // constructor keeps the service's dependency shape without holding any.
-}
-
-void RefoldPathIdentity::CacheCanonicalPath(StringRef path) const {
-  (void)refoldCanonicalPath(path);
 }
 
 StringRef RefoldPathIdentity::GetCanonicalPath(StringRef path) const {
@@ -64,17 +58,6 @@ bool RefoldPathIdentity::SamePhysicalIncludeFile(
     return candidatePath.empty();
 
   return PathsEqual(candidatePath, *producerPath);
-}
-
-bool RefoldPathIdentity::SameEnteredFileSpelling(
-    StringRef candidateSpelling,
-    const RefoldModel::IncludeItem &include) const {
-  std::optional<std::string> producerSpelling =
-      ProducerEnteredFileSpelling(include);
-  if (!producerSpelling)
-    return candidateSpelling.empty();
-
-  return candidateSpelling == StringRef(*producerSpelling);
 }
 
 } // namespace refold

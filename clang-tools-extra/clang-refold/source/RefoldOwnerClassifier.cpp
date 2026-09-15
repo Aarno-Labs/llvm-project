@@ -4,11 +4,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldOwnerClassifier.h"
+#include "source/RefoldOwnerClassifier.h"
 
 #include "edit/RefoldTUEditPlanner.h"
+#include "model/RefoldPathIdentity.h"
 #include "proof/RefoldSidebandReplayProof.h"
-#include "util/RefoldPathIdentity.h"
 
 #include "llvm/ADT/STLExtras.h"
 

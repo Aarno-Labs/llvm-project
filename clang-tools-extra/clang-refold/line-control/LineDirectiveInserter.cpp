@@ -12,9 +12,9 @@
 
 #include "line-control/LineDirectiveInserter.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
-#include "util/StringUtils.h"
+#include "model/RefoldModel.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include <algorithm>
 #include <cctype>

@@ -22,6 +22,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPROOFSERVICES_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPROOFSERVICES_H
 
+#include "model/RefoldToken.h"
 #include "proof/RefoldAcceptancePathClassifier.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldAcceptedResultRanker.h"
@@ -32,7 +33,6 @@
 #include "proof/RefoldWitnessEquivalenceKeyBuilder.h"
 #include "proof/RefoldWitnessResolver.h"
 #include "proof/RefoldWitnessTrace.h"
-#include "source/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"

@@ -11,7 +11,6 @@
 #include "include/RefoldIncludeMaterializer.h"
 #include "include/RefoldPragmaOnceGuardRewriter.h"
 
-#include "core/RefoldLog.h"
 #include "edit/RefoldSourceEnvelopeTiling.h"
 #include "edit/RefoldTextEditAssembler.h"
 #include "include/IncludeSpellingHelpers.h"
@@ -33,7 +32,8 @@
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
-#include "util/RefoldDenseMapInfo.h"
+#include "support/RefoldDenseMapInfo.h"
+#include "support/RefoldLog.h"
 
 #include "clang/Basic/LangOptions.h"
 #include "clang/Basic/SourceLocation.h"

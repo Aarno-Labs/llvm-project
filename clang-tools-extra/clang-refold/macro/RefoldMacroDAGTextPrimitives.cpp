@@ -13,13 +13,13 @@
 
 #include "macro/RefoldMacroDAGTextPrimitives.h"
 
-#include "core/RefoldModel.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroDAGSharedHelpers.h"
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
+#include "model/RefoldModel.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/LangOptions.h"
 

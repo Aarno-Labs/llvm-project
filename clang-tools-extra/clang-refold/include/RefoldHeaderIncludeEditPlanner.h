@@ -13,17 +13,17 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDHEADERINCLUDEEDITPLANNER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDHEADERINCLUDEEDITPLANNER_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldEditTypes.h"
 #include "edit/RefoldPatchTypes.h"
 #include "edit/RefoldSourceEnvelopeTiling.h"
 #include "line-control/SourceLineDirectiveHelpers.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldPathIdentity.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldAnchorWitnessTypes.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremTypes.h"
-#include "source/RefoldToken.h"
-#include "util/RefoldPathIdentity.h"
 
 #include "clang/Basic/LangOptions.h"
 

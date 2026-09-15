@@ -66,9 +66,6 @@
 
 #include "core/RefoldEngine.h"
 
-#include "core/RefoldLangOptions.h"
-#include "core/RefoldLog.h"
-#include "core/RefoldOwnerClassifier.h"
 #include "edit/RefoldBInsertionLedger.h"
 #include "edit/RefoldExpansionFallbackPlanner.h"
 #include "edit/RefoldFinalTUEmissionPlanner.h"
@@ -95,12 +92,15 @@
 #include "proof/RefoldProofServices.h"
 #include "sideband/RefoldSidebandPragmaEdits.h"
 #include "source/RefoldMixedOwnerTilingPlanner.h"
+#include "source/RefoldOwnerClassifier.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
 #include "source/RefoldPreprocessingStructureIndexProvider.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
 #include "source/RefoldTokenDiffPlanner.h"
 #include "source/TokenTextHelpers.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLangOptions.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceLocation.h"

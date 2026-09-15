@@ -11,12 +11,12 @@
 
 #include "macro/RefoldMacroStateRepairPlanner.h"
 
-#include "core/RefoldLog.h"
 #include "edit/RefoldPatchTypes.h"
 #include "edit/RefoldTextEditAssembler.h"
 #include "macro/RefoldMacroPatchPlanner.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldPathIdentity.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldMacroPatchProofClassifier.h"
@@ -30,8 +30,8 @@
 #include "source/RefoldStructuralHunkDispatcher.h"
 #include "source/RefoldTokenTextAnalysis.h"
 #include "source/TokenTextHelpers.h"
-#include "util/RefoldPathIdentity.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"

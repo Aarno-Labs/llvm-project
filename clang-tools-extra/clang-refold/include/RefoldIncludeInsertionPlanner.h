@@ -13,11 +13,11 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDINCLUDEINSERTIONPLANNER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDINCLUDEINSERTIONPLANNER_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldAnchorWitnessTypes.h"
-#include "source/DiffAlgorithms.h"
-#include "source/RefoldToken.h"
+#include "source/RefoldDiffTypes.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"

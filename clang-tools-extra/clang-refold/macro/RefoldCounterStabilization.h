@@ -13,15 +13,14 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDCOUNTERSTABILIZATION_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDCOUNTERSTABILIZATION_H
 
-#include "core/RefoldModel.h"
-#include "core/RefoldOwnerClassifier.h"
 #include "edit/RefoldPatchTypes.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldMacroPatchTypes.h"
 #include "proof/RefoldOwnerStateTypes.h"
-#include "source/DiffAlgorithms.h"
-#include "source/RefoldToken.h"
-#include "util/RefoldDenseMapInfo.h"
+#include "source/RefoldOwnerClassifier.h"
+#include "support/RefoldDenseMapInfo.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"

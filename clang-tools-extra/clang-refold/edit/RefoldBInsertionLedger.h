@@ -13,9 +13,9 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_EDIT_REFOLDBINSERTIONLEDGER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_EDIT_REFOLDBINSERTIONLEDGER_H
 
+#include "model/RefoldToken.h"
 #include "proof/RefoldTheoremTypes.h"
-#include "source/DiffAlgorithms.h"
-#include "source/RefoldToken.h"
+#include "source/RefoldDiffTypes.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"

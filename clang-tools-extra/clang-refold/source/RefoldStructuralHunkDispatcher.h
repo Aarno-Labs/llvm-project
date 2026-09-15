@@ -20,7 +20,7 @@
 #include "edit/RefoldEditTypes.h"
 #include "edit/RefoldPatchTypes.h"
 #include "source/RefoldAlignmentSemanticEvidence.h"
-#include "util/RefoldDenseMapInfo.h"
+#include "support/RefoldDenseMapInfo.h"
 #include "clang/Basic/LangOptions.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"

@@ -10,15 +10,15 @@
 
 #include "proof/RefoldPragmaTaxonomy.h"
 
-#include "core/RefoldLog.h"
 #include "edit/RefoldTextEditAssembler.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/SourceLineDirectiveHelpers.h"
+#include "model/RefoldPathIdentity.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldTerminalProofSink.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
-#include "util/RefoldPathIdentity.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"

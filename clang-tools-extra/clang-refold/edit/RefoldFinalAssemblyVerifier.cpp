@@ -4,13 +4,13 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldFinalAssemblyVerifier.h"
+#include "edit/RefoldFinalAssemblyVerifier.h"
 
-#include "core/RefoldLangOptions.h"
-#include "core/RefoldLog.h"
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/RefoldNoLinesPruning.h"
 #include "source/DiffAlgorithms.h"
+#include "support/RefoldLangOptions.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/Support/Error.h"
 

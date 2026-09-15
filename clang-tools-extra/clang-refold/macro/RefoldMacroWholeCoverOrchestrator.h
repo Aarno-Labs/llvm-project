@@ -26,7 +26,6 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROWHOLECOVERORCHESTRATOR_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROWHOLECOVERORCHESTRATOR_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
 #include "macro/RefoldMacroArgsOnlyWholeCoverPhase.h"
 #include "macro/RefoldMacroDAGLeafDiscoveryPhase.h"
@@ -34,8 +33,9 @@
 #include "macro/RefoldMacroFinalCandidateSelector.h"
 #include "macro/RefoldMacroPatchReusePhase.h"
 #include "macro/RefoldMacroSelectorSubstitutionPhase.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldMacroPatchTypes.h"
-#include "source/DiffAlgorithms.h"
+#include "source/RefoldDiffTypes.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"

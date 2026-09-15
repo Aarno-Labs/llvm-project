@@ -13,15 +13,15 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACRODAGSHAREDHELPERS_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACRODAGSHAREDHELPERS_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldSourceMapper.h"
-#include "source/RefoldToken.h"
 #include "source/TokenTextHelpers.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TokenKinds.h"

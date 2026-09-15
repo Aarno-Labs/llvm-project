@@ -10,8 +10,6 @@
 
 #include "macro/RefoldMacroReplayStabilityValidator.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldArgTextRecovery.h"
@@ -20,9 +18,11 @@
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroSubtreeReplayValidator.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldPathIdentity.h"
 #include "source/RefoldSourceMapper.h"
-#include "util/RefoldPathIdentity.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"

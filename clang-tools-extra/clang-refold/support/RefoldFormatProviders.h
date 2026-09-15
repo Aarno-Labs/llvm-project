@@ -10,7 +10,7 @@
 //   • `std::optional<T>`                — prints "(none)" or delegates to T.
 //   • any type with a `ToString()`      — member-function stringification
 //     member (excluding `Hunk`, which     (`Hunk` has its own explicit provider
-//     is special-cased elsewhere).         in `source/DiffAlgorithms.h`).
+//     is special-cased elsewhere).         in `source/RefoldDiffTypes.h`).
 //   • any enum with an ADL `toString()` — enum stringification.
 //   • `llvm::cl::opt<T>`                — delegates to the provider for T.
 //
@@ -21,7 +21,7 @@
 // enforces this strictly: a specialization seen *after* an implicit
 // instantiation is ill-formed ("partial specialization ... after
 // instantiation"), whereas Clang is more permissive.  Several low-level
-// headers (e.g. `core/RefoldModel.h`) format `std::optional<...>` from
+// headers (e.g. `model/RefoldModel.h`) format `std::optional<...>` from
 // non-template inline members, so the providers must be declared ahead of
 // those uses.  Keeping them in this standalone, dependency-light header lets
 // every translation unit pull them in early and in a consistent order.
@@ -48,7 +48,7 @@ namespace clang {
 namespace refold {
 namespace diffutils {
 // Forward declaration only: the generic `ToString()` provider below excludes
-// `Hunk` (which has its own explicit provider in `source/DiffAlgorithms.h`),
+// `Hunk` (which has its own explicit provider in `source/RefoldDiffTypes.h`),
 // and `std::is_same_v` needs only an incomplete type.
 struct Hunk;
 } // namespace diffutils

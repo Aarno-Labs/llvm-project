@@ -18,9 +18,9 @@
 #include "proof/RefoldNeutralityProof.h"
 
 #include "macro/RefoldMacroStateProof.h"
+#include "model/RefoldPathIdentity.h"
 #include "proof/RefoldOwnerStateProof.h"
-#include "util/RefoldPathIdentity.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"

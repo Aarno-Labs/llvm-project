@@ -67,9 +67,9 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_DIFFALGORITHMS_H
 
 // Brings in the generic format providers (optional/ToString/enum/cl::opt) so
-// they are visible before this header's own `formatv` uses and before the
-// explicit `format_provider<Hunk>` specialization defined at the bottom.
-#include "core/RefoldFormatProviders.h"
+// they are visible before this header's own `formatv` uses.
+#include "source/RefoldDiffTypes.h"
+#include "support/RefoldFormatProviders.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
@@ -113,119 +113,6 @@ constexpr unsigned long long DEFAULT_MAX_DIAGNOSTIC_EVIDENCE_BYTES =
     64ULL << 20;
 
 // ===== Myers shortest edit script (SES) =====
-
-enum class Op { Equal, Insert, Delete };
-
-static inline StringRef toString(Op op) {
-  switch (op) {
-  case Op::Equal:
-    return "Equal";
-  case Op::Insert:
-    return "Insert";
-  case Op::Delete:
-    return "Delete";
-  }
-  llvm_unreachable("Invalid op");
-}
-
-/// \brief Immutable atom in the shortest edit script (SES).
-///
-/// Each `Step` represents one maximal run of a single edit operation over
-/// half-open index ranges in the left (`A`) and right (`B`) sequences:
-/// `A[aLo,aHi)` and `B[bLo,bHi)`.
-///
-/// ### Semantics & invariants
-/// * **EQUAL** — consumes elements from both sides:
-///   * `aHi > aLo`, `bHi > bLo`
-///   * Length equality holds: `(aHi - aLo) == (bHi - bLo)`
-/// * **INSERT** — inserts `B[bLo,bHi)` with no elements consumed from `A`:
-///   * `aHi == aLo`, `bHi > bLo`
-/// * **DELETE** — deletes `A[aLo,aHi)` with no elements consumed from `B`:
-///   * `aHi > aLo`, `bHi == bLo`
-///
-/// Steps are emitted in order, non-overlapping, and collectively transform
-/// `A` into `B`. Replacements are represented as an adjacent **DELETE**
-/// followed by **INSERT** (no separate REPLACE operation).
-///
-/// ### Notes
-/// * Indices are zero-based; ranges are half-open `[lo,hi)`.
-/// * “Maximal run” means contiguous operations of the same kind are
-///   coalesced into a single `Step`.
-struct Step {
-  Op op;
-  uint64_t aLo, aHi; // indices in A
-  uint64_t bLo, bHi; // indices in B
-
-  std::string ToString() const {
-    std::string opStr;
-    switch (op) {
-    case Op::Equal:
-      opStr = "EQUAL";
-      break;
-    case Op::Insert:
-      opStr = "INSERT";
-      break;
-    case Op::Delete:
-      opStr = "DELETE";
-      break;
-    }
-    return formatv("{0} A[{1},{2}) -> B[{3},{4})", opStr, aLo, aHi, bLo, bHi);
-  }
-};
-
-/// \brief Coalesced edit region spanning contiguous non-EQUAL steps in the SES.
-///
-/// A `Hunk` summarizes one contiguous *edit run* between the original
-/// sequence `A` and the new sequence `B`:
-/// `A[aStart,aEnd)` is replaced by `B[bStart,bEnd)`.
-///
-/// **Special cases:**
-/// * **INSERT:** `aStart == aEnd && bStart < bEnd`
-/// * **DELETE:** `aStart < aEnd && bStart == bEnd`
-/// * **REPLACE:** `aStart < aEnd && bStart < bEnd`
-/// * **EQUAL (degenerate):** `aStart == aEnd && bStart == bEnd`
-///   *(Not normally emitted by `coalesce()`.)*
-///
-/// All indices are half-open and refer to element positions in the diff
-/// input sequences (not byte offsets).
-/// Instances are immutable and safe to reuse across passes.
-struct Hunk {
-  uint64_t aStart, aEnd;
-  uint64_t bStart, bEnd;
-
-  bool isInsertOnly() const { return (aStart == aEnd) && (bStart < bEnd); }
-  bool isDeleteOnly() const { return (aStart < aEnd) && (bStart == bEnd); }
-  bool isReplace() const { return (aStart < aEnd) && (bStart < bEnd); }
-  bool isEqual() const { return (aStart == aEnd) && (bStart == bEnd); }
-
-  bool operator==(const Hunk &other) const {
-    return aStart == other.aStart && aEnd == other.aEnd &&
-           bStart == other.bStart && bEnd == other.bEnd;
-  }
-
-  bool operator!=(const Hunk &other) const { return !(*this == other); }
-
-  template <bool kVerbose = false> std::string ToString() const {
-    if (kVerbose) {
-      std::string kind;
-      if (isInsertOnly()) {
-        kind.assign("INS");
-      } else if (isDeleteOnly()) {
-        kind.assign("DEL");
-      } else if (isReplace()) {
-        kind.assign("REP");
-      } else if (isEqual()) {
-        kind.assign("EQL");
-      }
-      assert(!kind.empty() && "invalid hunk");
-      return formatv("{0} HUNK A[{1},{2}) -> B[{3},{4})", kind, aStart, aEnd,
-                     bStart, bEnd);
-    } else {
-      return formatv("HUNK A[{0},{1}) -> B[{2},{3})", aStart, aEnd, bStart,
-                     bEnd);
-    }
-  }
-};
 
 /// \brief Compute the shortest edit script (SES) between sequences A and B.
 ///
@@ -1216,23 +1103,5 @@ std::vector<Hunk> hunksFromMap(ArrayRef<int64_t> map, size_t nA, size_t nB);
 } // namespace diffutils
 } // namespace refold
 } // namespace clang
-
-// Format providers for both `Hunk` and `Step` structs.
-namespace llvm {
-template <> struct format_provider<clang::refold::diffutils::Hunk> {
-  static void format(const clang::refold::diffutils::Hunk &hunk,
-                     raw_ostream &os, StringRef style) {
-    std::string hunkStr;
-    if (style.equals_insensitive("v") || style.equals_insensitive("verbose")) {
-      // Eat the "style" and call the appropriate "to string" function.
-      hunkStr.assign(hunk.ToString</*kVerbose*/ true>());
-      style = "";
-    } else {
-      hunkStr.assign(hunk.ToString</*kVerbose*/ false>());
-    }
-    format_provider<StringRef>::format(hunkStr, os, style);
-  }
-};
-} // namespace llvm
 
 #endif // LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_DIFFALGORITHMS_H

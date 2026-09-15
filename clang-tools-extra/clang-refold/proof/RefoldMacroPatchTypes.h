@@ -21,8 +21,7 @@
 #include "proof/RefoldAnchorWitnessTypes.h"
 #include "proof/RefoldCandidateTypes.h"
 
-#include "core/RefoldModel.h"
-#include "proof/RefoldProofVocabulary.h"
+#include "model/RefoldModel.h"
 
 #include "llvm/ADT/StringRef.h"
 #include <cstddef>

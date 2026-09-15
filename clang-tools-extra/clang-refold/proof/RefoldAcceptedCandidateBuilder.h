@@ -36,8 +36,9 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDACCEPTEDCANDIDATEBUILDER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDACCEPTEDCANDIDATEBUILDER_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldAcceptancePathClassifier.h"
 #include "proof/RefoldAcceptedResultRanker.h"
 #include "proof/RefoldAnchorWitnessTypes.h"
@@ -51,7 +52,6 @@
 #include "proof/RefoldTheoremTypes.h"
 #include "proof/RefoldWitnessResolver.h"
 #include "proof/RefoldWitnessTrace.h"
-#include "source/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"

@@ -97,9 +97,8 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDENGINE_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDENGINE_H
 
-#include "core/RefoldFinalAssemblyVerifier.h"
-#include "core/RefoldModel.h"
 #include "edit/RefoldEditTypes.h"
+#include "edit/RefoldFinalAssemblyVerifier.h"
 #include "edit/RefoldPatchTypes.h"
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/LineDirectiveInserter.h"
@@ -107,6 +106,8 @@
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldPathIdentity.h"
 #include "proof/RefoldOwnerStateTypes.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldSidebandReplayProof.h"
@@ -116,8 +117,7 @@
 #include "source/RefoldAlignmentSemanticResolver.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/RefoldTokenTextAnalysis.h"
-#include "util/RefoldDenseMapInfo.h"
-#include "util/RefoldPathIdentity.h"
+#include "support/RefoldDenseMapInfo.h"
 
 #include "clang/Basic/LangOptions.h"
 

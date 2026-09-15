@@ -67,9 +67,8 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLDLOG_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLDLOG_H
 
-#include "core/RefoldFormatProviders.h"
-#include "source/DiffAlgorithms.h"
-#include "util/StringUtils.h"
+#include "support/RefoldFormatProviders.h"
+#include "support/StringUtils.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -137,7 +136,7 @@
 
 // NOTE: The custom `llvm::format_provider<>` specializations used here (for
 // `std::optional<>`, `ToString()`-bearing types, ADL-`toString()` enums, and
-// `cl::opt<>`) now live in "core/RefoldFormatProviders.h", included above.
+// `cl::opt<>`) now live in "support/RefoldFormatProviders.h", included above.
 // They were moved out of this header so they are always declared before the
 // first `formatv` instantiation in lower-level headers (GCC rejects a
 // specialization seen after an implicit instantiation; Clang tolerated it).

@@ -15,7 +15,7 @@
 
 #include "line-control/FinalLineControlModel.h"
 #include "proof/RefoldCandidateTypes.h"
-#include "source/RefoldPreprocessingStructureIndex.h"
+#include "source/RefoldPreprocessingStructureKinds.h"
 
 #include "llvm/ADT/StringRef.h"
 

@@ -31,12 +31,11 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPROOFSUMMARYBUILDER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPROOFSUMMARYBUILDER_H
 
+#include "model/RefoldToken.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldCompletenessTypes.h"
 #include "proof/RefoldProofDischargeTypes.h"
-#include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldTheoremTypes.h"
-#include "source/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 

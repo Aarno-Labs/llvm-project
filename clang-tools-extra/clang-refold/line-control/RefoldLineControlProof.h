@@ -13,11 +13,11 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDLINECONTROLPROOF_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDLINECONTROLPROOF_H
 
-#include "core/RefoldModel.h"
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/LineDirectiveInserter.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldProofVocabulary.h"
-#include "source/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"

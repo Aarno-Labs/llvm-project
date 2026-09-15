@@ -10,7 +10,6 @@
 
 #include "proof/RefoldAcceptedResultPredicates.h"
 #include "proof/RefoldCandidateTypes.h"
-#include "proof/RefoldOwnerStateTypes.h"
 #include "proof/RefoldProofSummaryBuilder.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldTheoremAudit.h"

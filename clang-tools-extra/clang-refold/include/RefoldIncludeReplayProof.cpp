@@ -11,9 +11,9 @@
 
 #include "include/RefoldIncludeReplayProof.h"
 
-#include "core/RefoldLog.h"
 #include "include/IncludeSpellingHelpers.h"
 #include "line-control/RefoldLineControlFilename.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"

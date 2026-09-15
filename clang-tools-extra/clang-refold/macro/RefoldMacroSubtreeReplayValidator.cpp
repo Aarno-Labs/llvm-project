@@ -11,15 +11,15 @@
 
 #include "macro/RefoldMacroSubtreeReplayValidator.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldModel.h"
 #include "source/RefoldSourceMapper.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"

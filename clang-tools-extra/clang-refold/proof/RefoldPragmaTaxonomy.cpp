@@ -26,7 +26,7 @@
 
 #include "line-control/SourceLineDirectiveHelpers.h"
 #include "source/TokenTextHelpers.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/StringSwitch.h"
 

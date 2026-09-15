@@ -11,12 +11,12 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_SOURCELINEDIRECTIVEHELPERS_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_SOURCELINEDIRECTIVEHELPERS_H
 
-#include "core/RefoldModel.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlFilename.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldPathIdentity.h"
 #include "source/TokenTextHelpers.h"
-#include "util/RefoldPathIdentity.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/LangOptions.h"
 #include "clang/Basic/SourceLocation.h"

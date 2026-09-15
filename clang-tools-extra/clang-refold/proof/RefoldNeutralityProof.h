@@ -24,7 +24,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDNEUTRALITYPROOF_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDNEUTRALITYPROOF_H
 
-#include "core/RefoldModel.h"
+#include "model/RefoldModel.h"
 
 #include "clang/Basic/LangOptions.h"
 

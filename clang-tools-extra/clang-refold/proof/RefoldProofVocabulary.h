@@ -28,8 +28,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPROOFVOCABULARY_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPROOFVOCABULARY_H
 
-#include "core/RefoldModel.h"
-#include "util/StringUtils.h"
+#include "model/RefoldModel.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -54,80 +53,8 @@ using llvm::StringRef;
 enum class AcceptedPathKind : uint8_t;
 
 //===----------------------------------------------------------------------===//
-// Producer-include spelling helpers and small proof carriers.
+// Small proof carriers.
 //===----------------------------------------------------------------------===//
-
-/// Return the explicit producer-entered filename spelling for an include edge.
-///
-/// New-schema maps carry this exact `__FILE__` entry spelling in
-/// entered_file_spelling.  This helper intentionally does not fall back to
-/// resolved_path: file-spelling proofs need to distinguish an explicit producer
-/// fact from legacy spelling data and from independently recovered observer or
-/// replay witnesses.
-inline llvm::StringRef
-explicitProducerEnteredFileSpelling(const RefoldModel::IncludeItem &include) {
-  return include.enteredFileSpelling ? *include.enteredFileSpelling
-                                     : llvm::StringRef();
-}
-
-/// Return the legacy spelling-oriented include path, if present.
-///
-/// Older maps only had resolved_path, whose meaning drifted between physical
-/// identity and entered-file spelling.  New proof code should consult this
-/// helper only after exhausting stronger new-schema metadata and recovered
-/// observer/replay witnesses.
-inline llvm::StringRef
-legacyResolvedIncludePath(const RefoldModel::IncludeItem &include) {
-  return include.resolvedPath ? *include.resolvedPath : llvm::StringRef();
-}
-
-/// Return the best available producer-entered filename spelling for an include.
-///
-/// This is a convenience for legacy-neutral callers that only need a spelling
-/// anchor.  Proof-sensitive code that implements the full file-spelling
-/// fallback hierarchy should prefer explicitProducerEnteredFileSpelling(), then
-/// any context-specific observer/replay witnesses, and only then
-/// legacyResolvedIncludePath().
-inline llvm::StringRef
-producerEnteredFileSpelling(const RefoldModel::IncludeItem &include) {
-  llvm::StringRef explicitSpelling =
-      explicitProducerEnteredFileSpelling(include);
-  return !explicitSpelling.empty() ? explicitSpelling
-                                   : legacyResolvedIncludePath(include);
-}
-
-/// Return the exact producer `__FILE_NAME__` entry spelling when available.
-///
-/// entered_file_name is emitted by the producer using Clang's own
-/// processPathToFileName() logic.  If an old/new map lacks it, fall back to the
-/// deterministic refolder basename helper over entered_file_spelling / legacy
-/// resolved_path.  This fallback is compatibility-only; new maps should carry
-/// entered_file_name whenever the include was actually entered.
-inline llvm::StringRef
-producerEnteredFileName(const RefoldModel::IncludeItem &include) {
-  if (include.enteredFileName)
-    return *include.enteredFileName;
-  llvm::StringRef fileSpelling = producerEnteredFileSpelling(include);
-  return fileSpelling.empty() ? llvm::StringRef()
-                              : stringutils::pathBasename(fileSpelling);
-}
-
-/// Return the producer-side path spelling used as input to physical identity.
-///
-/// New maps carry opened_path for physical/FileEntry identity.  Legacy maps
-/// fall back to resolved_path, and callers must canonicalize only inside the
-/// physical proof path, e.g. through RefoldPathIdentity::PathsEqual().  Never
-/// use entered_file_spelling here: observer spelling and filesystem identity
-/// are intentionally separate proof domains.
-inline std::optional<std::filesystem::path>
-producerPhysicalIncludePath(const RefoldModel::IncludeItem &include) {
-  llvm::StringRef path = include.openedPath
-                             ? *include.openedPath
-                             : legacyResolvedIncludePath(include);
-  if (path.empty())
-    return std::nullopt;
-  return std::filesystem::path(path.str());
-}
 
 /// Proof-audit mode for the witness resolver.
 ///
@@ -268,10 +195,6 @@ inline LegacyPathDefinition describeLegacyPathKind(LegacyPathKind kind) {
   }
   return {LegacyPathKind::Unknown, "unclassified legacy dependency",
           "classify the dependency before it can be audited"};
-}
-
-inline bool isDefinedLegacyPathKind(LegacyPathKind kind) {
-  return kind != LegacyPathKind::Unknown;
 }
 
 /// \brief One semantic no-legacy audit finding.
@@ -611,10 +534,6 @@ struct WitnessStrictDomainDecision {
       WitnessStrictDomainObligation::Unknown;
   WitnessFallbackClass fallbackClass = WitnessFallbackClass::Unknown;
   std::string reason;
-
-  bool IsDeclaredInDomain() const {
-    return domainClass == WitnessStrictDomainClass::DeclaredInDomain;
-  }
 };
 
 /// \brief One semantic dimension inside a witness equivalence key.
@@ -963,20 +882,6 @@ struct RefoldWitness {
   std::string ToString() const {
     return llvm::formatv("id={0} family={1} owner={2} detail={3}", witnessId,
                          toString(family), owner, detail)
-        .str();
-  }
-};
-
-struct WitnessAmbiguityClass {
-  uint64_t classIndex = 0;
-  WitnessEquivalenceKey key;
-  uint64_t candidateCount = 0;
-  uint64_t selectableCount = 0;
-
-  std::string ToString() const {
-    return llvm::formatv("class={0} candidates={1} selectable={2} {3}",
-                         classIndex, candidateCount, selectableCount,
-                         key.ToString())
         .str();
   }
 };

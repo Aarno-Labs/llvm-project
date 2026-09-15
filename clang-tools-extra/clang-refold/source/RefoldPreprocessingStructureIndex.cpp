@@ -12,9 +12,9 @@
 
 #include "source/RefoldPreprocessingDirectiveScanner.h"
 
-#include "core/RefoldModel.h"
 #include "macro/RefoldMacroStateProof.h"
-#include "util/RefoldPathIdentity.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldPathIdentity.h"
 
 #include "clang/Basic/LangOptions.h"
 

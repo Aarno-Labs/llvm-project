@@ -4,8 +4,8 @@
 //
 // This module owns the `--no-lines`-specific pieces of the `--check` recheck
 // flow.  The generic recheck primitives `preprocessToBytes` and `compareTokens`
-// live in `core/RefoldPreprocessRecheck.h`; `lexPPTokens` lives next to
-// `PPTok` in `source/RefoldToken.h`; refold-map JSON extraction
+// live in `source/RefoldPreprocessRecheck.h`; `lexPPTokens` lives next to
+// `PPTok` in `model/RefoldToken.h`; refold-map JSON extraction
 // (`PreprocessContext`, source-path lookup) lives on `RefoldModel`; and the
 // final-line-control validation callback factory lives in
 // `line-control/FinalLineControlModel.h`.  This header exposes only:
@@ -25,10 +25,10 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDNOLINESPRUNING_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDNOLINESPRUNING_H
 
-#include "core/RefoldModel.h"
-#include "core/RefoldPreprocessRecheck.h"
 #include "line-control/FinalLineControlModel.h"
-#include "source/RefoldToken.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
+#include "source/RefoldPreprocessRecheck.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"

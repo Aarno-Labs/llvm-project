@@ -29,13 +29,12 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACRODAGSTRUCTUREDLIFTER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACRODAGSTRUCTUREDLIFTER_H
 
-#include "core/RefoldModel.h"
 #include "macro/RefoldMacroDAGInvertibilitySolver.h"
 #include "macro/RefoldMacroDAGLiftingContext.h"
 #include "macro/RefoldMacroDAGTextPrimitives.h"
 #include "macro/RefoldMacroPasteArgumentBuilder.h"
-#include "source/DiffAlgorithms.h"
-#include "source/RefoldToken.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"

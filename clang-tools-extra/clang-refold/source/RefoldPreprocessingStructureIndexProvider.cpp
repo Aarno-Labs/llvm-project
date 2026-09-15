@@ -13,8 +13,8 @@
 
 #include "line-control/LineDirectiveInserter.h"
 #include "macro/RefoldMacroStateProof.h"
+#include "model/RefoldPathIdentity.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
-#include "util/RefoldPathIdentity.h"
 
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"

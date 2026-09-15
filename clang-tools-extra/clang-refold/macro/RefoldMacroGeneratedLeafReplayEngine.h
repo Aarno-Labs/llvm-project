@@ -20,10 +20,9 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROGENERATEDLEAFREPLAYENGINE_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROGENERATEDLEAFREPLAYENGINE_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
-#include "source/DiffAlgorithms.h"
+#include "model/RefoldModel.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"

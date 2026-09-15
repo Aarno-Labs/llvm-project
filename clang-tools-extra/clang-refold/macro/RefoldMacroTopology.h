@@ -14,12 +14,12 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROTOPOLOGY_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROTOPOLOGY_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldPathIdentity.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldOwnerStateTypes.h"
 #include "source/RefoldSourceMapper.h"
-#include "source/RefoldToken.h"
-#include "util/RefoldPathIdentity.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"

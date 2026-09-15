@@ -20,7 +20,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldLog.h"
+#include "support/RefoldLog.h"
 
 // Declared at global scope in RefoldLog.h, matching the logging macros' use
 // sites, so the definitions live at global scope too.

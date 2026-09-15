@@ -26,7 +26,7 @@
 // Must precede any `formatv` use below (e.g. the `std::optional<>` fields
 // formatted from inline `ToString()` members): the custom format providers
 // have to be visible before their first implicit instantiation under GCC.
-#include "core/RefoldFormatProviders.h"
+#include "support/RefoldFormatProviders.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -250,19 +250,6 @@ public:
     /// Return true when this span consumes at least one A token.
     bool IsValid() const { return end > begin; }
   };
-
-  /// Return whether an argument span kind carries producer byte subranges in
-  /// addition to its A-token interval.
-  static constexpr bool HasByteRange(PPArgSpanKind kind) {
-    switch (kind) {
-    case PPArgSpanKind::Standard:
-      return false;
-    case PPArgSpanKind::Stringify:
-    case PPArgSpanKind::Paste:
-      return true;
-    }
-    llvm_unreachable("Invalid PPArgSpanKind");
-  }
 
   /// Producer span for one macro actual/formal contribution.
   ///
@@ -1215,10 +1202,6 @@ public:
   ArrayRef<MacroDirective> GetMacroDirectives() const { return macroDirs_; }
   /// Return producer pragma directives.
   ArrayRef<PragmaDirective> GetPragmas() const { return pragmas_; }
-  /// Return producer file records.
-  ArrayRef<FileItem> GetFileItems() const { return fileItems_; }
-  /// Return source insertion/replacement slots recorded by the producer.
-  ArrayRef<Slot> GetSlots() const { return slots_; }
   /// Return producer conditional groups.
   ArrayRef<CondGroup> GetConds() const { return conds_; }
   /// Return producer-proven active line-control events.
@@ -1308,23 +1291,8 @@ public:
   FindArmRefForByte(StringRef file, std::optional<uint64_t> parentIncludeId,
                     uint64_t byteOffset) const;
 
-  /// Convenience wrapper returning only the conditional arm pointer.
-  std::optional<const CondArm *>
-  FindArmForByte(StringRef file, std::optional<uint64_t> parentIncludeId,
-                 uint64_t byteOffset) const {
-    if (auto armRef = FindArmRefForByte(file, parentIncludeId, byteOffset))
-      return (*armRef).arm;
-    return std::nullopt;
-  }
-
   /// Find the selected conditional arm that produced A-token `ppIndex`.
   std::optional<ArmRef> FindArmRefAtPP(uint64_t ppIndex) const;
-  std::optional<const CondArm *> FindArmForPP(uint64_t ppIndex) const {
-    auto ref = FindArmRefAtPP(ppIndex);
-    if (!ref)
-      return std::nullopt;
-    return ref->arm;
-  }
 
   /// Return the first A-token index emitted by the selected arm of `group`.
   std::optional<uint64_t>
@@ -1348,30 +1316,6 @@ public:
             std::optional<uint64_t> ref,
             std::optional<uint64_t> ownerIncludeId) const;
 
-  /// Return the deterministic slot immediately before `includeId`, when
-  /// present.
-  std::optional<const Slot *> GetBeforeIncludeSlot(uint64_t includeId) const {
-    auto slots =
-        FindSlots(std::nullopt, "before_include", includeId, std::nullopt);
-    if (slots.empty())
-      return std::nullopt;
-    return slots.front();
-  }
-
-  /// Return the deterministic slot immediately after `includeId`, when present.
-  std::optional<const Slot *> GetAfterIncludeSlot(uint64_t includeId) const {
-    auto slots =
-        FindSlots(std::nullopt, "after_include", includeId, std::nullopt);
-    if (slots.empty())
-      return std::nullopt;
-    return slots.front();
-  }
-
-  /// Return the deterministic slot at the beginning of a conditional arm.
-  std::optional<const Slot *> GetArmBeginSlot(uint64_t armId) const;
-  /// Return the deterministic slot at the end of a conditional arm.
-  std::optional<const Slot *> GetArmEndSlot(uint64_t armId) const;
-
   // --- Tokmap queries ---
   /// Map one A-token index to its physical source-byte tokmap entry.
   std::optional<TokMapEntry> MapPP(uint64_t pp) const {
@@ -1380,13 +1324,6 @@ public:
       return std::nullopt;
     return it->second;
   }
-
-  /// Map a half-open A-token span to the producer tokmap entries it contains.
-  ///
-  /// Invalid spans return an empty vector. Missing PP indices are skipped
-  /// rather than synthesized, because not every preprocessed token is
-  /// guaranteed to have a concrete source spelling in tokmap.
-  std::vector<TokMapEntry> MapSpan(const PPSpan &span) const;
 
 private:
   RefoldModel() = default;

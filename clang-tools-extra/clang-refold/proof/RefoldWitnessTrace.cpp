@@ -6,9 +6,9 @@
 
 #include "proof/RefoldWitnessTrace.h"
 
-#include "core/RefoldLog.h"
 #include "proof/RefoldWitnessClassifier.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/FormatVariadic.h"

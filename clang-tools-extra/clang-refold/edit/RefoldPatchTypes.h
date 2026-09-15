@@ -13,10 +13,10 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPATCHTYPES_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPATCHTYPES_H
 
-#include "core/RefoldModel.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldMacroPatchTypes.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FormatVariadic.h"
 

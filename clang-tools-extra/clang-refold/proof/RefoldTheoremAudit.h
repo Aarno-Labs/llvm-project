@@ -16,13 +16,13 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDTHEOREMAUDIT_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDTHEOREMAUDIT_H
 
-#include "core/RefoldLog.h"
 #include "edit/RefoldPatchTypes.h"
 #include "proof/RefoldAcceptancePathTypes.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldOwnerStateTypes.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldTerminalProofSink.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/ADT/StringRef.h"
 

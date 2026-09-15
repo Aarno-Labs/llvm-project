@@ -14,7 +14,6 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDINCLUDEMATERIALIZER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDINCLUDEMATERIALIZER_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldEditTypes.h"
 #include "edit/RefoldPatchTypes.h"
 #include "include/RefoldIncludeReplayProof.h"
@@ -22,15 +21,16 @@
 #include "line-control/RefoldLineControlProof.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldPathIdentity.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldAnchorWitnessTypes.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTerminalProofSink.h"
 #include "proof/RefoldTheoremTypes.h"
-#include "source/RefoldToken.h"
-#include "util/RefoldDenseMapInfo.h"
-#include "util/RefoldPathIdentity.h"
+#include "support/RefoldDenseMapInfo.h"
 
 #include "clang/Basic/LangOptions.h"
 

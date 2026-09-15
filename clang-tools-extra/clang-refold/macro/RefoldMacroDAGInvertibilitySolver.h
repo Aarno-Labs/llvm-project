@@ -41,11 +41,11 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACRODAGINVERTIBILITYSOLVER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACRODAGINVERTIBILITYSOLVER_H
 
-#include "core/RefoldModel.h"
 #include "macro/RefoldMacroDAGTextPrimitives.h"
 #include "macro/RefoldMacroPasteArgumentBuilder.h"
-#include "source/DiffAlgorithms.h"
-#include "source/RefoldToken.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
+#include "source/RefoldDiffTypes.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"

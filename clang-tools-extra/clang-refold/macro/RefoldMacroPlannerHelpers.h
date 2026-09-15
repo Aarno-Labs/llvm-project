@@ -14,12 +14,12 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROPLANNERHELPERS_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROPLANNERHELPERS_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
 #include "macro/RefoldArgTextRecovery.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldOwnerStateTypes.h"
-#include "source/DiffAlgorithms.h"
-#include "source/RefoldToken.h"
+#include "source/RefoldDiffTypes.h"
 
 #include "clang/Basic/LangOptions.h"
 

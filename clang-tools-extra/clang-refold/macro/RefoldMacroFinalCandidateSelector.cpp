@@ -6,8 +6,6 @@
 
 #include "macro/RefoldMacroFinalCandidateSelector.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroDAGSharedHelpers.h"
 #include "macro/RefoldMacroPatchProofCertifier.h"
@@ -17,9 +15,11 @@
 #include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldAcceptedResultRanker.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"

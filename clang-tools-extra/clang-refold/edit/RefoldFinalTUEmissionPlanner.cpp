@@ -2,8 +2,6 @@
 
 #include "edit/RefoldFinalTUEmissionPlanner.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
 #include "edit/RefoldTextEditAssembler.h"
 #include "include/RefoldIncludeMaterializationScheduler.h"
@@ -11,10 +9,12 @@
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlProof.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldTerminalProofSink.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"

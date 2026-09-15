@@ -6,7 +6,7 @@
 
 #include "core/RefoldEngine.h"
 
-#include "core/RefoldLog.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FormatVariadic.h"

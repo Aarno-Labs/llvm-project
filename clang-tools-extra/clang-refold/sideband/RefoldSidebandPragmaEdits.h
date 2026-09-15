@@ -20,9 +20,9 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDSIDEBANDPRAGMAEDITS_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDSIDEBANDPRAGMAEDITS_H
 
+#include "model/RefoldToken.h"
 #include "proof/RefoldSidebandReplayProof.h"
-#include "source/DiffAlgorithms.h"
-#include "source/RefoldToken.h"
+#include "source/RefoldDiffTypes.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"

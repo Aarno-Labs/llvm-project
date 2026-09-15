@@ -13,13 +13,13 @@
 
 #include "macro/RefoldMacroStandardArgsOnlyInternals.h"
 
-#include "core/RefoldModel.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "source/RefoldSourceMapper.h"
-#include "source/RefoldToken.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"

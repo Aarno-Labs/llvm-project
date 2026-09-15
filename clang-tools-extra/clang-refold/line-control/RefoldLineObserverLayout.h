@@ -14,11 +14,11 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDLINEOBSERVERLAYOUT_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDLINEOBSERVERLAYOUT_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldEditTypes.h"
 #include "edit/RefoldPatchTypes.h"
 #include "line-control/FinalLineControlModel.h"
-#include "source/RefoldToken.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"

@@ -12,10 +12,10 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDINCLUDESUBTREEWORKCLASSIFIER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDINCLUDESUBTREEWORKCLASSIFIER_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldSidebandReplayProof.h"
-#include "util/RefoldDenseMapInfo.h"
+#include "support/RefoldDenseMapInfo.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"

@@ -20,11 +20,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldModel.h"
+#include "model/RefoldModel.h"
 
-#include "util/RefoldPathCanonicalization.h"
+#include "support/RefoldPathCanonicalization.h"
 
-#include "core/RefoldLog.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -3168,48 +3168,6 @@ RefoldModel::FindArmRefForByte(StringRef file,
   return best;
 }
 
-std::optional<const RefoldModel::Slot *>
-RefoldModel::GetArmBeginSlot(uint64_t armId) const {
-  // When the arm is indexed, search in its exact file/include-owner domain
-  // first so duplicate arm ids or slots from other materialization contexts
-  // cannot satisfy the lookup.
-  if (auto ref = GetArmRefById(armId)) {
-    auto slots = FindSlots(ref->group->file, "arm_begin", armId,
-                           ref->group->parentIncludeId);
-    if (!slots.empty())
-      return slots.front();
-    return std::nullopt;
-  }
-
-  // Fallback for older or partially indexed metadata where the arm ref was not
-  // recorded but the slot table still carries the arm id.
-  auto slots = FindSlots(std::nullopt, "arm_begin", armId, std::nullopt);
-  if (!slots.empty())
-    return slots.front();
-  return std::nullopt;
-}
-
-std::optional<const RefoldModel::Slot *>
-RefoldModel::GetArmEndSlot(uint64_t armId) const {
-  // When the arm is indexed, search in its exact file/include-owner domain
-  // first so duplicate arm ids or slots from other materialization contexts
-  // cannot satisfy the lookup.
-  if (auto ref = GetArmRefById(armId)) {
-    auto slots = FindSlots(ref->group->file, "arm_end", armId,
-                           ref->group->parentIncludeId);
-    if (!slots.empty())
-      return slots.front();
-    return std::nullopt;
-  }
-
-  // Fallback for older or partially indexed metadata where the arm ref was not
-  // recorded but the slot table still carries the arm id.
-  auto slots = FindSlots(std::nullopt, "arm_end", armId, std::nullopt);
-  if (!slots.empty())
-    return slots.front();
-  return std::nullopt;
-}
-
 std::vector<RefoldModel::Segment>
 RefoldModel::BuildSegmentsForFile(StringRef file,
                                   ArrayRef<const Slot *> fileSlots) const {
@@ -3505,28 +3463,6 @@ std::vector<const RefoldModel::Slot *> RefoldModel::FindSlots(
 
     return a->id < b->id;
   });
-  return out;
-}
-
-std::vector<RefoldModel::TokMapEntry>
-RefoldModel::MapSpan(const PPSpan &span) const {
-  if (!span.IsValid())
-    return {};
-
-  std::vector<TokMapEntry> out;
-
-  const uint64_t count = span.end - span.begin;
-  out.reserve(static_cast<std::size_t>(count));
-
-  // Convert the half-open PP-token span to the source-token mappings recorded
-  // by the producer. Missing PP indices are skipped because not every
-  // preprocessed token necessarily has a concrete source spelling.
-  for (uint64_t i = span.begin; i < span.end; ++i) {
-    auto it = tokmapByPP_.find(i);
-    if (it != tokmapByPP_.end()) {
-      out.push_back(it->second);
-    }
-  }
   return out;
 }
 

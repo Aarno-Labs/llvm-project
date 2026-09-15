@@ -10,7 +10,6 @@
 
 #include "edit/RefoldTextEditAssembler.h"
 
-#include "core/RefoldLog.h"
 #include "edit/RefoldTUEditPlanner.h"
 #include "include/IncludeSpellingHelpers.h"
 #include "include/RefoldIncludeReplayProof.h"
@@ -20,6 +19,7 @@
 #include "line-control/RefoldLineControlProof.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
+#include "model/RefoldPathIdentity.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldAcceptedResultPredicates.h"
 #include "proof/RefoldOwnerRealizationProofBuilder.h"
@@ -31,8 +31,8 @@
 #include "source/RefoldPreprocessingStructureIndex.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
-#include "util/RefoldDenseMapInfo.h"
-#include "util/RefoldPathIdentity.h"
+#include "support/RefoldDenseMapInfo.h"
+#include "support/RefoldLog.h"
 
 #include "clang/Basic/LangOptions.h"
 #include "clang/Basic/SourceLocation.h"

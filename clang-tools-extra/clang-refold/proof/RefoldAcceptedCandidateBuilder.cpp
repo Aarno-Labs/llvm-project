@@ -6,15 +6,15 @@
 
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "edit/RefoldTUEditPlanner.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldAcceptedResultPredicates.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/RefoldTokenTextAnalysis.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FormatVariadic.h"

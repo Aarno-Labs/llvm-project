@@ -9,8 +9,9 @@
 
 #include "source/RefoldSourceMapper.h"
 
-#include "core/RefoldLog.h"
-#include "util/StringUtils.h"
+#include "source/DiffAlgorithms.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include <algorithm>
 #include <cstdint>

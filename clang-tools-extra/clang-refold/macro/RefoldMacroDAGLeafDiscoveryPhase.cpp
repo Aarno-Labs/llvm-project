@@ -9,8 +9,6 @@
 
 #include "macro/RefoldMacroDAGLeafDiscoveryPhase.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroDAGSharedHelpers.h"
@@ -19,7 +17,9 @@
 #include "macro/RefoldMacroSubtreeReplayValidator.h"
 #include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
+#include "model/RefoldModel.h"
 #include "source/RefoldSourceMapper.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"

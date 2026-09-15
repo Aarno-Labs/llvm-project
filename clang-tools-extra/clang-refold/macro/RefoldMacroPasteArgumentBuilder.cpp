@@ -8,7 +8,7 @@
 
 #include "macro/RefoldMacroReplay.h"
 #include "source/RefoldSourceMapper.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/DenseMap.h"

@@ -14,11 +14,11 @@
 
 #include "macro/RefoldMacroStateProof.h"
 
-#include "core/RefoldLog.h"
+#include "model/RefoldPathIdentity.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "source/RefoldTokenTextAnalysis.h"
-#include "util/RefoldPathIdentity.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"

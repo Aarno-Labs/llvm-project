@@ -13,8 +13,8 @@
 
 #include "proof/RefoldSidebandReplayProof.h"
 
-#include "core/RefoldLog.h"
 #include "proof/RefoldTerminalProofSink.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"

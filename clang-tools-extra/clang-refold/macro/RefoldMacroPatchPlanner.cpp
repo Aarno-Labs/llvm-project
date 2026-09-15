@@ -11,8 +11,6 @@
 
 #include "macro/RefoldMacroPatchPlanner.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldOwnerClassifier.h"
 #include "edit/RefoldBInsertionLedger.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldArgTextRecovery.h"
@@ -23,8 +21,10 @@
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "proof/RefoldMacroPatchProofClassifier.h"
 #include "proof/RefoldOwnerStateProof.h"
+#include "source/RefoldOwnerClassifier.h"
 #include "source/TokenTextHelpers.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TokenKinds.h"

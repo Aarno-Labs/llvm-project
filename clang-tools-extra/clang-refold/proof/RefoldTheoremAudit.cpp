@@ -9,10 +9,10 @@
 #include "proof/RefoldTheoremAudit.h"
 #include "proof/RefoldProofSummaryBuilder.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldAcceptedResultPredicates.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/Support/FormatVariadic.h"
 

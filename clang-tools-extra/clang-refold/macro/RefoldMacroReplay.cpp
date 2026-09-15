@@ -13,7 +13,7 @@
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroTopology.h"
 #include "source/RefoldSourceMapper.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "clang/Lex/Lexer.h"
 

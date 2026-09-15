@@ -11,10 +11,10 @@
 
 #include "line-control/RefoldLineControlProof.h"
 
-#include "core/RefoldLog.h"
 #include "macro/RefoldMacroTopology.h"
-#include "util/RefoldPathIdentity.h"
-#include "util/StringUtils.h"
+#include "model/RefoldPathIdentity.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FormatVariadic.h"

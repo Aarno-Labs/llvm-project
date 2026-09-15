@@ -33,10 +33,10 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROREPLAYSTABILITYVALIDATOR_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROREPLAYSTABILITYVALIDATOR_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
 #include "macro/RefoldMacroOccurrenceProofValidator.h"
-#include "source/RefoldToken.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"

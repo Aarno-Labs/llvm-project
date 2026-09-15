@@ -7,7 +7,6 @@
 
 #include "macro/RefoldMacroArgsOnlyTemplateSolver.h"
 
-#include "core/RefoldLog.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
@@ -15,7 +14,8 @@
 #include "macro/RefoldMacroTupleHelpers.h"
 #include "proof/RefoldMacroPatchProofClassifier.h"
 #include "source/RefoldSourceMapper.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TokenKinds.h"

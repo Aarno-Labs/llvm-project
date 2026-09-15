@@ -6,10 +6,10 @@
 
 #include "proof/RefoldMacroPatchProofClassifier.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldOwnerStateProof.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FormatVariadic.h"

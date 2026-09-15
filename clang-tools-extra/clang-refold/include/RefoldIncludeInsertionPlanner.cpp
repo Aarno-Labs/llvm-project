@@ -11,10 +11,10 @@
 
 #include "include/RefoldIncludeInsertionPlanner.h"
 
-#include "core/RefoldLog.h"
 #include "proof/RefoldAcceptancePathClassifier.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"

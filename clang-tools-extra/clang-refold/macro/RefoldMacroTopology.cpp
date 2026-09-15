@@ -11,10 +11,10 @@
 
 #include "macro/RefoldMacroTopology.h"
 
-#include "core/RefoldLog.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroReplay.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"

@@ -11,9 +11,9 @@
 
 #include "proof/RefoldAcceptancePathClassifier.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "edit/RefoldTUAnchorProof.h"
+#include "model/RefoldModel.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FormatVariadic.h"

@@ -23,10 +23,10 @@
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroTupleHelpers.h"
+#include "model/RefoldToken.h"
 #include "source/RefoldSourceMapper.h"
-#include "source/RefoldToken.h"
 #include "source/TokenTextHelpers.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"

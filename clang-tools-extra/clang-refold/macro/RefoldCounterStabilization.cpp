@@ -11,7 +11,6 @@
 
 #include "macro/RefoldCounterStabilization.h"
 
-#include "core/RefoldLog.h"
 #include "macro/RefoldMacroPatchPlanner.h"
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "proof/RefoldMacroPatchProofClassifier.h"
@@ -19,6 +18,7 @@
 #include "proof/RefoldWitnessTrace.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"

@@ -66,14 +66,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "core/RefoldEngine.h"
-#include "core/RefoldLangOptions.h"
-#include "core/RefoldLog.h"
-#include "core/RefoldPreprocessRecheck.h"
-#include "core/RefoldSchema.h"
 #include "line-control/RefoldNoLinesPruning.h"
+#include "model/RefoldSchema.h"
 #include "sideband/RefoldSidebandPragmaEdits.h"
-#include "source/DiffAlgorithms.h"
-#include "util/StringUtils.h"
+#include "source/RefoldPreprocessRecheck.h"
+#include "support/RefoldLangOptions.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"

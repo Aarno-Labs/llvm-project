@@ -8,10 +8,10 @@
 
 #include "macro/RefoldMacroPatchProofCertifier.h"
 
-#include "core/RefoldLog.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldMacroPatchProofClassifier.h"
+#include "support/RefoldLog.h"
 
 #include <utility>
 

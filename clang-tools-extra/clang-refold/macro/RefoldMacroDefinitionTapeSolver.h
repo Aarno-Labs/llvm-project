@@ -18,10 +18,10 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACRODEFINITIONTAPESOLVER_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACRODEFINITIONTAPESOLVER_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
-#include "source/DiffAlgorithms.h"
-#include "source/RefoldToken.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
+#include "source/RefoldDiffTypes.h"
 
 #include "clang/Basic/LangOptions.h"
 

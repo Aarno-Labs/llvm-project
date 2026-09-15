@@ -4,9 +4,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "util/RefoldPathCanonicalization.h"
+#include "support/RefoldPathCanonicalization.h"
 
-#include "core/RefoldLog.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/ADT/StringMap.h"
 

@@ -18,7 +18,7 @@
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/LangOptions.h"
 

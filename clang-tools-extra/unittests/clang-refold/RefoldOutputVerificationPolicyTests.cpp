@@ -26,7 +26,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "core/RefoldFinalAssemblyVerifier.h"
+#include "edit/RefoldFinalAssemblyVerifier.h"
 
 #include "gtest/gtest.h"
 

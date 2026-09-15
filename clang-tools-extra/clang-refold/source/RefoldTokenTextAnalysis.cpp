@@ -6,8 +6,8 @@
 
 #include "source/RefoldTokenTextAnalysis.h"
 
-#include "core/RefoldLog.h"
 #include "source/RefoldPreprocessingDirectiveScanner.h"
+#include "support/RefoldLog.h"
 
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TokenKinds.h"

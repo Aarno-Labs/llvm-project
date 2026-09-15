@@ -6,11 +6,11 @@
 
 #include "edit/RefoldBInsertionLedger.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldOwnerClassifier.h"
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroTopology.h"
+#include "source/RefoldOwnerClassifier.h"
 #include "source/RefoldSourceMapper.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/Support/FormatVariadic.h"
 

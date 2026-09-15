@@ -11,7 +11,6 @@
 
 #include "include/RefoldHeaderIncludeEditPlanner.h"
 
-#include "core/RefoldLog.h"
 #include "edit/RefoldSourceEnvelopeTiling.h"
 #include "edit/RefoldTextEditAssembler.h"
 #include "include/IncludeSpellingHelpers.h"
@@ -30,7 +29,8 @@
 #include "source/RefoldSourceGapProof.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
-#include "util/RefoldDenseMapInfo.h"
+#include "support/RefoldDenseMapInfo.h"
+#include "support/RefoldLog.h"
 
 #include "clang/Basic/TokenKinds.h"
 #include "clang/Lex/Lexer.h"

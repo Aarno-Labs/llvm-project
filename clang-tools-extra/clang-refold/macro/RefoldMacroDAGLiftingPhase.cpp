@@ -11,8 +11,6 @@
 
 #include "macro/RefoldMacroDAGLiftingPhase.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldArgTextRecovery.h"
@@ -25,10 +23,12 @@
 #include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroTupleHelpers.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldMacroPatchProofClassifier.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TokenKinds.h"

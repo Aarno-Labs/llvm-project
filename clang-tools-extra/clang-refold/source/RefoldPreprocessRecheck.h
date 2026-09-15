@@ -16,15 +16,15 @@
 // ignore-mask construction and the line-control validation callback layer
 // sit on top of this surface.  The raw lexer that produces a `PPTok` stream
 // from a preprocessed byte buffer lives next to `PPTok` itself in
-// `source/RefoldToken.h`.
+// `model/RefoldToken.h`.
 //
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPREPROCESSRECHECK_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPREPROCESSRECHECK_H
 
-#include "core/RefoldModel.h"
-#include "source/RefoldToken.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"

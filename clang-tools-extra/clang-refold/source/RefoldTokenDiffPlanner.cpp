@@ -8,16 +8,16 @@
 
 #include "source/RefoldTokenDiffPlanner.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldPathIdentity.h"
 #include "source/RefoldAlignmentDiagnostic.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
 #include "source/RefoldPreprocessingStructureIndexProvider.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/RefoldTokenlessSourceProjection.h"
-#include "util/RefoldPathIdentity.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"

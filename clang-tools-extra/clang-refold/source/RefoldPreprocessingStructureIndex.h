@@ -27,6 +27,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_PREPROCESSING_STRUCTURE_INDEX_H
 
 #include "source/RefoldPreprocessingDirectiveScanner.h"
+#include "source/RefoldPreprocessingStructureKinds.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
@@ -45,54 +46,6 @@ namespace refold {
 class RefoldMacroStateProof;
 class RefoldModel;
 class RefoldPathIdentity;
-
-/// Physical preprocessing construct protected by the structure index.
-///
-/// Conditional-control directives are kept distinct because later structural
-/// tiling must preserve their ordered group/arm topology.  `OtherDirective`
-/// intentionally covers every lexically valid directive not modeled by a more
-/// specific enumerator; unknown directives are protected rather than ignored.
-enum class PreprocessingStructureKind {
-  ConditionalIf,
-  ConditionalIfdef,
-  ConditionalIfndef,
-  ConditionalElif,
-  ConditionalElifdef,
-  ConditionalElifndef,
-  ConditionalElse,
-  ConditionalEndif,
-  MacroDefine,
-  MacroUndef,
-  Include,
-  IncludeNext,
-  Import,
-  Pragma,
-  PragmaOperator,
-  LineControl,
-  ErrorDirective,
-  WarningDirective,
-  OtherDirective,
-};
-
-/// Return a stable diagnostic spelling for a preprocessing-structure kind.
-llvm::StringRef toString(PreprocessingStructureKind kind);
-
-/// Producer record class bound to a lexical preprocessing interval.
-///
-/// Model ids live in several producer arrays and are not assumed to share one
-/// namespace.  Carrying the record class prevents a line-control event id from
-/// being mistaken for an item id with the same integer value.
-enum class PreprocessingStructureModelKind {
-  None,
-  MacroDirective,
-  IncludeDirective,
-  PragmaDirective,
-  LineControlEvent,
-  ConditionalDirective,
-};
-
-/// Return a stable diagnostic spelling for a producer binding class.
-llvm::StringRef toString(PreprocessingStructureModelKind kind);
 
 /// One exact half-open physical source interval containing preprocessing
 /// structure.

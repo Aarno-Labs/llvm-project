@@ -14,14 +14,14 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDOWNERSTATEPROOF_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDOWNERSTATEPROOF_H
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldPathIdentity.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldOwnerStateTypes.h"
 #include "proof/RefoldTheoremAudit.h"
-#include "source/RefoldToken.h"
 #include "source/RefoldTokenTextAnalysis.h"
-#include "util/RefoldPathIdentity.h"
+#include "support/RefoldLog.h"
 
 #include "clang/Basic/LangOptions.h"
 

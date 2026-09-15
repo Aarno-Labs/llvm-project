@@ -26,7 +26,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "proof/RefoldProofVocabulary.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "gtest/gtest.h"
 

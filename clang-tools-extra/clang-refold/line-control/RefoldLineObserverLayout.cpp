@@ -14,10 +14,10 @@
 #include "line-control/LineControlEditHelpers.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlProof.h"
+#include "model/RefoldPathIdentity.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldOwnerStateProof.h"
-#include "util/RefoldPathIdentity.h"
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"

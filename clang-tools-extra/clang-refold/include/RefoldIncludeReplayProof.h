@@ -11,10 +11,10 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDINCLUDEREPLAYPROOF_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDINCLUDEREPLAYPROOF_H
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "line-control/LineDirectiveInserter.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldProofVocabulary.h"
+#include "support/RefoldLog.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"

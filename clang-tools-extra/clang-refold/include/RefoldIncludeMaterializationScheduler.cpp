@@ -6,7 +6,6 @@
 
 #include "include/RefoldIncludeMaterializationScheduler.h"
 
-#include "core/RefoldLog.h"
 #include "edit/RefoldTextEditAssembler.h"
 #include "include/RefoldIncludeInsertionPlanner.h"
 #include "include/RefoldIncludeMaterializer.h"
@@ -15,12 +14,13 @@
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroStateRepairPlanner.h"
+#include "model/RefoldPathIdentity.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
-#include "util/RefoldPathIdentity.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 

@@ -51,7 +51,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "util/StringUtils.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"

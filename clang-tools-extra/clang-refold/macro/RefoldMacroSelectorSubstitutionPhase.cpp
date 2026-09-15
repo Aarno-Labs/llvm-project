@@ -13,15 +13,15 @@
 
 #include "macro/RefoldMacroSelectorSubstitutionPhase.h"
 
-#include "core/RefoldLog.h"
-#include "core/RefoldModel.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroDAGSharedHelpers.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
+#include "model/RefoldModel.h"
 #include "proof/RefoldMacroPatchProofClassifier.h"
 #include "source/RefoldSourceMapper.h"
-#include "util/StringUtils.h"
+#include "support/RefoldLog.h"
+#include "support/StringUtils.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"

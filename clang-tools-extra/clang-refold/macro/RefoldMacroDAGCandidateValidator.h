@@ -39,7 +39,6 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACRODAGCANDIDATEVALIDATOR_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACRODAGCANDIDATEVALIDATOR_H
 
-#include "core/RefoldModel.h"
 #include "edit/RefoldPatchTypes.h"
 #include "macro/RefoldMacroDAGInvertibilitySolver.h"
 #include "macro/RefoldMacroDAGLiftingContext.h"
@@ -47,7 +46,8 @@
 #include "macro/RefoldMacroDAGSubtreeCertifier.h"
 #include "macro/RefoldMacroDAGTextPrimitives.h"
 #include "macro/RefoldMacroOccurrenceProofValidator.h"
-#include "source/RefoldToken.h"
+#include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
