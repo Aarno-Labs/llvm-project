@@ -125,10 +125,6 @@ struct ProofSummary {
   /// treating the construction inventory as an independent proof authority.
   std::optional<EmittedProof> emittedProof;
 
-  bool HasCanonicalEmittedProof() const {
-    return emittedProof && emittedProof->HasFinalTheoremClass();
-  }
-
   /// True when the summary's primary proof class came from a concrete
   /// accepted-path or patch-proof enum rather than from inferred legacy side
   /// bits. Proof closure requires theorem-facing emitted results to carry
@@ -377,9 +373,10 @@ struct AcceptedResultCandidate {
   ///   * a macro or include carrier stores a clipped, whitespace-escaped
   ///     rendering, which is only ever displayed;
   ///   * a direct-TU carrier stores the exact replacement bytes, because the
-  ///     emission audit in `RefoldTextEditAssembler` reconstructs the
-  ///     carrier's proven source surface from this field, and the macro-state
-  ///     repair planner compares it against the edit text it authorized.
+  ///     global source-edit firewall in `RefoldTextEditCertifier` reconstructs
+  ///     the carrier's proven source surface from this field, and the
+  ///     macro-state repair planner compares it against the edit text it
+  ///     authorized.
   ///
   /// So never clip what a TU carrier puts here, and never compare this field
   /// to decide whether two candidates emit the same repair: for the kinds

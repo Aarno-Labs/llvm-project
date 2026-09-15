@@ -6,11 +6,9 @@
 // pruning authority. Generation sites carry the typed obligation that explains
 // why a directive exists, while the fixed-point pruner discharges physical
 // deletion only when validation proves that removing that exact final-stream
-// range preserves the accepted preprocessed output.
-//
-// This header also exposes `buildFinalLineControlValidationCallback`, the
-// factory that constructs the executable preprocessing oracle the pruner
-// consumes for each proposed `#line` deletion.
+// range preserves the accepted preprocessed output.  That executable oracle
+// is injected; `buildFinalLineControlValidationCallback` in
+// source/RefoldPreprocessRecheck.h builds it.
 //
 //===----------------------------------------------------------------------===//
 
@@ -33,7 +31,6 @@
 namespace clang {
 namespace refold {
 
-class RefoldTheoremAudit;
 
 /// Physical source-owner identity associated with a final-stream line-control
 /// fact.
@@ -284,24 +281,6 @@ std::optional<std::string>
 producerSourceAnchorPath(llvm::StringRef producerSourcePath,
                          const RefoldModel::PreprocessContext &ctx);
 
-/// Build a callback that preprocesses an assembled final source through the
-/// producer-recorded context, using one stable temporary path beside \p
-/// anchorPath so `__FILE__` and quoted-include lookup stay comparable.
-///
-/// \p anchorPath must name the producer's own source, not the refold output;
-/// see `producerSourceAnchorPath()` for why the distinction is load-bearing.
-///
-///
-/// \p verifyIncludeDirs are caller-declared last-resort include directories.
-/// An edited stream may name a header that did not exist when the producer ran
-/// -- a transform that hoists globals into a new header, for instance -- so no
-/// producer-recorded search path can find it.  Where such a header lives is not
-/// derivable from the refold map, so it is declared rather than guessed; each
-/// directory is searched only after every producer-recorded path has missed.
-FinalSourcePreprocessCallback buildFinalSourcePreprocessCallback(
-    llvm::StringRef anchorPath, const RefoldModel::PreprocessContext &ctx,
-    llvm::ArrayRef<std::string> verifyIncludeDirs = {});
-
 using FinalLineControlValidationCallback =
     std::function<bool(llvm::StringRef currentOutput,
                        llvm::StringRef candidateOutput, std::string &reason)>;
@@ -320,42 +299,6 @@ FinalLineControlPruneResult PruneFinalLineControlDirectives(
         llvm::ArrayRef<FinalLineControlPruneCandidate>(),
     FinalLineControlValidationCallback validationCallback =
         FinalLineControlValidationCallback());
-
-/// Build the executable oracle that validates one proposed final-stream
-/// `#line` deletion.
-///
-/// The returned callback is consumed by `refoldTranslationUnit` and ultimately
-/// by the final-line-control pruner.  It re-invokes the producer-recorded
-/// preprocessor on the current accepted final source and the candidate final
-/// source using one stable temporary path located beside \p outputPath, so
-/// `__FILE__` and quoted-include lookup remain comparable across both inputs.
-/// Byte-for-byte preprocessor equivalence is accepted first; otherwise the
-/// callback falls back to token-sequence equality, which is the same oracle
-/// `--check` uses.
-FinalLineControlValidationCallback buildFinalLineControlValidationCallback(
-    llvm::StringRef outputPath, const RefoldModel::PreprocessContext &ctx);
-
-/// Audit the authority contract returned by the final-line-control pruner.
-///
-/// Reports a no-legacy audit finding for each pillar of the authority contract
-/// (compact removal proof, fixed-point pruning, validation callback) that is
-/// not marked authoritative.  Returns the contract's
-/// `IsClosedUnderCompactProofs` verdict so the caller can fail closed when a
-/// strict run has lost authority over the final pruning pass.
-bool AuditFinalLineControlAuthorityContract(
-    const RefoldTheoremAudit &audit,
-    const FinalLineControlAuthorityContract &authority, llvm::StringRef role);
-
-/// Audit the compact-proof population of \p candidates before fixed-point
-/// pruning runs.
-///
-/// Counts candidates that lack a complete obligation/removal proof and reports
-/// one no-legacy finding when any are missing.  Returns true iff every
-/// candidate carries the compact proof records the pruner needs.
-bool AuditFinalLineControlRemovalProofPopulation(
-    const RefoldTheoremAudit &audit,
-    llvm::ArrayRef<FinalLineControlPruneCandidate> candidates,
-    llvm::StringRef role);
 
 } // namespace refold
 } // namespace clang

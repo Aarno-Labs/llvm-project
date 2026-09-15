@@ -3,12 +3,11 @@
 // `--no-lines` pruning recheck pipeline for clang-refold.
 //
 // This module owns the `--no-lines`-specific pieces of the `--check` recheck
-// flow.  The generic recheck primitives `preprocessToBytes` and `compareTokens`
-// live in `source/RefoldPreprocessRecheck.h`; `lexPPTokens` lives next to
-// `PPTok` in `model/RefoldToken.h`; refold-map JSON extraction
-// (`PreprocessContext`, source-path lookup) lives on `RefoldModel`; and the
-// final-line-control validation callback factory lives in
-// `line-control/FinalLineControlModel.h`.  This header exposes only:
+// flow.  The generic recheck primitives `preprocessToBytes` and
+// `compareTokens`, and the final-line-control validation callback factory, live
+// in `source/RefoldPreprocessRecheck.h`; `lexPPTokens` lives next to `PPTok` in
+// `model/RefoldToken.h`; and refold-map JSON extraction (`PreprocessContext`,
+// source-path lookup) lives on `RefoldModel`.  This header exposes only:
 //
 //   - `buildNoLinesIgnoreMask`: computes the per-B-token ignore mask that
 //     relaxes token comparison for `__LINE__`/`__FILE__`-sensitive predefined

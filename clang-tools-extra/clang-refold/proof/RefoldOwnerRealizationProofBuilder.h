@@ -64,7 +64,7 @@ namespace refold {
 
 class RefoldAcceptancePathClassifier;
 class RefoldOwnerStateProof;
-class RefoldTUEditPlanner;
+class RefoldTUAnchorProof;
 struct StructuralHunkSegmentBinding;
 struct TUByteSpanPlan;
 
@@ -83,7 +83,7 @@ public:
   struct Dependencies {
     const RefoldModel &model;
     const RefoldOwnerStateProof &ownerStateProof;
-    const RefoldTUEditPlanner &tuEdits;
+    const RefoldTUAnchorProof &tuAnchorProof;
     uint64_t bTokenCount = 0;
     const RefoldProofSummaryBuilder &proofSummaryBuilder;
     const RefoldAcceptedResultRanker &acceptedResultRanker;

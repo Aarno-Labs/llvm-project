@@ -9,7 +9,6 @@
 
 #include "macro/RefoldMacroDAGLeafDiscoveryPhase.h"
 
-#include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroDAGSharedHelpers.h"
 #include "macro/RefoldMacroOccurrenceProofValidator.h"
@@ -66,8 +65,7 @@ void RefoldMacroDAGLeafDiscoveryPhase::Run(
                                                          : StringRef(""));
   StringRef invSpanText = result.invSpanText;
 
-  if (!RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-          invSpanText, m)) {
+  if (!invocationSpanMatchesCallsitePrefix(invSpanText, m)) {
     result.aborted = true;
     return;
   }
@@ -141,8 +139,7 @@ void RefoldMacroDAGLeafDiscoveryPhase::Run(
 
       std::optional<MacroPatch> pairRootPatch;
       if (!argLikeSpans.empty() && envTrimRootWithinArgLike &&
-          RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-              invSpanText, m)) {
+          invocationSpanMatchesCallsitePrefix(invSpanText, m)) {
         // Once the paired insertion envelope trims down to a valid
         // argument-local hunk, delegate to the standard args-only builder
         // for the actual rewrite and validation.

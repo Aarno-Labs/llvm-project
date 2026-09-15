@@ -6,7 +6,7 @@
 
 #include "include/RefoldIncludeMaterializationScheduler.h"
 
-#include "edit/RefoldTextEditAssembler.h"
+#include "edit/RefoldTextEditCertifier.h"
 #include "include/RefoldIncludeInsertionPlanner.h"
 #include "include/RefoldIncludeMaterializer.h"
 #include "include/RefoldIncludeSubtreeWorkClassifier.h"
@@ -64,9 +64,9 @@ RefoldIncludeMaterializationScheduler::RefoldIncludeMaterializationScheduler(
       macroStateRepairPlanner_(requireNonNull(
           deps_.macroStateRepairPlanner,
           "include scheduler requires macro-state repair planner")),
-      textEditAssembler_(
-          requireNonNull(deps_.textEditAssembler,
-                         "include scheduler requires text edit assembler")),
+      textEditCertifier_(
+          requireNonNull(deps_.textEditCertifier,
+                         "include scheduler requires text edit certifier")),
       pragmaOnceGuards_(
           requireNonNull(deps_.pragmaOnceGuards,
                          "include scheduler requires pragma-once guards")),
@@ -1019,7 +1019,7 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
       PreprocessingStructureKind::Include,
       PreprocessingStructureKind::IncludeNext,
       PreprocessingStructureKind::Import};
-  if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
+  if (!textEditCertifier_.AuthorizeProtectedSourceIntervals(
           edit, ProtectedSourceEditAuthorityKind::IncludeMaterialization,
           request_.tuPath, std::nullopt, request_.tuBytes, siteBegin, siteEnd,
           includeKinds))
@@ -1031,17 +1031,17 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
   auto acceptedIt = includeExpansionAcceptedResults_.find(includeId);
   std::optional<std::pair<uint64_t, uint64_t>> sidebandBRange;
   if (sidebandOnly || subtreeWork.UsesOnlySidebandReplayEnvelope(include->id))
-    sidebandBRange =
-        textEditAssembler_.SidebandPragmaMaterializedBByteRangeForInclude(
-            include->id);
+    sidebandBRange = sidebandPragmaMaterializedBByteRangeForInclude(
+        sidebandPragmaEdits_, include->id,
+        static_cast<uint64_t>(request_.bSource.size()));
 
   if (auto bEnv =
           includeInsertionPlanner_.ResolveIncludeRealizationBTokenEnvelope(
               include->cover.begin, include->cover.end)) {
-    textEditAssembler_.CertifyTextEditMaterializedBTokenRange(edit, bEnv->first,
+    textEditCertifier_.CertifyTextEditMaterializedBTokenRange(edit, bEnv->first,
                                                               bEnv->second);
   } else if (sidebandBRange) {
-    textEditAssembler_.CertifyTextEditMaterializedBByteRange(
+    textEditCertifier_.CertifyTextEditMaterializedBByteRange(
         edit, sidebandBRange->first, sidebandBRange->second);
   } else if (!include->cover.IsValid()) {
     // The producer recorded no preprocessed span for this include occurrence,
@@ -1053,16 +1053,16 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
     // once-state in the single output TU -- and realizes no B bytes at all.
     // Certify that instead of inventing a B envelope for an occurrence with no
     // B image.
-    textEditAssembler_.CertifyTextEditMaterializesNoBPayload(edit);
+    textEditCertifier_.CertifyTextEditMaterializesNoBPayload(edit);
   }
 
   // Preserve the accepted-result proof produced by the include materializer
   // when available; otherwise certify the edit as include materialized
   // expansion.
   if (acceptedIt != includeExpansionAcceptedResults_.end()) {
-    textEditAssembler_.AttachAcceptedResultCarrier(edit, acceptedIt->second);
+    textEditCertifier_.AttachAcceptedResultCarrier(edit, acceptedIt->second);
   } else {
-    textEditAssembler_.AttachAcceptedResultCarrier(
+    textEditCertifier_.AttachAcceptedResultCarrier(
         edit,
         acceptedCandidateBuilder_.BuildAcceptedIncludeRealizationCandidate(
             AcceptedPathKind::IncludeMaterializedExpansion, *include));

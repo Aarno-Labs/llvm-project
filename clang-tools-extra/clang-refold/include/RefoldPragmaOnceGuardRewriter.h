@@ -70,12 +70,12 @@ namespace refold {
 
 class LineDirectiveInserter;
 class RefoldLineControlProof;
-class RefoldMacroStateProof;
+class RefoldLineObserverLayout;
 class RefoldPathIdentity;
 class RefoldPreprocessingStructureIndex;
 class RefoldAcceptedCandidateBuilder;
 class RefoldTerminalProofSink;
-class RefoldTextEditAssembler;
+class RefoldTextEditCertifier;
 
 /// Return whether \p text is exactly one `#pragma once` directive spelling.
 ///
@@ -270,10 +270,10 @@ public:
   struct Dependencies {
     const RefoldModel &model;
     const RefoldPathIdentity &pathIdentity;
-    const RefoldMacroStateProof &macroStateProof;
     const LineDirectiveInserter &lineDirs;
     const RefoldLineControlProof &lineControlProof;
-    const RefoldTextEditAssembler &textEditAssembler;
+    const RefoldTextEditCertifier &textEditCertifier;
+    const RefoldLineObserverLayout &lineObserverLayout;
     const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder;
     RefoldTerminalProofSink &terminalSink;
     const clang::LangOptions &lexLang;
@@ -348,15 +348,6 @@ public:
   /// it needs no child index and stays exact for repeated instances of a header.
   bool HeaderMacroStateIsObservedOutside(llvm::StringRef physicalPath) const;
 
-  /// Return whether a header protects itself against re-entry at all, by
-  /// `#pragma once` or by a classic `#ifndef` guard the producer named.
-  ///
-  /// Both kinds create the same hazard once a copy of the header is inlined
-  /// into the translation unit: a later `#include` of it must not expand the
-  /// content a second time.  They differ only in how the original expressed the
-  /// protection, which is not a reason to repair them differently.
-  bool HeaderEstablishesReentryProtection(llvm::StringRef physicalPath) const;
-
   /// Return whether the header opened by \p include transitively includes any of
   /// \p targetPaths, other than by being that header itself.
   ///
@@ -418,12 +409,6 @@ public:
   bool AppendRealizedFromBIncludeGuardRestoration(
       llvm::ArrayRef<uint64_t> enteredSubtreeIncludeIds,
       std::string &realizedBody) const;
-
-  /// Return every usable guard, ordered by canonical physical path.
-  ///
-  /// Deterministic ordering makes the emitted guard numbering reproducible and
-  /// keeps diagnostics stable.
-  std::vector<const PragmaOnceGuard *> UsableGuards() const;
 
   /// Stage guard edits for one inlined copy of a header's *source* bytes.
   ///

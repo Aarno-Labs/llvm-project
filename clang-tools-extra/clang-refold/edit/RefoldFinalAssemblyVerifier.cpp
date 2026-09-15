@@ -9,6 +9,7 @@
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/RefoldNoLinesPruning.h"
 #include "source/DiffAlgorithms.h"
+#include "source/RefoldPreprocessRecheck.h"
 #include "support/RefoldLangOptions.h"
 #include "support/RefoldLog.h"
 

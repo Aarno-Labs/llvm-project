@@ -13,7 +13,6 @@
 
 #include "macro/RefoldMacroRecursiveTupleGeneratedReplay.h"
 
-#include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroGeneratedCalleeReplayEngine.h"
 #include "macro/RefoldMacroPatchProofCertifier.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
@@ -2851,8 +2850,8 @@ bool recursiveTupleGeneratedReplayPatchHasFinalLocalEnvelope(
   if (patch.macroId != request.rootInvocation.id || patch.replacement.empty() ||
       llvm::StringRef(patch.replacement) == request.baseInvocationText)
     return false;
-  if (!RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-          patch.replacement, request.rootInvocation))
+  if (!invocationSpanMatchesCallsitePrefix(patch.replacement,
+                                           request.rootInvocation))
     return false;
   if (!patch.materialized.hasBTokenRange ||
       patch.materialized.bTokStart >= patch.materialized.bTokEnd)

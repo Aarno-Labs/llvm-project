@@ -39,7 +39,7 @@ class RefoldLineControlProof;
 class RefoldOwnerStateProof;
 class RefoldPathIdentity;
 class RefoldAcceptedCandidateBuilder;
-class RefoldTextEditAssembler;
+class RefoldTextEditCertifier;
 
 /// Concrete line-observer layout realization service.
 ///
@@ -49,14 +49,6 @@ class RefoldTextEditAssembler;
 /// and include materialization vocabulary.
 class RefoldLineObserverLayout {
 public:
-  /// Return true iff a raw source span starts with the recorded macro callsite
-  /// spelling.  This is a token-boundary safety check for source-preserving
-  /// macro rewrite paths; it is static because it depends only on the source
-  /// slice and producer macro metadata.
-  static bool
-  InvocationSpanMatchesCallsitePrefix(llvm::StringRef invSpanText,
-                                      const RefoldModel::MacroInvocation &m);
-
   /// Construct a layout realization service over immutable producer/model
   /// facts and the proof/edit services it composes.
   RefoldLineObserverLayout(
@@ -67,14 +59,14 @@ public:
       const RefoldLineControlProof &lineControlProof,
       const RefoldOwnerStateProof &ownerStateProof,
       const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
-      const RefoldTextEditAssembler &textEditAssembler,
+      const RefoldTextEditCertifier &textEditCertifier,
       const LineDirectiveInserter &lineDirs)
       : model_(model), bSource_(bSource), aToks_(aToks), bToks_(bToks),
         bTokOff_(bTokOff), abTokMapA2B_(abTokMapA2B), abTokMapB2A_(abTokMapB2A),
         paths_(paths), lineControlProof_(lineControlProof),
         ownerStateProof_(ownerStateProof),
         acceptedCandidateBuilder_(acceptedCandidateBuilder),
-        textEditAssembler_(textEditAssembler), lineDirs_(lineDirs) {}
+        textEditCertifier_(textEditCertifier), lineDirs_(lineDirs) {}
 
   /// Append TU-local materialization edits for preserved source-spelled
   /// `__LINE__` observers whose B-side layout cannot be represented by legal
@@ -93,6 +85,28 @@ public:
   LineResyncShouldDeferToConditionalJoin(llvm::StringRef ownerFile,
                                          std::optional<uint64_t> ownerIncludeId,
                                          uint64_t resumeOffset) const;
+
+  /// \brief Compute how to preserve __LINE__ after applying replacement to
+  /// [start,end) in originalFileText.
+  ///
+  /// This method detects "line drift" by comparing the newline count in the
+  /// original span versus the replacement text. If there is no drift, it
+  /// returns (replacement, nullopt).
+  ///
+  /// If drift is detected, the method computes the logical resume line for the
+  /// first character at `end` in the original file, attempts a local resync via
+  /// LineDirectiveInserter::MaybeAppendResyncAfterReplacement, and otherwise
+  /// returns a PendingResync so the emission layer can flush a `#line`
+  /// directive at the next safe BOL.
+  ///
+  /// Safety note: local injection may fail when inserting a directive would
+  /// change token adjacency. In that case, pending resync state is carried only
+  /// because a model-recorded suffix __LINE__ observer exists; otherwise no
+  /// synthetic directive is produced.
+  ResyncOutcome ApplyResyncOrPend(
+      llvm::StringRef originalFileText, uint64_t start, uint64_t end,
+      llvm::StringRef replacement, llvm::StringRef fileSpellingForDirective,
+      std::optional<uint64_t> ownerIncludeId = std::nullopt) const;
 
   /// Wrap materialized include text with the entry/return `#line` directives
   /// proven necessary for child and parent line-state observers.
@@ -124,7 +138,7 @@ private:
   const RefoldLineControlProof &lineControlProof_;
   const RefoldOwnerStateProof &ownerStateProof_;
   const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder_;
-  const RefoldTextEditAssembler &textEditAssembler_;
+  const RefoldTextEditCertifier &textEditCertifier_;
   const LineDirectiveInserter &lineDirs_;
 };
 

@@ -17,6 +17,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDTHEOREMAUDIT_H
 
 #include "edit/RefoldPatchTypes.h"
+#include "line-control/FinalLineControlModel.h"
 #include "proof/RefoldAcceptancePathTypes.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldOwnerStateTypes.h"
@@ -59,11 +60,6 @@ public:
 
   /// Reset the per-run theorem audit ledger.
   void Reset() const { audit_ = TheoremAuditStats{}; }
-
-  /// Expose the mutable audit counters for services that accumulate low-level
-  /// proof statistics directly before the final theorem-audit invariant is
-  /// enforced.
-  TheoremAuditStats &Stats() const { return audit_; }
 
   /// Record the first theorem-audit violation encountered in this run.
   void NoteTheoremAuditViolation(llvm::StringRef detail) const;
@@ -246,6 +242,28 @@ void emitRefoldAttemptStatsSummary(const RefoldStats &stats,
 /// of the run's nested passes, as for `emitRefoldAttemptStatsSummary()`.
 void emitTheoremAuditSummary(const TheoremAuditStats &audit,
                              llvm::StringRef passRole);
+
+/// Audit the authority contract returned by the final-line-control pruner.
+///
+/// Reports a no-legacy audit finding for each pillar of the authority contract
+/// (compact removal proof, fixed-point pruning, validation callback) that is
+/// not marked authoritative.  Returns the contract's
+/// `IsClosedUnderCompactProofs` verdict so the caller can fail closed when a
+/// strict run has lost authority over the final pruning pass.
+bool AuditFinalLineControlAuthorityContract(
+    const RefoldTheoremAudit &audit,
+    const FinalLineControlAuthorityContract &authority, llvm::StringRef role);
+
+/// Audit the compact-proof population of \p candidates before fixed-point
+/// pruning runs.
+///
+/// Counts candidates that lack a complete obligation/removal proof and reports
+/// one no-legacy finding when any are missing.  Returns true iff every
+/// candidate carries the compact proof records the pruner needs.
+bool AuditFinalLineControlRemovalProofPopulation(
+    const RefoldTheoremAudit &audit,
+    llvm::ArrayRef<FinalLineControlPruneCandidate> candidates,
+    llvm::StringRef role);
 
 } // namespace refold
 } // namespace clang

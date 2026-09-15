@@ -7,6 +7,7 @@
 #include "source/RefoldStructuralHunkDispatcher.h"
 
 #include "line-control/RefoldLineObserverLayout.h"
+#include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroTopology.h"
 #include "model/RefoldModel.h"
 #include "model/RefoldPathIdentity.h"
@@ -73,12 +74,6 @@ bool RefoldStructuralHunkDispatcher::AppendLineObserverRealizationEdits(
   return layout.AppendIncludeRealizationEdits(perInclude_);
 }
 
-bool RefoldStructuralHunkDispatcher::HasIncludePatchesFor(
-    uint64_t includeId) const {
-  auto it = perInclude_.find(includeId);
-  return it != perInclude_.end() && !it->second.patches.empty();
-}
-
 RefoldStructuralHunkDispatcher::IncludeEditMap &
 RefoldStructuralHunkDispatcher::MutableIncludeEditBucketsForMaterialization() {
   return perInclude_;
@@ -122,7 +117,7 @@ RefoldStructuralHunkDispatcher::PrepareMacroPatchStagingSlot(
   slot.existingPatch = FindMacroPatchByKey(macro.ownerIncludeId, slot.patchKey);
   slot.existingIsCallsite =
       slot.existingPatch &&
-      RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
+      invocationSpanMatchesCallsitePrefix(
           StringRef(slot.existingPatch->replacement), macro);
 
   // When the existing patch is an expanded/non-callsite realization, keep the
@@ -278,13 +273,6 @@ RefoldStructuralHunkDispatcher::FindFinalMacroPatchesForOwner(
   if (it == macroPatchesByOwner_.end())
     return nullptr;
   return &it->second;
-}
-
-bool RefoldStructuralHunkDispatcher::HasFinalMacroPatchesForOwner(
-    std::optional<uint64_t> ownerIncludeId) const {
-  const std::vector<MacroPatch> *patches =
-      FindFinalMacroPatchesForOwner(ownerIncludeId);
-  return patches && !patches->empty();
 }
 
 bool RefoldStructuralHunkDispatcher::IncludeBucketsHavePatches() const {

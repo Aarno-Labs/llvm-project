@@ -104,9 +104,6 @@ public:
                                           llvm::StringRef tuPath,
                                           llvm::StringRef tuBytes);
 
-  /// Return whether a particular include bucket contains direct patches.
-  bool HasIncludePatchesFor(uint64_t includeId) const;
-
   /// Return include-local edit buckets for include materialization.
   IncludeEditMap &MutableIncludeEditBucketsForMaterialization();
 
@@ -141,10 +138,6 @@ public:
   FindFinalMacroPatchesForOwner(std::optional<uint64_t> ownerIncludeId);
   const std::vector<MacroPatch> *
   FindFinalMacroPatchesForOwner(std::optional<uint64_t> ownerIncludeId) const;
-
-  /// Return true when the finalized owner bucket contains macro patches.
-  bool
-  HasFinalMacroPatchesForOwner(std::optional<uint64_t> ownerIncludeId) const;
 
   /// Return true when any include bucket contains patches.
   bool IncludeBucketsHavePatches() const;

@@ -276,10 +276,6 @@ struct EmittedProof {
   std::optional<IncludeAnchorWitness> includeAnchor;
   std::optional<SuffixStabilityWitness> suffixStability;
   std::optional<TerminalFallbackWitness> terminalFallback;
-
-  bool HasFinalTheoremClass() const {
-    return theoremClass != TheoremProofClass::Unknown;
-  }
 };
 
 } // namespace refold

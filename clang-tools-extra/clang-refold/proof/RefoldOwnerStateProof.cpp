@@ -13,6 +13,7 @@
 
 #include "proof/RefoldTheoremAudit.h"
 #include "proof/RefoldWitnessTrace.h"
+#include "source/TokenTextHelpers.h"
 
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TokenKinds.h"
@@ -44,14 +45,6 @@ RefoldOwnerStateProof::RefoldOwnerStateProof(
       paths_(paths), tokenText_(tokenText), macroTopology_(macroTopology),
       theoremAudit_(theoremAudit), terminalSink_(terminalSink),
       ownerStateGraphMemo_(inputs.ownerStateGraphMemo) {}
-
-bool rawLexerCommentTokenIsComplete(StringRef spelling) {
-  if (spelling.starts_with("//"))
-    return true;
-  if (spelling.starts_with("/*"))
-    return spelling.find("*/", 2) != StringRef::npos;
-  return false;
-}
 
 namespace {
 
@@ -2522,24 +2515,6 @@ OwnerStateComponent RefoldOwnerStateProof::StateComponentForMissingStateFact(
     return OwnerStateComponent::UnmodeledState;
   }
   llvm_unreachable("Invalid missing state fact kind");
-}
-
-TerminalFallbackProofFailure
-RefoldOwnerStateProof::MissingStateFactTerminalFailure(
-    MissingStateFactKind kind, StringRef detail) {
-  TerminalFallbackProofFailure failure =
-      SuffixStabilityTerminalFailureForComponent(
-          StateComponentForMissingStateFact(kind));
-  failure.context.stateComponent = formatv("{0}:{1}", kind, detail).str();
-  if (kind == MissingStateFactKind::MissingOwnerOrderingFacts) {
-    failure.obligation = TerminalFallbackObligationKind::ProducerFactsAvailable;
-    failure.reason = TerminalFallbackFailureReason::MissingProducerFacts;
-    failure.theoremFailure =
-        NormalizeTerminalFallbackFailureReason(
-            TerminalFallbackFailureReason::MissingProducerFacts)
-            .value_or(TheoremFallbackFailureKind::Unknown);
-  }
-  return failure;
 }
 
 std::vector<OwnerStateComponent>

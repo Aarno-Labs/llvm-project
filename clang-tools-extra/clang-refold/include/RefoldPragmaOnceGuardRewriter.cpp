@@ -10,8 +10,10 @@
 
 #include "proof/RefoldPragmaTaxonomy.h"
 
-#include "edit/RefoldTextEditAssembler.h"
+#include "edit/RefoldTextEditCertifier.h"
 #include "line-control/LineDirectiveInserter.h"
+#include "line-control/RefoldLineControlProof.h"
+#include "line-control/RefoldLineObserverLayout.h"
 #include "line-control/SourceLineDirectiveHelpers.h"
 #include "model/RefoldPathIdentity.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
@@ -392,8 +394,7 @@ bool RefoldPragmaOnceGuardRewriter::DiscoverPragmaOnceSites(
   const RefoldPreprocessingStructureIndex index =
       RefoldPreprocessingStructureIndex::Build(
           RefoldPreprocessingStructureIndex::Dependencies{
-              deps_.model, deps_.pathIdentity, deps_.macroStateProof,
-              deps_.lexLang},
+              deps_.model, deps_.pathIdentity, deps_.lexLang},
           sourcePath, bytes, ownerIncludeId);
 
   // An incomplete protection census means the pragma inventory itself cannot be
@@ -624,8 +625,7 @@ bool RefoldPragmaOnceGuardRewriter::ProveNoUnaccountedIncludeDirectives(
     const RefoldPreprocessingStructureIndex index =
         RefoldPreprocessingStructureIndex::Build(
             RefoldPreprocessingStructureIndex::Dependencies{
-                deps_.model, deps_.pathIdentity, deps_.macroStateProof,
-                deps_.lexLang},
+                deps_.model, deps_.pathIdentity, deps_.lexLang},
             entry.first, *bytes, entry.second.ownerIncludeId);
 
     if (!index.IsProtectionCensusComplete()) {
@@ -1071,25 +1071,6 @@ bool RefoldPragmaOnceGuardRewriter::HeaderEstablishesOnceState(
          candidate->guard.rejection == PragmaOnceGuardRejection::None;
 }
 
-bool RefoldPragmaOnceGuardRewriter::HeaderEstablishesReentryProtection(
-    StringRef physicalPath) const {
-  if (HeaderEstablishesOnceState(physicalPath))
-    return true;
-
-  // A classic guard is recorded on the include instance rather than on the
-  // header, so ask whether any instance opening this file named one.
-  for (const RefoldModel::IncludeItem &include : deps_.model.GetIncludes()) {
-    if (!include.controllingMacro || include.controllingMacro->empty())
-      continue;
-    std::optional<std::string> canonical =
-        CanonicalPhysicalPathForInclude(include);
-    if (canonical &&
-        deps_.pathIdentity.PathsEqual(*canonical, physicalPath))
-      return true;
-  }
-  return false;
-}
-
 bool RefoldPragmaOnceGuardRewriter::IncludeClosureReentersHeader(
     const RefoldModel::IncludeItem &include, ArrayRef<std::string> targetPaths,
     std::string *reenteredPath) const {
@@ -1225,15 +1206,6 @@ bool RefoldPragmaOnceGuardRewriter::AppendRealizedFromBIncludeGuardRestoration(
   return true;
 }
 
-std::vector<const PragmaOnceGuard *>
-RefoldPragmaOnceGuardRewriter::UsableGuards() const {
-  std::vector<const PragmaOnceGuard *> guards;
-  for (const auto &entry : candidates_)
-    if (entry.second.active && entry.second.guard.IsUsable())
-      guards.push_back(&entry.second.guard);
-  return guards;
-}
-
 //===----------------------------------------------------------------------===//
 // Edit staging
 //===----------------------------------------------------------------------===//
@@ -1324,13 +1296,13 @@ RefoldPragmaOnceGuardRewriter::StageMaterializedBodyGuardEdits(
   // payload ends in a physical newline keeps any directive that begins the
   // header at logical beginning-of-line.
   if (emitGuard) {
-    ResyncOutcome ro = deps_.textEditAssembler.ApplyResyncOrPend(
+    ResyncOutcome ro = deps_.lineObserverLayout.ApplyResyncOrPend(
         headerBytes, 0, 0, (Twine("#ifndef ") + guard->macroName + "\n").str(),
         headerPath, include.id);
     TextEdit edit{0, 0, std::move(ro.text), std::move(ro.pending),
                   std::nullopt, {}, {}, {}};
     edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
-    deps_.textEditAssembler.AttachAcceptedResultCarrier(edit, carrier);
+    deps_.textEditCertifier.AttachAcceptedResultCarrier(edit, carrier);
     staged.push_back(std::move(edit));
   }
 
@@ -1365,13 +1337,13 @@ RefoldPragmaOnceGuardRewriter::StageMaterializedBodyGuardEdits(
               .str());
     }
     const std::string &replacement = *replacementOrNone;
-    ResyncOutcome ro = deps_.textEditAssembler.ApplyResyncOrPend(
+    ResyncOutcome ro = deps_.lineObserverLayout.ApplyResyncOrPend(
         headerBytes, site.spellingBegin, site.spellingEnd, replacement,
         headerPath, include.id);
     TextEdit edit{site.spellingBegin, site.spellingEnd, std::move(ro.text),
                   std::move(ro.pending), std::nullopt, {}, {}, {}};
     edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
-    if (!deps_.textEditAssembler.AuthorizeExactProtectedSourceInterval(
+    if (!deps_.textEditCertifier.AuthorizeExactProtectedSourceInterval(
             edit, ProtectedSourceEditAuthorityKind::PragmaOnceGuardRewrite,
             headerPath, include.id, headerBytes, site.spellingBegin,
             site.spellingEnd, pragmaGuardKinds(), /*allowedNestedKinds=*/{},
@@ -1383,7 +1355,7 @@ RefoldPragmaOnceGuardRewriter::StageMaterializedBodyGuardEdits(
                   include.id, site.spellingBegin, site.spellingEnd, headerPath)
               .str());
     }
-    deps_.textEditAssembler.AttachAcceptedResultCarrier(edit, carrier);
+    deps_.textEditCertifier.AttachAcceptedResultCarrier(edit, carrier);
     staged.push_back(std::move(edit));
   }
 
@@ -1396,12 +1368,12 @@ RefoldPragmaOnceGuardRewriter::StageMaterializedBodyGuardEdits(
     std::string text =
         (Twine(needsLeadingNewline ? "\n#endif\n" : "#endif\n")).str();
     const uint64_t at = headerBytes.size();
-    ResyncOutcome ro = deps_.textEditAssembler.ApplyResyncOrPend(
+    ResyncOutcome ro = deps_.lineObserverLayout.ApplyResyncOrPend(
         headerBytes, at, at, text, headerPath, include.id);
     TextEdit edit{at, at, std::move(ro.text), std::move(ro.pending),
                   std::nullopt, {}, {}, {}};
     edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
-    deps_.textEditAssembler.AttachAcceptedResultCarrier(edit, carrier);
+    deps_.textEditCertifier.AttachAcceptedResultCarrier(edit, carrier);
     staged.push_back(std::move(edit));
   }
 
@@ -1594,13 +1566,13 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
     text += "\n";
   text += "#endif\n";
 
-  ResyncOutcome ro = deps_.textEditAssembler.ApplyResyncOrPend(
+  ResyncOutcome ro = deps_.lineObserverLayout.ApplyResyncOrPend(
       ownerBytes, siteBegin, siteEnd, text, ownerPath, ownerIncludeId);
   TextEdit edit{siteBegin, siteEnd, std::move(ro.text), std::move(ro.pending),
                 std::nullopt, {}, {}, {}};
   edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
 
-  if (!deps_.textEditAssembler.AuthorizeProtectedSourceIntervals(
+  if (!deps_.textEditCertifier.AuthorizeProtectedSourceIntervals(
           edit, ProtectedSourceEditAuthorityKind::PragmaOnceGuardRewrite,
           ownerPath, ownerIncludeId, ownerBytes, siteBegin, siteEnd,
           includeGuardKinds(), /*requireProtectedInterval=*/true,
@@ -1613,7 +1585,7 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
             .str());
   }
 
-  deps_.textEditAssembler.AttachAcceptedResultCarrier(
+  deps_.textEditCertifier.AttachAcceptedResultCarrier(
       edit,
       deps_.acceptedCandidateBuilder.BuildAcceptedIncludeRealizationCandidate(
           AcceptedPathKind::IncludeMaterializedExpansion, include));

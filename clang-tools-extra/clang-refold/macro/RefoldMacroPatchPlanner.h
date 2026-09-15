@@ -188,24 +188,6 @@ public:
     return replayStabilityValidator_;
   }
 
-  /// Read-only access to the higher-order generated-callee replay engine.
-  /// Owns `GeneratedCalleeReplayPreservesEnvelope`,
-  /// `BuildGeneratedCalleeReplayCandidate`, and
-  /// `BuildTupleGeneratedCalleeReplayCandidate`.
-  const RefoldMacroGeneratedCalleeReplayEngine &
-  GeneratedCalleeReplayEngine() const {
-    return generatedCalleeReplayEngine_;
-  }
-
-  /// Read-only access to the generated-leaf fallback replay engine.  Owns
-  /// `BuildGeneratedLeafReplayCandidate`.  The engine reaches back into
-  /// planner helpers via std::function callbacks installed in its
-  /// Dependencies bundle, so no friend access is needed.
-  const RefoldMacroGeneratedLeafReplayEngine &
-  GeneratedLeafReplayEngine() const {
-    return generatedLeafReplayEngine_;
-  }
-
   /// Read-only access to the standard (non-paste) args-only patch builder.
   /// Owns `BuildStandardArgsOnlyPatch`.
   const RefoldMacroStandardArgsOnlyPatchBuilder &
@@ -546,14 +528,6 @@ private:
   bool
   CertifyMacroPatchWholeExpansionBRange(const RefoldModel::MacroInvocation &m,
                                         MacroPatch &patch) const;
-
-  /// Return whether the A token at the given index has exactly the expected
-  /// spelling.
-  bool MatchLiteralAToken(uint64_t tok, llvm::StringRef spelling) const;
-
-  /// Construct the subtree-membership / occurrence-proof predicate service
-  /// on demand. Lightweight; borrows model and topology from planner deps.
-  RefoldMacroOccurrenceProofValidator OccurrenceProofValidator() const;
 
   /// Resolve a function-like macro name through object-like single-token alias
   /// hops, reporting the number of hops consumed by the replay proof.

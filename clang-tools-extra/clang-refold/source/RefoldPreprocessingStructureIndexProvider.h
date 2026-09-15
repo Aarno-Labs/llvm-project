@@ -31,7 +31,6 @@ class LangOptions;
 namespace refold {
 
 class LineDirectiveInserter;
-class RefoldMacroStateProof;
 class RefoldModel;
 class RefoldPathIdentity;
 class RefoldPreprocessingStructureIndex;
@@ -51,7 +50,6 @@ public:
     const RefoldModel &model;
     const RefoldPathIdentity &pathIdentity;
     const LineDirectiveInserter &lineDirs;
-    const RefoldMacroStateProof &macroStateProof;
     const clang::LangOptions &lexLang;
   };
 

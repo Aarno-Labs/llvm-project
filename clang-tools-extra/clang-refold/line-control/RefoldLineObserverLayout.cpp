@@ -9,7 +9,7 @@
 
 #include "line-control/RefoldLineObserverLayout.h"
 
-#include "edit/RefoldTextEditAssembler.h"
+#include "edit/RefoldTextEditCertifier.h"
 #include "include/IncludeSpellingHelpers.h"
 #include "line-control/LineControlEditHelpers.h"
 #include "line-control/LineDirectiveInserter.h"
@@ -33,50 +33,6 @@ using namespace llvm;
 
 namespace clang {
 namespace refold {
-
-bool RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-    StringRef invSpanText, const RefoldModel::MacroInvocation &m) {
-  if (invSpanText.empty() || m.name.empty())
-    return false;
-
-  const size_t n = invSpanText.size();
-  size_t i = 0;
-
-  // Match against the spelled callsite prefix, ignoring only leading trivia
-  // before the macro name.
-  while (i < n && stringutils::isWs(invSpanText[i]))
-    i++;
-
-  if (i >= n)
-    return false;
-
-  // The callsite must begin with an identifier spelling. This intentionally
-  // avoids substring matching inside larger expressions or tokens.
-  const char c0 = invSpanText[i];
-  if (!stringutils::isIdentStart(c0))
-    return false;
-
-  size_t j = i + 1;
-  while (j < n && stringutils::isIdentPart(invSpanText[j]))
-    j++;
-
-  // The leading identifier must be exactly the invocation's macro name.
-  StringRef ident = invSpanText.slice(i, j);
-  if (ident != m.name)
-    return false;
-
-  // Object-like macros have no required argument-list syntax, so the leading
-  // identifier match is enough to identify the callsite prefix.
-  if (m.subkind != "func")
-    return true;
-
-  // Function-like macros must be followed by an opening parenthesis, with
-  // ordinary whitespace allowed between the macro name and '('.
-  while (j < n && stringutils::isWs(invSpanText[j]))
-    j++;
-
-  return (j < n && invSpanText[j] == '(');
-}
 
 /// Return true iff \p text is only horizontal whitespace or newlines, and it
 /// contains at least one physical newline.  This is used to prove that a source
@@ -744,15 +700,15 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
                   std::nullopt, {},      {},          {}};
     const PreprocessingStructureKind lineControlKinds[] = {
         PreprocessingStructureKind::LineControl};
-    if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
+    if (!textEditCertifier_.AuthorizeProtectedSourceIntervals(
             edit, ProtectedSourceEditAuthorityKind::LineControlRepair, tuPath,
             std::nullopt, tuBytes, editBegin, editEnd, lineControlKinds,
             /*requireProtectedInterval=*/false,
             /*requestTerminalOnFailure=*/false))
       return false;
-    textEditAssembler_.CertifyTextEditMaterializedBByteRange(edit, prevBEnd,
+    textEditCertifier_.CertifyTextEditMaterializedBByteRange(edit, prevBEnd,
                                                              initialBEnd);
-    textEditAssembler_.AttachAcceptedResultCarrier(
+    textEditCertifier_.AttachAcceptedResultCarrier(
         edit,
         acceptedCandidateBuilder_.BuildAcceptedSpecializedTUTextEditCandidate(
             AcceptedPathKind::TUByteSpanConservativeEdit, editBegin, editEnd,
@@ -864,15 +820,15 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
                   std::nullopt, {},      {},          {}};
     const PreprocessingStructureKind lineControlKinds[] = {
         PreprocessingStructureKind::LineControl};
-    if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
+    if (!textEditCertifier_.AuthorizeProtectedSourceIntervals(
             edit, ProtectedSourceEditAuthorityKind::LineControlRepair, tuPath,
             std::nullopt, tuBytes, editBegin, editEnd, lineControlKinds,
             /*requireProtectedInterval=*/false,
             /*requestTerminalOnFailure=*/false))
       return false;
-    textEditAssembler_.CertifyTextEditMaterializedBByteRange(
+    textEditCertifier_.CertifyTextEditMaterializedBByteRange(
         edit, collapsedGap->leftBEnd, firstObserverBBegin);
-    textEditAssembler_.AttachAcceptedResultCarrier(
+    textEditCertifier_.AttachAcceptedResultCarrier(
         edit,
         acceptedCandidateBuilder_.BuildAcceptedSpecializedTUTextEditCandidate(
             AcceptedPathKind::TUByteSpanConservativeEdit, editBegin, editEnd,
@@ -1161,6 +1117,170 @@ bool RefoldLineObserverLayout::LineResyncShouldDeferToConditionalJoin(
   }
 
   return false;
+}
+
+ResyncOutcome RefoldLineObserverLayout::ApplyResyncOrPend(
+    StringRef originalFileText, uint64_t start, uint64_t end,
+    StringRef replacement, StringRef fileSpellingForDirective,
+    std::optional<uint64_t> ownerIncludeId) const {
+  // If the replacement preserves the original newline count, no line-state
+  // correction is needed.
+  size_t origNl = stringutils::countNewlines(originalFileText, start, end);
+  size_t replNl =
+      stringutils::countNewlines(replacement, 0, replacement.size());
+  if (origNl == replNl)
+    return ResyncOutcome(replacement.str(), std::nullopt);
+
+  // Newline drift is only observable when a preserved suffix builtin depends
+  // on the logical line component. Do not synthesize #line directives merely
+  // because physical newline counts changed: materialized __LINE__ values do
+  // not observe the stream, and preserved __FILE__/__FILE_NAME__ only observe
+  // the file component, which newline drift alone does not change.
+  LineStateObserverDemand demand =
+      lineControlProof_.OwnerSuffixLineStateObserverDemand(
+          ownerIncludeId, fileSpellingForDirective, end);
+  const OwnerStateBoundary suffixBoundary =
+      OwnerStateBoundary::FromSource(OwnerSourceRange::From(
+          fileSpellingForDirective, end, end, ownerIncludeId));
+  const bool resyncPruneEligible = demand.PrunableByCompactFinalLineControl();
+
+  auto checkLineControlStateWithWitness =
+      [&](OwnerStateComponent component, StateMutationKind mutation,
+          SuffixStabilityWitness witness, StringRef detail,
+          bool requireKnownObserver) {
+        return ownerStateProof_.CheckStateTransitionAcrossEditBoundary(
+            suffixBoundary, component, mutation, std::move(witness),
+            "linedir/resync", detail, requireKnownObserver);
+      };
+
+  auto checkLineControlStateRepaired =
+      [&](OwnerStateComponent component, StateMutationKind mutation,
+          StringRef detail, bool requireKnownObserver = false) {
+        return checkLineControlStateWithWitness(
+            component, mutation,
+            ownerStateProof_.BuildStateTransitionWitness(
+                SuffixStabilityWitnessKind::StateRepair, component,
+                suffixBoundary, detail),
+            detail, requireKnownObserver);
+      };
+
+  auto checkLineControlStateTerminal =
+      [&](OwnerStateComponent component, StateMutationKind mutation,
+          StringRef detail, bool requireKnownObserver = true) {
+        return checkLineControlStateWithWitness(
+            component, mutation,
+            ownerStateProof_.BuildStateTransitionWitness(
+                SuffixStabilityWitnessKind::TerminalStateFailure, component,
+                suffixBoundary, detail),
+            detail, requireKnownObserver);
+      };
+
+  if (!demand.needsLine) {
+    return ResyncOutcome(replacement.str(), std::nullopt);
+  }
+
+  // A preserved suffix __LINE__ would otherwise resume at a different logical
+  // line. Use the source-authored line-control state at `end`, not merely the
+  // physical line in this owner file: `#line`, `# line`, and `# <number>` can
+  // make a copied suffix observe a virtual file/line.
+  LineDirectiveLocation resumeLoc =
+      LineDirectiveInserter::LogicalLocationAtOffset(
+          originalFileText, end, fileSpellingForDirective, model_,
+          fileSpellingForDirective, ownerIncludeId);
+
+  if (!resumeLoc.producerProven) {
+    if (resumeLoc.unprovenLineControlDirectiveOffset &&
+        *resumeLoc.unprovenLineControlDirectiveOffset >= start &&
+        *resumeLoc.unprovenLineControlDirectiveOffset < end) {
+      (void)checkLineControlStateTerminal(
+          OwnerStateComponent::LineNumber, StateMutationKind::Consumed,
+          llvm::formatv(
+              "newline-drift replacement consumes unmodeled source #line "
+              "directive at byte {0} in owner '{1}'",
+              *resumeLoc.unprovenLineControlDirectiveOffset,
+              fileSpellingForDirective)
+              .str(),
+          /*requireKnownObserver=*/true);
+      return ResyncOutcome(replacement.str(), std::nullopt);
+    }
+
+    if (std::optional<LineDirectiveLocation> producerLoc =
+            lineControlProof_.ProducerBackedLineControlLocationAt(
+                originalFileText, fileSpellingForDirective, ownerIncludeId,
+                start, end)) {
+      resumeLoc = std::move(*producerLoc);
+    } else {
+      return ResyncOutcome(replacement.str(), std::nullopt);
+    }
+  }
+
+  const bool deferToConditionalJoin = LineResyncShouldDeferToConditionalJoin(
+      fileSpellingForDirective, ownerIncludeId, end);
+  if (deferToConditionalJoin) {
+    (void)checkLineControlStateRepaired(
+        OwnerStateComponent::LineNumber, StateMutationKind::MovedLater,
+        llvm::formatv("deferred synthetic #line repair for newline drift at "
+                      "owner byte {0}",
+                      end)
+            .str(),
+        /*requireKnownObserver=*/false);
+    return ResyncOutcome{replacement.str(),
+                         PendingResync{fileSpellingForDirective, ownerIncludeId,
+                                       resyncPruneEligible,
+                                       resumeLoc.fileSpelling, resumeLoc.lineNo,
+                                       end,
+                                       /*deferToJoin=*/true}};
+  }
+
+  std::string injected = lineDirs_.MaybeAppendResyncAfterReplacement(
+      originalFileText, start, end, replacement, resumeLoc);
+  const std::string resyncDirective =
+      lineDirs_.FormatLineDirective(resumeLoc.lineNo, resumeLoc.fileSpelling);
+
+  // A changed result means the directive was inserted directly into this
+  // replacement, so no deferred resync state needs to be carried forward.
+  if (injected != replacement) {
+    (void)checkLineControlStateRepaired(
+        OwnerStateComponent::LineNumber, StateMutationKind::Replayed,
+        llvm::formatv("local synthetic #line repair for newline drift at "
+                      "owner byte {0}",
+                      end)
+            .str(),
+        /*requireKnownObserver=*/false);
+
+    std::vector<FinalLineControlPruneCandidate> candidates;
+    if (resyncPruneEligible) {
+      if (std::optional<FinalLineControlPruneCandidate> candidate =
+              makeInsertedSyntheticLineControlPruneCandidate(
+                  replacement, injected, resyncDirective,
+                  FinalLineDirective::Origin::SyntheticNewlineResync,
+                  FinalLineControlOwnerKey(fileSpellingForDirective.str(),
+                                           ownerIncludeId),
+                  FinalLineControlObligation::CosmeticSyntheticResync)) {
+        candidates.push_back(std::move(*candidate));
+      }
+    }
+
+    return ResyncOutcome(std::move(injected), std::nullopt,
+                         std::move(candidates));
+  }
+
+  // Local injection was not safe, usually because the replacement rejoins
+  // untouched bytes mid-line. Carry a pending resync so the next copied
+  // original slice can emit the directive at a valid boundary.
+  (void)checkLineControlStateRepaired(
+      OwnerStateComponent::LineNumber, StateMutationKind::MovedLater,
+      llvm::formatv("pending synthetic #line repair for newline drift at "
+                    "owner byte {0}",
+                    end)
+          .str(),
+      /*requireKnownObserver=*/false);
+
+  return ResyncOutcome{replacement.str(),
+                       PendingResync{fileSpellingForDirective, ownerIncludeId,
+                                     resyncPruneEligible,
+                                     resumeLoc.fileSpelling, resumeLoc.lineNo,
+                                     end}};
 }
 
 LineControlWrappedText

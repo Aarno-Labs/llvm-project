@@ -4,10 +4,12 @@
 
 #include "edit/RefoldPatchTypes.h"
 #include "edit/RefoldTextEditAssembler.h"
+#include "edit/RefoldTextEditCertifier.h"
 #include "include/RefoldIncludeMaterializationScheduler.h"
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlProof.h"
+#include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroTopology.h"
 #include "model/RefoldModel.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
@@ -44,6 +46,8 @@ public:
         lineControlProof_(*deps.lineControlProof), lineDirs_(*deps.lineDirs),
         macroStateRepairPlanner_(*deps.macroStateRepairPlanner),
         textEditAssembler_(*deps.textEditAssembler),
+        textEditCertifier_(*deps.textEditCertifier),
+        lineObserverLayout_(*deps.lineObserverLayout),
         terminalSink_(*deps.terminalSink),
         structuralHunkDispatcher_(*request.structuralHunkDispatcher),
         includeMaterializationScheduler_(
@@ -118,6 +122,8 @@ private:
   const LineDirectiveInserter &lineDirs_;
   const RefoldMacroStateRepairPlanner &macroStateRepairPlanner_;
   const RefoldTextEditAssembler &textEditAssembler_;
+  const RefoldTextEditCertifier &textEditCertifier_;
+  const RefoldLineObserverLayout &lineObserverLayout_;
   RefoldTerminalProofSink &terminalSink_;
   RefoldStructuralHunkDispatcher &structuralHunkDispatcher_;
   RefoldIncludeMaterializationScheduler &includeMaterializationScheduler_;
@@ -199,7 +205,7 @@ bool FinalTUEmissionContext::MacroPatchIsShadowedByAccepted(
 TextEdit
 FinalTUEmissionContext::BuildTUMacroPatchEdit(const MacroPatch &patch,
                                               uint64_t patchEnd) const {
-  ResyncOutcome resync = textEditAssembler_.ApplyResyncOrPend(
+  ResyncOutcome resync = lineObserverLayout_.ApplyResyncOrPend(
       request_.tuBytes, patch.invRange.begin, patchEnd, patch.replacement,
       request_.tuPath);
 
@@ -219,16 +225,16 @@ FinalTUEmissionContext::BuildTUMacroPatchEdit(const MacroPatch &patch,
 
   if (auto bRange =
           textEditAssembler_.MacroPatchMaterializedBByteRange(patch)) {
-    textEditAssembler_.CertifyTextEditMaterializedBByteRange(
+    textEditCertifier_.CertifyTextEditMaterializedBByteRange(
         edit, bRange->first, bRange->second);
   }
   if (auto outRange =
           textEditAssembler_.MacroPatchMaterializedOutputTextRange(patch)) {
-    textEditAssembler_.CertifyTextEditMaterializedOutputTextRange(
+    textEditCertifier_.CertifyTextEditMaterializedOutputTextRange(
         edit, outRange->first, outRange->second);
   }
 
-  textEditAssembler_.AttachAcceptedResultCarrier(
+  textEditCertifier_.AttachAcceptedResultCarrier(
       edit, deps_.acceptedCandidateBuilder->BuildAcceptedEmittedMacroCandidate(
                 patch));
   return edit;

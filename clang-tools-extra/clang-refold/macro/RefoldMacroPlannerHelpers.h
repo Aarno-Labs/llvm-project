@@ -20,6 +20,7 @@
 #include "model/RefoldToken.h"
 #include "proof/RefoldOwnerStateTypes.h"
 #include "source/RefoldDiffTypes.h"
+#include "support/StringUtils.h"
 
 #include "clang/Basic/LangOptions.h"
 
@@ -90,10 +91,6 @@ struct InvocationActualLayout {
     return contentRanges;
   }
 
-  ActualContentRange rangeAt(size_t index) const {
-    const auto &range = contentRanges[index];
-    return ActualContentRange{range.first, range.second};
-  }
 };
 
 /// Shared read-only state for the args-only planning pipeline.
@@ -436,6 +433,55 @@ inline diffutils::Hunk trimCommonEdgeTokens(diffutils::Hunk hunk,
     --hunk.bEnd;
   }
   return hunk;
+}
+
+/// Return true iff a raw source span starts with the recorded macro callsite
+/// spelling.  This is a token-boundary safety check for source-preserving
+/// macro rewrite paths; it depends only on the source slice and producer macro
+/// metadata.
+inline bool
+invocationSpanMatchesCallsitePrefix(llvm::StringRef invSpanText,
+                                    const RefoldModel::MacroInvocation &m) {
+  if (invSpanText.empty() || m.name.empty())
+    return false;
+
+  const size_t n = invSpanText.size();
+  size_t i = 0;
+
+  // Match against the spelled callsite prefix, ignoring only leading trivia
+  // before the macro name.
+  while (i < n && stringutils::isWs(invSpanText[i]))
+    i++;
+
+  if (i >= n)
+    return false;
+
+  // The callsite must begin with an identifier spelling. This intentionally
+  // avoids substring matching inside larger expressions or tokens.
+  const char c0 = invSpanText[i];
+  if (!stringutils::isIdentStart(c0))
+    return false;
+
+  size_t j = i + 1;
+  while (j < n && stringutils::isIdentPart(invSpanText[j]))
+    j++;
+
+  // The leading identifier must be exactly the invocation's macro name.
+  llvm::StringRef ident = invSpanText.slice(i, j);
+  if (ident != m.name)
+    return false;
+
+  // Object-like macros have no required argument-list syntax, so the leading
+  // identifier match is enough to identify the callsite prefix.
+  if (m.subkind != "func")
+    return true;
+
+  // Function-like macros must be followed by an opening parenthesis, with
+  // ordinary whitespace allowed between the macro name and '('.
+  while (j < n && stringutils::isWs(invSpanText[j]))
+    j++;
+
+  return (j < n && invSpanText[j] == '(');
 }
 
 /// Return true when the given invocation argument contributes to any pasted

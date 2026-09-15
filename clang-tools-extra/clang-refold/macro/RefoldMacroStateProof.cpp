@@ -313,100 +313,6 @@ bool RefoldMacroStateProof::SourceChunkObservesMacroStateDirectiveWhenCrossed(
       .has_value();
 }
 
-/// Recover the complete physical source interval for a recorded macro-state
-/// directive line.
-///
-/// When the producer recorded the directive's physical extent, that pair *is*
-/// the interval and is returned directly.  Otherwise the interval is recovered
-/// from the recorded spelling: MacroDirective::siteB is anchored at the macro
-/// name rather than at the `#`, so this reparses MacroDirective::text to find
-/// the name offset, translates that anchor back to the line start, and accepts
-/// the result only if the file bytes there equal the recorded text exactly.
-///
-/// The two paths are not interchangeable in strength.  MacroDirective::text is
-/// rendered from parsed macro tokens with canonical spacing, so the text
-/// comparison is a proof only for a directive whose source spelling already
-/// matches that rendering; it necessarily fails for tabs, runs of spaces, and
-/// backslash continuations, and no transform recovers the source bytes from a
-/// pretty-printer's output.  The recorded extent replaces that inference with a
-/// fact and therefore does not need the comparison.
-std::optional<MacroStateDirectiveLineInterval>
-RefoldMacroStateProof::RecoverMacroStateDirectiveLineInterval(
-    const RefoldModel::MacroDirective &directive, StringRef expectedPath,
-    StringRef fileBytes, std::optional<uint64_t> requiredOwnerIncludeId) const {
-  if (!directive.IsMacroStateDirective())
-    return std::nullopt;
-  if (directive.name.empty() || directive.text.empty())
-    return std::nullopt;
-  if (!paths_.PathsEqual(directive.sitePath, expectedPath))
-    return std::nullopt;
-
-  if (requiredOwnerIncludeId) {
-    if (!directive.ownerIncludeId ||
-        *directive.ownerIncludeId != *requiredOwnerIncludeId)
-      return std::nullopt;
-  } else if (directive.ownerIncludeId) {
-    return std::nullopt;
-  }
-
-  // Producer-recorded physical extent.  The model parser already proved the
-  // pair is ordered and contains the name-anchored site range; only its fit to
-  // these particular file bytes remains to be checked here, because the caller
-  // supplies the buffer.
-  if (directive.directiveLineB && directive.directiveLineE) {
-    if (*directive.directiveLineE > fileBytes.size())
-      return std::nullopt;
-
-    MacroStateDirectiveLineInterval recorded;
-    recorded.directive = &directive;
-    recorded.begin = *directive.directiveLineB;
-    recorded.end = *directive.directiveLineE;
-    recorded.name = directive.name;
-    return recorded;
-  }
-
-  StringRef text = directive.text;
-  size_t pos = 0;
-  stringutils::skipNonNewlineWs(text, pos);
-  if (pos >= text.size() || text[pos] != '#')
-    return std::nullopt;
-  ++pos;
-  stringutils::skipNonNewlineWs(text, pos);
-
-  StringRef keyword = directive.subkind.drop_front();
-  if (!text.substr(pos).starts_with(keyword))
-    return std::nullopt;
-  pos += keyword.size();
-  if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-    return std::nullopt;
-  stringutils::skipNonNewlineWs(text, pos);
-
-  const size_t nameTextBegin = pos;
-  if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
-    return std::nullopt;
-  ++pos;
-  while (pos < text.size() && stringutils::isIdentPart(text[pos]))
-    ++pos;
-  if (text.slice(nameTextBegin, pos) != directive.name)
-    return std::nullopt;
-
-  if (directive.siteB < nameTextBegin)
-    return std::nullopt;
-  const uint64_t fileBegin = directive.siteB - nameTextBegin;
-  const uint64_t fileEnd = fileBegin + text.size();
-  if (fileBegin >= fileEnd || fileEnd > fileBytes.size())
-    return std::nullopt;
-  if (fileBytes.slice(fileBegin, fileEnd) != text)
-    return std::nullopt;
-
-  MacroStateDirectiveLineInterval result;
-  result.directive = &directive;
-  result.begin = fileBegin;
-  result.end = fileEnd;
-  result.name = directive.name;
-  return result;
-}
-
 bool RefoldMacroStateProof::DefinitionIsLiveAtOwnerByte(
     const RefoldModel::MacroDirective &definition, StringRef macroName,
     StringRef expectedPath, StringRef fileBytes,
@@ -415,8 +321,8 @@ bool RefoldMacroStateProof::DefinitionIsLiveAtOwnerByte(
   uint64_t activeEnd = 0;
   for (const auto &candidate : model_.GetMacroDirectives()) {
     std::optional<MacroStateDirectiveLineInterval> piece =
-        RecoverMacroStateDirectiveLineInterval(
-            candidate, expectedPath, fileBytes, requiredOwnerIncludeId);
+        recoverMacroStateDirectiveLineInterval(
+            paths_, candidate, expectedPath, fileBytes, requiredOwnerIncludeId);
     if (!piece || piece->end > offset)
       continue;
     if (StringRef(piece->name) != macroName)
@@ -590,8 +496,9 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
 
   auto materializedHeaderMacroStateDirectiveInterval =
       [&](const RefoldModel::MacroDirective &directive) {
-        return RecoverMacroStateDirectiveLineInterval(
-            directive, headerPath, bytes, std::optional<uint64_t>(includeId));
+        return recoverMacroStateDirectiveLineInterval(
+            paths_, directive, headerPath, bytes,
+            std::optional<uint64_t>(includeId));
       };
 
   // A macro-state repair interval must not overlap an edit already staged for

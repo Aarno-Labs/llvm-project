@@ -57,6 +57,7 @@ class RefoldLineObserverLayout;
 class RefoldPragmaOnceGuardRewriter;
 class RefoldSourceMapper;
 class RefoldTextEditAssembler;
+class RefoldTextEditCertifier;
 
 class RefoldIncludeInsertionPlanner;
 
@@ -112,6 +113,7 @@ public:
       const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
       const RefoldAcceptedResultRanker &acceptedResultRanker,
       const RefoldTextEditAssembler &textEditAssembler,
+      const RefoldTextEditCertifier &textEditCertifier,
       const RefoldPragmaOnceGuardRewriter &pragmaOnceGuards,
       const RefoldTerminalProofSink &terminalSink,
       const clang::LangOptions &lexLang)
@@ -127,6 +129,7 @@ public:
         acceptedCandidateBuilder_(acceptedCandidateBuilder),
         acceptedResultRanker_(acceptedResultRanker),
         textEditAssembler_(textEditAssembler),
+        textEditCertifier_(textEditCertifier),
         pragmaOnceGuards_(pragmaOnceGuards), terminalSink_(terminalSink),
         lexLang_(lexLang) {}
 
@@ -277,6 +280,7 @@ private:
   /// Borrowed only to hand to the header-local include edit planner.
   const RefoldAcceptedResultRanker &acceptedResultRanker_;
   const RefoldTextEditAssembler &textEditAssembler_;
+  const RefoldTextEditCertifier &textEditCertifier_;
   const RefoldPragmaOnceGuardRewriter &pragmaOnceGuards_;
   const RefoldTerminalProofSink &terminalSink_;
   const clang::LangOptions &lexLang_;

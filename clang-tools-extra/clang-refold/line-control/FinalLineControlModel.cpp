@@ -5,38 +5,27 @@
 // This file implements the compact proof carriers, source mappings,
 // fixed-point candidate ordering, and validation-backed deletion machinery
 // used to remove redundant synthetic line-control directives from the final
-// emitted stream.  It also implements `buildFinalLineControlValidationCallback`
-// and its two static helpers (`writePruneValidationSource`,
-// `preprocessedTokensEqualForLinePrune`), which together produce the
-// executable preprocessing oracle the pruner consults for each proposed
-// deletion.
+// emitted stream.  The executable preprocessing oracle the pruner consults for
+// each proposed deletion is injected; its factory,
+// `buildFinalLineControlValidationCallback`, lives in
+// source/RefoldPreprocessRecheck.cpp.
 //
 //===----------------------------------------------------------------------===//
 
 #include "line-control/FinalLineControlModel.h"
 
-#include "model/RefoldToken.h"
 #include "proof/RefoldProofVocabulary.h"
-#include "proof/RefoldTheoremAudit.h"
-#include "source/RefoldPreprocessRecheck.h"
-#include "support/RefoldLangOptions.h"
 #include "support/StringUtils.h"
 
 #include "clang/Basic/LangOptions.h"
 
-#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/Support/Error.h"
-#include "llvm/Support/FileSystem.h"
-#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <string>
-#include <system_error>
 #include <vector>
 
 using namespace llvm;
@@ -667,73 +656,6 @@ FinalLineControlPruneResult PruneFinalLineControlDirectives(
   return result;
 }
 
-static Error writePruneValidationSource(StringRef path, StringRef bytes) {
-  std::error_code ec;
-  raw_fd_ostream os(path, ec, sys::fs::OF_Text);
-  if (ec)
-    return createStringError(
-        ec, formatv("cannot write pruning validation source '{0}'", path));
-  os << bytes;
-  os.close();
-  if (os.has_error())
-    return createStringError(
-        os.error(),
-        formatv("failed to flush pruning validation source '{0}'", path));
-  return Error::success();
-}
-
-/// Return true iff two already-preprocessed `-E -P` byte streams have the same
-/// token sequence.
-///
-/// Final line-control pruning normally requires byte-for-byte preprocessing
-/// equivalence.  That is intentionally stronger than the refolding checker, but
-/// it is too strong for stale `#line` directives whose only remaining effect is
-/// Clang's cosmetic blank-line accounting around zero-token/comment-only source
-/// lines.  In those cases the correct semantic oracle is the same one used by
-/// `--check`: the emitted source must replay to the same preprocessed token
-/// stream, including any materialized `__LINE__`, `__FILE__`, and
-/// `__FILE_NAME__` expansions.
-static bool
-preprocessedTokensEqualForLinePrune(StringRef currentPP, StringRef candidatePP,
-                                    const RefoldModel::PreprocessContext &ctx,
-                                    std::string &reason) {
-  const LangOptions lexLang = makeRefoldLexLangOptions(ctx.lang, ctx.argv);
-  std::vector<PPTok> currentTokens;
-  std::vector<PPTok> candidateTokens;
-  std::vector<std::size_t> currentOffsets;
-  std::vector<std::size_t> candidateOffsets;
-
-  lexPPTokens(currentPP.str(), currentTokens, currentOffsets, lexLang);
-  lexPPTokens(candidatePP.str(), candidateTokens, candidateOffsets, lexLang);
-
-  const size_t n = std::min(currentTokens.size(), candidateTokens.size());
-  for (size_t i = 0; i < n; ++i) {
-    if (currentTokens[i].spelling == candidateTokens[i].spelling)
-      continue;
-
-    reason = formatv("preprocessed bytes differ and token streams differ at "
-                     "index {0}: current='{1}' candidate='{2}'",
-                     i,
-                     stringutils::showWs(stringutils::clip(
-                         StringRef(currentTokens[i].spelling), 100)),
-                     stringutils::showWs(stringutils::clip(
-                         StringRef(candidateTokens[i].spelling), 100)))
-                 .str();
-    return false;
-  }
-
-  if (currentTokens.size() != candidateTokens.size()) {
-    reason = formatv("preprocessed bytes differ and token counts differ: "
-                     "current={0} candidate={1}",
-                     currentTokens.size(), candidateTokens.size())
-                 .str();
-    return false;
-  }
-
-  reason.clear();
-  return true;
-}
-
 std::optional<std::string>
 producerSourceAnchorPath(StringRef producerSourcePath,
                          const RefoldModel::PreprocessContext &ctx) {
@@ -751,180 +673,6 @@ producerSourceAnchorPath(StringRef producerSourcePath,
   SmallString<256> resolved(ctx.cwd);
   sys::path::append(resolved, producerSourcePath);
   return resolved.str().str();
-}
-
-/// Create an internal final-pruning validation callback.
-///
-/// The callback does not implement a user-facing `--check` mode.  It is an
-/// executable guard for one proposed `#line` deletion: preprocess the current
-/// accepted final source and the candidate final source through the same
-/// `clang -E -P` context, using one stable temporary source path located beside
-/// the producer's own source.  Reusing the same source path for both inputs
-/// keeps `__FILE__` and quoted-include lookup comparable, and anchoring on the
-/// producer's directory is what makes a quoted include resolve to the header the
-/// producer actually read.  Byte-for-byte equality is accepted first; if the
-/// only difference is preprocessing trivia, token-sequence equality is also
-/// accepted because the refolding soundness oracle is token equivalence.
-FinalSourcePreprocessCallback
-buildFinalSourcePreprocessCallback(StringRef anchorPath,
-                                   const RefoldModel::PreprocessContext &ctx,
-                                   ArrayRef<std::string> verifyIncludeDirs) {
-  SmallString<256> outputDir(anchorPath);
-  sys::path::remove_filename(outputDir);
-  if (outputDir.empty())
-    outputDir = ".";
-
-  SmallString<256> model(outputDir);
-  sys::path::append(model, ".clang-refold-observer-audit-%%%%%%.c");
-  std::string modelText = model.str().str();
-
-  std::vector<std::string> extraArgs;
-  extraArgs.reserve(verifyIncludeDirs.size() * 2);
-  for (const std::string &dir : verifyIncludeDirs) {
-    extraArgs.push_back("-I");
-    extraArgs.push_back(dir);
-  }
-
-  return [modelText, ctx,
-          extraArgs](StringRef finalSource) -> std::optional<std::string> {
-    SmallString<256> tmpPath;
-    int tmpFD = -1;
-    if (sys::fs::createUniqueFile(modelText, tmpFD, tmpPath))
-      return std::nullopt;
-    {
-      raw_fd_ostream closeStream(tmpFD, /*shouldClose=*/true);
-      closeStream.close();
-    }
-    auto cleanup = make_scope_exit([&]() { (void)sys::fs::remove(tmpPath); });
-
-    if (Error err = writePruneValidationSource(tmpPath, finalSource)) {
-      consumeError(std::move(err));
-      return std::nullopt;
-    }
-    auto ppOrErr = preprocessToBytes(tmpPath, ctx, extraArgs);
-    if (!ppOrErr) {
-      consumeError(ppOrErr.takeError());
-      return std::nullopt;
-    }
-    return std::move(*ppOrErr);
-  };
-}
-
-FinalLineControlValidationCallback buildFinalLineControlValidationCallback(
-    StringRef outputPath, const RefoldModel::PreprocessContext &ctx) {
-  SmallString<256> outputDir(outputPath);
-  sys::path::remove_filename(outputDir);
-  if (outputDir.empty())
-    outputDir = ".";
-
-  SmallString<256> model(outputDir);
-  sys::path::append(model, ".clang-refold-line-prune-%%%%%%.c");
-  std::string modelText = model.str().str();
-
-  return [modelText, ctx](StringRef currentOutput, StringRef candidateOutput,
-                          std::string &reason) -> bool {
-    SmallString<256> tmpPath;
-    int tmpFD = -1;
-    if (std::error_code ec =
-            sys::fs::createUniqueFile(modelText, tmpFD, tmpPath)) {
-      reason = formatv("could not create pruning validation source '{0}': {1}",
-                       modelText, ec.message())
-                   .str();
-      return false;
-    }
-
-    {
-      raw_fd_ostream closeStream(tmpFD, /*shouldClose=*/true);
-      closeStream.close();
-    }
-
-    auto cleanup = make_scope_exit([&]() { (void)sys::fs::remove(tmpPath); });
-
-    if (Error err = writePruneValidationSource(tmpPath, currentOutput)) {
-      reason = toString(std::move(err));
-      return false;
-    }
-
-    auto currentPPOrErr = preprocessToBytes(tmpPath, ctx);
-    if (!currentPPOrErr) {
-      reason = formatv("failed to preprocess current final source: {0}",
-                       toString(currentPPOrErr.takeError()))
-                   .str();
-      return false;
-    }
-
-    if (Error err = writePruneValidationSource(tmpPath, candidateOutput)) {
-      reason = toString(std::move(err));
-      return false;
-    }
-
-    auto candidatePPOrErr = preprocessToBytes(tmpPath, ctx);
-    if (!candidatePPOrErr) {
-      reason = formatv("failed to preprocess candidate final source: {0}",
-                       toString(candidatePPOrErr.takeError()))
-                   .str();
-      return false;
-    }
-
-    if (*currentPPOrErr != *candidatePPOrErr) {
-      if (!preprocessedTokensEqualForLinePrune(*currentPPOrErr,
-                                               *candidatePPOrErr, ctx, reason))
-        return false;
-      reason.clear();
-      return true;
-    }
-
-    reason.clear();
-    return true;
-  };
-}
-
-bool AuditFinalLineControlAuthorityContract(
-    const RefoldTheoremAudit &audit,
-    const FinalLineControlAuthorityContract &authority, StringRef role) {
-  if (!audit.IsNoLegacyAuditEnabled())
-    return true;
-
-  auto report = [&](StringRef detail) {
-    audit.ReportNoLegacyAuditFinding(
-        RefoldTheoremAudit::MakeLegacyAuditEvidence(
-            LegacyPathKind::FinalLineControlLivenessWithoutObligation, role,
-            detail));
-  };
-
-  if (!authority.compactRemovalProofIsAuthoritative)
-    report("final line-control compact removal proof is not authoritative");
-  if (!authority.fixedPointPruningIsAuthoritative)
-    report("final line-control fixed-point pruning is not authoritative");
-  if (!authority.validationCallbackIsAuthoritative)
-    report("final line-control validation callback is not authoritative");
-
-  return authority.IsClosedUnderCompactProofs();
-}
-
-bool AuditFinalLineControlRemovalProofPopulation(
-    const RefoldTheoremAudit &audit,
-    ArrayRef<FinalLineControlPruneCandidate> candidates, StringRef role) {
-  if (!audit.IsNoLegacyAuditEnabled())
-    return true;
-
-  size_t missing = 0;
-  for (const FinalLineControlPruneCandidate &candidate : candidates)
-    if (!HasCompleteFinalLineControlProof(candidate))
-      ++missing;
-
-  if (missing == 0)
-    return true;
-
-  audit.ReportNoLegacyAuditFinding(RefoldTheoremAudit::MakeLegacyAuditEvidence(
-      LegacyPathKind::FinalLineControlLivenessWithoutObligation, role,
-      llvm::formatv(
-          "{0} final line-control prune candidate(s) lack compact "
-          "obligation/removal proof; generation sites must populate both "
-          "facts before compact final-line-control pruning may run",
-          missing)
-          .str()));
-  return false;
 }
 
 } // namespace refold

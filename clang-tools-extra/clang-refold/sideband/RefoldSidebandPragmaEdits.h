@@ -37,13 +37,14 @@
 namespace clang {
 namespace refold {
 
+class RefoldLineObserverLayout;
 class RefoldModel;
 class RefoldPathIdentity;
 class RefoldAcceptedCandidateBuilder;
 class RefoldStructuralHunkDispatcher;
-class RefoldTUEditPlanner;
+class RefoldTUAnchorProof;
 class RefoldTerminalProofSink;
-class RefoldTextEditAssembler;
+class RefoldTextEditCertifier;
 
 /// One preserved `#pragma` directive line recovered from a raw `-E -P` replay
 /// surface.
@@ -117,6 +118,20 @@ bool buildSidebandPragmaSourceEdits(
     llvm::ArrayRef<PPTok> rawBToks, llvm::ArrayRef<std::size_t> rawBTokOff,
     std::vector<SidebandPragmaEdit> &edits);
 
+/// Validate one sideband pragma proof and report a classified terminal fallback
+/// request when validation fails.
+///
+/// This is the shared fail-closed reporting gate for TU and include-owned
+/// sideband edits.  Keeping `validateSidebandPragmaEditProof` pure and the
+/// failure translation here prevents each caller from hand-encoding the same
+/// terminal-fallback obligation, reason, and diagnostic detail.  `traceSuccess`
+/// preserves the engine-level owner-local trace without forcing include
+/// materialization to add new success logs.
+bool validateAndReportSidebandPragmaEditProof(
+    const SidebandPragmaEdit &edit, uint64_t bSize,
+    const RefoldTerminalProofSink &terminalSink, llvm::StringRef stage,
+    bool traceSuccess);
+
 /// Validate each sideband pragma edit's proof carrier and append a source edit
 /// for every TU-owned sideband to the structural hunk dispatcher.
 ///
@@ -131,7 +146,8 @@ bool appendSidebandPragmaSourceEdits(
     llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     const RefoldModel &model, llvm::StringRef tuPath, llvm::StringRef tuBytes,
     const RefoldPathIdentity &pathIdentity,
-    const RefoldTextEditAssembler &textEditAssembler,
+    const RefoldTextEditCertifier &textEditCertifier,
+    const RefoldLineObserverLayout &lineObserverLayout,
     const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
     const RefoldTerminalProofSink &terminalSink,
     RefoldStructuralHunkDispatcher &structuralHunkDispatcher);
@@ -145,7 +161,7 @@ bool appendSidebandPragmaSourceEdits(
 /// When `requireVisibleReplayText` is true, the helper only matches sidebands
 /// whose replay text is actually emitted at the boundary.
 bool tuInsertionBeforeMaterializedInclude(
-    const RefoldTUEditPlanner &planner, const RefoldModel &model,
+    const RefoldTUAnchorProof &tuAnchorProof, const RefoldModel &model,
     llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     const diffutils::Hunk &h, llvm::StringRef tuPath,
     const std::pair<uint64_t, uint64_t> &span, bool requireVisibleReplayText);

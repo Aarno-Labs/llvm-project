@@ -44,6 +44,7 @@ namespace refold {
 
 class LineDirectiveInserter;
 class RefoldLineControlProof;
+class RefoldLineObserverLayout;
 class RefoldMacroStateProof;
 class RefoldOwnerStateProof;
 class RefoldPreprocessingStructureIndex;
@@ -51,7 +52,7 @@ class RefoldAcceptedCandidateBuilder;
 class RefoldAcceptedResultRanker;
 class RefoldSourceMapper;
 class RefoldTerminalProofSink;
-class RefoldTextEditAssembler;
+class RefoldTextEditCertifier;
 struct HeaderSourceNeutralityContext;
 
 /// Plans byte edits that are local to one materialized header include.
@@ -79,7 +80,8 @@ public:
       const RefoldOwnerStateProof &ownerStateProof,
       const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
       const RefoldAcceptedResultRanker &acceptedResultRanker,
-      const RefoldTextEditAssembler &textEditAssembler,
+      const RefoldTextEditCertifier &textEditCertifier,
+      const RefoldLineObserverLayout &lineObserverLayout,
       llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
       const clang::LangOptions &lexLang);
 
@@ -754,7 +756,8 @@ private:
   const RefoldOwnerStateProof &ownerStateProof_;
   const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder_;
   const RefoldAcceptedResultRanker &acceptedResultRanker_;
-  const RefoldTextEditAssembler &textEditAssembler_;
+  const RefoldTextEditCertifier &textEditCertifier_;
+  const RefoldLineObserverLayout &lineObserverLayout_;
   llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits_;
   const clang::LangOptions &lexLang_;
 

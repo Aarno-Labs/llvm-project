@@ -12,12 +12,13 @@
 #include "include/RefoldHeaderIncludeEditPlanner.h"
 
 #include "edit/RefoldSourceEnvelopeTiling.h"
-#include "edit/RefoldTextEditAssembler.h"
+#include "edit/RefoldTextEditCertifier.h"
 #include "include/IncludeSpellingHelpers.h"
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/LineControlEditHelpers.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlProof.h"
+#include "line-control/RefoldLineObserverLayout.h"
 #include "line-control/SourceLineDirectiveHelpers.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
@@ -201,7 +202,8 @@ RefoldHeaderIncludeEditPlanner::RefoldHeaderIncludeEditPlanner(
     const RefoldOwnerStateProof &ownerStateProof,
     const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
     const RefoldAcceptedResultRanker &acceptedResultRanker,
-    const RefoldTextEditAssembler &textEditAssembler,
+    const RefoldTextEditCertifier &textEditCertifier,
+    const RefoldLineObserverLayout &lineObserverLayout,
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     const clang::LangOptions &lexLang)
     : model_(model), bSource_(bSource), aToks_(aToks), bToks_(bToks),
@@ -211,7 +213,8 @@ RefoldHeaderIncludeEditPlanner::RefoldHeaderIncludeEditPlanner(
       ownerStateProof_(ownerStateProof),
       acceptedCandidateBuilder_(acceptedCandidateBuilder),
       acceptedResultRanker_(acceptedResultRanker),
-      textEditAssembler_(textEditAssembler),
+      textEditCertifier_(textEditCertifier),
+      lineObserverLayout_(lineObserverLayout),
       sidebandPragmaEdits_(sidebandPragmaEdits), lexLang_(lexLang) {}
 
 RefoldHeaderIncludeEditPlanner::~RefoldHeaderIncludeEditPlanner() = default;
@@ -226,7 +229,7 @@ RefoldHeaderIncludeEditPlanner::GetHeaderOccurrenceStructureIndex(
 
   entry.index = std::make_unique<RefoldPreprocessingStructureIndex>(
       RefoldPreprocessingStructureIndex::Build(
-          {model_, paths_, macroStateProof_, lexLang_}, headerPath, headerText,
+          {model_, paths_, lexLang_}, headerPath, headerText,
           std::optional<uint64_t>(includeId)));
   entry.headerSize = headerText.size();
   return *entry.index;
@@ -236,7 +239,7 @@ RefoldHeaderIncludeEditPlanner::TextEdit
 RefoldHeaderIncludeEditPlanner::MakeTextEditWithResyncOrPending(
     StringRef original, uint64_t start, uint64_t end, StringRef replacement,
     StringRef fileSpelling, std::optional<uint64_t> ownerIncludeId) const {
-  ResyncOutcome outcome = textEditAssembler_.ApplyResyncOrPend(
+  ResyncOutcome outcome = lineObserverLayout_.ApplyResyncOrPend(
       original, start, end, replacement, fileSpelling, ownerIncludeId);
   TextEdit edit{start,
                 end,
@@ -697,8 +700,8 @@ bool RefoldHeaderIncludeEditPlanner::RecordedMacroDirectiveMatchesOwnerFile(
   const MemoryBuffer &mb = **bufOrErr;
   StringRef ownerBytes(mb.getBufferStart(), mb.getBufferSize());
   std::optional<MacroStateDirectiveLineInterval> interval =
-      macroStateProof_.RecoverMacroStateDirectiveLineInterval(
-          directive, ownerPath, ownerBytes, directive.ownerIncludeId);
+      recoverMacroStateDirectiveLineInterval(
+          paths_, directive, ownerPath, ownerBytes, directive.ownerIncludeId);
   if (!interval)
     return false;
 
@@ -1157,8 +1160,8 @@ bool RefoldHeaderIncludeEditPlanner::ProveHeaderSourceEnvelopeGap(
   SmallVector<HeaderPreservedGapPiece, 4> gapPieces;
   for (const auto &directive : model_.GetMacroDirectives()) {
     std::optional<MacroStateDirectiveLineInterval> directivePiece =
-        macroStateProof_.RecoverMacroStateDirectiveLineInterval(
-            directive, state.file, state.headerText,
+        recoverMacroStateDirectiveLineInterval(
+            paths_, directive, state.file, state.headerText,
             std::optional<uint64_t>(state.include.id));
     if (!directivePiece || directivePiece->begin < gapBegin ||
         gapEnd < directivePiece->end)
@@ -1709,8 +1712,8 @@ void RefoldHeaderIncludeEditPlanner::CollectHeaderMacroStateCarryCandidates(
       continue;
 
     std::optional<MacroStateDirectiveLineInterval> piece =
-        macroStateProof_.RecoverMacroStateDirectiveLineInterval(
-            directive, state.file, state.headerText,
+        recoverMacroStateDirectiveLineInterval(
+            paths_, directive, state.file, state.headerText,
             std::optional<uint64_t>(state.include.id));
     if (!piece || piece->end > *state.startByte)
       continue;
@@ -2086,7 +2089,7 @@ bool RefoldHeaderIncludeEditPlanner::CommitInsertCandidate(
                                               {},
                                               {},
                                               {}};
-  if (!textEditAssembler_.OrdinaryEditAvoidsProtectedPreprocessingStructure(
+  if (!textEditCertifier_.OrdinaryEditAvoidsProtectedPreprocessingStructure(
           edit, state.file, state.include.id, state.headerText,
           /*requestTerminalOnFailure=*/false)) {
     state.plan.requiresIncludeRealization = true;
@@ -2097,7 +2100,7 @@ bool RefoldHeaderIncludeEditPlanner::CommitInsertCandidate(
             .str();
     return false;
   }
-  textEditAssembler_.AttachAcceptedResultCarrier(edit, selected.accepted);
+  textEditCertifier_.AttachAcceptedResultCarrier(edit, selected.accepted);
   state.plan.edits.push_back(std::move(edit));
   return true;
 }
@@ -2502,7 +2505,7 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
       switch (p.directHeaderByteAuthority) {
       case DirectHeaderByteEditAuthorityKind::None:
         sourceAuthorityAccepted =
-            textEditAssembler_
+            textEditCertifier_
                 .OrdinaryEditAvoidsProtectedPreprocessingStructure(
                     edit, file, ie.include->id, headerText,
                     /*requestTerminalOnFailure=*/false);
@@ -2511,9 +2514,9 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
         const PreprocessingStructureKind lineControlKinds[] = {
             PreprocessingStructureKind::LineControl};
         sourceAuthorityAccepted =
-            textEditAssembler_.AuthorizeProtectedSourceIntervals(
-                edit, ProtectedSourceEditAuthorityKind::LineControlRepair,
-                file, ie.include->id, headerText, p.directHeaderByteBegin,
+            textEditCertifier_.AuthorizeProtectedSourceIntervals(
+                edit, ProtectedSourceEditAuthorityKind::LineControlRepair, file,
+                ie.include->id, headerText, p.directHeaderByteBegin,
                 p.directHeaderByteEnd, lineControlKinds,
                 /*requireProtectedInterval=*/false,
                 /*requestTerminalOnFailure=*/false);
@@ -2525,9 +2528,8 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
             PreprocessingStructureKind::IncludeNext,
             PreprocessingStructureKind::Import};
         sourceAuthorityAccepted =
-            textEditAssembler_.AuthorizeProtectedSourceIntervals(
-                edit,
-                ProtectedSourceEditAuthorityKind::IncludeDirectiveRewrite,
+            textEditCertifier_.AuthorizeProtectedSourceIntervals(
+                edit, ProtectedSourceEditAuthorityKind::IncludeDirectiveRewrite,
                 file, ie.include->id, headerText, p.directHeaderByteBegin,
                 p.directHeaderByteEnd, includeKinds,
                 /*requireProtectedInterval=*/true,
@@ -2542,7 +2544,7 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
             "authorization";
         return plan;
       }
-      textEditAssembler_.AttachAcceptedResultCarrier(
+      textEditCertifier_.AttachAcceptedResultCarrier(
           edit, acceptedCandidateBuilder_.BuildAcceptedIncludeCandidate(
                     AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, p,
                     &directWitness));
@@ -2592,11 +2594,10 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
 
       std::optional<std::pair<uint64_t, uint64_t>> bBytes =
           sourceMapper_.BTokenRangeToByteRange(materialBStart, materialBEnd);
-      materialInsertBytes =
-          textEditAssembler_.StripSeparatelyOwnedSidebandReplay(
-              materialInsertBytes,
-              bBytes ? std::optional<uint64_t>(bBytes->first) : std::nullopt,
-              bBytes ? std::optional<uint64_t>(bBytes->second) : std::nullopt);
+      materialInsertBytes = stripSeparatelyOwnedSidebandReplay(
+          sidebandPragmaEdits_, materialInsertBytes,
+          bBytes ? std::optional<uint64_t>(bBytes->first) : std::nullopt,
+          bBytes ? std::optional<uint64_t>(bBytes->second) : std::nullopt);
     }
 
     // If a replacement hunk starts by re-emitting the exact tokens of a
@@ -2917,10 +2918,9 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
       }
 
       sourceAuthorityAccepted =
-          textEditAssembler_.AuthorizeCompleteProtectedSourceClosure(
+          textEditCertifier_.AuthorizeCompleteProtectedSourceClosure(
               edit,
-              ProtectedSourceEditAuthorityKind::
-                  IncludePreservingSourceClosure,
+              ProtectedSourceEditAuthorityKind::IncludePreservingSourceClosure,
               file, ie.include->id, headerText, *startByte, *endByte,
               /*requireProtectedInterval=*/false,
               /*requestTerminalOnFailure=*/false,
@@ -2940,7 +2940,7 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
           PreprocessingStructureKind::MacroUndef};
       for (const HeaderMacroStateCarryCandidate &transition :
            carriedHeaderMacroStateTransitions) {
-        if (textEditAssembler_.AuthorizeExactProtectedSourceInterval(
+        if (textEditCertifier_.AuthorizeExactProtectedSourceInterval(
                 edit, ProtectedSourceEditAuthorityKind::MacroStateRepair, file,
                 ie.include->id, headerText, transition.begin, transition.end,
                 macroStateKinds, {},
@@ -2958,7 +2958,7 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
       // every protected interval and fall back to include realization if the
       // mapped byte envelope crosses even one directive-looking construct.
       sourceAuthorityAccepted =
-          textEditAssembler_.OrdinaryEditAvoidsProtectedPreprocessingStructure(
+          textEditCertifier_.OrdinaryEditAvoidsProtectedPreprocessingStructure(
               edit, file, ie.include->id, headerText,
               /*requestTerminalOnFailure=*/false);
     }
@@ -2968,7 +2968,7 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
           "mapped-header edit failed global protected-source authorization";
       return plan;
     }
-    textEditAssembler_.AttachAcceptedResultCarrier(
+    textEditCertifier_.AttachAcceptedResultCarrier(
         edit, acceptedCandidateBuilder_.BuildAcceptedIncludeCandidate(
                   AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, p,
                   &mappedHeaderWitness));

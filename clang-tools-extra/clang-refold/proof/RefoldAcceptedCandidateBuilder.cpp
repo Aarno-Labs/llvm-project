@@ -6,7 +6,7 @@
 
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 
-#include "edit/RefoldTUEditPlanner.h"
+#include "edit/RefoldTUAnchorProof.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroTopology.h"
 #include "model/RefoldModel.h"
@@ -710,9 +710,9 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedTUTextEditCandidate(
           currentPath, ownerRealization);
   candidate.begin = spanPlan.tuByteBegin;
   candidate.end = spanPlan.tuByteEnd;
-  // Not clipped: the emission audit in RefoldTextEditAssembler reconstructs
-  // this carrier's proven source surface from `payloadPreview`, so for a
-  // direct-TU carrier it must stay the exact bytes.
+  // Not clipped: the global source-edit firewall in RefoldTextEditCertifier
+  // reconstructs this carrier's proven source surface from `payloadPreview`,
+  // so for a direct-TU carrier it must stay the exact bytes.
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview = repairText.str();
   candidate.emittedRepair = EmittedRepairIdentity{

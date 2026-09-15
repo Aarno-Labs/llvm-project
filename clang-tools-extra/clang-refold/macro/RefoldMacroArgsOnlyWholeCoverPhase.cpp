@@ -11,7 +11,6 @@
 #include "macro/RefoldMacroArgsOnlyWholeCoverPhase.h"
 
 #include "edit/RefoldPatchTypes.h"
-#include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
 #include "model/RefoldModel.h"
@@ -51,8 +50,7 @@ void RefoldMacroArgsOnlyWholeCoverPhase::Run(
       !argLikeSpans.empty() &&
       deps_.sourceMapper.HunkFullyWithinArgSpans(hEff, argLikeSpans,
                                                  argTouched) &&
-      RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(invSpanText,
-                                                                    m);
+      invocationSpanMatchesCallsitePrefix(invSpanText, m);
 
   if (planningCtx.rootHasDirectArgLikeSurface) {
     // First try to patch arguments in-place. If that cannot satisfy the
@@ -72,8 +70,7 @@ void RefoldMacroArgsOnlyWholeCoverPhase::Run(
     return;
   }
 
-  if (RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(invSpanText,
-                                                                    m)) {
+  if (invocationSpanMatchesCallsitePrefix(invSpanText, m)) {
     // The definition-replay proof inside the args-only builder can handle
     // edits whose token hunk spans both argument substitutions and macro-
     // body tokens, most importantly __VA_OPT__ erasure/exposure.
@@ -119,8 +116,7 @@ RefoldMacroArgsOnlyWholeCoverPhase::TryPairedPureInsertionRootArgsOnly(
       !baseInvText.empty()
           ? baseInvText
           : (m.invText ? StringRef(*m.invText) : StringRef(""));
-  if (!RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-          invSpanText, m))
+  if (!invocationSpanMatchesCallsitePrefix(invSpanText, m))
     return std::nullopt;
 
   // Candidate ownership is tested against ordinary and stringify argument

@@ -30,12 +30,14 @@ namespace refold {
 class LineDirectiveInserter;
 class RefoldIncludeMaterializationScheduler;
 class RefoldLineControlProof;
+class RefoldLineObserverLayout;
 class RefoldMacroTopology;
 class RefoldModel;
 class RefoldAcceptedCandidateBuilder;
 class RefoldStructuralHunkDispatcher;
 class RefoldTerminalProofSink;
 class RefoldTextEditAssembler;
+class RefoldTextEditCertifier;
 
 /// Plans and emits the final TU text after all structural edit sources have
 /// been staged.
@@ -59,6 +61,10 @@ public:
     const RefoldMacroStateRepairPlanner *macroStateRepairPlanner = nullptr;
     /// Final byte-edit assembler used to lower staged edits into TU text.
     const RefoldTextEditAssembler *textEditAssembler = nullptr;
+    /// Certifies materialized ranges and accepted results on emitted edits.
+    const RefoldTextEditCertifier *textEditCertifier = nullptr;
+    /// Line-observer layout used for newline-drift resync.
+    const RefoldLineObserverLayout *lineObserverLayout = nullptr;
     /// Accepted-result carrier construction for emitted macro patches.
     const RefoldAcceptedCandidateBuilder *acceptedCandidateBuilder = nullptr;
     /// Terminal fallback sink for fail-closed emission failures.

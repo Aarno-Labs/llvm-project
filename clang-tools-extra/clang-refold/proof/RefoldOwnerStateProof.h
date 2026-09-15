@@ -352,12 +352,6 @@ public:
   /// unmodeled state surface.
   static OwnerStateComponent
   StateComponentForMissingStateFact(MissingStateFactKind kind);
-  /// Return the terminal fallback proof failure for a component-specific
-  /// missing producer fact.  The caller supplies the detail recorded when the
-  /// owner summary was built so diagnostics identify the missing fact, not
-  /// merely the fallback algorithm that noticed it.
-  static TerminalFallbackProofFailure
-  MissingStateFactTerminalFailure(MissingStateFactKind kind, StringRef detail);
   /// Return the terminal fallback proof failure for an undischargeable suffix
   /// observer of `component`.
   static TerminalFallbackProofFailure
@@ -481,15 +475,6 @@ struct ParsedDiagnosticPragmaStateDirective {
   StringRef optionSpelling;
   DiagnosticPragmaStateAction action = DiagnosticPragmaStateAction::Setting;
 };
-
-/// Return true iff a retained raw-lexer comment token has a complete spelling.
-///
-/// Clang's raw lexer owns the hard parts of raw-source normalization, including
-/// escaped-newline handling and language-mode details.  This helper is only a
-/// defensive completeness check before treating a comment token as ignorable
-/// source trivia: block comments must have a real closing delimiter, while line
-/// comments are complete at either newline or end-of-buffer.
-bool rawLexerCommentTokenIsComplete(StringRef spelling);
 
 /// Return true iff `text` is only whitespace and complete C/C++ comments.
 ///

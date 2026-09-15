@@ -1086,5 +1086,53 @@ void emitTheoremAuditSummary(const TheoremAuditStats &audit,
       audit.resolverClosureLedgerRows);
 }
 
+bool AuditFinalLineControlAuthorityContract(
+    const RefoldTheoremAudit &audit,
+    const FinalLineControlAuthorityContract &authority, StringRef role) {
+  if (!audit.IsNoLegacyAuditEnabled())
+    return true;
+
+  auto report = [&](StringRef detail) {
+    audit.ReportNoLegacyAuditFinding(
+        RefoldTheoremAudit::MakeLegacyAuditEvidence(
+            LegacyPathKind::FinalLineControlLivenessWithoutObligation, role,
+            detail));
+  };
+
+  if (!authority.compactRemovalProofIsAuthoritative)
+    report("final line-control compact removal proof is not authoritative");
+  if (!authority.fixedPointPruningIsAuthoritative)
+    report("final line-control fixed-point pruning is not authoritative");
+  if (!authority.validationCallbackIsAuthoritative)
+    report("final line-control validation callback is not authoritative");
+
+  return authority.IsClosedUnderCompactProofs();
+}
+
+bool AuditFinalLineControlRemovalProofPopulation(
+    const RefoldTheoremAudit &audit,
+    ArrayRef<FinalLineControlPruneCandidate> candidates, StringRef role) {
+  if (!audit.IsNoLegacyAuditEnabled())
+    return true;
+
+  size_t missing = 0;
+  for (const FinalLineControlPruneCandidate &candidate : candidates)
+    if (!HasCompleteFinalLineControlProof(candidate))
+      ++missing;
+
+  if (missing == 0)
+    return true;
+
+  audit.ReportNoLegacyAuditFinding(RefoldTheoremAudit::MakeLegacyAuditEvidence(
+      LegacyPathKind::FinalLineControlLivenessWithoutObligation, role,
+      llvm::formatv(
+          "{0} final line-control prune candidate(s) lack compact "
+          "obligation/removal proof; generation sites must populate both "
+          "facts before compact final-line-control pruning may run",
+          missing)
+          .str()));
+  return false;
+}
+
 } // namespace refold
 } // namespace clang

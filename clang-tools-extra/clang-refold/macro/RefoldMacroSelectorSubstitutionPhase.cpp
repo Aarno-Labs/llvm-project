@@ -13,7 +13,6 @@
 
 #include "macro/RefoldMacroSelectorSubstitutionPhase.h"
 
-#include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroDAGSharedHelpers.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
@@ -330,7 +329,7 @@ static bool directCalleeSubstitutionCandidateLess(
 }
 
 /// Return the byte range of the leading macro-name token inside a callsite text
-/// that was already admitted by InvocationSpanMatchesCallsitePrefix().  The
+/// that was already admitted by invocationSpanMatchesCallsitePrefix().  The
 /// range is relative to the replacement text carried by MacroPatch.
 static std::optional<std::pair<uint64_t, uint64_t>>
 findDirectCalleeNameByteRange(StringRef invSpanText,
@@ -770,8 +769,7 @@ std::optional<MacroPatch> RefoldMacroSelectorSubstitutionPhase::Run(
                      m.id, m.name);
     return std::nullopt;
   }
-  if (!RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-          invSpanText, m)) {
+  if (!invocationSpanMatchesCallsitePrefix(invSpanText, m)) {
     REFOLD_LOG_TRACE(
         "macro/selector-substitution",
         "reject inv id={0} name={1} reason=callsite-prefix-mismatch text='{2}'",

@@ -17,6 +17,7 @@
 #include "edit/RefoldTUAnchorProof.h"
 #include "edit/RefoldTUEditPlanner.h"
 #include "edit/RefoldTextEditAssembler.h"
+#include "edit/RefoldTextEditCertifier.h"
 #include "include/RefoldIncludeInsertionPlanner.h"
 #include "include/RefoldIncludeMaterializer.h"
 #include "include/RefoldPragmaOnceGuardRewriter.h"
@@ -97,7 +98,7 @@ void RefoldEngine::BuildServiceGraph() {
       std::make_unique<RefoldPreprocessingStructureIndex>(
           RefoldPreprocessingStructureIndex::Build(
               RefoldPreprocessingStructureIndex::Dependencies{
-                  model_, pathIdentity_, *macroStateProof_, lexLang_},
+                  model_, pathIdentity_, lexLang_},
               model_.GetSourcePath(), tuSourceBytes_, std::nullopt));
 
   // Protection diagnostics invalidate the whole physical census and therefore
@@ -117,7 +118,7 @@ void RefoldEngine::BuildServiceGraph() {
   preprocessingStructureIndexProvider_ =
       std::make_unique<RefoldPreprocessingStructureIndexProvider>(
           RefoldPreprocessingStructureIndexProvider::Dependencies{
-              model_, pathIdentity_, lineDirs_, *macroStateProof_, lexLang_},
+              model_, pathIdentity_, lineDirs_, lexLang_},
           model_.GetSourcePath(), *preprocessingStructureIndex_);
 
   // Token diff planning borrows the per-run source/token inputs and writes the
@@ -157,30 +158,29 @@ void RefoldEngine::BuildServiceGraph() {
                     ArrayRef<diffutils::LcsBGapProvenance>, uint64_t,
                     diffutils::CertifiedLcsResult &)>()});
 
-  // TU-anchor accepted-result construction is a narrow proof service.  Audit
-  // flows through the shared theorem/audit service and summary construction
-  // through the shared proof-summary builder, while the anchor proof builder
-  // owns only TU-anchor carrier construction.
-  tuAnchorProof_ =
-      std::make_unique<RefoldTUAnchorProof>(*theoremAudit_, bToks_);
+  // TU anchor and byte-span proofs.  Audit flows through the shared
+  // theorem/audit service and summary construction through the shared
+  // proof-summary builder.
+  tuAnchorProof_ = std::make_unique<RefoldTUAnchorProof>(
+      *theoremAudit_, RefoldTUAnchorProof::Deps{
+                          model_, pathIdentity_, macroTopology_, lineDirs_,
+                          *preprocessingStructureIndex_, tuSourceBytes_, aToks_,
+                          static_cast<uint64_t>(bToks_.size()), bToks_});
 
   // TU edit planning has a real owner.  The planner receives only read-only
   // services and token-map state; final TextEdit assembly intentionally remains
   // outside this service.
   tuEditPlanner_ =
       std::make_unique<RefoldTUEditPlanner>(RefoldTUEditPlanner::Deps{
-          model_, pathIdentity_, macroTopology_, *tuAnchorProof_, lineDirs_,
-          *preprocessingStructureIndex_, tuSourceBytes_, aToks_,
-          static_cast<uint64_t>(bToks_.size()), bToks_, abTokMapA2B_,
-          ownerDepthGap_, strict_});
+          model_, macroTopology_, *tuAnchorProof_, aToks_, abTokMapA2B_});
 
-  // Owner classification depends on the TU edit-planning service as a named,
-  // read-only dependency.  RefoldTUEditPlanner does not depend on the owner
+  // Owner classification depends on the TU anchor proofs as a named,
+  // read-only dependency.  RefoldTUAnchorProof does not depend on the owner
   // classifier, so normal constructor injection keeps the TU-anchor/TU-span
   // boundary explicit without creating a service cycle.
   ownerClassifier_ =
       std::make_unique<RefoldOwnerClassifier>(RefoldOwnerClassifier::Deps{
-          model_, pathIdentity_, *tuEditPlanner_, sidebandPragmaEdits_});
+          model_, pathIdentity_, *tuAnchorProof_, sidebandPragmaEdits_});
 
   // Structural tiling borrows the owner/proof services and exact preprocessing
   // census needed to prove deterministic token-hunk partitions.  The planner
@@ -221,7 +221,7 @@ void RefoldEngine::BuildServiceGraph() {
   // no proof service is late-bound.
   proofServices_ = std::make_unique<RefoldProofServices>(
       model_, bSource_, bToks_, sourceMapper_, tokenTextAnalysis_,
-      argTextRecovery_, macroTopology_, *ownerStateProof_, *tuEditPlanner_,
+      argTextRecovery_, macroTopology_, *ownerStateProof_, *tuAnchorProof_,
       *proofSummaryBuilder_, *theoremAudit_, lastTheoremAudit_, witnessTrace_,
       mixedOwnerTilingSegmentBindings_, mixedOwnerTilingWitnesses_);
 
@@ -263,26 +263,31 @@ void RefoldEngine::BuildServiceGraph() {
       bSource_, bToks_, bTokOff_, sourceMapper_,
       proofServices_->AcceptancePathClassifier());
 
-  // The assembler owns final byte-application behavior.  Theorem/audit policy
-  // is injected as RefoldTheoremAudit; the one remaining hook breaks the
-  // assembler <-> line-observer-layout construction cycle.
-  RefoldTextEditAssembler::Hooks assemblerHooks;
-  assemblerHooks.lineResyncShouldDeferToConditionalJoin =
-      [this](StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
-             uint64_t resumeOffset) {
-        return lineObserverLayout_->LineResyncShouldDeferToConditionalJoin(
-            ownerFile, ownerIncludeId, resumeOffset);
-      };
+  // Protected-source capabilities and materialization certification sit below
+  // planning, so the planners, the layout and the assembler all borrow them.
+  textEditCertifier_ = std::make_unique<RefoldTextEditCertifier>(
+      model_, bSource_, bToks_, sourceMapper_, pathIdentity_, lexLang_,
+      *preprocessingStructureIndex_, *tuAnchorProof_, terminalSink_,
+      *theoremAudit_);
 
+  lineObserverLayout_ = std::make_unique<RefoldLineObserverLayout>(
+      model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, abTokMapB2A_,
+      pathIdentity_, lineControlProof_, *ownerStateProof_,
+      proofServices_->AcceptedCandidateBuilder(), *textEditCertifier_,
+      lineDirs_);
+
+  // The assembler owns final byte-application behavior.  Theorem/audit policy
+  // is injected as RefoldTheoremAudit, and newline-drift resync is the
+  // layout's, built above.
   textEditAssembler_ = std::make_unique<RefoldTextEditAssembler>(
       model_, bSource_, aToks_, bToks_, bTokOff_, abTokHunks_, abTokMapA2B_,
-      abTokMapB2A_, sourceMapper_, pathIdentity_, *macroStateProof_, lexLang_,
-      *preprocessingStructureIndex_, *proofSummaryBuilder_,
+      abTokMapB2A_, sourceMapper_, lexLang_, *proofSummaryBuilder_,
       proofServices_->AcceptedCandidateBuilder(),
       proofServices_->OwnerRealizationProofBuilder(), *wholeCoverPlanBuilder_,
       *ownerStateProof_, macroTopology_, lineControlProof_, lineDirs_,
-      terminalSink_, *tuEditPlanner_, *theoremAudit_, sidebandPragmaEdits_,
-      mixedOwnerTilingWitnesses_, lastTheoremAudit_, std::move(assemblerHooks));
+      terminalSink_, *tuEditPlanner_, *tuAnchorProof_, *textEditCertifier_,
+      *lineObserverLayout_, *theoremAudit_, mixedOwnerTilingWitnesses_,
+      lastTheoremAudit_);
 
   RefoldMacroStateRepairPlanner::Dependencies repairDeps;
   repairDeps.model = &model_;
@@ -296,25 +301,20 @@ void RefoldEngine::BuildServiceGraph() {
   repairDeps.acceptedCandidateBuilder =
       &proofServices_->AcceptedCandidateBuilder();
   repairDeps.macroPatchPlanner = macroPatchPlanner_.get();
-  repairDeps.textEditAssembler = textEditAssembler_.get();
+  repairDeps.textEditCertifier = textEditCertifier_.get();
+  repairDeps.lineObserverLayout = lineObserverLayout_.get();
   repairDeps.terminalSink = &terminalSink_;
   repairDeps.lexLang = &lexLang_;
   macroStateRepairPlanner_ =
       std::make_unique<RefoldMacroStateRepairPlanner>(std::move(repairDeps));
 
-  lineObserverLayout_ = std::make_unique<RefoldLineObserverLayout>(
-      model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, abTokMapB2A_,
-      pathIdentity_, lineControlProof_, *ownerStateProof_,
-      proofServices_->AcceptedCandidateBuilder(), *textEditAssembler_,
-      lineDirs_);
-
   // The pragma-once catalog is built from producer include/pragma facts and
-  // the physical header bytes, so it must follow the assembler and
+  // the physical header bytes, so it must follow the certifier and
   // accepted-candidate builder it authorizes and certifies edits through.
   pragmaOnceGuardRewriter_ = std::make_unique<RefoldPragmaOnceGuardRewriter>(
       RefoldPragmaOnceGuardRewriter::Dependencies{
-          model_, pathIdentity_, *macroStateProof_, lineDirs_,
-          lineControlProof_, *textEditAssembler_,
+          model_, pathIdentity_, lineDirs_, lineControlProof_,
+          *textEditCertifier_, *lineObserverLayout_,
           proofServices_->AcceptedCandidateBuilder(), terminalSink_, lexLang_},
       RefoldPragmaOnceGuardRewriter::GuardNameInputs{
           model_.GetSourcePath(), tuSourceBytes_, aSource_, bSource_});
@@ -328,47 +328,17 @@ void RefoldEngine::BuildServiceGraph() {
       *macroStateProof_, *ownerStateProof_, *includeInsertionPlanner_,
       proofServices_->AcceptedCandidateBuilder(),
       proofServices_->AcceptedResultRanker(), *textEditAssembler_,
-      *pragmaOnceGuardRewriter_, terminalSink_, lexLang_);
+      *textEditCertifier_, *pragmaOnceGuardRewriter_, terminalSink_, lexLang_);
 
-  // The fallback planner is allocated after the materialization and proof
-  // services it calls into.  Its hooks route directly to the assembler; the
-  // bundle stays limited to the cycle-breaking boundary fallback emission
-  // requires.
-  RefoldExpansionFallbackPlanner::Hooks fallbackHooks;
-  fallbackHooks.applyResyncOrPend =
-      [this](StringRef originalFileText, uint64_t start, uint64_t end,
-             StringRef replacement, StringRef fileSpellingForDirective,
-             std::optional<uint64_t> ownerIncludeId) {
-        return textEditAssembler_->ApplyResyncOrPend(
-            originalFileText, start, end, replacement, fileSpellingForDirective,
-            ownerIncludeId);
-      };
-  fallbackHooks.certifyTextEditMaterializedBTokenRange =
-      [this](TextEdit &edit, uint64_t bTokBegin, uint64_t bTokEnd) {
-        textEditAssembler_->CertifyTextEditMaterializedBTokenRange(
-            edit, bTokBegin, bTokEnd);
-      };
-  fallbackHooks.attachAcceptedResultCarrier =
-      [this](TextEdit &edit, const AcceptedResultCandidate &candidate) {
-        textEditAssembler_->AttachAcceptedResultCarrier(edit, candidate);
-      };
-  fallbackHooks.authorizeTUIncludeClosure =
-      [this](TextEdit &edit, StringRef sourcePath, StringRef sourceBytes,
-             uint64_t begin, uint64_t end) {
-        return textEditAssembler_->AuthorizeCompleteProtectedSourceClosure(
-            edit, ProtectedSourceEditAuthorityKind::TUIncludeClosure,
-            sourcePath, std::nullopt, sourceBytes, begin, end,
-            /*requireProtectedInterval=*/true,
-            /*requestTerminalOnFailure=*/false);
-      };
-
+  // The fallback planner is allocated after the materialization, proof and
+  // certification services it calls into.
   expansionFallbackPlanner_ = std::make_unique<RefoldExpansionFallbackPlanner>(
       model_, bSource_, aToks_, abTokHunks_, abTokMapB2A_, abTokAnchorProofs_,
       lineDirs_, sourceMapper_, pathIdentity_, macroTopology_,
       lineControlProof_, *macroStateProof_, *preprocessingStructureIndex_,
       terminalSink_, lexLang_, *includeInsertionPlanner_,
       proofServices_->AcceptedCandidateBuilder(), *theoremAudit_, lastStats_,
-      materializedEditMappings_, std::move(fallbackHooks));
+      materializedEditMappings_, *textEditCertifier_, *lineObserverLayout_);
 }
 
 } // namespace refold

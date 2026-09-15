@@ -31,6 +31,7 @@
 namespace clang {
 namespace refold {
 
+class RefoldLineObserverLayout;
 class RefoldMacroPatchPlanner;
 class RefoldMacroStateProof;
 class RefoldMacroTopology;
@@ -40,7 +41,7 @@ class RefoldAcceptedCandidateBuilder;
 class RefoldMacroPatchProofClassifier;
 class RefoldStructuralHunkDispatcher;
 class RefoldTerminalProofSink;
-class RefoldTextEditAssembler;
+class RefoldTextEditCertifier;
 class RefoldTokenTextAnalysis;
 
 /// Plans macro-state repairs needed after TU edits consume #define/#undef
@@ -57,7 +58,8 @@ public:
     const RefoldMacroPatchProofClassifier *macroPatchProofClassifier = nullptr;
     const RefoldAcceptedCandidateBuilder *acceptedCandidateBuilder = nullptr;
     RefoldMacroPatchPlanner *macroPatchPlanner = nullptr;
-    RefoldTextEditAssembler *textEditAssembler = nullptr;
+    const RefoldTextEditCertifier *textEditCertifier = nullptr;
+    const RefoldLineObserverLayout *lineObserverLayout = nullptr;
     RefoldTerminalProofSink *terminalSink = nullptr;
     const clang::LangOptions *lexLang = nullptr;
   };

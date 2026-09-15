@@ -6,7 +6,7 @@
 
 #include "source/RefoldOwnerClassifier.h"
 
-#include "edit/RefoldTUEditPlanner.h"
+#include "edit/RefoldTUAnchorProof.h"
 #include "model/RefoldPathIdentity.h"
 #include "proof/RefoldSidebandReplayProof.h"
 
@@ -41,7 +41,7 @@ Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
   // Otherwise, if both sides of the gap are unambiguously within the same
   // include's PP coverage, treat the insertion as include-owned.
   if (a0 == a1) {
-    if (deps_.tuEdits.FindExactSlotBoundaryFromPPGap(tuPath, a0)) {
+    if (deps_.tuAnchorProof.FindExactSlotBoundaryFromPPGap(tuPath, a0)) {
       std::optional<uint64_t> leftInc =
           (a0 > 0) ? deps_.model.InnermostIncludeAtPP(a0 - 1) : std::nullopt;
       const uint64_t maxPP = deps_.model.GetTokensCountA();
@@ -121,7 +121,8 @@ Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
   // belongs to a header, we still anchor via the TU span because segments for
   // includes and conditional arms in that header are projected into the TU
   // through slots.
-  auto span = deps_.tuEdits.ProjectTUByteEnvelopeForOwnership(a0, a1, tuPath); // [b, e)
+  auto span = deps_.tuAnchorProof.ProjectTUByteEnvelopeForOwnership(
+      a0, a1, tuPath); // [b, e)
 
   // No truthful TU byte anchor exists for this PP segment, so choose its owner
   // using only preprocessed-token structure. This happens when the segment has
@@ -281,7 +282,8 @@ bool RefoldOwnerClassifier::HunkMapsToTU(uint64_t a0, uint64_t a1,
 
   // A pure insertion is TU-owned only when the exact PP gap has the same
   // conservative insertion-anchor proof used by concrete realization.
-  return deps_.tuEdits.FindProvableTUInsertionAnchor(a0, tuPath).has_value();
+  return deps_.tuAnchorProof.FindProvableTUInsertionAnchor(a0, tuPath)
+      .has_value();
 }
 
 } // namespace refold

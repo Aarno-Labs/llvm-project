@@ -11,7 +11,7 @@
 
 #include "macro/RefoldMacroTopology.h"
 
-#include "line-control/RefoldLineObserverLayout.h"
+#include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
 #include "support/RefoldLog.h"
 #include "support/StringUtils.h"
@@ -665,8 +665,7 @@ bool RefoldMacroTopology::MacroPatchRemainsExpanded(
       FindMacroInvocationById(patch.macroId);
   if (!macro)
     return true;
-  return !RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-      patch.replacement, *macro);
+  return !invocationSpanMatchesCallsitePrefix(patch.replacement, *macro);
 }
 
 } // namespace refold

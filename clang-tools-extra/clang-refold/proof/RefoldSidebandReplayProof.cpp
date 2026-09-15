@@ -5,15 +5,13 @@
 // This file deliberately contains no RefoldEngine mutation or TextEdit staging:
 // callers provide already-classified sideband proof records and receive either
 // a structural validation failure, a replay-stripped payload, or a B-byte
-// witness envelope.  The sideband validation reporter records classified
-// terminal fallback requests through RefoldTerminalProofSink so TU and include
-// paths share the same fail-closed policy.
+// witness envelope.  The fail-closed reporter over these checks,
+// validateAndReportSidebandPragmaEditProof, lives in the sideband module.
 //
 //===----------------------------------------------------------------------===//
 
 #include "proof/RefoldSidebandReplayProof.h"
 
-#include "proof/RefoldTerminalProofSink.h"
 #include "support/RefoldLog.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -38,48 +36,6 @@ validateSidebandPragmaEditProof(const SidebandPragmaEdit &edit,
     return StringRef("invalid sideband B-byte envelope");
 
   return std::nullopt;
-}
-
-bool validateAndReportSidebandPragmaEditProof(
-    const SidebandPragmaEdit &edit, uint64_t bSize,
-    const RefoldTerminalProofSink &terminalSink, StringRef stage,
-    bool traceSuccess) {
-  const auto sourceRange = edit.SourceByteRange();
-  const auto replayRange = edit.MaterializedBByteRange();
-
-  // Keep the structural sideband predicate pure, but centralize the
-  // fail-closed proof-to-terminal-fallback translation here.  Both TU and
-  // include materialization paths reject the same invalid proof with the same
-  // theorem-facing obligation and diagnostic envelope.
-  if (std::optional<StringRef> failure =
-          validateSidebandPragmaEditProof(edit, bSize)) {
-    terminalSink.RequestTerminalFallback(
-        MakeTerminalFallbackProofFailure(
-            TerminalFallbackObligationKind::PragmaBoundaryKnown,
-            TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary),
-        stage,
-        llvm::formatv(
-            "sideband owner-local proof invalid path='{0}' site=[{1},{2}) "
-            "b=[{3},{4}): {5}",
-            edit.SourcePath(), sourceRange.first, sourceRange.second,
-            replayRange.first, replayRange.second, *failure)
-            .str());
-    return false;
-  }
-
-  if (traceSuccess) {
-    REFOLD_LOG_TRACE(
-        "proof/owner-local",
-        "sideband proof ok stage={0} path='{1}' source=[{2},{3}) b=[{4},{5}) "
-        "owner={6}",
-        stage, edit.SourcePath(), sourceRange.first, sourceRange.second,
-        replayRange.first, replayRange.second,
-        edit.OwnerIncludeId()
-            ? llvm::formatv("inc#{0}", *edit.OwnerIncludeId()).str()
-            : std::string("TU"));
-  }
-
-  return true;
 }
 
 std::string stripSeparatelyOwnedSidebandReplay(

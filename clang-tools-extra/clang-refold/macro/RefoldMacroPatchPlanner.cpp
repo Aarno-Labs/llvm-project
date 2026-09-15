@@ -12,7 +12,6 @@
 #include "macro/RefoldMacroPatchPlanner.h"
 
 #include "edit/RefoldBInsertionLedger.h"
-#include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
@@ -462,12 +461,6 @@ RefoldMacroPatchPlanner::TemplateSolver() const {
        deps_.macroTopology, deps_.macroPatchProofClassifier, deps_.lexLang});
 }
 
-RefoldMacroOccurrenceProofValidator
-RefoldMacroPatchPlanner::OccurrenceProofValidator() const {
-  return RefoldMacroOccurrenceProofValidator(
-      {deps_.model, deps_.macroTopology});
-}
-
 bool RefoldMacroPatchPlanner::MacroArgReplacementMatchesAllOccurrencesInB(
     const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
     StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks) const {
@@ -574,8 +567,7 @@ static bool macroPatchIsCallsiteForInvocation(
     const MacroPatch &patch, const RefoldModel::MacroInvocation &invocation) {
   return patch.proof.preservesInvocationStructure &&
          patch.proof.proofRootMacroId == invocation.id &&
-         RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-             patch.replacement, invocation);
+         invocationSpanMatchesCallsitePrefix(patch.replacement, invocation);
 }
 
 /// An argument replacement re-spelled in the original call-site bytes.
@@ -1019,12 +1011,6 @@ bool RefoldMacroPatchPlanner::CertifyMacroPatchWholeExpansionBRange(
   patch.materialized.bTokStart = static_cast<uint64_t>(bEnv->first);
   patch.materialized.bTokEnd = static_cast<uint64_t>(bEnv->second);
   return true;
-}
-
-bool RefoldMacroPatchPlanner::MatchLiteralAToken(
-    uint64_t tok, llvm::StringRef spelling) const {
-  return tok < deps_.aToks.size() &&
-         deps_.aToks[static_cast<size_t>(tok)].spelling == spelling;
 }
 
 const RefoldModel::MacroDirective *

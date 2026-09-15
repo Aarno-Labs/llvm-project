@@ -12,7 +12,6 @@
 #include "source/RefoldPreprocessingStructureIndexProvider.h"
 
 #include "line-control/LineDirectiveInserter.h"
-#include "macro/RefoldMacroStateProof.h"
 #include "model/RefoldPathIdentity.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
 
@@ -87,8 +86,7 @@ RefoldPreprocessingStructureIndexProvider::Get(
     auto index = std::make_unique<RefoldPreprocessingStructureIndex>(
         RefoldPreprocessingStructureIndex::Build(
             RefoldPreprocessingStructureIndex::Dependencies{
-                deps_.model, deps_.pathIdentity, deps_.macroStateProof,
-                deps_.lexLang},
+                deps_.model, deps_.pathIdentity, deps_.lexLang},
             cachedPhysicalPath, sourceEntry.buffer->getBuffer(),
             ownerIncludeId));
     found = occurrenceIndexCache_

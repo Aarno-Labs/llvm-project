@@ -167,6 +167,7 @@ class RefoldProofServices;
 class RefoldProofSummaryBuilder;
 class RefoldStructuralHunkDispatcher;
 class RefoldTextEditAssembler;
+class RefoldTextEditCertifier;
 class RefoldTokenDiffPlanner;
 class RefoldTUAnchorProof;
 class RefoldTUEditPlanner;
@@ -822,17 +823,18 @@ private:
 
   /// Translation-unit edit planning service.
   ///
-  /// This owns TU insertion-anchor, TU byte-span, direct TU edit-plan, and
-  /// trailing-call-suffix extension policy.  Final TextEdit assembly and legacy
-  /// orchestration wrappers remain outside this service.
+  /// This owns direct TU edit-plan and trailing-call-suffix extension policy
+  /// over the anchors and byte spans RefoldTUAnchorProof proves.  Final
+  /// TextEdit assembly and legacy orchestration wrappers remain outside this
+  /// service.
   std::unique_ptr<RefoldTUEditPlanner> tuEditPlanner_;
 
-  /// TU-anchor accepted-result proof builder.
+  /// TU insertion-anchor and TU byte-span proofs.
   ///
-  /// This service certifies proven TU insertion-anchor witnesses into
-  /// normalized accepted-result carriers.  It is separate from the accepted
-  /// candidate builder so the TU edit planner can build anchor candidates
-  /// without depending on the proof services, which depend on TU planning.
+  /// This service proves anchors and byte spans, and certifies each proven
+  /// anchor witness into a normalized accepted-result carrier.  It is separate
+  /// from the accepted candidate builder, which depends on it through the
+  /// owner-realization proof builder.
   std::unique_ptr<RefoldTUAnchorProof> tuAnchorProof_;
 
   /// Counter-stabilization planner over producer macro topology.
@@ -910,6 +912,20 @@ private:
   /// include-edit dependency.
   std::unique_ptr<RefoldIncludeInsertionPlanner> includeInsertionPlanner_;
 
+  /// Protected-source authority and materialization certification.  Declared
+  /// before every service that borrows it.
+  std::unique_ptr<RefoldTextEditCertifier> textEditCertifier_;
+
+  /// Line-observer layout realization service owned by the engine.
+  ///
+  /// The service emits TU/header materialization edits and include `#line`
+  /// wrappers needed by preserved line-state observers, and repairs newline
+  /// drift.  It depends on proof services and the text-edit certifier, but it
+  /// owns no orchestration state from RefoldEngine.  It is declared before the
+  /// assembler and the include materializer so their borrowed references remain
+  /// valid through destruction.
+  std::unique_ptr<RefoldLineObserverLayout> lineObserverLayout_;
+
   /// Final byte-edit assembler owned by the engine.
   ///
   /// The assembler is intentionally a separate object from RefoldEngine: it
@@ -917,16 +933,6 @@ private:
   /// receiving proof, state, line-control, and terminal dependencies
   /// explicitly.
   std::unique_ptr<RefoldTextEditAssembler> textEditAssembler_;
-
-  /// Line-observer layout realization service owned by the engine.
-  ///
-  /// The service emits TU/header materialization edits and include `#line`
-  /// wrappers needed by preserved line-state observers.  It depends on proof
-  /// services and the final text-edit assembler, but it owns no orchestration
-  /// state from RefoldEngine.  It is declared before the include materializer
-  /// so the materializer's borrowed reference remains valid through
-  /// destruction.
-  std::unique_ptr<RefoldLineObserverLayout> lineObserverLayout_;
 
   /// Include-materialization planner/realizer owned by the engine.
   ///
@@ -1150,11 +1156,11 @@ private:
   /// \p span, the TU byte range a direct-TU proof has already accepted.
   ///
   /// This is the realization half of the direct-TU path: the caller supplies a
-  /// span that `RefoldTUEditPlanner::PlanTUByteSpan()` proved, and this turns it
-  /// into replacement text -- B token slice, gap and spacing repair, trailing
-  /// call-suffix extension, line-control resync -- and certifies the resulting
-  /// edit.  Returns std::nullopt when the edit could not be certified, leaving
-  /// the caller to escalate.
+  /// span that `RefoldTUAnchorProof::PlanTUByteSpan()` proved, and this turns
+  /// it into replacement text -- B token slice, gap and spacing repair,
+  /// trailing call-suffix extension, line-control resync -- and certifies the
+  /// resulting edit.  Returns std::nullopt when the edit could not be
+  /// certified, leaving the caller to escalate.
   ///
   /// It is separate from span planning so that a caller holding a *different*
   /// proved span for the same hunk can reuse the identical realization rather

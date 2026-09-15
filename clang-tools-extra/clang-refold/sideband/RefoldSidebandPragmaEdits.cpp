@@ -13,7 +13,8 @@
 
 #include "edit/RefoldPatchTypes.h"
 #include "edit/RefoldTUEditPlanner.h"
-#include "edit/RefoldTextEditAssembler.h"
+#include "edit/RefoldTextEditCertifier.h"
+#include "line-control/RefoldLineObserverLayout.h"
 #include "model/RefoldModel.h"
 #include "model/RefoldPathIdentity.h"
 #include "model/RefoldToken.h"
@@ -2571,11 +2572,54 @@ bool buildSidebandPragmaSourceEdits(
   return true;
 }
 
+bool validateAndReportSidebandPragmaEditProof(
+    const SidebandPragmaEdit &edit, uint64_t bSize,
+    const RefoldTerminalProofSink &terminalSink, StringRef stage,
+    bool traceSuccess) {
+  const auto sourceRange = edit.SourceByteRange();
+  const auto replayRange = edit.MaterializedBByteRange();
+
+  // Keep the structural sideband predicate pure, but centralize the
+  // fail-closed proof-to-terminal-fallback translation here.  Both TU and
+  // include materialization paths reject the same invalid proof with the same
+  // theorem-facing obligation and diagnostic envelope.
+  if (std::optional<StringRef> failure =
+          validateSidebandPragmaEditProof(edit, bSize)) {
+    terminalSink.RequestTerminalFallback(
+        MakeTerminalFallbackProofFailure(
+            TerminalFallbackObligationKind::PragmaBoundaryKnown,
+            TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary),
+        stage,
+        llvm::formatv(
+            "sideband owner-local proof invalid path='{0}' site=[{1},{2}) "
+            "b=[{3},{4}): {5}",
+            edit.SourcePath(), sourceRange.first, sourceRange.second,
+            replayRange.first, replayRange.second, *failure)
+            .str());
+    return false;
+  }
+
+  if (traceSuccess) {
+    REFOLD_LOG_TRACE(
+        "proof/owner-local",
+        "sideband proof ok stage={0} path='{1}' source=[{2},{3}) b=[{4},{5}) "
+        "owner={6}",
+        stage, edit.SourcePath(), sourceRange.first, sourceRange.second,
+        replayRange.first, replayRange.second,
+        edit.OwnerIncludeId()
+            ? llvm::formatv("inc#{0}", *edit.OwnerIncludeId()).str()
+            : std::string("TU"));
+  }
+
+  return true;
+}
+
 bool appendSidebandPragmaSourceEdits(
     llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     const RefoldModel &model, llvm::StringRef tuPath, llvm::StringRef tuBytes,
     const RefoldPathIdentity &pathIdentity,
-    const RefoldTextEditAssembler &textEditAssembler,
+    const RefoldTextEditCertifier &textEditCertifier,
+    const RefoldLineObserverLayout &lineObserverLayout,
     const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
     const RefoldTerminalProofSink &terminalSink,
     RefoldStructuralHunkDispatcher &structuralHunkDispatcher) {
@@ -2696,7 +2740,7 @@ bool appendSidebandPragmaSourceEdits(
       foldedReplacement = foldPragmaDirectiveBackIntoOperator(
           siteText, sideband.ReplacementText());
 
-    ResyncOutcome ro = textEditAssembler.ApplyResyncOrPend(
+    ResyncOutcome ro = lineObserverLayout.ApplyResyncOrPend(
         tuBytes, sourceRange.first, sourceRange.second, foldedReplacement,
         tuPath);
     TextEdit edit{sourceRange.first,
@@ -2716,17 +2760,17 @@ bool appendSidebandPragmaSourceEdits(
     const PreprocessingStructureKind pragmaKinds[] = {
         PreprocessingStructureKind::Pragma,
         PreprocessingStructureKind::PragmaOperator};
-    if (!textEditAssembler.AuthorizeProtectedSourceIntervals(
-            edit, ProtectedSourceEditAuthorityKind::SidebandPragmaEdit,
-            tuPath, std::nullopt, tuBytes, sourceRange.first,
-            sourceRange.second, pragmaKinds,
+    if (!textEditCertifier.AuthorizeProtectedSourceIntervals(
+            edit, ProtectedSourceEditAuthorityKind::SidebandPragmaEdit, tuPath,
+            std::nullopt, tuBytes, sourceRange.first, sourceRange.second,
+            pragmaKinds,
             /*requireProtectedInterval=*/false))
       return false;
 
     const bool folded =
         StringRef(foldedReplacement) != sideband.ReplacementText();
     if (!folded) {
-      textEditAssembler.CertifyTextEditMaterializedBReplayProof(edit, sideband);
+      textEditCertifier.CertifyTextEditMaterializedBReplayProof(edit, sideband);
     } else {
       // The replay text was re-materialized into the `_Pragma(...)` operator
       // form, which has a different length than the raw-B `#pragma` replay.
@@ -2734,14 +2778,14 @@ bool appendSidebandPragmaSourceEdits(
       // the folded operator text at the front of the (possibly resync-suffixed)
       // edit text.
       const auto bRange = sideband.MaterializedBByteRange();
-      textEditAssembler.CertifyTextEditMaterializedBByteRange(edit, bRange.first,
-                                                              bRange.second);
-      textEditAssembler.CertifyTextEditMaterializedOutputTextRange(
+      textEditCertifier.CertifyTextEditMaterializedBByteRange(
+          edit, bRange.first, bRange.second);
+      textEditCertifier.CertifyTextEditMaterializedOutputTextRange(
           edit, 0,
           std::min<uint64_t>(static_cast<uint64_t>(foldedReplacement.size()),
                              static_cast<uint64_t>(edit.text.size())));
     }
-    textEditAssembler.AttachAcceptedResultCarrier(
+    textEditCertifier.AttachAcceptedResultCarrier(
         edit,
         acceptedCandidateBuilder.BuildAcceptedSpecializedTUTextEditCandidate(
             AcceptedPathKind::TUByteSpanConservativeEdit, sourceRange.first,
@@ -2753,13 +2797,13 @@ bool appendSidebandPragmaSourceEdits(
 }
 
 bool tuInsertionBeforeMaterializedInclude(
-    const RefoldTUEditPlanner &planner, const RefoldModel &model,
+    const RefoldTUAnchorProof &tuAnchorProof, const RefoldModel &model,
     llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     const diffutils::Hunk &h, llvm::StringRef tuPath,
     const std::pair<uint64_t, uint64_t> &span, bool requireVisibleReplayText) {
   if (!h.isInsertOnly() || span.first != span.second)
     return false;
-  if (!planner.AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart))
+  if (!tuAnchorProof.AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart))
     return false;
 
   const uint64_t maxPP = model.GetTokensCountA();

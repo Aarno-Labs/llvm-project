@@ -6,7 +6,6 @@
 
 #include "macro/RefoldMacroFinalCandidateSelector.h"
 
-#include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroDAGSharedHelpers.h"
 #include "macro/RefoldMacroPatchProofCertifier.h"
 #include "macro/RefoldMacroPatchReusePhase.h"
@@ -574,8 +573,7 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
       !conflictingConcreteSubtreeWitnessForcesWholeCover && existingPatch &&
       existingIsCallsite && existingPatch->proof.preservesInvocationStructure &&
       existingPatch->proof.proofRootMacroId == m.id && !baseInvText.empty() &&
-      RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(baseInvText,
-                                                                    m);
+      invocationSpanMatchesCallsitePrefix(baseInvText, m);
 
   std::optional<WholeCoverPlan> wholeCoverPlan;
   bool canReuseExistingExpanded = false;
@@ -692,8 +690,7 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
             ? baseInvText
             : (m.invText ? StringRef(*m.invText) : StringRef(""));
     wholeCoverCanReplaceInvocationSource =
-        RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-            invocationText, m);
+        invocationSpanMatchesCallsitePrefix(invocationText, m);
   }
 
   // Log the final slot state after whole-cover source eligibility is known.

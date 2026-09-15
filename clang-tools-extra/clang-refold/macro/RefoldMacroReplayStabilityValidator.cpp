@@ -11,7 +11,6 @@
 #include "macro/RefoldMacroReplayStabilityValidator.h"
 
 #include "line-control/LineDirectiveInserter.h"
-#include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
@@ -232,8 +231,7 @@ bool RefoldMacroReplayStabilityValidator::
   const bool directCalleeSubstitution =
       patch.proof.kind == MacroPatchProofKind::DirectCalleeSubstitution;
   if (!directCalleeSubstitution &&
-      !RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-          patch.replacement, m)) {
+      !invocationSpanMatchesCallsitePrefix(patch.replacement, m)) {
     REFOLD_LOG_TRACE("macro/proof",
                      "suppress structure-preserving macro replay: inv id={0} "
                      "name={1} replacement no longer has a matching callsite "
@@ -745,8 +743,7 @@ bool RefoldMacroReplayStabilityValidator::
   if (!patch.proof.preservesInvocationStructure ||
       patch.proof.proofRootMacroId != m.id)
     return false;
-  if (!RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-          patch.replacement, m))
+  if (!invocationSpanMatchesCallsitePrefix(patch.replacement, m))
     return false;
   if (!m.ownerIncludeId || !m.invFile)
     return false;
@@ -791,8 +788,9 @@ bool RefoldMacroReplayStabilityValidator::
     std::optional<StringRef> headerBytes = getHeaderBytes();
     if (!headerBytes)
       return std::nullopt;
-    return deps_.macroStateProof.RecoverMacroStateDirectiveLineInterval(
-        directive, *m.invFile, *headerBytes, m.ownerIncludeId);
+    return recoverMacroStateDirectiveLineInterval(deps_.pathIdentity, directive,
+                                                  *m.invFile, *headerBytes,
+                                                  m.ownerIncludeId);
   };
 
   // If any active header-owned definition would be observed by the

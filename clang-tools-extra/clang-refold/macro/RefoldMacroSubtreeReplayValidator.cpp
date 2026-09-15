@@ -11,7 +11,6 @@
 
 #include "macro/RefoldMacroSubtreeReplayValidator.h"
 
-#include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
@@ -289,8 +288,7 @@ bool RefoldMacroSubtreeReplayValidator::
       !subtreeCertificateOf(patch).backed || patch.proof.proofRootMacroId != root.id ||
       !patch.proof.preservesInvocationStructure)
     return true;
-  if (!RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-          patch.replacement, root))
+  if (!invocationSpanMatchesCallsitePrefix(patch.replacement, root))
     return true;
 
   auto rootRangesOpt =

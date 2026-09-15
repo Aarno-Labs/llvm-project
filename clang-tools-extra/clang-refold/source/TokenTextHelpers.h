@@ -33,6 +33,21 @@
 namespace clang {
 namespace refold {
 
+/// Return true iff a retained raw-lexer comment token has a complete spelling.
+///
+/// Clang's raw lexer owns the hard parts of raw-source normalization, including
+/// escaped-newline handling and language-mode details.  This helper is only a
+/// defensive completeness check before treating a comment token as ignorable
+/// source trivia: block comments must have a real closing delimiter, while line
+/// comments are complete at either newline or end-of-buffer.
+inline bool rawLexerCommentTokenIsComplete(llvm::StringRef spelling) {
+  if (spelling.starts_with("//"))
+    return true;
+  if (spelling.starts_with("/*"))
+    return spelling.find("*/", 2) != llvm::StringRef::npos;
+  return false;
+}
+
 /// Convert a raw-lexer token location into an offset relative to the scratch
 /// buffer's artificial base location.
 ///

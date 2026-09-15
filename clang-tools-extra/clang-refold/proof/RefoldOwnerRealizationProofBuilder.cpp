@@ -8,7 +8,7 @@
 
 #include "proof/RefoldAcceptancePathClassifier.h"
 
-#include "edit/RefoldTUEditPlanner.h"
+#include "edit/RefoldTUAnchorProof.h"
 #include "model/RefoldModel.h"
 #include "proof/RefoldAcceptedResultPredicates.h"
 #include "proof/RefoldOwnerStateProof.h"
@@ -1055,11 +1055,10 @@ RefoldOwnerRealizationProofBuilder::BuildTUOwnerRealization(
   if ((currentPath != AcceptedPathKind::TUByteSpanMappedEdit &&
        currentPath != AcceptedPathKind::TUByteSpanConservativeEdit) ||
       hunk.bEnd > deps_.bTokenCount ||
-      !deps_.tuEdits.ValidateTUOwnerRealizationCarrier(
+      !deps_.tuAnchorProof.ValidateTUOwnerRealizationCarrier(
           hunk, spanPlan, structuralBinding) ||
-      (structuralBinding &&
-       !ValidateDurableStructuralSegmentBinding(hunk, spanPlan,
-                                                *structuralBinding))) {
+      (structuralBinding && !ValidateDurableStructuralSegmentBinding(
+                                hunk, spanPlan, *structuralBinding))) {
     return buildRejectedDirectTUCarrier(
         closure, detail, TerminalFallbackObligationKind::OwnerClosedCover,
         TerminalFallbackFailureReason::NoOwnerClosedCover);

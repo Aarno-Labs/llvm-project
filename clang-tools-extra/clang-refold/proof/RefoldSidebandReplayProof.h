@@ -1,18 +1,17 @@
 //===--- RefoldSidebandReplayProof.h --------------------------*- C++ -*-===//
 //
-// Sideband pragma replay proof carriers, replay-envelope helpers, and
-// validation reporting.
+// Sideband pragma replay proof carriers and replay-envelope helpers.
 //
 // Sideband pragmas are zero-normal-token artifacts: Clang may print their
 // directive text in the raw preprocessed replay stream even though the ordinary
 // PP-token model has deliberately removed those tokens before structural
-// diffing.  This module owns the proof objects, pure replay helpers, and shared
-// validation reporter that binds such source-side pragma edits to explicit
-// raw-B byte witnesses.
+// diffing.  This module owns the proof objects and pure replay helpers that
+// bind such source-side pragma edits to explicit raw-B byte witnesses.
 //
 // Callers remain responsible for edit emission, line-resync application,
-// and accepted-result attachment.  Terminal-fallback requests for failed
-// sideband proof validation are reported through RefoldTerminalProofSink so
+// and accepted-result attachment.  Failed sideband proof validation is
+// reported to RefoldTerminalProofSink by
+// validateAndReportSidebandPragmaEditProof in RefoldSidebandPragmaEdits.h, so
 // engine and include-materialization paths share the same fail-closed policy.
 //
 //===----------------------------------------------------------------------===//
@@ -32,8 +31,6 @@
 
 namespace clang {
 namespace refold {
-
-class RefoldTerminalProofSink;
 
 using llvm::ArrayRef;
 using llvm::StringRef;
@@ -113,9 +110,6 @@ public:
 
   /// Return the concrete include owner, when this proof is header-owned.
   std::optional<uint64_t> OwnerIncludeId() const { return ownerIncludeId; }
-
-  /// Return the owner-local source byte where this proof begins.
-  uint64_t SourceBegin() const { return begin; }
 
   /// Return the owner-local source byte where this proof ends.
   uint64_t SourceEnd() const { return end; }
@@ -379,20 +373,6 @@ public:
 /// proof and B replay envelope without mutating the terminal fallback ledger.
 std::optional<StringRef>
 validateSidebandPragmaEditProof(const SidebandPragmaEdit &edit, uint64_t bSize);
-
-/// Validate one sideband pragma proof and report a classified terminal fallback
-/// request when validation fails.
-///
-/// This is the shared fail-closed reporting gate for TU and include-owned
-/// sideband edits.  Keeping the predicate above pure and the failure
-/// translation here prevents each caller from hand-encoding the same
-/// terminal-fallback obligation, reason, and diagnostic detail.  `traceSuccess`
-/// preserves the engine-level owner-local trace without forcing include
-/// materialization to add new success logs.
-bool validateAndReportSidebandPragmaEditProof(
-    const SidebandPragmaEdit &edit, uint64_t bSize,
-    const RefoldTerminalProofSink &terminalSink, llvm::StringRef stage,
-    bool traceSuccess);
 
 /// Remove visible sideband replay bytes from an ordinary replay payload when
 /// those bytes are owned by separate, non-insertion sideband source edits.

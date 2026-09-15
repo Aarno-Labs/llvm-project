@@ -19,6 +19,7 @@
 #include "edit/RefoldTUAnchorProof.h"
 #include "edit/RefoldTUEditPlanner.h"
 #include "edit/RefoldTextEditAssembler.h"
+#include "edit/RefoldTextEditCertifier.h"
 #include "include/IncludeSpellingHelpers.h"
 #include "include/RefoldIncludeInsertionPlanner.h"
 #include "include/RefoldIncludeMaterializationScheduler.h"
@@ -40,6 +41,7 @@
 #include "sideband/RefoldSidebandPragmaEdits.h"
 #include "source/RefoldMixedOwnerTilingPlanner.h"
 #include "source/RefoldOwnerClassifier.h"
+#include "source/RefoldPreprocessRecheck.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
 #include "source/RefoldPreprocessingStructureIndexProvider.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
@@ -988,8 +990,9 @@ bool RefoldEngine::StageSidebandEdits(
   // sideband replay bytes from ordinary hunk replacements.
   return appendSidebandPragmaSourceEdits(
       sidebandPragmaEdits_, model_, tuPath, tuBytes, pathIdentity_,
-      *textEditAssembler_, proofServices_->AcceptedCandidateBuilder(),
-      terminalSink_, structuralHunkDispatcher);
+      *textEditCertifier_, *lineObserverLayout_,
+      proofServices_->AcceptedCandidateBuilder(), terminalSink_,
+      structuralHunkDispatcher);
 }
 
 void RefoldEngine::RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
@@ -1166,7 +1169,7 @@ bool RefoldEngine::DispatchStructuralHunks(
       return false;
 
     auto spanPlan =
-        tuEditPlanner_->PlanTUByteSpan(hunk.aStart, hunk.aEnd, tuPath);
+        tuAnchorProof_->PlanTUByteSpan(hunk.aStart, hunk.aEnd, tuPath);
     if (!spanPlan || spanPlan->tuByteBegin >= spanPlan->tuByteEnd)
       return false;
     auto span = spanPlan->byteRange();
@@ -1455,7 +1458,7 @@ bool RefoldEngine::DispatchStructuralHunks(
 
     if (mapsToTU) {
       auto spanPlan =
-          tuEditPlanner_->PlanTUByteSpan(h.aStart, h.aEnd, tuPath); // [b,e)
+          tuAnchorProof_->PlanTUByteSpan(h.aStart, h.aEnd, tuPath); // [b,e)
       if (spanPlan) {
         auto span = spanPlan->byteRange();
 
@@ -1492,8 +1495,8 @@ bool RefoldEngine::DispatchStructuralHunks(
               envelopeEnd =
                   *envelopeBegin + static_cast<uint64_t>(bSlice.size());
             }
-            repl = textEditAssembler_->StripSeparatelyOwnedSidebandReplay(
-                repl, envelopeBegin, envelopeEnd);
+            repl = stripSeparatelyOwnedSidebandReplay(
+                sidebandPragmaEdits_, repl, envelopeBegin, envelopeEnd);
           }
           const size_t b0 = bTokOff_[static_cast<size_t>(h.bStart)];
 
@@ -1545,7 +1548,7 @@ bool RefoldEngine::DispatchStructuralHunks(
 
         bool advancedOverSourceLineControlPrefix =
             maybeAdvanceTUInsertionPastSourceLineControlPrefix(
-                *tuEditPlanner_, lineControlProof_, h, tuPath, tuBytes, span);
+                *tuAnchorProof_, lineControlProof_, h, tuPath, tuBytes, span);
         std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment;
         if (advancedOverSourceLineControlPrefix) {
           insertionAnchorAdjustment = TUInsertionAnchorAdjustment{
@@ -1589,7 +1592,7 @@ bool RefoldEngine::DispatchStructuralHunks(
 
         const bool skipLocalResync =
             tuInsertionBeforeMaterializedInclude(
-                *tuEditPlanner_, model_, sidebandPragmaEdits_, h, tuPath, span,
+                *tuAnchorProof_, model_, sidebandPragmaEdits_, h, tuPath, span,
                 /*requireVisibleReplayText=*/true) ||
             lineControlProof_.TUInsertionCanDeferResyncToConditionalJoin(
                 advancedOverSourceLineControlPrefix, tuPath, span.second);
@@ -1597,7 +1600,7 @@ bool RefoldEngine::DispatchStructuralHunks(
         ResyncOutcome ro =
             skipLocalResync
                 ? ResyncOutcome(padded, std::nullopt)
-                : textEditAssembler_->ApplyResyncOrPend(
+                : lineObserverLayout_->ApplyResyncOrPend(
                       tuBytes, span.first, span.second, padded, tuPath);
         if (std::optional<TextEdit> directEdit =
                 textEditAssembler_->BuildDirectTUHunkTextEdit(
@@ -1666,7 +1669,7 @@ bool RefoldEngine::DispatchStructuralHunks(
       continue;
     }
 
-    if (auto spanPlan = tuEditPlanner_->PlanTUByteSpan(h.aStart, h.aEnd,
+    if (auto spanPlan = tuAnchorProof_->PlanTUByteSpan(h.aStart, h.aEnd,
                                                        tuPath)) { // [b, e)
       if (std::optional<TextEdit> directEdit = BuildDirectTUByteSpanEditForHunk(
               h, i, isDel, tuPath, tuBytes, spanPlan->byteRange())) {
@@ -1802,8 +1805,8 @@ std::optional<TextEdit> RefoldEngine::BuildDirectTUByteSpanEditForHunk(
                 static_cast<uint64_t>(bSlice.data() - bSource_.data());
             envelopeEnd = *envelopeBegin + static_cast<uint64_t>(bSlice.size());
           }
-          repl = textEditAssembler_->StripSeparatelyOwnedSidebandReplay(
-              repl, envelopeBegin, envelopeEnd);
+          repl = stripSeparatelyOwnedSidebandReplay(sidebandPragmaEdits_, repl,
+                                                    envelopeBegin, envelopeEnd);
         }
       }
 
@@ -1858,7 +1861,7 @@ std::optional<TextEdit> RefoldEngine::BuildDirectTUByteSpanEditForHunk(
 
       bool advancedOverSourceLineControlPrefix =
           maybeAdvanceTUInsertionPastSourceLineControlPrefix(
-              *tuEditPlanner_, lineControlProof_, h, tuPath, tuBytes, span);
+              *tuAnchorProof_, lineControlProof_, h, tuPath, tuBytes, span);
       std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment;
       if (advancedOverSourceLineControlPrefix) {
         insertionAnchorAdjustment = TUInsertionAnchorAdjustment{
@@ -1901,7 +1904,7 @@ std::optional<TextEdit> RefoldEngine::BuildDirectTUByteSpanEditForHunk(
 
       const bool skipLocalResync =
           tuInsertionBeforeMaterializedInclude(
-              *tuEditPlanner_, model_, sidebandPragmaEdits_, h, tuPath, span,
+              *tuAnchorProof_, model_, sidebandPragmaEdits_, h, tuPath, span,
               /*requireVisibleReplayText=*/false) ||
           lineControlProof_.TUInsertionCanDeferResyncToConditionalJoin(
               advancedOverSourceLineControlPrefix, tuPath, span.second);
@@ -1909,7 +1912,7 @@ std::optional<TextEdit> RefoldEngine::BuildDirectTUByteSpanEditForHunk(
       ResyncOutcome ro =
           skipLocalResync
               ? ResyncOutcome(padded, std::nullopt)
-              : textEditAssembler_->ApplyResyncOrPend(
+              : lineObserverLayout_->ApplyResyncOrPend(
                     tuBytes, span.first, span.second, padded, tuPath);
       return textEditAssembler_->BuildDirectTUHunkTextEdit(
           h, hunkIndex, span, std::move(ro), StringRef(padded), rawTUStart,
@@ -2140,7 +2143,7 @@ std::string RefoldEngine::FinalizeStructuralResult(
   includeSchedulerDeps.includeInsertionPlanner = includeInsertionPlanner_.get();
   includeSchedulerDeps.lineObserverLayout = lineObserverLayout_.get();
   includeSchedulerDeps.macroStateRepairPlanner = macroStateRepairPlanner_.get();
-  includeSchedulerDeps.textEditAssembler = textEditAssembler_.get();
+  includeSchedulerDeps.textEditCertifier = textEditCertifier_.get();
   includeSchedulerDeps.acceptedCandidateBuilder =
       &proofServices_->AcceptedCandidateBuilder();
   includeSchedulerDeps.pragmaOnceGuards = pragmaOnceGuardRewriter_.get();
@@ -2182,6 +2185,8 @@ std::string RefoldEngine::FinalizeStructuralResult(
   finalEmissionDeps.lineDirs = &lineDirs_;
   finalEmissionDeps.macroStateRepairPlanner = macroStateRepairPlanner_.get();
   finalEmissionDeps.textEditAssembler = textEditAssembler_.get();
+  finalEmissionDeps.textEditCertifier = textEditCertifier_.get();
+  finalEmissionDeps.lineObserverLayout = lineObserverLayout_.get();
   finalEmissionDeps.acceptedCandidateBuilder =
       &proofServices_->AcceptedCandidateBuilder();
   finalEmissionDeps.terminalSink = &terminalSink_;

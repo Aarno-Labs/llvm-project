@@ -32,7 +32,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -44,7 +43,9 @@ namespace refold {
 class LineDirectiveInserter;
 class RefoldAcceptedCandidateBuilder;
 class RefoldIncludeInsertionPlanner;
+class RefoldLineObserverLayout;
 class RefoldPreprocessingStructureIndex;
+class RefoldTextEditCertifier;
 class RefoldTheoremAudit;
 
 /// Plans explicit expansion fallback when no declared structural proof owns a
@@ -55,24 +56,6 @@ class RefoldExpansionFallbackPlanner {
 public:
   using TextEdit = ::clang::refold::TextEdit;
   using ResyncOutcome = ::clang::refold::ResyncOutcome;
-
-  /// Exceptional callback bundle for engine-owned emission ledgers and attempt
-  /// accounting.  Theorem/audit policy is a named service; these remaining
-  /// hooks mutate final edit/resync state that is still owned
-  /// by the engine/assembler boundary.
-  struct Hooks {
-    std::function<ResyncOutcome(llvm::StringRef, uint64_t, uint64_t,
-                                llvm::StringRef, llvm::StringRef,
-                                std::optional<uint64_t>)>
-        applyResyncOrPend;
-    std::function<void(TextEdit &, uint64_t, uint64_t)>
-        certifyTextEditMaterializedBTokenRange;
-    std::function<void(TextEdit &, const AcceptedResultCandidate &)>
-        attachAcceptedResultCarrier;
-    std::function<bool(TextEdit &, llvm::StringRef, llvm::StringRef, uint64_t,
-                       uint64_t)>
-        authorizeTUIncludeClosure;
-  };
 
   RefoldExpansionFallbackPlanner(
       const RefoldModel &model, llvm::StringRef bSource,
@@ -92,7 +75,8 @@ public:
       const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
       const RefoldTheoremAudit &theoremAuditService, RefoldStats &lastStats,
       std::vector<MaterializedEditMapping> *materializedEditMappings,
-      Hooks hooks)
+      const RefoldTextEditCertifier &textEditCertifier,
+      const RefoldLineObserverLayout &lineObserverLayout)
       : model_(model), bSource_(bSource), aToks_(aToks),
         abTokHunks_(abTokHunks), abTokMapB2A_(abTokMapB2A),
         abTokAnchorProofs_(abTokAnchorProofs), lineDirs_(lineDirs),
@@ -105,7 +89,8 @@ public:
         acceptedCandidateBuilder_(acceptedCandidateBuilder),
         theoremAuditService_(theoremAuditService), lastStats_(lastStats),
         materializedEditMappings_(materializedEditMappings),
-        hooks_(std::move(hooks)) {}
+        textEditCertifier_(textEditCertifier),
+        lineObserverLayout_(lineObserverLayout) {}
 
   /// Try to realize one unresolved PP hunk as the explicit
   /// TUIncludeClosureEdit proof class.  The implementation remains fail-closed:
@@ -168,7 +153,8 @@ private:
   const RefoldTheoremAudit &theoremAuditService_;
   RefoldStats &lastStats_;
   std::vector<MaterializedEditMapping> *materializedEditMappings_;
-  Hooks hooks_;
+  const RefoldTextEditCertifier &textEditCertifier_;
+  const RefoldLineObserverLayout &lineObserverLayout_;
 };
 
 } // namespace refold

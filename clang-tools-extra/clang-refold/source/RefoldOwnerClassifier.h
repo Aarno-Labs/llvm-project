@@ -5,8 +5,8 @@
 // This service owns the narrow question "which source owner does this A/B hunk
 // belong to?"  It deliberately does not build TU text edits, widen TU byte
 // spans, assemble accepted-result proof carriers, or order final TextEdits.
-// TU edit planning lives in RefoldTUEditPlanner; final assembly lives at the
-// text-edit assembler boundary.
+// TU anchors and byte spans are proved by RefoldTUAnchorProof; final assembly
+// lives at the text-edit assembler boundary.
 //
 //===----------------------------------------------------------------------===//
 
@@ -26,14 +26,14 @@ namespace clang {
 namespace refold {
 
 class RefoldPathIdentity;
-class RefoldTUEditPlanner;
+class RefoldTUAnchorProof;
 struct SidebandPragmaEdit;
 
 /// Classifies A-side hunk ownership without owning edit construction.
 ///
 /// The classifier receives stable read-only model/path/sideband inputs directly
-/// and queries TU-positioning through RefoldTUEditPlanner.  Keeping the planner
-/// as a named constructor dependency makes the owner/TU-anchor boundary
+/// and queries TU-positioning through RefoldTUAnchorProof.  Keeping the proof
+/// service as a named constructor dependency makes the owner/TU-anchor boundary
 /// explicit without letting this service build TU text edits or widen TU spans
 /// itself.
 class RefoldOwnerClassifier {
@@ -43,8 +43,8 @@ public:
     const RefoldModel &model;
     /// Path oracle used when physical TU identity must be canonicalized.
     const RefoldPathIdentity &pathIdentity;
-    /// TU-positioning service used only for proof queries, not edit building.
-    const RefoldTUEditPlanner &tuEdits;
+    /// TU anchor and byte-span proofs, queried for positioning only.
+    const RefoldTUAnchorProof &tuAnchorProof;
     /// Sideband pragma edits already removed from the token streams.
     llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits;
   };

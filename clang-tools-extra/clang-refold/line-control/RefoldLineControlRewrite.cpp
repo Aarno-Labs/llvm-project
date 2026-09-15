@@ -11,7 +11,7 @@
 
 #include "line-control/SourceLineDirectiveHelpers.h"
 
-#include "proof/RefoldOwnerStateProof.h"
+#include "source/TokenTextHelpers.h"
 
 #include "llvm/ADT/DenseMap.h"
 

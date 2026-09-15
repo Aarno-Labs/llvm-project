@@ -7,8 +7,8 @@
 #include "macro/RefoldMacroWholeCoverOrchestrator.h"
 
 #include "edit/RefoldBInsertionLedger.h"
+#include "edit/RefoldEditTypes.h"
 #include "line-control/LineDirectiveInserter.h"
-#include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroDAGSharedHelpers.h"
 #include "macro/RefoldMacroOccurrenceProofValidator.h"
@@ -390,8 +390,7 @@ RefoldMacroWholeCoverOrchestrator::TryRecursiveTupleGeneratedReplayFromCallerAnc
       continue;
     if (ancestor->calleeOrigin.kind != MacroCalleeOriginKind::LiteralMacroName)
       continue;
-    if (!RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-            *ancestor->invText, *ancestor))
+    if (!invocationSpanMatchesCallsitePrefix(*ancestor->invText, *ancestor))
       continue;
 
     std::optional<std::pair<uint64_t, uint64_t>> ancestorCover =
@@ -529,8 +528,7 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
     StringRef invocationText =
         !baseInvText.empty() ? baseInvText
                              : (m.invText ? StringRef(*m.invText) : StringRef());
-    if (!RefoldLineObserverLayout::InvocationSpanMatchesCallsitePrefix(
-            invocationText, m)) {
+    if (!invocationSpanMatchesCallsitePrefix(invocationText, m)) {
       if (std::optional<MacroPatch> ancestorPatch =
               TryRecursiveTupleGeneratedReplayFromCallerAncestor(m, hEff))
         return ancestorPatch;

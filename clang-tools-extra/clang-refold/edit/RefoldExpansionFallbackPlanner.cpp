@@ -12,13 +12,14 @@
 #include "edit/RefoldExpansionFallbackPlanner.h"
 
 #include "edit/RefoldSourceEnvelopeTiling.h"
+#include "edit/RefoldTextEditCertifier.h"
 #include "include/IncludeSpellingHelpers.h"
 #include "include/RefoldIncludeInsertionPlanner.h"
-#include "include/RefoldIncludeMaterializer.h"
 #include "include/RefoldIncludeReplayProof.h"
 #include "line-control/FinalLineControlModel.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlProof.h"
+#include "line-control/RefoldLineObserverLayout.h"
 #include "line-control/SourceLineDirectiveHelpers.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
@@ -1089,7 +1090,7 @@ public:
       llvm::ArrayRef<PPTok> aToks, const clang::LangOptions &lexLang,
       const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
       ArrayRef<const RefoldModel::IncludeItem *> touched)
-      : model_(model), paths_(paths), macroStateProof_(macroStateProof),
+      : model_(model), paths_(paths),
         preprocessingStructureIndex_(preprocessingStructureIndex),
         aToks_(aToks), lexLang_(lexLang), tuPath_(tuPath), tuBytes_(tuBytes),
         touched_(touched),
@@ -1914,8 +1915,8 @@ private:
   std::optional<MacroStateDirectiveLineInterval>
   MacroDirectiveFullSourceInterval(
       const RefoldModel::MacroDirective &directive) const {
-    return macroStateProof_.RecoverMacroStateDirectiveLineInterval(
-        directive, tuPath_, tuBytes_, std::nullopt);
+    return recoverMacroStateDirectiveLineInterval(paths_, directive, tuPath_,
+                                                  tuBytes_, std::nullopt);
   }
 
   /// Return a TU-spelled pragma wholly contained in the physical source line
@@ -2024,7 +2025,6 @@ private:
 
   const RefoldModel &model_;
   const RefoldPathIdentity &paths_;
-  const RefoldMacroStateProof &macroStateProof_;
   const RefoldPreprocessingStructureIndex &preprocessingStructureIndex_;
   llvm::ArrayRef<PPTok> aToks_;
   const clang::LangOptions &lexLang_;
@@ -3785,9 +3785,10 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (lineDirs_.Enabled()) {
         // Keep line-preservation semantic rather than physical in normal mode:
         // suppress synthetic blank padding here and let
-        // hooks_.applyResyncOrPend() observe the unchanged newline deficit over
-        // the final edit span. If a resync is needed, it will be emitted as a
-        // #line directive after any copied suffix line absorbed above.
+        // RefoldLineObserverLayout::ApplyResyncOrPend() observe the unchanged
+        // newline deficit over the final edit span. If a resync is needed, it
+        // will be emitted as a #line directive after any copied suffix line
+        // absorbed above.
         REFOLD_LOG_TRACE(
             "fallback",
             "TU include-closure physical newline pad deferred to #line "
@@ -3840,11 +3841,11 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       stringutils::showWsWithClip(rawReplacement, 120),
       stringutils::showWsWithClip(padded, 120));
 
-  ResyncOutcome ro =
-      emitsSourceLineDirectiveResume
-          ? ResyncOutcome(padded, std::nullopt)
-          : hooks_.applyResyncOrPend(tuBytes, sourceBegin, closureSourceEnd,
-                                     padded, tuPath, std::nullopt);
+  ResyncOutcome ro = emitsSourceLineDirectiveResume
+                         ? ResyncOutcome(padded, std::nullopt)
+                         : lineObserverLayout_.ApplyResyncOrPend(
+                               tuBytes, sourceBegin, closureSourceEnd, padded,
+                               tuPath, std::nullopt);
   TextEdit edit{sourceBegin,
                 closureSourceEnd,
                 std::move(ro.text),
@@ -3857,11 +3858,13 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   // path forwards them.
   if (!emitsSourceLineDirectiveResume)
     edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
-  hooks_.certifyTextEditMaterializedBTokenRange(edit, bEnvelope->first,
-                                                bEnvelope->second);
-  if (!hooks_.authorizeTUIncludeClosure ||
-      !hooks_.authorizeTUIncludeClosure(edit, tuPath, tuBytes, sourceBegin,
-                                        closureSourceEnd))
+  textEditCertifier_.CertifyTextEditMaterializedBTokenRange(
+      edit, bEnvelope->first, bEnvelope->second);
+  if (!textEditCertifier_.AuthorizeCompleteProtectedSourceClosure(
+          edit, ProtectedSourceEditAuthorityKind::TUIncludeClosure, tuPath,
+          std::nullopt, tuBytes, sourceBegin, closureSourceEnd,
+          /*requireProtectedInterval=*/true,
+          /*requestTerminalOnFailure=*/false))
     return std::nullopt;
 
   // Emit a first-class TU include-closure carrier instead of hiding this hybrid
@@ -3877,7 +3880,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   theoremAuditService_.AuditExpansionFallbackAcceptedCandidate(
       fallbackBranch, acceptedClosure,
       "BuildTUIncludeClosureEditForUnresolvedHunk/accepted");
-  hooks_.attachAcceptedResultCarrier(edit, acceptedClosure);
+  textEditCertifier_.AttachAcceptedResultCarrier(edit, acceptedClosure);
   return edit;
 }
 

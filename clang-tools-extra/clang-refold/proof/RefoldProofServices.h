@@ -48,7 +48,7 @@ class RefoldModel;
 class RefoldOwnerStateProof;
 class RefoldProofSummaryBuilder;
 class RefoldSourceMapper;
-class RefoldTUEditPlanner;
+class RefoldTUAnchorProof;
 class RefoldTheoremAudit;
 class RefoldTokenTextAnalysis;
 
@@ -70,7 +70,7 @@ public:
       const RefoldArgTextRecovery &argTextRecovery,
       const RefoldMacroTopology &macroTopology,
       const RefoldOwnerStateProof &ownerStateProof,
-      const RefoldTUEditPlanner &tuEdits,
+      const RefoldTUAnchorProof &tuAnchorProof,
       const RefoldProofSummaryBuilder &proofSummaryBuilder,
       const RefoldTheoremAudit &theoremAudit,
       TheoremAuditStats &lastTheoremAudit,
@@ -81,9 +81,6 @@ public:
 
   const RefoldWitnessEquivalenceKeyBuilder &EquivalenceKeyBuilder() const {
     return equivalenceKeyBuilder_;
-  }
-  const RefoldWitnessResolver &WitnessResolver() const {
-    return witnessResolver_;
   }
   const RefoldAcceptedResultRanker &AcceptedResultRanker() const {
     return acceptedResultRanker_;

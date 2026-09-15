@@ -13,6 +13,7 @@
 
 #include "edit/RefoldSourceEnvelopeTiling.h"
 #include "edit/RefoldTextEditAssembler.h"
+#include "edit/RefoldTextEditCertifier.h"
 #include "include/IncludeSpellingHelpers.h"
 #include "include/RefoldHeaderIncludeEditPlanner.h"
 #include "include/RefoldIncludeInsertionPlanner.h"
@@ -30,6 +31,7 @@
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
+#include "sideband/RefoldSidebandPragmaEdits.h"
 #include "source/RefoldSourceMapper.h"
 #include "source/TokenTextHelpers.h"
 #include "support/RefoldDenseMapInfo.h"
@@ -734,7 +736,7 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
             includeId, headerPath, sourceRange.second);
     ResyncOutcome ro =
         mustPreserveHeaderLineState
-            ? textEditAssembler_.ApplyResyncOrPend(
+            ? lineObserverLayout_.ApplyResyncOrPend(
                   bytes, sourceRange.first, sourceRange.second,
                   sideband.ReplacementText(), headerPath, includeId)
             : ResyncOutcome(sideband.ReplacementText().str(), std::nullopt);
@@ -750,15 +752,15 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
     const PreprocessingStructureKind pragmaKinds[] = {
         PreprocessingStructureKind::Pragma,
         PreprocessingStructureKind::PragmaOperator};
-    if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
+    if (!textEditCertifier_.AuthorizeProtectedSourceIntervals(
             edit, ProtectedSourceEditAuthorityKind::SidebandPragmaEdit,
-            headerPath, includeId, bytes, sourceRange.first,
-            sourceRange.second, pragmaKinds,
+            headerPath, includeId, bytes, sourceRange.first, sourceRange.second,
+            pragmaKinds,
             /*requireProtectedInterval=*/false)) {
       includeExpansion[includeId] = std::string();
       return;
     }
-    textEditAssembler_.AttachAcceptedResultCarrier(
+    textEditCertifier_.AttachAcceptedResultCarrier(
         edit,
         acceptedCandidateBuilder_.BuildAcceptedIncludeRealizationCandidate(
             AcceptedPathKind::IncludeMaterializedExpansion, *inc));
@@ -820,7 +822,7 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
 
       // Apply local line-resync policy before staging the edit, and carry the
       // accepted macro proof metadata to the emitted TextEdit.
-      ResyncOutcome ro = textEditAssembler_.ApplyResyncOrPend(
+      ResyncOutcome ro = lineObserverLayout_.ApplyResyncOrPend(
           bytes, editStart, editEnd, editReplacement, headerPath, includeId);
       TextEdit edit{
           editStart,
@@ -841,7 +843,7 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
             PreprocessingStructureKind::MacroUndef};
         for (const MacroStateDirectiveLineInterval &transition :
              movedMacroStateTransitions) {
-          if (textEditAssembler_.AuthorizeExactProtectedSourceInterval(
+          if (textEditCertifier_.AuthorizeExactProtectedSourceInterval(
                   edit, ProtectedSourceEditAuthorityKind::MacroStateRepair,
                   headerPath, includeId, bytes, transition.begin,
                   transition.end, macroStateKinds)) {
@@ -851,7 +853,7 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
           return;
         }
       }
-      textEditAssembler_.AttachAcceptedResultCarrier(
+      textEditCertifier_.AttachAcceptedResultCarrier(
           edit,
           acceptedCandidateBuilder_.BuildAcceptedEmittedMacroCandidate(mp));
 
@@ -1207,10 +1209,10 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
         if (sidebandOnly ||
             subtreeWork.UsesOnlySidebandReplayEnvelope(child->id)) {
           if (auto sidebandBRange =
-                  textEditAssembler_
-                      .SidebandPragmaMaterializedBByteRangeForInclude(
-                          child->id))
-            textEditAssembler_.CertifyTextEditMaterializedBByteRange(
+                  sidebandPragmaMaterializedBByteRangeForInclude(
+                      sidebandPragmaEdits_, child->id,
+                      static_cast<uint64_t>(bSource_.size())))
+            textEditCertifier_.CertifyTextEditMaterializedBByteRange(
                 edit, sidebandBRange->first, sidebandBRange->second);
         }
 
@@ -1218,9 +1220,8 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
             PreprocessingStructureKind::Include,
             PreprocessingStructureKind::IncludeNext,
             PreprocessingStructureKind::Import};
-        if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
-                edit,
-                ProtectedSourceEditAuthorityKind::IncludeMaterialization,
+        if (!textEditCertifier_.AuthorizeProtectedSourceIntervals(
+                edit, ProtectedSourceEditAuthorityKind::IncludeMaterialization,
                 headerPath, includeId, bytes, siteStart, siteEnd,
                 includeKinds)) {
           includeExpansion[includeId] = std::string();
@@ -1232,10 +1233,10 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
         // the generic materialized-expansion carrier for this child include.
         auto itAccepted = includeExpansionAcceptedResults.find(child->id);
         if (itAccepted != includeExpansionAcceptedResults.end()) {
-          textEditAssembler_.AttachAcceptedResultCarrier(edit,
+          textEditCertifier_.AttachAcceptedResultCarrier(edit,
                                                          itAccepted->second);
         } else {
-          textEditAssembler_.AttachAcceptedResultCarrier(
+          textEditCertifier_.AttachAcceptedResultCarrier(
               edit,
               acceptedCandidateBuilder_
                   .BuildAcceptedIncludeRealizationCandidate(
@@ -1745,13 +1746,13 @@ RefoldIncludeMaterializer::MakeCleanChildIncludeOperandRewriteEdit(
       PreprocessingStructureKind::Include,
       PreprocessingStructureKind::IncludeNext,
       PreprocessingStructureKind::Import};
-  if (!textEditAssembler_.AuthorizeProtectedSourceIntervals(
+  if (!textEditCertifier_.AuthorizeProtectedSourceIntervals(
           edit, ProtectedSourceEditAuthorityKind::IncludeDirectiveRewrite,
           child.sitePath, child.parent, ownerBytes, siteStart, siteEnd,
           includeKinds, /*requireProtectedInterval=*/true,
           /*requestTerminalOnFailure=*/false))
     return std::nullopt;
-  textEditAssembler_.AttachAcceptedResultCarrier(
+  textEditCertifier_.AttachAcceptedResultCarrier(
       edit, acceptedCandidateBuilder_.BuildAcceptedIncludeCandidate(
                 AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, patch,
                 &witness));
@@ -1771,7 +1772,7 @@ RefoldIncludeMaterializer::ComputeIncludeTextEdits(
       model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, lineDirs_,
       sourceMapper_, paths_, macroStateProof_, lineControlProof_,
       ownerStateProof_, acceptedCandidateBuilder_, acceptedResultRanker_,
-      textEditAssembler_, sidebandPragmaEdits_, lexLang_);
+      textEditCertifier_, lineObserverLayout_, sidebandPragmaEdits_, lexLang_);
   return planner.Compute(ie, std::move(headerText));
 }
 
@@ -1783,7 +1784,7 @@ RefoldIncludeMaterializer::ComputeChildBoundaryInsertByte(
       model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, lineDirs_,
       sourceMapper_, paths_, macroStateProof_, lineControlProof_,
       ownerStateProof_, acceptedCandidateBuilder_, acceptedResultRanker_,
-      textEditAssembler_, sidebandPragmaEdits_, lexLang_);
+      textEditCertifier_, lineObserverLayout_, sidebandPragmaEdits_, lexLang_);
   return planner.ComputeChildBoundaryInsertByte(p, file, witness);
 }
 

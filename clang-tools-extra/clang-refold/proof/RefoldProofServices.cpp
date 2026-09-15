@@ -27,7 +27,7 @@ RefoldProofServices::RefoldProofServices(
     const RefoldArgTextRecovery &argTextRecovery,
     const RefoldMacroTopology &macroTopology,
     const RefoldOwnerStateProof &ownerStateProof,
-    const RefoldTUEditPlanner &tuEdits,
+    const RefoldTUAnchorProof &tuAnchorProof,
     const RefoldProofSummaryBuilder &proofSummaryBuilder,
     const RefoldTheoremAudit &theoremAudit, TheoremAuditStats &lastTheoremAudit,
     const RefoldWitnessTrace &witnessTrace,
@@ -46,7 +46,7 @@ RefoldProofServices::RefoldProofServices(
           model, proofSummaryBuilder}),
       ownerRealizationProofBuilder_(
           RefoldOwnerRealizationProofBuilder::Dependencies{
-              model, ownerStateProof, tuEdits,
+              model, ownerStateProof, tuAnchorProof,
               static_cast<uint64_t>(bToks.size()), proofSummaryBuilder,
               acceptedResultRanker_, mixedOwnerTilingSegmentBindings,
               mixedOwnerTilingWitnesses, acceptancePathClassifier_}),

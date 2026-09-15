@@ -48,7 +48,7 @@ class RefoldPragmaOnceGuardRewriter;
 class RefoldAcceptedCandidateBuilder;
 class RefoldStructuralHunkDispatcher;
 class RefoldTerminalProofSink;
-class RefoldTextEditAssembler;
+class RefoldTextEditCertifier;
 struct SidebandPragmaEdit;
 
 /// Schedules include materialization and TU-root include-emission edits.
@@ -79,8 +79,8 @@ public:
     const RefoldLineObserverLayout *lineObserverLayout = nullptr;
     /// Macro-state repair planner consulted around include realization.
     const RefoldMacroStateRepairPlanner *macroStateRepairPlanner = nullptr;
-    /// Final text-edit assembler used for TU-root include edits.
-    const RefoldTextEditAssembler *textEditAssembler = nullptr;
+    /// Authorizes and certifies TU-root include edits.
+    const RefoldTextEditCertifier *textEditCertifier = nullptr;
     /// Builds the accepted-result carriers for TU-root include edits.
     const RefoldAcceptedCandidateBuilder *acceptedCandidateBuilder = nullptr;
     /// Synthetic `#pragma once` guard catalog.  Mutable because the scheduler is
@@ -320,7 +320,7 @@ private:
   const RefoldIncludeInsertionPlanner &includeInsertionPlanner_;
   const RefoldLineObserverLayout &lineObserverLayout_;
   const RefoldMacroStateRepairPlanner &macroStateRepairPlanner_;
-  const RefoldTextEditAssembler &textEditAssembler_;
+  const RefoldTextEditCertifier &textEditCertifier_;
   RefoldPragmaOnceGuardRewriter &pragmaOnceGuards_;
   const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder_;
   RefoldTerminalProofSink &terminalSink_;

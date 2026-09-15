@@ -11,18 +11,21 @@
 //     `-E -P` output bytes.
 //   - `compareTokens`: compares two `PPTok` streams for byte-exact agreement,
 //     returning a descriptive `llvm::Error` at the first mismatch.
+//   - `buildFinalSourcePreprocessCallback` and
+//     `buildFinalLineControlValidationCallback`: the executable oracles that
+//     final verification and final line-control pruning consume.
 //
 // These primitives are intentionally generic — the `--no-lines` mode's
-// ignore-mask construction and the line-control validation callback layer
-// sit on top of this surface.  The raw lexer that produces a `PPTok` stream
-// from a preprocessed byte buffer lives next to `PPTok` itself in
-// `model/RefoldToken.h`.
+// ignore-mask construction sits on top of this surface.  The raw lexer that
+// produces a `PPTok` stream from a preprocessed byte buffer lives next to
+// `PPTok` itself in `model/RefoldToken.h`.
 //
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPREPROCESSRECHECK_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPREPROCESSRECHECK_H
 
+#include "line-control/FinalLineControlModel.h"
 #include "model/RefoldModel.h"
 #include "model/RefoldToken.h"
 
@@ -60,6 +63,38 @@ preprocessToBytes(llvm::StringRef inputPath,
 /// ignore masks and `--no-lines` validation are layered above it.
 llvm::Error compareTokens(llvm::ArrayRef<PPTok> aToks,
                           llvm::ArrayRef<PPTok> bToks);
+
+/// Build a callback that preprocesses an assembled final source through the
+/// producer-recorded context, using one stable temporary path beside \p
+/// anchorPath so `__FILE__` and quoted-include lookup stay comparable.
+///
+/// \p anchorPath must name the producer's own source, not the refold output;
+/// see `producerSourceAnchorPath()` for why the distinction is load-bearing.
+///
+///
+/// \p verifyIncludeDirs are caller-declared last-resort include directories.
+/// An edited stream may name a header that did not exist when the producer ran
+/// -- a transform that hoists globals into a new header, for instance -- so no
+/// producer-recorded search path can find it.  Where such a header lives is not
+/// derivable from the refold map, so it is declared rather than guessed; each
+/// directory is searched only after every producer-recorded path has missed.
+FinalSourcePreprocessCallback buildFinalSourcePreprocessCallback(
+    llvm::StringRef anchorPath, const RefoldModel::PreprocessContext &ctx,
+    llvm::ArrayRef<std::string> verifyIncludeDirs = {});
+
+/// Build the executable oracle that validates one proposed final-stream
+/// `#line` deletion.
+///
+/// The returned callback is consumed by `refoldTranslationUnit` and ultimately
+/// by the final-line-control pruner.  It re-invokes the producer-recorded
+/// preprocessor on the current accepted final source and the candidate final
+/// source using one stable temporary path located beside \p outputPath, so
+/// `__FILE__` and quoted-include lookup remain comparable across both inputs.
+/// Byte-for-byte preprocessor equivalence is accepted first; otherwise the
+/// callback falls back to token-sequence equality, which is the same oracle
+/// `--check` uses.
+FinalLineControlValidationCallback buildFinalLineControlValidationCallback(
+    llvm::StringRef outputPath, const RefoldModel::PreprocessContext &ctx);
 
 } // namespace refold
 } // namespace clang

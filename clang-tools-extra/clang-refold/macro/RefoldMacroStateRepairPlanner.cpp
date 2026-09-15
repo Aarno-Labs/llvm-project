@@ -12,7 +12,8 @@
 #include "macro/RefoldMacroStateRepairPlanner.h"
 
 #include "edit/RefoldPatchTypes.h"
-#include "edit/RefoldTextEditAssembler.h"
+#include "edit/RefoldTextEditCertifier.h"
+#include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroPatchPlanner.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroTopology.h"
@@ -248,9 +249,13 @@ private:
   RefoldMacroPatchPlanner &MacroPatchPlanner() const {
     return *deps_.macroPatchPlanner;
   }
-  /// Returns the edit assembler used to restage and certify repair edits.
-  RefoldTextEditAssembler &TextEditAssembler() const {
-    return *deps_.textEditAssembler;
+  /// Returns the certifier used to authorize and certify repair edits.
+  const RefoldTextEditCertifier &TextEditCertifier() const {
+    return *deps_.textEditCertifier;
+  }
+  /// Returns the line-observer layout used for newline-drift resync.
+  const RefoldLineObserverLayout &LineObserverLayout() const {
+    return *deps_.lineObserverLayout;
   }
   /// Returns the terminal proof sink used for conservative fallback evidence.
   RefoldTerminalProofSink &TerminalSink() const { return *deps_.terminalSink; }
@@ -765,8 +770,8 @@ bool MacroStateRepairContext::IncludeAncestrySitePreservedByFinalTUEdit(
 std::optional<MacroDirectiveSourceInterval>
 MacroStateRepairContext::MacroDirectiveFullSourceInterval(
     const RefoldModel::MacroDirective &directive) const {
-  return MacroStateProof().RecoverMacroStateDirectiveLineInterval(
-      directive, tuPath_, tuBytes_, std::nullopt);
+  return recoverMacroStateDirectiveLineInterval(
+      PathIdentity(), directive, tuPath_, tuBytes_, std::nullopt);
 }
 
 /// MacroDirective::text is rendered from the parsed MacroInfo, so it is not the
@@ -1141,7 +1146,7 @@ bool MacroStateRepairContext::AuthorizeMacroStateSourceTransition(
       includeOwned ? ArrayRef<PreprocessingStructureKind>()
                    : ArrayRef<PreprocessingStructureKind>(nestedMacroKinds);
   const bool authorized =
-      TextEditAssembler().AuthorizeExactProtectedSourceInterval(
+      TextEditCertifier().AuthorizeExactProtectedSourceInterval(
           edit,
           includeOwned
               ? ProtectedSourceEditAuthorityKind::IncludeOwnedMacroStateRepair
@@ -1709,7 +1714,7 @@ void MacroStateRepairContext::AttachConservativeTUCarrier(
     candidate.proofSummary.inheritedStructuralSegmentIndex =
         inherited->segmentIndex;
   }
-  TextEditAssembler().AttachAcceptedResultCarrier(edit, std::move(candidate));
+  TextEditCertifier().AttachAcceptedResultCarrier(edit, std::move(candidate));
 }
 
 void MacroStateRepairContext::PromoteToSpecializedMacroStateRepairCarrier(
@@ -1776,7 +1781,7 @@ void MacroStateRepairContext::PromoteToSpecializedMacroStateRepairCarrier(
 void MacroStateRepairContext::RestageConservativeTUEdit(
     TextEdit &edit, uint64_t start, uint64_t end, StringRef replacement,
     ArrayRef<ProvenMacroStateSourceTransition> repairedTransitions) {
-  ResyncOutcome resync = TextEditAssembler().ApplyResyncOrPend(
+  ResyncOutcome resync = LineObserverLayout().ApplyResyncOrPend(
       tuBytes_, start, end, replacement, tuPath_);
   edit.start = start;
   edit.end = end;
