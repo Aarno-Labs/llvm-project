@@ -159,6 +159,18 @@ bool alignmentMatchedAToB(ArrayRef<int64_t> aToBMap, uint64_t aToken,
          aToBMap[static_cast<size_t>(aToken)] == static_cast<int64_t>(bToken);
 }
 
+/// Result of walking one hunk edge outward to the boundary of the macro
+/// expansion it splits.
+struct SplitExpansionWidening {
+  /// Tokens the edge moves outward, identically on the A and B sides.
+  uint64_t distance = 0;
+  /// The walk arrived at the neighbouring hunk's edge on both sides while that
+  /// edge still splits the expansion, so the expansion is shared with the
+  /// neighbour and cannot be consumed without it.  The caller merges the two
+  /// hunks and walks again from the merged edge.
+  bool reachesNeighbour = false;
+};
+
 /// Return how far one hunk edge must move *outward* for the macro expansion it
 /// splits to sit wholly inside the hunk, or `std::nullopt` when no reachable
 /// position achieves that.
@@ -177,21 +189,32 @@ bool alignmentMatchedAToB(ArrayRef<int64_t> aToBMap, uint64_t aToken,
 /// correspond at all -- the hunk list alone does not, because an insert-only
 /// hunk whose matched edge context was trimmed leaves matched B tokens outside
 /// every hunk with no A token beside them.  The neighbouring hunk's edge must
-/// also not have been reached, because an earlier repair may have taken an
-/// anchored pair into that hunk, and the map still records the pair the
-/// alignment chose rather than the ownership the repair established.  So the
-/// walk stops at the neighbouring hunk rather than merging hunks.
+/// also not be crossed, because an earlier repair may have taken an anchored
+/// pair into that hunk, and the map still records the pair the alignment chose
+/// rather than the ownership the repair established.
+///
+/// So the walk never moves an edge *into* the neighbouring hunk.  When it
+/// arrives exactly at the neighbour's edge on both sides and the expansion
+/// still extends past it, the neighbour holds part of the same expansion, and
+/// the result reports `reachesNeighbour`.  Merging the two hunks is then sound
+/// without consulting the map inside the neighbour: the merged replacement is
+/// the neighbour's own replacement, the walked run of matched identical pairs,
+/// and this hunk's replacement, in order, so it produces exactly the same B.
 ///
 /// \p aFloor and \p bFloor are the preceding hunk's exclusive A/B ends, or zero
-/// for the first hunk.
-static std::optional<uint64_t> leftEdgeWidenDistanceOutOfSplitExpansion(
+/// for the first hunk; \p floorIsHunkEdge says which.
+static std::optional<SplitExpansionWidening>
+leftEdgeWidenDistanceOutOfSplitExpansion(
     const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
     ArrayRef<int64_t> aToBMap, const diffutils::Hunk &hunk, uint64_t aFloor,
-    uint64_t bFloor) {
+    uint64_t bFloor, bool floorIsHunkEdge) {
   uint64_t aStart = hunk.aStart;
   uint64_t bStart = hunk.bStart;
   while (macroExpansionStraddledAtEdge(model, aStart, hunk.aEnd,
                                        /*edgeIsLeft=*/true)) {
+    if (floorIsHunkEdge && aStart == aFloor && bStart == bFloor)
+      return SplitExpansionWidening{hunk.aStart - aStart,
+                                    /*reachesNeighbour=*/true};
     if (aStart <= aFloor || bStart <= bFloor)
       return std::nullopt;
     --aStart;
@@ -200,21 +223,26 @@ static std::optional<uint64_t> leftEdgeWidenDistanceOutOfSplitExpansion(
         !alignmentMatchedAToB(aToBMap, aStart, bStart))
       return std::nullopt;
   }
-  return hunk.aStart - aStart;
+  return SplitExpansionWidening{hunk.aStart - aStart,
+                                /*reachesNeighbour=*/false};
 }
 
 /// Right-edge counterpart of `leftEdgeWidenDistanceOutOfSplitExpansion`.
 ///
 /// \p aLimit and \p bLimit are the following hunk's A/B starts, or the A/B
-/// token counts for the last hunk.
-static std::optional<uint64_t> rightEdgeWidenDistanceOutOfSplitExpansion(
+/// token counts for the last hunk; \p limitIsHunkEdge says which.
+static std::optional<SplitExpansionWidening>
+rightEdgeWidenDistanceOutOfSplitExpansion(
     const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
     ArrayRef<int64_t> aToBMap, const diffutils::Hunk &hunk, uint64_t aLimit,
-    uint64_t bLimit) {
+    uint64_t bLimit, bool limitIsHunkEdge) {
   uint64_t aEnd = hunk.aEnd;
   uint64_t bEnd = hunk.bEnd;
   while (macroExpansionStraddledAtEdge(model, aEnd, hunk.aStart,
                                        /*edgeIsLeft=*/false)) {
+    if (limitIsHunkEdge && aEnd == aLimit && bEnd == bLimit)
+      return SplitExpansionWidening{aEnd - hunk.aEnd,
+                                    /*reachesNeighbour=*/true};
     if (aEnd >= aLimit || bEnd >= bLimit)
       return std::nullopt;
     if (!aAndBTokensAreIdentical(aToks, bToks, aEnd, bEnd) ||
@@ -223,7 +251,7 @@ static std::optional<uint64_t> rightEdgeWidenDistanceOutOfSplitExpansion(
     ++aEnd;
     ++bEnd;
   }
-  return aEnd - hunk.aEnd;
+  return SplitExpansionWidening{aEnd - hunk.aEnd, /*reachesNeighbour=*/false};
 }
 
 /// Return how far a hunk's left edge must move *inward* for the hunk to lie
@@ -1161,46 +1189,94 @@ void RefoldEngine::RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
     // -- the expansion is then wholly consumed by one replacement, which is
     // realizable, where a split expansion is not.
     //
-    // The neighbouring hunks bound each walk.  An edge that cannot reach a
-    // whole-expansion boundary inside its own untouched run is left alone for
-    // the ordinary realizer lattice, which refuses a partial cover.
-    const uint64_t aFloor = index == 0 ? 0 : hunks[index - 1].aEnd;
-    const uint64_t bFloor = index == 0 ? 0 : hunks[index - 1].bEnd;
-    const uint64_t aLimit = index + 1 == hunks.size()
-                                ? static_cast<uint64_t>(aToks_.size())
-                                : hunks[index + 1].aStart;
-    const uint64_t bLimit = index + 1 == hunks.size()
-                                ? static_cast<uint64_t>(bToks_.size())
-                                : hunks[index + 1].bStart;
-
-    if (std::optional<uint64_t> distance =
-            leftEdgeWidenDistanceOutOfSplitExpansion(
-                model_, aToks_, bToks_, abTokMapA2B_, hunk, aFloor, bFloor)) {
-      if (*distance != 0) {
-        REFOLD_LOG_DEBUG(
-            "plan/hunk-edge",
-            "hunk #{0} A=[{1},{2}) starts inside a macro expansion whose "
-            "tokens differ from B's; widening the left edge by {3} token(s) to "
-            "A={4} so the expansion is wholly replaced",
-            index, hunk.aStart, hunk.aEnd, *distance, hunk.aStart - *distance);
+    // The neighbouring hunks bound each walk.  A walk that reaches a
+    // neighbour while still inside the expansion merges the neighbour, which
+    // holds part of the same expansion, and walks again from the merged edge;
+    // each merge removes one hunk, so the loops terminate.  An edge that cannot
+    // reach a whole-expansion boundary this way is left alone for the ordinary
+    // realizer lattice, which refuses a partial cover.
+    //
+    // A left merge erases the current hunk, so the widening below indexes
+    // `hunks` rather than using `hunk`.
+    for (;;) {
+      const bool floorIsHunkEdge = index != 0;
+      const uint64_t aFloor = floorIsHunkEdge ? hunks[index - 1].aEnd : 0;
+      const uint64_t bFloor = floorIsHunkEdge ? hunks[index - 1].bEnd : 0;
+      std::optional<SplitExpansionWidening> widening =
+          leftEdgeWidenDistanceOutOfSplitExpansion(
+              model_, aToks_, bToks_, abTokMapA2B_, hunks[index], aFloor,
+              bFloor, floorIsHunkEdge);
+      if (!widening)
+        break;
+      diffutils::Hunk &current = hunks[index];
+      if (!widening->reachesNeighbour) {
+        if (widening->distance != 0) {
+          REFOLD_LOG_DEBUG(
+              "plan/hunk-edge",
+              "hunk #{0} A=[{1},{2}) starts inside a macro expansion whose "
+              "tokens differ from B's; widening the left edge by {3} token(s) "
+              "to A={4} so the expansion is wholly replaced",
+              index, current.aStart, current.aEnd, widening->distance,
+              current.aStart - widening->distance);
+        }
+        current.aStart -= widening->distance;
+        current.bStart -= widening->distance;
+        break;
       }
-      hunk.aStart -= *distance;
-      hunk.bStart -= *distance;
+      diffutils::Hunk &previous = hunks[index - 1];
+      REFOLD_LOG_DEBUG(
+          "plan/hunk-edge",
+          "hunk #{0} A=[{1},{2}) starts inside a macro expansion shared with "
+          "hunk #{3} A=[{4},{5}); widening the left edge by {6} token(s) "
+          "merges the two into A=[{4},{2}) so the expansion is wholly replaced",
+          index, current.aStart, current.aEnd, index - 1, previous.aStart,
+          previous.aEnd, widening->distance);
+      previous.aEnd = current.aEnd;
+      previous.bEnd = current.bEnd;
+      hunks.erase(hunks.begin() + static_cast<std::ptrdiff_t>(index));
+      --index;
     }
 
-    if (std::optional<uint64_t> distance =
-            rightEdgeWidenDistanceOutOfSplitExpansion(
-                model_, aToks_, bToks_, abTokMapA2B_, hunk, aLimit, bLimit)) {
-      if (*distance != 0) {
-        REFOLD_LOG_DEBUG(
-            "plan/hunk-edge",
-            "hunk #{0} A=[{1},{2}) ends inside a macro expansion whose tokens "
-            "differ from B's; widening the right edge by {3} token(s) to A={4} "
-            "so the expansion is wholly replaced",
-            index, hunk.aStart, hunk.aEnd, *distance, hunk.aEnd + *distance);
+    for (;;) {
+      const bool limitIsHunkEdge = index + 1 < hunks.size();
+      const uint64_t aLimit = limitIsHunkEdge
+                                  ? hunks[index + 1].aStart
+                                  : static_cast<uint64_t>(aToks_.size());
+      const uint64_t bLimit = limitIsHunkEdge
+                                  ? hunks[index + 1].bStart
+                                  : static_cast<uint64_t>(bToks_.size());
+      std::optional<SplitExpansionWidening> widening =
+          rightEdgeWidenDistanceOutOfSplitExpansion(
+              model_, aToks_, bToks_, abTokMapA2B_, hunks[index], aLimit,
+              bLimit, limitIsHunkEdge);
+      if (!widening)
+        break;
+      diffutils::Hunk &current = hunks[index];
+      if (!widening->reachesNeighbour) {
+        if (widening->distance != 0) {
+          REFOLD_LOG_DEBUG(
+              "plan/hunk-edge",
+              "hunk #{0} A=[{1},{2}) ends inside a macro expansion whose tokens "
+              "differ from B's; widening the right edge by {3} token(s) to "
+              "A={4} so the expansion is wholly replaced",
+              index, current.aStart, current.aEnd, widening->distance,
+              current.aEnd + widening->distance);
+        }
+        current.aEnd += widening->distance;
+        current.bEnd += widening->distance;
+        break;
       }
-      hunk.aEnd += *distance;
-      hunk.bEnd += *distance;
+      const diffutils::Hunk next = hunks[index + 1];
+      REFOLD_LOG_DEBUG(
+          "plan/hunk-edge",
+          "hunk #{0} A=[{1},{2}) ends inside a macro expansion shared with "
+          "hunk #{3} A=[{4},{5}); widening the right edge by {6} token(s) "
+          "merges the two into A=[{1},{5}) so the expansion is wholly replaced",
+          index, current.aStart, current.aEnd, index + 1, next.aStart,
+          next.aEnd, widening->distance);
+      current.aEnd = next.aEnd;
+      current.bEnd = next.bEnd;
+      hunks.erase(hunks.begin() + static_cast<std::ptrdiff_t>(index + 1));
     }
   }
 }

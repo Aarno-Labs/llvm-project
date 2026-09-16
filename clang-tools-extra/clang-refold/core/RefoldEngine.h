@@ -1020,11 +1020,16 @@ private:
   /// Widening is sound because an absorbed token pair sits in the untouched run
   /// between two hunks, matched to each other by the selected alignment: moving
   /// such a pair across the edge leaves the edit script producing exactly the
-  /// same B.  It is admitted only on the A->B map's own evidence and only short
-  /// of the neighbouring hunk, for reasons the helper documents.  An edge that
-  /// cannot reach a whole-expansion boundary inside its own untouched run is
-  /// left alone for the ordinary realizer lattice, which refuses a partial
-  /// cover -- so this repair never trades a refusal for a guess.
+  /// same B.  It is admitted only on the A->B map's own evidence and never
+  /// moves an edge into the neighbouring hunk, for reasons the helper
+  /// documents.  When the walk arrives at a neighbour that holds part of the
+  /// same expansion, the two hunks are merged -- the neighbour's replacement,
+  /// the walked run, and this hunk's replacement still produce exactly the same
+  /// B -- and the walk continues from the merged edge, so an edit touching an
+  /// argument and the tokens past the callsite replaces the whole callsite.
+  /// An edge that cannot reach a whole-expansion boundary this way is left
+  /// alone for the ordinary realizer lattice, which refuses a partial cover --
+  /// so this repair never trades a refusal for a guess.
   void RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
       std::vector<diffutils::Hunk> &hunks) const;
 
