@@ -769,14 +769,32 @@ Expected<std::string> refoldTranslationUnit(
       // in the unit alongside it.  A request naming nothing still contributes
       // nothing here; it simply no longer vetoes the regions that others named.
       llvm::SmallVector<uint64_t, 8> owners;
-      const bool everyRequestNarrowable =
+      const RefoldEngine::TerminalRequestNarrowingCensus census =
           engine.AppendNarrowableOwnersForTerminalRequests(ownersMustExpand,
-                                                          owners);
-      if (!everyRequestNarrowable)
-        REFOLD_LOG_INFO("fallback",
-                        "some terminal requests name no region; narrowing the "
-                        "{0} region(s) that were named and re-planning",
-                        static_cast<uint64_t>(owners.size()));
+                                                           owners);
+      // A request that names a region is not the same as a request the ladder
+      // can act on: the region may already be given up with nothing enclosing
+      // it.  Say which, so the census `takeTerminalCarrier()` prints -- which
+      // reports whether a request names a region at all -- does not read as a
+      // contradiction of this line.
+      if (!census.EveryRequestNarrowable()) {
+        if (owners.empty())
+          REFOLD_LOG_INFO(
+              "fallback",
+              "no terminal request names a region the ladder can still give "
+              "up: requests={0} namingNoRegion={1} "
+              "namingOnlyGivenUpRegions={2}; taking the carrier",
+              census.requests, census.unattributed, census.exhausted);
+        else
+          REFOLD_LOG_INFO(
+              "fallback",
+              "{0} of {1} terminal request(s) name no region the ladder can "
+              "still give up: namingNoRegion={2} namingOnlyGivenUpRegions={3}; "
+              "narrowing the {4} region(s) the others named and re-planning",
+              census.unattributed + census.exhausted, census.requests,
+              census.unattributed, census.exhausted,
+              static_cast<uint64_t>(owners.size()));
+      }
       if (!owners.empty()) {
         // Progress, not a counter, is what bounds this.  Record only regions
         // the set did not already hold: a round that names nothing new would

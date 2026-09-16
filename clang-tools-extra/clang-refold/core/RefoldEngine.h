@@ -401,12 +401,28 @@ public:
   std::optional<AlignmentSelectionOverride> BuildLineAlignedHunkNarrowing(
       const diffutils::CertifiedLcsResult &coreAlignment) const;
 
+  /// How this run's terminal-fallback requests resolved against the narrowing
+  /// ladder.  Every request lands in exactly one bucket: it named a region the
+  /// ladder can still give up, it named no region at all, or every region it
+  /// named is already given up and has no enclosing region left to widen to.
+  struct TerminalRequestNarrowingCensus {
+    uint64_t requests = 0;
+    uint64_t unattributed = 0;
+    uint64_t exhausted = 0;
+
+    /// Return whether every request named a region the ladder can still give
+    /// up.
+    bool EveryRequestNarrowable() const {
+      return unattributed == 0 && exhausted == 0;
+    }
+  };
+
   /// Collect every region named by this run's terminal-fallback requests that
   /// has not already been given up.
   ///
-  /// Returns false when at least one request names no such region.  That is
-  /// reported for diagnostics only: the caller narrows the regions that *were*
-  /// named regardless, because the alternative to a partial refold is a
+  /// The returned census says which requests named no such region, and why.
+  /// It is reported for diagnostics only: the caller narrows the regions that
+  /// *were* named regardless, because the alternative to a partial refold is a
   /// verbatim copy of the whole translation unit, not a marginally larger one.
   ///
   /// A terminal request records the region whose proof failed when the site
@@ -414,7 +430,7 @@ public:
   /// macro or one include instead of emitting the edited stream for the whole
   /// translation unit.  Requests naming no region yield nothing, which leaves
   /// the terminal carrier in place.
-  bool AppendNarrowableOwnersForTerminalRequests(
+  TerminalRequestNarrowingCensus AppendNarrowableOwnersForTerminalRequests(
       const llvm::DenseSet<uint64_t> &alreadyExpanded,
       llvm::SmallVectorImpl<uint64_t> &owners) const;
 
@@ -983,16 +999,23 @@ private:
   /// that an edit newly wrote is one match richer than leaving them unmatched,
   /// and can be forced on every optimal path.
   ///
-  /// Exactly two moves resolve a split expansion, and this tries them in
-  /// preference order.  *Retraction* walks the edge inward across tokens that
-  /// are identical on both sides, giving the expansion back to the untouched
-  /// region beside the hunk; it keeps the invocation preserved, so it is
+  /// Two kinds of move resolve a split expansion, and this tries them in
+  /// preference order.  *Retraction* walks an edge inward across tokens that
+  /// are identical on both sides; it keeps the invocation preserved, so it is
   /// preferred, and it is what restores a match the certifier left unforced
-  /// because a repeated spelling made it ambiguous.  *Widening* walks the edge
-  /// outward to the expansion's own boundary, taking the rest of the expansion
-  /// into the hunk; it gives up that one callsite's spelling and is the only
-  /// move available when the tokens at the edge differ between A and B, which
-  /// is what an edit that rewrites the expression around a callsite produces.
+  /// because a repeated spelling made it ambiguous.  It comes in two forms.
+  /// The edge inside the expansion retracts out of it, giving the expansion
+  /// back to the untouched region beside the hunk.  When that edge's tokens
+  /// differ, the opposite edge may instead retract up to the expansion's
+  /// boundary, giving the tokens outside it back and leaving the hunk contained
+  /// in the expansion, where the callsite realizers own it -- the shape an
+  /// edit rewriting the start of a macro argument produces, when a repeated
+  /// `(` leaves the certifier unable to say which side of the callsite the new
+  /// one belongs on.  *Widening* walks the edge outward to the expansion's own
+  /// boundary, taking the rest of the expansion into the hunk; it gives up that
+  /// one callsite's spelling and is the only move available when no retraction
+  /// is, which is what an edit that rewrites the expression around a callsite
+  /// produces.
   ///
   /// Widening is sound because an absorbed token pair sits in the untouched run
   /// between two hunks, matched to each other by the selected alignment: moving

@@ -1,0 +1,12 @@
+# clang-refold grandfathered upward layer dependencies.
+#
+#   <from> -> <to>  # layer pair; what the edge is for; the roadmap item that removes it
+#
+# Every entry is a live include that points from a lower layer to a higher one
+# under docs/layers.txt.  The checker rejects any upward edge not listed here
+# and any entry here that is no longer a live upward edge, so this file can
+# only shrink.  Never add an entry to make a new change pass: fix the
+# dependency instead.  Roadmap items refer to
+# clang-refold-code-organization-roadmap.md.
+
+# Empty since roadmap Phase 4.  Phase 5 runs the checker with no allowlist.

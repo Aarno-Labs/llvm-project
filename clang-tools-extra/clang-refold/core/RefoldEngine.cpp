@@ -226,6 +226,92 @@ static std::optional<uint64_t> rightEdgeWidenDistanceOutOfSplitExpansion(
   return aEnd - hunk.aEnd;
 }
 
+/// Return how far a hunk's left edge must move *inward* for the hunk to lie
+/// wholly inside the macro expansion its right edge splits, zero when the right
+/// edge splits no expansion, or `std::nullopt` when no move achieves that.
+///
+/// This is retraction applied to the edge that does not sit inside the
+/// expansion.  A hunk that begins in tokens outside an expansion and ends
+/// inside it is a straddle: the expansion's owner cannot realize the tokens
+/// before it, and the owner of those tokens cannot realize a partial expansion.
+/// Ordinary retraction hands the expansion's part back to the untouched region
+/// on the right, and is unavailable when the tokens at that edge differ between
+/// A and B -- which is what an edit rewriting the start of a macro argument
+/// produces.  The tokens *before* the expansion may still be identical on both
+/// sides, and handing those back to the untouched region on the left leaves the
+/// hunk inside the expansion, where the callsite realizers own it and the
+/// invocation is kept.
+///
+/// Every token handed back must be the same lexeme on both sides, exactly as
+/// for ordinary retraction, so the edit script still produces the same B.  The
+/// B side must stay non-empty: emptying it turns a replacement into a deletion,
+/// which belongs to the owner-aligned deletion slide.  The move is taken only
+/// when neither edge of the result splits an expansion; when the right edge
+/// sits inside nested expansions the left edge walks to the innermost boundary.
+static std::optional<uint64_t> leftEdgeContainDistanceIntoSplitExpansion(
+    const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
+    const diffutils::Hunk &hunk) {
+  const RefoldModel::PPSpan *span = macroExpansionStraddledAtEdge(
+      model, hunk.aEnd, hunk.aStart, /*edgeIsLeft=*/false);
+  if (!span)
+    return 0;
+
+  uint64_t aStart = hunk.aStart;
+  uint64_t bStart = hunk.bStart;
+  while (span) {
+    // A straddle at the right edge means the span begins after the left edge
+    // and before the right one, so the walk stays inside the hunk.
+    const uint64_t distance = span->begin - aStart;
+    if (distance >= hunk.bEnd - bStart)
+      return std::nullopt;
+    for (uint64_t offset = 0; offset < distance; ++offset)
+      if (!aAndBTokensAreIdentical(aToks, bToks, aStart + offset,
+                                   bStart + offset))
+        return std::nullopt;
+    aStart += distance;
+    bStart += distance;
+    span = macroExpansionStraddledAtEdge(model, hunk.aEnd, aStart,
+                                         /*edgeIsLeft=*/false);
+  }
+  if (macroExpansionStraddledAtEdge(model, aStart, hunk.aEnd,
+                                    /*edgeIsLeft=*/true))
+    return std::nullopt;
+  return aStart - hunk.aStart;
+}
+
+/// Right-edge counterpart of `leftEdgeContainDistanceIntoSplitExpansion`: how
+/// far the right edge must move inward for the hunk to lie wholly inside the
+/// expansion its left edge splits.
+static std::optional<uint64_t> rightEdgeContainDistanceIntoSplitExpansion(
+    const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
+    const diffutils::Hunk &hunk) {
+  const RefoldModel::PPSpan *span = macroExpansionStraddledAtEdge(
+      model, hunk.aStart, hunk.aEnd, /*edgeIsLeft=*/true);
+  if (!span)
+    return 0;
+
+  uint64_t aEnd = hunk.aEnd;
+  uint64_t bEnd = hunk.bEnd;
+  while (span) {
+    // A straddle at the left edge means the span ends after the left edge and
+    // before the right one, so the walk stays inside the hunk.
+    const uint64_t distance = aEnd - span->end;
+    if (distance >= bEnd - hunk.bStart)
+      return std::nullopt;
+    for (uint64_t offset = 1; offset <= distance; ++offset)
+      if (!aAndBTokensAreIdentical(aToks, bToks, aEnd - offset, bEnd - offset))
+        return std::nullopt;
+    aEnd -= distance;
+    bEnd -= distance;
+    span = macroExpansionStraddledAtEdge(model, hunk.aStart, aEnd,
+                                         /*edgeIsLeft=*/true);
+  }
+  if (macroExpansionStraddledAtEdge(model, aEnd, hunk.aStart,
+                                    /*edgeIsLeft=*/false))
+    return std::nullopt;
+  return hunk.aEnd - aEnd;
+}
+
 /// Verify that every durable structural segment binding names one exact
 /// normalized hunk and the matching token edge in its parent witness.
 ///
@@ -1037,6 +1123,37 @@ void RefoldEngine::RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
       --hunk.bEnd;
     }
 
+    // When the edge inside the expansion could not retract, the opposite edge
+    // may: handing the identical tokens outside the expansion back leaves the
+    // hunk contained in it.  This is still retraction -- it restores matches
+    // and keeps the invocation -- so it is tried before widening consumes it.
+    if (std::optional<uint64_t> distance =
+            leftEdgeContainDistanceIntoSplitExpansion(model_, aToks_, bToks_,
+                                                      hunk);
+        distance && *distance != 0) {
+      REFOLD_LOG_DEBUG(
+          "plan/hunk-edge",
+          "hunk #{0} A=[{1},{2}) ends inside a macro expansion it does not "
+          "begin in; retracting the left edge by {3} identical token(s) to "
+          "A={4} so the hunk lies inside the expansion",
+          index, hunk.aStart, hunk.aEnd, *distance, hunk.aStart + *distance);
+      hunk.aStart += *distance;
+      hunk.bStart += *distance;
+    }
+    if (std::optional<uint64_t> distance =
+            rightEdgeContainDistanceIntoSplitExpansion(model_, aToks_, bToks_,
+                                                       hunk);
+        distance && *distance != 0) {
+      REFOLD_LOG_DEBUG(
+          "plan/hunk-edge",
+          "hunk #{0} A=[{1},{2}) begins inside a macro expansion it does not "
+          "end in; retracting the right edge by {3} identical token(s) to "
+          "A={4} so the hunk lies inside the expansion",
+          index, hunk.aStart, hunk.aEnd, *distance, hunk.aEnd - *distance);
+      hunk.aEnd -= *distance;
+      hunk.bEnd -= *distance;
+    }
+
     // Retraction restores a match the certifier left unforced, so it is tried
     // first: it keeps the invocation preserved.  It is unavailable when the
     // tokens at the edge are not the same on both sides, which is what an edit
@@ -1708,14 +1825,33 @@ bool RefoldEngine::DispatchStructuralHunks(
     // the invocation's proved whole-cover replacement closes that gap: the
     // region is expanded exactly where it failed and every other hunk keeps
     // its refolded realization.
+    //
+    // The staged replacement realizes exactly the B image of the invocation's
+    // whole cover, so it stands in for this hunk only when the cover contains
+    // the hunk.  The owner is found from the hunk's first token alone, and the
+    // ladder names an owner that holds only part of a failing range; a hunk
+    // that runs past the cover keeps edited tokens outside it that the
+    // replacement never produces, and taking the hunk as realized would drop
+    // them from the output.
     if (std::optional<uint64_t> failingOwner =
             FindSmallestOwnerForAToken(h.aStart)) {
       if (ownersMustExpand_.count(*failingOwner)) {
         if (const RefoldModel::MacroInvocation *invocation =
                 macroTopology_.FindMacroInvocationById(*failingOwner)) {
           if (invocation->invB && invocation->invE) {
-            if (std::optional<WholeCoverPlan> wholeCoverPlan =
-                    macroPatchPlanner_->ComputeWholeCoverPlan(*invocation)) {
+            std::optional<WholeCoverPlan> wholeCoverPlan =
+                macroPatchPlanner_->ComputeWholeCoverPlan(*invocation);
+            if (wholeCoverPlan && (h.aStart < wholeCoverPlan->covLoA ||
+                                   h.aEnd > wholeCoverPlan->covHiA)) {
+              REFOLD_LOG_DEBUG(
+                  "classify",
+                  "hunk A=[{0},{1}) runs past the cover A=[{2},{3}) of "
+                  "already-given-up {4}; its expansion cannot realize the hunk",
+                  h.aStart, h.aEnd, wholeCoverPlan->covLoA,
+                  wholeCoverPlan->covHiA, DescribeOwner(*failingOwner));
+              wholeCoverPlan.reset();
+            }
+            if (wholeCoverPlan) {
               MacroPatch wholeCoverPatch{*invocation->invB, *invocation->invE,
                                          wholeCoverPlan->clippedText,
                                          invocation->id};
@@ -2665,7 +2801,8 @@ RefoldEngine::BuildLineAlignedHunkNarrowing(
   return std::nullopt;
 }
 
-bool RefoldEngine::AppendNarrowableOwnersForTerminalRequests(
+RefoldEngine::TerminalRequestNarrowingCensus
+RefoldEngine::AppendNarrowableOwnersForTerminalRequests(
     const llvm::DenseSet<uint64_t> &alreadyExpanded,
     llvm::SmallVectorImpl<uint64_t> &owners) const {
   // Every region the ledger names is independently at fault, so give up all of
@@ -2673,8 +2810,9 @@ bool RefoldEngine::AppendNarrowableOwnersForTerminalRequests(
   // region and, past the attempt ceiling, would reach the terminal carrier with
   // narrowing still available.  A request naming nothing is not a defect: a
   // translation-unit wide producer inconsistency has no smaller region to name.
-  bool everyRequestNarrowable = true;
+  TerminalRequestNarrowingCensus census;
   for (const TerminalFallbackRequest &request : terminalSink_.Requests()) {
+    ++census.requests;
     const TerminalFallbackFailureContext &context = request.failure.context;
 
     // A request that names its region explicitly names exactly one, and it is
@@ -2703,7 +2841,7 @@ bool RefoldEngine::AppendNarrowableOwnersForTerminalRequests(
     }
 
     if (requestOwners.empty()) {
-      everyRequestNarrowable = false;
+      ++census.unattributed;
       continue;
     }
 
@@ -2723,9 +2861,9 @@ bool RefoldEngine::AppendNarrowableOwnersForTerminalRequests(
         owners.push_back(*owner);
     }
     if (!namedAnyRegion)
-      everyRequestNarrowable = false;
+      ++census.exhausted;
   }
-  return everyRequestNarrowable;
+  return census;
 }
 
 std::optional<uint64_t>

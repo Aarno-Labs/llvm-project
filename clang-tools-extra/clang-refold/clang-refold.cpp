@@ -348,7 +348,10 @@ static cl::alias NoLinesShort("n", cl::desc("Alias for --no-lines"),
 static cl::opt<OutputVerificationMode> VerifyOutput(
     "verify-output",
     cl::desc("Verify the refolded source against --pp-mod by re-preprocessing "
-             "it (default: off)"),
+             "it (default: off). Independent of this setting, a translation "
+             "unit with no admissible refold exits non-zero rather than "
+             "emitting --pp-mod verbatim, which would drop every comment and "
+             "directive"),
     cl::init(OutputVerificationMode::Off),
     cl::values(clEnumValN(OutputVerificationMode::Off, "off",
                           "Do not verify"),
@@ -686,6 +689,11 @@ int main(int argc, char **argv) {
     // arrive here, and both are answers about the input rather than internal
     // invariant breaks.  Report and exit non-zero: REFOLD_LOG_FATAL would abort
     // with a crash banner, which misrepresents a refusal as a tool defect.
+    //
+    // The log is written to buffered stdout and the error to unbuffered
+    // stderr, so a caller sending both to one file would otherwise see the
+    // error land in the middle of whatever log line was still buffered.
+    outs().flush();
     logAllUnhandledErrors(refoldedOrErr.takeError(), errs(), "clang-refold: ");
     return 1;
   }
