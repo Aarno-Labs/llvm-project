@@ -17,15 +17,15 @@
 //   * `rootHasDirectArgLikeSurface`  — surface fact consumed by later
 //                                       DAG and reuse arbitration
 //
-// Scope boundary: the phase does NOT run standard args-only construction
-// (that lives in `RefoldMacroStandardArgsOnlyPatchBuilder` and is called
-// through the callback below), and does NOT run DAG lifting or
-// whole-cover realization (each is owned by its own phase service).
+// Scope boundary: the phase does NOT run args-only construction itself
+// (that lives in `RefoldMacroStandardArgsOnlyPatchBuilder`, whose entry
+// point `BuildMacroInvocationPatchArgsOnly` the phase calls), and does NOT
+// run DAG lifting or whole-cover realization (each is owned by its own phase
+// service).
 //
-// The phase has no back-reference to the planner.  Planner-side helpers
-// that remain on the planner (`BuildMacroInvocationPatchArgsOnly`, which is
-// the args-only ENTRY POINT shared with another call site) are reached
-// through one std::function callback supplied at construction.
+// The phase has no back-reference to the planner.  It borrows the planner's
+// args-only builder, which the planner constructs before any whole-cover
+// orchestrator exists.
 //
 //===----------------------------------------------------------------------===//
 
@@ -40,7 +40,6 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 
-#include <functional>
 #include <optional>
 #include <vector>
 
@@ -49,6 +48,7 @@ namespace refold {
 
 struct RefoldMacroWholeCoverPlanningContext;
 class RefoldMacroPatchProofClassifier;
+class RefoldMacroStandardArgsOnlyPatchBuilder;
 class RefoldSourceMapper;
 
 /// Runs the direct args-only whole-cover admission phase for one planning
@@ -57,7 +57,7 @@ class RefoldSourceMapper;
 class RefoldMacroArgsOnlyWholeCoverPhase {
 public:
   /// Borrowed inputs needed by the args-only phase.  All references must
-  /// outlive the phase; the planner owns all of them.
+  /// outlive the phase; the planner owns or borrows all of them.
   ///
   /// `abTokHunks` is held by vector reference (not `ArrayRef`) because the
   /// engine populates it after the planner — and therefore this phase — is
@@ -69,15 +69,8 @@ public:
     const std::vector<diffutils::Hunk> &abTokHunks;
     const RefoldMacroPatchProofClassifier &macroPatchProofClassifier;
 
-    /// Delegates to
-    /// `RefoldMacroPatchPlanner::BuildMacroInvocationPatchArgsOnly`. That
-    /// method orchestrates actual-layout recovery and dispatches to paste-aware
-    /// / standard args-only builders; it stays on the planner because the
-    /// whole-cover orchestrator also calls it from a separate site.
-    std::function<std::optional<MacroPatch>(
-        const RefoldModel::MacroInvocation &, const diffutils::Hunk &,
-        llvm::StringRef)>
-        buildMacroInvocationPatchArgsOnly;
+    /// The args-only entry point, `BuildMacroInvocationPatchArgsOnly`.
+    const RefoldMacroStandardArgsOnlyPatchBuilder &argsOnlyPatchBuilder;
   };
 
   explicit RefoldMacroArgsOnlyWholeCoverPhase(Dependencies deps);

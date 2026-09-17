@@ -12,6 +12,7 @@
 
 #include "edit/RefoldPatchTypes.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
+#include "macro/RefoldMacroStandardArgsOnlyPatchBuilder.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
 #include "model/RefoldModel.h"
 #include "proof/RefoldMacroPatchProofClassifier.h"
@@ -57,7 +58,8 @@ void RefoldMacroArgsOnlyWholeCoverPhase::Run(
     // edit, DAG lifting may still preserve deeper nested structure, so
     // keep the candidate instead of returning immediately.
     planningCtx.argsOnlyCandidate =
-        deps_.buildMacroInvocationPatchArgsOnly(m, hEff, baseInvText);
+        deps_.argsOnlyPatchBuilder.BuildMacroInvocationPatchArgsOnly(
+            m, hEff, baseInvText);
     if (!planningCtx.argsOnlyCandidate) {
       // If an existing callsite patch already satisfies this trimmed hunk,
       // defer reuse until DAG chaining has had a chance to compete.
@@ -75,7 +77,8 @@ void RefoldMacroArgsOnlyWholeCoverPhase::Run(
     // edits whose token hunk spans both argument substitutions and macro-
     // body tokens, most importantly __VA_OPT__ erasure/exposure.
     planningCtx.argsOnlyCandidate =
-        deps_.buildMacroInvocationPatchArgsOnly(m, hEff, baseInvText);
+        deps_.argsOnlyPatchBuilder.BuildMacroInvocationPatchArgsOnly(
+            m, hEff, baseInvText);
     if (!planningCtx.argsOnlyCandidate && !argLikeSpans.empty())
       planningCtx.argsOnlyCandidate =
           TryPairedPureInsertionRootArgsOnly(planningCtx);
@@ -186,8 +189,8 @@ RefoldMacroArgsOnlyWholeCoverPhase::TryPairedPureInsertionRootArgsOnly(
     // Once the paired insertions have been converted into a proof-
     // compatible argument envelope, reuse the ordinary args-only builder
     // and validation.
-    auto patch =
-        deps_.buildMacroInvocationPatchArgsOnly(m, envTrim, baseInvText);
+    auto patch = deps_.argsOnlyPatchBuilder.BuildMacroInvocationPatchArgsOnly(
+        m, envTrim, baseInvText);
     if (!patch)
       continue;
 

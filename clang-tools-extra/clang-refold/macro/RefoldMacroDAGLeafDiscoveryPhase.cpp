@@ -13,6 +13,7 @@
 #include "macro/RefoldMacroDAGSharedHelpers.h"
 #include "macro/RefoldMacroOccurrenceProofValidator.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
+#include "macro/RefoldMacroStandardArgsOnlyPatchBuilder.h"
 #include "macro/RefoldMacroSubtreeReplayValidator.h"
 #include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
@@ -144,7 +145,8 @@ void RefoldMacroDAGLeafDiscoveryPhase::Run(
         // argument-local hunk, delegate to the standard args-only builder
         // for the actual rewrite and validation.
         pairRootPatch =
-            deps_.buildMacroInvocationPatchArgsOnly(m, envTrim, baseInvText);
+            deps_.argsOnlyPatchBuilder.BuildMacroInvocationPatchArgsOnly(
+                m, envTrim, baseInvText);
       }
 
       if (pairRootPatch) {

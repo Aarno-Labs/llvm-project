@@ -2,8 +2,9 @@
 //
 // Implementation of the standard args-only patch builder.
 //
-// The builder owns the standard args-only ranking slot, including the pure
-// paste-only fallback path that remains part of that slot after specialized
+// The builder owns the args-only entry point and the paste-aware replay it
+// tries before the standard args-only ranking slot.  That slot includes the
+// pure paste-only fallback path that remains part of it after specialized
 // paste-aware proofs decline.  Planner-side helpers still owned by
 // `RefoldMacroPatchPlanner` are reached through the std::function callbacks
 // supplied in `Dependencies`.  The public service boundary intentionally
@@ -18,6 +19,7 @@
 
 #include "edit/RefoldBInsertionLedger.h"
 #include "macro/RefoldArgTextRecovery.h"
+#include "macro/RefoldMacroDefinitionTapeSolver.h"
 #include "macro/RefoldMacroGeneratedCalleeReplayEngine.h"
 #include "macro/RefoldMacroGeneratedLeafReplayEngine.h"
 #include "macro/RefoldMacroPatchProofCertifier.h"
@@ -89,6 +91,13 @@ RefoldMacroPasteArgumentBuilder
 RefoldMacroStandardArgsOnlyPatchBuilder::PasteArgumentBuilder() const {
   return RefoldMacroPasteArgumentBuilder(
       {&deps_.sourceMapper, deps_.aToks, deps_.bToks, &deps_.lexLang});
+}
+
+RefoldMacroDefinitionTapeSolver
+RefoldMacroStandardArgsOnlyPatchBuilder::DefinitionTapeSolver() const {
+  return RefoldMacroDefinitionTapeSolver(
+      {&deps_.model, deps_.aToks, deps_.bToks, &deps_.sourceMapper,
+       &deps_.macroPatchProofClassifier, &deps_.witnessTrace, &deps_.lexLang});
 }
 
 namespace {
@@ -1249,6 +1258,476 @@ RefoldMacroStandardArgsOnlyPatchBuilder::BuildStandardArgsOnlyPatch(
 
   return ArgsOnlyProofCertifier(deps_).BuildAcceptedCandidate(
       m, actualRecoveryCtx, finalArgumentRewrites);
+}
+
+bool RefoldMacroStandardArgsOnlyPatchBuilder::
+    DerivedReplacementsReproduceStringifiedOperands(
+        const RefoldModel::MacroInvocation &m,
+        const DenseMap<uint32_t, std::string> &replacementsByArgIdx) const {
+  if (m.stringifySpans.empty())
+    return true;
+
+  for (const RefoldModel::PPArgSpan &stringifySpan : m.stringifySpans) {
+    auto replacement = replacementsByArgIdx.find(stringifySpan.argIdx);
+    if (replacement == replacementsByArgIdx.end())
+      continue;
+
+    // The stringified operand is one B token: the literal the edited stream
+    // actually spells at this position.
+    auto bEnv =
+        deps_.sourceMapper.MapAToBTokenEnvelopeByPPArgSpan(stringifySpan);
+    if (!bEnv || bEnv->second <= bEnv->first ||
+        bEnv->second - bEnv->first != 1) {
+      return false;
+    }
+
+    StringRef bStringifiedToken =
+        deps_.sourceMapper.SliceBSource(bEnv->first, bEnv->second).trim();
+    std::optional<std::string> decoded =
+        deps_.argTextRecovery.UnstringifyLiteralToArgText(
+            bStringifiedToken, /*allowTopLevelComma=*/true);
+    if (!decoded)
+      return false;
+    std::optional<std::string> canonical =
+        stringutils::canonicalizeStringifyInversePayload(*decoded);
+    if (!canonical)
+      return false;
+
+    // Clang stringification collapses internal whitespace, so compare the
+    // canonicalized inverse payload rather than raw spellings.
+    std::optional<std::string> canonicalReplacement =
+        stringutils::canonicalizeStringifyInversePayload(replacement->second);
+    if (!canonicalReplacement)
+      return false;
+
+    if (StringRef(*canonical).trim() !=
+        StringRef(*canonicalReplacement).trim()) {
+      REFOLD_LOG_TRACE(
+          "macro/args-only",
+          "reject inv id={0} name={1} reason=stringify-operand-not-reproduced "
+          "argIdx={2} bStringified='{3}' derivedArg='{4}'",
+          m.id, m.name, stringifySpan.argIdx, bStringifiedToken,
+          replacement->second);
+      return false;
+    }
+  }
+
+  return true;
+}
+
+std::optional<InvocationActualLayout>
+RefoldMacroStandardArgsOnlyPatchBuilder::RecoverInvocationActuals(
+    const RefoldModel::MacroInvocation &invocation,
+    StringRef baseInvocationText) const {
+  // Args-only replay starts with data recovery, not candidate construction.
+  // Keep recovery fail-closed and limited to the required availability checks:
+  // a concrete invocation byte span, a literal callee origin, parsed
+  // formal-content ranges, and the named actual-recovery precondition.
+  if (!invocation.invB || !invocation.invE)
+    return std::nullopt;
+
+  if (!hasLiteralMacroCalleeOrigin(invocation))
+    return std::nullopt;
+
+  auto rangesOpt = RefoldMacroActualLayout({&deps_.lexLang})
+                       .GetMacroInvocationFormalArgContentRanges(
+                           invocation, baseInvocationText);
+  if (!rangesOpt)
+    return std::nullopt;
+
+  InvocationActualLayout layout;
+  layout.contentRanges = std::move(*rangesOpt);
+
+  InvocationActualRecoveryContext actualRecoveryCtx{
+      invocation, baseInvocationText, layout.rangePairs()};
+  if (!InvocationActualsAreRecoverable(actualRecoveryCtx))
+    return std::nullopt;
+
+  return layout;
+}
+
+bool RefoldMacroStandardArgsOnlyPatchBuilder::InvocationActualsAreRecoverable(
+    const InvocationActualRecoveryContext &ctx) const {
+  // The source-spelling rewrite path is only meaningful for an invocation
+  // whose physical callsite byte range exists.  The caller already obtained
+  // the formal-content ranges from the recovery service; this method gives
+  // that data-availability precondition a named fail-closed boundary.
+  if (!ctx.invocation.invB || !ctx.invocation.invE)
+    return false;
+
+  // Do not validate every recovered argument range here: the rewrite builder
+  // validates only the argument indices it is asked to replace.
+  // Keeping that check in BuildInvocationRewriteWithRange preserves the exact
+  // fail-closed timing for paths that never touch a particular actual.
+  (void)ctx.baseInvocationText;
+  (void)ctx.invocationArgRanges;
+  return true;
+}
+
+RefoldMacroStandardArgsOnlyPatchBuilder::ArgsOnlyPatchAttempt
+RefoldMacroStandardArgsOnlyPatchBuilder::BuildPasteAwareArgsOnlyPatch(
+    const ArgsOnlyPlanningContext &ctx) const {
+  const RefoldModel::MacroInvocation &m = ctx.invocation;
+  const diffutils::Hunk &h = ctx.hunk;
+  StringRef baseInvText = ctx.baseInvocationText;
+  ArrayRef<std::pair<size_t, size_t>> invArgRanges =
+      ctx.actualLayout.rangePairs();
+  const diffutils::Hunk tokenHunksCurrent[] = {h};
+  SmallVector<diffutils::Hunk, 4> tokenHunksInInvocationCover;
+  for (const diffutils::Hunk &candidateHunk : deps_.abTokHunks) {
+    if (m.Covers(candidateHunk.aStart, candidateHunk.aEnd))
+      tokenHunksInInvocationCover.push_back(candidateHunk);
+  }
+  if (tokenHunksInInvocationCover.empty())
+    tokenHunksInInvocationCover.push_back(h);
+
+  const InvocationActualRecoveryContext actualRecoveryCtx{m, baseInvText,
+                                                          invArgRanges};
+
+  // Fast path for token-paste edits. A single pasted token can embed multiple
+  // argument contributions (e.g., X##_##Y##_##Z), so a single edit hunk may
+  // change multiple arg segments inside that token (e.g., a_b_c -> d_e_f). In
+  // that case we attempt to derive per-arg segment replacements and splice them
+  // into the invocation spelling.
+  if (!PasteArgumentBuilder().HunkTouchesAnyPasteToken(m, h))
+    return ArgsOnlyPatchAttempt::ContinueSearchResult();
+
+  // A pasted token can be locally ambiguous while another occurrence of the
+  // same formal disambiguates it.  For example, in `x##y` plus `#x`, the edit
+  // `abc -> alphabc` alone could be read as either `x: a -> alpha` or
+  // `y: bc -> lphabc`; the stringified occurrence `"a" -> "alpha"` proves the
+  // former.  Before the legacy single-segment paste fallback assigns bytes at
+  // an undelimited paste boundary, collect exact stringify-derived formal
+  // replacements and ask the grouped paste replay validator whether those
+  // replacements already explain every pasted token in B.  This is still
+  // fail-closed: malformed stringification, conflicting constraints, top-level
+  // comma introduction for non-variadic formals, or paste replay mismatch all
+  // decline this constrained path instead of guessing a boundary.
+  DenseMap<uint32_t, std::string> stringifyConstrainedReplacements;
+  for (const RefoldModel::PPArgSpan &stringifySpan : m.stringifySpans) {
+    uint32_t argIdx = stringifySpan.argIdx;
+    if (static_cast<size_t>(argIdx) >= invArgRanges.size())
+      continue;
+
+    bool argParticipatesInPaste = false;
+    for (const RefoldModel::PPArgSpan &pasteSpan : m.pasteSpans) {
+      if (pasteSpan.argIdx == argIdx) {
+        argParticipatesInPaste = true;
+        break;
+      }
+    }
+    if (!argParticipatesInPaste)
+      continue;
+
+    auto bEnv =
+        deps_.sourceMapper.MapAToBTokenEnvelopeByPPArgSpan(stringifySpan);
+    if (!bEnv || bEnv->second <= bEnv->first || bEnv->second - bEnv->first != 1)
+      continue;
+
+    StringRef bStringifiedToken =
+        deps_.sourceMapper.SliceBSource(bEnv->first, bEnv->second).trim();
+    std::optional<std::string> decoded =
+        deps_.argTextRecovery.UnstringifyLiteralToArgText(
+            bStringifiedToken, /*allowTopLevelComma=*/true);
+    if (!decoded)
+      continue;
+    std::optional<std::string> canonical =
+        stringutils::canonicalizeStringifyInversePayload(*decoded);
+    if (!canonical)
+      continue;
+
+    std::string newArg = StringRef(*canonical).trim().str();
+    if (!isMacroInvocationVariadicFormal(m, argIdx) &&
+        replacementIntroducesTopLevelComma(newArg, deps_.lexLang))
+      continue;
+
+    auto range = invArgRanges[argIdx];
+    StringRef baseArgText =
+        baseInvText.substr(range.first, range.second - range.first);
+    if (!OccurrenceReplay()
+             .MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
+                 m, argIdx, baseArgText, newArg, tokenHunksInInvocationCover))
+      continue;
+
+    auto existing = stringifyConstrainedReplacements.find(argIdx);
+    if (existing != stringifyConstrainedReplacements.end()) {
+      if (existing->second != newArg)
+        return ArgsOnlyPatchAttempt::RejectResult();
+      continue;
+    }
+    stringifyConstrainedReplacements[argIdx] = std::move(newArg);
+  }
+
+  if (!stringifyConstrainedReplacements.empty() &&
+      PasteArgumentBuilder().PasteArgReplacementsMatchAllPasteTokensInB(
+          m, baseInvText, invArgRanges, stringifyConstrainedReplacements)) {
+    std::optional<InvocationRewriteWithRange> rewrite =
+        deps_.buildInvocationRewriteWithRange(
+            actualRecoveryCtx, stringifyConstrainedReplacements,
+            /*materializedRangeByArgIdx=*/nullptr);
+    if (!rewrite)
+      return ArgsOnlyPatchAttempt::RejectResult();
+
+    MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
+    deps_.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
+        patch, rewrite->materializedOutputByteStart,
+        rewrite->materializedOutputByteEnd);
+    deps_.certifyMacroPatchWholeExpansionBRange(m, patch);
+    MacroPatchProof proof =
+        makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPasteMulti,
+                            /*preservesInvocationStructure=*/true, m.id);
+    proof.paste->replayValidated = true;
+    deps_.macroPatchProofClassifier.SetMacroPatchProof(patch, std::move(proof));
+    return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
+  }
+
+  auto edits = PasteArgumentBuilder().DerivePasteArgEdits(m, h);
+  if (edits && !edits->empty()) {
+    DenseMap<uint32_t, std::string> replByArgIdx;
+    for (const auto &pae : *edits) {
+      uint32_t argIdx = pae.argIdx;
+      if (static_cast<size_t>(argIdx) >= invArgRanges.size())
+        return ArgsOnlyPatchAttempt::RejectResult();
+
+      // A single argument may contribute multiple segments to the same
+      // pasted token (e.g. X##_..._##X). We merge repeated argIdx
+      // conservatively after deriving the candidate replacement below.
+      auto range = invArgRanges[argIdx];
+      StringRef baseArgText =
+          baseInvText.substr(range.first, range.second - range.first);
+
+      // Prefer an exact source-slice splice when the replay witness
+      // provides one. Otherwise retain the existing conservative boundary
+      // splice for legacy paste-span metadata.
+      std::string newArg =
+          (pae.argByteBegin && pae.argByteEnd)
+              ? RefoldMacroPasteSpelling::
+                    SplicePasteSegmentIntoSpellingArgExact(
+                        baseArgText, *pae.argByteBegin, *pae.argByteEnd,
+                        pae.oldSeg, pae.newSeg)
+              : RefoldMacroPasteSpelling::SplicePasteSegmentIntoSpellingArg(
+                    baseArgText, pae.oldSeg, pae.newSeg);
+      if (newArg.empty()) {
+        // Deleting an entire argument (making it empty) is legal. Accept this
+        // only when the paste-span covered the whole argument spelling.
+        if (!(StringRef(pae.newSeg).trim().empty() &&
+              baseArgText.trim() == StringRef(pae.oldSeg).trim()))
+          return ArgsOnlyPatchAttempt::RejectResult();
+      }
+
+      // If the argument is not the variadic formal, replacing it with a
+      // text that introduces a top-level comma would change the macro
+      // invocation's argument list.
+      if (!isMacroInvocationVariadicFormal(m, argIdx) &&
+          replacementIntroducesTopLevelComma(newArg, deps_.lexLang))
+        return ArgsOnlyPatchAttempt::RejectResult();
+
+      auto existing = replByArgIdx.find(argIdx);
+      if (existing != replByArgIdx.end()) {
+        if (existing->second != newArg)
+          return ArgsOnlyPatchAttempt::RejectResult();
+        continue;
+      }
+
+      // Per-arg safety gate: validate standard + stringify occurrences for
+      // this arg.
+      //
+      // NOTE: For multi-span paste edits where the pasted token length may
+      // change, per-arg paste-span validation cannot be done reliably in
+      // isolation. We validate paste tokens as a *group* below via
+      // pasteArgReplacementsMatchAllPasteTokensInB(...).
+      // Validate the locally derived paste replacement only against the hunk
+      // that produced it.  Repeated paste macros may contain many independent
+      // pasted products for the same formal; widening this per-segment check
+      // to the whole invocation cover can make one local derivation reject
+      // because other pasted products have not yet contributed their own local
+      // splice.  The complete replay obligation is still discharged below by
+      // `PasteArgReplacementsMatchAllPasteTokensInB`, after all derived
+      // replacements for this hunk have been collected.
+      if (!OccurrenceReplay()
+               .MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
+                   m, argIdx, baseArgText, newArg, tokenHunksCurrent)) {
+        return ArgsOnlyPatchAttempt::RejectResult();
+      }
+
+      replByArgIdx[argIdx] = std::move(newArg);
+    }
+
+    if (!replByArgIdx.empty()) {
+      // Combined safety gate: applying all derived replacements must
+      // reconstruct every pasted token occurrence exactly as seen in B.
+      if (!PasteArgumentBuilder().PasteArgReplacementsMatchAllPasteTokensInB(
+              m, baseInvText, invArgRanges, replByArgIdx)) {
+        return ArgsOnlyPatchAttempt::RejectResult();
+      }
+
+      // The paste gate above proves only the pasted operands.  A parameter that
+      // is also stringified is constrained independently, and the per-argument
+      // check earlier sees only the hunk that produced the replacement -- an
+      // unchanged literal such as `"mime"` lies outside it and is never
+      // examined.  Prove the stringified operands too, so an argument derived
+      // purely from the paste cannot silently rewrite a string literal that B
+      // left alone.
+      if (!DerivedReplacementsReproduceStringifiedOperands(m, replByArgIdx))
+        return ArgsOnlyPatchAttempt::RejectResult();
+
+      std::optional<InvocationRewriteWithRange> rewrite =
+          deps_.buildInvocationRewriteWithRange(
+              actualRecoveryCtx, replByArgIdx,
+              /*materializedRangeByArgIdx=*/nullptr);
+      if (!rewrite)
+        return ArgsOnlyPatchAttempt::RejectResult();
+
+      {
+        MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
+        deps_.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
+            patch, rewrite->materializedOutputByteStart,
+            rewrite->materializedOutputByteEnd);
+        // Paste replay validates the rewritten callsite against every pasted
+        // token occurrence in the expansion.  For the edit map, therefore,
+        // the B-side materialization is the whole expansion cover that the
+        // source argument rewrite regenerates, not merely the first changed
+        // pasted-token hunk.
+        deps_.certifyMacroPatchWholeExpansionBRange(m, patch);
+        MacroPatchProof proof =
+            makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPasteMulti,
+                                /*preservesInvocationStructure=*/true, m.id);
+        // The builder already proved this rewrite by replaying the rewritten
+        // invocation arguments against every pasted token occurrence in B.
+        // Carry that proof source onto the accepted patch for converted
+        // selector-site discharge.
+        proof.paste->replayValidated = true;
+        deps_.macroPatchProofClassifier.SetMacroPatchProof(patch,
+                                                           std::move(proof));
+        return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
+      }
+    }
+  }
+
+  // Single-segment paste edit (existing behavior)
+  //
+  // This handles the common case where only one pasted segment changes (e.g.
+  // X##_##Y, changing just X). The multi-span derivation above requires token
+  // lengths to remain stable; when they do not, we fall back to deriving a
+  // single segment edit from the token-level diff.
+  auto pae = PasteArgumentBuilder().DerivePasteArgEdit(m, h);
+  if (pae) {
+    uint32_t argIdx = pae->argIdx;
+
+    // HARD FAILURE: If we derived a paste edit but the index is invalid,
+    // we must exit, not fall through.
+    if (static_cast<size_t>(argIdx) >= invArgRanges.size())
+      return ArgsOnlyPatchAttempt::RejectResult();
+
+    auto r = invArgRanges[argIdx];
+    StringRef baseArgText = baseInvText.substr(r.first, r.second - r.first);
+    std::string newArg =
+        (pae->argByteBegin && pae->argByteEnd)
+            ? RefoldMacroPasteSpelling::SplicePasteSegmentIntoSpellingArgExact(
+                  baseArgText, *pae->argByteBegin, *pae->argByteEnd,
+                  pae->oldSeg, pae->newSeg)
+            : RefoldMacroPasteSpelling::SplicePasteSegmentIntoSpellingArg(
+                  baseArgText, pae->oldSeg, pae->newSeg);
+    if (newArg.empty()) {
+      // Deleting an entire argument (making it empty) is legal. Accept this
+      // only when the paste-span covered the whole argument spelling.
+      if (!(StringRef(pae->newSeg).trim().empty() &&
+            baseArgText.trim() == StringRef(pae->oldSeg).trim()))
+        return ArgsOnlyPatchAttempt::RejectResult();
+    }
+
+    if (!isMacroInvocationVariadicFormal(m, argIdx) &&
+        replacementIntroducesTopLevelComma(newArg, deps_.lexLang))
+      return ArgsOnlyPatchAttempt::RejectResult();
+
+    // Safety gate: for single-segment paste edits we can directly validate
+    // all occurrences, including paste-span occurrences, against the B
+    // stream.
+    if (!OccurrenceReplay().MacroArgReplacementMatchesAllOccurrencesInB(
+            m, argIdx, baseArgText, newArg, tokenHunksCurrent)) {
+      return ArgsOnlyPatchAttempt::RejectResult();
+    }
+
+    DenseMap<uint32_t, std::string> singleReplByArgIdx;
+    singleReplByArgIdx[argIdx] = std::move(newArg);
+    std::optional<InvocationRewriteWithRange> rewrite =
+        deps_.buildInvocationRewriteWithRange(
+            actualRecoveryCtx, singleReplByArgIdx,
+            /*materializedRangeByArgIdx=*/nullptr);
+    if (!rewrite)
+      return ArgsOnlyPatchAttempt::RejectResult();
+
+    {
+      MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
+      deps_.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
+          patch, rewrite->materializedOutputByteStart,
+          rewrite->materializedOutputByteEnd);
+      // As with the multi-paste path, the source argument rewrite is a
+      // compact representation of the macro's replayed expansion surface.
+      // Keep the B-side map anchored to that whole expansion envelope.
+      deps_.certifyMacroPatchWholeExpansionBRange(m, patch);
+      MacroPatchProof proof =
+          makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPasteSingle,
+                              /*preservesInvocationStructure=*/true, m.id);
+      // Single-segment paste rewrites are admitted only after direct replay
+      // validation against all touched occurrences in B. Record that proof
+      // source explicitly for converted selector-site discharge.
+      proof.paste->replayValidated = true;
+      deps_.macroPatchProofClassifier.SetMacroPatchProof(patch,
+                                                         std::move(proof));
+      return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
+    }
+  }
+
+  // If we touched paste but could not safely derive a paste splice patch,
+  // fall through to the standard (non-paste) args-only policy below.
+
+  return ArgsOnlyPatchAttempt::ContinueSearchResult();
+}
+
+std::optional<MacroPatch>
+RefoldMacroStandardArgsOnlyPatchBuilder::BuildMacroInvocationPatchArgsOnly(
+    const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
+    StringRef baseInvText) const {
+  std::optional<InvocationActualLayout> recoveredActualLayout =
+      RecoverInvocationActuals(m, baseInvText);
+  if (!recoveredActualLayout)
+    return std::nullopt;
+
+  const ArgsOnlyPlanningContext planningCtx{m, h, baseInvText,
+                                            *recoveredActualLayout};
+  const ArrayRef<std::pair<size_t, size_t>> invArgRanges =
+      recoveredActualLayout->rangePairs();
+  const ArgsOnlyTemplateReplayContext argsOnlyTemplateCtx{m, baseInvText,
+                                                          invArgRanges};
+
+  // Definition-tape replay proves surfaces that ordinary non-empty occurrence
+  // replay cannot see: empty actuals, zero-token formal slots, and __VA_OPT__
+  // branch flips.  A miss is non-terminal and only declines this replay path.
+  if (auto replayPatch =
+          DefinitionTapeSolver().TryDefinitionTapeReplayArgsOnlyPatch(
+              planningCtx.invocation, planningCtx.hunk,
+              planningCtx.baseInvocationText,
+              planningCtx.actualLayout.rangePairs()))
+    return replayPatch;
+
+  // The ordinary current-level template solver has higher priority than the
+  // later paste/standard fallback phases, preserving the established admission
+  // order for args-only candidates.
+  if (auto templatePatch =
+          TemplateSolver().TryTemplateSolvedArgsOnlyPatch(argsOnlyTemplateCtx))
+    return templatePatch;
+
+  // Paste-aware replay has two non-success outcomes: continue when the hunk was
+  // not accepted by a paste-specialized proof, or reject when a touched paste
+  // surface is proven invalid under the fail-closed paste contract.
+  ArgsOnlyPatchAttempt pasteAttempt = BuildPasteAwareArgsOnlyPatch(planningCtx);
+  if (pasteAttempt.disposition == ArgsOnlyPatchAttempt::Disposition::Accepted)
+    return std::move(pasteAttempt.patch);
+  if (pasteAttempt.disposition == ArgsOnlyPatchAttempt::Disposition::Reject)
+    return std::nullopt;
+
+  return BuildStandardArgsOnlyPatch(planningCtx);
 }
 } // namespace refold
 } // namespace clang

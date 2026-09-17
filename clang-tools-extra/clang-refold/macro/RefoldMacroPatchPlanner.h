@@ -15,8 +15,6 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROPATCHPLANNER_H
 
 #include "edit/RefoldPatchTypes.h"
-#include "macro/RefoldMacroArgsOnlyTemplateSolver.h"
-#include "macro/RefoldMacroDefinitionTapeSolver.h"
 #include "macro/RefoldMacroGeneratedCalleeReplayEngine.h"
 #include "macro/RefoldMacroGeneratedLeafReplayEngine.h"
 #include "macro/RefoldMacroOccurrenceProofValidator.h"
@@ -188,8 +186,9 @@ public:
     return replayStabilityValidator_;
   }
 
-  /// Read-only access to the standard (non-paste) args-only patch builder.
-  /// Owns `BuildStandardArgsOnlyPatch`.
+  /// Read-only access to the args-only patch builder.  Owns the args-only
+  /// entry point `BuildMacroInvocationPatchArgsOnly` and its standard slot,
+  /// `BuildStandardArgsOnlyPatch`.
   const RefoldMacroStandardArgsOnlyPatchBuilder &
   StandardArgsOnlyPatchBuilder() const {
     return standardArgsOnlyPatchBuilder_;
@@ -204,13 +203,6 @@ public:
   std::optional<MacroPatch> TryBuildTupleSiblingTerminalReplayPatch(
       const RefoldModel::MacroInvocation &m,
       llvm::StringRef baseInvocationText) const;
-
-  /// Build a structure-preserving invocation patch by rewriting only the
-  /// callsite arguments when all touched macro occurrences replay consistently.
-  std::optional<MacroPatch>
-  BuildMacroInvocationPatchArgsOnly(const RefoldModel::MacroInvocation &m,
-                                    const diffutils::Hunk &h,
-                                    llvm::StringRef baseInvocationText) const;
 
   /// Compute the claim-aware B-side replacement surface for whole-cover macro
   /// realization at a callsite.  Forwards to the borrowed
@@ -311,36 +303,6 @@ private:
   RefoldMacroOccurrenceReplay OccurrenceReplay() const;
   RefoldMacroActualLayout ActualLayout() const;
 
-  bool MacroArgReplacementMatchesAllOccurrencesInB(
-      const RefoldModel::MacroInvocation &m, uint32_t argIdx,
-      llvm::StringRef baseArg, llvm::StringRef newArg,
-      llvm::ArrayRef<diffutils::Hunk> tokenHunks) const;
-
-  bool MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
-      const RefoldModel::MacroInvocation &m, uint32_t argIdx,
-      llvm::StringRef baseArg, llvm::StringRef newArg,
-      llvm::ArrayRef<diffutils::Hunk> tokenHunks) const;
-
-  /// Return whether derived argument replacements reproduce every stringified
-  /// operand exactly as the edited stream spells it.
-  ///
-  /// A parameter used through `#` and through `##` is constrained twice, and
-  /// the two constraints are independent.  When only the pasted product was
-  /// rewritten -- `parse_mime` becoming `parse_mime_xjtr_0` while the literal
-  /// `"mime"` is untouched -- the argument that satisfies the paste necessarily
-  /// changes the stringified literal as well.  No argument text reproduces both
-  /// operands, so the callsite is not refoldable and must fall back to the
-  /// expanded text instead of silently corrupting the string.
-  ///
-  /// Each stringified operand is checked by decoding what the edited stream
-  /// actually spells and comparing it against the derived replacement, so the
-  /// obligation is discharged against B rather than against the paste that
-  /// produced the replacement.  An operand whose B spelling cannot be recovered
-  /// exactly fails closed.
-  bool DerivedReplacementsReproduceStringifiedOperands(
-      const RefoldModel::MacroInvocation &m,
-      const llvm::DenseMap<uint32_t, std::string> &replacementsByArgIdx) const;
-
   /// Local aliases for namespace-scope macro-planning carrier types.
   ///
   /// The aliases keep planner internals readable while the actual carrier
@@ -360,60 +322,6 @@ private:
   using InvocationActualLayout = ::clang::refold::InvocationActualLayout;
   using InvocationActualRecoveryContext =
       ::clang::refold::InvocationActualRecoveryContext;
-
-  /// Recover the parsed invocation-actual layout needed by args-only replay.
-  /// This performs only the admissibility precondition checks and source-range
-  /// recovery; candidate construction and ranking remain separate operations.
-  std::optional<InvocationActualLayout>
-  RecoverInvocationActuals(const RefoldModel::MacroInvocation &invocation,
-                           llvm::StringRef baseInvocationText) const;
-
-  /// Nested alias for the args-only planning-context carrier (defined in
-  /// `RefoldMacroPlannerHelpers.h`).  The template solver's own carrier
-  /// types (`ArgsOnlyTemplateElem`, `CurrentLevelTemplateSurface`,
-  /// `ArgsOnlyTemplateReplayContext`) live in
-  /// `RefoldMacroArgsOnlyTemplateSolver.h` and are reached directly through
-  /// their namespace-scope names.
-  using ArgsOnlyPlanningContext = ::clang::refold::ArgsOnlyPlanningContext;
-
-  /// Result of one args-only candidate attempt.
-  ///
-  /// Paste-aware replay needs to distinguish "no candidate, keep trying" from
-  /// "the touched paste surface was invalid, fail closed."  The carrier makes
-  /// that search/fail-closed control flow explicit for callers.
-  struct ArgsOnlyPatchAttempt {
-    enum class Disposition : uint8_t { ContinueSearch, Reject, Accepted };
-
-    Disposition disposition = Disposition::ContinueSearch;
-    std::optional<MacroPatch> patch;
-
-    static ArgsOnlyPatchAttempt ContinueSearchResult() {
-      return ArgsOnlyPatchAttempt{};
-    }
-
-    static ArgsOnlyPatchAttempt RejectResult() {
-      ArgsOnlyPatchAttempt result;
-      result.disposition = Disposition::Reject;
-      return result;
-    }
-
-    static ArgsOnlyPatchAttempt AcceptedResult(MacroPatch patch) {
-      ArgsOnlyPatchAttempt result;
-      result.disposition = Disposition::Accepted;
-      result.patch = std::move(patch);
-      return result;
-    }
-  };
-
-  /// Construct the definition-tape replay solver on demand. Lightweight;
-  /// borrows source/model/proof state from the planner's dependencies.
-  RefoldMacroDefinitionTapeSolver DefinitionTapeSolver() const;
-
-  /// Try paste-aware argument replay.  The result distinguishes a non-terminal
-  /// miss from a fail-closed paste-surface rejection so the caller preserves
-  /// the same search/fail-closed control flow.
-  ArgsOnlyPatchAttempt
-  BuildPasteAwareArgsOnlyPatch(const ArgsOnlyPlanningContext &ctx) const;
 
   /// Nested aliases for the generated-callee replay engine's carrier types
   /// (defined in `RefoldMacroGeneratedCalleeReplayEngine.h`).
@@ -439,13 +347,6 @@ private:
   /// local tuple solver state stays inside the replay method.
   using TupleGeneratedCalleeReplayContext =
       ::clang::refold::TupleGeneratedCalleeReplayContext;
-
-  /// Return whether the invocation actual surface recovered by the producer
-  /// contains enough bounded source ranges for args-only replay to attempt
-  /// source-spelling reconstruction.  This is a fail-closed data-availability
-  /// check only; it does not decide token-envelope or stringify/paste policy.
-  bool InvocationActualsAreRecoverable(
-      const InvocationActualRecoveryContext &ctx) const;
 
   /// Build a concrete rewritten invocation spelling from explicit per-formal
   /// replacements, preserving the materialized-output byte interval logic used
@@ -481,10 +382,6 @@ private:
   bool InvocationRewritePreservesLineObservers(
       const InvocationActualRecoveryContext &ctx,
       llvm::StringRef rewrittenInvocationText) const;
-
-  /// Construct the args-only template solver on demand. Lightweight; borrows
-  /// source/model/proof state from the planner's dependencies.
-  RefoldMacroArgsOnlyTemplateSolver TemplateSolver() const;
 
   /// Literalize a direct __COUNTER__ invocation when the B-side replacement is
   /// recoverable. This keeps the counter-specific owner-state proof explicit

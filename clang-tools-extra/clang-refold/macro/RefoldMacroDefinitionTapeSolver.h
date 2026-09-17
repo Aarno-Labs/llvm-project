@@ -10,7 +10,7 @@
 // (the caller continues with paste-aware and standard-formal replay paths).
 //
 // Proof carrier attachment is performed inside this service through the
-// borrowed macro-patch proof classifier; the planner does not need to certify
+// borrowed macro-patch proof classifier; the caller does not need to certify
 // anything after the returned MacroPatch.
 //
 //===----------------------------------------------------------------------===//

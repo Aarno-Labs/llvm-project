@@ -129,11 +129,11 @@ static uint64_t resolveGeneratedFunctionCallSourceEnd(
 // if you need them here.
 
 // Build the orchestrator's owned phase services from the planner's public
-// dependency bundle (`RefoldMacroPatchPlanner::Deps()`) plus a small set
-// of std::function callbacks that forward into planner-side helpers.  Each
-// phase is constructed once at orchestrator construction so the callbacks
-// are not reconstructed on every
-// `BuildMacroInvocationPatchWholeCover` call.
+// dependency bundle (`RefoldMacroPatchPlanner::Deps()`), the planner's
+// sub-service accessors, and a small set of std::function callbacks that
+// forward into planner-side helpers.  The planner constructs a temporary
+// orchestrator for every whole-cover call, so everything built here is
+// rebuilt per call; keep it to borrowed references and cheap lambdas.
 RefoldMacroWholeCoverOrchestrator::RefoldMacroWholeCoverOrchestrator(
     const RefoldMacroPatchPlanner *planner)
     : planner_(planner),
@@ -141,11 +141,7 @@ RefoldMacroWholeCoverOrchestrator::RefoldMacroWholeCoverOrchestrator(
           *planner_->Deps().sourceMapper, planner_->Deps().aToks,
           planner_->Deps().bToks, *planner_->Deps().abTokHunks,
           *planner_->Deps().macroPatchProofClassifier,
-          [planner](const RefoldModel::MacroInvocation &m,
-                    const diffutils::Hunk &h, llvm::StringRef baseInvText) {
-            return planner->BuildMacroInvocationPatchArgsOnly(m, h,
-                                                              baseInvText);
-          }}),
+          planner_->StandardArgsOnlyPatchBuilder()}),
       dagLeafDiscoveryPhase_(RefoldMacroDAGLeafDiscoveryPhase::Dependencies{
           *planner_->Deps().model, *planner_->Deps().macroTopology,
           *planner_->Deps().sourceMapper, *planner_->Deps().argTextRecovery,
@@ -157,11 +153,7 @@ RefoldMacroWholeCoverOrchestrator::RefoldMacroWholeCoverOrchestrator(
             return planner->GetMacroInvocationFormalArgContentRanges(m,
                                                                      invText);
           },
-          [planner](const RefoldModel::MacroInvocation &m,
-                    const diffutils::Hunk &h, llvm::StringRef baseInvText) {
-            return planner->BuildMacroInvocationPatchArgsOnly(m, h,
-                                                              baseInvText);
-          }}),
+          planner_->StandardArgsOnlyPatchBuilder()}),
       dagLiftingPhase_(RefoldMacroDAGLiftingPhase::Dependencies{
           *planner_->Deps().model, *planner_->Deps().sourceMapper,
           *planner_->Deps().lexLang, *planner_->Deps().lineDirs,
@@ -401,8 +393,9 @@ RefoldMacroWholeCoverOrchestrator::TryRecursiveTupleGeneratedReplayFromCallerAnc
       continue;
 
     std::optional<MacroPatch> candidate =
-        planner_->BuildMacroInvocationPatchArgsOnly(*ancestor, hunk,
-                                                   *ancestor->invText);
+        planner_->StandardArgsOnlyPatchBuilder()
+            .BuildMacroInvocationPatchArgsOnly(*ancestor, hunk,
+                                               *ancestor->invText);
     if (!candidate)
       continue;
 

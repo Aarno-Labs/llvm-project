@@ -19,7 +19,11 @@
 // its phase services need (`Deps()`, `GetOwnerStateProof()`,
 // `RecoverWholeCoverReuseContext()`, `IsParenthesizedTuple()`,
 // `TokenSpellingsEqualToA/B()`, etc.).  No friend-class relationship is used or
-// needed.
+// needed.  The planner builds a temporary orchestrator for each whole-cover
+// call, after its own construction is complete, so the planner's sub-services
+// already exist: the args-only entry point is reached through the borrowed
+// `RefoldMacroStandardArgsOnlyPatchBuilder`, by the recursive-tuple ancestor
+// probe and by the phases alike.
 //
 //===----------------------------------------------------------------------===//
 

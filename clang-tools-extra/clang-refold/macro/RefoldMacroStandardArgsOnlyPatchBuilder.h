@@ -2,7 +2,10 @@
 //
 // Standard args-only patch builder for clang-refold.
 //
-// Owns `BuildStandardArgsOnlyPatch`: the entry point for the standard
+// Owns the args-only entry point, `BuildMacroInvocationPatchArgsOnly`.  It
+// recovers the invocation's actuals and tries, in candidate order,
+// definition-tape replay, the current-level template solver, paste-aware
+// replay, and `BuildStandardArgsOnlyPatch`.  The last is the standard
 // args-only ranking slot, including the pure paste-only fallback path that
 // belongs to that same slot after specialized paste-aware proofs have
 // declined.  The builder collects arg-span occurrences (and stringify
@@ -16,8 +19,10 @@
 // The builder has no back-reference to `RefoldMacroPatchPlanner`.
 // Planner-side helpers that stay on the planner are reached through
 // std::function callbacks (`buildInvocationRewriteWithRange`,
-// `resolveFunctionLikeMacroThroughAliasesWithHops`); independent services are
-// passed by reference.
+// `resolveFunctionLikeMacroThroughAliasesWithHops`,
+// `certifyMacroPatchWholeExpansionBRange`); independent services are passed
+// by reference.  The planner constructs the builder before any whole-cover
+// orchestrator exists, so the orchestrator and its phases borrow it directly.
 //
 //===----------------------------------------------------------------------===//
 
@@ -53,12 +58,14 @@ namespace refold {
 
 class RefoldArgTextRecovery;
 class RefoldBInsertionLedger;
+class RefoldMacroDefinitionTapeSolver;
 class RefoldMacroGeneratedCalleeReplayEngine;
 class RefoldMacroGeneratedLeafReplayEngine;
 class RefoldMacroPatchProofCertifier;
 class RefoldMacroTopology;
 class RefoldMacroPatchProofClassifier;
 class RefoldSourceMapper;
+class RefoldWitnessTrace;
 struct SyntheticEnvelopeCache;
 
 // ArgsOnlyPlanningContext lives in RefoldMacroPlannerHelpers.h and is shared
@@ -74,7 +81,8 @@ class RefoldMacroStandardArgsOnlyPatchBuilder {
 public:
   /// Borrowed inputs needed by the standard args-only patch builder.
   ///
-  /// All references must outlive the builder; the planner owns all of them.
+  /// All references must outlive the builder; the planner owns or borrows all
+  /// of them.
   /// `abTokHunks` is stored as a vector reference, not `ArrayRef`, because the
   /// vector is populated after service construction and must be observed by
   /// later replay attempts.
@@ -92,6 +100,7 @@ public:
     const std::vector<diffutils::Hunk> &abTokHunks;
     RefoldMacroPatchProofCertifier &proofCertifier;
     const RefoldMacroPatchProofClassifier &macroPatchProofClassifier;
+    const RefoldWitnessTrace &witnessTrace;
     const RefoldMacroGeneratedCalleeReplayEngine &generatedCalleeReplayEngine;
     const RefoldMacroGeneratedLeafReplayEngine &generatedLeafReplayEngine;
     bool strict = false;
@@ -142,6 +151,25 @@ public:
     const RefoldMacroStandardArgsOnlyPatchBuilder &builder_;
   };
 
+  /// Build a structure-preserving invocation patch by rewriting only the
+  /// callsite arguments when all touched macro occurrences replay consistently.
+  ///
+  /// Tries definition-tape replay, the current-level template solver,
+  /// paste-aware replay and `BuildStandardArgsOnlyPatch`, in that order.  The
+  /// first admitted candidate is returned; a paste-surface rejection returns
+  /// nullopt without trying the standard slot.
+  std::optional<MacroPatch>
+  BuildMacroInvocationPatchArgsOnly(const RefoldModel::MacroInvocation &m,
+                                    const diffutils::Hunk &h,
+                                    llvm::StringRef baseInvocationText) const;
+
+  /// Recover the parsed invocation-actual layout needed by args-only replay.
+  /// This performs only the admissibility precondition checks and source-range
+  /// recovery; candidate construction and ranking remain separate operations.
+  std::optional<InvocationActualLayout>
+  RecoverInvocationActuals(const RefoldModel::MacroInvocation &invocation,
+                           llvm::StringRef baseInvocationText) const;
+
   /// Run ordinary standard/stringify formal replay after specialized
   /// args-only replay paths did not produce a candidate.  Returns nullopt
   /// for a non-terminal miss.
@@ -163,14 +191,77 @@ public:
       llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
 
 private:
+  /// Result of one args-only candidate attempt.
+  ///
+  /// Paste-aware replay needs to distinguish "no candidate, keep trying" from
+  /// "the touched paste surface was invalid, fail closed."  The carrier makes
+  /// that search/fail-closed control flow explicit for callers.
+  struct ArgsOnlyPatchAttempt {
+    enum class Disposition : uint8_t { ContinueSearch, Reject, Accepted };
+
+    Disposition disposition = Disposition::ContinueSearch;
+    std::optional<MacroPatch> patch;
+
+    static ArgsOnlyPatchAttempt ContinueSearchResult() {
+      return ArgsOnlyPatchAttempt{};
+    }
+
+    static ArgsOnlyPatchAttempt RejectResult() {
+      ArgsOnlyPatchAttempt result;
+      result.disposition = Disposition::Reject;
+      return result;
+    }
+
+    static ArgsOnlyPatchAttempt AcceptedResult(MacroPatch patch) {
+      ArgsOnlyPatchAttempt result;
+      result.disposition = Disposition::Accepted;
+      result.patch = std::move(patch);
+      return result;
+    }
+  };
+
   /// On-demand constructors for the short-lived macro-domain helper services
-  /// that the standard args-only body queries.
+  /// that the args-only paths query.
   ///
   /// Each helper borrows the same dependency bundle and remains local to the
   /// replay attempt; the builder does not keep additional mutable helper state.
   RefoldMacroArgsOnlyTemplateSolver TemplateSolver() const;
   RefoldMacroOccurrenceReplay OccurrenceReplay() const;
   RefoldMacroPasteArgumentBuilder PasteArgumentBuilder() const;
+  RefoldMacroDefinitionTapeSolver DefinitionTapeSolver() const;
+
+  /// Return whether the invocation actual surface recovered by the producer
+  /// contains enough bounded source ranges for args-only replay to attempt
+  /// source-spelling reconstruction.  This is a fail-closed data-availability
+  /// check only; it does not decide token-envelope or stringify/paste policy.
+  bool InvocationActualsAreRecoverable(
+      const InvocationActualRecoveryContext &ctx) const;
+
+  /// Return whether derived argument replacements reproduce every stringified
+  /// operand exactly as the edited stream spells it.
+  ///
+  /// A parameter used through `#` and through `##` is constrained twice, and
+  /// the two constraints are independent.  When only the pasted product was
+  /// rewritten -- `parse_mime` becoming `parse_mime_xjtr_0` while the literal
+  /// `"mime"` is untouched -- the argument that satisfies the paste necessarily
+  /// changes the stringified literal as well.  No argument text reproduces both
+  /// operands, so the callsite is not refoldable and must fall back to the
+  /// expanded text instead of silently corrupting the string.
+  ///
+  /// Each stringified operand is checked by decoding what the edited stream
+  /// actually spells and comparing it against the derived replacement, so the
+  /// obligation is discharged against B rather than against the paste that
+  /// produced the replacement.  An operand whose B spelling cannot be recovered
+  /// exactly fails closed.
+  bool DerivedReplacementsReproduceStringifiedOperands(
+      const RefoldModel::MacroInvocation &m,
+      const llvm::DenseMap<uint32_t, std::string> &replacementsByArgIdx) const;
+
+  /// Try paste-aware argument replay.  The result distinguishes a non-terminal
+  /// miss from a fail-closed paste-surface rejection so the caller preserves
+  /// the same search/fail-closed control flow.
+  ArgsOnlyPatchAttempt
+  BuildPasteAwareArgsOnlyPatch(const ArgsOnlyPlanningContext &ctx) const;
 
   Dependencies deps_;
 

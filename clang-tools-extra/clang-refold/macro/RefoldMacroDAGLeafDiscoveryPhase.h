@@ -20,13 +20,12 @@
 // `Run` publishes all of that in a `DAGLeafDiscoveryResult` carrier that
 // the lifting phase reads through local aliases.
 //
-// The phase has no back-reference to the planner: planner-side helpers
-// (`GetMacroInvocationFormalArgContentRanges`,
-// `BuildMacroInvocationPatchArgsOnly`) are reached through std::function
-// callbacks supplied at construction; the
-// `RefoldMacroSubtreeReplayValidator` and
-// `RefoldMacroOccurrenceProofValidator` services are passed by
-// reference / constructed from explicit deps.
+// The phase has no back-reference to the planner: the planner-side helper
+// `GetMacroInvocationFormalArgContentRanges` is reached through a
+// std::function callback supplied at construction; the args-only builder
+// (`RefoldMacroStandardArgsOnlyPatchBuilder`) and
+// `RefoldMacroSubtreeReplayValidator` are borrowed by reference, and
+// `RefoldMacroOccurrenceProofValidator` is constructed from explicit deps.
 //
 //===----------------------------------------------------------------------===//
 
@@ -55,6 +54,7 @@ namespace refold {
 
 struct RefoldMacroWholeCoverPlanningContext;
 class RefoldArgTextRecovery;
+class RefoldMacroStandardArgsOnlyPatchBuilder;
 class RefoldMacroSubtreeReplayValidator;
 class RefoldMacroTopology;
 class RefoldSourceMapper;
@@ -154,14 +154,10 @@ public:
         const RefoldModel::MacroInvocation &, llvm::StringRef)>
         getMacroInvocationFormalArgContentRanges;
 
-    /// Delegates to
-    /// `RefoldMacroPatchPlanner::BuildMacroInvocationPatchArgsOnly`. Used by
-    /// the split-insertion partner scan to convert a paired-pure- insertion
+    /// The args-only entry point, `BuildMacroInvocationPatchArgsOnly`. Used
+    /// by the split-insertion partner scan to convert a paired-pure-insertion
     /// envelope into a structure-preserving root candidate.
-    std::function<std::optional<MacroPatch>(
-        const RefoldModel::MacroInvocation &, const diffutils::Hunk &,
-        llvm::StringRef)>
-        buildMacroInvocationPatchArgsOnly;
+    const RefoldMacroStandardArgsOnlyPatchBuilder &argsOnlyPatchBuilder;
   };
 
   explicit RefoldMacroDAGLeafDiscoveryPhase(Dependencies deps);
