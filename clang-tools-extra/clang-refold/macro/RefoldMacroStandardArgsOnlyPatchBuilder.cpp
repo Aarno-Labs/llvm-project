@@ -40,6 +40,7 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <algorithm>
+#include <cassert>
 #include <optional>
 #include <string>
 #include <utility>
@@ -53,6 +54,21 @@ namespace refold {
 RefoldMacroStandardArgsOnlyPatchBuilder::
     RefoldMacroStandardArgsOnlyPatchBuilder(Dependencies deps)
     : deps_(std::move(deps)) {}
+
+RefoldMacroStandardArgsOnlyPatchBuilder::
+    ~RefoldMacroStandardArgsOnlyPatchBuilder() = default;
+
+RefoldMacroStandardArgsOnlyPatchBuilder::EnvelopeCacheScope::EnvelopeCacheScope(
+    const RefoldMacroStandardArgsOnlyPatchBuilder &builder)
+    : builder_(builder) {
+  assert(!builder_.envelopeCache_ && "envelope cache scopes do not nest");
+  builder_.envelopeCache_ = std::make_unique<SyntheticEnvelopeCache>();
+}
+
+RefoldMacroStandardArgsOnlyPatchBuilder::EnvelopeCacheScope::
+    ~EnvelopeCacheScope() {
+  builder_.envelopeCache_.reset();
+}
 
 RefoldMacroArgsOnlyTemplateSolver
 RefoldMacroStandardArgsOnlyPatchBuilder::TemplateSolver() const {
@@ -1081,7 +1097,7 @@ RefoldMacroStandardArgsOnlyPatchBuilder::BuildStandardArgsOnlyPatch(
 
   RefoldMacroOccurrenceReplay occurrenceReplay = OccurrenceReplay();
   std::optional<TouchedFormalHunkCollection> collectedTouchedFormalHunks =
-      TouchedFormalHunkCollector(deps_, occurrenceReplay)
+      TouchedFormalHunkCollector(deps_, occurrenceReplay, envelopeCache_.get())
           .Collect(touchedFormalHunks, m, hArgs, invArgRanges.size());
   if (!collectedTouchedFormalHunks)
     return std::nullopt;

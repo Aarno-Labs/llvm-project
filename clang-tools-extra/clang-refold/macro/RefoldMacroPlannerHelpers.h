@@ -396,6 +396,26 @@ inline bool isObjectLikeSingleTokenAliasName(const RefoldModel &model,
   return false;
 }
 
+/// Return the hunks whose A start lies in the closed interval
+/// `[aBegin, aEnd]`, in their original order.
+///
+/// `hunks` must be ordered by A start, as the dispatched token-hunk plan is.
+/// Every hunk contained in the half-open A range `[aBegin, aEnd)` -- including
+/// a pure insertion anchored exactly at `aEnd` -- is in the result, so a scan
+/// that tests containment in that range may iterate this subrange instead of
+/// the whole plan without changing what it visits or in which order.
+inline llvm::ArrayRef<diffutils::Hunk>
+hunksWithAStartIn(llvm::ArrayRef<diffutils::Hunk> hunks, uint64_t aBegin,
+                  uint64_t aEnd) {
+  const auto *first = llvm::partition_point(
+      hunks, [&](const diffutils::Hunk &h) { return h.aStart < aBegin; });
+  const auto *last =
+      std::partition_point(first, hunks.end(), [&](const diffutils::Hunk &h) {
+        return h.aStart <= aEnd;
+      });
+  return llvm::ArrayRef<diffutils::Hunk>(first, last);
+}
+
 /// Build the minimal token-edit envelope spanning two pure-insertion frontiers.
 inline diffutils::Hunk
 buildCombinedInsertionEnvelope(const diffutils::Hunk &left,

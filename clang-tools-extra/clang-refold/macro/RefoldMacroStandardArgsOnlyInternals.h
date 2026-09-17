@@ -25,8 +25,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -49,6 +51,55 @@ struct TouchedFormalHunkCollection {
   llvm::SmallVector<diffutils::Hunk, 8> tokenHunks;
 };
 
+/// Which argument occurrences one synthetic insertion envelope touches.
+enum class SyntheticEnvelopeTouch : uint8_t {
+  /// The envelope lies in argument spans but marks no occurrence.
+  None,
+  /// Every touched occurrence has the same formal index and token span.
+  OneOccurrence,
+  /// The touched occurrences differ in formal index or token span.
+  SeveralOccurrences,
+};
+
+/// The trimmed envelope pairing one insertion anchor with one insertion
+/// partner of the same invocation cover, recorded only when its A range is
+/// non-empty and wholly explained by argument occurrences.
+struct SyntheticEnvelopeCandidate {
+  diffutils::Hunk envelope;
+  SyntheticEnvelopeTouch touch = SyntheticEnvelopeTouch::None;
+  /// The touched occurrence's formal index and A-token span; meaningful only
+  /// for `OneOccurrence`.
+  uint32_t argIdx = 0;
+  uint64_t begin = 0;
+  uint64_t end = 0;
+};
+
+/// Every search input that is not fixed for the lifetime of a builder cache
+/// scope: the anchor, the invocation cover, and the formal index and A-token
+/// span of each occurrence, in order.  Nothing else the search reads varies
+/// while the token-hunk plan is final.
+struct SyntheticEnvelopeSearchKey {
+  diffutils::Hunk anchor;
+  uint64_t coverBegin = 0;
+  uint64_t coverEnd = 0;
+  std::vector<std::tuple<uint64_t, uint64_t, uint32_t>> occurrences;
+
+  bool operator<(const SyntheticEnvelopeSearchKey &other) const {
+    return std::tie(anchor.aStart, anchor.aEnd, anchor.bStart, anchor.bEnd,
+                    coverBegin, coverEnd, occurrences) <
+           std::tie(other.anchor.aStart, other.anchor.aEnd, other.anchor.bStart,
+                    other.anchor.bEnd, other.coverBegin, other.coverEnd,
+                    other.occurrences);
+  }
+};
+
+/// Envelope searches memoized for one `EnvelopeCacheScope`, keyed by their
+/// complete variable input.
+struct SyntheticEnvelopeCache {
+  std::map<SyntheticEnvelopeSearchKey, std::vector<SyntheticEnvelopeCandidate>>
+      searches;
+};
+
 /// Collects every token hunk that must be explained by the touched-formal
 /// args-only proof.
 ///
@@ -67,7 +118,8 @@ class TouchedFormalHunkCollector {
 public:
   TouchedFormalHunkCollector(
       const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
-      const RefoldMacroOccurrenceReplay &occurrenceReplay);
+      const RefoldMacroOccurrenceReplay &occurrenceReplay,
+      SyntheticEnvelopeCache *envelopeCache);
 
   /// Return the completed touched-formal hunk collection, or nullopt when the
   /// primary hunk or any required sibling/synthetic ownership proof cannot be
@@ -87,14 +139,28 @@ private:
                                 llvm::ArrayRef<RefoldModel::PPArgSpan> occs,
                                 const std::vector<char> &touched) const;
 
-  void MaybeAddSyntheticTouchedFormalEnvelope(
+  /// Pair the insertion `anchor` with every other insertion of the invocation
+  /// cover, in plan order, and return the pairs whose trimmed envelope is a
+  /// non-empty A range explained by `occs`.
+  std::vector<SyntheticEnvelopeCandidate>
+  SearchSyntheticEnvelopes(const RefoldModel::MacroInvocation &invocation,
+                           const diffutils::Hunk &anchor,
+                           llvm::ArrayRef<RefoldModel::PPArgSpan> occs) const;
+
+  /// Append, for every occurrence in `touchedOccIdxs`, the synthetic envelopes
+  /// that pair the insertion `anchor` with another insertion of the same cover
+  /// and trim to an A range explained by exactly that occurrence.  The append
+  /// order is not meaningful; the caller canonicalizes `tokenHunks`.
+  void MaybeAddSyntheticTouchedFormalEnvelopes(
       const RefoldModel::MacroInvocation &invocation,
-      const RefoldModel::PPArgSpan &sp, const diffutils::Hunk &anchor,
+      const diffutils::Hunk &anchor,
       llvm::ArrayRef<RefoldModel::PPArgSpan> occs,
+      llvm::ArrayRef<size_t> touchedOccIdxs,
       llvm::SmallVector<diffutils::Hunk, 8> &tokenHunks) const;
 
   const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps_;
   const RefoldMacroOccurrenceReplay &occurrenceReplay_;
+  SyntheticEnvelopeCache *envelopeCache_;
 };
 
 /// One old/new observation for a formal occurrence in the args-only replay.

@@ -39,6 +39,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -58,6 +59,7 @@ class RefoldMacroPatchProofCertifier;
 class RefoldMacroTopology;
 class RefoldMacroPatchProofClassifier;
 class RefoldSourceMapper;
+struct SyntheticEnvelopeCache;
 
 // ArgsOnlyPlanningContext lives in RefoldMacroPlannerHelpers.h and is shared
 // by definition-tape, paste-aware, template, and standard args-only replay
@@ -119,6 +121,26 @@ public:
   };
 
   explicit RefoldMacroStandardArgsOnlyPatchBuilder(Dependencies deps);
+  ~RefoldMacroStandardArgsOnlyPatchBuilder();
+
+  /// While alive, lets the builder reuse synthetic insertion-envelope searches
+  /// across args-only attempts.
+  ///
+  /// Those searches read the token-hunk plan, which `Dependencies::abTokHunks`
+  /// observes by reference and which is republished between passes.  Open the
+  /// scope only where that plan is final and cannot change before the scope
+  /// ends; outside a scope nothing is cached.  Scopes do not nest.
+  class EnvelopeCacheScope {
+  public:
+    explicit EnvelopeCacheScope(
+        const RefoldMacroStandardArgsOnlyPatchBuilder &builder);
+    ~EnvelopeCacheScope();
+    EnvelopeCacheScope(const EnvelopeCacheScope &) = delete;
+    EnvelopeCacheScope &operator=(const EnvelopeCacheScope &) = delete;
+
+  private:
+    const RefoldMacroStandardArgsOnlyPatchBuilder &builder_;
+  };
 
   /// Run ordinary standard/stringify formal replay after specialized
   /// args-only replay paths did not produce a candidate.  Returns nullopt
@@ -151,6 +173,9 @@ private:
   RefoldMacroPasteArgumentBuilder PasteArgumentBuilder() const;
 
   Dependencies deps_;
+
+  /// Envelope searches cached for the open `EnvelopeCacheScope`, or null.
+  mutable std::unique_ptr<SyntheticEnvelopeCache> envelopeCache_;
 };
 
 } // namespace refold

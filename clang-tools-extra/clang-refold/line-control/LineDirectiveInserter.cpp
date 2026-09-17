@@ -17,6 +17,7 @@
 #include "support/StringUtils.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <cstdint>
 #include <llvm/ADT/ArrayRef.h>
@@ -791,22 +792,49 @@ static bool collectLineControlLogicalLine(StringRef src, size_t lineBegin,
   return true;
 }
 
-// Return the logical line number at the start of a physical source line while
-// scanning the prefix.  If no source-authored line-control directive has been
-// seen, physical and logical lines coincide.  After a directive, the logical
-// line advances from the directive's post-line state by the number of physical
-// lines scanned since that directive.
-static size_t logicalLineAtSourceOffset(StringRef prefix, size_t lineStart,
-                                        bool sawLineDirective,
-                                        size_t activeLineAfterDirective,
-                                        size_t activeAfterDirectiveIdx) {
-  if (!sawLineDirective)
-    return stringutils::countNonSplicedNewlines(prefix, 0, lineStart) + 1;
+/// Logical line number at the start of each physical source line of one
+/// forward prefix scan.
+///
+/// If no source-authored line-control directive has been seen, physical and
+/// logical lines coincide.  After a directive, the logical line advances from
+/// the directive's post-line state by the number of physical lines scanned
+/// since that directive.
+///
+/// Whether a byte counts as a non-spliced newline depends only on the prefix
+/// and the byte's position, so counts over adjacent ranges add exactly.  The
+/// counter therefore extends its count from the previous line start instead of
+/// recounting from the anchor at every line, which made each scan quadratic in
+/// the prefix length.  Queries must use one prefix and non-decreasing line
+/// starts at or after the anchor.
+class LogicalLineCounter {
+public:
+  explicit LogicalLineCounter(StringRef prefix) : prefix_(prefix) {}
 
-  return activeLineAfterDirective +
-         stringutils::countNonSplicedNewlines(prefix, activeAfterDirectiveIdx,
-                                              lineStart);
-}
+  size_t LineAt(size_t lineStart, bool sawLineDirective,
+                size_t activeLineAfterDirective,
+                size_t activeAfterDirectiveIdx) {
+    const size_t anchor = sawLineDirective ? activeAfterDirectiveIdx : 0;
+    if (anchor != anchor_) {
+      anchor_ = anchor;
+      countedTo_ = anchor;
+      newlines_ = 0;
+    }
+    assert(lineStart >= countedTo_ && "line starts must not move backwards");
+    newlines_ +=
+        stringutils::countNonSplicedNewlines(prefix_, countedTo_, lineStart);
+    countedTo_ = lineStart;
+
+    if (!sawLineDirective)
+      return newlines_ + 1;
+    return activeLineAfterDirective + newlines_;
+  }
+
+private:
+  StringRef prefix_;
+  size_t anchor_ = 0;
+  size_t countedTo_ = 0;
+  size_t newlines_ = 0;
+};
 
 // A source-authored line-control directive is parsed after backslash-newline
 // deletion and comment replacement, but the physical lines consumed by its
@@ -1235,6 +1263,7 @@ logicalLocationAtOffsetImpl(StringRef src, uint64_t offset,
   std::optional<uint64_t> lastUnprovenLineControlDirectiveOffset;
 
   LineControlMacroMap lineControlMacros;
+  LogicalLineCounter logicalLineCounter(prefix);
   for (size_t lineStart = 0; lineStart < prefix.size();) {
     std::string logicalLine;
     size_t afterLine = lineStart;
@@ -1260,8 +1289,8 @@ logicalLocationAtOffsetImpl(StringRef src, uint64_t offset,
     // logical resume point for emitted #line repair; it must not strengthen
     // ownership, choose a different edit, or infer macro state outside this
     // source owner.
-    const size_t logicalLineAtLineStart = logicalLineAtSourceOffset(
-        prefix, lineStart, sawLineDirective, activeLineAfterDirective,
+    const size_t logicalLineAtLineStart = logicalLineCounter.LineAt(
+        lineStart, sawLineDirective, activeLineAfterDirective,
         activeAfterDirectiveIdx);
     StringRef activeFileForExpansion =
         activeFile ? StringRef(*activeFile) : defaultFileSpelling;

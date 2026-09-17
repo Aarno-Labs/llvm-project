@@ -1291,16 +1291,28 @@ bool RefoldEngine::DispatchStructuralHunks(
   const bool dispatchMatchesNormalizedCache =
       hunks.size() == abTokHunks_.size() &&
       std::equal(hunks.begin(), hunks.end(), abTokHunks_.begin());
+  // Owner services locate hunks by binary search on the A start, so the
+  // dispatched plan must be ordered by it.
+  const bool dispatchOrderedByAStart = llvm::is_sorted(
+      hunks, [](const diffutils::Hunk &lhs, const diffutils::Hunk &rhs) {
+        return lhs.aStart < rhs.aStart;
+      });
   if (structuralHunkPlanningPhase_ !=
           StructuralHunkPlanningPhase::InsertionLedgerReady ||
-      !dispatchMatchesNormalizedCache) {
+      !dispatchMatchesNormalizedCache || !dispatchOrderedByAStart) {
     REFOLD_LOG_FATAL(
         "plan/order",
         "structural owner dispatch observed an uncommitted hunk plan: "
-        "phase={0} dispatchedHunks={1} cachedHunks={2}",
+        "phase={0} dispatchedHunks={1} cachedHunks={2} orderedByAStart={3}",
         static_cast<unsigned>(structuralHunkPlanningPhase_), hunks.size(),
-        abTokHunks_.size());
+        abTokHunks_.size(), dispatchOrderedByAStart ? 1 : 0);
   }
+
+  // The plan was just certified as the published cache, and nothing
+  // republishes it before dispatch returns, so args-only envelope searches may
+  // be reused for the rest of the dispatch.
+  const RefoldMacroStandardArgsOnlyPatchBuilder::EnvelopeCacheScope
+      envelopeCacheScope(macroPatchPlanner_->StandardArgsOnlyPatchBuilder());
 
   // Local lexical predicate used by the theorem-lattice tie-breaker below.
   // A top-level comma in replacement text would split the original invocation

@@ -174,8 +174,10 @@ std::pair<size_t, size_t> maybeExtendRightBoundaryClosers(
 
 TouchedFormalHunkCollector::TouchedFormalHunkCollector(
     const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
-    const RefoldMacroOccurrenceReplay &occurrenceReplay)
-    : deps_(deps), occurrenceReplay_(occurrenceReplay) {}
+    const RefoldMacroOccurrenceReplay &occurrenceReplay,
+    SyntheticEnvelopeCache *envelopeCache)
+    : deps_(deps), occurrenceReplay_(occurrenceReplay),
+      envelopeCache_(envelopeCache) {}
 
 std::optional<TouchedFormalHunkCollection>
 TouchedFormalHunkCollector::Collect(TouchedFormalHunkCollection collection,
@@ -219,7 +221,8 @@ TouchedFormalHunkCollector::Collect(TouchedFormalHunkCollection collection,
   // actually proven.
   if (primaryHunk.aStart == primaryHunk.aEnd &&
       primaryHunk.bStart < primaryHunk.bEnd) {
-    for (const diffutils::Hunk &cand : deps_.abTokHunks) {
+    for (const diffutils::Hunk &cand : hunksWithAStartIn(
+             deps_.abTokHunks, invocation.cover.begin, invocation.cover.end)) {
       if (cand.aStart < invocation.cover.begin ||
           cand.aEnd > invocation.cover.end)
         continue;
@@ -295,19 +298,22 @@ TouchedFormalHunkCollector::Collect(TouchedFormalHunkCollection collection,
   SmallVector<diffutils::Hunk, 8> seedTokenHunks(tokenHunks.begin(),
                                                  tokenHunks.end());
 
+  SmallVector<size_t, 16> touchedOccIdxs;
   for (size_t occIdx = 0; occIdx < occs.size(); ++occIdx) {
     const auto &sp = occs[occIdx];
-    if (sp.argIdx >= touched.size() || !touched[sp.argIdx])
-      continue;
+    if (sp.argIdx < touched.size() && touched[sp.argIdx])
+      touchedOccIdxs.push_back(occIdx);
+  }
 
+  if (!touchedOccIdxs.empty()) {
     for (const auto &cand : seedTokenHunks) {
       // Only zero-width A-side insertion frontiers can participate in
       // synthetic envelope construction. Non-insertion hunks already expose
       // their A range.
       if (cand.aStart != cand.aEnd)
         continue;
-      MaybeAddSyntheticTouchedFormalEnvelope(invocation, sp, cand, occs,
-                                             tokenHunks);
+      MaybeAddSyntheticTouchedFormalEnvelopes(invocation, cand, occs,
+                                              touchedOccIdxs, tokenHunks);
     }
   }
 
@@ -330,6 +336,13 @@ bool TouchedFormalHunkCollector::HunkTouchesFormalOccurrence(
   // argument-span ownership helper to prove that the B insertion belongs to
   // this occurrence.
   if (cand.aStart == cand.aEnd) {
+    // Every ownership arm places the insertion inside the occurrence,
+    // immediately before its first token, or exactly at its end.  Decide that
+    // before mapping the occurrence into B, which costs a scan of the plan;
+    // the addition avoids underflowing at an occurrence that begins at token
+    // zero.
+    if (cand.aStart + 1 < sp.begin || cand.aStart > sp.end)
+      return false;
     auto bEnv = deps_.sourceMapper.MapAToBTokenEnvelopeByPPArgSpan(sp);
     if (!bEnv)
       return false;
@@ -357,20 +370,18 @@ bool TouchedFormalHunkCollector::HunkTouchesTouchedFormal(
   return false;
 }
 
-void TouchedFormalHunkCollector::MaybeAddSyntheticTouchedFormalEnvelope(
+std::vector<SyntheticEnvelopeCandidate>
+TouchedFormalHunkCollector::SearchSyntheticEnvelopes(
     const RefoldModel::MacroInvocation &invocation,
-    const RefoldModel::PPArgSpan &sp, const diffutils::Hunk &anchor,
-    llvm::ArrayRef<RefoldModel::PPArgSpan> occs,
-    SmallVector<diffutils::Hunk, 8> &tokenHunks) const {
-  // This synthesis is only for insertion-frontier hunks. Non-insertion hunks
-  // already carry an A-side interval and do not need reconstruction.
-  if (anchor.aStart != anchor.aEnd)
-    return;
-  if (anchor.aStart < invocation.cover.begin ||
-      anchor.aEnd > invocation.cover.end)
-    return;
+    const diffutils::Hunk &anchor,
+    llvm::ArrayRef<RefoldModel::PPArgSpan> occs) const {
+  std::vector<SyntheticEnvelopeCandidate> candidates;
 
-  for (const auto &partner : deps_.abTokHunks) {
+  // A partner must lie inside the invocation cover, so only the plan's cover
+  // subrange can qualify.  Scanning the whole plan instead, once per seed hunk,
+  // is quadratic in the plan for every hunk a macro-dense cover owns.
+  for (const auto &partner : hunksWithAStartIn(
+           deps_.abTokHunks, invocation.cover.begin, invocation.cover.end)) {
     if (sameTokenHunk(anchor, partner))
       continue;
 
@@ -392,37 +403,105 @@ void TouchedFormalHunkCollector::MaybeAddSyntheticTouchedFormalEnvelope(
     if (envTrim.aStart >= envTrim.aEnd)
       continue;
 
-    // The exposed range must be fully contained in the exact occurrence
-    // currently being considered.
-    if (!(sp.begin <= envTrim.aStart && envTrim.aEnd <= sp.end))
-      continue;
-
     SmallVector<char, 8> envTouched(occs.size(), 0);
     if (!deps_.sourceMapper.HunkFullyWithinArgSpans(envTrim, occs,
                                                     envTouched))
       continue;
 
-    bool touchesThisExactOccurrence = false;
+    SyntheticEnvelopeCandidate candidate;
+    candidate.envelope = envTrim;
     for (size_t occIdx = 0; occIdx < occs.size(); ++occIdx) {
       if (!envTouched[occIdx])
         continue;
-
-      // Fail closed if the synthetic envelope touches any other formal or any
-      // other occurrence. It is valid only as an explanation for this exact
-      // argument occurrence.
-      if (occs[occIdx].argIdx != sp.argIdx)
-        return;
-      if (occs[occIdx].begin != sp.begin || occs[occIdx].end != sp.end)
-        return;
-
-      touchesThisExactOccurrence = true;
+      const RefoldModel::PPArgSpan &occ = occs[occIdx];
+      if (candidate.touch == SyntheticEnvelopeTouch::None) {
+        candidate.touch = SyntheticEnvelopeTouch::OneOccurrence;
+        candidate.argIdx = occ.argIdx;
+        candidate.begin = occ.begin;
+        candidate.end = occ.end;
+      } else if (occ.argIdx != candidate.argIdx ||
+                 occ.begin != candidate.begin || occ.end != candidate.end) {
+        candidate.touch = SyntheticEnvelopeTouch::SeveralOccurrences;
+        break;
+      }
     }
-    if (!touchesThisExactOccurrence)
-      continue;
+    candidates.push_back(candidate);
+  }
+  return candidates;
+}
 
-    // Add the proof-compatible synthetic hunk so downstream args-only
-    // replacement logic validates the complete touched formal edit.
-    tokenHunks.push_back(envTrim);
+void TouchedFormalHunkCollector::MaybeAddSyntheticTouchedFormalEnvelopes(
+    const RefoldModel::MacroInvocation &invocation,
+    const diffutils::Hunk &anchor, llvm::ArrayRef<RefoldModel::PPArgSpan> occs,
+    llvm::ArrayRef<size_t> touchedOccIdxs,
+    SmallVector<diffutils::Hunk, 8> &tokenHunks) const {
+  // This synthesis is only for insertion-frontier hunks. Non-insertion hunks
+  // already carry an A-side interval and do not need reconstruction.
+  if (anchor.aStart != anchor.aEnd)
+    return;
+  if (anchor.aStart < invocation.cover.begin ||
+      anchor.aEnd > invocation.cover.end)
+    return;
+
+  // The search does not depend on which occurrences are touched, so an open
+  // cache scope serves every args-only attempt that repeats it.
+  std::vector<SyntheticEnvelopeCandidate> uncachedCandidates;
+  const std::vector<SyntheticEnvelopeCandidate> *candidates =
+      &uncachedCandidates;
+  if (envelopeCache_) {
+    SyntheticEnvelopeSearchKey key;
+    key.anchor = anchor;
+    key.coverBegin = invocation.cover.begin;
+    key.coverEnd = invocation.cover.end;
+    key.occurrences.reserve(occs.size());
+    for (const RefoldModel::PPArgSpan &occ : occs)
+      key.occurrences.emplace_back(occ.begin, occ.end, occ.argIdx);
+    auto it = envelopeCache_->searches.find(key);
+    if (it == envelopeCache_->searches.end())
+      it = envelopeCache_->searches
+               .emplace(std::move(key),
+                        SearchSyntheticEnvelopes(invocation, anchor, occs))
+               .first;
+    candidates = &it->second;
+  } else {
+    uncachedCandidates = SearchSyntheticEnvelopes(invocation, anchor, occs);
+  }
+
+  // Each touched occurrence is an independent explanation target.  Once an
+  // envelope that fits inside an occurrence also touches a different formal or
+  // occurrence, that occurrence accepts no further envelope from this anchor:
+  // fail closed rather than choose among conflicting explanations.
+  SmallVector<char, 16> occurrenceClosed(touchedOccIdxs.size(), 0);
+  size_t openOccurrences = touchedOccIdxs.size();
+  for (const SyntheticEnvelopeCandidate &candidate : *candidates) {
+    if (openOccurrences == 0)
+      return;
+    const diffutils::Hunk &envTrim = candidate.envelope;
+    for (size_t i = 0; i < touchedOccIdxs.size(); ++i) {
+      if (occurrenceClosed[i])
+        continue;
+      const RefoldModel::PPArgSpan &sp = occs[touchedOccIdxs[i]];
+
+      // The exposed range must be fully contained in this exact occurrence.
+      if (!(sp.begin <= envTrim.aStart && envTrim.aEnd <= sp.end))
+        continue;
+      if (candidate.touch == SyntheticEnvelopeTouch::None)
+        continue;
+
+      // The synthetic envelope is valid only as an explanation for this exact
+      // argument occurrence; touching any other formal or occurrence closes it.
+      if (candidate.touch == SyntheticEnvelopeTouch::SeveralOccurrences ||
+          candidate.argIdx != sp.argIdx || candidate.begin != sp.begin ||
+          candidate.end != sp.end) {
+        occurrenceClosed[i] = 1;
+        --openOccurrences;
+        continue;
+      }
+
+      // Add the proof-compatible synthetic hunk so downstream args-only
+      // replacement logic validates the complete touched formal edit.
+      tokenHunks.push_back(envTrim);
+    }
   }
 }
 
