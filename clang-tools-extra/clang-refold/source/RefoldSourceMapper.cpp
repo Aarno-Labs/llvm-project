@@ -244,6 +244,31 @@ RefoldSourceMapper::FindExactOwningArgSpanForPureInsertion(
   return std::nullopt;
 }
 
+/// Return how far argument-like acceptance reaches past `frontier`.
+///
+/// `HunkFullyWithinArgSpans()` accepts an A token either because a span covers
+/// it or because it is a separator comma immediately preceding a span.  This
+/// applies exactly those two rules to the single token at `frontier` and
+/// returns the end of the accepted run, or `frontier` itself when neither rule
+/// accepts that token.  Repeated application walks the maximal accepted prefix
+/// of a hunk without visiting its tokens one at a time.
+static uint64_t
+extendArgSpanAcceptedFrontier(uint64_t frontier,
+                              ArrayRef<RefoldModel::PPArgSpan> argSpans,
+                              ArrayRef<PPTok> aToks) {
+  uint64_t extended = frontier;
+  for (const RefoldModel::PPArgSpan &s : argSpans) {
+    if (s.begin <= frontier && frontier < s.end)
+      extended = std::max(extended, s.end);
+    // The comma rule is tested against every recorded span, including a
+    // token-empty one, exactly as the token walk tests it.
+    if (s.begin == frontier + 1 && frontier < aToks.size() &&
+        aToks[static_cast<size_t>(frontier)].spelling == ",")
+      extended = std::max(extended, s.begin);
+  }
+  return extended;
+}
+
 bool RefoldSourceMapper::HunkFullyWithinArgSpans(
     const diffutils::Hunk &h, ArrayRef<RefoldModel::PPArgSpan> argSpans,
     MutableArrayRef<char> touched) const {
@@ -264,6 +289,40 @@ bool RefoldSourceMapper::HunkFullyWithinArgSpans(
       return true;
     }
     return false;
+  }
+
+  // Reject a wide hunk against argument-like acceptance before walking it one
+  // token at a time.
+  //
+  // The walk below costs the hunk's width times the span count.  A paired
+  // insertion envelope spans the gap between two insertion frontiers, so it
+  // can be as wide as a whole macro cover, and for such an envelope rejection
+  // is overwhelmingly the outcome -- so the expensive case is the one that
+  // produces no candidate.
+  //
+  // Extending an accepted frontier decides the same question using the same
+  // two acceptance rules, so a gap found here is a token the walk would
+  // refuse: this rejects exactly the hunks the walk rejects, and never accepts
+  // one the walk would not.  It can only return false earlier than before,
+  // which no caller can observe -- every caller of this predicate treats
+  // `touched` as meaningful only on a true result -- and a hunk that survives
+  // still goes through the unchanged walk below.
+  //
+  // The width guard is a cost comparison, not a rule.  The frontier walk is
+  // quadratic in the span count, so it only pays for itself once the hunk is
+  // wider than that count; narrow hunks go straight to the token walk as
+  // before.
+  if (a1 - a0 > argSpans.size()) {
+    uint64_t frontier = a0;
+    while (frontier < a1) {
+      const uint64_t extended =
+          extendArgSpanAcceptedFrontier(frontier, argSpans, aToks_);
+      if (extended <= frontier)
+        break;
+      frontier = extended;
+    }
+    if (frontier < a1)
+      return false;
   }
 
   // For replacement/deletion hunks, every consumed A token must be explainable
