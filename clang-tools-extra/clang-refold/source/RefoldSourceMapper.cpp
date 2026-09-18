@@ -26,7 +26,8 @@ namespace clang {
 namespace refold {
 namespace {
 
-/// Compute `LCS(a,b[0,j))` for every B-token frontier `j`.
+/// Compute `LCS(a[0,split), b[0,j))` for every B-token frontier `j`, at every
+/// requested A-prefix length `split`.
 ///
 /// The row is calculated with linear auxiliary storage. Boundary uniqueness
 /// validation uses the complete row rather than one reconstructed LCS path
@@ -34,15 +35,29 @@ namespace {
 /// boundary has unique target ownership. Every frontier that participates in
 /// any maximum-length local
 /// alignment must remain observable until ambiguity is rejected.
-std::vector<size_t> buildForwardLCSFrontierRow(ArrayRef<PPTok> a,
-                                               ArrayRef<PPTok> b) {
+///
+/// One sweep answers every requested split: once the row for A-prefix length
+/// `i` has been computed it is exactly `LCS(a[0,i), b[0,j))` for every `j`, so
+/// the rows for several splits are snapshots of one dynamic program rather
+/// than one dynamic program each.  `splits` must be ascending; a split outside
+/// `[0,a.size()]` leaves its row empty so the caller fails closed on it.
+std::vector<std::vector<size_t>>
+buildForwardLCSFrontierRowsAtSplits(ArrayRef<PPTok> a, ArrayRef<PPTok> b,
+                                    ArrayRef<size_t> splits) {
+  std::vector<std::vector<size_t>> rows(splits.size());
   std::vector<size_t> previous(b.size() + 1, 0);
   std::vector<size_t> current(b.size() + 1, 0);
 
-  for (const PPTok &aToken : a) {
+  size_t nextSplit = 0;
+  while (nextSplit < splits.size() && splits[nextSplit] == 0) {
+    rows[nextSplit] = previous;
+    ++nextSplit;
+  }
+
+  for (size_t aIndex = 0; aIndex < a.size(); ++aIndex) {
     current[0] = 0;
     for (size_t bIndex = 0; bIndex < b.size(); ++bIndex) {
-      if (aToken.spelling == b[bIndex].spelling) {
+      if (a[aIndex].spelling == b[bIndex].spelling) {
         current[bIndex + 1] = previous[bIndex] + 1;
       } else {
         current[bIndex + 1] =
@@ -50,22 +65,40 @@ std::vector<size_t> buildForwardLCSFrontierRow(ArrayRef<PPTok> a,
       }
     }
     previous.swap(current);
+    while (nextSplit < splits.size() && splits[nextSplit] == aIndex + 1) {
+      rows[nextSplit] = previous;
+      ++nextSplit;
+    }
   }
 
-  return previous;
+  return rows;
 }
 
-/// Compute `LCS(a,b[j,m))` for every B-token frontier `j`.
+/// Compute `LCS(a[split,n), b[j,m))` for every B-token frontier `j`, at every
+/// requested A-prefix length `split`.
 ///
-/// This is the reverse counterpart of `buildForwardLCSFrontierRow()`. For one
-/// A split, the sum of the forward and reverse rows at B frontier `j` is the
-/// length of the best common subsequence constrained to cross that exact
-/// frontier. Consequently all maximum-length local alignments are represented
-/// without enumerating or tie-breaking among them.
-std::vector<size_t> buildReverseLCSFrontierRow(ArrayRef<PPTok> a,
-                                               ArrayRef<PPTok> b) {
+/// This is the reverse counterpart of
+/// `buildForwardLCSFrontierRowsAtSplits()`. For one A split, the sum of the
+/// forward and reverse rows at B frontier `j` is the length of the best common
+/// subsequence constrained to cross that exact frontier. Consequently all
+/// maximum-length local alignments are represented without enumerating or
+/// tie-breaking among them.
+///
+/// Rows are produced from the end of A backwards, so the caller's ascending
+/// `splits` are filled from the last one to the first.  A split outside
+/// `[0,a.size()]` leaves its row empty so the caller fails closed on it.
+std::vector<std::vector<size_t>>
+buildReverseLCSFrontierRowsAtSplits(ArrayRef<PPTok> a, ArrayRef<PPTok> b,
+                                    ArrayRef<size_t> splits) {
+  std::vector<std::vector<size_t>> rows(splits.size());
   std::vector<size_t> next(b.size() + 1, 0);
   std::vector<size_t> current(b.size() + 1, 0);
+
+  size_t pendingSplit = splits.size();
+  while (pendingSplit != 0 && splits[pendingSplit - 1] == a.size()) {
+    rows[pendingSplit - 1] = next;
+    --pendingSplit;
+  }
 
   for (size_t aIndex = a.size(); aIndex != 0; --aIndex) {
     current[b.size()] = 0;
@@ -79,9 +112,13 @@ std::vector<size_t> buildReverseLCSFrontierRow(ArrayRef<PPTok> a,
       }
     }
     next.swap(current);
+    while (pendingSplit != 0 && splits[pendingSplit - 1] == aIndex - 1) {
+      rows[pendingSplit - 1] = next;
+      --pendingSplit;
+    }
   }
 
-  return next;
+  return rows;
 }
 
 } // namespace
@@ -419,18 +456,20 @@ size_t RefoldSourceMapper::MapAByteToBByteUpperBound(size_t aByte) const {
   return static_cast<size_t>(std::max<int64_t>(0, result));
 }
 
-std::optional<RefoldSourceMapper::ATokenBoundaryProjection>
-RefoldSourceMapper::ProjectATokenBoundaryToBTokenBounds(
+std::vector<std::optional<RefoldSourceMapper::ATokenBoundaryProjection>>
+RefoldSourceMapper::ProjectATokenBoundariesToBTokenBounds(
     uint64_t parentAStart, uint64_t parentAEnd, uint64_t parentBStart,
-    uint64_t parentBEnd, uint64_t aBoundary) const {
-  // Boundary uniqueness validation projects only a strict interior boundary
-  // of one nonempty replacement. Both A fragments must therefore remain
-  // nonempty, and the parent B envelope must itself be well formed and inside
-  // the token domains.
-  if (parentAStart >= aBoundary || aBoundary >= parentAEnd ||
-      parentAEnd > aToks_.size() || parentBStart > parentBEnd ||
-      parentBEnd > bToks_.size()) {
-    return std::nullopt;
+    uint64_t parentBEnd, ArrayRef<uint64_t> aBoundaries) const {
+  std::vector<std::optional<ATokenBoundaryProjection>> projections(
+      aBoundaries.size());
+
+  // Boundary uniqueness validation projects only strict interior boundaries of
+  // one nonempty replacement. The parent envelope must therefore be well
+  // formed and inside the token domains; a boundary on either parent edge
+  // leaves one A fragment empty and keeps its unprojected entry.
+  if (parentAStart >= parentAEnd || parentAEnd > aToks_.size() ||
+      parentBStart > parentBEnd || parentBEnd > bToks_.size()) {
+    return projections;
   }
 
   const ArrayRef<PPTok> parentA =
@@ -439,16 +478,27 @@ RefoldSourceMapper::ProjectATokenBoundaryToBTokenBounds(
   const ArrayRef<PPTok> parentB =
       bToks_.slice(static_cast<size_t>(parentBStart),
                    static_cast<size_t>(parentBEnd - parentBStart));
-  const size_t localASplit = static_cast<size_t>(aBoundary - parentAStart);
+
+  // The frontier sweeps are shared by every boundary, so ask for each distinct
+  // interior split once and in ascending order.
+  SmallVector<size_t, 8> splits;
+  for (uint64_t aBoundary : aBoundaries) {
+    if (parentAStart < aBoundary && aBoundary < parentAEnd)
+      splits.push_back(static_cast<size_t>(aBoundary - parentAStart));
+  }
+  llvm::sort(splits);
+  splits.erase(std::unique(splits.begin(), splits.end()), splits.end());
+  if (splits.empty())
+    return projections;
 
   // A selected byte or token diff path is insufficient authority here. In a
   // replacement region with repeated spellings, several maximum-length edit
   // alignments can cross the structural A boundary at different B frontiers
   // even though one deterministic reconstruction happens to select only one.
-  // Compute the frontier set induced by *all* maximum-length local token
-  // alignments instead.
+  // Compute the frontier set induced by *all* maximum-length local alignments
+  // instead.
   //
-  // For each local B frontier `j`:
+  // For each local B frontier `j` of one split:
   //
   //   prefix[j] = LCS(A[0,split), B[0,j))
   //   suffix[j] = LCS(A[split,n), B[j,m))
@@ -462,36 +512,60 @@ RefoldSourceMapper::ProjectATokenBoundaryToBTokenBounds(
   // reject. Owner-depth, line-surface, and preferred-side tie-breaks are
   // intentionally excluded because they can select a placement without token
   // correspondence.
-  const std::vector<size_t> prefix = buildForwardLCSFrontierRow(
-      parentA.take_front(localASplit), parentB);
-  const std::vector<size_t> suffix = buildReverseLCSFrontierRow(
-      parentA.drop_front(localASplit), parentB);
-  if (prefix.size() != parentB.size() + 1 || suffix.size() != prefix.size())
-    return std::nullopt;
+  //
+  // Every split reads its rows out of one forward and one reverse sweep, so a
+  // hunk with `k` structural seams costs one `O(|A|*|B|)` pair of sweeps rather
+  // than one pair per seam. The rows are the same rows a per-boundary sweep
+  // would produce, so the admitted frontier set is unchanged.
+  const std::vector<std::vector<size_t>> prefixRows =
+      buildForwardLCSFrontierRowsAtSplits(parentA, parentB, splits);
+  const std::vector<std::vector<size_t>> suffixRows =
+      buildReverseLCSFrontierRowsAtSplits(parentA, parentB, splits);
+  if (prefixRows.size() != splits.size() || suffixRows.size() != splits.size())
+    return projections;
 
-  size_t bestScore = 0;
-  for (size_t frontier = 0; frontier < prefix.size(); ++frontier)
-    bestScore = std::max(bestScore, prefix[frontier] + suffix[frontier]);
-
-  std::optional<size_t> lowerFrontier;
-  size_t upperFrontier = 0;
-  for (size_t frontier = 0; frontier < prefix.size(); ++frontier) {
-    if (prefix[frontier] + suffix[frontier] != bestScore)
+  for (size_t index = 0; index < aBoundaries.size(); ++index) {
+    const uint64_t aBoundary = aBoundaries[index];
+    if (parentAStart >= aBoundary || aBoundary >= parentAEnd)
       continue;
-    if (!lowerFrontier)
-      lowerFrontier = frontier;
-    upperFrontier = frontier;
-  }
-  if (!lowerFrontier)
-    return std::nullopt;
 
-  ATokenBoundaryProjection projection;
-  projection.aBoundary = aBoundary;
-  projection.lowerBTokenBoundary =
-      parentBStart + static_cast<uint64_t>(*lowerFrontier);
-  projection.upperBTokenBoundary =
-      parentBStart + static_cast<uint64_t>(upperFrontier);
-  return projection;
+    const size_t localASplit = static_cast<size_t>(aBoundary - parentAStart);
+    const size_t splitIndex = static_cast<size_t>(
+        llvm::lower_bound(splits, localASplit) - splits.begin());
+    if (splitIndex >= splits.size() || splits[splitIndex] != localASplit)
+      continue;
+
+    const std::vector<size_t> &prefix = prefixRows[splitIndex];
+    const std::vector<size_t> &suffix = suffixRows[splitIndex];
+    if (prefix.size() != parentB.size() + 1 || suffix.size() != prefix.size())
+      continue;
+
+    size_t bestScore = 0;
+    for (size_t frontier = 0; frontier < prefix.size(); ++frontier)
+      bestScore = std::max(bestScore, prefix[frontier] + suffix[frontier]);
+
+    std::optional<size_t> lowerFrontier;
+    size_t upperFrontier = 0;
+    for (size_t frontier = 0; frontier < prefix.size(); ++frontier) {
+      if (prefix[frontier] + suffix[frontier] != bestScore)
+        continue;
+      if (!lowerFrontier)
+        lowerFrontier = frontier;
+      upperFrontier = frontier;
+    }
+    if (!lowerFrontier)
+      continue;
+
+    ATokenBoundaryProjection projection;
+    projection.aBoundary = aBoundary;
+    projection.lowerBTokenBoundary =
+        parentBStart + static_cast<uint64_t>(*lowerFrontier);
+    projection.upperBTokenBoundary =
+        parentBStart + static_cast<uint64_t>(upperFrontier);
+    projections[index] = projection;
+  }
+
+  return projections;
 }
 
 size_t RefoldSourceMapper::BTokIndexFloor(size_t bByte) const {

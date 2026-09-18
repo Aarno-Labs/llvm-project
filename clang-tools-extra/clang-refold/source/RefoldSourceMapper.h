@@ -349,23 +349,29 @@ public:
   MapATokRangeToBTokenEnvelopeByTokenDiff(uint64_t beginTok,
                                           uint64_t endTok) const;
 
-  /// Project one exact A-token boundary to lower/upper B-token boundaries.
+  /// Project exact A-token boundaries to lower/upper B-token boundaries.
   ///
-  /// The projection is the set of B frontiers crossed by all maximum-length
+  /// Each projection is the set of B frontiers crossed by all maximum-length
   /// local token alignments of the complete parent replacement. `lower` and
   /// `upper` are respectively the minimum and maximum such frontiers. This
   /// deliberately excludes owner-depth or surface-placement tie-breaks from
   /// proof authority: repeated tokens and an inseparable B expression retain
   /// distinct bounds, while only `lower == upper` proves one exact split of the
-  /// complete parent B envelope. The calculation is exact and uses linear
-  /// auxiliary storage; it never assigns payload by textual distance or a
-  /// preferred side.
-  std::optional<ATokenBoundaryProjection>
-  ProjectATokenBoundaryToBTokenBounds(uint64_t parentAStart,
-                                      uint64_t parentAEnd,
-                                      uint64_t parentBStart,
-                                      uint64_t parentBEnd,
-                                      uint64_t aBoundary) const;
+  /// complete parent B envelope. The calculation is exact; it never assigns
+  /// payload by textual distance or a preferred side.
+  ///
+  /// The result has one entry per requested boundary, in the requested order.
+  /// An entry is `std::nullopt` when that boundary is not a strict interior
+  /// boundary of a well-formed parent envelope, which the caller must treat as
+  /// no projection rather than as an unconstrained one. All boundaries share
+  /// one forward and one reverse frontier sweep, so a hunk with `k` structural
+  /// seams pays for the parent envelope once instead of once per seam;
+  /// auxiliary storage is linear in the parent B envelope per requested
+  /// boundary.
+  std::vector<std::optional<ATokenBoundaryProjection>>
+  ProjectATokenBoundariesToBTokenBounds(
+      uint64_t parentAStart, uint64_t parentAEnd, uint64_t parentBStart,
+      uint64_t parentBEnd, llvm::ArrayRef<uint64_t> aBoundaries) const;
 
   /// Map an A-token cover and trim edge pure insertions from the B envelope.
   ///

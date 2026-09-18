@@ -440,6 +440,50 @@ struct ClosedStateGapTransition {
   bool hasProtectedPreprocessingStructure = false;
 };
 
+/// Identity of one closed state-gap transition question.
+///
+/// `BuildClosedStateGapTransition()` reads its two token carriers only through
+/// their source sites and stamps the A/B coordinates of the left carrier's end
+/// on every proof-only edge it returns; everything else it consults is an
+/// immutable producer fact. Two adjacencies that agree on these fields are
+/// therefore the same question and have the same answer, which is what lets
+/// the partition search ask it once per distinct seam instead of once per DP
+/// state that reaches the seam. Paths are compared by spelling rather than by
+/// `RefoldPathIdentity`, so two spellings of one file are two keys: that costs
+/// a repeated proof, never a shared one.
+struct ClosedStateGapTransitionKey {
+  StringRef previousPath;
+  StringRef currentPath;
+  std::optional<uint64_t> previousIncludeId;
+  std::optional<uint64_t> currentIncludeId;
+  uint64_t previousSourceBegin = 0;
+  uint64_t previousSourceEnd = 0;
+  uint64_t currentSourceBegin = 0;
+  uint64_t currentSourceEnd = 0;
+  uint64_t aBoundary = 0;
+  uint64_t bBoundary = 0;
+
+  bool operator<(const ClosedStateGapTransitionKey &other) const {
+    return std::tie(previousPath, currentPath, previousIncludeId,
+                    currentIncludeId, previousSourceBegin, previousSourceEnd,
+                    currentSourceBegin, currentSourceEnd, aBoundary,
+                    bBoundary) <
+           std::tie(other.previousPath, other.currentPath,
+                    other.previousIncludeId, other.currentIncludeId,
+                    other.previousSourceBegin, other.previousSourceEnd,
+                    other.currentSourceBegin, other.currentSourceEnd,
+                    other.aBoundary, other.bBoundary);
+  }
+};
+
+/// Answers already proved for one original hunk's state-gap transitions.
+///
+/// The memo is per hunk and is only ever read through the key above, so it
+/// carries no state between hunks and no iteration order reaches a decision.
+using ClosedStateGapTransitionMemo =
+    std::map<ClosedStateGapTransitionKey,
+             std::optional<ClosedStateGapTransition>>;
+
 struct StructuralPartition {
   SmallVector<PartitionEdge, 8> edges;
   StructuralTilingReason reason = StructuralTilingReason::Unknown;
@@ -651,6 +695,84 @@ classifyStructuralTilingReason(bool mixedRealizers,
   return StructuralTilingReason::Unknown;
 }
 
+/// Producer state records grouped by the physical surface they sit on.
+///
+/// `CollectZeroTokenStateGaps()` asks the same question of every producer array
+/// once per state-gap transition: which records have their site inside this one
+/// physical interval?  Grouping each array by canonical path and include
+/// occurrence, ordered by site begin, answers that from the records that can
+/// actually qualify instead of rescanning the whole model per transition.
+///
+/// The index is a candidate filter and nothing more.  Every candidate it
+/// returns is still checked by the same predicate as before, and candidates
+/// come back in producer-array order, so the collected chain is exactly the one
+/// a full scan produces.
+class StructuralGapRecordIndex {
+public:
+  /// Add the record at `producerIndex`, whose site begins at `begin`, to the
+  /// surface named by `canonicalPath` and `includeId`.
+  ///
+  /// `canonicalPath` must outlive the index.
+  /// `RefoldPathIdentity::GetCanonicalPath()` returns process-lifetime
+  /// storage, and canonical spellings are what makes a surface lookup agree
+  /// with `RefoldPathIdentity::PathsEqual()`.
+  void Add(StringRef canonicalPath, std::optional<uint64_t> includeId,
+           uint64_t begin, uint32_t producerIndex) {
+    surfaces_[SurfaceKey{canonicalPath, includeId}].push_back(
+        SurfaceSite{begin, producerIndex});
+  }
+
+  /// Order every surface by site begin.  Call once, after the last `Add()`.
+  void Finalize() {
+    for (auto &surface : surfaces_)
+      llvm::sort(surface.second);
+  }
+
+  /// Return, in producer-array order, the records on one surface whose site
+  /// begins in `[begin,end]`.
+  ///
+  /// A site that begins outside the interval cannot lie wholly inside it, so
+  /// this range is a complete candidate set for a containment predicate.  A
+  /// candidate that begins inside and ends outside is still returned, and is
+  /// still rejected by that predicate.
+  SmallVector<uint32_t, 8>
+  RecordsWithSiteBeginInRange(StringRef canonicalPath,
+                              std::optional<uint64_t> includeId, uint64_t begin,
+                              uint64_t end) const {
+    SmallVector<uint32_t, 8> records;
+    if (end < begin)
+      return records;
+
+    const auto surface = surfaces_.find(SurfaceKey{canonicalPath, includeId});
+    if (surface == surfaces_.end())
+      return records;
+
+    for (auto site = llvm::lower_bound(surface->second, SurfaceSite{begin, 0});
+         site != surface->second.end() && site->first <= end; ++site) {
+      records.push_back(site->second);
+    }
+    llvm::sort(records);
+    return records;
+  }
+
+private:
+  /// One physical source surface: a canonical path and, where the querying
+  /// predicate distinguishes them, one include occurrence of that path.
+  struct SurfaceKey {
+    StringRef path;
+    std::optional<uint64_t> includeId;
+
+    bool operator<(const SurfaceKey &other) const {
+      return std::tie(path, includeId) < std::tie(other.path, other.includeId);
+    }
+  };
+
+  /// One record's site begin paired with its position in the producer array.
+  using SurfaceSite = std::pair<uint64_t, uint32_t>;
+
+  std::map<SurfaceKey, std::vector<SurfaceSite>> surfaces_;
+};
+
 /// Proof layer for one structural tiling pass.
 ///
 /// Every predicate here answers one question about one original hunk from the
@@ -674,6 +796,7 @@ public:
       if (!seenTokmapPP.insert(entry.pp).second)
         duplicateTokmapPP_.insert(entry.pp);
     }
+    BuildGapRecordIndexes();
   }
 
   // Return whether anything after `gap` could still observe the macro state its
@@ -1462,26 +1585,61 @@ public:
 
   std::optional<ClosedStateGapTransition>
   BuildClosedStateGapTransition(const PartitionEdge *prev,
-                                const PartitionEdge &cur) const {
-    ClosedStateGapTransition transition;
-
-    // The first token segment has no predecessor, and token owners from
-    // incomparable source sites do not create a proof obligation here.  They
-    // are still checked later by the ordinary owner-realization proofs.
+                                const PartitionEdge &cur,
+                                ClosedStateGapTransitionMemo &memo) const {
+    // The first token segment has no predecessor: there is no interval between
+    // two carriers, so there is nothing to prove and nothing to memoize.
     if (!prev)
-      return transition;
+      return ClosedStateGapTransition();
     if (!prev->IsTokenSegment() || !cur.IsTokenSegment() || !prev->closure ||
         !cur.closure)
       return std::nullopt;
-    if (!SourceSitesComparable(prev->closure->source, cur.closure->source) ||
-        cur.closure->source.begin < prev->closure->source.end)
+
+    ClosedStateGapTransitionKey key;
+    key.previousPath = prev->closure->source.path;
+    key.currentPath = cur.closure->source.path;
+    key.previousIncludeId = prev->closure->source.includeId;
+    key.currentIncludeId = cur.closure->source.includeId;
+    key.previousSourceBegin = prev->closure->source.begin;
+    key.previousSourceEnd = prev->closure->source.end;
+    key.currentSourceBegin = cur.closure->source.begin;
+    key.currentSourceEnd = cur.closure->source.end;
+    key.aBoundary = prev->aEnd;
+    key.bBoundary = prev->bEnd;
+
+    const auto cached = memo.find(key);
+    if (cached != memo.end())
+      return cached->second;
+
+    std::optional<ClosedStateGapTransition> transition =
+        ProveClosedStateGapTransition(*prev, cur);
+    memo.emplace(key, transition);
+    return transition;
+  }
+
+  /// Prove the complete state transition between two adjacent token carriers.
+  ///
+  /// Every fact this reads is either immutable producer metadata or one of the
+  /// key fields above, which is what makes the memo in
+  /// `BuildClosedStateGapTransition()` exact rather than an approximation of
+  /// repeated work.
+  std::optional<ClosedStateGapTransition>
+  ProveClosedStateGapTransition(const PartitionEdge &prev,
+                                const PartitionEdge &cur) const {
+    ClosedStateGapTransition transition;
+
+    // Token owners from incomparable source sites do not create a proof
+    // obligation here.  They are still checked later by the ordinary
+    // owner-realization proofs.
+    if (!SourceSitesComparable(prev.closure->source, cur.closure->source) ||
+        cur.closure->source.begin < prev.closure->source.end)
       return transition;
 
     OwnerSourceRange gapSource = OwnerSourceRange::From(
-        prev->closure->source.path, prev->closure->source.end,
-        cur.closure->source.begin, prev->closure->source.includeId);
+        prev.closure->source.path, prev.closure->source.end,
+        cur.closure->source.begin, prev.closure->source.includeId);
     SmallVector<PartitionEdge, 8> collected =
-        CollectZeroTokenStateGaps(gapSource, prev->aEnd, prev->bEnd);
+        CollectZeroTokenStateGaps(gapSource, prev.aEnd, prev.bEnd);
 
     // Exact lexical intervals are bound before byte coverage so a producer
     // site that names only the directive keyword/name cannot leave the rest
@@ -1491,9 +1649,8 @@ public:
     SmallVector<PartitionEdge, 8> exactCollected = collected;
     std::string structureReason;
     std::optional<bool> protectedBinding =
-        BindProtectedStructureIntervalsToStateGaps(gapSource, prev->aEnd,
-                                                   prev->bEnd, exactCollected,
-                                                   &structureReason);
+        BindProtectedStructureIntervalsToStateGaps(
+            gapSource, prev.aEnd, prev.bEnd, exactCollected, &structureReason);
 
     auto validateGapGraph = [&](ArrayRef<PartitionEdge> candidate,
                                 SmallVectorImpl<PartitionEdge> &validated) {
@@ -1805,7 +1962,7 @@ public:
     // to continue would let an
     // alternate partition assign the same ambiguous payload indirectly.
     //
-    // `ProjectATokenBoundaryToBTokenBounds()` now reports the minimum and
+    // `ProjectATokenBoundariesToBTokenBounds()` reports the minimum and
     // maximum B frontiers reached by all maximum-length local token
     // alignments. A strict range therefore means the B expression is
     // inseparable at this A
@@ -1817,12 +1974,28 @@ public:
       bool projectionsComplete = true;
       physicalSourceRuns->boundaryProjections.clear();
       physicalSourceRuns->macroStatePlacementProven.clear();
+
+      // Ask for every canonical run boundary at once.  The frontier sweeps the
+      // theorem needs are a property of the parent envelope, not of one seam,
+      // so sharing them leaves the admitted frontier set per seam unchanged.
+      SmallVector<uint64_t, 8> runBoundaries;
+      for (size_t runIndex = 0; runIndex + 1 < physicalSourceRuns->runs.size();
+           ++runIndex) {
+        runBoundaries.push_back(physicalSourceRuns->runs[runIndex].aEnd);
+      }
+      const std::vector<
+          std::optional<RefoldSourceMapper::ATokenBoundaryProjection>>
+          runBoundaryProjections =
+              deps_.sourceMapper.ProjectATokenBoundariesToBTokenBounds(
+                  h.aStart, h.aEnd, h.bStart, h.bEnd, runBoundaries);
+      if (runBoundaryProjections.size() != runBoundaries.size())
+        return std::nullopt;
+
       for (size_t runIndex = 0; runIndex + 1 < physicalSourceRuns->runs.size();
            ++runIndex) {
         const uint64_t aBoundary = physicalSourceRuns->runs[runIndex].aEnd;
         std::optional<RefoldSourceMapper::ATokenBoundaryProjection> projection =
-            deps_.sourceMapper.ProjectATokenBoundaryToBTokenBounds(
-                h.aStart, h.aEnd, h.bStart, h.bEnd, aBoundary);
+            runBoundaryProjections[runIndex];
         bool macroStatePlacementProven = false;
         // A strict range means the payload cannot be split at this seam by
         // alignment alone. That is not the end of the question: when the
@@ -2075,6 +2248,9 @@ public:
       return match;
     };
 
+    // One transition proof per distinct seam, not per DP state that reaches it.
+    ClosedStateGapTransitionMemo transitionMemo;
+
     std::vector<std::map<PartitionStateKey, PartitionParent>> dp(
         static_cast<size_t>(aLen) + 1);
     PartitionStateKey startKey;
@@ -2113,7 +2289,8 @@ public:
           // this DP edge from existing at all.  This lets cost and ambiguity
           // account for the real token+state proof graph instead of adding
           // state gaps as an after-the-fact annotation.
-          auto transitionGaps = BuildClosedStateGapTransition(prevEdge, edge);
+          auto transitionGaps =
+              BuildClosedStateGapTransition(prevEdge, edge, transitionMemo);
           if (!transitionGaps)
             continue;
 
@@ -2920,8 +3097,19 @@ private:
     // source order and represented as proof-only partition edges so the mixed
     // owner tiler can distinguish "there is no source gap" from "there is a
     // state gap that was proved closed".
-    for (const RefoldModel::MacroDirective &directive :
-         deps_.model.GetMacroDirectives()) {
+    //
+    // Every array below is visited through the per-pass surface index, which
+    // narrows the scan to the records whose site begins inside this gap and
+    // hands them back in producer order.  The per-record predicate is
+    // unchanged, so the resulting chain is the one a full rescan produces.
+    const StringRef gapPath =
+        deps_.pathIdentity.GetCanonicalPath(gapSource.path);
+
+    const ArrayRef<RefoldModel::MacroDirective> macroDirectives =
+        deps_.model.GetMacroDirectives();
+    for (uint32_t index : macroDirectiveGapIndex_.RecordsWithSiteBeginInRange(
+             gapPath, gapSource.includeId, gapSource.begin, gapSource.end)) {
+      const RefoldModel::MacroDirective &directive = macroDirectives[index];
       if (!SourceSiteMatchesGap(gapSource, directive.sitePath,
                                 directive.ownerIncludeId, directive.siteB,
                                 directive.siteE))
@@ -2933,8 +3121,11 @@ private:
           aBoundary, bBoundary));
     }
 
-    for (const RefoldModel::LineControlEvent &event :
-         deps_.model.GetLineControls()) {
+    const ArrayRef<RefoldModel::LineControlEvent> lineControls =
+        deps_.model.GetLineControls();
+    for (uint32_t index : lineControlGapIndex_.RecordsWithSiteBeginInRange(
+             gapPath, gapSource.includeId, gapSource.begin, gapSource.end)) {
+      const RefoldModel::LineControlEvent &event = lineControls[index];
       if (!event.siteB || !event.siteE)
         continue;
       if (!SourceSiteMatchesGap(gapSource, event.physicalFile,
@@ -2948,23 +3139,26 @@ private:
           aBoundary, bBoundary));
     }
 
-    for (const RefoldModel::PragmaDirective &pragma :
-         deps_.model.GetPragmas()) {
+    // Pragma candidates are narrowed by path only: the binding below resolves
+    // the include occurrence from segment facts rather than trusting the
+    // serialized one, so an occurrence-keyed lookup would hide exactly the
+    // records it is there to recover.
+    const ArrayRef<RefoldModel::PragmaDirective> pragmas =
+        deps_.model.GetPragmas();
+    for (uint32_t index : pragmaGapIndex_.RecordsWithSiteBeginInRange(
+             gapPath, std::nullopt, gapSource.begin, gapSource.end)) {
+      const RefoldModel::PragmaDirective &pragma = pragmas[index];
       // bind zero-token pragmas to the same source owner as the gap.  Newer
       // maps can carry owner_include_id directly; older maps are resolved
       // through segment facts.  A repeated-header pragma must never be
       // accepted from path+byte containment alone because the same file bytes
       // may be visited by several include occurrences.
       if (!pragma.ownerIncludeId) {
-        unsigned samePhysicalSiteWithoutOwner = 0;
-        for (const RefoldModel::PragmaDirective &other :
-             deps_.model.GetPragmas()) {
-          if (!other.ownerIncludeId &&
-              deps_.pathIdentity.PathsEqual(other.sitePath, pragma.sitePath) &&
-              other.siteB == pragma.siteB && other.siteE == pragma.siteE)
-            ++samePhysicalSiteWithoutOwner;
-        }
-        if (samePhysicalSiteWithoutOwner > 1)
+        const auto sharedSite = ownerlessPragmaSiteCounts_.find(std::make_tuple(
+            deps_.pathIdentity.GetCanonicalPath(pragma.sitePath), pragma.siteB,
+            pragma.siteE));
+        if (sharedSite != ownerlessPragmaSiteCounts_.end() &&
+            sharedSite->second > 1)
           continue;
       }
       std::optional<SourceOwnerIdentity> identity = BindSourceOwnerToGap(
@@ -2991,7 +3185,11 @@ private:
           aBoundary, bBoundary));
     }
 
-    for (const RefoldModel::IncludeItem &include : deps_.model.GetIncludes()) {
+    const ArrayRef<RefoldModel::IncludeItem> includes =
+        deps_.model.GetIncludes();
+    for (uint32_t index : includeGapIndex_.RecordsWithSiteBeginInRange(
+             gapPath, gapSource.includeId, gapSource.begin, gapSource.end)) {
+      const RefoldModel::IncludeItem &include = includes[index];
       if (!SourceSiteMatchesGap(gapSource, include.sitePath, include.parent,
                                 include.siteB, include.siteE))
         continue;
@@ -3006,8 +3204,11 @@ private:
           aBoundary, bBoundary));
     }
 
-    for (const RefoldModel::MacroInvocation &macro :
-         deps_.model.GetMacroInvocations()) {
+    const ArrayRef<RefoldModel::MacroInvocation> invocations =
+        deps_.model.GetMacroInvocations();
+    for (uint32_t index : macroInvocationGapIndex_.RecordsWithSiteBeginInRange(
+             gapPath, gapSource.includeId, gapSource.begin, gapSource.end)) {
+      const RefoldModel::MacroInvocation &macro = invocations[index];
       if (!macro.invFile || !macro.invB || !macro.invE)
         continue;
       if (macro.cover.IsValid())
@@ -3022,7 +3223,11 @@ private:
           aBoundary, bBoundary));
     }
 
-    for (const RefoldModel::CondGroup &group : deps_.model.GetConds()) {
+    const ArrayRef<RefoldModel::CondGroup> conditionalGroups =
+        deps_.model.GetConds();
+    for (uint32_t index : conditionalGroupGapIndex_.RecordsWithSiteBeginInRange(
+             gapPath, gapSource.includeId, gapSource.begin, gapSource.end)) {
+      const RefoldModel::CondGroup &group = conditionalGroups[index];
       if (!SourceSiteMatchesGap(gapSource, group.file, group.parentIncludeId,
                                 group.groupB, group.groupE))
         continue;
@@ -3532,6 +3737,87 @@ private:
     return summary;
   }
 
+  /// Group every producer array `CollectZeroTokenStateGaps()` consults by the
+  /// source surface its records sit on, and take the ownerless-pragma site
+  /// census.
+  ///
+  /// A record that can never be a zero-token gap owner is left out exactly
+  /// where the collector's own per-record filter would reject it -- a macro
+  /// invocation or include that has a token cover, a line control with no
+  /// recorded site -- so index candidates and full-scan candidates agree.
+  void BuildGapRecordIndexes() {
+    const auto canonical = [this](StringRef path) {
+      return deps_.pathIdentity.GetCanonicalPath(path);
+    };
+
+    const ArrayRef<RefoldModel::MacroDirective> directives =
+        deps_.model.GetMacroDirectives();
+    for (uint32_t index = 0; index < directives.size(); ++index) {
+      const RefoldModel::MacroDirective &directive = directives[index];
+      macroDirectiveGapIndex_.Add(canonical(directive.sitePath),
+                                  directive.ownerIncludeId, directive.siteB,
+                                  index);
+    }
+
+    const ArrayRef<RefoldModel::LineControlEvent> lineControls =
+        deps_.model.GetLineControls();
+    for (uint32_t index = 0; index < lineControls.size(); ++index) {
+      const RefoldModel::LineControlEvent &event = lineControls[index];
+      if (!event.siteB || !event.siteE)
+        continue;
+      lineControlGapIndex_.Add(canonical(event.physicalFile),
+                               event.ownerIncludeId, *event.siteB, index);
+    }
+
+    const ArrayRef<RefoldModel::PragmaDirective> pragmas =
+        deps_.model.GetPragmas();
+    for (uint32_t index = 0; index < pragmas.size(); ++index) {
+      const RefoldModel::PragmaDirective &pragma = pragmas[index];
+      const StringRef path = canonical(pragma.sitePath);
+      pragmaGapIndex_.Add(path, std::nullopt, pragma.siteB, index);
+      if (!pragma.ownerIncludeId) {
+        ++ownerlessPragmaSiteCounts_[std::make_tuple(path, pragma.siteB,
+                                                     pragma.siteE)];
+      }
+    }
+
+    const ArrayRef<RefoldModel::IncludeItem> includes =
+        deps_.model.GetIncludes();
+    for (uint32_t index = 0; index < includes.size(); ++index) {
+      const RefoldModel::IncludeItem &include = includes[index];
+      // Canonicalize before the cover filter so every record's path is put
+      // through the same identity service a full scan put it through.
+      const StringRef path = canonical(include.sitePath);
+      if (include.cover.IsValid())
+        continue;
+      includeGapIndex_.Add(path, include.parent, include.siteB, index);
+    }
+
+    const ArrayRef<RefoldModel::MacroInvocation> invocations =
+        deps_.model.GetMacroInvocations();
+    for (uint32_t index = 0; index < invocations.size(); ++index) {
+      const RefoldModel::MacroInvocation &macro = invocations[index];
+      if (!macro.invFile || !macro.invB || !macro.invE || macro.cover.IsValid())
+        continue;
+      macroInvocationGapIndex_.Add(canonical(*macro.invFile),
+                                   macro.ownerIncludeId, *macro.invB, index);
+    }
+
+    const ArrayRef<RefoldModel::CondGroup> groups = deps_.model.GetConds();
+    for (uint32_t index = 0; index < groups.size(); ++index) {
+      const RefoldModel::CondGroup &group = groups[index];
+      conditionalGroupGapIndex_.Add(canonical(group.file),
+                                    group.parentIncludeId, group.groupB, index);
+    }
+
+    macroDirectiveGapIndex_.Finalize();
+    lineControlGapIndex_.Finalize();
+    pragmaGapIndex_.Finalize();
+    includeGapIndex_.Finalize();
+    macroInvocationGapIndex_.Finalize();
+    conditionalGroupGapIndex_.Finalize();
+  }
+
   RefoldStructuralHunkTilingPlanner::Dependencies &deps_;
 
   /// Per-structure placement proofs for a preserved structural gap.  The
@@ -3543,6 +3829,29 @@ private:
   /// token has no unique physical source position, so a canonical source run
   /// cannot be derived through it.
   std::set<uint64_t> duplicateTokmapPP_;
+
+  /// Zero-token state-record candidates by source surface, one index per
+  /// producer array `CollectZeroTokenStateGaps()` consults.
+  StructuralGapRecordIndex macroDirectiveGapIndex_;
+  StructuralGapRecordIndex lineControlGapIndex_;
+  /// Pragmas are keyed by canonical path alone, with no include occurrence:
+  /// the collector binds a pragma to a gap through segment facts rather than
+  /// by comparing the serialized owner occurrence, so narrowing candidates by
+  /// occurrence here would drop the records that binding is meant to recover.
+  StructuralGapRecordIndex pragmaGapIndex_;
+  StructuralGapRecordIndex includeGapIndex_;
+  StructuralGapRecordIndex macroInvocationGapIndex_;
+  StructuralGapRecordIndex conditionalGroupGapIndex_;
+
+  /// How many pragma records with no serialized owner occurrence share one
+  /// physical site, keyed by canonical path and site range.
+  ///
+  /// A physical pragma site shared by more than one ownerless record cannot be
+  /// bound to a concrete include occurrence, so the collector skips it.  The
+  /// census is a function of the producer arrays alone, so it is taken once
+  /// per pass rather than rescanned per candidate.
+  std::map<std::tuple<StringRef, uint64_t, uint64_t>, unsigned>
+      ownerlessPragmaSiteCounts_;
 };
 
 } // namespace
