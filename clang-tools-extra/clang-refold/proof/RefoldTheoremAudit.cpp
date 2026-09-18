@@ -968,7 +968,7 @@ void resetRefoldAttemptStats(RefoldStats &stats, const RefoldModel &model) {
 void emitRefoldAttemptStatsSummary(const RefoldStats &stats,
                                    bool hasTerminalRequest,
                                    StringRef passRole) {
-  REFOLD_LOG_INFO(
+  REFOLD_LOG_DEBUG(
       "stats",
       "refold summary [{0}]: expandedIncludes={1}/{2} "
       "expandedRootMacros={3}/{4} terminalFallback={5}",
@@ -996,7 +996,7 @@ void emitTheoremAuditSummary(const TheoremAuditStats &audit,
                                          audit.terminalFailureAuditViolations;
 
   if (satisfied) {
-    REFOLD_LOG_INFO(
+    REFOLD_LOG_DEBUG(
         "theorem",
         "audit passed [{0}]: emittedEdits={1} carriers={2} resolverAudits={3} "
         "terminalFailures={4} closureLedgerRows={5}",
