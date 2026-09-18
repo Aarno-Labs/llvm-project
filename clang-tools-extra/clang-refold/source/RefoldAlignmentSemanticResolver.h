@@ -223,9 +223,17 @@ private:
   /// The window's complete candidate set is always enumerated and simulated in
   /// full: uniqueness is a property of the whole enumerated set, so committing
   /// on a prefix would be the ranked selection this resolver exists to avoid.
+  ///
+  /// \p laterWindowCarriesAmbiguity is whether any certification window after
+  /// this one can carry ambiguity.  When none can, this window's verdict feeds
+  /// no later resolution, so its outcome is observed only through the emitted
+  /// output; that is what lets an over-budget observational-irrelevance rule
+  /// be retired once committing and declining are proved to emit the same
+  /// output.
   WindowResolution
   ResolveCertificationWindow(size_t windowIndex,
-                             llvm::ArrayRef<int64_t> baseMap) const;
+                             llvm::ArrayRef<int64_t> baseMap,
+                             bool laterWindowCarriesAmbiguity) const;
 
   /// Realize \p candidateMap through one complete planning simulation, reusing
   /// \p slot when it already holds this map's result.
@@ -248,6 +256,30 @@ private:
       size_t windowIndex, size_t mapIndex, size_t mapCount,
       llvm::ArrayRef<int64_t> candidateMap,
       std::optional<AlignmentSemanticSimulationResult> &slot) const;
+
+  /// Return whether the observational-irrelevance rule's verdict on one window
+  /// is proved not to change the emitted output.
+  ///
+  /// The rule has two verdicts.  It commits when every enumerated map is
+  /// accepted with one concrete output, and that output is
+  /// \p soleConcreteOutputKey, the key every realized prefix map shares.
+  /// Otherwise it is denied, and when \p legacyProposalRuleReachable is false
+  /// no rule remains: the least-source-mutation rule is bounded by the same
+  /// realization cost, which the caller has already found over budget, so the
+  /// window declines and keeps \p baseMap.  Its output is then the realization
+  /// of \p baseMap itself.
+  ///
+  /// Both verdicts therefore emit one output exactly when that realization is
+  /// accepted with \p soleConcreteOutputKey.  This realizes it, once, and
+  /// answers so.  Neither verdict feeds a later resolution when
+  /// \p laterWindowCarriesAmbiguity is false, since every later window is then
+  /// skipped however this one ends; when it is true, or when the legacy rule is
+  /// reachable, a denied rule is followed by a verdict this cannot predict, and
+  /// the answer is false without realizing anything.
+  bool ObservationalVerdictIsOutputNeutral(
+      size_t windowIndex, llvm::ArrayRef<int64_t> baseMap,
+      llvm::StringRef soleConcreteOutputKey, bool legacyProposalRuleReachable,
+      bool laterWindowCarriesAmbiguity) const;
 
   /// Return whether one certification window can carry alignment ambiguity.
   ///

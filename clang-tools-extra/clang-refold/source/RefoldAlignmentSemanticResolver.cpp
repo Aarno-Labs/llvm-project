@@ -539,14 +539,26 @@ RefoldAlignmentSemanticResolver::Resolve() const {
   std::vector<int64_t> baseMap = deps_.coreAlignment.forcedMap;
   std::vector<WindowResolution> committedWindows;
   size_t windowsWithOracle = 0;
-  for (size_t windowIndex = 0;
-       windowIndex < deps_.coreAlignment.certificationWindows.size();
-       ++windowIndex) {
+
+  // Whether each window can carry ambiguity is a fact about the core theorem
+  // alone, so it is decided once for every window.  A window resolved with no
+  // ambiguous window after it is the last whose verdict can reach the base map
+  // of a later resolution.
+  const size_t windowCount = deps_.coreAlignment.certificationWindows.size();
+  std::vector<bool> windowCarriesAmbiguity(windowCount, false);
+  size_t lastAmbiguousWindow = windowCount;
+  for (size_t windowIndex = 0; windowIndex < windowCount; ++windowIndex) {
+    windowCarriesAmbiguity[windowIndex] = WindowCarriesAmbiguity(windowIndex);
+    if (windowCarriesAmbiguity[windowIndex])
+      lastAmbiguousWindow = windowIndex;
+  }
+
+  for (size_t windowIndex = 0; windowIndex < windowCount; ++windowIndex) {
     // A window the core theorem already determined has one optimal map, so
     // resolution would recompute its quadratic pair facts only to return the
     // anchors it already has. Skipping it changes no outcome; every window that
     // can carry ambiguity is still resolved, and none is passed over for cost.
-    if (!WindowCarriesAmbiguity(windowIndex)) {
+    if (!windowCarriesAmbiguity[windowIndex]) {
       REFOLD_LOG_TRACE(
           "lcs/semantic-resolver",
           "window {0} needs no resolution: the core theorem forced every one "
@@ -569,8 +581,9 @@ RefoldAlignmentSemanticResolver::Resolve() const {
       continue;
     }
     ++windowsWithOracle;
-    WindowResolution resolution =
-        ResolveCertificationWindow(windowIndex, baseMap);
+    WindowResolution resolution = ResolveCertificationWindow(
+        windowIndex, baseMap,
+        /*laterWindowCarriesAmbiguity=*/windowIndex < lastAmbiguousWindow);
     if (deps_.releaseWindowOracle)
       deps_.releaseWindowOracle(windowIndex);
     if (!resolution.committed) {
@@ -750,9 +763,38 @@ RefoldAlignmentSemanticResolver::RealizeCandidateMap(
   return *slot;
 }
 
+bool RefoldAlignmentSemanticResolver::ObservationalVerdictIsOutputNeutral(
+    size_t windowIndex, ArrayRef<int64_t> baseMap,
+    StringRef soleConcreteOutputKey, bool legacyProposalRuleReachable,
+    bool laterWindowCarriesAmbiguity) const {
+  if (legacyProposalRuleReachable || laterWindowCarriesAmbiguity ||
+      soleConcreteOutputKey.empty())
+    return false;
+
+  REFOLD_LOG_DEBUG("lcs/semantic-resolver",
+                   "window {0}: realizing its core-forced alignment as a "
+                   "complete refold, to compare declining with committing",
+                   windowIndex);
+  const AlignmentSemanticSimulationResult declined =
+      deps_.simulate(buildSimulationSelection(baseMap, deps_.coreAlignment));
+  const bool neutral =
+      declined.disposition ==
+          AlignmentSemanticSimulationDisposition::Accepted &&
+      declined.accepted &&
+      declined.concreteOutputEquivalenceKey == soleConcreteOutputKey;
+  REFOLD_LOG_DEBUG(
+      "lcs/semantic-resolver",
+      "window {0}: core-forced alignment realized: {1}; its output {2} the "
+      "output every realized candidate shares",
+      windowIndex, describeSimulationDisposition(declined.disposition),
+      neutral ? "matches" : "does not match");
+  return neutral;
+}
+
 RefoldAlignmentSemanticResolver::WindowResolution
 RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
-    size_t windowIndex, ArrayRef<int64_t> baseMap) const {
+    size_t windowIndex, ArrayRef<int64_t> baseMap,
+    bool laterWindowCarriesAmbiguity) const {
   // Every path that declines this window returns `result` rather than a fresh
   // value.  A commit is built and returned by `commitRealizationClass()`, so
   // `result` carries nothing but the enumeration census recorded below -- and
@@ -946,9 +988,21 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   // declining the window: a rule whose set is small is still reached below, and
   // a window with no rule left keeps its core-forced anchors, which is the same
   // fail-closed answer every other exhausted budget here gives.
+  //
+  // Observational irrelevance has no such budget, because declining it can
+  // change the output: it commits exactly when every map agrees, and its prefix
+  // denials fire only on disagreement, so the window it would commit is the one
+  // it must realize in full.  It is retired early only when committing and
+  // declining are proved to emit the same output; see
+  // `ObservationalVerdictIsOutputNeutral()` below.
   bool observationalRuleReachable = true;
   bool containmentRuleReachable = true;
   std::optional<std::string> soleConcreteOutputKey;
+
+  // Whether the observational-irrelevance rule's verdict has already been
+  // tested for output neutrality.  The test costs one realization and its
+  // answer cannot change as the enumeration proceeds, so it is asked once.
+  bool observationalNeutralityTested = false;
 
   // Structural validity is a fail-closed guard over the whole ground set -- one
   // invalid map abandons the window -- so it is decided before anything is
@@ -996,6 +1050,33 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         soleConcreteOutputKey = realized.concreteOutputEquivalenceKey;
       } else if (*soleConcreteOutputKey !=
                  realized.concreteOutputEquivalenceKey) {
+        observationalRuleReachable = false;
+      }
+    }
+
+    // Deciding observational irrelevance over budget is worth nothing when its
+    // two verdicts are proved to emit one output; see
+    // `ObservationalVerdictIsOutputNeutral()`.  The proof costs a realization,
+    // and a disagreement denies the rule for nothing, so it is asked only once
+    // two realized maps agree: most over-budget windows disagree at the second
+    // map, and asking at the first would pay for a proof those never use.
+    if (observationalRuleReachable && !observationalNeutralityTested &&
+        mapIndex >= 1 &&
+        realizationCost(globalMaps.size(), deps_.aLexemes.size()) >
+            maxRealizationCostPerCommitRule()) {
+      observationalNeutralityTested = true;
+      if (ObservationalVerdictIsOutputNeutral(
+              windowIndex, baseMap, *soleConcreteOutputKey,
+              legacyProposalRuleReachable, laterWindowCarriesAmbiguity)) {
+        REFOLD_LOG_TRACE(
+            "lcs/semantic-resolver",
+            "window {0} retires the observational-irrelevance rule after "
+            "realizing {1} map(s): committing and declining emit one output, "
+            "so realizing its {2} enumerated map(s) over {3} A token(s) "
+            "(cost {4}, over the realization budget {5}) cannot change it",
+            windowIndex, mapIndex + 1, globalMaps.size(), deps_.aLexemes.size(),
+            realizationCost(globalMaps.size(), deps_.aLexemes.size()),
+            maxRealizationCostPerCommitRule());
         observationalRuleReachable = false;
       }
     }
