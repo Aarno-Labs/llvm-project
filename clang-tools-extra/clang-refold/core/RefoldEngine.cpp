@@ -1137,6 +1137,7 @@ void RefoldEngine::RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
     // Left edge: advance past the expansion it sits inside.  Each step gives
     // one leading token back to the untouched region on the left, so the token
     // must be identical on both sides for that region to reproduce it.
+    const uint64_t originalAStart = hunk.aStart;
     while (hunk.aStart < hunk.aEnd && hunk.bStart < hunk.bEnd) {
       const RefoldModel::PPSpan *span = macroExpansionStraddledAtEdge(
           model_, hunk.aStart, hunk.aEnd, /*edgeIsLeft=*/true);
@@ -1147,9 +1148,18 @@ void RefoldEngine::RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
       ++hunk.aStart;
       ++hunk.bStart;
     }
+    if (hunk.aStart != originalAStart)
+      REFOLD_LOG_DEBUG(
+          "plan/hunk-edge",
+          "hunk #{0} A=[{1},{2}) starts inside a macro expansion it does not "
+          "end in; retracting the left edge by {3} identical token(s) to A={4} "
+          "so the expansion is left untouched",
+          index, originalAStart, hunk.aEnd, hunk.aStart - originalAStart,
+          hunk.aStart);
 
     // Right edge: retreat before the expansion, giving trailing tokens back to
     // the untouched region on the right under the same identity requirement.
+    const uint64_t originalAEnd = hunk.aEnd;
     while (hunk.aStart < hunk.aEnd && hunk.bStart < hunk.bEnd) {
       const RefoldModel::PPSpan *span = macroExpansionStraddledAtEdge(
           model_, hunk.aEnd, hunk.aStart, /*edgeIsLeft=*/false);
@@ -1162,6 +1172,14 @@ void RefoldEngine::RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
       --hunk.aEnd;
       --hunk.bEnd;
     }
+    if (hunk.aEnd != originalAEnd)
+      REFOLD_LOG_DEBUG(
+          "plan/hunk-edge",
+          "hunk #{0} A=[{1},{2}) ends inside a macro expansion it does not "
+          "begin in; retracting the right edge by {3} identical token(s) to "
+          "A={4} so the expansion is left untouched",
+          index, hunk.aStart, originalAEnd, originalAEnd - hunk.aEnd,
+          hunk.aEnd);
 
     // When the edge inside the expansion could not retract, the opposite edge
     // may: handing the identical tokens outside the expansion back leaves the
