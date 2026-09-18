@@ -1556,6 +1556,28 @@ struct GeneratedReplayElem {
 
 using GeneratedSolvedActuals = SmallVector<std::string, 8>;
 
+/// One partial formal assignment on a generated-callee inversion search path.
+///
+/// `bound[i]` records whether a replay element on the current path has bound
+/// formal `i`.  An unbound slot holds the old actual, so a formal the pattern
+/// never references still solves to its old actual.  Boundness is tracked
+/// explicitly because it cannot be recovered from the slot's text: a formal
+/// bound to text equal to its old actual is still bound, and every later
+/// occurrence of that formal must replay the same text.
+struct GeneratedSolveState {
+  GeneratedSolvedActuals actuals;
+  SmallVector<bool, 8> bound;
+
+  /// Build the unbound starting state from each formal's old actual.
+  static GeneratedSolveState Unbound(ArrayRef<std::string> oldActuals) {
+    GeneratedSolveState state;
+    for (const std::string &actual : oldActuals)
+      state.actuals.push_back(actual);
+    state.bound.assign(oldActuals.size(), false);
+    return state;
+  }
+};
+
 /// Parses the final generated-callee replacement tape into replay elements.
 ///
 /// The caller trusts the current macro definition and the recovered old actual
@@ -1723,12 +1745,12 @@ public:
 
   /// Assigns one solved actual while preserving existing compatible bindings.
   ///
-  /// A slot still equal to its old actual may be refined to `value`.  A slot
-  /// already refined must remain token-equivalent to `value`; conflicts fail
-  /// closed.
-  bool AssignSolvedActual(GeneratedSolvedActuals &actuals, uint32_t paramIdx,
+  /// An unbound slot takes `value`.  A slot already bound on this search path,
+  /// including one bound to its old actual's spelling, must remain
+  /// token-equivalent to `value`; conflicts fail closed.
+  bool AssignSolvedActual(GeneratedSolveState &state, uint32_t paramIdx,
                           StringRef value) const {
-    if (paramIdx >= actuals.size())
+    if (paramIdx >= state.actuals.size() || paramIdx >= state.bound.size())
       return false;
 
     // A solved non-variadic formal is one macro actual.  Do not let it absorb a
@@ -1744,22 +1766,15 @@ public:
         replacementIntroducesTopLevelComma(value, lexLang_))
       return false;
 
-    // Existing assignments are compared by token equivalence, not raw spelling,
-    // so harmless lexical differences do not create false conflicts.
-    if (!generatedCalleeTextsTokenEquivalent(actuals[paramIdx],
-                                             oldActuals_[paramIdx], lexLang_) &&
-        !generatedCalleeTextsTokenEquivalent(actuals[paramIdx], value,
-                                             lexLang_))
-      return false;
-
-    // The old actual is the unassigned sentinel for this slot.
-    if (generatedCalleeTextsTokenEquivalent(actuals[paramIdx],
-                                            oldActuals_[paramIdx], lexLang_)) {
-      actuals[paramIdx] = value.trim().str();
+    if (!state.bound[paramIdx]) {
+      state.actuals[paramIdx] = value.trim().str();
+      state.bound[paramIdx] = true;
       return true;
     }
 
-    return generatedCalleeTextsTokenEquivalent(actuals[paramIdx], value,
+    // Existing assignments are compared by token equivalence, not raw spelling,
+    // so harmless lexical differences do not create false conflicts.
+    return generatedCalleeTextsTokenEquivalent(state.actuals[paramIdx], value,
                                                lexLang_);
   }
 
@@ -1768,10 +1783,10 @@ public:
   /// Literal-anchored paste forms use DFS over the candidate spelling.  Paste
   /// forms without a literal anchor keep the old deterministic inverse by using
   /// original actual widths instead of inventing arbitrary split points.
-  SmallVector<GeneratedSolvedActuals, 4>
+  SmallVector<GeneratedSolveState, 4>
   Solve(ArrayRef<GeneratedPastePiece> pieces, StringRef spelling,
-        const GeneratedSolvedActuals &seed) const {
-    SmallVector<GeneratedSolvedActuals, 4> solutions;
+        const GeneratedSolveState &seed) const {
+    SmallVector<GeneratedSolveState, 4> solutions;
     const bool hasLiteralAnchor =
         llvm::any_of(pieces, [](const GeneratedPastePiece &piece) {
           return !piece.isParam && !piece.literal.empty();
@@ -1780,7 +1795,7 @@ public:
     // Without a fixed literal anchor, preserve the old deterministic inverse:
     // use the original actual widths instead of inventing arbitrary cuts.
     if (!hasLiteralAnchor) {
-      GeneratedSolvedActuals cur = seed;
+      GeneratedSolveState cur = seed;
       size_t cursor = 0;
       for (const GeneratedPastePiece &piece : pieces) {
         if (!piece.isParam) {
@@ -1808,7 +1823,7 @@ public:
       return solutions;
     }
 
-    GeneratedSolvedActuals start = seed;
+    GeneratedSolveState start = seed;
     DfsPaste(pieces, spelling, 0, 0, start, solutions);
     return solutions;
   }
@@ -1820,8 +1835,8 @@ private:
   /// enumerate candidate slices in increasing end-offset order.  Search stops
   /// after two solutions because the caller only accepts unique inversions.
   void DfsPaste(ArrayRef<GeneratedPastePiece> pieces, StringRef spelling,
-                size_t pieceIdx, size_t cursor, GeneratedSolvedActuals &cur,
-                SmallVectorImpl<GeneratedSolvedActuals> &solutions) const {
+                size_t pieceIdx, size_t cursor, GeneratedSolveState &cur,
+                SmallVectorImpl<GeneratedSolveState> &solutions) const {
     if (solutions.size() > 1)
       return;
 
@@ -1844,7 +1859,7 @@ private:
     // Parameter pieces enumerate slices in deterministic increasing-end order.
     // Ambiguity is preserved by retaining at most two solutions.
     for (size_t end = cursor; end <= spelling.size(); ++end) {
-      GeneratedSolvedActuals next = cur;
+      GeneratedSolveState next = cur;
       if (!AssignSolvedActual(next, piece.paramIdx, spelling.slice(cursor, end)))
         continue;
       DfsPaste(pieces, spelling, pieceIdx + 1, end, next, solutions);
@@ -1888,16 +1903,14 @@ public:
     SmallVector<ReplayTok, 32> toks;
     lexGeneratedCalleeReplayTokens(expansion, lexLang_, toks);
 
-    SmallVector<GeneratedSolvedActuals, 4> solutions;
-    GeneratedSolvedActuals seed;
-    for (const std::string &actual : oldActuals_)
-      seed.push_back(actual);
+    SmallVector<GeneratedSolveState, 4> solutions;
+    GeneratedSolveState seed = GeneratedSolveState::Unbound(oldActuals_);
 
     Dfs(expansion, toks, replayPattern_, 0, seed,
         /*vaOptPayloadPresent=*/std::nullopt, solutions);
     if (solutions.size() != 1)
       return std::nullopt;
-    return solutions.front();
+    return std::move(solutions.front().actuals);
   }
 
 private:
@@ -1909,8 +1922,8 @@ private:
   /// after two solutions because only a unique assignment is admissible.
   void Dfs(StringRef expansion, ArrayRef<ReplayTok> toks,
            ArrayRef<GeneratedReplayElem> elems, size_t tokPos,
-           GeneratedSolvedActuals &cur, std::optional<bool> vaOptPayloadPresent,
-           SmallVectorImpl<GeneratedSolvedActuals> &solutions) const {
+           GeneratedSolveState &cur, std::optional<bool> vaOptPayloadPresent,
+           SmallVectorImpl<GeneratedSolveState> &solutions) const {
     if (solutions.size() > 1)
       return;
 
@@ -1957,7 +1970,7 @@ private:
           value = expansion.slice(byteBegin, byteEnd);
         }
 
-        GeneratedSolvedActuals next = cur;
+        GeneratedSolveState next = cur;
         if (pasteSolver_.AssignSolvedActual(next, elem.paramIdx, value))
           Dfs(expansion, toks, rest, *anchoredEnd, next,
               vaOptPayloadPresent, solutions);
@@ -1972,7 +1985,7 @@ private:
           value = expansion.slice(byteBegin, byteEnd);
         }
 
-        GeneratedSolvedActuals next = cur;
+        GeneratedSolveState next = cur;
         if (!pasteSolver_.AssignSolvedActual(next, elem.paramIdx, value))
           continue;
 
@@ -1993,7 +2006,7 @@ private:
       if (!content)
         return;
 
-      GeneratedSolvedActuals next = cur;
+      GeneratedSolveState next = cur;
       if (!pasteSolver_.AssignSolvedActual(next, elem.paramIdx,
                                            StringRef(*content)))
         return;
@@ -2008,13 +2021,12 @@ private:
       // paste-solver assignment in the solver's deterministic order.
       if (tokPos >= toks.size())
         return;
-      SmallVector<GeneratedSolvedActuals, 4> pasteSolutions =
-          pasteSolver_.Solve(
-              ArrayRef<GeneratedPastePiece>(elem.pastePieces.data(),
-                                            elem.pastePieces.size()),
-              toks[tokPos].spelling, cur);
+      SmallVector<GeneratedSolveState, 4> pasteSolutions = pasteSolver_.Solve(
+          ArrayRef<GeneratedPastePiece>(elem.pastePieces.data(),
+                                        elem.pastePieces.size()),
+          toks[tokPos].spelling, cur);
 
-      for (GeneratedSolvedActuals &pasteSol : pasteSolutions) {
+      for (GeneratedSolveState &pasteSol : pasteSolutions) {
         Dfs(expansion, toks, rest, tokPos + 1, pasteSol,
             vaOptPayloadPresent, solutions);
         if (solutions.size() > 1)
@@ -2029,7 +2041,7 @@ private:
         Dfs(expansion, toks, rest, tokPos, cur, erasedPayload, solutions);
       }
       if (!vaOptPayloadPresent || *vaOptPayloadPresent) {
-        GeneratedSolvedActuals withPayload = cur;
+        GeneratedSolveState withPayload = cur;
         std::optional<bool> presentPayload = true;
         DfsVaOptChildren(expansion, toks,
                          ArrayRef<GeneratedReplayElem>(elem.children.data(),
@@ -2080,13 +2092,13 @@ private:
   /// Paste and nested `__VA_OPT__` remain outside this local theorem and
   /// therefore fail closed.  The payload-present branch must consume at least
   /// one token before resuming the parent replay.
-  void DfsVaOptChildren(
-      StringRef expansion, ArrayRef<ReplayTok> toks,
-      ArrayRef<GeneratedReplayElem> childElems,
-      ArrayRef<GeneratedReplayElem> parentRest, size_t parentTokPos,
-      size_t childTokPos, GeneratedSolvedActuals &childAssigned,
-      std::optional<bool> vaOptPayloadPresent,
-      SmallVectorImpl<GeneratedSolvedActuals> &solutions) const {
+  void DfsVaOptChildren(StringRef expansion, ArrayRef<ReplayTok> toks,
+                        ArrayRef<GeneratedReplayElem> childElems,
+                        ArrayRef<GeneratedReplayElem> parentRest,
+                        size_t parentTokPos, size_t childTokPos,
+                        GeneratedSolveState &childAssigned,
+                        std::optional<bool> vaOptPayloadPresent,
+                        SmallVectorImpl<GeneratedSolveState> &solutions) const {
     if (solutions.size() > 1)
       return;
 
@@ -2120,7 +2132,7 @@ private:
       if (!content)
         return;
 
-      GeneratedSolvedActuals next = childAssigned;
+      GeneratedSolveState next = childAssigned;
       if (!pasteSolver_.AssignSolvedActual(next, child.paramIdx,
                                            StringRef(*content)))
         return;
@@ -2135,15 +2147,14 @@ private:
   }
 
   /// Enumerates a parameter binding inside a `__VA_OPT__` payload.
-  void DfsVaOptParam(
-      StringRef expansion, ArrayRef<ReplayTok> toks,
-      ArrayRef<GeneratedReplayElem> childRest,
-      ArrayRef<GeneratedReplayElem> parentRest, size_t parentTokPos,
-      uint32_t paramIdx, size_t childTokPos,
-      GeneratedSolvedActuals &childAssigned,
-      std::optional<bool> vaOptPayloadPresent,
-      SmallVectorImpl<GeneratedSolvedActuals> &solutions) const {
-    if (paramIdx >= childAssigned.size())
+  void DfsVaOptParam(StringRef expansion, ArrayRef<ReplayTok> toks,
+                     ArrayRef<GeneratedReplayElem> childRest,
+                     ArrayRef<GeneratedReplayElem> parentRest,
+                     size_t parentTokPos, uint32_t paramIdx, size_t childTokPos,
+                     GeneratedSolveState &childAssigned,
+                     std::optional<bool> vaOptPayloadPresent,
+                     SmallVectorImpl<GeneratedSolveState> &solutions) const {
+    if (paramIdx >= childAssigned.actuals.size())
       return;
 
     for (size_t end = childTokPos; end <= toks.size(); ++end) {
@@ -2153,7 +2164,7 @@ private:
         const size_t byteEnd = toks[end - 1].end;
         value = expansion.slice(byteBegin, byteEnd);
       }
-      GeneratedSolvedActuals next = childAssigned;
+      GeneratedSolveState next = childAssigned;
       if (!pasteSolver_.AssignSolvedActual(next, paramIdx, value))
         continue;
       DfsVaOptChildren(expansion, toks, childRest, parentRest, parentTokPos,
@@ -2165,11 +2176,12 @@ private:
 
   /// Checks the chosen `__VA_OPT__` branch against solved variadic formals.
   bool VaOptPayloadStateMatchesSolvedVariadic(
-      const GeneratedSolvedActuals &actuals,
+      const GeneratedSolveState &state,
       std::optional<bool> vaOptPayloadPresent) const {
     if (!vaOptPayloadPresent)
       return true;
 
+    const GeneratedSolvedActuals &actuals = state.actuals;
     bool hasVariadicTokens = false;
     for (size_t i = 0; i < actuals.size() && i < variadicParamByIdx_.size();
          ++i) {
@@ -2829,9 +2841,9 @@ std::optional<std::string> materializeSingleRootPasteToken(
 std::optional<GeneratedSolvedActuals> solveRootPasteActualsForCallee(
     ArrayRef<GeneratedPastePiece> pieces, StringRef calleeSpelling,
     ArrayRef<std::string> oldRootActuals, const clang::LangOptions &lexLang) {
-  GeneratedSolvedActuals seed;
-  for (const std::string &actual : oldRootActuals)
-    seed.push_back(StringRef(actual).trim().str());
+  GeneratedSolveState seed = GeneratedSolveState::Unbound(oldRootActuals);
+  for (std::string &actual : seed.actuals)
+    actual = StringRef(actual).trim().str();
 
   SmallVector<bool, 8> variadicParamByIdx;
   variadicParamByIdx.resize(oldRootActuals.size(), false);
@@ -2839,11 +2851,11 @@ std::optional<GeneratedSolvedActuals> solveRootPasteActualsForCallee(
       oldRootActuals, ArrayRef<bool>(variadicParamByIdx.data(),
                                      variadicParamByIdx.size()),
       lexLang);
-  SmallVector<GeneratedSolvedActuals, 4> solutions =
+  SmallVector<GeneratedSolveState, 4> solutions =
       solver.Solve(pieces, calleeSpelling, seed);
   if (solutions.size() != 1)
     return std::nullopt;
-  return solutions.front();
+  return std::move(solutions.front().actuals);
 }
 
 /// Replays one macro definition against an expansion surface with a unique
@@ -3113,6 +3125,25 @@ struct TupleCalleeReplayElem {
 
 using TupleSolvedActuals = SmallVector<std::string, 8>;
 
+/// One partial tuple-actual assignment on a tuple replay search path.
+///
+/// Mirrors `GeneratedSolveState` without sharing carrier types: `bound[i]`
+/// records whether formal `i` has been bound on the current path, so a formal
+/// bound to its old actual's spelling still constrains every later occurrence.
+struct TupleSolveState {
+  TupleSolvedActuals actuals;
+  SmallVector<bool, 8> bound;
+
+  /// Build the unbound starting state from each formal's old actual.
+  static TupleSolveState Unbound(ArrayRef<std::string> oldActuals) {
+    TupleSolveState state;
+    for (const std::string &actual : oldActuals)
+      state.actuals.push_back(actual);
+    state.bound.assign(oldActuals.size(), false);
+    return state;
+  }
+};
+
 /// Parses the tuple generated-callee replacement tape without sharing carrier
 /// types with the non-tuple generated-callee parser.
 ///
@@ -3296,28 +3327,26 @@ public:
     SmallVector<ReplayTok, 32> toks;
     lexGeneratedCalleeReplayTokens(expansion, lexLang_, toks);
 
-    SmallVector<TupleSolvedActuals, 4> solutions;
-    TupleSolvedActuals seed;
-    seed.reserve(oldActuals_.size());
-    for (const std::string &actual : oldActuals_)
-      seed.push_back(actual);
+    SmallVector<TupleSolveState, 4> solutions;
+    TupleSolveState seed = TupleSolveState::Unbound(oldActuals_);
 
     std::optional<bool> vaOptPayloadPresent;
     Dfs(expansion, toks, replayPattern_, 0, seed, vaOptPayloadPresent,
         solutions);
     if (solutions.size() != 1)
       return std::nullopt;
-    return solutions.front();
+    return std::move(solutions.front().actuals);
   }
 
 private:
   /// Assigns one tuple actual while preserving compatible prior bindings.
   ///
-  /// A slot still equal to its old actual may be refined to `value`.  A slot
-  /// already refined must remain token-equivalent to `value`.
-  bool AssignSolvedActual(TupleSolvedActuals &actuals, uint32_t paramIdx,
+  /// An unbound slot takes `value`.  A slot already bound on this search path,
+  /// including one bound to its old actual's spelling, must remain
+  /// token-equivalent to `value`.
+  bool AssignSolvedActual(TupleSolveState &state, uint32_t paramIdx,
                           StringRef value) const {
-    if (paramIdx >= actuals.size())
+    if (paramIdx >= state.actuals.size() || paramIdx >= state.bound.size())
       return false;
 
     if (paramIdx < variadicParamByIdx_.size() &&
@@ -3325,21 +3354,15 @@ private:
         containsTopLevelMacroArgumentComma(value, lexLang_))
       return false;
 
-    // Compare by token equivalence so harmless spelling differences do not
-    // create false conflicts during tuple replay inversion.
-    if (!generatedCalleeTextsTokenEquivalent(actuals[paramIdx],
-                                             oldActuals_[paramIdx], lexLang_) &&
-        !generatedCalleeTextsTokenEquivalent(actuals[paramIdx], value,
-                                             lexLang_))
-      return false;
-
-    // The old actual spelling is the unassigned sentinel for this slot.
-    if (generatedCalleeTextsTokenEquivalent(actuals[paramIdx],
-                                            oldActuals_[paramIdx], lexLang_)) {
-      actuals[paramIdx] = value.trim().str();
+    if (!state.bound[paramIdx]) {
+      state.actuals[paramIdx] = value.trim().str();
+      state.bound[paramIdx] = true;
       return true;
     }
-    return generatedCalleeTextsTokenEquivalent(actuals[paramIdx], value,
+
+    // Compare by token equivalence so harmless spelling differences do not
+    // create false conflicts during tuple replay inversion.
+    return generatedCalleeTextsTokenEquivalent(state.actuals[paramIdx], value,
                                                lexLang_);
   }
 
@@ -3388,10 +3411,10 @@ private:
   /// callee.  In that constrained case enumeration is still deterministic and
   /// fail-closed because `SolveExpansion` accepts only one final solution after
   /// all later occurrences have replayed.
-  SmallVector<TupleSolvedActuals, 4>
+  SmallVector<TupleSolveState, 4>
   SolvePasteToken(ArrayRef<TupleCalleePastePiece> pieces, StringRef spelling,
-                  const TupleSolvedActuals &seed) const {
-    SmallVector<TupleSolvedActuals, 4> solutions;
+                  const TupleSolveState &seed) const {
+    SmallVector<TupleSolveState, 4> solutions;
 
     const bool hasLiteralAnchor =
         llvm::any_of(pieces, [](const TupleCalleePastePiece &piece) {
@@ -3404,7 +3427,7 @@ private:
     // the tuple solver's prior deterministic inverse: original actual widths,
     // not arbitrary cuts.
     if (!hasLiteralAnchor && !hasNonLocalFormalConstraint) {
-      TupleSolvedActuals cur = seed;
+      TupleSolveState cur = seed;
       size_t cursor = 0;
       for (const TupleCalleePastePiece &piece : pieces) {
         if (!piece.isParam) {
@@ -3432,7 +3455,7 @@ private:
       return solutions;
     }
 
-    TupleSolvedActuals start = seed;
+    TupleSolveState start = seed;
     DfsPaste(pieces, spelling, 0, 0, start, solutions,
              /*stopAfterSecondSolution=*/!hasNonLocalFormalConstraint);
     return solutions;
@@ -3447,8 +3470,8 @@ private:
   /// streamed to the outer replay DFS so the independent occurrence can reject
   /// the wrong splits before the global uniqueness check runs.
   void DfsPaste(ArrayRef<TupleCalleePastePiece> pieces, StringRef spelling,
-                size_t pieceIdx, size_t cursor, TupleSolvedActuals &cur,
-                SmallVectorImpl<TupleSolvedActuals> &solutions,
+                size_t pieceIdx, size_t cursor, TupleSolveState &cur,
+                SmallVectorImpl<TupleSolveState> &solutions,
                 bool stopAfterSecondSolution) const {
     if (stopAfterSecondSolution && solutions.size() > 1)
       return;
@@ -3476,7 +3499,7 @@ private:
     // the split first.
     for (size_t end = cursor; end <= spelling.size(); ++end) {
       StringRef slice = spelling.slice(cursor, end);
-      TupleSolvedActuals next = cur;
+      TupleSolveState next = cur;
       if (!AssignSolvedActual(next, piece.paramIdx, slice))
         continue;
       DfsPaste(pieces, spelling, pieceIdx + 1, end, next, solutions,
@@ -3496,8 +3519,8 @@ private:
   /// from stealing the leading comma by binding it into `__VA_ARGS__`.
   void Dfs(StringRef expansion, ArrayRef<ReplayTok> toks,
            ArrayRef<TupleCalleeReplayElem> elems, size_t tokPos,
-           TupleSolvedActuals &cur, std::optional<bool> vaOptPayloadPresent,
-           SmallVectorImpl<TupleSolvedActuals> &solutions) const {
+           TupleSolveState &cur, std::optional<bool> vaOptPayloadPresent,
+           SmallVectorImpl<TupleSolveState> &solutions) const {
     if (solutions.size() > 1)
       return;
 
@@ -3531,7 +3554,7 @@ private:
           const size_t byteEnd = toks[end - 1].end;
           value = expansion.slice(byteBegin, byteEnd);
         }
-        TupleSolvedActuals next = cur;
+        TupleSolveState next = cur;
         if (!AssignSolvedActual(next, elem.paramIdx, value))
           continue;
         Dfs(expansion, toks, rest, end, next, vaOptPayloadPresent, solutions);
@@ -3549,7 +3572,7 @@ private:
           decodeSimpleStringLiteralToken(toks[tokPos].spelling);
       if (!content)
         return;
-      TupleSolvedActuals next = cur;
+      TupleSolveState next = cur;
       if (!AssignSolvedActual(next, elem.paramIdx, StringRef(*content)))
         return;
       Dfs(expansion, toks, rest, tokPos + 1, next, vaOptPayloadPresent,
@@ -3562,11 +3585,11 @@ private:
       // the paste solver's assignment order.
       if (tokPos >= toks.size())
         return;
-      SmallVector<TupleSolvedActuals, 4> pasteSolutions = SolvePasteToken(
-          ArrayRef<TupleCalleePastePiece>(elem.pastePieces.data(),
-                                          elem.pastePieces.size()),
-          toks[tokPos].spelling, cur);
-      for (TupleSolvedActuals &pasteSol : pasteSolutions) {
+      SmallVector<TupleSolveState, 4> pasteSolutions =
+          SolvePasteToken(ArrayRef<TupleCalleePastePiece>(
+                              elem.pastePieces.data(), elem.pastePieces.size()),
+                          toks[tokPos].spelling, cur);
+      for (TupleSolveState &pasteSol : pasteSolutions) {
         Dfs(expansion, toks, rest, tokPos + 1, pasteSol, vaOptPayloadPresent,
             solutions);
         if (solutions.size() > 1)
@@ -3581,7 +3604,7 @@ private:
         Dfs(expansion, toks, rest, tokPos, cur, erasedPayload, solutions);
       }
       if (!vaOptPayloadPresent || *vaOptPayloadPresent) {
-        TupleSolvedActuals withPayload = cur;
+        TupleSolveState withPayload = cur;
         std::optional<bool> presentPayload = true;
         DfsVaOptChildren(expansion, toks, elem.children, rest, tokPos, tokPos,
                          withPayload, presentPayload, solutions);
@@ -3597,13 +3620,13 @@ private:
   /// payload.  Stringification, paste, and nested `__VA_OPT__` remain outside
   /// this local theorem and therefore fail closed.  The payload-present branch
   /// must consume at least one token before resuming the parent replay.
-  void DfsVaOptChildren(
-      StringRef expansion, ArrayRef<ReplayTok> toks,
-      ArrayRef<TupleCalleeReplayElem> childElems,
-      ArrayRef<TupleCalleeReplayElem> parentRest, size_t parentTokPos,
-      size_t childTokPos, TupleSolvedActuals &childAssigned,
-      std::optional<bool> vaOptPayloadPresent,
-      SmallVectorImpl<TupleSolvedActuals> &solutions) const {
+  void DfsVaOptChildren(StringRef expansion, ArrayRef<ReplayTok> toks,
+                        ArrayRef<TupleCalleeReplayElem> childElems,
+                        ArrayRef<TupleCalleeReplayElem> parentRest,
+                        size_t parentTokPos, size_t childTokPos,
+                        TupleSolveState &childAssigned,
+                        std::optional<bool> vaOptPayloadPresent,
+                        SmallVectorImpl<TupleSolveState> &solutions) const {
     if (solutions.size() > 1)
       return;
 
@@ -3637,14 +3660,14 @@ private:
   }
 
   /// Enumerates a parameter binding inside a `__VA_OPT__` payload.
-  void DfsVaOptParam(
-      StringRef expansion, ArrayRef<ReplayTok> toks,
-      ArrayRef<TupleCalleeReplayElem> childRest,
-      ArrayRef<TupleCalleeReplayElem> parentRest, size_t parentTokPos,
-      uint32_t paramIdx, size_t childTokPos, TupleSolvedActuals &childAssigned,
-      std::optional<bool> vaOptPayloadPresent,
-      SmallVectorImpl<TupleSolvedActuals> &solutions) const {
-    if (paramIdx >= childAssigned.size())
+  void DfsVaOptParam(StringRef expansion, ArrayRef<ReplayTok> toks,
+                     ArrayRef<TupleCalleeReplayElem> childRest,
+                     ArrayRef<TupleCalleeReplayElem> parentRest,
+                     size_t parentTokPos, uint32_t paramIdx, size_t childTokPos,
+                     TupleSolveState &childAssigned,
+                     std::optional<bool> vaOptPayloadPresent,
+                     SmallVectorImpl<TupleSolveState> &solutions) const {
+    if (paramIdx >= childAssigned.actuals.size())
       return;
 
     for (size_t end = childTokPos; end <= toks.size(); ++end) {
@@ -3654,7 +3677,7 @@ private:
         const size_t byteEnd = toks[end - 1].end;
         value = expansion.slice(byteBegin, byteEnd);
       }
-      TupleSolvedActuals next = childAssigned;
+      TupleSolveState next = childAssigned;
       if (!AssignSolvedActual(next, paramIdx, value))
         continue;
       DfsVaOptChildren(expansion, toks, childRest, parentRest, parentTokPos,
@@ -3666,11 +3689,12 @@ private:
 
   /// Checks the chosen `__VA_OPT__` branch against solved variadic formals.
   bool VaOptPayloadStateMatchesSolvedVariadic(
-      const TupleSolvedActuals &actuals,
+      const TupleSolveState &state,
       std::optional<bool> vaOptPayloadPresent) const {
     if (!vaOptPayloadPresent)
       return true;
 
+    const TupleSolvedActuals &actuals = state.actuals;
     bool hasVariadicTokens = false;
     for (size_t i = 0; i < actuals.size() && i < variadicParamByIdx_.size();
          ++i) {
