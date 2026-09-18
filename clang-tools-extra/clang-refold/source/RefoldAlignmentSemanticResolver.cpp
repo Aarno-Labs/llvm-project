@@ -499,6 +499,20 @@ bool noMoreSourceDestructive(
   return "unknown";
 }
 
+/// Name why a legacy boundary proposal cannot be the legacy rule's proposal.
+///
+/// Read only for the trace; the reachability decision is made from the same
+/// fields by the caller.
+StringRef
+describeLegacyProposalFailure(bool gapProvenanceCoversStreams,
+                              const LegacyAlignmentDiagnosticResult &proposal) {
+  if (!gapProvenanceCoversStreams)
+    return "gap provenance is incomplete";
+  if (!proposal.complete)
+    return proposal.constructionFailure;
+  return proposal.jointOptimalityFailure;
+}
+
 [[maybe_unused]] std::string formatMapIndices(ArrayRef<size_t> indices) {
   std::string text = "[";
   for (size_t index = 0; index < indices.size(); ++index) {
@@ -947,6 +961,11 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   const bool legacyProposalRuleReachable =
       gapProvenanceCoversStreams && proposal.complete && proposal.monotone &&
       proposal.lexemesAgree && proposal.jointlyCoreOptimal;
+  if (!legacyProposalRuleReachable)
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "window {0}: legacy boundary proposal is unreachable: {1}", windowIndex,
+        describeLegacyProposalFailure(gapProvenanceCoversStreams, proposal));
 
   // Realizing one candidate costs a complete refold of the translation unit, so
   // the loop below tracks which commit rules a prefix of the enumeration has

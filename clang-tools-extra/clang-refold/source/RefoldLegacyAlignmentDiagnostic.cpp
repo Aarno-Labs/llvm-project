@@ -310,6 +310,14 @@ LegacyAlignmentDiagnosticResult reconstructLegacyBoundaryProposal(
   result.selectedMap.assign(aCount, -1);
   result.anchorOrigins.assign(aCount, LegacyAlignmentAnchorOrigin::None);
 
+  // The proposal reads the complete-stream oracle in global coordinates, which
+  // exists only when the whole stream certified as one window; this query holds
+  // for window 0 exactly then.  A partitioned run therefore never reaches the
+  // legacy rule, and that is deliberate.  Building the proposal per window from
+  // each window's own oracle is exact, but measured on 2026-09-18 it made
+  // partitioned runs commit this proposal's insertion placement where they had
+  // kept core-forced anchors, and that placement was worse: a doc comment split
+  // from its function, inserted lines taking the original line's indentation.
   if (!coreAlignment.HasCompleteSemanticOracleForWindow(
           /*windowIndex=*/0)) {
     result.constructionFailure = "core all-optimal certification is incomplete";
