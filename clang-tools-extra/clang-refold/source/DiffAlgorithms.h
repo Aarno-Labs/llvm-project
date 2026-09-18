@@ -488,11 +488,17 @@ public:
   ///
   /// The query uses the same absolute A-gap costs as the global problem. It is
   /// a local optimum and does not by itself assert that the window endpoints
-  /// occur together on a globally optimal path. Invalid bounds or incomplete
-  /// certification return the default objective; callers should validate the
-  /// oracle and bounds before issuing the query.
-  LcsObjective ObjectiveForWindow(uint64_t aBegin, uint64_t aEnd,
-                                  uint64_t bBegin, uint64_t bEnd) const;
+  /// occur together on a globally optimal path.
+  ///
+  /// Returns `std::nullopt` when the objective is not computed: missing
+  /// storage, invalid bounds, or a window whose tables do not fit the byte
+  /// budget left beside the retained oracle.  A refusal is not a zero
+  /// objective -- an empty-looking result would silently drop the window's
+  /// matches and gap cost from any objective it is summed into -- so callers
+  /// must fail closed on it.
+  std::optional<LcsObjective> ObjectiveForWindow(uint64_t aBegin, uint64_t aEnd,
+                                                 uint64_t bBegin,
+                                                 uint64_t bEnd) const;
 
   /// Enumerate every distinct core-optimal match map inside one conditioned
   /// forced-anchor window.

@@ -17,6 +17,7 @@ add_extra_unittest(ClangRefoldTests
   RefoldWitnessJoinTests.cpp
   RefoldProofOrderTests.cpp
   RefoldTerminalObligationTests.cpp
+  RefoldLcsOracleObjectiveTests.cpp
   )
 
 clang_target_link_libraries(ClangRefoldTests

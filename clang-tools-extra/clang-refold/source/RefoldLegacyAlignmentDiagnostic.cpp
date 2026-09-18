@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <utility>
 
 using namespace llvm;
@@ -195,11 +196,17 @@ bool mapCanOccurOnOneOptimalPath(
       return false;
     }
 
-    const diffutils::LcsObjective prefix =
+    // A window the oracle declines to compute contributes an unknown
+    // objective.  Summing a placeholder instead could hide exactly the gap cost
+    // that makes the anchors jointly suboptimal, so fail closed.
+    const std::optional<diffutils::LcsObjective> prefix =
         alignment.oracle.ObjectiveForWindow(aBegin, aToken, bBegin, bToken);
-    if (!addObjectiveChecked(conditioned, prefix) ||
-        conditioned.matchedTokenCount ==
-            std::numeric_limits<uint32_t>::max()) {
+    if (!prefix) {
+      failure = "conditioned prefix objective is unavailable";
+      return false;
+    }
+    if (!addObjectiveChecked(conditioned, *prefix) ||
+        conditioned.matchedTokenCount == std::numeric_limits<uint32_t>::max()) {
       failure = "conditioned objective overflowed";
       return false;
     }
@@ -211,10 +218,15 @@ bool mapCanOccurOnOneOptimalPath(
     bBegin = bToken + 1;
   }
 
-  const diffutils::LcsObjective suffix = alignment.oracle.ObjectiveForWindow(
-      aBegin, alignment.oracle.GetATokenCount(), bBegin,
-      alignment.oracle.GetBTokenCount());
-  if (!addObjectiveChecked(conditioned, suffix)) {
+  const std::optional<diffutils::LcsObjective> suffix =
+      alignment.oracle.ObjectiveForWindow(
+          aBegin, alignment.oracle.GetATokenCount(), bBegin,
+          alignment.oracle.GetBTokenCount());
+  if (!suffix) {
+    failure = "conditioned suffix objective is unavailable";
+    return false;
+  }
+  if (!addObjectiveChecked(conditioned, *suffix)) {
     failure = "conditioned suffix objective overflowed";
     return false;
   }

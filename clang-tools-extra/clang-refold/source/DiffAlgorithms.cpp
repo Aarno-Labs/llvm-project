@@ -816,12 +816,12 @@ bool OptimalTokenAlignmentOracle::PairOccursOnOptimalPath(
           PairOccursOnOptimalPathFact) != 0;
 }
 
-LcsObjective OptimalTokenAlignmentOracle::ObjectiveForWindow(
+std::optional<LcsObjective> OptimalTokenAlignmentOracle::ObjectiveForWindow(
     uint64_t aBegin, uint64_t aEnd, uint64_t bBegin, uint64_t bEnd) const {
   OracleWindowDp window;
   if (!storage_ ||
       !buildOracleWindowDp(*storage_, aBegin, aEnd, bBegin, bEnd, window))
-    return LcsObjective{};
+    return std::nullopt;
   return window.forward.Get(window.aWidth * window.stride + window.bWidth);
 }
 
