@@ -955,6 +955,18 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
 
   std::vector<diffutils::Hunk> hunks = std::move(diffPlan.hunks);
   RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(hunks);
+
+  // Hunk-edge repair is an owner-aware normalization of the token diff the
+  // planner just published: it moves edges out of partially owned macro
+  // expansions and can merge two hunks into one.  Every later A->B coordinate
+  // projection reads the shared token-hunk cache, so the repaired vector has to
+  // replace the published one here.  Leaving the pre-repair vector in place
+  // makes the first structural tiling sweep project candidate envelopes against
+  // hunk boundaries that no longer exist; the cache would then be corrected
+  // only as a side effect of tiling publishing a split, which is not a
+  // correction any theorem asked for.
+  abTokHunks_ = hunks;
+
   structuralHunkPlanningPhase_ =
       StructuralHunkPlanningPhase::InitialTokenDiffBuilt;
 

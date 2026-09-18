@@ -143,6 +143,13 @@ public:
   /// they are explained by modeled zero-token state owners or lexer-ignorable
   /// trivia; otherwise the original hunk remains unsplit for the normal
   /// owner/fallback path.
+  ///
+  /// \p hunks must already be published in the borrowed `ABTokHunks` cache:
+  /// the planner projects candidate B envelopes through the shared source
+  /// mapper, which reads that cache, so a caller that normalizes the token diff
+  /// after it was published must republish it before planning. The precondition
+  /// is checked rather than assumed, because the cache it names is the one
+  /// coordinate surface a stale entry cannot be detected on later.
   StructuralHunkTilingPlan Plan(std::vector<diffutils::Hunk> hunks);
 
 private:

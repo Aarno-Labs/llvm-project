@@ -3875,6 +3875,22 @@ RefoldStructuralHunkTilingPlanner::FinishPlan(
 
 RefoldStructuralHunkTilingPlanner::StructuralHunkTilingPlan
 RefoldStructuralHunkTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
+  // Every candidate B envelope this pass projects is read through the shared
+  // source mapper, which resolves A/B coordinates against the borrowed
+  // token-hunk cache.  Planning against a cache that no longer mirrors the
+  // hunks would map envelopes onto boundaries that no longer exist, and the
+  // first sweep is exactly where that is invisible: the cache is refreshed as a
+  // side effect of publishing a split, so a stale entry disappears without ever
+  // being reported.  Require the caller to have published its normalization.
+  if (deps_.abTokHunks != hunks) {
+    REFOLD_LOG_FATAL(
+        "plan/order",
+        "structural tiling was handed {0} hunk(s) that the shared token-hunk "
+        "cache does not mirror ({1} cached); the caller normalized the token "
+        "diff without republishing it",
+        hunks.size(), deps_.abTokHunks.size());
+  }
+
   // Structural witnesses are rebuilt from the current token diff and attached
   // to later accepted candidates by exact A/B token-envelope binding.
   deps_.structuralHunkTilingWitnesses.clear();
