@@ -505,6 +505,29 @@ void TouchedFormalHunkCollector::MaybeAddSyntheticTouchedFormalEnvelopes(
   }
 }
 
+/// Return true when a stringified occurrence carries no edit of its own: the
+/// literal B exposes at this position unstringifies to the same argument text A
+/// exposed there.
+///
+/// Both operands are argument text, not literal spelling: the caller has
+/// already inverted each side through \c UnstringifyLiteralToArgText.  An
+/// inversion that failed leaves the raw literal in \p originalArgText, which
+/// cannot compare equal to inverted text, so the predicate fails closed.
+///
+/// This is the whole licence for the relaxed pipeline to keep an args-only
+/// rewrite whose stringified occurrence disagrees with the argument an
+/// evaluated occurrence fixed.  A stale occurrence is an observer of the old
+/// argument that the editor did not reach -- re-expanding the refolded
+/// invocation regenerates it from the new argument, and the relaxed `--check`
+/// masks the position.  A stringification B edited independently is a real
+/// edit at that position, and an args-only rewrite cannot realize it: the
+/// regenerated literal would be neither A's nor B's.  Tolerating it discards
+/// the edit and emits source that does not replay B.
+static bool isStaleStringifiedOccurrence(StringRef originalArgText,
+                                         StringRef editedArgText) {
+  return originalArgText.trim() == editedArgText.trim();
+}
+
 InvocationOccurrenceObservationCollector::
     InvocationOccurrenceObservationCollector(
         const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
@@ -522,11 +545,19 @@ InvocationOccurrenceObservationCollector::Collect(const RefoldModel::MacroInvoca
 
   // Tracks whether the current `result.unifiedNewArg` was fixed by an evaluated
   // (non-stringified) occurrence.  In relaxed mode an evaluated use is
-  // authoritative for the refolded argument, and a stringified occurrence whose
-  // spelling was not correspondingly edited is tolerated rather than forcing
-  // tuple forwarding: re-expanding the refolded invocation regenerates `#arg`
-  // from the new argument.  Strict mode still requires every occurrence to agree.
+  // authoritative for the refolded argument, and a stringified occurrence that
+  // B left at its original spelling is tolerated rather than forcing tuple
+  // forwarding: re-expanding the refolded invocation regenerates `#arg` from
+  // the new argument.  Strict mode still requires every occurrence to agree.
   bool unifiedNewArgFromEvaluated = false;
+
+  // Tracks, when `result.unifiedNewArg` was instead fixed by a stringified
+  // occurrence, whether that occurrence was stale.  An evaluated occurrence may
+  // supersede a stale one -- superseding it discards nothing, because B
+  // recorded no edit there.  Superseding a stringification B edited
+  // independently would discard that edit, so it is not tolerated in either
+  // mode.
+  bool unifiedNewArgStringifyWasStale = false;
 
   for (size_t i = 0; i < occurrences.size(); ++i) {
     const auto &sp = occurrences[i];
@@ -602,6 +633,11 @@ InvocationOccurrenceObservationCollector::Collect(const RefoldModel::MacroInvoca
     // for the same formal have been incorporated.
     StringRef oldText = deps_.sourceMapper.SliceASource(sp.begin, sp.end).trim();
 
+    // Backing store for `oldText` once the stringify branch below rewrites it
+    // into unstringified argument text.  `oldText` is observed as late as the
+    // observation record, so its storage must live in this scope.
+    std::string oldTextStorage;
+
     // For ordinary argument occurrences, allow a narrow right-edge repair over
     // unchanged closer tokens when the diff split leaves balancing delimiters
     // just outside the initial B envelope.
@@ -661,8 +697,10 @@ InvocationOccurrenceObservationCollector::Collect(const RefoldModel::MacroInvoca
       // argument text.
       auto oldUn =
           deps_.argTextRecovery.UnstringifyLiteralToArgText(oldText, true);
-      if (oldUn)
-        oldText = StringRef(*oldUn).trim();
+      if (oldUn) {
+        oldTextStorage = std::move(*oldUn);
+        oldText = StringRef(oldTextStorage).trim();
+      }
     }
 
     if (!occurrenceIsStringify[i] && !invocation.pasteSpans.empty()) {
@@ -718,23 +756,35 @@ InvocationOccurrenceObservationCollector::Collect(const RefoldModel::MacroInvoca
     const bool thisIsStringify =
         i < occurrenceIsStringify.size() && occurrenceIsStringify[i] != 0;
 
+    // Only a stale stringified occurrence may be tolerated when it disagrees;
+    // see isStaleStringifiedOccurrence for why the distinction is the licence
+    // for the relaxation rather than a refinement of it.
+    const bool thisStringifyIsStale =
+        thisIsStringify && isStaleStringifiedOccurrence(oldText, newArg);
+
     if (!result.unifiedNewArg) {
       result.unifiedNewArg = newArg;
       unifiedNewArgFromEvaluated = !thisIsStringify;
+      unifiedNewArgStringifyWasStale = thisStringifyIsStale;
     } else if (*result.unifiedNewArg != newArg) {
-      if (!deps_.strict && thisIsStringify && unifiedNewArgFromEvaluated) {
-        // Relaxed: an evaluated occurrence already fixed the argument; this
-        // stringified occurrence kept a stale spelling.  Tolerate it — the
-        // stringification is regenerated from the new argument on re-expansion.
-        // Strict mode falls through below and forces tuple forwarding.
+      if (!deps_.strict && thisStringifyIsStale && unifiedNewArgFromEvaluated) {
+        // Relaxed: an evaluated occurrence already fixed the argument and B
+        // left this stringified occurrence at its original spelling.  Tolerate
+        // it — the stringification is regenerated from the new argument on
+        // re-expansion.  Strict mode falls through below and forces tuple
+        // forwarding, and so does a stringification B edited independently.
       } else if (!deps_.strict && !thisIsStringify &&
-                 !unifiedNewArgFromEvaluated) {
+                 !unifiedNewArgFromEvaluated &&
+                 unifiedNewArgStringifyWasStale) {
         // Relaxed: an evaluated occurrence supersedes an argument previously
-        // inferred only from a stringified occurrence, regardless of order.
+        // inferred only from a stringified occurrence, regardless of order —
+        // but only a stale one, so that superseding it discards no edit.
         result.unifiedNewArg = newArg;
         unifiedNewArgFromEvaluated = true;
+        unifiedNewArgStringifyWasStale = false;
       } else {
-        // Strict mode, or a genuine disagreement between two authoritative
+        // Strict mode, a stringified occurrence B edited independently of the
+        // argument, a genuine disagreement between two authoritative
         // (evaluated) occurrences, or between stringified-only occurrences.
         result.needTupleForwarding = true;
       }
