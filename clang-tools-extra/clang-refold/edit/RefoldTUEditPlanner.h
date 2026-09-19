@@ -34,6 +34,8 @@ namespace refold {
 class RefoldLineControlProof;
 class RefoldMacroTopology;
 class RefoldModel;
+class RefoldPreprocessingStructureIndex;
+struct SidebandPragmaLinePairing;
 
 /// Include-boundary owner selected for a pure insertion before TU edit
 /// planning.
@@ -275,6 +277,54 @@ bool maybeAdvanceTUInsertionPastSourceLineControlPrefix(
     const RefoldLineControlProof &lineControlProof, const diffutils::Hunk &h,
     llvm::StringRef tuPath, llvm::StringRef tuBytes,
     std::pair<uint64_t, uint64_t> &span);
+
+/// Where a pure TU insertion lands among the `#pragma` lines that clang
+/// printed at its A gap and that survived unedited into B.
+struct PrintedPragmaInsertionPlacement {
+  enum class Kind : uint8_t {
+    /// No surviving printed line at the gap is printed after the payload in
+    /// B, so the ordinary anchor and token envelope already realize B.
+    NotApplicable,
+    /// The insertion must land at `tuByteOffset`, replaying only the B bytes
+    /// ending at `bByteEnd` when that is set.
+    Placed,
+    /// A surviving printed line constrains the placement, but no exact source
+    /// site could be proved.  Any other placement emits that line on the
+    /// wrong side of the payload, so the direct TU edit must not be built.
+    Refused,
+  };
+  Kind kind = Kind::NotApplicable;
+  uint64_t tuByteOffset = 0;
+  /// End of the replayed B bytes, set when a line B prints after the payload
+  /// would otherwise be replayed with it; unset keeps the token envelope.
+  std::optional<uint64_t> bByteEnd;
+};
+
+/// Place a pure TU insertion relative to the printed `#pragma` lines preserved
+/// at its A gap.
+///
+/// A paired line keeps its source directive, so it is printed wherever that
+/// source line stands; its B gap says which side of the payload B printed it
+/// on.  Lines B printed at `h.bStart` precede the payload, lines at `h.bEnd`
+/// follow it.  The insertion therefore lands between the end of the last
+/// preceding line and the start of the first following one -- at the base
+/// anchor when that already lies there -- and replays B only up to the first
+/// following line's B copy, which the preserved directive already prints.
+///
+/// The placement is proved only when every line at the gap binds to a unique
+/// TU-owned producer record with an A image, all preceding lines come before
+/// all following ones in source and in B, no line sits strictly inside the
+/// payload, and the source between the base anchor and the placement holds
+/// nothing but those directives and lexer trivia.  Printed pragmas cannot
+/// change macro state, so moving the insertion across them changes only the
+/// order in which their lines and the payload are printed -- the order B
+/// fixes.
+PrintedPragmaInsertionPlacement placeTUInsertionAmongPrintedPragmas(
+    const RefoldModel &model,
+    const RefoldPreprocessingStructureIndex &structureIndex,
+    llvm::ArrayRef<SidebandPragmaLinePairing> pairings,
+    const diffutils::Hunk &h, llvm::ArrayRef<size_t> bTokOff,
+    llvm::StringRef tuPath, llvm::StringRef tuBytes, uint64_t baseAnchor);
 
 } // namespace refold
 } // namespace clang

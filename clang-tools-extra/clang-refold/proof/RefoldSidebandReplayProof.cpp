@@ -12,6 +12,8 @@
 
 #include "proof/RefoldSidebandReplayProof.h"
 
+#include "model/RefoldModel.h"
+
 #include "support/RefoldLog.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -36,6 +38,24 @@ validateSidebandPragmaEditProof(const SidebandPragmaEdit &edit,
     return StringRef("invalid sideband B-byte envelope");
 
   return std::nullopt;
+}
+
+std::optional<uint64_t>
+tuDirectivePragmaForPrintedLine(const RefoldModel &model, StringRef tuPath,
+                                const SidebandPragmaLinePairing &line) {
+  const RefoldModel::PragmaDirective *found = nullptr;
+  for (const RefoldModel::PragmaDirective &pragma : model.GetPragmas()) {
+    if (!pragma.HasEmittedImage() || *pragma.ppByteBegin < line.aLineBegin ||
+        line.aLineEnd < *pragma.ppByteEnd)
+      continue;
+    if (found)
+      return std::nullopt;
+    found = &pragma;
+  }
+  if (!found || found->viaPragmaOperator || found->ownerIncludeId ||
+      found->sitePath != tuPath || found->siteB >= found->siteE)
+    return std::nullopt;
+  return found->id;
 }
 
 std::string stripSeparatelyOwnedSidebandReplay(

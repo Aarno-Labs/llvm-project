@@ -110,13 +110,18 @@ void filterSidebandPragmaTokens(llvm::ArrayRef<SidebandPragmaLine> lines,
 /// when every difference was discharged through this proof path; the function
 /// fails closed when any sideband shape escapes the owner-local source-edit
 /// domain.
+///
+/// `aLinePairings` receives one entry per line of `aLines`, in the same order,
+/// recording whether the pairing found that line unedited in B and at which
+/// B gap.  It is meaningful only when the function returns `true`.
 bool buildSidebandPragmaSourceEdits(
     const llvm::json::Object &rootJson, llvm::StringRef refoldMapPath,
     llvm::ArrayRef<SidebandPragmaLine> aLines,
     llvm::ArrayRef<SidebandPragmaLine> bLines, llvm::ArrayRef<PPTok> rawAToks,
     llvm::ArrayRef<std::size_t> rawATokOff, llvm::StringRef bBytes,
     llvm::ArrayRef<PPTok> rawBToks, llvm::ArrayRef<std::size_t> rawBTokOff,
-    std::vector<SidebandPragmaEdit> &edits);
+    std::vector<SidebandPragmaEdit> &edits,
+    std::vector<SidebandPragmaLinePairing> &aLinePairings);
 
 /// Validate one sideband pragma proof and report a classified terminal fallback
 /// request when validation fails.

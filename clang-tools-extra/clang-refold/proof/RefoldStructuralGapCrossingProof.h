@@ -206,6 +206,11 @@ public:
   /// Answer the placement question for every structure in one gap.
   GapCrossingProof Prove(const Query &query) const;
 
+  /// Return the unique producer pragma record bound to `interval`, or null
+  /// when the interval names none or names it ambiguously.
+  const RefoldModel::PragmaDirective *
+  ProducerPragmaFor(const PreprocessingStructureInterval &interval) const;
+
 private:
   /// Answer one structure, without the macro-state directives.
   ///
@@ -249,10 +254,6 @@ private:
   /// the payload sees.  B is a preprocessed stream, so this is reachable in
   /// practice only through a pragma the preprocessor re-emitted into it.
   bool CommittedTextCarriesDirective(const Query &query) const;
-
-  /// Return the unique producer pragma record bound to `interval`.
-  const RefoldModel::PragmaDirective *
-  ProducerPragmaFor(const PreprocessingStructureInterval &interval) const;
 
   /// Return the unique producer line-control record bound to `interval`.
   const RefoldModel::LineControlEvent *

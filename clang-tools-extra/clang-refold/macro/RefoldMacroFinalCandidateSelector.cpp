@@ -17,6 +17,7 @@
 #include "model/RefoldModel.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldAcceptedResultRanker.h"
+#include "proof/RefoldSidebandReplayProof.h"
 #include "support/RefoldLog.h"
 #include "support/StringUtils.h"
 
@@ -91,6 +92,11 @@ struct FinalMacroCandidateAdmissionContext {
   /// Root invocations ruled out from keeping their callsite, or null when none
   /// are.  Borrowed for the duration of one admission.
   const llvm::DenseSet<uint64_t> *ownersMustExpand = nullptr;
+
+  /// B gaps of the paired `#pragma` lines this invocation's expansion printed.
+  /// Replacing the invocation removes the source that printed them, so a
+  /// candidate must replay each one itself.
+  ArrayRef<uint64_t> printedPragmaBGaps;
 
   bool hasDirectArgsOnlyCandidate = false;
   bool hasDagRootReplayCandidate = false;
@@ -206,6 +212,31 @@ bool addFinalMacroCandidate(
     return false;
   }
 
+  // An invocation whose expansion printed a surviving `#pragma` line is the
+  // only source of that line.  A candidate keeping the callsite re-expands it,
+  // but nothing proves the re-expansion prints the line where B does; one
+  // replacing the callsite with B's tokens carries the line only when it lies
+  // strictly inside that B range, because exact token coverage stops at the
+  // first and last token and leaves a line at either edge behind.
+  for (uint64_t bGap : ctx.printedPragmaBGaps) {
+    const MacroPatch &patch = candidate.patch;
+    if (patch.proof.preservesInvocationStructure ||
+        !patch.materialized.hasBTokenRange ||
+        !(patch.materialized.bTokStart < bGap &&
+          bGap < patch.materialized.bTokEnd)) {
+      REFOLD_LOG_TRACE(
+          "macro/final-candidate",
+          "reject inv id={0} name={1} origin={2} "
+          "reason=printed-pragma-not-replayed pragmaB={3} candidateB=[{4},{5}) "
+          "preserves={6}",
+          ctx.invocation.id, ctx.invocation.name,
+          finalMacroCandidateOriginName(candidate.origin), bGap,
+          patch.materialized.bTokStart, patch.materialized.bTokEnd,
+          patch.proof.preservesInvocationStructure ? 1 : 0);
+      return false;
+    }
+  }
+
   if (!ctx.replayStabilityCtx) {
     REFOLD_LOG_TRACE("macro/final-candidate",
                      "reject inv id={0} name={1} origin={2} reason=no-replay-stability-context",
@@ -301,6 +332,28 @@ materializeWholeCoverPatch(const RefoldMacroPatchProofCertifier &certifier,
 RefoldMacroFinalCandidateSelector::RefoldMacroFinalCandidateSelector(
     Dependencies deps)
     : deps_(std::move(deps)) {}
+
+SmallVector<uint64_t, 2>
+RefoldMacroFinalCandidateSelector::PrintedPragmaBGapsOf(
+    const RefoldModel::MacroInvocation &m) const {
+  SmallVector<uint64_t, 2> bGaps;
+  for (const SidebandPragmaLinePairing &line :
+       deps_.sidebandPragmaLinePairings) {
+    if (!line.bNormalTokenGap)
+      continue;
+    const uint64_t aGap = line.aNormalTokenGap;
+    const std::optional<ArrayRef<uint64_t>> ancestors =
+        deps_.topology.PragmaExpansionAncestorsAtGap(aGap);
+    const bool produced =
+        ancestors ? llvm::is_contained(*ancestors, m.id)
+                  : llvm::any_of(m.spans, [&](const RefoldModel::PPSpan &span) {
+                      return span.begin <= aGap && aGap <= span.end;
+                    });
+    if (produced)
+      bGaps.push_back(*line.bNormalTokenGap);
+  }
+  return bGaps;
+}
 
 std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
     RefoldMacroWholeCoverPlanningContext &planningCtx) const {
@@ -624,6 +677,7 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
   // deterministic construction order and delegates ranking to the proof
   // lattice; it does not discover new fallback paths.
   SmallVector<FinalMacroCandidate, 5> finalMacroCandidates;
+  const SmallVector<uint64_t, 2> printedPragmaBGaps = PrintedPragmaBGapsOf(m);
   FinalMacroCandidateAdmissionContext finalAdmissionCtx{
       m,
       hEff,
@@ -631,8 +685,8 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
       finalMacroCandidates,
       &finalSubtreeValidationCtx,
       allowNonTopLevelMacroSelectorFailure,
-      deps_.ownersMustExpand};
-
+      deps_.ownersMustExpand,
+      printedPragmaBGaps};
 
   if (argsOnlyCandidate) {
     addFinalMacroCandidate(

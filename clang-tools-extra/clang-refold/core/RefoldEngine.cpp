@@ -492,6 +492,8 @@ RefoldEngine::RefoldEngine(RefoldModel model, StringRef aSource,
       passRole_(std::move(config.role)),
       sidebandPragmaEdits_(config.sidebandPragmaEdits.begin(),
                            config.sidebandPragmaEdits.end()),
+      sidebandPragmaLinePairings_(config.sidebandPragmaLinePairings.begin(),
+                                  config.sidebandPragmaLinePairings.end()),
       alignmentSelectionOverride_(std::move(config.alignmentSelectionOverride)),
       alignmentSemanticResolverEnabled_(
           config.alignmentSemanticResolverEnabled),
@@ -1016,6 +1018,28 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   }
   structuralHunkPlanningPhase_ =
       StructuralHunkPlanningPhase::StructuralTilingComplete;
+
+  // A surviving directive the hunks cannot print where B does would make the
+  // assembly print it on the wrong side of a payload.  Fail closed.
+  if (const auto &violation = structuralTilingPlan.printedPragmaViolation) {
+    TerminalFallbackFailureContext context;
+    context.aTokenBegin = violation->aGap;
+    context.aTokenEnd = violation->aGap;
+    context.bTokenBegin = violation->bGap;
+    context.bTokenEnd = violation->bGap;
+    terminalSink_.RequestTerminalFallback(
+        MakeTerminalFallbackProofFailure(
+            TerminalFallbackObligationKind::EmissionEditSetComposable,
+            TerminalFallbackFailureReason::UncomposableEmissionEditSet,
+            std::move(context)),
+        "tiling/printed-pragma",
+        llvm::formatv("surviving #pragma at A gap {0} is printed at B gap {1} "
+                      "in B, but the token hunks print it within B=[{2},{3}] "
+                      "and cannot be repaired",
+                      violation->aGap, violation->bGap, violation->bLo,
+                      violation->bHi)
+            .str());
+  }
 
   if (inDebugMode()) {
     size_t insertOnlyHunks = 0;
@@ -1695,6 +1719,14 @@ bool RefoldEngine::DispatchStructuralHunks(
     if (mapsToTU) {
       auto spanPlan =
           tuAnchorProof_->PlanTUByteSpan(h.aStart, h.aEnd, tuPath); // [b,e)
+      PrintedPragmaInsertionPlacement pragmaPlacement;
+      if (spanPlan) {
+        pragmaPlacement = PlaceTUInsertionAmongPrintedPragmas(
+            h, tuPath, spanPlan->tuByteBegin);
+        if (pragmaPlacement.kind ==
+            PrintedPragmaInsertionPlacement::Kind::Refused)
+          spanPlan.reset();
+      }
       if (spanPlan) {
         auto span = spanPlan->byteRange();
 
@@ -1709,11 +1741,17 @@ bool RefoldEngine::DispatchStructuralHunks(
           materializedBByteEnd = bBytes->second;
         }
 
+        if (pragmaPlacement.kind ==
+            PrintedPragmaInsertionPlacement::Kind::Placed) {
+          span = {pragmaPlacement.tuByteOffset, pragmaPlacement.tuByteOffset};
+          if (pragmaPlacement.bByteEnd)
+            materializedBByteEnd = *pragmaPlacement.bByteEnd;
+        }
+
         if (h.bStart < h.bEnd) {
           StringRef bSlice =
               h.isInsertOnly()
-                  ? refoldSliceTokenEnvelope(bTokOff_, bSource_, h.bStart,
-                                             h.bEnd)
+                  ? InsertionEnvelope(h, pragmaPlacement)
                   : refoldSliceExactTokenCoverage(bTokOff_, bToks_, bSource_,
                                                   h.bStart, h.bEnd);
           repl.assign(bSlice.data(), bSlice.data() + bSlice.size());
@@ -1782,15 +1820,15 @@ bool RefoldEngine::DispatchStructuralHunks(
         tuEditPlanner_->MaybeExtendTUSpanOverClosedTrailingCallSuffix(
             h, tuPath, tuBytes, repl, span);
 
-        bool advancedOverSourceLineControlPrefix =
+        const bool advancedOverSourceLineControlPrefix =
+            pragmaPlacement.kind !=
+                PrintedPragmaInsertionPlacement::Kind::Placed &&
             maybeAdvanceTUInsertionPastSourceLineControlPrefix(
                 *tuAnchorProof_, lineControlProof_, h, tuPath, tuBytes, span);
-        std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment;
-        if (advancedOverSourceLineControlPrefix) {
-          insertionAnchorAdjustment = TUInsertionAnchorAdjustment{
-              TUInsertionAnchorAdjustmentKind::SourceLineControlPrefix,
-              rawTUStart, span.first};
-        }
+        std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment =
+            InsertionAnchorAdjustment(pragmaPlacement,
+                                      advancedOverSourceLineControlPrefix,
+                                      rawTUStart, span.first);
 
         // Is this span replacing a TU "gap" (bytes that are all whitespace)?
         std::string original;
@@ -2022,6 +2060,65 @@ bool RefoldEngine::DispatchStructuralHunks(
   return true;
 }
 
+PrintedPragmaInsertionPlacement
+RefoldEngine::PlaceTUInsertionAmongPrintedPragmas(const diffutils::Hunk &h,
+                                                  StringRef tuPath,
+                                                  uint64_t baseAnchor) const {
+  PrintedPragmaInsertionPlacement placement =
+      placeTUInsertionAmongPrintedPragmas(
+          model_, *preprocessingStructureIndex_, sidebandPragmaLinePairings_, h,
+          bTokOff_, tuPath, tuSourceBytes_, baseAnchor);
+  switch (placement.kind) {
+  case PrintedPragmaInsertionPlacement::Kind::NotApplicable:
+    break;
+  case PrintedPragmaInsertionPlacement::Kind::Placed:
+    REFOLD_LOG_TRACE("tu/insertion",
+                     "insertion A={0} B=[{1},{2}) placed at source byte {3} "
+                     "(base anchor {4}) on the side of each preserved pragma "
+                     "B prints it on; replaying B up to byte {5}",
+                     h.aStart, h.bStart, h.bEnd, placement.tuByteOffset,
+                     baseAnchor,
+                     placement.bByteEnd ? std::to_string(*placement.bByteEnd)
+                                        : std::string("<envelope end>"));
+    break;
+  case PrintedPragmaInsertionPlacement::Kind::Refused:
+    REFOLD_LOG_TRACE("tu/insertion",
+                     "insertion A={0} B=[{1},{2}) has a preserved pragma B "
+                     "prints after it, but no exact source site between the "
+                     "directives was proved; refusing the direct TU edit",
+                     h.aStart, h.bStart, h.bEnd);
+    break;
+  }
+  return placement;
+}
+
+StringRef RefoldEngine::InsertionEnvelope(
+    const diffutils::Hunk &h,
+    const PrintedPragmaInsertionPlacement &placement) const {
+  if (placement.kind != PrintedPragmaInsertionPlacement::Kind::Placed ||
+      !placement.bByteEnd)
+    return refoldSliceTokenEnvelope(bTokOff_, bSource_, h.bStart, h.bEnd);
+  const uint64_t begin = bTokOff_[static_cast<size_t>(h.bStart)];
+  return bSource_.slice(begin, *placement.bByteEnd);
+}
+
+std::optional<TUInsertionAnchorAdjustment>
+RefoldEngine::InsertionAnchorAdjustment(
+    const PrintedPragmaInsertionPlacement &placement,
+    bool advancedOverSourceLineControlPrefix, uint64_t rawTUStart,
+    uint64_t anchor) {
+  if (placement.kind == PrintedPragmaInsertionPlacement::Kind::Placed &&
+      anchor != rawTUStart)
+    return TUInsertionAnchorAdjustment{
+        TUInsertionAnchorAdjustmentKind::PrintedPragmaPlacement, rawTUStart,
+        anchor};
+  if (advancedOverSourceLineControlPrefix)
+    return TUInsertionAnchorAdjustment{
+        TUInsertionAnchorAdjustmentKind::SourceLineControlPrefix, rawTUStart,
+        anchor};
+  return std::nullopt;
+}
+
 std::optional<TextEdit> RefoldEngine::BuildDirectTUByteSpanEditForHunk(
     const diffutils::Hunk &h, size_t hunkIndex, bool isDel, StringRef tuPath,
     StringRef tuBytes, std::pair<uint64_t, uint64_t> span) {
@@ -2037,12 +2134,24 @@ std::optional<TextEdit> RefoldEngine::BuildDirectTUByteSpanEditForHunk(
         materializedBByteBegin = bBytes->first;
         materializedBByteEnd = bBytes->second;
       }
+      const PrintedPragmaInsertionPlacement pragmaPlacement =
+          isDel ? PrintedPragmaInsertionPlacement()
+                : PlaceTUInsertionAmongPrintedPragmas(h, tuPath, span.first);
+      if (pragmaPlacement.kind ==
+          PrintedPragmaInsertionPlacement::Kind::Refused)
+        return std::nullopt;
+      if (pragmaPlacement.kind ==
+          PrintedPragmaInsertionPlacement::Kind::Placed) {
+        span = {pragmaPlacement.tuByteOffset, pragmaPlacement.tuByteOffset};
+        if (pragmaPlacement.bByteEnd)
+          materializedBByteEnd = *pragmaPlacement.bByteEnd;
+      }
       if (isDel) {
         repl = "";
       } else {
         StringRef bSlice =
             h.isInsertOnly()
-                ? refoldSliceTokenEnvelope(bTokOff_, bSource_, h.bStart, h.bEnd)
+                ? InsertionEnvelope(h, pragmaPlacement)
                 : refoldSliceExactTokenCoverage(bTokOff_, bToks_, bSource_,
                                                 h.bStart, h.bEnd);
         repl.assign(bSlice.data(), bSlice.data() + bSlice.size());
@@ -2114,15 +2223,15 @@ std::optional<TextEdit> RefoldEngine::BuildDirectTUByteSpanEditForHunk(
       tuEditPlanner_->MaybeExtendTUSpanOverClosedTrailingCallSuffix(
           h, tuPath, tuBytes, repl, span);
 
-      bool advancedOverSourceLineControlPrefix =
+      const bool advancedOverSourceLineControlPrefix =
+          pragmaPlacement.kind !=
+              PrintedPragmaInsertionPlacement::Kind::Placed &&
           maybeAdvanceTUInsertionPastSourceLineControlPrefix(
               *tuAnchorProof_, lineControlProof_, h, tuPath, tuBytes, span);
-      std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment;
-      if (advancedOverSourceLineControlPrefix) {
-        insertionAnchorAdjustment = TUInsertionAnchorAdjustment{
-            TUInsertionAnchorAdjustmentKind::SourceLineControlPrefix,
-            rawTUStart, span.first};
-      }
+      std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment =
+          InsertionAnchorAdjustment(pragmaPlacement,
+                                    advancedOverSourceLineControlPrefix,
+                                    rawTUStart, span.first);
 
       // If we are replacing whitespace-only text in the TU, we prefer to
       // preserve the existing TU gap whitespace rather than introducing new

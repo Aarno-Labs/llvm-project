@@ -23,9 +23,9 @@
 //
 // An exact gap is still required where nothing else can supply a placement: a
 // B-only sideband insertion has no A-side line to inherit one from.  See
-// `surviving_pragma_straddle_refuses` for the payload whose side of the
-// directive is genuinely undetermined -- it pairs now, and refuses one stage
-// later for that reason instead.
+// `surviving_pragma_straddle_commits_payload_after_printed_directive` for a
+// payload whose side of the directive alignment leaves undetermined -- the
+// pairing's B gap is what places it.
 //
 // Applies to every pragma clang re-emits -- `pack`, `message`,
 // `GCC diagnostic`, and the `_Pragma` spellings of each -- and to no pragma it

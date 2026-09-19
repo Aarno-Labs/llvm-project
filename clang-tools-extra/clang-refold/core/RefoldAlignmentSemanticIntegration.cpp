@@ -787,6 +787,7 @@ RefoldEngine::SimulateSemanticAlignmentCandidate(
   config.proofAuditMode = proofAuditMode_;
   config.finalOutputPath = finalOutputPath_;
   config.sidebandPragmaEdits = sidebandPragmaEdits_;
+  config.sidebandPragmaLinePairings = sidebandPragmaLinePairings_;
   config.materializedEditMappings = candidateMaterializedMappings;
   config.alignmentSelectionOverride = selection;
   config.alignmentSemanticResolverEnabled = false;

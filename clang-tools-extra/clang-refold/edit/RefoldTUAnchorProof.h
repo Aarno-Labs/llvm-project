@@ -69,6 +69,11 @@ struct TUInsertionAnchor {
 enum class TUInsertionAnchorAdjustmentKind : uint8_t {
   Unknown,
   SourceLineControlPrefix,
+  /// The insertion was placed among printed `#pragma` lines preserved at its
+  /// A gap, on the side of each that B prints it; see
+  /// `placeTUInsertionAmongPrintedPragmas`.  Unlike a line-control prefix,
+  /// this may move the anchor backwards.
+  PrintedPragmaPlacement,
 };
 
 /// Typed proof input for moving a pure insertion across preserved source
@@ -80,8 +85,15 @@ struct TUInsertionAnchorAdjustment {
   uint64_t adjustedTUByteOffset = 0;
 
   bool IsValid() const {
-    return kind != TUInsertionAnchorAdjustmentKind::Unknown &&
-           originalTUByteOffset <= adjustedTUByteOffset;
+    switch (kind) {
+    case TUInsertionAnchorAdjustmentKind::Unknown:
+      return false;
+    case TUInsertionAnchorAdjustmentKind::SourceLineControlPrefix:
+      return originalTUByteOffset <= adjustedTUByteOffset;
+    case TUInsertionAnchorAdjustmentKind::PrintedPragmaPlacement:
+      return originalTUByteOffset != adjustedTUByteOffset;
+    }
+    return false;
   }
 };
 
@@ -278,6 +290,16 @@ public:
   /// use FindProvableTUInsertionAnchor() instead.
   std::optional<uint64_t> FindExactSlotBoundaryFromPPGap(llvm::StringRef tuPath,
                                                          uint64_t ppGap) const;
+
+  /// Return whether the nonempty TU byte range `[begin,end)` holds at least
+  /// one `#pragma` directive and nothing but complete producer-bound pragmas
+  /// clang printed, and lexer trivia.
+  ///
+  /// A printed pragma is one no handler consumed, and every pragma that
+  /// changes macro state is consumed, so moving a pure insertion across such a
+  /// range changes only the order in which the directive lines and the
+  /// insertion are printed.
+  bool RangeHoldsOnlyPrintedPragmas(uint64_t begin, uint64_t end) const;
 
   /// Return true iff a PP gap sits at the exit of a selected conditional arm.
   bool IsPPGapAtSelectedConditionalArmExit(uint64_t ppGap) const;

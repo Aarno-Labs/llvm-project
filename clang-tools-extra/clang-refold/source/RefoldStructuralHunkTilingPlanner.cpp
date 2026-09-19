@@ -28,6 +28,7 @@
 #include "model/RefoldModel.h"
 #include "model/RefoldPathIdentity.h"
 #include "proof/RefoldOwnerStateProof.h"
+#include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldStructuralGapCrossingProof.h"
 #include "proof/RefoldStructuralHunkTilingProof.h"
 #include "proof/RefoldWitnessTrace.h"
@@ -617,6 +618,133 @@ bool transitionContainsMacroStateDirective(
            gap.protectedStructureKind ==
                StructuralProtectedStructureKind::MacroUndef;
   });
+}
+
+/// The B gaps at which B printed the first and the last of the directives
+/// preserved at one A-token seam.
+struct PrintedPragmaSeamGaps {
+  uint64_t first = 0;
+  uint64_t last = 0;
+};
+
+/// Return where B printed the directives preserved at an A-token seam, or
+/// std::nullopt unless that is fully accounted for.
+///
+/// A structural split leaves the gap between two source runs in place, so the
+/// refolded output prints each directive in it exactly where that source gap
+/// lands.  Where B printed the same directive is therefore a fact about B's
+/// token order that no placement may contradict.  It is read only when:
+///
+///  - every structure in the gap is a `#pragma` directive whose producer record
+///    carries an image in A.  Clang prints only pragmas that no preprocessor
+///    handler consumes, plus the diagnostic, message, execution-charset and
+///    `assume_nonnull` callbacks; every pragma that changes macro state
+///    (`push_macro`, `pop_macro`, `poison`) is consumed and has no image.  So
+///    the gap changes nothing a payload's expansion can observe, and its only
+///    effect on the output stream is where its lines are printed;
+///  - every image lies inside an A sideband line printed at `aBoundary`, and
+///    every A sideband line printed there holds one of those images, so no
+///    other emission at the seam is left unplaced;
+///  - every such line survived unedited into B, in source order at
+///    nondecreasing B gaps, each of which is the first or the last and lies
+///    inside the seam's admissible range `[lowerB, upperB]`.
+std::optional<PrintedPragmaSeamGaps> printedPragmaGapsAtSeam(
+    const RefoldStructuralGapCrossingProver &producerRecords,
+    ArrayRef<SidebandPragmaLinePairing> pairings,
+    ArrayRef<const PreprocessingStructureInterval *> gapStructures,
+    uint64_t aBoundary, uint64_t lowerB, uint64_t upperB) {
+  if (gapStructures.empty())
+    return std::nullopt;
+
+  SmallVector<const SidebandPragmaLinePairing *, 2> linesAtSeam;
+  for (const SidebandPragmaLinePairing &pairing : pairings)
+    if (pairing.aNormalTokenGap == aBoundary)
+      linesAtSeam.push_back(&pairing);
+  if (linesAtSeam.empty())
+    return std::nullopt;
+
+  // Bind each structure's A image to the one line at the seam containing it.
+  SmallVector<bool, 2> lineBound(linesAtSeam.size(), false);
+  for (const PreprocessingStructureInterval *structure : gapStructures) {
+    if (!structure || structure->kind != PreprocessingStructureKind::Pragma)
+      return std::nullopt;
+    const RefoldModel::PragmaDirective *pragma =
+        producerRecords.ProducerPragmaFor(*structure);
+    if (!pragma || !pragma->HasEmittedImage() ||
+        *pragma->ppByteBegin >= *pragma->ppByteEnd)
+      return std::nullopt;
+    std::optional<size_t> container;
+    for (size_t i = 0; i < linesAtSeam.size(); ++i) {
+      if (linesAtSeam[i]->aLineBegin > *pragma->ppByteBegin ||
+          *pragma->ppByteEnd > linesAtSeam[i]->aLineEnd)
+        continue;
+      if (container)
+        return std::nullopt;
+      container = i;
+    }
+    if (!container)
+      return std::nullopt;
+    lineBound[*container] = true;
+  }
+
+  for (size_t i = 0; i < linesAtSeam.size(); ++i)
+    if (!lineBound[i] || !linesAtSeam[i]->bNormalTokenGap)
+      return std::nullopt;
+  PrintedPragmaSeamGaps gaps{*linesAtSeam.front()->bNormalTokenGap,
+                             *linesAtSeam.back()->bNormalTokenGap};
+  if (gaps.first < lowerB || gaps.last > upperB || gaps.first > gaps.last)
+    return std::nullopt;
+  uint64_t previous = gaps.first;
+  for (const SidebandPragmaLinePairing *line : linesAtSeam) {
+    const uint64_t bGap = *line->bNormalTokenGap;
+    if (bGap < previous || (bGap != gaps.first && bGap != gaps.last))
+      return std::nullopt;
+    previous = bGap;
+  }
+  return gaps;
+}
+
+/// Return the include occurrence owning the `#pragma` directive printed as
+/// \p line, when that directive is spelled in a header; std::nullopt for a
+/// translation-unit line, an operator, or a record that does not bind.
+std::optional<uint64_t>
+headerDirectiveOwnerOfPrintedLine(const RefoldModel &model,
+                                  const SidebandPragmaLinePairing &line) {
+  const RefoldModel::PragmaDirective *found = nullptr;
+  for (const RefoldModel::PragmaDirective &pragma : model.GetPragmas()) {
+    if (!pragma.HasEmittedImage() || *pragma.ppByteBegin < line.aLineBegin ||
+        line.aLineEnd < *pragma.ppByteEnd)
+      continue;
+    if (found)
+      return std::nullopt;
+    found = &pragma;
+  }
+  if (!found || found->viaPragmaOperator)
+    return std::nullopt;
+  return found->ownerIncludeId;
+}
+
+/// Return whether a pragma record is a `#pragma` directive line of the
+/// translation unit itself, bound to exactly that line in the source index.
+bool isTUDirectiveRecord(const RefoldModel &model,
+                         const RefoldPreprocessingStructureIndex &tuIndex,
+                         uint64_t id) {
+  const RefoldModel::PragmaDirective *record = nullptr;
+  for (const RefoldModel::PragmaDirective &pragma : model.GetPragmas()) {
+    if (pragma.id != id)
+      continue;
+    if (record)
+      return false;
+    record = &pragma;
+  }
+  if (!record)
+    return false;
+  size_t bound = 0;
+  for (const PreprocessingStructureInterval *interval :
+       tuIndex.FindOverlapping(record->siteB, record->siteE))
+    bound += interval->kind == PreprocessingStructureKind::Pragma &&
+             interval->modelItemId == id;
+  return bound == 1;
 }
 
 Owner ownerForPreservedStructureInterval(
@@ -1906,6 +2034,79 @@ public:
     }
     return true;
   }
+
+  /// Split a replacement at a seam whose preserved pragmas B prints on both
+  /// sides of a payload, or return std::nullopt.
+  ///
+  /// A structural tiling keeps each source gap whole and gives it one B
+  /// boundary, so it cannot express a payload B prints between two directives
+  /// of the same gap.  B's token order still fixes the whole shape: every B
+  /// token before the first directive's copy is realized by the run before
+  /// the gap, every token after the last copy by the run after it, and the
+  /// tokens between the copies land between the directive lines themselves.
+  /// The split states exactly that as three ordinary hunks -- the two runs
+  /// and a pure insertion at the seam's A gap -- each of which must then be
+  /// realized by its own proof; the insertion's source site is placed by
+  /// `placeTUInsertionAmongPrintedPragmas`.  Only the first such seam is
+  /// split; a later one is reached when the remaining hunk is replanned.
+  std::optional<std::vector<diffutils::Hunk>>
+  SplitAroundPrintedPragmas(const diffutils::Hunk &h) const {
+    if (!h.isReplace() || h.aEnd - h.aStart < 2 ||
+        deps_.sidebandPragmaLinePairings.empty())
+      return std::nullopt;
+
+    // The same whole-invocation guard as the tiling itself: never compete
+    // with the macro lattice for a hunk one invocation covers.
+    Owner wholeOwner =
+        deps_.ownerClassifier.ClassifyOwnerWithSegments(deps_.tuPath, h);
+    if (auto *wholeMacro = deps_.macroTopology.SmallestCoveringPatchableMacro(
+            h.aStart, h.aEnd, wholeOwner.includeId)) {
+      if (wholeMacro->invB && wholeMacro->invE)
+        return std::nullopt;
+    }
+
+    std::optional<PhysicalSourceRunPlan> runs = BuildPhysicalSourceRunPlan(h);
+    if (!runs || runs->runs.size() < 2 ||
+        runs->protectedGapFacts.size() + 1 != runs->runs.size())
+      return std::nullopt;
+    SmallVector<uint64_t, 8> runBoundaries;
+    for (size_t runIndex = 0; runIndex + 1 < runs->runs.size(); ++runIndex)
+      runBoundaries.push_back(runs->runs[runIndex].aEnd);
+    const std::vector<
+        std::optional<RefoldSourceMapper::ATokenBoundaryProjection>>
+        projections = deps_.sourceMapper.ProjectATokenBoundariesToBTokenBounds(
+            h.aStart, h.aEnd, h.bStart, h.bEnd, runBoundaries);
+    if (projections.size() != runBoundaries.size())
+      return std::nullopt;
+
+    for (size_t runIndex = 0; runIndex < runBoundaries.size(); ++runIndex) {
+      const std::optional<RefoldSourceMapper::ATokenBoundaryProjection>
+          &projection = projections[runIndex];
+      if (!projection)
+        return std::nullopt;
+      const uint64_t aBoundary = runBoundaries[runIndex];
+      std::optional<PrintedPragmaSeamGaps> printed = printedPragmaGapsAtSeam(
+          gapCrossingProver_, deps_.sidebandPragmaLinePairings,
+          runs->protectedGapFacts[runIndex].intervals, aBoundary,
+          projection->lowerBTokenBoundary, projection->upperBTokenBoundary);
+      if (!printed || printed->first == printed->last)
+        continue;
+      if (printed->first < h.bStart || h.bEnd < printed->last)
+        return std::nullopt;
+      REFOLD_LOG_TRACE("tiling/structural",
+                       "seam A={0} of A=[{1},{2}) B=[{3},{4}): B prints its "
+                       "preserved pragmas at B={5} and B={6}; splitting the "
+                       "payload between them into an insertion at the seam",
+                       aBoundary, h.aStart, h.aEnd, h.bStart, h.bEnd,
+                       printed->first, printed->last);
+      return std::vector<diffutils::Hunk>{
+          diffutils::Hunk{h.aStart, aBoundary, h.bStart, printed->first},
+          diffutils::Hunk{aBoundary, aBoundary, printed->first, printed->last},
+          diffutils::Hunk{aBoundary, h.aEnd, printed->last, h.bEnd}};
+    }
+    return std::nullopt;
+  }
+
   // boundary: failures while *searching* for a structural
   // partition are non-applicability, not terminal proof failures.  Until a
   // partition has been accepted and durable segment witnesses have been
@@ -1997,6 +2198,33 @@ public:
         std::optional<RefoldSourceMapper::ATokenBoundaryProjection> projection =
             runBoundaryProjections[runIndex];
         bool macroStatePlacementProven = false;
+        // Directives B still print at one gap fix the seam outright: see
+        // `printedPragmaGapsAtSeam`.  This is asked first because it is a
+        // fact about B rather than an equivalence between placements, so the
+        // crossing proof below is not needed once it answers.  Directives B
+        // prints on both sides of a payload fix no single seam; see
+        // `SplitAroundPrintedPragmas`.
+        if (projection && !projection->IsUnique() &&
+            runIndex < physicalSourceRuns->protectedGapFacts.size()) {
+          std::optional<PrintedPragmaSeamGaps> printed =
+              printedPragmaGapsAtSeam(
+                  gapCrossingProver_, deps_.sidebandPragmaLinePairings,
+                  physicalSourceRuns->protectedGapFacts[runIndex].intervals,
+                  aBoundary, projection->lowerBTokenBoundary,
+                  projection->upperBTokenBoundary);
+          if (printed && printed->first == printed->last) {
+            REFOLD_LOG_TRACE(
+                "tiling/structural",
+                "seam A={0} undetermined in B=[{1},{2}] is fixed at B={3} by "
+                "the {4} preserved pragma(s) B prints there",
+                aBoundary, projection->lowerBTokenBoundary,
+                projection->upperBTokenBoundary, printed->first,
+                physicalSourceRuns->protectedGapFacts[runIndex]
+                    .intervals.size());
+            projection->lowerBTokenBoundary = printed->first;
+            projection->upperBTokenBoundary = printed->first;
+          }
+        }
         // A strict range means the payload cannot be split at this seam by
         // alignment alone. That is not the end of the question: when the
         // preserved gap changes state the payload provably cannot observe,
@@ -3899,8 +4127,13 @@ RefoldStructuralHunkTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
   // Tiling only has work to do when there is at least one hunk to split; with
   // none, the plan is the unchanged input.  Returning early here keeps the
   // whole tiling body at function indentation instead of nesting it.
-  if (hunks.empty())
-    return FinishPlan(std::move(hunks));
+  if (hunks.empty()) {
+    std::optional<PrintedPragmaPlacementViolation> violation =
+        EnforcePrintedPragmaPlacement(hunks, {});
+    StructuralHunkTilingPlan plan = FinishPlan(std::move(hunks));
+    plan.printedPragmaViolation = violation;
+    return plan;
+  }
 
   // Every predicate the tiling proof needs reads producer facts and its own
   // arguments only, so one instance answers every hunk of this pass.
@@ -3926,7 +4159,14 @@ RefoldStructuralHunkTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
       }
       auto partition = prover.TryBuildStructuralPartition(h);
       if (!partition) {
-        splitHunks.push_back(h);
+        std::optional<std::vector<diffutils::Hunk>> pieces =
+            prover.SplitAroundPrintedPragmas(h);
+        if (!pieces) {
+          splitHunks.push_back(h);
+          continue;
+        }
+        splitHunks.insert(splitHunks.end(), pieces->begin(), pieces->end());
+        changed = true;
         continue;
       }
 
@@ -3985,7 +4225,218 @@ RefoldStructuralHunkTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
     }
   }
 
-  return FinishPlan(std::move(hunks));
+  std::optional<PrintedPragmaPlacementViolation> violation =
+      EnforcePrintedPragmaPlacement(hunks, emittedEdges);
+  StructuralHunkTilingPlan plan = FinishPlan(std::move(hunks));
+  plan.printedPragmaViolation = violation;
+  return plan;
+}
+
+std::optional<
+    RefoldStructuralHunkTilingPlanner::PrintedPragmaPlacementViolation>
+RefoldStructuralHunkTilingPlanner::EnforcePrintedPragmaPlacement(
+    std::vector<diffutils::Hunk> &hunks,
+    const std::set<std::tuple<uint64_t, uint64_t, uint64_t, uint64_t>>
+        &boundHunks) const {
+  const RefoldPreprocessingStructureIndex &tuIndex =
+      deps_.preprocessingStructureIndexes.GetTUIndex();
+  // A surviving TU `#pragma` directive line, at a gap no macro expansion
+  // prints a pragma at, may be repaired.  Every other printed line with a
+  // known B position -- a header directive, a `_Pragma`, a macro-produced
+  // line, or the B lines a sideband edit writes -- is checked only.
+  std::map<uint64_t, std::pair<uint64_t, uint64_t>> bRangeByAGap;
+  // A checked line, and the include occurrence whose expansion prints it when
+  // it is written inside a header.
+  struct CheckedLine {
+    SidebandPragmaEdit::PrintedGaps gaps;
+    std::optional<uint64_t> ownerIncludeId;
+  };
+  SmallVector<CheckedLine, 4> checkedGaps;
+  for (const SidebandPragmaLinePairing &line :
+       deps_.sidebandPragmaLinePairings) {
+    if (!line.bNormalTokenGap)
+      continue;
+    const uint64_t aGap = line.aNormalTokenGap;
+    const uint64_t bGap = *line.bNormalTokenGap;
+    const std::optional<uint64_t> directive =
+        tuDirectivePragmaForPrintedLine(deps_.model, deps_.tuPath, line);
+    const std::optional<ArrayRef<uint64_t>> expansionAncestors =
+        deps_.macroTopology.PragmaExpansionAncestorsAtGap(aGap);
+    if (!directive || !expansionAncestors || !expansionAncestors->empty() ||
+        !isTUDirectiveRecord(deps_.model, tuIndex, *directive)) {
+      checkedGaps.push_back(
+          {{aGap, bGap, bGap},
+           expansionAncestors && expansionAncestors->empty()
+               ? headerDirectiveOwnerOfPrintedLine(deps_.model, line)
+               : std::nullopt});
+      continue;
+    }
+    auto [it, inserted] = bRangeByAGap.try_emplace(aGap, bGap, bGap);
+    if (!inserted) {
+      it->second.first = std::min(it->second.first, bGap);
+      it->second.second = std::max(it->second.second, bGap);
+    }
+  }
+  for (const SidebandPragmaEdit &edit : deps_.sidebandPragmaEdits)
+    if (edit.GetPrintedGaps())
+      checkedGaps.push_back({*edit.GetPrintedGaps(), edit.OwnerIncludeId()});
+
+  auto isBound = [&](const diffutils::Hunk &h) {
+    return boundHunks.count(
+               std::make_tuple(h.aStart, h.aEnd, h.bStart, h.bEnd)) != 0;
+  };
+
+  for (const auto &[aGap, wanted] : bRangeByAGap) {
+    // Locate the hunks touching the gap: one ending at it, one pure insertion
+    // at it, one starting at it.  A hunk strictly across it would carry the
+    // directive's source inside one edit, which is never a placement.
+    std::optional<size_t> left, insertion, right;
+    int64_t delta = 0;
+    bool ambiguous = false;
+    for (size_t i = 0; i < hunks.size(); ++i) {
+      const diffutils::Hunk &h = hunks[i];
+      std::optional<size_t> *slot = nullptr;
+      if (h.aStart < aGap && aGap < h.aEnd)
+        ambiguous = true;
+      else if (h.aStart == aGap && h.aEnd == aGap)
+        slot = &insertion;
+      else if (h.aEnd == aGap)
+        slot = &left;
+      else if (h.aStart == aGap)
+        slot = &right;
+      else if (h.aEnd < aGap)
+        delta += static_cast<int64_t>(h.bEnd - h.bStart) -
+                 static_cast<int64_t>(h.aEnd - h.aStart);
+      if (slot) {
+        ambiguous |= slot->has_value();
+        *slot = i;
+      }
+    }
+
+    // The B gaps the hunks currently realize for the directive.
+    uint64_t curLo = 0;
+    if (insertion)
+      curLo = hunks[*insertion].bStart;
+    else if (left)
+      curLo = hunks[*left].bEnd;
+    else if (right)
+      curLo = hunks[*right].bStart;
+    else
+      curLo = static_cast<uint64_t>(static_cast<int64_t>(aGap) + delta);
+    const uint64_t curHi = insertion ? hunks[*insertion].bEnd : curLo;
+    PrintedPragmaPlacementViolation violation{aGap, wanted.first, curLo, curHi};
+    if (wanted.first < curLo)
+      violation.bGap = wanted.first;
+    else if (wanted.second > curHi)
+      violation.bGap = wanted.second;
+    else if (!ambiguous)
+      continue;
+    if (ambiguous)
+      return violation;
+    if ((left && hunks[*left].bEnd != curLo) ||
+        (right && hunks[*right].bStart != curHi))
+      return violation;
+
+    // Move the far side of each directive into the insertion at the gap.
+    const uint64_t newLo = std::min(curLo, wanted.first);
+    const uint64_t newHi = std::max(curHi, wanted.second);
+    if ((newLo < curLo &&
+         (!left || isBound(hunks[*left]) || newLo < hunks[*left].bStart)) ||
+        (newHi > curHi &&
+         (!right || isBound(hunks[*right]) || hunks[*right].bEnd < newHi)) ||
+        (insertion && isBound(hunks[*insertion])))
+      return violation;
+
+    REFOLD_LOG_TRACE("tiling/printed-pragma",
+                     "A gap {0} holds surviving directive(s) B prints at "
+                     "B=[{1},{2}] but the hunks print at B=[{3},{4}]; moving "
+                     "B=[{5},{6}) into a pure insertion at the gap",
+                     aGap, wanted.first, wanted.second, curLo, curHi, newLo,
+                     newHi);
+    if (left)
+      hunks[*left].bEnd = newLo;
+    if (right)
+      hunks[*right].bStart = newHi;
+    if (insertion) {
+      hunks[*insertion].bStart = newLo;
+      hunks[*insertion].bEnd = newHi;
+      continue;
+    }
+    const size_t at = right ? *right : (left ? *left + 1 : hunks.size());
+    hunks.insert(hunks.begin() + static_cast<std::ptrdiff_t>(at),
+                 diffutils::Hunk{aGap, aGap, newLo, newHi});
+  }
+
+  // A checked line is printed where its source site lands: the single B gap
+  // the hunks leave at its A gap.  A line whose macro caller chain does not
+  // resolve has no known carrier, so no hunk may border its gap either.
+  //
+  // A pure insertion at the gap has no proved order against a line written in
+  // translation-unit source.  Against a line written inside a header it does,
+  // at the header's own boundary: the owner classifier assigns an insertion
+  // the least common ancestor of the includes on either side of its gap, and
+  // at an include's first or last gap one side lies outside that include.  So
+  // the insertion is realized outside the header -- before all of its lines
+  // at the first gap, after them at the last.  A header covering no tokens has
+  // one gap for both and stays refused.
+  for (const CheckedLine &checked : checkedGaps) {
+    const uint64_t aGap = checked.gaps.aGap;
+    const bool unknownCarrier =
+        !deps_.macroTopology.PragmaExpansionAncestorsAtGap(aGap);
+    std::optional<size_t> left, insertion, right;
+    int64_t delta = 0;
+    bool refused = false;
+    for (size_t i = 0; i < hunks.size(); ++i) {
+      const diffutils::Hunk &h = hunks[i];
+      std::optional<size_t> *slot = nullptr;
+      if (h.aStart < aGap && aGap < h.aEnd)
+        refused = true;
+      else if (h.aStart == aGap && h.aEnd == aGap)
+        slot = &insertion;
+      else if (h.aEnd == aGap)
+        slot = &left;
+      else if (h.aStart == aGap)
+        slot = &right;
+      else if (h.aEnd < aGap)
+        delta += static_cast<int64_t>(h.bEnd - h.bStart) -
+                 static_cast<int64_t>(h.aEnd - h.aStart);
+      if (slot) {
+        refused |= slot->has_value() || unknownCarrier;
+        *slot = i;
+      }
+    }
+
+    uint64_t bGap = static_cast<uint64_t>(static_cast<int64_t>(aGap) + delta);
+    if (insertion) {
+      const RefoldModel::IncludeItem *owner =
+          checked.ownerIncludeId
+              ? deps_.model.GetIncludeById(*checked.ownerIncludeId)
+              : nullptr;
+      const bool atFirstGap = owner && owner->cover.IsValid() &&
+                              owner->cover.begin < owner->cover.end &&
+                              aGap == owner->cover.begin;
+      const bool atLastGap = owner && owner->cover.IsValid() &&
+                             owner->cover.begin < owner->cover.end &&
+                             aGap == owner->cover.end;
+      refused |= !atFirstGap && !atLastGap;
+      bGap = atFirstGap ? hunks[*insertion].bEnd : hunks[*insertion].bStart;
+    } else if (left) {
+      bGap = hunks[*left].bEnd;
+    } else if (right) {
+      bGap = hunks[*right].bStart;
+    }
+    if (left && right && !insertion &&
+        hunks[*left].bEnd != hunks[*right].bStart)
+      refused = true;
+    if (refused || checked.gaps.bGapFirst != bGap ||
+        checked.gaps.bGapLast != bGap)
+      return PrintedPragmaPlacementViolation{aGap,
+                                             checked.gaps.bGapFirst != bGap
+                                                 ? checked.gaps.bGapFirst
+                                                 : checked.gaps.bGapLast,
+                                             bGap, bGap};
+  }
+  return std::nullopt;
 }
 
 } // namespace refold

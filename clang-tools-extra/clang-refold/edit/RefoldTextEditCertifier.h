@@ -94,7 +94,8 @@ public:
       const RefoldPreprocessingStructureIndex &tuPreprocessingStructureIndex,
       const RefoldTUAnchorProof &tuAnchorProof,
       const RefoldTerminalProofSink &terminalSink,
-      const RefoldTheoremAudit &theoremAuditService);
+      const RefoldTheoremAudit &theoremAuditService,
+      llvm::ArrayRef<PrintedPragmaCarrier> printedPragmaCarriers = {});
 
   /// Declared out of line so the emission structure-index cache can hold a
   /// forward-declared RefoldPreprocessingStructureIndex.
@@ -260,6 +261,9 @@ private:
   const RefoldTUAnchorProof &tuAnchorProof_;
   const RefoldTerminalProofSink &terminalSink_;
   const RefoldTheoremAudit &theoremAuditService_;
+  /// Source carriers of the paired `#pragma` lines; see
+  /// `PrintedPragmaCarrier`.
+  llvm::ArrayRef<PrintedPragmaCarrier> printedPragmaCarriers_;
 
   /// One built emission census plus the source extent it was built from.
   struct EmissionStructureIndexCacheEntry {

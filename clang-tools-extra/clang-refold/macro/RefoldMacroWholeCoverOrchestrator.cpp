@@ -213,6 +213,7 @@ RefoldMacroWholeCoverOrchestrator::RefoldMacroWholeCoverOrchestrator(
           *planner_->Deps().acceptedResultRanker,
           planner_->ReplayStabilityValidator(), planner_->ProofCertifier(),
           patchReusePhase_, planner_->Deps().ownersMustExpand,
+          planner_->Deps().sidebandPragmaLinePairings,
           *planner_->Deps().wholeCoverPlanBuilder,
           [planner](const MacroPatch &patch, const Owner &owner) {
             return planner->MacroPatchOwnerMatches(patch, owner);

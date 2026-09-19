@@ -1801,8 +1801,16 @@ bool buildSidebandPragmaSourceEdits(
     ArrayRef<SidebandPragmaLine> aLines, ArrayRef<SidebandPragmaLine> bLines,
     ArrayRef<PPTok> rawAToks, ArrayRef<std::size_t> rawATokOff,
     StringRef bBytes, ArrayRef<PPTok> rawBToks,
-    ArrayRef<std::size_t> rawBTokOff, std::vector<SidebandPragmaEdit> &edits) {
+    ArrayRef<std::size_t> rawBTokOff, std::vector<SidebandPragmaEdit> &edits,
+    std::vector<SidebandPragmaLinePairing> &aLinePairings) {
   edits.clear();
+  // Every line starts unpaired.  The pairing below may narrow `aLines`, and a
+  // line it drops is carried by an ordinary hunk, which is not a survival.
+  aLinePairings.clear();
+  aLinePairings.reserve(aLines.size());
+  for (const SidebandPragmaLine &line : aLines)
+    aLinePairings.push_back(
+        {line.begin, line.end, line.normalTokenGap, std::nullopt, 0, 0});
   if (aLines.empty() && bLines.empty())
     return false;
 
@@ -2080,6 +2088,23 @@ bool buildSidebandPragmaSourceEdits(
     if (lcs[a] >= 0 && static_cast<size_t>(lcs[a]) < bToA.size())
       bToA[static_cast<size_t>(lcs[a])] = static_cast<int64_t>(a);
 
+  // A matched pair shares its window key, so it emits no edit: record the B
+  // gap it survived at.  The key is unambiguous within a window on each side,
+  // so the recorded gap is the only one that line's text occupies there.
+  for (size_t a = 0; a < lcs.size() && a < aLines.size(); ++a) {
+    if (lcs[a] < 0 || static_cast<size_t>(lcs[a]) >= bLines.size())
+      continue;
+    for (SidebandPragmaLinePairing &pairing : aLinePairings) {
+      if (pairing.aLineBegin != aLines[a].begin)
+        continue;
+      const SidebandPragmaLine &bLine = bLines[static_cast<size_t>(lcs[a])];
+      pairing.bNormalTokenGap = bLine.normalTokenGap;
+      pairing.bLineBegin = bLine.begin;
+      pairing.bLineEnd = bLine.end;
+      break;
+    }
+  }
+
   using SidebandBReplayProof = OwnerLocalBReplayProof;
 
   struct SidebandBReplayBlockProof {
@@ -2114,13 +2139,31 @@ bool buildSidebandPragmaSourceEdits(
     SidebandBReplayProof TakeReplay() { return std::move(replay); }
   };
 
-  auto appendProvedSidebandEdit = [&](std::optional<SidebandSourceProof> source,
-                                      SidebandBReplayProof replay) -> bool {
+  // A replaying edit writes B lines [bStart, bEnd) at a source position whose
+  // normal-token gap is `aGap`; record both so the token plan can be checked
+  // against where B prints them.
+  auto printedGapsFor = [&](uint64_t aGap, uint64_t bStart, uint64_t bEnd) {
+    SidebandPragmaEdit::PrintedGaps gaps{aGap, 0, 0};
+    for (uint64_t b = bStart; b < bEnd; ++b) {
+      const uint64_t bGap = bLines[static_cast<size_t>(b)].normalTokenGap;
+      gaps.bGapFirst = b == bStart ? bGap : std::min(gaps.bGapFirst, bGap);
+      gaps.bGapLast = b == bStart ? bGap : std::max(gaps.bGapLast, bGap);
+    }
+    return gaps;
+  };
+
+  auto appendProvedSidebandEdit =
+      [&](std::optional<SidebandSourceProof> source,
+          SidebandBReplayProof replay,
+          std::optional<SidebandPragmaEdit::PrintedGaps> printedGaps =
+              std::nullopt) -> bool {
     std::optional<SidebandPragmaEdit> edit =
         SidebandPragmaEdit::Create(std::move(source), std::move(replay),
                                    static_cast<uint64_t>(bBytes.size()));
     if (!edit)
       return false;
+    if (printedGaps)
+      edit->SetPrintedGaps(*printedGaps);
     edits.push_back(std::move(*edit));
     return true;
   };
@@ -2276,6 +2319,8 @@ bool buildSidebandPragmaSourceEdits(
   struct ProvedSidebandInsertion {
     SidebandSourceProof source;
     SidebandBReplayProof replay;
+    /// The exact A gap the insertion is owned by and written at.
+    uint64_t ownerGap = 0;
   };
 
   auto proveInsertion =
@@ -2353,7 +2398,7 @@ bool buildSidebandPragmaSourceEdits(
               SidebandSourceProof::ZeroWidthInsertion(next->pragma->sitePath,
                                                       next->pragma->siteB,
                                                       next->ownerIncludeId),
-              insertedBlock->TakeReplay()};
+              insertedBlock->TakeReplay(), ownerGap};
         }
 
         if (prev->pragma->sitePath != next->pragma->sitePath ||
@@ -2376,7 +2421,7 @@ bool buildSidebandPragmaSourceEdits(
               SidebandSourceProof::ZeroWidthInsertion(next->pragma->sitePath,
                                                       next->pragma->siteB,
                                                       next->ownerIncludeId),
-              insertedBlock->TakeReplay()};
+              insertedBlock->TakeReplay(), ownerGap};
         }
 
         std::optional<SidebandBReplayBlockProof> replayWithNext =
@@ -2387,7 +2432,7 @@ bool buildSidebandPragmaSourceEdits(
             SidebandSourceProof::SourceAtom(
                 next->pragma->sitePath, next->pragma->siteB,
                 next->pragma->siteE, next->ownerIncludeId),
-            replayWithNext->TakeReplay()};
+            replayWithNext->TakeReplay(), ownerGap};
       }
 
       const BoundSidebandSourceAtom &base = *prev;
@@ -2404,7 +2449,7 @@ bool buildSidebandPragmaSourceEdits(
       return ProvedSidebandInsertion{
           SidebandSourceProof::ZeroWidthInsertion(
               base.pragma->sitePath, siteByte, base.ownerIncludeId),
-          insertedBlock->TakeReplay()};
+          insertedBlock->TakeReplay(), ownerGap};
     }
 
     std::optional<SidebandSourceProof> anchor =
@@ -2413,7 +2458,7 @@ bool buildSidebandPragmaSourceEdits(
     if (!anchor)
       return std::nullopt;
     return ProvedSidebandInsertion{std::move(*anchor),
-                                   insertedBlock->TakeReplay()};
+                                   insertedBlock->TakeReplay(), ownerGap};
   };
 
   auto appendBarrierSeparatedReplacement =
@@ -2483,10 +2528,14 @@ bool buildSidebandPragmaSourceEdits(
     }
 
     const BoundSidebandSourceAtom &last = atoms.back();
-    if (!appendProvedSidebandEdit(SidebandSourceProof::SourceAtom(
-                                      last.pragma->sitePath, last.pragma->siteB,
-                                      last.pragma->siteE, last.ownerIncludeId),
-                                  bBlock->TakeReplay())) {
+    if (!appendProvedSidebandEdit(
+            SidebandSourceProof::SourceAtom(
+                last.pragma->sitePath, last.pragma->siteB, last.pragma->siteE,
+                last.ownerIncludeId),
+            bBlock->TakeReplay(),
+            printedGapsFor(
+                aLines[static_cast<size_t>(h.aEnd - 1)].normalTokenGap,
+                h.bStart, h.bEnd))) {
       edits.erase(edits.begin() + editsBefore, edits.end());
       return false;
     }
@@ -2512,8 +2561,9 @@ bool buildSidebandPragmaSourceEdits(
         return true;
       }
 
-      return appendProvedSidebandEdit(std::move(insertion->source),
-                                      std::move(insertion->replay));
+      return appendProvedSidebandEdit(
+          std::move(insertion->source), std::move(insertion->replay),
+          printedGapsFor(insertion->ownerGap, h.bStart, h.bEnd));
     }
 
     if (h.isDeleteOnly()) {
@@ -2542,7 +2592,11 @@ bool buildSidebandPragmaSourceEdits(
         std::optional<SidebandSourceProof> source =
             proveSourceRun(h.aStart, h.aEnd, ownerWindow);
         if (source &&
-            appendProvedSidebandEdit(std::move(source), bBlock->TakeReplay()))
+            appendProvedSidebandEdit(
+                std::move(source), bBlock->TakeReplay(),
+                printedGapsFor(
+                    aLines[static_cast<size_t>(h.aStart)].normalTokenGap,
+                    h.bStart, h.bEnd)))
           return true;
       }
       if (appendBarrierSeparatedReplacement(h))
@@ -2551,9 +2605,11 @@ bool buildSidebandPragmaSourceEdits(
         return false;
       for (uint64_t a = h.aStart, b = h.bStart; a < h.aEnd; ++a, ++b) {
         const SidebandPragmaLine &line = bLines[static_cast<size_t>(b)];
-        if (!appendProvedSidebandEdit(proveSourceRun(a, a + 1, std::nullopt),
-                                      SidebandBReplayProof::FromText(
-                                          line.text, line.begin, line.end)))
+        if (!appendProvedSidebandEdit(
+                proveSourceRun(a, a + 1, std::nullopt),
+                SidebandBReplayProof::FromText(line.text, line.begin, line.end),
+                printedGapsFor(aLines[static_cast<size_t>(a)].normalTokenGap, b,
+                               b + 1)))
           return false;
       }
       return true;

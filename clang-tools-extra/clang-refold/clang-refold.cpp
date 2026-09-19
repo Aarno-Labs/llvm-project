@@ -556,6 +556,7 @@ int main(int argc, char **argv) {
   std::vector<PPTok> aToks, bToks;
   std::vector<std::size_t> aTokByteOff, bTokByteOff;
   std::vector<SidebandPragmaEdit> sidebandPragmaEdits;
+  std::vector<SidebandPragmaLinePairing> sidebandPragmaLinePairings;
   lexPPTokens(aBytes, aToks, aTokByteOff, lexLang);
   lexPPTokens(bBytes, bToks, bTokByteOff, lexLang);
 
@@ -568,10 +569,10 @@ int main(int argc, char **argv) {
     annotateSidebandPragmaTokenGaps(bSidebandPragmas, bToks, bTokByteOff);
 
     if (!aSidebandPragmas.empty() || !bSidebandPragmas.empty()) {
-      if (buildSidebandPragmaSourceEdits(rootJson, RefoldJSONPath,
-                                         aSidebandPragmas, bSidebandPragmas,
-                                         aToks, aTokByteOff, bBytes, bToks,
-                                         bTokByteOff, sidebandPragmaEdits)) {
+      if (buildSidebandPragmaSourceEdits(
+              rootJson, RefoldJSONPath, aSidebandPragmas, bSidebandPragmas,
+              aToks, aTokByteOff, bBytes, bToks, bTokByteOff,
+              sidebandPragmaEdits, sidebandPragmaLinePairings)) {
         // Keep the raw `.i` byte buffers intact, but remove preserved pragma
         // directive tokens from the sequences fed to the structural diff.  The
         // matching source directive edits are carried separately in
@@ -593,6 +594,7 @@ int main(int argc, char **argv) {
         // token-count/domain checks will route them through the explicit
         // fallback path rather than guessing a source placement.
         sidebandPragmaEdits.clear();
+        sidebandPragmaLinePairings.clear();
         REFOLD_LOG_DEBUG(
             "pragma/sideband",
             "sideband pragma stream not fully modelled; keeping raw tokens "
@@ -681,6 +683,7 @@ int main(int argc, char **argv) {
   auto refoldedOrErr = refoldTranslationUnit(
       rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff, NoLines,
       StrictMode, proofAuditMode, ModifiedSrcPath, sidebandPragmaEdits,
+      sidebandPragmaLinePairings,
       emitEditMap ? &materializedEditMappings : nullptr,
       buildFinalLineControlValidationCallback(ModifiedSrcPath, ctx),
       VerifyOutput, VerifyIncludeDirs);

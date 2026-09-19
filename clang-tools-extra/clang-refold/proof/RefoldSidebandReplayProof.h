@@ -32,6 +32,8 @@
 namespace clang {
 namespace refold {
 
+class RefoldModel;
+
 using llvm::ArrayRef;
 using llvm::StringRef;
 
@@ -267,9 +269,19 @@ public:
 /// corresponding source directive edits here so the engine can delete or
 /// replace the original `DirectivePragmaItem` without falling back to raw B.
 struct SidebandPragmaEdit {
+  /// Where a replaying edit prints B's lines among the normal tokens: at A
+  /// gap `aGap`, the gap of the source position the lines are written to,
+  /// while B prints them at B gaps `bGapFirst` through `bGapLast`.
+  struct PrintedGaps {
+    uint64_t aGap = 0;
+    uint64_t bGapFirst = 0;
+    uint64_t bGapLast = 0;
+  };
+
 private:
   OwnerLocalSourceEditProof source;
   OwnerLocalBReplayProof replay;
+  std::optional<PrintedGaps> printedGaps;
 
   SidebandPragmaEdit(OwnerLocalSourceEditProof source,
                      OwnerLocalBReplayProof replay)
@@ -349,6 +361,14 @@ public:
     return source.IsComplete() && ReplayIsValid(bSize);
   }
 
+  /// Return where this edit prints B's lines, when it replays any.
+  const std::optional<PrintedGaps> &GetPrintedGaps() const {
+    return printedGaps;
+  }
+
+  /// Record where this edit prints B's lines; see `PrintedGaps`.
+  void SetPrintedGaps(PrintedGaps gaps) { printedGaps = gaps; }
+
   /// Build a complete sideband edit from already-proved source and replay
   /// facts.  This keeps the final construction gate with the proof object:
   /// callers may supply only a discharged source proof, a B replay proof, and
@@ -364,6 +384,62 @@ public:
     return edit;
   }
 };
+
+/// The certified-window pairing outcome for one `#pragma` line printed into A.
+///
+/// A line the pairing matched to an identical B line gets no sideband edit: its
+/// source directive stays where it is, and is printed wherever that source
+/// position lands in the refolded output.  B's copy therefore names the one
+/// normal-token gap that position has to realize, which is a fact about B's
+/// token order rather than a choice.  Any other line -- deleted, replaced, or
+/// carried by an ordinary replacement hunk -- has no such gap.
+///
+/// `aLineBegin`/`aLineEnd` bound the line in the raw A replay surface, which is
+/// the coordinate of a producer pragma record's A image, so a record binds to
+/// the line by containment.  Both gaps are in the normal-token coordinate of
+/// the sideband-filtered streams the structural diff consumes.
+struct SidebandPragmaLinePairing {
+  uint64_t aLineBegin = 0;
+  uint64_t aLineEnd = 0;
+  uint64_t aNormalTokenGap = 0;
+  /// The paired B line's normal-token gap, when the line survived unedited.
+  std::optional<uint64_t> bNormalTokenGap;
+  /// The paired B line's half-open byte range in the B replay surface,
+  /// including its trailing newline; set together with `bNormalTokenGap`.
+  uint64_t bLineBegin = 0;
+  uint64_t bLineEnd = 0;
+};
+
+/// The physical source that prints one surviving `#pragma` line, and B's copy
+/// of that line.
+///
+/// A paired line keeps its source, so the refolded output prints it only while
+/// that source survives: the directive line, the `_Pragma` operator, or -- for
+/// a line a macro expansion printed -- the root invocation's spelling.  An
+/// emitted edit that consumes any of those bytes removes the line, and must
+/// replay B's copy in its place.  `[sourceBegin, sourceEnd)` is in the file
+/// `path` of include occurrence `ownerIncludeId` (none for the translation
+/// unit); `[bLineBegin, bLineEnd)` is in the B replay surface.
+struct PrintedPragmaCarrier {
+  StringRef path;
+  std::optional<uint64_t> ownerIncludeId;
+  uint64_t sourceBegin = 0;
+  uint64_t sourceEnd = 0;
+  uint64_t bLineBegin = 0;
+  uint64_t bLineEnd = 0;
+};
+
+/// Return the id of the producer record for the translation unit's own
+/// `#pragma` directive printed as \p line, or std::nullopt.
+///
+/// The record must be the unique one whose A image lies inside the line, be
+/// spelled as a directive rather than a `_Pragma` operator, and belong to the
+/// translation unit rather than an included header.  Only such a directive
+/// is printed wherever its source line stands in the refolded output, so only
+/// its paired B gap constrains where source edits may place it.
+std::optional<uint64_t>
+tuDirectivePragmaForPrintedLine(const RefoldModel &model, StringRef tuPath,
+                                const SidebandPragmaLinePairing &line);
 
 /// Return an implementation-local validation failure for a complete sideband
 /// proof, or std::nullopt when the proof is structurally valid for the B

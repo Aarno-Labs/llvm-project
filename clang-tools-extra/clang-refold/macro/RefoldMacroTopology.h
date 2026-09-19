@@ -78,6 +78,17 @@ public:
   /// one, so moving a newline inside an invocation cannot change them.
   bool ExpansionContainsLineObserver(uint64_t macroId) const;
 
+  /// Return every invocation whose expansion produced a `_Pragma` that is
+  /// printed at A gap \p aGap -- the full caller chain of each such
+  /// pseudo-invocation -- or std::nullopt when a chain there does not resolve.
+  ///
+  /// The producer records each `_Pragma` as a pseudo-invocation at the gap its
+  /// line is printed at; one with a caller came out of a macro expansion, and
+  /// its line is printed wherever that expansion lands.  An empty result means
+  /// no macro expansion printed a pragma at the gap.
+  std::optional<llvm::ArrayRef<uint64_t>>
+  PragmaExpansionAncestorsAtGap(uint64_t aGap) const;
+
   /// True iff \p m is lexically contained in a producer-recorded #define
   /// extent.
   bool IsInvocationInsideDefineDirective(
@@ -176,6 +187,13 @@ private:
   /// Built once with the invocation graph by walking each `__LINE__` record's
   /// caller chain upwards, so the query is a single lookup.
   llvm::DenseSet<uint64_t> lineObserverAncestorIds_;
+
+  /// Per A gap, the callers of every macro-produced `_Pragma` printed there;
+  /// see `PragmaExpansionAncestorsAtGap`.  Gaps whose chain does not resolve
+  /// are in `unresolvedPragmaExpansionGaps_` instead.
+  llvm::DenseMap<uint64_t, llvm::SmallVector<uint64_t, 4>>
+      pragmaExpansionAncestorsByGap_;
+  llvm::DenseSet<uint64_t> unresolvedPragmaExpansionGaps_;
 
   /// Per-run source-text cache used while building #define containment extents.
   /// It is intentionally not process-global because the producer working

@@ -51,6 +51,8 @@
 namespace clang {
 namespace refold {
 
+struct SidebandPragmaLinePairing;
+
 class LineDirectiveInserter;
 class RefoldBInsertionLedger;
 class RefoldArgTextRecovery;
@@ -122,6 +124,10 @@ public:
     /// owner is ruled out.  Borrowed: the set outlives the planner and may grow
     /// between refold attempts.
     const llvm::DenseSet<uint64_t> *ownersMustExpand = nullptr;
+
+    /// Where each `#pragma` line printed into A survived in B.  A candidate
+    /// that rewrites an invocation must carry the lines its expansion printed.
+    llvm::ArrayRef<SidebandPragmaLinePairing> sidebandPragmaLinePairings;
 
     // Borrowed proof services.  They are initialized before the macro planner
     // and outlive it; direct pointers keep the service graph explicit without

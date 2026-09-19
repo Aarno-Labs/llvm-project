@@ -26,6 +26,7 @@
 #include "macro/RefoldMacroPatchPlanner.h"
 #include "macro/RefoldMacroStateProof.h"
 #include "macro/RefoldMacroStateRepairPlanner.h"
+#include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofServices.h"
@@ -51,6 +52,63 @@ using namespace llvm;
 
 namespace clang {
 namespace refold {
+
+namespace {
+
+/// Derive the source carrier of every paired `#pragma` line.
+///
+/// The producer record printed into the line names its source: a directive's
+/// site, or a `_Pragma` operator's exact bytes.  When a macro expansion printed
+/// the line, the source that survives or not is the root invocation's
+/// spelling instead; a caller chain that does not resolve falls back to the
+/// record's own site, which the producer places at the invocation.  A line
+/// whose record does not bind uniquely yields no carrier, which leaves it to
+/// the planner's placement check alone.
+std::vector<PrintedPragmaCarrier>
+buildPrintedPragmaCarriers(const RefoldModel &model,
+                           const RefoldMacroTopology &topology,
+                           ArrayRef<SidebandPragmaLinePairing> pairings) {
+  std::vector<PrintedPragmaCarrier> carriers;
+  for (const SidebandPragmaLinePairing &line : pairings) {
+    if (!line.bNormalTokenGap)
+      continue;
+    const RefoldModel::PragmaDirective *record = nullptr;
+    bool unique = true;
+    for (const RefoldModel::PragmaDirective &pragma : model.GetPragmas()) {
+      if (!pragma.HasEmittedImage() || *pragma.ppByteBegin < line.aLineBegin ||
+          line.aLineEnd < *pragma.ppByteEnd)
+        continue;
+      unique = record == nullptr;
+      record = &pragma;
+    }
+    if (!record || !unique)
+      continue;
+
+    const std::optional<ArrayRef<uint64_t>> ancestors =
+        topology.PragmaExpansionAncestorsAtGap(line.aNormalTokenGap);
+    if (ancestors && !ancestors->empty()) {
+      for (uint64_t id : *ancestors) {
+        const RefoldModel::MacroInvocation *root =
+            topology.FindMacroInvocationById(id);
+        if (!root || root->callerMacroId || !root->invFile || !root->invB ||
+            !root->invE)
+          continue;
+        carriers.push_back({*root->invFile, root->ownerIncludeId, *root->invB,
+                            *root->invE, line.bLineBegin, line.bLineEnd});
+      }
+      continue;
+    }
+    const bool operatorBytes = ancestors && record->viaPragmaOperator &&
+                               record->operatorB && record->operatorE;
+    carriers.push_back({record->sitePath, record->ownerIncludeId,
+                        operatorBytes ? *record->operatorB : record->siteB,
+                        operatorBytes ? *record->operatorE : record->siteE,
+                        line.bLineBegin, line.bLineEnd});
+  }
+  return carriers;
+}
+
+} // namespace
 
 void RefoldEngine::BuildServiceGraph() {
   // The audit is built before the proof services, which take it by reference.
@@ -192,7 +250,8 @@ void RefoldEngine::BuildServiceGraph() {
           RefoldStructuralHunkTilingPlanner::Dependencies{
               model_, model_.GetSourcePath(), pathIdentity_, macroTopology_,
               *macroStateProof_, tokenTextAnalysis_, sourceMapper_,
-              tuSourceBytes_, bSource_, lexLang_, *ownerClassifier_,
+              tuSourceBytes_, bSource_, sidebandPragmaLinePairings_,
+              sidebandPragmaEdits_, lexLang_, *ownerClassifier_,
               *ownerStateProof_, *preprocessingStructureIndexProvider_,
               abTokHunks_, structuralHunkTilingWitnesses_,
               structuralHunkTilingSegmentBindings_});
@@ -246,6 +305,7 @@ void RefoldEngine::BuildServiceGraph() {
   patchDeps.wholeCoverPlanBuilder = wholeCoverPlanBuilder_.get();
   patchDeps.strict = strict_;
   patchDeps.ownersMustExpand = &ownersMustExpand_;
+  patchDeps.sidebandPragmaLinePairings = sidebandPragmaLinePairings_;
 
   patchDeps.macroStateProof = macroStateProof_.get();
   patchDeps.ownerStateProof = ownerStateProof_.get();
@@ -264,10 +324,12 @@ void RefoldEngine::BuildServiceGraph() {
 
   // Protected-source capabilities and materialization certification sit below
   // planning, so the planners, the layout and the assembler all borrow them.
+  printedPragmaCarriers_ = buildPrintedPragmaCarriers(
+      model_, macroTopology_, sidebandPragmaLinePairings_);
   textEditCertifier_ = std::make_unique<RefoldTextEditCertifier>(
       model_, bSource_, bToks_, sourceMapper_, pathIdentity_, lexLang_,
       *preprocessingStructureIndex_, *tuAnchorProof_, terminalSink_,
-      *theoremAudit_);
+      *theoremAudit_, printedPragmaCarriers_);
 
   lineObserverLayout_ = std::make_unique<RefoldLineObserverLayout>(
       model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, abTokMapB2A_,

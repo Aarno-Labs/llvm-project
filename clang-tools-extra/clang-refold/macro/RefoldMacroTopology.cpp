@@ -84,6 +84,54 @@ void RefoldMacroTopology::BuildMacroInvocationGraph() {
       callerId = caller->callerMacroId;
     }
   }
+
+  // Index the caller chain of every macro-produced `_Pragma` by the gaps its
+  // line is printed at.  The walk is bounded by the invocation count, so a
+  // cyclic caller_macro_id marks the gap unresolved instead of looping.
+  pragmaExpansionAncestorsByGap_.clear();
+  unresolvedPragmaExpansionGaps_.clear();
+  for (const auto &mi : macroInvocations) {
+    if (mi.name != "_Pragma" || !mi.callerMacroId)
+      continue;
+    llvm::SmallVector<uint64_t, 4> ancestors;
+    bool resolved = false;
+    std::optional<uint64_t> callerId = mi.callerMacroId;
+    for (size_t depth = 0; depth <= macroInvocations.size(); ++depth) {
+      if (!callerId) {
+        resolved = true;
+        break;
+      }
+      const RefoldModel::MacroInvocation *caller =
+          FindMacroInvocationById(*callerId);
+      if (!caller)
+        break;
+      ancestors.push_back(caller->id);
+      callerId = caller->callerMacroId;
+    }
+    for (const RefoldModel::PPSpan &span : mi.spans) {
+      for (uint64_t gap = span.begin; gap <= span.end; ++gap) {
+        if (!resolved) {
+          unresolvedPragmaExpansionGaps_.insert(gap);
+          continue;
+        }
+        llvm::SmallVector<uint64_t, 4> &atGap =
+            pragmaExpansionAncestorsByGap_[gap];
+        for (uint64_t id : ancestors)
+          if (!llvm::is_contained(atGap, id))
+            atGap.push_back(id);
+      }
+    }
+  }
+}
+
+std::optional<ArrayRef<uint64_t>>
+RefoldMacroTopology::PragmaExpansionAncestorsAtGap(uint64_t aGap) const {
+  if (unresolvedPragmaExpansionGaps_.contains(aGap))
+    return std::nullopt;
+  auto it = pragmaExpansionAncestorsByGap_.find(aGap);
+  if (it == pragmaExpansionAncestorsByGap_.end())
+    return ArrayRef<uint64_t>();
+  return ArrayRef<uint64_t>(it->second);
 }
 
 bool RefoldMacroTopology::ExpansionContainsLineObserver(

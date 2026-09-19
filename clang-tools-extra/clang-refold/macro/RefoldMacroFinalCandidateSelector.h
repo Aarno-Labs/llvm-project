@@ -27,6 +27,7 @@
 #include "model/RefoldModel.h"
 #include "proof/RefoldMacroPatchTypes.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstddef>
@@ -47,6 +48,7 @@ class RefoldMacroTopology;
 class RefoldMacroWholeCoverPlanBuilder;
 class RefoldAcceptedCandidateBuilder;
 class RefoldAcceptedResultRanker;
+struct SidebandPragmaLinePairing;
 
 /// Final whole-cover-family candidate selector.
 ///
@@ -69,6 +71,10 @@ public:
     /// Root invocations ruled out from keeping their callsite, or null when
     /// none are.  Borrowed from the planner's dependency bundle.
     const llvm::DenseSet<uint64_t> *ownersMustExpand = nullptr;
+
+    /// Where each `#pragma` line printed into A survived in B; see
+    /// `SidebandPragmaLinePairing`.  Borrowed from the planner's bundle.
+    llvm::ArrayRef<SidebandPragmaLinePairing> sidebandPragmaLinePairings;
 
     /// Whole-cover plan computation, and the plan/patch consistency check
     /// that gates reuse of an existing whole-cover patch for the same root.
@@ -103,6 +109,13 @@ public:
   Run(RefoldMacroWholeCoverPlanningContext &planningCtx) const;
 
 private:
+  /// Return the B gaps of the paired `#pragma` lines that \p m's expansion
+  /// printed: those whose `_Pragma` has \p m among its callers.  A gap whose
+  /// caller chain does not resolve counts when it lies within \p m's own
+  /// A-token extent, so an unknown producer is never assumed absent.
+  llvm::SmallVector<uint64_t, 2>
+  PrintedPragmaBGapsOf(const RefoldModel::MacroInvocation &m) const;
+
   Dependencies deps_;
 };
 

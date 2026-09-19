@@ -451,6 +451,41 @@ bool RefoldTUAnchorProof::CollectDirectTUMacroRepairEvidenceOrEmpty(
   return CollectDirectTUMacroRepairEvidence(begin, end, intervals);
 }
 
+bool RefoldTUAnchorProof::RangeHoldsOnlyPrintedPragmas(uint64_t begin,
+                                                       uint64_t end) const {
+  if (begin >= end)
+    return false;
+  uint64_t cursor = begin;
+  bool crossedPragma = false;
+  for (const PreprocessingStructureInterval *interval :
+       deps_.preprocessingStructureIndex.FindOverlapping(begin, end)) {
+    if (interval->begin < cursor || end < interval->end ||
+        interval->kind != PreprocessingStructureKind::Pragma ||
+        interval->modelKind !=
+            PreprocessingStructureModelKind::PragmaDirective ||
+        !interval->modelItemId ||
+        !deps_.preprocessingStructureIndex.IsRangeLexicallyIgnorable(
+            cursor, interval->begin))
+      return false;
+    const RefoldModel::PragmaDirective *record = nullptr;
+    for (const RefoldModel::PragmaDirective &pragma :
+         deps_.model.GetPragmas()) {
+      if (pragma.id != *interval->modelItemId)
+        continue;
+      if (record)
+        return false;
+      record = &pragma;
+    }
+    if (!record || !record->HasEmittedImage())
+      return false;
+    crossedPragma = true;
+    cursor = interval->end;
+  }
+  return crossedPragma &&
+         deps_.preprocessingStructureIndex.IsRangeLexicallyIgnorable(cursor,
+                                                                     end);
+}
+
 bool RefoldTUAnchorProof::ValidateOrdinaryDirectTUEnvelope(
     StringRef tuPath, uint64_t begin, uint64_t end) const {
   const RefoldPreprocessingStructureIndex &structure =
@@ -1529,13 +1564,25 @@ bool RefoldTUAnchorProof::ValidateTUOwnerRealizationCarrier(
     const TUInsertionAnchorAdjustment &adjustment =
         *span.insertionAnchorAdjustment;
     if (!adjustment.IsValid() ||
-        adjustment.kind !=
-            TUInsertionAnchorAdjustmentKind::SourceLineControlPrefix ||
         adjustment.originalTUByteOffset != baseAnchor ||
         adjustment.adjustedTUByteOffset != span.tuByteBegin ||
         span.tuByteBegin != span.tuByteEnd) {
       return false;
     }
+
+    // A printed-pragma placement may move either way; what it crosses is
+    // revalidated from the source index alone.
+    if (adjustment.kind ==
+        TUInsertionAnchorAdjustmentKind::PrintedPragmaPlacement) {
+      return RangeHoldsOnlyPrintedPragmas(
+          std::min(adjustment.originalTUByteOffset,
+                   adjustment.adjustedTUByteOffset),
+          std::max(adjustment.originalTUByteOffset,
+                   adjustment.adjustedTUByteOffset));
+    }
+    if (adjustment.kind !=
+        TUInsertionAnchorAdjustmentKind::SourceLineControlPrefix)
+      return false;
 
     // The adjustment theorem leaves the skipped #line structure physically in
     // place.  Revalidate that the complete byte interval between the original

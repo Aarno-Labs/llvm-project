@@ -171,6 +171,8 @@ class RefoldTextEditCertifier;
 class RefoldTokenDiffPlanner;
 class RefoldTUAnchorProof;
 class RefoldTUEditPlanner;
+struct PrintedPragmaInsertionPlacement;
+struct TUInsertionAnchorAdjustment;
 
 /// Per-pass policy and borrowed run state, fixed when a pass is built.
 ///
@@ -189,6 +191,9 @@ struct RefoldPassConfig {
   ProofAuditMode proofAuditMode = ProofAuditMode::Default;
   StringRef finalOutputPath;
   ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits;
+  /// Where each A sideband pragma line survived in B; see
+  /// `SidebandPragmaLinePairing`.
+  ArrayRef<SidebandPragmaLinePairing> sidebandPragmaLinePairings;
   std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr;
   FinalLineControlValidationCallback finalLineControlValidationCallback;
   /// Closing assembly check; absent for probes and candidate simulations.
@@ -686,6 +691,13 @@ private:
   /// occurrences are rejected by the structural pass because this single-file
   /// output cannot directly edit an arbitrary header.
   std::vector<SidebandPragmaEdit> sidebandPragmaEdits_;
+  /// Where each sideband pragma line removed from the A token stream survived
+  /// in B.  Structural tiling reads this to place a preserved directive at the
+  /// gap B printed it in.
+  std::vector<SidebandPragmaLinePairing> sidebandPragmaLinePairings_;
+  /// The source carrier of every paired line, derived from the pairings once
+  /// the macro topology exists; see `PrintedPragmaCarrier`.
+  std::vector<PrintedPragmaCarrier> printedPragmaCarriers_;
 
   RefoldStats lastStats_;
   mutable TheoremAuditStats lastTheoremAudit_;
@@ -1202,6 +1214,26 @@ private:
                                    StringRef tuBytes,
                                    std::pair<uint64_t, uint64_t> span);
 
+  /// Place a pure TU insertion among the printed pragma lines preserved at
+  /// its A gap; see `placeTUInsertionAmongPrintedPragmas`.  Non-insertions
+  /// and gaps without such lines report `NotApplicable`.
+  PrintedPragmaInsertionPlacement PlaceTUInsertionAmongPrintedPragmas(
+      const diffutils::Hunk &h, StringRef tuPath, uint64_t baseAnchor) const;
+
+  /// Return the B bytes a pure insertion replays: its token envelope, cut
+  /// before the first preserved pragma line B prints after it when
+  /// \p placement placed it.
+  StringRef
+  InsertionEnvelope(const diffutils::Hunk &h,
+                    const PrintedPragmaInsertionPlacement &placement) const;
+
+  /// Return the typed anchor adjustment an insertion's final site carries,
+  /// or std::nullopt when it still sits on its base anchor.
+  static std::optional<TUInsertionAnchorAdjustment>
+  InsertionAnchorAdjustment(const PrintedPragmaInsertionPlacement &placement,
+                            bool advancedOverSourceLineControlPrefix,
+                            uint64_t rawTUStart, uint64_t anchor);
+
   /// \brief Run the structural refold pass.
   ///
   /// The caller reacts to typed requests recorded in RefoldTerminalProofSink by
@@ -1257,6 +1289,7 @@ Expected<std::string> refoldTranslationUnit(
     ProofAuditMode proofAuditMode = ProofAuditMode::Default,
     StringRef finalOutputPath = StringRef(),
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits = {},
+    ArrayRef<SidebandPragmaLinePairing> sidebandPragmaLinePairings = {},
     std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr,
     FinalLineControlValidationCallback finalLineControlValidationCallback =
         FinalLineControlValidationCallback(),

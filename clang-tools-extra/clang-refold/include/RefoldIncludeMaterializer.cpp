@@ -750,6 +750,13 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
                   {},
                   {}};
     edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
+    // Record the B bytes this edit replays, as the translation-unit sideband
+    // path does, so the emission audit can see which surviving lines it
+    // carries.
+    const std::pair<uint64_t, uint64_t> replayRange =
+        sideband.MaterializedBByteRange();
+    textEditCertifier_.CertifyTextEditMaterializedBByteRange(
+        edit, replayRange.first, replayRange.second);
     const PreprocessingStructureKind pragmaKinds[] = {
         PreprocessingStructureKind::Pragma,
         PreprocessingStructureKind::PragmaOperator};

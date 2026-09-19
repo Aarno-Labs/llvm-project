@@ -14,6 +14,8 @@
 
 #include "edit/RefoldTextEditCertifier.h"
 
+#include "proof/RefoldSidebandReplayProof.h"
+
 #include "edit/RefoldTUAnchorProof.h"
 #include "proof/RefoldAcceptedResultPredicates.h"
 #include "proof/RefoldTerminalProofSink.h"
@@ -404,13 +406,15 @@ RefoldTextEditCertifier::RefoldTextEditCertifier(
     const RefoldPreprocessingStructureIndex &tuPreprocessingStructureIndex,
     const RefoldTUAnchorProof &tuAnchorProof,
     const RefoldTerminalProofSink &terminalSink,
-    const RefoldTheoremAudit &theoremAuditService)
+    const RefoldTheoremAudit &theoremAuditService,
+    ArrayRef<PrintedPragmaCarrier> printedPragmaCarriers)
     : model_(model), bSource_(bSource), bToks_(bToks),
       sourceMapper_(sourceMapper), pathIdentity_(pathIdentity),
       lexLang_(lexLang),
       tuPreprocessingStructureIndex_(tuPreprocessingStructureIndex),
       tuAnchorProof_(tuAnchorProof), terminalSink_(terminalSink),
-      theoremAuditService_(theoremAuditService) {}
+      theoremAuditService_(theoremAuditService),
+      printedPragmaCarriers_(printedPragmaCarriers) {}
 
 RefoldTextEditCertifier::~RefoldTextEditCertifier() = default;
 
@@ -842,6 +846,53 @@ bool RefoldTextEditCertifier::AuditGlobalSourceEditInvariant(
     return reject("global source-edit audit has an incomplete physical "
                   "preprocessing census");
 
+  // An edit that consumes the source printing a surviving `#pragma` line
+  // removes that line from the output, so it must replay B's copy itself.  A
+  // zero-width edit consumes the carrier only by landing strictly inside it.
+  //
+  // A recorded B range is a token envelope: it runs to the start of the next
+  // token, past the last byte a replacement actually writes.  So the line
+  // counts as replayed only when a B token inside the range follows it, which
+  // puts it inside every realizer's replay, or when the range holds no token
+  // at all and so replays sideband lines alone.
+  const ArrayRef<size_t> bTokOff = sourceMapper_.BTokenByteOffsets();
+  auto rangeReplaysLine = [&](uint64_t begin, uint64_t end,
+                              const PrintedPragmaCarrier &carrier) {
+    if (carrier.bLineBegin < begin || end < carrier.bLineEnd || bTokOff.empty())
+      return false;
+    const ArrayRef<size_t> tokens = bTokOff.drop_back();
+    const size_t *firstInRange = llvm::lower_bound(tokens, begin);
+    if (firstInRange == tokens.end() || *firstInRange >= end)
+      return true;
+    const size_t *firstAfterLine = llvm::lower_bound(tokens, carrier.bLineEnd);
+    return firstAfterLine != tokens.end() && *firstAfterLine < end;
+  };
+  for (const PrintedPragmaCarrier &carrier : printedPragmaCarriers_) {
+    if (carrier.ownerIncludeId != ownerIncludeId ||
+        !pathIdentity_.PathsEqual(carrier.path, emissionOwner))
+      continue;
+    for (const TextEdit &edit : edits) {
+      const bool consumes = edit.start == edit.end
+                                ? carrier.sourceBegin < edit.start &&
+                                      edit.start < carrier.sourceEnd
+                                : edit.start < carrier.sourceEnd &&
+                                      carrier.sourceBegin < edit.end;
+      if (!consumes)
+        continue;
+      if (!edit.materializedBByteBegin || !edit.materializedBByteEnd ||
+          !rangeReplaysLine(*edit.materializedBByteBegin,
+                            *edit.materializedBByteEnd, carrier))
+        return reject(
+            llvm::formatv("edit source=[{0},{1}) consumes the source [{2},{3}) "
+                          "printing a surviving #pragma line but does not "
+                          "replay its B copy [{4},{5})",
+                          edit.start, edit.end, carrier.sourceBegin,
+                          carrier.sourceEnd, carrier.bLineBegin,
+                          carrier.bLineEnd)
+                .str());
+    }
+  }
+
   for (const TextEdit &edit : edits) {
     if (edit.start > edit.end || edit.end > originalFileText.size())
       return reject("global source-edit audit found an out-of-bounds edit");
@@ -1011,17 +1062,17 @@ bool RefoldTextEditCertifier::AuditGlobalSourceEditInvariant(
 
       const bool ordinaryContainingSpan =
           finalBegin <= rawBegin && rawEnd <= finalEnd;
-      const bool adjustedPureInsertion =
+      const bool movedPureInsertion =
           edit.directTUHunkAStart && edit.directTUHunkAEnd &&
           edit.directTUHunkBStart && edit.directTUHunkBEnd &&
           *edit.directTUHunkAStart == *edit.directTUHunkAEnd &&
           *edit.directTUHunkBStart < *edit.directTUHunkBEnd &&
-          rawBegin == rawEnd && finalBegin == finalEnd &&
-          rawBegin < finalBegin;
+          rawBegin == rawEnd && finalBegin == finalEnd;
+      const bool adjustedPureInsertion =
+          movedPureInsertion && rawBegin != finalBegin;
       if (!ordinaryContainingSpan && !adjustedPureInsertion)
         return reject("direct TU edit does not contain its raw carrier and is "
-                      "not a forward source-line-control insertion "
-                      "adjustment");
+                      "not a moved pure insertion");
 
       // Revalidate the original token-derived carrier against the immutable
       // source index instead of trusting that normalization preserved the
@@ -1035,10 +1086,18 @@ bool RefoldTextEditCertifier::AuditGlobalSourceEditInvariant(
       }
 
       if (adjustedPureInsertion) {
-        // The only admitted movement of a direct insertion anchor is past a
-        // source-authored line-control prefix that remains physically in place.
-        // Recompute that exact topology here instead of trusting the earlier
-        // adjustment witness after edit normalization.
+        // Two movements of a direct insertion anchor are admitted, each across
+        // structure that remains physically in place: in either direction
+        // across printed pragmas, placing the insertion on the side of each
+        // that B prints it; or forward past a source-authored line-control
+        // prefix.  Recompute that exact topology here instead of trusting the
+        // earlier adjustment witness after edit normalization.
+        if (tuAnchorProof_.RangeHoldsOnlyPrintedPragmas(
+                std::min(rawBegin, finalBegin), std::max(rawBegin, finalBegin)))
+          continue;
+        if (finalBegin < rawBegin)
+          return reject("direct TU insertion moved backwards across structure "
+                        "other than printed pragmas");
         uint64_t cursor = rawBegin;
         bool sawLineControl = false;
         for (const PreprocessingStructureInterval *interval :

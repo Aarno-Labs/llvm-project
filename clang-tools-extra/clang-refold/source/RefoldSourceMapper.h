@@ -157,6 +157,10 @@ public:
   std::optional<std::pair<uint64_t, uint64_t>>
   BTokenRangeToByteRange(uint64_t bTokBegin, uint64_t bTokEnd) const;
 
+  /// Return the start offset of every B token in B, in order, followed by one
+  /// sentinel offset past the last token.
+  llvm::ArrayRef<size_t> BTokenByteOffsets() const { return bTokOff_; }
+
   /// Slice the edited B-side preprocessed source by the bytes its tokens
   /// physically occupy: from the first token's first byte through the last
   /// token's last byte.

@@ -394,6 +394,7 @@ Expected<std::string> refoldTranslationUnit(
     ArrayRef<size_t> bTokOff, bool noLines, bool strict,
     ProofAuditMode proofAuditMode, StringRef finalOutputPath,
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
+    ArrayRef<SidebandPragmaLinePairing> sidebandPragmaLinePairings,
     std::vector<MaterializedEditMapping> *materializedEditMappings,
     FinalLineControlValidationCallback finalLineControlValidationCallback,
     OutputVerificationMode verifyMode,
@@ -545,6 +546,7 @@ Expected<std::string> refoldTranslationUnit(
     config.proofAuditMode = proofAuditMode;
     config.finalOutputPath = finalOutputPath;
     config.sidebandPragmaEdits = sidebandPragmaEdits;
+    config.sidebandPragmaLinePairings = sidebandPragmaLinePairings;
     config.materializedEditMappings = materializedEditMappings;
     // Copied, not moved: this runs once per attempt, and a moved-from callback
     // would silently disable final line-control validation for every attempt
@@ -648,6 +650,7 @@ Expected<std::string> refoldTranslationUnit(
         probeConfig.proofAuditMode = proofAuditMode;
         probeConfig.finalOutputPath = finalOutputPath;
         probeConfig.sidebandPragmaEdits = sidebandPragmaEdits;
+        probeConfig.sidebandPragmaLinePairings = sidebandPragmaLinePairings;
         probeConfig.materializedEditMappings =
             materializedEditMappings ? &probeMaterializedEditMappings : nullptr;
         // A probe stops before final line-control pruning, the callback's only

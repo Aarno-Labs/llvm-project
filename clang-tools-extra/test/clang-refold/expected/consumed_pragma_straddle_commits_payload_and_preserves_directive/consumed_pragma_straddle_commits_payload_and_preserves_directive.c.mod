@@ -10,8 +10,8 @@
 //   * The preprocessor emits nothing for this spelling.  That is a producer
 //     fact -- the pragma has no recorded image in A -- and not a guess from the
 //     directive text.  A pragma clang re-emits is spelled into both streams and
-//     the payload's side of it *is* token order; see
-//     `surviving_pragma_straddle_refuses`, which must keep refusing.
+//     the payload's side of it *is* token order, which B fixes; see
+//     `surviving_pragma_straddle_commits_payload_after_printed_directive`.
 //   * `region` changes no state a payload could observe and binds to nothing
 //     that follows it.  Clang registers `PragmaRegionHandler` for `region` and
 //     `endregion` with an empty handler body, documented as an editor-only
