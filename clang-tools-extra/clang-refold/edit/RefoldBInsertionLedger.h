@@ -95,15 +95,6 @@ public:
   llvm::SmallVector<std::pair<size_t, size_t>, 4>
   ClipBTokenRangeAgainstClaims(size_t bTokStart, size_t bTokEnd) const;
 
-  /// \brief Slice \c [bTokStart,bTokEnd) from B while omitting claimed
-  /// insertion segments.
-  ///
-  /// This concatenates the B-token segments returned by \c
-  /// ClipBTokenRangeAgainstClaims and returns the resulting B-source byte
-  /// sequence.
-  std::string SliceBSourceClippedAgainstClaims(size_t bTokStart,
-                                               size_t bTokEnd) const;
-
   /// Return all tracked pure-insertion segments.
   const std::vector<BInsertionProv> &Insertions() const { return bInsertions_; }
 

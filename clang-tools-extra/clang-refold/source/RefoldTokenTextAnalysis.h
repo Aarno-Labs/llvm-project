@@ -77,21 +77,6 @@ public:
       llvm::StringRef name, llvm::StringRef text,
       llvm::StringRef suffix = llvm::StringRef()) const;
 
-  /// Return true when `text` plus the optional preserved `suffix` contains a
-  /// real function-like invocation of `name`.
-  bool FunctionLikeInvocationAppearsInText(
-      llvm::StringRef name, llvm::StringRef text,
-      llvm::StringRef suffix = llvm::StringRef()) const;
-
-  /// True iff \p text contains a line-state builtin observer token.
-  bool TextMentionsLineObserver(llvm::StringRef text) const;
-
-  /// True iff \p text contains a file-spelling builtin observer token.
-  bool TextMentionsFileObserver(llvm::StringRef text) const;
-
-  /// True iff \p text contains a `__COUNTER__` observer/consumer token.
-  bool TextMentionsCounterObserver(llvm::StringRef text) const;
-
   /// Return true when `text` contains an exact preprocessing directive line.
   ///
   /// Macro-state transitions may cross ordinary source bytes only when those

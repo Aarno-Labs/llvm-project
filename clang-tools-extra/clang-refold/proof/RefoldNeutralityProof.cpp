@@ -1117,11 +1117,6 @@ bool macroInvocationIsSourceNeutralZeroToken(
 // Public non-adapter entry points.
 //===----------------------------------------------------------------------===//
 
-bool sourceTextIsOnlyIgnorableGapTrivia(StringRef text,
-                                        const LangOptions &lang) {
-  return sourceTextIsOnlyWhitespaceAndCompleteComments(text, lang);
-}
-
 /// Return whether one recorded pragma is a `#pragma once`.
 ///
 /// Matched on the producer-recorded directive text after the `#`/`pragma`

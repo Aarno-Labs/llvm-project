@@ -184,11 +184,6 @@ RefoldMacroPatchPlanner::RefoldMacroPatchPlanner(Dependencies deps)
 // Borrowed proof service accessors
 //===----------------------------------------------------------------------===//
 
-RefoldMacroStateProof &RefoldMacroPatchPlanner::GetMacroStateProof() const {
-  assert(deps_.macroStateProof && "macro planner requires macro-state proof");
-  return *deps_.macroStateProof;
-}
-
 RefoldOwnerStateProof &RefoldMacroPatchPlanner::GetOwnerStateProof() const {
   assert(deps_.ownerStateProof && "macro planner requires owner-state proof");
   return *deps_.ownerStateProof;

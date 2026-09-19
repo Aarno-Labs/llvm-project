@@ -131,22 +131,5 @@ void RefoldMacroPatchProofCertifier::
   deps_.macroPatchProofClassifier.SetMacroPatchProof(patch, std::move(proof));
 }
 
-void RefoldMacroPatchProofCertifier::AttachArgsOnlyProofCarrier(
-    MacroPatch &patch, const RefoldModel::MacroInvocation &invocation,
-    bool wholeEnvelopeReplayValidated,
-    bool definitionTapeReplayValidated) const {
-  SetArgsOnlyStandardProof(patch, invocation, wholeEnvelopeReplayValidated,
-                           definitionTapeReplayValidated);
-}
-
-void RefoldMacroPatchProofCertifier::CertifyArgsOnlyAcceptedCandidate(
-    MacroPatch &patch, uint64_t outputByteStart, uint64_t outputByteEnd,
-    uint64_t bTokenStart, uint64_t bTokenEnd) const {
-  patch.materialized.hasOutputByteRange = true;
-  patch.materialized.outputByteStart = outputByteStart;
-  patch.materialized.outputByteEnd = outputByteEnd;
-  certifyMacroPatchMaterializedBTokenRange(patch, bTokenStart, bTokenEnd);
-}
-
 } // namespace refold
 } // namespace clang

@@ -105,24 +105,6 @@ public:
       MacroPatch &patch, const RefoldModel::MacroInvocation &rootInvocation,
       RecursiveTupleGeneratedCalleeReplayWitness witness) const;
 
-  /// Install the args-only proof carrier on the patch.  Thin wrapper over
-  /// `SetArgsOnlyStandardProof` named for the args-only-template-solver call
-  /// site that uses it.
-  void
-  AttachArgsOnlyProofCarrier(MacroPatch &patch,
-                             const RefoldModel::MacroInvocation &invocation,
-                             bool wholeEnvelopeReplayValidated,
-                             bool definitionTapeReplayValidated) const;
-
-  /// Certify an args-only accepted candidate: record the materialized output
-  /// byte range and B-token range together.  Atomic with
-  /// `AttachArgsOnlyProofCarrier`.
-  void CertifyArgsOnlyAcceptedCandidate(MacroPatch &patch,
-                                        uint64_t outputByteStart,
-                                        uint64_t outputByteEnd,
-                                        uint64_t bTokenStart,
-                                        uint64_t bTokenEnd) const;
-
 private:
   Dependencies deps_;
 };

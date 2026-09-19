@@ -197,7 +197,6 @@ public:
     const RefoldMacroDAGTextPrimitives &textPrimitives;
     const RefoldMacroDAGInvertibilitySolver &invertibilitySolver;
     const RefoldMacroDAGStructuredLifter &structuredLifter;
-    const RefoldMacroDAGSubtreeCertifier &subtreeCertifier;
     const RefoldSourceMapper &sourceMapper;
     llvm::ArrayRef<PPTok> bToks;
     const RefoldArgTextRecovery &argTextRecovery;

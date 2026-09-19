@@ -70,17 +70,11 @@ inline bool refoldHasSafeSynthesizedRelativeComponents(llvm::StringRef path) {
 /// synthesized into emitted source.  The accepted grammar is intentionally
 /// narrow: non-empty ASCII path components using [A-Za-z0-9_./-], with no
 /// backslashes, quotes, absolute path spelling, empty components, `.`, or `..`.
+/// It enforces only this no-escape path contract; the caller separately proves
+/// replay and source-graph semantics and chooses quoted or angled delimiters.
 inline bool safeSynthesizedRelativeIncludeOperandPath(llvm::StringRef path) {
   return refoldHasSafeIncludePathSpelling(path) &&
          refoldHasSafeSynthesizedRelativeComponents(path);
-}
-
-/// Predicate for synthesized relative operands that may be emitted into an
-/// include directive after the caller has separately proven replay/source-graph
-/// semantics.  The caller chooses quoted vs. angled delimiters; this helper
-/// only enforces the relative no-escape path contract.
-inline bool safeSynthesizedRelativeIncludeOperand(llvm::StringRef path) {
-  return safeSynthesizedRelativeIncludeOperandPath(path);
 }
 
 /// Return the logical filename spelling to restore for an include edge.

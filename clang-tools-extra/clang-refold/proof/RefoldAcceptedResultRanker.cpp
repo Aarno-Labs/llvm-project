@@ -216,12 +216,6 @@ RefoldAcceptedResultRanker::CompareAcceptedResultCandidateProofs(
   return ProofDominanceOrder::Incomparable;
 }
 
-bool RefoldAcceptedResultRanker::AcceptedResultCandidateProofPrefers(
-    const AcceptedResultCandidate &lhs, const AcceptedResultCandidate &rhs) {
-  return CompareAcceptedResultCandidateProofs(lhs, rhs) ==
-         ProofDominanceOrder::LeftDominates;
-}
-
 bool RefoldAcceptedResultRanker::AcceptedResultCandidateCanonicalPrefers(
     const AcceptedResultCandidate &lhs, const AcceptedResultCandidate &rhs) {
   // The proof order intentionally stays coarse. When two summaries tie, prefer
@@ -522,16 +516,6 @@ RefoldAcceptedResultRanker::SelectPreferredAcceptedResultCandidate(
           *bestIdx),
       *bestIdx);
   return selected;
-}
-
-std::optional<size_t>
-RefoldAcceptedResultRanker::SelectPreferredAcceptedResultCandidateIndex(
-    ArrayRef<AcceptedResultCandidate> candidates) const {
-  std::optional<SelectedAcceptedResultCandidate> selected =
-      SelectPreferredAcceptedResultCandidate(candidates);
-  if (!selected)
-    return std::nullopt;
-  return selected->index;
 }
 
 } // namespace refold

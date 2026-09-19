@@ -212,27 +212,6 @@ RefoldTokenTextAnalysis::FirstFunctionLikeInvocationOffsetInText(
   }
 }
 
-bool RefoldTokenTextAnalysis::FunctionLikeInvocationAppearsInText(
-    StringRef name, StringRef text, StringRef suffix) const {
-  return FirstFunctionLikeInvocationOffsetInText(name, text, suffix)
-      .has_value();
-}
-
-bool RefoldTokenTextAnalysis::TextMentionsLineObserver(StringRef text) const {
-  return RawIdentifierAppearsInText("__LINE__", text);
-}
-
-bool RefoldTokenTextAnalysis::TextMentionsFileObserver(StringRef text) const {
-  return RawIdentifierAppearsInText("__FILE__", text) ||
-         RawIdentifierAppearsInText("__FILE_NAME__", text) ||
-         RawIdentifierAppearsInText("__BASE_FILE__", text);
-}
-
-bool RefoldTokenTextAnalysis::TextMentionsCounterObserver(
-    StringRef text) const {
-  return RawIdentifierAppearsInText("__COUNTER__", text);
-}
-
 bool RefoldTokenTextAnalysis::TextContainsDirectiveLine(StringRef text) const {
   return lineHasPreprocessingDirectiveIntroducer(text, lexLang_);
 }

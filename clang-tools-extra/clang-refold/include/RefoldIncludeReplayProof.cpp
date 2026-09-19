@@ -432,7 +432,7 @@ IncludeReplayProofContext::StableContainedRelativeOperand(
     return std::nullopt;
 
   const std::string operand = relative.generic_string();
-  if (!safeSynthesizedRelativeIncludeOperand(operand))
+  if (!safeSynthesizedRelativeIncludeOperandPath(operand))
     return std::nullopt;
   return operand;
 }
@@ -1634,7 +1634,7 @@ IncludeReplayProofContext::EvaluateIncludeReplayCandidate(
 void IncludeReplayProofContext::AppendQuotedChildIncludeRewriteCandidate(
     SmallVectorImpl<QuotedChildIncludeRewriteCandidate> &candidates,
     StringRef operand) const {
-  if (operand.empty() || !safeSynthesizedRelativeIncludeOperand(operand))
+  if (operand.empty() || !safeSynthesizedRelativeIncludeOperandPath(operand))
     return;
   for (const QuotedChildIncludeRewriteCandidate &existing : candidates) {
     if (StringRef(existing.operand) == operand)

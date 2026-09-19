@@ -175,19 +175,3 @@ RefoldBInsertionLedger::ClipBTokenRangeAgainstClaims(size_t bTokStart,
 
   return segs;
 }
-
-std::string
-RefoldBInsertionLedger::SliceBSourceClippedAgainstClaims(size_t bTokStart,
-                                                         size_t bTokEnd) const {
-  SmallVector<std::pair<size_t, size_t>, 4> segs =
-      ClipBTokenRangeAgainstClaims(bTokStart, bTokEnd);
-  if (segs.empty())
-    return std::string();
-
-  std::string out;
-  for (const auto &s : segs) {
-    StringRef frag = deps_.sourceMapper.SliceBSource(s.first, s.second);
-    out.append(frag.begin(), frag.end());
-  }
-  return out;
-}

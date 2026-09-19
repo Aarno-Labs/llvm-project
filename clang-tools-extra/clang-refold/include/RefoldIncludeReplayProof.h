@@ -73,9 +73,6 @@ struct IncludeReplayProofServices {
 
   llvm::function_ref<bool(const RefoldModel::MacroInvocation &macro)>
       lineStateBuiltinInvocationIsPreservedObserver;
-
-  llvm::function_ref<LineStateObserverDemand(uint64_t includeId)>
-      includeSubtreeLineStateObserverDemand;
 };
 
 /// Proves whether source-spelled include edges can be replayed after

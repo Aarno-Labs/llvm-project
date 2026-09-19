@@ -42,17 +42,6 @@ namespace refold {
 class RefoldMacroStateProof;
 class RefoldPathIdentity;
 
-/// Return true iff a source-gap byte slice is ignorable preprocessing trivia.
-///
-/// Structural tiling uses this predicate only for bytes that sit between
-/// modeled zero-token state owners.  The raw lexer accepts whitespace, complete
-/// comments, and physical escaped-newline splices according to the producer
-/// language mode; any real token/directive-looking byte means the source gap is
-/// not fully covered by modeled owners and therefore cannot be silently crossed
-/// by a structural tiling proof.
-bool sourceTextIsOnlyIgnorableGapTrivia(llvm::StringRef text,
-                                        const clang::LangOptions &lang);
-
 //===----------------------------------------------------------------------===//
 // Conditional-island and balanced diagnostic-pragma neutrality proofs.
 //===----------------------------------------------------------------------===//

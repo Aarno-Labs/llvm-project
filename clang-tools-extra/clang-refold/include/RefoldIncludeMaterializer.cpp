@@ -273,18 +273,6 @@ struct IncludeReplayLineStateBuiltinInvocationIsPreservedObserver {
   }
 };
 
-/// Adapter for include-subtree line-state observer demand.
-/// The callable keeps demand classification scoped to the proof invocation.
-struct IncludeReplayIncludeSubtreeLineStateObserverDemand {
-  /// Line-control proof service used for subtree demand classification.
-  const RefoldLineControlProof &lineControlProof_;
-
-  /// Returns the observer demand required by the include subtree.
-  LineStateObserverDemand operator()(uint64_t includeId) const {
-    return lineControlProof_.IncludeSubtreeLineStateObserverDemand(includeId);
-  }
-};
-
 struct IncludeDirectiveHeaderOperandRange {
   size_t begin = 0;
   size_t end = 0;
@@ -1046,16 +1034,13 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
   IncludeReplayLineStateBuiltinInvocationIsPreservedObserver
       includeReplayLineStateBuiltinInvocationIsPreservedObserver{
           lineControlProof_};
-  IncludeReplayIncludeSubtreeLineStateObserverDemand
-      includeReplayIncludeSubtreeLineStateObserverDemand{lineControlProof_};
 
   IncludeReplayProofInputs includeReplayProofInputs{model_, aSource_, lineDirs_,
                                                     finalReplaySurface_};
   IncludeReplayProofServices includeReplayProofServices{
       includeReplaySliceASource, includeReplaySamePhysicalIncludeFile,
       includeReplayLineStateObservableMacroSite,
-      includeReplayLineStateBuiltinInvocationIsPreservedObserver,
-      includeReplayIncludeSubtreeLineStateObserverDemand};
+      includeReplayLineStateBuiltinInvocationIsPreservedObserver};
   IncludeReplayProofContext includeReplayProof(includeReplayProofInputs,
                                                includeReplayProofServices);
 

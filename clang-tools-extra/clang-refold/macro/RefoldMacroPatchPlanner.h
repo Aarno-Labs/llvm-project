@@ -301,10 +301,6 @@ public:
       ExistingMacroPatchContext existingContext) const;
 
 private:
-  /// Return the borrowed macro-state proof service.  The named accessor
-  /// centralizes the invariant that service-graph construction installed a
-  /// stable proof service before the planner was created.
-  RefoldMacroStateProof &GetMacroStateProof() const;
 
   RefoldMacroOccurrenceReplay OccurrenceReplay() const;
   RefoldMacroActualLayout ActualLayout() const;

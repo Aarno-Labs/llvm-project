@@ -170,16 +170,6 @@ public:
   CompareAcceptedResultCandidateProofs(const AcceptedResultCandidate &lhs,
                                        const AcceptedResultCandidate &rhs);
 
-  /// Return whether \p lhs has a strictly stronger proof than \p rhs.
-  ///
-  /// Thin spelling of `CompareAcceptedResultCandidateProofs(...) ==
-  /// LeftDominates`, kept for call sites that only need the strict answer.  A
-  /// caller that must also act on incomparability should ask for the order
-  /// directly rather than probing this predicate in both directions.
-  static bool
-  AcceptedResultCandidateProofPrefers(const AcceptedResultCandidate &lhs,
-                                      const AcceptedResultCandidate &rhs);
-
   /// Deterministic canonical tie-breaker for already-valid candidates.
   ///
   /// This predicate is intentionally not a proof obligation.  It may order
@@ -255,14 +245,6 @@ public:
   /// against the no-legacy theorem-audit ledger before returning.
   std::optional<::clang::refold::SelectedAcceptedResultCandidate>
   SelectPreferredAcceptedResultCandidate(
-      llvm::ArrayRef<AcceptedResultCandidate> candidates) const;
-
-  /// Compatibility wrapper returning only the selected index.
-  ///
-  /// Existing callers that do not own a concrete artifact can still ask for the
-  /// index, but the implementation delegates to the carrier-returning selector
-  /// above so there is only one selection authority.
-  std::optional<size_t> SelectPreferredAcceptedResultCandidateIndex(
       llvm::ArrayRef<AcceptedResultCandidate> candidates) const;
 
 private:

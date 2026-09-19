@@ -79,9 +79,8 @@ RefoldMacroDAGLiftingPhase::RefoldMacroDAGLiftingPhase(Dependencies deps)
           textPrimitives_, structuredLifter_}),
       candidateValidator_(RefoldMacroDAGCandidateValidator::Dependencies{
           textPrimitives_, invertibilitySolver_, structuredLifter_,
-          subtreeCertifier_, deps_.sourceMapper, deps_.bToks,
-          deps_.argTextRecovery, deps_.macroTopology,
-          deps_.macroPatchProofClassifier, deps_.lexLang,
+          deps_.sourceMapper, deps_.bToks, deps_.argTextRecovery,
+          deps_.macroTopology, deps_.macroPatchProofClassifier, deps_.lexLang,
           deps_.getMacroInvocationFormalArgContentRanges,
           deps_.wholeCoverPlanBuilder}) {}
 
