@@ -1308,171 +1308,12 @@ bool RefoldEngine::DispatchStructuralHunks(
     }
 
     if (mapsToTU) {
-      auto spanPlan =
-          tuAnchorProof_->PlanTUByteSpan(h.aStart, h.aEnd, tuPath); // [b,e)
-      PrintedPragmaInsertionPlacement pragmaPlacement;
-      if (spanPlan) {
-        pragmaPlacement =
-            PlaceTUInsertionAmongPrintedPragmas(h, spanPlan->tuByteBegin);
-        if (pragmaPlacement.kind ==
-            PrintedPragmaInsertionPlacement::Kind::Refused)
-          spanPlan.reset();
-      }
-      if (spanPlan) {
-        auto span = spanPlan->byteRange();
-
-        std::string repl;
-        const uint64_t rawTUStart = span.first;
-        const uint64_t rawTUEnd = span.second;
-        std::optional<uint64_t> materializedBByteBegin;
-        std::optional<uint64_t> materializedBByteEnd;
-        if (auto bBytes =
-                sourceMapper_.BTokenRangeToByteRange(h.bStart, h.bEnd)) {
-          materializedBByteBegin = bBytes->first;
-          materializedBByteEnd = bBytes->second;
-        }
-
-        if (pragmaPlacement.kind ==
-            PrintedPragmaInsertionPlacement::Kind::Placed) {
-          span = {pragmaPlacement.tuByteOffset, pragmaPlacement.tuByteOffset};
-          if (pragmaPlacement.bByteEnd)
-            materializedBByteEnd = *pragmaPlacement.bByteEnd;
-        }
-
-        if (h.bStart < h.bEnd) {
-          StringRef bSlice =
-              h.isInsertOnly()
-                  ? InsertionEnvelope(h, pragmaPlacement)
-                  : refoldSliceExactTokenCoverage(bTokOff_, bToks_, bSource_,
-                                                  h.bStart, h.bEnd);
-          repl.assign(bSlice.data(), bSlice.data() + bSlice.size());
-          if (h.isInsertOnly()) {
-            // Pure insertions use the token envelope, which may include
-            // zero-normal-token sideband directive lines adjacent to the
-            // ordinary inserted tokens.  If a sideband replacement/deletion is
-            // also proved and materialized through its owning include/TU atom,
-            // the ordinary insertion must not replay the same B bytes.
-            std::optional<uint64_t> envelopeBegin;
-            std::optional<uint64_t> envelopeEnd;
-            if (!bSlice.empty()) {
-              envelopeBegin =
-                  static_cast<uint64_t>(bSlice.data() - bSource_.data());
-              envelopeEnd =
-                  *envelopeBegin + static_cast<uint64_t>(bSlice.size());
-            }
-            repl = stripSeparatelyOwnedSidebandReplay(
-                sidebandPragmaEdits_, repl, envelopeBegin, envelopeEnd);
-          }
-          const size_t b0 = bTokOff_[static_cast<size_t>(h.bStart)];
-
-          // Token-envelope byte ranges begin at the first inserted token, so
-          // they do not include any spaces or tabs that appear immediately
-          // before that token in B on the same line. For a zero-width TU
-          // insertion, preserve those preceding spaces or tabs when forming
-          // the inserted text, unless equivalent spacing is already present
-          // immediately to the left of the insertion point in the TU.
-          if (span.first == span.second && h.bStart > 0) {
-            size_t p = b0;
-            while (p > 0) {
-              char c = bSource_[p - 1];
-              if (c == ' ' || c == '\t') {
-                --p;
-                continue;
-              }
-              break;
-            }
-            if (p < b0) {
-              bool hasSpaceLeft =
-                  (span.first > 0 && (tuBytes[span.first - 1] == ' ' ||
-                                      tuBytes[span.first - 1] == '\t'));
-              if (!hasSpaceLeft) {
-                repl.insert(0, std::string(bSource_.data() + p, b0 - p));
-                materializedBByteBegin = static_cast<uint64_t>(p);
-              }
-            }
-          }
-        }
-
-        bool consumedSeparatorGapForPunctuation = false;
-
-        if (h.isInsertOnly()) {
-          // B attaches the inserted content to its left neighbour iff there is
-          // no whitespace before the first inserted B token.
-          const size_t bStartIdx = static_cast<size_t>(h.bStart);
-          const bool replayAttachesLeftInB =
-              bStartIdx < bTokOff_.size() && bTokOff_[bStartIdx] > 0 &&
-              !stringutils::isWs(bSource_[bTokOff_[bStartIdx] - 1]);
-          consumedSeparatorGapForPunctuation =
-              maybeConsumeLeftSourceGapWhenBAttaches(
-                  model_, pathIdentity_, tuPath, tuBytes, span, StringRef(repl),
-                  replayAttachesLeftInB, lexLang_);
-        }
-
-        tuEditPlanner_->MaybeExtendTUSpanOverClosedTrailingCallSuffix(
-            h, tuPath, tuBytes, repl, span);
-
-        const bool advancedOverSourceLineControlPrefix =
-            pragmaPlacement.kind !=
-                PrintedPragmaInsertionPlacement::Kind::Placed &&
-            maybeAdvanceTUInsertionPastSourceLineControlPrefix(
-                *tuAnchorProof_, lineControlProof_, h, tuPath, tuBytes, span);
-        std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment =
-            InsertionAnchorAdjustment(pragmaPlacement,
-                                      advancedOverSourceLineControlPrefix,
-                                      rawTUStart, span.first);
-
-        // Is this span replacing a TU "gap" (bytes that are all whitespace)?
-        std::string original;
-        if (span.second > span.first) {
-          original.assign(tuBytes.data() + span.first,
-                          tuBytes.data() + span.second);
-        } else if (span.second < span.first) {
-          REFOLD_LOG_FATAL("tu/span", "invalid TU byte span: [{0},{1})",
-                           span.first, span.second);
-        }
-
-        bool replacingGap = !original.empty() && stringutils::isWs(original);
-
-        // If we’re replacing a non-empty TU gap and the inserted text doesn’t
-        // start with WS, prefix EXACTLY ONE space from the gap to preserve
-        // “return injected” (no double spaces).
-        if (replacingGap && !consumedSeparatorGapForPunctuation &&
-            !repl.empty() && !stringutils::isWs(repl.front())) {
-          repl.insert(repl.begin(), ' ');
-        }
-
-        // Final boundary spacing fixup:
-        // - On the left, only let refoldPadAtBoundaries add a space if we did
-        //   not already preserve whitespace from a replaced TU gap; otherwise
-        //   we could duplicate spacing.
-        // - On the right, always allow padding if the replacement would
-        //   otherwise glue to the following TU text.
-        // Keep a copy for logging; refoldPadAtBoundaries consumes via move.
-        std::string rawRepl = repl;
-
-        std::string padded = refoldPadAtBoundaries(
-            tuBytes, static_cast<size_t>(span.first),
-            static_cast<size_t>(span.second), std::move(repl),
-            /*allowLeft*/ !replacingGap, /*allowRight*/ true, lexLang_);
-
-        const bool skipLocalResync =
-            tuInsertionBeforeMaterializedInclude(
-                *tuAnchorProof_, model_, sidebandPragmaEdits_, h, tuPath, span,
-                /*requireVisibleReplayText=*/true) ||
-            lineControlProof_.TUInsertionCanDeferResyncToConditionalJoin(
-                advancedOverSourceLineControlPrefix, tuPath, span.second);
-
-        ResyncOutcome ro =
-            skipLocalResync
-                ? ResyncOutcome(padded, std::nullopt)
-                : lineObserverLayout_->ApplyResyncOrPend(
-                      tuBytes, span.first, span.second, padded, tuPath);
+      if (auto spanPlan = tuAnchorProof_->PlanTUByteSpan(h.aStart, h.aEnd,
+                                                         tuPath)) { // [b,e)
         if (std::optional<TextEdit> directEdit =
-                textEditAssembler_->BuildDirectTUHunkTextEdit(
-                    h, i, span, std::move(ro), StringRef(padded), rawTUStart,
-                    rawTUEnd, materializedBByteBegin, materializedBByteEnd,
-                    AcceptedPathKind::TUByteSpanMappedEdit,
-                    std::move(insertionAnchorAdjustment))) {
+                BuildDirectTUByteSpanEditForHunk(
+                    h, i, isDel, tuPath, tuBytes, spanPlan->byteRange(),
+                    AcceptedPathKind::TUByteSpanMappedEdit)) {
           structuralHunkDispatcher.AddTUEdit(std::move(*directEdit));
           continue;
         }
@@ -1537,7 +1378,8 @@ bool RefoldEngine::DispatchStructuralHunks(
     if (auto spanPlan = tuAnchorProof_->PlanTUByteSpan(h.aStart, h.aEnd,
                                                        tuPath)) { // [b, e)
       if (std::optional<TextEdit> directEdit = BuildDirectTUByteSpanEditForHunk(
-              h, i, isDel, tuPath, tuBytes, spanPlan->byteRange())) {
+              h, i, isDel, tuPath, tuBytes, spanPlan->byteRange(),
+              AcceptedPathKind::TUByteSpanConservativeEdit)) {
         structuralHunkDispatcher.AddTUEdit(std::move(*directEdit));
         continue;
       }
@@ -1750,170 +1592,167 @@ RefoldEngine::IncludeHoldingPayloadBesidePrintedPragma(
 
 std::optional<TextEdit> RefoldEngine::BuildDirectTUByteSpanEditForHunk(
     const diffutils::Hunk &h, size_t hunkIndex, bool isDel, StringRef tuPath,
-    StringRef tuBytes, std::pair<uint64_t, uint64_t> span) {
-  {
-    {
-      std::string repl;
-      const uint64_t rawTUStart = span.first;
-      const uint64_t rawTUEnd = span.second;
-      std::optional<uint64_t> materializedBByteBegin;
-      std::optional<uint64_t> materializedBByteEnd;
-      if (auto bBytes =
-              sourceMapper_.BTokenRangeToByteRange(h.bStart, h.bEnd)) {
-        materializedBByteBegin = bBytes->first;
-        materializedBByteEnd = bBytes->second;
+    StringRef tuBytes, std::pair<uint64_t, uint64_t> span,
+    AcceptedPathKind acceptedPath) {
+  // The mapped and conservative realizations differ in exactly three
+  // respects, all derived from the accepted path: whether a whitespace-only
+  // span keeps its own bytes, whether a materialized-include deferral needs
+  // visible replay text, and the path the certified edit records.
+  assert((acceptedPath == AcceptedPathKind::TUByteSpanMappedEdit ||
+          acceptedPath == AcceptedPathKind::TUByteSpanConservativeEdit) &&
+         "direct TU byte-span edit with a non-byte-span accepted path");
+  const bool mapped = acceptedPath == AcceptedPathKind::TUByteSpanMappedEdit;
+
+  std::string repl;
+  const uint64_t rawTUStart = span.first;
+  const uint64_t rawTUEnd = span.second;
+  std::optional<uint64_t> materializedBByteBegin;
+  std::optional<uint64_t> materializedBByteEnd;
+  if (auto bBytes = sourceMapper_.BTokenRangeToByteRange(h.bStart, h.bEnd)) {
+    materializedBByteBegin = bBytes->first;
+    materializedBByteEnd = bBytes->second;
+  }
+  const PrintedPragmaInsertionPlacement pragmaPlacement =
+      isDel ? PrintedPragmaInsertionPlacement()
+            : PlaceTUInsertionAmongPrintedPragmas(h, span.first);
+  if (pragmaPlacement.kind == PrintedPragmaInsertionPlacement::Kind::Refused)
+    return std::nullopt;
+  if (pragmaPlacement.kind == PrintedPragmaInsertionPlacement::Kind::Placed) {
+    span = {pragmaPlacement.tuByteOffset, pragmaPlacement.tuByteOffset};
+    if (pragmaPlacement.bByteEnd)
+      materializedBByteEnd = *pragmaPlacement.bByteEnd;
+  }
+  if (isDel) {
+    repl = "";
+  } else {
+    StringRef bSlice = h.isInsertOnly()
+                           ? InsertionEnvelope(h, pragmaPlacement)
+                           : refoldSliceExactTokenCoverage(
+                                 bTokOff_, bToks_, bSource_, h.bStart, h.bEnd);
+    repl.assign(bSlice.data(), bSlice.data() + bSlice.size());
+    if (h.isInsertOnly()) {
+      // For pure insertions the source slice is the *token envelope*, not
+      // just the exact token byte cover.  Zero-normal-token sideband lines
+      // can live between the inserted ordinary tokens and the next normal
+      // token.  Use the actual envelope bytes when partitioning replay so a
+      // separately materialized sideband replacement/deletion is not also
+      // emitted by this ordinary TU insertion.
+      std::optional<uint64_t> envelopeBegin;
+      std::optional<uint64_t> envelopeEnd;
+      if (!bSlice.empty()) {
+        envelopeBegin = static_cast<uint64_t>(bSlice.data() - bSource_.data());
+        envelopeEnd = *envelopeBegin + static_cast<uint64_t>(bSlice.size());
       }
-      const PrintedPragmaInsertionPlacement pragmaPlacement =
-          isDel ? PrintedPragmaInsertionPlacement()
-                : PlaceTUInsertionAmongPrintedPragmas(h, span.first);
-      if (pragmaPlacement.kind ==
-          PrintedPragmaInsertionPlacement::Kind::Refused)
-        return std::nullopt;
-      if (pragmaPlacement.kind ==
-          PrintedPragmaInsertionPlacement::Kind::Placed) {
-        span = {pragmaPlacement.tuByteOffset, pragmaPlacement.tuByteOffset};
-        if (pragmaPlacement.bByteEnd)
-          materializedBByteEnd = *pragmaPlacement.bByteEnd;
-      }
-      if (isDel) {
-        repl = "";
-      } else {
-        StringRef bSlice =
-            h.isInsertOnly()
-                ? InsertionEnvelope(h, pragmaPlacement)
-                : refoldSliceExactTokenCoverage(bTokOff_, bToks_, bSource_,
-                                                h.bStart, h.bEnd);
-        repl.assign(bSlice.data(), bSlice.data() + bSlice.size());
-        if (h.isInsertOnly()) {
-          // For pure insertions the source slice is the *token envelope*, not
-          // just the exact token byte cover.  Zero-normal-token sideband lines
-          // can live between the inserted ordinary tokens and the next normal
-          // token.  Use the actual envelope bytes when partitioning replay so a
-          // separately materialized sideband replacement/deletion is not also
-          // emitted by this ordinary TU insertion.
-          std::optional<uint64_t> envelopeBegin;
-          std::optional<uint64_t> envelopeEnd;
-          if (!bSlice.empty()) {
-            envelopeBegin =
-                static_cast<uint64_t>(bSlice.data() - bSource_.data());
-            envelopeEnd = *envelopeBegin + static_cast<uint64_t>(bSlice.size());
-          }
-          repl = stripSeparatelyOwnedSidebandReplay(sidebandPragmaEdits_, repl,
-                                                    envelopeBegin, envelopeEnd);
-        }
-      }
-
-      // This patch inserts B text at a zero-width TU site: the TU span is
-      // empty, but the hunk contributes one or more B tokens. Token-envelope
-      // byte ranges begin at the first inserted token, so they do not include
-      // any spaces or tabs that appear immediately before that token in B on
-      // the same line. Preserve those preceding spaces/tabs when forming the
-      // inserted text, unless equivalent spacing is already present immediately
-      // to the left of the insertion point in the TU.
-      if (!isDel && span.first == span.second && h.bStart < h.bEnd &&
-          h.bStart > 0) {
-        const size_t bTokStart = static_cast<size_t>(h.bStart);
-        const size_t b0 = bTokOff_[bTokStart];
-        size_t p = b0;
-        while (p > 0) {
-          char c = bSource_[p - 1];
-          if (c == ' ' || c == '\t') {
-            --p;
-            continue;
-          }
-          break;
-        }
-        if (p < b0) {
-          const bool tuHasSpaceLeft =
-              span.first > 0 && (tuBytes[span.first - 1] == ' ' ||
-                                 tuBytes[span.first - 1] == '\t');
-          if (!tuHasSpaceLeft) {
-            repl.insert(0, std::string(bSource_.data() + p, b0 - p));
-            materializedBByteBegin = static_cast<uint64_t>(p);
-          }
-        }
-      }
-
-      bool consumedSeparatorGapForPunctuation = false;
-
-      if (!isDel && h.isInsertOnly()) {
-        // B attaches the inserted content to its left neighbour iff there is no
-        // whitespace before the first inserted B token.
-        const size_t bStartIdx = static_cast<size_t>(h.bStart);
-        const bool replayAttachesLeftInB =
-            bStartIdx < bTokOff_.size() && bTokOff_[bStartIdx] > 0 &&
-            !stringutils::isWs(bSource_[bTokOff_[bStartIdx] - 1]);
-        consumedSeparatorGapForPunctuation =
-            maybeConsumeLeftSourceGapWhenBAttaches(
-                model_, pathIdentity_, tuPath, tuBytes, span, StringRef(repl),
-                replayAttachesLeftInB, lexLang_);
-      }
-
-      tuEditPlanner_->MaybeExtendTUSpanOverClosedTrailingCallSuffix(
-          h, tuPath, tuBytes, repl, span);
-
-      const bool advancedOverSourceLineControlPrefix =
-          pragmaPlacement.kind !=
-              PrintedPragmaInsertionPlacement::Kind::Placed &&
-          maybeAdvanceTUInsertionPastSourceLineControlPrefix(
-              *tuAnchorProof_, lineControlProof_, h, tuPath, tuBytes, span);
-      std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment =
-          InsertionAnchorAdjustment(pragmaPlacement,
-                                    advancedOverSourceLineControlPrefix,
-                                    rawTUStart, span.first);
-
-      // If we are replacing whitespace-only text in the TU, we prefer to
-      // preserve the existing TU gap whitespace rather than introducing new
-      // whitespace from B.
-      bool replacingGap = false;
-      if (span.first < span.second) {
-        std::string original(tuBytes.data() + span.first,
-                             tuBytes.data() + span.second);
-        replacingGap = !original.empty() && stringutils::isWs(original);
-        if (replacingGap && !consumedSeparatorGapForPunctuation) {
-          // Preserve exactly the gap as the replacement.
-          repl = std::move(original);
-        }
-      } else if (span.second < span.first) {
-        REFOLD_LOG_FATAL("tu/span", "invalid TU byte span: [{0},{1})",
-                         span.first, span.second);
-      }
-
-      // If this patch replaces a non-empty whitespace gap in the TU, and the
-      // replacement text does not already begin with whitespace, prefix a
-      // single space so adjacent tokens remain separated. Add only one space,
-      // even if the original gap was wider, to avoid duplicating spacing.
-      if (replacingGap && !consumedSeparatorGapForPunctuation &&
-          !repl.empty() && !stringutils::isWs(repl.front()))
-        repl.insert(repl.begin(), ' ');
-
-      // Keep a copy for logging; refoldPadAtBoundaries consumes via move.
-      std::string rawRepl = repl;
-
-      std::string padded = refoldPadAtBoundaries(
-          tuBytes, static_cast<size_t>(span.first),
-          static_cast<size_t>(span.second), std::move(repl),
-          /*allowLeft*/ !replacingGap, /*allowRight*/ true, lexLang_);
-
-      const bool skipLocalResync =
-          tuInsertionBeforeMaterializedInclude(
-              *tuAnchorProof_, model_, sidebandPragmaEdits_, h, tuPath, span,
-              /*requireVisibleReplayText=*/false) ||
-          lineControlProof_.TUInsertionCanDeferResyncToConditionalJoin(
-              advancedOverSourceLineControlPrefix, tuPath, span.second);
-
-      ResyncOutcome ro =
-          skipLocalResync
-              ? ResyncOutcome(padded, std::nullopt)
-              : lineObserverLayout_->ApplyResyncOrPend(
-                    tuBytes, span.first, span.second, padded, tuPath);
-      return textEditAssembler_->BuildDirectTUHunkTextEdit(
-          h, hunkIndex, span, std::move(ro), StringRef(padded), rawTUStart,
-          rawTUEnd, materializedBByteBegin, materializedBByteEnd,
-          AcceptedPathKind::TUByteSpanConservativeEdit,
-          std::move(insertionAnchorAdjustment));
+      repl = stripSeparatelyOwnedSidebandReplay(sidebandPragmaEdits_, repl,
+                                                envelopeBegin, envelopeEnd);
     }
   }
+
+  // This patch inserts B text at a zero-width TU site: the TU span is
+  // empty, but the hunk contributes one or more B tokens. Token-envelope
+  // byte ranges begin at the first inserted token, so they do not include
+  // any spaces or tabs that appear immediately before that token in B on
+  // the same line. Preserve those preceding spaces/tabs when forming the
+  // inserted text, unless equivalent spacing is already present immediately
+  // to the left of the insertion point in the TU.
+  if (!isDel && span.first == span.second && h.bStart < h.bEnd &&
+      h.bStart > 0) {
+    const size_t bTokStart = static_cast<size_t>(h.bStart);
+    const size_t b0 = bTokOff_[bTokStart];
+    size_t p = b0;
+    while (p > 0) {
+      char c = bSource_[p - 1];
+      if (c == ' ' || c == '\t') {
+        --p;
+        continue;
+      }
+      break;
+    }
+    if (p < b0) {
+      const bool tuHasSpaceLeft =
+          span.first > 0 &&
+          (tuBytes[span.first - 1] == ' ' || tuBytes[span.first - 1] == '\t');
+      if (!tuHasSpaceLeft) {
+        repl.insert(0, std::string(bSource_.data() + p, b0 - p));
+        materializedBByteBegin = static_cast<uint64_t>(p);
+      }
+    }
+  }
+
+  bool consumedSeparatorGapForPunctuation = false;
+
+  if (!isDel && h.isInsertOnly()) {
+    // B attaches the inserted content to its left neighbour iff there is no
+    // whitespace before the first inserted B token.
+    const size_t bStartIdx = static_cast<size_t>(h.bStart);
+    const bool replayAttachesLeftInB =
+        bStartIdx < bTokOff_.size() && bTokOff_[bStartIdx] > 0 &&
+        !stringutils::isWs(bSource_[bTokOff_[bStartIdx] - 1]);
+    consumedSeparatorGapForPunctuation = maybeConsumeLeftSourceGapWhenBAttaches(
+        model_, pathIdentity_, tuPath, tuBytes, span, StringRef(repl),
+        replayAttachesLeftInB, lexLang_);
+  }
+
+  tuEditPlanner_->MaybeExtendTUSpanOverClosedTrailingCallSuffix(
+      h, tuPath, tuBytes, repl, span);
+
+  const bool advancedOverSourceLineControlPrefix =
+      pragmaPlacement.kind != PrintedPragmaInsertionPlacement::Kind::Placed &&
+      maybeAdvanceTUInsertionPastSourceLineControlPrefix(
+          *tuAnchorProof_, lineControlProof_, h, tuPath, tuBytes, span);
+  std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment =
+      InsertionAnchorAdjustment(pragmaPlacement,
+                                advancedOverSourceLineControlPrefix, rawTUStart,
+                                span.first);
+
+  // If we are replacing whitespace-only text in the TU, we prefer to
+  // preserve the existing TU gap whitespace rather than introducing new
+  // whitespace from B.
+  bool replacingGap = false;
+  if (span.first < span.second) {
+    std::string original(tuBytes.data() + span.first,
+                         tuBytes.data() + span.second);
+    replacingGap = !original.empty() && stringutils::isWs(original);
+    if (!mapped && replacingGap && !consumedSeparatorGapForPunctuation) {
+      // Preserve exactly the gap as the replacement.
+      repl = std::move(original);
+    }
+  } else if (span.second < span.first) {
+    REFOLD_LOG_FATAL("tu/span", "invalid TU byte span: [{0},{1})", span.first,
+                     span.second);
+  }
+
+  // If this patch replaces a non-empty whitespace gap in the TU, and the
+  // replacement text does not already begin with whitespace, prefix a
+  // single space so adjacent tokens remain separated. Add only one space,
+  // even if the original gap was wider, to avoid duplicating spacing.
+  if (replacingGap && !consumedSeparatorGapForPunctuation && !repl.empty() &&
+      !stringutils::isWs(repl.front()))
+    repl.insert(repl.begin(), ' ');
+
+  // On the left, let refoldPadAtBoundaries add a space only when no replaced
+  // TU gap already supplied whitespace; on the right, always allow padding if
+  // the replacement would otherwise glue to the following TU text.
+  std::string padded = refoldPadAtBoundaries(
+      tuBytes, static_cast<size_t>(span.first),
+      static_cast<size_t>(span.second), std::move(repl),
+      /*allowLeft*/ !replacingGap, /*allowRight*/ true, lexLang_);
+
+  const bool skipLocalResync =
+      tuInsertionBeforeMaterializedInclude(
+          *tuAnchorProof_, model_, sidebandPragmaEdits_, h, tuPath, span,
+          /*requireVisibleReplayText=*/mapped) ||
+      lineControlProof_.TUInsertionCanDeferResyncToConditionalJoin(
+          advancedOverSourceLineControlPrefix, tuPath, span.second);
+
+  ResyncOutcome ro =
+      skipLocalResync ? ResyncOutcome(padded, std::nullopt)
+                      : lineObserverLayout_->ApplyResyncOrPend(
+                            tuBytes, span.first, span.second, padded, tuPath);
+  return textEditAssembler_->BuildDirectTUHunkTextEdit(
+      h, hunkIndex, span, std::move(ro), StringRef(padded), rawTUStart,
+      rawTUEnd, materializedBByteBegin, materializedBByteEnd, acceptedPath,
+      std::move(insertionAnchorAdjustment));
 }
 
 std::string RefoldEngine::FinalizeStructuralResult(

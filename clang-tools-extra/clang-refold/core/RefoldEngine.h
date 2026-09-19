@@ -1142,8 +1142,6 @@ private:
       uint64_t aBegin, uint64_t aEnd,
       llvm::SmallVectorImpl<uint64_t> &owners) const;
 
-
-
   /// Build the ordinary direct-TU byte-span edit realizing one token hunk over
   /// \p span, the TU byte range a direct-TU proof has already accepted.
   ///
@@ -1156,12 +1154,16 @@ private:
   ///
   /// It is separate from span planning so that a caller holding a *different*
   /// proved span for the same hunk can reuse the identical realization rather
-  /// than restating it.
-  std::optional<TextEdit>
-  BuildDirectTUByteSpanEditForHunk(const diffutils::Hunk &h, size_t hunkIndex,
-                                   bool isDel, StringRef tuPath,
-                                   StringRef tuBytes,
-                                   std::pair<uint64_t, uint64_t> span);
+  /// than restating it.  \p acceptedPath names which proof supplied the span:
+  /// `TUByteSpanMappedEdit` when the hunk's tokens map to the TU, or
+  /// `TUByteSpanConservativeEdit` for the unresolved-owner fallback.  Only a
+  /// conservative edit over a whitespace-only span keeps the span's own bytes,
+  /// and only a mapped insertion before a materialized include needs visible
+  /// replay text to defer its resync.
+  std::optional<TextEdit> BuildDirectTUByteSpanEditForHunk(
+      const diffutils::Hunk &h, size_t hunkIndex, bool isDel, StringRef tuPath,
+      StringRef tuBytes, std::pair<uint64_t, uint64_t> span,
+      AcceptedPathKind acceptedPath);
 
   /// Return the include a pure insertion must be realized inside, because B
   /// prints one of that include's surviving `#pragma` lines between the
