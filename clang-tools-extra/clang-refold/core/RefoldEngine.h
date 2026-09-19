@@ -149,6 +149,7 @@ struct AlignmentCertificationMemo;
 struct OwnerStateGraphMemo;
 class RefoldBInsertionLedger;
 class RefoldCounterStabilization;
+class RefoldDirectTUEditBuilder;
 class RefoldExpansionFallbackPlanner;
 class RefoldIncludeInsertionPlanner;
 class RefoldIncludeMaterializer;
@@ -171,8 +172,6 @@ class RefoldTextEditCertifier;
 class RefoldTokenDiffPlanner;
 class RefoldTUAnchorProof;
 class RefoldTUEditPlanner;
-struct PrintedPragmaInsertionPlacement;
-struct TUInsertionAnchorAdjustment;
 
 /// Per-pass policy and borrowed run state, fixed when a pass is built.
 ///
@@ -965,6 +964,10 @@ private:
   /// explicitly.
   std::unique_ptr<RefoldTextEditAssembler> textEditAssembler_;
 
+  /// Direct-TU byte-span edit construction for the mapped and conservative
+  /// TU paths; owner selection and fallback order stay with the engine.
+  std::unique_ptr<RefoldDirectTUEditBuilder> directTUEditBuilder_;
+
   /// Include-materialization planner/realizer owned by the engine.
   ///
   /// The materializer owns include subtree realization, header-local include
@@ -1142,29 +1145,6 @@ private:
       uint64_t aBegin, uint64_t aEnd,
       llvm::SmallVectorImpl<uint64_t> &owners) const;
 
-  /// Build the ordinary direct-TU byte-span edit realizing one token hunk over
-  /// \p span, the TU byte range a direct-TU proof has already accepted.
-  ///
-  /// This is the realization half of the direct-TU path: the caller supplies a
-  /// span that `RefoldTUAnchorProof::PlanTUByteSpan()` proved, and this turns
-  /// it into replacement text -- B token slice, gap and spacing repair,
-  /// trailing call-suffix extension, line-control resync -- and certifies the
-  /// resulting edit.  Returns std::nullopt when the edit could not be
-  /// certified, leaving the caller to escalate.
-  ///
-  /// It is separate from span planning so that a caller holding a *different*
-  /// proved span for the same hunk can reuse the identical realization rather
-  /// than restating it.  \p acceptedPath names which proof supplied the span:
-  /// `TUByteSpanMappedEdit` when the hunk's tokens map to the TU, or
-  /// `TUByteSpanConservativeEdit` for the unresolved-owner fallback.  Only a
-  /// conservative edit over a whitespace-only span keeps the span's own bytes,
-  /// and only a mapped insertion before a materialized include needs visible
-  /// replay text to defer its resync.
-  std::optional<TextEdit> BuildDirectTUByteSpanEditForHunk(
-      const diffutils::Hunk &h, size_t hunkIndex, bool isDel, StringRef tuPath,
-      StringRef tuBytes, std::pair<uint64_t, uint64_t> span,
-      AcceptedPathKind acceptedPath);
-
   /// Return the include a pure insertion must be realized inside, because B
   /// prints one of that include's surviving `#pragma` lines between the
   /// payload and the rest of the include: before a payload at the include's
@@ -1172,27 +1152,6 @@ private:
   /// forced; the ordinary owner then stands.
   const RefoldModel::IncludeItem *
   IncludeHoldingPayloadBesidePrintedPragma(const diffutils::Hunk &h) const;
-
-  /// Place a pure TU insertion among the printed pragma lines preserved at
-  /// its A gap; see `placeTUInsertionAmongPrintedPragmas`.  Non-insertions
-  /// and gaps without such lines report `NotApplicable`.
-  PrintedPragmaInsertionPlacement
-  PlaceTUInsertionAmongPrintedPragmas(const diffutils::Hunk &h,
-                                      uint64_t baseAnchor) const;
-
-  /// Return the B bytes a pure insertion replays: its token envelope, cut
-  /// before the first preserved pragma line B prints after it when
-  /// \p placement placed it.
-  StringRef
-  InsertionEnvelope(const diffutils::Hunk &h,
-                    const PrintedPragmaInsertionPlacement &placement) const;
-
-  /// Return the typed anchor adjustment an insertion's final site carries,
-  /// or std::nullopt when it still sits on its base anchor.
-  static std::optional<TUInsertionAnchorAdjustment>
-  InsertionAnchorAdjustment(const PrintedPragmaInsertionPlacement &placement,
-                            bool advancedOverSourceLineControlPrefix,
-                            uint64_t rawTUStart, uint64_t anchor);
 
   /// \brief Run the structural refold pass.
   ///

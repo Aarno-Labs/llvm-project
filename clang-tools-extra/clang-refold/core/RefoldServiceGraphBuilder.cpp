@@ -13,6 +13,7 @@
 #include "core/RefoldEngine.h"
 
 #include "edit/RefoldBInsertionLedger.h"
+#include "edit/RefoldDirectTUEditBuilder.h"
 #include "edit/RefoldExpansionFallbackPlanner.h"
 #include "edit/RefoldTUAnchorProof.h"
 #include "edit/RefoldTUEditPlanner.h"
@@ -434,6 +435,14 @@ void RefoldEngine::BuildServiceGraph() {
       terminalSink_, *tuEditPlanner_, *tuAnchorProof_, *textEditCertifier_,
       *lineObserverLayout_, *theoremAudit_, structuralHunkTilingWitnesses_,
       lastTheoremAudit_);
+
+  directTUEditBuilder_ = std::make_unique<RefoldDirectTUEditBuilder>(
+      RefoldDirectTUEditBuilder::Dependencies{
+          model_, pathIdentity_, lexLang_, tuSourceBytes_, bSource_, bToks_,
+          bTokOff_, sourceMapper_, *tuAnchorProof_, lineControlProof_,
+          *tuEditPlanner_, *lineObserverLayout_, *textEditAssembler_,
+          sidebandPragmaEdits_, sidebandPragmaLinePairings_,
+          printedPragmaCarriers_});
 
   RefoldMacroStateRepairPlanner::Dependencies repairDeps;
   repairDeps.model = &model_;

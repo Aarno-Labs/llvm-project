@@ -32,6 +32,7 @@ add_clang_library(clangRefold STATIC
   include/RefoldIncludeMaterializer.cpp
   include/RefoldIncludeMaterializationScheduler.cpp
   include/RefoldPragmaOnceGuardRewriter.cpp
+  edit/RefoldDirectTUEditBuilder.cpp
   edit/RefoldTextEditAssembler.cpp
   edit/RefoldTextEditCertifier.cpp
   support/RefoldPathCanonicalization.cpp
