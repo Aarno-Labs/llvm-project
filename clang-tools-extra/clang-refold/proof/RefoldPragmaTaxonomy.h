@@ -46,8 +46,8 @@ enum class PragmaStateEffect : uint8_t {
   /// engine has never seen may do either.
   Unknown,
 
-  /// Diagnostic output only, with no effect on preprocessing or codegen:
-  /// `message`, `warning`, `error`.
+  /// Diagnostic output or nothing at all, with no effect on preprocessing or
+  /// codegen: `message`, `warning`, `error`, `region`, `mark`, `dependency`.
   NoState,
 
   /// Suppresses later textual inclusion of the containing file: `once`.

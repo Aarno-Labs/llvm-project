@@ -933,9 +933,10 @@ public:
   /// Count one pragma the preprocessor printed into the preprocessed output.
   ///
   /// Called by every printing path, before and independently of whether that
-  /// path can bind the emission to a recorded item.  Some cannot: Clang hands
-  /// `PPCallbacks::PragmaAssumeNonNullEnd` an invalid `SourceLocation`, so its
-  /// directive is printed while no site identifies which item it belongs to.
+  /// path can bind the emission to a recorded item.  Some cannot: an emission
+  /// reported with an invalid `SourceLocation` names no site, and a header
+  /// included twice prints its pragma twice while `recordPragmaItem` keeps one
+  /// item per physical line, whose image is the first emission only.
   ///
   /// The count is what makes absence of an image mean something.  A consumer
   /// reads "this pragma has no image" as "the preprocessor emitted nothing for

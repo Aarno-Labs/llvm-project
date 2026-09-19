@@ -9,11 +9,10 @@
 // `StatelessDiagnosticDirective` -- and the crossing is admitted exactly
 // because each of them is.
 //
-// This is the positive half of the composition contract.  The negative half is
-// `structural_gap_straddle_unknown_directive_refuses`, where two crossable
-// conditional controls surround one unrecognized directive and the whole gap
-// must still refuse; if that test ever passes, the tiler is admitting a gap it
-// has not decomposed.
+// This is the positive half of the composition contract.  The negative half,
+// one uncrossable structure refusing the whole gap, was pinned by an
+// unrecognized directive in a skipped arm until that became crossable
+// (`structural_gap_straddle_skipped_unknown_directive_commits_payload`).
 int arr[] = { 
 #define COMPOSED_GAP_A 1
 #warning straddled

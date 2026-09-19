@@ -1,15 +1,12 @@
 // RUN: %clang-refold-tester structural_gap_straddle_error_in_skipped_arm_commits_payload
-// Regression: a gap holding `#if 0` / `#error` / `#endif` is crossed, and the
-// contrast with `structural_gap_straddle_unknown_directive_refuses` is that
-// this file's middle directive is one the engine classifies.
+// Regression: a gap holding `#if 0` / `#error` / `#endif` is crossed.
 //
-// The two inputs differ in exactly one line.  Both gaps hold three structures,
-// both surround it with a conditional control the arm-selection rule admits,
-// and in both the crossing is decided structure by structure.  Here the middle
-// directive is a `#error` the producer recorded inside an arm it did not
-// select, so it never executed and preserving the gap's bytes in place leaves
-// it unexecuted; there the middle directive is unrecognized, may do anything,
-// and takes the whole gap down with it.
+// The gap holds three structures, the conditional controls are admitted by the
+// arm-selection rule, and the crossing is decided structure by structure.  The
+// middle directive is a `#error` the producer recorded inside an arm it did
+// not select, so it never executed and preserving the gap's bytes in place
+// leaves it unexecuted.  The same rule answers an unrecognized directive in
+// that position (`structural_gap_straddle_skipped_unknown_directive_commits_payload`).
 //
 // A reached `#error` is deliberately not admitted.  It has already made the
 // translation unit ill-formed, and nothing available here separates "reached"

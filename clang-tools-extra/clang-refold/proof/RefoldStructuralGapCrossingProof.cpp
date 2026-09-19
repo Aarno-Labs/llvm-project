@@ -107,6 +107,8 @@ StringRef toString(GapCrossingProofKind kind) {
     return "StatelessIncludeInstance";
   case GapCrossingProofKind::LineControlUnobserved:
     return "LineControlUnobserved";
+  case GapCrossingProofKind::SkippedArmDirective:
+    return "SkippedArmDirective";
   }
   llvm_unreachable("invalid gap-crossing proof kind");
 }
@@ -391,9 +393,22 @@ RefoldStructuralGapCrossingProver::ProveDiagnosticDirective(
 
   // A reached `#error` has already made the translation unit ill-formed, and
   // nothing here separates "reached" from "skipped" on its own.  The producer's
-  // arm selection does: an `#error` the producer recorded inside an arm it did
-  // not select was never executed, and preserving the gap's bytes in place
-  // leaves it unexecuted.
+  // arm selection does.
+  return ProveSkippedArmDirective(
+      interval, query, GapCrossingProofKind::StatelessDiagnosticDirective);
+}
+
+GapCrossingEvidence RefoldStructuralGapCrossingProver::ProveSkippedArmDirective(
+    const PreprocessingStructureInterval &interval, const Query &query,
+    GapCrossingProofKind proofKind) const {
+  if (CommittedTextCarriesDirective(query)) {
+    return rejectStructure(interval,
+                           GapCrossingRejection::PayloadCarriesDirective);
+  }
+
+  // `ownerConditionalArmId` is the lexically nearest enclosing arm, bound to
+  // its producer record exactly.  An arm the producer did not select was
+  // skipped, and so was every directive in it however deeply it nests.
   if (!interval.ownerConditionalArmId)
     return rejectStructure(interval, GapCrossingRejection::NoProducerRecord);
   std::optional<RefoldModel::ArmRef> armRef =
@@ -402,8 +417,7 @@ RefoldStructuralGapCrossingProver::ProveDiagnosticDirective(
     return rejectStructure(interval, GapCrossingRejection::NoProducerRecord);
   if (armRef->arm->selected)
     return rejectStructure(interval, GapCrossingRejection::PayloadObservesState);
-  return admitStructure(interval,
-                        GapCrossingProofKind::StatelessDiagnosticDirective);
+  return admitStructure(interval, proofKind);
 }
 
 GapCrossingEvidence RefoldStructuralGapCrossingProver::ProveOneStructure(
@@ -432,10 +446,15 @@ GapCrossingEvidence RefoldStructuralGapCrossingProver::ProveOneStructure(
   case PreprocessingStructureKind::MacroUndef:
     llvm_unreachable("macro-state directives are answered as one set");
 
-  case PreprocessingStructureKind::Import:
   case PreprocessingStructureKind::OtherDirective:
-    // `#import` is a Clang extension in neither C nor C++, and an unrecognized
-    // directive may do anything.  Both stay unclassified by design.
+    // An unrecognized directive that executes may do anything, and in C it is
+    // an error outside a skipped group.  Only the skipped instance is answered.
+    return ProveSkippedArmDirective(interval, query,
+                                    GapCrossingProofKind::SkippedArmDirective);
+
+  case PreprocessingStructureKind::Import:
+    // `#import` is a Clang extension in neither C nor C++, and stays
+    // unclassified by design.
     return rejectStructure(interval,
                            GapCrossingRejection::NoRuleForStructureKind);
 

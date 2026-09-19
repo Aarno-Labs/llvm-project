@@ -1985,8 +1985,11 @@ struct PragmaAssumeNonNullHandler : public PragmaHandler {
         return;
       }
       NewLoc = SourceLocation();
+      // Report the directive's own location, as for `begin`.  `NewLoc` is the
+      // audit state after this directive, which is invalid by design, and an
+      // invalid location leaves a printed `end` with no identifiable site.
       if (Callbacks)
-        Callbacks->PragmaAssumeNonNullEnd(NewLoc);
+        Callbacks->PragmaAssumeNonNullEnd(Loc);
     }
 
     PP.setPragmaAssumeNonNullLoc(NewLoc);

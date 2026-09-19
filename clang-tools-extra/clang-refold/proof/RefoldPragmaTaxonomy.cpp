@@ -120,9 +120,33 @@ bool consumeParenthesizedStringOperand(StringRef text, size_t pos,
   return !out.empty() && restIsTrivia(text, pos);
 }
 
+/// Consume the header-name operand of `dependency` and require nothing after
+/// it.
+///
+/// Only a quoted or angled header name followed by trivia is recognized.  The
+/// handler lexes any other operand, and any trailing message, with macro
+/// expansion, and expansion can advance `__COUNTER__`; this exact shape is the
+/// one whose handling expands nothing.  A backslash is rejected so the quoted
+/// form cannot be read differently as a string literal and as a header name.
+bool consumeDependencyOperand(StringRef text, size_t pos) {
+  stringutils::skipNonNewlineWs(text, pos);
+  if (pos >= text.size() || (text[pos] != '"' && text[pos] != '<'))
+    return false;
+  const char close = text[pos] == '"' ? '"' : '>';
+  ++pos;
+  const size_t begin = pos;
+  while (pos < text.size() && text[pos] != close) {
+    if (text[pos] == '\\' || text[pos] == '\n' || text[pos] == '\r')
+      return false;
+    ++pos;
+  }
+  if (pos >= text.size() || pos == begin)
+    return false;
+  return restIsTrivia(text, pos + 1);
+}
+
 /// Classify the `GCC`/`clang` namespaced spellings.
-PragmaClassification classifyNamespacedPragma(StringRef namespaceName,
-                                              StringRef text, size_t pos) {
+PragmaClassification classifyNamespacedPragma(StringRef text, size_t pos) {
   PragmaClassification result;
 
   StringRef action;
@@ -137,9 +161,8 @@ PragmaClassification classifyNamespacedPragma(StringRef namespaceName,
     return result;
   }
 
-  if (namespaceName != "GCC")
-    return result;
-
+  // Clang registers the same `poison`, `system_header` and `dependency`
+  // handlers under both namespaces, so the two spellings share one answer.
   if (action == "poison") {
     if (!consumeIdentifierList(text, pos, result.namedIdentifiers)) {
       result.namedIdentifiers.clear();
@@ -152,6 +175,15 @@ PragmaClassification classifyNamespacedPragma(StringRef namespaceName,
 
   if (action == "system_header" && restIsTrivia(text, pos)) {
     result.effect = PragmaStateEffect::SystemHeader;
+    result.binding = PragmaConstructBinding::NonBinding;
+    return result;
+  }
+
+  // `PragmaDependencyHandler` looks the named file up and at most emits a
+  // warning that it is newer than the current file.  It changes no
+  // preprocessor state and produces no token.
+  if (action == "dependency" && consumeDependencyOperand(text, pos)) {
+    result.effect = PragmaStateEffect::NoState;
     result.binding = PragmaConstructBinding::NonBinding;
     return result;
   }
@@ -204,7 +236,10 @@ PragmaClassification classifyPragmaDirective(StringRef directiveText) {
   // observe and binds to nothing that follows it.  The operand is free text a
   // folding editor displays, so it is not validated for the same reason the
   // diagnostic spellings' operands are not.
-  if (head == "region" || head == "endregion") {
+  //
+  // `mark` is the same kind of marker: `HandlePragmaMark` reads the rest of the
+  // line raw, without expanding it, and hands it to a callback.
+  if (head == "region" || head == "endregion" || head == "mark") {
     result.effect = PragmaStateEffect::NoState;
     result.binding = PragmaConstructBinding::NonBinding;
     return result;
@@ -221,7 +256,7 @@ PragmaClassification classifyPragmaDirective(StringRef directiveText) {
   }
 
   if (head == "GCC" || head == "clang")
-    return classifyNamespacedPragma(head, text, pos);
+    return classifyNamespacedPragma(text, pos);
 
   return result;
 }

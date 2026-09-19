@@ -18,10 +18,12 @@
 // Both directives survive into the refolded source; composition is what lets
 // the payload past them rather than around them.
 //
-// The negative half it used to hold has moved to
-// `structural_gap_straddle_unclassified_consumed_pragma_refuses`, whose pragma
-// is one no classification covers, so the property stays pinned by an input
-// this package did not make answerable.
+// The negative half it used to hold moved to a `GCC dependency` input, which
+// was later classified and now folds as
+// `structural_gap_straddle_dependency_pragma_commits_payload`.  The only
+// consumed pragmas left unclassified are Clang's own extensions, such as
+// `clang assume_nonnull` and `clang deprecated`, which are out of scope, so no
+// lit input pins the fail-closed default for an unclassified one.
 int arr[] = { 
 #define GAP_A 1
 #pragma region
