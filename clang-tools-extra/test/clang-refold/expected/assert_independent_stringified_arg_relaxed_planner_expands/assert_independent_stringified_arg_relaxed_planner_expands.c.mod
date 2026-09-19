@@ -27,8 +27,9 @@
 // Off, nothing rescues the planner, so the pinned `.c.mod` is a statement about
 // the admission rule.
 //
-// The repair counterpart is assert_independent_stringified_arg_audit_repair
-// _expands.c, which drives the same A/B through --verify-output=repair.
+// The repair counterpart is
+// assert_independent_stringified_arg_repair_mode_matches_planner.c, which
+// drives the same A/B through --verify-output=repair and must agree.
 #define assert(expr) ((expr) ? (void)0 : __assert_fail(#expr))
 int x = 5;
 int y = 7;

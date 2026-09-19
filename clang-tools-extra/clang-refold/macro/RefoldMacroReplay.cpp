@@ -341,113 +341,142 @@ bool RefoldMacroOccurrenceReplay::
   StringRef argTrim = newArg.trim();
   StringRef baseTrim = baseArg.trim();
 
+  bool argHasStringifySpan = false;
+  for (const auto &s : m.stringifySpans) {
+    if (s.argIdx == argIdx) {
+      argHasStringifySpan = true;
+      break;
+    }
+  }
+
   // If this arg is stringified anywhere, accept args-only without enforcing
   // paste-span checks.
-  bool argIsStringified = false;
-  if (deps_.strict) {
-    for (const auto &s : m.stringifySpans) {
-      if (s.argIdx == argIdx) {
-        argIsStringified = true;
-        break;
-      }
-    }
+  //
+  // Deliberately still strict-only.  This flag also waives the paste
+  // obligations below, and only strict has ever taken that waiver; widening it
+  // here would change which paste facts the relaxed pipeline discharges, which
+  // is a different question from the one the stringify block decides.
+  bool argIsStringified = deps_.strict && argHasStringifySpan;
 
-    // Check all STRINGIFY spans for this argument, but only in strict mode.
-    if (argIsStringified) {
-      auto canonArg = stringutils::canonicalizeStringifyInversePayload(argTrim);
-      if (!canonArg || StringRef(*canonArg).trim() != argTrim)
+  // A stringified occurrence constrains the argument independently of every
+  // evaluated use, so validate the spans in both modes.  The replacement must
+  // regenerate the literal B spells at each span, or B must have left that
+  // literal exactly as A spelled it; strict requires the first, relaxed accepts
+  // either.  Skipping this in relaxed left the standard args-only path with no
+  // comparison against Clang's own stringization at all, so it admitted
+  // literals outside the image of `#` -- one carrying leading or trailing white
+  // space, which stringization always deletes, and which therefore no argument
+  // can produce.
+  if (argHasStringifySpan) {
+    auto canonArg = stringutils::canonicalizeStringifyInversePayload(argTrim);
+    if (!canonArg || StringRef(*canonArg).trim() != argTrim)
+      return false;
+
+    for (const auto &s : m.stringifySpans) {
+      if (s.argIdx != argIdx)
+        continue;
+
+      auto bEnv = deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(s);
+      if (!bEnv)
         return false;
 
-      for (const auto &s : m.stringifySpans) {
-        if (s.argIdx != argIdx)
-          continue;
+      // Whether B left this position exactly as A spelled it, decided on the
+      // unwidened envelope: a position some hunk reaches is not one B left
+      // alone.  This staleness is the relaxed tolerance's only licence, and
+      // it is read only after the exact comparison below has failed.
+      const bool spanIsStale =
+          (bEnv->second - bEnv->first) == 1 &&
+          deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim() ==
+              deps_.sourceMapper->SliceASource(s.begin, s.end).trim();
 
-        auto bEnv = deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(s);
-        if (!bEnv)
-          return false;
-
-        // Extend the B-envelope to account for hunks that touch this
-        // occurrence. This is required for insertions at the argument boundary
-        // (e.g. appending tokens).
-        if (!tokenHunks.empty()) {
-          size_t lo = bEnv->first;
-          size_t hi = bEnv->second;
-          for (const auto &h : tokenHunks) {
-            if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(
-                    s, m.stringifySpans, *bEnv, h)) {
-              lo = std::min(lo, owned->first);
-              hi = std::max(hi, owned->second);
-              continue;
-            }
-
-            bool touches;
-            if (h.aStart == h.aEnd) {
-              touches = false;
-            } else {
-              // The normal case: split the rewritten core around the original
-              // literal delimiters and require a unique segmentation.
-              touches = (h.aStart < s.end && h.aEnd > s.begin);
-            }
-            if (touches && h.bStart < h.bEnd) {
-              lo = static_cast<size_t>(std::min<uint64_t>(lo, h.bStart));
-              hi = static_cast<size_t>(std::max<uint64_t>(hi, h.bEnd));
-            }
+      // Extend the B-envelope to account for hunks that touch this
+      // occurrence. This is required for insertions at the argument boundary
+      // (e.g. appending tokens).
+      if (!tokenHunks.empty()) {
+        size_t lo = bEnv->first;
+        size_t hi = bEnv->second;
+        for (const auto &h : tokenHunks) {
+          if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(
+                  s, m.stringifySpans, *bEnv, h)) {
+            lo = std::min(lo, owned->first);
+            hi = std::max(hi, owned->second);
+            continue;
           }
-          lo = static_cast<size_t>(std::clamp<uint64_t>(lo, 0ULL, maxTok));
-          hi = static_cast<size_t>(std::clamp<uint64_t>(hi, lo, maxTok));
-          bEnv = {lo, hi};
-        }
 
-        StringRef tok =
-            deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
-        if (tok.empty())
-          return false;
-
-        // If the occurrence records byte offsets inside the original A token,
-        // reduce the rewritten B token to the corresponding editable core.
-        // Prefer peeling the original prefix/suffix delimiters from the B
-        // spelling; if the rewritten token no longer preserves those delimiters
-        // verbatim, fall back to the same byte window clamped onto B. This
-        // keeps the comparison focused on the argument payload rather than
-        // surrounding literal text.
-        if (s.byteBegin && s.byteEnd) {
-          if ((bEnv->second - bEnv->first) != 1)
-            return false;
-          StringRef aTok = deps_.sourceMapper->SliceASource(
-              static_cast<size_t>(s.begin), static_cast<size_t>(s.end));
-          const uint64_t bb = *s.byteBegin;
-          const uint64_t be = *s.byteEnd;
-          if (be < bb || be > static_cast<uint64_t>(aTok.size()))
-            return false;
-          StringRef aPref = aTok.take_front(static_cast<size_t>(bb));
-          StringRef aSuff = aTok.drop_front(static_cast<size_t>(be));
-          if (tok.starts_with(aPref) && tok.ends_with(aSuff) &&
-              tok.size() >= aPref.size() + aSuff.size()) {
-            tok = tok.slice(aPref.size(), tok.size() - aSuff.size());
+          bool touches;
+          if (h.aStart == h.aEnd) {
+            touches = false;
           } else {
             // The normal case: split the rewritten core around the original
             // literal delimiters and require a unique segmentation.
-            const uint64_t bbC = std::min<uint64_t>(bb, tok.size());
-            const uint64_t beC = std::min<uint64_t>(be, tok.size());
-            if (beC < bbC)
-              return false;
-            tok = tok.slice(static_cast<size_t>(bbC), static_cast<size_t>(beC));
+            touches = (h.aStart < s.end && h.aEnd > s.begin);
           }
-          tok = tok.trim();
+          if (touches && h.bStart < h.bEnd) {
+            lo = static_cast<size_t>(std::min<uint64_t>(lo, h.bStart));
+            hi = static_cast<size_t>(std::max<uint64_t>(hi, h.bEnd));
+          }
         }
+        lo = static_cast<size_t>(std::clamp<uint64_t>(lo, 0ULL, maxTok));
+        hi = static_cast<size_t>(std::clamp<uint64_t>(hi, lo, maxTok));
+        bEnv = {lo, hi};
+      }
 
-        // Compare against Clang's exact `#` stringization of the recovered
-        // argument, not a blanket C-string escape.  `quoteCString` would double
-        // a stray backslash (e.g. `a\tb` -> `"a\\tb"`), but `#(a\tb)` yields
-        // `"a\tb"`, so the old model rejected valid stringified-argument folds
-        // whenever the edited value contained an escape sequence.
-        std::optional<std::string> expect =
-            deps_.lexLang
-                ? stringizeMacroArgumentLikeClang(argTrim, deps_.lexLang)
-                : std::optional<std::string>(stringutils::quoteCString(argTrim));
-        if (!expect || tok != *expect) {
+      StringRef tok =
+          deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();
+      if (tok.empty())
+        return false;
+
+      // If the occurrence records byte offsets inside the original A token,
+      // reduce the rewritten B token to the corresponding editable core.
+      // Prefer peeling the original prefix/suffix delimiters from the B
+      // spelling; if the rewritten token no longer preserves those delimiters
+      // verbatim, fall back to the same byte window clamped onto B. This
+      // keeps the comparison focused on the argument payload rather than
+      // surrounding literal text.
+      if (s.byteBegin && s.byteEnd) {
+        if ((bEnv->second - bEnv->first) != 1)
           return false;
+        StringRef aTok = deps_.sourceMapper->SliceASource(
+            static_cast<size_t>(s.begin), static_cast<size_t>(s.end));
+        const uint64_t bb = *s.byteBegin;
+        const uint64_t be = *s.byteEnd;
+        if (be < bb || be > static_cast<uint64_t>(aTok.size()))
+          return false;
+        StringRef aPref = aTok.take_front(static_cast<size_t>(bb));
+        StringRef aSuff = aTok.drop_front(static_cast<size_t>(be));
+        if (tok.starts_with(aPref) && tok.ends_with(aSuff) &&
+            tok.size() >= aPref.size() + aSuff.size()) {
+          tok = tok.slice(aPref.size(), tok.size() - aSuff.size());
+        } else {
+          // The normal case: split the rewritten core around the original
+          // literal delimiters and require a unique segmentation.
+          const uint64_t bbC = std::min<uint64_t>(bb, tok.size());
+          const uint64_t beC = std::min<uint64_t>(be, tok.size());
+          if (beC < bbC)
+            return false;
+          tok = tok.slice(static_cast<size_t>(bbC), static_cast<size_t>(beC));
         }
+        tok = tok.trim();
+      }
+
+      // Compare against Clang's exact `#` stringization of the recovered
+      // argument, not a blanket C-string escape.  `quoteCString` would double
+      // a stray backslash (e.g. `a\tb` -> `"a\\tb"`), but `#(a\tb)` yields
+      // `"a\tb"`, so the old model rejected valid stringified-argument folds
+      // whenever the edited value contained an escape sequence.
+      std::optional<std::string> expect =
+          deps_.lexLang
+              ? stringizeMacroArgumentLikeClang(argTrim, deps_.lexLang)
+              : std::optional<std::string>(stringutils::quoteCString(argTrim));
+      if (!expect)
+        return false;
+      if (tok != *expect) {
+        // Strict requires the literal to be reproduced.  Relaxed also accepts
+        // a stale one: B recorded no edit there, re-expansion regenerates it
+        // from the new argument, and the relaxed check masks the position.
+        // Every other literal is an edit this rewrite cannot realize.
+        if (deps_.strict || !spanIsStale)
+          return false;
       }
     }
   }
