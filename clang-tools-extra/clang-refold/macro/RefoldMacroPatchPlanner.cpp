@@ -493,15 +493,92 @@ static bool macroPatchIsCallsiteForInvocation(
 /// An argument replacement re-spelled in the original call-site bytes.
 ///
 /// `text` carries exactly the token sequence the caller certified.  The
-/// half-open byte range `[newBegin, newEnd)` of the certified replacement was
-/// copied verbatim and now starts at `resultBegin` in `text`; every byte
-/// outside it came from the original argument spelling.
+/// half-open byte range `[newBegin, newEnd)` of the certified replacement now
+/// occupies `[resultBegin, resultEnd)` in `text`; every byte outside it came
+/// from the original argument spelling.  The range was copied verbatim unless
+/// `interiorRespaced` is set, in which case some of its inter-token whitespace
+/// was replaced and only the whole range has a known image.
 struct RespelledArgumentReplacement {
   std::string text;
   uint64_t newBegin = 0;
   uint64_t newEnd = 0;
   uint64_t resultBegin = 0;
+  uint64_t resultEnd = 0;
+  bool interiorRespaced = false;
 };
+
+/// Re-spell the replaced interior of a multi-line argument so it keeps the
+/// line breaks the original interior had.
+///
+/// The interior is tokens `[interiorBegin, baseInteriorEnd)` of the original
+/// argument and `[interiorBegin, newInteriorEnd)` of the new one.  Each gap
+/// between two original interior tokens that holds a line break is copied
+/// verbatim over one gap of the new interior: the gap at the nearest token
+/// index, the earlier one on a tie, each used at most once.
+///
+/// Only a new gap that already holds whitespace is used, so the copied bytes,
+/// which are whitespace and comments, still stringify to a single space.  A gap
+/// followed by `#` is never used, because the `#` would then begin a line
+/// inside the invocation and be read as a directive.  Returns `std::nullopt`
+/// when the original interior holds no line break, when a line break sits
+/// inside a token (a line splice has no gap to move to), or when too few new
+/// gaps qualify.  The caller re-lexes the result against the certified tokens,
+/// including whether each token is preceded by white space, which also rejects
+/// a copied gap that a line splice leaves without any.
+std::optional<std::string>
+carryInteriorLineBreaks(StringRef baseArgText,
+                        ArrayRef<RefoldLexBoundaryToken> baseToks,
+                        size_t baseInteriorEnd, StringRef newArgText,
+                        ArrayRef<RefoldLexBoundaryToken> newToks,
+                        size_t newInteriorEnd, size_t interiorBegin) {
+  SmallVector<std::pair<size_t, StringRef>, 4> breakingGaps;
+  size_t gapBreaks = 0;
+  for (size_t k = interiorBegin + 1; k < baseInteriorEnd; ++k) {
+    StringRef gap = baseArgText.slice(baseToks[k - 1].end, baseToks[k].begin);
+    if (!gap.contains('\n'))
+      continue;
+    breakingGaps.push_back({k - interiorBegin, gap});
+    gapBreaks += gap.count('\n');
+  }
+  if (breakingGaps.empty())
+    return std::nullopt;
+  const StringRef baseInterior = baseArgText.slice(
+      baseToks[interiorBegin].begin, baseToks[baseInteriorEnd - 1].end);
+  if (gapBreaks != baseInterior.count('\n'))
+    return std::nullopt;
+
+  const size_t newTokCount = newInteriorEnd - interiorBegin;
+  SmallVector<std::optional<StringRef>, 8> assigned(newTokCount);
+  for (const auto &[baseGap, gapText] : breakingGaps) {
+    std::optional<size_t> best;
+    for (size_t gap = 1; gap < newTokCount; ++gap) {
+      const RefoldLexBoundaryToken &before = newToks[interiorBegin + gap - 1];
+      const RefoldLexBoundaryToken &after = newToks[interiorBegin + gap];
+      if (assigned[gap] || before.end == after.begin || after.kind == tok::hash)
+        continue;
+      const size_t distance = gap > baseGap ? gap - baseGap : baseGap - gap;
+      const size_t bestDistance =
+          best ? (*best > baseGap ? *best - baseGap : baseGap - *best) : 0;
+      if (!best || distance < bestDistance)
+        best = gap;
+    }
+    if (!best)
+      return std::nullopt;
+    assigned[*best] = gapText;
+  }
+
+  std::string text;
+  for (size_t gap = 0; gap < newTokCount; ++gap) {
+    const RefoldLexBoundaryToken &token = newToks[interiorBegin + gap];
+    if (gap > 0)
+      text += assigned[gap]
+                  ? *assigned[gap]
+                  : newArgText.slice(newToks[interiorBegin + gap - 1].end,
+                                     token.begin);
+    text += newArgText.slice(token.begin, token.end);
+  }
+  return text;
+}
 
 /// Re-spell a certified argument replacement using the original call-site
 /// argument spelling wherever the two agree token-for-token.
@@ -526,10 +603,16 @@ struct RespelledArgumentReplacement {
 /// token-identical outside the interior -- returns `std::nullopt` and leaves
 /// the caller with the uncollapsed B text.  This is a spelling choice only; it
 /// admits nothing and rejects nothing.
+///
+/// With \p keepInteriorLineBreaks, an interior that lost line breaks is also
+/// re-spaced by `carryInteriorLineBreaks`, so a whole-actual replacement keeps
+/// the original line count.  The caller asks for it only when a line observer
+/// expands inside the invocation, where that count is observable.
 std::optional<RespelledArgumentReplacement>
 respellArgumentReplacementInBaseSpelling(StringRef baseArgText,
                                          StringRef newArgText,
-                                         const LangOptions &lexLang) {
+                                         const LangOptions &lexLang,
+                                         bool keepInteriorLineBreaks) {
   SmallVector<RefoldLexBoundaryToken, 16> baseToks;
   SmallVector<RefoldLexBoundaryToken, 16> newToks;
   refoldLexBoundaryTokens(baseArgText, lexLang, baseToks);
@@ -591,17 +674,36 @@ respellArgumentReplacementInBaseSpelling(StringRef baseArgText,
   out.newEnd = newToks[newMidEndTok - 1].end;
   out.resultBegin = baseMidBegin;
 
+  std::string interior =
+      newArgText.substr(out.newBegin, out.newEnd - out.newBegin).str();
+  if (keepInteriorLineBreaks) {
+    if (std::optional<std::string> respaced = carryInteriorLineBreaks(
+            baseArgText, baseToks, baseMidEndTok, newArgText, newToks,
+            newMidEndTok, prefix)) {
+      interior = std::move(*respaced);
+      out.interiorRespaced = true;
+    }
+  }
+
   out.text = baseArgText.substr(0, baseMidBegin).str();
-  out.text += newArgText.substr(out.newBegin, out.newEnd - out.newBegin);
+  out.text += interior;
+  out.resultEnd = out.text.size();
   out.text += baseArgText.substr(baseMidEnd);
 
   SmallVector<RefoldLexBoundaryToken, 16> resultToks;
   refoldLexBoundaryTokens(out.text, lexLang, resultToks);
   if (resultToks.size() != newCount)
     return std::nullopt;
-  for (size_t i = 0; i < newCount; ++i)
+  for (size_t i = 0; i < newCount; ++i) {
     if (!sameToken(resultToks[i], newToks[i]))
       return std::nullopt;
+    // Re-spacing swaps the white space between interior tokens for original
+    // gaps, so it must leave each of those tokens' leading-space fact alone:
+    // `#` stringifies exactly that.
+    if (out.interiorRespaced && i > prefix && i < newMidEndTok &&
+        resultToks[i].leadingSpace != newToks[i].leadingSpace)
+      return std::nullopt;
+  }
 
   return out;
 }
@@ -685,10 +787,21 @@ RefoldMacroPatchPlanner::BuildInvocationRewriteWithRange(
     std::string respelledStorage;
     if (baseArgText.contains('\n')) {
       if (auto respelled = respellArgumentReplacementInBaseSpelling(
-              baseArgText, replacementText, *deps_.lexLang)) {
+              baseArgText, replacementText, *deps_.lexLang,
+              deps_.macroTopology->ExpansionContainsLineObserver(
+                  ctx.invocation.id))) {
         std::optional<std::pair<uint64_t, uint64_t>> remapped;
-        if (materializedRel && materializedRel->first >= respelled->newBegin &&
-            materializedRel->second <= respelled->newEnd) {
+        if (respelled->interiorRespaced) {
+          // Re-spacing moved bytes inside the interior, so only an interval
+          // covering exactly the whole interior keeps a known image.
+          if (materializedRel &&
+              *materializedRel ==
+                  std::make_pair(respelled->newBegin, respelled->newEnd))
+            remapped =
+                std::make_pair(respelled->resultBegin, respelled->resultEnd);
+        } else if (materializedRel &&
+                   materializedRel->first >= respelled->newBegin &&
+                   materializedRel->second <= respelled->newEnd) {
           const uint64_t remappedBegin =
               respelled->resultBegin +
               (materializedRel->first - respelled->newBegin);

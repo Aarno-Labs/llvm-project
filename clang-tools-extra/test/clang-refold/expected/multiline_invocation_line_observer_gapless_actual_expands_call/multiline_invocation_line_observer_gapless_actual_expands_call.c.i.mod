@@ -1,5 +1,5 @@
 int fail(const char *, int);
 int g(int), q(int);
 int f(int x, int y) {
-  return ((g(x) > 0) ? 0 : fail("g(x) > 0", 17));
+  return ((q(y)) ? 0 : fail("q(y)", 27));
 }

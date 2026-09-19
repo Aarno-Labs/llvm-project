@@ -76,6 +76,9 @@ struct RefoldLexBoundaryToken {
   std::string spelling;
   size_t begin = 0;
   size_t end = 0;
+  /// Whether white space or a comment precedes the token after line splicing,
+  /// as the lexer reports it.  This is the fact stringification reads.
+  bool leadingSpace = false;
 };
 
 /// Lex a snippet into non-comment boundary tokens for maximal-munch checks.
@@ -105,7 +108,7 @@ refoldLexBoundaryTokens(llvm::StringRef text, const LangOptions &lang,
         static_cast<unsigned>(refoldTokenOffsetFromBase(token, baseLoc));
     out.push_back({token.getKind(),
                    std::string(text.substr(offset, token.getLength())), offset,
-                   offset + token.getLength()});
+                   offset + token.getLength(), token.hasLeadingSpace()});
   }
 }
 
