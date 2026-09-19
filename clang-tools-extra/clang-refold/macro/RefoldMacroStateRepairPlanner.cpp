@@ -182,8 +182,13 @@ struct MacroStateGapCarryCandidate {
 
 struct SyntheticUndefCandidate {
   const RefoldModel::MacroDirective *definition = nullptr;
-  MacroDirectiveSourceInterval interval;
+  /// End of the definition's transition in the translation unit, which orders
+  /// candidates by where they were written.
+  uint64_t boundFrom = 0;
   std::string name;
+  /// The producer's exact directive text, re-emitted after the payload's line,
+  /// or empty when nothing after the payload can observe the definition.
+  std::string restoreText;
 };
 
 class MacroStateRepairContext {
@@ -207,6 +212,12 @@ public:
   /// Applies delayed definition carry repairs after replacement edit boundaries
   /// have stabilized.
   void CarryObservedGapDefinitionsAfterReplacements();
+  /// Fails closed on a replacement that still observes a definition live at its
+  /// own position after every repair has been attempted.
+  void RequireEveryObservedGapDefinitionRepaired();
+  /// Brackets a B-derived replacement that observes a live definition with a
+  /// synthetic undef, and a restore when anything later may observe it.
+  void SynthesizeUndefBeforeObservedGapDefinitions();
   /// Appends required macro definition repairs to a materialized include
   /// replacement when surviving downstream observers still need them.
   bool RepairConsumedDefinitionsForMaterializedInclude(
@@ -346,9 +357,19 @@ private:
       bool requireKnownObserver = false) const;
   /// Mint the exact protected-source capability carried by one already-proved
   /// transition.  Raw source intervals are deliberately not accepted.
+  /// Collect every include instance an include-owned transition consumes: the
+  /// instances whose TU directive lies inside its interval, and everything they
+  /// entered.  Return the smallest root id, or std::nullopt when none.
+  std::optional<uint64_t> CollectIncludeSubtreeConsumedBy(
+      const ProvenMacroStateSourceTransition &transition,
+      llvm::DenseSet<uint64_t> &subtree) const;
   /// Return the include this transition would delete when its subtree carries,
   /// anywhere, a pragma this repair cannot preserve.
   std::optional<uint64_t> IncludeSubtreeCarryingUnmodeledPragma(
+      const ProvenMacroStateSourceTransition &transition) const;
+  /// Return the include this transition would move when its subtree contributes
+  /// any A token, which moving its directive would reorder.
+  std::optional<uint64_t> IncludeSubtreeContributingTokens(
       const ProvenMacroStateSourceTransition &transition) const;
 
   bool AuthorizeMacroStateSourceTransition(
@@ -357,6 +378,16 @@ private:
   /// Finds the active definition for a macro name at a physical source offset.
   const RefoldModel::MacroDirective *
   ActiveDefinitionAtSourceOffset(StringRef macroName, uint64_t offset) const;
+  /// Finds the definition bound to a macro name at a TU offset for the
+  /// liveness audit.
+  ///
+  /// Unlike `ActiveDefinitionAtSourceOffset()`, a definition inside an include
+  /// the ladder has ruled out still counts: it is emitted where the include
+  /// stood, so it binds everything after that site, even though no repair may
+  /// consume it as a transition surface.
+  const RefoldModel::MacroDirective *
+  DefinitionBoundAtSourceOffsetForAudit(StringRef macroName,
+                                        uint64_t offset) const;
   /// Returns whether a consumed macro-state directive can be delayed after a
   /// replacement edit without changing observer semantics.
   bool MacroStateDirectiveCanBeDelayedAfterEdit(
@@ -402,9 +433,6 @@ private:
   bool DirectCalleePatchRequiresDefinitionBeforeReplacement(
       const TextEdit &edit, const RefoldModel::MacroDirective &definition,
       StringRef macroName) const;
-  /// Returns whether this edit's replacement folds preserved TU source in with
-  /// its B payload, so the replacement is not wholly in B's macro state.
-  bool EditClosesOverPreservedTUSource(const TextEdit &edit) const;
 
   /// Builds the owner-state boundary immediately after a macro directive.
   OwnerStateBoundary MacroDirectiveSuffixBoundary(
@@ -504,12 +532,6 @@ private:
   /// Advances consumed undef transitions before replacements that observe the
   /// prior definition state.
   void AdvancePreservedUndefsBeforeObservedReplacements();
-  /// Synthesizes undef repairs before observed gap definitions when required to
-  /// preserve macro-state partitioning.
-  void SynthesizeUndefBeforeObservedGapDefinitions();
-  /// Fails closed on a replacement that still observes a definition live at its
-  /// own position after every repair has been attempted.
-  void RequireEveryObservedGapDefinitionRepaired();
   /// Returns whether every byte of an edit's replacement is B-derived payload.
   bool EditReplacementIsMappedBPayload(const TextEdit &edit) const;
   /// Returns the offset at which a replacement reads a macro while that macro
@@ -1016,38 +1038,65 @@ MacroStateRepairContext::ProveMacroStateSourceTransition(
 }
 
 std::optional<uint64_t>
-MacroStateRepairContext::IncludeSubtreeCarryingUnmodeledPragma(
-    const ProvenMacroStateSourceTransition &transition) const {
-  // Which include instances does this consumed TU interval delete?  An
+MacroStateRepairContext::CollectIncludeSubtreeConsumedBy(
+    const ProvenMacroStateSourceTransition &transition,
+    llvm::DenseSet<uint64_t> &subtree) const {
+  // Which include instances does this consumed TU interval hold?  An
   // include-owned transition consumes the directive line itself, so match by
   // containment of the recorded site rather than by path alone: the same header
-  // can be included several times and only the covered instances die here.
-  llvm::SmallVector<uint64_t, 4> dyingRoots;
+  // can be included several times and only the covered instances are affected.
+  llvm::SmallVector<uint64_t, 4> roots;
   for (const RefoldModel::IncludeItem &include : Model().GetIncludes()) {
     if (!PathIdentity().PathsEqual(include.sitePath, tuPath_))
       continue;
     if (include.siteB < transition.source.interval.begin ||
         include.siteE > transition.source.interval.end)
       continue;
-    dyingRoots.push_back(include.id);
+    roots.push_back(include.id);
   }
-  if (dyingRoots.empty())
+  if (roots.empty())
     return std::nullopt;
-  llvm::sort(dyingRoots);
+  llvm::sort(roots);
 
-  // Deleting an include deletes everything it entered, so the question is about
-  // the whole subtree: a pragma two headers down dies exactly as one in the
-  // directly included file does.
-  llvm::SmallVector<uint64_t, 16> subtree(dyingRoots.begin(), dyingRoots.end());
-  llvm::DenseSet<uint64_t> visited(dyingRoots.begin(), dyingRoots.end());
-  for (size_t index = 0; index < subtree.size(); ++index) {
+  // What happens to an include happens to everything it entered, so the
+  // question is about the whole subtree: a header two levels down is deleted or
+  // moved exactly as the directly included file is.
+  llvm::SmallVector<uint64_t, 16> worklist(roots.begin(), roots.end());
+  subtree.insert(roots.begin(), roots.end());
+  for (size_t index = 0; index < worklist.size(); ++index) {
     for (const RefoldModel::IncludeItem &child : Model().GetIncludes()) {
-      if (!child.parent || *child.parent != subtree[index])
+      if (!child.parent || *child.parent != worklist[index])
         continue;
-      if (visited.insert(child.id).second)
-        subtree.push_back(child.id);
+      if (subtree.insert(child.id).second)
+        worklist.push_back(child.id);
     }
   }
+  return roots.front();
+}
+
+std::optional<uint64_t>
+MacroStateRepairContext::IncludeSubtreeContributingTokens(
+    const ProvenMacroStateSourceTransition &transition) const {
+  llvm::DenseSet<uint64_t> subtree;
+  std::optional<uint64_t> root =
+      CollectIncludeSubtreeConsumedBy(transition, subtree);
+  if (!root)
+    return std::nullopt;
+  for (const RefoldModel::IncludeItem &include : Model().GetIncludes())
+    if (subtree.contains(include.id) &&
+        (include.cover.IsValid() || !include.spans.empty()))
+      return root;
+  return std::nullopt;
+}
+
+std::optional<uint64_t>
+MacroStateRepairContext::IncludeSubtreeCarryingUnmodeledPragma(
+    const ProvenMacroStateSourceTransition &transition) const {
+  llvm::DenseSet<uint64_t> visited;
+  std::optional<uint64_t> dyingRoot =
+      CollectIncludeSubtreeConsumedBy(transition, visited);
+  if (!dyingRoot)
+    return std::nullopt;
 
   for (const RefoldModel::PragmaDirective &pragma : Model().GetPragmas()) {
     if (pragmaDirectiveIsPragmaOnce(pragma, *deps_.lexLang))
@@ -1058,17 +1107,17 @@ MacroStateRepairContext::IncludeSubtreeCarryingUnmodeledPragma(
     // outside the dying subtree answers yes, which only declines a deletion.
     if (pragma.ownerIncludeId) {
       if (visited.count(*pragma.ownerIncludeId))
-        return dyingRoots.front();
+        return dyingRoot;
       continue;
     }
-    for (uint64_t includeId : subtree) {
+    for (uint64_t includeId : visited) {
       const RefoldModel::IncludeItem *include = Model().GetIncludeById(includeId);
       const std::optional<StringRef> openedPath =
           include ? (include->openedPath ? include->openedPath
                                          : include->resolvedPath)
                   : std::nullopt;
       if (openedPath && PathIdentity().PathsEqual(*openedPath, pragma.sitePath))
-        return dyingRoots.front();
+        return dyingRoot;
     }
   }
 
@@ -1138,6 +1187,29 @@ bool MacroStateRepairContext::AuthorizeMacroStateSourceTransition(
           "include subtree; the include must be materialized instead");
       return false;
     }
+
+    // Moving the directive to repair one macro moves everything the include
+    // printed along with it, across the bytes it crosses.  Only the macro was
+    // proven indifferent to that crossing, so an include contributing any token
+    // cannot move on this proof; materializing it leaves the tokens in place
+    // and exposes the definition as a directive that can move alone.
+    const bool moved =
+        transition.disposition == MacroStateTransitionDisposition::MovedLater ||
+        transition.disposition == MacroStateTransitionDisposition::MovedEarlier;
+    if (std::optional<uint64_t> tokenOwner =
+            moved ? IncludeSubtreeContributingTokens(transition)
+                  : std::nullopt) {
+      TerminalSink().RequestTerminalFallback(
+          MakeTerminalFallbackProofFailure(
+              TerminalFallbackObligationKind::EmissionEditSetComposable,
+              TerminalFallbackFailureReason::UncomposableEmissionEditSet,
+              TerminalFallbackFailureContext::ForOwnerId(*tokenOwner)),
+          "macro/state-repair",
+          "include-owned macro-state repair would move an include whose "
+          "subtree contributes tokens; the include must be materialized "
+          "instead");
+      return false;
+    }
   }
   const ArrayRef<PreprocessingStructureKind> allowedKinds =
       includeOwned ? ArrayRef<PreprocessingStructureKind>(includeKinds)
@@ -1204,6 +1276,36 @@ MacroStateRepairContext::ActiveDefinitionAtSourceOffset(StringRef macroName,
         (transition->interval.end == activeEnd && candidate.id > active->id)) {
       active = &candidate;
       activeEnd = transition->interval.end;
+    }
+  }
+  return active && active->IsDefine() ? active : nullptr;
+}
+
+const RefoldModel::MacroDirective *
+MacroStateRepairContext::DefinitionBoundAtSourceOffsetForAudit(
+    StringRef macroName, uint64_t offset) const {
+  const RefoldModel::MacroDirective *active = nullptr;
+  uint64_t activeEnd = 0;
+  const auto bucket = plan_.namedMacroDirectivesByName.find(macroName);
+  if (bucket == plan_.namedMacroDirectivesByName.end())
+    return nullptr;
+
+  for (uint32_t position : bucket->second) {
+    const RefoldModel::MacroDirective &candidate =
+        *plan_.namedMacroDirectives[position].directive;
+    std::optional<uint64_t> end;
+    if (std::optional<MacroStateSourceTransition> transition =
+            MacroStateSourceTransitionFor(candidate))
+      end = transition->interval.end;
+    else if (const RefoldModel::IncludeItem *inc =
+                 OwningIncludeSiteInTU(candidate))
+      end = inc->siteE;
+    if (!end || *end > offset)
+      continue;
+    if (!active || *end > activeEnd ||
+        (*end == activeEnd && candidate.id > active->id)) {
+      active = &candidate;
+      activeEnd = *end;
     }
   }
   return active && active->IsDefine() ? active : nullptr;
@@ -1558,18 +1660,6 @@ bool MacroStateRepairContext::
 /// preserved-source bytes, so this reports only that such a mixture exists.
 /// Callers that would rewrite the macro state of a whole replacement must treat
 /// that as missing evidence rather than as permission.
-bool MacroStateRepairContext::EditClosesOverPreservedTUSource(
-    const TextEdit &edit) const {
-  for (const auto &carrier : edit.acceptedResults) {
-    if (!carrier)
-      continue;
-    if (carrier->proofSummary.inventory.currentPath ==
-        AcceptedPathKind::TUIncludeClosureEdit)
-      return true;
-  }
-  return false;
-}
-
 OwnerStateBoundary MacroStateRepairContext::MacroDirectiveSuffixBoundary(
     const RefoldModel::MacroDirective &directive) const {
   return OwnerStateBoundary::FromSource(
@@ -2192,12 +2282,13 @@ MacroStateRepairContext::TryQueueMacroStateDirectivePreservation(
   return MacroStatePreservationPlacement::AfterReplacement;
 }
 
-// Insert a synthetic #undef at the start of a widened replacement line when
-// the preserved source before the edit intentionally crosses a definition, but
-// the replacement text must observe B's undefined macro state.  This is a
-// conservative token-level repair: it does not attempt to restore the
-// definition later, so suffix text that still needs the definition fails
-// closed.
+// Insert a synthetic #undef at the start of a replacement's line when the
+// preserved source before the edit crosses a definition but the B-derived
+// replacement must see the name unbound.  When anything after the replacement
+// could still need the definition, the repair also restores it right after the
+// replacement's line from the producer's exact directive text, so the macro
+// state after the repaired interval equals the state before it and nothing is
+// required of source the repair cannot see.
 void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
   SmallVector<size_t, 16> editOrder;
   editOrder.reserve(tuEdits_.size());
@@ -2221,12 +2312,12 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
     // That is justified only for a B-derived payload: B is already fully
     // expanded, so a live definition named there would be a spurious
     // re-expansion that the synthetic #undef removes.  When the replacement
-    // also carries preserved TU source, an observation may instead be an
+    // also carries preserved source, an observation may instead be an
     // expansion the preserved source requires, and nothing records which
     // replacement bytes are which.  Refuse rather than assume: undefining the
     // macro would otherwise silently change how the preserved source
     // preprocesses.
-    if (EditClosesOverPreservedTUSource(edit))
+    if (!EditReplacementIsMappedBPayload(edit))
       continue;
 
     const size_t editStart = static_cast<size_t>(edit.start);
@@ -2238,7 +2329,26 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
     if (SourceRangeOverlapsFinalTUEditExcept(lineStart, edit.start, editIndex))
       continue;
 
+    // A restore goes after the physical line the replacement ends on, so the
+    // rest of that line is absorbed into the repaired interval as well.
+    const size_t editEnd = static_cast<size_t>(edit.end);
+    const size_t lineEnd = stringutils::lineEndOffset(tuBytes_, editEnd);
+    size_t lineBreakEnd = lineEnd;
+    bool restoreSiteAvailable = true;
+    if (lineEnd < tuBytes_.size()) {
+      restoreSiteAvailable = !stringutils::isLineSplice(tuBytes_, lineEnd);
+      lineBreakEnd += tuBytes_[lineEnd] == '\r' &&
+                              lineEnd + 1 < tuBytes_.size() &&
+                              tuBytes_[lineEnd + 1] == '\n'
+                          ? 2
+                          : 1;
+    }
+    restoreSiteAvailable =
+        restoreSiteAvailable && !SourceRangeOverlapsFinalTUEditExcept(
+                                    edit.end, lineBreakEnd, editIndex);
+
     StringRef sameLinePrefix = tuBytes_.slice(lineStart, edit.start);
+    StringRef sameLineSuffix = tuBytes_.slice(edit.end, lineEnd);
     StringRef ReplacementText(edit.text);
     StringRef untouchedSuffix = tuBytes_.drop_front(edit.end);
 
@@ -2247,19 +2357,16 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
       const RefoldModel::MacroDirective &definitionLocal = *ref.directive;
       if (!definitionLocal.IsDefine())
         continue;
-      if (plan_.syntheticUndefPartitionedDefinitionIds.contains(
-              definitionLocal.id))
-        continue;
 
+      // A definition inside an include the ladder has ruled out has no
+      // movable transition surface, but it is still bound after the include's
+      // site, and an undef/restore consumes no surface at all.
+      const RefoldModel::MacroDirective *bound =
+          DefinitionBoundAtSourceOffsetForAudit(ref.name, lineStart);
+      if (bound != &definitionLocal)
+        continue;
       std::optional<MacroStateSourceTransition> transition =
           MacroStateSourceTransitionFor(definitionLocal);
-      if (!transition)
-        continue;
-      if (transition->interval.end > lineStart)
-        continue;
-      if (ActiveDefinitionAtSourceOffset(ref.name, lineStart) !=
-          &definitionLocal)
-        continue;
 
       std::optional<size_t> firstObservationOffset =
           FirstReplacementObservationOffset(edit, definitionLocal, ref.name);
@@ -2287,25 +2394,41 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
               definitionLocal, ref.name, sameLinePrefix, ReplacementText))
         continue;
 
-      // Use this partition only when the crossed pre-edit region really is a
-      // macro-state barrier/observer.  If it is neutral, the existing carry
-      // proof can move the definition after the replacement without adding a
-      // synthetic transition.
-      if (!MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
+      // Without a restore the name stays unbound for the rest of the unit.
+      // The scan counts any directive in the suffix as an observer, since it
+      // cannot see through an `#include` or into a `push_macro` operand.  With
+      // a restore, only the rest of the replacement's line lands between the
+      // #undef and the restore, so that must not need the definition.
+      const bool needsRestore =
+          MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
+              definitionLocal, ref.name, untouchedSuffix, StringRef());
+      if (needsRestore &&
+          (!restoreSiteAvailable ||
+           MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
+               definitionLocal, ref.name, sameLineSuffix, StringRef())))
+        continue;
+
+      // Prefer carrying the definition past the replacement when the crossed
+      // pre-edit region is neutral: that proof adds no synthetic transition.
+      // A definition with no movable surface cannot be carried.
+      if (transition &&
+          !MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
               definitionLocal, ref.name,
               tuBytes_.slice(transition->interval.end, edit.start),
               ReplacementText))
         continue;
 
-      // This minimal partition does not restore the definition after the
-      // replacement.  Do not synthesize it when later preserved source would
-      // observe the old definition; that requires an explicit restore tiling.
-      if (MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
-              definitionLocal, ref.name, untouchedSuffix, StringRef()))
-        continue;
-
+      std::string restoreText;
+      if (needsRestore) {
+        restoreText = DirectiveTextForPreservation(definitionLocal);
+        if (StringRef(restoreText).trim().empty())
+          continue;
+      }
+      const uint64_t boundFrom =
+          transition ? transition->interval.end
+                     : OwningIncludeSiteInTU(definitionLocal)->siteE;
       candidates.push_back(SyntheticUndefCandidate{
-          &definitionLocal, transition->interval, ref.name.str()});
+          &definitionLocal, boundFrom, ref.name.str(), std::move(restoreText)});
     }
 
     if (candidates.empty())
@@ -2313,8 +2436,8 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
 
     llvm::sort(candidates, [](const SyntheticUndefCandidate &lhs,
                               const SyntheticUndefCandidate &rhs) {
-      if (lhs.interval.begin != rhs.interval.begin)
-        return lhs.interval.begin < rhs.interval.begin;
+      if (lhs.boundFrom != rhs.boundFrom)
+        return lhs.boundFrom < rhs.boundFrom;
       return lhs.definition->id < rhs.definition->id;
     });
 
@@ -2325,16 +2448,27 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
       undefPrefix.push_back('\n');
     }
 
+    const bool restores =
+        llvm::any_of(candidates, [](const SyntheticUndefCandidate &candidate) {
+          return !candidate.restoreText.empty();
+        });
     std::string replacement;
-    replacement.reserve(undefPrefix.size() + sameLinePrefix.size() +
-                        ReplacementText.size());
     replacement += undefPrefix;
     replacement.append(sameLinePrefix.begin(), sameLinePrefix.end());
     replacement.append(ReplacementText.begin(), ReplacementText.end());
+    if (restores) {
+      replacement.append(tuBytes_.begin() + editEnd,
+                         tuBytes_.begin() + lineBreakEnd);
+      if (replacement.back() != '\n')
+        replacement.push_back('\n');
+      for (const SyntheticUndefCandidate &candidate : candidates)
+        replacement += candidate.restoreText;
+    }
 
     const uint64_t oldStart = edit.start;
     const uint64_t oldEnd = edit.end;
-    RestageConservativeTUEdit(edit, lineStart, oldEnd, replacement);
+    RestageConservativeTUEdit(edit, lineStart, restores ? lineBreakEnd : oldEnd,
+                              replacement);
 
     for (const SyntheticUndefCandidate &candidate : candidates) {
       plan_.syntheticUndefPartitionedDefinitionIds.insert(
@@ -2342,24 +2476,26 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
       (void)CheckMacroStateRepaired(
           *candidate.definition, StateMutationKind::MovedEarlier,
           "macro-synthetic-undef-partition",
-          llvm::formatv("synthesized #undef for active definition #{0} of "
-                        "macro '{1}' before observing TU replacement [{2},{3})",
+          llvm::formatv("synthesized #undef{4} for active definition #{0} of "
+                        "macro '{1}' around observing TU replacement [{2},{3})",
                         candidate.definition->id, candidate.name, oldStart,
-                        oldEnd)
+                        oldEnd,
+                        candidate.restoreText.empty() ? "" : " and restore")
               .str());
       ++synthesizedCount;
     }
 
     REFOLD_LOG_WARN("macro/liveness",
-                    "synthesizing local #undef partition before observed "
-                    "replacement: defs={0} edit=[{1},{2}) widened=[{3},{4})",
+                    "synthesizing local #undef/restore partition around "
+                    "observed replacement: defs={0} edit=[{1},{2}) "
+                    "widened=[{3},{4})",
                     candidates.size(), oldStart, oldEnd, edit.start, edit.end);
   }
 
   if (synthesizedCount != 0)
     REFOLD_LOG_INFO(
         "macro/liveness",
-        "synthesized {0} local #undef partition(s) before observing "
+        "synthesized {0} local #undef/restore partition(s) around observing "
         "replacement payloads",
         synthesizedCount);
 }
@@ -2382,14 +2518,22 @@ bool MacroStateRepairContext::EditReplacementIsMappedBPayload(
   // audit does not have.  That is the standing partition gap, not a hole opened
   // here; the same gap already stops the synthetic-undef repair from acting on
   // a closure edit.
+  //
+  // An include realized from B is the other: its replacement is a slice of the
+  // edited stream and nothing else, so a name in it is B's identifier too, and
+  // it lands where the `#include` stood, under the TU's macro state there.
   if (edit.acceptedResults.empty())
     return false;
   for (const auto &carrier : edit.acceptedResults) {
     if (!carrier)
       return false;
-    if (carrier->kind != AcceptedResultCandidateKind::TUTextEdit ||
-        carrier->proofSummary.inventory.currentPath !=
-            AcceptedPathKind::TUByteSpanMappedEdit)
+    const AcceptedPathKind path = carrier->proofSummary.inventory.currentPath;
+    const bool mappedTUSlice =
+        carrier->kind == AcceptedResultCandidateKind::TUTextEdit &&
+        path == AcceptedPathKind::TUByteSpanMappedEdit;
+    const bool includeSliceOfB =
+        path == AcceptedPathKind::IncludeRealizationInlineFromB;
+    if (!mappedTUSlice && !includeSliceOfB)
       return false;
   }
   return true;
@@ -2518,15 +2662,18 @@ void MacroStateRepairContext::RequireEveryObservedGapDefinitionRepaired() {
       const RefoldModel::MacroDirective &definition = *ref.directive;
       if (!definition.IsDefine())
         continue;
-      if (plan_.syntheticUndefPartitionedDefinitionIds.contains(definition.id) ||
-          plan_.carriedGapDefinitionIds.contains(definition.id) ||
+      // A synthetic undef/restore is per edit and sits in the replacement
+      // text, where the read check below sees it; skipping its definition
+      // here would also hide every other edit that reads the name.
+      if (plan_.carriedGapDefinitionIds.contains(definition.id) ||
           plan_.preservedDefinitionDirectiveIds.contains(definition.id))
         continue;
 
       // The name must actually be bound where the replacement lands.  A
       // definition that a later `#undef` or redefinition has already displaced
       // binds nothing here and cannot be re-expanded.
-      if (ActiveDefinitionAtSourceOffset(ref.name, edit.start) != &definition)
+      if (DefinitionBoundAtSourceOffsetForAudit(ref.name, edit.start) !=
+          &definition)
         continue;
       const std::optional<size_t> boundReadOffset =
           ReplacementReadsMacroWhileBound(edit, definition, ref.name);
@@ -3553,6 +3700,14 @@ void RefoldMacroStateRepairPlanner::
         const MacroStateRepairRequest &request) const {
   MacroStateRepairContext Context(deps_, request, plan);
   Context.CarryObservedGapDefinitionsAfterReplacements();
+}
+
+bool RefoldMacroStateRepairPlanner::RequireEveryObservedGapDefinitionRepaired(
+    MacroStateRepairPlan &plan, const MacroStateRepairRequest &request) const {
+  MacroStateRepairContext Context(deps_, request, plan);
+  Context.SynthesizeUndefBeforeObservedGapDefinitions();
+  Context.RequireEveryObservedGapDefinitionRepaired();
+  return !deps_.terminalSink->HasRequest();
 }
 
 bool RefoldMacroStateRepairPlanner::

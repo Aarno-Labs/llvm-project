@@ -176,6 +176,9 @@ public:
       : model_(model), paths_(paths), tokenText_(tokenText),
         ownerStateProof_(ownerStateProof) {}
 
+  /// Return the raw-token text analysis this service observes payloads with.
+  const RefoldTokenTextAnalysis &TokenText() const { return tokenText_; }
+
   /// Return the observation mode for \p directive when it controls \p
   /// macroName.
   MacroStateObservationKind MacroStateObservationKindForDirective(

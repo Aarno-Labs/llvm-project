@@ -246,7 +246,13 @@ bool FinalTUEmissionContext::StageTURootIncludeExpansionEdits() {
   macroStateRepairPlanner_.CarryObservedGapDefinitionsAfterReplacements(
       macroStatePlan_, macroStateRequest_);
 
-  return includeMaterializationScheduler_.StageTURootIncludeExpansionEdits(
+  if (!includeMaterializationScheduler_.StageTURootIncludeExpansionEdits(
+          macroStatePlan_, macroStateRequest_))
+    return false;
+
+  // An include realized from B is a TU edit of B's own bytes staged only now,
+  // after the planning pass repaired and audited liveness, so do both again.
+  return macroStateRepairPlanner_.RequireEveryObservedGapDefinitionRepaired(
       macroStatePlan_, macroStateRequest_);
 }
 

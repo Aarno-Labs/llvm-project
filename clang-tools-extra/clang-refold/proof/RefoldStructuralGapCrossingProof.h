@@ -199,6 +199,15 @@ public:
     /// Conditional arm owning the run the payload is committed to, or nullopt
     /// when that run is not inside any conditional arm.
     std::optional<uint64_t> committedArmId;
+
+    /// Who answers for a payload identifier that is itself a live macro, when
+    /// the gap's `#define`/`#undef` bindings are asked about.
+    ///
+    /// `NeutralisedByLivenessAudit` is correct only for a caller whose edit is
+    /// a translation-unit replacement of wholly B-derived bytes, which is the
+    /// set `RequireEveryObservedGapDefinitionRepaired` walks.
+    PayloadIdentifierExpansionPolicy expansionPolicy =
+        PayloadIdentifierExpansionPolicy::Unconstrained;
   };
 
   explicit RefoldStructuralGapCrossingProver(Dependencies deps) : deps_(deps) {}

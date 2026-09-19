@@ -484,19 +484,15 @@ RefoldStructuralGapCrossingProver::Prove(const Query &query) const {
   // payload alone: every byte from the committed boundary to the end of the
   // hunk lands after the directive, so the wider question subsumes the exact
   // placement obligation.
-  // `Query::payload` and `Query::committedSuffix` are slices of B, and the
-  // replacement this decision produces is a translation-unit edit carrying
-  // exactly those bytes, so it is one of the edits
-  // `RequireEveryObservedGapDefinitionRepaired` walks.  That audit owns the
+  // A caller whose replacement is a translation-unit edit carrying exactly
+  // these B bytes says so through `Query::expansionPolicy`: that edit is one
+  // `RequireEveryObservedGapDefinitionRepaired` walks, and the audit owns the
   // question of whether an identifier in the payload still expands where it
-  // lands; asking it again here would refuse a placement for a reason that is
-  // not about placement at all.  Direct spelling of a bound name is still
-  // decided by the proof below.
+  // lands.  Direct spelling of a bound name is decided here either way.
   const bool macroStateUnobserved =
       proof.macroBindingsComplete && !proof.macroBindings.empty() &&
       !deps_.macroStateProof.PayloadObservesMacroStateBindings(
-          proof.macroBindings, query.committedSuffix,
-          PayloadIdentifierExpansionPolicy::NeutralisedByLivenessAudit);
+          proof.macroBindings, query.committedSuffix, query.expansionPolicy);
 
   for (const PreprocessingStructureInterval *interval : query.structures) {
     if (!interval) {

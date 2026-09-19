@@ -571,6 +571,24 @@ RefoldIncludeMaterializer::BuildInlineIncludeRealizationFromB(
       refusal = llvm::formatv("staged payload B=[{0},{1}) lies outside it",
                               patch.bStart, patch.bEnd)
                     .str();
+  // The envelope is projected through the byte diff, which picks one of
+  // several equally short alignments on its own.  The token map is the
+  // certified one, so the slice must agree with it: every token of the cover
+  // that survives into B survives inside the slice, and nothing that survives
+  // from outside the cover does.
+  for (size_t a = 0; !refusal && a < abTokMapA2B_.size(); ++a) {
+    const int64_t b = abTokMapA2B_[a];
+    if (b < 0)
+      continue;
+    const bool inCover = inc.cover.begin <= a && a < inc.cover.end;
+    const bool inSlice = bEnvOpt->first <= static_cast<size_t>(b) &&
+                         static_cast<size_t>(b) < bEnvOpt->second;
+    if (inCover != inSlice)
+      refusal = llvm::formatv("A token {0} maps to B token {1}, which the "
+                              "slice would {2}",
+                              a, b, inCover ? "drop" : "print a second time")
+                    .str();
+  }
   if (refusal) {
     terminalSink_.RequestTerminalFallback(
         MakeTerminalFallbackProofFailure(

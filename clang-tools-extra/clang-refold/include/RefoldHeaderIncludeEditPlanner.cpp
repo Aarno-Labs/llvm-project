@@ -26,9 +26,11 @@
 #include "proof/RefoldNeutralityProof.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldSidebandReplayProof.h"
+#include "proof/RefoldStructuralGapCrossingProof.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldSourceGapProof.h"
 #include "source/RefoldSourceMapper.h"
+#include "source/RefoldTokenTextAnalysis.h"
 #include "source/TokenTextHelpers.h"
 #include "support/RefoldDenseMapInfo.h"
 #include "support/RefoldLog.h"
@@ -2416,11 +2418,13 @@ RefoldHeaderIncludeEditPlanner::PlaceAmongPrintedPragmas(
     }
   }
 
-  // The gap's source extent in this header holds nothing but these directive
-  // lines and trivia, so a site between them is a site inside the gap.
+  // The gap's source extent in this header holds these directive lines, other
+  // preserved structures and trivia, and nothing else.
   const RefoldPreprocessingStructureIndex &census =
       GetHeaderOccurrenceStructureIndex(state.file, state.include.id,
                                         state.headerText);
+  if (!census.IsProtectionCensusComplete())
+    return std::nullopt;
   std::optional<uint64_t> gapBegin = 0;
   if (std::optional<uint64_t> leftPP =
           FindLeftNeighborPP(state.file, state.pos, state.ppLo, state.ppHi))
@@ -2431,44 +2435,134 @@ RefoldHeaderIncludeEditPlanner::PlaceAmongPrintedPragmas(
     gapEnd = sourceMapper_.ByteStartForPPInFile(state.file, *rightPP);
   if (!gapBegin || !gapEnd || *gapEnd < *gapBegin)
     return std::nullopt;
-  uint64_t cursor = *gapBegin;
-  for (const PrintedPragmaCarrier *carrier : gapCarriers) {
-    if (carrier->sourceBegin < cursor || *gapEnd < carrier->sourceEnd ||
-        !census.IsRangeLexicallyIgnorable(cursor, carrier->sourceBegin))
-      return std::nullopt;
-    cursor = carrier->sourceEnd;
-  }
-  if (!census.IsRangeLexicallyIgnorable(cursor, *gapEnd))
-    return std::nullopt;
+  SmallVector<std::pair<uint64_t, uint64_t>, 8> gapPieces;
+  for (const PrintedPragmaCarrier *carrier : gapCarriers)
+    gapPieces.emplace_back(carrier->sourceBegin, carrier->sourceEnd);
+  SmallVector<const PreprocessingStructureInterval *, 4> crossedStructures;
   for (const PreprocessingStructureInterval *interval :
-       census.FindOverlapping(*gapBegin, *gapEnd))
-    if (llvm::none_of(gapCarriers, [&](const PrintedPragmaCarrier *carrier) {
+       census.FindOverlapping(*gapBegin, *gapEnd)) {
+    if (llvm::any_of(gapCarriers, [&](const PrintedPragmaCarrier *carrier) {
           return carrier->sourceBegin <= interval->begin &&
                  interval->end <= carrier->sourceEnd;
         }))
+      continue;
+    if (!interval->IsValid())
       return std::nullopt;
+    crossedStructures.push_back(interval);
+    gapPieces.emplace_back(interval->begin, interval->end);
+  }
+  llvm::sort(gapPieces);
+  uint64_t cursor = *gapBegin;
+  for (const auto &[pieceBegin, pieceEnd] : gapPieces) {
+    if (pieceBegin < cursor || *gapEnd < pieceEnd ||
+        !census.IsRangeLexicallyIgnorable(cursor, pieceBegin))
+      return std::nullopt;
+    cursor = pieceEnd;
+  }
+  if (!census.IsRangeLexicallyIgnorable(cursor, *gapEnd))
+    return std::nullopt;
 
   // Land after the last preceding line, which ends with its newline, or
   // before the first following one; replay B only up to that line's copy.
   HeaderPrintedPragmaPlacement placement;
   placement.applies = true;
+  const PrintedPragmaCarrier *siteCarrier = nullptr;
   if (firstFollowingCarrier) {
+    siteCarrier = firstFollowingCarrier;
     placement.anchorByte = firstFollowingCarrier->sourceBegin;
     const uint64_t payloadBegin = bTokOff_[static_cast<size_t>(patch.bStart)];
     if (payloadBegin >= firstFollowing->bLineBegin)
       return std::nullopt;
-    placement.bByteEnd = firstFollowing->bLineBegin;
+    placement.payload = stripSeparatelyOwnedSidebandReplay(
+        sidebandPragmaEdits_,
+        bSource_.slice(payloadBegin, firstFollowing->bLineBegin), payloadBegin,
+        firstFollowing->bLineBegin);
   } else {
+    siteCarrier = lastPreceding;
     placement.anchorByte = lastPreceding->sourceEnd;
     if (placement.anchorByte == 0 ||
         state.headerText[static_cast<size_t>(placement.anchorByte - 1)] != '\n')
       return std::nullopt;
+    placement.payload = state.materialInsertBytes.str();
   }
+  if (crossedStructures.empty())
+    return placement;
+
+  // The other structures in the gap print nothing, so B does not order the
+  // payload against them; the site is fixed only relative to the lines.  That
+  // is sound exactly when the payload cannot observe any of them, so that every
+  // site in the gap re-preprocesses it alike.  The site sits beside a line this
+  // occurrence printed with no directive between, so it is in that line's arm.
+  // `PlanPureInsertionPatch` refuses a payload spelling any recorded macro,
+  // but nothing audits what an identifier might expand to, so reachability of
+  // the gap's bindings stays the prover's own question.
+  RefoldStructuralGapCrossingProver::Query query;
+  query.structures = crossedStructures;
+  query.payload = placement.payload;
+  query.committedSuffix = placement.payload;
+  query.expansionPolicy = PayloadIdentifierExpansionPolicy::Unconstrained;
+  if (std::optional<RefoldModel::ArmRef> armRef = model_.FindArmRefForByte(
+          state.file, state.include.id, siteCarrier->sourceBegin);
+      armRef && armRef->arm)
+    query.committedArmId = armRef->arm->id;
+  const RefoldStructuralGapCrossingProver prover(
+      RefoldStructuralGapCrossingProver::Dependencies{
+          model_, macroStateProof_, macroStateProof_.TokenText(), lexLang_});
+  if (!prover.Prove(query).Crossable())
+    return std::nullopt;
   return placement;
+}
+
+std::optional<StringRef>
+RefoldHeaderIncludeEditPlanner::RecordedMacroNamedByHeaderPayload(
+    StringRef payload,
+    ArrayRef<HeaderMacroStateCarryCandidate> carriedPastPayload) const {
+  SmallVector<StringRef, 16> identifiers;
+  macroStateProof_.TokenText().CollectRawIdentifiersInText(payload,
+                                                           identifiers);
+  const DenseSet<StringRef> spelled(identifiers.begin(), identifiers.end());
+  for (const RefoldModel::MacroDirective &directive :
+       model_.GetMacroDirectives()) {
+    if (!directive.IsDefine() || directive.name.empty() ||
+        !spelled.contains(directive.name))
+      continue;
+    if (macroStateProof_.SelfReferentialDefinitionIsUnobservableInText(
+            directive, directive.name, payload))
+      continue;
+    // A carried definition no longer precedes the payload.  That leaves the
+    // name unbound there only when it is the name's sole definition.
+    if (llvm::any_of(carriedPastPayload,
+                     [&](const HeaderMacroStateCarryCandidate &carried) {
+                       return carried.directive == &directive;
+                     }) &&
+        llvm::count_if(model_.GetMacroDirectives(),
+                       [&](const RefoldModel::MacroDirective &other) {
+                         return other.IsDefine() &&
+                                other.name == directive.name;
+                       }) == 1)
+      continue;
+    return StringRef(directive.name);
+  }
+  return std::nullopt;
 }
 
 bool RefoldHeaderIncludeEditPlanner::PlanPureInsertionPatch(
     const HeaderInsertionPlanningState &state) const {
+  // B is preprocessed, so a macro name in the payload is an identifier the
+  // refold must keep one.  No stage audits a header edit for that, and the
+  // definitions live at a header byte include the TU's as well as the
+  // header's own, so refuse any payload naming a recorded definition.
+  if (std::optional<StringRef> name =
+          RecordedMacroNamedByHeaderPayload(state.materialInsertBytes)) {
+    state.plan.requiresIncludeRealization = true;
+    state.plan.realizationReason =
+        llvm::formatv("INSERT: B payload in {0} names macro '{1}', which a "
+                      "header edit cannot prove unbound where it lands",
+                      state.file, *name)
+            .str();
+    return false;
+  }
+
   // A surviving pragma line of this header at the insertion's gap fixes which
   // side of it the payload goes on, and no other anchor knows that.  When the
   // lines bind but no site is provable, only include realization -- which
@@ -2485,17 +2579,8 @@ bool RefoldHeaderIncludeEditPlanner::PlanPureInsertionPatch(
     return false;
   }
   if (pragmaPlacement->applies) {
-    std::string payload = state.materialInsertBytes.str();
-    if (pragmaPlacement->bByteEnd) {
-      const uint64_t payloadBegin =
-          bTokOff_[static_cast<size_t>(state.patch.bStart)];
-      payload = stripSeparatelyOwnedSidebandReplay(
-          sidebandPragmaEdits_,
-          bSource_.slice(payloadBegin, *pragmaPlacement->bByteEnd),
-          payloadBegin, *pragmaPlacement->bByteEnd);
-    }
     HeaderInsertionPlanningState placedState = state;
-    placedState.materialInsertBytes = payload;
+    placedState.materialInsertBytes = pragmaPlacement->payload;
     InsertAnchorCandidate candidate;
     candidate.path = AcceptedPathKind::IncludeInsertPrintedPragmaPlacement;
     candidate.anchorByte = pragmaPlacement->anchorByte;
@@ -2652,6 +2737,20 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
                     {},
                     {},
                     {}};
+      if (p.directHeaderByteAuthority ==
+              DirectHeaderByteEditAuthorityKind::None &&
+          !isDelete)
+        if (std::optional<StringRef> name =
+                RecordedMacroNamedByHeaderPayload(p.insertBytes)) {
+          plan.requiresIncludeRealization = true;
+          plan.realizationReason =
+              llvm::formatv("direct B payload in {0} names macro '{1}', which "
+                            "a header edit cannot prove unbound where it lands",
+                            file, *name)
+                  .str();
+          return plan;
+        }
+
       bool sourceAuthorityAccepted = false;
       switch (p.directHeaderByteAuthority) {
       case DirectHeaderByteEditAuthorityKind::None:
@@ -2940,6 +3039,21 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
       carriedHeaderMacroState = TryCarryHeaderMacroStateAfterReplacement(
           carryState, carriedHeaderMacroStateTransitions);
     }
+
+    // The replace counterpart of the insertion obligation in
+    // `PlanPureInsertionPatch`: every name the B payload spells must be unbound
+    // where it lands.
+    if (!isDelete)
+      if (std::optional<StringRef> name = RecordedMacroNamedByHeaderPayload(
+              replacement, carriedHeaderMacroStateTransitions)) {
+        plan.requiresIncludeRealization = true;
+        plan.realizationReason =
+            llvm::formatv("B payload in {0} names macro '{1}', which a header "
+                          "edit cannot prove unbound where it lands",
+                          file, *name)
+                .str();
+        return plan;
+      }
 
     if (!headerGapPreservations.empty()) {
       // Emit preserved gap pieces after the B-derived payload. That keeps

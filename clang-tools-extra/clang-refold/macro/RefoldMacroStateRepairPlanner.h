@@ -124,6 +124,12 @@ public:
   void CarryObservedGapDefinitionsAfterReplacements(
       MacroStateRepairPlan &plan, const MacroStateRepairRequest &request) const;
 
+  /// Repair edits staged after `Plan()` with the synthetic undef/restore, then
+  /// re-run the liveness audit over the final TU edit set, and return false
+  /// when it requested terminal fallback.
+  bool RequireEveryObservedGapDefinitionRepaired(
+      MacroStateRepairPlan &plan, const MacroStateRepairRequest &request) const;
+
   /// Repairs macro definitions consumed by a materialized include replacement
   /// while preserving include ancestry and post-include observers.
   bool RepairConsumedDefinitionsForMaterializedInclude(

@@ -2292,6 +2292,10 @@ public:
                   committedSuffixBytes->first, committedSuffixBytes->second);
               crossingQuery.committedArmId =
                   physicalSourceRuns->runs[runIndex + 1].condArmId;
+              // The replacement is a translation-unit edit carrying exactly
+              // these B bytes, so the liveness audit answers for expansion.
+              crossingQuery.expansionPolicy =
+                  PayloadIdentifierExpansionPolicy::NeutralisedByLivenessAudit;
 
               const GapCrossingProof crossing =
                   gapCrossingProver_.Prove(crossingQuery);

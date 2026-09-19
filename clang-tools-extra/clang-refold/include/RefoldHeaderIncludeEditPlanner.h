@@ -174,12 +174,12 @@ private:
 
   /// Where a header-owned pure insertion lands among the header's surviving
   /// printed pragma lines at its gap.  `applies` is false when no such line is
-  /// at the gap; otherwise the insertion goes at `anchorByte`, replaying B only
-  /// up to `bByteEnd` when a line follows the payload.
+  /// at the gap; otherwise the insertion writes `payload` at `anchorByte`.
+  /// `payload` replays B only up to the first line that follows it.
   struct HeaderPrintedPragmaPlacement {
     bool applies = false;
     uint64_t anchorByte = 0;
-    std::optional<uint64_t> bByteEnd;
+    std::string payload;
   };
 
   /// Selected insertion anchor plus its accepted-result carrier.
@@ -683,11 +683,25 @@ private:
   /// Each line at the gap must bind to exactly one relocatable directive-line
   /// carrier of this header occurrence, all lines B prints before the payload
   /// must precede all it prints after, and the gap's source extent must hold
-  /// nothing but those lines and trivia.  The payload then lands at the first
-  /// following line, replaying B only up to that line's copy, or after the
-  /// last preceding one.
+  /// nothing but those lines, trivia, and structures the payload is proven by
+  /// `RefoldStructuralGapCrossingProver` not to observe.  The payload then
+  /// lands at the first following line, replaying B only up to that line's
+  /// copy, or after the last preceding one.
   std::optional<HeaderPrintedPragmaPlacement>
   PlaceAmongPrintedPragmas(const HeaderInsertionPlanningState &state) const;
+
+  /// Return the name of a recorded `#define` that \p payload spells and that
+  /// would not survive its own expansion, or std::nullopt when there is none.
+  /// A definition in \p carriedPastPayload is exempt when it is its name's
+  /// only recorded definition, since nothing then binds the name there.
+  ///
+  /// This is deliberately blind to where the payload lands: a name defined
+  /// later, undefined earlier, or function-like with no following `(` is still
+  /// reported.  Over-reporting costs completeness only.
+  std::optional<llvm::StringRef> RecordedMacroNamedByHeaderPayload(
+      llvm::StringRef payload,
+      llvm::ArrayRef<HeaderMacroStateCarryCandidate> carriedPastPayload = {})
+      const;
 
   std::optional<SelectedInsertAnchorCandidate>
   SelectBestInsertCandidate(llvm::ArrayRef<InsertAnchorCandidate> candidates,

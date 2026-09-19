@@ -746,6 +746,24 @@ static uint64_t certifiedWindowBeforeGap(ArrayRef<uint8_t> matchedTokens,
   return certified;
 }
 
+/// Mark every certified window that holds at least one unmatched normal token
+/// of a stream, indexed as `certifiedWindowBeforeGap` numbers windows.
+static std::vector<uint8_t>
+windowsHoldingUnmatchedTokens(ArrayRef<uint8_t> matchedTokens) {
+  std::vector<uint8_t> holds;
+  uint64_t window = 0;
+  for (uint8_t matched : matchedTokens) {
+    if (matched) {
+      ++window;
+      continue;
+    }
+    if (holds.size() <= window)
+      holds.resize(window + 1, 0);
+    holds[static_cast<size_t>(window)] = 1;
+  }
+  return holds;
+}
+
 static bool isOnlyWhitespaceForSidebandBlock(StringRef text) {
   for (char c : text) {
     if (!stringutils::isNonNewlineWs(c) && c != '\n' && c != '\r')
@@ -2073,41 +2091,81 @@ bool buildSidebandPragmaSourceEdits(
     return std::to_string(window) + "\x1f" + canonicalText.str();
   };
 
-  // Refuse a window that does not determine which directive is meant.
+  // Refuse a window that does not determine which directive is meant, unless
+  // every choice it leaves open prints the same thing.
   //
   // A window is coarser than a gap, so two lines of one stream can share a
   // window key while sitting at different gaps.  Pairing them by position in
-  // the key sequence would be an order tie-break, not a proof, and the two
-  // choices name different source directives.  Lines that share a window *and*
-  // a gap are a different matter: the previous exact-gap key could not tell
-  // them apart either, so refusing them would withdraw folds that already work.
-  // The guard therefore rejects exactly the ambiguity this coordinate
-  // introduces and nothing that was already accepted.
+  // the key sequence is an order tie-break, and the two choices name different
+  // source directives.  Lines that share a window *and* a gap are a different
+  // matter: the previous exact-gap key could not tell them apart either.
+  //
+  // Two same-key lines at different gaps are interchangeable when both of these
+  // hold.  Every line between them in stream order has the same key, so no
+  // other printed line separates them.  And the other stream holds no normal
+  // token in the window, so nothing it prints there can fall between them
+  // either.  Only this stream's unmatched tokens then separate the two lines,
+  // and those vanish (A) or are replayed around the paired line as a block
+  // (B).  Either pairing prints, between the window's two anchors, the same
+  // sequence of identically spelled lines, so choosing one is not a tie-break
+  // between different refolds.
+  const std::vector<uint8_t> aWindowsHoldTokens =
+      windowsHoldingUnmatchedTokens(matchedATokens);
+  const std::vector<uint8_t> bWindowsHoldTokens =
+      windowsHoldingUnmatchedTokens(matchedBTokens);
   auto sidebandWindowKeysAreUnambiguous =
-      [&](ArrayRef<SidebandPragmaLine> lines,
-          ArrayRef<uint8_t> matchedTokens) -> bool {
-    std::map<std::string, uint64_t> gapForKey;
-    for (const SidebandPragmaLine &line : lines) {
-      const std::string key = sidebandWindowKey(
+      [&](ArrayRef<SidebandPragmaLine> lines, ArrayRef<uint8_t> matchedTokens,
+          ArrayRef<uint8_t> otherWindowsHoldTokens) -> bool {
+    std::vector<std::string> keys;
+    keys.reserve(lines.size());
+    for (const SidebandPragmaLine &line : lines)
+      keys.push_back(sidebandWindowKey(
           certifiedWindowBeforeGap(matchedTokens, line.normalTokenGap),
-          line.canonicalText);
-      auto inserted = gapForKey.emplace(key, line.normalTokenGap);
-      if (!inserted.second && inserted.first->second != line.normalTokenGap) {
+          line.canonicalText));
+    std::map<std::string, size_t> lastIndexForKey;
+    for (size_t index = 0; index < lines.size(); ++index) {
+      const SidebandPragmaLine &line = lines[index];
+      auto inserted = lastIndexForKey.emplace(keys[index], index);
+      if (inserted.second)
+        continue;
+      const size_t previous = inserted.first->second;
+      inserted.first->second = index;
+      const uint64_t previousGap = lines[previous].normalTokenGap;
+      if (previousGap == line.normalTokenGap)
+        continue;
+      const uint64_t window =
+          certifiedWindowBeforeGap(matchedTokens, line.normalTokenGap);
+      bool onlySameKeyBetween = true;
+      for (size_t between = previous + 1; between < index; ++between)
+        onlySameKeyBetween &= keys[between] == keys[index];
+      const bool otherWindowEmpty =
+          window >= otherWindowsHoldTokens.size() ||
+          !otherWindowsHoldTokens[static_cast<size_t>(window)];
+      if (onlySameKeyBetween && otherWindowEmpty) {
         REFOLD_LOG_TRACE(
             "pragma/sideband",
-            "refusing sideband pairing: certified window {0} holds two "
-            "directives spelled '{1}' at normal-token gaps {2} and {3}",
-            certifiedWindowBeforeGap(matchedTokens, line.normalTokenGap),
-            stringutils::showWs(StringRef(line.canonicalText).trim()),
-            inserted.first->second, line.normalTokenGap);
-        return false;
+            "certified window {0} holds two directives spelled '{1}' at "
+            "normal-token gaps {2} and {3}, but nothing else prints between "
+            "them in either stream, so both pairings print the same lines",
+            window, stringutils::showWs(StringRef(line.canonicalText).trim()),
+            previousGap, line.normalTokenGap);
+        continue;
       }
+      REFOLD_LOG_TRACE(
+          "pragma/sideband",
+          "refusing sideband pairing: certified window {0} holds two "
+          "directives spelled '{1}' at normal-token gaps {2} and {3}",
+          window, stringutils::showWs(StringRef(line.canonicalText).trim()),
+          previousGap, line.normalTokenGap);
+      return false;
     }
     return true;
   };
 
-  if (!sidebandWindowKeysAreUnambiguous(aLines, matchedATokens) ||
-      !sidebandWindowKeysAreUnambiguous(bLines, matchedBTokens))
+  if (!sidebandWindowKeysAreUnambiguous(aLines, matchedATokens,
+                                        bWindowsHoldTokens) ||
+      !sidebandWindowKeysAreUnambiguous(bLines, matchedBTokens,
+                                        aWindowsHoldTokens))
     return false;
 
   for (const auto &line : aLines)
