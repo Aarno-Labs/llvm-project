@@ -1189,7 +1189,7 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
                         childSiteEnd,
                         ComputeAncestorArmForChildInclude(
                             *child, includeId, ancestorArmIdAtIncludeSite),
-                        edits);
+                        /*noInlinedCopyFollows=*/false, edits);
                 !guardResult.proven) {
               // Leaving an empty expansion here would silently delete the
               // *parent's* whole body while the caller consumed it as a
@@ -1395,7 +1395,7 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
                   *sibling, headerPath, includeId, bytes, siteStart, siteEnd,
                   ComputeAncestorArmForChildInclude(*sibling, includeId,
                                                     ancestorArmIdAtIncludeSite),
-                  edits);
+                  /*noInlinedCopyFollows=*/false, edits);
           !guardResult.proven) {
         // As above: an empty expansion would drop this header's whole body
         // rather than fail, so the rejection is propagated as terminal.

@@ -25,13 +25,18 @@
 // header, and the site inventory is re-proven in the domain of the occurrence
 // the producer *entered*.
 //
-// That second one is what the operator spelling exposed.  Both occurrences are
-// materialized here -- a surviving `#include` would need an eager define, which
-// a conditional site cannot license -- and the second occurrence was suppressed
-// by the very once-state being catalogued, so it entered nothing and carries no
-// producer record.  Re-proving in its own domain made every once site in it
-// look unbound and rejected the header; the inventory belongs to the header's
-// bytes, and only the binding evidence belongs to an occurrence.
+// That second one is what the operator spelling exposed.  The second
+// occurrence was suppressed by the very once-state being catalogued, so it
+// entered nothing and carries no producer record.  Re-proving in its own
+// domain made every once site in it look unbound and rejected the header; the
+// inventory belongs to the header's bytes, and only the binding evidence
+// belongs to an occurrence.
+//
+// The second occurrence survives as a directive.  Its wrapper tests the guard
+// but does not define it eagerly, which a conditional site cannot license; no
+// inlined copy follows it, so Clang's own once-state for the unmodified header
+// covers whatever it enters.  It used to be inlined as well, which removed an
+// `#include` nothing forced out.
 //
 // The arm is `#if 1`, always taken -- and that is the point.  Nothing here
 // evaluates the condition; the define is placed inside the arm precisely so
@@ -49,12 +54,7 @@ int cond_use = MIDLINE_COND_V;
 int mid = 0;
 
 #ifndef __CLANG_REFOLD_ONCE_1
-#if 1
-int cond_op = 0; 
-#define __CLANG_REFOLD_ONCE_1
-#endif
-#define MIDLINE_COND_V 4
-int cond_use = MIDLINE_COND_V;
+#include "guard_once_operator_midline_conditional.h"
 #endif
 
 int tail = MIDLINE_COND_V;

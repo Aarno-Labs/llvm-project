@@ -38,6 +38,10 @@
 // copy, the real once-set is populated while the macro is not; without the eager
 // define the later `#ifndef` would pass and the body would be emitted twice.
 //
+// A wrapper without the eager define is admitted only for a conditional
+// pragma, which cannot license one, and only when no inlined copy follows the
+// directive.
+//
 // The service is deliberately fail-closed.  Every physical header it cannot
 // fully prove carries an explicit `PragmaOnceGuardRejection` rather than a
 // silently weaker guard, because emitting an unguarded inlined body beside a
@@ -460,14 +464,21 @@ public:
   /// verbatim, including comments, delimiters, macro-computed operands, and
   /// `#include_next`.
   ///
-  /// Requires an unconditional pragma: the wrapper defines the macro eagerly,
-  /// which would mark a conditionally-once header as included even when the
-  /// original pragma would not have fired.
+  /// An unconditional pragma gets the eager wrapper, which defines the macro
+  /// before entering the header.  A conditional pragma cannot license that:
+  /// it would mark the header as included even when the original pragma would
+  /// not have fired.  It gets a wrapper that only tests the macro, and only
+  /// when \p noInlinedCopyFollows is set; otherwise the include is rejected.
+  ///
+  /// \p noInlinedCopyFollows is the caller's proof that no inlined source copy
+  /// of this header appears after the directive in the output.  Such a copy
+  /// consults only the macro, so it would miss a once-state this directive
+  /// establishes inside the unmodified header.
   PragmaOnceGuardEditResult StageSurvivingIncludeGuardEdit(
       const RefoldModel::IncludeItem &include, llvm::StringRef ownerPath,
       std::optional<uint64_t> ownerIncludeId, llvm::StringRef ownerBytes,
       uint64_t siteBegin, uint64_t siteEnd,
-      std::optional<uint64_t> ancestorArmId,
+      std::optional<uint64_t> ancestorArmId, bool noInlinedCopyFollows,
       std::vector<TextEdit> &edits) const;
 
 private:
@@ -578,9 +589,10 @@ private:
   /// line-control mode.
   ///
   /// The prologue and epilogue add whole physical lines, and the surviving-include
-  /// wrapper adds three.  With `#line` injection enabled the drift is repaired by
-  /// the ordinary resync machinery; with `--no-lines` it is unrepairable, so a
-  /// preserved line-state observer in the shifted suffix must fail closed.
+  /// wrapper adds two or three.  With `#line` injection enabled the drift is
+  /// repaired by the ordinary resync machinery; with `--no-lines` it is
+  /// unrepairable, so a preserved line-state observer in the shifted suffix
+  /// must fail closed.
   bool GuardLineDriftIsRepairable(std::optional<uint64_t> ownerIncludeId,
                                   llvm::StringRef ownerPath,
                                   uint64_t offset) const;

@@ -1468,7 +1468,7 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
     const RefoldModel::IncludeItem &include, StringRef ownerPath,
     std::optional<uint64_t> ownerIncludeId, StringRef ownerBytes,
     uint64_t siteBegin, uint64_t siteEnd, std::optional<uint64_t> ancestorArmId,
-    std::vector<TextEdit> &edits) const {
+    bool noInlinedCopyFollows, std::vector<TextEdit> &edits) const {
   if (!activeSetRecorded_) {
     REFOLD_LOG_FATAL("pragma/once/guard",
                      "guard staging requested before the active header set was "
@@ -1512,11 +1512,21 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
             .str());
   }
 
-  // The wrapper defines the macro eagerly, before entering the header.  For a
+  // The eager wrapper defines the macro before entering the header.  For a
   // conditionally-once header that would mark the header as included even when
-  // the original pragma would not have fired, so the establishing site must
-  // dominate through the whole include ancestry.
-  if (!EstablishingSiteIsUnconditional(guard->sites, ancestorArmId)) {
+  // the original pragma would not have fired, so it needs an establishing site
+  // that dominates through the whole include ancestry.
+  //
+  // Without one, the wrapper may only test the macro.  Once-state is then held
+  // in two places: the macro, defined by each inlined copy at its own pragma
+  // site, and Clang's once-set, populated when a surviving directive enters the
+  // unmodified header and its pragma fires.  Together they record exactly the
+  // pragma executions of the original.  A later surviving directive consults
+  // both, as the original did.  A later inlined copy consults only the macro
+  // and would miss this directive's execution, so the caller must exclude one.
+  const bool eagerDefine =
+      EstablishingSiteIsUnconditional(guard->sites, ancestorArmId);
+  if (!eagerDefine && !noInlinedCopyFollows) {
     return PragmaOnceGuardEditResult::Reject(
         PragmaOnceGuardRejection::NonDominatingEstablishingSite,
         formatv("surviving include inc#{0} of '{1}' would need an eager define "
@@ -1536,12 +1546,12 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
             .str());
   }
 
-  // The wrapper adds three physical lines around the directive, in TU or
+  // The wrapper adds two or three physical lines around the directive, in TU or
   // parent-header bytes: user source whose suffix may observe line state.
   if (!GuardLineDriftIsRepairable(ownerIncludeId, ownerPath, siteEnd)) {
     return PragmaOnceGuardEditResult::Reject(
         PragmaOnceGuardRejection::UnrepairableLineDrift,
-        formatv("surviving include inc#{0} wrapper would shift 3 lines past a "
+        formatv("surviving include inc#{0} wrapper would shift lines past a "
                 "preserved line-state observer in '{1}' with #line injection "
                 "disabled",
                 include.id, ownerPath)
@@ -1558,9 +1568,12 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
   text.reserve(original.size() + 3 * guard->macroName.size() + 48);
   text += "#ifndef ";
   text += guard->macroName;
-  text += "\n#define ";
-  text += guard->macroName;
   text += "\n";
+  if (eagerDefine) {
+    text += "#define ";
+    text += guard->macroName;
+    text += "\n";
+  }
   text += original;
   if (!originalEndsWithNewline)
     text += "\n";
@@ -1593,8 +1606,9 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
 
   REFOLD_LOG_TRACE("pragma/once/guard",
                    "staged surviving-include guard '{0}' for inc#{1} at "
-                   "[{2},{3}) in '{4}'",
-                   guard->macroName, include.id, siteBegin, siteEnd, ownerPath);
+                   "[{2},{3}) in '{4}' (eagerDefine={5})",
+                   guard->macroName, include.id, siteBegin, siteEnd, ownerPath,
+                   eagerDefine);
   return PragmaOnceGuardEditResult::Proven();
 }
 

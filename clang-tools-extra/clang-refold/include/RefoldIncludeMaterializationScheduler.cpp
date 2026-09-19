@@ -497,7 +497,8 @@ bool RefoldIncludeMaterializationScheduler::StageTURootSurvivingIncludeGuards() 
     if (PragmaOnceGuardEditResult guardResult =
             pragmaOnceGuards_.StageSurvivingIncludeGuardEdit(
                 *include, request_.tuPath, std::nullopt, request_.tuBytes,
-                siteBegin, siteEnd, ancestorArm, tuEdits_);
+                siteBegin, siteEnd, ancestorArm,
+                NoInlinedCopyFollowsTUSite(*include), tuEdits_);
         !guardResult.proven) {
       REFOLD_LOG_TRACE("pragma/once/guard",
                        "TU surviving include inc#{0} rejected: {1} ({2})",
@@ -517,6 +518,37 @@ bool RefoldIncludeMaterializationScheduler::StageTURootSurvivingIncludeGuards() 
     }
   }
 
+  return true;
+}
+
+bool RefoldIncludeMaterializationScheduler::NoInlinedCopyFollowsTUSite(
+    const RefoldModel::IncludeItem &survivor) const {
+  const PragmaOnceGuard *guard =
+      pragmaOnceGuards_.FindGuardForInclude(survivor);
+  if (!guard)
+    return false;
+
+  for (const auto &expansion : includeExpansion_) {
+    const RefoldModel::IncludeItem *inlined =
+        model_.GetIncludeById(expansion.first);
+    // Physical identity comes from `openedPath`; without it the copy may be of
+    // this header, and the guard lookup below would silently say it is not.
+    if (!inlined || !inlined->openedPath || inlined->openedPath->empty())
+      return false;
+    if (pragmaOnceGuards_.FindGuardForInclude(*inlined) != guard)
+      continue;
+
+    const RefoldModel::IncludeItem *root = inlined;
+    while (root->parent) {
+      root = model_.GetIncludeById(*root->parent);
+      if (!root)
+        return false;
+    }
+    if (!pathIdentity_.PathsEqual(root->sitePath, request_.tuPath))
+      return false;
+    if (root->siteB >= survivor.siteB)
+      return false;
+  }
   return true;
 }
 

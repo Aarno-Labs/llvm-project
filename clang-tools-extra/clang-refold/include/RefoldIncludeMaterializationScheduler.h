@@ -243,6 +243,17 @@ private:
   /// directive because its header was inlined at another occurrence.
   bool StageTURootSurvivingIncludeGuards();
 
+  /// Return whether no inlined copy of the header opened by \p survivor appears
+  /// after its TU directive in the output.
+  ///
+  /// This is the obligation a surviving-include wrapper without an eager
+  /// `#define` leaves to its caller.  It is decided over every inlined include,
+  /// nested ones included, so it is valid only once materialization is final.
+  /// An inlined copy is placed at the TU site of its TU-owned ancestor.  One
+  /// whose header or ancestor cannot be identified counts as following.
+  bool
+  NoInlinedCopyFollowsTUSite(const RefoldModel::IncludeItem &survivor) const;
+
   /// Prove that no surviving include can re-enter a header whose inlined body
   /// lost its own include-guard protection.
   ///
