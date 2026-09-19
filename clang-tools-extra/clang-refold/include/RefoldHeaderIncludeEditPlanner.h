@@ -83,7 +83,9 @@ public:
       const RefoldTextEditCertifier &textEditCertifier,
       const RefoldLineObserverLayout &lineObserverLayout,
       llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
-      const clang::LangOptions &lexLang);
+      const clang::LangOptions &lexLang,
+      llvm::ArrayRef<SidebandPragmaLinePairing> sidebandPragmaLinePairings = {},
+      llvm::ArrayRef<PrintedPragmaCarrier> printedPragmaCarriers = {});
 
   /// Declared out of line so the occurrence structure-index cache can hold a
   /// forward-declared RefoldPreprocessingStructureIndex.
@@ -168,6 +170,16 @@ private:
 
     /// Concrete insertion byte in the materialized header text.
     uint64_t anchorByte = 0;
+  };
+
+  /// Where a header-owned pure insertion lands among the header's surviving
+  /// printed pragma lines at its gap.  `applies` is false when no such line is
+  /// at the gap; otherwise the insertion goes at `anchorByte`, replaying B only
+  /// up to `bByteEnd` when a line follows the payload.
+  struct HeaderPrintedPragmaPlacement {
+    bool applies = false;
+    uint64_t anchorByte = 0;
+    std::optional<uint64_t> bByteEnd;
   };
 
   /// Selected insertion anchor plus its accepted-result carrier.
@@ -663,6 +675,20 @@ private:
 
   /// Selects the best proved insertion candidate with the proof lattice.
   /// The returned value carries the exact accepted-result proof for commit.
+  /// Place a header-owned pure insertion among this header's surviving
+  /// printed `#pragma` lines at its gap, or return std::nullopt when lines are
+  /// there but no site is provable.
+  ///
+  /// This is the header counterpart of `placeTUInsertionAmongPrintedPragmas`.
+  /// Each line at the gap must bind to exactly one relocatable directive-line
+  /// carrier of this header occurrence, all lines B prints before the payload
+  /// must precede all it prints after, and the gap's source extent must hold
+  /// nothing but those lines and trivia.  The payload then lands at the first
+  /// following line, replaying B only up to that line's copy, or after the
+  /// last preceding one.
+  std::optional<HeaderPrintedPragmaPlacement>
+  PlaceAmongPrintedPragmas(const HeaderInsertionPlanningState &state) const;
+
   std::optional<SelectedInsertAnchorCandidate>
   SelectBestInsertCandidate(llvm::ArrayRef<InsertAnchorCandidate> candidates,
                             const IncludePatch &patch) const;
@@ -760,6 +786,8 @@ private:
   const RefoldLineObserverLayout &lineObserverLayout_;
   llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits_;
   const clang::LangOptions &lexLang_;
+  llvm::ArrayRef<SidebandPragmaLinePairing> sidebandPragmaLinePairings_;
+  llvm::ArrayRef<PrintedPragmaCarrier> printedPragmaCarriers_;
 
   /// Return the occurrence-local structure census for one header inclusion.
   ///

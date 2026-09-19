@@ -93,10 +93,10 @@ struct FinalMacroCandidateAdmissionContext {
   /// are.  Borrowed for the duration of one admission.
   const llvm::DenseSet<uint64_t> *ownersMustExpand = nullptr;
 
-  /// B gaps of the paired `#pragma` lines this invocation's expansion printed.
+  /// The paired `#pragma` lines this invocation's expansion printed.
   /// Replacing the invocation removes the source that printed them, so a
   /// candidate must replay each one itself.
-  ArrayRef<uint64_t> printedPragmaBGaps;
+  ArrayRef<const SidebandPragmaLinePairing *> printedPragmaLines;
 
   bool hasDirectArgsOnlyCandidate = false;
   bool hasDagRootReplayCandidate = false;
@@ -214,16 +214,20 @@ bool addFinalMacroCandidate(
 
   // An invocation whose expansion printed a surviving `#pragma` line is the
   // only source of that line.  A candidate keeping the callsite re-expands it,
-  // but nothing proves the re-expansion prints the line where B does; one
-  // replacing the callsite with B's tokens carries the line only when it lies
-  // strictly inside that B range, because exact token coverage stops at the
-  // first and last token and leaves a line at either edge behind.
-  for (uint64_t bGap : ctx.printedPragmaBGaps) {
+  // but nothing proves the re-expansion prints the line where B does.  One
+  // replacing the callsite with B's tokens carries the line when it lies
+  // strictly inside that B range, or when the realization records replaying
+  // it at an edge: exact token coverage stops at the first and last token.
+  for (const SidebandPragmaLinePairing *line : ctx.printedPragmaLines) {
     const MacroPatch &patch = candidate.patch;
+    const uint64_t bGap = *line->bNormalTokenGap;
+    const bool replayedAtEdge =
+        llvm::is_contained(patch.materialized.replayedPragmaLines,
+                           std::make_pair(line->bLineBegin, line->bLineEnd));
     if (patch.proof.preservesInvocationStructure ||
         !patch.materialized.hasBTokenRange ||
-        !(patch.materialized.bTokStart < bGap &&
-          bGap < patch.materialized.bTokEnd)) {
+        !(replayedAtEdge || (patch.materialized.bTokStart < bGap &&
+                             bGap < patch.materialized.bTokEnd))) {
       REFOLD_LOG_TRACE(
           "macro/final-candidate",
           "reject inv id={0} name={1} origin={2} "
@@ -333,10 +337,10 @@ RefoldMacroFinalCandidateSelector::RefoldMacroFinalCandidateSelector(
     Dependencies deps)
     : deps_(std::move(deps)) {}
 
-SmallVector<uint64_t, 2>
-RefoldMacroFinalCandidateSelector::PrintedPragmaBGapsOf(
+SmallVector<const SidebandPragmaLinePairing *, 2>
+RefoldMacroFinalCandidateSelector::PrintedPragmaLinesOf(
     const RefoldModel::MacroInvocation &m) const {
-  SmallVector<uint64_t, 2> bGaps;
+  SmallVector<const SidebandPragmaLinePairing *, 2> lines;
   for (const SidebandPragmaLinePairing &line :
        deps_.sidebandPragmaLinePairings) {
     if (!line.bNormalTokenGap)
@@ -350,9 +354,9 @@ RefoldMacroFinalCandidateSelector::PrintedPragmaBGapsOf(
                       return span.begin <= aGap && aGap <= span.end;
                     });
     if (produced)
-      bGaps.push_back(*line.bNormalTokenGap);
+      lines.push_back(&line);
   }
-  return bGaps;
+  return lines;
 }
 
 std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
@@ -677,7 +681,8 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
   // deterministic construction order and delegates ranking to the proof
   // lattice; it does not discover new fallback paths.
   SmallVector<FinalMacroCandidate, 5> finalMacroCandidates;
-  const SmallVector<uint64_t, 2> printedPragmaBGaps = PrintedPragmaBGapsOf(m);
+  const SmallVector<const SidebandPragmaLinePairing *, 2> printedPragmaLines =
+      PrintedPragmaLinesOf(m);
   FinalMacroCandidateAdmissionContext finalAdmissionCtx{
       m,
       hEff,
@@ -686,7 +691,7 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
       &finalSubtreeValidationCtx,
       allowNonTopLevelMacroSelectorFailure,
       deps_.ownersMustExpand,
-      printedPragmaBGaps};
+      printedPragmaLines};
 
   if (argsOnlyCandidate) {
     addFinalMacroCandidate(

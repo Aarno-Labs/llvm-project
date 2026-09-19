@@ -109,12 +109,12 @@ public:
   Run(RefoldMacroWholeCoverPlanningContext &planningCtx) const;
 
 private:
-  /// Return the B gaps of the paired `#pragma` lines that \p m's expansion
-  /// printed: those whose `_Pragma` has \p m among its callers.  A gap whose
-  /// caller chain does not resolve counts when it lies within \p m's own
-  /// A-token extent, so an unknown producer is never assumed absent.
-  llvm::SmallVector<uint64_t, 2>
-  PrintedPragmaBGapsOf(const RefoldModel::MacroInvocation &m) const;
+  /// Return the paired `#pragma` lines that \p m's expansion printed: those
+  /// whose `_Pragma` has \p m among its callers.  A gap whose caller chain
+  /// does not resolve counts when it lies within \p m's own A-token extent,
+  /// so an unknown producer is never assumed absent.
+  llvm::SmallVector<const SidebandPragmaLinePairing *, 2>
+  PrintedPragmaLinesOf(const RefoldModel::MacroInvocation &m) const;
 
   Dependencies deps_;
 };

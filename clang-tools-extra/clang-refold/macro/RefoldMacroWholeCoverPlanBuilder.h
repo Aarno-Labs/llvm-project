@@ -36,11 +36,18 @@
 #include "model/RefoldModel.h"
 #include "proof/RefoldMacroPatchTypes.h"
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
+
 #include <cstdint>
 #include <optional>
+#include <utility>
 
 namespace clang {
 namespace refold {
+
+class RefoldMacroTopology;
+struct SidebandPragmaLinePairing;
 
 class RefoldBInsertionLedger;
 class RefoldSourceMapper;
@@ -62,6 +69,12 @@ public:
   struct Dependencies {
     const RefoldSourceMapper &sourceMapper;
     const RefoldBInsertionLedger &bInsertionLedger;
+    /// Caller chains of macro-produced `_Pragma`s, and where each printed
+    /// `#pragma` line survived in B: an invocation replaced by its whole cover
+    /// must replay the lines its own expansion printed.
+    const RefoldMacroTopology &topology;
+    llvm::ArrayRef<SidebandPragmaLinePairing> sidebandPragmaLinePairings;
+    llvm::StringRef bSource;
   };
 
   explicit RefoldMacroWholeCoverPlanBuilder(Dependencies deps) : deps_(deps) {}
@@ -99,6 +112,22 @@ public:
                                          uint64_t rootMacroId);
 
 private:
+  /// Make \p plan replay the surviving `#pragma` lines \p m's own expansion
+  /// printed, and record them.
+  ///
+  /// Replacing the callsite removes the only source that printed such a line,
+  /// so the whole cover must carry B's copy.  A line strictly inside the kept
+  /// B segment is already part of \p material.  One at either edge is added,
+  /// provided only whitespace and other such lines separate it from
+  /// \p material; a leading line is given a line of its own because the
+  /// callsite may sit mid-line.  A line B prints outside the segment, or an
+  /// edge holding anything else, leaves the plan unextended and unrecorded,
+  /// so a candidate built from it is refused rather than dropping the line.
+  void ReplayProducedPragmaLines(const RefoldModel::MacroInvocation &m,
+                                 std::pair<size_t, size_t> keptSegment,
+                                 llvm::StringRef material,
+                                 WholeCoverPlan &plan) const;
+
   Dependencies deps_;
 };
 

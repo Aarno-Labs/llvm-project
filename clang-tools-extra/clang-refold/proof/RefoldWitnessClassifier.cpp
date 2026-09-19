@@ -40,6 +40,7 @@ witnessFamilyForAcceptedPath(AcceptedPathKind path) {
   case AcceptedPathKind::IncludeInsertChildBoundary:
   case AcceptedPathKind::IncludeInsertRightNeighborPP:
   case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+  case AcceptedPathKind::IncludeInsertPrintedPragmaPlacement:
   case AcceptedPathKind::IncludeInsertDeclBoundary:
     return WitnessProofFamily::IncludePreservation;
   case AcceptedPathKind::IncludeRealizationInlineFromB:
@@ -85,6 +86,7 @@ witnessProducerKindForAcceptedPath(AcceptedPathKind path) {
   case AcceptedPathKind::IncludeInsertChildBoundary:
   case AcceptedPathKind::IncludeInsertRightNeighborPP:
   case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+  case AcceptedPathKind::IncludeInsertPrintedPragmaPlacement:
   case AcceptedPathKind::IncludeInsertDeclBoundary:
   case AcceptedPathKind::TUExactSlotBoundary:
   case AcceptedPathKind::TUProvableInsertionAnchor:

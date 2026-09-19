@@ -45,6 +45,7 @@ class RefoldPathIdentity;
 class RefoldPreprocessingStructureIndexProvider;
 class RefoldSourceMapper;
 class RefoldTokenTextAnalysis;
+struct PrintedPragmaCarrier;
 struct SidebandPragmaEdit;
 struct SidebandPragmaLinePairing;
 
@@ -115,6 +116,9 @@ public:
     /// Sideband source edits; a replaying one prints B's lines at its own
     /// source position, which the token hunks must agree with.
     llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits;
+    /// Source carriers of the paired lines; a relocatable one may be repaired
+    /// around.  See `PrintedPragmaCarrier`.
+    llvm::ArrayRef<PrintedPragmaCarrier> printedPragmaCarriers;
     /// Lexer options for classifying that directive and its payload.
     const clang::LangOptions &lexLang;
     /// Owner classifier used to assign hunk subranges to owner domains.
@@ -197,17 +201,21 @@ private:
   /// that -- it is decided before, and independently of, the alignment the
   /// hunks come from -- so it is checked here, on the final hunks.
   ///
-  /// A translation-unit `#pragma` directive line may be repaired: when B
-  /// prints it inside a hunk bordering its gap, B's token order forces the
-  /// tokens on the far side into a pure insertion at the gap, placed by
-  /// `placeTUInsertionAmongPrintedPragmas`.  Hunks a tiling witness is bound
-  /// to are never changed.
+  /// A line printed by a relocatable carrier (see
+  /// `PrintedPragmaCarrier::relocatable`) may be repaired: when B prints it
+  /// inside a hunk bordering its gap, B's token order forces the tokens on the
+  /// far side into a pure insertion at the gap, placed by
+  /// `placeTUInsertionAmongPrintedPragmas`.  When no hunk borders the gap, the
+  /// unchanged tokens between A's and B's positions are first stated as an
+  /// identity hunk, so a moved directive becomes those tokens deleted on one
+  /// side and inserted on the other.  Hunks a tiling witness is bound to are
+  /// never changed.
   ///
-  /// Every other paired line -- a header directive, a `_Pragma` operator, a
-  /// line a macro expansion produced -- and the lines a translation-unit
-  /// sideband edit writes are checked only, because the insertion placement
-  /// proves an order only against translation-unit directive lines: each must
-  /// sit at the single B gap the hunks leave at its A gap.  A line whose macro
+  /// Every other paired line -- a header directive, a line a macro expansion
+  /// that is not relocatable produced -- and the lines a sideband edit writes
+  /// are checked only, because the insertion placement proves an order only
+  /// against relocatable carriers: each must sit at the single B gap the hunks
+  /// leave at its A gap.  A line whose macro
   /// caller chain does not resolve has no known carrier, so no hunk may border
   /// its gap.  Every disagreement is returned, and must fail closed.
   ///

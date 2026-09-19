@@ -205,7 +205,9 @@ RefoldHeaderIncludeEditPlanner::RefoldHeaderIncludeEditPlanner(
     const RefoldTextEditCertifier &textEditCertifier,
     const RefoldLineObserverLayout &lineObserverLayout,
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
-    const clang::LangOptions &lexLang)
+    const clang::LangOptions &lexLang,
+    ArrayRef<SidebandPragmaLinePairing> sidebandPragmaLinePairings,
+    ArrayRef<PrintedPragmaCarrier> printedPragmaCarriers)
     : model_(model), bSource_(bSource), aToks_(aToks), bToks_(bToks),
       bTokOff_(bTokOff), abTokMapA2B_(abTokMapA2B), lineDirs_(lineDirs),
       sourceMapper_(sourceMapper), paths_(paths),
@@ -215,7 +217,9 @@ RefoldHeaderIncludeEditPlanner::RefoldHeaderIncludeEditPlanner(
       acceptedResultRanker_(acceptedResultRanker),
       textEditCertifier_(textEditCertifier),
       lineObserverLayout_(lineObserverLayout),
-      sidebandPragmaEdits_(sidebandPragmaEdits), lexLang_(lexLang) {}
+      sidebandPragmaEdits_(sidebandPragmaEdits), lexLang_(lexLang),
+      sidebandPragmaLinePairings_(sidebandPragmaLinePairings),
+      printedPragmaCarriers_(printedPragmaCarriers) {}
 
 RefoldHeaderIncludeEditPlanner::~RefoldHeaderIncludeEditPlanner() = default;
 
@@ -2362,8 +2366,155 @@ bool RefoldHeaderIncludeEditPlanner::AppendSecondaryInsertionAnchors(
   return true;
 }
 
+std::optional<RefoldHeaderIncludeEditPlanner::HeaderPrintedPragmaPlacement>
+RefoldHeaderIncludeEditPlanner::PlaceAmongPrintedPragmas(
+    const HeaderInsertionPlanningState &state) const {
+  const IncludePatch &patch = state.patch;
+  if (patch.aStart != patch.aEnd || patch.bStart >= patch.bEnd)
+    return HeaderPrintedPragmaPlacement{};
+
+  SmallVector<const SidebandPragmaLinePairing *, 2> linesAtGap;
+  for (const SidebandPragmaLinePairing &line : sidebandPragmaLinePairings_)
+    if (line.aNormalTokenGap == patch.aStart && line.bNormalTokenGap)
+      linesAtGap.push_back(&line);
+  if (linesAtGap.empty())
+    return HeaderPrintedPragmaPlacement{};
+
+  // Every line at the gap is printed on one side of the payload, preceding
+  // lines first, and binds to exactly one relocatable carrier of this header
+  // occurrence; anything else leaves no provable site here.
+  const SidebandPragmaLinePairing *firstFollowing = nullptr;
+  const PrintedPragmaCarrier *lastPreceding = nullptr;
+  const PrintedPragmaCarrier *firstFollowingCarrier = nullptr;
+  SmallVector<const PrintedPragmaCarrier *, 2> gapCarriers;
+  uint64_t lastSourceEnd = 0;
+  for (const SidebandPragmaLinePairing *line : linesAtGap) {
+    const uint64_t bGap = *line->bNormalTokenGap;
+    const bool follows = bGap == patch.bEnd;
+    if ((!follows && bGap != patch.bStart) || (firstFollowing && !follows))
+      return std::nullopt;
+    const PrintedPragmaCarrier *carrier = nullptr;
+    size_t bound = 0;
+    for (const PrintedPragmaCarrier &candidate : printedPragmaCarriers_)
+      if (candidate.aLineBegin == line->aLineBegin) {
+        carrier = &candidate;
+        ++bound;
+      }
+    if (bound != 1 || !carrier->relocatable || !carrier->directiveLine ||
+        carrier->ownerIncludeId != state.include.id ||
+        !paths_.PathsEqual(carrier->path, state.file) ||
+        carrier->sourceBegin < lastSourceEnd ||
+        carrier->sourceEnd > state.fileLen)
+      return std::nullopt;
+    lastSourceEnd = carrier->sourceEnd;
+    gapCarriers.push_back(carrier);
+    if (!follows) {
+      lastPreceding = carrier;
+    } else if (!firstFollowing) {
+      firstFollowing = line;
+      firstFollowingCarrier = carrier;
+    }
+  }
+
+  // The gap's source extent in this header holds nothing but these directive
+  // lines and trivia, so a site between them is a site inside the gap.
+  const RefoldPreprocessingStructureIndex &census =
+      GetHeaderOccurrenceStructureIndex(state.file, state.include.id,
+                                        state.headerText);
+  std::optional<uint64_t> gapBegin = 0;
+  if (std::optional<uint64_t> leftPP =
+          FindLeftNeighborPP(state.file, state.pos, state.ppLo, state.ppHi))
+    gapBegin = sourceMapper_.ByteEndForPPInFile(state.file, *leftPP);
+  std::optional<uint64_t> gapEnd = state.fileLen;
+  if (std::optional<uint64_t> rightPP =
+          FindRightNeighborPP(state.file, state.pos, state.ppLo, state.ppHi))
+    gapEnd = sourceMapper_.ByteStartForPPInFile(state.file, *rightPP);
+  if (!gapBegin || !gapEnd || *gapEnd < *gapBegin)
+    return std::nullopt;
+  uint64_t cursor = *gapBegin;
+  for (const PrintedPragmaCarrier *carrier : gapCarriers) {
+    if (carrier->sourceBegin < cursor || *gapEnd < carrier->sourceEnd ||
+        !census.IsRangeLexicallyIgnorable(cursor, carrier->sourceBegin))
+      return std::nullopt;
+    cursor = carrier->sourceEnd;
+  }
+  if (!census.IsRangeLexicallyIgnorable(cursor, *gapEnd))
+    return std::nullopt;
+  for (const PreprocessingStructureInterval *interval :
+       census.FindOverlapping(*gapBegin, *gapEnd))
+    if (llvm::none_of(gapCarriers, [&](const PrintedPragmaCarrier *carrier) {
+          return carrier->sourceBegin <= interval->begin &&
+                 interval->end <= carrier->sourceEnd;
+        }))
+      return std::nullopt;
+
+  // Land after the last preceding line, which ends with its newline, or
+  // before the first following one; replay B only up to that line's copy.
+  HeaderPrintedPragmaPlacement placement;
+  placement.applies = true;
+  if (firstFollowingCarrier) {
+    placement.anchorByte = firstFollowingCarrier->sourceBegin;
+    const uint64_t payloadBegin = bTokOff_[static_cast<size_t>(patch.bStart)];
+    if (payloadBegin >= firstFollowing->bLineBegin)
+      return std::nullopt;
+    placement.bByteEnd = firstFollowing->bLineBegin;
+  } else {
+    placement.anchorByte = lastPreceding->sourceEnd;
+    if (placement.anchorByte == 0 ||
+        state.headerText[static_cast<size_t>(placement.anchorByte - 1)] != '\n')
+      return std::nullopt;
+  }
+  return placement;
+}
+
 bool RefoldHeaderIncludeEditPlanner::PlanPureInsertionPatch(
     const HeaderInsertionPlanningState &state) const {
+  // A surviving pragma line of this header at the insertion's gap fixes which
+  // side of it the payload goes on, and no other anchor knows that.  When the
+  // lines bind but no site is provable, only include realization -- which
+  // replays B's own lines -- is sound.
+  std::optional<HeaderPrintedPragmaPlacement> pragmaPlacement =
+      PlaceAmongPrintedPragmas(state);
+  if (!pragmaPlacement) {
+    state.plan.requiresIncludeRealization = true;
+    state.plan.realizationReason =
+        llvm::formatv("INSERT: surviving pragma lines at the insertion's gap "
+                      "in {0} leave no provable site",
+                      state.file)
+            .str();
+    return false;
+  }
+  if (pragmaPlacement->applies) {
+    std::string payload = state.materialInsertBytes.str();
+    if (pragmaPlacement->bByteEnd) {
+      const uint64_t payloadBegin =
+          bTokOff_[static_cast<size_t>(state.patch.bStart)];
+      payload = stripSeparatelyOwnedSidebandReplay(
+          sidebandPragmaEdits_,
+          bSource_.slice(payloadBegin, *pragmaPlacement->bByteEnd),
+          payloadBegin, *pragmaPlacement->bByteEnd);
+    }
+    HeaderInsertionPlanningState placedState = state;
+    placedState.materialInsertBytes = payload;
+    InsertAnchorCandidate candidate;
+    candidate.path = AcceptedPathKind::IncludeInsertPrintedPragmaPlacement;
+    candidate.anchorByte = pragmaPlacement->anchorByte;
+    candidate.witness.evidence =
+        IncludeAnchorEvidenceKind::PrintedPragmaPlacement;
+    candidate.witness.hasAnchorByte = true;
+    candidate.witness.anchorByte = pragmaPlacement->anchorByte;
+    SmallVector<InsertAnchorCandidate, 1> candidates{candidate};
+    if (auto selected = SelectBestInsertCandidate(candidates, state.patch))
+      return CommitInsertCandidate(placedState, *selected);
+    state.plan.requiresIncludeRealization = true;
+    state.plan.realizationReason =
+        llvm::formatv("INSERT: printed-pragma placement in {0} was not "
+                      "admitted",
+                      state.file)
+            .str();
+    return false;
+  }
+
   // First try the strongest insertion anchors: boundaries already tied to the
   // selected conditional arm or to a child include boundary.  The
   // child-boundary case is a declared include-preserving proof, not an

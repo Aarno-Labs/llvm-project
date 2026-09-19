@@ -184,6 +184,8 @@ inline StringRef toString(AcceptanceSupportKind value) {
            "IncludeInsertionByRightNeighborPP")                                \
   REFOLD_X(IncludeInsertionByLeftNeighborPP,                                   \
            "IncludeInsertionByLeftNeighborPP")                                 \
+  REFOLD_X(IncludeInsertionByPrintedPragmaPlacement,                           \
+           "IncludeInsertionByPrintedPragmaPlacement")                         \
   REFOLD_X(IncludeInsertionByDeclBoundary, "IncludeInsertionByDeclBoundary")   \
   REFOLD_X(IncludeRealizationCover, "IncludeRealizationCover")                 \
   REFOLD_X(IncludeMaterializedExpansionRealization,                            \

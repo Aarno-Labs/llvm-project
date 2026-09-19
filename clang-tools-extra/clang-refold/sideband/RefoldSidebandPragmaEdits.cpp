@@ -1796,6 +1796,52 @@ buildSidebandOwnerDepthGaps(uint64_t tokenCount,
 /// include/TU boundaries remain fail-closed so the caller can route them
 /// through the existing fallback path instead of manufacturing a source
 /// placement.
+/// Pair the sideband lines the certified-window pairing left unpaired, where
+/// one line's text occurs exactly once among the unpaired lines of each side.
+///
+/// The window key ties a pair to one alignment of the normal tokens, and a
+/// repeated-token tie or a directive that moved across unchanged tokens gives
+/// the two copies different windows, which turns a surviving directive into a
+/// delete-and-insert.  Pairing is not what makes placement sound: every paired
+/// line's A and B gaps are enforced on the final token plan, which repairs or
+/// refuses a pairing the edits cannot honor.  So a text that names exactly one
+/// candidate on each side may be paired outright, provided the pair keeps the
+/// line map increasing, as `hunksFromMap` requires.
+static void pairUniqueUnpairedSidebandLines(ArrayRef<SidebandPragmaLine> aLines,
+                                            ArrayRef<SidebandPragmaLine> bLines,
+                                            std::vector<int64_t> &lcs) {
+  std::vector<bool> bPaired(bLines.size(), false);
+  for (int64_t b : lcs)
+    if (b >= 0 && static_cast<size_t>(b) < bPaired.size())
+      bPaired[static_cast<size_t>(b)] = true;
+
+  std::map<StringRef, std::pair<size_t, size_t>> aByText, bByText;
+  for (size_t a = 0; a < aLines.size() && a < lcs.size(); ++a)
+    if (lcs[a] < 0) {
+      auto &entry = aByText[aLines[a].canonicalText];
+      entry = {a, entry.second + 1};
+    }
+  for (size_t b = 0; b < bLines.size(); ++b)
+    if (!bPaired[b]) {
+      auto &entry = bByText[bLines[b].canonicalText];
+      entry = {b, entry.second + 1};
+    }
+
+  for (const auto &[text, aEntry] : aByText) {
+    auto bIt = bByText.find(text);
+    if (aEntry.second != 1 || bIt == bByText.end() || bIt->second.second != 1)
+      continue;
+    const size_t a = aEntry.first;
+    const int64_t b = static_cast<int64_t>(bIt->second.first);
+    bool increasing = true;
+    for (size_t other = 0; other < lcs.size() && increasing; ++other)
+      if (lcs[other] >= 0 && other != a)
+        increasing = other < a ? lcs[other] < b : lcs[other] > b;
+    if (increasing)
+      lcs[a] = b;
+  }
+}
+
 bool buildSidebandPragmaSourceEdits(
     const json::Object &rootJson, StringRef refoldMapPath,
     ArrayRef<SidebandPragmaLine> aLines, ArrayRef<SidebandPragmaLine> bLines,
@@ -2080,6 +2126,7 @@ bool buildSidebandPragmaSourceEdits(
     bTextRefs.push_back(key);
 
   std::vector<int64_t> lcs = diffutils::lcsMapAB(aTextRefs, bTextRefs);
+  pairUniqueUnpairedSidebandLines(aLines, bLines, lcs);
   std::vector<diffutils::Hunk> hunks =
       diffutils::hunksFromMap(lcs, aLines.size(), bLines.size());
 

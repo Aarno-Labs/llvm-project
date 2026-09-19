@@ -55,6 +55,24 @@ namespace refold {
 
 namespace {
 
+/// Return whether every pragma the producer records at a root invocation's
+/// spelling was printed.
+///
+/// A pragma performed by the invocation's expansion is recorded with a site
+/// covering the invocation.  One without an A image was consumed by its
+/// handler, and every pragma that changes preprocessor state is consumed, so
+/// an invocation passing this check performed no state change.
+bool invocationPerformedOnlyPrintedPragmas(
+    const RefoldModel &model, const RefoldPathIdentity &paths,
+    const RefoldModel::MacroInvocation &root) {
+  for (const RefoldModel::PragmaDirective &pragma : model.GetPragmas())
+    if (paths.PathsEqual(pragma.sitePath, *root.invFile) &&
+        pragma.siteB < *root.invE && *root.invB < pragma.siteE &&
+        !pragma.HasEmittedImage())
+      return false;
+  return true;
+}
+
 /// Derive the source carrier of every paired `#pragma` line.
 ///
 /// The producer record printed into the line names its source: a directive's
@@ -63,11 +81,15 @@ namespace {
 /// spelling instead; a caller chain that does not resolve falls back to the
 /// record's own site, which the producer places at the invocation.  A line
 /// whose record does not bind uniquely yields no carrier, which leaves it to
-/// the planner's placement check alone.
-std::vector<PrintedPragmaCarrier>
-buildPrintedPragmaCarriers(const RefoldModel &model,
-                           const RefoldMacroTopology &topology,
-                           ArrayRef<SidebandPragmaLinePairing> pairings) {
+/// the planner's placement check alone.  `relocatable` is established here,
+/// once, from the producer records and the translation unit's source census.
+std::vector<PrintedPragmaCarrier> buildPrintedPragmaCarriers(
+    const RefoldModel &model, const RefoldMacroTopology &topology,
+    const RefoldPathIdentity &paths,
+    const RefoldPreprocessingStructureIndexProvider &indexes,
+    ArrayRef<SidebandPragmaLinePairing> pairings) {
+  const RefoldPreprocessingStructureIndex &tuIndex = indexes.GetTUIndex();
+  const StringRef tuPath = model.GetSourcePath();
   std::vector<PrintedPragmaCarrier> carriers;
   for (const SidebandPragmaLinePairing &line : pairings) {
     if (!line.bNormalTokenGap)
@@ -84,26 +106,85 @@ buildPrintedPragmaCarriers(const RefoldModel &model,
     if (!record || !unique)
       continue;
 
+    PrintedPragmaCarrier carrier;
+    carrier.bLineBegin = line.bLineBegin;
+    carrier.bLineEnd = line.bLineEnd;
+    carrier.aLineBegin = line.aLineBegin;
+    carrier.aNormalTokenGap = line.aNormalTokenGap;
+    carrier.bNormalTokenGap = *line.bNormalTokenGap;
+
     const std::optional<ArrayRef<uint64_t>> ancestors =
         topology.PragmaExpansionAncestorsAtGap(line.aNormalTokenGap);
     if (ancestors && !ancestors->empty()) {
-      for (uint64_t id : *ancestors) {
-        const RefoldModel::MacroInvocation *root =
-            topology.FindMacroInvocationById(id);
-        if (!root || root->callerMacroId || !root->invFile || !root->invB ||
-            !root->invE)
-          continue;
-        carriers.push_back({*root->invFile, root->ownerIncludeId, *root->invB,
-                            *root->invE, line.bLineBegin, line.bLineEnd});
+      SmallVector<const RefoldModel::MacroInvocation *, 1> roots;
+      for (uint64_t id : *ancestors)
+        if (const RefoldModel::MacroInvocation *root =
+                topology.FindMacroInvocationById(id))
+          if (!root->callerMacroId && root->invFile && root->invB && root->invE)
+            roots.push_back(root);
+      for (const RefoldModel::MacroInvocation *root : roots) {
+        PrintedPragmaCarrier rootCarrier = carrier;
+        rootCarrier.path = *root->invFile;
+        rootCarrier.ownerIncludeId = root->ownerIncludeId;
+        rootCarrier.sourceBegin = *root->invB;
+        rootCarrier.sourceEnd = *root->invE;
+        rootCarrier.relocatable =
+            roots.size() == 1 && !root->ownerIncludeId &&
+            paths.PathsEqual(*root->invFile, tuPath) &&
+            llvm::all_of(root->spans,
+                         [](const RefoldModel::PPSpan &span) {
+                           return span.begin == span.end;
+                         }) &&
+            invocationPerformedOnlyPrintedPragmas(model, paths, *root);
+        carriers.push_back(rootCarrier);
       }
       continue;
     }
-    const bool operatorBytes = ancestors && record->viaPragmaOperator &&
-                               record->operatorB && record->operatorE;
-    carriers.push_back({record->sitePath, record->ownerIncludeId,
-                        operatorBytes ? *record->operatorB : record->siteB,
-                        operatorBytes ? *record->operatorE : record->siteE,
-                        line.bLineBegin, line.bLineEnd});
+
+    carrier.path = record->sitePath;
+    carrier.ownerIncludeId = record->ownerIncludeId;
+    const bool inTU =
+        !record->ownerIncludeId && paths.PathsEqual(record->sitePath, tuPath);
+    if (ancestors && record->viaPragmaOperator && record->operatorB &&
+        record->operatorE) {
+      carrier.sourceBegin = *record->operatorB;
+      carrier.sourceEnd = *record->operatorE;
+      bool spelledOperator = false;
+      bool insideDefinition = false;
+      for (const PreprocessingStructureInterval *interval :
+           tuIndex.FindOverlapping(carrier.sourceBegin, carrier.sourceEnd)) {
+        insideDefinition |=
+            interval->kind == PreprocessingStructureKind::MacroDefine ||
+            interval->kind == PreprocessingStructureKind::MacroUndef;
+        spelledOperator |=
+            interval->kind == PreprocessingStructureKind::PragmaOperator &&
+            interval->begin == carrier.sourceBegin &&
+            interval->end == carrier.sourceEnd;
+      }
+      carrier.relocatable = inTU && spelledOperator && !insideDefinition;
+    } else {
+      carrier.sourceBegin = record->siteB;
+      carrier.sourceEnd = record->siteE;
+      // A directive is bound in the census of the file occurrence that spells
+      // it: the translation unit's, or its own include's.
+      const RefoldPreprocessingStructureIndex *ownerIndex = &tuIndex;
+      if (!inTU) {
+        const RefoldPreprocessingStructureIndexProvider::LookupResult lookup =
+            indexes.Get(record->sitePath, record->ownerIncludeId);
+        ownerIndex = record->ownerIncludeId ? lookup.index : nullptr;
+      }
+      size_t bound = 0;
+      if (ownerIndex)
+        for (const PreprocessingStructureInterval *interval :
+             ownerIndex->FindOverlapping(record->siteB, record->siteE))
+          bound += interval->kind == PreprocessingStructureKind::Pragma &&
+                   interval->modelItemId == record->id &&
+                   interval->begin == record->siteB &&
+                   interval->end == record->siteE;
+      carrier.directiveLine = ancestors && !record->viaPragmaOperator;
+      carrier.relocatable = carrier.directiveLine && bound == 1;
+    }
+    carriers.push_back(carrier);
   }
   return carriers;
 }
@@ -178,6 +259,9 @@ void RefoldEngine::BuildServiceGraph() {
           RefoldPreprocessingStructureIndexProvider::Dependencies{
               model_, pathIdentity_, lineDirs_, lexLang_},
           model_.GetSourcePath(), *preprocessingStructureIndex_);
+  printedPragmaCarriers_ = buildPrintedPragmaCarriers(
+      model_, macroTopology_, pathIdentity_,
+      *preprocessingStructureIndexProvider_, sidebandPragmaLinePairings_);
 
   // Token diff planning borrows the per-run source/token inputs and writes the
   // engine-owned diff caches later services observe.  The named service owns
@@ -223,7 +307,8 @@ void RefoldEngine::BuildServiceGraph() {
       *theoremAudit_, RefoldTUAnchorProof::Deps{
                           model_, pathIdentity_, macroTopology_, lineDirs_,
                           *preprocessingStructureIndex_, tuSourceBytes_, aToks_,
-                          static_cast<uint64_t>(bToks_.size()), bToks_});
+                          static_cast<uint64_t>(bToks_.size()), bToks_,
+                          printedPragmaCarriers_});
 
   // TU edit planning has a real owner.  The planner receives only read-only
   // services and token-map state; final TextEdit assembly intentionally remains
@@ -251,9 +336,10 @@ void RefoldEngine::BuildServiceGraph() {
               model_, model_.GetSourcePath(), pathIdentity_, macroTopology_,
               *macroStateProof_, tokenTextAnalysis_, sourceMapper_,
               tuSourceBytes_, bSource_, sidebandPragmaLinePairings_,
-              sidebandPragmaEdits_, lexLang_, *ownerClassifier_,
-              *ownerStateProof_, *preprocessingStructureIndexProvider_,
-              abTokHunks_, structuralHunkTilingWitnesses_,
+              sidebandPragmaEdits_, printedPragmaCarriers_, lexLang_,
+              *ownerClassifier_, *ownerStateProof_,
+              *preprocessingStructureIndexProvider_, abTokHunks_,
+              structuralHunkTilingWitnesses_,
               structuralHunkTilingSegmentBindings_});
 
   // Pure B-token insertion ownership is a named edit-domain ledger.  The
@@ -269,8 +355,9 @@ void RefoldEngine::BuildServiceGraph() {
   // the macro patch planner and the text-edit assembler, because both of those
   // consume plans.
   wholeCoverPlanBuilder_ = std::make_unique<RefoldMacroWholeCoverPlanBuilder>(
-      RefoldMacroWholeCoverPlanBuilder::Dependencies{sourceMapper_,
-                                                     *bInsertionLedger_});
+      RefoldMacroWholeCoverPlanBuilder::Dependencies{
+          sourceMapper_, *bInsertionLedger_, macroTopology_,
+          sidebandPragmaLinePairings_, bSource_});
 
   counterStabilization_ = std::make_unique<RefoldCounterStabilization>(
       model_, aToks_, bToks_, macroTopology_, *ownerClassifier_);
@@ -324,8 +411,6 @@ void RefoldEngine::BuildServiceGraph() {
 
   // Protected-source capabilities and materialization certification sit below
   // planning, so the planners, the layout and the assembler all borrow them.
-  printedPragmaCarriers_ = buildPrintedPragmaCarriers(
-      model_, macroTopology_, sidebandPragmaLinePairings_);
   textEditCertifier_ = std::make_unique<RefoldTextEditCertifier>(
       model_, bSource_, bToks_, sourceMapper_, pathIdentity_, lexLang_,
       *preprocessingStructureIndex_, *tuAnchorProof_, terminalSink_,
@@ -389,7 +474,8 @@ void RefoldEngine::BuildServiceGraph() {
       *macroStateProof_, *ownerStateProof_, *includeInsertionPlanner_,
       proofServices_->AcceptedCandidateBuilder(),
       proofServices_->AcceptedResultRanker(), *textEditAssembler_,
-      *textEditCertifier_, *pragmaOnceGuardRewriter_, terminalSink_, lexLang_);
+      *textEditCertifier_, *pragmaOnceGuardRewriter_, terminalSink_, lexLang_,
+      sidebandPragmaLinePairings_, printedPragmaCarriers_);
 
   // The fallback planner is allocated after the materialization, proof and
   // certification services it calls into.

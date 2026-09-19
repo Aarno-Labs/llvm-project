@@ -311,6 +311,7 @@ bool pathIsMacroRepairReplayStateNeutralCandidate(AcceptedPathKind path) {
   case AcceptedPathKind::IncludeInsertChildBoundary:
   case AcceptedPathKind::IncludeInsertRightNeighborPP:
   case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+  case AcceptedPathKind::IncludeInsertPrintedPragmaPlacement:
   case AcceptedPathKind::IncludeInsertDeclBoundary:
   case AcceptedPathKind::IncludeRealizationInlineFromB:
   case AcceptedPathKind::IncludeMaterializedExpansion:

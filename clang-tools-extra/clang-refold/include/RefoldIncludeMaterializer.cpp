@@ -504,7 +504,8 @@ static size_t computeFirstEmittedHeaderLine(
 std::optional<std::string>
 RefoldIncludeMaterializer::BuildInlineIncludeRealizationFromB(
     const RefoldModel::IncludeItem &inc, StringRef reason,
-    AcceptedResultCandidate *acceptedCandidate) const {
+    AcceptedResultCandidate *acceptedCandidate,
+    ArrayRef<IncludePatch> patches) const {
   // Inline include realization is theorem-facing only when the include's
   // A-cover can be projected to a concrete B-token envelope by an accepted
   // witness: either the canonical A-cover mapping or the boundary-stable
@@ -530,6 +531,56 @@ RefoldIncludeMaterializer::BuildInlineIncludeRealizationFromB(
                       "canonical-or-consensus-resolvable B envelope for "
                       "A cover [{0},{1}) for inc#{2}; reason={3}",
                       inc.cover.begin, inc.cover.end, inc.id, reason)
+            .str());
+    return std::nullopt;
+  }
+
+  // The slice is all this realization emits: every surviving line the
+  // include printed, and every payload staged for it, must lie inside, and no
+  // line whose source survives outside the include may.
+  const std::optional<std::pair<uint64_t, uint64_t>> sliceBytes =
+      sourceMapper_.BTokenRangeToByteRange(bEnvOpt->first, bEnvOpt->second);
+  auto withinInclude = [&](std::optional<uint64_t> owner) {
+    for (size_t depth = 0; owner && depth <= model_.GetIncludes().size();
+         ++depth) {
+      if (*owner == inc.id)
+        return true;
+      const RefoldModel::IncludeItem *item = model_.GetIncludeById(*owner);
+      owner = item ? item->parent : std::nullopt;
+    }
+    return false;
+  };
+  std::optional<std::string> refusal;
+  if (!sliceBytes)
+    refusal = "its B envelope has no byte range";
+  for (const PrintedPragmaCarrier &carrier : printedPragmaCarriers_) {
+    if (refusal)
+      break;
+    const bool inside = sliceBytes && sliceBytes->first <= carrier.bLineBegin &&
+                        carrier.bLineEnd <= sliceBytes->second;
+    if (withinInclude(carrier.ownerIncludeId) != inside)
+      refusal = llvm::formatv("surviving #pragma line B=[{0},{1}) would be "
+                              "{2}",
+                              carrier.bLineBegin, carrier.bLineEnd,
+                              inside ? "printed twice" : "dropped")
+                    .str();
+  }
+  for (const IncludePatch &patch : patches)
+    if (!refusal && patch.bStart < patch.bEnd &&
+        (patch.bStart < bEnvOpt->first || bEnvOpt->second < patch.bEnd))
+      refusal = llvm::formatv("staged payload B=[{0},{1}) lies outside it",
+                              patch.bStart, patch.bEnd)
+                    .str();
+  if (refusal) {
+    terminalSink_.RequestTerminalFallback(
+        MakeTerminalFallbackProofFailure(
+            TerminalFallbackObligationKind::IncludeRealizationBEnvelopeMapped,
+            TerminalFallbackFailureReason::UnmappableIncludeBEnvelope,
+            TerminalFallbackFailureContext::ForOwnerId(inc.id)),
+        "include/mat",
+        llvm::formatv("include realization from B of inc#{0} over B tokens "
+                      "[{1},{2}) is refused: {3}; reason={4}",
+                      inc.id, bEnvOpt->first, bEnvOpt->second, *refusal, reason)
             .str());
     return std::nullopt;
   }
@@ -901,7 +952,8 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
                          includeId, plan.realizationReason);
         AcceptedResultCandidate realizationCandidate;
         if (auto realized = BuildInlineIncludeRealizationFromB(
-                *inc, plan.realizationReason, &realizationCandidate)) {
+                *inc, plan.realizationReason, &realizationCandidate,
+                it->second.patches)) {
           includeExpansion[includeId] = std::move(*realized);
           includeExpansionStartLineNos[includeId] = 1;
           includeExpansionAcceptedResults[includeId] =
@@ -939,7 +991,7 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
                          "inc#{0} requires whole-include realization: {1}",
                          includeId, reason);
         if (auto realized = BuildInlineIncludeRealizationFromB(
-                *inc, reason, &realizationCandidate)) {
+                *inc, reason, &realizationCandidate, it->second.patches)) {
           includeExpansion[includeId] = std::move(*realized);
           includeExpansionStartLineNos[includeId] = 1;
           includeExpansionAcceptedResults[includeId] =
@@ -1780,7 +1832,8 @@ RefoldIncludeMaterializer::ComputeIncludeTextEdits(
       model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, lineDirs_,
       sourceMapper_, paths_, macroStateProof_, lineControlProof_,
       ownerStateProof_, acceptedCandidateBuilder_, acceptedResultRanker_,
-      textEditCertifier_, lineObserverLayout_, sidebandPragmaEdits_, lexLang_);
+      textEditCertifier_, lineObserverLayout_, sidebandPragmaEdits_, lexLang_,
+      sidebandPragmaLinePairings_, printedPragmaCarriers_);
   return planner.Compute(ie, std::move(headerText));
 }
 
@@ -1792,7 +1845,8 @@ RefoldIncludeMaterializer::ComputeChildBoundaryInsertByte(
       model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, lineDirs_,
       sourceMapper_, paths_, macroStateProof_, lineControlProof_,
       ownerStateProof_, acceptedCandidateBuilder_, acceptedResultRanker_,
-      textEditCertifier_, lineObserverLayout_, sidebandPragmaEdits_, lexLang_);
+      textEditCertifier_, lineObserverLayout_, sidebandPragmaEdits_, lexLang_,
+      sidebandPragmaLinePairings_, printedPragmaCarriers_);
   return planner.ComputeChildBoundaryInsertByte(p, file, witness);
 }
 

@@ -116,7 +116,9 @@ public:
       const RefoldTextEditCertifier &textEditCertifier,
       const RefoldPragmaOnceGuardRewriter &pragmaOnceGuards,
       const RefoldTerminalProofSink &terminalSink,
-      const clang::LangOptions &lexLang)
+      const clang::LangOptions &lexLang,
+      llvm::ArrayRef<SidebandPragmaLinePairing> sidebandPragmaLinePairings = {},
+      llvm::ArrayRef<PrintedPragmaCarrier> printedPragmaCarriers = {})
       : model_(model), aSource_(aSource), bSource_(bSource), aToks_(aToks),
         bToks_(bToks), bTokOff_(bTokOff), abTokMapA2B_(abTokMapA2B),
         lineDirs_(lineDirs), finalReplaySurface_(finalReplaySurface),
@@ -131,7 +133,9 @@ public:
         textEditAssembler_(textEditAssembler),
         textEditCertifier_(textEditCertifier),
         pragmaOnceGuards_(pragmaOnceGuards), terminalSink_(terminalSink),
-        lexLang_(lexLang) {}
+        lexLang_(lexLang),
+        sidebandPragmaLinePairings_(sidebandPragmaLinePairings),
+        printedPragmaCarriers_(printedPragmaCarriers) {}
 
   /// Realize an include expansion directly from the edited preprocessed stream
   /// B after the include-realization envelope has been proven by the shared
@@ -143,9 +147,16 @@ public:
   /// consensus proof.  If no such envelope exists, callers must use the
   /// explicit terminal-fallback path instead of synthesizing a weaker
   /// realization.
+  ///
+  /// The realization replays B's bytes over that envelope and nothing else,
+  /// so it is refused when a surviving `#pragma` line this include printed,
+  /// or a payload staged for it in \p patches, lies outside those bytes --
+  /// it would be dropped -- or when a surviving line whose source stays
+  /// outside the include lies inside them -- it would be printed twice.
   std::optional<std::string> BuildInlineIncludeRealizationFromB(
       const RefoldModel::IncludeItem &inc, llvm::StringRef reason,
-      AcceptedResultCandidate *acceptedCandidate = nullptr) const;
+      AcceptedResultCandidate *acceptedCandidate = nullptr,
+      llvm::ArrayRef<IncludePatch> patches = {}) const;
 
   /// Fully materialize one include instance, recursively realizing any child
   /// include that cannot remain a proven source-spelled include directive.
@@ -284,6 +295,10 @@ private:
   const RefoldPragmaOnceGuardRewriter &pragmaOnceGuards_;
   const RefoldTerminalProofSink &terminalSink_;
   const clang::LangOptions &lexLang_;
+  /// Where each printed `#pragma` line survived in B, and each line's source
+  /// carrier; a header-owned insertion is placed among the header's own.
+  llvm::ArrayRef<SidebandPragmaLinePairing> sidebandPragmaLinePairings_;
+  llvm::ArrayRef<PrintedPragmaCarrier> printedPragmaCarriers_;
 };
 
 } // namespace refold

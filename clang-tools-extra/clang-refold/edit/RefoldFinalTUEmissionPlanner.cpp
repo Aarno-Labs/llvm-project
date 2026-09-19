@@ -223,6 +223,7 @@ FinalTUEmissionContext::BuildTUMacroPatchEdit(const MacroPatch &patch,
       {}};
   edit.lineControlPruneCandidates =
       std::move(resync.lineControlPruneCandidates);
+  edit.replayedPragmaLines = patch.materialized.replayedPragmaLines;
 
   if (auto bRange =
           textEditAssembler_.MacroPatchMaterializedBByteRange(patch)) {

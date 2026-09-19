@@ -1214,11 +1214,20 @@ private:
                                    StringRef tuBytes,
                                    std::pair<uint64_t, uint64_t> span);
 
+  /// Return the include a pure insertion must be realized inside, because B
+  /// prints one of that include's surviving `#pragma` lines between the
+  /// payload and the rest of the include: before a payload at the include's
+  /// first gap, or after one at its last.  Null when no single include is
+  /// forced; the ordinary owner then stands.
+  const RefoldModel::IncludeItem *
+  IncludeHoldingPayloadBesidePrintedPragma(const diffutils::Hunk &h) const;
+
   /// Place a pure TU insertion among the printed pragma lines preserved at
   /// its A gap; see `placeTUInsertionAmongPrintedPragmas`.  Non-insertions
   /// and gaps without such lines report `NotApplicable`.
-  PrintedPragmaInsertionPlacement PlaceTUInsertionAmongPrintedPragmas(
-      const diffutils::Hunk &h, StringRef tuPath, uint64_t baseAnchor) const;
+  PrintedPragmaInsertionPlacement
+  PlaceTUInsertionAmongPrintedPragmas(const diffutils::Hunk &h,
+                                      uint64_t baseAnchor) const;
 
   /// Return the B bytes a pure insertion replays: its token envelope, cut
   /// before the first preserved pragma line B prints after it when

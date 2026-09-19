@@ -18,6 +18,7 @@
 #include "model/RefoldModel.h"
 #include "model/RefoldPathIdentity.h"
 #include "proof/RefoldAcceptedResultPredicates.h"
+#include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
 #include "support/RefoldLog.h"
@@ -143,6 +144,7 @@ buildTUAnchorAcceptancePathInventory(AcceptedPathKind currentPath) {
   case AcceptedPathKind::IncludeInsertChildBoundary:
   case AcceptedPathKind::IncludeInsertRightNeighborPP:
   case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+  case AcceptedPathKind::IncludeInsertPrintedPragmaPlacement:
   case AcceptedPathKind::IncludeInsertDeclBoundary:
   case AcceptedPathKind::IncludeRealizationInlineFromB:
   case AcceptedPathKind::IncludeMaterializedExpansion:
@@ -230,6 +232,7 @@ validateTUAnchorProof(AcceptedPathKind currentPath,
   case AcceptedPathKind::IncludeInsertChildBoundary:
   case AcceptedPathKind::IncludeInsertRightNeighborPP:
   case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+  case AcceptedPathKind::IncludeInsertPrintedPragmaPlacement:
   case AcceptedPathKind::IncludeInsertDeclBoundary:
   case AcceptedPathKind::IncludeRealizationInlineFromB:
   case AcceptedPathKind::IncludeMaterializedExpansion:
@@ -291,6 +294,7 @@ buildAcceptedTUAnchorProofSummary(const RefoldProofSummaryBuilder &builder,
   case AcceptedPathKind::IncludeInsertChildBoundary:
   case AcceptedPathKind::IncludeInsertRightNeighborPP:
   case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+  case AcceptedPathKind::IncludeInsertPrintedPragmaPlacement:
   case AcceptedPathKind::IncludeInsertDeclBoundary:
   case AcceptedPathKind::IncludeRealizationInlineFromB:
   case AcceptedPathKind::IncludeMaterializedExpansion:
@@ -455,35 +459,36 @@ bool RefoldTUAnchorProof::RangeHoldsOnlyPrintedPragmas(uint64_t begin,
                                                        uint64_t end) const {
   if (begin >= end)
     return false;
+  const StringRef tuPath = deps_.model.GetSourcePath();
+  SmallVector<std::pair<uint64_t, uint64_t>, 2> carriers;
+  for (const PrintedPragmaCarrier &carrier : deps_.printedPragmaCarriers)
+    if (carrier.relocatable && !carrier.ownerIncludeId &&
+        deps_.pathIdentity.PathsEqual(carrier.path, tuPath) &&
+        begin <= carrier.sourceBegin && carrier.sourceEnd <= end &&
+        !llvm::is_contained(
+            carriers, std::make_pair(carrier.sourceBegin, carrier.sourceEnd)))
+      carriers.push_back({carrier.sourceBegin, carrier.sourceEnd});
+  if (carriers.empty())
+    return false;
+  llvm::sort(carriers);
+
   uint64_t cursor = begin;
-  bool crossedPragma = false;
-  for (const PreprocessingStructureInterval *interval :
-       deps_.preprocessingStructureIndex.FindOverlapping(begin, end)) {
-    if (interval->begin < cursor || end < interval->end ||
-        interval->kind != PreprocessingStructureKind::Pragma ||
-        interval->modelKind !=
-            PreprocessingStructureModelKind::PragmaDirective ||
-        !interval->modelItemId ||
+  for (const auto &[carrierBegin, carrierEnd] : carriers) {
+    if (carrierBegin < cursor ||
         !deps_.preprocessingStructureIndex.IsRangeLexicallyIgnorable(
-            cursor, interval->begin))
+            cursor, carrierBegin))
       return false;
-    const RefoldModel::PragmaDirective *record = nullptr;
-    for (const RefoldModel::PragmaDirective &pragma :
-         deps_.model.GetPragmas()) {
-      if (pragma.id != *interval->modelItemId)
-        continue;
-      if (record)
-        return false;
-      record = &pragma;
-    }
-    if (!record || !record->HasEmittedImage())
-      return false;
-    crossedPragma = true;
-    cursor = interval->end;
+    cursor = carrierEnd;
   }
-  return crossedPragma &&
-         deps_.preprocessingStructureIndex.IsRangeLexicallyIgnorable(cursor,
-                                                                     end);
+  if (!deps_.preprocessingStructureIndex.IsRangeLexicallyIgnorable(cursor, end))
+    return false;
+  for (const PreprocessingStructureInterval *interval :
+       deps_.preprocessingStructureIndex.FindOverlapping(begin, end))
+    if (llvm::none_of(carriers, [&](const std::pair<uint64_t, uint64_t> &c) {
+          return c.first <= interval->begin && interval->end <= c.second;
+        }))
+      return false;
+  return true;
 }
 
 bool RefoldTUAnchorProof::ValidateOrdinaryDirectTUEnvelope(

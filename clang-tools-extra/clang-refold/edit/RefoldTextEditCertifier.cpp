@@ -877,11 +877,45 @@ bool RefoldTextEditCertifier::AuditGlobalSourceEditInvariant(
                                       edit.start < carrier.sourceEnd
                                 : edit.start < carrier.sourceEnd &&
                                       carrier.sourceBegin < edit.end;
-      if (!consumes)
+      if (!consumes) {
+        // The carrier survives this edit and prints the line itself, so an
+        // edit replaying B's copy would print it twice.  The spelling is only
+        // used to refuse: the copy must appear in the edit's text, and lie in
+        // its B range unless the edit is a pure insertion, whose text is B's
+        // bytes by construction.
+        const bool withinRange =
+            edit.start == edit.end ||
+            (edit.materializedBByteBegin && edit.materializedBByteEnd &&
+             *edit.materializedBByteBegin <= carrier.bLineBegin &&
+             carrier.bLineEnd <= *edit.materializedBByteEnd);
+        const bool mayReplay =
+            withinRange && carrier.bLineEnd <= bSource_.size() &&
+            StringRef(edit.text).contains(
+                bSource_.slice(carrier.bLineBegin, carrier.bLineEnd));
+        if (mayReplay)
+          return reject(
+              llvm::formatv(
+                  "edit source=[{0},{1}) replays the B copy [{2},{3}) "
+                  "of a surviving #pragma line whose source [{4},{5}) "
+                  "still prints it",
+                  edit.start, edit.end, carrier.bLineBegin, carrier.bLineEnd,
+                  carrier.sourceBegin, carrier.sourceEnd)
+                  .str());
         continue;
-      if (!edit.materializedBByteBegin || !edit.materializedBByteEnd ||
-          !rangeReplaysLine(*edit.materializedBByteBegin,
-                            *edit.materializedBByteEnd, carrier))
+      }
+      // A realizer may instead record replaying the line at the edge of its
+      // range; the text must then hold the line's bytes.
+      const bool replayedAtEdge =
+          llvm::is_contained(
+              edit.replayedPragmaLines,
+              std::make_pair(carrier.bLineBegin, carrier.bLineEnd)) &&
+          carrier.bLineEnd <= bSource_.size() &&
+          StringRef(edit.text).contains(
+              bSource_.slice(carrier.bLineBegin, carrier.bLineEnd));
+      if (!replayedAtEdge &&
+          (!edit.materializedBByteBegin || !edit.materializedBByteEnd ||
+           !rangeReplaysLine(*edit.materializedBByteBegin,
+                             *edit.materializedBByteEnd, carrier)))
         return reject(
             llvm::formatv("edit source=[{0},{1}) consumes the source [{2},{3}) "
                           "printing a surviving #pragma line but does not "

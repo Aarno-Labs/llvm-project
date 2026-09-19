@@ -34,7 +34,7 @@ namespace refold {
 class RefoldLineControlProof;
 class RefoldMacroTopology;
 class RefoldModel;
-class RefoldPreprocessingStructureIndex;
+struct PrintedPragmaCarrier;
 struct SidebandPragmaLinePairing;
 
 /// Include-boundary owner selected for a pure insertion before TU edit
@@ -311,20 +311,20 @@ struct PrintedPragmaInsertionPlacement {
 /// anchor when that already lies there -- and replays B only up to the first
 /// following line's B copy, which the preserved directive already prints.
 ///
-/// The placement is proved only when every line at the gap binds to a unique
-/// TU-owned producer record with an A image, all preceding lines come before
-/// all following ones in source and in B, no line sits strictly inside the
-/// payload, and the source between the base anchor and the placement holds
-/// nothing but those directives and lexer trivia.  Printed pragmas cannot
-/// change macro state, so moving the insertion across them changes only the
-/// order in which their lines and the payload are printed -- the order B
-/// fixes.
+/// The placement is proved only when every line at the gap binds to exactly
+/// one relocatable carrier (see `PrintedPragmaCarrier::relocatable`), all
+/// preceding lines come before all following ones in source and in B, no line
+/// sits strictly inside the payload, and the source between the base anchor
+/// and the placement holds nothing but such carriers and lexer trivia.  None
+/// of those carriers changes preprocessor state, so moving the insertion
+/// across them changes only the order in which their lines and the payload
+/// are printed -- the order B fixes.
 PrintedPragmaInsertionPlacement placeTUInsertionAmongPrintedPragmas(
-    const RefoldModel &model,
-    const RefoldPreprocessingStructureIndex &structureIndex,
+    const RefoldTUAnchorProof &tuAnchorProof,
+    llvm::ArrayRef<PrintedPragmaCarrier> carriers,
     llvm::ArrayRef<SidebandPragmaLinePairing> pairings,
     const diffutils::Hunk &h, llvm::ArrayRef<size_t> bTokOff,
-    llvm::StringRef tuPath, llvm::StringRef tuBytes, uint64_t baseAnchor);
+    llvm::StringRef tuBytes, uint64_t baseAnchor);
 
 } // namespace refold
 } // namespace clang

@@ -620,6 +620,23 @@ bool transitionContainsMacroStateDirective(
   });
 }
 
+/// Return whether a replacement hunk begins or ends with an A token spelled
+/// like the B token at the same edge.
+///
+/// The core alignment matches such a pair unless another optimal alignment
+/// matches one of them elsewhere, so a hunk with one is a hunk the certified
+/// theorem widened across an anchor it suppressed as a tie, and the alignment
+/// inside it is a tie-break.  Placing a seam there by where B prints a
+/// directive commits that tie-break; the alignment resolver and the
+/// line-stability narrowing are the stages that decide it.  The spelling is
+/// used only to decline, never to admit anything.
+bool hunkEdgesWereWidenedAcrossATie(const RefoldSourceMapper &sourceMapper,
+                                    const diffutils::Hunk &h) {
+  return h.aStart < h.aEnd && h.bStart < h.bEnd &&
+         (sourceMapper.TokensShareSpelling(h.aStart, h.bStart) ||
+          sourceMapper.TokensShareSpelling(h.aEnd - 1, h.bEnd - 1));
+}
+
 /// The B gaps at which B printed the first and the last of the directives
 /// preserved at one A-token seam.
 struct PrintedPragmaSeamGaps {
@@ -704,6 +721,24 @@ std::optional<PrintedPragmaSeamGaps> printedPragmaGapsAtSeam(
   return gaps;
 }
 
+/// Return whether some hunk consumes A tokens of a root invocation among
+/// \p ancestors, which hands that invocation to a macro realizer.
+bool rootInvocationTouchedByHunk(const RefoldMacroTopology &topology,
+                                 ArrayRef<uint64_t> ancestors,
+                                 ArrayRef<diffutils::Hunk> hunks) {
+  for (uint64_t id : ancestors) {
+    const RefoldModel::MacroInvocation *root =
+        topology.FindMacroInvocationById(id);
+    if (!root || root->callerMacroId)
+      continue;
+    for (const RefoldModel::PPSpan &span : root->spans)
+      for (const diffutils::Hunk &h : hunks)
+        if (h.aStart < span.end && span.begin < h.aEnd)
+          return true;
+  }
+  return false;
+}
+
 /// Return the include occurrence owning the `#pragma` directive printed as
 /// \p line, when that directive is spelled in a header; std::nullopt for a
 /// translation-unit line, an operator, or a record that does not bind.
@@ -724,28 +759,6 @@ headerDirectiveOwnerOfPrintedLine(const RefoldModel &model,
   return found->ownerIncludeId;
 }
 
-/// Return whether a pragma record is a `#pragma` directive line of the
-/// translation unit itself, bound to exactly that line in the source index.
-bool isTUDirectiveRecord(const RefoldModel &model,
-                         const RefoldPreprocessingStructureIndex &tuIndex,
-                         uint64_t id) {
-  const RefoldModel::PragmaDirective *record = nullptr;
-  for (const RefoldModel::PragmaDirective &pragma : model.GetPragmas()) {
-    if (pragma.id != id)
-      continue;
-    if (record)
-      return false;
-    record = &pragma;
-  }
-  if (!record)
-    return false;
-  size_t bound = 0;
-  for (const PreprocessingStructureInterval *interval :
-       tuIndex.FindOverlapping(record->siteB, record->siteE))
-    bound += interval->kind == PreprocessingStructureKind::Pragma &&
-             interval->modelItemId == id;
-  return bound == 1;
-}
 
 Owner ownerForPreservedStructureInterval(
     const PreprocessingStructureInterval &interval) {
@@ -2052,7 +2065,8 @@ public:
   std::optional<std::vector<diffutils::Hunk>>
   SplitAroundPrintedPragmas(const diffutils::Hunk &h) const {
     if (!h.isReplace() || h.aEnd - h.aStart < 2 ||
-        deps_.sidebandPragmaLinePairings.empty())
+        deps_.sidebandPragmaLinePairings.empty() ||
+        hunkEdgesWereWidenedAcrossATie(deps_.sourceMapper, h))
       return std::nullopt;
 
     // The same whole-invocation guard as the tiling itself: never compete
@@ -2205,7 +2219,8 @@ public:
         // prints on both sides of a payload fix no single seam; see
         // `SplitAroundPrintedPragmas`.
         if (projection && !projection->IsUnique() &&
-            runIndex < physicalSourceRuns->protectedGapFacts.size()) {
+            runIndex < physicalSourceRuns->protectedGapFacts.size() &&
+            !hunkEdgesWereWidenedAcrossATie(deps_.sourceMapper, h)) {
           std::optional<PrintedPragmaSeamGaps> printed =
               printedPragmaGapsAtSeam(
                   gapCrossingProver_, deps_.sidebandPragmaLinePairings,
@@ -4238,12 +4253,10 @@ RefoldStructuralHunkTilingPlanner::EnforcePrintedPragmaPlacement(
     std::vector<diffutils::Hunk> &hunks,
     const std::set<std::tuple<uint64_t, uint64_t, uint64_t, uint64_t>>
         &boundHunks) const {
-  const RefoldPreprocessingStructureIndex &tuIndex =
-      deps_.preprocessingStructureIndexes.GetTUIndex();
-  // A surviving TU `#pragma` directive line, at a gap no macro expansion
-  // prints a pragma at, may be repaired.  Every other printed line with a
-  // known B position -- a header directive, a `_Pragma`, a macro-produced
-  // line, or the B lines a sideband edit writes -- is checked only.
+  // A line printed by a relocatable carrier may be repaired.  Every other
+  // printed line with a known B position -- a header directive, a line a
+  // non-relocatable macro expansion printed, or the B lines a sideband edit
+  // writes -- is checked only.
   std::map<uint64_t, std::pair<uint64_t, uint64_t>> bRangeByAGap;
   // A checked line, and the include occurrence whose expansion prints it when
   // it is written inside a header.
@@ -4258,12 +4271,33 @@ RefoldStructuralHunkTilingPlanner::EnforcePrintedPragmaPlacement(
       continue;
     const uint64_t aGap = line.aNormalTokenGap;
     const uint64_t bGap = *line.bNormalTokenGap;
-    const std::optional<uint64_t> directive =
-        tuDirectivePragmaForPrintedLine(deps_.model, deps_.tuPath, line);
-    const std::optional<ArrayRef<uint64_t>> expansionAncestors =
-        deps_.macroTopology.PragmaExpansionAncestorsAtGap(aGap);
-    if (!directive || !expansionAncestors || !expansionAncestors->empty() ||
-        !isTUDirectiveRecord(deps_.model, tuIndex, *directive)) {
+    const PrintedPragmaCarrier *carrier = nullptr;
+    size_t bound = 0;
+    for (const PrintedPragmaCarrier &candidate : deps_.printedPragmaCarriers)
+      if (candidate.aLineBegin == line.aLineBegin) {
+        carrier = &candidate;
+        ++bound;
+      }
+    // A header's carrier is repaired at a gap inside that header or on its
+    // boundary.  Inside, the insertion the repair makes is owned by the header
+    // and placed among its own lines.  On the boundary, B's order decides: a
+    // payload B prints between the line and the rest of the header is forced
+    // into the header (`IncludeHoldingPayloadBesidePrintedPragma`), and one it
+    // prints outside stays with the parent, before or after the whole header.
+    // A header with no tokens sits exactly at the gap its own lines print at.
+    const RefoldModel::IncludeItem *carrierInclude =
+        carrier && carrier->ownerIncludeId
+            ? deps_.model.GetIncludeById(*carrier->ownerIncludeId)
+            : nullptr;
+    const bool repairable =
+        bound == 1 && carrier->relocatable &&
+        (!carrier->ownerIncludeId ||
+         (carrierInclude && (carrierInclude->spans.empty() ||
+                             (carrierInclude->cover.begin <= aGap &&
+                              aGap <= carrierInclude->cover.end))));
+    if (!repairable) {
+      const std::optional<ArrayRef<uint64_t>> expansionAncestors =
+          deps_.macroTopology.PragmaExpansionAncestorsAtGap(aGap);
       checkedGaps.push_back(
           {{aGap, bGap, bGap},
            expansionAncestors && expansionAncestors->empty()
@@ -4337,6 +4371,48 @@ RefoldStructuralHunkTilingPlanner::EnforcePrintedPragmaPlacement(
         (right && hunks[*right].bStart != curHi))
       return violation;
 
+    // A directive B prints across tokens no hunk changes is moved by deleting
+    // those tokens on one side of it and inserting them again on the other.
+    // Being unchanged, they map one-to-one, so an identity hunk over them
+    // states exactly that; it is made only over tokens no other hunk touches.
+    auto tokensAreUntouched = [&](uint64_t lo, uint64_t hi) {
+      return llvm::none_of(hunks, [&](const diffutils::Hunk &h) {
+        return h.aStart == h.aEnd ? lo < h.aStart && h.aStart < hi
+                                  : h.aStart < hi && lo < h.aEnd;
+      });
+    };
+    if (!left && !insertion && wanted.first < curLo) {
+      const uint64_t k = curLo - wanted.first;
+      if (k > aGap || !tokensAreUntouched(aGap - k, aGap))
+        return violation;
+      const size_t at =
+          static_cast<size_t>(llvm::find_if(hunks,
+                                            [&](const diffutils::Hunk &h) {
+                                              return h.aStart >= aGap;
+                                            }) -
+                              hunks.begin());
+      hunks.insert(hunks.begin() + static_cast<std::ptrdiff_t>(at),
+                   diffutils::Hunk{aGap - k, aGap, curLo - k, curLo});
+      left = at;
+      if (right)
+        ++*right;
+    }
+    if (!right && !insertion && wanted.second > curHi) {
+      const uint64_t k = wanted.second - curHi;
+      if (aGap + k > deps_.model.GetTokensCountA() ||
+          !tokensAreUntouched(aGap, aGap + k))
+        return violation;
+      const size_t at =
+          static_cast<size_t>(llvm::find_if(hunks,
+                                            [&](const diffutils::Hunk &h) {
+                                              return h.aStart > aGap;
+                                            }) -
+                              hunks.begin());
+      hunks.insert(hunks.begin() + static_cast<std::ptrdiff_t>(at),
+                   diffutils::Hunk{aGap, aGap + k, curHi, curHi + k});
+      right = at;
+    }
+
     // Move the far side of each directive into the insertion at the gap.
     const uint64_t newLo = std::min(curLo, wanted.first);
     const uint64_t newHi = std::max(curHi, wanted.second);
@@ -4381,8 +4457,18 @@ RefoldStructuralHunkTilingPlanner::EnforcePrintedPragmaPlacement(
   // one gap for both and stays refused.
   for (const CheckedLine &checked : checkedGaps) {
     const uint64_t aGap = checked.gaps.aGap;
-    const bool unknownCarrier =
-        !deps_.macroTopology.PragmaExpansionAncestorsAtGap(aGap);
+    const std::optional<ArrayRef<uint64_t>> expansionAncestors =
+        deps_.macroTopology.PragmaExpansionAncestorsAtGap(aGap);
+    const bool unknownCarrier = !expansionAncestors;
+    // A line a macro expansion printed stays where it is only while its root
+    // invocation does.  A hunk inside that invocation hands it to a macro
+    // realizer, which rewrites the callsite; where the line lands is then the
+    // realizer's to prove -- its candidate admission and the emission audit
+    // both require B's copy to be replayed -- and not this gap's.
+    if (expansionAncestors &&
+        rootInvocationTouchedByHunk(deps_.macroTopology, *expansionAncestors,
+                                    hunks))
+      continue;
     std::optional<size_t> left, insertion, right;
     int64_t delta = 0;
     bool refused = false;

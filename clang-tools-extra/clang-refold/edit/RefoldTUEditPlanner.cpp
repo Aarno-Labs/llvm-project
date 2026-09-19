@@ -17,7 +17,6 @@
 #include "macro/RefoldMacroTupleHelpers.h"
 #include "model/RefoldModel.h"
 #include "proof/RefoldSidebandReplayProof.h"
-#include "source/RefoldPreprocessingStructureIndex.h"
 
 #include "llvm/Support/FormatVariadic.h"
 
@@ -245,52 +244,18 @@ bool maybeAdvanceTUInsertionPastSourceLineControlPrefix(
   return true;
 }
 
-namespace {
-
-/// Return the producer structure interval bound to one pragma record id, or
-/// null unless exactly one record and exactly one interval name it.
-const PreprocessingStructureInterval *structureIntervalForPragmaRecord(
-    const RefoldModel &model,
-    const RefoldPreprocessingStructureIndex &structureIndex, uint64_t id) {
-  const RefoldModel::PragmaDirective *record = nullptr;
-  for (const RefoldModel::PragmaDirective &pragma : model.GetPragmas()) {
-    if (pragma.id != id)
-      continue;
-    if (record)
-      return nullptr;
-    record = &pragma;
-  }
-  if (!record)
-    return nullptr;
-  const PreprocessingStructureInterval *found = nullptr;
-  for (const PreprocessingStructureInterval *interval :
-       structureIndex.FindOverlapping(record->siteB, record->siteE)) {
-    if (interval->kind != PreprocessingStructureKind::Pragma ||
-        interval->modelKind !=
-            PreprocessingStructureModelKind::PragmaDirective ||
-        interval->modelItemId != id)
-      continue;
-    if (found)
-      return nullptr;
-    found = interval;
-  }
-  return found;
-}
-
-} // namespace
-
 PrintedPragmaInsertionPlacement placeTUInsertionAmongPrintedPragmas(
-    const RefoldModel &model,
-    const RefoldPreprocessingStructureIndex &structureIndex,
+    const RefoldTUAnchorProof &tuAnchorProof,
+    ArrayRef<PrintedPragmaCarrier> carriers,
     ArrayRef<SidebandPragmaLinePairing> pairings, const diffutils::Hunk &h,
-    ArrayRef<size_t> bTokOff, StringRef tuPath, StringRef tuBytes,
-    uint64_t baseAnchor) {
+    ArrayRef<size_t> bTokOff, StringRef tuBytes, uint64_t baseAnchor) {
   using Kind = PrintedPragmaInsertionPlacement::Kind;
   const PrintedPragmaInsertionPlacement refused{Kind::Refused, 0, std::nullopt};
   if (!h.isInsertOnly() || h.bStart >= h.bEnd)
     return {};
 
-  // Lines are in A order, which is source order for TU-owned directives.
+  // Lines are in A order, which is source order for translation-unit
+  // carriers.
   SmallVector<const SidebandPragmaLinePairing *, 2> linesAtGap;
   bool anyFollowsPayload = false;
   for (const SidebandPragmaLinePairing &line : pairings) {
@@ -306,46 +271,48 @@ PrintedPragmaInsertionPlacement placeTUInsertionAmongPrintedPragmas(
   const PrintedPragmaInsertionPlacement unbound =
       anyFollowsPayload ? refused : PrintedPragmaInsertionPlacement();
 
-  // Every line is printed on one side of the payload, preceding lines first.
+  // Every line is printed on one side of the payload, preceding lines first,
+  // and binds to exactly one relocatable carrier.
   const SidebandPragmaLinePairing *firstFollowing = nullptr;
-  const PreprocessingStructureInterval *lastPreceding = nullptr;
-  const PreprocessingStructureInterval *firstFollowingInterval = nullptr;
-  SmallVector<uint64_t, 2> lineRecordIds;
+  const PrintedPragmaCarrier *lastPreceding = nullptr;
+  const PrintedPragmaCarrier *firstFollowingCarrier = nullptr;
   uint64_t lastSourceEnd = 0;
   for (const SidebandPragmaLinePairing *line : linesAtGap) {
     const uint64_t bGap = *line->bNormalTokenGap;
     const bool follows = bGap == h.bEnd;
     if ((!follows && bGap != h.bStart) || (firstFollowing && !follows))
       return refused;
-    const std::optional<uint64_t> pragmaId =
-        tuDirectivePragmaForPrintedLine(model, tuPath, *line);
-    const PreprocessingStructureInterval *interval =
-        pragmaId
-            ? structureIntervalForPragmaRecord(model, structureIndex, *pragmaId)
-            : nullptr;
-    if (!interval || interval->begin < lastSourceEnd ||
-        interval->end > tuBytes.size())
+    const PrintedPragmaCarrier *carrier = nullptr;
+    size_t bound = 0;
+    for (const PrintedPragmaCarrier &candidate : carriers)
+      if (candidate.aLineBegin == line->aLineBegin) {
+        carrier = &candidate;
+        ++bound;
+      }
+    if (bound != 1 || !carrier->relocatable || carrier->ownerIncludeId ||
+        carrier->sourceBegin < lastSourceEnd ||
+        carrier->sourceEnd > tuBytes.size())
       return unbound;
-    lastSourceEnd = interval->end;
-    lineRecordIds.push_back(*pragmaId);
+    lastSourceEnd = carrier->sourceEnd;
     if (!follows) {
-      lastPreceding = interval;
+      lastPreceding = carrier;
     } else if (!firstFollowing) {
       firstFollowing = line;
-      firstFollowingInterval = interval;
+      firstFollowingCarrier = carrier;
     }
   }
 
-  // The insertion must land after the last preceding directive's line and
-  // before the first following one.  A site already inside that range stays.
+  // The insertion must land after the last preceding carrier and before the
+  // first following one.  A site already inside that range stays.
   uint64_t target = baseAnchor;
-  if (lastPreceding && target < lastPreceding->end)
-    target = lastPreceding->end;
-  else if (firstFollowingInterval && firstFollowingInterval->begin < target)
-    target = firstFollowingInterval->begin;
-  // A site after a directive must begin a line, or the payload would join the
-  // directive's own logical line.
-  if (target != baseAnchor && lastPreceding && target == lastPreceding->end &&
+  if (lastPreceding && target < lastPreceding->sourceEnd)
+    target = lastPreceding->sourceEnd;
+  else if (firstFollowingCarrier && firstFollowingCarrier->sourceBegin < target)
+    target = firstFollowingCarrier->sourceBegin;
+  // A site after a directive line must begin a line, or the payload would join
+  // the directive's own logical line.
+  if (target != baseAnchor && lastPreceding && lastPreceding->directiveLine &&
+      target == lastPreceding->sourceEnd &&
       (target == 0 || tuBytes[target - 1] != '\n'))
     return refused;
   if (!firstFollowing && target == baseAnchor)
@@ -366,21 +333,10 @@ PrintedPragmaInsertionPlacement placeTUInsertionAmongPrintedPragmas(
     bByteEnd = firstFollowing->bLineBegin;
   }
 
-  // Moving the anchor may cross only the gap's own printed directives.
-  const uint64_t lo = std::min(baseAnchor, target);
-  const uint64_t hi = std::max(baseAnchor, target);
-  uint64_t cursor = lo;
-  for (const PreprocessingStructureInterval *interval :
-       structureIndex.FindOverlapping(lo, hi)) {
-    if (interval->begin < cursor || hi < interval->end ||
-        interval->kind != PreprocessingStructureKind::Pragma ||
-        !interval->modelItemId ||
-        !llvm::is_contained(lineRecordIds, *interval->modelItemId) ||
-        !structureIndex.IsRangeLexicallyIgnorable(cursor, interval->begin))
-      return refused;
-    cursor = interval->end;
-  }
-  if (!structureIndex.IsRangeLexicallyIgnorable(cursor, hi))
+  // Moving the anchor may cross only printed-pragma carriers and trivia.
+  if (target != baseAnchor &&
+      !tuAnchorProof.RangeHoldsOnlyPrintedPragmas(std::min(baseAnchor, target),
+                                                  std::max(baseAnchor, target)))
     return refused;
 
   return {Kind::Placed, target, bByteEnd};

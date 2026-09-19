@@ -348,6 +348,7 @@ inline StringRef toString(TheoremSelectionTieBreakerKind value) {
   REFOLD_X(IncludeInsertChildBoundary)                                         \
   REFOLD_X(IncludeInsertRightNeighborPP)                                       \
   REFOLD_X(IncludeInsertLeftNeighborPP)                                        \
+  REFOLD_X(IncludeInsertPrintedPragmaPlacement)                                \
   REFOLD_X(IncludeInsertDeclBoundary)                                          \
   REFOLD_X(IncludeRealizationInlineFromB)                                      \
   REFOLD_X(IncludeMaterializedExpansion)                                       \

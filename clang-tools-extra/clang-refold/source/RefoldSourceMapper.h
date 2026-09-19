@@ -161,6 +161,12 @@ public:
   /// sentinel offset past the last token.
   llvm::ArrayRef<size_t> BTokenByteOffsets() const { return bTokOff_; }
 
+  /// Return whether A token \p a and B token \p b have the same spelling.
+  bool TokensShareSpelling(uint64_t a, uint64_t b) const {
+    return a < aToks_.size() && b < bToks_.size() &&
+           aToks_[a].spelling == bToks_[b].spelling;
+  }
+
   /// Slice the edited B-side preprocessed source by the bytes its tokens
   /// physically occupy: from the first token's first byte through the last
   /// token's last byte.

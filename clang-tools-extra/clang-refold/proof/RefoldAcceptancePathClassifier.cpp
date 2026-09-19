@@ -176,6 +176,11 @@ RefoldAcceptancePathClassifier::BuildAcceptancePathInventory(
     inventory.futureTarget =
         FutureProofTarget::IncludeInsertionByLeftNeighborPP;
     break;
+  case AcceptedPathKind::IncludeInsertPrintedPragmaPlacement:
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
+    inventory.futureTarget =
+        FutureProofTarget::IncludeInsertionByPrintedPragmaPlacement;
+    break;
   case AcceptedPathKind::IncludeInsertDeclBoundary:
     inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::IncludeInsertionByDeclBoundary;
@@ -272,6 +277,7 @@ RefoldAcceptancePathClassifier::BuildTheoremProofClassForAcceptedPath(
   case AcceptedPathKind::IncludeInsertChildBoundary:
   case AcceptedPathKind::IncludeInsertRightNeighborPP:
   case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+  case AcceptedPathKind::IncludeInsertPrintedPragmaPlacement:
   case AcceptedPathKind::IncludeInsertDeclBoundary:
   case AcceptedPathKind::TUExactSlotBoundary:
   case AcceptedPathKind::TUProvableInsertionAnchor:
@@ -349,6 +355,7 @@ RefoldAcceptancePathClassifier::BuildAcceptedPathProofSummary(
   case AcceptedPathKind::IncludeInsertChildBoundary:
   case AcceptedPathKind::IncludeInsertRightNeighborPP:
   case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+  case AcceptedPathKind::IncludeInsertPrintedPragmaPlacement:
   case AcceptedPathKind::IncludeInsertDeclBoundary:
     deps_.proofSummaryBuilder.ConfigureProofSummary(
         summary, BuildTheoremProofClassForAcceptedPath(currentPath),
@@ -614,6 +621,17 @@ RefoldAcceptancePathClassifier::ValidateIncludePreservingProof(
     discharge.Require(witness && witness->hasNeighborPP,
                       ProofObligationKind::IncludeLeftNeighborWitnessTracked,
                       ProofFailureReason::MissingIncludeLeftNeighborWitness);
+    break;
+
+  case AcceptedPathKind::IncludeInsertPrintedPragmaPlacement:
+    // A printed-pragma placement anchors at the edge of a header directive
+    // line that B prints on the other side of the payload; the anchor byte is
+    // that edge, derived from the directive's own census interval.
+    RequireIncludeZeroWidthAnchor(
+        discharge, *patch, witness,
+        IncludeAnchorEvidenceKind::PrintedPragmaPlacement,
+        ProofObligationKind::IncludePrintedPragmaPlacementWitnessTracked,
+        ProofFailureReason::MissingIncludePrintedPragmaPlacementWitness);
     break;
 
   case AcceptedPathKind::IncludeInsertDeclBoundary:

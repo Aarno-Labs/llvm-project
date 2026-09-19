@@ -1650,6 +1650,20 @@ bool RefoldEngine::DispatchStructuralHunks(
       }
     }
 
+    // c0) A pure insertion B prints between an include's own surviving pragma
+    // line and the rest of that include can only be realized inside it.
+    if (isIns) {
+      if (const RefoldModel::IncludeItem *inc =
+              IncludeHoldingPayloadBesidePrintedPragma(h)) {
+        IncludePatch patch =
+            includeInsertionPlanner_->BuildIncludeInsertionPatch(*inc, h);
+        patch.condArm.present = owner.condArmId.has_value();
+        patch.condArm.armId = owner.condArmId.value_or(0);
+        structuralHunkDispatcher.AddIncludePatch(inc, std::move(patch));
+        continue;
+      }
+    }
+
     // c) Special case: pure insertions exactly at the boundary between sibling
     // includes that share a common parent. In this case, per policy, the
     // insertion should be attached to the *parent* include so that the
@@ -1721,8 +1735,8 @@ bool RefoldEngine::DispatchStructuralHunks(
           tuAnchorProof_->PlanTUByteSpan(h.aStart, h.aEnd, tuPath); // [b,e)
       PrintedPragmaInsertionPlacement pragmaPlacement;
       if (spanPlan) {
-        pragmaPlacement = PlaceTUInsertionAmongPrintedPragmas(
-            h, tuPath, spanPlan->tuByteBegin);
+        pragmaPlacement =
+            PlaceTUInsertionAmongPrintedPragmas(h, spanPlan->tuByteBegin);
         if (pragmaPlacement.kind ==
             PrintedPragmaInsertionPlacement::Kind::Refused)
           spanPlan.reset();
@@ -2062,12 +2076,11 @@ bool RefoldEngine::DispatchStructuralHunks(
 
 PrintedPragmaInsertionPlacement
 RefoldEngine::PlaceTUInsertionAmongPrintedPragmas(const diffutils::Hunk &h,
-                                                  StringRef tuPath,
                                                   uint64_t baseAnchor) const {
   PrintedPragmaInsertionPlacement placement =
       placeTUInsertionAmongPrintedPragmas(
-          model_, *preprocessingStructureIndex_, sidebandPragmaLinePairings_, h,
-          bTokOff_, tuPath, tuSourceBytes_, baseAnchor);
+          *tuAnchorProof_, printedPragmaCarriers_, sidebandPragmaLinePairings_,
+          h, bTokOff_, tuSourceBytes_, baseAnchor);
   switch (placement.kind) {
   case PrintedPragmaInsertionPlacement::Kind::NotApplicable:
     break;
@@ -2119,6 +2132,45 @@ RefoldEngine::InsertionAnchorAdjustment(
   return std::nullopt;
 }
 
+const RefoldModel::IncludeItem *
+RefoldEngine::IncludeHoldingPayloadBesidePrintedPragma(
+    const diffutils::Hunk &h) const {
+  if (!h.isInsertOnly() || h.bStart >= h.bEnd)
+    return nullptr;
+  const RefoldModel::IncludeItem *found = nullptr;
+  for (const SidebandPragmaLinePairing &line : sidebandPragmaLinePairings_) {
+    if (line.aNormalTokenGap != h.aStart || !line.bNormalTokenGap)
+      continue;
+    for (const PrintedPragmaCarrier &carrier : printedPragmaCarriers_) {
+      if (carrier.aLineBegin != line.aLineBegin || !carrier.relocatable ||
+          !carrier.directiveLine || !carrier.ownerIncludeId)
+        continue;
+      const RefoldModel::IncludeItem *inc =
+          model_.GetIncludeById(*carrier.ownerIncludeId);
+      if (!inc || inc->cover.end < inc->cover.begin)
+        continue;
+      // B prints the include's line before a payload at its first gap, or
+      // after one at its last gap: the payload sits between the line and the
+      // rest of the include.  An include with no tokens prints everything at
+      // its lines' own gap, where a site beside the line is only provable
+      // inside it; the translation-unit anchor there does not say which side
+      // of the directive it takes.
+      const uint64_t bGap = *line.bNormalTokenGap;
+      const bool inside =
+          inc->spans.empty()
+              ? bGap == h.bStart || bGap == h.bEnd
+              : (h.aStart == inc->cover.begin && bGap == h.bStart) ||
+                    (h.aStart == inc->cover.end && bGap == h.bEnd);
+      if (!inside)
+        continue;
+      if (found && found != inc)
+        return nullptr;
+      found = inc;
+    }
+  }
+  return found;
+}
+
 std::optional<TextEdit> RefoldEngine::BuildDirectTUByteSpanEditForHunk(
     const diffutils::Hunk &h, size_t hunkIndex, bool isDel, StringRef tuPath,
     StringRef tuBytes, std::pair<uint64_t, uint64_t> span) {
@@ -2136,7 +2188,7 @@ std::optional<TextEdit> RefoldEngine::BuildDirectTUByteSpanEditForHunk(
       }
       const PrintedPragmaInsertionPlacement pragmaPlacement =
           isDel ? PrintedPragmaInsertionPlacement()
-                : PlaceTUInsertionAmongPrintedPragmas(h, tuPath, span.first);
+                : PlaceTUInsertionAmongPrintedPragmas(h, span.first);
       if (pragmaPlacement.kind ==
           PrintedPragmaInsertionPlacement::Kind::Refused)
         return std::nullopt;

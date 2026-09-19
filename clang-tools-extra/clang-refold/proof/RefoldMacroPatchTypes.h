@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace clang {
@@ -266,6 +267,10 @@ struct WholeCoverPlan {
   bool adjustedRight = false;
   bool claimsClipped = false;
   std::string clippedText;
+  /// B byte ranges of the `#pragma` lines this invocation's expansion printed
+  /// that `clippedText` replays verbatim; see
+  /// `RefoldMacroWholeCoverPlanBuilder::ComputeWholeCoverPlan`.
+  std::vector<std::pair<uint64_t, uint64_t>> replayedPragmaLines;
 };
 
 enum class OccurrenceSupportMode {

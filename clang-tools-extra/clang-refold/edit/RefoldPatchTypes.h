@@ -109,6 +109,10 @@ struct OwnerCertificate {
 ///     full callsite while only the rewritten argument envelope is the surface
 ///     corresponding to the B materialization.
 struct MaterializedSurface {
+  /// B byte ranges of surviving `#pragma` lines the replacement replays
+  /// verbatim, because replacing the callsite removes the only source that
+  /// printed them.  Dropped whenever the replacement text is rewritten.
+  std::vector<std::pair<uint64_t, uint64_t>> replayedPragmaLines;
   /// True when `bTokStart`/`bTokEnd` name a valid B-token interval.
   bool hasBTokenRange = false;
   /// Inclusive B-token index of the materialized surface envelope.
@@ -245,6 +249,7 @@ inline const SubtreeCertificate &subtreeCertificateOf(const MacroPatch &patch) {
 inline void invalidateMacroPatchReplacementByteProvenance(MacroPatch &patch) {
   patch.materialized.hasOutputByteRange = false;
   patch.materialized.replacementIsWhollyBPayload = false;
+  patch.materialized.replayedPragmaLines.clear();
 }
 
 /// Specialized authority carried by an exact direct-header byte patch.

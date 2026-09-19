@@ -427,19 +427,22 @@ struct PrintedPragmaCarrier {
   uint64_t sourceEnd = 0;
   uint64_t bLineBegin = 0;
   uint64_t bLineEnd = 0;
+  /// The paired line, by its A replay-surface start, and its two gaps.
+  uint64_t aLineBegin = 0;
+  uint64_t aNormalTokenGap = 0;
+  uint64_t bNormalTokenGap = 0;
+  /// Whether the carrier is source that prints nothing but printed pragma
+  /// lines: a `#pragma` directive line bound in its own file occurrence's
+  /// census, a `_Pragma` operator spelled in translation-unit text, or a
+  /// zero-token translation-unit macro invocation every one of whose
+  /// `_Pragma`s was printed.  No such carrier changes preprocessor state, so
+  /// an insertion in the same file occurrence may be placed on either side of
+  /// it, and moved across it, on the strength of where B prints the line.
+  bool relocatable = false;
+  /// Whether the carrier is a whole directive line, after which an insertion
+  /// must begin a line of its own.
+  bool directiveLine = false;
 };
-
-/// Return the id of the producer record for the translation unit's own
-/// `#pragma` directive printed as \p line, or std::nullopt.
-///
-/// The record must be the unique one whose A image lies inside the line, be
-/// spelled as a directive rather than a `_Pragma` operator, and belong to the
-/// translation unit rather than an included header.  Only such a directive
-/// is printed wherever its source line stands in the refolded output, so only
-/// its paired B gap constrains where source edits may place it.
-std::optional<uint64_t>
-tuDirectivePragmaForPrintedLine(const RefoldModel &model, StringRef tuPath,
-                                const SidebandPragmaLinePairing &line);
 
 /// Return an implementation-local validation failure for a complete sideband
 /// proof, or std::nullopt when the proof is structurally valid for the B

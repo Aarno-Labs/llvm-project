@@ -40,6 +40,7 @@
 namespace clang {
 namespace refold {
 
+struct PrintedPragmaCarrier;
 class LineDirectiveInserter;
 class RefoldMacroTopology;
 class RefoldPathIdentity;
@@ -232,6 +233,9 @@ public:
     /// B-token stream, used to ask what an insertion would actually emit.  It
     /// is also the shared proof-summary builder's only hard input.
     llvm::ArrayRef<PPTok> bTokens;
+    /// Source carriers of the paired `#pragma` lines; the relocatable ones are
+    /// the only structure a printed-pragma placement may move across.
+    llvm::ArrayRef<PrintedPragmaCarrier> printedPragmaCarriers = {};
   };
 
   RefoldTUAnchorProof(const RefoldTheoremAudit &theoremAudit, Deps deps);
@@ -292,13 +296,14 @@ public:
                                                          uint64_t ppGap) const;
 
   /// Return whether the nonempty TU byte range `[begin,end)` holds at least
-  /// one `#pragma` directive and nothing but complete producer-bound pragmas
-  /// clang printed, and lexer trivia.
+  /// one relocatable printed-pragma carrier and nothing but such carriers and
+  /// lexer trivia; see `PrintedPragmaCarrier::relocatable`.
   ///
   /// A printed pragma is one no handler consumed, and every pragma that
   /// changes macro state is consumed, so moving a pure insertion across such a
-  /// range changes only the order in which the directive lines and the
-  /// insertion are printed.
+  /// range changes only the order in which those lines and the insertion are
+  /// printed.  Every preprocessing structure in the range must lie inside one
+  /// of the carriers.
   bool RangeHoldsOnlyPrintedPragmas(uint64_t begin, uint64_t end) const;
 
   /// Return true iff a PP gap sits at the exit of a selected conditional arm.

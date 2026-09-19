@@ -11,8 +11,11 @@
 
 #include "edit/RefoldBInsertionLedger.h"
 #include "macro/RefoldMacroReplay.h"
+#include "macro/RefoldMacroTopology.h"
+#include "proof/RefoldSidebandReplayProof.h"
 #include "source/RefoldSourceMapper.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -129,8 +132,76 @@ RefoldMacroWholeCoverPlanBuilder::ComputeWholeCoverPlan(
   if (!material)
     return std::nullopt;
   plan.clippedText = material->trim().str();
+  ReplayProducedPragmaLines(m, keptSegment, material->trim(), plan);
 
   return plan;
+}
+
+void RefoldMacroWholeCoverPlanBuilder::ReplayProducedPragmaLines(
+    const RefoldModel::MacroInvocation &m,
+    std::pair<size_t, size_t> keptSegment, StringRef material,
+    WholeCoverPlan &plan) const {
+  const uint64_t materialBegin =
+      static_cast<uint64_t>(material.data() - deps_.bSource.data());
+  const uint64_t materialEnd = materialBegin + material.size();
+
+  SmallVector<const SidebandPragmaLinePairing *, 2> leading, interior, trailing;
+  for (const SidebandPragmaLinePairing &line :
+       deps_.sidebandPragmaLinePairings) {
+    if (!line.bNormalTokenGap)
+      continue;
+    const std::optional<ArrayRef<uint64_t>> ancestors =
+        deps_.topology.PragmaExpansionAncestorsAtGap(line.aNormalTokenGap);
+    if (!ancestors || !llvm::is_contained(*ancestors, m.id))
+      continue;
+    const uint64_t bGap = *line.bNormalTokenGap;
+    if (bGap == keptSegment.first)
+      leading.push_back(&line);
+    else if (bGap == keptSegment.second)
+      trailing.push_back(&line);
+    else if (keptSegment.first < bGap && bGap < keptSegment.second &&
+             materialBegin <= line.bLineBegin && line.bLineEnd <= materialEnd)
+      interior.push_back(&line);
+    else
+      return; // B prints it outside this cover; the plan cannot replay it.
+  }
+
+  // The lines at one edge, in B order, with only whitespace between them and
+  // the kept material; std::nullopt when anything else lies there.
+  auto edgeBytes =
+      [&](SmallVectorImpl<const SidebandPragmaLinePairing *> &lines,
+          bool before) -> std::optional<StringRef> {
+    if (lines.empty())
+      return StringRef();
+    llvm::sort(lines, [](const auto *lhs, const auto *rhs) {
+      return lhs->bLineBegin < rhs->bLineBegin;
+    });
+    uint64_t cursor = before ? lines.front()->bLineBegin : materialEnd;
+    const uint64_t stop = before ? materialBegin : lines.back()->bLineEnd;
+    for (const SidebandPragmaLinePairing *line : lines) {
+      if (line->bLineBegin < cursor ||
+          !deps_.bSource.slice(cursor, line->bLineBegin).trim().empty())
+        return std::nullopt;
+      cursor = line->bLineEnd;
+    }
+    if (stop < cursor || !deps_.bSource.slice(cursor, stop).trim().empty())
+      return std::nullopt;
+    return deps_.bSource.slice(before ? lines.front()->bLineBegin : materialEnd,
+                               stop);
+  };
+  std::optional<StringRef> prefix = edgeBytes(leading, /*before=*/true);
+  std::optional<StringRef> suffix = edgeBytes(trailing, /*before=*/false);
+  if (!prefix || !suffix)
+    return;
+
+  // A leading directive needs its own line: the callsite may sit mid-line.
+  // A trailing one already starts on a fresh line and ends with its newline.
+  if (!prefix->empty())
+    plan.clippedText = "\n" + prefix->str() + plan.clippedText;
+  plan.clippedText += suffix->str();
+  for (const auto *lines : {&leading, &interior, &trailing})
+    for (const SidebandPragmaLinePairing *line : *lines)
+      plan.replayedPragmaLines.push_back({line->bLineBegin, line->bLineEnd});
 }
 
 bool RefoldMacroWholeCoverPlanBuilder::WholeCoverPatchMatchesPlan(

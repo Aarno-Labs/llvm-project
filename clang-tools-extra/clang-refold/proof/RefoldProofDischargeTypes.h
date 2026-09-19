@@ -98,6 +98,7 @@ inline StringRef toString(ProofDischargeStatus value) {
   REFOLD_X(IncludeChildBoundaryWitnessTracked)                                 \
   REFOLD_X(IncludeRightNeighborWitnessTracked)                                 \
   REFOLD_X(IncludeLeftNeighborWitnessTracked)                                  \
+  REFOLD_X(IncludePrintedPragmaPlacementWitnessTracked)                        \
   REFOLD_X(IncludeDeclBoundaryWitnessTracked)                                  \
   REFOLD_X(TUAnchorPathClassified)                                             \
   REFOLD_X(TUAnchorWitnessTracked)                                             \
@@ -164,6 +165,7 @@ inline StringRef toString(ProofObligationKind obligation) {
   REFOLD_X(MissingIncludeChildBoundaryWitness)                                 \
   REFOLD_X(MissingIncludeRightNeighborWitness)                                 \
   REFOLD_X(MissingIncludeLeftNeighborWitness)                                  \
+  REFOLD_X(MissingIncludePrintedPragmaPlacementWitness)                        \
   REFOLD_X(MissingIncludeDeclBoundaryWitness)                                  \
   REFOLD_X(MissingTUAnchorClassification)                                      \
   REFOLD_X(MissingTUAnchorWitness)                                             \

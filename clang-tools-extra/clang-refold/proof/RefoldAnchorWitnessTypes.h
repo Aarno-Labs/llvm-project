@@ -104,6 +104,7 @@ struct TUAnchorWitness {
   REFOLD_X(ChildBoundary)                                                      \
   REFOLD_X(RightNeighborPP)                                                    \
   REFOLD_X(LeftNeighborPP)                                                     \
+  REFOLD_X(PrintedPragmaPlacement)                                             \
   REFOLD_X(DeclBoundary)
 
 enum class IncludeAnchorEvidenceKind : uint8_t {
