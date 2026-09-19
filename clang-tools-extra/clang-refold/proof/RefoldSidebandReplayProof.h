@@ -444,6 +444,15 @@ struct PrintedPragmaCarrier {
   bool directiveLine = false;
 };
 
+/// Return the one carrier bound to \p line, or null when none or several are.
+///
+/// A line a macro expansion printed has one carrier per root invocation, so
+/// several may bind to it.  No single source then decides whether the line is
+/// printed, and no placement can be proved against it.
+const PrintedPragmaCarrier *
+findUniquePrintedPragmaCarrier(ArrayRef<PrintedPragmaCarrier> carriers,
+                               const SidebandPragmaLinePairing &line);
+
 /// Return an implementation-local validation failure for a complete sideband
 /// proof, or std::nullopt when the proof is structurally valid for the B
 /// buffer.

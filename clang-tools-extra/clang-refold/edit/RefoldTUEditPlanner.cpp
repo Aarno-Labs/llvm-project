@@ -282,14 +282,9 @@ PrintedPragmaInsertionPlacement placeTUInsertionAmongPrintedPragmas(
     const bool follows = bGap == h.bEnd;
     if ((!follows && bGap != h.bStart) || (firstFollowing && !follows))
       return refused;
-    const PrintedPragmaCarrier *carrier = nullptr;
-    size_t bound = 0;
-    for (const PrintedPragmaCarrier &candidate : carriers)
-      if (candidate.aLineBegin == line->aLineBegin) {
-        carrier = &candidate;
-        ++bound;
-      }
-    if (bound != 1 || !carrier->relocatable || carrier->ownerIncludeId ||
+    const PrintedPragmaCarrier *carrier =
+        findUniquePrintedPragmaCarrier(carriers, *line);
+    if (!carrier || !carrier->relocatable || carrier->ownerIncludeId ||
         carrier->sourceBegin < lastSourceEnd ||
         carrier->sourceEnd > tuBytes.size())
       return unbound;

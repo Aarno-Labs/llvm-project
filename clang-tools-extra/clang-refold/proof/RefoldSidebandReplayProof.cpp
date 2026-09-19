@@ -24,6 +24,20 @@
 namespace clang {
 namespace refold {
 
+const PrintedPragmaCarrier *
+findUniquePrintedPragmaCarrier(ArrayRef<PrintedPragmaCarrier> carriers,
+                               const SidebandPragmaLinePairing &line) {
+  const PrintedPragmaCarrier *found = nullptr;
+  for (const PrintedPragmaCarrier &carrier : carriers) {
+    if (carrier.aLineBegin != line.aLineBegin)
+      continue;
+    if (found)
+      return nullptr;
+    found = &carrier;
+  }
+  return found;
+}
+
 std::optional<StringRef>
 validateSidebandPragmaEditProof(const SidebandPragmaEdit &edit,
                                 uint64_t bSize) {

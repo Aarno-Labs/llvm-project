@@ -41,6 +41,7 @@ add_clang_library(clangRefold STATIC
   model/RefoldToken.cpp
   source/RefoldTokenDiffPlanner.cpp
   source/RefoldTokenlessSourceProjection.cpp
+  source/RefoldPrintedPragmaHunkPlacement.cpp
   source/RefoldStructuralHunkTilingPlanner.cpp
   source/RefoldPreprocessingDirectiveScanner.cpp
   source/RefoldPreprocessingStructureIndex.cpp

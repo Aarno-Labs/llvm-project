@@ -2395,14 +2395,9 @@ RefoldHeaderIncludeEditPlanner::PlaceAmongPrintedPragmas(
     const bool follows = bGap == patch.bEnd;
     if ((!follows && bGap != patch.bStart) || (firstFollowing && !follows))
       return std::nullopt;
-    const PrintedPragmaCarrier *carrier = nullptr;
-    size_t bound = 0;
-    for (const PrintedPragmaCarrier &candidate : printedPragmaCarriers_)
-      if (candidate.aLineBegin == line->aLineBegin) {
-        carrier = &candidate;
-        ++bound;
-      }
-    if (bound != 1 || !carrier->relocatable || !carrier->directiveLine ||
+    const PrintedPragmaCarrier *carrier =
+        findUniquePrintedPragmaCarrier(printedPragmaCarriers_, *line);
+    if (!carrier || !carrier->relocatable || !carrier->directiveLine ||
         carrier->ownerIncludeId != state.include.id ||
         !paths_.PathsEqual(carrier->path, state.file) ||
         carrier->sourceBegin < lastSourceEnd ||

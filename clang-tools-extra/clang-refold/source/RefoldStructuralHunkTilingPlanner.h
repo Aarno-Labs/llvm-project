@@ -21,6 +21,7 @@
 
 #include "proof/RefoldTilingWitnessTypes.h"
 #include "source/RefoldDiffTypes.h"
+#include "source/RefoldPrintedPragmaHunkPlacement.h"
 #include "clang/Basic/LangOptions.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -29,8 +30,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <set>
-#include <tuple>
 #include <vector>
 
 namespace clang {
@@ -137,16 +136,6 @@ public:
         &structuralHunkTilingSegmentBindings;
   };
 
-  /// A surviving translation-unit `#pragma` directive at A gap `aGap` that B
-  /// prints at B gap `bGap`, which no repair of the hunks around the gap can
-  /// realize.  `bLo`/`bHi` bound the B gaps the final hunks do realize there.
-  struct PrintedPragmaPlacementViolation {
-    uint64_t aGap = 0;
-    uint64_t bGap = 0;
-    uint64_t bLo = 0;
-    uint64_t bHi = 0;
-  };
-
   struct StructuralHunkTilingPlan {
     /// A/B token hunks after deterministic structural splitting.
     std::vector<diffutils::Hunk> hunks;
@@ -155,7 +144,7 @@ public:
     /// Number of emitted token-segment bindings across those witnesses.
     size_t segmentBindingCount = 0;
     /// The first surviving `#pragma` directive the hunks cannot print where
-    /// B does, when there is one; see `EnforcePrintedPragmaPlacement`.
+    /// B does, when there is one; see `enforcePrintedPragmaPlacement`.
     std::optional<PrintedPragmaPlacementViolation> printedPragmaViolation;
   };
 
@@ -189,44 +178,6 @@ private:
   /// Both exits of Plan() end here, so the empty-input early return and the
   /// completed tiling pass report the witness and binding counts the same way.
   StructuralHunkTilingPlan FinishPlan(std::vector<diffutils::Hunk> hunks);
-
-  /// Make the hunks print every printed pragma line whose B position is known
-  /// where B prints it, or report the first they cannot.
-  ///
-  /// A paired line keeps its source, and a replaying sideband edit writes B's
-  /// lines at a source position, so each is printed wherever that position
-  /// lands among the realized hunks: before a hunk that starts at its A gap,
-  /// after one that ends there, and on the side a pure insertion at the gap is
-  /// placed on.  The B gap must be one of those.  Pairing cannot guarantee
-  /// that -- it is decided before, and independently of, the alignment the
-  /// hunks come from -- so it is checked here, on the final hunks.
-  ///
-  /// A line printed by a relocatable carrier (see
-  /// `PrintedPragmaCarrier::relocatable`) may be repaired: when B prints it
-  /// inside a hunk bordering its gap, B's token order forces the tokens on the
-  /// far side into a pure insertion at the gap, placed by
-  /// `placeTUInsertionAmongPrintedPragmas`.  When no hunk borders the gap, the
-  /// unchanged tokens between A's and B's positions are first stated as an
-  /// identity hunk, so a moved directive becomes those tokens deleted on one
-  /// side and inserted on the other.  Hunks a tiling witness is bound to are
-  /// never changed.
-  ///
-  /// Every other paired line -- a header directive, a line a macro expansion
-  /// that is not relocatable produced -- and the lines a sideband edit writes
-  /// are checked only, because the insertion placement proves an order only
-  /// against relocatable carriers: each must sit at the single B gap the hunks
-  /// leave at its A gap.  A line whose macro
-  /// caller chain does not resolve has no known carrier, so no hunk may border
-  /// its gap.  Every disagreement is returned, and must fail closed.
-  ///
-  /// This is necessary, not sufficient, for a line whose carrier a realizer
-  /// may replace -- a macro invocation rewritten or expanded from B, or a
-  /// header materialized around a sideband edit.  Where such a realizer puts
-  /// the line is decided after planning and is not checked here.
-  std::optional<PrintedPragmaPlacementViolation> EnforcePrintedPragmaPlacement(
-      std::vector<diffutils::Hunk> &hunks,
-      const std::set<std::tuple<uint64_t, uint64_t, uint64_t, uint64_t>>
-          &boundHunks) const;
 
   /// Borrowed service graph and output ledgers for one refold engine instance.
   Dependencies deps_;
