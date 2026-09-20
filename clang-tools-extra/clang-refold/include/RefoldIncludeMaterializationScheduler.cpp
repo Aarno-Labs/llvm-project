@@ -11,6 +11,7 @@
 #include "include/RefoldIncludeMaterializer.h"
 #include "include/RefoldIncludeSubtreeWorkClassifier.h"
 #include "include/RefoldPragmaOnceGuardRewriter.h"
+#include "line-control/LineControlEditHelpers.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroStateRepairPlanner.h"
@@ -29,6 +30,7 @@
 #include <map>
 #include <optional>
 #include <utility>
+#include <vector>
 
 using namespace llvm;
 
@@ -985,11 +987,13 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
 
   // Repair consumed macro-state directives before wrapping the expansion so the
   // final TU edit carries the macro state required by the materialized header.
-  if (!macroStateRepairPlanner_.RepairConsumedDefinitionsForMaterializedInclude(
-          macroStatePlan, macroStateRequest, *include, siteBegin, siteEnd,
-          expansionText)) {
+  const RefoldMacroStateRepairPlanner::MaterializedIncludeDefinitionRepair
+      definitionRepair = macroStateRepairPlanner_
+                             .RepairConsumedDefinitionsForMaterializedInclude(
+                                 macroStatePlan, macroStateRequest, *include,
+                                 siteBegin, siteEnd, expansionText);
+  if (!definitionRepair.succeeded)
     return false;
-  }
 
   LineDirectiveLocation parentResume =
       LineDirectiveInserter::LogicalLocationAtOffset(
@@ -1013,19 +1017,31 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
 
   // Forward any line-control pruning and source-mapping evidence produced while
   // materializing the include body into the final TU wrapper.
-  ArrayRef<FinalLineControlPruneCandidate> includeLineCandidates;
+  //
+  // These offsets address the expansion body, and the macro-state repair above
+  // may have moved that whole body right by prepending preserved `#define`
+  // directives to it.  The wrapper shifts them exactly once more, by where the
+  // body lands inside the wrapper, so this is the one place the repair's own
+  // displacement can still be applied.  Forwarding them unshifted leaves each
+  // candidate naming bytes that precede the directive it stands for, and the
+  // final pruner deletes that misplaced range verbatim.
+  std::vector<FinalLineControlPruneCandidate> includeLineCandidates;
   if (auto includeCandidatesIt =
           includeExpansionLineControlPruneCandidates_.find(include->id);
       includeCandidatesIt !=
       includeExpansionLineControlPruneCandidates_.end()) {
-    includeLineCandidates = includeCandidatesIt->second;
+    appendShiftedLineControlPruneCandidates(
+        includeLineCandidates, includeCandidatesIt->second,
+        definitionRepair.prependedByteCount);
   }
 
-  ArrayRef<FinalLineControlSourceMapping> includeLineSourceMappings;
+  std::vector<FinalLineControlSourceMapping> includeLineSourceMappings;
   if (auto includeMappingsIt =
           includeExpansionLineControlSourceMappings_.find(include->id);
       includeMappingsIt != includeExpansionLineControlSourceMappings_.end()) {
-    includeLineSourceMappings = includeMappingsIt->second;
+    appendShiftedLineControlSourceMappings(includeLineSourceMappings,
+                                           includeMappingsIt->second,
+                                           definitionRepair.prependedByteCount);
   }
 
   LineControlWrappedText wrapped =

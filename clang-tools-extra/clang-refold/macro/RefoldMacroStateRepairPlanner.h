@@ -130,9 +130,29 @@ public:
   bool RequireEveryObservedGapDefinitionRepaired(
       MacroStateRepairPlan &plan, const MacroStateRepairRequest &request) const;
 
+  /// Outcome of repairing the definitions a materialized include consumes.
+  ///
+  /// The repair preserves those definitions by inserting their directive text
+  /// at offset 0 of the replacement, so every byte already in that buffer moves
+  /// by `prependedByteCount`.  Metadata recorded against the buffer -- its
+  /// line-control pruning candidates and source mappings -- is expressed in the
+  /// buffer's own coordinates and does not move with it, so the count is
+  /// reported rather than discarded: the caller owns both the text and that
+  /// metadata and is the only place the two can be kept in agreement.
+  struct MaterializedIncludeDefinitionRepair {
+    /// Whether the repair completed without requesting terminal fallback.
+    bool succeeded = false;
+    /// Number of bytes inserted at offset 0 of the replacement text.
+    uint64_t prependedByteCount = 0;
+  };
+
   /// Repairs macro definitions consumed by a materialized include replacement
   /// while preserving include ancestry and post-include observers.
-  bool RepairConsumedDefinitionsForMaterializedInclude(
+  ///
+  /// On success `replacementText` is prefixed with the preserved directives and
+  /// the returned count states how far the original text moved.
+  MaterializedIncludeDefinitionRepair
+  RepairConsumedDefinitionsForMaterializedInclude(
       MacroStateRepairPlan &plan, const MacroStateRepairRequest &request,
       const RefoldModel::IncludeItem &materializedInclude,
       uint64_t materializedSiteBegin, uint64_t materializedSiteEnd,

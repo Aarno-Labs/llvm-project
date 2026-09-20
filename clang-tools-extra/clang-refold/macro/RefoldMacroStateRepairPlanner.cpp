@@ -66,6 +66,8 @@ using MacroStateRepairPlan =
 using MacroStateRepairRequest =
     RefoldMacroStateRepairPlanner::MacroStateRepairRequest;
 using Dependencies = RefoldMacroStateRepairPlanner::Dependencies;
+using MaterializedIncludeDefinitionRepair =
+    RefoldMacroStateRepairPlanner::MaterializedIncludeDefinitionRepair;
 
 enum class MacroStatePreservationPlacement {
   BeforeReplacement,
@@ -218,9 +220,11 @@ public:
   /// Brackets a B-derived replacement that observes a live definition with a
   /// synthetic undef, and a restore when anything later may observe it.
   void SynthesizeUndefBeforeObservedGapDefinitions();
-  /// Appends required macro definition repairs to a materialized include
-  /// replacement when surviving downstream observers still need them.
-  bool RepairConsumedDefinitionsForMaterializedInclude(
+  /// Prepends required macro definition repairs to a materialized include
+  /// replacement when surviving downstream observers still need them, and
+  /// reports how far that moved the replacement's existing bytes.
+  MaterializedIncludeDefinitionRepair
+  RepairConsumedDefinitionsForMaterializedInclude(
       const RefoldModel::IncludeItem &materializedInclude,
       uint64_t materializedSiteBegin, uint64_t materializedSiteEnd,
       std::string &replacementText);
@@ -3532,7 +3536,8 @@ bool MacroStateRepairContext::DefinitionReplacementListNamesMacro(
   return false;
 }
 
-bool MacroStateRepairContext::RepairConsumedDefinitionsForMaterializedInclude(
+MaterializedIncludeDefinitionRepair
+MacroStateRepairContext::RepairConsumedDefinitionsForMaterializedInclude(
     const RefoldModel::IncludeItem &materializedInclude,
     uint64_t materializedSiteBegin, uint64_t materializedSiteEnd,
     std::string &replacementText) {
@@ -3628,7 +3633,7 @@ bool MacroStateRepairContext::RepairConsumedDefinitionsForMaterializedInclude(
                         materializedInclude.id, definition.id, ref.name)
               .str(),
           /*RequireKnownObserver=*/true, materializedInclude.id);
-      return false;
+      return MaterializedIncludeDefinitionRepair();
     }
 
     // A payload that names the macro normally forbids carrying its definition
@@ -3652,7 +3657,7 @@ bool MacroStateRepairContext::RepairConsumedDefinitionsForMaterializedInclude(
                         materializedInclude.id, definition.id, ref.name)
               .str(),
           /*RequireKnownObserver=*/true, materializedInclude.id);
-      return false;
+      return MaterializedIncludeDefinitionRepair();
     }
 
     std::string directiveText = DirectiveTextForPreservation(definition);
@@ -3674,10 +3679,15 @@ bool MacroStateRepairContext::RepairConsumedDefinitionsForMaterializedInclude(
     plan_.preservedDefinitionDirectiveIds.insert(definition.id);
   }
 
-  if (!preservedDirectivePrefix.empty())
+  MaterializedIncludeDefinitionRepair repair;
+  repair.succeeded = true;
+  if (!preservedDirectivePrefix.empty()) {
     replacementText.insert(0, preservedDirectivePrefix);
+    repair.prependedByteCount =
+        static_cast<uint64_t>(preservedDirectivePrefix.size());
+  }
 
-  return true;
+  return repair;
 }
 
 } // namespace
@@ -3710,12 +3720,12 @@ bool RefoldMacroStateRepairPlanner::RequireEveryObservedGapDefinitionRepaired(
   return !deps_.terminalSink->HasRequest();
 }
 
-bool RefoldMacroStateRepairPlanner::
-    RepairConsumedDefinitionsForMaterializedInclude(
-        MacroStateRepairPlan &plan, const MacroStateRepairRequest &request,
-        const RefoldModel::IncludeItem &materializedInclude,
-        uint64_t materializedSiteBegin, uint64_t materializedSiteEnd,
-        std::string &replacementText) const {
+RefoldMacroStateRepairPlanner::MaterializedIncludeDefinitionRepair
+RefoldMacroStateRepairPlanner::RepairConsumedDefinitionsForMaterializedInclude(
+    MacroStateRepairPlan &plan, const MacroStateRepairRequest &request,
+    const RefoldModel::IncludeItem &materializedInclude,
+    uint64_t materializedSiteBegin, uint64_t materializedSiteEnd,
+    std::string &replacementText) const {
   MacroStateRepairContext Context(deps_, request, plan);
   return Context.RepairConsumedDefinitionsForMaterializedInclude(
       materializedInclude, materializedSiteBegin, materializedSiteEnd,

@@ -15,11 +15,13 @@
 #include "line-control/FinalLineControlModel.h"
 
 #include "proof/RefoldProofVocabulary.h"
+#include "support/RefoldLog.h"
 #include "support/StringUtils.h"
 
 #include "clang/Basic/LangOptions.h"
 
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Path.h"
 
@@ -366,6 +368,61 @@ StringRef preprocessorKeyword(StringRef line) {
   return line.take_front(end);
 }
 
+/// Return whether a candidate's byte range is exactly one complete
+/// line-control directive in the stream it is about to be deleted from.
+///
+/// Every candidate is minted around a directive this tool synthesized, at the
+/// offsets of whichever buffer held it then, and is shifted once for each
+/// splice of that buffer into a parent.  A shift that is skipped leaves a
+/// perfectly well-formed range sitting over the wrong bytes, and the deletion
+/// oracle can still accept it: token equivalence does not see a header guard
+/// spliced into the tail of a filename, because neither half contributes a
+/// token.  So the property is re-derived from the final bytes here rather than
+/// inherited from the bookkeeping that produced the range.
+///
+/// The range must hold one whole logical line that spells either `#line` or a
+/// GNU line marker -- the two forms this tool emits.  Horizontal whitespace on
+/// either side may sit outside the range: a directive is introduced by `#`
+/// after optional blanks, so a resync placed at the front of a replacement that
+/// begins past the line's indentation still owns its whole line, and the
+/// indentation left behind by deleting it is blank text.  An interior newline
+/// or a trailing backslash is refused: a synthesized directive is never
+/// spliced, so a range holding one is not the directive it claims to be.
+bool candidateRangeCoversCompleteLineControlDirective(
+    const FinalLineControlPruneCandidate &candidate, StringRef current) {
+  const size_t begin = static_cast<size_t>(candidate.finalBegin);
+  const size_t end = static_cast<size_t>(candidate.finalEnd);
+
+  // Only blanks may separate the range from the start of its physical line.
+  size_t lineBegin = begin;
+  while (lineBegin > 0 && stringutils::isNonNewlineWs(current[lineBegin - 1]))
+    --lineBegin;
+  if (lineBegin != 0 && current[lineBegin - 1] != '\n')
+    return false;
+
+  StringRef directive = current.slice(begin, end);
+
+  // ... and only blanks may separate it from that line's end.
+  if (!directive.ends_with("\n")) {
+    StringRef tail =
+        current.drop_front(end).take_until([](char c) { return c == '\n'; });
+    if (!stringutils::trimHorizontal(tail).empty())
+      return false;
+  }
+
+  directive.consume_back("\n");
+  directive.consume_back("\r");
+  if (directive.contains('\n') || directive.ends_with("\\"))
+    return false;
+
+  const StringRef keyword = preprocessorKeyword(directive);
+  if (keyword == "line")
+    return true;
+
+  // GNU line marker: `#` then the line number, with no intervening keyword.
+  return !keyword.empty() && isDigit(keyword.front());
+}
+
 bool isConditionalDirectiveKeyword(StringRef keyword) {
   return keyword == "if" || keyword == "ifdef" || keyword == "ifndef" ||
          keyword == "elif" || keyword == "elifdef" || keyword == "elifndef" ||
@@ -535,6 +592,15 @@ bool candidateMayBeValidationDischarged(
     const FinalLineControlPruneCandidate &candidate, StringRef current) {
   if (!candidateRangeIsValid(candidate, current))
     return false;
+  if (!candidateRangeCoversCompleteLineControlDirective(candidate, current)) {
+    REFOLD_LOG_WARN("linedir/prune",
+                    "refusing final line-control deletion: range [{0},{1}) is "
+                    "not one complete directive (origin={2}); the candidate "
+                    "offsets do not address the directive they stand for",
+                    candidate.finalBegin, candidate.finalEnd,
+                    toString(candidate.origin));
+    return false;
+  }
   if (!HasCompleteFinalLineControlProof(candidate))
     return false;
   if (candidate.removalProof->verdict ==
