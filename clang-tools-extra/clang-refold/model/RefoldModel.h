@@ -1294,15 +1294,6 @@ public:
   /// Find the selected conditional arm that produced A-token `ppIndex`.
   std::optional<ArmRef> FindArmRefAtPP(uint64_t ppIndex) const;
 
-  /// Return the first A-token index emitted by the selected arm of `group`.
-  std::optional<uint64_t>
-  FirstConditionalArmStartA(const CondGroup &group) const;
-  std::optional<uint64_t> FirstConditionalArmStartA(uint64_t groupId) const {
-    const CondGroup *group = GetCondGroupById(groupId);
-    if (!group)
-      return std::nullopt;
-    return FirstConditionalArmStartA(*group);
-  }
 
   // --- Slot queries ---
   /// Return all slots matching the supplied exact-match filters.

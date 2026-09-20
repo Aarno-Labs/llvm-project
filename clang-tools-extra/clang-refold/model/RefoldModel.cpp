@@ -3378,46 +3378,6 @@ RefoldModel::FindArmRefAtPP(uint64_t ppIndex) const {
   return std::nullopt;
 }
 
-std::optional<uint64_t>
-RefoldModel::FirstConditionalArmStartA(const CondGroup &group) const {
-  if (group.arms.empty())
-    return std::nullopt;
-
-  // Build an O(1) membership set for the group's arm ids. SmallDenseSet keeps
-  // the common few-arm case inline while still handling larger conditionals.
-  SmallDenseSet<uint64_t, 8> armIds;
-  armIds.reserve(group.arms.size());
-  for (const auto &arm : group.arms)
-    armIds.insert(arm.id);
-
-  uint64_t best = std::numeric_limits<uint64_t>::max();
-  bool found = false;
-
-  for (const auto &slot : slots_) {
-    // Only arm-begin slots in the same recorded file and include-owner domain
-    // can mark the first A-token position for this conditional group.
-    if (slot.kind != "arm_begin" || !refoldPathsEqual(slot.file, group.file))
-      continue;
-
-    if (slot.ownerIncludeId != group.parentIncludeId)
-      continue;
-
-    if (!slot.pp || !slot.ref)
-      continue;
-
-    // Reject slots for other conditional groups.
-    if (!armIds.count(*slot.ref))
-      continue;
-
-    if (*slot.pp < best) {
-      best = *slot.pp;
-      found = true;
-    }
-  }
-
-  return found ? std::optional<uint64_t>(best) : std::nullopt;
-}
-
 std::vector<const RefoldModel::Slot *> RefoldModel::FindSlots(
     std::optional<StringRef> file, std::optional<StringRef> kind,
     std::optional<uint64_t> ref, std::optional<uint64_t> ownerIncludeId) const {

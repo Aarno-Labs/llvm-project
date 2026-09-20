@@ -1261,22 +1261,6 @@ bool RefoldEngine::DispatchStructuralHunks(
                                                  std::move(patch));
         continue;
       }
-
-      if (owner.kind == OwnerKind::Include && owner.includeId) {
-        std::optional<uint64_t> firstCond =
-            model_.FirstConditionalArmStartA(*owner.includeId);
-        if (firstCond && h.aStart <= *firstCond) {
-          const RefoldModel::IncludeItem *inc =
-              model_.GetIncludeById(*owner.includeId);
-          // NOTE: `inc` cannot be null if owner has an `includeId`
-          IncludePatch patch =
-              includeInsertionPlanner_->BuildIncludeInsertionPatch(*inc, h);
-          patch.condArm.present = owner.condArmId.has_value();
-          patch.condArm.armId = owner.condArmId.value_or(0);
-          structuralHunkDispatcher.AddIncludePatch(inc, std::move(patch));
-          continue;
-        }
-      }
     }
 
     // d) Include-owned edit (segment policy already enforced in
