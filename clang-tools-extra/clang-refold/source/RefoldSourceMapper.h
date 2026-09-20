@@ -46,35 +46,47 @@ namespace refold {
 ///
 /// This is a memo, not a budget.  It never coarsens the diff, never bounds it,
 /// and never changes which hunks are published: a recorded result is returned
-/// only to a caller presenting the exact bytes it was built from.
+/// only to a caller presenting the exact buffers it was built from.
 struct RawByteHunkMemo {
   /// Whether `hunks` holds a result this run already built.
   bool recorded = false;
 
   /// Identity of the source buffers `hunks` was built from.
   ///
-  /// The digest covers every byte and the buffer length, so two buffers
-  /// agreeing on it present the same input to the diff.  Computing it is one
-  /// linear scan over bytes the diff would otherwise walk many times.
-  uint64_t aSourceDigest = 0;
-  uint64_t bSourceDigest = 0;
+  /// The A and B buffers are parameters of `refoldTranslationUnit`, which owns
+  /// this memo, so both outlive it and every attempt, candidate simulation and
+  /// resolution probe is handed the same two.  Address and length therefore
+  /// identify a buffer exactly: while the recorded buffer is alive, no other
+  /// live buffer can share its address, so a match is the same bytes and not
+  /// merely bytes that agree somewhere.
+  ///
+  /// A digest cannot state that.  Agreement on a fixed-width hash is evidence
+  /// about the bytes, not the equality itself, and the memo hands back a proof
+  /// artifact, so the identity it turns on has to be exact.  A caller that ever
+  /// presents an equal buffer at a different address simply rebuilds the
+  /// hunks, which is slower and still correct.
+  const char *aSourceData = nullptr;
+  size_t aSourceSize = 0;
+  const char *bSourceData = nullptr;
+  size_t bSourceSize = 0;
 
   /// The recorded hunks, copied out on every match.
   std::vector<diffutils::Hunk> hunks;
 
-  /// Return the identity digest of one source buffer.
-  static uint64_t DigestSource(llvm::StringRef source);
-
   /// Return whether a recorded result was built from exactly these buffers.
-  bool MatchesInputs(uint64_t aDigest, uint64_t bDigest) const {
-    return recorded && aSourceDigest == aDigest && bSourceDigest == bDigest;
+  bool MatchesInputs(llvm::StringRef aSource, llvm::StringRef bSource) const {
+    return recorded && aSourceData == aSource.data() &&
+           aSourceSize == aSource.size() && bSourceData == bSource.data() &&
+           bSourceSize == bSource.size();
   }
 
   /// Record \p built as this run's byte hunks for these buffers.
-  void Record(uint64_t aDigest, uint64_t bDigest,
+  void Record(llvm::StringRef aSource, llvm::StringRef bSource,
               std::vector<diffutils::Hunk> built) {
-    aSourceDigest = aDigest;
-    bSourceDigest = bDigest;
+    aSourceData = aSource.data();
+    aSourceSize = aSource.size();
+    bSourceData = bSource.data();
+    bSourceSize = bSource.size();
     hunks = std::move(built);
     recorded = true;
   }

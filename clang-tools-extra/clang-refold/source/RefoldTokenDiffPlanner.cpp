@@ -90,24 +90,6 @@ static uint64_t getLcsDiagnosticEvidenceByteBudget() {
 RefoldTokenDiffPlanner::RefoldTokenDiffPlanner(Dependencies deps)
     : deps_(deps) {}
 
-uint64_t AlignmentCertificationMemo::DigestLexemes(ArrayRef<StringRef> lexemes) {
-  // FNV-1a over every lexeme's exact bytes, with each length folded in so that
-  // a different tokenization of the same characters digests differently.
-  uint64_t digest = 0xcbf29ce484222325ULL;
-  auto mix = [&digest](uint8_t byte) {
-    digest ^= byte;
-    digest *= 0x100000001b3ULL;
-  };
-  for (StringRef lexeme : lexemes) {
-    for (uint64_t length = lexeme.size(); length != 0; length >>= 8)
-      mix(static_cast<uint8_t>(length & 0xff));
-    mix(0xff);
-    for (char c : lexeme)
-      mix(static_cast<uint8_t>(c));
-  }
-  return digest;
-}
-
 CertifiedAlignmentFacts RefoldTokenDiffPlanner::CertifyAlignment(
     ArrayRef<StringRef> aSeq, ArrayRef<StringRef> bSeq,
     uint64_t certificationByteBudget) {
@@ -205,15 +187,13 @@ RefoldTokenDiffPlanner::Plan(AlignmentCertificationMemo *certificationMemo,
 
     // Certification is the same quadratic theorem on every attempt of one run,
     // so a run proves it once and each attempt takes its own copy of the result.
-    // The recorded streams are re-checked rather than assumed.
-    const uint64_t aLexemeDigest =
-        AlignmentCertificationMemo::DigestLexemes(aSeq);
-    const uint64_t bLexemeDigest =
-        AlignmentCertificationMemo::DigestLexemes(bSeq);
+    // `aSeq`/`bSeq` are one lexeme per token in token order, so matching the
+    // recorded token arrays establishes the recorded streams rather than
+    // assuming them.
     CertifiedAlignmentFacts facts;
-    if (certificationMemo && certificationMemo->MatchesInputs(
-                                 aLexemeDigest, bLexemeDigest,
-                                 certificationByteBudget)) {
+    if (certificationMemo &&
+        certificationMemo->MatchesInputs(deps_.aToks, deps_.bToks,
+                                         certificationByteBudget)) {
       facts = certificationMemo->facts;
       REFOLD_LOG_TRACE(
           "lcs/certification",
@@ -223,7 +203,7 @@ RefoldTokenDiffPlanner::Plan(AlignmentCertificationMemo *certificationMemo,
     } else {
       facts = CertifyAlignment(aSeq, bSeq, certificationByteBudget);
       if (certificationMemo)
-        certificationMemo->Record(aLexemeDigest, bLexemeDigest,
+        certificationMemo->Record(deps_.aToks, deps_.bToks,
                                   certificationByteBudget, facts);
     }
     alignment = facts.alignment;

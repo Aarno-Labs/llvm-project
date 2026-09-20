@@ -372,31 +372,13 @@ bool RefoldSourceMapper::HunkFullyWithinArgSpans(
   return any;
 }
 
-uint64_t RawByteHunkMemo::DigestSource(StringRef source) {
-  // FNV-1a over every byte, with the length folded in so that a buffer which
-  // is a prefix of another digests differently.
-  uint64_t digest = 0xcbf29ce484222325ULL;
-  auto mix = [&digest](uint8_t byte) {
-    digest ^= byte;
-    digest *= 0x100000001b3ULL;
-  };
-  for (uint64_t length = source.size(); length != 0; length >>= 8)
-    mix(static_cast<uint8_t>(length & 0xff));
-  mix(0xff);
-  for (char c : source)
-    mix(static_cast<uint8_t>(c));
-  return digest;
-}
-
 std::vector<diffutils::Hunk>
 RefoldSourceMapper::BuildByteHunksFromRawText(RawByteHunkMemo *memo) const {
   // The diff below reads the A and B buffers alone, and both are constants of
   // the run, so this run may already have built the identical hunks on an
-  // earlier attempt.  Digesting the exact bytes re-checks that rather than
-  // assuming it.
-  const uint64_t aDigest = memo ? RawByteHunkMemo::DigestSource(aSource_) : 0;
-  const uint64_t bDigest = memo ? RawByteHunkMemo::DigestSource(bSource_) : 0;
-  if (memo && memo->MatchesInputs(aDigest, bDigest)) {
+  // earlier attempt.  Matching the recorded buffers by address and length
+  // establishes that rather than assuming it.
+  if (memo && memo->MatchesInputs(aSource_, bSource_)) {
     REFOLD_LOG_TRACE(
         "diff/byte-hunks",
         "replaying this run's raw byte hunks: A={0} bytes B={1} bytes "
@@ -416,7 +398,7 @@ RefoldSourceMapper::BuildByteHunksFromRawText(RawByteHunkMemo *memo) const {
                                ArrayRef<char>(bSource_.data(), bSource_.size()));
   std::vector<diffutils::Hunk> hunks = diffutils::coalesce(steps);
   if (memo)
-    memo->Record(aDigest, bDigest, hunks);
+    memo->Record(aSource_, bSource_, hunks);
   return hunks;
 }
 

@@ -71,32 +71,42 @@ struct AlignmentCertificationMemo {
 
   /// Identity of the streams `facts` was certified from.
   ///
-  /// The digest covers every lexeme's exact bytes and its boundaries, so two
-  /// streams agreeing on it are the same input to the certifier.  Computing it
-  /// is one linear scan; proving the alignment again is a quadratic dynamic
-  /// program over the same tokens.
-  uint64_t aLexemeDigest = 0;
-  uint64_t bLexemeDigest = 0;
+  /// The certified lexemes are the token spellings, one per token and in token
+  /// order, so the A and B token arrays identify the input.  Both are
+  /// parameters of `refoldTranslationUnit`, which owns this memo, so they
+  /// outlive it and every attempt is handed the same two: address and length
+  /// identify an array exactly, because no other live array can share the
+  /// address of one still in scope.
+  ///
+  /// A digest cannot state that.  Agreement on a fixed-width hash is evidence
+  /// about the lexemes, not the equality itself, and what the memo hands back
+  /// is a certificate, so the identity it turns on has to be exact.  A caller
+  /// that ever presents an equal stream in a different array simply certifies
+  /// again, which is slower and still correct.
+  const PPTok *aToksData = nullptr;
+  size_t aToksSize = 0;
+  const PPTok *bToksData = nullptr;
+  size_t bToksSize = 0;
   uint64_t certificationByteBudget = 0;
 
   /// The recorded result, copied out on every match.
   CertifiedAlignmentFacts facts;
 
-  /// Return the identity digest of one lexeme stream.
-  static uint64_t DigestLexemes(llvm::ArrayRef<llvm::StringRef> lexemes);
-
   /// Return whether a recorded result was certified from exactly these inputs.
-  bool MatchesInputs(uint64_t aDigest, uint64_t bDigest,
+  bool MatchesInputs(llvm::ArrayRef<PPTok> aToks, llvm::ArrayRef<PPTok> bToks,
                      uint64_t byteBudget) const {
-    return recorded && aLexemeDigest == aDigest && bLexemeDigest == bDigest &&
-           certificationByteBudget == byteBudget;
+    return recorded && aToksData == aToks.data() &&
+           aToksSize == aToks.size() && bToksData == bToks.data() &&
+           bToksSize == bToks.size() && certificationByteBudget == byteBudget;
   }
 
   /// Record \p certified as this run's result for these inputs.
-  void Record(uint64_t aDigest, uint64_t bDigest, uint64_t byteBudget,
-              CertifiedAlignmentFacts certified) {
-    aLexemeDigest = aDigest;
-    bLexemeDigest = bDigest;
+  void Record(llvm::ArrayRef<PPTok> aToks, llvm::ArrayRef<PPTok> bToks,
+              uint64_t byteBudget, CertifiedAlignmentFacts certified) {
+    aToksData = aToks.data();
+    aToksSize = aToks.size();
+    bToksData = bToks.data();
+    bToksSize = bToks.size();
     certificationByteBudget = byteBudget;
     facts = std::move(certified);
     recorded = true;
