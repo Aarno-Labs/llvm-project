@@ -59,15 +59,16 @@ std::optional<MacroPatch> PurePasteOnlyArgsOnlyCandidateBuilder::TryBuild(
   // First derive per-argument paste edits from the current hunk. The derivation
   // proves that the edited pasted-token spelling can be mapped back to argument
   // segments rather than arbitrary token substrings.
-  auto edits = pasteBuilder_.DerivePasteArgEdits(invocation, hunk);
-  if (!edits || edits->empty())
+  PasteArgEditsResult edits =
+      pasteBuilder_.DerivePasteArgEdits(invocation, hunk);
+  if (edits.edits.empty())
     return std::nullopt;
 
   // Merge all derived paste edits into one replacement spelling per invocation
   // argument. Multiple pasted-token occurrences may refer to the same formal,
   // but they must all demand the same final argument spelling.
   DenseMap<uint32_t, std::string> replByArgIdx;
-  for (const auto &pae : *edits) {
+  for (const auto &pae : edits.edits) {
     const uint32_t argIdx = pae.argIdx;
     if (static_cast<size_t>(argIdx) >= invocationArgRanges.size())
       return std::nullopt;

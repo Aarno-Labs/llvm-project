@@ -1481,10 +1481,18 @@ RefoldMacroStandardArgsOnlyPatchBuilder::BuildPasteAwareArgsOnlyPatch(
     return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
   }
 
-  auto edits = PasteArgumentBuilder().DerivePasteArgEdits(m, h);
-  if (edits && !edits->empty()) {
+  PasteArgEditsResult edits = PasteArgumentBuilder().DerivePasteArgEdits(m, h);
+
+  // A proved-ambiguous paste origin must not fall through to the single-segment
+  // derivation below: that path re-derives the same argument from the raw token
+  // diff, so it would answer a question this one just refused. Reject and let
+  // the candidate ladder carry the hunk some other way.
+  if (edits.kind == PasteArgDerivation::AmbiguousOrigin)
+    return ArgsOnlyPatchAttempt::RejectResult();
+
+  if (!edits.edits.empty()) {
     DenseMap<uint32_t, std::string> replByArgIdx;
-    for (const auto &pae : *edits) {
+    for (const auto &pae : edits.edits) {
       uint32_t argIdx = pae.argIdx;
       if (static_cast<size_t>(argIdx) >= invArgRanges.size())
         return ArgsOnlyPatchAttempt::RejectResult();

@@ -1203,10 +1203,18 @@ RefoldMacroPatchPlanner::TryBuildTupleSiblingTerminalReplayPatch(
     for (size_t hunkIdx = 0; hunkIdx < coverHunks.size(); ++hunkIdx) {
       const diffutils::Hunk &coverHunk = coverHunks[hunkIdx];
       bool explainedByPaste = false;
-      std::optional<std::vector<PasteArgEdit>> pasteEdits =
+      PasteArgEditsResult pasteEdits =
           PasteArgumentBuilder().DerivePasteArgEdits(child, coverHunk);
-      if (pasteEdits) {
-        for (const PasteArgEdit &edit : *pasteEdits) {
+
+      // A proved-ambiguous paste origin refuses the whole cover: the
+      // single-segment derivation below would otherwise re-derive the same
+      // argument from the raw token diff and add a constraint this derivation
+      // declined to justify.
+      if (pasteEdits.kind == PasteArgDerivation::AmbiguousOrigin)
+        return std::nullopt;
+
+      {
+        for (const PasteArgEdit &edit : pasteEdits.edits) {
           if (edit.argIdx >= oldChildActuals.size())
             return std::nullopt;
           StringRef baseArg = oldChildActuals[edit.argIdx];

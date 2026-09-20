@@ -581,6 +581,27 @@ bool RefoldMacroPasteArgumentBuilder::HunkTouchesAnyPasteToken(
   return false;
 }
 
+/// Return the argument contribution whose byte interval contains a zero-width
+/// edit at `pos`, or null when none does or more than one does.
+///
+/// Mirrors the point-overlap rule used to attribute a zero-width edit to one
+/// paste span: half-open, so a position exactly at a span's end belongs to the
+/// fixed text that follows rather than to that span.
+static const RefoldModel::PPArgSpan *pasteSpanContainingInsertionPoint(
+    ArrayRef<const RefoldModel::PPArgSpan *> cands, size_t pos) {
+  const RefoldModel::PPArgSpan *hit = nullptr;
+  for (const auto *ps : cands) {
+    if (!ps->byteBegin || !ps->byteEnd || *ps->byteEnd < *ps->byteBegin)
+      continue;
+    if (*ps->byteBegin <= pos && pos < *ps->byteEnd) {
+      if (hit)
+        return nullptr;
+      hit = ps;
+    }
+  }
+  return hit;
+}
+
 std::optional<PasteArgEdit> RefoldMacroPasteArgumentBuilder::DerivePasteArgEdit(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h) const {
   // This helper only applies when the producer reported paste spans.
@@ -657,6 +678,37 @@ std::optional<PasteArgEdit> RefoldMacroPasteArgumentBuilder::DerivePasteArgEdit(
 
   const size_t diffStart = pref;
   const size_t diffEndA = aLen - suff;
+
+  // `suff` above is deliberately clamped so the two common runs cannot
+  // overlap.  That clamp also hides how far an edit boundary may legally
+  // slide, so the unclamped common suffix is computed separately; it is what
+  // decides whether the edit position is forced.  For `foo_bar` -> `foo_x_bar`
+  // the clamped value is 3 while `_bar` (4) is genuinely common.
+  size_t suffFull = 0;
+  while (suffFull < minLen &&
+         aTok[aLen - 1 - suffFull] == bTok[bLen - 1 - suffFull]) {
+    suffFull++;
+  }
+
+  // A pure insertion admits every split point in [aLen - suffFull, pref]:
+  // B equals aTok[0,q) + <inserted text> + aTok[q,aLen) for each such q, with
+  // the inserted text varying accordingly.  Repeated characters at the
+  // boundary make that window wider than one position, and two positions in it
+  // can belong to different argument contributions -- `foo_bar` -> `foo_x_bar`
+  // is explained equally by b = "x_bar" (q = 4) and by a = "foo_x" (q = 3).
+  // Maximizing the common prefix picks one of those origins without evidence,
+  // so attribute only when no position in the window can change the answer.
+  //
+  // Scope: this proves the *insertion* case, which is where the split point is
+  // free.  A replacement region is left to the checks below.
+  if (diffStart == diffEndA && bLen > aLen) {
+    const size_t slideLo = aLen > suffFull ? aLen - suffFull : 0;
+    const size_t slideHi = pref;
+    if (slideLo < slideHi &&
+        pasteSpanContainingInsertionPoint(cands, slideLo) !=
+            pasteSpanContainingInsertionPoint(cands, slideHi))
+      return std::nullopt;
+  }
 
   // If there is no difference at all, this hunk cannot be explained as a
   // paste-segment rewrite.
@@ -746,11 +798,12 @@ std::optional<PasteArgEdit> RefoldMacroPasteArgumentBuilder::DerivePasteArgEdit(
   return PasteArgEdit(chosen->argIdx, std::move(newSeg), std::move(oldSeg));
 }
 
-std::optional<std::vector<PasteArgEdit>>
+PasteArgEditsResult
 RefoldMacroPasteArgumentBuilder::DerivePasteArgEdits(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h) const {
+  PasteArgEditsResult notApplicable;
   if (m.pasteSpans.empty())
-    return std::nullopt;
+    return notApplicable;
 
   // Gather all paste spans that intersect this hunk in the A-stream.
   std::vector<const RefoldModel::PPArgSpan *> cands;
@@ -760,7 +813,7 @@ RefoldMacroPasteArgumentBuilder::DerivePasteArgEdits(
   }
 
   if (cands.empty())
-    return std::nullopt;
+    return notApplicable;
 
   // All candidates should reference the same pasted token range [begin, end) in
   // A.
@@ -769,12 +822,12 @@ RefoldMacroPasteArgumentBuilder::DerivePasteArgEdits(
   auto bEnvOpt =
       (*deps_.sourceMapper).MapAToBTokenEnvelopeByPPArgSpan(*tokenSpan);
   if (!bEnvOpt || bEnvOpt->second <= bEnvOpt->first)
-    return std::nullopt;
+    return notApplicable;
 
   // Paste edits are only representable as args-only when the A-span maps to
   // exactly one B token.
   if (bEnvOpt->second - bEnvOpt->first != 1)
-    return std::nullopt;
+    return notApplicable;
 
   StringRef aTokRaw =
       (*deps_.sourceMapper).SliceASource(tokenSpan->begin, tokenSpan->end);
@@ -810,7 +863,7 @@ RefoldMacroPasteArgumentBuilder::DerivePasteArgEdits(
           if (part.kind != RefoldModel::PastePartKind::Arg)
             continue;
           if (!part.argIndex || argPartIdx >= replay.argSegments.size())
-            return std::nullopt;
+            return notApplicable;
           StringRef oldSeg = part.spelling;
           const std::string &newSeg = replay.argSegments[argPartIdx++];
           if (oldSeg == newSeg)
@@ -819,15 +872,27 @@ RefoldMacroPasteArgumentBuilder::DerivePasteArgEdits(
                              part.argByteBegin, part.argByteEnd);
         }
         if (argPartIdx != replay.argSegments.size())
-          return std::nullopt;
+          return notApplicable;
         if (!edits.empty()) {
-          return edits;
+          PasteArgEditsResult derived;
+          derived.kind = PasteArgDerivation::Derived;
+          derived.edits = std::move(edits);
+          return derived;
         }
-        return std::nullopt;
+        return notApplicable;
       }
-      if (replay.kind == PasteReplaySegmentationKind::Ambiguous ||
-          replay.kind == PasteReplaySegmentationKind::Unsupported)
-        return std::nullopt;
+      // A witness that proves more than one origin is a refusal and must not
+      // read as "no paste derivation applies": the caller would otherwise fall
+      // back to the token-level differ and re-decide the same question with
+      // less evidence. `Unsupported` carries no such proof, so it stays a
+      // plain non-result.
+      if (replay.kind == PasteReplaySegmentationKind::Ambiguous) {
+        PasteArgEditsResult ambiguous;
+        ambiguous.kind = PasteArgDerivation::AmbiguousOrigin;
+        return ambiguous;
+      }
+      if (replay.kind == PasteReplaySegmentationKind::Unsupported)
+        return notApplicable;
     }
   }
 
@@ -839,14 +904,19 @@ RefoldMacroPasteArgumentBuilder::DerivePasteArgEdits(
   // We derive the new per-arg segments by walking the A token left-to-right and
   // using the fixed (non-span) substrings between paste spans as anchors. If
   // spans are adjacent (no fixed anchor) and the total length changes,
-  // segmentation is ambiguous and we conservatively return std::nullopt.
+  // segmentation is ambiguous and the result is a refusal, not a non-result.
   std::vector<const RefoldModel::PPArgSpan *> spans = cands;
   std::sort(spans.begin(), spans.end(), ppArgSpanPtrLessByByteBegin);
 
-  std::optional<std::vector<std::string>> newSegs =
+  PasteTokenSegmentation newSegs =
       SegmentPastedTokenArgsByFixedSlices(aTok, bTok, spans);
-  if (!newSegs)
-    return std::nullopt;
+  if (newSegs.kind == PasteArgDerivation::AmbiguousOrigin) {
+    PasteArgEditsResult ambiguous;
+    ambiguous.kind = PasteArgDerivation::AmbiguousOrigin;
+    return ambiguous;
+  }
+  if (newSegs.kind != PasteArgDerivation::Derived)
+    return notApplicable;
 
   std::vector<PasteArgEdit> edits;
 
@@ -856,15 +926,15 @@ RefoldMacroPasteArgumentBuilder::DerivePasteArgEdits(
   for (size_t i = 0; i < spans.size(); ++i) {
     const auto *ps = spans[i];
     if (!ps->byteBegin || *ps->byteEnd < *ps->byteBegin)
-      return std::nullopt;
+      return notApplicable;
 
     size_t bb = static_cast<size_t>(*ps->byteBegin);
     size_t be = static_cast<size_t>(*ps->byteEnd);
     if (be > aTok.size())
-      return std::nullopt;
+      return notApplicable;
 
     StringRef oldSeg = aTok.substr(bb, be - bb);
-    const std::string &newSeg = (*newSegs)[i];
+    const std::string &newSeg = newSegs.segments[i];
 
     if (oldSeg == newSeg)
       continue;
@@ -876,37 +946,48 @@ RefoldMacroPasteArgumentBuilder::DerivePasteArgEdits(
   }
 
   if (edits.empty())
-    return std::nullopt;
+    return notApplicable;
 
-  return edits;
+  PasteArgEditsResult derived;
+  derived.kind = PasteArgDerivation::Derived;
+  derived.edits = std::move(edits);
+  return derived;
 }
 
-std::optional<std::vector<std::string>>
+PasteTokenSegmentation
 RefoldMacroPasteArgumentBuilder::SegmentPastedTokenArgsByFixedSlices(
     StringRef aTok, StringRef bTok,
     ArrayRef<const RefoldModel::PPArgSpan *> spansAsc) {
+  PasteTokenSegmentation notApplicable;
   if (spansAsc.empty())
-    return std::nullopt;
+    return notApplicable;
 
   // Basic span sanity
   for (const auto *ps : spansAsc) {
     if (!ps->byteBegin || *ps->byteEnd < *ps->byteBegin)
-      return std::nullopt;
+      return notApplicable;
     if (static_cast<size_t>(*ps->byteEnd) > aTok.size())
-      return std::nullopt;
+      return notApplicable;
   }
 
   using MemoKey = std::pair<size_t, size_t>;
-  std::map<MemoKey, std::optional<std::vector<std::string>>> memo;
+  std::map<MemoKey, PasteReplaySegmentationResult> memo;
 
   // Recursively invert the rewritten B token against the original A token and
   // the ordered paste-span list. Fixed A-token text between spans acts as an
   // anchor; each contiguous run of adjacent paste spans is mapped to the
-  // corresponding B substring. The result is the ordered list of derived
-  // argument segment spellings, or nullopt if the A/B token pair cannot be
-  // uniquely replayed.
+  // corresponding B substring.
+  //
+  // A segmentation is reported only when it is the sole one compatible with
+  // the fixed slices. Two anchor occurrences that both replay are two distinct
+  // origins for the same edited token, and the token alone does not decide
+  // between them, so the state is `Ambiguous` and the caller fails closed
+  // instead of preferring an endpoint. `Unsupported` is kept distinct from
+  // `NoMatch` for the same reason: a malformed span record must not be read as
+  // "this endpoint does not replay", which would let a later endpoint supply a
+  // segmentation this function never proved.
   auto solve = [&](auto &&self, size_t idx,
-                   size_t posB) -> std::optional<std::vector<std::string>> {
+                   size_t posB) -> PasteReplaySegmentationResult {
     // State is defined by the next paste span to consume and the current byte
     // position in the rewritten B token. Memoization prevents repeated anchor
     // searches from re-solving the same suffix.
@@ -915,15 +996,20 @@ RefoldMacroPasteArgumentBuilder::SegmentPastedTokenArgsByFixedSlices(
     if (it != memo.end())
       return it->second;
 
+    const auto remember = [&](PasteReplaySegmentationKind kind) {
+      PasteReplaySegmentationResult result;
+      result.kind = kind;
+      memo.emplace(key, result);
+      return result;
+    };
+
     // `posA` is the byte position in the original A token immediately after the
     // previous consumed paste span. The fixed text from `posA` to the next span
     // must still appear verbatim in B.
     size_t posA = 0;
     if (idx > 0) {
-      if (!spansAsc[idx - 1]->byteEnd) {
-        memo.emplace(key, std::nullopt);
-        return std::nullopt;
-      }
+      if (!spansAsc[idx - 1]->byteEnd)
+        return remember(PasteReplaySegmentationKind::Unsupported);
       posA = static_cast<size_t>(*spansAsc[idx - 1]->byteEnd);
     }
 
@@ -931,10 +1017,10 @@ RefoldMacroPasteArgumentBuilder::SegmentPastedTokenArgsByFixedSlices(
     // exactly match the remaining fixed A suffix.
     if (idx >= spansAsc.size()) {
       StringRef tail = aTok.substr(posA);
-      std::optional<std::vector<std::string>> result =
-          (bTok.substr(posB) == tail) ? std::optional<std::vector<std::string>>(
-                                            std::vector<std::string>())
-                                      : std::nullopt;
+      if (bTok.substr(posB) != tail)
+        return remember(PasteReplaySegmentationKind::NoMatch);
+      PasteReplaySegmentationResult result;
+      result.kind = PasteReplaySegmentationKind::Unique;
       memo.emplace(key, result);
       return result;
     }
@@ -944,27 +1030,21 @@ RefoldMacroPasteArgumentBuilder::SegmentPastedTokenArgsByFixedSlices(
     // Each paste span must provide a valid byte interval inside the original A
     // token. Without that interval there is no proof-grade way to align the
     // fixed A text and the editable paste contribution.
-    if (!ps->byteBegin || !ps->byteEnd || *ps->byteEnd < *ps->byteBegin) {
-      memo.emplace(key, std::nullopt);
-      return std::nullopt;
-    }
+    if (!ps->byteBegin || !ps->byteEnd || *ps->byteEnd < *ps->byteBegin)
+      return remember(PasteReplaySegmentationKind::Unsupported);
 
     const size_t bA = static_cast<size_t>(*ps->byteBegin);
     const size_t eA = static_cast<size_t>(*ps->byteEnd);
 
     // Spans must be processed in non-overlapping ascending order. Overlap would
     // make the fixed/paste decomposition ambiguous.
-    if (bA < posA) {
-      memo.emplace(key, std::nullopt);
-      return std::nullopt;
-    }
+    if (bA < posA)
+      return remember(PasteReplaySegmentationKind::Unsupported);
 
     // The fixed A text before this paste span anchors the next B position.
     StringRef fixedBefore = aTok.substr(posA, bA - posA);
-    if (!bTok.substr(posB).starts_with(fixedBefore)) {
-      memo.emplace(key, std::nullopt);
-      return std::nullopt;
-    }
+    if (!bTok.substr(posB).starts_with(fixedBefore))
+      return remember(PasteReplaySegmentationKind::NoMatch);
 
     // The paste-derived B run begins immediately after the fixed prefix.
     const size_t runStartB = posB + fixedBefore.size();
@@ -988,11 +1068,8 @@ RefoldMacroPasteArgumentBuilder::SegmentPastedTokenArgsByFixedSlices(
 
       // Adjacent-run discovery requires ordered, non-overlapping span
       // intervals.
-      if (!cur->byteEnd || !next->byteBegin ||
-          *next->byteBegin < *cur->byteEnd) {
-        memo.emplace(key, std::nullopt);
-        return std::nullopt;
-      }
+      if (!cur->byteEnd || !next->byteBegin || *next->byteBegin < *cur->byteEnd)
+        return remember(PasteReplaySegmentationKind::Unsupported);
 
       // A non-empty fixed gap terminates the run and becomes the next B-side
       // anchor used to find possible endpoints for the current paste run.
@@ -1007,35 +1084,50 @@ RefoldMacroPasteArgumentBuilder::SegmentPastedTokenArgsByFixedSlices(
       // Empty fixed gap: the next span is adjacent to this run and must be
       // segmented together with it.
       ++runEnd;
-      if (!spansAsc[runEnd]->byteEnd) {
-        memo.emplace(key, std::nullopt);
-        return std::nullopt;
-      }
+      if (!spansAsc[runEnd]->byteEnd)
+        return remember(PasteReplaySegmentationKind::Unsupported);
       nextPosA = static_cast<size_t>(*spansAsc[runEnd]->byteEnd);
     }
 
-    auto tryRun =
-        [&](size_t runEndB) -> std::optional<std::vector<std::string>> {
+    // Prepend `run` to the segments of an already validated suffix result.
+    const auto combineWithSuffix =
+        [](ArrayRef<std::string> run,
+           const PasteReplaySegmentationResult &suffix) {
+          PasteReplaySegmentationResult combined;
+          combined.kind = PasteReplaySegmentationKind::Unique;
+          combined.argSegments.reserve(run.size() + suffix.argSegments.size());
+          combined.argSegments.insert(combined.argSegments.end(), run.begin(),
+                                      run.end());
+          combined.argSegments.insert(combined.argSegments.end(),
+                                      suffix.argSegments.begin(),
+                                      suffix.argSegments.end());
+          return combined;
+        };
+
+    auto tryRun = [&](size_t runEndB) -> PasteReplaySegmentationResult {
+      PasteReplaySegmentationResult result;
+      result.kind = PasteReplaySegmentationKind::NoMatch;
+
       // Candidate endpoint for the current paste run must define a valid B
       // slice.
       if (runEndB < runStartB || runEndB > bTok.size())
-        return std::nullopt;
+        return result;
 
-      // First try the proof-grade adjacent-run certificate. It verifies that
-      // the B substring can be uniquely decomposed according to the paste-span
-      // run.
+      // The proof-grade adjacent-run certificate verifies that the B substring
+      // decomposes uniquely according to the paste-span run.
       auto cert = buildAdjacentPasteRunInvertibilityCertificate(
           aTok, bTok.substr(runStartB, runEndB - runStartB),
           spansAsc.slice(idx, runEnd - idx + 1));
       if (cert.kind == PasteRunInvertibilityKind::Unique &&
           cert.derivedSegs.size() == runEnd - idx + 1) {
-        // The current run is uniquely invertible; now require the suffix after
-        // the run to be invertible as well.
-        if (auto suffix = self(self, runEnd + 1, runEndB)) {
-          std::vector<std::string> combined = cert.derivedSegs;
-          combined.insert(combined.end(), suffix->begin(), suffix->end());
-          return combined;
-        }
+        // The current run is uniquely invertible; the suffix after the run must
+        // be uniquely invertible as well.
+        PasteReplaySegmentationResult suffix = self(self, runEnd + 1, runEndB);
+        if (suffix.kind == PasteReplaySegmentationKind::Unique)
+          result = mergePasteReplayResults(
+              std::move(result), combineWithSuffix(cert.derivedSegs, suffix));
+        else
+          result = mergePasteReplayResults(std::move(result), suffix);
       }
 
       // Legacy single-span fallback: when the current run contains only one
@@ -1043,44 +1135,75 @@ RefoldMacroPasteArgumentBuilder::SegmentPastedTokenArgsByFixedSlices(
       // segment boundary. The newer adjacent-run certificate is stricter, but
       // some pure-paste cases (e.g. CONCAT-style token assembly) are still
       // structurally invertible via this simpler anchor-based split.
-      if (runEnd == idx) {
-        if (auto suffix = self(self, idx + 1, runEndB)) {
-          std::vector<std::string> combined;
-          combined.reserve(1 + suffix->size());
-          combined.push_back(bTok.substr(runStartB, runEndB - runStartB).str());
-          combined.insert(combined.end(), suffix->begin(), suffix->end());
-          return combined;
+      //
+      // Both derivations are merged rather than ordered: they are two proofs
+      // about the same endpoint, so if they disagree the endpoint has no single
+      // origin and the merge reports ambiguity.
+      if (runEnd == idx &&
+          result.kind != PasteReplaySegmentationKind::Ambiguous &&
+          result.kind != PasteReplaySegmentationKind::Unsupported) {
+        PasteReplaySegmentationResult suffix = self(self, idx + 1, runEndB);
+        if (suffix.kind == PasteReplaySegmentationKind::Unique) {
+          std::string runSeg =
+              bTok.substr(runStartB, runEndB - runStartB).str();
+          result = mergePasteReplayResults(
+              std::move(result),
+              combineWithSuffix(ArrayRef<std::string>(runSeg), suffix));
+        } else {
+          result = mergePasteReplayResults(std::move(result), suffix);
         }
       }
 
-      return std::nullopt;
+      return result;
     };
 
     // If there is no fixed text after the run, the paste run must consume the
-    // remainder of the rewritten B token.
+    // remainder of the rewritten B token, so exactly one endpoint is possible.
     if (fixedAfter.empty()) {
-      auto result = tryRun(bTok.size());
+      PasteReplaySegmentationResult result = tryRun(bTok.size());
       memo.emplace(key, result);
       return result;
     }
 
     // Otherwise, every occurrence of the next fixed A anchor in B is a
-    // candidate endpoint for the paste run. Accept the first endpoint whose
-    // run and suffix both replay successfully.
+    // candidate endpoint for the paste run. All of them are enumerated and
+    // merged: accepting the first one that happens to replay would choose one
+    // of several possible source origins without evidence.
+    PasteReplaySegmentationResult result;
+    result.kind = PasteReplaySegmentationKind::NoMatch;
     for (size_t k = bTok.find(fixedAfter, runStartB); k != StringRef::npos;
          k = bTok.find(fixedAfter, k + 1)) {
-      if (auto result = tryRun(k)) {
-        memo.emplace(key, result);
-        return result;
-      }
+      result = mergePasteReplayResults(std::move(result), tryRun(k));
+
+      // Ambiguity and out-of-domain data are terminal for this state: a later
+      // endpoint cannot restore a uniqueness proof that is already lost.
+      if (result.kind == PasteReplaySegmentationKind::Ambiguous ||
+          result.kind == PasteReplaySegmentationKind::Unsupported)
+        break;
     }
 
-    // No anchor position produced a valid replay.
-    memo.emplace(key, std::nullopt);
-    return std::nullopt;
+    memo.emplace(key, result);
+    return result;
   };
 
-  return solve(solve, /*idx=*/0, /*posB=*/0);
+  PasteReplaySegmentationResult result = solve(solve, /*idx=*/0, /*posB=*/0);
+
+  PasteTokenSegmentation out;
+  // Only a proved non-unique split is reported as an ambiguous origin. A
+  // `NoMatch` means the fixed slices cannot explain the edited token at all,
+  // and an `Unsupported` means the span records are out of domain; neither is
+  // evidence about how many origins exist, so neither blocks another
+  // derivation from being tried.
+  if (result.kind == PasteReplaySegmentationKind::Ambiguous) {
+    out.kind = PasteArgDerivation::AmbiguousOrigin;
+    return out;
+  }
+  if (result.kind != PasteReplaySegmentationKind::Unique)
+    return out;
+
+  out.kind = PasteArgDerivation::Derived;
+  out.segments = std::move(result.argSegments);
+  return out;
 }
 
 StringRef
