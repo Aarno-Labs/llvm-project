@@ -2407,9 +2407,16 @@ static Score hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
     return Score{};
 
   // Small exact DP base case.
+  //
+  // A single A token is solved directly however wide B is. The split below
+  // would put `mid` at 0, leaving the right subproblem equal to this box, so
+  // the recursion would not progress; the cell guard alone does not prevent
+  // that, because one A token over 524288 B tokens already exceeds it. The
+  // one-row DP costs O(|B|) cells, the same order as the two split rows this
+  // function allocates anyway, so admitting it keeps the linear-space budget.
   const unsigned long long cells = static_cast<unsigned long long>(n + 1ULL) *
                                    static_cast<unsigned long long>(m + 1ULL);
-  if (cells <= (1ULL << 20))
+  if (n == 1 || cells <= (1ULL << 20))
     return solveSmallWeightedDP(aV, bV, gapV, outMap);
 
   // Split A in half. The gap view is split with one extra element on each side
@@ -2434,13 +2441,13 @@ static Score hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
       computeSuffixRowWeighted(aRight, bV, gapRight);
 
   // Choose split j maximizing the core objective (length, then inverse cost).
-  // On exact equality, prefer the smallest j for determinism.
+  // Only a strict improvement updates the choice, so ties keep the smallest j
+  // and the split is deterministic.
   size_t bestJ = 0;
   Score best = leftRow[0] + rightRow[0];
   for (size_t j = 1; j <= m; ++j) {
     Score cand = leftRow[j] + rightRow[j];
-    if (isCoreBetter(cand.len, cand.cost, best.len, best.cost) ||
-        (cand == best && j < bestJ)) {
+    if (isCoreBetter(cand.len, cand.cost, best.len, best.cost)) {
       bestJ = j;
       best = cand;
     }
@@ -2657,9 +2664,13 @@ static void hirschbergUnweightedRec(const SpanView &aV, const SpanView &bV,
     return;
 
   // Small exact DP base case.
+  //
+  // A single A token is solved directly however wide B is, for the reason
+  // given in the weighted counterpart: `mid` would be 0 and the right
+  // subproblem would be this same box, so the recursion would not progress.
   const unsigned long long cells = static_cast<unsigned long long>(n + 1ULL) *
                                    static_cast<unsigned long long>(m + 1ULL);
-  if (cells <= (1ULL << 20)) {
+  if (n == 1 || cells <= (1ULL << 20)) {
     solveSmallUnweightedDP(aV, bV, outMap);
     return;
   }
@@ -2680,13 +2691,14 @@ static void hirschbergUnweightedRec(const SpanView &aV, const SpanView &bV,
   const SpanView bRev{bV.base, bV.off, m, true};
   const std::vector<unsigned> rightRowRev = computeRowLen(aRightRev, bRev);
 
-  // Choose the B split that maximizes the total LCS length. On ties, prefer the
-  // smallest split index for deterministic output.
+  // Choose the B split that maximizes the total LCS length. Only a strictly
+  // longer candidate updates the choice, so ties keep the smallest split index
+  // and the output is deterministic.
   size_t bestJ = 0;
   unsigned bestLen = leftRow[0] + rightRowRev[m];
   for (size_t j = 1; j <= m; ++j) {
     const unsigned candLen = leftRow[j] + rightRowRev[m - j];
-    if (candLen > bestLen || (candLen == bestLen && j < bestJ)) {
+    if (candLen > bestLen) {
       bestLen = candLen;
       bestJ = j;
     }
