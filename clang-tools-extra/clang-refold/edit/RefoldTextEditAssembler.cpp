@@ -2676,17 +2676,23 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
                                       static_cast<size_t>(insertionOffset));
 
       auto previousLineControlIsInsideThisConditionalGroup = [&]() -> bool {
-        std::optional<std::pair<uint64_t, uint64_t>> previousDirective =
-            findLastLineControlDirectiveRangeBefore(
-                StringRef(out.data(), out.size()), insertionOffset);
-        if (!previousDirective)
-          return false;
-
         std::optional<uint64_t> groupFinalBegin =
             sourceOffsetToFinalOffset(group->groupB);
         std::optional<uint64_t> groupFinalEnd =
             sourceOffsetToFinalOffset(group->groupE);
         if (!groupFinalBegin || !groupFinalEnd)
+          return false;
+
+        // Only a directive inside the group can make this true, so the group's
+        // own start is the exact boundary for the search. Bounding it by a
+        // fixed window instead would report "no directive" for a group whose
+        // emitted body is larger than the window, and a false answer here
+        // suppresses the post-join `#line` that the observer needs.
+        std::optional<std::pair<uint64_t, uint64_t>> previousDirective =
+            findLastLineControlDirectiveRangeBefore(
+                StringRef(out.data(), out.size()), insertionOffset,
+                *groupFinalBegin);
+        if (!previousDirective)
           return false;
 
         return previousDirective->first >= *groupFinalBegin &&

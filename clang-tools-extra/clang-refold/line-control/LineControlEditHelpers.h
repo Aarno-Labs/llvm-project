@@ -48,29 +48,46 @@ inline bool isPhysicalLineControlDirectiveLine(llvm::StringRef line) {
   return !line.empty() && line.front() >= '0' && line.front() <= '9';
 }
 
-/// Find the last concrete line-control directive line before an insertion point
-/// in an already-emitted output prefix.  The returned range is in final-output
-/// coordinates and includes the trailing newline when present.
+/// Find the last concrete line-control directive line in
+/// `[scanLowerBound, insertionOffset)` of an already-emitted output prefix.
+/// The returned range is in final-output coordinates and includes the trailing
+/// newline when present.
+///
+/// `scanLowerBound` is a proof boundary supplied by the caller, not a work
+/// budget: the search is exact within it, and `std::nullopt` means "no
+/// directive line lies wholly inside that region", never "the search gave up".
+/// A caller that treats a refusal as a negative answer would suppress a repair
+/// the output needs, so the bound must be the offset beyond which the caller's
+/// question is already answered.
 inline std::optional<std::pair<uint64_t, uint64_t>>
 findLastLineControlDirectiveRangeBefore(llvm::StringRef out,
-                                        uint64_t insertionOffset) {
+                                        uint64_t insertionOffset,
+                                        uint64_t scanLowerBound) {
   if (insertionOffset > out.size())
     insertionOffset = out.size();
+  if (scanLowerBound > insertionOffset)
+    return std::nullopt;
 
-  const uint64_t lookbackLimit =
-      insertionOffset > 16 * 1024 ? insertionOffset - 16 * 1024 : 0;
   uint64_t cursor = insertionOffset;
-  while (cursor > lookbackLimit) {
+  while (cursor > scanLowerBound) {
     uint64_t contentEnd = cursor;
-    uint64_t rangeEnd = cursor;
-    if (contentEnd > lookbackLimit && out[contentEnd - 1] == '\n') {
+    const uint64_t rangeEnd = cursor;
+    if (out[contentEnd - 1] == '\n')
       --contentEnd;
-      rangeEnd = cursor;
-    }
 
+    // Walk to the physical start of the line, past the bound if necessary.
+    // Stopping at the bound would hand a fragment to the directive predicate,
+    // which both hides a real directive whose line straddles the bound and can
+    // classify the tail of an ordinary line as one.
     uint64_t lineBegin = contentEnd;
-    while (lineBegin > lookbackLimit && out[lineBegin - 1] != '\n')
+    while (lineBegin > 0 && out[lineBegin - 1] != '\n')
       --lineBegin;
+
+    // A line starting before the bound is not wholly inside the scanned
+    // region, so it cannot answer the caller's question, and no earlier line
+    // can either.
+    if (lineBegin < scanLowerBound)
+      return std::nullopt;
 
     llvm::StringRef line(out.data() + lineBegin,
                          static_cast<size_t>(contentEnd - lineBegin));
