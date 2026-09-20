@@ -29,7 +29,11 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <optional>
+#include <string>
 #include <tuple>
+#include <utility>
+#include <vector>
 
 namespace clang {
 namespace refold {
@@ -119,6 +123,102 @@ struct RefoldOwnerStateProofInputs {
 };
 
 class RefoldTheoremAudit;
+
+/// Deterministic total order over owner-state graph nodes.
+///
+/// `BuildOwnerStateGraph` sorts with this, and the resulting index becomes
+/// each node's `order` and its `predecessor`/`successor` links, which
+/// `OwnerStateGraphNode` documents as a deterministic total order.  A sort is
+/// defined only for a strict weak ordering, so the relation has to be one.
+///
+/// Ordering token-producing owners by their A tokens while ordering zero-token
+/// directives by their physical source anchor does not give one, because the
+/// two keys disagree.  A `#define` A, a later token owner B in A's own file,
+/// and a token owner C in an included file yield A < B by source, B < C by
+/// token, and C < A because C has tokens and A does not -- a cycle.  The order
+/// below removes the second key by projecting every node onto the A token
+/// stream first, and uses source anchor, node kind, and owner identity only to
+/// break ties at an equal projection.
+///
+/// The class is exposed because the offending triples can be built directly
+/// from `OwnerStateGraphNode` values, while no lit input distinguishes the two
+/// relations: the misorder is real but nothing downstream has been shown to
+/// consume it.  See `RefoldProofOrderTests`.
+class OwnerStateGraphOrder {
+public:
+  /// Indexes \p nodes and \p includes.  Both must be complete: an anchor
+  /// derived from a partial node set would not agree with the one derived
+  /// after the rest were added.
+  OwnerStateGraphOrder(
+      llvm::ArrayRef<OwnerStateGraphNode> nodes,
+      llvm::ArrayRef<RefoldModel::IncludeItem> includes);
+
+  /// Returns the A-stream position \p node is ordered at.
+  ///
+  /// A token-producing node anchors at its own first A token.  An include
+  /// entry and exit anchor at the ends of the A range the include covers,
+  /// which is the one anchor the parent domain cannot supply: the header's
+  /// tokens belong to the header's own domain, so projecting the directive
+  /// site would place the entry after the body it opens.  Every other
+  /// zero-token node is projected from its source anchor.
+  uint64_t AnchorFor(const OwnerStateGraphNode &node) const;
+
+  /// Strict weak ordering over graph nodes.
+  bool Less(const OwnerStateGraphNode &lhs,
+            const OwnerStateGraphNode &rhs) const;
+
+  /// Same order, for callers that already projected both nodes.
+  ///
+  /// The sort uses this so an anchor is computed once per node instead of
+  /// once per comparison; the result is identical to the two-argument form.
+  bool Less(uint64_t lhsAnchor, const OwnerStateGraphNode &lhs,
+            uint64_t rhsAnchor, const OwnerStateGraphNode &rhs) const;
+
+private:
+  /// A domain's contribution to the A stream, ascending by source anchor.
+  struct DomainExtent {
+    /// (source anchor, first A token) per token-producing node in the domain.
+    std::vector<std::pair<uint64_t, uint64_t>> tokenStarts;
+    /// One past the last A token the domain contributes.
+    uint64_t aEnd = 0;
+  };
+
+  /// The A range one include occurrence covers, and where its directive sits.
+  struct IncludeExtent {
+    std::string sitePath;
+    std::optional<uint64_t> siteIncludeId;
+    uint64_t siteBegin = 0;
+    uint64_t aBegin = 0;
+    uint64_t aEnd = 0;
+    /// False when the include contributed no valid span, so `aBegin`/`aEnd`
+    /// carry no position and must not be read as one.
+    bool coversTokens = false;
+  };
+
+  /// A source surface is identified by physical path and include occurrence:
+  /// the same header entered twice contributes two disjoint A ranges.
+  static std::pair<std::string, uint64_t>
+  DomainKeyOf(const OwnerSourceRange &source);
+
+  /// Projects a source anchor onto the A stream.
+  ///
+  /// Within a domain that contributes tokens the anchor is the first A token
+  /// at or after the source offset, and the domain's A end when the offset
+  /// follows every token it contributes -- which keeps a trailing `#define`
+  /// beside its own file's tokens rather than drifting to the end of the
+  /// stream.  A domain that contributes no tokens has nothing to project onto
+  /// and defers to its own include site in the parent domain.
+  ///
+  /// \p visitedIncludes stops a malformed `parent` chain that never reaches
+  /// the translation unit.  Anchoring such a node at zero keeps the order
+  /// total and deterministic; no proof reads an anchor as evidence.
+  uint64_t
+  ProjectSource(const OwnerSourceRange &source,
+                llvm::SmallVectorImpl<uint64_t> &visitedIncludes) const;
+
+  std::map<std::pair<std::string, uint64_t>, DomainExtent> domains_;
+  std::map<uint64_t, IncludeExtent> includes_;
+};
 
 /// Builds and checks owner-state proof facts for source-preserving edits.
 ///

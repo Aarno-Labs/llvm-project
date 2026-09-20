@@ -24,7 +24,9 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <utility>
@@ -1429,6 +1431,137 @@ private:
 
 } // namespace
 
+OwnerStateGraphOrder::OwnerStateGraphOrder(
+    ArrayRef<OwnerStateGraphNode> nodes,
+    ArrayRef<RefoldModel::IncludeItem> includes) {
+  for (const OwnerStateGraphNode &node : nodes) {
+    if (!node.HasTokenAnchor())
+      continue;
+    DomainExtent &extent = domains_[DomainKeyOf(node.source)];
+    extent.tokenStarts.emplace_back(node.source.begin, node.aTokens.begin);
+    extent.aEnd = std::max(extent.aEnd, node.aTokens.end);
+  }
+  for (auto &entry : domains_)
+    llvm::sort(entry.second.tokenStarts);
+
+  for (const RefoldModel::IncludeItem &include : includes) {
+    IncludeExtent &extent = includes_[include.id];
+    extent.sitePath = include.sitePath.str();
+    extent.siteIncludeId = include.parent;
+    extent.siteBegin = include.siteB;
+    uint64_t begin = std::numeric_limits<uint64_t>::max();
+    uint64_t end = 0;
+    for (const RefoldModel::PPSpan &span : include.spans) {
+      if (!span.IsValid())
+        continue;
+      begin = std::min<uint64_t>(begin, span.begin);
+      end = std::max<uint64_t>(end, span.end);
+      extent.coversTokens = true;
+    }
+    if (extent.coversTokens) {
+      extent.aBegin = begin;
+      extent.aEnd = end;
+    }
+  }
+}
+
+std::pair<std::string, uint64_t>
+OwnerStateGraphOrder::DomainKeyOf(const OwnerSourceRange &source) {
+  return {source.path,
+          source.includeId.value_or(std::numeric_limits<uint64_t>::max())};
+}
+
+uint64_t
+OwnerStateGraphOrder::AnchorFor(const OwnerStateGraphNode &node) const {
+  if (node.HasTokenAnchor())
+    return node.aTokens.begin;
+
+  const bool isEntry = node.kind == OwnerStateGraphNodeKind::IncludeEntry;
+  const bool isExit = node.kind == OwnerStateGraphNodeKind::IncludeExit;
+  if ((isEntry || isExit) && node.closure.owner.includeId) {
+    const auto it = includes_.find(*node.closure.owner.includeId);
+    if (it != includes_.end() && it->second.coversTokens)
+      return isEntry ? it->second.aBegin : it->second.aEnd;
+  }
+
+  SmallVector<uint64_t, 8> visitedIncludes;
+  return ProjectSource(node.source, visitedIncludes);
+}
+
+uint64_t OwnerStateGraphOrder::ProjectSource(
+    const OwnerSourceRange &source,
+    SmallVectorImpl<uint64_t> &visitedIncludes) const {
+  const auto domain = domains_.find(DomainKeyOf(source));
+  if (domain != domains_.end()) {
+    const DomainExtent &extent = domain->second;
+    const auto at = std::lower_bound(
+        extent.tokenStarts.begin(), extent.tokenStarts.end(),
+        std::make_pair(source.begin, static_cast<uint64_t>(0)));
+    if (at != extent.tokenStarts.end())
+      return at->second;
+    return extent.aEnd;
+  }
+
+  if (!source.includeId)
+    return 0;
+  if (llvm::is_contained(visitedIncludes, *source.includeId))
+    return 0;
+  visitedIncludes.push_back(*source.includeId);
+
+  const auto include = includes_.find(*source.includeId);
+  if (include == includes_.end())
+    return 0;
+  if (include->second.coversTokens)
+    return include->second.aBegin;
+  return ProjectSource(OwnerSourceRange::From(include->second.sitePath,
+                                              include->second.siteBegin,
+                                              include->second.siteBegin,
+                                              include->second.siteIncludeId),
+                       visitedIncludes);
+}
+
+bool OwnerStateGraphOrder::Less(const OwnerStateGraphNode &lhs,
+                                const OwnerStateGraphNode &rhs) const {
+  return Less(AnchorFor(lhs), lhs, AnchorFor(rhs), rhs);
+}
+
+bool OwnerStateGraphOrder::Less(uint64_t lhsAnchor,
+                                const OwnerStateGraphNode &lhs,
+                                uint64_t rhsAnchor,
+                                const OwnerStateGraphNode &rhs) const {
+  if (lhsAnchor != rhsAnchor)
+    return lhsAnchor < rhsAnchor;
+
+  // The projected anchor is the only primary key, which is what makes this a
+  // strict weak ordering.  Everything after it is a tie-break on facts that
+  // are total over distinct nodes, so the order is also deterministic: the
+  // source anchor keeps a zero-token directive ahead of the tokens it projects
+  // onto and orders directives that project together, and node kind and owner
+  // identity separate owners that share a source range.
+  const auto sourceKey = [](const OwnerSourceRange &source) {
+    const uint64_t none = std::numeric_limits<uint64_t>::max();
+    return std::make_tuple(source.path, source.includeId.value_or(none),
+                           source.begin, source.end);
+  };
+  const auto identityKey = [](const Owner &owner) {
+    const uint64_t none = std::numeric_limits<uint64_t>::max();
+    return std::make_tuple(
+        static_cast<unsigned>(owner.kind), owner.includeId.value_or(none),
+        owner.macroInvocationId.value_or(none),
+        owner.macroDirectiveId.value_or(none),
+        owner.lineControlId.value_or(none), owner.pragmaId.value_or(none),
+        owner.condGroupId.value_or(none), owner.condArmId.value_or(none));
+  };
+
+  const auto lhsSource = sourceKey(lhs.source);
+  const auto rhsSource = sourceKey(rhs.source);
+  if (lhsSource != rhsSource)
+    return lhsSource < rhsSource;
+  if (lhs.kind != rhs.kind)
+    return static_cast<unsigned>(lhs.kind) < static_cast<unsigned>(rhs.kind);
+  return identityKey(lhs.closure.owner) < identityKey(rhs.closure.owner);
+}
+
 OwnerStateDelta
 RefoldOwnerStateProof::BuildOwnerStateDelta(const Owner &owner) const {
   OwnerStateFactRecorder recorder(*this, theoremAudit_.IsNoLegacyAuditEnabled(),
@@ -1988,60 +2121,6 @@ OwnerStateGraph RefoldOwnerStateProof::BuildOwnerStateGraph() const {
             tokens, formatv("macro invocation {0}", macro.id).str());
   }
 
-  auto ownerIdentityKey = [](const Owner &owner)
-      -> std::tuple<unsigned, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
-                    uint64_t, uint64_t> {
-    const uint64_t none = std::numeric_limits<uint64_t>::max();
-    return std::make_tuple(
-        static_cast<unsigned>(owner.kind), owner.includeId.value_or(none),
-        owner.macroInvocationId.value_or(none),
-        owner.macroDirectiveId.value_or(none),
-        owner.lineControlId.value_or(none), owner.pragmaId.value_or(none),
-        owner.condGroupId.value_or(none), owner.condArmId.value_or(none));
-  };
-
-  auto sourceDomainKey = [](const OwnerSourceRange &source)
-      -> std::tuple<std::string, uint64_t, uint64_t, uint64_t> {
-    const uint64_t none = std::numeric_limits<uint64_t>::max();
-    return std::make_tuple(source.path, source.includeId.value_or(none),
-                           source.begin, source.end);
-  };
-
-  auto graphNodeLess = [&](const OwnerStateGraphNode &lhs,
-                           const OwnerStateGraphNode &rhs) {
-    const bool sameSourceDomain = lhs.source.path == rhs.source.path &&
-                                  lhs.source.includeId == rhs.source.includeId;
-    if (sameSourceDomain) {
-      // zero-token directives are ordered against token-producing
-      // owners by their physical source anchor when both events live in the
-      // same source/include domain.  We deliberately do this before consulting
-      // token anchors so #define/#undef/#line/#pragma events cannot all drift
-      // to EOF.
-      if (lhs.source.begin != rhs.source.begin)
-        return lhs.source.begin < rhs.source.begin;
-      if (lhs.source.end != rhs.source.end)
-        return lhs.source.end < rhs.source.end;
-    }
-
-    const bool lhsHasTokens = lhs.HasTokenAnchor();
-    const bool rhsHasTokens = rhs.HasTokenAnchor();
-    if (lhsHasTokens && rhsHasTokens && lhs.aTokens.begin != rhs.aTokens.begin)
-      return lhs.aTokens.begin < rhs.aTokens.begin;
-    if (lhsHasTokens && rhsHasTokens && lhs.aTokens.end != rhs.aTokens.end)
-      return lhs.aTokens.end < rhs.aTokens.end;
-    if (lhsHasTokens != rhsHasTokens)
-      return lhsHasTokens;
-
-    const auto lhsSource = sourceDomainKey(lhs.source);
-    const auto rhsSource = sourceDomainKey(rhs.source);
-    if (lhsSource != rhsSource)
-      return lhsSource < rhsSource;
-    if (lhs.kind != rhs.kind)
-      return static_cast<unsigned>(lhs.kind) < static_cast<unsigned>(rhs.kind);
-    return ownerIdentityKey(lhs.closure.owner) <
-           ownerIdentityKey(rhs.closure.owner);
-  };
-
   static constexpr OwnerStateComponent components[] = {
       OwnerStateComponent::MacroState,
       OwnerStateComponent::DefinedOperator,
@@ -2055,7 +2134,31 @@ OwnerStateGraph RefoldOwnerStateProof::BuildOwnerStateGraph() const {
       OwnerStateComponent::IncludeState};
 
   auto assignGraphOrder = [&]() {
-    std::stable_sort(graph.nodes.begin(), graph.nodes.end(), graphNodeLess);
+    // Project once.  An anchor costs a domain lookup and a binary search, and
+    // projecting inside the comparison would repeat both O(n log n) times on a
+    // graph this pass already rebuilds per production attempt.  Sorting a
+    // permutation rather than the nodes is what lets the anchors be read by
+    // position while the sort runs.
+    const OwnerStateGraphOrder order(graph.nodes, model_.GetIncludes());
+    std::vector<uint64_t> anchors;
+    anchors.reserve(graph.nodes.size());
+    for (const OwnerStateGraphNode &node : graph.nodes)
+      anchors.push_back(order.AnchorFor(node));
+
+    std::vector<size_t> permutation(graph.nodes.size());
+    std::iota(permutation.begin(), permutation.end(), static_cast<size_t>(0));
+    std::stable_sort(permutation.begin(), permutation.end(),
+                     [&](size_t lhs, size_t rhs) {
+                       return order.Less(anchors[lhs], graph.nodes[lhs],
+                                         anchors[rhs], graph.nodes[rhs]);
+                     });
+
+    std::vector<OwnerStateGraphNode> ordered;
+    ordered.reserve(graph.nodes.size());
+    for (size_t index : permutation)
+      ordered.push_back(std::move(graph.nodes[index]));
+    graph.nodes = std::move(ordered);
+
     for (uint64_t i = 0, e = graph.nodes.size(); i < e; ++i) {
       OwnerStateGraphNode &node = graph.nodes[static_cast<size_t>(i)];
       node.id = i;

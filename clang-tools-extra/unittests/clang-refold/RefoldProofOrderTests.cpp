@@ -36,10 +36,17 @@
 // tie-breaker still decides the one competition it exists for, and the audit
 // that now guards every selection really does reject a cyclic relation.
 //
+// `OwnerStateGraphOrder` is pinned here for the same reason.  It is sorted
+// with, so it must be a strict weak ordering, and the relation it replaced was
+// not one.  No lit input distinguishes the two: every test in the suite passes
+// under either, and the node order differs in all 303 graph builds the suite
+// performs, so only a directly constructed triple can state the law.
+//
 //===----------------------------------------------------------------------===//
 
 #include "proof/RefoldAcceptedResultRanker.h"
 #include "proof/RefoldCandidateTypes.h"
+#include "proof/RefoldOwnerStateProof.h"
 #include "proof/RefoldProofVocabulary.h"
 #include "proof/RefoldTheoremTypes.h"
 
@@ -296,6 +303,113 @@ TEST(RefoldProofOrder, IncomparableSummariesAreReportedAsSuch) {
   EXPECT_EQ(RefoldAcceptedResultRanker::CompareAcceptedResultCandidateProofs(
                 rhs, lhs),
             ProofDominanceOrder::LeftDominates);
+}
+
+//===----------------------------------------------------------------------===//
+// Owner-state graph order.
+//
+// The three nodes below are the minimal shape the previous relation cycled
+// on: a zero-token `#define`, a later token owner in the same file, and a
+// token owner contributed by an included file.  It ordered same-domain pairs
+// by source anchor and every other pair by token anchor, so it reported
+// define < use, use < header token, and header token < define.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A zero-token directive node, anchored only in physical source.
+OwnerStateGraphNode zeroTokenNode(OwnerStateGraphNodeKind kind, StringRef path,
+                                  uint64_t begin, uint64_t end,
+                                  std::optional<uint64_t> includeId,
+                                  uint64_t directiveId) {
+  OwnerStateGraphNode node;
+  node.kind = kind;
+  node.source = OwnerSourceRange::From(path, begin, end, includeId);
+  node.aTokens = OwnerTokenRange::From(0, 0);
+  node.closure.owner = Owner::MacroDirective(directiveId, std::nullopt);
+  node.closure.source = node.source;
+  return node;
+}
+
+/// A token-producing owner node covering `[aBegin, aEnd)` of the A stream.
+OwnerStateGraphNode tokenNode(StringRef path, uint64_t begin, uint64_t end,
+                              std::optional<uint64_t> includeId,
+                              uint64_t aBegin, uint64_t aEnd,
+                              uint64_t invocationId) {
+  OwnerStateGraphNode node;
+  node.kind = OwnerStateGraphNodeKind::MacroInvocation;
+  node.source = OwnerSourceRange::From(path, begin, end, includeId);
+  node.aTokens = OwnerTokenRange::From(aBegin, aEnd);
+  node.closure.owner = Owner::MacroInvocation(invocationId, std::nullopt);
+  node.closure.source = node.source;
+  return node;
+}
+
+} // namespace
+
+TEST(RefoldOwnerStateGraphOrder, TransitiveAcrossAnIncludedDomain) {
+  // `#define` at byte 76 of the TU, no A tokens of its own.
+  const OwnerStateGraphNode define =
+      zeroTokenNode(OwnerStateGraphNodeKind::MacroDefineEvent, "tu.c", 76, 96,
+                    std::nullopt, /*directiveId=*/1);
+  // Its use, later in the same file, covering A tokens [10, 12).
+  const OwnerStateGraphNode use =
+      tokenNode("tu.c", 216, 224, std::nullopt, 10, 12, /*invocationId=*/2);
+  // An owner contributed by an included file, covering A tokens [20, 22).
+  const OwnerStateGraphNode header =
+      tokenNode("h.h", 4, 12, /*includeId=*/7, 20, 22, /*invocationId=*/3);
+
+  const std::vector<OwnerStateGraphNode> nodes = {define, use, header};
+  const OwnerStateGraphOrder order(nodes, {});
+
+  EXPECT_TRUE(order.Less(define, use));
+  EXPECT_TRUE(order.Less(use, header));
+
+  // The transitive consequence.  The previous relation reported the opposite
+  // here, because `header` carried A tokens and `define` did not, which closed
+  // the cycle and left the sort undefined.
+  EXPECT_TRUE(order.Less(define, header));
+  EXPECT_FALSE(order.Less(header, define));
+}
+
+TEST(RefoldOwnerStateGraphOrder, ZeroTokenDirectivePrecedesItsAnchor) {
+  // A directive projects onto the first A token its own domain contributes at
+  // or after it, so it ties with that owner's anchor and the source anchor
+  // must decide.  A definition that sorted after its use is the shape this
+  // rules out.
+  const OwnerStateGraphNode define =
+      zeroTokenNode(OwnerStateGraphNodeKind::MacroDefineEvent, "tu.c", 81, 101,
+                    std::nullopt, /*directiveId=*/1);
+  const OwnerStateGraphNode use =
+      tokenNode("tu.c", 133, 141, std::nullopt, 0, 4, /*invocationId=*/2);
+
+  const std::vector<OwnerStateGraphNode> nodes = {use, define};
+  const OwnerStateGraphOrder order(nodes, {});
+
+  EXPECT_EQ(order.AnchorFor(define), order.AnchorFor(use));
+  EXPECT_TRUE(order.Less(define, use));
+  EXPECT_FALSE(order.Less(use, define));
+}
+
+TEST(RefoldOwnerStateGraphOrder, TrailingDirectiveStaysInsideItsOwnDomain) {
+  // A directive after every token its domain contributes anchors at that
+  // domain's A end, not at the end of the stream, so it still precedes an
+  // owner that a later domain contributes.
+  const OwnerStateGraphNode headerToken =
+      tokenNode("h.h", 4, 12, /*includeId=*/7, 2, 4, /*invocationId=*/2);
+  const OwnerStateGraphNode headerTrailingUndef =
+      zeroTokenNode(OwnerStateGraphNodeKind::MacroUndefEvent, "h.h", 40, 52,
+                    /*includeId=*/7, /*directiveId=*/3);
+  const OwnerStateGraphNode laterTuToken =
+      tokenNode("tu.c", 300, 308, std::nullopt, 9, 11, /*invocationId=*/4);
+
+  const std::vector<OwnerStateGraphNode> nodes = {
+      headerToken, headerTrailingUndef, laterTuToken};
+  const OwnerStateGraphOrder order(nodes, {});
+
+  EXPECT_EQ(order.AnchorFor(headerTrailingUndef), 4u);
+  EXPECT_TRUE(order.Less(headerToken, headerTrailingUndef));
+  EXPECT_TRUE(order.Less(headerTrailingUndef, laterTuToken));
 }
 
 } // namespace
