@@ -1,0 +1,4 @@
+#ifndef CARRIED_DEFINITION_LINE_PRUNE_STRESS_OUTER_H
+#define CARRIED_DEFINITION_LINE_PRUNE_STRESS_OUTER_H
+#include "carried_definition_line_prune_stress_inner.h"
+#endif
