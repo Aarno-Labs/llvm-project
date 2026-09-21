@@ -262,6 +262,26 @@ private:
   /// this fails closed rather than emitting a duplicated body.
   bool ProveNoReentryIntoUnprotectedInlinedHeaders();
 
+  /// Return whether the body of include instance \p instanceId is emitted as
+  /// a slice of the edited preprocessed stream, either because the instance
+  /// itself or one of its entered ancestors is in \p realizedFromB.
+  ///
+  /// Such a body is tokens, so no directive lexically inside it survives into
+  /// the output.  An ancestor chain that cannot be followed answers false.
+  bool IncludeInstanceBodyIsRealizedFromB(
+      uint64_t instanceId, const llvm::DenseSet<uint64_t> &realizedFromB) const;
+
+  /// Return whether the directive of \p include lies inside a realized-from-B
+  /// body in every instance of its containing header, so the directive text
+  /// is absent from the output.
+  ///
+  /// An entered edge names its containing instance through `parent`.  A skipped
+  /// edge does not, so it qualifies only when every entered instance of its
+  /// site header has a body realized from B.  A TU-owned edge never qualifies.
+  bool IncludeDirectiveIsInsideRealizedFromBBody(
+      const RefoldModel::IncludeItem &include,
+      const llvm::DenseSet<uint64_t> &realizedFromB) const;
+
   /// Return whether the producer recorded a controlling macro for one physical
   /// header, meaning its lost include-guard state can be restored by name.
   bool HeaderControllingMacroIsRecorded(llvm::StringRef physicalPath) const;

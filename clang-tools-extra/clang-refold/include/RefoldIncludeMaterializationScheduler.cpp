@@ -292,13 +292,18 @@ bool RefoldIncludeMaterializationScheduler::
     realizedIds.push_back(kv.first);
   llvm::sort(realizedIds);
 
+  DenseSet<uint64_t> realizedFromB;
   for (uint64_t includeId : realizedIds) {
     const AcceptedResultCandidate &candidate =
         includeExpansionAcceptedResults_.find(includeId)->second;
-    if (candidate.proofSummary.inventory.currentPath !=
-        AcceptedPathKind::IncludeRealizationInlineFromB) {
+    if (candidate.proofSummary.inventory.currentPath ==
+        AcceptedPathKind::IncludeRealizationInlineFromB)
+      realizedFromB.insert(includeId);
+  }
+
+  for (uint64_t includeId : realizedIds) {
+    if (!realizedFromB.contains(includeId))
       continue;
-    }
     std::vector<std::string> emitted;
     CollectEnteredSubtreePhysicalPaths(includeId, emitted);
     for (std::string &path : emitted) {
@@ -362,6 +367,13 @@ bool RefoldIncludeMaterializationScheduler::
     // by its body.
     if (includeExpansion_.count(include.id))
       continue;
+    // Nor can a directive inside a realized-from-B body: that body is a slice
+    // of the edited stream, so the directive's text is not in the output.  If
+    // its containing header is re-entered from disk instead, the surviving
+    // directive that reaches it has that header in its own closure and is
+    // checked below in its place.
+    if (IncludeDirectiveIsInsideRealizedFromBBody(include, realizedFromB))
+      continue;
 
     // The re-entry side is intentionally over-approximated over *all* edges,
     // not just entered ones: once the refolded TU is preprocessed, an edge that
@@ -424,6 +436,53 @@ bool RefoldIncludeMaterializationScheduler::
   }
 
   return reentryProven;
+}
+
+bool RefoldIncludeMaterializationScheduler::IncludeInstanceBodyIsRealizedFromB(
+    uint64_t instanceId, const DenseSet<uint64_t> &realizedFromB) const {
+  // The depth bound only guards against a malformed parent cycle.
+  std::optional<uint64_t> current = instanceId;
+  for (size_t depth = 0; current && depth <= model_.GetIncludes().size();
+       ++depth) {
+    if (realizedFromB.contains(*current))
+      return true;
+    const RefoldModel::IncludeItem *item = model_.GetIncludeById(*current);
+    if (!item)
+      return false;
+    current = item->parent;
+  }
+  return false;
+}
+
+bool RefoldIncludeMaterializationScheduler::
+    IncludeDirectiveIsInsideRealizedFromBBody(
+        const RefoldModel::IncludeItem &include,
+        const DenseSet<uint64_t> &realizedFromB) const {
+  if (realizedFromB.empty())
+    return false;
+  if (include.parent)
+    return IncludeInstanceBodyIsRealizedFromB(*include.parent, realizedFromB);
+  if (pathIdentity_.PathsEqual(include.sitePath, request_.tuPath))
+    return false;
+
+  // A skipped edge names no containing instance, so every instance of its
+  // site header must qualify.  A header with no entered instance proves
+  // nothing.
+  bool sawInstance = false;
+  for (const RefoldModel::IncludeItem &instance : model_.GetIncludes()) {
+    if (!instance.openedPath ||
+        !pathIdentity_.PathsEqual(*instance.openedPath, include.sitePath)) {
+      continue;
+    }
+    const bool entered =
+        instance.enteredFileName.has_value() || instance.parent.has_value();
+    if (!entered)
+      continue;
+    if (!IncludeInstanceBodyIsRealizedFromB(instance.id, realizedFromB))
+      return false;
+    sawInstance = true;
+  }
+  return sawInstance;
 }
 
 void RefoldIncludeMaterializationScheduler::RecordActiveGuardedHeaders(
