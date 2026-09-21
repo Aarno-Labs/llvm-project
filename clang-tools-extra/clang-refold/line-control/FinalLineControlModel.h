@@ -197,9 +197,16 @@ FinalLineControlRemovalProof MakeFinalLineControlRemovalProof(
 /// The byte range is always in the current final-output coordinate space.  A
 /// candidate must carry both compact proof records; otherwise the pruner fails
 /// closed and leaves the directive intact.
+///
+/// `directiveSpelling` is the exact text the mint site appended at the range,
+/// newline included.  It binds the candidate to one directive rather than to
+/// whatever bytes its offsets happen to address: the pruner deletes only when
+/// the range still holds exactly this text, and a candidate without a spelling
+/// is never eligible.
 struct FinalLineControlPruneCandidate {
   uint64_t finalBegin = 0;
   uint64_t finalEnd = 0;
+  std::string directiveSpelling;
   FinalLineDirective::Origin origin = FinalLineDirective::Origin::Unknown;
   std::optional<FinalLineControlOwnerKey> physicalOwner = std::nullopt;
   bool producerProven = false;
@@ -208,7 +215,8 @@ struct FinalLineControlPruneCandidate {
 };
 
 FinalLineControlPruneCandidate MakeFinalLineControlPruneCandidate(
-    uint64_t finalBegin, uint64_t finalEnd, FinalLineDirective::Origin origin,
+    uint64_t finalBegin, uint64_t finalEnd, std::string directiveSpelling,
+    FinalLineDirective::Origin origin,
     std::optional<FinalLineControlOwnerKey> physicalOwner, bool producerProven,
     FinalLineControlObligation obligation,
     FinalLineControlRemovalVerdict removalVerdict =

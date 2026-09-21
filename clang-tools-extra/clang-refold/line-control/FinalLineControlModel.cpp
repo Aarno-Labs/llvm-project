@@ -21,7 +21,6 @@
 #include "clang/Basic/LangOptions.h"
 
 #include "llvm/ADT/SmallString.h"
-#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Path.h"
 
@@ -255,13 +254,15 @@ FinalLineControlRemovalProof MakeFinalLineControlRemovalProof(
 }
 
 FinalLineControlPruneCandidate MakeFinalLineControlPruneCandidate(
-    uint64_t finalBegin, uint64_t finalEnd, FinalLineDirective::Origin origin,
+    uint64_t finalBegin, uint64_t finalEnd, std::string directiveSpelling,
+    FinalLineDirective::Origin origin,
     std::optional<FinalLineControlOwnerKey> physicalOwner, bool producerProven,
     FinalLineControlObligation obligation,
     FinalLineControlRemovalVerdict removalVerdict) {
   FinalLineControlPruneCandidate candidate;
   candidate.finalBegin = finalBegin;
   candidate.finalEnd = finalEnd;
+  candidate.directiveSpelling = std::move(directiveSpelling);
   candidate.origin = origin;
   candidate.physicalOwner = std::move(physicalOwner);
   candidate.producerProven = producerProven;
@@ -331,6 +332,10 @@ void CanonicalizeFinalLineControlPruneCandidates(
 
       if (merged.origin != candidate.origin)
         merged.origin = FinalLineDirective::Origin::Unknown;
+      // Two mints that disagree on the directive at one range cannot both
+      // stand for it; clearing the spelling makes the merge ineligible.
+      if (merged.directiveSpelling != candidate.directiveSpelling)
+        merged.directiveSpelling.clear();
       if (!SameFinalLineControlOwner(merged.physicalOwner,
                                      candidate.physicalOwner))
         merged.physicalOwner = std::nullopt;
@@ -368,8 +373,8 @@ StringRef preprocessorKeyword(StringRef line) {
   return line.take_front(end);
 }
 
-/// Return whether a candidate's byte range is exactly one complete
-/// line-control directive in the stream it is about to be deleted from.
+/// Return whether a candidate's byte range still holds exactly the directive
+/// the candidate was minted around.
 ///
 /// Every candidate is minted around a directive this tool synthesized, at the
 /// offsets of whichever buffer held it then, and is shifted once for each
@@ -380,47 +385,18 @@ StringRef preprocessorKeyword(StringRef line) {
 /// token.  So the property is re-derived from the final bytes here rather than
 /// inherited from the bookkeeping that produced the range.
 ///
-/// The range must hold one whole logical line that spells either `#line` or a
-/// GNU line marker -- the two forms this tool emits.  Horizontal whitespace on
-/// either side may sit outside the range: a directive is introduced by `#`
-/// after optional blanks, so a resync placed at the front of a replacement that
-/// begins past the line's indentation still owns its whole line, and the
-/// indentation left behind by deleting it is blank text.  An interior newline
-/// or a trailing backslash is refused: a synthesized directive is never
-/// spliced, so a range holding one is not the directive it claims to be.
-bool candidateRangeCoversCompleteLineControlDirective(
+/// Checking that the range holds *some* complete line-control directive is not
+/// enough: a stale range can land exactly on a different one.  The range must
+/// therefore equal the spelling recorded when the directive was appended, which
+/// fixes both its shape and its identity.  A candidate with no recorded
+/// spelling carries no identity and is refused.
+bool candidateRangeStillHoldsItsDirective(
     const FinalLineControlPruneCandidate &candidate, StringRef current) {
-  const size_t begin = static_cast<size_t>(candidate.finalBegin);
-  const size_t end = static_cast<size_t>(candidate.finalEnd);
-
-  // Only blanks may separate the range from the start of its physical line.
-  size_t lineBegin = begin;
-  while (lineBegin > 0 && stringutils::isNonNewlineWs(current[lineBegin - 1]))
-    --lineBegin;
-  if (lineBegin != 0 && current[lineBegin - 1] != '\n')
+  if (candidate.directiveSpelling.empty())
     return false;
-
-  StringRef directive = current.slice(begin, end);
-
-  // ... and only blanks may separate it from that line's end.
-  if (!directive.ends_with("\n")) {
-    StringRef tail =
-        current.drop_front(end).take_until([](char c) { return c == '\n'; });
-    if (!stringutils::trimHorizontal(tail).empty())
-      return false;
-  }
-
-  directive.consume_back("\n");
-  directive.consume_back("\r");
-  if (directive.contains('\n') || directive.ends_with("\\"))
-    return false;
-
-  const StringRef keyword = preprocessorKeyword(directive);
-  if (keyword == "line")
-    return true;
-
-  // GNU line marker: `#` then the line number, with no intervening keyword.
-  return !keyword.empty() && isDigit(keyword.front());
+  return current.slice(static_cast<size_t>(candidate.finalBegin),
+                       static_cast<size_t>(candidate.finalEnd)) ==
+         candidate.directiveSpelling;
 }
 
 bool isConditionalDirectiveKeyword(StringRef keyword) {
@@ -592,11 +568,12 @@ bool candidateMayBeValidationDischarged(
     const FinalLineControlPruneCandidate &candidate, StringRef current) {
   if (!candidateRangeIsValid(candidate, current))
     return false;
-  if (!candidateRangeCoversCompleteLineControlDirective(candidate, current)) {
+  if (!candidateRangeStillHoldsItsDirective(candidate, current)) {
     REFOLD_LOG_WARN("linedir/prune",
-                    "refusing final line-control deletion: range [{0},{1}) is "
-                    "not one complete directive (origin={2}); the candidate "
-                    "offsets do not address the directive they stand for",
+                    "refusing final line-control deletion: range [{0},{1}) "
+                    "does not hold the directive the candidate was minted "
+                    "around (origin={2}); the candidate offsets do not "
+                    "address the directive they stand for",
                     candidate.finalBegin, candidate.finalEnd,
                     toString(candidate.origin));
     return false;

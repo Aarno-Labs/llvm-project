@@ -126,6 +126,7 @@ void appendFinalLineControlPlan(
   for (const FinalLineControlPruneCandidate &candidate : pruneCandidates) {
     key.AddU64(candidate.finalBegin);
     key.AddU64(candidate.finalEnd);
+    key.AddString(candidate.directiveSpelling);
     key.AddU64(static_cast<uint64_t>(candidate.origin));
     appendFinalLineControlOwner(key, candidate.physicalOwner);
     key.AddBool(candidate.producerProven);

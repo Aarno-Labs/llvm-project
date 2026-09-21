@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -110,12 +111,16 @@ findLastLineControlDirectiveRangeBefore(llvm::StringRef out,
 /// spliced into its parent output.  This keeps candidate generation
 /// deterministic despite later edit normalization, include nesting, and
 /// pending-resync flushes.
+///
+/// \p directive must be the exact text the caller appended at [begin, end);
+/// the pruner deletes the range only while it still holds that text.
 inline FinalLineControlPruneCandidate makeSyntheticLineControlPruneCandidate(
-    uint64_t begin, uint64_t end, FinalLineDirective::Origin origin,
+    uint64_t begin, uint64_t end, std::string directive,
+    FinalLineDirective::Origin origin,
     std::optional<FinalLineControlOwnerKey> owner,
     FinalLineControlObligation obligation) {
   return MakeFinalLineControlPruneCandidate(
-      begin, end, origin, std::move(owner),
+      begin, end, std::move(directive), origin, std::move(owner),
       /*producerProven=*/true, obligation);
 }
 
@@ -182,17 +187,17 @@ makeInsertedSyntheticLineControlPruneCandidate(
 
   return makeSyntheticLineControlPruneCandidate(
       static_cast<uint64_t>(prefix),
-      static_cast<uint64_t>(prefix + directive.size()), origin,
+      static_cast<uint64_t>(prefix + directive.size()), directive.str(), origin,
       std::move(owner), obligation);
 }
 
 /// Remove duplicate candidate records after composition/duplicate-edit merging.
 ///
 /// Candidate equality is byte-range based because the final pruner matches the
-/// concrete directive bytes.  Preserve compact obligation/removal proofs only
-/// when duplicate generation sites agree exactly; conflicting metadata is
-/// discarded fail-closed while leaving the operational candidate eligible under
-/// the existing authoritative final model.
+/// concrete directive bytes.  Preserve compact obligation/removal proofs and
+/// the directive spelling only when duplicate generation sites agree exactly;
+/// conflicting metadata is discarded fail-closed.  A discarded spelling makes
+/// the candidate ineligible for deletion.
 inline void deduplicateLineControlPruneCandidates(
     std::vector<FinalLineControlPruneCandidate> &candidates) {
   llvm::sort(candidates, [](const FinalLineControlPruneCandidate &lhs,
@@ -212,6 +217,8 @@ inline void deduplicateLineControlPruneCandidates(
         deduped.back().finalEnd == candidate.finalEnd &&
         deduped.back().origin == candidate.origin) {
       FinalLineControlPruneCandidate &merged = deduped.back();
+      if (merged.directiveSpelling != candidate.directiveSpelling)
+        merged.directiveSpelling.clear();
       if (!SameFinalLineControlOwner(merged.physicalOwner,
                                      candidate.physicalOwner))
         merged.physicalOwner = std::nullopt;

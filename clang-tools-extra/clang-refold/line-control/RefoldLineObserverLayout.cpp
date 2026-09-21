@@ -1383,7 +1383,8 @@ RefoldLineObserverLayout::WrapIncludeExpansionForMaterialization(
         if (removableCandidate) {
           wrapped.lineControlPruneCandidates.push_back(
               makeSyntheticLineControlPruneCandidate(
-                  begin, end, origin, std::move(owner), obligation));
+                  begin, end, std::move(directive), origin, std::move(owner),
+                  obligation));
         }
       };
 

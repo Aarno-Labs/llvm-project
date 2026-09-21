@@ -376,7 +376,7 @@ void FinalTUEmissionContext::InsertTUPrologue(std::string &tuResult) const {
     candidate.finalEnd += insertedBytes;
   }
   finalLineControlPruneCandidates_.push_back(MakeFinalLineControlPruneCandidate(
-      /*finalBegin=*/0, insertedBytes,
+      /*finalBegin=*/0, insertedBytes, std::move(directive),
       FinalLineDirective::Origin::SyntheticTUPrologue,
       FinalLineControlOwnerKey(request_.tuPath.str(), std::nullopt),
       /*producerProven=*/true, FinalLineControlObligation::TUPrologueRepair));

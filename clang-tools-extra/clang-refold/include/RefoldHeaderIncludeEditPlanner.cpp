@@ -3104,13 +3104,14 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
       } else if (replacement.back() != '\n') {
         replacement.push_back('\n');
       }
-      const uint64_t resumeBegin = static_cast<uint64_t>(replacement.size());
-      replacement +=
+      std::string resumeDirective =
           formatSourceLineDirectiveGapResume(*headerSourceLineDirectiveResume);
+      const uint64_t resumeBegin = static_cast<uint64_t>(replacement.size());
+      replacement += resumeDirective;
       const uint64_t resumeEnd = static_cast<uint64_t>(replacement.size());
       sourceLineResumeCandidates.push_back(
           makeSyntheticLineControlPruneCandidate(
-              resumeBegin, resumeEnd,
+              resumeBegin, resumeEnd, std::move(resumeDirective),
               FinalLineDirective::Origin::SyntheticSourceLineResume,
               FinalLineControlOwnerKey(file, ie.include->id),
               FinalLineControlObligation::HeaderResumeRepair));

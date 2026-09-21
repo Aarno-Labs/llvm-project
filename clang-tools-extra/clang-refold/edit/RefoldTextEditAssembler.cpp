@@ -2945,7 +2945,8 @@ RefoldTextEditAssembler::AppendOriginalSliceWithPending(
           pending->finalLineControlPruneEligible) {
         lineControlPruneCandidates->push_back(
             makeSyntheticLineControlPruneCandidate(
-                begin, end, FinalLineDirective::Origin::SyntheticNewlineResync,
+                begin, end, directive,
+                FinalLineDirective::Origin::SyntheticNewlineResync,
                 FinalLineControlOwnerKey(pending->fileSpellingForDir,
                                          pending->ownerIncludeId),
                 FinalLineControlObligation::CosmeticSyntheticResync));
@@ -3001,7 +3002,7 @@ RefoldTextEditAssembler::AppendOriginalSliceWithPending(
             pending->finalLineControlPruneEligible) {
           lineControlPruneCandidates->push_back(
               makeSyntheticLineControlPruneCandidate(
-                  begin, end,
+                  begin, end, directive,
                   FinalLineDirective::Origin::SyntheticNewlineResync,
                   FinalLineControlOwnerKey(pending->fileSpellingForDir,
                                            pending->ownerIncludeId),
