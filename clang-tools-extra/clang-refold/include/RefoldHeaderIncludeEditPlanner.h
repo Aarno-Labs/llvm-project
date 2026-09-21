@@ -507,6 +507,20 @@ private:
       const RefoldModel::IncludeItem &root, llvm::StringRef replacement,
       llvm::SmallVectorImpl<HeaderPreservedGapPiece> &out) const;
 
+  /// Returns whether every A token that the patch run `[firstIdx, lastIdx]`
+  /// leaves unedited between consecutive patches is effective material of the
+  /// selected arm of \p group.
+  ///
+  /// A coalesced run is replaced by B text as a whole, so each such token is
+  /// re-spelled from B although no hunk edited it.  That is acceptable only
+  /// for a token of the arm the run consumes, which leaves with its group.  An
+  /// unedited token outside that arm is surviving source, and coalescing over
+  /// it would drop every directive and comment around it.
+  bool
+  PatchRunGapsLieInsideSelectedArm(const IncludeEdits &includeEdits,
+                                   size_t firstIdx, size_t lastIdx,
+                                   const RefoldModel::CondGroup &group) const;
+
   /// Coalesces adjacent patches that together consume a selected conditional
   /// group.  This preserves the original shortest-run search order.
   bool TryBuildConsumedHeaderConditionalCoalescedPatch(

@@ -757,6 +757,30 @@ bool RefoldHeaderIncludeEditPlanner::
   return true;
 }
 
+bool RefoldHeaderIncludeEditPlanner::PatchRunGapsLieInsideSelectedArm(
+    const IncludeEdits &includeEdits, size_t firstIdx, size_t lastIdx,
+    const RefoldModel::CondGroup &group) const {
+  for (const RefoldModel::CondArm &arm : group.arms) {
+    if (!arm.selected)
+      continue;
+    bool gapsInsideArm = true;
+    for (size_t idx = firstIdx; gapsInsideArm && idx < lastIdx; ++idx) {
+      const uint64_t gapBegin = includeEdits.patches[idx].aEnd;
+      const uint64_t gapEnd = includeEdits.patches[idx + 1].aStart;
+      for (uint64_t pp = gapBegin; pp < gapEnd; ++pp) {
+        std::optional<RefoldModel::ArmRef> owner = model_.FindArmRefAtPP(pp);
+        if (!owner || !HeaderArmIsSameOrNestedUnder(*owner, arm.id)) {
+          gapsInsideArm = false;
+          break;
+        }
+      }
+    }
+    if (gapsInsideArm)
+      return true;
+  }
+  return false;
+}
+
 bool RefoldHeaderIncludeEditPlanner::
     TryBuildConsumedHeaderConditionalCoalescedPatch(
         const IncludeEdits &includeEdits, StringRef file, StringRef headerText,
@@ -799,7 +823,8 @@ bool RefoldHeaderIncludeEditPlanner::
       overlapsConditionalGroup = true;
       if (HeaderConditionalGroupIsConsumedSourceEnvelope(
               *includeEdits.include, file, headerText, group, materialBeginA,
-              materialEndA)) {
+              materialEndA) &&
+          PatchRunGapsLieInsideSelectedArm(includeEdits, idx, endIdx, group)) {
         consumesConditionalGroup = true;
         break;
       }
