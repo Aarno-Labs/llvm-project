@@ -751,6 +751,21 @@ class RefoldMapBuilder {
   std::optional<std::pair<uint64_t, uint64_t>>
   computeCurrentMacroStateDirectivePhysicalExtent(SourceLocation MacroNameLoc);
 
+  /// Return the complete physical extent of the `#line` or GNU line-marker
+  /// directive whose handling issued the current file-rename callback.
+  ///
+  /// The begin is the introducer published by
+  /// Preprocessor::getCurrentDirectiveIntroducerLoc(), and the end is
+  /// \p AfterLoc, where Clang's lexer stands once it has read the directive's
+  /// end-of-directive token.  Both are Clang's own measurements, so the extent
+  /// covers line splices and block comments that continue the directive onto
+  /// later physical lines, which a physical-line scan cannot see.
+  ///
+  /// \returns (begin, end) in the directive's source file, or nullopt when the
+  ///          two locations do not describe one directive ending in a newline.
+  std::optional<std::pair<uint64_t, uint64_t>>
+  computeCurrentLineControlDirectiveExtent(SourceLocation AfterLoc);
+
   /// Canonical absolute path for a file entry (when possible).
   ///
   /// Resolves the given `FileEntryRef` to a canonical absolute path suitable

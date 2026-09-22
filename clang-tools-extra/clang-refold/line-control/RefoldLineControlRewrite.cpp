@@ -11,6 +11,7 @@
 
 #include "line-control/SourceLineDirectiveHelpers.h"
 
+#include "source/RefoldPreprocessingStructureIndex.h"
 #include "source/TokenTextHelpers.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -1925,12 +1926,98 @@ formatSourceLineDirectiveGapResume(const SourceLineDirectiveGapResume &resume) {
   return result;
 }
 
+/// Fold one executed line-control directive's spelling into \p state, whose
+/// file the caller then replaces with the producer's evaluated file.
+static bool foldLineControlMarkerFlags(StringRef text,
+                                       SourceLineControlState &state) {
+  std::optional<std::string> logicalLine =
+      removeLineSplicesForLineControl(text);
+  if (!logicalLine)
+    return false;
+  if (std::optional<ParsedSourceLineDirectiveLogicalLine> parsed =
+          parseSourceLineDirectiveLogicalLine(*logicalLine,
+                                              state.fileSpelling)) {
+    if (parsed->updatesLineMarkerFlags)
+      state.lineMarkerFlags = parsed->lineMarkerFlags;
+    return true;
+  }
+
+  // Only a canonical `#line` is known to keep the flags whatever its operands
+  // expand to.
+  StringRef rest = StringRef(*logicalLine).ltrim(" \t\v\f");
+  if (!rest.consume_front("#"))
+    return false;
+  rest = rest.ltrim(" \t\v\f");
+  return rest.consume_front("line") && !rest.empty() &&
+         !stringutils::isIdentPart(rest.front());
+}
+
+std::optional<SourceLineControlState> sourceLineControlStateBefore(
+    const RefoldModel &model, const RefoldPathIdentity &paths,
+    const RefoldPreprocessingStructureIndex &structureIndex, StringRef file,
+    std::optional<uint64_t> ownerIncludeId, uint64_t offset,
+    StringRef physicalFileSpelling) {
+  DenseMap<uint64_t, const RefoldModel::LineControlEvent *> eventsById;
+  size_t ownerEventsBefore = 0;
+  for (const RefoldModel::LineControlEvent &event : model.GetLineControls()) {
+    if (!paths.PathsEqual(event.physicalFile, file))
+      continue;
+    // An unattributed event in a header could belong to any of its include
+    // instances, so the state of this one is not known.
+    if (ownerIncludeId && !event.ownerIncludeId)
+      return std::nullopt;
+    if (event.ownerIncludeId != ownerIncludeId)
+      continue;
+    eventsById[event.id] = &event;
+    if (!event.siteB || *event.siteB < offset)
+      ++ownerEventsBefore;
+  }
+
+  SourceLineControlState state{physicalFileSpelling.str(), std::string()};
+  size_t foldedEvents = 0;
+  for (const PreprocessingStructureInterval *interval :
+       structureIndex.FindOverlapping(0, offset)) {
+    if (!interval || interval->kind != PreprocessingStructureKind::LineControl)
+      continue;
+    if (interval->end > offset)
+      return std::nullopt;
+
+    if (interval->modelKind !=
+            PreprocessingStructureModelKind::LineControlEvent ||
+        !interval->modelItemId) {
+      // Clang records every directive it executes, so an unbound directive is
+      // harmless only inside an arm the producer did not select.
+      std::optional<RefoldModel::ArmRef> arm;
+      if (interval->ownerConditionalArmId)
+        arm = model.GetArmRefById(*interval->ownerConditionalArmId);
+      if (!arm || !arm->arm || arm->arm->selected)
+        return std::nullopt;
+      continue;
+    }
+
+    auto found = eventsById.find(*interval->modelItemId);
+    if (found == eventsById.end() || !found->second->active ||
+        !found->second->producerProven ||
+        !foldLineControlMarkerFlags(found->second->text, state))
+      return std::nullopt;
+    state.fileSpelling = found->second->logicalFileAfter.str();
+    ++foldedEvents;
+  }
+
+  // Every executed directive ahead of the offset must have been folded; one
+  // the index could not bind would otherwise be silently skipped.
+  if (foldedEvents != ownerEventsBefore)
+    return std::nullopt;
+  return state;
+}
+
 std::optional<SourceLineDirectiveGapResume> computeSourceLineDirectiveGapResume(
     StringRef fileText, uint64_t gapBegin, uint64_t gapEnd,
     uint64_t resumeOffset, StringRef defaultFileSpelling,
     SourceLineDirectiveLogicalLineRewriter logicalLineRewriter,
     SmallVectorImpl<uint64_t> *acceptedMacroInvocationIds,
-    StringRef baseFileSpelling, bool allowUnknownFilenameOperand) {
+    StringRef baseFileSpelling, bool allowUnknownFilenameOperand,
+    StringRef initialLineMarkerFlags) {
   if (gapBegin >= gapEnd || gapEnd > fileText.size() || resumeOffset < gapEnd ||
       resumeOffset > fileText.size())
     return std::nullopt;
@@ -1941,7 +2028,7 @@ std::optional<SourceLineDirectiveGapResume> computeSourceLineDirectiveGapResume(
   size_t lastLineAfterDirective = 0;
   uint64_t lastAfterDirectiveOffset = gapBegin;
   std::string currentFileSpelling = defaultFileSpelling.str();
-  std::string currentLineMarkerFlags;
+  std::string currentLineMarkerFlags = initialLineMarkerFlags.str();
   const bool prefixHasLineControl =
       sourcePrefixMayContainLineControlDirective(fileText, gapBegin);
 

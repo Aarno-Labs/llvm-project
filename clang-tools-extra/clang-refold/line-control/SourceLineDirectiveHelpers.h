@@ -42,6 +42,8 @@
 namespace clang {
 namespace refold {
 
+class RefoldPreprocessingStructureIndex;
+
 using llvm::ArrayRef;
 using llvm::DenseSet;
 using llvm::SmallVector;
@@ -474,6 +476,36 @@ rewriteSourceLineDirectiveLogicalLineMacros(
 std::string
 formatSourceLineDirectiveGapResume(const SourceLineDirectiveGapResume &resume);
 
+/// Presumed file and line-marker flags in effect at one byte of an owner's
+/// source, before any directive of a gap starting there is applied.
+struct SourceLineControlState {
+  std::string fileSpelling;
+  std::string lineMarkerFlags;
+};
+
+/// Return the line-control state in effect immediately before \p offset in
+/// the source of \p file as owned by \p ownerIncludeId (std::nullopt for the
+/// translation unit), whose lexical inventory is \p structureIndex.
+///
+/// Every line-control directive the index finds ahead of \p offset is taken in
+/// source order.  One bound to a producer event supplies Clang's evaluated
+/// `logicalFileAfter`, and its spelling updates the line-marker flags through
+/// the shared grammar; a canonical `#line` whose operands that grammar cannot
+/// read, such as a macro call, keeps the prior flags.  An unbound directive is
+/// skipped only inside a conditional arm the producer did not select.  With no
+/// executed directive the file is \p physicalFileSpelling.
+///
+/// Returns std::nullopt when the state is not proven: an unbound directive
+/// outside a provably unselected arm, a directive straddling \p offset, a
+/// numeric marker the grammar cannot read, an event of the owner that no
+/// directive ahead of \p offset accounts for, or a header event that cannot be
+/// attributed to an include instance.
+std::optional<SourceLineControlState> sourceLineControlStateBefore(
+    const RefoldModel &model, const RefoldPathIdentity &paths,
+    const RefoldPreprocessingStructureIndex &structureIndex, StringRef file,
+    std::optional<uint64_t> ownerIncludeId, uint64_t offset,
+    StringRef physicalFileSpelling);
+
 /// Prove that a source gap is made only of trivia plus complete source-spelled
 /// `#line` directives, and compute the logical file/line state at
 /// `resumeOffset`.
@@ -484,13 +516,18 @@ formatSourceLineDirectiveGapResume(const SourceLineDirectiveGapResume &resume);
 /// source interval, so a directive before a consumed include line is rewritten
 /// to the line that the suffix would have observed after that include line had
 /// executed.
+///
+/// `defaultFileSpelling` and `initialLineMarkerFlags` are the state in effect
+/// at `gapBegin`, which a directive without a filename operand keeps; callers
+/// obtain them from sourceLineControlStateBefore().
 std::optional<SourceLineDirectiveGapResume> computeSourceLineDirectiveGapResume(
     StringRef fileText, uint64_t gapBegin, uint64_t gapEnd,
     uint64_t resumeOffset, StringRef defaultFileSpelling,
     SourceLineDirectiveLogicalLineRewriter logicalLineRewriter = nullptr,
     SmallVectorImpl<uint64_t> *acceptedMacroInvocationIds = nullptr,
     StringRef baseFileSpelling = StringRef(),
-    bool allowUnknownFilenameOperand = false);
+    bool allowUnknownFilenameOperand = false,
+    StringRef initialLineMarkerFlags = StringRef());
 
 } // namespace refold
 } // namespace clang

@@ -2566,6 +2566,40 @@ RefoldMapBuilder::computeCurrentMacroStateDirectivePhysicalExtent(
   return {{HashOffset, End}};
 }
 
+std::optional<std::pair<uint64_t, uint64_t>>
+RefoldMapBuilder::computeCurrentLineControlDirectiveExtent(
+    SourceLocation AfterLoc) {
+  const SourceLocation HashLoc =
+      SM.getFileLoc(PP.getCurrentDirectiveIntroducerLoc());
+  const SourceLocation EndLoc = SM.getFileLoc(AfterLoc);
+  if (!HashLoc.isValid() || !EndLoc.isValid())
+    return std::nullopt;
+
+  // Both locations must describe one directive in one file; anything else means
+  // the side channel was observed outside the directive that renamed the file.
+  const FileID FID = SM.getFileID(HashLoc);
+  if (SM.getFileID(EndLoc) != FID)
+    return std::nullopt;
+
+  bool Invalid = false;
+  StringRef Buf = SM.getBufferData(FID, &Invalid);
+  if (Invalid)
+    return std::nullopt;
+
+  const size_t HashOffset = SM.getFileOffset(HashLoc);
+  const size_t EndOffset = SM.getFileOffset(EndLoc);
+  if (HashOffset >= EndOffset || EndOffset > Buf.size() ||
+      Buf[HashOffset] != '#')
+    return std::nullopt;
+
+  // The directive handler has lexed through the end-of-directive token, so the
+  // lexer stands just past the newline that terminated the logical line.
+  const char Last = Buf[EndOffset - 1];
+  if (Last != '\n' && Last != '\r')
+    return std::nullopt;
+  return {{HashOffset, EndOffset}};
+}
+
 std::string RefoldMapBuilder::absolutePathFor(const clang::FileEntryRef &FER) {
   if (auto RP = FER.getFileEntry().tryGetRealPathName(); !RP.empty())
     return RP.str();
@@ -3569,7 +3603,11 @@ void RefoldMapBuilder::onLineControlDirective(SourceLocation Loc) {
   if (!IncludeStack.empty() && IncludeStack.back())
     Ev.OwnerIncludeId = Items[*IncludeStack.back()].ID;
 
-  if (auto Site = findLineControlDirectiveLineNearLoc(SM, Loc)) {
+  std::optional<std::pair<uint64_t, uint64_t>> Site =
+      computeCurrentLineControlDirectiveExtent(Loc);
+  if (!Site)
+    Site = findLineControlDirectiveLineNearLoc(SM, Loc);
+  if (Site) {
     Ev.SiteBegin = Site->first;
     Ev.SiteEnd = Site->second;
 

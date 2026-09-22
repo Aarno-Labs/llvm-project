@@ -1045,7 +1045,8 @@ std::optional<StringRef> sourceLineDirectiveGapUndefinedMacro(
 ///     on its position;
 ///   * the consumed source between \p sourceBegin and the gap holds no
 ///     directive, `_Pragma` operator or recorded pragma, so removing it leaves
-///     the macro state the operands see unchanged; and
+///     the macro state the operands see, and the presumed file a directive
+///     without a filename operand keeps, unchanged; and
 ///   * the replacement text emitted ahead of the gap holds no directive either.
 ///     The caller checks this one once that text exists.
 ///
@@ -2639,11 +2640,8 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   SmallVector<std::pair<uint64_t, uint64_t>, 4>
       mixedPreservedSourceLineDirectiveGapPieces;
   std::optional<SourceLineDirectiveGapResume> mixedSourceLineDirectiveResume;
-  // Set only while exactly one consumed gap needs a resume: with two, the
-  // later gap's spelling alone can lose a filename the earlier one set.
   std::optional<SourceLineDirectiveGapRespelling>
       mixedSourceLineDirectiveRespelling;
-  size_t mixedSourceLineDirectiveResumeGaps = 0;
 
   // Prove a mixed TU/include closure.
   //
@@ -3164,12 +3162,18 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
         if (*macro.invB < gapBegin || gapEnd < *macro.invE)
           continue;
 
+        std::optional<SourceLineControlState> stateAtGap =
+            sourceLineControlStateBefore(model_, paths_,
+                                         preprocessingStructureIndex_, tuPath,
+                                         std::nullopt, gapBegin, tuPath);
         SmallVector<uint64_t, 4> acceptedMacroIds;
-        if (!computeSourceLineDirectiveGapResume(
-                tuBytes, gapBegin, gapEnd, sourceEnd, tuPath,
-                sourceLineDirectiveLineRewriter, &acceptedMacroIds, StringRef(),
+        if (!stateAtGap ||
+            !computeSourceLineDirectiveGapResume(
+                tuBytes, gapBegin, gapEnd, sourceEnd, stateAtGap->fileSpelling,
+                sourceLineDirectiveLineRewriter, &acceptedMacroIds, tuPath,
                 !sourceSuffixMayObservePresumedFileSpelling(
-                    model_, tuPath, sourceEnd, paths_, tuBytes)))
+                    model_, tuPath, sourceEnd, paths_, tuBytes),
+                stateAtGap->lineMarkerFlags))
           continue;
 
         recordSourceLineDirectiveMacroIds(acceptedMacroIds);
@@ -3282,15 +3286,23 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
                   /*allowTUConditionalControl=*/true))
             return true;
 
+          // A directive without a filename operand keeps the presumed file in
+          // effect at the gap, which an earlier `#line` may have set.
+          std::optional<SourceLineControlState> stateAtGap =
+              sourceLineControlStateBefore(model_, paths_,
+                                           preprocessingStructureIndex_, tuPath,
+                                           std::nullopt, gapBegin, tuPath);
           SmallVector<uint64_t, 4> acceptedMacroIds;
           const bool allowUnknownFilenameOperand =
               !sourceSuffixMayObservePresumedFileSpelling(
                   model_, tuPath, sourceEnd, paths_, tuBytes);
-          if (std::optional<SourceLineDirectiveGapResume> lineResume =
-                  computeSourceLineDirectiveGapResume(
-                      tuBytes, gapBegin, gapEnd, sourceEnd, tuPath,
-                      sourceLineDirectiveLineRewriter, &acceptedMacroIds,
-                      StringRef(), allowUnknownFilenameOperand)) {
+          std::optional<SourceLineDirectiveGapResume> lineResume;
+          if (stateAtGap)
+            lineResume = computeSourceLineDirectiveGapResume(
+                tuBytes, gapBegin, gapEnd, sourceEnd, stateAtGap->fileSpelling,
+                sourceLineDirectiveLineRewriter, &acceptedMacroIds, tuPath,
+                allowUnknownFilenameOperand, stateAtGap->lineMarkerFlags);
+          if (lineResume) {
             // A source-spelled line-control directive contributes no PP
             // tokens, but it is not disposable trivia.  If the copied
             // suffix has no live line-state observer, preserve the original
@@ -3310,16 +3322,19 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
                   "from gap=[{0},{1})",
                   gapBegin, gapEnd);
             } else {
-              mixedSourceLineDirectiveRespelling.reset();
-              if (++mixedSourceLineDirectiveResumeGaps == 1)
-                mixedSourceLineDirectiveRespelling =
-                    proveSourceLineDirectiveGapRespelling(
-                        model_, paths_, lexLang_, tuPath, tuBytes, sourceBegin,
-                        gapBegin, gapEnd, *lineResume,
-                        computeSourceLineDirectiveGapResume(
-                            tuBytes, gapBegin, gapEnd, gapEnd, tuPath,
-                            sourceLineDirectiveLineRewriter, nullptr,
-                            StringRef(), allowUnknownFilenameOperand));
+              // The last directive-bearing gap sets the suffix's state, so
+              // each one replaces the previous gap's decision.  An earlier gap
+              // lies in this one's consumed prefix, which the proof refuses.
+              mixedSourceLineDirectiveRespelling =
+                  proveSourceLineDirectiveGapRespelling(
+                      model_, paths_, lexLang_, tuPath, tuBytes, sourceBegin,
+                      gapBegin, gapEnd, *lineResume,
+                      computeSourceLineDirectiveGapResume(
+                          tuBytes, gapBegin, gapEnd, gapEnd,
+                          stateAtGap->fileSpelling,
+                          sourceLineDirectiveLineRewriter, nullptr, tuPath,
+                          allowUnknownFilenameOperand,
+                          stateAtGap->lineMarkerFlags));
               mixedSourceLineDirectiveResume = std::move(lineResume);
               REFOLD_LOG_TRACE(
                   "fallback",

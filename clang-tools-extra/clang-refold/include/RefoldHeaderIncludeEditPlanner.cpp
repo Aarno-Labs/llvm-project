@@ -1139,14 +1139,21 @@ bool RefoldHeaderIncludeEditPlanner::ProveHeaderSourceEnvelopeGap(
         state.include.id, std::move(builtinMacroResolver));
   };
 
-  if (std::optional<SourceLineDirectiveGapResume> lineResume =
-          computeSourceLineDirectiveGapResume(
-              state.headerText, gapBegin, gapEnd, sourceEnvelope.end,
-              state.file, headerSourceLineDirectiveLineRewriter, nullptr,
-              model_.GetSourcePath(),
-              !sourceSuffixMayObservePresumedFileSpelling(
-                  model_, state.file, sourceEnvelope.end, paths_,
-                  state.headerText))) {
+  // A directive without a filename operand keeps the presumed file in effect
+  // at the gap, which an earlier `#line` in this include instance may have set.
+  std::optional<SourceLineControlState> stateAtGap =
+      sourceLineControlStateBefore(model_, paths_, structureIndex, state.file,
+                                   state.include.id, gapBegin, state.file);
+  std::optional<SourceLineDirectiveGapResume> lineResume;
+  if (stateAtGap)
+    lineResume = computeSourceLineDirectiveGapResume(
+        state.headerText, gapBegin, gapEnd, sourceEnvelope.end,
+        stateAtGap->fileSpelling, headerSourceLineDirectiveLineRewriter,
+        nullptr, model_.GetSourcePath(),
+        !sourceSuffixMayObservePresumedFileSpelling(
+            model_, state.file, sourceEnvelope.end, paths_, state.headerText),
+        stateAtGap->lineMarkerFlags);
+  if (lineResume) {
     // Header full-envelope widening uses the same owner-piece gap proof as
     // TU/include closure. A source-spelled line-control gap is not disposable
     // trivia, but it is preservable by carrying its net line state forward to
