@@ -1000,6 +1000,10 @@ public:
     uint64_t repeatedSpellingGroupStart = 0;
     uint64_t repeatedSpellingGroupEnd = 0;
 
+    // Exclusive end of a root invocation's whole cover that the run consumes
+    // as its callsite spelling; tokens before it add no new source bytes.
+    uint64_t callsiteCoverEnd = 0;
+
     PhysicalSourceRun currentRun;
 
     for (uint64_t pp = h.aStart; pp < h.aEnd; ++pp) {
@@ -1037,19 +1041,50 @@ public:
         return std::nullopt;
       }
 
+      // The rest of a consumed callsite cover is produced at that one
+      // callsite, which overlaps no preprocessing structure, so it shares the
+      // run's owner and arm; check that rather than assume it.
+      if (pp < callsiteCoverEnd) {
+        if (!deps_.pathIdentity.PathsEqual(physicalPath, entry.file) ||
+            physicalOwner->includeId != tokenOwner->includeId ||
+            structureIndex != tokenStructureIndex ||
+            physicalOwner->condArmId != tokenOwner->condArmId) {
+          return std::nullopt;
+        }
+        currentRun.aEnd = pp + 1;
+        continue;
+      }
+
+      // A function-like invocation's tokens map to its name and argument
+      // spellings, never to its whole extent, so the ordered walk below would
+      // see the rest of the callsite as a gap it cannot prove.  Where one is
+      // proven consumed whole, take its callsite spelling once in place of the
+      // cover's tokens.
+      uint64_t spellingBegin = entry.b;
+      uint64_t spellingEnd = entry.e;
+      const std::optional<RefoldMacroTopology::CallsiteWholeCover> callsite =
+          ConsumedCallsiteWholeCover(pp, entry.file, tokenOwner->includeId,
+                                     h.aEnd, *tokenStructureIndex);
+      const bool consumesCallsite = callsite.has_value();
+      if (consumesCallsite) {
+        spellingBegin = callsite->sourceBegin;
+        spellingEnd = callsite->sourceEnd;
+        callsiteCoverEnd = callsite->aEnd;
+      }
+
       if (!physicalOwner) {
         physicalOwner = tokenOwner;
         physicalPath = entry.file;
         structureIndex = tokenStructureIndex;
         currentRun.aStart = pp;
         currentRun.aEnd = pp + 1;
-        currentRun.source = OwnerSourceRange::From(entry.file, entry.b, entry.e,
-                                                   tokenOwner->includeId);
+        currentRun.source = OwnerSourceRange::From(
+            entry.file, spellingBegin, spellingEnd, tokenOwner->includeId);
         currentRun.condArmId = tokenOwner->condArmId;
-        previousBegin = entry.b;
-        previousEnd = entry.e;
+        previousBegin = spellingBegin;
+        previousEnd = spellingEnd;
         repeatedSpellingGroupStart = pp;
-        repeatedSpellingGroupEnd = 0;
+        repeatedSpellingGroupEnd = consumesCallsite ? callsite->aEnd : 0;
         havePrevious = true;
         continue;
       }
@@ -1073,7 +1108,8 @@ public:
       // Prove it at the group's first repetition and consume the rest of the
       // proven cover by index, so a partially consumed expansion still falls
       // through to the refusal below.
-      if (havePrevious && entry.b == previousBegin && entry.e == previousEnd) {
+      if (!consumesCallsite && havePrevious && entry.b == previousBegin &&
+          entry.e == previousEnd) {
         if (pp >= repeatedSpellingGroupEnd) {
           const std::optional<std::pair<uint64_t, uint64_t>> wholeCover =
               deps_.macroTopology.WholeCoverForRepeatedSourceSpelling(
@@ -1109,28 +1145,30 @@ public:
       // source spellings.  Equality is a repeated physical mapping; a lower
       // offset is nonmonotone.  Either condition makes the direct structural
       // path unavailable rather than selecting one spelling heuristically.
-      if (!havePrevious || entry.b < previousBegin || entry.b < previousEnd) {
+      if (!havePrevious || spellingBegin < previousBegin ||
+          spellingBegin < previousEnd) {
         REFOLD_LOG_TRACE(
             "tiling/runplan",
             "abandoned: hunk A=[{0},{1}) pp={2} maps to source [{3},{4}) "
             "which is not strictly after the previous token's [{5},{6}); "
             "repeated physical spelling (macro expansion) or nonmonotone",
-            h.aStart, h.aEnd, pp, entry.b, entry.e, previousBegin, previousEnd);
+            h.aStart, h.aEnd, pp, spellingBegin, spellingEnd, previousBegin,
+            previousEnd);
         return std::nullopt;
       }
 
       bool crossesProtectedStructure = false;
       bool crossesConditionalControl = false;
       ProtectedGapFacts gapFacts;
-      if (previousEnd < entry.b) {
+      if (previousEnd < spellingBegin) {
         // Canonical run construction and later state-gap discharge must use
         // the same physical byte-cover theorem.  Treat every indexed
         // preprocessing interval as an opaque preserved source piece and
         // require exact lexer trivia between those pieces.  This removes the
         // former second interval sorter/cursor proof from the tiler.
         std::optional<SourceGapProofResult> gapProof =
-            proveSourceGapWithIndexedStructureAndTrivia(*structureIndex,
-                                                        previousEnd, entry.b);
+            proveSourceGapWithIndexedStructureAndTrivia(
+                *structureIndex, previousEnd, spellingBegin);
         if (!gapProof)
           return std::nullopt;
 
@@ -1176,25 +1214,25 @@ public:
         }
         plan.runs.push_back(currentRun);
         plan.protectedGaps.push_back(OwnerSourceRange::From(
-            entry.file, previousEnd, entry.b, tokenOwner->includeId));
+            entry.file, previousEnd, spellingBegin, tokenOwner->includeId));
         plan.protectedGapFacts.push_back(std::move(gapFacts));
         currentRun.aStart = pp;
         currentRun.aEnd = pp + 1;
-        currentRun.source = OwnerSourceRange::From(entry.file, entry.b, entry.e,
-                                                   tokenOwner->includeId);
+        currentRun.source = OwnerSourceRange::From(
+            entry.file, spellingBegin, spellingEnd, tokenOwner->includeId);
         currentRun.condArmId = tokenOwner->condArmId;
       } else {
         if (physicalOwner->condArmId != tokenOwner->condArmId)
           return std::nullopt;
         currentRun.aEnd = pp + 1;
-        currentRun.source.end = entry.e;
+        currentRun.source.end = spellingEnd;
       }
 
       physicalOwner->condArmId = tokenOwner->condArmId;
-      previousBegin = entry.b;
-      previousEnd = entry.e;
+      previousBegin = spellingBegin;
+      previousEnd = spellingEnd;
       repeatedSpellingGroupStart = pp;
-      repeatedSpellingGroupEnd = 0;
+      repeatedSpellingGroupEnd = consumesCallsite ? callsite->aEnd : 0;
     }
 
     if (!havePrevious || currentRun.aEnd <= currentRun.aStart ||
@@ -2969,12 +3007,38 @@ private:
     return LookupStructureIndexForSource(source).index;
   }
 
+  /// Return the root invocation whose whole cover begins at \p pp when the
+  /// A range ending at \p aEnd consumes all of it and its callsite spelling
+  /// overlaps no preprocessing structure in \p structureIndex.
+  ///
+  /// Both the physical run plan and the TU segment projection consume such a
+  /// callsite as one spelling, so they must admit it under this one rule or a
+  /// segment's source would disagree with the run it is matched against.  A
+  /// callsite with a directive inside its argument list is refused here and
+  /// left to the per-token walk, which refuses it too.
+  std::optional<RefoldMacroTopology::CallsiteWholeCover>
+  ConsumedCallsiteWholeCover(
+      uint64_t pp, StringRef file, std::optional<uint64_t> ownerIncludeId,
+      uint64_t aEnd,
+      const RefoldPreprocessingStructureIndex &structureIndex) const {
+    std::optional<RefoldMacroTopology::CallsiteWholeCover> callsite =
+        deps_.macroTopology.RootWholeCoverAtCallsite(pp, file, ownerIncludeId,
+                                                     aEnd);
+    if (!callsite || structureIndex.HasOverlapping(callsite->sourceBegin,
+                                                   callsite->sourceEnd))
+      return std::nullopt;
+    return callsite;
+  }
+
   std::optional<OwnerSourceRange>
   MappedTUSourceRangeForTokens(uint64_t aStart, uint64_t aEnd) const {
     const auto &tokmapByPP = deps_.model.GetTokmapByPP();
     uint64_t sourceBegin = std::numeric_limits<uint64_t>::max();
     uint64_t sourceEnd = 0;
     bool sawTU = false;
+    const RefoldPreprocessingStructureIndex *structureIndex =
+        GetStructureIndexForSource(
+            OwnerSourceRange::From(deps_.tuPath, 0, 0, std::nullopt));
 
     for (uint64_t pp = aStart; pp < aEnd; ++pp) {
       auto it = tokmapByPP.find(pp);
@@ -2983,8 +3047,21 @@ private:
       const RefoldModel::TokMapEntry &entry = it->second;
       if (!deps_.pathIdentity.PathsEqual(entry.file, deps_.tuPath))
         return std::nullopt;
-      sourceBegin = std::min<uint64_t>(sourceBegin, entry.b);
-      sourceEnd = std::max<uint64_t>(sourceEnd, entry.e);
+      uint64_t spellingBegin = entry.b;
+      uint64_t spellingEnd = entry.e;
+      // A consumed callsite contributes its whole spelling, as it does in the
+      // physical run plan; its argument tokens alone would omit the name.
+      if (structureIndex) {
+        if (const std::optional<RefoldMacroTopology::CallsiteWholeCover>
+                callsite = ConsumedCallsiteWholeCover(
+                    pp, deps_.tuPath, std::nullopt, aEnd, *structureIndex)) {
+          spellingBegin = callsite->sourceBegin;
+          spellingEnd = callsite->sourceEnd;
+          pp = callsite->aEnd - 1;
+        }
+      }
+      sourceBegin = std::min<uint64_t>(sourceBegin, spellingBegin);
+      sourceEnd = std::max<uint64_t>(sourceEnd, spellingEnd);
       sawTU = true;
     }
 

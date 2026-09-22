@@ -1294,6 +1294,10 @@ RefoldTUAnchorProof::PlanTUByteSpan(uint64_t a0, uint64_t a1,
   uint64_t repeatedSpellingGroupStart = 0;
   uint64_t repeatedSpellingGroupEnd = 0;
 
+  // Exclusive end of a root invocation's whole cover that the span consumes
+  // as its callsite spelling; tokens before it are already accounted for.
+  uint64_t callsiteCoverEnd = 0;
+
   for (uint64_t pp = a0; pp < a1; ++pp) {
     if (duplicateTokmapPP_.count(pp) != 0) {
       return reject("duplicate producer token mapping inside A envelope",
@@ -1314,6 +1318,49 @@ RefoldTUAnchorProof::PlanTUByteSpan(uint64_t a0, uint64_t a1,
             entry.b, entry.e)) {
       return reject("A token lacks one exact in-bounds TU spelling",
                     "owner-specific realization/fallback path");
+    }
+
+    if (pp < callsiteCoverEnd)
+      continue;
+
+    // A function-like invocation's tokens map to its name and argument
+    // spellings, never to its whole extent, so the per-token walk below would
+    // see the rest of the callsite as an unproved gap.  When the producer's
+    // records prove this token begins a root invocation's whole cover and the
+    // span consumes all of it, consume the recorded callsite spelling once in
+    // place of the cover's tokens.  The ordered checks below still apply to
+    // that spelling, so no token outside the cover may be spelled inside it.
+    // A callsite spelling that overlaps preprocessing structure -- a directive
+    // inside the argument list -- is left to the per-token walk, which refuses
+    // it, rather than admitting the directive as removable callsite bytes.
+    const std::optional<RefoldMacroTopology::CallsiteWholeCover> callsite =
+        deps_.macroTopology.RootWholeCoverAtCallsite(pp, tuPath, std::nullopt,
+                                                     a1);
+    if (callsite && !deps_.preprocessingStructureIndex.HasOverlapping(
+                        callsite->sourceBegin, callsite->sourceEnd)) {
+      if (havePrevious) {
+        if (callsite->sourceBegin < previousEnd)
+          return reject("mapped TU token spellings are nonmonotone or overlap",
+                        "safe owner/fallback path");
+        if (previousEnd < callsite->sourceBegin &&
+            !ProveDirectTUGapWithMacroRepairEvidence(previousEnd,
+                                                     callsite->sourceBegin)) {
+          return reject("internal source gap is neither exact ordinary "
+                        "direct-TU trivia nor complete macro-state repair "
+                        "evidence",
+                        "structural hunk tiling");
+        }
+      } else {
+        spanBegin = callsite->sourceBegin;
+        havePrevious = true;
+      }
+      previousBegin = callsite->sourceBegin;
+      previousEnd = callsite->sourceEnd;
+      spanEnd = callsite->sourceEnd;
+      repeatedSpellingGroupStart = pp;
+      repeatedSpellingGroupEnd = callsite->aEnd;
+      callsiteCoverEnd = callsite->aEnd;
+      continue;
     }
 
     if (!havePrevious) {

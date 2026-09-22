@@ -370,6 +370,67 @@ RefoldMacroTopology::WholeCoverForRepeatedSourceSpelling(
   return cover;
 }
 
+std::optional<RefoldMacroTopology::CallsiteWholeCover>
+RefoldMacroTopology::RootWholeCoverAtCallsite(
+    uint64_t aStart, StringRef file, std::optional<uint64_t> ownerIncludeId,
+    uint64_t consumedAEnd) const {
+  // An invocation whose cover begins at `aStart` has an envelope stabbing
+  // `aStart`, so it is registered in that bucket; scanning the bucket is the
+  // exhaustive scan, which is what makes the uniqueness check below a proof.
+  BuildMacroStabIndex();
+  const uint64_t stabBucket = aStart / MacroStabBucketWidth;
+  if (stabBucket >= macroStabBuckets_.size())
+    return std::nullopt;
+  ArrayRef<RefoldModel::MacroInvocation> invocations =
+      model_.GetMacroInvocations();
+
+  const RefoldModel::MacroInvocation *root = nullptr;
+  std::optional<std::pair<uint64_t, uint64_t>> rootCover;
+  for (uint32_t candidateIndex : macroStabBuckets_[stabBucket]) {
+    const RefoldModel::MacroInvocation &m = invocations[candidateIndex];
+    if (m.callerMacroId || m.ownerIncludeId != ownerIncludeId)
+      continue;
+    const std::optional<std::pair<uint64_t, uint64_t>> cover =
+        RefoldMacroWholeCoverProof::GetWholeCoverATokRange(m);
+    if (!cover || cover->first != aStart)
+      continue;
+    // Two roots claiming one first token is a malformed record; do not pick.
+    if (root)
+      return std::nullopt;
+    root = &m;
+    rootCover = cover;
+  }
+
+  if (!root || !root->invFile || !root->invB || !root->invE ||
+      *root->invB >= *root->invE || !paths_.PathsEqual(*root->invFile, file) ||
+      IsInvocationInsideDefineDirective(*root) ||
+      rootCover->second > consumedAEnd ||
+      !RefoldMacroWholeCoverProof::MacroWholeCoverIsSelfContained(*root)) {
+    return std::nullopt;
+  }
+
+  // The cover's tokens must all be spelled inside the callsite, or replacing
+  // the callsite would leave source behind that still produces some of them,
+  // e.g. a function-like macro name produced by the expansion that consumes a
+  // following argument list the record does not include.  That no token
+  // outside the cover is spelled inside the callsite is the caller's ordered
+  // walk to establish.
+  const auto &tokmapByPP = model_.GetTokmapByPP();
+  for (uint64_t coverPP = rootCover->first; coverPP < rootCover->second;
+       ++coverPP) {
+    auto coverIt = tokmapByPP.find(coverPP);
+    if (coverIt == tokmapByPP.end())
+      return std::nullopt;
+    const RefoldModel::TokMapEntry &coverEntry = coverIt->second;
+    if (coverEntry.pp != coverPP || !paths_.PathsEqual(coverEntry.file, file) ||
+        coverEntry.b < *root->invB || coverEntry.e > *root->invE)
+      return std::nullopt;
+  }
+
+  return CallsiteWholeCover{rootCover->first, rootCover->second, *root->invB,
+                            *root->invE};
+}
+
 void RefoldMacroTopology::BuildMacroStabIndex() const {
   if (macroStabIndexBuilt_)
     return;
