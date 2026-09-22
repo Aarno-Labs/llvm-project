@@ -909,7 +909,7 @@ bool RefoldEngine::StageSidebandEdits(
   return appendSidebandPragmaSourceEdits(
       sidebandPragmaEdits_, model_, tuPath, tuBytes, pathIdentity_,
       *textEditCertifier_, *lineObserverLayout_,
-      proofServices_->AcceptedCandidateBuilder(), terminalSink_,
+      proofServices_->AcceptedCandidateBuilder(), terminalSink_, lexLang_,
       structuralHunkDispatcher);
 }
 

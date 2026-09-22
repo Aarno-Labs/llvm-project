@@ -792,12 +792,19 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
          sideband.OwnsTrailingReplayBlankLine()) ||
         lineControlProof_.OwnerSuffixHasLineStateSensitiveBuiltin(
             includeId, headerPath, sourceRange.second);
-    ResyncOutcome ro =
-        mustPreserveHeaderLineState
-            ? lineObserverLayout_.ApplyResyncOrPend(
-                  bytes, sourceRange.first, sourceRange.second,
-                  sideband.ReplacementText(), headerPath, includeId)
-            : ResyncOutcome(sideband.ReplacementText().str(), std::nullopt);
+    // B deletes the pragma, not the comments on its site; keep them.  They
+    // are not B text, so the certified replay ranges below do not cover them.
+    const std::string replacement =
+        sideband.ReplacementText().empty()
+            ? keptCommentsOfDeletedSidebandSite(
+                  StringRef(bytes).slice(sourceRange.first, sourceRange.second),
+                  lexLang_)
+            : sideband.ReplacementText().str();
+    ResyncOutcome ro = mustPreserveHeaderLineState
+                           ? lineObserverLayout_.ApplyResyncOrPend(
+                                 bytes, sourceRange.first, sourceRange.second,
+                                 replacement, headerPath, includeId)
+                           : ResyncOutcome(replacement, std::nullopt);
     TextEdit edit{sourceRange.first,
                   sourceRange.second,
                   std::move(ro.text),

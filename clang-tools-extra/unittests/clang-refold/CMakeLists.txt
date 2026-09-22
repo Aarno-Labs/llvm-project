@@ -21,6 +21,7 @@ add_extra_unittest(ClangRefoldTests
   RefoldHirschbergProgressTests.cpp
   RefoldLineControlLookbackTests.cpp
   RefoldLineControlPruneIdentityTests.cpp
+  RefoldSidebandKeptCommentTests.cpp
   )
 
 clang_target_link_libraries(ClangRefoldTests

@@ -35,6 +35,7 @@
 #include <vector>
 
 namespace clang {
+class LangOptions;
 namespace refold {
 
 class RefoldLineObserverLayout;
@@ -155,7 +156,22 @@ bool appendSidebandPragmaSourceEdits(
     const RefoldLineObserverLayout &lineObserverLayout,
     const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
     const RefoldTerminalProofSink &terminalSink,
+    const clang::LangOptions &lexLang,
     RefoldStructuralHunkDispatcher &structuralHunkDispatcher);
+
+/// Return the text that replaces a pragma site B deletes, so the site's
+/// comments survive the deletion.
+///
+/// `siteText` is the complete source site of one sideband pragma: a logical
+/// directive line or a `_Pragma` operator.  The result holds every complete
+/// comment on the site, in source order and separated by one space, followed
+/// by a newline when the site ends with one.  A comment is preprocessing
+/// whitespace, so the result contributes no token.  The result is empty when
+/// the site holds no comment, or when it ends in a line comment but not in a
+/// newline, since no line-neutral spelling can then keep it.
+std::string
+keptCommentsOfDeletedSidebandSite(llvm::StringRef siteText,
+                                  const clang::LangOptions &lexLang);
 
 /// Return whether a zero-width TU insertion lands at the include-boundary just
 /// before a materialized include that owns a sideband pragma edit.

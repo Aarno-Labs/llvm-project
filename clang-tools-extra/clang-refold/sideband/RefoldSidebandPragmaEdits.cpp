@@ -22,6 +22,7 @@
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTerminalProofSink.h"
 #include "source/DiffAlgorithms.h"
+#include "source/RefoldPreprocessingDirectiveScanner.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
 #include "support/RefoldLog.h"
 #include "support/StringUtils.h"
@@ -2783,6 +2784,7 @@ bool appendSidebandPragmaSourceEdits(
     const RefoldLineObserverLayout &lineObserverLayout,
     const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
     const RefoldTerminalProofSink &terminalSink,
+    const clang::LangOptions &lexLang,
     RefoldStructuralHunkDispatcher &structuralHunkDispatcher) {
   if (sidebandPragmaEdits.empty())
     return true;
@@ -2900,6 +2902,12 @@ bool appendSidebandPragmaSourceEdits(
     else
       foldedReplacement = foldPragmaDirectiveBackIntoOperator(
           siteText, sideband.ReplacementText());
+    // B deletes the pragma, not the comments on its site; keep them.  The
+    // materialized output range stays empty because none of it is B text.
+    const bool deletesSite = !argFold && sideband.ReplacementText().empty() &&
+                             foldedReplacement.empty();
+    if (deletesSite)
+      foldedReplacement = keptCommentsOfDeletedSidebandSite(siteText, lexLang);
 
     ResyncOutcome ro = lineObserverLayout.ApplyResyncOrPend(
         tuBytes, sourceRange.first, sourceRange.second, foldedReplacement,
@@ -2930,7 +2938,7 @@ bool appendSidebandPragmaSourceEdits(
 
     const bool folded =
         StringRef(foldedReplacement) != sideband.ReplacementText();
-    if (!folded) {
+    if (!folded || deletesSite) {
       textEditCertifier.CertifyTextEditMaterializedBReplayProof(edit, sideband);
     } else {
       // The replay text was re-materialized into the `_Pragma(...)` operator
@@ -2955,6 +2963,30 @@ bool appendSidebandPragmaSourceEdits(
   }
 
   return true;
+}
+
+std::string keptCommentsOfDeletedSidebandSite(StringRef siteText,
+                                              const LangOptions &lexLang) {
+  const PreprocessingDirectiveScanResult scan =
+      scanPreprocessingDirectives(siteText, lexLang);
+  if (!scan.IsComplete() || scan.commentIntervals.empty())
+    return std::string();
+
+  std::string kept;
+  for (const PreprocessingTriviaInterval &comment : scan.commentIntervals) {
+    if (!kept.empty())
+      kept.push_back(' ');
+    kept += siteText.slice(comment.begin, comment.end).str();
+  }
+  const bool endsWithNewline =
+      sourceTextEndsWithNonSplicedPhysicalNewline(siteText, lexLang);
+  const PreprocessingTriviaInterval &last = scan.commentIntervals.back();
+  if (!endsWithNewline &&
+      siteText.slice(last.begin, last.end).starts_with("//"))
+    return std::string();
+  if (endsWithNewline)
+    kept.push_back('\n');
+  return kept;
 }
 
 bool tuInsertionBeforeMaterializedInclude(
