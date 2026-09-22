@@ -2931,6 +2931,27 @@ bool projectLcsBoundaryToOptimalBFrontiers(
       static_cast<size_t>(aBoundary - aBegin), result);
 }
 
+bool projectLcsBoundaryToOptimalBFrontiers(
+    ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
+    ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd, uint64_t aBoundary,
+    ArrayRef<uint32_t> ownerDepthGap, LcsBoundaryFrontierProjection &result) {
+  result = LcsBoundaryFrontierProjection{};
+  result.aBoundary = aBoundary;
+  if (!hasBoundaryVectorSize(a.size(), ownerDepthGap.size()) ||
+      aBegin > aBoundary || aBoundary > aEnd || aEnd > a.size() ||
+      bBegin > bEnd || bEnd > b.size() || bEnd > MAX)
+    return false;
+
+  const size_t absoluteABegin = static_cast<size_t>(aBegin);
+  const size_t aWidth = static_cast<size_t>(aEnd - aBegin);
+  const size_t bWidth = static_cast<size_t>(bEnd - bBegin);
+  return projectBoundaryWithOwnerDepth(
+      a.slice(absoluteABegin, aWidth),
+      b.slice(static_cast<size_t>(bBegin), bWidth),
+      ownerDepthGap.slice(absoluteABegin, aWidth + 1), aBegin, bBegin,
+      static_cast<size_t>(aBoundary - aBegin), result);
+}
+
 std::vector<uint64_t> nominateLcsPartitionBoundaries(
     ArrayRef<LcsAGapProvenance> gapProvenance,
     ArrayRef<int64_t> forcedMap,

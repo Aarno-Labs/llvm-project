@@ -858,10 +858,13 @@ scanPreprocessingDirectives(StringRef sourceBytes,
     // not direct A-token spellings.  Excluding them also preserves byte-level
     // boundaries inside ordinary whitespace when a caller configures the raw
     // lexer to emit an entire whitespace run as one token.
-    if (isCommentToken(token) ||
-        isRawWhitespaceToken(sourceBytes, token, lexLang)) {
+    if (isCommentToken(token)) {
+      result.commentIntervals.push_back(
+          PreprocessingTriviaInterval{token.begin, token.end});
       continue;
     }
+    if (isRawWhitespaceToken(sourceBytes, token, lexLang))
+      continue;
     result.lexicalTokenIntervals.push_back(
         PreprocessingLexicalTokenInterval{token.begin, token.end});
   }

@@ -21,6 +21,7 @@
 #include "source/RefoldAlignmentSemanticResolver.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstddef>
@@ -241,6 +242,40 @@ private:
   /// pure spellings-to-lexemes transform.
   static std::vector<llvm::StringRef> MapLexemes(llvm::ArrayRef<PPTok> toks,
                                                  llvm::ArrayRef<size_t> offs);
+
+  /// Split every hunk at the interior A gaps that hold a source comment.
+  ///
+  /// A hunk replaces the source bytes from its first A token to its last, so a
+  /// comment in a gap between two of its A tokens is lost even when no optimal
+  /// alignment needs either token replaced.  Splitting the hunk into
+  /// `A[aStart,g)->B[bStart,j)` and `A[g,aEnd)->B[j,bEnd)` leaves the A gap
+  /// `g` outside both pieces.  The concatenated replacements are still exactly
+  /// `B[bStart,bEnd)`, so the split is token-sound for every `j`; it adds no
+  /// alignment anchor and changes no selected map.
+  ///
+  /// `j` is the latest B frontier at which some core-optimal path of the hunk
+  /// rectangle crosses `g`.  That places the comment directly before the A
+  /// token it precedes in the source.  Only gaps accepted by
+  /// `AGapHoldsPreservableComment` are split, and only inside a certified
+  /// window; every other hunk is returned unchanged.
+  std::vector<diffutils::Hunk>
+  SplitHunksAtCommentGaps(llvm::ArrayRef<llvm::StringRef> aSeq,
+                          llvm::ArrayRef<llvm::StringRef> bSeq,
+                          const diffutils::CertifiedLcsResult &alignment,
+                          std::vector<diffutils::Hunk> hunks) const;
+
+  /// Return whether A gap \p aGap lies between two plain source tokens of one
+  /// owner and its bytes are ordinary trivia holding a complete comment.
+  ///
+  /// Both adjacent A tokens must have exactly one tokmap entry, lie outside
+  /// every macro expansion, and share one file, include occurrence and
+  /// conditional arm.  The source bytes between them must be proven ordinary
+  /// internal trivia by that owner's structure index, which excludes every
+  /// directive and `_Pragma` operator, and must contain a complete comment.
+  /// \p duplicateTokmapPP holds the A tokens claimed by more than one tokmap
+  /// entry.
+  bool AGapHoldsPreservableComment(
+      uint64_t aGap, const llvm::DenseSet<uint64_t> &duplicateTokmapPP) const;
 
   /// Compute per-gap ownership depth for A-side PP-token gaps.
   ///

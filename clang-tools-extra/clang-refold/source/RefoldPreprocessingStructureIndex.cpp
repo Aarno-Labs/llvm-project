@@ -278,6 +278,8 @@ scanPreprocessingStructure(StringRef sourcePath, StringRef sourceBytes,
                                &triviaIntervals,
                            std::vector<PreprocessingIndivisibleTriviaInterval>
                                &indivisibleTriviaIntervals,
+                           std::vector<PreprocessingTriviaInterval>
+                               &commentIntervals,
                            std::vector<std::string> &diagnostics) {
   PreprocessingDirectiveScanResult lexicalScan =
       scanPreprocessingDirectives(sourceBytes, lexLang);
@@ -285,6 +287,7 @@ scanPreprocessingStructure(StringRef sourcePath, StringRef sourceBytes,
   triviaIntervals = std::move(lexicalScan.triviaIntervals);
   indivisibleTriviaIntervals =
       std::move(lexicalScan.indivisibleTriviaIntervals);
+  commentIntervals = std::move(lexicalScan.commentIntervals);
   diagnostics.insert(diagnostics.end(), lexicalScan.diagnostics.begin(),
                      lexicalScan.diagnostics.end());
 
@@ -1245,7 +1248,8 @@ RefoldPreprocessingStructureIndex RefoldPreprocessingStructureIndex::Build(
   std::vector<ScannedDirective> directives = scanPreprocessingStructure(
       sourcePath, sourceBytes, ownerIncludeId, deps.lexLang,
       index.lexicalTokenIntervals_, index.triviaIntervals_,
-      index.indivisibleTriviaIntervals_, protectionDiagnostics);
+      index.indivisibleTriviaIntervals_, index.commentIntervals_,
+      protectionDiagnostics);
 
   // Supplement directly scanned `_Pragma` expressions with producer-proven
   // expansion-derived occurrences before source ordering and conditional
@@ -1413,6 +1417,15 @@ bool RefoldPreprocessingStructureIndex::IsExactLexicalBoundary(
   return !componentIt->ContainsInteriorBoundary(offset);
 }
 
+bool RefoldPreprocessingStructureIndex::RangeContainsComment(
+    uint64_t begin, uint64_t end) const {
+  auto commentIt = std::lower_bound(
+      commentIntervals_.begin(), commentIntervals_.end(), begin,
+      [](const PreprocessingTriviaInterval &interval, uint64_t boundary) {
+        return interval.begin < boundary;
+      });
+  return commentIt != commentIntervals_.end() && commentIt->end <= end;
+}
 
 namespace {
 

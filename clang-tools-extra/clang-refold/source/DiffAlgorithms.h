@@ -838,6 +838,16 @@ bool projectLcsBoundaryToOptimalBFrontiers(
     uint64_t aBoundary, ArrayRef<LcsAGapProvenance> gapProvenance,
     LcsBoundaryFrontierProjection &result);
 
+/// Project one A boundary using the scalar owner-depth objective directly.
+///
+/// This is the same theorem as the provenance overload, which reads only the
+/// `ownerDepth` field of each gap profile. `ownerDepthGap` has one entry per
+/// A gap of the complete stream, `a.size() + 1` in all.
+bool projectLcsBoundaryToOptimalBFrontiers(
+    ArrayRef<StringRef> a, uint64_t aBegin, uint64_t aEnd,
+    ArrayRef<StringRef> b, uint64_t bBegin, uint64_t bEnd, uint64_t aBoundary,
+    ArrayRef<uint32_t> ownerDepthGap, LcsBoundaryFrontierProjection &result);
+
 /// Nominate deterministic, identity-bearing A partition boundaries.
 ///
 /// The returned vector is sorted and unique. It contains exact provenance
