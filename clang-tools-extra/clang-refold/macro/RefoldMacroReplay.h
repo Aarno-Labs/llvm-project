@@ -36,6 +36,16 @@ namespace refold {
 class RefoldMacroTopology;
 class RefoldSourceMapper;
 
+/// Reproduce Clang's `#` (stringize) operator on a macro-argument spelling.
+///
+/// White space and comments between tokens collapse to one space, leading and
+/// trailing white space is dropped, and each `\` and `"` belonging to a string
+/// literal or character constant is escaped.  Returns the literal with its
+/// quotes, or nullopt when \p lang is null.
+std::optional<std::string>
+stringizeMacroArgumentLikeClang(llvm::StringRef argText,
+                                const clang::LangOptions *lang);
+
 /// Provides shared occurrence-level macro replay helpers.
 ///
 /// The service recovers invocation occurrence surfaces and validates replay

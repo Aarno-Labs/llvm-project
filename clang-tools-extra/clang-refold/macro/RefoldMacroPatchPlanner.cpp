@@ -578,13 +578,14 @@ carryInteriorLineBreaks(StringRef baseArgText,
 /// Re-spell a certified argument replacement using the original call-site
 /// argument spelling wherever the two agree token-for-token.
 ///
-/// `newArgText` is derived from the modified preprocessed stream B, where an
-/// expansion occupies a single physical line.  Splicing it verbatim over an
-/// argument whose source spelling spanned several lines collapses the
-/// invocation onto one line.  That collapse is observable: `__LINE__` in the
-/// callee's replacement list takes the line of the invocation's *closing
-/// paren*, so a lost newline moves the observer and the closing check rejects
-/// the assembly.  Interior indentation and comments are lost the same way.
+/// `newArgText` is derived from the modified preprocessed stream B, which has
+/// no comments and puts an expansion on a single physical line.  Splicing it
+/// verbatim over the argument drops every comment and the original spacing,
+/// even around tokens the edit did not touch.  For an argument whose source
+/// spelling spanned several lines it also collapses the invocation onto one
+/// line, which is observable: `__LINE__` in the callee's replacement list
+/// takes the line of the invocation's *closing paren*, so a lost newline moves
+/// the observer and the closing check rejects the assembly.
 ///
 /// The repair aligns the two token sequences from both ends and copies only
 /// the differing interior out of `newArgText`, keeping the original bytes
@@ -603,11 +604,17 @@ carryInteriorLineBreaks(StringRef baseArgText,
 /// re-spaced by `carryInteriorLineBreaks`, so a whole-actual replacement keeps
 /// the original line count.  The caller asks for it only when a line observer
 /// expands inside the invocation, where that count is observable.
+///
+/// When the formal is \p stringified, the kept original gaps must also leave
+/// `#` unchanged: equal tokens with different white space between them
+/// stringify differently.  The result is then required to stringify exactly as
+/// `newArgText` does, or `std::nullopt` is returned.
 std::optional<RespelledArgumentReplacement>
 respellArgumentReplacementInBaseSpelling(StringRef baseArgText,
                                          StringRef newArgText,
                                          const LangOptions &lexLang,
-                                         bool keepInteriorLineBreaks) {
+                                         bool keepInteriorLineBreaks,
+                                         bool stringified) {
   SmallVector<RefoldLexBoundaryToken, 16> baseToks;
   SmallVector<RefoldLexBoundaryToken, 16> newToks;
   refoldLexBoundaryTokens(baseArgText, lexLang, baseToks);
@@ -631,6 +638,10 @@ respellArgumentReplacementInBaseSpelling(StringRef baseArgText,
   // The original spelling already carries the certified tokens; keep its bytes
   // whole rather than re-deriving them from B.
   if (prefix == baseCount && prefix == newCount) {
+    if (stringified &&
+        stringizeMacroArgumentLikeClang(baseArgText, &lexLang) !=
+            stringizeMacroArgumentLikeClang(newArgText, &lexLang))
+      return std::nullopt;
     RespelledArgumentReplacement identical;
     identical.text = baseArgText.str();
     return identical;
@@ -699,6 +710,9 @@ respellArgumentReplacementInBaseSpelling(StringRef baseArgText,
         resultToks[i].leadingSpace != newToks[i].leadingSpace)
       return std::nullopt;
   }
+  if (stringified && stringizeMacroArgumentLikeClang(out.text, &lexLang) !=
+                         stringizeMacroArgumentLikeClang(newArgText, &lexLang))
+    return std::nullopt;
 
   return out;
 }
@@ -771,49 +785,51 @@ RefoldMacroPatchPlanner::BuildInvocationRewriteWithRange(
       }
     }
 
-    // The replacement is derived from B, where the whole expansion sits on one
-    // physical line.  An argument whose original spelling spanned several lines
-    // must not be collapsed onto one: `__LINE__` in the callee's replacement
-    // list observes the line of the invocation's closing paren, so the collapse
-    // would move a preserved line observer.  Re-spell the certified replacement
-    // in the original argument's bytes when the two agree token for token
-    // outside the edit; the helper fails closed to the B text otherwise.
+    // The replacement is derived from B, which has no comments and puts the
+    // whole expansion on one physical line.  Re-spell the certified
+    // replacement in the original argument's bytes wherever the two agree
+    // token for token, so comments, spacing and line breaks outside the edit
+    // survive.  Line breaks are observable: `__LINE__` in the callee's
+    // replacement list takes the line of the invocation's closing paren.  The
+    // helper fails closed to the B text.
     const StringRef baseArgText = baseInvocationText.slice(r.begin, r.end);
     std::string respelledStorage;
-    if (baseArgText.contains('\n')) {
-      if (auto respelled = respellArgumentReplacementInBaseSpelling(
-              baseArgText, replacementText, *deps_.lexLang,
-              deps_.macroTopology->ExpansionContainsLineObserver(
-                  ctx.invocation.id))) {
-        std::optional<std::pair<uint64_t, uint64_t>> remapped;
-        if (respelled->interiorRespaced) {
-          // Re-spacing moved bytes inside the interior, so only an interval
-          // covering exactly the whole interior keeps a known image.
-          if (materializedRel &&
-              *materializedRel ==
-                  std::make_pair(respelled->newBegin, respelled->newEnd))
-            remapped =
-                std::make_pair(respelled->resultBegin, respelled->resultEnd);
-        } else if (materializedRel &&
-                   materializedRel->first >= respelled->newBegin &&
-                   materializedRel->second <= respelled->newEnd) {
-          const uint64_t remappedBegin =
-              respelled->resultBegin +
-              (materializedRel->first - respelled->newBegin);
-          const uint64_t remappedEnd =
-              remappedBegin +
-              (materializedRel->second - materializedRel->first);
-          remapped = std::make_pair(remappedBegin, remappedEnd);
-        }
+    const bool stringified = llvm::any_of(
+        ctx.invocation.stringifySpans, [&](const RefoldModel::PPArgSpan &span) {
+          return span.argIdx == argIdx;
+        });
+    if (auto respelled = respellArgumentReplacementInBaseSpelling(
+            baseArgText, replacementText, *deps_.lexLang,
+            deps_.macroTopology->ExpansionContainsLineObserver(
+                ctx.invocation.id),
+            stringified)) {
+      std::optional<std::pair<uint64_t, uint64_t>> remapped;
+      if (respelled->interiorRespaced) {
+        // Re-spacing moved bytes inside the interior, so only an interval
+        // covering exactly the whole interior keeps a known image.
+        if (materializedRel &&
+            *materializedRel ==
+                std::make_pair(respelled->newBegin, respelled->newEnd))
+          remapped =
+              std::make_pair(respelled->resultBegin, respelled->resultEnd);
+      } else if (materializedRel &&
+                 materializedRel->first >= respelled->newBegin &&
+                 materializedRel->second <= respelled->newEnd) {
+        const uint64_t remappedBegin =
+            respelled->resultBegin +
+            (materializedRel->first - respelled->newBegin);
+        const uint64_t remappedEnd =
+            remappedBegin + (materializedRel->second - materializedRel->first);
+        remapped = std::make_pair(remappedBegin, remappedEnd);
+      }
 
-        // A materialized output interval that does not land inside the spliced
-        // region has no proven image in the re-spelled bytes, so keep the
-        // uncollapsed replacement for that argument rather than guess one.
-        if (!materializedRel || remapped) {
-          respelledStorage = std::move(respelled->text);
-          replacementText = respelledStorage;
-          materializedRel = remapped;
-        }
+      // A materialized output interval that does not land inside the spliced
+      // region has no proven image in the re-spelled bytes, so keep the
+      // uncollapsed replacement for that argument rather than guess one.
+      if (!materializedRel || remapped) {
+        respelledStorage = std::move(respelled->text);
+        replacementText = respelledStorage;
+        materializedRel = remapped;
       }
     }
 

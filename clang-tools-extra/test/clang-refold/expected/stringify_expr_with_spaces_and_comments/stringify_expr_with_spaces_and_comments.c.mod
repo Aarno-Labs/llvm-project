@@ -3,5 +3,5 @@
 // test76: stringify expression with spaces/comments.
 //#include <string.h>
 #define S(x) #x
-const char *s76 = S(a - b);
+const char *s76 = S(a /*c*/ - b);
 int main(){ return (int)strlen(s76); }

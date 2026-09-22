@@ -30,8 +30,6 @@
 using namespace llvm;
 using namespace clang::refold;
 
-namespace {
-
 /// Reproduce Clang's `#` (stringize) operator on a macro-argument spelling.
 ///
 /// Per C 6.10.3.2 / [cpp.stringize], white space between the argument's
@@ -48,8 +46,8 @@ namespace {
 /// when \p lang is unavailable (the caller then falls back to conservative
 /// behavior and fails the replay closed).
 std::optional<std::string>
-stringizeMacroArgumentLikeClang(StringRef argText,
-                                const clang::LangOptions *lang) {
+clang::refold::stringizeMacroArgumentLikeClang(StringRef argText,
+                                               const clang::LangOptions *lang) {
   if (!lang)
     return std::nullopt;
 
@@ -106,8 +104,6 @@ stringizeMacroArgumentLikeClang(StringRef argText,
   out.push_back('"');
   return out;
 }
-
-} // namespace
 
 //===----------------------------------------------------------------------===//
 // RefoldMacroOccurrenceReplay
