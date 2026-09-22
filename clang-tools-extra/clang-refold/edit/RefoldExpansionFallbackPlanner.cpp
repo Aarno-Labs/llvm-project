@@ -1025,7 +1025,9 @@ struct TUPreservedGapPiece {
   enum class Kind {
     ZeroTokenMacroInvocation,
     ZeroTokenConditionalGroup,
-    BalancedPragmaStateIsland
+    BalancedPragmaStateIsland,
+    /// One complete comment token from a gap proven to be ordinary trivia.
+    Comment
   };
 
   Kind kind = Kind::ZeroTokenMacroInvocation;
@@ -1561,6 +1563,22 @@ public:
         gapBegin, gapEnd, includeCount, macroCount, macroDirectiveCount,
         conditionalGroupCount, conditionalDirectiveCount);
     return true;
+  }
+
+  /// Append each complete comment in an ordinary-trivia gap as a preserved
+  /// piece.
+  ///
+  /// The caller has already proven `[begin,end)` to be trivia with no
+  /// preprocessing structure, so a comment is the only source-visible text in
+  /// it.  A comment contributes no PP token, so re-emitting it anywhere in the
+  /// replacement leaves the B token stream unchanged.
+  void
+  CollectTriviaGapComments(uint64_t begin, uint64_t end,
+                           SmallVectorImpl<TUPreservedGapPiece> &out) const {
+    for (const PreprocessingTriviaInterval &comment :
+         preprocessingStructureIndex_.CommentsWithin(begin, end))
+      out.push_back({TUPreservedGapPiece::Kind::Comment, comment.begin,
+                     comment.end, /*id=*/0});
   }
 
   /// Return the original TU bytes a preserved gap piece re-emits, or the
@@ -3095,12 +3113,13 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     // The envelope may widen across physical gaps between required pieces, but
     // only across source-neutral control/trivia or complete zero-token source
-    // artifacts.  Complete comments and literal empty conditional-control
-    // islands are consumed with the replacement for the same reason as
-    // whitespace: they contribute no PP tokens and are physically inside the
-    // source interval whose A-side material was replaced by the B-side hunk.
-    // Any other byte would be meaningful source text that the proof has not
-    // justified replacing.
+    // artifacts.  Whitespace and literal empty conditional-control islands are
+    // consumed with the replacement: they contribute no PP tokens and are
+    // physically inside the source interval whose A-side material was replaced
+    // by the B-side hunk.  A comment in a gap that is otherwise ordinary trivia
+    // also contributes no PP token, but it is source text, so it is re-emitted
+    // after the replacement rather than consumed.  Any other byte would be
+    // meaningful source text that the proof has not justified replacing.
     // The source envelope was already computed from the normalized piece list
     // above.  At this point the only remaining common source-envelope proof
     // step is the inter-piece gap proof; avoid recomputing the same envelope
@@ -3116,8 +3135,13 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
             return true;
           }
           if (gapProver.GapIsIndexedPreservableIncludeClosureTrivia(gapBegin,
-                                                          gapEnd))
+                                                                    gapEnd)) {
+            // Whitespace is consumed with the replacement; comments are
+            // source text and are re-emitted.
+            gapProver.CollectTriviaGapComments(
+                gapBegin, gapEnd, mixedPreservedZeroTokenGapPieces);
             return true;
+          }
 
           SmallVector<TUPreservedGapPiece, 4> preservedZeroTokenPieces;
           if (gapProver.CollectPreservableZeroTokenGapPieces(gapBegin, gapEnd,

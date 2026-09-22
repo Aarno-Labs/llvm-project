@@ -1419,12 +1419,26 @@ bool RefoldPreprocessingStructureIndex::IsExactLexicalBoundary(
 
 bool RefoldPreprocessingStructureIndex::RangeContainsComment(
     uint64_t begin, uint64_t end) const {
-  auto commentIt = std::lower_bound(
+  return !CommentsWithin(begin, end).empty();
+}
+
+ArrayRef<PreprocessingTriviaInterval>
+RefoldPreprocessingStructureIndex::CommentsWithin(uint64_t begin,
+                                                  uint64_t end) const {
+  // Comments never overlap, so the ones starting at or after `begin` are
+  // sorted by `end` as well and those ending by `end` form a prefix.
+  auto first = std::lower_bound(
       commentIntervals_.begin(), commentIntervals_.end(), begin,
       [](const PreprocessingTriviaInterval &interval, uint64_t boundary) {
         return interval.begin < boundary;
       });
-  return commentIt != commentIntervals_.end() && commentIt->end <= end;
+  auto last =
+      std::partition_point(first, commentIntervals_.end(),
+                           [&](const PreprocessingTriviaInterval &interval) {
+                             return interval.end <= end;
+                           });
+  return ArrayRef<PreprocessingTriviaInterval>(commentIntervals_)
+      .slice(first - commentIntervals_.begin(), last - first);
 }
 
 namespace {

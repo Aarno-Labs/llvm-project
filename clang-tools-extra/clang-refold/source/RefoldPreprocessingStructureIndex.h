@@ -313,6 +313,11 @@ public:
   /// separately.
   bool RangeContainsComment(uint64_t begin, uint64_t end) const;
 
+  /// Return every complete comment token lying inside `[begin,end)`, in
+  /// source order.
+  llvm::ArrayRef<PreprocessingTriviaInterval>
+  CommentsWithin(uint64_t begin, uint64_t end) const;
+
   /// Collect exact producer-bound macro-state directives inside a byte range.
   ///
   /// This is an evidence-only query.  It reports complete `#define` and
