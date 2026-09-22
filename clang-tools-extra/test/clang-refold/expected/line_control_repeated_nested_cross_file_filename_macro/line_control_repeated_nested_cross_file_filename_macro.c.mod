@@ -9,7 +9,8 @@
 #include "b9pair.h"
 int x =
 3
-#line 124 "gap.c"
+#line 123 PAIR(F)
+
 ;
 int y = __LINE__;
 const char *f = __FILE__;

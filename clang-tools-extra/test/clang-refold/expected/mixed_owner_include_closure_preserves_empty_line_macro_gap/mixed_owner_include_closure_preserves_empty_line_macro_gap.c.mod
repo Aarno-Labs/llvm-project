@@ -2,7 +2,8 @@
 #define EMPTY
 int x =
 3
-#line 124 "gap.c"
+#line EMPTY 123 "gap.c"
+
 ;
 int y = __LINE__;
 const char *f = __FILE__;

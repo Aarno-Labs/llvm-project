@@ -2,6 +2,7 @@
 #define NUM(a,b) a ## b
 int x =
 3
-#line 124 "gap.c"
+#line NUM(12,3) "gap.c"
+
 ;
 int y = __LINE__;

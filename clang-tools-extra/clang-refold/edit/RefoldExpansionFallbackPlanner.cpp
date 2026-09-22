@@ -28,6 +28,7 @@
 #include "proof/RefoldPragmaTaxonomy.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
+#include "source/RefoldPreprocessingDirectiveScanner.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
 #include "source/RefoldSourceGapProof.h"
 #include "source/RefoldTokenlessSourceProjection.h"
@@ -976,6 +977,125 @@ bool canStartLineDirectiveWithOptionalLeadingNewline(StringRef tuBytes,
     return true;
 
   return pos == 0 || tuBytes[pos - 1] != '\\';
+}
+
+/// A consumed source line-control gap kept with its own spelling.
+///
+/// The gap's bytes are re-emitted at the end of the closure replacement,
+/// followed by `trailingNewlines` newlines that stand in for the consumed
+/// source lines between the gap and the untouched suffix.
+struct SourceLineDirectiveGapRespelling {
+  uint64_t gapBegin = 0;
+  uint64_t gapEnd = 0;
+  size_t trailingNewlines = 0;
+};
+
+/// True unless the shared directive scanner completely covers \p text and
+/// finds no preprocessing directive and no `_Pragma` operator in it.
+bool textMayChangePreprocessorState(StringRef text,
+                                    const LangOptions &lexLang) {
+  const PreprocessingDirectiveScanResult scan =
+      scanPreprocessingDirectives(text, lexLang);
+  return !scan.IsComplete() || !scan.directives.empty() ||
+         !scan.pragmaOperators.empty();
+}
+
+/// Return the name of a macro without a recorded definition that the source
+/// line-control gap [\p gapBegin, \p gapEnd) invokes, directly or through a
+/// nested expansion.
+///
+/// Such a macro is a builtin like `__LINE__` or `__COUNTER__`, or a record the
+/// producer did not bind.  Its expansion depends on where and how often it is
+/// evaluated, so re-emitting the directive that invokes it is not proven to
+/// re-establish the same line state.
+std::optional<StringRef> sourceLineDirectiveGapUndefinedMacro(
+    const RefoldModel &model, const RefoldPathIdentity &paths, StringRef tuPath,
+    uint64_t gapBegin, uint64_t gapEnd) {
+  DenseSet<uint64_t> operandInvocations;
+  for (const RefoldModel::MacroInvocation &m : model.GetMacroInvocations())
+    if (m.invFile && paths.PathsEqual(*m.invFile, tuPath) && m.invB && m.invE &&
+        gapBegin <= *m.invB && *m.invE <= gapEnd)
+      operandInvocations.insert(m.id);
+
+  // A nested invocation can be spelled in a replacement list rather than in
+  // the gap, so close over the recorded caller edges.
+  for (bool grew = !operandInvocations.empty(); grew;) {
+    grew = false;
+    for (const RefoldModel::MacroInvocation &m : model.GetMacroInvocations())
+      if (m.callerMacroId && operandInvocations.contains(*m.callerMacroId) &&
+          operandInvocations.insert(m.id).second)
+        grew = true;
+  }
+
+  for (const RefoldModel::MacroInvocation &m : model.GetMacroInvocations())
+    if (operandInvocations.contains(m.id) && !m.definitionDirectiveId)
+      return m.name;
+  return std::nullopt;
+}
+
+/// Prove that re-emitting the consumed source line-control gap
+/// [\p gapBegin, \p gapEnd) at the end of a mixed TU/include closure that
+/// starts at \p sourceBegin re-establishes \p resume for the untouched suffix,
+/// and return how to emit it.
+///
+/// \p resumeAtGapEnd is the state the gap establishes at its own end.  The
+/// re-emitted gap evaluates to that same state when three obligations hold:
+///
+///   * no macro in its operands lacks a recorded definition, so none depends
+///     on its position;
+///   * the consumed source between \p sourceBegin and the gap holds no
+///     directive, `_Pragma` operator or recorded pragma, so removing it leaves
+///     the macro state the operands see unchanged; and
+///   * the replacement text emitted ahead of the gap holds no directive either.
+///     The caller checks this one once that text exists.
+///
+/// The suffix then resumes `resume.lineAtResume - resumeAtGapEnd.lineAtResume`
+/// lines after the gap, which is the number of newlines emitted after it.
+std::optional<SourceLineDirectiveGapRespelling>
+proveSourceLineDirectiveGapRespelling(
+    const RefoldModel &model, const RefoldPathIdentity &paths,
+    const LangOptions &lexLang, StringRef tuPath, StringRef tuBytes,
+    uint64_t sourceBegin, uint64_t gapBegin, uint64_t gapEnd,
+    const SourceLineDirectiveGapResume &resume,
+    const std::optional<SourceLineDirectiveGapResume> &resumeAtGapEnd) {
+  if (!resumeAtGapEnd || resumeAtGapEnd->fileSpelling != resume.fileSpelling ||
+      resumeAtGapEnd->lineMarkerFlags != resume.lineMarkerFlags ||
+      resumeAtGapEnd->lineAtResume > resume.lineAtResume) {
+    REFOLD_LOG_TRACE("fallback",
+                     "TU/include closure re-expressing source #line gap=[{0},"
+                     "{1}): the state at the gap's end does not extend to the "
+                     "resume",
+                     gapBegin, gapEnd);
+    return std::nullopt;
+  }
+
+  if (std::optional<StringRef> name = sourceLineDirectiveGapUndefinedMacro(
+          model, paths, tuPath, gapBegin, gapEnd)) {
+    REFOLD_LOG_TRACE("fallback",
+                     "TU/include closure re-expressing source #line gap=[{0},"
+                     "{1}): operand invokes '{2}', which has no recorded "
+                     "definition",
+                     gapBegin, gapEnd, *name);
+    return std::nullopt;
+  }
+
+  bool prefixHasPragma = false;
+  for (const RefoldModel::PragmaDirective &pragma : model.GetPragmas())
+    if (paths.PathsEqual(pragma.sitePath, tuPath) && pragma.siteB < gapBegin &&
+        sourceBegin < pragma.siteE)
+      prefixHasPragma = true;
+  if (prefixHasPragma || textMayChangePreprocessorState(
+                             tuBytes.slice(sourceBegin, gapBegin), lexLang)) {
+    REFOLD_LOG_TRACE("fallback",
+                     "TU/include closure re-expressing source #line gap=[{0},"
+                     "{1}): consumed source [{2},{0}) may change preprocessor "
+                     "state",
+                     gapBegin, gapEnd, sourceBegin);
+    return std::nullopt;
+  }
+
+  return SourceLineDirectiveGapRespelling{
+      gapBegin, gapEnd, resume.lineAtResume - resumeAtGapEnd->lineAtResume};
 }
 
 /// True when a pragma establishes include-once state for its file.
@@ -2519,6 +2639,11 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   SmallVector<std::pair<uint64_t, uint64_t>, 4>
       mixedPreservedSourceLineDirectiveGapPieces;
   std::optional<SourceLineDirectiveGapResume> mixedSourceLineDirectiveResume;
+  // Set only while exactly one consumed gap needs a resume: with two, the
+  // later gap's spelling alone can lose a filename the earlier one set.
+  std::optional<SourceLineDirectiveGapRespelling>
+      mixedSourceLineDirectiveRespelling;
+  size_t mixedSourceLineDirectiveResumeGaps = 0;
 
   // Prove a mixed TU/include closure.
   //
@@ -3158,13 +3283,14 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
             return true;
 
           SmallVector<uint64_t, 4> acceptedMacroIds;
+          const bool allowUnknownFilenameOperand =
+              !sourceSuffixMayObservePresumedFileSpelling(
+                  model_, tuPath, sourceEnd, paths_, tuBytes);
           if (std::optional<SourceLineDirectiveGapResume> lineResume =
                   computeSourceLineDirectiveGapResume(
                       tuBytes, gapBegin, gapEnd, sourceEnd, tuPath,
                       sourceLineDirectiveLineRewriter, &acceptedMacroIds,
-                      StringRef(),
-                      !sourceSuffixMayObservePresumedFileSpelling(
-                          model_, tuPath, sourceEnd, paths_, tuBytes))) {
+                      StringRef(), allowUnknownFilenameOperand)) {
             // A source-spelled line-control directive contributes no PP
             // tokens, but it is not disposable trivia.  If the copied
             // suffix has no live line-state observer, preserve the original
@@ -3184,6 +3310,16 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
                   "from gap=[{0},{1})",
                   gapBegin, gapEnd);
             } else {
+              mixedSourceLineDirectiveRespelling.reset();
+              if (++mixedSourceLineDirectiveResumeGaps == 1)
+                mixedSourceLineDirectiveRespelling =
+                    proveSourceLineDirectiveGapRespelling(
+                        model_, paths_, lexLang_, tuPath, tuBytes, sourceBegin,
+                        gapBegin, gapEnd, *lineResume,
+                        computeSourceLineDirectiveGapResume(
+                            tuBytes, gapBegin, gapEnd, gapEnd, tuPath,
+                            sourceLineDirectiveLineRewriter, nullptr,
+                            StringRef(), allowUnknownFilenameOperand));
               mixedSourceLineDirectiveResume = std::move(lineResume);
               REFOLD_LOG_TRACE(
                   "fallback",
@@ -3687,13 +3823,26 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
                                               sourceEnd < tuBytes.size();
   if (emitsSourceLineDirectiveResume) {
     // The consumed source envelope contained a source-spelled line-control
-    // directive.  Re-emit only its net state, adjusted through the consumed
-    // envelope, so the untouched suffix observes the same presumed file/line as
-    // it did in the original source. Replacement hunks normally carry edited B
-    // material before the resync; delete-only hunks have no such payload, so
-    // they may need a leading physical newline to make the resync a standalone
-    // preprocessing directive rather than gluing `#line` onto the preceding
-    // source line.
+    // directive, and the untouched suffix must observe the same presumed
+    // file/line as it did in the original source.  Keep the directive's own
+    // spelling when the respelling proof holds and nothing emitted ahead of it
+    // can change the state its operands see; otherwise re-emit only its net
+    // state, adjusted through the consumed envelope.  Replacement hunks
+    // normally carry edited B material before the directive; delete-only hunks
+    // have no such payload, so they may need a leading physical newline to make
+    // the directive standalone rather than gluing it onto the preceding source
+    // line.
+    bool keepsSourceSpelling = mixedSourceLineDirectiveRespelling.has_value();
+    if (keepsSourceSpelling &&
+        textMayChangePreprocessorState(padded, lexLang_)) {
+      keepsSourceSpelling = false;
+      REFOLD_LOG_TRACE("fallback",
+                       "TU/include closure re-expressing source #line gap=[{0},"
+                       "{1}): the replacement emitted ahead of it may change "
+                       "preprocessor state",
+                       mixedSourceLineDirectiveRespelling->gapBegin,
+                       mixedSourceLineDirectiveRespelling->gapEnd);
+    }
     if (padded.empty()) {
       if (!lineDirectiveStartsAtPrefix(tuBytes, sourceBegin))
         padded.push_back('\n');
@@ -3701,13 +3850,35 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
       padded.push_back('\n');
     }
 
-    padded +=
-        formatSourceLineDirectiveGapResume(*mixedSourceLineDirectiveResume);
-    REFOLD_LOG_TRACE(
-        "fallback",
-        "TU/include closure emitted source #line resume line={0} file={1}",
-        mixedSourceLineDirectiveResume->lineAtResume,
-        mixedSourceLineDirectiveResume->fileSpelling);
+    if (keepsSourceSpelling) {
+      StringRef gapText =
+          tuBytes.slice(mixedSourceLineDirectiveRespelling->gapBegin,
+                        mixedSourceLineDirectiveRespelling->gapEnd);
+      // The directive now starts a line.  A newline opening the gap ended the
+      // source line the replacement already ended, so it is dropped rather
+      // than doubled.
+      if (gapText.starts_with("\r\n"))
+        gapText = gapText.drop_front(2);
+      else if (gapText.starts_with("\n") || gapText.starts_with("\r"))
+        gapText = gapText.drop_front(1);
+      padded.append(gapText.begin(), gapText.end());
+      padded.append(mixedSourceLineDirectiveRespelling->trailingNewlines, '\n');
+      REFOLD_LOG_TRACE(
+          "fallback",
+          "TU/include closure kept source #line spelling gap=[{0},{1}) "
+          "trailingNewlines={2}",
+          mixedSourceLineDirectiveRespelling->gapBegin,
+          mixedSourceLineDirectiveRespelling->gapEnd,
+          mixedSourceLineDirectiveRespelling->trailingNewlines);
+    } else {
+      padded +=
+          formatSourceLineDirectiveGapResume(*mixedSourceLineDirectiveResume);
+      REFOLD_LOG_TRACE(
+          "fallback",
+          "TU/include closure emitted source #line resume line={0} file={1}",
+          mixedSourceLineDirectiveResume->lineAtResume,
+          mixedSourceLineDirectiveResume->fileSpelling);
+    }
   }
 
   // This closure class replaces only a contiguous run of top-level include

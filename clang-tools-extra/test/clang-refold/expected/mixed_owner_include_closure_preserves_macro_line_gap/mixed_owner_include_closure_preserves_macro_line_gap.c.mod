@@ -2,6 +2,7 @@
 #define GAP_LINE 123
 int x =
 3
-#line 124 "gap.c"
+#line GAP_LINE "gap.c"
+
 ;
 int y = __LINE__;

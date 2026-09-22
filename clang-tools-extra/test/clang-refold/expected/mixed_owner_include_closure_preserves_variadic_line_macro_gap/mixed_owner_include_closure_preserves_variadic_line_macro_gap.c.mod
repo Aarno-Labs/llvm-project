@@ -2,6 +2,7 @@
 #define LINE_NO(...) 123
 int x =
 3
-#line 124 "gap.c"
+#line LINE_NO(foo) "gap.c"
+
 ;
 int y = __LINE__;

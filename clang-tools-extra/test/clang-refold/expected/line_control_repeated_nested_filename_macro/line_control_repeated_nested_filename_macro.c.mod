@@ -3,7 +3,8 @@
 #define FILE_NAME F F
 int x =
 3
-#line 124 "gap.c"
+#line 123 FILE_NAME
+
 ;
 int y = __LINE__;
 const char *f = __FILE__;

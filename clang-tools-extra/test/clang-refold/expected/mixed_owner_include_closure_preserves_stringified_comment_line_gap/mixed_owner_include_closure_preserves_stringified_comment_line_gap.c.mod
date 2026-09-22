@@ -2,7 +2,8 @@
 #define FILE_NAME(x) #x
 int x =
 3
-#line 124 "gap c"
+#line 123 FILE_NAME(gap /* dot */ c)
+
 ;
 int y = __LINE__;
 const char *f = __FILE__;
