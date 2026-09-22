@@ -1016,6 +1016,16 @@ public:
     return {};
   }
 
+  /// Build the identity part of a token segment's owner closure: owner,
+  /// source site, and A/B token ranges, with empty state deltas.
+  ///
+  /// The partition search enumerates every admissible A subrange of the hunk
+  /// and reads only these fields, so the canonical state summary is attached
+  /// by `AttachTokenSegmentStateSummary()` to the edges of the reconstructed
+  /// path alone. Attaching it here instead copies the owner's complete delta
+  /// into every candidate; for a TU realizer that delta is the census of the
+  /// whole translation unit, and a wide hunk has quadratically many
+  /// candidates.
   std::optional<OwnerClosure>
   BuildTokenSegmentClosure(const PartitionEdge &edge) const {
     if (!edge.IsTokenSegment() || edge.aEnd <= edge.aStart ||
@@ -1068,10 +1078,20 @@ public:
       return std::nullopt;
     }
 
-    return deps_.ownerStateProof.AttachCanonicalStateSummary(
-        OwnerClosure::From(std::move(owner), std::move(*source),
-                           OwnerTokenRange::From(edge.aStart, edge.aEnd),
-                           OwnerTokenRange::From(edge.bStart, edge.bEnd)));
+    return OwnerClosure::From(std::move(owner), std::move(*source),
+                              OwnerTokenRange::From(edge.aStart, edge.aEnd),
+                              OwnerTokenRange::From(edge.bStart, edge.bEnd));
+  }
+
+  /// Attach the canonical state summary of a token segment's owner to the
+  /// closure built by `BuildTokenSegmentClosure()`. The summary depends only
+  /// on the owner, so deferring it to the chosen path yields the closure an
+  /// eager attachment would have produced.
+  void AttachTokenSegmentStateSummary(PartitionEdge &edge) const {
+    if (!edge.IsTokenSegment() || !edge.closure)
+      return;
+    edge.closure = deps_.ownerStateProof.AttachCanonicalStateSummary(
+        std::move(*edge.closure));
   }
 
   bool SourceSitesComparable(const OwnerSourceRange &lhs,
@@ -2463,7 +2483,7 @@ public:
           continue;
 
         const size_t edgeIndex = edges.size();
-        edges.push_back(edge);
+        edges.push_back(std::move(edge));
         edgesByAOffset[static_cast<size_t>(aLo - h.aStart)].push_back(
             edgeIndex);
       }
@@ -2835,6 +2855,7 @@ public:
       const PartitionParent &parent = stateIt->second;
       const PartitionEdge &edge = edges[parent.edgeIndex];
       reversePath.push_back(edge);
+      AttachTokenSegmentStateSummary(reversePath.back());
       // Gaps are stored before the token edge in forward order.  During
       // backward reconstruction, append them in reverse so the final reverse
       // below yields: previous token, gap..., current token.
