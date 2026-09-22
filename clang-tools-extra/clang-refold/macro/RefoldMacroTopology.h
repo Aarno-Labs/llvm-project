@@ -152,6 +152,40 @@ public:
       uint64_t groupAStart, const RefoldModel::TokMapEntry &entry,
       std::optional<uint64_t> ownerIncludeId, uint64_t consumedAEnd) const;
 
+  /// A root invocation's whole cover, proven to begin at one A token, paired
+  /// with the physical callsite spelling that produces exactly that cover.
+  struct CallsiteWholeCover {
+    /// Half-open A-token range of the whole cover.
+    uint64_t aBegin = 0;
+    uint64_t aEnd = 0;
+    /// Half-open physical byte range of the invocation's recorded spelling.
+    uint64_t sourceBegin = 0;
+    uint64_t sourceEnd = 0;
+  };
+
+  /// Prove that \p aStart begins the whole cover of exactly one root macro
+  /// invocation spelled in \p file, and return that cover with its callsite
+  /// spelling.
+  ///
+  /// A function-like invocation maps its body tokens to the macro name and its
+  /// argument tokens to their spellings inside the parentheses, so no single
+  /// token spelling equals the invocation extent and the repeated-spelling
+  /// proof above cannot see it.  The cover is instead admitted from the
+  /// producer's invocation record: the invocation is a root (no caller), is
+  /// spelled at a real callsite in \p file under \p ownerIncludeId rather than
+  /// inside a `#define`, is the only such root whose cover begins at
+  /// \p aStart, its whole cover is self-contained and lies inside
+  /// `[aStart, consumedAEnd)`, and every token of the cover maps into the
+  /// recorded spelling `[invB, invE)` of \p file.  Replacing that spelling then
+  /// removes exactly the cover's tokens and no others.
+  ///
+  /// \returns nullopt when any required fact is absent, leaving the caller to
+  ///          fail closed or to try its other proofs.
+  std::optional<CallsiteWholeCover>
+  RootWholeCoverAtCallsite(uint64_t aStart, llvm::StringRef file,
+                           std::optional<uint64_t> ownerIncludeId,
+                           uint64_t consumedAEnd) const;
+
   /// Build the stable identity for one concrete `__COUNTER__` event.
   CounterEventIdentity BuildCounterEventIdentity(
       const RefoldModel::MacroInvocation &macro, uint64_t occurrenceOrdinal,
