@@ -187,9 +187,10 @@ public:
   /// no ambiguity to resolve and running it would return the same anchors after
   /// paying for them.
   ///
-  /// Enumeration budgets are proof budgets only: exceeding one returns the
-  /// forced-only map for that window and cannot authorize a partial class or
-  /// ranked winner.
+  /// Enumeration budgets are proof budgets only: exceeding one denies the
+  /// commit rules that quantify over the refused set and cannot authorize a
+  /// partial class or ranked winner.  A window with no rule left keeps its
+  /// forced-only map.
   ResolutionResult Resolve() const;
 
 private:
@@ -209,6 +210,10 @@ private:
     /// that could not tell those apart would report a decline where nothing was
     /// declined.
     uint64_t enumeratedMapCount = 0;
+    /// True when the window's complete ground set could not be enumerated and
+    /// the legacy boundary proposal committed over the maps carrying its
+    /// required anchors instead.  `enumeratedMapCount` then counts those maps.
+    bool enumeratedOnlyRequiredAnchorCarriers = false;
     uint64_t acceptedMapCount = 0;
     uint64_t rejectedMapCount = 0;
   };
@@ -220,9 +225,13 @@ private:
   /// comparison isolates this window's choice. `windowIndex` must satisfy
   /// `HasCompleteSemanticOracleForWindow()`.
   ///
-  /// The window's complete candidate set is always enumerated and simulated in
-  /// full: uniqueness is a property of the whole enumerated set, so committing
-  /// on a prefix would be the ranked selection this resolver exists to avoid.
+  /// Each commit rule decides over its complete ground set, never a prefix:
+  /// uniqueness is a property of the whole set, so committing on a prefix
+  /// would be the ranked selection this resolver exists to avoid.  The
+  /// observational and least-source-mutation rules' set is every optimal map
+  /// of the window; the legacy boundary proposal's is the optimal maps that
+  /// carry its required anchors, which it enumerates directly when the
+  /// window's complete enumeration exceeds its proof budget.
   ///
   /// \p laterWindowCarriesAmbiguity is whether any certification window after
   /// this one can carry ambiguity.  When none can, this window's verdict feeds
