@@ -306,6 +306,13 @@ public:
   /// preprocessing state and is never ordinary trivia authority.
   bool ProveOrdinaryDirectTUInternalGap(uint64_t begin, uint64_t end) const;
 
+  /// Return whether one complete comment token lies inside `[begin,end)`.
+  ///
+  /// This is a lexical fact only.  It proves nothing about the rest of the
+  /// range; a caller that needs the range to be trivia must prove that
+  /// separately.
+  bool RangeContainsComment(uint64_t begin, uint64_t end) const;
+
   /// Collect exact producer-bound macro-state directives inside a byte range.
   ///
   /// This is an evidence-only query.  It reports complete `#define` and
@@ -336,6 +343,8 @@ private:
   std::vector<PreprocessingTriviaInterval> triviaIntervals_;
   std::vector<PreprocessingIndivisibleTriviaInterval>
       indivisibleTriviaIntervals_;
+  /// Complete comment tokens, sorted by `begin`.
+  std::vector<PreprocessingTriviaInterval> commentIntervals_;
   /// Failures that leave physical preprocessing protection incomplete.
   std::vector<std::string> directTUProtectionDiagnostics_;
   /// Complete lexical and producer-binding diagnostic stream.

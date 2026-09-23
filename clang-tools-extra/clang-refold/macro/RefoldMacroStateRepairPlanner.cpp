@@ -13,6 +13,7 @@
 
 #include "edit/RefoldPatchTypes.h"
 #include "edit/RefoldTextEditCertifier.h"
+#include "line-control/LineControlEditHelpers.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroPatchPlanner.h"
 #include "macro/RefoldMacroStateProof.h"
@@ -529,6 +530,26 @@ private:
   /// Applies queued macro-state preservations and authorizes only the exact
   /// transitions discharged by those repairs.
   bool ApplyQueuedMacroStatePreservations();
+  /// Restore the line state of the untouched suffix after the directives
+  /// replayed after \p edit's replacement, which occupy
+  /// `[blockBegin, replacement.size())` of \p replacement.
+  ///
+  /// The replacement's own line-control resync was decided when the edit was
+  /// built, before any directive was replayed after it, so it accounts for the
+  /// replacement alone.  The replayed block adds physical lines after that
+  /// resync, and every line observer in the untouched suffix would read a
+  /// presumed line shifted by the block's line count.  The block is therefore
+  /// resynced as what it is: an insertion at the edit's end, whose resume
+  /// location is the one the suffix already had.  An edit whose resync is
+  /// deferred needs nothing, because the deferred directive is flushed after
+  /// the whole edit and restores that same location.
+  ///
+  /// Returns false, after requesting the terminal fallback, when the line layer
+  /// would place its directive anywhere but after the block: that would move
+  /// replayed directive bytes whose offsets are already recorded.
+  bool ResyncLineStateAfterReplacementBlock(TextEdit &edit,
+                                            std::string &replacement,
+                                            size_t blockBegin);
 
   /// Returns whether a definition directive is consumed or altered by TU edits.
   bool DefinitionDirectiveTouchedByTUEdit(
@@ -3154,6 +3175,7 @@ bool MacroStateRepairContext::ApplyQueuedMacroStatePreservations() {
                                originalReplacement.end());
 
     bool appendedAfterReplacementSeparator = false;
+    const size_t afterReplacementBlockBegin = repairedReplacement.size();
     for (const MacroStatePreservation &preservation : preservations) {
       if (preservation.placement !=
           MacroStatePreservationPlacement::AfterReplacement)
@@ -3165,6 +3187,10 @@ bool MacroStateRepairContext::ApplyQueuedMacroStatePreservations() {
       }
       appendPreservation(preservation);
     }
+    if (appendedAfterReplacementSeparator &&
+        !ResyncLineStateAfterReplacementBlock(edit, repairedReplacement,
+                                              afterReplacementBlockBegin))
+      return false;
 
     SmallVector<ProvenMacroStateSourceTransition, 8> provedTransitions;
     provedTransitions.reserve(emissions.size());
@@ -3225,6 +3251,37 @@ bool MacroStateRepairContext::ApplyQueuedMacroStatePreservations() {
     }
     PromoteToSpecializedMacroStateRepairCarrier(edit);
   }
+  return true;
+}
+
+bool MacroStateRepairContext::ResyncLineStateAfterReplacementBlock(
+    TextEdit &edit, std::string &replacement, size_t blockBegin) {
+  if (edit.pending || blockBegin >= replacement.size())
+    return true;
+
+  const std::string block = replacement.substr(blockBegin);
+  ResyncOutcome resync = LineObserverLayout().ApplyResyncOrPend(
+      tuBytes_, edit.end, edit.end, block, tuPath_);
+  if (!StringRef(resync.text).starts_with(block)) {
+    TerminalSink().RequestTerminalFallback(
+        MakeTerminalFallbackProofFailure(
+            TerminalFallbackObligationKind::LineControlStateProducerProven,
+            TerminalFallbackFailureReason::LineControlStateNotProducerProven),
+        "macro/state-repair",
+        llvm::formatv("line-state resync for directives replayed after the "
+                      "replacement at TU bytes [{0},{1}) would split the "
+                      "replayed block",
+                      edit.start, edit.end)
+            .str());
+    return false;
+  }
+
+  replacement.resize(blockBegin);
+  replacement += resync.text;
+  edit.pending = std::move(resync.pending);
+  appendShiftedLineControlPruneCandidates(edit.lineControlPruneCandidates,
+                                          resync.lineControlPruneCandidates,
+                                          blockBegin);
   return true;
 }
 

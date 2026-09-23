@@ -173,6 +173,12 @@ struct PreprocessingDirectiveScanResult {
   std::vector<PreprocessingTriviaInterval> triviaIntervals;
   std::vector<PreprocessingIndivisibleTriviaInterval>
       indivisibleTriviaIntervals;
+  /// Complete block and line comment tokens, in source order.
+  ///
+  /// Every entry is also one indivisible trivia component.  The separate list
+  /// records which components are comments, which a splice or CRLF component
+  /// cannot be.
+  std::vector<PreprocessingTriviaInterval> commentIntervals;
   std::vector<std::string> diagnostics;
 
   /// Scanner diagnostics indicate that exact lexical coverage was not proven.

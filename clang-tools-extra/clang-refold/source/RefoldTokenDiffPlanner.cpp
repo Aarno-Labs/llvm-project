@@ -337,8 +337,10 @@ RefoldTokenDiffPlanner::Plan(AlignmentCertificationMemo *certificationMemo,
   }
   deps_.abTokAnchorProofs = alignment.selectedAnchorProofs;
 
-  std::vector<diffutils::Hunk> hunks = diffutils::hunksFromMap(
-      a2b, alignment.certifiedBoundaries, aSeq.size(), bSeq.size());
+  std::vector<diffutils::Hunk> hunks = SplitHunksAtCommentGaps(
+      aSeq, bSeq, alignment,
+      diffutils::hunksFromMap(a2b, alignment.certifiedBoundaries, aSeq.size(),
+                              bSeq.size()));
 
   std::vector<int64_t> b2a(bSeq.size(), -1);
   for (size_t ai = 0; ai < a2b.size(); ++ai) {
@@ -376,6 +378,111 @@ RefoldTokenDiffPlanner::Plan(AlignmentCertificationMemo *certificationMemo,
   deps_.abByteHunks = deps_.sourceMapper.BuildByteHunksFromRawText(byteHunkMemo);
   deps_.sourceMapper.BuildByteHunkPrefixDeltaCache();
   return TokenDiffPlan{std::move(hunks), std::move(alignment)};
+}
+
+bool RefoldTokenDiffPlanner::AGapHoldsPreservableComment(
+    uint64_t aGap, const DenseSet<uint64_t> &duplicateTokmapPP) const {
+  if (aGap == 0)
+    return false;
+  const uint64_t leftPP = aGap - 1;
+  const uint64_t rightPP = aGap;
+  if (duplicateTokmapPP.contains(leftPP) || duplicateTokmapPP.contains(rightPP))
+    return false;
+
+  const std::optional<RefoldModel::TokMapEntry> left =
+      deps_.model.MapPP(leftPP);
+  const std::optional<RefoldModel::TokMapEntry> right =
+      deps_.model.MapPP(rightPP);
+  if (!left || !right || left->file != right->file || left->e > right->b)
+    return false;
+
+  const std::optional<uint64_t> includeId =
+      deps_.model.InnermostIncludeAtPP(leftPP);
+  if (includeId != deps_.model.InnermostIncludeAtPP(rightPP))
+    return false;
+
+  // The lexical checks are logarithmic, so they run before the linear scan of
+  // macro invocations below; almost every gap has no comment.
+  const RefoldPreprocessingStructureIndexProvider::LookupResult structure =
+      deps_.preprocessingStructureIndexes.Get(left->file, includeId);
+  if (!structure.HasIndex() ||
+      !structure.index->RangeContainsComment(left->e, right->b) ||
+      !structure.index->ProveOrdinaryDirectTUInternalGap(left->e, right->b))
+    return false;
+
+  const std::optional<RefoldModel::ArmRef> leftArm =
+      deps_.model.FindArmRefAtPP(leftPP);
+  const std::optional<RefoldModel::ArmRef> rightArm =
+      deps_.model.FindArmRefAtPP(rightPP);
+  if (leftArm.has_value() != rightArm.has_value() ||
+      (leftArm && leftArm->arm != rightArm->arm))
+    return false;
+
+  return llvm::none_of(deps_.model.GetMacroInvocations(),
+                       [&](const RefoldModel::MacroInvocation &invocation) {
+                         return invocation.Covers(leftPP, leftPP + 1) ||
+                                invocation.Covers(rightPP, rightPP + 1);
+                       });
+}
+
+std::vector<diffutils::Hunk> RefoldTokenDiffPlanner::SplitHunksAtCommentGaps(
+    ArrayRef<StringRef> aSeq, ArrayRef<StringRef> bSeq,
+    const diffutils::CertifiedLcsResult &alignment,
+    std::vector<diffutils::Hunk> hunks) const {
+  // The tokmap census is taken only once some hunk has an interior gap.
+  std::optional<DenseSet<uint64_t>> duplicateTokmapPP;
+  std::vector<diffutils::Hunk> split;
+  split.reserve(hunks.size());
+  for (const diffutils::Hunk &hunk : hunks) {
+    const bool inCertifiedWindow = llvm::any_of(
+        alignment.certificationWindows,
+        [&](const diffutils::LcsCertificationWindow &window) {
+          return window.IsCertified() && window.aBegin <= hunk.aStart &&
+                 hunk.aEnd <= window.aEnd && window.bBegin <= hunk.bStart &&
+                 hunk.bEnd <= window.bEnd;
+        });
+    if (!inCertifiedWindow || hunk.aEnd - hunk.aStart < 2) {
+      split.push_back(hunk);
+      continue;
+    }
+
+    if (!duplicateTokmapPP) {
+      duplicateTokmapPP.emplace();
+      DenseSet<uint64_t> seen;
+      for (const RefoldModel::TokMapEntry &entry : deps_.model.GetTokmap())
+        if (!seen.insert(entry.pp).second)
+          duplicateTokmapPP->insert(entry.pp);
+    }
+
+    diffutils::Hunk piece = hunk;
+    for (uint64_t aGap = hunk.aStart + 1; aGap < hunk.aEnd; ++aGap) {
+      if (!AGapHoldsPreservableComment(aGap, *duplicateTokmapPP))
+        continue;
+      diffutils::LcsBoundaryFrontierProjection projection;
+      if (!diffutils::projectLcsBoundaryToOptimalBFrontiers(
+              aSeq, hunk.aStart, hunk.aEnd, bSeq, hunk.bStart, hunk.bEnd, aGap,
+              deps_.ownerDepthGap, projection) ||
+          !projection.objectiveIsExact ||
+          projection.admissibleBFrontiers.empty())
+        continue;
+      // Frontiers of later A gaps are never earlier, because every optimal
+      // path is monotone; the check keeps the pieces ordered regardless.
+      const uint64_t bFrontier = projection.admissibleBFrontiers.back();
+      if (bFrontier < piece.bStart)
+        continue;
+      REFOLD_LOG_TRACE("diff/comment-seam",
+                       "hunk A=[{0},{1}) B=[{2},{3}) split at A gap {4}, B "
+                       "frontier {5} of {6} admissible",
+                       hunk.aStart, hunk.aEnd, hunk.bStart, hunk.bEnd, aGap,
+                       bFrontier, projection.admissibleBFrontiers.size());
+      split.push_back(
+          diffutils::Hunk{piece.aStart, aGap, piece.bStart, bFrontier});
+      piece.aStart = aGap;
+      piece.bStart = bFrontier;
+    }
+    split.push_back(piece);
+  }
+  return split;
 }
 
 namespace {
