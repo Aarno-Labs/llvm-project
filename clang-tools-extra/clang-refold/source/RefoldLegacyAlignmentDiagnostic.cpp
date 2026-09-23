@@ -176,7 +176,10 @@ bool addObjectiveChecked(diffutils::LcsObjective &total,
 bool mapCanOccurOnOneOptimalPath(
     ArrayRef<int64_t> map, const diffutils::CertifiedLcsResult &alignment,
     std::string &failure) {
-  if (!alignment.HasCompleteSemanticOracleForWindow(/*windowIndex=*/0)) {
+  // Every query below reads the complete-stream oracle in global coordinates,
+  // so it is the one that must exist.  A retained per-window oracle for window
+  // 0 does not stand in for it.
+  if (!alignment.HasCompleteGlobalOracle()) {
     failure = "core all-optimal oracle is incomplete";
     return false;
   }
@@ -311,15 +314,20 @@ LegacyAlignmentDiagnosticResult reconstructLegacyBoundaryProposal(
   result.anchorOrigins.assign(aCount, LegacyAlignmentAnchorOrigin::None);
 
   // The proposal reads the complete-stream oracle in global coordinates, which
-  // exists only when the whole stream certified as one window; this query holds
-  // for window 0 exactly then.  A partitioned run therefore never reaches the
-  // legacy rule, and that is deliberate.  Building the proposal per window from
-  // each window's own oracle is exact, but measured on 2026-09-18 it made
-  // partitioned runs commit this proposal's insertion placement where they had
-  // kept core-forced anchors, and that placement was worse: a doc comment split
-  // from its function, inserted lines taking the original line's indentation.
-  if (!coreAlignment.HasCompleteSemanticOracleForWindow(
-          /*windowIndex=*/0)) {
+  // exists only when the whole stream certified as one window.  A partitioned
+  // run therefore never reaches the legacy rule, and that is deliberate.
+  // Building the proposal per window from each window's own oracle is exact,
+  // but measured on 2026-09-18 it made partitioned runs commit this proposal's
+  // insertion placement where they had kept core-forced anchors, and that
+  // placement was worse: a doc comment split from its function, inserted lines
+  // taking the original line's indentation.
+  //
+  // `HasCompleteSemanticOracleForWindow(0)` is not this test: it also holds in
+  // a partitioned run while window 0's own oracle is retained, and the
+  // complete-stream oracle is then empty.  Every pair query below would answer
+  // false after scanning all |A| x |B| lexeme pairs, and the rule would be
+  // denied anyway, on a misleading reason.
+  if (!coreAlignment.HasCompleteGlobalOracle()) {
     result.constructionFailure = "core all-optimal certification is incomplete";
     return result;
   }
