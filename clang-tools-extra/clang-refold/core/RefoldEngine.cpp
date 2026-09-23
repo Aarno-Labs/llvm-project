@@ -722,6 +722,10 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   }
 
   std::vector<diffutils::Hunk> hunks = std::move(diffPlan.hunks);
+  // Include edges first: an edge that leaves an include lands in the file that
+  // includes it, where it may still split a macro expansion the macro repair
+  // must then see.
+  retractHunkEdgesOutOfPartiallyOwnedIncludes(model_, aToks_, bToks_, hunks);
   repairHunkEdgesOutOfPartiallyOwnedMacroExpansions(model_, aToks_, bToks_,
                                                     abTokMapA2B_, hunks);
 
