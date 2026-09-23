@@ -340,6 +340,58 @@ static std::optional<uint64_t> rightEdgeContainDistanceIntoSplitExpansion(
   return hunk.aEnd - aEnd;
 }
 
+/// Return the include instance whose A-token cover a hunk's left edge falls
+/// strictly inside while the hunk ends past that cover, or null.
+///
+/// This is `macroExpansionStraddledAtEdge` for include instances, left edge
+/// only.  A cover boundary is not interior, so an edge on one already owns
+/// whole instances on both sides; and a hunk that also ends within the cover is
+/// contained in the instance, where the include's own realizers own it.
+/// Covers are half-open, so a token-less instance straddles nothing.
+const RefoldModel::IncludeItem *
+includeStraddledAtLeftEdge(const RefoldModel &model, uint64_t aStart,
+                           uint64_t aEnd) {
+  for (const RefoldModel::IncludeItem &include : model.GetIncludes()) {
+    const RefoldModel::PPCover &cover = include.cover;
+    if (cover.begin < aStart && aStart < cover.end && cover.end < aEnd)
+      return &include;
+  }
+  return nullptr;
+}
+
+/// Return how far a hunk's left edge must move inward for it to leave every
+/// include instance it straddles, zero when it straddles none, or
+/// `std::nullopt` when the move is not admissible.
+///
+/// Each crossed token pair must be the same lexeme on both sides, so the
+/// untouched region on the left reproduces it.  When the edge sits inside
+/// nested instances the walk continues until no straddled cover contains it;
+/// an inner cover never extends past the outer one, so the walk stops at the
+/// outermost straddled boundary whichever instance is examined first.  The B
+/// side must stay non-empty: emptying it would turn the replacement into a
+/// deletion, which belongs to the owner-aligned deletion slide.
+static std::optional<uint64_t> leftEdgeRetractDistanceOutOfSplitInclude(
+    const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
+    const diffutils::Hunk &hunk) {
+  uint64_t aStart = hunk.aStart;
+  uint64_t bStart = hunk.bStart;
+  while (const RefoldModel::IncludeItem *include =
+             includeStraddledAtLeftEdge(model, aStart, hunk.aEnd)) {
+    // A left-edge straddle means the cover ends inside the hunk, so the walk
+    // stays within the hunk's A side.
+    const uint64_t distance = include->cover.end - aStart;
+    if (distance >= hunk.bEnd - bStart)
+      return std::nullopt;
+    for (uint64_t offset = 0; offset < distance; ++offset)
+      if (!aAndBTokensAreIdentical(aToks, bToks, aStart + offset,
+                                   bStart + offset))
+        return std::nullopt;
+    aStart += distance;
+    bStart += distance;
+  }
+  return aStart - hunk.aStart;
+}
+
 /// Verify that every durable structural segment binding names one exact
 /// normalized hunk and the matching token edge in its parent witness.
 ///
@@ -954,6 +1006,10 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   }
 
   std::vector<diffutils::Hunk> hunks = std::move(diffPlan.hunks);
+  // Include edges first: an edge that leaves an include lands in the file that
+  // includes it, where it may still split a macro expansion the macro repair
+  // must then see.
+  RetractHunkEdgesOutOfPartiallyOwnedIncludes(hunks);
   RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(hunks);
 
   // Hunk-edge repair is an owner-aware normalization of the token diff the
@@ -1120,6 +1176,32 @@ bool RefoldEngine::StageSidebandEdits(
       *textEditCertifier_, *lineObserverLayout_,
       proofServices_->AcceptedCandidateBuilder(), terminalSink_,
       structuralHunkDispatcher);
+}
+
+void RefoldEngine::RetractHunkEdgesOutOfPartiallyOwnedIncludes(
+    std::vector<diffutils::Hunk> &hunks) const {
+  for (size_t index = 0; index < hunks.size(); ++index) {
+    diffutils::Hunk &hunk = hunks[index];
+
+    // Only a replacement is repaired here, for the reasons given in
+    // `RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions`.
+    if (hunk.aStart >= hunk.aEnd || hunk.bStart >= hunk.bEnd)
+      continue;
+
+    if (std::optional<uint64_t> distance =
+            leftEdgeRetractDistanceOutOfSplitInclude(model_, aToks_, bToks_,
+                                                     hunk);
+        distance && *distance != 0) {
+      REFOLD_LOG_DEBUG(
+          "plan/hunk-edge",
+          "hunk #{0} A=[{1},{2}) starts inside an include instance it does not "
+          "end in; retracting the left edge by {3} identical token(s) to A={4} "
+          "so the include is left untouched",
+          index, hunk.aStart, hunk.aEnd, *distance, hunk.aStart + *distance);
+      hunk.aStart += *distance;
+      hunk.bStart += *distance;
+    }
+  }
 }
 
 void RefoldEngine::RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(

@@ -1033,6 +1033,40 @@ private:
   void RepairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
       std::vector<diffutils::Hunk> &hunks) const;
 
+  /// Move a hunk's left edge off an include instance the hunk only partially
+  /// owns.
+  ///
+  /// An include is realized either by keeping its directive, which reproduces
+  /// every token of the instance, or by giving the instance up.  A replacement
+  /// hunk that begins strictly inside an include's A-token cover and ends past
+  /// it holds the instance's trailing tokens and part of the file after it, so
+  /// no owner covers it: the include cannot realize the tokens beyond its
+  /// cover, and the including file has no spelling for the header's tokens. The
+  /// only way out is to give the include up, which loses the `#include` line,
+  /// and fails outright when the hunk's source projection -- which then spans
+  /// everything between that line and the edited tokens -- crosses a directive
+  /// it cannot absorb, such as a macro definition whose body invokes another
+  /// macro.
+  ///
+  /// The token objective admits this edge when a header's last token is spelled
+  /// like a token the edit wrote after it, typically a `;`: several optimal
+  /// alignments then disagree on which of the equal tokens is kept, none is
+  /// forced, and the core-forced plan leaves all of them inside the hunk.  The
+  /// owner-depth tie-break does not separate them, because deleting a header's
+  /// last token pays the depth of the gap out of the header, which is the
+  /// including file's.  Only the left edge is repaired: deleting a header's
+  /// leading token pays the header's own depth, and no mirror-image straddle
+  /// has been reproduced.
+  ///
+  /// The repair is retraction only: the edge walks inward to the cover's end,
+  /// handing back tokens that are the same lexeme on both sides, so the
+  /// untouched region still reproduces them and the edit script produces
+  /// exactly the same B.  The move is taken whole or not at all -- every token
+  /// between the edge and the cover's end must match, and the B side must stay
+  /// non-empty -- so an edge that cannot leave the include this way is left for
+  /// the ordinary realizer lattice, which refuses it.
+  void RetractHunkEdgesOutOfPartiallyOwnedIncludes(
+      std::vector<diffutils::Hunk> &hunks) const;
 
 
 
