@@ -316,6 +316,57 @@ static std::optional<uint64_t> leftEdgeRetractDistanceOutOfSplitInclude(
   return aStart - hunk.aStart;
 }
 
+/// Return the first A token of the outermost include instance whose cover ends
+/// exactly at a hunk's right edge and begins after its left edge, or nullopt.
+///
+/// Such a hunk holds that instance whole as its trailing tokens, together with
+/// part of the including file before it.  The owner-depth tie-break leaves the
+/// instance unforced when deleting it is free, which is the case for a header
+/// whose only token sits in a gap the including file owns -- an included value
+/// in an initializer list, for one.  Nested instances end no later than the
+/// instance containing them, so the outermost one is the one with the earliest
+/// begin.
+std::optional<uint64_t> wholeIncludeBeginAtRightEdge(const RefoldModel &model,
+                                                     uint64_t aStart,
+                                                     uint64_t aEnd) {
+  std::optional<uint64_t> begin;
+  for (const RefoldModel::IncludeItem &include : model.GetIncludes()) {
+    const RefoldModel::PPCover &cover = include.cover;
+    if (cover.begin < cover.end && aStart < cover.begin && cover.end == aEnd &&
+        (!begin || cover.begin < *begin))
+      begin = cover.begin;
+  }
+  return begin;
+}
+
+/// Return how far a hunk's right edge must move inward to hand back every
+/// include instance it holds whole at that edge, zero when it holds none, or
+/// `std::nullopt` when the move is not admissible.
+///
+/// The admissibility conditions are those of
+/// `leftEdgeRetractDistanceOutOfSplitInclude`: every crossed token pair is the
+/// same lexeme on both sides, so the untouched region after the hunk reproduces
+/// it through the kept `#include`, and the B side stays non-empty.  Adjacent
+/// instances at the edge are handed back one after another.
+static std::optional<uint64_t> rightEdgeRetractDistanceOutOfWholeInclude(
+    const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
+    const diffutils::Hunk &hunk) {
+  uint64_t aEnd = hunk.aEnd;
+  uint64_t bEnd = hunk.bEnd;
+  while (std::optional<uint64_t> coverBegin =
+             wholeIncludeBeginAtRightEdge(model, hunk.aStart, aEnd)) {
+    const uint64_t distance = aEnd - *coverBegin;
+    if (distance >= bEnd - hunk.bStart)
+      return std::nullopt;
+    for (uint64_t offset = 1; offset <= distance; ++offset)
+      if (!aAndBTokensAreIdentical(aToks, bToks, aEnd - offset, bEnd - offset))
+        return std::nullopt;
+    aEnd -= distance;
+    bEnd -= distance;
+  }
+  return hunk.aEnd - aEnd;
+}
+
 } // namespace
 
 void retractHunkEdgesOutOfPartiallyOwnedIncludes(
@@ -340,6 +391,19 @@ void retractHunkEdgesOutOfPartiallyOwnedIncludes(
           index, hunk.aStart, hunk.aEnd, *distance, hunk.aStart + *distance);
       hunk.aStart += *distance;
       hunk.bStart += *distance;
+    }
+    if (std::optional<uint64_t> distance =
+            rightEdgeRetractDistanceOutOfWholeInclude(model, aToks, bToks,
+                                                      hunk);
+        distance && *distance != 0) {
+      REFOLD_LOG_DEBUG(
+          "plan/hunk-edge",
+          "hunk #{0} A=[{1},{2}) ends with a whole include instance it begins "
+          "before; retracting the right edge by {3} identical token(s) to "
+          "A={4} so the include is left untouched",
+          index, hunk.aStart, hunk.aEnd, *distance, hunk.aEnd - *distance);
+      hunk.aEnd -= *distance;
+      hunk.bEnd -= *distance;
     }
   }
 }

@@ -3539,21 +3539,17 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
   auto bEnvelope =
       includeInsertionPlanner_.ResolveIncludeRealizationBTokenEnvelope(
           materialBeginA, materialEndA, &evidenceKind);
-  if (h.isDeleteOnly() && materialBeginA == h.aStart &&
-      materialEndA == h.aEnd) {
-    // A delete-only exact closure has no edited B material by definition.  Do
-    // not let a neighbor-based cover projection reintroduce adjacent surviving
-    // tokens into the replacement; any source-control bytes that must survive
-    // are carried explicitly as preserved trivia below.
-    bEnvelope = std::make_pair(static_cast<size_t>(h.bStart),
-                               static_cast<size_t>(h.bEnd));
-    evidenceKind = IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope;
-    REFOLD_LOG_TRACE("fallback",
-                     "TU/include closure using exact delete hunk B envelope: "
-                     "A=[{0},{1}) B=[{2},{3})",
-                     materialBeginA, materialEndA, h.bStart, h.bEnd);
-  } else if (!bEnvelope && materialBeginA == h.aStart &&
-             materialEndA == h.aEnd) {
+  if (materialBeginA == h.aStart && materialEndA == h.aEnd) {
+    // An exact closure realizes exactly this hunk, and the token edit script
+    // already says which B tokens replace its A tokens: the hunk's own B range.
+    // Every other realizer of a hunk uses that range.  Do not let a cover
+    // projection substitute a different one: the canonical projection runs
+    // through the byte diff, which can pair repeated spellings differently
+    // from the token diff -- `1, 2, <h.h: 1>` against `7, 1, 0` projects to
+    // `1, 0` -- and a delete-only hunk has no edited B material at all, so a
+    // neighbor-based projection could only reintroduce surviving tokens.  Any
+    // source-control bytes that must survive are carried explicitly as
+    // preserved trivia below.
     bEnvelope = std::make_pair(static_cast<size_t>(h.bStart),
                                static_cast<size_t>(h.bEnd));
     evidenceKind = IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope;

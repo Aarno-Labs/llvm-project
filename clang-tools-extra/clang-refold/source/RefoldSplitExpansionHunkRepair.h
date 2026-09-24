@@ -83,37 +83,44 @@ void repairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
     llvm::ArrayRef<PPTok> bToks, llvm::ArrayRef<int64_t> aToBMap,
     std::vector<diffutils::Hunk> &hunks);
 
-/// Move a hunk's left edge off an include instance the hunk only partially
-/// owns.
+/// Move hunk edges off include instances the hunk shares with the including
+/// file, when the tokens at the edge allow it.
 ///
 /// An include is realized either by keeping its directive, which reproduces
-/// every token of the instance, or by giving the instance up.  A replacement
-/// hunk that begins strictly inside an include's A-token cover and ends past it
-/// holds the instance's trailing tokens and part of the file after it, so no
-/// owner covers it: the include cannot realize the tokens beyond its cover, and
-/// the including file has no spelling for the header's tokens.  The only way
-/// out is to give the include up, which loses the `#include` line, and fails
-/// outright when the hunk's source projection -- which then spans everything
-/// between that line and the edited tokens -- crosses a directive it cannot
-/// absorb, such as a macro definition whose body invokes another macro.
+/// every token of the instance, or by giving the instance up.  Two edge shapes
+/// put an instance's tokens in one hunk with tokens of the including file:
 ///
-/// The token objective admits this edge when a header's last token is spelled
-/// like a token the edit wrote after it, typically a `;`: several optimal
-/// alignments then disagree on which of the equal tokens is kept, none is
-/// forced, and the core-forced plan leaves all of them inside the hunk.  The
-/// owner-depth tie-break does not separate them, because deleting a header's
-/// last token pays the depth of the gap out of the header, which is the
-/// including file's.  Only the left edge is repaired: deleting a header's
-/// leading token pays the header's own depth, and no mirror-image straddle has
-/// been reproduced.
+/// - the hunk begins strictly inside an include's A-token cover and ends past
+///   it, holding the instance's trailing tokens;
+/// - the hunk begins before an include's cover and ends exactly at its end,
+///   holding the whole instance as its trailing tokens.
 ///
-/// The repair is retraction only: the edge walks inward to the cover's end,
+/// Neither include can realize the tokens outside its cover, and the including
+/// file has no spelling for the header's tokens.  The only way out is to give
+/// the include up, which loses the `#include` line, and fails outright when the
+/// hunk's source projection -- which then spans everything between that line
+/// and the edited tokens -- crosses a directive it cannot absorb, such as a
+/// macro definition whose body invokes another macro.
+///
+/// The token objective admits both shapes when a header token is spelled like
+/// a token the edit wrote beside it: several optimal alignments then disagree
+/// on which of the equal tokens is kept, none is forced, and the core-forced
+/// plan leaves all of them inside the hunk.  The owner-depth tie-break does not
+/// separate them only where deleting the header token is free, which is when
+/// the gap after it belongs to the including file: a header's last token (the
+/// first shape, typically a `;`), or a header whose only token sits in the
+/// including file's gap (the second, typically an included initializer value).
+/// The mirror images -- a hunk ending strictly inside a cover, or beginning on
+/// a whole instance -- would need a header token whose deletion pays the
+/// header's own depth, and neither has been reproduced, so neither is repaired.
+///
+/// The repair is retraction only: the edge walks inward to the cover boundary,
 /// handing back tokens that are the same lexeme on both sides, so the untouched
-/// region still reproduces them and the edit script produces exactly the same
-/// B.  The move is taken whole or not at all -- every token between the edge
-/// and the cover's end must match, and the B side must stay non-empty -- so an
-/// edge that cannot leave the include this way is left for the ordinary
-/// realizer lattice, which refuses it.
+/// region still reproduces them through the kept `#include` and the edit script
+/// produces exactly the same B.  The move is taken whole or not at all -- every
+/// token between the edge and the cover boundary must match, and the B side
+/// must stay non-empty -- so an edge that cannot leave the include this way is
+/// left unchanged for the ordinary realizer lattice.
 void retractHunkEdgesOutOfPartiallyOwnedIncludes(
     const RefoldModel &model, llvm::ArrayRef<PPTok> aToks,
     llvm::ArrayRef<PPTok> bToks, std::vector<diffutils::Hunk> &hunks);
