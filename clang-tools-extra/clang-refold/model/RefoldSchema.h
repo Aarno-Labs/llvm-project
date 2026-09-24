@@ -45,6 +45,8 @@
 //   "slots":  [ Slot, ... ],                // explicit insertion anchors
 //   "conds":  [ Cond, ... ],                // conditional groups
 //   "line_controls": [ LineControlEvent, ... ] // active #line events
+//   "skipped_ranges": [ SkippedRange, ... ] // text Clang skipped in
+//                                           // excluded conditional groups
 //   "items":  [ Item, ... ]                 //
 //   macros/includes/defs/pragmas/files
 // }
@@ -311,6 +313,13 @@ static constexpr const char *RefoldSchema = R"json(
         "$ref": "#/$defs/LineControlEvent"
       },
       "description": "Producer-proven active source #line / GNU line-marker events with post-expansion logical state. Optional for backward compatibility with older refold maps."
+    },
+    "skipped_ranges": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SkippedRange"
+      },
+      "description": "Physical source ranges Clang skipped while excluding conditional groups, recorded from PPCallbacks::SourceRangeSkipped in event order. Optional for backward compatibility with older refold maps; absence means no skipped text is proven."
     },
     "items": {
       "type": "array",
@@ -1743,6 +1752,37 @@ static constexpr const char *RefoldSchema = R"json(
         "text": {
           "type": "string",
           "description": "Exact source text for the physical directive line when available."
+        }
+      }
+    },
+    "SkippedRange": {
+      "type": "object",
+      "required": [
+        "physical_file",
+        "b",
+        "e"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "physical_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Physical source file containing the skipped range."
+        },
+        "b": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte offset of the '#' of the directive that started skipping."
+        },
+        "e": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte offset no earlier than the start of the directive that stopped skipping. Every byte in [b, e) outside those two directives was scanned only for directive names: it produced no token and changed no preprocessor state."
+        },
+        "owner_include_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Include item id of the file instance being lexed. Absent for the translation unit."
         }
       }
     },

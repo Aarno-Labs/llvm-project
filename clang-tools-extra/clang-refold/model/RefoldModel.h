@@ -1073,6 +1073,28 @@ public:
     StringRef text;
   };
 
+  /// Physical source range of one file instance that Clang skipped while
+  /// excluding a conditional group.
+  ///
+  /// Recorded from `PPCallbacks::SourceRangeSkipped`, so it is the
+  /// preprocessor's own control-flow decision; unlike `CondArm::selected` it is
+  /// a takenness fact.  `[b, e)` begins at the `#` of the directive that
+  /// started skipping and ends no earlier than the start of the directive that
+  /// stopped it.  Every byte in it outside those two directives was scanned
+  /// only for directive names: it produced no token and changed no
+  /// preprocessor state.
+  struct SkippedRange {
+    /// Physical source file containing the range.
+    StringRef physicalFile;
+    /// Inclusive physical source-byte offset.
+    uint64_t b = 0;
+    /// Exclusive physical source-byte offset.
+    uint64_t e = 0;
+    /// Include instance lexing the file when it was skipped, or nullopt for
+    /// the translation unit.
+    std::optional<uint64_t> ownerIncludeId;
+  };
+
   /// \brief Producer-recorded preprocessing context recovered from the
   /// refold-map `pp_ctx` field.
   ///
@@ -1206,6 +1228,9 @@ public:
   ArrayRef<CondGroup> GetConds() const { return conds_; }
   /// Return producer-proven active line-control events.
   ArrayRef<LineControlEvent> GetLineControls() const { return lineControls_; }
+  /// Producer-recorded skipped ranges, ordered by owner, file, and offsets.
+  /// Empty for maps produced before schema 3.6.
+  ArrayRef<SkippedRange> GetSkippedRanges() const { return skippedRanges_; }
 
   /// Look up a producer include instance by stable ID.
   const IncludeItem *GetIncludeById(uint64_t id) const {
@@ -1354,6 +1379,7 @@ private:
   std::vector<Slot> slots_;
   std::vector<CondGroup> conds_;
   std::vector<LineControlEvent> lineControls_;
+  std::vector<SkippedRange> skippedRanges_;
 
   // ============================= Derived indices =============================
 

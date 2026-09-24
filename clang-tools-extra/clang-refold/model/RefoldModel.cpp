@@ -780,6 +780,7 @@ using MacroReplacementTokenKind = RefoldModel::MacroReplacementTokenKind;
 using PPArgSpan = RefoldModel::PPArgSpan;
 using PPSpan = RefoldModel::PPSpan;
 using PragmaDirective = RefoldModel::PragmaDirective;
+using SkippedRange = RefoldModel::SkippedRange;
 using Slot = RefoldModel::Slot;
 using TokMapEntry = RefoldModel::TokMapEntry;
 
@@ -2072,6 +2073,34 @@ parseLineControlEvent(const json::Object &obj, const std::string &ctxItem) {
   return event;
 }
 
+/// Parse one producer-recorded skipped source range.
+static Expected<SkippedRange> parseSkippedRange(const json::Object &obj,
+                                                const std::string &ctxItem) {
+  SkippedRange range;
+
+  auto fileOrErr = applyToField(asString, obj, "physical_file", ctxItem);
+  if (!fileOrErr)
+    return fileOrErr.takeError();
+  range.physicalFile = *fileOrErr;
+
+  auto bOrErr = applyToField(asUInt64, obj, "b", ctxItem);
+  if (!bOrErr)
+    return bOrErr.takeError();
+  range.b = *bOrErr;
+
+  auto eOrErr = applyToField(asUInt64, obj, "e", ctxItem);
+  if (!eOrErr)
+    return eOrErr.takeError();
+  range.e = *eOrErr;
+
+  range.ownerIncludeId = asOptUInt64(obj, "owner_include_id");
+
+  if (range.e < range.b)
+    return createStringError(inconvertibleErrorCode(),
+                             "Invalid skipped range at %s", ctxItem.c_str());
+  return range;
+}
+
 /// Parse one file/conditional/arm slot record.
 static Expected<Slot> parseSlot(const json::Object &obj,
                                 const std::string &ctxItem) {
@@ -2424,6 +2453,36 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
               });
   }
 
+  // skipped_ranges (optional; maps produced before schema 3.6 do not contain
+  // it, and then no text is proven skipped)
+  if (auto arr = asOptArray(root, "skipped_ranges")) {
+    model.skippedRanges_.reserve((*arr)->size());
+    for (std::size_t i = 0; i < (*arr)->size(); ++i) {
+      const std::string ctxItem =
+          (Twine("skipped_ranges[") + Twine(i) + "]").str();
+
+      auto objOrErr = arrayObjElemAt(**arr, i, ctxItem);
+      if (!objOrErr)
+        return objOrErr.takeError();
+
+      auto rangeOrErr = parseSkippedRange(**objOrErr, ctxItem);
+      if (!rangeOrErr)
+        return rangeOrErr.takeError();
+      model.skippedRanges_.push_back(std::move(*rangeOrErr));
+    }
+
+    std::sort(model.skippedRanges_.begin(), model.skippedRanges_.end(),
+              [](const SkippedRange &a, const SkippedRange &bLocal) {
+                if (a.ownerIncludeId != bLocal.ownerIncludeId)
+                  return a.ownerIncludeId < bLocal.ownerIncludeId;
+                if (a.physicalFile != bLocal.physicalFile)
+                  return a.physicalFile < bLocal.physicalFile;
+                if (a.b != bLocal.b)
+                  return a.b < bLocal.b;
+                return a.e < bLocal.e;
+              });
+  }
+
   // conds
   {
     auto arrOrErr = applyToField(asArray, root, "conds");
@@ -2494,6 +2553,7 @@ RefoldModel RefoldModel::CloneForReadOnlyConsumer() const {
   clone.slots_ = slots_;
   clone.conds_ = conds_;
   clone.lineControls_ = lineControls_;
+  clone.skippedRanges_ = skippedRanges_;
 
   // Rebuild all pointer-bearing and ordering-sensitive derived state against
   // the clone's own vectors.  The producer-backed StringRefs intentionally

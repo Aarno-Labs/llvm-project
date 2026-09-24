@@ -610,6 +610,24 @@ struct CondGroup {
   std::vector<CondArm> Arms;
 };
 
+/// Physical source bytes of one file instance that Clang skipped while
+/// excluding a conditional group.
+///
+/// Recorded from `PPCallbacks::SourceRangeSkipped`, so it is the preprocessor's
+/// own control-flow decision rather than a reconstruction.  The range begins at
+/// the `#` of the directive that started skipping and ends no earlier than the
+/// start of the directive that stopped it.  Inside it only those two directives
+/// executed: every other byte was scanned for directive names alone, produced
+/// no token, and changed no preprocessor state.
+struct SkippedSourceRange {
+  std::string PhysicalFile;
+  uint64_t Begin = 0;
+  uint64_t End = 0;
+  /// Include instance lexing the file when the range was skipped, or nullopt
+  /// for the translation unit.
+  std::optional<uint64_t> OwnerIncludeId;
+};
+
 /// Producer-proven active source line-control event.
 ///
 /// Clang has already evaluated any macro operands and conditional activity by
@@ -684,6 +702,7 @@ class RefoldMapBuilder {
 
   std::vector<TokMapEntry> TokMap;
   std::vector<LineControlEvent> LineControlEvents;
+  std::vector<SkippedSourceRange> SkippedSourceRanges;
 
   /// (FileID, file-local byte offset) of each site where `__has_include` /
   /// `__has_include_next` was evaluated during preprocessing.  Consumed while
@@ -927,6 +946,14 @@ public:
   /// producer-proven.  The source-site range is best-effort: it is present when
   /// the physical directive line can be located deterministically.
   void onLineControlDirective(SourceLocation Loc);
+
+  /// Callback for a conditional group body the preprocessor skipped.
+  ///
+  /// Recorded only when the file instance being lexed is identified: the
+  /// translation unit itself, or an include instance this builder bound.  An
+  /// unidentified instance records nothing, so a consumer asking about it finds
+  /// no skipped text and fails closed.
+  void onSourceRangeSkipped(SourceRange Range);
 
   /// Callback for a raw `#pragma` line.
   ///

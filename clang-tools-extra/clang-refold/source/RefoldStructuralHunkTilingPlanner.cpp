@@ -1101,6 +1101,30 @@ public:
            lhs.includeId == rhs.includeId;
   }
 
+  /// Return the producer-recorded skipped ranges of one physical source
+  /// instance, in source order.
+  ///
+  /// The instance is the file together with the include occurrence lexing it,
+  /// because two occurrences of one header can skip different arms.  An
+  /// instance the producer did not record yields none, so a gap proof that
+  /// needs one fails closed.
+  SmallVector<SourceGapSkippedText, 4>
+  SkippedTextForSourceInstance(StringRef path,
+                               std::optional<uint64_t> includeId) const {
+    SmallVector<SourceGapSkippedText, 4> skippedText;
+    ArrayRef<RefoldModel::SkippedRange> ranges = deps_.model.GetSkippedRanges();
+    auto first = llvm::partition_point(
+        ranges, [&](const RefoldModel::SkippedRange &range) {
+          return range.ownerIncludeId < includeId;
+        });
+    for (auto it = first; it != ranges.end() && it->ownerIncludeId == includeId;
+         ++it) {
+      if (deps_.pathIdentity.PathsEqual(it->physicalFile, path))
+        skippedText.push_back(SourceGapSkippedText{it->b, it->e});
+    }
+    return skippedText;
+  }
+
   std::optional<PhysicalSourceRunPlan>
   BuildPhysicalSourceRunPlan(const diffutils::Hunk &h) const {
     if (h.aEnd <= h.aStart)
@@ -1286,11 +1310,14 @@ public:
         // Canonical run construction and later state-gap discharge must use
         // the same physical byte-cover theorem.  Treat every indexed
         // preprocessing interval as an opaque preserved source piece and
-        // require exact lexer trivia between those pieces.  This removes the
+        // require exact lexer trivia, or text the producer's preprocessor
+        // skipped in this instance, between those pieces.  This removes the
         // former second interval sorter/cursor proof from the tiler.
         std::optional<SourceGapProofResult> gapProof =
-            proveSourceGapWithIndexedStructureAndTrivia(
-                *structureIndex, previousEnd, spellingBegin);
+            proveSourceGapWithIndexedStructureTriviaAndSkippedText(
+                *structureIndex, previousEnd, spellingBegin,
+                SkippedTextForSourceInstance(entry.file,
+                                             tokenOwner->includeId));
         if (!gapProof)
           return std::nullopt;
 
@@ -3654,9 +3681,15 @@ private:
     // shared theorem now performs the same deterministic interval
     // normalization, exact preprocessing-inventory check, and lexer-trivia
     // coverage used by expansion fallback.  No directive-looking byte can be
-    // skipped merely because it contributed no ordinary PP token.
-    std::optional<SourceGapProofResult> proof = proveSourceGapWithIndexedTrivia(
-        *structureIndex, gapSource.begin, gapSource.end, pieces, reason);
+    // skipped merely because it contributed no ordinary PP token.  Text is
+    // neutral beyond trivia only where the producer's preprocessor recorded
+    // skipping it in this instance, which is the same theorem run
+    // construction used for this gap.
+    std::optional<SourceGapProofResult> proof =
+        proveSourceGapWithIndexedTriviaAndSkippedText(
+            *structureIndex, gapSource.begin, gapSource.end, pieces,
+            SkippedTextForSourceInstance(gapSource.path, gapSource.includeId),
+            reason);
     // Every submitted owner must be accounted for: it either survived as an
     // outer piece or was absorbed by a containing piece whose proof declared
     // that nested class.  Anything else means an owner vanished.
