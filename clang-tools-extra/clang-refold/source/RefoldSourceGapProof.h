@@ -124,6 +124,29 @@ uint64_t sourceGapProtectedStructureKindBit(
 /// neutral or preservable.
 uint64_t sourceGapConditionalDirectiveKindMask();
 
+/// Half-open physical byte range, in one source file instance, that the
+/// producer's preprocessor skipped while excluding a conditional group.
+///
+/// Only the directives that started and stopped skipping executed inside it;
+/// every other byte produced no token and changed no preprocessor state.  The
+/// bounding directives are indexed structure and remain opaque pieces, so this
+/// fact makes only the text between them neutral.
+struct SourceGapSkippedText {
+  uint64_t begin = 0;
+  uint64_t end = 0;
+};
+
+/// Return whether `[begin, end)` is exact indexed lexer trivia, or lies wholly
+/// inside one producer-recorded skipped range of the same source instance.
+///
+/// A skipped range is the preprocessor's own record that the bytes produced no
+/// token, so no lexical judgement is made about them.  A range that is neither
+/// fails closed; it is never split across trivia and skipped text.
+bool isSourceGapTriviaOrSkippedText(
+    const RefoldPreprocessingStructureIndex &structureIndex,
+    llvm::ArrayRef<SourceGapSkippedText> skippedText, uint64_t begin,
+    uint64_t end);
+
 /// Prove that a gap consists only of indexed preprocessing structure and exact
 /// lexer trivia.
 ///
@@ -137,6 +160,15 @@ proveSourceGapWithIndexedStructureAndTrivia(
     const RefoldPreprocessingStructureIndex &structureIndex,
     uint64_t gapBegin, uint64_t gapEnd, std::string *reason = nullptr);
 
+/// Like `proveSourceGapWithIndexedStructureAndTrivia()`, but a neutral range
+/// may also be text inside one of `skippedText`, the producer-recorded skipped
+/// ranges of the gap's own source instance.
+std::optional<SourceGapProofResult>
+proveSourceGapWithIndexedStructureTriviaAndSkippedText(
+    const RefoldPreprocessingStructureIndex &structureIndex, uint64_t gapBegin,
+    uint64_t gapEnd, llvm::ArrayRef<SourceGapSkippedText> skippedText,
+    std::string *reason = nullptr);
+
 /// Prove one gap using the index's exact lexer-trivia census.
 ///
 /// Every protected preprocessing interval must be wholly contained by one
@@ -147,6 +179,16 @@ std::optional<SourceGapProofResult> proveSourceGapWithIndexedTrivia(
     const RefoldPreprocessingStructureIndex &structureIndex,
     uint64_t gapBegin, uint64_t gapEnd,
     llvm::ArrayRef<SourceGapProofPiece> pieces,
+    std::string *reason = nullptr);
+
+/// Like `proveSourceGapWithIndexedTrivia()`, but a neutral range may also be
+/// text inside one of `skippedText`, the producer-recorded skipped ranges of
+/// the gap's own source instance.
+std::optional<SourceGapProofResult>
+proveSourceGapWithIndexedTriviaAndSkippedText(
+    const RefoldPreprocessingStructureIndex &structureIndex, uint64_t gapBegin,
+    uint64_t gapEnd, llvm::ArrayRef<SourceGapProofPiece> pieces,
+    llvm::ArrayRef<SourceGapSkippedText> skippedText,
     std::string *reason = nullptr);
 
 /// Prove one gap with a caller-specific neutral-range policy.

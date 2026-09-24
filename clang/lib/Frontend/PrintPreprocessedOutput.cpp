@@ -1356,6 +1356,12 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
                           ExpansionContext.ParentExpansionFrameId);
       }
 
+      void SourceRangeSkipped(SourceRange Range,
+                              SourceLocation EndifLoc) override {
+        (void)EndifLoc;
+        R->onSourceRangeSkipped(Range);
+      }
+
       void HasInclude(SourceLocation Loc, StringRef FileName, bool IsAngled,
                       OptionalFileEntryRef File,
                       SrcMgr::CharacteristicKind FileType) override {

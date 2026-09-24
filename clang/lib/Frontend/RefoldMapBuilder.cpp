@@ -3584,6 +3584,40 @@ void RefoldMapBuilder::onLineControlDirective(SourceLocation Loc) {
   LineControlEvents.push_back(std::move(Ev));
 }
 
+void RefoldMapBuilder::onSourceRangeSkipped(SourceRange Range) {
+  if (!enabled())
+    return;
+
+  // The bottom of the include stack is the main file.  Any deeper entry the
+  // builder did not bind to an include item (the predefines buffer, `-include`
+  // files) has no instance identity a consumer could match, so it is dropped
+  // rather than attributed to the translation unit.
+  if (IncludeStack.empty())
+    return;
+  std::optional<uint64_t> OwnerIncludeId;
+  if (IncludeStack.back())
+    OwnerIncludeId = Items[*IncludeStack.back()].ID;
+  else if (IncludeStack.size() != 1)
+    return;
+
+  if (Range.getBegin().isInvalid() || Range.getEnd().isInvalid() ||
+      !Range.getBegin().isFileID() || !Range.getEnd().isFileID())
+    return;
+  const std::pair<FileID, unsigned> Begin =
+      SM.getDecomposedLoc(Range.getBegin());
+  const std::pair<FileID, unsigned> End = SM.getDecomposedLoc(Range.getEnd());
+  if (Begin.first.isInvalid() || Begin.first != End.first ||
+      End.second < Begin.second)
+    return;
+
+  SkippedSourceRange Skipped;
+  Skipped.PhysicalFile = filePathForLocAbs(SM, Range.getBegin(), EmitAbsPaths);
+  Skipped.Begin = Begin.second;
+  Skipped.End = End.second;
+  Skipped.OwnerIncludeId = OwnerIncludeId;
+  SkippedSourceRanges.push_back(std::move(Skipped));
+}
+
 void RefoldMapBuilder::onHasInclude(SourceLocation Loc) {
   if (!enabled())
     return;
@@ -4931,7 +4965,7 @@ void RefoldMapBuilder::writeJSON() {
       PragmaItemsWithImage == PragmasEmittedIntoOutput;
 
   JO.object([&] {
-    JO.attribute("version", "3.5");
+    JO.attribute("version", "3.6");
     JO.attribute("pragma_images_complete", PragmaImagesComplete);
 
     const auto &PPO = PP.getPreprocessorOpts();
@@ -4991,6 +5025,18 @@ void RefoldMapBuilder::writeJSON() {
             JO.attribute("owner_include_id", *Ev.OwnerIncludeId);
           if (!Ev.Text.empty())
             JO.attribute("text", Ev.Text);
+        });
+      }
+    });
+
+    JO.attributeArray("skipped_ranges", [&] {
+      for (const SkippedSourceRange &Skipped : SkippedSourceRanges) {
+        JO.object([&] {
+          JO.attribute("physical_file", Skipped.PhysicalFile);
+          JO.attribute("b", Skipped.Begin);
+          JO.attribute("e", Skipped.End);
+          if (Skipped.OwnerIncludeId)
+            JO.attribute("owner_include_id", *Skipped.OwnerIncludeId);
         });
       }
     });

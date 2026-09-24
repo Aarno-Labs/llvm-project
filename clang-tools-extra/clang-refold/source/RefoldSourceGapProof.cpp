@@ -288,10 +288,30 @@ uint64_t sourceGapConditionalDirectiveKindMask() {
              PreprocessingStructureKind::ConditionalEndif);
 }
 
+bool isSourceGapTriviaOrSkippedText(
+    const RefoldPreprocessingStructureIndex &structureIndex,
+    ArrayRef<SourceGapSkippedText> skippedText, uint64_t begin, uint64_t end) {
+  if (structureIndex.IsRangeLexicallyIgnorable(begin, end))
+    return true;
+  return llvm::any_of(skippedText, [&](const SourceGapSkippedText &skipped) {
+    return skipped.begin <= begin && end <= skipped.end;
+  });
+}
+
 std::optional<SourceGapProofResult>
 proveSourceGapWithIndexedStructureAndTrivia(
     const RefoldPreprocessingStructureIndex &structureIndex,
     uint64_t gapBegin, uint64_t gapEnd, std::string *reason) {
+  return proveSourceGapWithIndexedStructureTriviaAndSkippedText(
+      structureIndex, gapBegin, gapEnd, ArrayRef<SourceGapSkippedText>(),
+      reason);
+}
+
+std::optional<SourceGapProofResult>
+proveSourceGapWithIndexedStructureTriviaAndSkippedText(
+    const RefoldPreprocessingStructureIndex &structureIndex, uint64_t gapBegin,
+    uint64_t gapEnd, ArrayRef<SourceGapSkippedText> skippedText,
+    std::string *reason) {
   std::vector<const PreprocessingStructureInterval *> intervals =
       structureIndex.FindOverlapping(gapBegin, gapEnd);
 
@@ -319,18 +339,29 @@ proveSourceGapWithIndexedStructureAndTrivia(
         intervalIndex});
   }
 
-  return proveSourceGapWithIndexedTrivia(structureIndex, gapBegin, gapEnd,
-                                         pieces, reason);
+  return proveSourceGapWithIndexedTriviaAndSkippedText(
+      structureIndex, gapBegin, gapEnd, pieces, skippedText, reason);
 }
 
 std::optional<SourceGapProofResult> proveSourceGapWithIndexedTrivia(
     const RefoldPreprocessingStructureIndex &structureIndex,
     uint64_t gapBegin, uint64_t gapEnd,
     ArrayRef<SourceGapProofPiece> pieces, std::string *reason) {
+  return proveSourceGapWithIndexedTriviaAndSkippedText(
+      structureIndex, gapBegin, gapEnd, pieces,
+      ArrayRef<SourceGapSkippedText>(), reason);
+}
+
+std::optional<SourceGapProofResult>
+proveSourceGapWithIndexedTriviaAndSkippedText(
+    const RefoldPreprocessingStructureIndex &structureIndex, uint64_t gapBegin,
+    uint64_t gapEnd, ArrayRef<SourceGapProofPiece> pieces,
+    ArrayRef<SourceGapSkippedText> skippedText, std::string *reason) {
   return proveSourceGapImpl(
       structureIndex, gapBegin, gapEnd, pieces,
       [&](uint64_t begin, uint64_t end) {
-        return structureIndex.IsRangeLexicallyIgnorable(begin, end);
+        return isSourceGapTriviaOrSkippedText(structureIndex, skippedText,
+                                              begin, end);
       },
       [](size_t) {}, /*uncoveredProtectedStructureKinds=*/0, reason);
 }
