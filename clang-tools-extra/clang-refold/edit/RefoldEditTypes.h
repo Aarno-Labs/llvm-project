@@ -309,7 +309,7 @@ struct TextEdit {
   /// B byte ranges of surviving `#pragma` lines this edit's text replays
   /// verbatim at the edge of its B range, where the envelope alone cannot
   /// show it.  Set only by a realizer that deliberately carries them.
-  std::vector<std::pair<uint64_t, uint64_t>> replayedPragmaLines;
+  std::vector<std::pair<uint64_t, uint64_t>> replayedPragmaLines = {};
 
   /// Inclusive byte offset inside this edit's replacement `text` to report as
   /// the refolded-output side of the materialized edit map.

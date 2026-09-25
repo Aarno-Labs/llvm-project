@@ -112,7 +112,7 @@ struct MaterializedSurface {
   /// B byte ranges of surviving `#pragma` lines the replacement replays
   /// verbatim, because replacing the callsite removes the only source that
   /// printed them.  Dropped whenever the replacement text is rewritten.
-  std::vector<std::pair<uint64_t, uint64_t>> replayedPragmaLines;
+  std::vector<std::pair<uint64_t, uint64_t>> replayedPragmaLines = {};
   /// True when `bTokStart`/`bTokEnd` name a valid B-token interval.
   bool hasBTokenRange = false;
   /// Inclusive B-token index of the materialized surface envelope.

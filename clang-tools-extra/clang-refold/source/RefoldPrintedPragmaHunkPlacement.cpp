@@ -140,7 +140,12 @@ std::optional<PrintedPragmaPlacementViolation> enforcePrintedPragmaPlacement(
                std::make_tuple(h.aStart, h.aEnd, h.bStart, h.bEnd)) != 0;
   };
 
-  for (const auto &[aGap, wanted] : bRangeByAGap) {
+  for (const auto &aGapEntry : bRangeByAGap) {
+    // Bind by name rather than by structured binding: the repair lambdas below
+    // capture the gap, and capturing a structured binding is C++20.
+    const uint64_t aGap = aGapEntry.first;
+    const std::pair<uint64_t, uint64_t> &wanted = aGapEntry.second;
+
     // Locate the hunks touching the gap: one ending at it, one pure insertion
     // at it, one starting at it.  A hunk strictly across it would carry the
     // directive's source inside one edit, which is never a placement.

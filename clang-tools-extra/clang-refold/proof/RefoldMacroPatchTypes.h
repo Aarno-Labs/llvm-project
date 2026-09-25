@@ -270,7 +270,7 @@ struct WholeCoverPlan {
   /// B byte ranges of the `#pragma` lines this invocation's expansion printed
   /// that `clippedText` replays verbatim; see
   /// `RefoldMacroWholeCoverPlanBuilder::ComputeWholeCoverPlan`.
-  std::vector<std::pair<uint64_t, uint64_t>> replayedPragmaLines;
+  std::vector<std::pair<uint64_t, uint64_t>> replayedPragmaLines = {};
 };
 
 enum class OccurrenceSupportMode {
