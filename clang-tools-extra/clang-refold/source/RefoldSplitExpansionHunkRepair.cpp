@@ -283,6 +283,28 @@ includeStraddledAtLeftEdge(const RefoldModel &model, uint64_t aStart,
   return nullptr;
 }
 
+/// Return whether one owner covers every A token of the deletion
+/// `[aBegin, aEnd)`.
+///
+/// A retraction that consumes a hunk's whole B side no longer decides only
+/// where an edge falls: B keeps none of the hunk's tokens, so the retraction
+/// picks which of several identically spelled A tokens are deleted.  That pick
+/// is an improvement only when the deletion it leaves is one owner's, which is
+/// the property the owner-aligned deletion slide requires of a deletion it
+/// moves.  A deletion that still holds an include instance beside the
+/// including file's tokens straddles the boundary the retraction exists to
+/// clear, and may cross the directives between them.
+static bool deletionHasOneOwner(const RefoldModel &model, uint64_t aBegin,
+                                uint64_t aEnd) {
+  if (aEnd <= aBegin)
+    return false;
+  const std::optional<uint64_t> owner = model.InnermostIncludeAtPP(aBegin);
+  for (uint64_t aToken = aBegin + 1; aToken < aEnd; ++aToken)
+    if (model.InnermostIncludeAtPP(aToken) != owner)
+      return false;
+  return true;
+}
+
 /// Return how far a hunk's left edge must move inward for it to leave every
 /// include instance it straddles, zero when it straddles none, or
 /// `std::nullopt` when the move is not admissible.
@@ -291,9 +313,9 @@ includeStraddledAtLeftEdge(const RefoldModel &model, uint64_t aStart,
 /// untouched region on the left reproduces it.  When the edge sits inside
 /// nested instances the walk continues until no straddled cover contains it;
 /// an inner cover never extends past the outer one, so the walk stops at the
-/// outermost straddled boundary whichever instance is examined first.  The B
-/// side must stay non-empty: emptying it would turn the replacement into a
-/// deletion, which belongs to the owner-aligned deletion slide.
+/// outermost straddled boundary whichever instance is examined first.  The walk
+/// may consume the whole B side only when the deletion it leaves has one owner;
+/// see `deletionHasOneOwner`.
 static std::optional<uint64_t> leftEdgeRetractDistanceOutOfSplitInclude(
     const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
     const diffutils::Hunk &hunk) {
@@ -304,7 +326,7 @@ static std::optional<uint64_t> leftEdgeRetractDistanceOutOfSplitInclude(
     // A left-edge straddle means the cover ends inside the hunk, so the walk
     // stays within the hunk's A side.
     const uint64_t distance = include->cover.end - aStart;
-    if (distance >= hunk.bEnd - bStart)
+    if (distance > hunk.bEnd - bStart)
       return std::nullopt;
     for (uint64_t offset = 0; offset < distance; ++offset)
       if (!aAndBTokensAreIdentical(aToks, bToks, aStart + offset,
@@ -313,6 +335,8 @@ static std::optional<uint64_t> leftEdgeRetractDistanceOutOfSplitInclude(
     aStart += distance;
     bStart += distance;
   }
+  if (bStart == hunk.bEnd && !deletionHasOneOwner(model, aStart, hunk.aEnd))
+    return std::nullopt;
   return aStart - hunk.aStart;
 }
 
@@ -346,8 +370,9 @@ std::optional<uint64_t> wholeIncludeBeginAtRightEdge(const RefoldModel &model,
 /// The admissibility conditions are those of
 /// `leftEdgeRetractDistanceOutOfSplitInclude`: every crossed token pair is the
 /// same lexeme on both sides, so the untouched region after the hunk reproduces
-/// it through the kept `#include`, and the B side stays non-empty.  Adjacent
-/// instances at the edge are handed back one after another.
+/// it through the kept `#include`, and the walk consumes the whole B side only
+/// when the deletion it leaves has one owner.  Adjacent instances at the edge
+/// are handed back one after another.
 static std::optional<uint64_t> rightEdgeRetractDistanceOutOfWholeInclude(
     const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
     const diffutils::Hunk &hunk) {
@@ -356,7 +381,7 @@ static std::optional<uint64_t> rightEdgeRetractDistanceOutOfWholeInclude(
   while (std::optional<uint64_t> coverBegin =
              wholeIncludeBeginAtRightEdge(model, hunk.aStart, aEnd)) {
     const uint64_t distance = aEnd - *coverBegin;
-    if (distance >= bEnd - hunk.bStart)
+    if (distance > bEnd - hunk.bStart)
       return std::nullopt;
     for (uint64_t offset = 1; offset <= distance; ++offset)
       if (!aAndBTokensAreIdentical(aToks, bToks, aEnd - offset, bEnd - offset))
@@ -364,6 +389,8 @@ static std::optional<uint64_t> rightEdgeRetractDistanceOutOfWholeInclude(
     aEnd -= distance;
     bEnd -= distance;
   }
+  if (bEnd == hunk.bStart && !deletionHasOneOwner(model, hunk.aStart, aEnd))
+    return std::nullopt;
   return hunk.aEnd - aEnd;
 }
 

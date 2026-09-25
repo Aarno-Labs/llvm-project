@@ -118,9 +118,24 @@ void repairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
 /// handing back tokens that are the same lexeme on both sides, so the untouched
 /// region still reproduces them through the kept `#include` and the edit script
 /// produces exactly the same B.  The move is taken whole or not at all -- every
-/// token between the edge and the cover boundary must match, and the B side
-/// must stay non-empty -- so an edge that cannot leave the include this way is
-/// left unchanged for the ordinary realizer lattice.
+/// token between the edge and the cover boundary must match -- so an edge that
+/// cannot leave the include this way is left unchanged for the ordinary
+/// realizer lattice.
+///
+/// The move may consume the hunk's whole B side, turning the replacement into
+/// a deletion.  That is the shape of an edit deleting a declaration that ends
+/// in the same token as the header before it: the `;` both sides keep is the
+/// header's, and the deletion lies wholly in the including file.  The same
+/// identity argument covers it, and the A side never empties, because a
+/// straddled or trailing cover always leaves including-file tokens in the hunk.
+/// With B empty the move also chooses which identical A tokens are deleted, so
+/// it is taken only when one owner covers the whole deletion -- the condition
+/// the owner-aligned deletion slide imposes on a deletion it moves.  A hunk
+/// whose opposite edge holds another instance keeps its replacement.  The
+/// slide itself cannot stand in for this move: it moves only a
+/// pure deletion, and only after a terminal request names it, while a
+/// replacement straddling an include is typically realized, with no request,
+/// by giving the include up.
 void retractHunkEdgesOutOfPartiallyOwnedIncludes(
     const RefoldModel &model, llvm::ArrayRef<PPTok> aToks,
     llvm::ArrayRef<PPTok> bToks, std::vector<diffutils::Hunk> &hunks);
