@@ -109,6 +109,28 @@ public:
   std::string ResolvePostStructuralFallback();
 
 private:
+  /// How a mixed TU/include closure treats a source gap that both the in-place
+  /// directive preservation proof and the zero-token consumption proof admit,
+  /// which is a gap holding macro-state directives.
+  enum class MacroDirectiveGapPolicy {
+    /// Keep the directives at their original position, splitting the B payload
+    /// around them.
+    PreserveInPlace,
+    /// Consume the directives with the replaced envelope, leaving later
+    /// observers to the macro-state repair pass.
+    Consume,
+  };
+
+  /// Build one TUIncludeClosureEdit under \p macroDirectiveGapPolicy.
+  ///
+  /// \p usedInPlaceMacroDirectiveGap is set when a macro-directive gap was
+  /// preserved in place, which is the only way the two policies differ.
+  std::optional<TextEdit> BuildTUIncludeClosureEdit(
+      const diffutils::Hunk &h, llvm::StringRef tuPath, llvm::StringRef tuBytes,
+      llvm::ArrayRef<std::pair<uint64_t, uint64_t>> stagedSourceIntervals,
+      MacroDirectiveGapPolicy macroDirectiveGapPolicy,
+      bool &usedInPlaceMacroDirectiveGap) const;
+
   /// True when the proposed widened A range would cover any token diff hunk
   /// besides \p realizedHunk, the hunk currently being realized.
   bool RangeHasForeignTokenDiff(const diffutils::Hunk &realizedHunk,

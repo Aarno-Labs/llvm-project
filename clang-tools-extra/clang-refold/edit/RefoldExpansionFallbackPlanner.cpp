@@ -1187,6 +1187,14 @@ struct TUPositionPreservedDirective {
   /// Macro definitions a preserved `#define`/`#undef` binds.  Empty for the
   /// other kinds.  Each binding points into the model's directive record.
   SmallVector<MacroStateBinding, 2> macroBindings;
+  /// The source bytes re-emitted for the directive, `[emitBegin, emitEnd)`.
+  /// They contain `[begin, end)` and extend over the comments of the
+  /// directive's gap, which carry no tokens and would otherwise be lost with
+  /// the rest of the replaced envelope.  `begin`/`end` stay the directive's own
+  /// interval, which is what the frontier projection and the gap proof reason
+  /// about.
+  uint64_t emitBegin = 0;
+  uint64_t emitEnd = 0;
 };
 
 /// Proves what the source gaps inside a proposed TU/include-closure
@@ -2034,16 +2042,55 @@ public:
       return false;
     }
 
-    for (size_t payloadIndex : gapProof->outerPiecePayloadIndices) {
-      const TUPositionPreservedDirective &piece = pragmas[payloadIndex];
+    SmallVector<TUPositionPreservedDirective, 4> accepted;
+    for (size_t payloadIndex : gapProof->outerPiecePayloadIndices)
+      accepted.push_back(pragmas[payloadIndex]);
+    attachGapCommentsToPreservedDirectives(gapBegin, gapEnd, accepted);
+
+    for (const TUPositionPreservedDirective &piece : accepted) {
       REFOLD_LOG_TRACE(
           "fallback",
           "TU/include closure preserving TU directive id={0} in place "
-          "source=[{1},{2}) aFrontier={3} gap=[{4},{5})",
-          piece.id, piece.begin, piece.end, piece.aFrontier, gapBegin, gapEnd);
+          "source=[{1},{2}) emit=[{3},{4}) aFrontier={5} gap=[{6},{7})",
+          piece.id, piece.begin, piece.end, piece.emitBegin, piece.emitEnd,
+          piece.aFrontier, gapBegin, gapEnd);
       out.push_back(piece);
     }
     return true;
+  }
+
+  /// Widen the emitted bytes of a gap's preserved directives over the gap's
+  /// comments.
+  ///
+  /// The gap proof has established that `[gapBegin, gapEnd)` is exactly
+  /// trivia plus `directives`, so the bytes between two consecutive
+  /// directives, or between a directive and a gap edge, are whitespace and
+  /// comments.  A comment carries no token, so re-emitting it beside a
+  /// directive leaves the B token stream unchanged.  Each comment goes with the
+  /// directive after it, and those after the last directive go with that one;
+  /// every extension is a contiguous source slice, so the comments keep their
+  /// spelling and their layout relative to the directive.  `directives` must
+  /// be in source order.
+  void attachGapCommentsToPreservedDirectives(
+      uint64_t gapBegin, uint64_t gapEnd,
+      MutableArrayRef<TUPositionPreservedDirective> directives) const {
+    uint64_t segmentBegin = gapBegin;
+    for (TUPositionPreservedDirective &directive : directives) {
+      directive.emitBegin = directive.begin;
+      directive.emitEnd = directive.end;
+      ArrayRef<PreprocessingTriviaInterval> leading =
+          preprocessingStructureIndex_.CommentsWithin(segmentBegin,
+                                                      directive.begin);
+      if (!leading.empty())
+        directive.emitBegin = leading.front().begin;
+      segmentBegin = directive.end;
+    }
+    if (directives.empty())
+      return;
+    ArrayRef<PreprocessingTriviaInterval> trailing =
+        preprocessingStructureIndex_.CommentsWithin(segmentBegin, gapEnd);
+    if (!trailing.empty())
+      directives.back().emitEnd = trailing.back().end;
   }
 
 private:
@@ -2483,6 +2530,45 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
           ExpansionFallbackBranchKind::TUIncludeClosureEdit);
   theoremAuditService_.AuditExpansionFallbackBranchClassification(
       fallbackBranch, "BuildTUIncludeClosureEditForUnresolvedHunk");
+
+  // A macro-state directive in a replaced gap is kept where it is when the B
+  // payload can be split around it.  Whether it can is decided only once the
+  // payload is known, well after the gap proofs, so a refusal there -- edited
+  // material that observes the directive's binding has no determined side of
+  // it -- cannot fall back gap by gap.  It falls back as a whole: the same
+  // closure is proved again with those gaps consumed, which is the realization
+  // the planner produced before in-place preservation was tried first.
+  bool usedInPlaceMacroDirectiveGap = false;
+  if (std::optional<TextEdit> edit =
+          BuildTUIncludeClosureEdit(h, tuPath, tuBytes, stagedSourceIntervals,
+                                    MacroDirectiveGapPolicy::PreserveInPlace,
+                                    usedInPlaceMacroDirectiveGap))
+    return edit;
+  if (!usedInPlaceMacroDirectiveGap)
+    return std::nullopt;
+
+  REFOLD_LOG_TRACE("fallback",
+                   "TU include-closure retrying hunk A=[{0},{1}) with its "
+                   "macro-state directive gaps consumed rather than preserved "
+                   "in place",
+                   h.aStart, h.aEnd);
+  bool unusedInPlaceMacroDirectiveGap = false;
+  return BuildTUIncludeClosureEdit(h, tuPath, tuBytes, stagedSourceIntervals,
+                                   MacroDirectiveGapPolicy::Consume,
+                                   unusedInPlaceMacroDirectiveGap);
+}
+
+std::optional<RefoldExpansionFallbackPlanner::TextEdit>
+RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
+    const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
+    ArrayRef<std::pair<uint64_t, uint64_t>> stagedSourceIntervals,
+    MacroDirectiveGapPolicy macroDirectiveGapPolicy,
+    bool &usedInPlaceMacroDirectiveGap) const {
+  // The public entry point audits this classification once per hunk; each
+  // attempt only needs it to certify an accepted closure.
+  const ExpansionFallbackBranchClassification fallbackBranch =
+      ClassifyExpansionFallbackBranch(
+          ExpansionFallbackBranchKind::TUIncludeClosureEdit);
 
   // Expansion fallback and structural hunk tiling must reason over the same
   // exact physical preprocessing census.  A mismatched source surface would
@@ -3281,6 +3367,32 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
             return true;
           }
 
+          // A macro-state directive is meaningful source, so keeping it where
+          // it is comes before consuming it.  Consumption is token-sound -- the
+          // macro-state repair pass re-inserts a consumed definition only when
+          // a later observer needs it -- but it deletes every directive that
+          // no observer reaches, and the gap's comments with it.  The in-place
+          // proof covers only gaps whose protected intervals are all
+          // preservable directives, so any other gap still falls through to
+          // the consumption proof below.
+          if (macroDirectiveGapPolicy ==
+              MacroDirectiveGapPolicy::PreserveInPlace) {
+            const size_t preservedBefore =
+                mixedPositionPreservedTUDirectives.size();
+            if (gapProver.CollectPositionPreservedTUDirectiveGapPieces(
+                    gapBegin, gapEnd, mixedPositionPreservedTUDirectives)) {
+              if (llvm::any_of(
+                      llvm::drop_begin(mixedPositionPreservedTUDirectives,
+                                       preservedBefore),
+                      [](const TUPositionPreservedDirective &directive) {
+                        return directive.kind == TUPositionPreservedDirective::
+                                                     Kind::MacroDirective;
+                      }))
+                usedInPlaceMacroDirectiveGap = true;
+              return true;
+            }
+          }
+
           if (gapProver.GapIsConsumableZeroTokenSourceClosure(
                   gapBegin, gapEnd,
                   /*allowTUConditionalControl=*/true))
@@ -3699,7 +3811,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
         return std::nullopt;
       }
 
-      StringRef pragmaBytes = tuBytes.slice(pragma.begin, pragma.end);
+      StringRef pragmaBytes = tuBytes.slice(pragma.emitBegin, pragma.emitEnd);
       rawReplacement.append(pragmaBytes.begin(), pragmaBytes.end());
       if (rawReplacement.back() != '\n')
         rawReplacement.push_back('\n');
