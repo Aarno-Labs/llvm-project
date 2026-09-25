@@ -193,6 +193,14 @@ struct SyntheticUndefCandidate {
   std::string restoreText;
 };
 
+/// A definition consumed by a final TU edit together with the recorded
+/// invocation that expanded through it.  The invocation is either a surviving
+/// root callsite or a nested invocation that root's expansion produced.
+struct ConsumedExpansionDefinition {
+  const RefoldModel::MacroInvocation *invocation = nullptr;
+  const RefoldModel::MacroDirective *definition = nullptr;
+};
+
 class MacroStateRepairContext {
 public:
   /// Creates a repair context and builds the shared macro directive index
@@ -545,6 +553,19 @@ private:
       StringRef macroName) const;
   /// Repairs definitions required by surviving callsites after final TU edits.
   void RepairSurvivingDefinitionCallsites();
+  /// Collects every definition consumed by a final TU edit that the recorded
+  /// expansion of a surviving root callsite used, including the definitions of
+  /// nested invocations its expansion produced.
+  void CollectConsumedDefinitionsUsedByExpansion(
+      const RefoldModel::MacroInvocation &root,
+      SmallVectorImpl<ConsumedExpansionDefinition> &out) const;
+  /// Queues preservation of one consumed definition used by a surviving
+  /// callsite's expansion.  Returns false when no proved placement exists, in
+  /// which case the caller must remove the callsite's dependency on it.
+  bool TryPreserveConsumedDefinitionForCallsite(
+      const ConsumedExpansionDefinition &used,
+      const RefoldModel::MacroInvocation &root, bool survivesAsTUCallsite,
+      bool survivesAsIncludeCallsite, size_t &preservedCount);
   /// Preserves consumed undef directives that remain semantically required and
   /// returns the number of applied repairs.
   size_t PreserveConsumedUndefs();
@@ -3003,6 +3024,83 @@ bool MacroStateRepairContext::DefinitionHasOtherSurvivingSameNameTransition(
   return false;
 }
 
+/// A surviving callsite re-expands under the macro state of the emitted
+/// source, so every definition its recorded expansion used must still be live
+/// there -- not only the definition of the macro it names.  The producer
+/// records each nested invocation with its caller and the exact definition
+/// directive that expanded it, so the set is read from that graph rather than
+/// rediscovered by scanning replacement lists: a replacement list names a
+/// macro, but which definition of that name is live is decided at expansion
+/// time.  Invocations are visited in producer order, and a definition shared by
+/// several nested invocations is reported once.
+void MacroStateRepairContext::CollectConsumedDefinitionsUsedByExpansion(
+    const RefoldModel::MacroInvocation &root,
+    SmallVectorImpl<ConsumedExpansionDefinition> &out) const {
+  DenseSet<uint64_t> visitedInvocationIds;
+  DenseSet<uint64_t> collectedDefinitionIds;
+  SmallVector<const RefoldModel::MacroInvocation *, 8> worklist{&root};
+  while (!worklist.empty()) {
+    const RefoldModel::MacroInvocation *invocation = worklist.pop_back_val();
+    if (!visitedInvocationIds.insert(invocation->id).second)
+      continue;
+
+    const RefoldModel::MacroDirective *definition =
+        ActiveDefinitionForInvocation(*invocation);
+    if (definition && DefinitionDirectiveTouchedByTUEdit(*definition) &&
+        collectedDefinitionIds.insert(definition->id).second)
+      out.push_back(ConsumedExpansionDefinition{invocation, definition});
+
+    // Push in reverse so children are visited in producer order.
+    ArrayRef<const RefoldModel::MacroInvocation *> children =
+        MacroTopology().MacroChildrenOf(invocation->id);
+    for (const RefoldModel::MacroInvocation *child : llvm::reverse(children))
+      worklist.push_back(child);
+  }
+}
+
+bool MacroStateRepairContext::TryPreserveConsumedDefinitionForCallsite(
+    const ConsumedExpansionDefinition &used,
+    const RefoldModel::MacroInvocation &root, bool survivesAsTUCallsite,
+    bool survivesAsIncludeCallsite, size_t &preservedCount) {
+  const RefoldModel::MacroInvocation &invocation = *used.invocation;
+  const RefoldModel::MacroDirective &definition = *used.definition;
+
+  const bool hasOtherSurvivingSameNameTransition =
+      DefinitionHasOtherSurvivingSameNameTransition(definition,
+                                                    invocation.name);
+  const bool mayPreserveDefinition =
+      survivesAsIncludeCallsite ||
+      (survivesAsTUCallsite && !hasOtherSurvivingSameNameTransition);
+  if (!mayPreserveDefinition)
+    return false;
+
+  std::optional<size_t> editIndex =
+      FinalTUEditContainingMacroDirective(definition);
+  if (!editIndex)
+    return false;
+
+  if (plan_.preservedDefinitionDirectiveIds.contains(definition.id))
+    return true;
+
+  std::optional<MacroStatePreservationPlacement> placement =
+      TryQueueMacroStateDirectivePreservation(*editIndex, definition,
+                                              invocation.name,
+                                              /*ObservedDefinition=*/nullptr);
+  if (!placement)
+    return false;
+
+  plan_.preservedDefinitionDirectiveIds.insert(definition.id);
+  ++preservedCount;
+  REFOLD_LOG_WARN("macro/liveness",
+                  "preserving consumed #define for surviving macro callsite: "
+                  "macro='{0}' defDirective=#{1} inv=#{2} root=#{3} "
+                  "edit=[{4},{5}) placement={6}",
+                  invocation.name, definition.id, invocation.id, root.id,
+                  tuEdits_[*editIndex].start, tuEdits_[*editIndex].end,
+                  MacroStatePreservationPlacementName(*placement));
+  return true;
+}
+
 void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
   size_t preservedDefinitionLivenessDirectives = 0;
   size_t forcedDefinitionLivenessPatches = 0;
@@ -3021,67 +3119,44 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
     if (!survivesAsTUCallsite && !survivesAsIncludeCallsite)
       continue;
 
-    const RefoldModel::MacroDirective *definition =
-        ActiveDefinitionForInvocation(invocation);
-    if (!definition || !DefinitionDirectiveTouchedByTUEdit(*definition))
+    SmallVector<ConsumedExpansionDefinition, 4> consumedDefinitions;
+    CollectConsumedDefinitionsUsedByExpansion(invocation, consumedDefinitions);
+    if (consumedDefinitions.empty())
       continue;
 
     if (PhysicalCallsiteIsMaterialized(invocation))
       continue;
 
-    bool preservedDefinition = false;
-    const bool hasOtherSurvivingSameNameTransition =
-        DefinitionHasOtherSurvivingSameNameTransition(*definition,
-                                                      invocation.name);
-    const bool mayPreserveDefinition =
-        survivesAsIncludeCallsite ||
-        (survivesAsTUCallsite && !hasOtherSurvivingSameNameTransition);
-    if (mayPreserveDefinition) {
-      if (std::optional<size_t> editIndex =
-              FinalTUEditContainingMacroDirective(*definition)) {
-        std::optional<MacroStatePreservationPlacement> placement;
-        if (!plan_.preservedDefinitionDirectiveIds.contains(definition->id))
-          placement = TryQueueMacroStateDirectivePreservation(
-              *editIndex, *definition, invocation.name,
-              /*ObservedDefinition=*/nullptr);
-        else
-          placement = MacroStatePreservationPlacement::BeforeReplacement;
-
-        if (placement) {
-          preservedDefinition = true;
-          if (!plan_.preservedDefinitionDirectiveIds.contains(definition->id)) {
-            plan_.preservedDefinitionDirectiveIds.insert(definition->id);
-            ++preservedDefinitionLivenessDirectives;
-            REFOLD_LOG_WARN(
-                "macro/liveness",
-                "preserving consumed #define for surviving macro callsite: "
-                "macro='{0}' defDirective=#{1} inv=#{2} edit=[{3},{4}) "
-                "placement={5}",
-                invocation.name, definition->id, invocation.id,
-                tuEdits_[*editIndex].start, tuEdits_[*editIndex].end,
-                MacroStatePreservationPlacementName(*placement));
-          }
-        }
-      }
+    // Every consumed definition the expansion used must be preserved; one
+    // missing definition leaves its name unexpanded in the emitted source.
+    // Queued preservations are proved and authorized atomically after all
+    // replacement-local insertion offsets are finalized, so no detached
+    // gateway check is performed here.
+    const ConsumedExpansionDefinition *unpreserved = nullptr;
+    for (const ConsumedExpansionDefinition &used : consumedDefinitions) {
+      if (TryPreserveConsumedDefinitionForCallsite(
+              used, invocation, survivesAsTUCallsite, survivesAsIncludeCallsite,
+              preservedDefinitionLivenessDirectives))
+        continue;
+      unpreserved = &used;
+      break;
     }
-
-    if (preservedDefinition) {
-      // The queued preservation is proved and authorized atomically after all
-      // replacement-local insertion offsets are finalized.  Performing a
-      // detached gateway check here would create proof evidence unrelated to
-      // the exact transition capability eventually minted for the edit.
+    if (!unpreserved)
       continue;
-    }
+    const RefoldModel::MacroDirective *definition = unpreserved->definition;
 
     if (survivesAsIncludeCallsite) {
       (void)CheckMacroStateTerminal(
           *definition, StateMutationKind::Consumed, "macro-definition-liveness",
           llvm::formatv("macro '{0}' invocation #{1} survives inside preserved "
-                        "include site, but active definition directive #{2} "
-                        "was consumed by a TU edit and the directive could not "
+                        "include site, but definition directive #{2} used by "
+                        "its expansion (macro '{3}' invocation #{4}) was "
+                        "consumed by a TU edit and the directive could not "
                         "be preserved in any proved placement before the "
                         "surviving include observes macro state",
-                        invocation.name, invocation.id, definition->id)
+                        invocation.name, invocation.id, definition->id,
+                        unpreserved->invocation->name,
+                        unpreserved->invocation->id)
               .str(),
           /*RequireKnownObserver=*/true, invocation.id);
       continue;
@@ -3095,11 +3170,14 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
     if (!wholePlan) {
       (void)CheckMacroStateTerminal(
           *definition, StateMutationKind::Consumed, "macro-definition-liveness",
-          llvm::formatv("macro '{0}' invocation #{1} survives but active "
-                        "definition directive #{2} was consumed by a TU edit; "
-                        "the #define could not be preserved in any proved "
+          llvm::formatv("macro '{0}' invocation #{1} survives but definition "
+                        "directive #{2} used by its expansion (macro '{3}' "
+                        "invocation #{4}) was consumed by a TU edit; the "
+                        "#define could not be preserved in any proved "
                         "placement and no whole-cover realization is available",
-                        invocation.name, invocation.id, definition->id)
+                        invocation.name, invocation.id, definition->id,
+                        unpreserved->invocation->name,
+                        unpreserved->invocation->id)
               .str(),
           /*RequireKnownObserver=*/true, invocation.id);
       continue;
@@ -3126,9 +3204,10 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
                     "forced whole-cover macro realization because active "
                     "definition was consumed by TU edit and could not be "
                     "preserved: macro='{0}' defDirective=#{1} inv=#{2} "
-                    "invBytes=[{3},{4})",
+                    "usedBy=#{3} invBytes=[{4},{5})",
                     invocation.name, definition->id, invocation.id,
-                    *invocation.invB, *invocation.invE);
+                    unpreserved->invocation->id, *invocation.invB,
+                    *invocation.invE);
   }
 
   if (TerminalSink().HasRequest())
