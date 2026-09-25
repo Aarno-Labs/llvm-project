@@ -167,6 +167,36 @@ uint64_t maxRealizationCostPerCommitRule() {
   return budget;
 }
 
+/// The number of maps a commit rule may always realize, whatever the cost.
+///
+/// Two is the smallest ground set that carries ambiguity at all, and it is the
+/// one size at which the cost budget buys nothing.  The enumeration loop
+/// realizes its first map before any budget is consulted, so a two-map window
+/// that declines on cost has already paid half of what deciding it would cost;
+/// admitting it spends at most one more realization per window.  Declining
+/// instead is not cheap in the sense the budget means: a window whose first map
+/// requests terminal fallback keeps core-forced anchors, and the hunk those
+/// leave spans both repeated-token candidates, so the second map -- often the
+/// only admissible one -- is never tried and the run reaches its carrier.
+/// `mquickjs.c` did exactly that above 65536 A tokens, deleting a definition
+/// whose final `;` repeats the one ending the preceding header.
+///
+/// The floor must stay below the smallest map count measured to spend its
+/// realizations only to decline, `uxnmin` window 7 at 7 maps; see
+/// `DefaultMaxRealizationCostPerCommitRule`.
+constexpr size_t MinAlwaysRealizedMapsPerCommitRule = 2;
+
+/// Return true when a commit rule may realize \p maps candidate maps over
+/// \p aTokens.
+///
+/// The floor is applied even under an injected budget: it is policy, not a
+/// default, and a test driving a rule past the budget must use a ground set
+/// larger than the floor to observe the decline.
+bool realizationWithinBudget(size_t maps, size_t aTokens) {
+  return maps <= MinAlwaysRealizedMapsPerCommitRule ||
+         realizationCost(maps, aTokens) <= maxRealizationCostPerCommitRule();
+}
+
 /// One A/B match pair that every map of an enumeration is conditioned on.
 ///
 /// Core-forced anchors are such pairs by the core theorem.  A legacy-proposal
@@ -1191,8 +1221,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     // map, and asking at the first would pay for a proof those never use.
     if (observationalRuleReachable && !observationalNeutralityTested &&
         mapIndex >= 1 &&
-        realizationCost(globalMaps.size(), deps_.aLexemes.size()) >
-            maxRealizationCostPerCommitRule()) {
+        !realizationWithinBudget(globalMaps.size(), deps_.aLexemes.size())) {
       observationalNeutralityTested = true;
       if (ObservationalVerdictIsOutputNeutral(
               windowIndex, baseMap, *soleConcreteOutputKey,
@@ -1226,8 +1255,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     // the whole ground set however few of it has been paid for, and declining
     // on the first candidate spends one realization instead of the budget.
     if (containmentRuleReachable &&
-        realizationCost(globalMaps.size(), deps_.aLexemes.size()) >
-            maxRealizationCostPerCommitRule()) {
+        !realizationWithinBudget(globalMaps.size(), deps_.aLexemes.size())) {
       REFOLD_LOG_TRACE(
           "lcs/semantic-resolver",
           "window {0} declines the least-source-mutation rule after realizing "
@@ -1710,8 +1738,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   // least-source-mutation rule's ground set is.  A window whose enumeration
   // fits inside the budget can never reach this decline: the survivors are a
   // subset of the enumeration.
-  if (realizationCost(survivingMaps.size(), deps_.aLexemes.size()) >
-      maxRealizationCostPerCommitRule()) {
+  if (!realizationWithinBudget(survivingMaps.size(), deps_.aLexemes.size())) {
     REFOLD_LOG_TRACE(
         "lcs/semantic-resolver",
         "window {0} keeps core-forced anchors: realizing the {1} map(s) "
