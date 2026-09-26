@@ -102,6 +102,12 @@ struct AlignmentSemanticSimulationResult {
   std::string concreteOutputEquivalenceKey;
   std::string rejectionReason;
   AlignmentSemanticEquivalenceComponents components;
+  /// For a `TerminalFallback` result, the half-open A token envelope each
+  /// terminal request names, in request order; `std::nullopt` stands for a
+  /// request that names none.  Read from the requests' structured failure
+  /// context, never from their diagnostic text.
+  std::vector<std::optional<std::pair<uint64_t, uint64_t>>>
+      terminalRequestATokenRanges;
 };
 
 /// Exact reason one proposal anchor became mandatory.
@@ -367,9 +373,17 @@ private:
   /// accept exactly one concrete output and \p baseMap requests terminal
   /// fallback.
   ///
+  /// When the combinations exceed the realization budget, \p baseMap is
+  /// realized first, and only the preferred sub-rectangles that one of its
+  /// terminal requests' A envelopes meets vary; the rest stay at \p baseMap,
+  /// as declining would leave them.  This narrows which candidates are tried
+  /// and admits none: each is still realized whole and must be the one
+  /// accepted output.  It applies only when every request names an A
+  /// envelope; otherwise the decline's failure cannot be located.
+  ///
   /// It declines -- so the window keeps \p baseMap -- when no sub-rectangle
   /// expresses a preference, when one cannot be enumerated within the bound,
-  /// when the combinations exceed the realization budget, when one is
+  /// when the combinations exceed the realization budget even so, when one is
   /// proof-incomplete, when they accept zero or several outputs, or when
   /// \p baseMap does not request terminal fallback.  The last check is what
   /// confines the rule to windows whose decline is inadmissible.

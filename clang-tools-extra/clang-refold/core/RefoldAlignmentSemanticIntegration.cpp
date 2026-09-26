@@ -947,6 +947,16 @@ RefoldEngine::SimulateSemanticAlignmentCandidate(
         AlignmentSemanticSimulationDisposition::TerminalFallback;
     result.rejectionReason =
         "candidate requested terminal fallback during structural planning";
+    for (const TerminalFallbackRequest &request :
+         candidate.terminalSink_.Requests()) {
+      const TerminalFallbackFailureContext &context = request.failure.context;
+      if (context.aTokenBegin && context.aTokenEnd &&
+          *context.aTokenBegin <= *context.aTokenEnd)
+        result.terminalRequestATokenRanges.emplace_back(
+            std::make_pair(*context.aTokenBegin, *context.aTokenEnd));
+      else
+        result.terminalRequestATokenRanges.emplace_back(std::nullopt);
+    }
     return result;
   }
 

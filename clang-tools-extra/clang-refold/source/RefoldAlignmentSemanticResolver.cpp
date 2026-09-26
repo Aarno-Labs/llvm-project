@@ -832,6 +832,76 @@ std::vector<size_t> selectPreferredRepairMaps(ArrayRef<RepairMapFacts> facts) {
   return keepLeastByInclusion(kept, facts, &RepairMapFacts::straddledComments);
 }
 
+/// One forced-anchor sub-rectangle whose structure-respecting keys kept a
+/// strict subset of its optimal maps.
+struct PreferredSubRectangle {
+  uint64_t aBegin = 0;
+  /// Each kept map covers A tokens `[aBegin, aBegin + map.size())`.
+  std::vector<std::vector<int64_t>> maps;
+
+  uint64_t aEnd() const { return aBegin + maps.front().size(); }
+};
+
+/// Return how many combinations of kept maps \p rectangles realize, or
+/// `MaxGlobalSemanticCandidateMaps + 1` once the product exceeds it.
+size_t countRepairCombinations(ArrayRef<PreferredSubRectangle> rectangles) {
+  size_t combinationCount = 1;
+  for (const PreferredSubRectangle &rectangle : rectangles) {
+    if (rectangle.maps.size() >
+        MaxGlobalSemanticCandidateMaps / combinationCount)
+      return MaxGlobalSemanticCandidateMaps + 1;
+    combinationCount *= rectangle.maps.size();
+  }
+  return combinationCount;
+}
+
+/// Return whether the repair may realize \p combinationCount combinations
+/// over \p aTokens, together with the decline configuration it also realizes.
+bool repairCombinationsWithinBudget(size_t combinationCount, size_t aTokens) {
+  return combinationCount <= MaxGlobalSemanticCandidateMaps &&
+         realizationWithinBudget(combinationCount + 1, aTokens);
+}
+
+/// Return whether the half-open A token envelope \p request, named by a
+/// terminal-fallback request, lies at least partly where \p rectangle's maps
+/// vary.
+///
+/// A sub-rectangle's maps vary its A tokens and the positions between them,
+/// including its two ends, which sit against the forced anchors bounding it.
+/// A non-empty envelope therefore meets it when the two half-open ranges
+/// overlap; an empty one, an insertion point, when it lies at either end or
+/// between.
+bool requestMeetsSubRectangle(std::pair<uint64_t, uint64_t> request,
+                              const PreferredSubRectangle &rectangle) {
+  if (request.first == request.second)
+    return rectangle.aBegin <= request.first &&
+           request.first <= rectangle.aEnd();
+  return request.first < rectangle.aEnd() && rectangle.aBegin < request.second;
+}
+
+/// Keep the members of \p rectangles that some envelope in \p requests meets.
+///
+/// Returns `std::nullopt` when a request names no A envelope: the realization
+/// that request fails in cannot then be located, so no sub-rectangle can be
+/// shown to be irrelevant to it.
+std::optional<std::vector<PreferredSubRectangle>> keepSubRectanglesNamedBy(
+    ArrayRef<std::optional<std::pair<uint64_t, uint64_t>>> requests,
+    std::vector<PreferredSubRectangle> rectangles) {
+  if (requests.empty())
+    return std::nullopt;
+  for (const std::optional<std::pair<uint64_t, uint64_t>> &request : requests)
+    if (!request)
+      return std::nullopt;
+  llvm::erase_if(rectangles, [&](const PreferredSubRectangle &rectangle) {
+    return llvm::none_of(
+        requests,
+        [&](const std::optional<std::pair<uint64_t, uint64_t>> &request) {
+          return requestMeetsSubRectangle(*request, rectangle);
+        });
+  });
+  return rectangles;
+}
+
 [[maybe_unused]] std::string formatMapIndices(ArrayRef<size_t> indices) {
   std::string text = "[";
   for (size_t index = 0; index < indices.size(); ++index) {
@@ -1168,11 +1238,6 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
       deps_.coreAlignment.certificationWindows[windowIndex];
   const ArrayRef<uint64_t> boundaries = ProtectedABoundaries();
 
-  // One sub-rectangle whose keys kept a strict subset of its optimal maps.
-  struct PreferredSubRectangle {
-    uint64_t aBegin = 0;
-    std::vector<std::vector<int64_t>> maps;
-  };
   std::vector<PreferredSubRectangle> preferred;
 
   // Split exactly where enumeration splits: every optimal map carries the
@@ -1261,24 +1326,52 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
   }
 
   // Every combination of the preferred sub-rectangle maps, plus the decline
-  // configuration, is realized.
-  size_t combinationCount = 1;
-  for (const PreferredSubRectangle &rectangle : preferred) {
-    if (rectangle.maps.size() >
-        MaxGlobalSemanticCandidateMaps / combinationCount) {
-      combinationCount = MaxGlobalSemanticCandidateMaps + 1;
-      break;
+  // configuration, is realized.  Over the budget, only the sub-rectangles the
+  // decline's own terminal requests meet vary; see the declaration.
+  std::optional<AlignmentSemanticSimulationResult> declined;
+  if (!repairCombinationsWithinBudget(countRepairCombinations(preferred),
+                                      deps_.aLexemes.size())) {
+    REFOLD_LOG_DEBUG("lcs/semantic-resolver",
+                     "window {0}: realizing its core-forced alignment as a "
+                     "complete refold, to locate the terminal requests "
+                     "declining makes",
+                     windowIndex);
+    declined.emplace(
+        Simulate(buildSimulationSelection(baseMap, deps_.coreAlignment)));
+    if (declined->disposition !=
+        AlignmentSemanticSimulationDisposition::TerminalFallback) {
+      REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                       "window {0} has no structure-respecting repair: its "
+                       "core-forced alignment {1}, so declining is admissible",
+                       windowIndex,
+                       describeSimulationDisposition(declined->disposition));
+      return std::nullopt;
     }
-    combinationCount *= rectangle.maps.size();
-  }
-  if (combinationCount > MaxGlobalSemanticCandidateMaps ||
-      !realizationWithinBudget(combinationCount + 1, deps_.aLexemes.size())) {
+    std::optional<std::vector<PreferredSubRectangle>> named =
+        keepSubRectanglesNamedBy(declined->terminalRequestATokenRanges,
+                                 preferred);
+    if (!named || named->empty() ||
+        !repairCombinationsWithinBudget(countRepairCombinations(*named),
+                                        deps_.aLexemes.size())) {
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "window {0} has no structure-respecting repair: its {1} preferred "
+          "sub-rectangle(s) combine into more maps than the realization "
+          "budget admits, and the {2} its core-forced alignment's terminal "
+          "request(s) meet {3}",
+          windowIndex, preferred.size(), named ? named->size() : 0,
+          !named           ? "cannot be located"
+          : named->empty() ? "are none"
+                           : "still exceed it");
+      return std::nullopt;
+    }
     REFOLD_LOG_TRACE("lcs/semantic-resolver",
-                     "window {0} has no structure-respecting repair: its {1} "
-                     "preferred sub-rectangle(s) combine into more maps than "
-                     "the realization budget admits",
-                     windowIndex, preferred.size());
-    return std::nullopt;
+                     "window {0}: its {1} preferred sub-rectangle(s) combine "
+                     "into more maps than the realization budget admits; "
+                     "varying only the {2} its core-forced alignment's "
+                     "terminal request(s) meet",
+                     windowIndex, preferred.size(), named->size());
+    preferred = std::move(*named);
   }
 
   std::vector<std::vector<int64_t>> candidates(1, baseMap.vec());
@@ -1334,19 +1427,22 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
     return std::nullopt;
   }
 
-  REFOLD_LOG_DEBUG("lcs/semantic-resolver",
-                   "window {0}: realizing its core-forced alignment as a "
-                   "complete refold, to test whether declining is admissible",
-                   windowIndex);
-  const AlignmentSemanticSimulationResult declined =
-      Simulate(buildSimulationSelection(baseMap, deps_.coreAlignment));
-  if (declined.disposition !=
+  if (!declined) {
+    REFOLD_LOG_DEBUG("lcs/semantic-resolver",
+                     "window {0}: realizing its core-forced alignment as a "
+                     "complete refold, to test whether declining is "
+                     "admissible",
+                     windowIndex);
+    declined.emplace(
+        Simulate(buildSimulationSelection(baseMap, deps_.coreAlignment)));
+  }
+  if (declined->disposition !=
       AlignmentSemanticSimulationDisposition::TerminalFallback) {
     REFOLD_LOG_TRACE("lcs/semantic-resolver",
                      "window {0} has no structure-respecting repair: its "
                      "core-forced alignment {1}, so declining is admissible",
                      windowIndex,
-                     describeSimulationDisposition(declined.disposition));
+                     describeSimulationDisposition(declined->disposition));
     return std::nullopt;
   }
 
