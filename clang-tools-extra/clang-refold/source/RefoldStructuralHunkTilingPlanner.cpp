@@ -444,35 +444,43 @@ struct ClosedStateGapTransition {
 /// Identity of one closed state-gap transition question.
 ///
 /// `BuildClosedStateGapTransition()` reads its two token carriers only through
-/// their source sites and stamps the A/B coordinates of the left carrier's end
-/// on every proof-only edge it returns; everything else it consults is an
+/// the seam between them -- the left carrier's source end, the right carrier's
+/// source begin, both sites' paths and include occurrences, and whether each
+/// site is complete -- and stamps the A/B coordinates of the left carrier's
+/// end on every proof-only edge it returns; everything else it consults is an
 /// immutable producer fact. Two adjacencies that agree on these fields are
 /// therefore the same question and have the same answer, which is what lets
-/// the partition search ask it once per distinct seam instead of once per DP
-/// state that reaches the seam. Paths are compared by spelling rather than by
-/// `RefoldPathIdentity`, so two spellings of one file are two keys: that costs
-/// a repeated proof, never a shared one.
+/// the partition search ask it once per distinct seam instead of once per pair
+/// of carriers meeting there.
+///
+/// The far ends of the carriers are deliberately absent.  Keying on them made
+/// every pair of carriers meeting at one boundary a distinct question, so a
+/// W-token hunk proved the same seam O(W^2) times and retained O(W^3) answers.
+/// Only whether each site is complete reaches the proof, through
+/// `SourceSitesComparable()`, so that bit is kept instead.  Paths are compared
+/// by spelling rather than by `RefoldPathIdentity`, so two spellings of one
+/// file are two keys: that costs a repeated proof, never a shared one.
 struct ClosedStateGapTransitionKey {
   StringRef previousPath;
   StringRef currentPath;
   std::optional<uint64_t> previousIncludeId;
   std::optional<uint64_t> currentIncludeId;
-  uint64_t previousSourceBegin = 0;
+  bool previousSourceComplete = false;
   uint64_t previousSourceEnd = 0;
   uint64_t currentSourceBegin = 0;
-  uint64_t currentSourceEnd = 0;
+  bool currentSourceComplete = false;
   uint64_t aBoundary = 0;
   uint64_t bBoundary = 0;
 
   bool operator<(const ClosedStateGapTransitionKey &other) const {
     return std::tie(previousPath, currentPath, previousIncludeId,
-                    currentIncludeId, previousSourceBegin, previousSourceEnd,
-                    currentSourceBegin, currentSourceEnd, aBoundary,
-                    bBoundary) <
+                    currentIncludeId, previousSourceComplete,
+                    previousSourceEnd, currentSourceBegin,
+                    currentSourceComplete, aBoundary, bBoundary) <
            std::tie(other.previousPath, other.currentPath,
                     other.previousIncludeId, other.currentIncludeId,
-                    other.previousSourceBegin, other.previousSourceEnd,
-                    other.currentSourceBegin, other.currentSourceEnd,
+                    other.previousSourceComplete, other.previousSourceEnd,
+                    other.currentSourceBegin, other.currentSourceComplete,
                     other.aBoundary, other.bBoundary);
   }
 };
@@ -1787,10 +1795,10 @@ public:
     key.currentPath = cur.closure->source.path;
     key.previousIncludeId = prev->closure->source.includeId;
     key.currentIncludeId = cur.closure->source.includeId;
-    key.previousSourceBegin = prev->closure->source.begin;
+    key.previousSourceComplete = prev->closure->source.IsComplete();
     key.previousSourceEnd = prev->closure->source.end;
     key.currentSourceBegin = cur.closure->source.begin;
-    key.currentSourceEnd = cur.closure->source.end;
+    key.currentSourceComplete = cur.closure->source.IsComplete();
     key.aBoundary = prev->aEnd;
     key.bBoundary = prev->bEnd;
 
@@ -2173,6 +2181,141 @@ public:
   // emitted, the ordinary macro/include/TU owner-realization paths still own
   // the hunk.  Returning std::nullopt here therefore preserves the existing
   // lattice ordering instead of prematurely forcing raw-B terminal output.
+
+
+  using PartitionStateMap = std::map<PartitionStateKey, PartitionParent>;
+
+  /// Return the protected source intervals a partition chain keeps in place,
+  /// sorted and unique, walking back from \p finalKey through \p dp.
+  ///
+  /// Returns nullopt when the chain cannot be reconstructed, which leaves the
+  /// caller's tie unresolved.
+  std::optional<std::vector<std::pair<uint64_t, uint64_t>>>
+  CollectPreservedProtectedIntervals(ArrayRef<PartitionStateMap> dp,
+                                     ArrayRef<PartitionEdge> edges,
+                                     const diffutils::Hunk &h,
+                                     PartitionStateKey finalKey) const {
+    std::vector<std::pair<uint64_t, uint64_t>> preserved;
+    uint64_t aPos = h.aEnd;
+    while (aPos != h.aStart) {
+      const PartitionStateMap &states =
+          dp[static_cast<size_t>(aPos - h.aStart)];
+      const auto state = states.find(finalKey);
+      if (state == states.end() || !state->second.valid ||
+          state->second.edgeIndex >= edges.size())
+        return std::nullopt;
+      for (const PartitionEdge &gap : state->second.stateGapsBeforeEdge)
+        if (gap.protectedPreprocessingStructure && gap.closure)
+          preserved.emplace_back(gap.closure->source.begin,
+                                 gap.closure->source.end);
+      const uint64_t edgeStart = edges[state->second.edgeIndex].aStart;
+      if (edgeStart >= aPos)
+        return std::nullopt;
+      aPos = edgeStart;
+      finalKey = state->second.prev;
+    }
+    llvm::sort(preserved);
+    preserved.erase(std::unique(preserved.begin(), preserved.end()),
+                    preserved.end());
+    return preserved;
+  }
+
+  /// Return whether \p h lies inside a range whose ties are settled in
+  /// favour of preserved structure; see
+  /// `Dependencies::structurePreservingTieRanges`.
+  bool SettlesTiesByPreservedStructure(const diffutils::Hunk &h) const {
+    return llvm::any_of(deps_.structurePreservingTieRanges,
+                        [&](const std::pair<uint64_t, uint64_t> &range) {
+                          return range.first <= h.aStart &&
+                                 h.aEnd <= range.second;
+                        });
+  }
+
+  /// Select the final partition state that keeps the most protected
+  /// structure in place, inside a window the structure-respecting alignment
+  /// repair committed.
+  ///
+  /// Partitions of one hunk can differ in which protected preprocessing
+  /// intervals stay in the source as preserved gaps and which fall inside a
+  /// token segment, where the only realization is to consume the directive
+  /// with the tokens around it.  The search's cost counts every preserved gap
+  /// as an edge, so keeping two directive lines costs more than consuming
+  /// them, and cost alone selects the consuming partition.  The
+  /// structure-respecting repair chose this hunk's alignment because it
+  /// straddles the least protected structure, and consuming that structure is
+  /// not what the choice was for.  So inside its ranges the order is: keep the
+  /// greatest set of protected intervals -- the set every other partition's
+  /// kept intervals are contained in -- and only then the least cost.
+  ///
+  /// Returns that final state only when the greatest set exists, is nonempty,
+  /// and exactly one unambiguous state attains it at its least cost;
+  /// otherwise nullopt, and the cost-based selection stands.
+  ///
+  /// The search keeps one parent per state key, and the key records only
+  /// whether some structure was preserved, so of two chains reaching one key
+  /// the cheaper survives even when the other keeps more.  The greatest set is
+  /// therefore taken over the chains the search retained, which can fall
+  /// short of every partition; the selection then declines rather than
+  /// guesses.
+  std::optional<PartitionStateMap::const_iterator>
+  SelectStructurePreservingFinalState(ArrayRef<PartitionStateMap> dp,
+                                      ArrayRef<PartitionEdge> edges,
+                                      const diffutils::Hunk &h) const {
+    const PartitionStateMap &finalStates = dp.back();
+    struct FinalState {
+      PartitionStateMap::const_iterator state;
+      std::vector<std::pair<uint64_t, uint64_t>> preserved;
+    };
+    std::vector<FinalState> candidates;
+    for (auto it = finalStates.begin(); it != finalStates.end(); ++it) {
+      const PartitionStateKey &key = it->first;
+      if (key.bPos != h.bEnd ||
+          (!key.mixedRealizers && !key.preservedPreprocessingStructure))
+        continue;
+      std::optional<std::vector<std::pair<uint64_t, uint64_t>>> preserved =
+          CollectPreservedProtectedIntervals(dp, edges, h, key);
+      if (!preserved)
+        return std::nullopt;
+      candidates.push_back(FinalState{it, std::move(*preserved)});
+    }
+
+    // The greatest preserved set, when one exists, contains every other.
+    const std::vector<std::pair<uint64_t, uint64_t>> *greatest = nullptr;
+    for (const FinalState &candidate : candidates) {
+      const bool containsEveryOther =
+          llvm::all_of(candidates, [&](const FinalState &other) {
+            return std::includes(
+                candidate.preserved.begin(), candidate.preserved.end(),
+                other.preserved.begin(), other.preserved.end());
+          });
+      if (containsEveryOther) {
+        greatest = &candidate.preserved;
+        break;
+      }
+    }
+    if (!greatest || greatest->empty())
+      return std::nullopt;
+
+    std::optional<PartitionStateMap::const_iterator> selected;
+    unsigned selectedCost = std::numeric_limits<unsigned>::max();
+    bool tiedAtSelectedCost = false;
+    for (const FinalState &candidate : candidates) {
+      if (candidate.preserved != *greatest)
+        continue;
+      const unsigned cost = candidate.state->second.cost;
+      if (cost < selectedCost) {
+        selected = candidate.state;
+        selectedCost = cost;
+        tiedAtSelectedCost = false;
+      } else if (cost == selectedCost) {
+        tiedAtSelectedCost = true;
+      }
+    }
+    if (!selected || tiedAtSelectedCost || (*selected)->second.ambiguous)
+      return std::nullopt;
+    return selected;
+  }
+
   std::optional<StructuralPartition>
   TryBuildStructuralPartition(const diffutils::Hunk &h) const {
     const bool replaceHunk = h.isReplace();
@@ -2795,6 +2938,24 @@ public:
     }
     if (bestFinal == finalStates.end())
       return std::nullopt;
+
+    // Inside a window the structure-respecting repair committed, the
+    // partition keeping the most protected structure in place is selected
+    // ahead of cost.  See `SelectStructurePreservingFinalState()`.
+    if (SettlesTiesByPreservedStructure(h)) {
+      if (std::optional<PartitionStateMap::const_iterator> preserving =
+              SelectStructurePreservingFinalState(dp, edges, h)) {
+        REFOLD_LOG_TRACE("tiling/partition",
+                         "hunk A=[{0},{1}) B=[{2},{3}) lies in a window the "
+                         "structure-respecting repair committed; selecting "
+                         "the partition that keeps the most protected "
+                         "structure in place (cost {4}, least cost {5})",
+                         h.aStart, h.aEnd, h.bStart, h.bEnd,
+                         (*preserving)->second.cost, bestCost);
+        bestFinal = *preserving;
+        ambiguousBest = false;
+      }
+    }
 
     if (ambiguousBest) {
       if (inTraceMode()) {

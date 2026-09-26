@@ -726,6 +726,14 @@ private:
   /// same strict witness domain without changing unrelated planner policy.
   bool alignmentSemanticTheoremActive_ = false;
 
+  /// A ranges whose structural tiling ties are settled in favour of preserved
+  /// structure: the windows the structure-respecting repair committed.  An
+  /// isolated candidate takes them from its alignment override; the production
+  /// engine takes them from the committed resolution.  The structural tiling
+  /// planner holds a reference, so the vector is assigned, never replaced by
+  /// another object, before tiling reads it.
+  std::vector<std::pair<uint64_t, uint64_t>> structurePreservingTieRanges_;
+
   /// Exact outer-run TU byte snapshot supplied to isolated simulations.
   /// Production engines leave this empty and load the physical source once;
   /// simulations reuse that immutable snapshot instead of rereading the file.
@@ -1038,6 +1046,11 @@ private:
       llvm::ArrayRef<diffutils::LcsBGapProvenance> bGapProvenance,
       uint64_t certificationByteBudget,
       diffutils::CertifiedLcsResult &alignment);
+
+  /// Return the translation-unit source bytes the tokmap assigns to one A
+  /// token, or nullopt when the token is not spelled in the translation unit.
+  std::optional<std::pair<uint64_t, uint64_t>>
+  ATokenTUSourceRange(uint64_t aToken) const;
 
   /// Run one candidate map through a fresh, non-recursive structural engine.
   AlignmentSemanticSimulationResult SimulateSemanticAlignmentCandidate(

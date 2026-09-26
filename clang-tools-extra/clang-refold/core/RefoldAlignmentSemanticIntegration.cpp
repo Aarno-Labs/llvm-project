@@ -6,6 +6,8 @@
 
 #include "core/RefoldEngine.h"
 
+#include "source/RefoldTokenDiffPlanner.h"
+
 #include "support/RefoldLog.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -667,6 +669,51 @@ std::string buildAlignmentConcreteOutputEquivalenceKey(
 
 } // namespace
 
+/// Return whether only horizontal white space separates source offset
+/// \p begin from the start of its physical line, and that line does not
+/// continue one spliced by a backslash-newline.
+static bool sourceOffsetBeginsLine(StringRef bytes, uint64_t begin) {
+  if (begin > bytes.size())
+    return false;
+  uint64_t cursor = begin;
+  while (cursor > 0 && StringRef(" \t\f\v").contains(bytes[cursor - 1]))
+    --cursor;
+  if (cursor == 0)
+    return true;
+  if (bytes[cursor - 1] != '\n')
+    return false;
+  StringRef before = bytes.take_front(cursor - 1);
+  before.consume_back("\r");
+  return !before.ends_with("\\");
+}
+
+/// Return whether only horizontal white space separates source offset \p end
+/// from the end of its physical line, and that line is not spliced onto the
+/// next by a backslash-newline.
+static bool sourceOffsetEndsLine(StringRef bytes, uint64_t end) {
+  if (end > bytes.size())
+    return false;
+  uint64_t cursor = end;
+  while (cursor < bytes.size() &&
+         StringRef(" \t\f\v").contains(bytes[cursor]))
+    ++cursor;
+  if (cursor < bytes.size() && bytes[cursor] == '\r')
+    ++cursor;
+  return cursor == bytes.size() || bytes[cursor] == '\n';
+}
+
+std::optional<std::pair<uint64_t, uint64_t>>
+RefoldEngine::ATokenTUSourceRange(uint64_t aToken) const {
+  const auto &tokmapByPP = model_.GetTokmapByPP();
+  const auto entry = tokmapByPP.find(aToken);
+  if (entry == tokmapByPP.end() ||
+      !pathIdentity_.PathsEqual(entry->second.file, model_.GetSourcePath()) ||
+      entry->second.b > entry->second.e ||
+      entry->second.e > tuSourceBytes_.size())
+    return std::nullopt;
+  return std::make_pair(entry->second.b, entry->second.e);
+}
+
 void RefoldEngine::ResolveSemanticAlignment(
     ArrayRef<StringRef> aLexemes, ArrayRef<StringRef> bLexemes,
     ArrayRef<diffutils::LcsAGapProvenance> aGapProvenance,
@@ -728,7 +775,28 @@ void RefoldEngine::ResolveSemanticAlignment(
                 alignment.windowOracles[windowIndex] =
                     diffutils::OptimalTokenAlignmentOracle{};
               }
-            }});
+            },
+            [this]() {
+              return tokenDiffPlanner_
+                  ->CollectProtectedAlignmentBoundaryCoordinates();
+            },
+            AlignmentSourceLayoutQueries{
+                [this](uint64_t aToken) {
+                  std::optional<std::pair<uint64_t, uint64_t>> range =
+                      ATokenTUSourceRange(aToken);
+                  return range &&
+                         sourceOffsetBeginsLine(tuSourceBytes_, range->first);
+                },
+                [this](uint64_t aToken) {
+                  std::optional<std::pair<uint64_t, uint64_t>> range =
+                      ATokenTUSourceRange(aToken);
+                  return range &&
+                         sourceOffsetEndsLine(tuSourceBytes_, range->second);
+                },
+                [this](uint64_t aBegin, uint64_t aEnd) {
+                  return tokenDiffPlanner_->CollectPreservableCommentGaps(
+                      aBegin, aEnd);
+                }}});
     resolution = resolver.Resolve();
 
     // Record against the alignment as the resolver saw it, before the commit
@@ -753,6 +821,8 @@ void RefoldEngine::ResolveSemanticAlignment(
   alignment.selectedMap = std::move(resolution.selectedMap);
   alignment.selectedAnchorProofs =
       std::move(resolution.selectedAnchorProofs);
+  structurePreservingTieRanges_ =
+      std::move(resolution.structurePreservingTieRanges);
   alignmentSemanticResolutionWitnesses_ = std::move(resolution.witnesses);
 
   // Reaching here means resolution.committedEquivalentClass held; the early

@@ -341,7 +341,8 @@ void RefoldEngine::BuildServiceGraph() {
               *ownerClassifier_, *ownerStateProof_,
               *preprocessingStructureIndexProvider_, abTokHunks_,
               structuralHunkTilingWitnesses_,
-              structuralHunkTilingSegmentBindings_});
+              structuralHunkTilingSegmentBindings_,
+              structurePreservingTieRanges_});
 
   // Pure B-token insertion ownership is a named edit-domain ledger.  The
   // ledger borrows the owner classifier and macro-boundary selector directly;

@@ -820,19 +820,46 @@ bool RefoldTextEditCertifier::OrdinaryEditAvoidsProtectedPreprocessingStructure(
   return true;
 }
 
+/// Return the token envelope of the direct-TU hunk \p edit was planned from,
+/// or an empty context when the edit records no such hunk.
+///
+/// An edit that crosses protected structure does so because of where its hunk
+/// begins and ends, and those frontiers are what a different anchor placement
+/// moves.  Naming the A and B tokens is what lets the run tell this failure
+/// apart from one no alignment can reach.  An edit without direct-TU hunk
+/// provenance names nothing, and its request stays unattributed.
+static TerminalFallbackFailureContext
+directTUHunkEnvelopeContext(const TextEdit &edit) {
+  TerminalFallbackFailureContext context;
+  if (!edit.directTUHunkAStart || !edit.directTUHunkAEnd ||
+      !edit.directTUHunkBStart || !edit.directTUHunkBEnd)
+    return context;
+  context.hunk = edit.directTUHunkIndex;
+  context.aTokenBegin = edit.directTUHunkAStart;
+  context.aTokenEnd = edit.directTUHunkAEnd;
+  context.bTokenBegin = edit.directTUHunkBStart;
+  context.bTokenEnd = edit.directTUHunkBEnd;
+  return context;
+}
+
 bool RefoldTextEditCertifier::AuditGlobalSourceEditInvariant(
     ArrayRef<TextEdit> edits, StringRef emissionStage,
     StringRef emissionOwner, std::optional<uint64_t> ownerIncludeId,
     StringRef originalFileText) const {
-  auto reject = [&](StringRef detail) {
+  auto rejectWithContext = [&](StringRef detail,
+                               TerminalFallbackFailureContext context) {
     theoremAuditService_.NoteTheoremAuditViolation(detail);
     terminalSink_.RequestTerminalFallback(
         MakeTerminalFallbackProofFailure(
             TerminalFallbackObligationKind::EmissionEditSetComposable,
-            TerminalFallbackFailureReason::UncomposableEmissionEditSet),
+            TerminalFallbackFailureReason::UncomposableEmissionEditSet,
+            std::move(context)),
         emissionStage, detail);
     REFOLD_LOG_TRACE("edits/global-source-audit", "{0}", detail);
     return false;
+  };
+  auto reject = [&](StringRef detail) {
+    return rejectWithContext(detail, TerminalFallbackFailureContext{});
   };
 
   if (edits.empty())
@@ -982,12 +1009,13 @@ bool RefoldTextEditCertifier::AuditGlobalSourceEditInvariant(
                            "required action=specialized structural repair or "
                            "terminal fallback");
         }
-        return reject(llvm::formatv(
-                          "ordinary direct-TU carrier [{0},{1}) interferes "
+        return rejectWithContext(
+            llvm::formatv("ordinary direct-TU carrier [{0},{1}) interferes "
                           "with protected {2} interval [{3},{4})",
                           candidate.begin, candidate.end,
                           toString(interval.kind), interval.begin, interval.end)
-                          .str());
+                .str(),
+            directTUHunkEnvelopeContext(edit));
       }
     }
 
@@ -1043,13 +1071,14 @@ bool RefoldTextEditCertifier::AuditGlobalSourceEditInvariant(
       }
 
       if (!matchedAuthorization) {
-        return reject(llvm::formatv(
-                          "ordinary edit [{0},{1}) overlaps protected {2} "
+        return rejectWithContext(
+            llvm::formatv("ordinary edit [{0},{1}) overlaps protected {2} "
                           "interval [{3},{4}) without exact specialized "
                           "authority",
                           edit.start, edit.end, toString(interval.kind),
                           interval.begin, interval.end)
-                          .str());
+                .str(),
+            directTUHunkEnvelopeContext(edit));
       }
     }
 

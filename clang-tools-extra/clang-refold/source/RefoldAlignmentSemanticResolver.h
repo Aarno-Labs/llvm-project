@@ -25,6 +25,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace clang {
@@ -42,6 +43,12 @@ struct AlignmentSelectionOverride {
   llvm::SmallVector<diffutils::LcsCertifiedBoundary, 1> certifiedBoundaries;
   llvm::SmallVector<diffutils::LcsCertificationWindow, 1>
       certificationWindows;
+  /// Half-open A ranges of the windows whose alignment the
+  /// structure-respecting repair chose.  A structural tiling tie inside one is
+  /// settled in favour of the partition keeping protected structure in place;
+  /// see `RefoldStructuralHunkTilingPlanner`.  Empty everywhere else, which
+  /// leaves every tie declined as before.
+  std::vector<std::pair<uint64_t, uint64_t>> structurePreservingTieRanges;
 };
 
 /// Diagnostic classification of one isolated alignment simulation.
@@ -131,6 +138,24 @@ struct AlignmentSemanticResolutionWitness {
   std::vector<AlignmentSemanticAnchorEvidence> anchorEvidence;
 };
 
+/// Source-layout queries read by the structure-respecting repair's preference
+/// keys.
+///
+/// They describe where A tokens sit in the translation unit's own source, and
+/// they only order candidates that are each realized and audited in full; no
+/// answer here can admit a realization.  A token or gap the translation unit
+/// does not spell answers false, which only withholds a preference.
+struct AlignmentSourceLayoutQueries {
+  /// Whether the A token is the first token on its logical source line.
+  std::function<bool(uint64_t)> aTokenBeginsSourceLine;
+  /// Whether the A token is the last token on its logical source line.
+  std::function<bool(uint64_t)> aTokenEndsSourceLine;
+  /// The sorted A gaps `g`, with `aBegin < g < aEnd`, whose source bytes are
+  /// ordinary trivia holding a comment the comment-seam splitter preserves.
+  std::function<std::vector<uint64_t>(uint64_t aBegin, uint64_t aEnd)>
+      collectCommentGaps;
+};
+
 /// Exact semantic resolver for ambiguity left by the core LCS theorem.
 class RefoldAlignmentSemanticResolver {
 public:
@@ -158,6 +183,15 @@ public:
     /// Release the facts retained for one window once it has been resolved.
     /// Committed anchors survive; only the quadratic payload is dropped.
     std::function<void(size_t)> releaseWindowOracle;
+    /// Collect the sorted, unique A-token frontiers that the translation
+    /// unit's protected preprocessing structure projects to: directives, and
+    /// the edges of each directly included file's cover.  This is the same
+    /// producer-backed surface that schedules certification partitions.  It is
+    /// called at most once, and only when a window reaches the
+    /// structure-respecting repair rule.
+    std::function<std::vector<uint64_t>()> collectProtectedABoundaries;
+    /// Layout queries for the structure-respecting repair's later keys.
+    AlignmentSourceLayoutQueries sourceLayout;
   };
 
   struct ResolutionResult {
@@ -166,6 +200,9 @@ public:
     std::vector<AlignmentSemanticResolutionWitness> witnesses;
     bool committedEquivalentClass = false;
     bool completeEnumeration = false;
+    /// A ranges of the windows committed by the structure-respecting repair;
+    /// see `AlignmentSelectionOverride::structurePreservingTieRanges`.
+    std::vector<std::pair<uint64_t, uint64_t>> structurePreservingTieRanges;
   };
 
   explicit RefoldAlignmentSemanticResolver(Dependencies deps);
@@ -216,6 +253,9 @@ private:
     bool enumeratedOnlyRequiredAnchorCarriers = false;
     uint64_t acceptedMapCount = 0;
     uint64_t rejectedMapCount = 0;
+    /// True when `SelectStructureRespectingRepair()` chose this commit, so
+    /// its realization must keep the structure the repair preferred.
+    bool structureRespectingRepair = false;
   };
 
   /// Resolve the ambiguity inside one certification window.
@@ -232,6 +272,12 @@ private:
   /// of the window; the legacy boundary proposal's is the optimal maps that
   /// carry its required anchors, which it enumerates directly when the
   /// window's complete enumeration exceeds its proof budget.
+  ///
+  /// A window every rule declines, enumerated or not, is then offered to
+  /// `SelectStructureRespectingRepair()`.  That is the one ranked selection
+  /// here: it prefers a source layout among realizations that are each
+  /// audited in full, and it is reached only when declining is itself proved
+  /// to request terminal fallback, so it never replaces an admissible output.
   ///
   /// \p laterWindowCarriesAmbiguity is whether any certification window after
   /// this one can carry ambiguity.  When none can, this window's verdict feeds
@@ -261,10 +307,84 @@ private:
   /// log and are read for nothing else.  A realization is the most expensive
   /// step this tool takes, so each one reports itself rather than appearing as
   /// an unexplained repeat of the whole planning pipeline.
+  ///
+  /// \p tieRanges are added to the candidate's structure-preserving tie
+  /// ranges; see `Simulate()`.
   const AlignmentSemanticSimulationResult &RealizeCandidateMap(
       size_t windowIndex, size_t mapIndex, size_t mapCount,
       llvm::ArrayRef<int64_t> candidateMap,
-      std::optional<AlignmentSemanticSimulationResult> &slot) const;
+      std::optional<AlignmentSemanticSimulationResult> &slot,
+      llvm::ArrayRef<std::pair<uint64_t, uint64_t>> tieRanges = {}) const;
+
+  /// Realize \p selection through the simulation callback, after adding the
+  /// windows the structure-respecting repair has already committed.
+  ///
+  /// A committed window is realized in production with its ties settled in
+  /// favour of preserved structure, so every later simulation realizes it the
+  /// same way; otherwise a later window would be compared against a
+  /// realization production never emits.
+  AlignmentSemanticSimulationResult
+  Simulate(AlignmentSelectionOverride selection) const;
+
+  /// The map the structure-respecting repair commits, and the census that
+  /// selected it.
+  struct StructureRespectingRepair {
+    std::string equivalenceKey;
+    std::vector<int64_t> selectedMap;
+    /// Candidates realized for the decision, and how many of them share the
+    /// committed output.
+    uint64_t candidateCount = 0;
+    uint64_t classSize = 0;
+  };
+
+  /// Select the map a window commits when declining it is proved
+  /// inadmissible, by a preference over where its hunks sit in the source.
+  ///
+  /// Every other commit rule may decline, and a declining window keeps
+  /// \p baseMap.  That map is not one of the window's optimal maps: it matches
+  /// only the forced anchors, so its hunk is the envelope of every candidate's
+  /// hunk and straddles every construct any of them straddles.  When that
+  /// realization requests terminal fallback, declining is known to reach the
+  /// whole-translation-unit carrier, and any accepted candidate -- each a
+  /// complete, independently audited refold -- is strictly better.  The
+  /// preference below therefore orders candidates; it admits none.
+  ///
+  /// The window is split at its forced anchors, exactly as enumeration splits
+  /// it, and each sub-rectangle's optimal maps are enumerated up to the repair's
+  /// own bound.  A sub-rectangle's runs of unmatched A tokens are its hunks, and
+  /// its maps are narrowed by four keys in order, each applied only where it
+  /// expresses a preference:
+  ///
+  ///   1. the least set, under inclusion, of straddled protected boundaries;
+  ///   2. every run begins and ends a source line;
+  ///   3. the fewest runs;
+  ///   4. the least set, under inclusion, of straddled preservable comments.
+  ///
+  /// A boundary or comment gap is straddled when it lies strictly inside a
+  /// run.  A sub-rectangle whose keys keep every map expresses no preference and
+  /// stays at \p baseMap; the others vary over the maps they keep, and every
+  /// combination is realized.  The window commits when those realizations
+  /// accept exactly one concrete output and \p baseMap requests terminal
+  /// fallback.
+  ///
+  /// It declines -- so the window keeps \p baseMap -- when no sub-rectangle
+  /// expresses a preference, when one cannot be enumerated within the bound,
+  /// when the combinations exceed the realization budget, when one is
+  /// proof-incomplete, when they accept zero or several outputs, or when
+  /// \p baseMap does not request terminal fallback.  The last check is what
+  /// confines the rule to windows whose decline is inadmissible.
+  ///
+  /// Every combination is realized with the window's structural tiling ties
+  /// settled in favour of preserved structure, which is how production will
+  /// realize the committed map.  The decline configuration is realized as
+  /// production would realize the decline, without that setting.
+  std::optional<StructureRespectingRepair>
+  SelectStructureRespectingRepair(size_t windowIndex,
+                                  llvm::ArrayRef<int64_t> baseMap) const;
+
+  /// Return the translation unit's protected A boundaries, collecting them on
+  /// first use.  Empty when no collector was supplied.
+  llvm::ArrayRef<uint64_t> ProtectedABoundaries() const;
 
   /// Return whether the observational-irrelevance rule's verdict on one window
   /// is proved not to change the emitted output.
@@ -309,6 +429,17 @@ private:
   bool WindowCarriesAmbiguity(size_t windowIndex) const;
 
   Dependencies deps_;
+
+  /// Protected A boundaries, collected by `ProtectedABoundaries()` on first
+  /// use.  Mutable because `Resolve()` is const: this caches a run constant
+  /// and no rule can observe whether it was collected before or after.
+  mutable std::optional<std::vector<uint64_t>> protectedABoundaries_;
+
+  /// A ranges of the windows this resolution has committed through the
+  /// structure-respecting repair, in commit order.  Mutable because
+  /// `Resolve()` is const; it is written only as windows commit and read by
+  /// `Simulate()`.
+  mutable std::vector<std::pair<uint64_t, uint64_t>> committedTieRanges_;
 };
 
 /// One run's recorded alignment-resolution theorem.

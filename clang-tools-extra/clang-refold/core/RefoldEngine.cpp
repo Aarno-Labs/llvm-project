@@ -273,6 +273,9 @@ RefoldEngine::RefoldEngine(RefoldModel model, StringRef aSource,
                              lexLang_),
       lineControlProof_(model_, pathIdentity_, macroTopology_, lineDirs_,
                         aToks_, bToks_, abTokMapA2B_, abTokMapB2A_) {
+  if (alignmentSelectionOverride_)
+    structurePreservingTieRanges_ =
+        alignmentSelectionOverride_->structurePreservingTieRanges;
   BuildServiceGraph();
 }
 

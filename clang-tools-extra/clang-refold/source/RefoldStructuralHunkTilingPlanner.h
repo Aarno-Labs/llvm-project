@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace clang {
@@ -134,6 +135,12 @@ public:
     /// Bindings from emitted A/B token hunks back to durable witness segments.
     std::vector<StructuralHunkTilingSegmentBinding>
         &structuralHunkTilingSegmentBindings;
+    /// Half-open A ranges in which a tie among minimum-cost partitions is
+    /// settled in favour of the partition keeping the most protected
+    /// structure in place.  They are the windows the structure-respecting
+    /// alignment repair committed; everywhere else a tie is declined.
+    const std::vector<std::pair<uint64_t, uint64_t>>
+        &structurePreservingTieRanges;
   };
 
   struct StructuralHunkTilingPlan {

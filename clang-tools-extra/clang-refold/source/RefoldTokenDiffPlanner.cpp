@@ -804,6 +804,29 @@ RefoldTokenDiffPlanner::CollectProtectedAlignmentBoundarySurfaces(
       .Collect();
 }
 
+std::vector<uint64_t>
+RefoldTokenDiffPlanner::CollectProtectedAlignmentBoundaryCoordinates() const {
+  return CollectProtectedAlignmentBoundarySurfaces(
+             /*retainDiagnosticIdentities=*/false)
+      .proofSchedulingCoordinates;
+}
+
+std::vector<uint64_t>
+RefoldTokenDiffPlanner::CollectPreservableCommentGaps(uint64_t aBegin,
+                                                      uint64_t aEnd) const {
+  DenseSet<uint64_t> seen;
+  DenseSet<uint64_t> duplicateTokmapPP;
+  for (const RefoldModel::TokMapEntry &entry : deps_.model.GetTokmap())
+    if (!seen.insert(entry.pp).second)
+      duplicateTokmapPP.insert(entry.pp);
+
+  std::vector<uint64_t> gaps;
+  for (uint64_t aGap = aBegin + 1; aGap < aEnd; ++aGap)
+    if (AGapHoldsPreservableComment(aGap, duplicateTokmapPP))
+      gaps.push_back(aGap);
+  return gaps;
+}
+
 void RefoldTokenDiffPlanner::TraceProtectedAlignmentBoundaryIdentities(
     ArrayRef<AlignmentProtectedBoundaryIdentity> identities) const {
   if (!inTraceMode())

@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -705,6 +706,132 @@ describeLegacyProposalFailure(bool gapProvenanceCoversStreams,
   return proposal.jointOptimalityFailure;
 }
 
+/// The most optimal maps the structure-respecting repair enumerates in one
+/// forced-anchor sub-rectangle.
+///
+/// This bounds a preference search, not a proof: a sub-rectangle over it makes
+/// the repair decline, which leaves the window exactly where every other rule
+/// left it.  It is larger than `MaxUniqueMapsPerForcedWindow` because the
+/// repair realizes only the maps its keys keep rather than every enumerated
+/// one; a single repeated closing brace in a table of initializers already
+/// yields hundreds of optimal maps.
+constexpr size_t MaxStructureRepairMapsPerSubRectangle = 4096;
+
+/// Return the runs of unmatched A tokens a sub-rectangle map leaves, as
+/// absolute half-open A ranges.
+///
+/// \p localMap covers A tokens `[aBegin, aBegin + localMap.size())`.  A run
+/// touching either end is extended through the tokens \p baseMap leaves
+/// unmatched beyond it: inside a window a sub-rectangle is bounded by forced
+/// anchors, which are matched, so only a run at a window edge extends, and it
+/// does so exactly as the realized hunk would.
+std::vector<std::pair<uint64_t, uint64_t>>
+collectUnmatchedRuns(ArrayRef<int64_t> localMap, uint64_t aBegin,
+                     ArrayRef<int64_t> baseMap) {
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  const uint64_t aEnd = aBegin + localMap.size();
+  uint64_t aToken = aBegin;
+  while (aToken < aEnd) {
+    if (localMap[aToken - aBegin] >= 0) {
+      ++aToken;
+      continue;
+    }
+    uint64_t runBegin = aToken;
+    uint64_t runEnd = aToken + 1;
+    while (runEnd < aEnd && localMap[runEnd - aBegin] < 0)
+      ++runEnd;
+    aToken = runEnd;
+    if (runBegin == aBegin)
+      while (runBegin > 0 && baseMap[runBegin - 1] < 0)
+        --runBegin;
+    if (runEnd == aEnd)
+      while (runEnd < baseMap.size() && baseMap[runEnd] < 0)
+        ++runEnd;
+    runs.emplace_back(runBegin, runEnd);
+  }
+  return runs;
+}
+
+/// Return the members of sorted \p gaps lying strictly inside one of \p runs.
+///
+/// A gap strictly inside a run sits between two A tokens one hunk removes, so
+/// the hunk must be realized around whatever the gap holds.  At a run's edge,
+/// or between matched tokens, it stays on one side of every hunk.
+std::vector<uint64_t>
+collectStraddledGaps(ArrayRef<std::pair<uint64_t, uint64_t>> runs,
+                     ArrayRef<uint64_t> gaps) {
+  std::vector<uint64_t> straddled;
+  for (const std::pair<uint64_t, uint64_t> &run : runs)
+    for (auto gap = std::upper_bound(gaps.begin(), gaps.end(), run.first);
+         gap != gaps.end() && *gap < run.second; ++gap)
+      straddled.push_back(*gap);
+  return straddled;
+}
+
+/// Preference facts of one sub-rectangle map, read by
+/// `selectPreferredRepairMaps()`.
+struct RepairMapFacts {
+  std::vector<uint64_t> straddledStructure;
+  bool lineAligned = false;
+  size_t runCount = 0;
+  std::vector<uint64_t> straddledComments;
+};
+
+/// Narrow \p candidates to the members whose \p set is contained in every
+/// other member's, when such a least set exists; otherwise keep them all.
+///
+/// The least set under inclusion, when it exists, is the intersection of all
+/// of them, and it exists exactly when some member attains it.
+std::vector<size_t> keepLeastByInclusion(
+    ArrayRef<size_t> candidates, ArrayRef<RepairMapFacts> facts,
+    std::vector<uint64_t> RepairMapFacts::*set) {
+  std::vector<uint64_t> common = facts[candidates.front()].*set;
+  for (size_t candidate : candidates.drop_front()) {
+    const std::vector<uint64_t> &members = facts[candidate].*set;
+    std::vector<uint64_t> narrowed;
+    std::set_intersection(common.begin(), common.end(), members.begin(),
+                          members.end(), std::back_inserter(narrowed));
+    common = std::move(narrowed);
+  }
+  std::vector<size_t> least;
+  for (size_t candidate : candidates)
+    if (facts[candidate].*set == common)
+      least.push_back(candidate);
+  if (least.empty())
+    return std::vector<size_t>(candidates.begin(), candidates.end());
+  return least;
+}
+
+/// Return the sub-rectangle maps the structure-respecting repair prefers.
+///
+/// The keys apply in order, each narrowing what the previous one kept, and a
+/// key that cannot tell the maps apart keeps them all: least straddled
+/// protected structure, then line-aligned runs, then fewest runs, then least
+/// straddled comments.  See `SelectStructureRespectingRepair()`.
+std::vector<size_t> selectPreferredRepairMaps(ArrayRef<RepairMapFacts> facts) {
+  std::vector<size_t> kept(facts.size());
+  for (size_t index = 0; index < facts.size(); ++index)
+    kept[index] = index;
+
+  kept = keepLeastByInclusion(kept, facts,
+                              &RepairMapFacts::straddledStructure);
+
+  std::vector<size_t> aligned;
+  for (size_t index : kept)
+    if (facts[index].lineAligned)
+      aligned.push_back(index);
+  if (!aligned.empty())
+    kept = std::move(aligned);
+
+  size_t fewestRuns = std::numeric_limits<size_t>::max();
+  for (size_t index : kept)
+    fewestRuns = std::min(fewestRuns, facts[index].runCount);
+  llvm::erase_if(kept,
+                 [&](size_t index) { return facts[index].runCount != fewestRuns; });
+
+  return keepLeastByInclusion(kept, facts, &RepairMapFacts::straddledComments);
+}
+
 [[maybe_unused]] std::string formatMapIndices(ArrayRef<size_t> indices) {
   std::string text = "[";
   for (size_t index = 0; index < indices.size(); ++index) {
@@ -828,6 +955,11 @@ RefoldAlignmentSemanticResolver::Resolve() const {
             : "enumerated",
         static_cast<uint64_t>(resolution.anchorEvidence.size()));
     baseMap = resolution.selectedMap;
+    if (resolution.structureRespectingRepair) {
+      const diffutils::LcsCertificationWindow &window =
+          deps_.coreAlignment.certificationWindows[windowIndex];
+      committedTieRanges_.emplace_back(window.aBegin, window.aEnd);
+    }
     committedWindows.push_back(std::move(resolution));
   }
 
@@ -906,6 +1038,7 @@ RefoldAlignmentSemanticResolver::Resolve() const {
   }
 
   result.committedEquivalentClass = true;
+  result.structurePreservingTieRanges = committedTieRanges_;
   return result;
 }
 
@@ -946,11 +1079,20 @@ static StringRef describeSimulationDisposition(
   return "unknown";
 }
 
+AlignmentSemanticSimulationResult RefoldAlignmentSemanticResolver::Simulate(
+    AlignmentSelectionOverride selection) const {
+  selection.structurePreservingTieRanges.insert(
+      selection.structurePreservingTieRanges.end(),
+      committedTieRanges_.begin(), committedTieRanges_.end());
+  return deps_.simulate(selection);
+}
+
 const AlignmentSemanticSimulationResult &
 RefoldAlignmentSemanticResolver::RealizeCandidateMap(
     size_t windowIndex, size_t mapIndex, size_t mapCount,
     ArrayRef<int64_t> candidateMap,
-    std::optional<AlignmentSemanticSimulationResult> &slot) const {
+    std::optional<AlignmentSemanticSimulationResult> &slot,
+    ArrayRef<std::pair<uint64_t, uint64_t>> tieRanges) const {
   // A map already in its slot was realized by an earlier rule and is replayed,
   // not re-planned.  Reporting it again would double-count the run's most
   // expensive step.
@@ -961,8 +1103,11 @@ RefoldAlignmentSemanticResolver::RealizeCandidateMap(
                    "window {0}: realizing candidate map {1} of {2} as a "
                    "complete refold",
                    windowIndex, mapIndex + 1, mapCount);
-  slot.emplace(deps_.simulate(
-      buildSimulationSelection(candidateMap, deps_.coreAlignment)));
+  AlignmentSelectionOverride selection =
+      buildSimulationSelection(candidateMap, deps_.coreAlignment);
+  selection.structurePreservingTieRanges.assign(tieRanges.begin(),
+                                                tieRanges.end());
+  slot.emplace(Simulate(std::move(selection)));
   REFOLD_LOG_DEBUG("lcs/semantic-resolver",
                    "window {0}: candidate map {1} of {2} realized: {3}{4}{5}",
                    windowIndex, mapIndex + 1, mapCount,
@@ -985,7 +1130,7 @@ bool RefoldAlignmentSemanticResolver::ObservationalVerdictIsOutputNeutral(
                    "complete refold, to compare declining with committing",
                    windowIndex);
   const AlignmentSemanticSimulationResult declined =
-      deps_.simulate(buildSimulationSelection(baseMap, deps_.coreAlignment));
+      Simulate(buildSimulationSelection(baseMap, deps_.coreAlignment));
   const bool neutral =
       declined.disposition ==
           AlignmentSemanticSimulationDisposition::Accepted &&
@@ -998,6 +1143,227 @@ bool RefoldAlignmentSemanticResolver::ObservationalVerdictIsOutputNeutral(
       windowIndex, describeSimulationDisposition(declined.disposition),
       neutral ? "matches" : "does not match");
   return neutral;
+}
+
+ArrayRef<uint64_t>
+RefoldAlignmentSemanticResolver::ProtectedABoundaries() const {
+  if (!protectedABoundaries_)
+    protectedABoundaries_ = deps_.collectProtectedABoundaries
+                                ? deps_.collectProtectedABoundaries()
+                                : std::vector<uint64_t>{};
+  return *protectedABoundaries_;
+}
+
+std::optional<RefoldAlignmentSemanticResolver::StructureRespectingRepair>
+RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
+    size_t windowIndex, ArrayRef<int64_t> baseMap) const {
+  const diffutils::OptimalTokenAlignmentOracle *oracle =
+      deps_.coreAlignment.GetSemanticOracleForWindow(windowIndex);
+  const AlignmentSourceLayoutQueries &layout = deps_.sourceLayout;
+  if (!oracle || baseMap.size() != deps_.aLexemes.size() ||
+      !layout.aTokenBeginsSourceLine || !layout.aTokenEndsSourceLine ||
+      !layout.collectCommentGaps)
+    return std::nullopt;
+  const diffutils::LcsCertificationWindow &window =
+      deps_.coreAlignment.certificationWindows[windowIndex];
+  const ArrayRef<uint64_t> boundaries = ProtectedABoundaries();
+
+  // One sub-rectangle whose keys kept a strict subset of its optimal maps.
+  struct PreferredSubRectangle {
+    uint64_t aBegin = 0;
+    std::vector<std::vector<int64_t>> maps;
+  };
+  std::vector<PreferredSubRectangle> preferred;
+
+  // Split exactly where enumeration splits: every optimal map carries the
+  // forced anchors, so the sub-rectangles between them vary independently.
+  const std::vector<MatchAnchor> forcedAnchors =
+      collectForcedAnchors(deps_.coreAlignment, window.aBegin, window.aEnd);
+  uint64_t aBegin = window.aBegin;
+  uint64_t bBegin = window.bBegin;
+  for (size_t anchorIndex = 0; anchorIndex <= forcedAnchors.size();
+       ++anchorIndex) {
+    const bool last = anchorIndex == forcedAnchors.size();
+    const uint64_t aEnd = last ? window.aEnd : forcedAnchors[anchorIndex].aToken;
+    const uint64_t bEnd = last ? window.bEnd : forcedAnchors[anchorIndex].bToken;
+    const uint64_t subABegin = aBegin;
+    const uint64_t subBBegin = bBegin;
+    if (!last) {
+      aBegin = forcedAnchors[anchorIndex].aToken + 1;
+      bBegin = forcedAnchors[anchorIndex].bToken + 1;
+    }
+    // Without both A and B tokens a sub-rectangle has one map, the empty one.
+    if (subABegin >= aEnd || subBBegin >= bEnd)
+      continue;
+
+    diffutils::OptimalLcsMapEnumeration enumeration =
+        oracle->EnumerateOptimalMapsForWindow(
+            subABegin - window.aBegin, aEnd - window.aBegin,
+            subBBegin - window.bBegin, bEnd - window.bBegin,
+            MaxStructureRepairMapsPerSubRectangle);
+    if (!enumeration.complete || enumeration.maps.empty()) {
+      REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                       "window {0} has no structure-respecting repair: "
+                       "sub-rectangle A=[{1},{2}) B=[{3},{4}) has more than {5} "
+                       "optimal maps or cannot be enumerated",
+                       windowIndex, subABegin, aEnd, subBBegin, bEnd,
+                       MaxStructureRepairMapsPerSubRectangle);
+      return std::nullopt;
+    }
+    if (enumeration.maps.size() == 1)
+      continue;
+    for (std::vector<int64_t> &map : enumeration.maps)
+      for (int64_t &mapped : map)
+        if (mapped >= 0)
+          mapped += static_cast<int64_t>(window.bBegin);
+
+    const std::vector<uint64_t> commentGaps =
+        layout.collectCommentGaps(subABegin, aEnd);
+    std::vector<RepairMapFacts> facts;
+    facts.reserve(enumeration.maps.size());
+    for (const std::vector<int64_t> &map : enumeration.maps) {
+      const std::vector<std::pair<uint64_t, uint64_t>> runs =
+          collectUnmatchedRuns(map, subABegin, baseMap);
+      RepairMapFacts mapFacts;
+      mapFacts.straddledStructure = collectStraddledGaps(runs, boundaries);
+      mapFacts.lineAligned = llvm::all_of(
+          runs, [&](const std::pair<uint64_t, uint64_t> &run) {
+            return layout.aTokenBeginsSourceLine(run.first) &&
+                   layout.aTokenEndsSourceLine(run.second - 1);
+          });
+      mapFacts.runCount = runs.size();
+      mapFacts.straddledComments = collectStraddledGaps(runs, commentGaps);
+      facts.push_back(std::move(mapFacts));
+    }
+
+    const std::vector<size_t> kept = selectPreferredRepairMaps(facts);
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "window {0}: sub-rectangle A=[{1},{2}) B=[{3},{4}) keeps "
+                     "{5} of its {6} optimal map(s) under the "
+                     "structure-respecting keys",
+                     windowIndex, subABegin, aEnd, subBBegin, bEnd, kept.size(),
+                     enumeration.maps.size());
+    if (kept.size() == enumeration.maps.size())
+      continue;
+    PreferredSubRectangle rectangle;
+    rectangle.aBegin = subABegin;
+    for (size_t index : kept)
+      rectangle.maps.push_back(std::move(enumeration.maps[index]));
+    preferred.push_back(std::move(rectangle));
+  }
+
+  if (preferred.empty()) {
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "window {0} has no structure-respecting repair: no "
+                     "sub-rectangle expresses a preference",
+                     windowIndex);
+    return std::nullopt;
+  }
+
+  // Every combination of the preferred sub-rectangle maps, plus the decline
+  // configuration, is realized.
+  size_t combinationCount = 1;
+  for (const PreferredSubRectangle &rectangle : preferred) {
+    if (rectangle.maps.size() >
+        MaxGlobalSemanticCandidateMaps / combinationCount) {
+      combinationCount = MaxGlobalSemanticCandidateMaps + 1;
+      break;
+    }
+    combinationCount *= rectangle.maps.size();
+  }
+  if (combinationCount > MaxGlobalSemanticCandidateMaps ||
+      !realizationWithinBudget(combinationCount + 1, deps_.aLexemes.size())) {
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "window {0} has no structure-respecting repair: its {1} "
+                     "preferred sub-rectangle(s) combine into more maps than "
+                     "the realization budget admits",
+                     windowIndex, preferred.size());
+    return std::nullopt;
+  }
+
+  std::vector<std::vector<int64_t>> candidates(1, baseMap.vec());
+  for (const PreferredSubRectangle &rectangle : preferred) {
+    std::vector<std::vector<int64_t>> expanded;
+    for (const std::vector<int64_t> &partial : candidates)
+      for (const std::vector<int64_t> &local : rectangle.maps) {
+        std::vector<int64_t> candidate = partial;
+        std::copy(local.begin(), local.end(),
+                  candidate.begin() + rectangle.aBegin);
+        expanded.push_back(std::move(candidate));
+      }
+    candidates = std::move(expanded);
+  }
+  if (!everyMapIsMonotoneAndLexemeAgreeing(candidates, deps_.aLexemes,
+                                           deps_.bLexemes))
+    return std::nullopt;
+
+  // Each combination is realized as production will realize it once
+  // committed: with this window's tiling ties settled in favour of preserved
+  // structure.  That is why realizations the other rules made, which settle
+  // no tie, are not reused here.
+  const std::pair<uint64_t, uint64_t> windowRange{window.aBegin, window.aEnd};
+  std::vector<std::optional<AlignmentSemanticSimulationResult>> realizations(
+      candidates.size());
+  std::map<std::string, std::vector<size_t>> outputClasses;
+  for (size_t index = 0; index < candidates.size(); ++index) {
+    const AlignmentSemanticSimulationResult &simulation =
+        RealizeCandidateMap(windowIndex, index, candidates.size(),
+                            candidates[index], realizations[index],
+                            ArrayRef(windowRange));
+    if (simulation.disposition ==
+        AlignmentSemanticSimulationDisposition::ProofIncomplete) {
+      REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                       "window {0} has no structure-respecting repair: "
+                       "preferred map {1} has incomplete proof",
+                       windowIndex, index);
+      return std::nullopt;
+    }
+    if (simulation.disposition !=
+            AlignmentSemanticSimulationDisposition::Accepted ||
+        !simulation.accepted)
+      continue;
+    if (simulation.concreteOutputEquivalenceKey.empty())
+      return std::nullopt;
+    outputClasses[simulation.concreteOutputEquivalenceKey].push_back(index);
+  }
+  if (outputClasses.size() != 1) {
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "window {0} has no structure-respecting repair: its {1} "
+                     "preferred map(s) realize {2} accepted output(s)",
+                     windowIndex, candidates.size(), outputClasses.size());
+    return std::nullopt;
+  }
+
+  REFOLD_LOG_DEBUG("lcs/semantic-resolver",
+                   "window {0}: realizing its core-forced alignment as a "
+                   "complete refold, to test whether declining is admissible",
+                   windowIndex);
+  const AlignmentSemanticSimulationResult declined =
+      Simulate(buildSimulationSelection(baseMap, deps_.coreAlignment));
+  if (declined.disposition !=
+      AlignmentSemanticSimulationDisposition::TerminalFallback) {
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "window {0} has no structure-respecting repair: its "
+                     "core-forced alignment {1}, so declining is admissible",
+                     windowIndex,
+                     describeSimulationDisposition(declined.disposition));
+    return std::nullopt;
+  }
+
+  const auto &onlyClass = *outputClasses.begin();
+  REFOLD_LOG_TRACE(
+      "lcs/semantic-resolver",
+      "window {0} committing structure-respecting repair: declining requests "
+      "terminal fallback; {1} preferred sub-rectangle(s) combine into {2} "
+      "map(s), and their accepted members {3} realize one output",
+      windowIndex, preferred.size(), candidates.size(),
+      formatMapIndices(onlyClass.second));
+  StructureRespectingRepair repair;
+  repair.equivalenceKey = onlyClass.first;
+  repair.selectedMap = candidates[onlyClass.second.front()];
+  repair.candidateCount = candidates.size();
+  repair.classSize = onlyClass.second.size();
+  return repair;
 }
 
 RefoldAlignmentSemanticResolver::WindowResolution
@@ -1087,6 +1453,101 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         "window {0}: legacy boundary proposal is unreachable: {1}", windowIndex,
         describeLegacyProposalFailure(gapProvenanceCoversStreams, proposal));
 
+  // Realized candidate maps, indexed by position in `globalMaps`.  A map is
+  // realized when a commit rule first reads it and never realized twice; see
+  // `RealizeCandidateMap()` for why the order the rules ask in cannot change
+  // any answer.
+  std::vector<std::optional<AlignmentSemanticSimulationResult>> realizedMaps(
+      globalMaps.size());
+
+  // Whether every enumerated map was realized.  The two rules that quantify
+  // over the complete ground set may be decided only when this holds; the loop
+  // below stops early exactly when both of them have already been denied, and
+  // a ground set that was never enumerated was never realized either.
+  bool everyMapRealized = groundSetEnumerated;
+
+  // Commit \p selectedMap as this window's choice, out of \p candidateCount
+  // candidates of which \p classSize share its output.
+  auto commitSelectedMap =
+      [&](StringRef equivalenceKey, ArrayRef<int64_t> selectedMap,
+          uint64_t candidateCount, uint64_t classSize,
+          ArrayRef<RequiredAnchor> requiredAnchors) -> WindowResolution {
+    WindowResolution committed;
+    committed.enumeratedMapCount = candidateCount;
+    committed.enumeratedOnlyRequiredAnchorCarriers = !groundSetEnumerated;
+    committed.acceptedMapCount = classSize;
+    committed.rejectedMapCount =
+        committed.enumeratedMapCount - committed.acceptedMapCount;
+    committed.equivalenceKey = equivalenceKey.str();
+    committed.selectedMap.assign(selectedMap.begin(), selectedMap.end());
+
+    std::map<std::pair<uint64_t, uint64_t>, AlignmentSemanticAnchorBasis>
+        requiredBasis;
+    for (const RequiredAnchor &anchor : requiredAnchors)
+      requiredBasis[{anchor.aToken, anchor.bToken}] = anchor.basis;
+
+    // Record evidence only for anchors this window actually chose. Anchors
+    // outside the window are either core-forced or already proved by an
+    // earlier window's witness, and restating them here would claim authority
+    // this enumeration never established.
+    for (size_t aToken = 0; aToken < committed.selectedMap.size(); ++aToken) {
+      const int64_t bToken = committed.selectedMap[aToken];
+      if (bToken < 0 || aToken < window.aBegin || aToken >= window.aEnd ||
+          isForcedAnchor(deps_.coreAlignment, aToken, bToken))
+        continue;
+
+      const auto required = requiredBasis.find(
+          {aToken, static_cast<uint64_t>(bToken)});
+      const AlignmentSemanticAnchorBasis basis =
+          required == requiredBasis.end()
+              ? AlignmentSemanticAnchorBasis::
+                    EquivalentRealizationRepresentative
+              : required->second;
+      committed.anchorEvidence.push_back(AlignmentSemanticAnchorEvidence{
+          aToken, static_cast<uint64_t>(bToken), basis});
+    }
+
+    committed.committed = true;
+    return committed;
+  };
+
+  auto commitRealizationClass =
+      [&](StringRef equivalenceKey, ArrayRef<size_t> classMembers,
+          ArrayRef<RequiredAnchor> requiredAnchors) -> WindowResolution {
+    if (classMembers.empty())
+      return WindowResolution{};
+    const size_t representativeIndex = classMembers.front();
+    WindowResolution committed = commitSelectedMap(
+        equivalenceKey, globalMaps[representativeIndex], globalMaps.size(),
+        classMembers.size(), requiredAnchors);
+    REFOLD_LOG_TRACE(
+        "lcs/semantic-resolver",
+        "window {0} committing realized-source class: candidates={1} "
+        "classMembers={2} requiredAnchors={3} representative={4} anchors={5}",
+        windowIndex, globalMaps.size(), formatMapIndices(classMembers),
+        requiredAnchors.size(), representativeIndex,
+        committed.anchorEvidence.size());
+    return committed;
+  };
+
+  // Every decline of an ambiguous window funnels through here, whether or not
+  // its ground set was enumerated.  The rules each prove one admissible
+  // realization or decline; a decline keeps `baseMap`, and when that
+  // realization is itself inadmissible the structure-respecting repair gets
+  // the last word.  See `SelectStructureRespectingRepair()`.  It enumerates the
+  // window's sub-rectangles itself and reuses whatever the rules realized.
+  auto declineWindow = [&]() -> WindowResolution {
+    std::optional<StructureRespectingRepair> repair =
+        SelectStructureRespectingRepair(windowIndex, baseMap);
+    if (!repair)
+      return result;
+    WindowResolution committed = commitSelectedMap(
+        repair->equivalenceKey, repair->selectedMap, repair->candidateCount,
+        repair->classSize, ArrayRef<RequiredAnchor>());
+    committed.structureRespectingRepair = true;
+    return committed;
+  };
+
   // Without the ground set, the two rules that quantify over it cannot be
   // decided at all, so only the legacy boundary proposal remains.
   if (!groundSetEnumerated) {
@@ -1097,7 +1558,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "enumerated within the proof budget, and the legacy boundary "
           "proposal is unreachable",
           windowIndex);
-      return result;
+      return declineWindow();
     }
     REFOLD_LOG_DEBUG(
         "lcs/semantic-resolver",
@@ -1178,19 +1639,6 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         windowIndex);
     return result;
   }
-
-  // Realized candidate maps, indexed by position in `globalMaps`.  A map is
-  // realized when a commit rule first reads it and never realized twice; see
-  // `RealizeCandidateMap()` for why the order the rules ask in cannot change
-  // any answer.
-  std::vector<std::optional<AlignmentSemanticSimulationResult>> realizedMaps(
-      globalMaps.size());
-
-  // Whether every enumerated map was realized.  The two rules that quantify
-  // over the complete ground set may be decided only when this holds; the loop
-  // below stops early exactly when both of them have already been denied, and
-  // a ground set that was never enumerated was never realized either.
-  bool everyMapRealized = groundSetEnumerated;
 
   for (size_t mapIndex = 0; mapIndex < globalMaps.size(); ++mapIndex) {
     const AlignmentSemanticSimulationResult &realized =
@@ -1277,7 +1725,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0} keeps core-forced anchors: no commit rule remains "
           "reachable after realizing {1} of {2} enumerated map(s)",
           windowIndex, mapIndex + 1, globalMaps.size());
-      return result;
+      return declineWindow();
     }
 
     // The legacy boundary proposal is the only rule left, and it reads the
@@ -1287,60 +1735,6 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     everyMapRealized = false;
     break;
   }
-
-  auto commitRealizationClass =
-      [&](StringRef equivalenceKey, ArrayRef<size_t> classMembers,
-          ArrayRef<RequiredAnchor> requiredAnchors) -> WindowResolution {
-    WindowResolution committed;
-    if (classMembers.empty())
-      return committed;
-
-    const size_t representativeIndex = classMembers.front();
-    committed.enumeratedMapCount = globalMaps.size();
-    committed.enumeratedOnlyRequiredAnchorCarriers = !groundSetEnumerated;
-    committed.acceptedMapCount = classMembers.size();
-    committed.rejectedMapCount =
-        committed.enumeratedMapCount - committed.acceptedMapCount;
-    committed.equivalenceKey = equivalenceKey.str();
-    committed.selectedMap = globalMaps[representativeIndex];
-
-    std::map<std::pair<uint64_t, uint64_t>, AlignmentSemanticAnchorBasis>
-        requiredBasis;
-    for (const RequiredAnchor &anchor : requiredAnchors)
-      requiredBasis[{anchor.aToken, anchor.bToken}] = anchor.basis;
-
-    // Record evidence only for anchors this window actually chose. Anchors
-    // outside the window are either core-forced or already proved by an
-    // earlier window's witness, and restating them here would claim authority
-    // this enumeration never established.
-    for (size_t aToken = 0; aToken < committed.selectedMap.size(); ++aToken) {
-      const int64_t bToken = committed.selectedMap[aToken];
-      if (bToken < 0 || aToken < window.aBegin || aToken >= window.aEnd ||
-          isForcedAnchor(deps_.coreAlignment, aToken, bToken))
-        continue;
-
-      const auto required = requiredBasis.find(
-          {aToken, static_cast<uint64_t>(bToken)});
-      const AlignmentSemanticAnchorBasis basis =
-          required == requiredBasis.end()
-              ? AlignmentSemanticAnchorBasis::
-                    EquivalentRealizationRepresentative
-              : required->second;
-      committed.anchorEvidence.push_back(AlignmentSemanticAnchorEvidence{
-          aToken, static_cast<uint64_t>(bToken), basis});
-    }
-
-    REFOLD_LOG_TRACE(
-        "lcs/semantic-resolver",
-        "window {0} committing realized-source class: candidates={1} "
-        "classMembers={2} requiredAnchors={3} representative={4} anchors={5}",
-        windowIndex, globalMaps.size(), formatMapIndices(classMembers),
-        requiredAnchors.size(), representativeIndex,
-        committed.anchorEvidence.size());
-
-    committed.committed = true;
-    return committed;
-  };
 
   // Permanent census of the realized candidate set. Every commit rule below is
   // a statement about these counts, so reporting them makes a declined window
@@ -1529,14 +1923,14 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   // this rule could still fire; the reachability decision recorded there is
   // the one this rule reaches here.
   if (!gapProvenanceCoversStreams)
-    return result;
+    return declineWindow();
   if (!legacyProposalRuleReachable) {
     REFOLD_LOG_DEBUG(
         "lcs/semantic-resolver",
         "window {0} keeps core-forced anchors: legacy boundary proposal is "
         "not a complete jointly core-optimal map",
         windowIndex);
-    return result;
+    return declineWindow();
   }
 
   // Only anchors inside this window are counterfactual candidates. A proposal
@@ -1561,7 +1955,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0} keeps core-forced anchors: {1} proposal anchors exceed "
           "the counterfactual budget ({2})",
           windowIndex, proposalNonForcedCount, MaxProposalCounterfactuals);
-      return result;
+      return declineWindow();
     }
     // The historical proposal is commonly one of the enumerated complete maps.
     // Realize it through that map's slot, so a proposal the enumeration already
@@ -1584,7 +1978,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0}: realizing the legacy boundary proposal as a "
           "complete refold; it is not among the {1} enumerated map(s)",
           windowIndex, globalMaps.size());
-      ownedProposalSimulation.emplace(deps_.simulate(
+      ownedProposalSimulation.emplace(Simulate(
           buildSimulationSelection(proposal.selectedMap,
                                    deps_.coreAlignment)));
       proposalSimulation = &*ownedProposalSimulation;
@@ -1599,7 +1993,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0} keeps core-forced anchors: the legacy proposal's own "
           "simulation was not accepted ('{1}')",
           windowIndex, proposalSimulation->rejectionReason);
-      return result;
+      return declineWindow();
     }
 
     for (size_t aToken = 0; aToken < proposal.selectedMap.size(); ++aToken) {
@@ -1610,7 +2004,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
 
       std::vector<int64_t> counterfactualMap = proposal.selectedMap;
       counterfactualMap[aToken] = -1;
-      AlignmentSemanticSimulationResult counterfactual = deps_.simulate(
+      AlignmentSemanticSimulationResult counterfactual = Simulate(
           buildSimulationSelection(counterfactualMap,
                                    deps_.coreAlignment));
       if (!counterfactual.accepted) {
@@ -1677,7 +2071,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0} keeps core-forced anchors: no proposal anchor is "
           "required, so the surviving maps are the unenumerated ground set",
           windowIndex);
-      return result;
+      return declineWindow();
     }
     std::optional<std::vector<std::vector<int64_t>>> survivors =
         enumerateMapsThroughAnchors(
@@ -1689,7 +2083,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0} keeps core-forced anchors: the maps carrying the {1} "
           "required anchor(s) could not be enumerated within the proof budget",
           windowIndex, requiredAnchors.size());
-      return result;
+      return declineWindow();
     }
     if (!everyMapIsMonotoneAndLexemeAgreeing(*survivors, deps_.aLexemes,
                                              deps_.bLexemes)) {
@@ -1698,7 +2092,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0} keeps core-forced anchors: a map carrying the required "
           "anchors is not a monotone lexeme-agreeing alignment",
           windowIndex);
-      return result;
+      return declineWindow();
     }
     REFOLD_LOG_DEBUG(
         "lcs/semantic-resolver",
@@ -1730,7 +2124,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         "window {0} keeps core-forced anchors: no enumerated map contains "
         "every one of the {1} required anchors",
         windowIndex, requiredAnchors.size());
-    return result;
+    return declineWindow();
   }
 
   // The uniqueness test below spans every surviving map, so this rule's own
@@ -1748,7 +2142,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         deps_.aLexemes.size(),
         realizationCost(survivingMaps.size(), deps_.aLexemes.size()),
         maxRealizationCostPerCommitRule());
-    return result;
+    return declineWindow();
   }
 
   // Unknown witness dimensions are not semantic rejections. If a surviving
@@ -1765,7 +2159,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0} keeps core-forced anchors: surviving map {1} has "
           "incomplete proof ('{2}')",
           windowIndex, mapIndex, simulation.rejectionReason);
-      return result;
+      return declineWindow();
     }
   }
 
@@ -1783,7 +2177,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
           "window {0} keeps core-forced anchors: surviving map {1} carries no "
           "realization key ('{2}')",
           windowIndex, mapIndex, simulation.rejectionReason);
-      return result;
+      return declineWindow();
     }
     realizationClasses[simulation.realizationEquivalenceKey].push_back(
         mapIndex);
@@ -1795,7 +2189,7 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         "distinct realization classes after {3} required anchor(s)",
         windowIndex, survivingMaps.size(), realizationClasses.size(),
         requiredAnchors.size());
-    return result;
+    return declineWindow();
   }
 
   const auto &onlyClass = *realizationClasses.begin();

@@ -221,6 +221,21 @@ public:
   TokenDiffPlan Plan(AlignmentCertificationMemo *certificationMemo = nullptr,
                      RawByteHunkMemo *byteHunkMemo = nullptr);
 
+  /// Return the sorted, unique A-token frontiers of the translation unit's
+  /// protected preprocessing structure.
+  ///
+  /// This is the proof-scheduling surface of
+  /// `CollectProtectedAlignmentBoundarySurfaces()`: direct-TU directives and
+  /// the cover edges of directly included files.  Header-internal structure is
+  /// not part of it.
+  std::vector<uint64_t> CollectProtectedAlignmentBoundaryCoordinates() const;
+
+  /// Return the sorted A gaps `g`, with `aBegin < g < aEnd`, accepted by
+  /// `AGapHoldsPreservableComment()`: the gaps the comment-seam splitter keeps
+  /// outside every hunk.
+  std::vector<uint64_t> CollectPreservableCommentGaps(uint64_t aBegin,
+                                                      uint64_t aEnd) const;
+
 private:
   /// Certify the core A-to-B alignment and collect its evidence transcript.
   ///
