@@ -388,6 +388,22 @@ struct PartitionEdge {
   bool IsStateGap() const { return kind == PartitionEdgeKind::StateGap; }
 };
 
+/// What the partition search reads of a token `PartitionEdge`.  There is one
+/// candidate per admissible A subrange, O(W^2) of them, and an edge is ~3 KB
+/// even with empty state deltas, so only the chosen path becomes edges.
+struct TokenSegmentCandidate {
+  uint64_t aStart = 0;
+  uint64_t aEnd = 0;
+  uint64_t bStart = 0;
+  uint64_t bEnd = 0;
+  HunkRealizer realizer;
+  /// See `PartitionEdge::allowEmptyBEnvelope`.
+  bool allowEmptyBEnvelope = false;
+  Owner owner;
+  /// The complete source site the realizer spells this segment at.
+  OwnerSourceRange source;
+};
+
 /// Sentinel `PartitionStateKey::lastTokenEdgeIndex` for a DP state that no
 /// token segment has reached yet.
 constexpr size_t noTokenEdgeIndex = std::numeric_limits<size_t>::max();
@@ -416,6 +432,14 @@ struct PartitionStateKey {
   }
 };
 
+struct ClosedStateGapTransition {
+  SmallVector<PartitionEdge, 4> gaps;
+  /// True only when the exact preprocessing-structure index found at least
+  /// one protected interval in the physical gap and that interval had one
+  /// unique modeled state-gap owner.
+  bool hasProtectedPreprocessingStructure = false;
+};
+
 struct PartitionParent {
   bool valid = false;
   size_t edgeIndex = 0;
@@ -425,20 +449,20 @@ struct PartitionParent {
   // not advance A or B token coordinates, they are stored on the transition
   // that reaches the following token segment rather than as standalone DP
   // states that would create zero-length cycles.
-  SmallVector<PartitionEdge, 4> stateGapsBeforeEdge;
+  // The transition is the memo's answer, referenced rather than copied: a
+  // copy put four inline edges (~12 KB) on each of O(W^2) states.
+  const ClosedStateGapTransition *gapTransition = nullptr;
   // True once the same DP state can be reached by two distinct minimal
   // parent chains.  The structural tiling proof requires a deterministic
   // tiling, not merely a deterministic tie-breaker, so equal-cost ambiguity is
   // rejected.
   bool ambiguous = false;
-};
 
-struct ClosedStateGapTransition {
-  SmallVector<PartitionEdge, 4> gaps;
-  /// True only when the exact preprocessing-structure index found at least
-  /// one protected interval in the physical gap and that interval had one
-  /// unique modeled state-gap owner.
-  bool hasProtectedPreprocessingStructure = false;
+  ArrayRef<PartitionEdge> StateGapsBeforeEdge() const {
+    if (!gapTransition)
+      return {};
+    return gapTransition->gaps;
+  }
 };
 
 /// Identity of one closed state-gap transition question.
@@ -489,9 +513,13 @@ struct ClosedStateGapTransitionKey {
 ///
 /// The memo is per hunk and is only ever read through the key above, so it
 /// carries no state between hunks and no iteration order reaches a decision.
-using ClosedStateGapTransitionMemo =
-    std::map<ClosedStateGapTransitionKey,
-             std::optional<ClosedStateGapTransition>>;
+/// Answers are never rewritten, so a `PartitionParent` may point at one.
+struct ClosedStateGapTransitionMemo {
+  std::map<ClosedStateGapTransitionKey, std::optional<ClosedStateGapTransition>>
+      answers;
+  /// The answer for a first token segment, which has no gap to prove.
+  const ClosedStateGapTransition noPredecessor;
+};
 
 struct StructuralPartition {
   SmallVector<PartitionEdge, 8> edges;
@@ -1024,31 +1052,29 @@ public:
     return {};
   }
 
-  /// Build the identity part of a token segment's owner closure: owner,
-  /// source site, and A/B token ranges, with empty state deltas.
+  /// Bind the identity part of a token segment's owner closure -- owner and
+  /// source site -- to \p candidate, or return false when its realizer does
+  /// not spell the segment at one complete source site.
   ///
   /// The partition search enumerates every admissible A subrange of the hunk
   /// and reads only these fields, so the canonical state summary is attached
-  /// by `AttachTokenSegmentStateSummary()` to the edges of the reconstructed
+  /// by `MaterializeTokenSegmentEdge()` to the edges of the reconstructed
   /// path alone. Attaching it here instead copies the owner's complete delta
   /// into every candidate; for a TU realizer that delta is the census of the
   /// whole translation unit, and a wide hunk has quadratically many
   /// candidates.
-  std::optional<OwnerClosure>
-  BuildTokenSegmentClosure(const PartitionEdge &edge) const {
-    if (!edge.IsTokenSegment() || edge.aEnd <= edge.aStart ||
-        edge.bEnd < edge.bStart ||
-        (!edge.allowEmptyBEnvelope && edge.bEnd <= edge.bStart))
-      return std::nullopt;
+  bool BindTokenSegmentOwner(TokenSegmentCandidate &candidate) const {
+    if (candidate.aEnd <= candidate.aStart ||
+        candidate.bEnd < candidate.bStart ||
+        (!candidate.allowEmptyBEnvelope && candidate.bEnd <= candidate.bStart))
+      return false;
 
-    Owner owner = Owner::Unknown();
-    std::optional<OwnerSourceRange> source;
-    switch (edge.realizer.kind) {
+    switch (candidate.realizer.kind) {
     case HunkRealizerKind::Macro: {
       const RefoldModel::MacroInvocation *macro =
-          deps_.macroTopology.FindMacroInvocationById(edge.realizer.id);
+          deps_.macroTopology.FindMacroInvocationById(candidate.realizer.id);
       if (!macro || !macro->invFile || !macro->invB || !macro->invE)
-        return std::nullopt;
+        return false;
       // A macro realizer must realize the *whole* invocation, not a suffix of
       // its expansion.  Otherwise the search offers one candidate per interior
       // split point, each handing this realizer a different sub-range of the
@@ -1058,48 +1084,58 @@ public:
       // once in source and can only be replayed whole.  Requiring the exact
       // recorded cover removes them by admissibility rather than preferring
       // one of them, which would be ordering mistaken for proof.
-      if (edge.aStart != macro->cover.begin || edge.aEnd != macro->cover.end)
-        return std::nullopt;
-      owner = Owner::MacroInvocation(macro->id);
-      source = OwnerSourceRange::From(*macro->invFile, *macro->invB,
-                                      *macro->invE, macro->ownerIncludeId);
-      break;
+      if (candidate.aStart != macro->cover.begin ||
+          candidate.aEnd != macro->cover.end)
+        return false;
+      candidate.owner = Owner::MacroInvocation(macro->id);
+      candidate.source = OwnerSourceRange::From(
+          *macro->invFile, *macro->invB, *macro->invE, macro->ownerIncludeId);
+      return true;
     }
     case HunkRealizerKind::Include: {
       const RefoldModel::IncludeItem *include =
-          deps_.model.GetIncludeById(edge.realizer.id);
+          deps_.model.GetIncludeById(candidate.realizer.id);
       if (!include)
-        return std::nullopt;
-      owner = Owner::Include(include->id);
-      source = OwnerSourceRange::From(include->sitePath, include->siteB,
-                                      include->siteE, include->parent);
-      break;
+        return false;
+      candidate.owner = Owner::Include(include->id);
+      candidate.source = OwnerSourceRange::From(
+          include->sitePath, include->siteB, include->siteE, include->parent);
+      return true;
     }
     case HunkRealizerKind::TU: {
-      owner = Owner::TU();
-      source = MappedTUSourceRangeForTokens(edge.aStart, edge.aEnd);
+      std::optional<OwnerSourceRange> source =
+          MappedTUSourceRangeForTokens(candidate.aStart, candidate.aEnd);
       if (!source)
-        return std::nullopt;
-      break;
+        return false;
+      candidate.owner = Owner::TU();
+      candidate.source = std::move(*source);
+      return true;
     }
     case HunkRealizerKind::Unknown:
-      return std::nullopt;
+      return false;
     }
-
-    return OwnerClosure::From(std::move(owner), std::move(*source),
-                              OwnerTokenRange::From(edge.aStart, edge.aEnd),
-                              OwnerTokenRange::From(edge.bStart, edge.bEnd));
+    return false;
   }
 
-  /// Attach the canonical state summary of a token segment's owner to the
-  /// closure built by `BuildTokenSegmentClosure()`. The summary depends only
-  /// on the owner, so deferring it to the chosen path yields the closure an
-  /// eager attachment would have produced.
-  void AttachTokenSegmentStateSummary(PartitionEdge &edge) const {
-    if (!edge.IsTokenSegment() || !edge.closure)
-      return;
-    edge.closure = deps_.ownerStateProof.AttachCanonicalStateSummary(
-        std::move(*edge.closure));
+  /// Materialize \p candidate as a token-segment edge whose owner closure
+  /// carries the canonical state summary of its owner. The summary depends
+  /// only on the owner, so deferring it to the chosen path yields the closure
+  /// an eager attachment would have produced.
+  PartitionEdge
+  MaterializeTokenSegmentEdge(const TokenSegmentCandidate &candidate) const {
+    PartitionEdge edge;
+    edge.aStart = candidate.aStart;
+    edge.aEnd = candidate.aEnd;
+    edge.bStart = candidate.bStart;
+    edge.bEnd = candidate.bEnd;
+    edge.realizer = candidate.realizer;
+    edge.allowEmptyBEnvelope = candidate.allowEmptyBEnvelope;
+    edge.closure =
+        deps_.ownerStateProof.AttachCanonicalStateSummary(OwnerClosure::From(
+            candidate.owner, candidate.source,
+            OwnerTokenRange::From(candidate.aStart, candidate.aEnd),
+            OwnerTokenRange::From(candidate.bStart, candidate.bEnd)));
+    return edge;
   }
 
   bool SourceSitesComparable(const OwnerSourceRange &lhs,
@@ -1778,38 +1814,35 @@ public:
     return witness;
   }
 
-  std::optional<ClosedStateGapTransition>
-  BuildClosedStateGapTransition(const PartitionEdge *prev,
-                                const PartitionEdge &cur,
+  /// Return the proved state transition from \p prev to \p cur, owned by
+  /// \p memo, or null when the gap between them does not close.
+  const ClosedStateGapTransition *
+  BuildClosedStateGapTransition(const TokenSegmentCandidate *prev,
+                                const TokenSegmentCandidate &cur,
                                 ClosedStateGapTransitionMemo &memo) const {
     // The first token segment has no predecessor: there is no interval between
     // two carriers, so there is nothing to prove and nothing to memoize.
     if (!prev)
-      return ClosedStateGapTransition();
-    if (!prev->IsTokenSegment() || !cur.IsTokenSegment() || !prev->closure ||
-        !cur.closure)
-      return std::nullopt;
+      return &memo.noPredecessor;
 
     ClosedStateGapTransitionKey key;
-    key.previousPath = prev->closure->source.path;
-    key.currentPath = cur.closure->source.path;
-    key.previousIncludeId = prev->closure->source.includeId;
-    key.currentIncludeId = cur.closure->source.includeId;
-    key.previousSourceComplete = prev->closure->source.IsComplete();
-    key.previousSourceEnd = prev->closure->source.end;
-    key.currentSourceBegin = cur.closure->source.begin;
-    key.currentSourceComplete = cur.closure->source.IsComplete();
+    key.previousPath = prev->source.path;
+    key.currentPath = cur.source.path;
+    key.previousIncludeId = prev->source.includeId;
+    key.currentIncludeId = cur.source.includeId;
+    key.previousSourceComplete = prev->source.IsComplete();
+    key.previousSourceEnd = prev->source.end;
+    key.currentSourceBegin = cur.source.begin;
+    key.currentSourceComplete = cur.source.IsComplete();
     key.aBoundary = prev->aEnd;
     key.bBoundary = prev->bEnd;
 
-    const auto cached = memo.find(key);
-    if (cached != memo.end())
-      return cached->second;
-
-    std::optional<ClosedStateGapTransition> transition =
-        ProveClosedStateGapTransition(*prev, cur);
-    memo.emplace(key, transition);
-    return transition;
+    auto answer = memo.answers.find(key);
+    if (answer == memo.answers.end())
+      answer =
+          memo.answers.emplace(key, ProveClosedStateGapTransition(*prev, cur))
+              .first;
+    return answer->second ? &*answer->second : nullptr;
   }
 
   /// Prove the complete state transition between two adjacent token carriers.
@@ -1819,20 +1852,20 @@ public:
   /// `BuildClosedStateGapTransition()` exact rather than an approximation of
   /// repeated work.
   std::optional<ClosedStateGapTransition>
-  ProveClosedStateGapTransition(const PartitionEdge &prev,
-                                const PartitionEdge &cur) const {
+  ProveClosedStateGapTransition(const TokenSegmentCandidate &prev,
+                                const TokenSegmentCandidate &cur) const {
     ClosedStateGapTransition transition;
 
     // Token owners from incomparable source sites do not create a proof
     // obligation here.  They are still checked later by the ordinary
     // owner-realization proofs.
-    if (!SourceSitesComparable(prev.closure->source, cur.closure->source) ||
-        cur.closure->source.begin < prev.closure->source.end)
+    if (!SourceSitesComparable(prev.source, cur.source) ||
+        cur.source.begin < prev.source.end)
       return transition;
 
-    OwnerSourceRange gapSource = OwnerSourceRange::From(
-        prev.closure->source.path, prev.closure->source.end,
-        cur.closure->source.begin, prev.closure->source.includeId);
+    OwnerSourceRange gapSource =
+        OwnerSourceRange::From(prev.source.path, prev.source.end,
+                               cur.source.begin, prev.source.includeId);
     SmallVector<PartitionEdge, 8> collected =
         CollectZeroTokenStateGaps(gapSource, prev.aEnd, prev.bEnd);
 
@@ -2192,7 +2225,7 @@ public:
   /// caller's tie unresolved.
   std::optional<std::vector<std::pair<uint64_t, uint64_t>>>
   CollectPreservedProtectedIntervals(ArrayRef<PartitionStateMap> dp,
-                                     ArrayRef<PartitionEdge> edges,
+                                     ArrayRef<TokenSegmentCandidate> edges,
                                      const diffutils::Hunk &h,
                                      PartitionStateKey finalKey) const {
     std::vector<std::pair<uint64_t, uint64_t>> preserved;
@@ -2204,7 +2237,7 @@ public:
       if (state == states.end() || !state->second.valid ||
           state->second.edgeIndex >= edges.size())
         return std::nullopt;
-      for (const PartitionEdge &gap : state->second.stateGapsBeforeEdge)
+      for (const PartitionEdge &gap : state->second.StateGapsBeforeEdge())
         if (gap.protectedPreprocessingStructure && gap.closure)
           preserved.emplace_back(gap.closure->source.begin,
                                  gap.closure->source.end);
@@ -2259,7 +2292,7 @@ public:
   /// guesses.
   std::optional<PartitionStateMap::const_iterator>
   SelectStructurePreservingFinalState(ArrayRef<PartitionStateMap> dp,
-                                      ArrayRef<PartitionEdge> edges,
+                                      ArrayRef<TokenSegmentCandidate> edges,
                                       const diffutils::Hunk &h) const {
     const PartitionStateMap &finalStates = dp.back();
     struct FinalState {
@@ -2574,7 +2607,7 @@ public:
     }
 
     const uint64_t aLen = h.aEnd - h.aStart;
-    std::vector<PartitionEdge> edges;
+    std::vector<TokenSegmentCandidate> edges;
     std::vector<std::vector<size_t>> edgesByAOffset(static_cast<size_t>(aLen) +
                                                     1);
 
@@ -2635,7 +2668,7 @@ public:
           }
         }
 
-        PartitionEdge edge;
+        TokenSegmentCandidate edge;
         edge.aStart = aLo;
         edge.aEnd = aHi;
         edge.bStart = edgeBStart;
@@ -2648,8 +2681,7 @@ public:
         edge.allowEmptyBEnvelope =
             deleteOnlyHunk ||
             (replaceHunk && exactPhysicalRunIndex && edgeBStart == edgeBEnd);
-        edge.closure = BuildTokenSegmentClosure(edge);
-        if (!edge.closure)
+        if (!BindTokenSegmentOwner(edge))
           continue;
 
         const size_t edgeIndex = edges.size();
@@ -2660,20 +2692,18 @@ public:
     }
 
     auto physicalRunIndexForEdge =
-        [&](const PartitionEdge &candidate) -> std::optional<size_t> {
-      if (!physicalSourceRuns || !candidate.IsTokenSegment() ||
-          !candidate.closure || !candidate.closure->source.IsComplete()) {
+        [&](const TokenSegmentCandidate &candidate) -> std::optional<size_t> {
+      if (!physicalSourceRuns || !candidate.source.IsComplete())
         return std::nullopt;
-      }
 
       std::optional<size_t> match;
       for (size_t runIndex = 0; runIndex < physicalSourceRuns->runs.size();
            ++runIndex) {
         const PhysicalSourceRun &run = physicalSourceRuns->runs[runIndex];
         if (candidate.aStart != run.aStart || candidate.aEnd != run.aEnd ||
-            !SourceSitesComparable(candidate.closure->source, run.source) ||
-            candidate.closure->source.begin != run.source.begin ||
-            candidate.closure->source.end != run.source.end) {
+            !SourceSitesComparable(candidate.source, run.source) ||
+            candidate.source.begin != run.source.begin ||
+            candidate.source.end != run.source.end) {
           continue;
         }
 
@@ -2708,11 +2738,11 @@ public:
         const unsigned curCost = state.second.cost;
 
         for (size_t edgeIndex : edgesByAOffset[static_cast<size_t>(aOff)]) {
-          const PartitionEdge &edge = edges[edgeIndex];
+          const TokenSegmentCandidate &edge = edges[edgeIndex];
           if (edge.bStart != key.bPos)
             continue;
 
-          const PartitionEdge *prevEdge = nullptr;
+          const TokenSegmentCandidate *prevEdge = nullptr;
           if (key.lastTokenEdgeIndex != noTokenEdgeIndex) {
             if (key.lastTokenEdgeIndex >= edges.size())
               continue;
@@ -2725,7 +2755,7 @@ public:
           // this DP edge from existing at all.  This lets cost and ambiguity
           // account for the real token+state proof graph instead of adding
           // state gaps as an after-the-fact annotation.
-          auto transitionGaps =
+          const ClosedStateGapTransition *transitionGaps =
               BuildClosedStateGapTransition(prevEdge, edge, transitionMemo);
           if (!transitionGaps)
             continue;
@@ -2772,10 +2802,9 @@ public:
 
               const OwnerSourceRange &provedGap =
                   physicalSourceRuns->protectedGaps[*boundaryIndex];
-              if (!SourceSitesComparable(prevEdge->closure->source,
-                                         provedGap) ||
-                  provedGap.begin != prevEdge->closure->source.end ||
-                  provedGap.end != edge.closure->source.begin) {
+              if (!SourceSitesComparable(prevEdge->source, provedGap) ||
+                  provedGap.begin != prevEdge->source.end ||
+                  provedGap.end != edge.source.begin) {
                 continue;
               }
 
@@ -2839,10 +2868,9 @@ public:
 
               const OwnerSourceRange &provedGap =
                   physicalSourceRuns->protectedGaps[*previousRun];
-              if (!SourceSitesComparable(prevEdge->closure->source,
-                                         provedGap) ||
-                  provedGap.begin != prevEdge->closure->source.end ||
-                  provedGap.end != edge.closure->source.begin) {
+              if (!SourceSitesComparable(prevEdge->source, provedGap) ||
+                  provedGap.begin != prevEdge->source.end ||
+                  provedGap.end != edge.source.begin) {
                 continue;
               }
             }
@@ -2903,7 +2931,7 @@ public:
             parent.edgeIndex = edgeIndex;
             parent.prev = key;
             parent.cost = nextCost;
-            parent.stateGapsBeforeEdge = transitionGaps->gaps;
+            parent.gapTransition = transitionGaps;
             parent.ambiguous = state.second.ambiguous;
             dst[nextKey] = std::move(parent);
           } else if (nextCost == existing->second.cost) {
@@ -2981,12 +3009,12 @@ public:
               if (s2 == dp[static_cast<size_t>(aOff2)].end() ||
                   !s2->second.valid)
                 break;
-              const PartitionEdge &e2 = edges[s2->second.edgeIndex];
+              const TokenSegmentCandidate &e2 = edges[s2->second.edgeIndex];
               chain = llvm::formatv(
                           "[{0},{1})->[{2},{3}) r={4}/{5} gaps={6} | ",
                           e2.aStart, e2.aEnd, e2.bStart, e2.bEnd,
                           static_cast<int>(e2.realizer.kind), e2.realizer.id,
-                          s2->second.stateGapsBeforeEdge.size())
+                          s2->second.StateGapsBeforeEdge().size())
                           .str() +
                       chain;
               aPos2 = e2.aStart;
@@ -3041,14 +3069,14 @@ public:
       }
 
       const PartitionParent &parent = stateIt->second;
-      const PartitionEdge &edge = edges[parent.edgeIndex];
-      reversePath.push_back(edge);
-      AttachTokenSegmentStateSummary(reversePath.back());
+      const TokenSegmentCandidate &edge = edges[parent.edgeIndex];
+      reversePath.push_back(MaterializeTokenSegmentEdge(edge));
       // Gaps are stored before the token edge in forward order.  During
       // backward reconstruction, append them in reverse so the final reverse
       // below yields: previous token, gap..., current token.
-      for (auto gapIt = parent.stateGapsBeforeEdge.rbegin();
-           gapIt != parent.stateGapsBeforeEdge.rend(); ++gapIt) {
+      ArrayRef<PartitionEdge> gapsBeforeEdge = parent.StateGapsBeforeEdge();
+      for (auto gapIt = gapsBeforeEdge.rbegin(); gapIt != gapsBeforeEdge.rend();
+           ++gapIt) {
         reversePath.push_back(*gapIt);
       }
 
