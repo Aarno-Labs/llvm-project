@@ -26,7 +26,7 @@
 // CHECK: rejecting direct-TU insertion at A gap 13: B=[13,14) would supply a replacement-list literal of macro {{[0-9]+}} (IN_USE)
 // CHECK: candidate map 3 of 3 realized: requested terminal fallback
 // CHECK: candidate census: enumerated=3 realized=3 accepted=1 terminalFallback=2 proofIncomplete=0
-// CHECK: committed one realized-source class: 1 of 3 enumerated map(s) share it
+// CHECK: committed CompleteGroundSetEquivalence: 1 of 3 enumerated map(s) share its output
 #define IN_USE(x) (x >= 0)
 
 int probe(int **p, int j) {

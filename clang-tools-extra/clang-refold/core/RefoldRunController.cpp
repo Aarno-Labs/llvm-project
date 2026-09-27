@@ -678,7 +678,7 @@ Expected<std::string> refoldTranslationUnit(
                            std::move(probeConfig));
         probe.ProbeAlignmentResolution();
 
-        if (alignmentResolutionMemo.resolution.committedEquivalentClass) {
+        if (alignmentResolutionMemo.resolution.committedSemanticResolution) {
           REFOLD_LOG_INFO(
               "fallback",
               "attempt {0} is limited by alignment ambiguity; resolution "

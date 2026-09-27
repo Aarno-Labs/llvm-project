@@ -3,11 +3,10 @@
 // Exact semantic resolution for non-forced weighted-LCS alignment anchors.
 //
 // The core certifier exposes only match edges used by every optimal path. This
-// service may restore non-forced anchors only after complete optimal-map
-// enumeration and isolated full-planner proofs establish either one identical
-// realization or one globally least exact source-transformation class.
-// Historical boundary choices remain proposal-only and require exact
-// counterfactual validation.
+// service may restore non-forced anchors only after isolated full-planner
+// proofs over a completely enumerated candidate domain establish one of three
+// theorems; see `AlignmentSemanticResolutionKind`. Historical boundary choices
+// remain proposal-only and require exact counterfactual validation.
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,6 +18,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/ErrorHandling.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -132,13 +132,80 @@ struct AlignmentSemanticAnchorEvidence {
       AlignmentSemanticAnchorBasis::EquivalentRealizationRepresentative;
 };
 
-/// Durable proof that one ambiguity class has one structural realization.
+/// Theorem by which one certification window's non-forced anchors were
+/// committed.
+enum class AlignmentSemanticResolutionKind : uint8_t {
+  /// Every core-optimal map of the window was enumerated and realized, and the
+  /// observational-irrelevance or least-source-mutation rule reduced them to
+  /// one realized-source class.
+  CompleteGroundSetEquivalence,
+  /// Each of the legacy boundary proposal's required anchors was proved
+  /// necessary by its counterfactual, and every core-optimal map carrying all
+  /// of them reduced to one realization class.  Quantifies over those carriers
+  /// only, whether they were filtered from an enumerated ground set or
+  /// enumerated directly through the anchors.
+  RequiredAnchorCarrierEquivalence,
+  /// Declining the window was proved to request terminal fallback, and every
+  /// accepted member of the structure-respecting repair's candidate set
+  /// produced one concrete output.  Asserts nothing about core-optimal maps
+  /// outside that candidate set; see
+  /// `RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair()`.
+  StructureRespectingTerminalRecovery,
+};
+
+inline llvm::StringRef toString(AlignmentSemanticResolutionKind kind) {
+  switch (kind) {
+  case AlignmentSemanticResolutionKind::CompleteGroundSetEquivalence:
+    return "CompleteGroundSetEquivalence";
+  case AlignmentSemanticResolutionKind::RequiredAnchorCarrierEquivalence:
+    return "RequiredAnchorCarrierEquivalence";
+  case AlignmentSemanticResolutionKind::StructureRespectingTerminalRecovery:
+    return "StructureRespectingTerminalRecovery";
+  }
+  llvm_unreachable("invalid alignment semantic resolution kind");
+}
+
+/// The set of candidate maps one resolution theorem quantified over.
+enum class AlignmentSemanticCandidateDomain : uint8_t {
+  /// Every core-optimal map of the window.
+  AllOptimalMaps,
+  /// The core-optimal maps of the window that carry every required anchor.
+  RequiredAnchorCarriers,
+  /// The combinations of the structure-respecting repair's preferred
+  /// sub-rectangle maps.
+  StructureRepairCandidates,
+};
+
+/// Which preferred sub-rectangles a structure-respecting repair varied.
+enum class StructureRepairScope : uint8_t {
+  /// Every sub-rectangle whose preference keys kept a proper subset of its
+  /// optimal maps.
+  AllPreferredSubRectangles,
+  /// Only the preferred sub-rectangles that a terminal request of the
+  /// declined window's realization meets, because all of them together
+  /// exceeded the realization budget.
+  TerminalRequestIntersectingSubRectangles,
+};
+
+/// Durable record of the theorem that committed one certification window.
+///
+/// `resolutionKind` names that theorem, and `candidateDomain` the set it
+/// quantified over; only `CompleteGroundSetEquivalence` is a statement about
+/// every core-optimal map of the window.
 struct AlignmentSemanticResolutionWitness {
   uint64_t witnessId = 0;
+  AlignmentSemanticResolutionKind resolutionKind =
+      AlignmentSemanticResolutionKind::CompleteGroundSetEquivalence;
+  AlignmentSemanticCandidateDomain candidateDomain =
+      AlignmentSemanticCandidateDomain::AllOptimalMaps;
+  /// Every member of `candidateDomain` was enumerated and realized.  This says
+  /// nothing about core-optimal maps outside that domain.
+  bool candidateDomainCompletelyEnumerated = false;
+  /// Set only for `StructureRespectingTerminalRecovery`.
+  std::optional<StructureRepairScope> structureRepairScope;
   uint64_t enumeratedMapCount = 0;
   uint64_t acceptedMapCount = 0;
   uint64_t rejectedMapCount = 0;
-  bool completeEnumeration = false;
   std::string equivalenceKey;
   std::vector<int64_t> representativeMap;
   std::vector<AlignmentSemanticAnchorEvidence> anchorEvidence;
@@ -204,8 +271,9 @@ public:
     std::vector<int64_t> selectedMap;
     std::vector<diffutils::LcsAnchorProof> selectedAnchorProofs;
     std::vector<AlignmentSemanticResolutionWitness> witnesses;
-    bool committedEquivalentClass = false;
-    bool completeEnumeration = false;
+    /// At least one window committed, and `witnesses` names the theorem of
+    /// each.
+    bool committedSemanticResolution = false;
     /// A ranges of the windows committed by the structure-respecting repair;
     /// see `AlignmentSelectionOverride::structurePreservingTieRanges`.
     std::vector<std::pair<uint64_t, uint64_t>> structurePreservingTieRanges;
@@ -259,9 +327,16 @@ private:
     bool enumeratedOnlyRequiredAnchorCarriers = false;
     uint64_t acceptedMapCount = 0;
     uint64_t rejectedMapCount = 0;
-    /// True when `SelectStructureRespectingRepair()` chose this commit, so
-    /// its realization must keep the structure the repair preferred.
-    bool structureRespectingRepair = false;
+    /// The theorem that committed this window, and the set it quantified
+    /// over.  Read only when `committed`.  A
+    /// `StructureRespectingTerminalRecovery` commit must be realized keeping
+    /// the structure the repair preferred.
+    AlignmentSemanticResolutionKind resolutionKind =
+        AlignmentSemanticResolutionKind::CompleteGroundSetEquivalence;
+    AlignmentSemanticCandidateDomain candidateDomain =
+        AlignmentSemanticCandidateDomain::AllOptimalMaps;
+    bool candidateDomainCompletelyEnumerated = false;
+    std::optional<StructureRepairScope> structureRepairScope;
   };
 
   /// Resolve the ambiguity inside one certification window.
@@ -341,6 +416,8 @@ private:
     /// committed output.
     uint64_t candidateCount = 0;
     uint64_t classSize = 0;
+    StructureRepairScope scope =
+        StructureRepairScope::AllPreferredSubRectangles;
   };
 
   /// Select the map a window commits when declining it is proved

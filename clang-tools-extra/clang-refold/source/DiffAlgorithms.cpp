@@ -759,7 +759,7 @@ describeLcsCertificationRun(
     case LcsAnchorProofKind::CoreOptimalPathForced:
       ++coreForcedAnchors;
       break;
-    case LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner:
+    case LcsAnchorProofKind::SemanticResolutionWitness:
       ++semanticAnchors;
       break;
     case LcsAnchorProofKind::OwnerAlignedDeletionSlide:
@@ -773,7 +773,7 @@ describeLcsCertificationRun(
   // repaired ones.
   lines.push_back(
       formatv("retained anchors total={0} CoreOptimalPathForced={1} "
-              "EquivalentNormalizedHunkAndOwner={2} "
+              "SemanticResolutionWitness={2} "
               "OwnerAlignedDeletionSlide={3}",
               retainedAnchors, coreForcedAnchors, semanticAnchors,
               ownerAlignedSlideAnchors)

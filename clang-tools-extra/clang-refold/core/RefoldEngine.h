@@ -721,7 +721,7 @@ private:
 
   /// Dynamic theorem boundary for semantic alignment. Isolated candidates set
   /// this from their alignment override; the production engine sets it only
-  /// after one complete semantic equivalence class is committed. Proof/audit
+  /// after the resolver commits at least one window's witness. Proof/audit
   /// services borrow this flag so candidate and production realization use the
   /// same strict witness domain without changing unrelated planner policy.
   bool alignmentSemanticTheoremActive_ = false;
@@ -1033,8 +1033,8 @@ private:
   /// provenance.  No macro/include/TU owner dispatch may consume the sequence
   /// before this method completes.
   /// Resolve non-forced core-optimal anchors through isolated full structural
-  /// simulations and one exact semantic equivalence class per certification
-  /// window.
+  /// simulations, committing at most one resolution theorem per certification
+  /// window; see `AlignmentSemanticResolutionKind`.
   ///
   /// `certificationByteBudget` is the budget the core theorem ran under; the
   /// per-window pair facts recomputed during resolution are charged against

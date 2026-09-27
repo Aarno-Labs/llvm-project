@@ -635,8 +635,8 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
             "lcs/semantic-resolver",
             "alignment semantic witness ledger has an invalid duplicate id");
       }
-      if (!witness.completeEnumeration || witness.enumeratedMapCount == 0 ||
-          witness.acceptedMapCount == 0 ||
+      if (!witness.candidateDomainCompletelyEnumerated ||
+          witness.enumeratedMapCount == 0 || witness.acceptedMapCount == 0 ||
           witness.acceptedMapCount + witness.rejectedMapCount !=
               witness.enumeratedMapCount ||
           witness.equivalenceKey.empty() ||
@@ -676,8 +676,7 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
           // that witness's obligation and is checked against it below. With a
           // single witness this skips nothing: every non-forced anchor then
           // names that one witness.
-          if (proof.kind == diffutils::LcsAnchorProofKind::
-                                EquivalentNormalizedHunkAndOwner &&
+          if (proof.IsSemanticWitnessBacked() &&
               proof.semanticWitnessId != witness.witnessId)
             continue;
         }
@@ -692,8 +691,7 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
     }
     for (size_t aToken = 0; aToken < abTokAnchorProofs_.size(); ++aToken) {
       const diffutils::LcsAnchorProof &proof = abTokAnchorProofs_[aToken];
-      if (proof.kind !=
-          diffutils::LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner)
+      if (!proof.IsSemanticWitnessBacked())
         continue;
       if (!alignmentSemanticTheoremActive_) {
         REFOLD_LOG_FATAL(

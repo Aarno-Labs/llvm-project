@@ -434,10 +434,10 @@ AlignmentSelectionOverride buildSimulationSelection(
     }
 
     // Isolated runs are theorem checks, not production authority. The sentinel
-    // witness id is replaced only after the outer resolver commits one complete
-    // realized-source class.
+    // witness id is replaced only after the outer resolver commits the window
+    // and records the witness naming its theorem.
     selection.selectedAnchorProofs[aToken] = diffutils::LcsAnchorProof{
-        diffutils::LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner,
+        diffutils::LcsAnchorProofKind::SemanticResolutionWitness,
         std::numeric_limits<uint64_t>::max()};
   }
   return selection;
@@ -1017,15 +1017,20 @@ RefoldAlignmentSemanticResolver::Resolve() const {
     }
     REFOLD_LOG_DEBUG(
         "lcs/semantic-resolver",
-        "window {0} committed one realized-source class: {1} of {2} "
-        "{3} map(s) share it, {4} anchor(s) proved",
-        windowIndex, resolution.acceptedMapCount, resolution.enumeratedMapCount,
-        resolution.enumeratedOnlyRequiredAnchorCarriers
+        "window {0} committed {1}: {2} of {3} {4} map(s) share its output, "
+        "{5} anchor(s) proved",
+        windowIndex, toString(resolution.resolutionKind),
+        resolution.acceptedMapCount, resolution.enumeratedMapCount,
+        resolution.candidateDomain ==
+                AlignmentSemanticCandidateDomain::StructureRepairCandidates
+            ? "structure-repair candidate"
+        : resolution.enumeratedOnlyRequiredAnchorCarriers
             ? "required-anchor-carrying"
             : "enumerated",
         static_cast<uint64_t>(resolution.anchorEvidence.size()));
     baseMap = resolution.selectedMap;
-    if (resolution.structureRespectingRepair) {
+    if (resolution.resolutionKind ==
+        AlignmentSemanticResolutionKind::StructureRespectingTerminalRecovery) {
       const diffutils::LcsCertificationWindow &window =
           deps_.coreAlignment.certificationWindows[windowIndex];
       committedTieRanges_.emplace_back(window.aBegin, window.aEnd);
@@ -1033,7 +1038,6 @@ RefoldAlignmentSemanticResolver::Resolve() const {
     committedWindows.push_back(std::move(resolution));
   }
 
-  result.completeEnumeration = windowsWithOracle != 0;
   if (committedWindows.empty()) {
     REFOLD_LOG_TRACE(
         "lcs/semantic-resolver",
@@ -1063,10 +1067,14 @@ RefoldAlignmentSemanticResolver::Resolve() const {
   for (WindowResolution &resolution : committedWindows) {
     AlignmentSemanticResolutionWitness witness;
     witness.witnessId = nextWitnessId++;
+    witness.resolutionKind = resolution.resolutionKind;
+    witness.candidateDomain = resolution.candidateDomain;
+    witness.candidateDomainCompletelyEnumerated =
+        resolution.candidateDomainCompletelyEnumerated;
+    witness.structureRepairScope = resolution.structureRepairScope;
     witness.enumeratedMapCount = resolution.enumeratedMapCount;
     witness.acceptedMapCount = resolution.acceptedMapCount;
     witness.rejectedMapCount = resolution.rejectedMapCount;
-    witness.completeEnumeration = true;
     witness.equivalenceKey = std::move(resolution.equivalenceKey);
     witness.representativeMap = result.selectedMap;
     witness.anchorEvidence = std::move(resolution.anchorEvidence);
@@ -1075,7 +1083,7 @@ RefoldAlignmentSemanticResolver::Resolve() const {
       if (evidence.aToken >= result.selectedAnchorProofs.size())
         return ResolutionResult{};
       result.selectedAnchorProofs[evidence.aToken] = diffutils::LcsAnchorProof{
-          diffutils::LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner,
+          diffutils::LcsAnchorProofKind::SemanticResolutionWitness,
           witness.witnessId};
     }
     result.witnesses.push_back(std::move(witness));
@@ -1102,12 +1110,11 @@ RefoldAlignmentSemanticResolver::Resolve() const {
               diffutils::LcsAnchorProofKind::CoreOptimalPathForced, 0};
         }
       }
-      forcedOnly.completeEnumeration = result.completeEnumeration;
       return forcedOnly;
     }
   }
 
-  result.committedEquivalentClass = true;
+  result.committedSemanticResolution = true;
   result.structurePreservingTieRanges = committedTieRanges_;
   return result;
 }
@@ -1329,6 +1336,7 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
   // configuration, is realized.  Over the budget, only the sub-rectangles the
   // decline's own terminal requests meet vary; see the declaration.
   std::optional<AlignmentSemanticSimulationResult> declined;
+  StructureRepairScope scope = StructureRepairScope::AllPreferredSubRectangles;
   if (!repairCombinationsWithinBudget(countRepairCombinations(preferred),
                                       deps_.aLexemes.size())) {
     REFOLD_LOG_DEBUG("lcs/semantic-resolver",
@@ -1372,6 +1380,7 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
                      "terminal request(s) meet",
                      windowIndex, preferred.size(), named->size());
     preferred = std::move(*named);
+    scope = StructureRepairScope::TerminalRequestIntersectingSubRectangles;
   }
 
   std::vector<std::vector<int64_t>> candidates(1, baseMap.vec());
@@ -1459,6 +1468,7 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
   repair.selectedMap = candidates[onlyClass.second.front()];
   repair.candidateCount = candidates.size();
   repair.classSize = onlyClass.second.size();
+  repair.scope = scope;
   return repair;
 }
 
@@ -1562,13 +1572,22 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   // a ground set that was never enumerated was never realized either.
   bool everyMapRealized = groundSetEnumerated;
 
-  // Commit \p selectedMap as this window's choice, out of \p candidateCount
-  // candidates of which \p classSize share its output.
+  // Commit \p selectedMap as this window's choice under theorem \p kind, out
+  // of \p candidateCount candidates of which \p classSize share its output.
+  //
+  // Every caller commits only after realizing each member of \p domain, and
+  // declines on the first member it cannot realize, so the domain was
+  // completely enumerated whenever this is reached.
   auto commitSelectedMap =
-      [&](StringRef equivalenceKey, ArrayRef<int64_t> selectedMap,
-          uint64_t candidateCount, uint64_t classSize,
+      [&](AlignmentSemanticResolutionKind kind,
+          AlignmentSemanticCandidateDomain domain, StringRef equivalenceKey,
+          ArrayRef<int64_t> selectedMap, uint64_t candidateCount,
+          uint64_t classSize,
           ArrayRef<RequiredAnchor> requiredAnchors) -> WindowResolution {
     WindowResolution committed;
+    committed.resolutionKind = kind;
+    committed.candidateDomain = domain;
+    committed.candidateDomainCompletelyEnumerated = true;
     committed.enumeratedMapCount = candidateCount;
     committed.enumeratedOnlyRequiredAnchorCarriers = !groundSetEnumerated;
     committed.acceptedMapCount = classSize;
@@ -1608,14 +1627,16 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   };
 
   auto commitRealizationClass =
-      [&](StringRef equivalenceKey, ArrayRef<size_t> classMembers,
+      [&](AlignmentSemanticResolutionKind kind,
+          AlignmentSemanticCandidateDomain domain, StringRef equivalenceKey,
+          ArrayRef<size_t> classMembers,
           ArrayRef<RequiredAnchor> requiredAnchors) -> WindowResolution {
     if (classMembers.empty())
       return WindowResolution{};
     const size_t representativeIndex = classMembers.front();
     WindowResolution committed = commitSelectedMap(
-        equivalenceKey, globalMaps[representativeIndex], globalMaps.size(),
-        classMembers.size(), requiredAnchors);
+        kind, domain, equivalenceKey, globalMaps[representativeIndex],
+        globalMaps.size(), classMembers.size(), requiredAnchors);
     REFOLD_LOG_TRACE(
         "lcs/semantic-resolver",
         "window {0} committing realized-source class: candidates={1} "
@@ -1638,9 +1659,11 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     if (!repair)
       return result;
     WindowResolution committed = commitSelectedMap(
+        AlignmentSemanticResolutionKind::StructureRespectingTerminalRecovery,
+        AlignmentSemanticCandidateDomain::StructureRepairCandidates,
         repair->equivalenceKey, repair->selectedMap, repair->candidateCount,
         repair->classSize, ArrayRef<RequiredAnchor>());
-    committed.structureRespectingRepair = true;
+    committed.structureRepairScope = repair->scope;
     return committed;
   };
 
@@ -1916,8 +1939,10 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     }
     if (everyCompleteMapAccepted && completeOutputClasses.size() == 1) {
       const auto &onlyClass = *completeOutputClasses.begin();
-      return commitRealizationClass(onlyClass.first, onlyClass.second,
-                                    ArrayRef<RequiredAnchor>());
+      return commitRealizationClass(
+          AlignmentSemanticResolutionKind::CompleteGroundSetEquivalence,
+          AlignmentSemanticCandidateDomain::AllOptimalMaps, onlyClass.first,
+          onlyClass.second, ArrayRef<RequiredAnchor>());
     }
     REFOLD_LOG_DEBUG(
         "lcs/semantic-resolver",
@@ -1994,8 +2019,10 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
             "accepted={1} least={2} classMembers={3}",
             windowIndex, acceptedMaps.size(), leastDestructiveMaps.size(),
             formatMapIndices(onlyClass.second));
-        return commitRealizationClass(onlyClass.first, onlyClass.second,
-                                      ArrayRef<RequiredAnchor>());
+        return commitRealizationClass(
+            AlignmentSemanticResolutionKind::CompleteGroundSetEquivalence,
+            AlignmentSemanticCandidateDomain::AllOptimalMaps, onlyClass.first,
+            onlyClass.second, ArrayRef<RequiredAnchor>());
       }
       REFOLD_LOG_DEBUG(
           "lcs/semantic-resolver",
@@ -2289,8 +2316,10 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   }
 
   const auto &onlyClass = *realizationClasses.begin();
-  return commitRealizationClass(onlyClass.first, onlyClass.second,
-                                requiredAnchors);
+  return commitRealizationClass(
+      AlignmentSemanticResolutionKind::RequiredAnchorCarrierEquivalence,
+      AlignmentSemanticCandidateDomain::RequiredAnchorCarriers, onlyClass.first,
+      onlyClass.second, requiredAnchors);
 }
 
 /// Return the window partition identity carried by \p alignment.

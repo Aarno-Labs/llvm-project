@@ -195,9 +195,11 @@ enum class LcsAnchorProofKind : uint8_t {
   /// Every core-optimal weighted-LCS path through the anchor's certified
   /// window uses this exact match edge.
   CoreOptimalPathForced,
-  /// A semantic alignment resolver proved that every remaining admissible
-  /// explanation produces one equivalent normalized owner/edit realization.
-  EquivalentNormalizedHunkAndOwner,
+  /// A semantic alignment resolver witness, named by the proof's
+  /// `semanticWitnessId`, authorizes the anchor.  The witness, not this kind,
+  /// records which theorem supplied that authority; see
+  /// `AlignmentSemanticResolutionWitness`.
+  SemanticResolutionWitness,
   /// The owner-alignment repair moved this anchor so a deletion run stops
   /// bisecting the owner that produced its tokens.
   ///
@@ -218,8 +220,8 @@ inline StringRef toString(LcsAnchorProofKind kind) {
     return "None";
   case LcsAnchorProofKind::CoreOptimalPathForced:
     return "CoreOptimalPathForced";
-  case LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner:
-    return "EquivalentNormalizedHunkAndOwner";
+  case LcsAnchorProofKind::SemanticResolutionWitness:
+    return "SemanticResolutionWitness";
   case LcsAnchorProofKind::OwnerAlignedDeletionSlide:
     return "OwnerAlignedDeletionSlide";
   }
@@ -229,14 +231,20 @@ inline StringRef toString(LcsAnchorProofKind kind) {
 /// Durable theorem reference for one selected production anchor.
 struct LcsAnchorProof {
   LcsAnchorProofKind kind = LcsAnchorProofKind::None;
-  /// Nonzero only for `EquivalentNormalizedHunkAndOwner`; identifies the
-  /// semantic resolver witness that discharged the ambiguity.
+  /// Nonzero only for `SemanticResolutionWitness`; identifies the semantic
+  /// resolver witness that discharged the ambiguity.
   uint64_t semanticWitnessId = 0;
+
+  /// Whether a semantic resolver witness, rather than the core theorem or an
+  /// alignment repair, is the claimed authority for this anchor.
+  bool IsSemanticWitnessBacked() const {
+    return kind == LcsAnchorProofKind::SemanticResolutionWitness;
+  }
 
   bool IsAuthorized() const {
     if (kind == LcsAnchorProofKind::CoreOptimalPathForced)
       return semanticWitnessId == 0;
-    if (kind == LcsAnchorProofKind::EquivalentNormalizedHunkAndOwner)
+    if (IsSemanticWitnessBacked())
       return semanticWitnessId != 0;
     if (kind == LcsAnchorProofKind::OwnerAlignedDeletionSlide)
       return semanticWitnessId == 0;
@@ -614,8 +622,9 @@ struct LcsCertificationDiagnosticEvidence {
 /// `forcedMap` contains only anchors forced by the unchanged core objective.
 /// The core certifier initializes `selectedMap` from that exact surface. A
 /// later semantic alignment resolver may add non-forced anchors only after it
-/// records one durable `EquivalentNormalizedHunkAndOwner` witness. Every mapped
-/// A token has a parallel `selectedAnchorProofs` entry naming its authority.
+/// records the durable witness their `SemanticResolutionWitness` proofs name.
+/// Every mapped A token has a parallel `selectedAnchorProofs` entry naming its
+/// authority.
 ///
 /// Certification is window-local. A failed window contributes no anchors, but
 /// anchors already proved in independent certified windows remain valid. The

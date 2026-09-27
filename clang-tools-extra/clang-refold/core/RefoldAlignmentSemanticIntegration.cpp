@@ -667,6 +667,19 @@ std::string buildAlignmentConcreteOutputEquivalenceKey(
   return key.Take();
 }
 
+/// Return the resolution kind of each witness, comma-separated in witness
+/// order, for the committed-resolution trace.
+std::string
+formatResolutionKinds(ArrayRef<AlignmentSemanticResolutionWitness> witnesses) {
+  std::string kinds;
+  for (const AlignmentSemanticResolutionWitness &witness : witnesses) {
+    if (!kinds.empty())
+      kinds.push_back(',');
+    kinds.append(toString(witness.resolutionKind).str());
+  }
+  return kinds;
+}
+
 } // namespace
 
 /// Return whether only horizontal white space separates source offset
@@ -750,7 +763,7 @@ void RefoldEngine::ResolveSemanticAlignment(
     REFOLD_LOG_TRACE(
         "lcs/semantic-resolver",
         "replaying this run's recorded resolution: committed={0} witnesses={1}",
-        resolution.committedEquivalentClass, resolution.witnesses.size());
+        resolution.committedSemanticResolution, resolution.witnesses.size());
   } else {
     // Semantic restoration needs the all-optimal pair facts for the window it is
     // resolving. The partitioned certifier releases those facts on purpose, so
@@ -811,7 +824,7 @@ void RefoldEngine::ResolveSemanticAlignment(
   // anchors and their witnesses are the durable output.
   alignment.windowOracles.clear();
 
-  if (!resolution.committedEquivalentClass) {
+  if (!resolution.committedSemanticResolution) {
     // Enumeration failure, proof-budget exhaustion, or multiple inequivalent
     // realizations grants no rank-selected authority. Preserve the exact core
     // map directly rather than relying on a resolver fallback payload.
@@ -825,12 +838,13 @@ void RefoldEngine::ResolveSemanticAlignment(
       std::move(resolution.structurePreservingTieRanges);
   alignmentSemanticResolutionWitnesses_ = std::move(resolution.witnesses);
 
-  // Reaching here means resolution.committedEquivalentClass held; the early
-  // return above discharged the negative case.
+  // Reaching here means resolution.committedSemanticResolution held; the
+  // early return above discharged the negative case.
   alignmentSemanticTheoremActive_ = true;
   REFOLD_LOG_TRACE(
       "lcs/semantic-resolver",
-      "committed one theorem-equivalent alignment class: witnesses={0}",
+      "committed semantic alignment resolution: kinds=[{0}] witnesses={1}",
+      formatResolutionKinds(alignmentSemanticResolutionWitnesses_),
       alignmentSemanticResolutionWitnesses_.size());
 }
 

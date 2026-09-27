@@ -26,7 +26,7 @@
 // CHECK: exact map enumeration incomplete for A=[45,48) B=[65,244) through 72 anchor(s)
 // CHECK: could not be enumerated within the proof budget; only the legacy boundary proposal, which enumerates the maps carrying its required anchors, remains decidable
 // CHECK: 1 core-optimal map(s) carry the 3 required anchor(s)
-// CHECK: committed one realized-source class: 1 of 1 required-anchor-carrying map(s) share it, 3 anchor(s) proved
+// CHECK: committed RequiredAnchorCarrierEquivalence: 1 of 1 required-anchor-carrying map(s) share its output, 3 anchor(s) proved
 #define NIL ((void*)0)
 
 void push(char c);
