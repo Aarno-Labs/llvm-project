@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -286,6 +287,25 @@ void RefoldMacroTopology::BuildDefineDirectiveIndex() const {
 }
 
 bool RefoldMacroTopology::IsInvocationInsideDefineDirective(
+    const RefoldModel::MacroInvocation &m) const {
+  // The answer reads only the record and the one-shot define index, so it is
+  // fixed per record.  Key by position rather than id: ids may repeat.
+  ArrayRef<RefoldModel::MacroInvocation> invocations =
+      model_.GetMacroInvocations();
+  if (!std::less_equal<>()(invocations.begin(), &m) ||
+      !std::less<>()(&m, invocations.end()))
+    return ComputeInvocationInsideDefineDirective(m);
+
+  if (insideDefineByInvocation_.empty())
+    insideDefineByInvocation_.assign(invocations.size(), 0);
+  uint8_t &answer =
+      insideDefineByInvocation_[static_cast<size_t>(&m - invocations.begin())];
+  if (answer == 0)
+    answer = ComputeInvocationInsideDefineDirective(m) ? 2 : 1;
+  return answer == 2;
+}
+
+bool RefoldMacroTopology::ComputeInvocationInsideDefineDirective(
     const RefoldModel::MacroInvocation &m) const {
   if (!m.invFile || !m.invB || !m.invE)
     return false;

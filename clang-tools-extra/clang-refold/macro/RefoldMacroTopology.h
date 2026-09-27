@@ -206,6 +206,8 @@ private:
 
   void BuildMacroInvocationGraph();
   void BuildDefineDirectiveIndex() const;
+  bool ComputeInvocationInsideDefineDirective(
+      const RefoldModel::MacroInvocation &m) const;
   std::string ToAbsolutePath(llvm::StringRef spelledPath) const;
 
   const RefoldModel &model_;
@@ -243,6 +245,10 @@ private:
 
   /// True after the lazy #define containment index has been built for this run.
   mutable bool definesIndexBuilt_ = false;
+
+  /// `IsInvocationInsideDefineDirective()` answers indexed like
+  /// `RefoldModel::GetMacroInvocations()`: 0 unknown, 1 outside, 2 inside.
+  mutable std::vector<uint8_t> insideDefineByInvocation_;
 
   /// Bucket width, in A tokens, of the invocation stabbing index below.
   static constexpr uint64_t MacroStabBucketWidth = 64;

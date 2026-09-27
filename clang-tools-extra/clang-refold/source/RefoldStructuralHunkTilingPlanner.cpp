@@ -404,6 +404,27 @@ struct TokenSegmentCandidate {
   OwnerSourceRange source;
 };
 
+/// What a TU segment's source span reads of one A token.
+struct TUTokenSpelling {
+  /// The producer mapped the token to some file.
+  bool mapped = false;
+  /// That file is the translation unit.
+  bool inTU = false;
+  uint64_t begin = 0;
+  uint64_t end = 0;
+  /// The consumed callsite whose whole cover begins at this token, with no
+  /// bound on its cover end.
+  std::optional<RefoldMacroTopology::CallsiteWholeCover> callsite;
+};
+
+/// `TUTokenSpelling`s of one hunk's A tokens, indexed from `aStart`.  A
+/// W-token hunk has O(W^2) candidate segments of O(W) tokens each, so these
+/// facts are gathered once rather than looked up per segment.
+struct HunkTUTokenSpellings {
+  uint64_t aStart = 0;
+  std::vector<TUTokenSpelling> tokens;
+};
+
 /// Sentinel `PartitionStateKey::lastTokenEdgeIndex` for a DP state that no
 /// token segment has reached yet.
 constexpr size_t noTokenEdgeIndex = std::numeric_limits<size_t>::max();
@@ -496,16 +517,18 @@ struct ClosedStateGapTransitionKey {
   uint64_t aBoundary = 0;
   uint64_t bBoundary = 0;
 
+  /// Integers are compared before paths: nearly every key in one hunk's memo
+  /// shares both paths, so leading with them made each probe a string compare.
+  /// The memo is never iterated, so this order reaches no decision.
   bool operator<(const ClosedStateGapTransitionKey &other) const {
-    return std::tie(previousPath, currentPath, previousIncludeId,
-                    currentIncludeId, previousSourceComplete,
-                    previousSourceEnd, currentSourceBegin,
-                    currentSourceComplete, aBoundary, bBoundary) <
-           std::tie(other.previousPath, other.currentPath,
-                    other.previousIncludeId, other.currentIncludeId,
-                    other.previousSourceComplete, other.previousSourceEnd,
-                    other.currentSourceBegin, other.currentSourceComplete,
-                    other.aBoundary, other.bBoundary);
+    return std::tie(aBoundary, bBoundary, previousSourceEnd, currentSourceBegin,
+                    previousIncludeId, currentIncludeId, previousSourceComplete,
+                    currentSourceComplete, previousPath, currentPath) <
+           std::tie(other.aBoundary, other.bBoundary, other.previousSourceEnd,
+                    other.currentSourceBegin, other.previousIncludeId,
+                    other.currentIncludeId, other.previousSourceComplete,
+                    other.currentSourceComplete, other.previousPath,
+                    other.currentPath);
   }
 };
 
@@ -1063,7 +1086,8 @@ public:
   /// into every candidate; for a TU realizer that delta is the census of the
   /// whole translation unit, and a wide hunk has quadratically many
   /// candidates.
-  bool BindTokenSegmentOwner(TokenSegmentCandidate &candidate) const {
+  bool BindTokenSegmentOwner(TokenSegmentCandidate &candidate,
+                             const HunkTUTokenSpellings &spellings) const {
     if (candidate.aEnd <= candidate.aStart ||
         candidate.bEnd < candidate.bStart ||
         (!candidate.allowEmptyBEnvelope && candidate.bEnd <= candidate.bStart))
@@ -1103,8 +1127,8 @@ public:
       return true;
     }
     case HunkRealizerKind::TU: {
-      std::optional<OwnerSourceRange> source =
-          MappedTUSourceRangeForTokens(candidate.aStart, candidate.aEnd);
+      std::optional<OwnerSourceRange> source = MappedTUSourceRangeForTokens(
+          spellings, candidate.aStart, candidate.aEnd);
       if (!source)
         return false;
       candidate.owner = Owner::TU();
@@ -2607,6 +2631,7 @@ public:
     }
 
     const uint64_t aLen = h.aEnd - h.aStart;
+    const HunkTUTokenSpellings tuSpellings = CollectTUTokenSpellings(h);
     std::vector<TokenSegmentCandidate> edges;
     std::vector<std::vector<size_t>> edgesByAOffset(static_cast<size_t>(aLen) +
                                                     1);
@@ -2681,7 +2706,7 @@ public:
         edge.allowEmptyBEnvelope =
             deleteOnlyHunk ||
             (replaceHunk && exactPhysicalRunIndex && edgeBStart == edgeBEnd);
-        if (!BindTokenSegmentOwner(edge))
+        if (!BindTokenSegmentOwner(edge, tuSpellings))
           continue;
 
         const size_t edgeIndex = edges.size();
@@ -3475,35 +3500,63 @@ private:
     return callsite;
   }
 
-  std::optional<OwnerSourceRange>
-  MappedTUSourceRangeForTokens(uint64_t aStart, uint64_t aEnd) const {
+  /// Gather the TU spelling facts of every A token in the hunk \p h, once.
+  ///
+  /// `RootWholeCoverAtCallsite()` reads the consumed A end only to refuse a
+  /// cover that runs past it, so a callsite found with an unbounded end is the
+  /// answer for every subrange that reaches the cover's end, and there is no
+  /// answer for any subrange that stops short of it.
+  HunkTUTokenSpellings CollectTUTokenSpellings(const diffutils::Hunk &h) const {
     const auto &tokmapByPP = deps_.model.GetTokmapByPP();
-    uint64_t sourceBegin = std::numeric_limits<uint64_t>::max();
-    uint64_t sourceEnd = 0;
-    bool sawTU = false;
     const RefoldPreprocessingStructureIndex *structureIndex =
         GetStructureIndexForSource(
             OwnerSourceRange::From(deps_.tuPath, 0, 0, std::nullopt));
 
-    for (uint64_t pp = aStart; pp < aEnd; ++pp) {
+    HunkTUTokenSpellings spellings;
+    spellings.aStart = h.aStart;
+    spellings.tokens.resize(static_cast<size_t>(h.aEnd - h.aStart));
+    for (uint64_t pp = h.aStart; pp < h.aEnd; ++pp) {
+      TUTokenSpelling &token = spellings.tokens[pp - h.aStart];
       auto it = tokmapByPP.find(pp);
       if (it == tokmapByPP.end())
         continue;
       const RefoldModel::TokMapEntry &entry = it->second;
-      if (!deps_.pathIdentity.PathsEqual(entry.file, deps_.tuPath))
+      token.mapped = true;
+      token.inTU = deps_.pathIdentity.PathsEqual(entry.file, deps_.tuPath);
+      token.begin = entry.b;
+      token.end = entry.e;
+      if (token.inTU && structureIndex) {
+        token.callsite = ConsumedCallsiteWholeCover(
+            pp, deps_.tuPath, std::nullopt,
+            std::numeric_limits<uint64_t>::max(), *structureIndex);
+      }
+    }
+    return spellings;
+  }
+
+  /// Return the TU source span of the A tokens [\p aStart, \p aEnd), read from
+  /// \p spellings, which must cover that range.
+  std::optional<OwnerSourceRange>
+  MappedTUSourceRangeForTokens(const HunkTUTokenSpellings &spellings,
+                               uint64_t aStart, uint64_t aEnd) const {
+    uint64_t sourceBegin = std::numeric_limits<uint64_t>::max();
+    uint64_t sourceEnd = 0;
+    bool sawTU = false;
+
+    for (uint64_t pp = aStart; pp < aEnd; ++pp) {
+      const TUTokenSpelling &token = spellings.tokens[pp - spellings.aStart];
+      if (!token.mapped)
+        continue;
+      if (!token.inTU)
         return std::nullopt;
-      uint64_t spellingBegin = entry.b;
-      uint64_t spellingEnd = entry.e;
+      uint64_t spellingBegin = token.begin;
+      uint64_t spellingEnd = token.end;
       // A consumed callsite contributes its whole spelling, as it does in the
       // physical run plan; its argument tokens alone would omit the name.
-      if (structureIndex) {
-        if (const std::optional<RefoldMacroTopology::CallsiteWholeCover>
-                callsite = ConsumedCallsiteWholeCover(
-                    pp, deps_.tuPath, std::nullopt, aEnd, *structureIndex)) {
-          spellingBegin = callsite->sourceBegin;
-          spellingEnd = callsite->sourceEnd;
-          pp = callsite->aEnd - 1;
-        }
+      if (token.callsite && token.callsite->aEnd <= aEnd) {
+        spellingBegin = token.callsite->sourceBegin;
+        spellingEnd = token.callsite->sourceEnd;
+        pp = token.callsite->aEnd - 1;
       }
       sourceBegin = std::min<uint64_t>(sourceBegin, spellingBegin);
       sourceEnd = std::max<uint64_t>(sourceEnd, spellingEnd);
