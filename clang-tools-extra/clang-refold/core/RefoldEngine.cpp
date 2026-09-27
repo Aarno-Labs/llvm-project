@@ -352,6 +352,7 @@ std::string RefoldEngine::Refold() {
   // merely being reported.
   theoremAudit_->EnforceTheoremAuditInvariants(
       witnessTrace_.GetWitnessResolverMode());
+  AuditAlignmentResolutionReplay(out);
 
   if (terminalSink_.HasRequest()) {
     out = expansionFallbackPlanner_->ResolvePostStructuralFallback();

@@ -82,6 +82,7 @@ struct WellFormedLedger {
             StructureRespectingTerminalRecoveryRepresentative));
     witnesses[2].structureRepairScope =
         StructureRepairScope::AllPreferredSubRectangles;
+    witnesses[2].variedSubRectangleCount = 1;
 
     anchorProofs.resize(selectedMap.size());
     for (size_t token = 0; token < selectedMap.size(); ++token) {
@@ -194,6 +195,14 @@ TEST(RefoldAlignmentSemanticLedger, OnlyStructureRecoveryHasARepairScope) {
   WellFormedLedger withoutScope;
   withoutScope.witnesses[2].structureRepairScope.reset();
   expectDefect(withoutScope.audit(), "structure repair scope");
+
+  WellFormedLedger withCount;
+  withCount.witnesses[0].variedSubRectangleCount = 1;
+  expectDefect(withCount.audit(), "varied sub-rectangle count");
+
+  WellFormedLedger withoutCount;
+  withoutCount.witnesses[2].variedSubRectangleCount = 0;
+  expectDefect(withoutCount.audit(), "varied sub-rectangle count");
 }
 
 TEST(RefoldAlignmentSemanticLedger, IncompleteCandidateDomainIsRejected) {

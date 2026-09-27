@@ -713,6 +713,10 @@ private:
   std::vector<AlignmentSemanticResolutionWitness>
       alignmentSemanticResolutionWitnesses_;
 
+  /// The output the committed resolution must reproduce; see
+  /// `AuditAlignmentResolutionReplay()`.
+  std::optional<AlignmentSemanticReplayReference> alignmentReplayReference_;
+
   /// Internal exact alignment override used by an isolated semantic simulation.
   std::optional<AlignmentSelectionOverride> alignmentSelectionOverride_;
 
@@ -1056,6 +1060,25 @@ private:
   AlignmentSemanticSimulationResult SimulateSemanticAlignmentCandidate(
       const AlignmentSelectionOverride &selection) const;
 
+  /// Fill the concrete-output fields of \p components from \p finalTU, the
+  /// assembly this engine produced, and from the final line-control plan and
+  /// materialized mappings it holds, all read before final line-control
+  /// pruning.  Simulation and production both key their output through this.
+  void CaptureConcreteOutputComponents(
+      std::string finalTU,
+      AlignmentSemanticEquivalenceComponents &components) const;
+
+  /// Request terminal fallback unless this engine reproduced the concrete
+  /// output its committed alignment resolution was simulated to produce.
+  ///
+  /// \p assembly is the structural pass's output, checked at the point a
+  /// simulation stops: before terminal resolution and final line-control
+  /// pruning.  The reference is compared only when this engine planned under
+  /// the simulation's inputs, which exclude any owner the run gave up.  A
+  /// terminal request already recorded is itself a failure to reproduce an
+  /// accepted simulation; it is reported, and the output is already the
+  /// fallback.
+  void AuditAlignmentResolutionReplay(llvm::StringRef assembly);
 
   /// Reject an isolated run whose durable structural witnesses are incomplete.
   bool AlignmentSimulationProofComplete(std::string &failure) const;

@@ -226,8 +226,11 @@ struct AlignmentSemanticResolutionWitness {
   /// Every member of `candidateDomain` was enumerated and realized.  This says
   /// nothing about core-optimal maps outside that domain.
   bool candidateDomainCompletelyEnumerated = false;
-  /// Set only for `StructureRespectingTerminalRecovery`.
+  /// Set only for `StructureRespectingTerminalRecovery`, as is a nonzero
+  /// `variedSubRectangleCount`: how many preferred sub-rectangles the repair's
+  /// candidates combine the maps of, after narrowing to that scope.
   std::optional<StructureRepairScope> structureRepairScope;
+  uint64_t variedSubRectangleCount = 0;
   /// Members of `candidateDomain`, and how many of them share the committed
   /// class; the rest were rejected.
   uint64_t candidateCount = 0;
@@ -238,6 +241,22 @@ struct AlignmentSemanticResolutionWitness {
   std::string equivalenceKey;
   std::vector<int64_t> representativeMap;
   std::vector<AlignmentSemanticAnchorEvidence> anchorEvidence;
+};
+
+/// The concrete output production must reproduce when it plans a committed
+/// resolution.
+///
+/// Windows are resolved in order, each simulated against the commits before
+/// it, with every later window at its core-forced anchors.  The simulation of
+/// the last committed window's representative therefore realized the final
+/// selection: the final map, and every structure-preserving tie range.  No
+/// earlier window's simulation did, whatever its theorem.  This holds that
+/// simulation's `concreteOutputEquivalenceKey`, which a
+/// `RequiredAnchorCarrierEquivalence` witness does not record as its own key.
+struct AlignmentSemanticReplayReference {
+  /// The last committed window's witness.
+  uint64_t witnessId = 0;
+  std::string concreteOutputKey;
 };
 
 /// The production alignment state that
@@ -337,6 +356,8 @@ public:
     /// A ranges of the windows committed by the structure-respecting repair;
     /// see `AlignmentSelectionOverride::structurePreservingTieRanges`.
     std::vector<std::pair<uint64_t, uint64_t>> structurePreservingTieRanges;
+    /// Set exactly when `committedSemanticResolution` holds.
+    std::optional<AlignmentSemanticReplayReference> replayReference;
   };
 
   explicit RefoldAlignmentSemanticResolver(Dependencies deps);
@@ -374,6 +395,9 @@ private:
     std::vector<int64_t> selectedMap;
     std::vector<AlignmentSemanticAnchorEvidence> anchorEvidence;
     std::string equivalenceKey;
+    /// The concrete-output key of `selectedMap`'s own accepted simulation;
+    /// see `AlignmentSemanticReplayReference`.
+    std::string representativeConcreteOutputKey;
     /// Number of distinct complete optimal maps enumerated through the window.
     ///
     /// Recorded whether or not the window commits, because it is what separates
@@ -396,6 +420,7 @@ private:
         AlignmentSemanticCandidateDomain::AllOptimalMaps;
     bool candidateDomainCompletelyEnumerated = false;
     std::optional<StructureRepairScope> structureRepairScope;
+    uint64_t variedSubRectangleCount = 0;
     AlignmentSemanticEquivalenceKeyKind equivalenceKeyKind =
         AlignmentSemanticEquivalenceKeyKind::ConcreteOutput;
   };
@@ -479,6 +504,8 @@ private:
     uint64_t classSize = 0;
     StructureRepairScope scope =
         StructureRepairScope::AllPreferredSubRectangles;
+    /// Preferred sub-rectangles the candidates vary, after narrowing.
+    uint64_t variedSubRectangleCount = 0;
   };
 
   /// Select the map a window commits when declining it is proved

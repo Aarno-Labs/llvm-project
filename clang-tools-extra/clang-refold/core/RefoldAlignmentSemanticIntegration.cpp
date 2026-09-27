@@ -14,6 +14,7 @@
 #include "llvm/Support/FormatVariadic.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <utility>
@@ -667,6 +668,11 @@ std::string buildAlignmentConcreteOutputEquivalenceKey(
   return key.Take();
 }
 
+/// Test-only: when set, production compares its output against a reference
+/// that no output can equal, so a lit test can show a mismatch fails closed.
+constexpr StringLiteral TestOnlyPerturbReplayReferenceEnvironment =
+    "CLANG_REFOLD_TEST_ONLY_PERTURB_ALIGNMENT_REPLAY_REFERENCE";
+
 /// Return the resolution kind of each witness, comma-separated in witness
 /// order, for the committed-resolution trace.
 std::string
@@ -734,6 +740,7 @@ void RefoldEngine::ResolveSemanticAlignment(
     uint64_t certificationByteBudget,
     diffutils::CertifiedLcsResult &alignment) {
   alignmentSemanticResolutionWitnesses_.clear();
+  alignmentReplayReference_.reset();
   if (!alignmentSemanticResolverEnabled_ || alignmentSelectionOverride_)
     return;
 
@@ -837,6 +844,7 @@ void RefoldEngine::ResolveSemanticAlignment(
   structurePreservingTieRanges_ =
       std::move(resolution.structurePreservingTieRanges);
   alignmentSemanticResolutionWitnesses_ = std::move(resolution.witnesses);
+  alignmentReplayReference_ = std::move(resolution.replayReference);
 
   // Reaching here means resolution.committedSemanticResolution held; the
   // early return above discharged the negative case.
@@ -946,16 +954,7 @@ RefoldEngine::SimulateSemanticAlignmentCandidate(
       components.preservationFootprint.semanticPostconditionKey;
   components.realizationPostconditions =
       components.preservationFootprint.realizationPostconditionKey;
-  components.finalTU = finalTU;
-  ExactKeyBuilder finalLineControlPlanKey;
-  appendFinalLineControlPlan(finalLineControlPlanKey,
-                             candidate.finalLineControlPruneCandidates_,
-                             candidate.finalLineControlSourceMappings_);
-  components.finalLineControlPlan = finalLineControlPlanKey.Take();
-
-  ExactKeyBuilder materializedMappingKey;
-  appendMaterializedMappings(materializedMappingKey, materializedMappings);
-  components.materializedMappings = materializedMappingKey.Take();
+  candidate.CaptureConcreteOutputComponents(std::move(finalTU), components);
   if (candidate.terminalSink_.HasRequest()) {
     result.disposition =
         AlignmentSemanticSimulationDisposition::TerminalFallback;
@@ -989,6 +988,85 @@ RefoldEngine::SimulateSemanticAlignmentCandidate(
   result.concreteOutputEquivalenceKey =
       buildAlignmentConcreteOutputEquivalenceKey(components);
   return result;
+}
+
+void RefoldEngine::CaptureConcreteOutputComponents(
+    std::string finalTU,
+    AlignmentSemanticEquivalenceComponents &components) const {
+  components.finalTU = std::move(finalTU);
+  ExactKeyBuilder finalLineControlPlanKey;
+  appendFinalLineControlPlan(finalLineControlPlanKey,
+                             finalLineControlPruneCandidates_,
+                             finalLineControlSourceMappings_);
+  components.finalLineControlPlan = finalLineControlPlanKey.Take();
+
+  // A simulation holds a mapping sink exactly when its parent does, so an
+  // absent sink reads as no mappings on both sides.
+  ExactKeyBuilder materializedMappingKey;
+  appendMaterializedMappings(materializedMappingKey,
+                             materializedEditMappings_
+                                 ? ArrayRef(*materializedEditMappings_)
+                                 : ArrayRef<MaterializedEditMapping>());
+  components.materializedMappings = materializedMappingKey.Take();
+}
+
+void RefoldEngine::AuditAlignmentResolutionReplay(StringRef assembly) {
+  if (!alignmentReplayReference_)
+    return;
+  const AlignmentSemanticReplayReference &reference =
+      *alignmentReplayReference_;
+
+  // Simulations plan with no owner given up, which is what makes resolution
+  // one answer per run.  Giving one up changes the output legitimately.
+  if (!ownersMustExpand_.empty()) {
+    REFOLD_LOG_DEBUG("lcs/semantic-resolver",
+                     "alignment resolution replay not checked: this attempt "
+                     "gave up {0} owner(s) that witness {1}'s simulation "
+                     "planned without",
+                     static_cast<uint64_t>(ownersMustExpand_.size()),
+                     reference.witnessId);
+    return;
+  }
+  if (terminalSink_.HasRequest()) {
+    REFOLD_LOG_WARN("lcs/semantic-resolver",
+                    "alignment resolution did not reproduce: witness {0}'s "
+                    "simulation was accepted, but production requested "
+                    "terminal fallback",
+                    reference.witnessId);
+    return;
+  }
+
+  AlignmentSemanticEquivalenceComponents components;
+  CaptureConcreteOutputComponents(assembly.str(), components);
+  const std::string producedKey =
+      buildAlignmentConcreteOutputEquivalenceKey(components);
+  std::string expectedKey = reference.concreteOutputKey;
+  if (std::getenv(TestOnlyPerturbReplayReferenceEnvironment.data()))
+    expectedKey.push_back('\0');
+  if (producedKey == expectedKey) {
+    REFOLD_LOG_DEBUG("lcs/semantic-resolver",
+                     "alignment resolution reproduced: production's concrete "
+                     "output equals witness {0}'s simulation",
+                     reference.witnessId);
+    return;
+  }
+
+  REFOLD_LOG_WARN("lcs/semantic-resolver",
+                  "alignment resolution did not reproduce: production's "
+                  "concrete output differs from witness {0}'s simulation; "
+                  "taking the terminal fallback",
+                  reference.witnessId);
+  terminalSink_.RequestTerminalFallback(
+      MakeTerminalFallbackProofFailure(
+          TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
+          TerminalFallbackFailureReason::TheoremAuditInvariantViolation,
+          TerminalFallbackFailureContext::ForStateComponent(
+              "AlignmentResolutionReplay")),
+      "alignment-resolution-replay",
+      formatv("production did not reproduce the concrete output of alignment "
+              "semantic witness {0}",
+              reference.witnessId)
+          .str());
 }
 
 bool RefoldEngine::AlignmentSimulationProofComplete(std::string &failure) const {

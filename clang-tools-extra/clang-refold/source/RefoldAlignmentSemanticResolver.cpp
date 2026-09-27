@@ -1122,6 +1122,7 @@ RefoldAlignmentSemanticResolver::Resolve() const {
     witness.candidateDomainCompletelyEnumerated =
         resolution.candidateDomainCompletelyEnumerated;
     witness.structureRepairScope = resolution.structureRepairScope;
+    witness.variedSubRectangleCount = resolution.variedSubRectangleCount;
     witness.candidateCount = resolution.enumeratedMapCount;
     witness.acceptedCandidateCount = resolution.acceptedMapCount;
     witness.rejectedCandidateCount = resolution.rejectedMapCount;
@@ -1167,6 +1168,9 @@ RefoldAlignmentSemanticResolver::Resolve() const {
 
   result.committedSemanticResolution = true;
   result.structurePreservingTieRanges = committedTieRanges_;
+  result.replayReference = AlignmentSemanticReplayReference{
+      result.witnesses.back().witnessId,
+      std::move(committedWindows.back().representativeConcreteOutputKey)};
   return result;
 }
 
@@ -1520,6 +1524,7 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
   repair.candidateCount = candidates.size();
   repair.classSize = onlyClass.second.size();
   repair.scope = scope;
+  repair.variedSubRectangleCount = preferred.size();
   return repair;
 }
 
@@ -1625,17 +1630,24 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
 
   // Commit \p selectedMap as this window's choice under \p theorem, out of
   // the \p candidateCount members of its candidate domain, of which
-  // \p classSize share its class.
+  // \p classSize share its class.  \p representativeConcreteOutputKey is the
+  // concrete-output key of \p selectedMap's own accepted simulation; without
+  // one, production could not be checked against it, so the window declines.
   //
   // Every caller commits only after realizing each member of the theorem's
   // domain, and declines on the first member it cannot realize, so the domain
   // was completely enumerated whenever this is reached.
   auto commitSelectedMap =
       [&](const CommitTheorem &theorem, StringRef equivalenceKey,
+          StringRef representativeConcreteOutputKey,
           ArrayRef<int64_t> selectedMap, uint64_t candidateCount,
           uint64_t classSize,
           ArrayRef<RequiredAnchor> requiredAnchors) -> WindowResolution {
     WindowResolution committed;
+    if (representativeConcreteOutputKey.empty())
+      return committed;
+    committed.representativeConcreteOutputKey =
+        representativeConcreteOutputKey.str();
     committed.windowIndex = windowIndex;
     committed.resolutionKind = theorem.kind;
     committed.candidateDomain = theorem.domain;
@@ -1685,9 +1697,14 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     if (classMembers.empty())
       return WindowResolution{};
     const size_t representativeIndex = classMembers.front();
+    const std::optional<AlignmentSemanticSimulationResult> &representative =
+        realizedMaps[representativeIndex];
     WindowResolution committed = commitSelectedMap(
-        theorem, equivalenceKey, globalMaps[representativeIndex],
-        candidateCount, classMembers.size(), requiredAnchors);
+        theorem, equivalenceKey,
+        representative ? StringRef(representative->concreteOutputEquivalenceKey)
+                       : StringRef(),
+        globalMaps[representativeIndex], candidateCount, classMembers.size(),
+        requiredAnchors);
     REFOLD_LOG_TRACE(
         "lcs/semantic-resolver",
         "window {0} committing realized-source class: candidates={1} "
@@ -1709,11 +1726,14 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
         SelectStructureRespectingRepair(windowIndex, baseMap);
     if (!repair)
       return result;
+    // Every accepted candidate shares the class key, so it is also the
+    // selected map's own.
     WindowResolution committed = commitSelectedMap(
         StructureRespectingRecoveryTheorem, repair->equivalenceKey,
-        repair->selectedMap, repair->candidateCount, repair->classSize,
-        ArrayRef<RequiredAnchor>());
+        repair->equivalenceKey, repair->selectedMap, repair->candidateCount,
+        repair->classSize, ArrayRef<RequiredAnchor>());
     committed.structureRepairScope = repair->scope;
+    committed.variedSubRectangleCount = repair->variedSubRectangleCount;
     return committed;
   };
 
@@ -2476,9 +2496,11 @@ findWitnessTheoremDefect(const AlignmentSemanticResolutionWitness &witness) {
                    "wrong kind",
                    witness.witnessId, kindName)
         .str();
-  if (witness.structureRepairScope.has_value() != structureRecovery)
+  if (witness.structureRepairScope.has_value() != structureRecovery ||
+      (witness.variedSubRectangleCount != 0) != structureRecovery)
     return formatv("alignment semantic witness {0} ({1}) has a structure "
-                   "repair scope exactly when it should not",
+                   "repair scope or varied sub-rectangle count exactly when "
+                   "it should not",
                    witness.witnessId, kindName)
         .str();
   for (const AlignmentSemanticAnchorEvidence &evidence : witness.anchorEvidence)
