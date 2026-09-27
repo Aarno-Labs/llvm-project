@@ -28,6 +28,7 @@
 #include "source/RefoldPreprocessingStructureKinds.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
@@ -150,6 +151,10 @@ public:
   /// constructs that are physically contained by that exact transition and
   /// semantically inseparable from it. The current macro-state theorem uses
   /// this only for `_Pragma` operators inside a complete macro replacement.
+  /// When \p grantedIntervals is supplied and the authorization succeeds, it
+  /// receives the exact half-open interval of every capability this call
+  /// granted, the matched transition first, whether or not the edit already
+  /// held an equal capability.
   bool AuthorizeExactProtectedSourceInterval(
       TextEdit &edit, ProtectedSourceEditAuthorityKind authority,
       llvm::StringRef sourcePath, std::optional<uint64_t> ownerIncludeId,
@@ -157,7 +162,9 @@ public:
       uint64_t intervalEnd,
       llvm::ArrayRef<PreprocessingStructureKind> allowedKinds,
       llvm::ArrayRef<PreprocessingStructureKind> allowedNestedKinds = {},
-      bool requestTerminalOnFailure = true) const;
+      bool requestTerminalOnFailure = true,
+      llvm::SmallVectorImpl<std::pair<uint64_t, uint64_t>> *grantedIntervals =
+          nullptr) const;
 
   /// Authorize a complete source-closure operation after its independent
   /// source-gap theorem has proved the entire physical byte envelope.

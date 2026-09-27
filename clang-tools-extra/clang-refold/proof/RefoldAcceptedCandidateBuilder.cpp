@@ -724,10 +724,11 @@ RefoldAcceptedCandidateBuilder::BuildAcceptedTUTextEditCandidate(
 ::clang::refold::AcceptedResultCandidate
 RefoldAcceptedCandidateBuilder::BuildAcceptedSpecializedTUTextEditCandidate(
     AcceptedPathKind currentPath, uint64_t begin, uint64_t end,
-    StringRef repairText) const {
+    StringRef repairText,
+    ArrayRef<SuffixStabilityWitness> stateWitnesses) const {
   const OwnerRealizationResult ownerRealization =
       deps_.ownerRealizationProofBuilder.BuildSpecializedTUOwnerRealization(
-          currentPath, begin, end);
+          currentPath, begin, end, stateWitnesses);
   AcceptedResultCandidate candidate;
   candidate.kind = AcceptedResultCandidateKind::TUTextEdit;
   candidate.proofSummary =

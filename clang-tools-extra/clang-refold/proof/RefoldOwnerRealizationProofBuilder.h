@@ -192,8 +192,16 @@ public:
   /// evidence. Their caller-specific planners have already discharged the
   /// structure/state obligations, so this distinct evidence class prevents
   /// those paths from manufacturing a direct hunk carrier.
+  ///
+  /// \p stateWitnesses are the suffix-stability witnesses of the state
+  /// transitions the calling planner proved for this edit.  The caller must
+  /// supply either none or one for every transition the edit's source range
+  /// consumes; they are what lets the witness-equivalence key summarize the
+  /// edit's suffix state.  They are attached only when every one is a
+  /// discharging macro-state witness, and otherwise none is attached.
   OwnerRealizationResult BuildSpecializedTUOwnerRealization(
-      AcceptedPathKind currentPath, uint64_t begin, uint64_t end) const;
+      AcceptedPathKind currentPath, uint64_t begin, uint64_t end,
+      llvm::ArrayRef<SuffixStabilityWitness> stateWitnesses = {}) const;
 
   /// Build the generic proof summary for realized include/TU/macro output.
   ///

@@ -24,8 +24,10 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace clang {
@@ -109,6 +111,16 @@ public:
     /// that no repair reached.  Without it a declining repair is
     /// indistinguishable from a repair that was never needed.
     llvm::DenseSet<uint64_t> carriedGapDefinitionIds;
+    /// Suffix-stability witnesses of each macro-state transition this planner
+    /// proved and authorized, one entry per transition.
+    std::vector<std::vector<SuffixStabilityWitness>>
+        authorizedTransitionWitnesses;
+    /// The transition in `authorizedTransitionWitnesses` that was granted each
+    /// exact half-open TU interval, including a transition's nested `_Pragma`
+    /// intervals.  An interval granted to two transitions maps to none, so no
+    /// carrier can claim either proof for it.
+    std::map<std::pair<uint64_t, uint64_t>, std::optional<size_t>>
+        authorizedTransitionByInterval;
   };
 
   /// Creates a macro-state repair planner bound to the subsystem dependencies

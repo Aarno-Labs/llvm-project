@@ -385,8 +385,23 @@ private:
       const ProvenMacroStateSourceTransition &transition) const;
 
   bool AuthorizeMacroStateSourceTransition(
-      TextEdit &edit,
-      const ProvenMacroStateSourceTransition &transition) const;
+      TextEdit &edit, const ProvenMacroStateSourceTransition &transition);
+  /// Record that \p transition was granted every interval in
+  /// \p grantedIntervals, so a carrier for an edit holding those capabilities
+  /// can carry the transition's suffix-stability witnesses.
+  void RecordAuthorizedTransition(
+      ArrayRef<std::pair<uint64_t, uint64_t>> grantedIntervals,
+      const ProvenMacroStateSourceTransition &transition);
+  /// Return the suffix-stability witnesses of the transitions proved for the
+  /// protected intervals \p edit consumes, or nothing unless each of its
+  /// capabilities was granted to exactly one transition this planner proved.
+  ///
+  /// The final emission audit rejects any edit that consumes a protected
+  /// interval without a capability for it, so on an emitted edit these are the
+  /// witnesses of every preprocessing state transition its source range
+  /// removes.
+  std::vector<SuffixStabilityWitness>
+  CollectAuthorizedTransitionWitnesses(const TextEdit &edit) const;
   /// Finds the active definition for a macro name at a physical source offset.
   const RefoldModel::MacroDirective *
   ActiveDefinitionAtSourceOffset(StringRef macroName, uint64_t offset) const;
@@ -513,7 +528,9 @@ private:
   /// Promote a repaired edit from ordinary direct-TU provenance to the
   /// specialized macro-state repair carrier.  Ordinary TUByteSpan carriers are
   /// removed rather than retained beside the new authority, so final emission
-  /// cannot repurpose their weaker theorem after edit normalization.
+  /// cannot repurpose their weaker theorem after edit normalization.  The
+  /// specialized carrier carries the witnesses
+  /// `CollectAuthorizedTransitionWitnesses()` returns for the edit.
   void PromoteToSpecializedMacroStateRepairCarrier(TextEdit &edit);
   /// Restages a conservative TU edit after a repair changes its byte range or
   /// replacement text.
@@ -535,11 +552,15 @@ private:
   /// and dropping the key leaves the emission audit to reject the edit.
   std::optional<InheritedStructuralSegmentKey>
   DirectTUStructuralSegmentKey(const TextEdit &edit) const;
+  /// Return the structural-segment key the specialized carriers already on
+  /// \p edit inherited, or nothing when they hold none or disagree.
+  std::optional<InheritedStructuralSegmentKey>
+  SpecializedCarrierStructuralSegmentKey(const TextEdit &edit) const;
 
   /// Attaches conservative TU proof carrier metadata to a repaired edit.
   void AttachConservativeTUCarrier(
-      TextEdit &edit,
-      std::optional<InheritedStructuralSegmentKey> inherited = std::nullopt);
+      TextEdit &edit, std::optional<InheritedStructuralSegmentKey> inherited,
+      ArrayRef<SuffixStabilityWitness> stateWitnesses);
 
   /// Advances consumed undef transitions before replacements that observe the
   /// prior definition state.
@@ -1150,8 +1171,7 @@ MacroStateRepairContext::IncludeSubtreeCarryingUnmodeledPragma(
 }
 
 bool MacroStateRepairContext::AuthorizeMacroStateSourceTransition(
-    TextEdit &edit,
-    const ProvenMacroStateSourceTransition &transition) const {
+    TextEdit &edit, const ProvenMacroStateSourceTransition &transition) {
   if (!transition.IsComplete() ||
       transition.source.interval.begin < edit.start ||
       edit.end < transition.source.interval.end ||
@@ -1242,6 +1262,7 @@ bool MacroStateRepairContext::AuthorizeMacroStateSourceTransition(
   const ArrayRef<PreprocessingStructureKind> allowedNestedKinds =
       includeOwned ? ArrayRef<PreprocessingStructureKind>()
                    : ArrayRef<PreprocessingStructureKind>(nestedMacroKinds);
+  SmallVector<std::pair<uint64_t, uint64_t>, 2> grantedIntervals;
   const bool authorized =
       TextEditCertifier().AuthorizeExactProtectedSourceInterval(
           edit,
@@ -1249,8 +1270,13 @@ bool MacroStateRepairContext::AuthorizeMacroStateSourceTransition(
               ? ProtectedSourceEditAuthorityKind::IncludeOwnedMacroStateRepair
               : ProtectedSourceEditAuthorityKind::MacroStateRepair,
           tuPath_, std::nullopt, tuBytes_, transition.source.interval.begin,
-          transition.source.interval.end, allowedKinds, allowedNestedKinds);
+          transition.source.interval.end, allowedKinds, allowedNestedKinds,
+          /*requestTerminalOnFailure=*/true, &grantedIntervals);
   if (authorized) {
+    // Only TU-local transitions are recorded: an include-owned one also moves
+    // the include, whose state no macro-state witness describes.
+    if (!includeOwned)
+      RecordAuthorizedTransition(grantedIntervals, transition);
     REFOLD_LOG_TRACE(
         "macro/state-repair",
         "authorized specialized macro-state transition: directive=#{0} "
@@ -1273,6 +1299,44 @@ bool MacroStateRepairContext::AuthorizeMacroStateSourceTransition(
         transition.reason);
   }
   return authorized;
+}
+
+void MacroStateRepairContext::RecordAuthorizedTransition(
+    ArrayRef<std::pair<uint64_t, uint64_t>> grantedIntervals,
+    const ProvenMacroStateSourceTransition &transition) {
+  const size_t transitionIndex = plan_.authorizedTransitionWitnesses.size();
+  plan_.authorizedTransitionWitnesses.push_back(
+      transition.proof.suffixWitnesses);
+  for (const std::pair<uint64_t, uint64_t> &interval : grantedIntervals) {
+    auto [entry, inserted] = plan_.authorizedTransitionByInterval.try_emplace(
+        interval, transitionIndex);
+    if (!inserted)
+      entry->second = std::nullopt;
+  }
+}
+
+std::vector<SuffixStabilityWitness>
+MacroStateRepairContext::CollectAuthorizedTransitionWitnesses(
+    const TextEdit &edit) const {
+  SmallVector<size_t, 4> transitionIndices;
+  for (const ProtectedSourceEditAuthorization &authorization :
+       edit.protectedSourceAuthorizations) {
+    if (authorization.authority !=
+        ProtectedSourceEditAuthorityKind::MacroStateRepair)
+      return {};
+    auto entry = plan_.authorizedTransitionByInterval.find(
+        {authorization.begin, authorization.end});
+    if (entry == plan_.authorizedTransitionByInterval.end() || !entry->second)
+      return {};
+    if (!llvm::is_contained(transitionIndices, *entry->second))
+      transitionIndices.push_back(*entry->second);
+  }
+
+  std::vector<SuffixStabilityWitness> witnesses;
+  for (size_t transitionIndex : transitionIndices)
+    llvm::append_range(witnesses,
+                       plan_.authorizedTransitionWitnesses[transitionIndex]);
+  return witnesses;
 }
 
 const RefoldModel::MacroDirective *
@@ -1818,12 +1882,54 @@ MacroStateRepairContext::DirectTUStructuralSegmentKey(
   return key;
 }
 
+/// Return whether \p candidate is a conservative specialized TU carrier for
+/// exactly the byte range of \p edit.
+static bool isExactConservativeTUCarrier(
+    const std::shared_ptr<const AcceptedResultCandidate> &candidate,
+    const TextEdit &edit) {
+  return candidate &&
+         candidate->kind == AcceptedResultCandidateKind::TUTextEdit &&
+         candidate->begin == edit.start && candidate->end == edit.end &&
+         AcceptedResultIsSpecializedTUCarrier(
+             *candidate, AcceptedPathKind::TUByteSpanConservativeEdit);
+}
+
+/// Return whether \p candidate carries suffix-stability witnesses on its
+/// owner realization.
+static bool carriesOwnerStateWitnesses(
+    const std::shared_ptr<const AcceptedResultCandidate> &candidate) {
+  return candidate && candidate->proofSummary.hasOwnerRealizationWitness &&
+         !candidate->proofSummary.ownerRealizationWitness.stateWitnesses
+              .empty();
+}
+
+std::optional<MacroStateRepairContext::InheritedStructuralSegmentKey>
+MacroStateRepairContext::SpecializedCarrierStructuralSegmentKey(
+    const TextEdit &edit) const {
+  std::optional<InheritedStructuralSegmentKey> key;
+  for (const std::shared_ptr<const AcceptedResultCandidate> &candidate :
+       edit.acceptedResults) {
+    if (!isExactConservativeTUCarrier(candidate, edit) ||
+        !candidate->proofSummary.hasInheritedStructuralSegmentBinding)
+      continue;
+    const InheritedStructuralSegmentKey found{
+        candidate->proofSummary.inheritedStructuralWitnessId,
+        candidate->proofSummary.inheritedStructuralSegmentIndex};
+    if (key && (key->witnessId != found.witnessId ||
+                key->segmentIndex != found.segmentIndex))
+      return std::nullopt;
+    key = found;
+  }
+  return key;
+}
+
 void MacroStateRepairContext::AttachConservativeTUCarrier(
-    TextEdit &edit, std::optional<InheritedStructuralSegmentKey> inherited) {
+    TextEdit &edit, std::optional<InheritedStructuralSegmentKey> inherited,
+    ArrayRef<SuffixStabilityWitness> stateWitnesses) {
   AcceptedResultCandidate candidate =
       AcceptedCandidateBuilder().BuildAcceptedSpecializedTUTextEditCandidate(
           AcceptedPathKind::TUByteSpanConservativeEdit, edit.start, edit.end,
-          StringRef(edit.text));
+          StringRef(edit.text), stateWitnesses);
   if (inherited) {
     candidate.proofSummary.hasInheritedStructuralSegmentBinding = true;
     candidate.proofSummary.inheritedStructuralWitnessId = inherited->witnessId;
@@ -1844,6 +1950,8 @@ void MacroStateRepairContext::PromoteToSpecializedMacroStateRepairCarrier(
   // whole assembly as uncomposable.
   const std::optional<InheritedStructuralSegmentKey> inheritedSegmentKey =
       DirectTUStructuralSegmentKey(edit);
+  const std::vector<SuffixStabilityWitness> stateWitnesses =
+      CollectAuthorizedTransitionWitnesses(edit);
 
   // A repaired source surface is no longer justified by the ordinary token
   // hunk theorem.  Remove only carriers whose canonical owner-realization
@@ -1880,18 +1988,32 @@ void MacroStateRepairContext::PromoteToSpecializedMacroStateRepairCarrier(
   edit.directTUFinalStart.reset();
   edit.directTUFinalEnd.reset();
 
-  const bool alreadySpecialized = llvm::any_of(
+  auto isExactCarrier =
+      [&](const std::shared_ptr<const AcceptedResultCandidate> &candidate) {
+        return isExactConservativeTUCarrier(candidate, edit);
+      };
+  if (llvm::none_of(edit.acceptedResults, isExactCarrier)) {
+    AttachConservativeTUCarrier(edit, inheritedSegmentKey, stateWitnesses);
+    return;
+  }
+
+  // A carrier already standing for this exact surface was built before the
+  // edit held its current capabilities, so the transition witnesses it carries
+  // may be those of a smaller set.  It is rebuilt whenever either side has
+  // witnesses: the carrier then states exactly the proofs of the capabilities
+  // beside it, and states none when some capability has no recorded proof.
+  const bool standingCarrierHasWitnesses = llvm::any_of(
       edit.acceptedResults,
       [&](const std::shared_ptr<const AcceptedResultCandidate> &candidate) {
-        if (!candidate ||
-            candidate->kind != AcceptedResultCandidateKind::TUTextEdit ||
-            candidate->begin != edit.start || candidate->end != edit.end)
-          return false;
-        return AcceptedResultIsSpecializedTUCarrier(
-            *candidate, AcceptedPathKind::TUByteSpanConservativeEdit);
+        return isExactCarrier(candidate) &&
+               carriesOwnerStateWitnesses(candidate);
       });
-  if (!alreadySpecialized)
-    AttachConservativeTUCarrier(edit, inheritedSegmentKey);
+  if (stateWitnesses.empty() && !standingCarrierHasWitnesses)
+    return;
+  const std::optional<InheritedStructuralSegmentKey> standingSegmentKey =
+      SpecializedCarrierStructuralSegmentKey(edit);
+  llvm::erase_if(edit.acceptedResults, isExactCarrier);
+  AttachConservativeTUCarrier(edit, standingSegmentKey, stateWitnesses);
 }
 
 void MacroStateRepairContext::RestageConservativeTUEdit(

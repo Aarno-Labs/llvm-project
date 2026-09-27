@@ -560,7 +560,8 @@ bool RefoldTextEditCertifier::AuthorizeExactProtectedSourceInterval(
     StringRef sourceBytes, uint64_t intervalBegin, uint64_t intervalEnd,
     ArrayRef<PreprocessingStructureKind> allowedKinds,
     ArrayRef<PreprocessingStructureKind> allowedNestedKinds,
-    bool requestTerminalOnFailure) const {
+    bool requestTerminalOnFailure,
+    SmallVectorImpl<std::pair<uint64_t, uint64_t>> *grantedIntervals) const {
   auto reject = [&](StringRef detail) {
     if (requestTerminalOnFailure) {
       theoremAuditService_.NoteTheoremAuditViolation(detail);
@@ -720,6 +721,9 @@ bool RefoldTextEditCertifier::AuthorizeExactProtectedSourceInterval(
   // must not leave a partial capability on a caller-owned edit.
   for (ProtectedSourceEditAuthorization &newAuthorization :
        newAuthorizations) {
+    if (grantedIntervals)
+      grantedIntervals->emplace_back(newAuthorization.begin,
+                                     newAuthorization.end);
     appendUniqueProtectedSourceAuthorization(edit,
                                              std::move(newAuthorization));
   }

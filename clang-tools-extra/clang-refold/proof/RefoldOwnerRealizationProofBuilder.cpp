@@ -38,6 +38,26 @@ bool isClosureWideningWitness(const SuffixStabilityWitness &witness) {
   return witness.kind == SuffixStabilityWitnessKind::ClosureWidening;
 }
 
+/// Return whether \p witness discharges a macro-state transition: the macro
+/// state it changed is repaired, materialized away, or unobserved by every
+/// suffix observer.  Closure widening only names an obligation, and a terminal
+/// or absent witness proves nothing, so neither qualifies.
+bool isDischargingMacroStateWitness(const SuffixStabilityWitness &witness) {
+  switch (witness.kind) {
+  case SuffixStabilityWitnessKind::StateRepair:
+  case SuffixStabilityWitnessKind::OwnerMaterialization:
+  case SuffixStabilityWitnessKind::SuffixUnobserved:
+    return RefoldOwnerStateProof::SuffixStabilityWitnessNamesComponent(
+        witness, OwnerStateComponent::MacroState);
+  case SuffixStabilityWitnessKind::None:
+  case SuffixStabilityWitnessKind::ClosureWidening:
+  case SuffixStabilityWitnessKind::Literalization:
+  case SuffixStabilityWitnessKind::TerminalStateFailure:
+    return false;
+  }
+  llvm_unreachable("Invalid suffix-stability witness kind");
+}
+
 /// Build the canonical fail-closed result for an invalid direct TU carrier.
 ///
 /// This helper takes the closure by value so callers may safely reject both
@@ -1101,7 +1121,8 @@ RefoldOwnerRealizationProofBuilder::BuildTUOwnerRealization(
 
 ::clang::refold::OwnerRealizationResult
 RefoldOwnerRealizationProofBuilder::BuildSpecializedTUOwnerRealization(
-    AcceptedPathKind currentPath, uint64_t begin, uint64_t end) const {
+    AcceptedPathKind currentPath, uint64_t begin, uint64_t end,
+    ArrayRef<SuffixStabilityWitness> stateWitnesses) const {
   OwnerClosure closure = OwnerClosure::From(
       Owner::TU(),
       OwnerSourceRange::From(deps_.model.GetSourcePath(), begin, end),
@@ -1118,11 +1139,21 @@ RefoldOwnerRealizationProofBuilder::BuildSpecializedTUOwnerRealization(
         /*attachCanonicalStateSummary=*/false);
   }
 
-  return TryBuildOwnerRealizationImpl(
+  OwnerRealizationResult result = TryBuildOwnerRealizationImpl(
       OwnerRealizationEvidenceKind::TUSpecializedRealization,
       std::move(closure),
       formatv("specialized-tu-edit path={0}", currentPath).str(),
       /*attachCanonicalStateSummary=*/true);
+
+  // A TU owner's canonical delta is the whole unit's, not this range's, so the
+  // gate above can neither require nor check these witnesses.  Their
+  // completeness is the caller's obligation; this only refuses a set that
+  // contains a witness which discharges nothing.
+  if (result.accepted && !stateWitnesses.empty() &&
+      llvm::all_of(stateWitnesses, isDischargingMacroStateWitness))
+    result.witness.stateWitnesses.assign(stateWitnesses.begin(),
+                                         stateWitnesses.end());
+  return result;
 }
 
 ::clang::refold::ProofSummary

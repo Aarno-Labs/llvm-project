@@ -223,9 +223,11 @@ public:
   /// These callers already own directive/state-specific proof machinery and do
   /// not claim ordinary `TUByteSpan` evidence. Keeping the factory separate
   /// prevents future direct callers from dropping their hunk/span proof inputs.
+  /// \p stateWitnesses is forwarded to `BuildSpecializedTUOwnerRealization()`.
   AcceptedResultCandidate BuildAcceptedSpecializedTUTextEditCandidate(
       AcceptedPathKind currentPath, uint64_t begin, uint64_t end,
-      llvm::StringRef repairText) const;
+      llvm::StringRef repairText,
+      llvm::ArrayRef<SuffixStabilityWitness> stateWitnesses = {}) const;
 
   /// Build an accepted-result candidate for terminal fallback.
   ///
