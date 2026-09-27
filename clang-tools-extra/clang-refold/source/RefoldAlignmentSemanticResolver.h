@@ -62,7 +62,8 @@ enum class AlignmentSemanticSimulationDisposition : uint8_t {
   ProofIncomplete,
 };
 
-/// Exact component payloads used by alignment equivalence theorems.
+/// Exact component payloads from which every alignment resolution theorem's
+/// keys are built.
 ///
 /// These payloads begin after owner/structure planning. The semantic resolver
 /// deliberately excludes the initial A/B hunk partition and compares only the

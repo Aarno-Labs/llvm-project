@@ -709,7 +709,8 @@ private:
   /// Theorem authority parallel to the selected production A-to-B token map.
   std::vector<diffutils::LcsAnchorProof> abTokAnchorProofs_;
 
-  /// Durable semantic-equivalence witnesses emitted by the alignment resolver.
+  /// Durable witnesses of the theorem that committed each alignment window;
+  /// see `AlignmentSemanticResolutionKind`.
   std::vector<AlignmentSemanticResolutionWitness>
       alignmentSemanticResolutionWitnesses_;
 

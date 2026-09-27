@@ -202,7 +202,7 @@ public:
   ///
   /// The plan lexeme-maps both A and B token sequences, computes A-side owner
   /// depth and structured gap provenance, retains the exact core LCS result,
-  /// invokes the semantic equivalence resolver when ambiguity remains, derives
+  /// invokes the semantic alignment resolver when ambiguity remains, derives
   /// normalized token hunks, and builds the raw-byte
   /// hunk/prefix-delta caches used by later coordinate projection. The returned
   /// hunks are identical to

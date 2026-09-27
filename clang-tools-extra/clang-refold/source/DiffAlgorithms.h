@@ -685,7 +685,7 @@ struct CertifiedLcsResult {
   /// one certification window.
   ///
   /// A `Certified` status proves core-forced anchors, but it does not imply
-  /// that the quadratic pair facts needed by semantic equivalence remain
+  /// that the quadratic pair facts needed by semantic resolution remain
   /// available. Two independent surfaces can supply them: the historical
   /// complete-stream compatibility oracle, which is available only when the
   /// whole stream certified as one window, and a per-window oracle installed by

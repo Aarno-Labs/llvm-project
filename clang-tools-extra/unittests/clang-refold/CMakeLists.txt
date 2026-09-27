@@ -10,6 +10,7 @@ include_directories(
 
 add_extra_unittest(ClangRefoldTests
   RefoldAlignmentSemanticLedgerTests.cpp
+  RefoldAlignmentSemanticResolverTests.cpp
   RefoldPragmaTaxonomyTests.cpp
   RefoldSourceLinePredicateTests.cpp
   RefoldOutputVerificationPolicyTests.cpp
