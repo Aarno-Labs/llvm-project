@@ -92,7 +92,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <set>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -622,104 +621,17 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   }
 
   // Production non-forced anchors must resolve to one durable semantic
-  // witness retained by this engine run. Isolated candidate simulations carry
-  // a temporary theorem-bearing override and are validated by the outer
-  // resolver instead.
+  // witness retained by this engine run, and each witness must prove exactly
+  // the theorem it names. Isolated candidate simulations carry a temporary
+  // theorem-bearing override and are validated by the outer resolver instead.
   if (!alignmentSelectionOverride_) {
-    std::set<uint64_t> semanticWitnessIds;
-    for (const AlignmentSemanticResolutionWitness &witness :
-         alignmentSemanticResolutionWitnesses_) {
-      if (witness.witnessId == 0 ||
-          !semanticWitnessIds.insert(witness.witnessId).second) {
-        REFOLD_LOG_FATAL(
-            "lcs/semantic-resolver",
-            "alignment semantic witness ledger has an invalid duplicate id");
-      }
-      if (!witness.candidateDomainCompletelyEnumerated ||
-          witness.enumeratedMapCount == 0 || witness.acceptedMapCount == 0 ||
-          witness.acceptedMapCount + witness.rejectedMapCount !=
-              witness.enumeratedMapCount ||
-          witness.equivalenceKey.empty() ||
-          witness.representativeMap.size() != abTokMapA2B_.size()) {
-        REFOLD_LOG_FATAL(
-            "lcs/semantic-resolver",
-            "alignment semantic witness {0} is incomplete or malformed",
-            witness.witnessId);
-      }
-
-      std::set<std::pair<uint64_t, uint64_t>> anchorEvidence;
-      for (const AlignmentSemanticAnchorEvidence &evidence :
-           witness.anchorEvidence) {
-        if (evidence.aToken >= witness.representativeMap.size() ||
-            witness.representativeMap[evidence.aToken] !=
-                static_cast<int64_t>(evidence.bToken) ||
-            !anchorEvidence.insert({evidence.aToken, evidence.bToken}).second) {
-          REFOLD_LOG_FATAL(
-              "lcs/semantic-resolver",
-              "alignment semantic witness {0} has malformed anchor evidence",
-              witness.witnessId);
-        }
-      }
-      for (size_t aToken = 0; aToken < witness.representativeMap.size();
-           ++aToken) {
-        const int64_t bToken = witness.representativeMap[aToken];
-        if (bToken < 0)
-          continue;
-        if (aToken < abTokAnchorProofs_.size()) {
-          const diffutils::LcsAnchorProof &proof = abTokAnchorProofs_[aToken];
-          if (proof.kind ==
-              diffutils::LcsAnchorProofKind::CoreOptimalPathForced)
-            continue;
-          // Resolution is per certification window, so every witness records
-          // the same complete-stream map but owes evidence only for the
-          // anchors it proved. An anchor authorized by a different witness is
-          // that witness's obligation and is checked against it below. With a
-          // single witness this skips nothing: every non-forced anchor then
-          // names that one witness.
-          if (proof.IsSemanticWitnessBacked() &&
-              proof.semanticWitnessId != witness.witnessId)
-            continue;
-        }
-        if (!anchorEvidence.count(
-                {aToken, static_cast<uint64_t>(bToken)})) {
-          REFOLD_LOG_FATAL(
-              "lcs/semantic-resolver",
-              "alignment semantic witness {0} lacks evidence for A-token {1}",
-              witness.witnessId, aToken);
-        }
-      }
-    }
-    for (size_t aToken = 0; aToken < abTokAnchorProofs_.size(); ++aToken) {
-      const diffutils::LcsAnchorProof &proof = abTokAnchorProofs_[aToken];
-      if (!proof.IsSemanticWitnessBacked())
-        continue;
-      if (!alignmentSemanticTheoremActive_) {
-        REFOLD_LOG_FATAL(
-            "lcs/semantic-resolver",
-            "A-token anchor {0} has semantic authority while the theorem "
-            "boundary is inactive",
-            aToken);
-      }
-      if (!semanticWitnessIds.count(proof.semanticWitnessId)) {
-        REFOLD_LOG_FATAL(
-            "lcs/semantic-resolver",
-            "A-token anchor {0} names missing semantic witness {1}", aToken,
-            proof.semanticWitnessId);
-      }
-      const auto witnessIt = llvm::find_if(
-          alignmentSemanticResolutionWitnesses_,
-          [&](const AlignmentSemanticResolutionWitness &witness) {
-            return witness.witnessId == proof.semanticWitnessId;
-          });
-      if (witnessIt == alignmentSemanticResolutionWitnesses_.end() ||
-          aToken >= witnessIt->representativeMap.size() ||
-          witnessIt->representativeMap[aToken] != abTokMapA2B_[aToken]) {
-        REFOLD_LOG_FATAL(
-            "lcs/semantic-resolver",
-            "A-token anchor {0} disagrees with semantic witness {1}", aToken,
-            proof.semanticWitnessId);
-      }
-    }
+    if (std::optional<std::string> defect =
+            findAlignmentSemanticLedgerDefect(AlignmentSemanticLedger{
+                alignmentSemanticResolutionWitnesses_, abTokMapA2B_,
+                abTokAnchorProofs_, diffPlan.alignment.certificationWindows,
+                structurePreservingTieRanges_,
+                alignmentSemanticTheoremActive_}))
+      REFOLD_LOG_FATAL("lcs/semantic-resolver", "{0}", *defect);
   }
 
   std::vector<diffutils::Hunk> hunks = std::move(diffPlan.hunks);

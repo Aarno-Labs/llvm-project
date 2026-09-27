@@ -215,6 +215,38 @@ struct RequiredAnchor {
       AlignmentSemanticAnchorBasis::EquivalentRealizationRepresentative;
 };
 
+/// The theorem one commit rule proves, as its durable witness records it.
+struct CommitTheorem {
+  AlignmentSemanticResolutionKind kind;
+  AlignmentSemanticCandidateDomain domain;
+  AlignmentSemanticEquivalenceKeyKind keyKind;
+  /// Basis of every non-forced anchor the rule chose that no counterfactual
+  /// proved necessary.
+  AlignmentSemanticAnchorBasis representativeBasis;
+};
+
+/// The observational-irrelevance and least-source-mutation rules.
+constexpr CommitTheorem CompleteGroundSetTheorem{
+    AlignmentSemanticResolutionKind::CompleteGroundSetEquivalence,
+    AlignmentSemanticCandidateDomain::AllOptimalMaps,
+    AlignmentSemanticEquivalenceKeyKind::ConcreteOutput,
+    AlignmentSemanticAnchorBasis::EquivalentRealizationRepresentative};
+
+/// The legacy boundary proposal rule.
+constexpr CommitTheorem RequiredAnchorCarrierTheorem{
+    AlignmentSemanticResolutionKind::RequiredAnchorCarrierEquivalence,
+    AlignmentSemanticCandidateDomain::RequiredAnchorCarriers,
+    AlignmentSemanticEquivalenceKeyKind::Realization,
+    AlignmentSemanticAnchorBasis::EquivalentRealizationRepresentative};
+
+/// The structure-respecting repair.
+constexpr CommitTheorem StructureRespectingRecoveryTheorem{
+    AlignmentSemanticResolutionKind::StructureRespectingTerminalRecovery,
+    AlignmentSemanticCandidateDomain::StructureRepairCandidates,
+    AlignmentSemanticEquivalenceKeyKind::ConcreteOutput,
+    AlignmentSemanticAnchorBasis::
+        StructureRespectingTerminalRecoveryRepresentative};
+
 bool isForcedAnchor(const diffutils::CertifiedLcsResult &alignment,
                     size_t aToken, int64_t bToken) {
   return aToken < alignment.forcedMap.size() &&
@@ -688,8 +720,24 @@ bool noMoreSourceDestructive(
     return "source-preservation-necessary";
   case AlignmentSemanticAnchorBasis::EquivalentRealizationRepresentative:
     return "equivalent-realization-representative";
+  case AlignmentSemanticAnchorBasis::
+      StructureRespectingTerminalRecoveryRepresentative:
+    return "structure-respecting-terminal-recovery-representative";
   }
   return "unknown";
+}
+
+/// Name the members of \p domain for the per-window commit verdict.
+StringRef describeCandidateDomain(AlignmentSemanticCandidateDomain domain) {
+  switch (domain) {
+  case AlignmentSemanticCandidateDomain::AllOptimalMaps:
+    return "enumerated";
+  case AlignmentSemanticCandidateDomain::RequiredAnchorCarriers:
+    return "required-anchor-carrying";
+  case AlignmentSemanticCandidateDomain::StructureRepairCandidates:
+    return "structure-repair candidate";
+  }
+  llvm_unreachable("invalid alignment semantic candidate domain");
 }
 
 /// Name why a legacy boundary proposal cannot be the legacy rule's proposal.
@@ -1021,12 +1069,7 @@ RefoldAlignmentSemanticResolver::Resolve() const {
         "{5} anchor(s) proved",
         windowIndex, toString(resolution.resolutionKind),
         resolution.acceptedMapCount, resolution.enumeratedMapCount,
-        resolution.candidateDomain ==
-                AlignmentSemanticCandidateDomain::StructureRepairCandidates
-            ? "structure-repair candidate"
-        : resolution.enumeratedOnlyRequiredAnchorCarriers
-            ? "required-anchor-carrying"
-            : "enumerated",
+        describeCandidateDomain(resolution.candidateDomain),
         static_cast<uint64_t>(resolution.anchorEvidence.size()));
     baseMap = resolution.selectedMap;
     if (resolution.resolutionKind ==
@@ -1065,16 +1108,24 @@ RefoldAlignmentSemanticResolver::Resolve() const {
 
   uint64_t nextWitnessId = 1;
   for (WindowResolution &resolution : committedWindows) {
+    const diffutils::LcsCertificationWindow &window =
+        deps_.coreAlignment.certificationWindows[resolution.windowIndex];
     AlignmentSemanticResolutionWitness witness;
     witness.witnessId = nextWitnessId++;
+    witness.windowIndex = resolution.windowIndex;
+    witness.aBegin = window.aBegin;
+    witness.aEnd = window.aEnd;
+    witness.bBegin = window.bBegin;
+    witness.bEnd = window.bEnd;
     witness.resolutionKind = resolution.resolutionKind;
     witness.candidateDomain = resolution.candidateDomain;
     witness.candidateDomainCompletelyEnumerated =
         resolution.candidateDomainCompletelyEnumerated;
     witness.structureRepairScope = resolution.structureRepairScope;
-    witness.enumeratedMapCount = resolution.enumeratedMapCount;
-    witness.acceptedMapCount = resolution.acceptedMapCount;
-    witness.rejectedMapCount = resolution.rejectedMapCount;
+    witness.candidateCount = resolution.enumeratedMapCount;
+    witness.acceptedCandidateCount = resolution.acceptedMapCount;
+    witness.rejectedCandidateCount = resolution.rejectedMapCount;
+    witness.equivalenceKeyKind = resolution.equivalenceKeyKind;
     witness.equivalenceKey = std::move(resolution.equivalenceKey);
     witness.representativeMap = result.selectedMap;
     witness.anchorEvidence = std::move(resolution.anchorEvidence);
@@ -1572,24 +1623,25 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   // a ground set that was never enumerated was never realized either.
   bool everyMapRealized = groundSetEnumerated;
 
-  // Commit \p selectedMap as this window's choice under theorem \p kind, out
-  // of \p candidateCount candidates of which \p classSize share its output.
+  // Commit \p selectedMap as this window's choice under \p theorem, out of
+  // the \p candidateCount members of its candidate domain, of which
+  // \p classSize share its class.
   //
-  // Every caller commits only after realizing each member of \p domain, and
-  // declines on the first member it cannot realize, so the domain was
-  // completely enumerated whenever this is reached.
+  // Every caller commits only after realizing each member of the theorem's
+  // domain, and declines on the first member it cannot realize, so the domain
+  // was completely enumerated whenever this is reached.
   auto commitSelectedMap =
-      [&](AlignmentSemanticResolutionKind kind,
-          AlignmentSemanticCandidateDomain domain, StringRef equivalenceKey,
+      [&](const CommitTheorem &theorem, StringRef equivalenceKey,
           ArrayRef<int64_t> selectedMap, uint64_t candidateCount,
           uint64_t classSize,
           ArrayRef<RequiredAnchor> requiredAnchors) -> WindowResolution {
     WindowResolution committed;
-    committed.resolutionKind = kind;
-    committed.candidateDomain = domain;
+    committed.windowIndex = windowIndex;
+    committed.resolutionKind = theorem.kind;
+    committed.candidateDomain = theorem.domain;
     committed.candidateDomainCompletelyEnumerated = true;
+    committed.equivalenceKeyKind = theorem.keyKind;
     committed.enumeratedMapCount = candidateCount;
-    committed.enumeratedOnlyRequiredAnchorCarriers = !groundSetEnumerated;
     committed.acceptedMapCount = classSize;
     committed.rejectedMapCount =
         committed.enumeratedMapCount - committed.acceptedMapCount;
@@ -1614,10 +1666,8 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
       const auto required = requiredBasis.find(
           {aToken, static_cast<uint64_t>(bToken)});
       const AlignmentSemanticAnchorBasis basis =
-          required == requiredBasis.end()
-              ? AlignmentSemanticAnchorBasis::
-                    EquivalentRealizationRepresentative
-              : required->second;
+          required == requiredBasis.end() ? theorem.representativeBasis
+                                          : required->second;
       committed.anchorEvidence.push_back(AlignmentSemanticAnchorEvidence{
           aToken, static_cast<uint64_t>(bToken), basis});
     }
@@ -1626,17 +1676,18 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     return committed;
   };
 
+  // Commit the class of `globalMaps` indices \p classMembers, out of the
+  // \p candidateCount members of \p theorem's candidate domain.
   auto commitRealizationClass =
-      [&](AlignmentSemanticResolutionKind kind,
-          AlignmentSemanticCandidateDomain domain, StringRef equivalenceKey,
-          ArrayRef<size_t> classMembers,
+      [&](const CommitTheorem &theorem, StringRef equivalenceKey,
+          ArrayRef<size_t> classMembers, uint64_t candidateCount,
           ArrayRef<RequiredAnchor> requiredAnchors) -> WindowResolution {
     if (classMembers.empty())
       return WindowResolution{};
     const size_t representativeIndex = classMembers.front();
     WindowResolution committed = commitSelectedMap(
-        kind, domain, equivalenceKey, globalMaps[representativeIndex],
-        globalMaps.size(), classMembers.size(), requiredAnchors);
+        theorem, equivalenceKey, globalMaps[representativeIndex],
+        candidateCount, classMembers.size(), requiredAnchors);
     REFOLD_LOG_TRACE(
         "lcs/semantic-resolver",
         "window {0} committing realized-source class: candidates={1} "
@@ -1659,10 +1710,9 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     if (!repair)
       return result;
     WindowResolution committed = commitSelectedMap(
-        AlignmentSemanticResolutionKind::StructureRespectingTerminalRecovery,
-        AlignmentSemanticCandidateDomain::StructureRepairCandidates,
-        repair->equivalenceKey, repair->selectedMap, repair->candidateCount,
-        repair->classSize, ArrayRef<RequiredAnchor>());
+        StructureRespectingRecoveryTheorem, repair->equivalenceKey,
+        repair->selectedMap, repair->candidateCount, repair->classSize,
+        ArrayRef<RequiredAnchor>());
     committed.structureRepairScope = repair->scope;
     return committed;
   };
@@ -1939,10 +1989,9 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     }
     if (everyCompleteMapAccepted && completeOutputClasses.size() == 1) {
       const auto &onlyClass = *completeOutputClasses.begin();
-      return commitRealizationClass(
-          AlignmentSemanticResolutionKind::CompleteGroundSetEquivalence,
-          AlignmentSemanticCandidateDomain::AllOptimalMaps, onlyClass.first,
-          onlyClass.second, ArrayRef<RequiredAnchor>());
+      return commitRealizationClass(CompleteGroundSetTheorem, onlyClass.first,
+                                    onlyClass.second, globalMaps.size(),
+                                    ArrayRef<RequiredAnchor>());
     }
     REFOLD_LOG_DEBUG(
         "lcs/semantic-resolver",
@@ -2019,10 +2068,9 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
             "accepted={1} least={2} classMembers={3}",
             windowIndex, acceptedMaps.size(), leastDestructiveMaps.size(),
             formatMapIndices(onlyClass.second));
-        return commitRealizationClass(
-            AlignmentSemanticResolutionKind::CompleteGroundSetEquivalence,
-            AlignmentSemanticCandidateDomain::AllOptimalMaps, onlyClass.first,
-            onlyClass.second, ArrayRef<RequiredAnchor>());
+        return commitRealizationClass(CompleteGroundSetTheorem, onlyClass.first,
+                                      onlyClass.second, globalMaps.size(),
+                                      ArrayRef<RequiredAnchor>());
       }
       REFOLD_LOG_DEBUG(
           "lcs/semantic-resolver",
@@ -2316,10 +2364,9 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   }
 
   const auto &onlyClass = *realizationClasses.begin();
-  return commitRealizationClass(
-      AlignmentSemanticResolutionKind::RequiredAnchorCarrierEquivalence,
-      AlignmentSemanticCandidateDomain::RequiredAnchorCarriers, onlyClass.first,
-      onlyClass.second, requiredAnchors);
+  return commitRealizationClass(RequiredAnchorCarrierTheorem, onlyClass.first,
+                                onlyClass.second, survivingMaps.size(),
+                                requiredAnchors);
 }
 
 /// Return the window partition identity carried by \p alignment.
@@ -2370,6 +2417,214 @@ void AlignmentSemanticResolutionMemo::Record(
   certificationWindows = collectWindowIdentities(alignment);
   resolution = std::move(result);
   recorded = true;
+}
+
+namespace {
+
+/// Return whether a `kind` witness may record an anchor with \p basis.
+///
+/// A complete-ground-set equivalence names only its class representative, and
+/// a structure-respecting recovery only its selected map.  A required-anchor
+/// carrier equivalence adds the counterfactual necessity bases.
+bool witnessKindAdmitsBasis(AlignmentSemanticResolutionKind kind,
+                            AlignmentSemanticAnchorBasis basis) {
+  switch (kind) {
+  case AlignmentSemanticResolutionKind::CompleteGroundSetEquivalence:
+    return basis ==
+           AlignmentSemanticAnchorBasis::EquivalentRealizationRepresentative;
+  case AlignmentSemanticResolutionKind::RequiredAnchorCarrierEquivalence:
+    return basis != AlignmentSemanticAnchorBasis::
+                        StructureRespectingTerminalRecoveryRepresentative;
+  case AlignmentSemanticResolutionKind::StructureRespectingTerminalRecovery:
+    return basis == AlignmentSemanticAnchorBasis::
+                        StructureRespectingTerminalRecoveryRepresentative;
+  }
+  return false;
+}
+
+/// Return the first way \p witness claims a theorem other than the one its
+/// resolution kind names: a candidate domain, key kind, repair scope or anchor
+/// basis that kind does not produce.
+std::optional<std::string>
+findWitnessTheoremDefect(const AlignmentSemanticResolutionWitness &witness) {
+  AlignmentSemanticCandidateDomain domain =
+      AlignmentSemanticCandidateDomain::AllOptimalMaps;
+  AlignmentSemanticEquivalenceKeyKind keyKind =
+      AlignmentSemanticEquivalenceKeyKind::ConcreteOutput;
+  bool structureRecovery = false;
+  switch (witness.resolutionKind) {
+  case AlignmentSemanticResolutionKind::CompleteGroundSetEquivalence:
+    break;
+  case AlignmentSemanticResolutionKind::RequiredAnchorCarrierEquivalence:
+    domain = AlignmentSemanticCandidateDomain::RequiredAnchorCarriers;
+    keyKind = AlignmentSemanticEquivalenceKeyKind::Realization;
+    break;
+  case AlignmentSemanticResolutionKind::StructureRespectingTerminalRecovery:
+    domain = AlignmentSemanticCandidateDomain::StructureRepairCandidates;
+    structureRecovery = true;
+    break;
+  }
+
+  const StringRef kindName = toString(witness.resolutionKind);
+  if (witness.candidateDomain != domain)
+    return formatv("alignment semantic witness {0} ({1}) names a candidate "
+                   "domain its theorem does not quantify over",
+                   witness.witnessId, kindName)
+        .str();
+  if (witness.equivalenceKeyKind != keyKind)
+    return formatv("alignment semantic witness {0} ({1}) holds a key of the "
+                   "wrong kind",
+                   witness.witnessId, kindName)
+        .str();
+  if (witness.structureRepairScope.has_value() != structureRecovery)
+    return formatv("alignment semantic witness {0} ({1}) has a structure "
+                   "repair scope exactly when it should not",
+                   witness.witnessId, kindName)
+        .str();
+  for (const AlignmentSemanticAnchorEvidence &evidence : witness.anchorEvidence)
+    if (!witnessKindAdmitsBasis(witness.resolutionKind, evidence.basis))
+      return formatv("alignment semantic witness {0} ({1}) records A-token {2} "
+                     "under a basis its theorem does not establish",
+                     witness.witnessId, kindName, evidence.aToken)
+          .str();
+  return std::nullopt;
+}
+
+} // namespace
+
+std::optional<std::string>
+findAlignmentSemanticLedgerDefect(const AlignmentSemanticLedger &ledger) {
+  std::set<uint64_t> witnessIds;
+  std::set<size_t> resolvedWindows;
+  size_t structureRecoveries = 0;
+  for (const AlignmentSemanticResolutionWitness &witness : ledger.witnesses) {
+    if (witness.witnessId == 0 || !witnessIds.insert(witness.witnessId).second)
+      return std::string(
+          "alignment semantic witness ledger has an invalid duplicate id");
+    if (!witness.candidateDomainCompletelyEnumerated ||
+        witness.candidateCount == 0 || witness.acceptedCandidateCount == 0 ||
+        witness.acceptedCandidateCount + witness.rejectedCandidateCount !=
+            witness.candidateCount ||
+        witness.equivalenceKey.empty() ||
+        witness.representativeMap.size() != ledger.selectedMap.size())
+      return formatv("alignment semantic witness {0} is incomplete or "
+                     "malformed",
+                     witness.witnessId)
+          .str();
+
+    // A witness proves one certification window, and it must be the window
+    // the core alignment actually certified there; a second witness for the
+    // same window would be a second theorem about one choice.
+    if (witness.windowIndex >= ledger.certificationWindows.size() ||
+        !resolvedWindows.insert(witness.windowIndex).second)
+      return formatv("alignment semantic witness {0} names a missing or "
+                     "already resolved certification window {1}",
+                     witness.witnessId, witness.windowIndex)
+          .str();
+    const diffutils::LcsCertificationWindow &window =
+        ledger.certificationWindows[witness.windowIndex];
+    if (!window.IsCertified() || window.aBegin != witness.aBegin ||
+        window.aEnd != witness.aEnd || window.bBegin != witness.bBegin ||
+        window.bEnd != witness.bEnd)
+      return formatv("alignment semantic witness {0} disagrees with "
+                     "certification window {1}",
+                     witness.witnessId, witness.windowIndex)
+          .str();
+
+    if (std::optional<std::string> defect = findWitnessTheoremDefect(witness))
+      return defect;
+    if (witness.resolutionKind ==
+        AlignmentSemanticResolutionKind::StructureRespectingTerminalRecovery) {
+      ++structureRecoveries;
+      if (!llvm::is_contained(ledger.structurePreservingTieRanges,
+                              std::make_pair(witness.aBegin, witness.aEnd)))
+        return formatv("alignment semantic witness {0} is a "
+                       "structure-respecting recovery without a "
+                       "structure-preserving tie range over its window",
+                       witness.witnessId)
+            .str();
+    }
+
+    std::set<std::pair<uint64_t, uint64_t>> anchorEvidence;
+    for (const AlignmentSemanticAnchorEvidence &evidence :
+         witness.anchorEvidence) {
+      if (evidence.aToken >= witness.representativeMap.size() ||
+          witness.representativeMap[evidence.aToken] !=
+              static_cast<int64_t>(evidence.bToken) ||
+          !anchorEvidence.insert({evidence.aToken, evidence.bToken}).second)
+        return formatv("alignment semantic witness {0} has malformed anchor "
+                       "evidence",
+                       witness.witnessId)
+            .str();
+      if (evidence.aToken < witness.aBegin || evidence.aToken >= witness.aEnd ||
+          evidence.bToken < witness.bBegin || evidence.bToken >= witness.bEnd)
+        return formatv("alignment semantic witness {0} has anchor evidence "
+                       "for A-token {1} outside its window",
+                       witness.witnessId, evidence.aToken)
+            .str();
+    }
+    for (size_t aToken = 0; aToken < witness.representativeMap.size();
+         ++aToken) {
+      const int64_t bToken = witness.representativeMap[aToken];
+      if (bToken < 0)
+        continue;
+      if (aToken < ledger.anchorProofs.size()) {
+        const diffutils::LcsAnchorProof &proof = ledger.anchorProofs[aToken];
+        if (proof.kind == diffutils::LcsAnchorProofKind::CoreOptimalPathForced)
+          continue;
+        // Resolution is per certification window, so every witness records
+        // the same complete-stream map but owes evidence only for the anchors
+        // it proved. An anchor authorized by a different witness is that
+        // witness's obligation and is checked against it below. With a single
+        // witness this skips nothing: every non-forced anchor then names that
+        // one witness.
+        if (proof.IsSemanticWitnessBacked() &&
+            proof.semanticWitnessId != witness.witnessId)
+          continue;
+      }
+      if (!anchorEvidence.count({aToken, static_cast<uint64_t>(bToken)}))
+        return formatv("alignment semantic witness {0} lacks evidence for "
+                       "A-token {1}",
+                       witness.witnessId, aToken)
+            .str();
+    }
+  }
+  // Each structure-respecting recovery owns the tie range over its own
+  // window, and the windows are distinct, so equal counts leave no range
+  // without a recovery to answer for it.
+  if (ledger.structurePreservingTieRanges.size() != structureRecoveries)
+    return std::string("structure-preserving tie ranges do not correspond "
+                       "one-to-one with structure-respecting recovery "
+                       "witnesses");
+
+  for (size_t aToken = 0; aToken < ledger.anchorProofs.size(); ++aToken) {
+    const diffutils::LcsAnchorProof &proof = ledger.anchorProofs[aToken];
+    if (!proof.IsSemanticWitnessBacked())
+      continue;
+    if (!ledger.theoremActive)
+      return formatv("A-token anchor {0} has semantic authority while the "
+                     "theorem boundary is inactive",
+                     aToken)
+          .str();
+    const auto witness = llvm::find_if(
+        ledger.witnesses, [&](const AlignmentSemanticResolutionWitness &w) {
+          return w.witnessId == proof.semanticWitnessId;
+        });
+    if (witness == ledger.witnesses.end())
+      return formatv("A-token anchor {0} names missing semantic witness {1}",
+                     aToken, proof.semanticWitnessId)
+          .str();
+    if (aToken >= witness->representativeMap.size() ||
+        aToken >= ledger.selectedMap.size() ||
+        witness->representativeMap[aToken] != ledger.selectedMap[aToken])
+      return formatv("A-token anchor {0} disagrees with semantic witness {1}",
+                     aToken, proof.semanticWitnessId)
+          .str();
+    // The anchor also lies inside that witness's window: the witness loop
+    // above required evidence for it from the witness it names, and evidence
+    // outside the witness's window was refused there.
+  }
+  return std::nullopt;
 }
 
 } // namespace refold

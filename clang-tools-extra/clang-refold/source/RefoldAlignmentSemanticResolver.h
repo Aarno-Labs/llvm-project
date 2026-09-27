@@ -119,9 +119,17 @@ enum class AlignmentSemanticAnchorBasis : uint8_t {
   /// Removing the anchor yields a strictly more destructive source carrier.
   SourcePreservationNecessary,
   /// The anchor belongs to the deterministic representative selected after
-  /// exact equivalence or source-mutation containment reduced every surviving
-  /// complete map to one realized-source class.
+  /// exact equivalence or source-mutation containment reduced every map of
+  /// the committing theorem's candidate domain to one realized-source class.
   EquivalentRealizationRepresentative,
+  /// The anchor belongs to the deterministically selected map of the
+  /// structure-respecting terminal-recovery theorem.  Declining the window was
+  /// proved to request terminal fallback; the selected map independently
+  /// passed the complete planning and theorem audit; and every accepted
+  /// member of the theorem's declared candidate domain produced the same
+  /// concrete output.  This does not assert equivalence over the window's
+  /// complete optimal-map ground set.
+  StructureRespectingTerminalRecoveryRepresentative,
 };
 
 /// Durable evidence for one non-forced production anchor.
@@ -187,13 +195,30 @@ enum class StructureRepairScope : uint8_t {
   TerminalRequestIntersectingSubRectangles,
 };
 
+/// Which simulation key a witness's `equivalenceKey` holds.
+enum class AlignmentSemanticEquivalenceKeyKind : uint8_t {
+  /// `AlignmentSemanticSimulationResult::concreteOutputEquivalenceKey`.
+  ConcreteOutput,
+  /// `AlignmentSemanticSimulationResult::realizationEquivalenceKey`.
+  Realization,
+};
+
 /// Durable record of the theorem that committed one certification window.
 ///
 /// `resolutionKind` names that theorem, and `candidateDomain` the set it
 /// quantified over; only `CompleteGroundSetEquivalence` is a statement about
-/// every core-optimal map of the window.
+/// every core-optimal map of the window.  The witness names the window it
+/// resolved, and its anchor evidence lies inside that window's half-open A and
+/// B ranges.
 struct AlignmentSemanticResolutionWitness {
   uint64_t witnessId = 0;
+  /// Index into the core alignment's certification windows, and that
+  /// window's half-open A and B token ranges.
+  size_t windowIndex = 0;
+  uint64_t aBegin = 0;
+  uint64_t aEnd = 0;
+  uint64_t bBegin = 0;
+  uint64_t bEnd = 0;
   AlignmentSemanticResolutionKind resolutionKind =
       AlignmentSemanticResolutionKind::CompleteGroundSetEquivalence;
   AlignmentSemanticCandidateDomain candidateDomain =
@@ -203,13 +228,48 @@ struct AlignmentSemanticResolutionWitness {
   bool candidateDomainCompletelyEnumerated = false;
   /// Set only for `StructureRespectingTerminalRecovery`.
   std::optional<StructureRepairScope> structureRepairScope;
-  uint64_t enumeratedMapCount = 0;
-  uint64_t acceptedMapCount = 0;
-  uint64_t rejectedMapCount = 0;
+  /// Members of `candidateDomain`, and how many of them share the committed
+  /// class; the rest were rejected.
+  uint64_t candidateCount = 0;
+  uint64_t acceptedCandidateCount = 0;
+  uint64_t rejectedCandidateCount = 0;
+  AlignmentSemanticEquivalenceKeyKind equivalenceKeyKind =
+      AlignmentSemanticEquivalenceKeyKind::ConcreteOutput;
   std::string equivalenceKey;
   std::vector<int64_t> representativeMap;
   std::vector<AlignmentSemanticAnchorEvidence> anchorEvidence;
 };
+
+/// The production alignment state that
+/// `findAlignmentSemanticLedgerDefect()` audits.
+struct AlignmentSemanticLedger {
+  llvm::ArrayRef<AlignmentSemanticResolutionWitness> witnesses;
+  /// The production A-to-B map and the anchor proof of each A token.
+  llvm::ArrayRef<int64_t> selectedMap;
+  llvm::ArrayRef<diffutils::LcsAnchorProof> anchorProofs;
+  llvm::ArrayRef<diffutils::LcsCertificationWindow> certificationWindows;
+  /// The A ranges production realizes with structural tiling ties settled in
+  /// favour of preserved structure.
+  llvm::ArrayRef<std::pair<uint64_t, uint64_t>> structurePreservingTieRanges;
+  /// Whether the engine's semantic theorem boundary is active.
+  bool theoremActive = false;
+};
+
+/// Return the first contradiction in \p ledger, or `std::nullopt` when every
+/// witness proves exactly the theorem it names.
+///
+/// Each witness must be complete over its declared candidate domain, carry the
+/// domain, key kind, repair scope and anchor bases its resolution kind
+/// requires, match the certification window it names, and keep its anchor
+/// evidence inside that window.  A structure-respecting recovery must own a
+/// structure-preserving tie range equal to its window's A range, and every
+/// such range must belong to one.  Every semantic-witness-backed anchor must
+/// name an existing witness that records evidence for it, which places it
+/// inside that witness's window, and whose representative agrees with the
+/// production map.  The result describes the defect for a
+/// fatal diagnostic; any defect is an internal proof contradiction.
+std::optional<std::string>
+findAlignmentSemanticLedgerDefect(const AlignmentSemanticLedger &ledger);
 
 /// Source-layout queries read by the structure-respecting repair's preference
 /// keys.
@@ -308,6 +368,8 @@ private:
   /// Outcome of resolving the ambiguity inside one certification window.
   struct WindowResolution {
     bool committed = false;
+    /// The certification window resolved.  Read only when `committed`.
+    size_t windowIndex = 0;
     /// Complete-stream map: `baseMap` with this window's choice substituted.
     std::vector<int64_t> selectedMap;
     std::vector<AlignmentSemanticAnchorEvidence> anchorEvidence;
@@ -319,12 +381,9 @@ private:
     /// (zero), a window the core theorem had already determined (one), and real
     /// ambiguity that no commit rule closed (more than one).  A verdict log
     /// that could not tell those apart would report a decline where nothing was
-    /// declined.
+    /// declined.  A commit replaces it with the size of the committing
+    /// theorem's candidate domain.
     uint64_t enumeratedMapCount = 0;
-    /// True when the window's complete ground set could not be enumerated and
-    /// the legacy boundary proposal committed over the maps carrying its
-    /// required anchors instead.  `enumeratedMapCount` then counts those maps.
-    bool enumeratedOnlyRequiredAnchorCarriers = false;
     uint64_t acceptedMapCount = 0;
     uint64_t rejectedMapCount = 0;
     /// The theorem that committed this window, and the set it quantified
@@ -337,6 +396,8 @@ private:
         AlignmentSemanticCandidateDomain::AllOptimalMaps;
     bool candidateDomainCompletelyEnumerated = false;
     std::optional<StructureRepairScope> structureRepairScope;
+    AlignmentSemanticEquivalenceKeyKind equivalenceKeyKind =
+        AlignmentSemanticEquivalenceKeyKind::ConcreteOutput;
   };
 
   /// Resolve the ambiguity inside one certification window.
