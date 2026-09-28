@@ -374,17 +374,27 @@ struct Item {
       SiteEnd;                 // one-past-end of the directive line (incl. EOL)
   std::string SitePath;        // file path that contains the directive
 
-  // --- Complete physical extent of a macro-state directive line ---
-  // For `#define`/`#undef`, the half-open source-byte range of the whole
-  // directive as spelled, from its `#` introducer through the end of the
-  // logical line reached after every translation-phase-2 splice.  Unlike
-  // [SiteBegin, SiteEnd), which is anchored on the macro name token and stops
-  // at the first physical newline, this range is exactly the bytes a consumer
-  // may preserve to keep the directive.  It is recorded only when every
-  // producer self-consistency check passes; consumers must fall back when it is
-  // absent.
+  // --- Complete physical extent of a directive line ---
+  // For `#define`/`#undef` and the include directives, the half-open
+  // source-byte range of the whole directive as spelled, from its `#`
+  // introducer through the end of the logical line reached after every
+  // translation-phase-2 splice.  Unlike [SiteBegin, SiteEnd), which stops at
+  // the first physical newline (and, for a macro-state directive, is anchored
+  // on the macro name token), this range is exactly the bytes a consumer may
+  // preserve to keep the directive.  It is recorded only when every producer
+  // self-consistency check passes; consumers must fall back when it is absent.
   std::optional<uint64_t> DirectiveLineBegin;
   std::optional<uint64_t> DirectiveLineEnd;
+
+  // --- Include directive spellings ---
+  // Source-byte ranges, inside [DirectiveLineBegin, DirectiveLineEnd), of the
+  // directive keyword token (`include`, `include_next`, `import`) and of the
+  // header-name operand with its delimiters.  Both are Clang's own tokens, so
+  // they cover any comment or splice Clang skipped around them.  The operand
+  // is recorded only when it was spelled directly in the file: a header name
+  // produced by macro expansion has no source bytes to rewrite.
+  std::optional<std::pair<uint64_t, uint64_t>> IncludeKeywordRange;
+  std::optional<std::pair<uint64_t, uint64_t>> IncludeOperandRange;
 
   // --- Pragma-operator provenance (Subkind == "#pragma") ---
   // True when the directive was spelled with the `_Pragma("...")` operator
@@ -780,8 +790,8 @@ class RefoldMapBuilder {
   std::optional<std::pair<uint64_t, uint64_t>>
   computeCurrentMacroStateDirectivePhysicalExtent(SourceLocation MacroNameLoc);
 
-  /// Return the complete physical extent of a `#line` or GNU line-marker
-  /// directive.
+  /// Return the complete physical extent of a directive whose handler has read
+  /// its end-of-directive token: a `#line` or GNU line marker, or an include.
   ///
   /// \p HashLoc is the directive introducer and \p EndLoc is where Clang's
   /// lexer stands once it has read the directive's end-of-directive token.
@@ -793,8 +803,21 @@ class RefoldMapBuilder {
   ///          two locations do not describe one directive that ends in a
   ///          newline or at the end of its file.
   std::optional<std::pair<uint64_t, uint64_t>>
-  computeLineControlDirectiveExtent(SourceLocation HashLoc,
-                                    SourceLocation EndLoc);
+  computeDirectiveExtent(SourceLocation HashLoc, SourceLocation EndLoc);
+
+  /// Return the source-byte range of one token spelled inside a directive.
+  ///
+  /// \p Begin and \p End delimit the token as Clang lexed it.  Both must be
+  /// file locations in the directive's own file, so a token that macro
+  /// expansion produced -- which has no bytes of its own there -- yields
+  /// nullopt rather than the location of the macro that produced it.
+  ///
+  /// \param Extent the directive's extent from computeDirectiveExtent(); the
+  ///        token must lie inside it.
+  std::optional<std::pair<uint64_t, uint64_t>>
+  computeDirectiveTokenRange(SourceLocation HashLoc, SourceLocation Begin,
+                             SourceLocation End,
+                             std::pair<uint64_t, uint64_t> Extent);
 
   /// Canonical absolute path for a file entry (when possible).
   ///
@@ -956,7 +979,7 @@ public:
   /// operands before this callback is reached, so the recorded logical state is
   /// producer-proven.  The source-site range comes from \p HashLoc and
   /// \p EndLoc alone; it is omitted, never guessed, when they fail
-  /// computeLineControlDirectiveExtent()'s checks.
+  /// computeDirectiveExtent()'s checks.
   void onLineControlDirective(SourceLocation HashLoc, SourceLocation EndLoc,
                               PPCallbacks::FileChangeReason Reason,
                               SrcMgr::CharacteristicKind FileKind);

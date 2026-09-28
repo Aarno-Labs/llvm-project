@@ -2530,8 +2530,8 @@ RefoldMapBuilder::computeCurrentMacroStateDirectivePhysicalExtent(
 }
 
 std::optional<std::pair<uint64_t, uint64_t>>
-RefoldMapBuilder::computeLineControlDirectiveExtent(SourceLocation HashLoc,
-                                                    SourceLocation EndLoc) {
+RefoldMapBuilder::computeDirectiveExtent(SourceLocation HashLoc,
+                                         SourceLocation EndLoc) {
   const SourceLocation BeginLoc = SM.getFileLoc(HashLoc);
   const SourceLocation AfterLoc = SM.getFileLoc(EndLoc);
   if (!BeginLoc.isValid() || !AfterLoc.isValid())
@@ -2559,6 +2559,25 @@ RefoldMapBuilder::computeLineControlDirectiveExtent(SourceLocation HashLoc,
   if (EndOffset != Buf.size() && Last != '\n' && Last != '\r')
     return std::nullopt;
   return {{HashOffset, EndOffset}};
+}
+
+std::optional<std::pair<uint64_t, uint64_t>>
+RefoldMapBuilder::computeDirectiveTokenRange(
+    SourceLocation HashLoc, SourceLocation Begin, SourceLocation End,
+    std::pair<uint64_t, uint64_t> Extent) {
+  if (!Begin.isValid() || !End.isValid() || !Begin.isFileID() ||
+      !End.isFileID())
+    return std::nullopt;
+  const FileID FID = SM.getFileID(SM.getFileLoc(HashLoc));
+  if (SM.getFileID(Begin) != FID || SM.getFileID(End) != FID)
+    return std::nullopt;
+
+  const uint64_t BeginOffset = SM.getFileOffset(Begin);
+  const uint64_t EndOffset = SM.getFileOffset(End);
+  if (BeginOffset >= EndOffset || BeginOffset < Extent.first ||
+      EndOffset > Extent.second)
+    return std::nullopt;
+  return {{BeginOffset, EndOffset}};
 }
 
 std::string RefoldMapBuilder::absolutePathFor(const clang::FileEntryRef &FER) {
@@ -2778,6 +2797,29 @@ void RefoldMapBuilder::onIncludeDirective(
     It.SiteEnd = Line->second;
   }
   It.SitePath = filePathForLocAbs(SM, HashLoc, EmitAbsPaths);
+
+  // Clang reports the inclusion only after reading the directive's
+  // end-of-directive token, so the lexer already stands on the first byte past
+  // the directive.  That is the same measurement a line-control event records,
+  // and it covers splices and comments that [SiteBegin, SiteEnd) stops short
+  // of.  The keyword and operand are Clang's own tokens inside that extent.
+  // `Lexer` is the only concrete PreprocessorLexer, and only it exposes its
+  // position publicly; computeDirectiveExtent() rejects any position that does
+  // not end this directive in its own file.
+  if (PreprocessorLexer *DirectiveLexer = PP.getCurrentLexer()) {
+    if (std::optional<std::pair<uint64_t, uint64_t>> Extent =
+            computeDirectiveExtent(
+                HashLoc,
+                static_cast<Lexer *>(DirectiveLexer)->getSourceLocation())) {
+      It.DirectiveLineBegin = Extent->first;
+      It.DirectiveLineEnd = Extent->second;
+      It.IncludeKeywordRange = computeDirectiveTokenRange(
+          HashLoc, IncludeTok.getLocation(), IncludeTok.getEndLoc(), *Extent);
+      It.IncludeOperandRange =
+          computeDirectiveTokenRange(HashLoc, FilenameRange.getBegin(),
+                                     FilenameRange.getEnd(), *Extent);
+    }
+  }
 
   // Producer-owned include identity/spelling data, when available.
   // `resolved_path` is retained only as a legacy spelling-preserving alias.
@@ -3569,7 +3611,7 @@ void RefoldMapBuilder::onLineControlDirective(
     Ev.OwnerIncludeId = Items[*IncludeStack.back()].ID;
 
   if (std::optional<std::pair<uint64_t, uint64_t>> Site =
-          computeLineControlDirectiveExtent(HashLoc, EndLoc)) {
+          computeDirectiveExtent(HashLoc, EndLoc)) {
     Ev.SiteBegin = Site->first;
     Ev.SiteEnd = Site->second;
 
@@ -3806,14 +3848,22 @@ void RefoldMapBuilder::recordPragmaItem(
   // Multiple PP callback paths can report the same pragma. For example, the
   // generic PragmaDirective hook can fire before an UnknownPragmaHandler, and
   // `#pragma GCC system_header` is also visible as a FileChanged reason. Keep
-  // only one structural marker for a physical pragma line.
+  // only one structural marker for a physical pragma line in one file
+  // instance.
+  //
+  // The instance is its FileID: a header entered twice shares its path and
+  // byte offsets between the two entries, so keying on those alone folds the
+  // second entry's pragma into the first's item.  That item then carries the
+  // first entry's owner and image only, the second emission has no image, and
+  // `pragma_images_complete` is false for the whole translation unit.
   if (Line) {
     for (Item &Existing : Items) {
       if (Existing.Kind != IK_Directive || Existing.Subkind != "#pragma")
         continue;
       if (Existing.SitePath != SitePath || !Existing.SiteBegin ||
           !Existing.SiteEnd || *Existing.SiteBegin != Line->first ||
-          *Existing.SiteEnd != Line->second)
+          *Existing.SiteEnd != Line->second ||
+          SM.getFileID(Existing.Loc) != FID)
         continue;
       // The operator hook runs before the pragma handlers, so its record is
       // already in place when a printing callback reports the same pragma. That
@@ -4964,7 +5014,7 @@ void RefoldMapBuilder::writeJSON() {
       PragmaItemsWithImage == PragmasEmittedIntoOutput;
 
   JO.object([&] {
-    JO.attribute("version", "3.7");
+    JO.attribute("version", "3.8");
     JO.attribute("pragma_images_complete", PragmaImagesComplete);
 
     const auto &PPO = PP.getPreprocessorOpts();
@@ -6510,14 +6560,24 @@ void RefoldMapBuilder::writeJSON() {
             }
           }
 
-          // Complete physical extent of a macro-state directive line.  Emitted
-          // as a pair or not at all: a consumer may only use it to bound a
-          // preserved directive when both endpoints are recorded.
+          // Complete physical extent of a macro-state or include directive
+          // line.  Emitted as a pair or not at all: a consumer may only use it
+          // to bound a preserved directive when both endpoints are recorded.
           if (It.Kind == IK_Directive &&
-              (It.Subkind == "#define" || It.Subkind == "#undef") &&
+              (It.Subkind == "#define" || It.Subkind == "#undef" ||
+               It.Subkind == "#include" || It.Subkind == "#include_next" ||
+               It.Subkind == "#import") &&
               It.DirectiveLineBegin && It.DirectiveLineEnd) {
             JO.attribute("directive_line_b", *It.DirectiveLineBegin);
             JO.attribute("directive_line_e", *It.DirectiveLineEnd);
+            if (It.IncludeKeywordRange) {
+              JO.attribute("keyword_b", It.IncludeKeywordRange->first);
+              JO.attribute("keyword_e", It.IncludeKeywordRange->second);
+            }
+            if (It.IncludeOperandRange) {
+              JO.attribute("operand_b", It.IncludeOperandRange->first);
+              JO.attribute("operand_e", It.IncludeOperandRange->second);
+            }
           }
 
           if (It.Kind == IK_Directive && It.Subkind == "#define") {
