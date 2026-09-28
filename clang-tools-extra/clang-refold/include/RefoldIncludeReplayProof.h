@@ -766,9 +766,6 @@ private:
       const RefoldModel::IncludeItem &child,
       const CleanChildIncludeReplayDemand &demand) const;
 
-  /// Return whether an include id belongs to an include subtree rooted at root.
-  bool IncludeIdIsDescendantOrSelf(uint64_t owner, uint64_t root) const;
-
   /// Recover the producer-side spelling payload emitted by a file observer.
   std::optional<std::string> ProducerObservedFileSpellingPayload(
       const RefoldModel::MacroInvocation &macro) const;

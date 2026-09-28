@@ -667,8 +667,7 @@ int main(int argc, char **argv) {
       mergeMask(std::move(*maskOrErr));
     }
 
-    Error err = haveMask ? compareTokensNoLinesAware(aToks, bToks, ignoreMask)
-                         : compareTokens(aToks, bToks);
+    Error err = compareTokensNoLinesAware(aToks, bToks, ignoreMask);
     if (err) {
       outs() << toString(std::move(err)) << "\n";
       outs() << "FAILURE!\n";

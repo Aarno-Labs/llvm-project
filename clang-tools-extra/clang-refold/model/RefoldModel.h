@@ -1238,6 +1238,21 @@ public:
     return it == includeById_.end() ? nullptr : it->second;
   }
 
+  /// Return whether include instance `id` is `root` or a descendant of it.
+  ///
+  /// Ancestry follows producer include-parent links, never paths: one file may
+  /// be included several times and ownership is per include instance.  Any
+  /// other id the model does not name is not a descendant.
+  bool IncludeIsDescendantOrSelf(uint64_t id, uint64_t root) const {
+    while (id != root) {
+      const IncludeItem *inc = GetIncludeById(id);
+      if (!inc || !inc->parent)
+        return false;
+      id = *inc->parent;
+    }
+    return true;
+  }
+
   /// Look up a producer conditional group by stable ID.
   const CondGroup *GetCondGroupById(uint64_t id) const {
     auto it = condGroupById_.find(id);

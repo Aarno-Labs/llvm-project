@@ -1033,20 +1033,6 @@ certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                   LcsCertificationDiagnosticEvidence *diagnosticEvidence =
                       nullptr);
 
-/// \brief Compute the provenance-certified owner-aware LCS map.
-///
-/// This overload derives the scalar owner-depth array from `gapProvenance` and
-/// then builds a certified partial map containing only core-LCS-forced
-/// anchors. Ambiguous equal-token anchors remain suppressed until the separate
-/// semantic resolver proves that every optimal explanation induces one
-/// equivalent normalized owner/edit realization. A failed certification
-/// window contributes no anchors; in the current one-window implementation,
-/// that conservatively suppresses the complete returned map rather than
-/// selecting one uncertified weighted LCS.
-std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                              ArrayRef<LcsAGapProvenance> gapProvenance,
-                              unsigned long long maxBytes = DEFAULT_MAX_BYTES);
-
 /// \brief Compute a plain deterministic one-sided LCS backmap from A to B.
 ///
 /// This overload is for generic sequence alignment when no owner/provenance

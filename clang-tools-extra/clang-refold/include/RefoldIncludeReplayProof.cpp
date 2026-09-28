@@ -1110,19 +1110,6 @@ bool IncludeReplayProofContext::
              *include.includeNext->selectedSearchChainIndex;
 }
 
-bool IncludeReplayProofContext::IncludeIdIsDescendantOrSelf(
-    uint64_t owner, uint64_t root) const {
-  uint64_t cur = owner;
-  while (true) {
-    if (cur == root)
-      return true;
-    const RefoldModel::IncludeItem *inc = model_.GetIncludeById(cur);
-    if (!inc || !inc->parent)
-      return false;
-    cur = *inc->parent;
-  }
-}
-
 std::optional<std::string>
 IncludeReplayProofContext::ProducerObservedFileSpellingPayload(
     const RefoldModel::MacroInvocation &macro) const {
@@ -1154,7 +1141,7 @@ IncludeReplayProofContext::ObservableMacroOwnerInIncludeSubtree(
   std::optional<uint64_t> owner = site && site->ownerIncludeId
                                       ? site->ownerIncludeId
                                       : macro.ownerIncludeId;
-  if (!owner || !IncludeIdIsDescendantOrSelf(*owner, includeId))
+  if (!owner || !model_.IncludeIsDescendantOrSelf(*owner, includeId))
     return std::nullopt;
   if (!services_.lineStateBuiltinInvocationIsPreservedObserver(macro))
     return std::nullopt;
@@ -1191,7 +1178,7 @@ IncludeReplayProofContext::BuildCleanChildIncludeReplayDemand(
       continue;
     if (descendant.subkind != "#include_next")
       continue;
-    if (!IncludeIdIsDescendantOrSelf(descendant.id, includeId))
+    if (!model_.IncludeIsDescendantOrSelf(descendant.id, includeId))
       continue;
 
     IncludeNextObligation obligation;
@@ -1451,7 +1438,7 @@ IncludeReplayProofContext::PreservedChildIncludeReplayResolver::Replay(
   const RefoldModel::IncludeItem *include =
       context_.model_.GetIncludeById(includeId);
   if (!include ||
-      !context_.IncludeIdIsDescendantOrSelf(includeId, rootChild_.id) ||
+      !context_.model_.IncludeIsDescendantOrSelf(includeId, rootChild_.id) ||
       !include->parent)
     return Fail(includeId);
 

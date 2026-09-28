@@ -104,12 +104,9 @@ producerPhysicalIncludePath(const RefoldModel::IncludeItem &include) {
 /// itself is answered from the one process-wide cache in
 /// `support/RefoldPathCanonicalization.h`, which layers below this one -- the model
 /// among them -- also use, so a path is resolved once no matter who asks.
+/// The oracle itself holds no per-run state.
 class RefoldPathIdentity {
 public:
-  RefoldPathIdentity(const RefoldModel &model,
-                     llvm::StringRef originalWorkingDirectory,
-                     bool emitAbsPaths);
-
   /// Return the cached weakly-canonical spelling for one non-empty path.
   ///
   /// The returned view remains valid for the lifetime of the process. Empty

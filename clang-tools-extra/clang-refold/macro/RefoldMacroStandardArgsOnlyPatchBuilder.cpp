@@ -1365,6 +1365,31 @@ bool RefoldMacroStandardArgsOnlyPatchBuilder::InvocationActualsAreRecoverable(
 }
 
 RefoldMacroStandardArgsOnlyPatchBuilder::ArgsOnlyPatchAttempt
+RefoldMacroStandardArgsOnlyPatchBuilder::AcceptPasteReplayedRewrite(
+    const RefoldModel::MacroInvocation &m,
+    const InvocationActualRecoveryContext &actualRecoveryCtx,
+    const DenseMap<uint32_t, std::string> &replByArgIdx,
+    MacroPatchProofKind proofKind) const {
+  std::optional<InvocationRewriteWithRange> rewrite =
+      deps_.buildInvocationRewriteWithRange(
+          actualRecoveryCtx, replByArgIdx,
+          /*materializedRangeByArgIdx=*/nullptr);
+  if (!rewrite)
+    return ArgsOnlyPatchAttempt::RejectResult();
+
+  MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
+  deps_.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
+      patch, rewrite->materializedOutputByteStart,
+      rewrite->materializedOutputByteEnd);
+  deps_.certifyMacroPatchWholeExpansionBRange(m, patch);
+  MacroPatchProof proof = makeMacroPatchProof(
+      proofKind, /*preservesInvocationStructure=*/true, m.id);
+  proof.paste->replayValidated = true;
+  deps_.macroPatchProofClassifier.SetMacroPatchProof(patch, std::move(proof));
+  return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
+}
+
+RefoldMacroStandardArgsOnlyPatchBuilder::ArgsOnlyPatchAttempt
 RefoldMacroStandardArgsOnlyPatchBuilder::BuildPasteAwareArgsOnlyPatch(
     const ArgsOnlyPlanningContext &ctx) const {
   const RefoldModel::MacroInvocation &m = ctx.invocation;
@@ -1461,24 +1486,9 @@ RefoldMacroStandardArgsOnlyPatchBuilder::BuildPasteAwareArgsOnlyPatch(
   if (!stringifyConstrainedReplacements.empty() &&
       PasteArgumentBuilder().PasteArgReplacementsMatchAllPasteTokensInB(
           m, baseInvText, invArgRanges, stringifyConstrainedReplacements)) {
-    std::optional<InvocationRewriteWithRange> rewrite =
-        deps_.buildInvocationRewriteWithRange(
-            actualRecoveryCtx, stringifyConstrainedReplacements,
-            /*materializedRangeByArgIdx=*/nullptr);
-    if (!rewrite)
-      return ArgsOnlyPatchAttempt::RejectResult();
-
-    MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
-    deps_.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
-        patch, rewrite->materializedOutputByteStart,
-        rewrite->materializedOutputByteEnd);
-    deps_.certifyMacroPatchWholeExpansionBRange(m, patch);
-    MacroPatchProof proof =
-        makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPasteMulti,
-                            /*preservesInvocationStructure=*/true, m.id);
-    proof.paste->replayValidated = true;
-    deps_.macroPatchProofClassifier.SetMacroPatchProof(patch, std::move(proof));
-    return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
+    return AcceptPasteReplayedRewrite(m, actualRecoveryCtx,
+                                      stringifyConstrainedReplacements,
+                                      MacroPatchProofKind::ArgsOnlyPasteMulti);
   }
 
   PasteArgEditsResult edits = PasteArgumentBuilder().DerivePasteArgEdits(m, h);
@@ -1579,36 +1589,9 @@ RefoldMacroStandardArgsOnlyPatchBuilder::BuildPasteAwareArgsOnlyPatch(
       if (!DerivedReplacementsReproduceStringifiedOperands(m, replByArgIdx))
         return ArgsOnlyPatchAttempt::RejectResult();
 
-      std::optional<InvocationRewriteWithRange> rewrite =
-          deps_.buildInvocationRewriteWithRange(
-              actualRecoveryCtx, replByArgIdx,
-              /*materializedRangeByArgIdx=*/nullptr);
-      if (!rewrite)
-        return ArgsOnlyPatchAttempt::RejectResult();
-
-      {
-        MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
-        deps_.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
-            patch, rewrite->materializedOutputByteStart,
-            rewrite->materializedOutputByteEnd);
-        // Paste replay validates the rewritten callsite against every pasted
-        // token occurrence in the expansion.  For the edit map, therefore,
-        // the B-side materialization is the whole expansion cover that the
-        // source argument rewrite regenerates, not merely the first changed
-        // pasted-token hunk.
-        deps_.certifyMacroPatchWholeExpansionBRange(m, patch);
-        MacroPatchProof proof =
-            makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPasteMulti,
-                                /*preservesInvocationStructure=*/true, m.id);
-        // The builder already proved this rewrite by replaying the rewritten
-        // invocation arguments against every pasted token occurrence in B.
-        // Carry that proof source onto the accepted patch for converted
-        // selector-site discharge.
-        proof.paste->replayValidated = true;
-        deps_.macroPatchProofClassifier.SetMacroPatchProof(patch,
-                                                           std::move(proof));
-        return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
-      }
+      return AcceptPasteReplayedRewrite(
+          m, actualRecoveryCtx, replByArgIdx,
+          MacroPatchProofKind::ArgsOnlyPasteMulti);
     }
   }
 
@@ -1658,33 +1641,10 @@ RefoldMacroStandardArgsOnlyPatchBuilder::BuildPasteAwareArgsOnlyPatch(
 
     DenseMap<uint32_t, std::string> singleReplByArgIdx;
     singleReplByArgIdx[argIdx] = std::move(newArg);
-    std::optional<InvocationRewriteWithRange> rewrite =
-        deps_.buildInvocationRewriteWithRange(
-            actualRecoveryCtx, singleReplByArgIdx,
-            /*materializedRangeByArgIdx=*/nullptr);
-    if (!rewrite)
-      return ArgsOnlyPatchAttempt::RejectResult();
-
-    {
-      MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
-      deps_.proofCertifier.CertifyInvocationRewriteMaterializedOutputRange(
-          patch, rewrite->materializedOutputByteStart,
-          rewrite->materializedOutputByteEnd);
-      // As with the multi-paste path, the source argument rewrite is a
-      // compact representation of the macro's replayed expansion surface.
-      // Keep the B-side map anchored to that whole expansion envelope.
-      deps_.certifyMacroPatchWholeExpansionBRange(m, patch);
-      MacroPatchProof proof =
-          makeMacroPatchProof(MacroPatchProofKind::ArgsOnlyPasteSingle,
-                              /*preservesInvocationStructure=*/true, m.id);
-      // Single-segment paste rewrites are admitted only after direct replay
-      // validation against all touched occurrences in B. Record that proof
-      // source explicitly for converted selector-site discharge.
-      proof.paste->replayValidated = true;
-      deps_.macroPatchProofClassifier.SetMacroPatchProof(patch,
-                                                         std::move(proof));
-      return ArgsOnlyPatchAttempt::AcceptedResult(std::move(patch));
-    }
+    // Single-segment paste rewrites are admitted only after direct replay
+    // validation against all touched occurrences in B.
+    return AcceptPasteReplayedRewrite(m, actualRecoveryCtx, singleReplByArgIdx,
+                                      MacroPatchProofKind::ArgsOnlyPasteSingle);
   }
 
   // If we touched paste but could not safely derive a paste splice patch,

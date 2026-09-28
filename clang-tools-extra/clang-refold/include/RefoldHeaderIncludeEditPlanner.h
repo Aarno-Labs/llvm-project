@@ -60,12 +60,6 @@ struct HeaderSourceNeutralityContext;
 /// inputs and emits an IncludeTextEditPlan without owning recursive state.
 class RefoldHeaderIncludeEditPlanner {
 public:
-  using IncludeEdits = ::clang::refold::IncludeEdits;
-  using IncludePatch = ::clang::refold::IncludePatch;
-  using IncludeTextEditPlan = ::clang::refold::IncludeTextEditPlan;
-  using IncludeAnchorWitness = ::clang::refold::IncludeAnchorWitness;
-  using TextEdit = ::clang::refold::TextEdit;
-
   /// Constructs a header-local edit planner over the immutable pass inputs.
   /// The referenced services remain owned by the caller and must outlive the
   /// planner invocation.
@@ -414,11 +408,6 @@ private:
       const RefoldModel::IncludeItem &currentInclude, llvm::StringRef file,
       llvm::StringRef headerText, const RefoldModel::MacroInvocation &macro,
       uint64_t gapBegin, uint64_t gapEnd) const;
-
-  /// Returns whether one include instance is nested below another in the model.
-  /// The check follows producer parent links rather than path identity.
-  bool HeaderIncludeIsDescendantOf(const RefoldModel::IncludeItem &candidate,
-                                   const RefoldModel::IncludeItem &root) const;
 
   /// Proves that a direct child include subtree can be preserved as zero-token.
   /// Descendant includes, macros, conditionals, and macro-state directives must

@@ -82,16 +82,6 @@ class RefoldMacroPatchPlanner {
   // getters, spelling/tuple predicates, `RecoverWholeCoverReuseContext`,
   // and the sub-service accessors).
 public:
-  /// Nested alias for `::clang::refold::MacroPatchReuseAdmissionContext`
-  /// (defined in `RefoldMacroPlannerHelpers.h`).  Declared ahead of its first
-  /// use so the name has a single, consistent meaning throughout the class
-  /// scope (GCC's -Wchanges-meaning otherwise flags the earlier bare uses),
-  /// and kept so planner-internal references — including the qualified
-  /// `RefoldMacroPatchPlanner::MacroPatchReuseAdmissionContext` spellings in
-  /// the .cpp — continue to compile.
-  using MacroPatchReuseAdmissionContext =
-      ::clang::refold::MacroPatchReuseAdmissionContext;
-
   /// Explicit object-graph inputs for the macro-planning service.
   ///
   /// The planner borrows source/model/proof services directly.  Macro
@@ -153,12 +143,6 @@ public:
   /// surface.
   std::optional<std::pair<uint64_t, uint64_t>>
   GetWholeCoverATokRange(const RefoldModel::MacroInvocation &m) const;
-
-  /// Nested-name alias for `::clang::refold::ExistingMacroPatchContext`
-  /// (defined in `RefoldMacroWholeCoverOrchestrator.h`).  Preserved so
-  /// existing external `RefoldMacroPatchPlanner::ExistingMacroPatchContext`
-  /// references stay valid.
-  using ExistingMacroPatchContext = ::clang::refold::ExistingMacroPatchContext;
 
   /// Construct the macro-planning service from explicit borrowed dependencies.
   explicit RefoldMacroPatchPlanner(Dependencies deps);
@@ -301,54 +285,8 @@ public:
       ExistingMacroPatchContext existingContext) const;
 
 private:
-
   RefoldMacroOccurrenceReplay OccurrenceReplay() const;
   RefoldMacroActualLayout ActualLayout() const;
-
-  /// Local aliases for namespace-scope macro-planning carrier types.
-  ///
-  /// The aliases keep planner internals readable while the actual carrier
-  /// definitions live beside the services that share them.
-  ///
-  ///   * `InvocationRewriteWithRange` — an invocation spelling produced by
-  ///     a formal-rewrite path plus the replacement-relative byte interval
-  ///     that materializes B output.
-  ///   * `ActualContentRange` / `InvocationActualLayout` — the parsed
-  ///     callsite formal-content surface used by args-only replay.
-  ///   * `InvocationActualRecoveryContext` — a borrowed view over the
-  ///     above layouts so generated-callee/tuple replay helpers can reuse
-  ///     caller-owned storage without copying.
-  using InvocationRewriteWithRange =
-      ::clang::refold::InvocationRewriteWithRange;
-  using ActualContentRange = ::clang::refold::ActualContentRange;
-  using InvocationActualLayout = ::clang::refold::InvocationActualLayout;
-  using InvocationActualRecoveryContext =
-      ::clang::refold::InvocationActualRecoveryContext;
-
-  /// Nested aliases for the generated-callee replay engine's carrier types
-  /// (defined in `RefoldMacroGeneratedCalleeReplayEngine.h`).
-  ///
-  ///   * `GeneratedCalleeSourceSlot` — a source slot tracked while
-  ///     following a generated-callee chain.
-  ///   * `GeneratedCalleeReplayContext` — the explicit state bundle used
-  ///     during higher-order generated-callee replay; the replay-chain
-  ///     vectors and flags remain caller-owned.
-  using GeneratedCalleeSourceSlot = ::clang::refold::GeneratedCalleeSourceSlot;
-  using GeneratedCalleeReplayContext =
-      ::clang::refold::GeneratedCalleeReplayContext;
-
-  /// Local alias for the generated-leaf replay context defined in
-  /// `RefoldMacroGeneratedLeafReplayEngine.h`.
-  using GeneratedLeafReplayContext =
-      ::clang::refold::GeneratedLeafReplayContext;
-
-  /// Local alias for the tuple-generated-callee replay context.
-  ///
-  /// Tuple replay edits tuple elements inside one root formal; the context
-  /// keeps owner/forwarder identity and object-alias hop counts explicit while
-  /// local tuple solver state stays inside the replay method.
-  using TupleGeneratedCalleeReplayContext =
-      ::clang::refold::TupleGeneratedCalleeReplayContext;
 
   /// Build a concrete rewritten invocation spelling from explicit per-formal
   /// replacements, preserving the materialized-output byte interval logic used

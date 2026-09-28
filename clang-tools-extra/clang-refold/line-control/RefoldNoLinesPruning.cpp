@@ -6,9 +6,9 @@
 // internal helpers that recover location-sensitive predefined macro spans
 // (`__LINE__`, `__FILE__`, `__FILE_NAME__`, `__BASE_FILE__`), assemble the
 // per-B-token ignore mask used by `--check --no-lines`, and run the
-// mask-aware token comparison.  The generic preprocessor invocation
-// (`preprocessToBytes`) and byte-exact token comparison (`compareTokens`)
-// live in `core/RefoldPreprocessRecheck.{h,cpp}`; the raw-lexer producer
+// mask-aware token comparison, which is byte-exact under an empty mask.  The
+// generic preprocessor invocation (`preprocessToBytes`) lives in
+// `source/RefoldPreprocessRecheck.{h,cpp}`; the raw-lexer producer
 // (`lexPPTokens`) lives next to `PPTok` in `source/RefoldToken.{h,cpp}`.
 //
 //===----------------------------------------------------------------------===//

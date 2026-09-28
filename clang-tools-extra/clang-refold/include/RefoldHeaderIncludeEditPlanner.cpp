@@ -241,8 +241,7 @@ RefoldHeaderIncludeEditPlanner::GetHeaderOccurrenceStructureIndex(
   return *entry.index;
 }
 
-RefoldHeaderIncludeEditPlanner::TextEdit
-RefoldHeaderIncludeEditPlanner::MakeTextEditWithResyncOrPending(
+TextEdit RefoldHeaderIncludeEditPlanner::MakeTextEditWithResyncOrPending(
     StringRef original, uint64_t start, uint64_t end, StringRef replacement,
     StringRef fileSpelling, std::optional<uint64_t> ownerIncludeId) const {
   ResyncOutcome outcome = lineObserverLayout_.ApplyResyncOrPend(
@@ -378,29 +377,6 @@ bool RefoldHeaderIncludeEditPlanner::HeaderMacroInvocationIsPreservableGap(
                                                        macro);
 }
 
-bool RefoldHeaderIncludeEditPlanner::HeaderIncludeIsDescendantOf(
-    const RefoldModel::IncludeItem &candidate,
-    const RefoldModel::IncludeItem &root) const {
-  // Walk producer include-parent links rather than inferring ancestry from
-  // paths.  Multiple include instances of the same file may exist, and the
-  // preservation proof is instance-specific.
-  std::optional<uint64_t> cur = candidate.parent;
-  while (cur) {
-    if (*cur == root.id)
-      return true;
-    const RefoldModel::IncludeItem *parent = nullptr;
-    for (const auto &inc : model_.GetIncludes())
-      if (inc.id == *cur) {
-        parent = &inc;
-        break;
-      }
-    if (!parent)
-      return false;
-    cur = parent->parent;
-  }
-  return false;
-}
-
 bool RefoldHeaderIncludeEditPlanner::
     HeaderZeroTokenChildIncludeIsPreservableGap(
         const RefoldModel::IncludeItem &currentInclude, StringRef file,
@@ -426,9 +402,7 @@ bool RefoldHeaderIncludeEditPlanner::
   // A zero-token include subtree may contain nested include directives, but
   // none of those descendants may contribute materialized PP tokens.
   for (const auto &inc : model_.GetIncludes()) {
-    if (&inc == &child)
-      continue;
-    if (!HeaderIncludeIsDescendantOf(inc, child))
+    if (&inc == &child || !model_.IncludeIsDescendantOrSelf(inc.id, child.id))
       continue;
     if (inc.cover.IsValid())
       return false;
@@ -440,15 +414,7 @@ bool RefoldHeaderIncludeEditPlanner::
     // the include is not a neutral gap owner.
     if (!macro.ownerIncludeId)
       continue;
-    bool ownedByChild = *macro.ownerIncludeId == child.id;
-    if (!ownedByChild)
-      for (const auto &inc : model_.GetIncludes())
-        if (inc.id == *macro.ownerIncludeId &&
-            HeaderIncludeIsDescendantOf(inc, child)) {
-          ownedByChild = true;
-          break;
-        }
-    if (ownedByChild &&
+    if (model_.IncludeIsDescendantOrSelf(*macro.ownerIncludeId, child.id) &&
         RefoldSourceNeutralityProof::MacroInvocationHasMaterializedPPTokens(
             macro))
       return false;
@@ -460,15 +426,7 @@ bool RefoldHeaderIncludeEditPlanner::
     // zero-token gap would silently discard live conditional output.
     if (!group.parentIncludeId)
       continue;
-    bool ownedByChild = *group.parentIncludeId == child.id;
-    if (!ownedByChild)
-      for (const auto &inc : model_.GetIncludes())
-        if (inc.id == *group.parentIncludeId &&
-            HeaderIncludeIsDescendantOf(inc, child)) {
-          ownedByChild = true;
-          break;
-        }
-    if (!ownedByChild)
+    if (!model_.IncludeIsDescendantOrSelf(*group.parentIncludeId, child.id))
       continue;
     for (const RefoldModel::CondArm &arm : group.arms)
       if (arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end)
@@ -482,15 +440,7 @@ bool RefoldHeaderIncludeEditPlanner::
     // the transition could change how the replacement preprocesses.
     if (!directive.ownerIncludeId)
       continue;
-    bool ownedByChild = *directive.ownerIncludeId == child.id;
-    if (!ownedByChild)
-      for (const auto &inc : model_.GetIncludes())
-        if (inc.id == *directive.ownerIncludeId &&
-            HeaderIncludeIsDescendantOf(inc, child)) {
-          ownedByChild = true;
-          break;
-        }
-    if (!ownedByChild)
+    if (!model_.IncludeIsDescendantOrSelf(*directive.ownerIncludeId, child.id))
       continue;
     if (macroStateProof_.ReplacementObservesMacroStateDirective(
             directive, replacement, /*unparseableObserves=*/false))
@@ -675,14 +625,8 @@ bool RefoldHeaderIncludeEditPlanner::
 bool RefoldHeaderIncludeEditPlanner::IncludeOwnsDirective(
     const RefoldModel::MacroDirective &directive,
     const RefoldModel::IncludeItem &root) const {
-  if (!directive.ownerIncludeId)
-    return false;
-  if (*directive.ownerIncludeId == root.id)
-    return true;
-  for (const auto &inc : model_.GetIncludes())
-    if (inc.id == *directive.ownerIncludeId)
-      return HeaderIncludeIsDescendantOf(inc, root);
-  return false;
+  return directive.ownerIncludeId &&
+         model_.IncludeIsDescendantOrSelf(*directive.ownerIncludeId, root.id);
 }
 
 bool RefoldHeaderIncludeEditPlanner::RecordedMacroDirectiveMatchesOwnerFile(
@@ -2677,7 +2621,7 @@ bool RefoldHeaderIncludeEditPlanner::PlanPureInsertionPatch(
   return false;
 }
 
-RefoldHeaderIncludeEditPlanner::IncludeTextEditPlan
+IncludeTextEditPlan
 RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
                                         std::string headerText) const {
   const std::string file = refoldIncludeEnteredFileSpelling(*ie.include);

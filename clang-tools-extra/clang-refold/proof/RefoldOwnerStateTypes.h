@@ -762,45 +762,6 @@ struct OwnerStateFacts {
     return !conditionalStateEvents.empty();
   }
 
-  /// Copy theorem-facing component facts from `other`.
-  OwnerStateFacts &MergeTheoremFactsFrom(const OwnerStateFacts &other) {
-    for (const MacroStateIdentity &identity : other.macroDefinitions)
-      AddMacroDefinition(identity);
-    for (const MacroStateIdentity &identity : other.macroUndefinitions)
-      AddMacroUndefinition(identity);
-    for (const MacroStateIdentity &identity : other.macroRequirements)
-      AddMacroRequirement(identity);
-    for (const MacroStateObservation &observation :
-         other.macroExpansionObservations)
-      AddMacroObservation(observation);
-    for (const MacroStateObservation &observation :
-         other.definedOperatorObservations)
-      AddMacroObservation(observation);
-    for (const MacroStateObservation &observation :
-         other.conditionalMacroObservations)
-      AddMacroObservation(observation);
-    for (const LineControlStateIdentity &identity : other.lineControlEvents)
-      AddLineControlEvent(identity);
-    for (const BuiltinLocationObservation &observation :
-         other.builtinLocationObservations)
-      AddBuiltinLocationObservation(observation);
-    for (const CounterEventIdentity &identity : other.counterEvents)
-      AddCounterEvent(identity);
-    for (const PragmaStateIdentity &identity : other.pragmaStateEvents)
-      AddPragmaStateEvent(identity);
-    for (const IncludeStateIdentity &identity : other.includeStateEvents)
-      AddIncludeStateEvent(identity);
-    for (const IncludeGuardStateIdentity &identity :
-         other.includeGuardStateEvents)
-      AddIncludeGuardStateEvent(identity);
-    for (const ConditionalStateIdentity &identity :
-         other.conditionalStateEvents)
-      AddConditionalStateEvent(identity);
-    for (const MissingStateFact &fact : other.missingStateFacts)
-      AddMissingStateFact(fact.kind, fact.detail);
-    return *this;
-  }
-
   bool HasTheoremUnknownPragmaState() const {
     if (HasMissingFactKind(MissingStateFactKind::MissingPragmaFacts))
       return true;
@@ -1023,19 +984,6 @@ struct OwnerStateDelta {
     observes.MergeFrom(other.observes);
     mutates.MergeFrom(other.mutates);
     exit.MergeFrom(other.exit);
-    return *this;
-  }
-
-  /// Merge theorem-facing component facts from another delta.
-  ///
-  /// This path keeps the Entry/Observes/Mutates/Exit bucket structure intact
-  /// while preserving the precise per-component facts already attached to the
-  /// source delta.
-  OwnerStateDelta &MergeTheoremFactsFrom(const OwnerStateDelta &other) {
-    entry.MergeTheoremFactsFrom(other.entry);
-    observes.MergeTheoremFactsFrom(other.observes);
-    mutates.MergeTheoremFactsFrom(other.mutates);
-    exit.MergeTheoremFactsFrom(other.exit);
     return *this;
   }
 };

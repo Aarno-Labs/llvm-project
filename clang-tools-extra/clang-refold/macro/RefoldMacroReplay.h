@@ -274,6 +274,15 @@ public:
       std::optional<uint64_t> ownerIncludeId = std::nullopt) const;
 
 private:
+  /// Return the shortest source-spelled invocation whose cover ends at
+  /// `aGap` (or, unless `rightBoundaryOnly`, begins there) and that has itself
+  /// or a descendant satisfying `witness`; equal lengths prefer the lower id.
+  const RefoldModel::MacroInvocation *ShortestBoundarySourceMacro(
+      uint64_t aGap, std::optional<uint64_t> ownerIncludeId,
+      bool rightBoundaryOnly,
+      llvm::function_ref<bool(const RefoldModel::MacroInvocation &)> witness)
+      const;
+
   const RefoldModel &model_;
   const RefoldMacroTopology &macroTopology_;
   const RefoldSourceMapper &sourceMapper_;

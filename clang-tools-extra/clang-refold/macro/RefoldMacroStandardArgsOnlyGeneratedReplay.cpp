@@ -48,14 +48,6 @@ namespace clang {
 namespace refold {
 namespace {
 
-/// Boundary-lexed token carrier for parent-tuple generated-callee replay.
-///
-struct ParentTupleCalleeReplayTok {
-  std::string spelling;
-  size_t begin = 0;
-  size_t end = 0;
-};
-
 /// Boundary-lexed token with byte offsets inside a replay text slice.
 ///
 /// The standard args-only builder uses this local carrier for replay helpers
@@ -67,12 +59,9 @@ struct ReplayTok {
   size_t end = 0;
 };
 
-/// Compare a parent-tuple callee replay token subrange against expected
-/// spellings.  The parent-tuple solver uses its own replay-token carrier, so
-/// this helper is deliberately typed to that carrier instead of the generic
-/// generated-callee replay token used by other local solvers.
+/// Compare a replay token subrange against expected spellings.
 bool replayTokenRangeSpellingsEqual(
-    llvm::ArrayRef<ParentTupleCalleeReplayTok> toks, size_t begin,
+    llvm::ArrayRef<ReplayTok> toks, size_t begin,
     llvm::ArrayRef<std::string> expected) {
   if (begin + expected.size() > toks.size())
     return false;
@@ -184,175 +173,6 @@ tokenSpellingsForReplayText(StringRef text, const clang::LangOptions &lexLang) {
   return out;
 }
 
-/// Classifies one element in the standard-args generated-callee replay tree.
-enum class StandardArgsGeneratedCalleeReplayKind {
-  /// Literal replacement token.
-  Literal,
-  /// Formal parameter reference.
-  Param,
-  /// Conditional `__VA_OPT__` payload.
-  VaOpt,
-  /// Stringification of a formal parameter.
-  Stringify,
-  /// Token-paste expression.
-  Paste
-};
-
-/// One literal or parameter piece inside a generated-callee paste expression.
-struct StandardArgsGeneratedCalleePastePiece {
-  /// Whether this paste piece references a formal parameter.
-  bool isParam = false;
-
-  /// Formal parameter index when `isParam` is true.
-  uint32_t paramIdx = 0;
-
-  /// Literal spelling when `isParam` is false.
-  std::string literal;
-};
-
-/// One parsed element of the standard-args generated-callee replay tree.
-struct StandardArgsGeneratedCalleeReplayElem {
-  /// Element kind controlling which payload fields are meaningful.
-  StandardArgsGeneratedCalleeReplayKind kind =
-      StandardArgsGeneratedCalleeReplayKind::Literal;
-
-  /// Literal spelling for literal replay elements.
-  std::string literal;
-
-  /// Formal parameter index for parameter or stringification elements.
-  uint32_t paramIdx = 0;
-
-  /// Ordered nested replay elements for `__VA_OPT__` payloads.
-  std::vector<StandardArgsGeneratedCalleeReplayElem> children;
-
-  /// Ordered paste pieces for token-paste replay elements.
-  std::vector<StandardArgsGeneratedCalleePastePiece> pastePieces;
-};
-
-/// Parses a standard-args generated-callee replacement list into replay nodes.
-///
-/// The parser trusts the selected callee definition and the recovered old
-/// actual slots.  It preserves replacement-token order and fails closed for
-/// malformed stringification, malformed paste chains, out-of-range formal
-/// references, and unsupported `__VA_OPT__` payloads.
-class StandardArgsGeneratedCalleeReplayParser {
-public:
-  StandardArgsGeneratedCalleeReplayParser(
-      const RefoldModel::MacroDirective &definition,
-      ArrayRef<std::string> oldActuals)
-      : definition_(definition), oldActuals_(oldActuals) {}
-
-  /// Parses `begin..end` into ordered replay elements.
-  bool Parse(size_t begin, size_t end,
-             std::vector<StandardArgsGeneratedCalleeReplayElem> &out) const {
-    for (size_t i = begin; i < end;) {
-      const auto &tok = definition_.replacementTokens[i];
-
-      // Accept only the canonical stringification form: # <formal-param>.
-      if (tok.spelling == "#") {
-        if (i + 1 >= end ||
-            definition_.replacementTokens[i + 1].kind !=
-                RefoldModel::MacroReplacementTokenKind::ParamRef ||
-            !definition_.replacementTokens[i + 1].paramIndex)
-          return false;
-        const uint32_t paramIdx =
-            *definition_.replacementTokens[i + 1].paramIndex;
-        if (paramIdx >= oldActuals_.size())
-          return false;
-        StandardArgsGeneratedCalleeReplayElem elem;
-        elem.kind = StandardArgsGeneratedCalleeReplayKind::Stringify;
-        elem.paramIdx = paramIdx;
-        out.push_back(std::move(elem));
-        i += 2;
-        continue;
-      }
-
-      // A paste replay element begins when the next replacement token is ##.
-      // The full paste chain is consumed left-to-right.
-      if (i + 1 < end &&
-          definition_.replacementTokens[i + 1].spelling == "##") {
-        StandardArgsGeneratedCalleeReplayElem elem;
-        elem.kind = StandardArgsGeneratedCalleeReplayKind::Paste;
-        StandardArgsGeneratedCalleePastePiece first;
-        if (!PastePieceFromReplacementToken(tok, first))
-          return false;
-        elem.pastePieces.push_back(std::move(first));
-        i += 2;
-        while (true) {
-          if (i >= end)
-            return false;
-          StandardArgsGeneratedCalleePastePiece next;
-          if (!PastePieceFromReplacementToken(definition_.replacementTokens[i],
-                                             next))
-            return false;
-          elem.pastePieces.push_back(std::move(next));
-          ++i;
-          if (i >= end || definition_.replacementTokens[i].spelling != "##")
-            break;
-          ++i;
-        }
-        out.push_back(std::move(elem));
-        continue;
-      }
-
-      if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
-        if (!tok.paramIndex || *tok.paramIndex >= oldActuals_.size())
-          return false;
-        StandardArgsGeneratedCalleeReplayElem elem;
-        elem.kind = StandardArgsGeneratedCalleeReplayKind::Param;
-        elem.paramIdx = *tok.paramIndex;
-        out.push_back(std::move(elem));
-        ++i;
-        continue;
-      }
-      if (tok.spelling == "##")
-        return false;
-      if (tok.spelling == "__VA_OPT__") {
-        std::optional<size_t> close =
-            findVaOptPayloadClose(definition_, i, end);
-        if (!close)
-          return false;
-        StandardArgsGeneratedCalleeReplayElem elem;
-        elem.kind = StandardArgsGeneratedCalleeReplayKind::VaOpt;
-        if (!Parse(i + 2, *close, elem.children))
-          return false;
-        out.push_back(std::move(elem));
-        i = *close + 1;
-        continue;
-      }
-      StandardArgsGeneratedCalleeReplayElem elem;
-      elem.kind = StandardArgsGeneratedCalleeReplayKind::Literal;
-      elem.literal = tok.spelling.str();
-      out.push_back(std::move(elem));
-      ++i;
-    }
-    return true;
-  }
-
-private:
-  /// Converts one replacement token into a replay-safe paste piece.
-  bool PastePieceFromReplacementToken(
-      const RefoldModel::MacroReplacementToken &tok,
-      StandardArgsGeneratedCalleePastePiece &piece) const {
-    if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
-      if (!tok.paramIndex || *tok.paramIndex >= oldActuals_.size())
-        return false;
-      piece.isParam = true;
-      piece.paramIdx = *tok.paramIndex;
-      return true;
-    }
-    if (tok.spelling == "#" || tok.spelling == "##" ||
-        tok.spelling == "__VA_OPT__")
-      return false;
-    piece.isParam = false;
-    piece.literal = tok.spelling.str();
-    return true;
-  }
-
-  const RefoldModel::MacroDirective &definition_;
-  ArrayRef<std::string> oldActuals_;
-};
-
 /// Matches the old generated-callee expansion against the replay tree.
 ///
 /// This is the A-side proof for the parent-tuple bridge.  It preserves replay
@@ -361,7 +181,7 @@ private:
 class OldExpansionReplayMatcher {
 public:
   OldExpansionReplayMatcher(
-      ArrayRef<StandardArgsGeneratedCalleeReplayElem> replayPattern,
+      ArrayRef<GeneratedReplayElem> replayPattern,
       ArrayRef<SmallVector<std::string, 16>> oldActualTokSpellings,
       ArrayRef<std::string> oldActuals, const clang::LangOptions &lexLang)
       : replayPattern_(replayPattern),
@@ -379,21 +199,21 @@ public:
 
 private:
   /// Recursively collects token end positions reachable from `pos`.
-  void MatchEnds(ArrayRef<StandardArgsGeneratedCalleeReplayElem> elems,
+  void MatchEnds(ArrayRef<GeneratedReplayElem> elems,
                  ArrayRef<ReplayTok> toks, size_t pos,
                  SmallVectorImpl<size_t> &ends) const {
     if (elems.empty()) {
       ends.push_back(pos);
       return;
     }
-    const StandardArgsGeneratedCalleeReplayElem &elem = elems.front();
-    ArrayRef<StandardArgsGeneratedCalleeReplayElem> rest = elems.drop_front();
+    const GeneratedReplayElem &elem = elems.front();
+    ArrayRef<GeneratedReplayElem> rest = elems.drop_front();
     switch (elem.kind) {
-    case StandardArgsGeneratedCalleeReplayKind::Literal:
+    case GeneratedReplayKind::Literal:
       if (pos < toks.size() && toks[pos].spelling == elem.literal)
         MatchEnds(rest, toks, pos + 1, ends);
       return;
-    case StandardArgsGeneratedCalleeReplayKind::Param: {
+    case GeneratedReplayKind::Param: {
       const auto &expected = oldActualTokSpellings_[elem.paramIdx];
       if (pos + expected.size() > toks.size())
         return;
@@ -403,7 +223,7 @@ private:
       MatchEnds(rest, toks, pos + expected.size(), ends);
       return;
     }
-    case StandardArgsGeneratedCalleeReplayKind::Stringify: {
+    case GeneratedReplayKind::Stringify: {
       if (pos >= toks.size())
         return;
       std::optional<std::string> content =
@@ -417,11 +237,11 @@ private:
       MatchEnds(rest, toks, pos + 1, ends);
       return;
     }
-    case StandardArgsGeneratedCalleeReplayKind::Paste: {
+    case GeneratedReplayKind::Paste: {
       if (pos >= toks.size())
         return;
       std::string expected;
-      for (const StandardArgsGeneratedCalleePastePiece &piece :
+      for (const GeneratedPastePiece &piece :
            elem.pastePieces) {
         if (piece.isParam)
           expected += StringRef(oldActuals_[piece.paramIdx]).trim();
@@ -433,7 +253,7 @@ private:
       MatchEnds(rest, toks, pos + 1, ends);
       return;
     }
-    case StandardArgsGeneratedCalleeReplayKind::VaOpt: {
+    case GeneratedReplayKind::VaOpt: {
       // First preserve the erased-payload path, then try the payload-present
       // path and continue only when the payload consumes at least one token.
       MatchEnds(rest, toks, pos, ends);
@@ -447,7 +267,7 @@ private:
     }
   }
 
-  ArrayRef<StandardArgsGeneratedCalleeReplayElem> replayPattern_;
+  ArrayRef<GeneratedReplayElem> replayPattern_;
   ArrayRef<SmallVector<std::string, 16>> oldActualTokSpellings_;
   ArrayRef<std::string> oldActuals_;
   const clang::LangOptions &lexLang_;
@@ -461,7 +281,7 @@ private:
 class NewExpansionUniqueSolver {
 public:
   NewExpansionUniqueSolver(
-      ArrayRef<StandardArgsGeneratedCalleeReplayElem> replayPattern,
+      ArrayRef<GeneratedReplayElem> replayPattern,
       size_t calleeParamCount, ArrayRef<bool> variadicParamByIdx,
       const clang::LangOptions &lexLang)
       : replayPattern_(replayPattern), calleeParamCount_(calleeParamCount),
@@ -491,7 +311,7 @@ private:
 
   /// DFSes replay elements against the token stream in deterministic order.
   void Dfs(StringRef expansion, ArrayRef<ReplayTok> toks,
-           ArrayRef<StandardArgsGeneratedCalleeReplayElem> elems,
+           ArrayRef<GeneratedReplayElem> elems,
            size_t tokPos, AssignedRanges &curAssigned,
            std::optional<bool> vaOptPayloadPresent,
            SmallVectorImpl<SmallVector<std::string, 8>> &solutions) const {
@@ -503,22 +323,22 @@ private:
       return;
     }
 
-    const StandardArgsGeneratedCalleeReplayElem &elem = elems.front();
-    ArrayRef<StandardArgsGeneratedCalleeReplayElem> rest = elems.drop_front();
+    const GeneratedReplayElem &elem = elems.front();
+    ArrayRef<GeneratedReplayElem> rest = elems.drop_front();
     switch (elem.kind) {
-    case StandardArgsGeneratedCalleeReplayKind::Literal:
+    case GeneratedReplayKind::Literal:
       if (tokPos < toks.size() && toks[tokPos].spelling == elem.literal)
         Dfs(expansion, toks, rest, tokPos + 1, curAssigned,
             vaOptPayloadPresent, solutions);
       return;
-    case StandardArgsGeneratedCalleeReplayKind::Param:
+    case GeneratedReplayKind::Param:
       DfsParam(expansion, toks, rest, elem.paramIdx, tokPos, curAssigned,
                vaOptPayloadPresent, solutions);
       return;
-    case StandardArgsGeneratedCalleeReplayKind::Stringify:
-    case StandardArgsGeneratedCalleeReplayKind::Paste:
+    case GeneratedReplayKind::Stringify:
+    case GeneratedReplayKind::Paste:
       return;
-    case StandardArgsGeneratedCalleeReplayKind::VaOpt: {
+    case GeneratedReplayKind::VaOpt: {
       // `__VA_OPT__` is semantically controlled by the variadic argument for
       // the same macro.  Track the chosen branch and validate it after the
       // variadic formal has been solved, so the erased branch cannot steal an
@@ -541,7 +361,7 @@ private:
 
   /// Enumerates a parameter binding in increasing token-end order.
   void DfsParam(StringRef expansion, ArrayRef<ReplayTok> toks,
-                ArrayRef<StandardArgsGeneratedCalleeReplayElem> rest,
+                ArrayRef<GeneratedReplayElem> rest,
                 uint32_t paramIdx, size_t tokPos, AssignedRanges &curAssigned,
                 std::optional<bool> vaOptPayloadPresent,
                 SmallVectorImpl<SmallVector<std::string, 8>> &solutions) const {
@@ -570,8 +390,8 @@ private:
   /// DFSes a `__VA_OPT__` payload and then resumes the parent suffix.
   void DfsVaOptChildren(
       StringRef expansion, ArrayRef<ReplayTok> toks,
-      ArrayRef<StandardArgsGeneratedCalleeReplayElem> childElems,
-      ArrayRef<StandardArgsGeneratedCalleeReplayElem> parentRest,
+      ArrayRef<GeneratedReplayElem> childElems,
+      ArrayRef<GeneratedReplayElem> parentRest,
       size_t parentTokPos, size_t childTokPos, AssignedRanges &childAssigned,
       std::optional<bool> vaOptPayloadPresent,
       SmallVectorImpl<SmallVector<std::string, 8>> &solutions) const {
@@ -582,25 +402,25 @@ private:
       return;
     }
 
-    const StandardArgsGeneratedCalleeReplayElem &child = childElems.front();
-    ArrayRef<StandardArgsGeneratedCalleeReplayElem> childRest =
+    const GeneratedReplayElem &child = childElems.front();
+    ArrayRef<GeneratedReplayElem> childRest =
         childElems.drop_front();
     switch (child.kind) {
-    case StandardArgsGeneratedCalleeReplayKind::Literal:
+    case GeneratedReplayKind::Literal:
       if (childTokPos < toks.size() &&
           toks[childTokPos].spelling == child.literal)
         DfsVaOptChildren(expansion, toks, childRest, parentRest, parentTokPos,
                          childTokPos + 1, childAssigned, vaOptPayloadPresent,
                          solutions);
       return;
-    case StandardArgsGeneratedCalleeReplayKind::Param:
+    case GeneratedReplayKind::Param:
       DfsVaOptParam(expansion, toks, childRest, parentRest, parentTokPos,
                     child.paramIdx, childTokPos, childAssigned,
                     vaOptPayloadPresent, solutions);
       return;
-    case StandardArgsGeneratedCalleeReplayKind::Stringify:
-    case StandardArgsGeneratedCalleeReplayKind::Paste:
-    case StandardArgsGeneratedCalleeReplayKind::VaOpt:
+    case GeneratedReplayKind::Stringify:
+    case GeneratedReplayKind::Paste:
+    case GeneratedReplayKind::VaOpt:
       return;
     }
   }
@@ -608,8 +428,8 @@ private:
   /// Enumerates parameter slices inside a `__VA_OPT__` payload.
   void DfsVaOptParam(
       StringRef expansion, ArrayRef<ReplayTok> toks,
-      ArrayRef<StandardArgsGeneratedCalleeReplayElem> childRest,
-      ArrayRef<StandardArgsGeneratedCalleeReplayElem> parentRest,
+      ArrayRef<GeneratedReplayElem> childRest,
+      ArrayRef<GeneratedReplayElem> parentRest,
       size_t parentTokPos, uint32_t paramIdx, size_t childTokPos,
       AssignedRanges &childAssigned, std::optional<bool> vaOptPayloadPresent,
       SmallVectorImpl<SmallVector<std::string, 8>> &solutions) const {
@@ -679,163 +499,11 @@ private:
     return true;
   }
 
-  ArrayRef<StandardArgsGeneratedCalleeReplayElem> replayPattern_;
+  ArrayRef<GeneratedReplayElem> replayPattern_;
   size_t calleeParamCount_ = 0;
   SmallVector<bool, 8> variadicParamByIdx_;
   const clang::LangOptions &lexLang_;
 };
-
-/// One literal or parameter element in the simple forwarded-callee replay.
-struct ForwardedGeneratedCalleeReplayElem {
-  /// Whether this element references a callee formal parameter.
-  bool isParam = false;
-
-  /// Literal spelling when `isParam` is false.
-  std::string literal;
-
-  /// Formal parameter index when `isParam` is true.
-  uint32_t paramIdx = 0;
-};
-
-/// Solves the direct tuple-ref forwarded-callee replay sub-engine.
-///
-/// This resolver keeps the simpler carrier used by the child-forwarding bridge:
-/// only literal and parameter elements are accepted, while `#`, `##`, and
-/// `__VA_OPT__` remain unsupported and cause the caller to skip this optional
-/// proof path without changing fallback policy.
-class ForwardedGeneratedCalleeReplaySolver {
-public:
-  ForwardedGeneratedCalleeReplaySolver(
-      ArrayRef<ForwardedGeneratedCalleeReplayElem> replayPattern,
-      ArrayRef<SmallVector<std::string, 8>> oldActualTokSpellings,
-      size_t calleeParamCount, const clang::LangOptions &lexLang)
-      : replayPattern_(replayPattern),
-        oldActualTokSpellings_(oldActualTokSpellings),
-        calleeParamCount_(calleeParamCount), lexLang_(lexLang) {}
-
-  /// Returns whether the old expansion is exactly explained by old actuals.
-  bool MatchOldExpansion(StringRef oldExpansion) const {
-    SmallVector<ParentTupleCalleeReplayTok, 16> toks;
-    lexReplayTokens(oldExpansion, lexLang_, toks);
-    size_t pos = 0;
-    for (const ForwardedGeneratedCalleeReplayElem &elem : replayPattern_) {
-      if (!elem.isParam) {
-        if (pos >= toks.size() || toks[pos].spelling != elem.literal)
-          return false;
-        ++pos;
-        continue;
-      }
-      const auto &expected = oldActualTokSpellings_[elem.paramIdx];
-      if (!replayTokenRangeSpellingsEqual(toks, pos, expected))
-        return false;
-      pos += expected.size();
-    }
-    return pos == toks.size();
-  }
-
-  /// Solves new callee actual text if the B-side assignment is unique.
-  std::optional<SmallVector<std::string, 4>>
-  SolveNewExpansion(StringRef newExpansion) const {
-    SmallVector<ParentTupleCalleeReplayTok, 16> toks;
-    lexReplayTokens(newExpansion, lexLang_, toks);
-    AssignedRanges assigned;
-    assigned.resize(calleeParamCount_);
-    SmallVector<SmallVector<std::string, 4>, 4> solutions;
-
-    Dfs(newExpansion, toks, 0, 0, assigned, solutions);
-    if (solutions.size() != 1)
-      return std::nullopt;
-    return solutions.front();
-  }
-
-private:
-  using AssignedRanges = SmallVector<std::optional<std::pair<size_t, size_t>>, 4>;
-
-  /// DFSes the simple forwarded replay pattern in left-to-right order.
-  void Dfs(StringRef expansion, ArrayRef<ParentTupleCalleeReplayTok> toks,
-           size_t elemIdx, size_t tokPos, AssignedRanges &assigned,
-           SmallVectorImpl<SmallVector<std::string, 4>> &solutions) const {
-    if (solutions.size() > 1)
-      return;
-    if (elemIdx == replayPattern_.size()) {
-      MaybeRecordSolution(expansion, toks, tokPos, assigned, solutions);
-      return;
-    }
-
-    const ForwardedGeneratedCalleeReplayElem &elem = replayPattern_[elemIdx];
-    if (!elem.isParam) {
-      if (tokPos < toks.size() && toks[tokPos].spelling == elem.literal)
-        Dfs(expansion, toks, elemIdx + 1, tokPos + 1, assigned, solutions);
-      return;
-    }
-
-    DfsParam(expansion, toks, elemIdx, tokPos, elem.paramIdx, assigned,
-             solutions);
-  }
-
-  /// Enumerates one parameter binding in increasing token-end order.
-  void DfsParam(StringRef expansion,
-                ArrayRef<ParentTupleCalleeReplayTok> toks, size_t elemIdx,
-                size_t tokPos, uint32_t paramIdx, AssignedRanges &assigned,
-                SmallVectorImpl<SmallVector<std::string, 4>> &solutions) const {
-    if (paramIdx >= assigned.size())
-      return;
-    if (assigned[paramIdx]) {
-      const auto range = *assigned[paramIdx];
-      const size_t width = range.second - range.first;
-      if (tokPos + width <= toks.size() &&
-          TokenRangesHaveSameSpellings(toks, range.first, tokPos, width))
-        Dfs(expansion, toks, elemIdx + 1, tokPos + width, assigned, solutions);
-      return;
-    }
-
-    for (size_t end = tokPos; end <= toks.size(); ++end) {
-      assigned[paramIdx] = std::make_pair(tokPos, end);
-      Dfs(expansion, toks, elemIdx + 1, end, assigned, solutions);
-      assigned[paramIdx].reset();
-      if (solutions.size() > 1)
-        return;
-    }
-  }
-
-  /// Records a solved actual vector when all replay tokens are consumed.
-  void MaybeRecordSolution(
-      StringRef expansion, ArrayRef<ParentTupleCalleeReplayTok> toks,
-      size_t tokPos, const AssignedRanges &assigned,
-      SmallVectorImpl<SmallVector<std::string, 4>> &solutions) const {
-    if (tokPos != toks.size())
-      return;
-    SmallVector<std::string, 4> actuals;
-    for (const auto &range : assigned) {
-      if (!range)
-        return;
-      if (range->first == range->second) {
-        actuals.push_back(std::string());
-        continue;
-      }
-      const size_t byteBegin = toks[range->first].begin;
-      const size_t byteEnd = toks[range->second - 1].end;
-      actuals.push_back(expansion.slice(byteBegin, byteEnd).str());
-    }
-    solutions.push_back(std::move(actuals));
-  }
-
-  /// Compares two same-width token ranges by spelling.
-  bool TokenRangesHaveSameSpellings(
-      ArrayRef<ParentTupleCalleeReplayTok> toks, size_t lhsBegin,
-      size_t rhsBegin, size_t width) const {
-    for (size_t i = 0; i < width; ++i)
-      if (toks[lhsBegin + i].spelling != toks[rhsBegin + i].spelling)
-        return false;
-    return true;
-  }
-
-  ArrayRef<ForwardedGeneratedCalleeReplayElem> replayPattern_;
-  ArrayRef<SmallVector<std::string, 8>> oldActualTokSpellings_;
-  size_t calleeParamCount_ = 0;
-  const clang::LangOptions &lexLang_;
-};
-
 
 /// Resolves the parent tuple generated-callee bridge for one caller argument.
 ///
@@ -1018,7 +686,7 @@ public:
           TupleElementText(tuplePayload, tupleElems, ref.forwarderParamIdx));
     }
 
-    SmallVector<StringRef, 8> oldCalleeActualPieces;
+    SmallVector<std::string, 8> oldCalleeActualPieces;
     if (adjacencyGeneratedCall) {
       // In the adjacency form `f t`, the forwarding formal `t` supplies the
       // complete macro-call actual list, including the surrounding parentheses.
@@ -1028,52 +696,33 @@ public:
       // LOG("x", A, B) without collapsing the parent tuple.
       if (oldGeneratedActualPieces.size() != 1 || generatedArgs.size() != 1)
         return false;
-      if (!CollectParenthesizedAdjacencyActuals(oldGeneratedActualPieces.front(),
-                                                oldCalleeActualPieces))
+      if (!collectParenthesizedTupleGeneratedActuals(
+              oldGeneratedActualPieces.front(), deps_.lexLang,
+              oldCalleeActualPieces))
         return false;
     } else {
-      oldCalleeActualPieces.append(oldGeneratedActualPieces.begin(),
-                                   oldGeneratedActualPieces.end());
+      for (StringRef piece : oldGeneratedActualPieces)
+        oldCalleeActualPieces.push_back(piece.str());
     }
-
-    const bool calleeHasVariadic = !calleeDefinition->defParams.empty() &&
-                                   calleeDefinition->defParams.back().variadic;
-    const size_t fixedCalleeActuals =
-        calleeHasVariadic ? calleeDefinition->defParams.size() - 1
-                          : calleeDefinition->defParams.size();
-    if ((!calleeHasVariadic &&
-         oldCalleeActualPieces.size() != calleeDefinition->defParams.size()) ||
-        (calleeHasVariadic &&
-         oldCalleeActualPieces.size() < fixedCalleeActuals))
-      return false;
 
     // Repackage the tuple pieces as the actual list of the generated callee.  For
     // a variadic callee, all generated tail pieces are joined into the one
     // variadic formal spelling; the inverse mapping back to tuple elements is
     // performed after solving the new expansion.
-    SmallVector<std::string, 8> &oldActuals = state.oldActuals;
-    oldActuals.reserve(calleeDefinition->defParams.size());
-    for (size_t i = 0; i < fixedCalleeActuals; ++i)
-      oldActuals.push_back(oldCalleeActualPieces[i].str());
-    if (calleeHasVariadic) {
-      std::string variadicText;
-      raw_string_ostream os(variadicText);
-      for (size_t i = fixedCalleeActuals; i < oldCalleeActualPieces.size();
-           ++i) {
-        if (i != fixedCalleeActuals)
-          os << ", ";
-        os << oldCalleeActualPieces[i].trim();
-      }
-      os.flush();
-      oldActuals.push_back(std::move(variadicText));
-    }
-    if (oldActuals.size() != calleeDefinition->defParams.size())
+    std::optional<SmallVector<std::string, 8>> foldedActuals =
+        foldCalleeActualPieces(*calleeDefinition, oldCalleeActualPieces);
+    if (!foldedActuals)
       return false;
+    SmallVector<std::string, 8> &oldActuals = state.oldActuals;
+    oldActuals.append(foldedActuals->begin(), foldedActuals->end());
 
-    std::vector<StandardArgsGeneratedCalleeReplayElem> calleePattern;
-    StandardArgsGeneratedCalleeReplayParser calleeParser(
+    std::vector<GeneratedReplayElem> calleePattern;
+    bool usesStringification = false;
+    bool usesPaste = false;
+    GeneratedCalleeReplayPatternParser calleeParser(
         *calleeDefinition,
-        ArrayRef<std::string>(oldActuals.data(), oldActuals.size()));
+        ArrayRef<std::string>(oldActuals.data(), oldActuals.size()),
+        usesStringification, usesPaste);
     if (!calleeParser.Parse(0, calleeDefinition->replacementTokens.size(),
                             calleePattern) ||
         calleePattern.empty())
@@ -1085,7 +734,7 @@ public:
           tokenSpellingsForReplayText(actual, deps_.lexLang));
 
     OldExpansionReplayMatcher oldExpansionMatcher(
-        ArrayRef<StandardArgsGeneratedCalleeReplayElem>(calleePattern.data(),
+        ArrayRef<GeneratedReplayElem>(calleePattern.data(),
                                                         calleePattern.size()),
         ArrayRef<SmallVector<std::string, 16>>(
             oldActualTokSpellings.data(), oldActualTokSpellings.size()),
@@ -1098,7 +747,7 @@ public:
       variadicParamByIdx.push_back(param.variadic);
 
     NewExpansionUniqueSolver newExpansionSolver(
-        ArrayRef<StandardArgsGeneratedCalleeReplayElem>(calleePattern.data(),
+        ArrayRef<GeneratedReplayElem>(calleePattern.data(),
                                                         calleePattern.size()),
         calleeDefinition->defParams.size(),
         ArrayRef<bool>(variadicParamByIdx.data(), variadicParamByIdx.size()),
@@ -1114,7 +763,7 @@ public:
       const bool singleStringifyPattern =
           calleePattern.size() == 1 &&
           calleePattern.front().kind ==
-              StandardArgsGeneratedCalleeReplayKind::Stringify;
+              GeneratedReplayKind::Stringify;
       const uint32_t stringifyParamIdx =
           singleStringifyPattern ? calleePattern.front().paramIdx : 0;
 
@@ -1172,7 +821,7 @@ public:
       oldGeneratedPiecesForRewrite.push_back(piece.trim().str());
     if (calleePattern.size() == 1 &&
         calleePattern.front().kind ==
-            StandardArgsGeneratedCalleeReplayKind::Stringify) {
+            GeneratedReplayKind::Stringify) {
       const uint32_t paramIdx = calleePattern.front().paramIdx;
       if (paramIdx < oldGeneratedPiecesForRewrite.size()) {
         for (const OccObservation &obs : occObservations) {
@@ -1205,14 +854,8 @@ public:
     // Split the solved callee actuals back into the generated tuple pieces.  A
     // non-empty variadic tail appends more tuple elements; an empty tail deletes
     // the old variadic tail slice during the tuple-edit pass below.
-    SmallVector<std::string, 8> newGeneratedPieces;
-    for (size_t i = 0; i < fixedCalleeActuals; ++i)
-      newGeneratedPieces.push_back((*mergedSolvedActuals)[i]);
-    if (calleeHasVariadic) {
-      StringRef tail = StringRef((*mergedSolvedActuals).back()).trim();
-      if (!tail.empty())
-        newGeneratedPieces.push_back(tail.str());
-    }
+    SmallVector<std::string, 8> newGeneratedPieces =
+        unfoldCalleeActuals(*calleeDefinition, *mergedSolvedActuals);
 
     // Translate the solved callee actuals back to the tuple elements consumed by
     // the forwarding macro.  Non-variadic forwarding parameters map to one tuple
@@ -1233,7 +876,7 @@ public:
         return false;
       const TupleElementSlice &elem = tupleElems[ref.forwarderParamIdx];
       std::string rebuiltElement =
-          BuildParenthesizedAdjacencyActualList(newGeneratedPieces);
+          buildParenthesizedTupleGeneratedActualList(newGeneratedPieces);
       if (StringRef(rebuiltElement).trim() !=
           tuplePayload.slice(elem.trimBegin, elem.trimEnd).trim()) {
         edits.push_back(TupleEdit{elem.trimBegin, elem.trimEnd,
@@ -1356,50 +999,6 @@ private:
     return tuplePayload.slice(elem.trimBegin, elem.trimEnd).trim();
   }
 
-  /// Splits the macro-call actual list supplied by an adjacency tuple element.
-  ///
-  /// A forwarding definition such as `CALL(f, t) f t` forms a generated macro
-  /// invocation only when the tuple element bound to `t` supplies the call
-  /// parentheses, for example `CALL(LOG, ("x"))`.  The source tuple element is
-  /// edited as one unit, but replay must see the payload as the generated
-  /// callee's actual list so fixed and variadic formals can be solved normally.
-  bool CollectParenthesizedAdjacencyActuals(
-      StringRef sourceTupleElement, SmallVectorImpl<StringRef> &out) const {
-    out.clear();
-    StringRef trimmed = sourceTupleElement.trim();
-    if (!trimmed.starts_with("(") || !trimmed.ends_with(")") ||
-        trimmed.size() < 2)
-      return false;
-
-    StringRef payload = trimmed.drop_front().drop_back();
-    SmallVector<TupleElementSlice, 8> pieces;
-    if (!splitTopLevelMacroActualsWithLexer(payload, deps_.lexLang, pieces))
-      return false;
-    for (size_t i = 0; i < pieces.size(); ++i)
-      out.push_back(TupleElementText(payload, pieces, i));
-    return !out.empty();
-  }
-
-  /// Rebuilds the parenthesized actual list stored in one adjacency tuple slot.
-  ///
-  /// The solver has already proved every generated-callee formal value.  This
-  /// helper only reassembles those values into the single source tuple element
-  /// that provides the macro-call parentheses for `f t`.
-  static std::string BuildParenthesizedAdjacencyActualList(
-      ArrayRef<std::string> actualPieces) {
-    std::string text;
-    raw_string_ostream os(text);
-    os << '(';
-    for (size_t i = 0; i < actualPieces.size(); ++i) {
-      if (i)
-        os << ", ";
-      os << StringRef(actualPieces[i]).trim();
-    }
-    os << ')';
-    os.flush();
-    return text;
-  }
-
   /// Returns a single replay-token spelling, rejecting multi-token text.
   std::optional<std::string> SingleTokenSpelling(StringRef text) const {
     SmallVector<ReplayTok, 4> toks;
@@ -1435,18 +1034,18 @@ private:
   /// spelling rules.  All other generated-callee patterns are left to
   /// `NewExpansionUniqueSolver`, preserving the existing unique-solution policy.
   std::optional<SmallVector<std::string, 8>> SolveStringifyOrPasteNewExpansion(
-      ArrayRef<StandardArgsGeneratedCalleeReplayElem> calleePattern,
+      ArrayRef<GeneratedReplayElem> calleePattern,
       const RefoldModel::MacroDirective &calleeDefinition,
       ArrayRef<std::string> oldActuals, StringRef newExpansion) const {
     if (calleePattern.size() != 1)
       return std::nullopt;
-    const StandardArgsGeneratedCalleeReplayElem &elem = calleePattern.front();
+    const GeneratedReplayElem &elem = calleePattern.front();
     SmallVector<std::string, 8> actuals;
     actuals.resize(calleeDefinition.defParams.size());
     for (size_t i = 0; i < oldActuals.size(); ++i)
       actuals[i] = oldActuals[i];
 
-    if (elem.kind == StandardArgsGeneratedCalleeReplayKind::Stringify) {
+    if (elem.kind == GeneratedReplayKind::Stringify) {
       std::optional<std::string> token = SingleTokenSpelling(newExpansion);
       if (!token)
         return std::nullopt;
@@ -1458,7 +1057,7 @@ private:
       return actuals;
     }
 
-    if (elem.kind != StandardArgsGeneratedCalleeReplayKind::Paste)
+    if (elem.kind != GeneratedReplayKind::Paste)
       return std::nullopt;
     std::optional<std::string> pasted = SingleTokenSpelling(newExpansion);
     if (!pasted)
@@ -1467,7 +1066,7 @@ private:
     size_t cursor = 0;
     SmallVector<std::optional<std::string>, 8> assigned;
     assigned.resize(calleeDefinition.defParams.size());
-    for (const StandardArgsGeneratedCalleePastePiece &piece : elem.pastePieces) {
+    for (const GeneratedPastePiece &piece : elem.pastePieces) {
       if (piece.isParam) {
         const size_t width = StringRef(oldActuals[piece.paramIdx]).trim().size();
         if (cursor + width > pasted->size())
@@ -1504,7 +1103,7 @@ private:
 /// element.  This resolver owns only that forwarded-callee bridge: it proves the
 /// child replacement list is a generated function-like invocation built from
 /// tuple-ref formals, resolves the generated callee to one unique definition,
-/// replays that callee with `ForwardedGeneratedCalleeReplaySolver`, and mutates
+/// replays that callee with the old-expansion matcher and unique solver, and mutates
 /// only `newTextByOld` with additional tuple-element rewrites that are uniquely
 /// implied by every matching occurrence.
 ///
@@ -1603,17 +1202,21 @@ public:
       oldActuals.push_back(text->str());
     }
 
-    SmallVector<ForwardedGeneratedCalleeReplayElem, 16> calleePattern;
+    // Only literal and parameter elements are accepted; `#`, `##`, and
+    // `__VA_OPT__` skip this optional proof path without changing fallback
+    // policy.  On such a pattern the matcher has exactly one path and the
+    // solver never enters a `__VA_OPT__` branch.
+    SmallVector<GeneratedReplayElem, 16> calleePattern;
     for (const RefoldModel::MacroReplacementToken &tok :
          calleeDefinition->replacementTokens) {
       if (tok.spelling == "#" || tok.spelling == "##" ||
           tok.spelling == "__VA_OPT__")
         return true;
-      ForwardedGeneratedCalleeReplayElem elem;
+      GeneratedReplayElem elem;
       if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
         if (!tok.paramIndex || *tok.paramIndex >= oldActuals.size())
           return true;
-        elem.isParam = true;
+        elem.kind = GeneratedReplayKind::Param;
         elem.paramIdx = *tok.paramIndex;
       } else {
         elem.literal = tok.spelling.str();
@@ -1623,22 +1226,21 @@ public:
     if (calleePattern.empty())
       return true;
 
-    SmallVector<SmallVector<std::string, 8>, 4> oldActualTokSpellings;
+    SmallVector<SmallVector<std::string, 16>, 4> oldActualTokSpellings;
     for (const std::string &actual : oldActuals)
       oldActualTokSpellings.push_back(
-          tokenSpellingsForReplayText<8>(actual, deps_.lexLang));
+          tokenSpellingsForReplayText(actual, deps_.lexLang));
 
-    ForwardedGeneratedCalleeReplaySolver forwardedCalleeSolver(
-        ArrayRef<ForwardedGeneratedCalleeReplayElem>(calleePattern.data(),
-                                                     calleePattern.size()),
-        ArrayRef<SmallVector<std::string, 8>>(oldActualTokSpellings.data(),
-                                              oldActualTokSpellings.size()),
-        calleeDefinition->defParams.size(), deps_.lexLang);
+    OldExpansionReplayMatcher oldExpansionMatcher(
+        calleePattern, oldActualTokSpellings, oldActuals, deps_.lexLang);
+    NewExpansionUniqueSolver newExpansionSolver(
+        calleePattern, calleeDefinition->defParams.size(),
+        /*variadicParamByIdx=*/{}, deps_.lexLang);
 
     for (const OccObservation &obs : occObservations) {
-      if (!forwardedCalleeSolver.MatchOldExpansion(StringRef(obs.oldText)))
+      if (!oldExpansionMatcher.Match(StringRef(obs.oldText)))
         continue;
-      auto solvedActuals = forwardedCalleeSolver.SolveNewExpansion(obs.newText);
+      auto solvedActuals = newExpansionSolver.Solve(obs.newText);
       if (!solvedActuals)
         return false;
       if (solvedActuals->size() != forwardedChildArgs.size())
@@ -1682,7 +1284,7 @@ private:
     if (childArgs.empty() || childDefinition.replacementTokens.empty())
       return true;
 
-    SmallVector<ForwardedGeneratedCalleeReplayElem, 8> replayPattern;
+    SmallVector<GeneratedReplayElem, 8> replayPattern;
     SmallVector<std::string, 4> oldActuals;
     DenseMap<uint32_t, uint32_t> childArgToCompactParam;
 
@@ -1692,7 +1294,7 @@ private:
           tok.spelling == "__VA_OPT__")
         return true;
 
-      ForwardedGeneratedCalleeReplayElem elem;
+      GeneratedReplayElem elem;
       if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef) {
         elem.literal = tok.spelling.str();
         replayPattern.push_back(std::move(elem));
@@ -1715,7 +1317,7 @@ private:
         compactParam = compactIt->second;
       }
 
-      elem.isParam = true;
+      elem.kind = GeneratedReplayKind::Param;
       elem.paramIdx = compactParam;
       replayPattern.push_back(std::move(elem));
     }
@@ -1723,30 +1325,21 @@ private:
     if (oldActuals.empty())
       return true;
 
-    SmallVector<SmallVector<std::string, 8>, 4> oldActualTokSpellings;
+    SmallVector<SmallVector<std::string, 16>, 4> oldActualTokSpellings;
     for (const std::string &actual : oldActuals)
       oldActualTokSpellings.push_back(
-          tokenSpellingsForReplayText<8>(actual, deps_.lexLang));
+          tokenSpellingsForReplayText(actual, deps_.lexLang));
 
-    ForwardedGeneratedCalleeReplaySolver oldReplayMatcher(
-        ArrayRef<ForwardedGeneratedCalleeReplayElem>(replayPattern.data(),
-                                                     replayPattern.size()),
-        ArrayRef<SmallVector<std::string, 8>>(oldActualTokSpellings.data(),
-                                              oldActualTokSpellings.size()),
-        oldActuals.size(), deps_.lexLang);
+    OldExpansionReplayMatcher oldReplayMatcher(
+        replayPattern, oldActualTokSpellings, oldActuals, deps_.lexLang);
 
     for (const OccObservation &obs : occObservations) {
-      if (!oldReplayMatcher.MatchOldExpansion(StringRef(obs.oldText)))
+      if (!oldReplayMatcher.Match(StringRef(obs.oldText)))
         continue;
 
       std::optional<SmallVector<std::string, 4>> solvedActuals =
-          SolveSingleChangedDirectReplay(
-              ArrayRef<ForwardedGeneratedCalleeReplayElem>(
-                  replayPattern.data(), replayPattern.size()),
-              ArrayRef<SmallVector<std::string, 8>>(
-                  oldActualTokSpellings.data(), oldActualTokSpellings.size()),
-              ArrayRef<std::string>(oldActuals.data(), oldActuals.size()),
-              obs.newText);
+          SolveSingleChangedDirectReplay(replayPattern, oldActualTokSpellings,
+                                         oldActuals, obs.newText);
       if (!solvedActuals)
         return false;
       if (solvedActuals->size() != oldActuals.size())
@@ -1774,10 +1367,10 @@ private:
   /// Solve a direct child replacement replay where exactly one forwarded formal
   /// is allowed to change and all other formals remain old-spelling anchors.
   std::optional<SmallVector<std::string, 4>> SolveSingleChangedDirectReplay(
-      ArrayRef<ForwardedGeneratedCalleeReplayElem> replayPattern,
-      ArrayRef<SmallVector<std::string, 8>> oldActualTokSpellings,
+      ArrayRef<GeneratedReplayElem> replayPattern,
+      ArrayRef<SmallVector<std::string, 16>> oldActualTokSpellings,
       ArrayRef<std::string> oldActuals, StringRef newExpansion) const {
-    SmallVector<ParentTupleCalleeReplayTok, 16> toks;
+    SmallVector<ReplayTok, 16> toks;
     lexReplayTokens(newExpansion, deps_.lexLang, toks);
 
     SmallVector<SmallVector<std::string, 4>, 4> solutions;
@@ -1799,10 +1392,10 @@ private:
   /// DFS used by `SolveSingleChangedDirectReplay`.  Unchanged formals are fixed
   /// anchors; the candidate changed formal is the only variable-width slice.
   void SolveDirectReplayDfs(
-      ArrayRef<ForwardedGeneratedCalleeReplayElem> replayPattern,
-      ArrayRef<SmallVector<std::string, 8>> oldActualTokSpellings,
+      ArrayRef<GeneratedReplayElem> replayPattern,
+      ArrayRef<SmallVector<std::string, 16>> oldActualTokSpellings,
       ArrayRef<std::string> oldActuals, StringRef newExpansion,
-      ArrayRef<ParentTupleCalleeReplayTok> toks, size_t changedParam,
+      ArrayRef<ReplayTok> toks, size_t changedParam,
       size_t elemIdx, size_t tokPos,
       std::optional<std::pair<size_t, size_t>> &assignedChangedRange,
       SmallVectorImpl<SmallVector<std::string, 4>> &solutions) const {
@@ -1835,8 +1428,8 @@ private:
       return;
     }
 
-    const ForwardedGeneratedCalleeReplayElem &elem = replayPattern[elemIdx];
-    if (!elem.isParam) {
+    const GeneratedReplayElem &elem = replayPattern[elemIdx];
+    if (elem.kind != GeneratedReplayKind::Param) {
       if (tokPos < toks.size() && toks[tokPos].spelling == elem.literal)
         SolveDirectReplayDfs(replayPattern, oldActualTokSpellings, oldActuals,
                              newExpansion, toks, changedParam, elemIdx + 1,
@@ -1848,7 +1441,7 @@ private:
       return;
 
     if (elem.paramIdx != changedParam) {
-      const SmallVector<std::string, 8> &expected =
+      const SmallVector<std::string, 16> &expected =
           oldActualTokSpellings[elem.paramIdx];
       if (replayTokenRangeSpellingsEqual(toks, tokPos, expected))
         SolveDirectReplayDfs(replayPattern, oldActualTokSpellings, oldActuals,
@@ -1883,7 +1476,7 @@ private:
 
   /// Compare two token ranges inside one replay token vector by spelling.
   static bool TokenRangesHaveSameSpellings(
-      ArrayRef<ParentTupleCalleeReplayTok> toks, size_t lhsBegin,
+      ArrayRef<ReplayTok> toks, size_t lhsBegin,
       size_t rhsBegin, size_t width) {
     if (lhsBegin + width > toks.size() || rhsBegin + width > toks.size())
       return false;

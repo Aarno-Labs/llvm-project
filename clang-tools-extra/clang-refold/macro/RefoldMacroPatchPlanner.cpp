@@ -718,7 +718,7 @@ respellArgumentReplacementInBaseSpelling(StringRef baseArgText,
 }
 } // namespace
 
-std::optional<RefoldMacroPatchPlanner::InvocationRewriteWithRange>
+std::optional<InvocationRewriteWithRange>
 RefoldMacroPatchPlanner::BuildInvocationRewriteWithRange(
     const InvocationActualRecoveryContext &ctx,
     const DenseMap<uint32_t, std::string> &replByArgIdx,
@@ -886,7 +886,7 @@ bool RefoldMacroPatchPlanner::InvocationRewritePreservesLineObservers(
   return false;
 }
 
-RefoldMacroPatchPlanner::MacroPatchReuseAdmissionContext
+MacroPatchReuseAdmissionContext
 RefoldMacroPatchPlanner::RecoverWholeCoverReuseContext(
     const RefoldModel::MacroInvocation &invocation,
     const Owner &currentPatchOwner, uint64_t invocationStart,
@@ -965,7 +965,7 @@ void RefoldMacroPatchPlanner::CollectExistingMacroPatchReuseFromMap(
 
 void RefoldMacroPatchPlanner::AdmitCallerExistingMacroPatchContext(
     MacroPatchReuseAdmissionContext &ctx,
-    RefoldMacroPatchPlanner::ExistingMacroPatchContext existingContext) const {
+    ExistingMacroPatchContext existingContext) const {
   if (ctx.existingPatch || ctx.existingExpandedPatch || !existingContext.patch)
     return;
 
@@ -1473,7 +1473,7 @@ RefoldMacroPatchPlanner::BuildMacroInvocationPatchWholeCover(
     StringRef baseInvText,
     const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
         &patchMap,
-    RefoldMacroPatchPlanner::ExistingMacroPatchContext existingContext) const {
+    ExistingMacroPatchContext existingContext) const {
   return RefoldMacroWholeCoverOrchestrator(this)
       .BuildMacroInvocationPatchWholeCover(m, h, baseInvText, patchMap,
                                            existingContext);

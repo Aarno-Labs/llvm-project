@@ -301,6 +301,31 @@ public:
       llvm::ArrayRef<const RefoldModel::PPArgSpan *> group,
       llvm::StringRef observedSurface, llvm::StringRef traceStage) const;
 
+  /// Try to explain an observed rewrite of a pasted surface by replaying
+  /// exactly one direct paste-producing child invocation.
+  ///
+  /// This helper is intentionally narrow. It only succeeds when:
+  ///
+  /// * the child has exactly one paste product at this hop,
+  /// * the pasted operands can be rebased onto the observed surface of
+  ///   `surfaceOwner`,
+  /// * the rewritten surface has a unique split around the original
+  ///   inter-operand delimiters, and
+  /// * every recovered operand rewrite can be lifted through the child's
+  ///   normal formal-derivation certificate.
+  ///
+  /// Any ambiguity is rejected because it would amount to inventing an
+  /// inverse paste decomposition rather than proving one.  The result is the
+  /// sorted, non-empty set of derived parent-formal constraints.
+  std::optional<
+      llvm::SmallVector<std::pair<uint32_t, ObservedFormalConstraint>, 4>>
+  DeriveConstraintsFromDirectPasteChild(
+      const RefoldMacroDAGLiftingContext &ctx,
+      const RefoldModel::MacroInvocation &surfaceOwner,
+      const RefoldModel::MacroInvocation &pasteChild,
+      llvm::StringRef observedOld, llvm::StringRef observedNew,
+      llvm::StringRef traceStage) const;
+
   /// Parent-constraint derivation through a nested paste chain.
   std::optional<ParentConstraintDerivationCertificate>
   TryBuildNestedPasteChainDerivation(const RefoldMacroDAGLiftingContext &ctx,

@@ -309,9 +309,7 @@ OwnerStateDelta RefoldOwnerStateProof::BuildTheoremStateDelta(
   // Project precise facts attached to the builder surface, then merge precise
   // facts that later proof passes may have attached directly to delta buckets.
   projectComponentFacts(facts);
-  OwnerStateDelta preciseDelta;
-  preciseDelta.MergeTheoremFactsFrom(directDelta);
-  projected.MergeFrom(preciseDelta);
+  projected.MergeFrom(directDelta);
   return projected;
 }
 

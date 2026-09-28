@@ -9,8 +9,6 @@
 //   - `preprocessToBytes`: re-invokes Clang's preprocessor on a candidate
 //     source using the producer-recorded `PreprocessContext` and returns the
 //     `-E -P` output bytes.
-//   - `compareTokens`: compares two `PPTok` streams for byte-exact agreement,
-//     returning a descriptive `llvm::Error` at the first mismatch.
 //   - `buildFinalSourcePreprocessCallback` and
 //     `buildFinalLineControlValidationCallback`: the executable oracles that
 //     final verification and final line-control pruning consume.
@@ -54,15 +52,6 @@ llvm::Expected<std::string>
 preprocessToBytes(llvm::StringRef inputPath,
                   const RefoldModel::PreprocessContext &ctx,
                   llvm::ArrayRef<std::string> extraArgs = {});
-
-/// Compare two preprocessed-token streams for `--check` mode.
-///
-/// Returns `Error::success()` on full agreement.  Any divergence is returned
-/// as a descriptive `llvm::Error` carrying the first mismatch's position.  This
-/// routine performs byte/token comparison only; caller-provided line-control
-/// ignore masks and `--no-lines` validation are layered above it.
-llvm::Error compareTokens(llvm::ArrayRef<PPTok> aToks,
-                          llvm::ArrayRef<PPTok> bToks);
 
 /// Build a callback that preprocesses an assembled final source through the
 /// producer-recorded context, using one stable temporary path beside \p

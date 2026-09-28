@@ -68,27 +68,6 @@ class RefoldIncludeInsertionPlanner;
 /// include-local patch buckets without owning include search-chain proof.
 class RefoldIncludeMaterializer {
 public:
-  using AcceptedPathKind = ::clang::refold::AcceptedPathKind;
-  using AcceptedResultCandidate = ::clang::refold::AcceptedResultCandidate;
-  using IncludeAnchorEvidenceKind = ::clang::refold::IncludeAnchorEvidenceKind;
-  using IncludeAnchorWitness = ::clang::refold::IncludeAnchorWitness;
-  using IncludeEdits = ::clang::refold::IncludeEdits;
-  using IncludePatch = ::clang::refold::IncludePatch;
-  using IncludeRealizationEvidenceKind =
-      ::clang::refold::IncludeRealizationEvidenceKind;
-  using IncludeTextEditPlan = ::clang::refold::IncludeTextEditPlan;
-  using LineControlWrappedText = ::clang::refold::LineControlWrappedText;
-  using MacroPatch = ::clang::refold::MacroPatch;
-  using MacroStateDirectiveLineInterval =
-      ::clang::refold::MacroStateDirectiveLineInterval;
-  using OwnerSourceRange = ::clang::refold::OwnerSourceRange;
-  using ResyncOutcome = ::clang::refold::ResyncOutcome;
-  using SelectedAcceptedResultCandidate =
-      ::clang::refold::SelectedAcceptedResultCandidate;
-  using StabilizedMaterializedHeaderMacroPatch =
-      ::clang::refold::StabilizedMaterializedHeaderMacroPatch;
-  using TextEdit = ::clang::refold::TextEdit;
-
   /// Construct an include materializer over immutable A/B token/source inputs
   /// and explicit proof/edit services.
   ///

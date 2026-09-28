@@ -3,8 +3,8 @@
 // `--no-lines` pruning recheck pipeline for clang-refold.
 //
 // This module owns the `--no-lines`-specific pieces of the `--check` recheck
-// flow.  The generic recheck primitives `preprocessToBytes` and
-// `compareTokens`, and the final-line-control validation callback factory, live
+// flow.  The generic recheck primitive `preprocessToBytes` and the
+// final-line-control validation callback factory live
 // in `source/RefoldPreprocessRecheck.h`; `lexPPTokens` lives next to `PPTok` in
 // `model/RefoldToken.h`; and refold-map JSON extraction (`PreprocessContext`,
 // source-path lookup) lives on `RefoldModel`.  This header exposes only:
@@ -79,10 +79,11 @@ buildRelaxedStringifyIgnoreMask(const llvm::json::Object &rootJson,
 
 /// Compare two preprocessed-token streams while honoring an ignore mask.
 ///
-/// Used by `--check --no-lines` mode.  Token-position mismatches whose B-side
-/// index is set in \p ignoreMask are skipped (the producer-known
-/// line-sensitive predefined macros are allowed to differ).  All other
-/// divergences are returned as a descriptive `llvm::Error`.
+/// Used by `--check` and final verification.  Token-position mismatches whose
+/// B-side index is set in \p ignoreMask are skipped (the producer-known
+/// line-sensitive predefined macros are allowed to differ); with an empty mask
+/// the comparison is byte-exact.  All other divergences are returned as a
+/// descriptive `llvm::Error` carrying the first mismatch's position.
 llvm::Error compareTokensNoLinesAware(llvm::ArrayRef<PPTok> aToks,
                                       llvm::ArrayRef<PPTok> bToks,
                                       llvm::ArrayRef<uint8_t> ignoreMask);

@@ -355,6 +355,15 @@ inline uint64_t countSubstringOccurrences(llvm::StringRef text,
   return count;
 }
 
+/// Returns the unique delimiter-respecting pasted-core split, or std::nullopt
+/// when the original delimiter ordering admits no split or more than one
+/// distinct split. Callers preserve proof construction and sibling-surface
+/// checks by validating the returned segment count before consuming it.
+std::optional<llvm::SmallVector<llvm::StringRef, 4>>
+splitPastedCoreByDelimiters(llvm::StringRef core,
+                            llvm::ArrayRef<llvm::StringRef> oldSegs,
+                            llvm::ArrayRef<llvm::StringRef> midBodies);
+
 /// Total ordering for paste-span pointer groups.
 inline bool pasteSpanPtrLessByByteRange(const RefoldModel::PPArgSpan *a,
                                         const RefoldModel::PPArgSpan *b) {

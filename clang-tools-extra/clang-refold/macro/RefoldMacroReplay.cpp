@@ -1062,26 +1062,12 @@ RefoldMacroBoundarySelector::RefoldMacroBoundarySelector(
       bToks_(bToks), lexLang_(lexLang) {}
 
 const RefoldModel::MacroInvocation *
-RefoldMacroBoundarySelector::RightBoundaryVaOptActivationMacro(
-    uint64_t aGap, std::optional<uint64_t> ownerIncludeId) const {
+RefoldMacroBoundarySelector::ShortestBoundarySourceMacro(
+    uint64_t aGap, std::optional<uint64_t> ownerIncludeId,
+    bool rightBoundaryOnly,
+    function_ref<bool(const RefoldModel::MacroInvocation &)> witness) const {
   const RefoldModel::MacroInvocation *best = nullptr;
   uint64_t bestLen = std::numeric_limits<uint64_t>::max();
-
-  auto definitionFor = [&](const RefoldModel::MacroInvocation &inv)
-      -> const RefoldModel::MacroDirective * {
-    if (!inv.definitionDirectiveId)
-      return nullptr;
-    return model_.GetMacroDirectiveById(*inv.definitionDirectiveId);
-  };
-
-  auto definitionContainsVaOpt =
-      [](const RefoldModel::MacroDirective &directive) -> bool {
-    for (const auto &tok : directive.replacementTokens) {
-      if (tok.spelling == "__VA_OPT__")
-        return true;
-    }
-    return false;
-  };
 
   auto isDescendantOf = [&](const RefoldModel::MacroInvocation &child,
                             const RefoldModel::MacroInvocation &root) {
@@ -1097,43 +1083,32 @@ RefoldMacroBoundarySelector::RightBoundaryVaOptActivationMacro(
     return false;
   };
 
-  auto hasVaOptDescendantAtBoundary =
-      [&](const RefoldModel::MacroInvocation &root) {
-        for (const RefoldModel::MacroInvocation &candidate :
-             model_.GetMacroInvocations()) {
-          if (!isDescendantOf(candidate, root))
-            continue;
-          const RefoldModel::MacroDirective *definition =
-              definitionFor(candidate);
-          if (definition && definitionContainsVaOpt(*definition))
-            return true;
-        }
-        return false;
-      };
-
   for (const RefoldModel::MacroInvocation &m : model_.GetMacroInvocations()) {
     if (ownerIncludeId) {
       if (!m.ownerIncludeId || *m.ownerIncludeId != *ownerIncludeId)
         continue;
     }
-
-    if (!m.cover.IsValid() || m.cover.end <= m.cover.begin ||
-        m.cover.end != aGap)
+    if (!m.cover.IsValid() || m.cover.end <= m.cover.begin)
+      continue;
+    if (m.cover.end != aGap && (rightBoundaryOnly || m.cover.begin != aGap))
       continue;
 
     // Only real source callsites can own the eventual patch. Generated child
-    // invocations may supply the `__VA_OPT__` evidence, but the emitted rewrite
-    // must be applied to an invocation spelling that exists in source.
+    // invocations may supply the witness, but the emitted rewrite must be
+    // applied to an invocation spelling that exists in source.
     if (!m.invB || !m.invE || !m.invText)
       continue;
     if (macroTopology_.IsInvocationInsideDefineDirective(m))
       continue;
 
-    if (!hasVaOptDescendantAtBoundary(m))
+    if (llvm::none_of(model_.GetMacroInvocations(),
+                      [&](const RefoldModel::MacroInvocation &candidate) {
+                        return isDescendantOf(candidate, m) &&
+                               witness(candidate);
+                      }))
       continue;
 
     const uint64_t len = m.cover.end - m.cover.begin;
-
     if (!best || len < bestLen || (len == bestLen && m.id < best->id)) {
       best = &m;
       bestLen = len;
@@ -1144,70 +1119,39 @@ RefoldMacroBoundarySelector::RightBoundaryVaOptActivationMacro(
 }
 
 const RefoldModel::MacroInvocation *
+RefoldMacroBoundarySelector::RightBoundaryVaOptActivationMacro(
+    uint64_t aGap, std::optional<uint64_t> ownerIncludeId) const {
+  return ShortestBoundarySourceMacro(
+      aGap, ownerIncludeId, /*rightBoundaryOnly=*/true,
+      [&](const RefoldModel::MacroInvocation &candidate) {
+        const RefoldModel::MacroDirective *definition =
+            candidate.definitionDirectiveId
+                ? model_.GetMacroDirectiveById(*candidate.definitionDirectiveId)
+                : nullptr;
+        return definition &&
+               llvm::any_of(definition->replacementTokens,
+                            [](const RefoldModel::MacroReplacementToken &tok) {
+                              return tok.spelling == "__VA_OPT__";
+                            });
+      });
+}
+
+const RefoldModel::MacroInvocation *
 RefoldMacroBoundarySelector::BoundaryGeneratedSelectorMacro(
     uint64_t aGap, std::optional<uint64_t> ownerIncludeId) const {
-  const RefoldModel::MacroInvocation *best = nullptr;
-  uint64_t bestLen = std::numeric_limits<uint64_t>::max();
-
-  auto isDescendantOf = [&](const RefoldModel::MacroInvocation &child,
-                            const RefoldModel::MacroInvocation &root) {
-    const RefoldModel::MacroInvocation *cur = &child;
-    for (size_t depth = 0; cur && depth <= model_.GetMacroInvocations().size();
-         ++depth) {
-      if (cur->id == root.id)
-        return true;
-      if (!cur->callerMacroId)
-        return false;
-      cur = macroTopology_.FindMacroInvocationById(*cur->callerMacroId);
-    }
-    return false;
-  };
-
-  auto hasGeneratedSelectorDescendant =
-      [&](const RefoldModel::MacroInvocation &root) {
-        for (const RefoldModel::MacroInvocation &candidate :
-             model_.GetMacroInvocations()) {
-          if (!isDescendantOf(candidate, root))
-            continue;
-          if (candidate.calleeOrigin.kind ==
-                  MacroCalleeOriginKind::CallerParam &&
-              !candidate.calleeOrigin.callerParamIndices.empty())
-            return true;
-        }
-        return false;
-      };
-
-  for (const RefoldModel::MacroInvocation &m : model_.GetMacroInvocations()) {
-    if (ownerIncludeId) {
-      if (!m.ownerIncludeId || *m.ownerIncludeId != *ownerIncludeId)
-        continue;
-    }
-    if (!m.cover.IsValid() || m.cover.end <= m.cover.begin)
-      continue;
-    if (m.cover.begin != aGap && m.cover.end != aGap)
-      continue;
-    if (!m.invB || !m.invE || !m.invText)
-      continue;
-    if (macroTopology_.IsInvocationInsideDefineDirective(m))
-      continue;
-
-    // Boundary insertions around a generated selector replacement are safe to
-    // leave for the macro proof only when a descendant callee token actually
-    // came from a caller parameter.  This keeps ordinary expression/include
-    // boundary insertions out of macro ownership while allowing proofs such as
-    // `STR(x)` -> `WRAP(x)`, where the added string-literal context appears on
-    // both sides of the old generated callee expansion.
-    if (!hasGeneratedSelectorDescendant(m))
-      continue;
-
-    const uint64_t len = m.cover.end - m.cover.begin;
-    if (!best || len < bestLen || (len == bestLen && m.id < best->id)) {
-      best = &m;
-      bestLen = len;
-    }
-  }
-
-  return best;
+  // Boundary insertions around a generated selector replacement are safe to
+  // leave for the macro proof only when a descendant callee token actually
+  // came from a caller parameter.  This keeps ordinary expression/include
+  // boundary insertions out of macro ownership while allowing proofs such as
+  // `STR(x)` -> `WRAP(x)`, where the added string-literal context appears on
+  // both sides of the old generated callee expansion.
+  return ShortestBoundarySourceMacro(
+      aGap, ownerIncludeId, /*rightBoundaryOnly=*/false,
+      [](const RefoldModel::MacroInvocation &candidate) {
+        return candidate.calleeOrigin.kind ==
+                   MacroCalleeOriginKind::CallerParam &&
+               !candidate.calleeOrigin.callerParamIndices.empty();
+      });
 }
 
 const RefoldModel::MacroInvocation *

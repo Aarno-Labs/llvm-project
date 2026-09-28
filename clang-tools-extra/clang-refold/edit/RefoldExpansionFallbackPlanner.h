@@ -54,9 +54,6 @@ class RefoldTheoremAudit;
 /// silently authorizing raw-B output.
 class RefoldExpansionFallbackPlanner {
 public:
-  using TextEdit = ::clang::refold::TextEdit;
-  using ResyncOutcome = ::clang::refold::ResyncOutcome;
-
   RefoldExpansionFallbackPlanner(
       const RefoldModel &model, llvm::StringRef bSource,
       llvm::ArrayRef<PPTok> aToks,

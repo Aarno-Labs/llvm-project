@@ -2798,10 +2798,10 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
   return std::string(out.str());
 }
 
-std::optional<RefoldTextEditAssembler::PendingResync>
+std::optional<PendingResync>
 RefoldTextEditAssembler::AppendOriginalSliceWithPending(
     SmallVectorImpl<char> &out, llvm::StringRef original, uint64_t from,
-    uint64_t to, std::optional<RefoldTextEditAssembler::PendingResync> pending,
+    uint64_t to, std::optional<PendingResync> pending,
     StringRef emissionOwner, std::optional<uint64_t> ownerIncludeId,
     std::vector<FinalLineControlPruneCandidate> *lineControlPruneCandidates,
     std::vector<FinalLineControlSourceMapping> *lineControlSourceMappings)

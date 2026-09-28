@@ -459,7 +459,7 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
     StringRef baseInvText,
     const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
         &patchMap,
-    RefoldMacroPatchPlanner::ExistingMacroPatchContext existingContext) const {
+    ExistingMacroPatchContext existingContext) const {
   // Strategy (in priority order):
   //   1) Prefer an args-only rewrite of the invocation spelling when the edit
   //      is fully contained within argument-like spans.

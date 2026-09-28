@@ -105,9 +105,9 @@ struct HeaderEnvelopeRealization {
 /// its accepted carrier's anchor witness.  An edit without it declares no
 /// realized cover, so nothing may be proved subsumed by it.
 static SmallVector<HeaderEnvelopeRealization, 4> headerEnvelopeRealizations(
-    ArrayRef<RefoldIncludeMaterializer::TextEdit> planEdits) {
+    ArrayRef<TextEdit> planEdits) {
   SmallVector<HeaderEnvelopeRealization, 4> realizations;
-  for (const RefoldIncludeMaterializer::TextEdit &edit : planEdits) {
+  for (const TextEdit &edit : planEdits) {
     for (const auto &carrier : edit.acceptedResults) {
       if (!carrier)
         continue;
@@ -145,9 +145,9 @@ static SmallVector<HeaderEnvelopeRealization, 4> headerEnvelopeRealizations(
 /// overlap, or a missing cover on either side -- leaves the two edits
 /// genuinely incomparable, and the caller falls back rather than picking one.
 static bool dropStagedMacroPatchEditsSubsumedByHeaderEnvelope(
-    uint64_t includeId, ArrayRef<RefoldIncludeMaterializer::TextEdit> planEdits,
+    uint64_t includeId, ArrayRef<TextEdit> planEdits,
     ArrayRef<StagedMacroPatchEdit> stagedMacroPatchEdits,
-    std::vector<RefoldIncludeMaterializer::TextEdit> &edits) {
+    std::vector<TextEdit> &edits) {
   const SmallVector<HeaderEnvelopeRealization, 4> realizations =
       headerEnvelopeRealizations(planEdits);
   if (realizations.empty())
@@ -157,7 +157,7 @@ static bool dropStagedMacroPatchEditsSubsumedByHeaderEnvelope(
   for (const StagedMacroPatchEdit &staged : stagedMacroPatchEdits) {
     if (staged.editIndex >= edits.size())
       return false;
-    const RefoldIncludeMaterializer::TextEdit &stagedEdit =
+    const TextEdit &stagedEdit =
         edits[staged.editIndex];
 
     for (const HeaderEnvelopeRealization &realization : realizations) {
@@ -193,7 +193,7 @@ static bool dropStagedMacroPatchEditsSubsumedByHeaderEnvelope(
                    "realized by a widened header source envelope",
                    includeId, subsumed.size());
 
-  std::vector<RefoldIncludeMaterializer::TextEdit> kept;
+  std::vector<TextEdit> kept;
   kept.reserve(edits.size() - subsumed.size());
   for (size_t index = 0; index < edits.size(); ++index) {
     if (subsumed.contains(index))
@@ -210,10 +210,10 @@ static bool dropStagedMacroPatchEditsSubsumedByHeaderEnvelope(
 /// carriers, or text-assembly metadata.
 static SmallVector<MacroStateStagedEditInterval, 8>
 macroStateStagedEditIntervals(
-    ArrayRef<RefoldIncludeMaterializer::TextEdit> edits) {
+    ArrayRef<TextEdit> edits) {
   SmallVector<MacroStateStagedEditInterval, 8> intervals;
   intervals.reserve(edits.size());
-  for (const RefoldIncludeMaterializer::TextEdit &edit : edits)
+  for (const TextEdit &edit : edits)
     intervals.push_back(MacroStateStagedEditInterval{edit.start, edit.end});
   return intervals;
 }
@@ -445,8 +445,8 @@ rewriteIncludeNextDirectiveAsOrdinaryInclude(std::string &replacement) {
 /// Orders text edits by source interval start, then end. This is used for
 /// deterministic traversal of edit pointers.
 static bool
-textEditPointerPrecedes(const RefoldIncludeMaterializer::TextEdit *lhs,
-                        const RefoldIncludeMaterializer::TextEdit *rhs) {
+textEditPointerPrecedes(const TextEdit *lhs,
+                        const TextEdit *rhs) {
   if (lhs->start != rhs->start)
     return lhs->start < rhs->start;
   return lhs->end < rhs->end;
@@ -456,13 +456,13 @@ textEditPointerPrecedes(const RefoldIncludeMaterializer::TextEdit *lhs,
 /// Leading deletions advance the reported line, while leading replacements
 /// still occupy their original source line.
 static size_t computeFirstEmittedHeaderLine(
-    StringRef bytes, ArrayRef<RefoldIncludeMaterializer::TextEdit> edits) {
+    StringRef bytes, ArrayRef<TextEdit> edits) {
   if (edits.empty())
     return 1;
 
-  SmallVector<const RefoldIncludeMaterializer::TextEdit *, 8> ordered;
+  SmallVector<const TextEdit *, 8> ordered;
   ordered.reserve(edits.size());
-  for (const RefoldIncludeMaterializer::TextEdit &edit : edits)
+  for (const TextEdit &edit : edits)
     ordered.push_back(&edit);
   llvm::sort(ordered, textEditPointerPrecedes);
 
@@ -472,7 +472,7 @@ static size_t computeFirstEmittedHeaderLine(
   // surviving source line, not blindly line 1 of the header.  A leading
   // replacement still occupies the replaced directive's logical line.
   uint64_t cursor = 0;
-  for (const RefoldIncludeMaterializer::TextEdit *edit : ordered) {
+  for (const TextEdit *edit : ordered) {
     if (cursor < edit->start)
       return stringutils::lineAtOffset(bytes, cursor);
     if (cursor > edit->start)
@@ -1751,7 +1751,7 @@ bool RefoldIncludeMaterializer::TryRecordInlineIncludeRealizationFromB(
   return false;
 }
 
-std::optional<RefoldIncludeMaterializer::TextEdit>
+std::optional<TextEdit>
 RefoldIncludeMaterializer::MakeCleanChildIncludeOperandRewriteEdit(
     const RefoldModel::IncludeItem &child, StringRef rewrittenOperand,
     IncludeReplayProofContext::OrdinaryIncludeDelimiterKind delimiterKind,
@@ -1835,7 +1835,7 @@ RefoldIncludeMaterializer::FindHeaderDeclForPatch(
   return RefoldHeaderIncludeEditPlanner::FindHeaderDeclForPatch(inc, p);
 }
 
-RefoldIncludeMaterializer::IncludeTextEditPlan
+IncludeTextEditPlan
 RefoldIncludeMaterializer::ComputeIncludeTextEdits(
     const IncludeEdits &ie, std::string headerText) const {
   RefoldHeaderIncludeEditPlanner planner(

@@ -135,10 +135,8 @@ RefoldFinalAssemblyVerifier::Verify(StringRef finalSource) const {
     return verdict;
   }
 
-  Error err = ignoreMask_.empty()
-                  ? compareTokens(assemblyTokens, editedTokens_)
-                  : compareTokensNoLinesAware(assemblyTokens, editedTokens_,
-                                              ignoreMask_);
+  Error err =
+      compareTokensNoLinesAware(assemblyTokens, editedTokens_, ignoreMask_);
   if (!err) {
     verdict.kind = FinalAssemblyVerdictKind::Verified;
     return verdict;

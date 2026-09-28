@@ -4,8 +4,7 @@
 //
 // See RefoldPreprocessRecheck.h for the public contract.  This file implements
 // `preprocessToBytes` (which drives Clang's preprocessor on a candidate
-// source) and `compareTokens` (byte-exact preprocessed-token comparison used
-// by `--check`).  The raw-lexer producer that turns `-E -P` bytes into a
+// source).  The raw-lexer producer that turns `-E -P` bytes into a
 // `PPTok` stream lives next to `PPTok` itself in `model/RefoldToken.cpp`.
 //
 //===----------------------------------------------------------------------===//
@@ -217,39 +216,6 @@ preprocessToBytes(StringRef inputPath,
   std::string out;
   readTempFileForPreprocessRecheck(tmpPath, out);
   return out;
-}
-
-Error compareTokens(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks) {
-  // Compare token spellings up to the min length first.
-  const size_t n = std::min(aToks.size(), bToks.size());
-  for (size_t i = 0; i < n; ++i) {
-    if (aToks[i].spelling != bToks[i].spelling) {
-      const std::string aDbg = stringutils::showWs(
-          stringutils::clip(StringRef(aToks[i].spelling), 100));
-      const std::string bDbg = stringutils::showWs(
-          stringutils::clip(StringRef(bToks[i].spelling), 180));
-      return createStringError(
-          inconvertibleErrorCode(),
-          formatv("token mismatch at index {0}: A='{1}' B='{2}'", i, aDbg, bDbg)
-              .str());
-    }
-    if (inDebugMode()) {
-      const std::string aDbg = stringutils::showWs(
-          stringutils::clip(StringRef(aToks[i].spelling), 100));
-      const std::string bDbg = stringutils::showWs(
-          stringutils::clip(StringRef(bToks[i].spelling), 180));
-      debug("compare", "token match at index {0}: A='{1}' B='{2}'", i, aDbg,
-            bDbg);
-    }
-  }
-
-  if (aToks.size() != bToks.size()) {
-    return createStringError(
-        inconvertibleErrorCode(),
-        formatv("token count mismatch: A={0} B={1}", aToks.size(), bToks.size())
-            .str());
-  }
-  return Error::success();
 }
 
 static Error writePruneValidationSource(StringRef path, StringRef bytes) {

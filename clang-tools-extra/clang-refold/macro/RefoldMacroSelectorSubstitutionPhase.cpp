@@ -748,8 +748,6 @@ std::optional<MacroPatch> RefoldMacroSelectorSubstitutionPhase::Run(
   const RefoldModel::MacroInvocation &m = planningCtx.m;
   const diffutils::Hunk &hEff = planningCtx.hEff;
   StringRef baseInvText = planningCtx.baseInvText;
-  [[maybe_unused]] const uint64_t invStart = planningCtx.invStart;
-  [[maybe_unused]] const uint64_t invEnd = planningCtx.invEnd;
 
   StringRef invSpanText =
       !baseInvText.empty()

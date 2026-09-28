@@ -70,39 +70,6 @@ class RefoldTheoremAudit;
 /// include candidates.
 class RefoldTextEditAssembler {
 public:
-  using TextEdit = ::clang::refold::TextEdit;
-  using PendingResync = ::clang::refold::PendingResync;
-  using ResyncOutcome = ::clang::refold::ResyncOutcome;
-  using AcceptedResultCandidate = ::clang::refold::AcceptedResultCandidate;
-  using AcceptedResultCandidateKind =
-      ::clang::refold::AcceptedResultCandidateKind;
-  using MacroPatch = ::clang::refold::MacroPatch;
-  using SidebandPragmaEdit = ::clang::refold::SidebandPragmaEdit;
-  using LineStateObserverDemand = ::clang::refold::LineStateObserverDemand;
-  using LineStateObserverSite = ::clang::refold::LineStateObserverSite;
-  using OwnerSourceRange = ::clang::refold::OwnerSourceRange;
-  using OwnerStateBoundary = ::clang::refold::OwnerStateBoundary;
-  using OwnerStateComponent = ::clang::refold::OwnerStateComponent;
-  using StateMutationKind = ::clang::refold::StateMutationKind;
-  using SuffixStabilityWitness = ::clang::refold::SuffixStabilityWitness;
-  using SuffixStabilityWitnessKind =
-      ::clang::refold::SuffixStabilityWitnessKind;
-  using AcceptanceSupportKind = ::clang::refold::AcceptanceSupportKind;
-  using AcceptedPathKind = ::clang::refold::AcceptedPathKind;
-  using CompletenessCoverageKind = ::clang::refold::CompletenessCoverageKind;
-  using LegacyPathKind = ::clang::refold::LegacyPathKind;
-  using ProofSummary = ::clang::refold::ProofSummary;
-  using TheoremDomainKind = ::clang::refold::TheoremDomainKind;
-  using TheoremProofClass = ::clang::refold::TheoremProofClass;
-  using TerminalFallbackFailureContext =
-      ::clang::refold::TerminalFallbackFailureContext;
-  using TerminalFallbackFailureReason =
-      ::clang::refold::TerminalFallbackFailureReason;
-  using TerminalFallbackObligationKind =
-      ::clang::refold::TerminalFallbackObligationKind;
-  using TerminalFallbackProofFailure =
-      ::clang::refold::TerminalFallbackProofFailure;
-
   RefoldTextEditAssembler(
       const RefoldModel &model, llvm::StringRef bSource,
       llvm::ArrayRef<PPTok> aToks, llvm::ArrayRef<PPTok> bToks,

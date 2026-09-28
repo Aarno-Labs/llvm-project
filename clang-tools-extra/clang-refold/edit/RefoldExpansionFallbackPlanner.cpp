@@ -823,7 +823,7 @@ private:
     for (const auto &directive : model_.GetMacroDirectives()) {
       if (!directive.ownerIncludeId)
         continue;
-      if (!IncludeOwnsOrContains(inc, *directive.ownerIncludeId))
+      if (!model_.IncludeIsDescendantOrSelf(*directive.ownerIncludeId, inc.id))
         continue;
 
       if (HunkReplacementObservesMacroStateDirective(directive))
@@ -833,7 +833,7 @@ private:
     for (const auto &group : model_.GetConds()) {
       if (!group.parentIncludeId)
         continue;
-      if (!IncludeOwnsOrContains(inc, *group.parentIncludeId))
+      if (!model_.IncludeIsDescendantOrSelf(*group.parentIncludeId, inc.id))
         continue;
       for (const RefoldModel::CondArm &arm : group.arms)
         if (arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end)
@@ -843,7 +843,7 @@ private:
     for (const auto &macro : model_.GetMacroInvocations()) {
       if (!macro.ownerIncludeId)
         continue;
-      if (!IncludeOwnsOrContains(inc, *macro.ownerIncludeId))
+      if (!model_.IncludeIsDescendantOrSelf(*macro.ownerIncludeId, inc.id))
         continue;
       if (macro.cover.IsValid())
         return finish(false);
@@ -869,36 +869,6 @@ private:
     return macroStateProof_.ReplacementObservesMacroStateDirective(
         directive, sourceMapper_.SliceBSource(h_.bStart, h_.bEnd),
         /*unprovenObserves=*/true);
-  }
-
-  /// Return true iff \p ownerIncludeId names \p inc itself or a recorded
-  /// descendant of it.
-  ///
-  /// This is the exact ownership domain of the subtree proof: producer facts
-  /// attached to a nested include are attributed to the outer include whose
-  /// preservation is being decided.  An owner id the model does not name is not
-  /// in the domain, matching the previous scan that simply found no match.
-  bool IncludeOwnsOrContains(const RefoldModel::IncludeItem &inc,
-                             uint64_t ownerIncludeId) const {
-    if (ownerIncludeId == inc.id)
-      return true;
-    const RefoldModel::IncludeItem *owner =
-        model_.GetIncludeById(ownerIncludeId);
-    return owner && IncludeIsDescendantOf(*owner, inc);
-  }
-
-  bool IncludeIsDescendantOf(const RefoldModel::IncludeItem &candidate,
-                             const RefoldModel::IncludeItem &root) const {
-    std::optional<uint64_t> cur = candidate.parent;
-    while (cur) {
-      if (*cur == root.id)
-        return true;
-      const RefoldModel::IncludeItem *parent = model_.GetIncludeById(*cur);
-      if (!parent)
-        return false;
-      cur = parent->parent;
-    }
-    return false;
   }
 
   const RefoldModel &model_;
@@ -2521,7 +2491,7 @@ RefoldExpansionFallbackPlanner::NonConsumableTUPragmaGapReason(
   return std::nullopt;
 }
 
-std::optional<RefoldExpansionFallbackPlanner::TextEdit>
+std::optional<TextEdit>
 RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
     const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
     ArrayRef<std::pair<uint64_t, uint64_t>> stagedSourceIntervals) const {
@@ -2558,7 +2528,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEditForUnresolvedHunk(
                                    unusedInPlaceMacroDirectiveGap);
 }
 
-std::optional<RefoldExpansionFallbackPlanner::TextEdit>
+std::optional<TextEdit>
 RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
     const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
     ArrayRef<std::pair<uint64_t, uint64_t>> stagedSourceIntervals,

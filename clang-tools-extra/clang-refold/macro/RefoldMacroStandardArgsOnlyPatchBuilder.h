@@ -263,6 +263,19 @@ private:
   ArgsOnlyPatchAttempt
   BuildPasteAwareArgsOnlyPatch(const ArgsOnlyPlanningContext &ctx) const;
 
+  /// Accept `replByArgIdx` as a paste-replayed args-only rewrite of `m`.
+  ///
+  /// The caller has already replayed the rewritten invocation arguments
+  /// against every pasted-token occurrence in B, so the proof records
+  /// `replayValidated` for converted selector-site discharge.  The B-side
+  /// materialization is the whole expansion cover the source argument rewrite
+  /// regenerates, not merely the first changed pasted-token hunk.
+  ArgsOnlyPatchAttempt AcceptPasteReplayedRewrite(
+      const RefoldModel::MacroInvocation &m,
+      const InvocationActualRecoveryContext &actualRecoveryCtx,
+      const llvm::DenseMap<uint32_t, std::string> &replByArgIdx,
+      MacroPatchProofKind proofKind) const;
+
   Dependencies deps_;
 
   /// Envelope searches cached for the open `EnvelopeCacheScope`, or null.

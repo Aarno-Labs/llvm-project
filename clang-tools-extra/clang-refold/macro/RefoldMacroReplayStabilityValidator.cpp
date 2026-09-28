@@ -69,14 +69,16 @@ void addNonEmptyTokenInterval(SmallVectorImpl<TokenInterval> &out,
     out.push_back({begin, end});
 }
 
-/// Split `body` into the sub-intervals that lie outside `argumentIntervals`,
-/// appending them to `fixed`.  Returns false when `body` escapes `cover`.
-/// This is the shared literal-body replay slicer used by args-only envelope
-/// validation after argument-owned intervals have been excluded.
-bool appendFixedPiecesOutsideArguments(
-    SmallVectorImpl<TokenInterval> &fixed, TokenInterval body,
-    std::pair<uint64_t, uint64_t> cover,
-    ArrayRef<TokenInterval> argumentIntervals) {
+/// Split `body` into the sub-intervals that lie outside the sorted
+/// `excludedIntervals`, appending them to `fixed`.  Returns false when `body`
+/// escapes `cover`.  This is the shared fixed-body replay slicer used by
+/// args-only envelope validation after argument-owned intervals have been
+/// excluded, and by root-body replay after known macro-owned or argument-owned
+/// surfaces have been excluded.
+bool appendFixedPiecesOutside(SmallVectorImpl<TokenInterval> &fixed,
+                              TokenInterval body,
+                              std::pair<uint64_t, uint64_t> cover,
+                              ArrayRef<TokenInterval> excludedIntervals) {
   if (body.begin >= body.end)
     return true;
   if (body.begin < cover.first || body.end > cover.second ||
@@ -84,35 +86,7 @@ bool appendFixedPiecesOutsideArguments(
     return false;
 
   uint64_t cursor = body.begin;
-  for (const TokenInterval &arg : argumentIntervals) {
-    if (arg.end <= cursor)
-      continue;
-    if (arg.begin >= body.end)
-      break;
-    if (arg.begin > cursor)
-      fixed.push_back({cursor, std::min<uint64_t>(arg.begin, body.end)});
-    cursor = std::max(cursor, std::min<uint64_t>(arg.end, body.end));
-  }
-  if (cursor < body.end)
-    fixed.push_back({cursor, body.end});
-  return true;
-}
-
-/// Split `body` into the sub-intervals that lie outside `excludedA`,
-/// appending them to `fixed`.  Returns false when `body` escapes `cover`.
-/// This is the shared root-body replay slicer used after known macro-owned or
-/// argument-owned surfaces have been excluded from the fixed-body check.
-bool appendFixedPiecesOutsideExcludedSurfaces(
-    SmallVectorImpl<TokenInterval> &fixed, TokenInterval body,
-    std::pair<uint64_t, uint64_t> cover, ArrayRef<TokenInterval> excludedA) {
-  if (body.begin >= body.end)
-    return true;
-  if (body.begin < cover.first || body.end > cover.second ||
-      body.end < body.begin)
-    return false;
-
-  uint64_t cursor = body.begin;
-  for (const TokenInterval &excluded : excludedA) {
+  for (const TokenInterval &excluded : excludedIntervals) {
     if (excluded.end <= cursor)
       continue;
     if (excluded.begin >= body.end)
@@ -445,8 +419,8 @@ bool RefoldMacroReplayStabilityValidator::
 
   SmallVector<TokenInterval, 32> fixedIntervals;
   for (const auto &bs : m.bodySpans) {
-    if (!appendFixedPiecesOutsideArguments(fixedIntervals, {bs.begin, bs.end},
-                                           *cover, mergedArgumentIntervals)) {
+    if (!appendFixedPiecesOutside(fixedIntervals, {bs.begin, bs.end}, *cover,
+                                  mergedArgumentIntervals)) {
       REFOLD_LOG_TRACE("macro/proof",
                        "suppress structure-preserving macro replay: inv id={0} "
                        "name={1} body span escapes whole cover: body=[{2},{3}) "
@@ -675,8 +649,8 @@ bool RefoldMacroReplayStabilityValidator::
   for (const auto &span : m.bodySpans) {
     const uint64_t begin = std::max<uint64_t>(span.begin, cover->first);
     const uint64_t end = std::min<uint64_t>(span.end, cover->second);
-    if (!appendFixedPiecesOutsideExcludedSurfaces(fixedBodyA, {begin, end},
-                                                  *cover, excludedA)) {
+    if (!appendFixedPiecesOutside(fixedBodyA, {begin, end}, *cover,
+                                  excludedA)) {
       REFOLD_LOG_TRACE("macro/proof",
                        "suppress structure-preserving macro replay: inv id={0} "
                        "name={1} fixed root body span escapes whole cover: "

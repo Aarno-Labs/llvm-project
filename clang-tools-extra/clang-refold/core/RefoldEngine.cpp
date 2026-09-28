@@ -223,7 +223,6 @@ RefoldEngine::RefoldEngine(RefoldModel model, StringRef aSource,
       aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff),
       noLines_(config.noLines), finalOutputPath_(config.finalOutputPath.str()),
       lineDirs_(!config.noLines, model_.GetPPCwd()),
-      pathIdentity_(model_, model_.GetPPCwd(), /*emitAbsPaths=*/false),
       strict_(config.strict), proofAuditMode_(config.proofAuditMode),
       lexLang_(
           makeRefoldLexLangOptions(model_.GetPPLang(), model_.GetPPArgv())),
@@ -1092,7 +1091,7 @@ bool RefoldEngine::DispatchStructuralHunks(
              target != nullptr;) {
           RefoldStructuralHunkDispatcher::MacroPatchStagingSlot stagingSlot =
               structuralHunkDispatcher.PrepareMacroPatchStagingSlot(*target);
-          RefoldMacroPatchPlanner::ExistingMacroPatchContext
+          ExistingMacroPatchContext
               existingPatchContext;
           existingPatchContext.patch = stagingSlot.existingPatch;
           existingPatchContext.isCallsite = stagingSlot.existingIsCallsite;

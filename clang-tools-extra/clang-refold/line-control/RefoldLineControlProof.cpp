@@ -192,18 +192,6 @@ RefoldLineControlProof::IncludeSubtreeLineStateObserverDemand(
     uint64_t includeId) const {
   LineStateObserverDemand demand;
 
-  auto isDescendantOrSelf = [&](uint64_t owner) -> bool {
-    uint64_t cur = owner;
-    while (true) {
-      if (cur == includeId)
-        return true;
-      const RefoldModel::IncludeItem *inc = model_.GetIncludeById(cur);
-      if (!inc || !inc->parent)
-        return false;
-      cur = *inc->parent;
-    }
-  };
-
   for (const auto &macro : model_.GetMacroInvocations()) {
     const bool observesLine = macro.name == "__LINE__";
     // `__BASE_FILE__` is deliberately absent here, unlike in the owner-suffix
@@ -241,7 +229,7 @@ RefoldLineControlProof::IncludeSubtreeLineStateObserverDemand(
     std::optional<uint64_t> owner = site->ownerIncludeId;
     if (!owner)
       owner = macro.ownerIncludeId;
-    if (!owner || !isDescendantOrSelf(*owner))
+    if (!owner || !model_.IncludeIsDescendantOrSelf(*owner, includeId))
       continue;
 
     if (!LineStateBuiltinInvocationIsPreservedObserver(macro)) {

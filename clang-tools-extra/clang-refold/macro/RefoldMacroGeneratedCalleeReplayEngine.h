@@ -45,6 +45,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace clang {
 
@@ -54,6 +55,133 @@ namespace refold {
 
 class RefoldMacroPatchProofCertifier;
 class RefoldSourceMapper;
+
+/// Classifies one token-level element in a generated-callee replay pattern.
+enum class GeneratedReplayKind {
+  /// Literal replacement text.
+  Literal,
+  /// Formal parameter reference.
+  Param,
+  /// Stringification of a formal parameter.
+  Stringify,
+  /// Token-paste expression.
+  Paste,
+  /// `__VA_OPT__` payload replay.
+  VaOpt
+};
+
+/// One literal or parameter piece inside a generated token-paste expression.
+struct GeneratedPastePiece {
+  /// Whether this paste piece references a formal parameter.
+  bool isParam = false;
+
+  /// Formal parameter index when `isParam` is true.
+  uint32_t paramIdx = 0;
+
+  /// Literal spelling when `isParam` is false.
+  std::string literal;
+};
+
+/// One parsed element of a generated-callee replay pattern.
+struct GeneratedReplayElem {
+  /// Element kind controlling which payload fields are meaningful.
+  GeneratedReplayKind kind = GeneratedReplayKind::Literal;
+
+  /// Literal spelling for literal replay elements.
+  std::string literal;
+
+  /// Formal parameter index for parameter or stringification elements.
+  uint32_t paramIdx = 0;
+
+  /// Ordered nested replay elements for `__VA_OPT__` payloads.
+  std::vector<GeneratedReplayElem> children;
+
+  /// Ordered paste pieces for token-paste replay elements.
+  std::vector<GeneratedPastePiece> pastePieces;
+};
+
+/// Parses the final generated-callee replacement tape into replay elements.
+///
+/// The caller trusts the current macro definition and the recovered old actual
+/// slots.  The parser owns the syntactic rejection obligations for unsupported
+/// token forms: malformed stringification, malformed paste chains,
+/// out-of-range formal references, and malformed `__VA_OPT__` payloads all
+/// fail closed.  The
+/// stringification and paste proof facts are meaningful only after a successful
+/// parse, and are raised only for replay elements that are emitted into the
+/// accepted pattern.
+class GeneratedCalleeReplayPatternParser {
+public:
+  GeneratedCalleeReplayPatternParser(
+      const RefoldModel::MacroDirective &definition,
+      llvm::ArrayRef<std::string> oldActuals, bool &usesStringification,
+      bool &usesPaste)
+      : definition_(definition), oldActuals_(oldActuals),
+        usesStringification_(usesStringification), usesPaste_(usesPaste) {}
+
+  /// Parses `begin..end` into ordered generated-callee replay elements.
+  ///
+  /// Unsupported replay syntax fails closed.  Stringification and paste proof
+  /// facts are set only when the corresponding token form is accepted.
+  bool Parse(size_t begin, size_t end,
+             std::vector<GeneratedReplayElem> &out) const;
+
+private:
+  /// Converts one replacement token into a replay-safe paste piece.
+  ///
+  /// Only literals and in-range formal references are accepted.  Operators and
+  /// `__VA_OPT__` fail closed because they cannot be replayed as paste operands
+  /// by this generated-callee parser.
+  bool PastePieceFromReplacementToken(
+      const RefoldModel::MacroReplacementToken &tok,
+      GeneratedPastePiece &piece) const;
+
+  const RefoldModel::MacroDirective &definition_;
+  llvm::ArrayRef<std::string> oldActuals_;
+  bool &usesStringification_;
+  bool &usesPaste_;
+};
+
+/// Splits the parenthesized generated-callee actual list carried by one tuple
+/// element in an adjacency forwarder.
+///
+/// A forwarding macro such as `CALL(f, t) f t` does not spell the generated
+/// call parentheses in its replacement list.  Instead, the tuple element bound
+/// to `t` supplies the whole actual-list spelling, for example `("x")` in
+/// `OUTER((LOG, ("x")))`.  The tuple element is edited as one source slot, but
+/// replay must reason over the generated callee's individual actuals, including
+/// an empty variadic tail.  This helper performs only the deterministic
+/// top-level split; callee arity and variadic admission are checked by the
+/// caller.
+bool collectParenthesizedTupleGeneratedActuals(
+    llvm::StringRef sourceTupleElement, const clang::LangOptions &lexLang,
+    llvm::SmallVectorImpl<std::string> &out);
+
+/// Rebuilds the single tuple element that supplies adjacency-call parentheses.
+///
+/// The tuple-generated solver has already produced the generated callee's fixed
+/// and variadic actual spellings.  The source-preserving obligation here is
+/// only to place those spellings back into the one parenthesized tuple slot
+/// consumed by `f t`, so the parent tuple shape survives instead of being
+/// collapsed into the generated expansion text.
+std::string buildParenthesizedTupleGeneratedActualList(
+    llvm::ArrayRef<std::string> actualPieces);
+
+/// Fold a generated call's actual pieces into one actual per callee formal.
+///
+/// Fixed formals take one piece each; a trailing variadic formal takes the
+/// remaining pieces, trimmed and joined with ", ".  Returns nullopt when the
+/// piece count does not fit the callee's formal list.
+std::optional<llvm::SmallVector<std::string, 8>>
+foldCalleeActualPieces(const RefoldModel::MacroDirective &callee,
+                       llvm::ArrayRef<std::string> pieces);
+
+/// Split solved callee actuals back into actual pieces: each fixed formal is
+/// one trimmed piece, and a non-empty variadic tail is one more piece (an
+/// empty tail contributes none).
+llvm::SmallVector<std::string, 8>
+unfoldCalleeActuals(const RefoldModel::MacroDirective &callee,
+                    llvm::ArrayRef<std::string> actuals);
 
 /// Source slot tracked while following a generated-callee chain.
 ///

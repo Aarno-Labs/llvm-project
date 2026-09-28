@@ -148,7 +148,6 @@ std::optional<StringRef> asOptString(const json::Object &obj, StringRef key,
   return std::nullopt;
 }
 
-[[maybe_unused]]
 /// Read an optional uint32_t field.
 ///
 /// Out-of-range integer values are fatal because they cannot be represented in
@@ -193,25 +192,6 @@ std::optional<uint64_t> asOptUInt64(const json::Object &obj, StringRef key,
   return std::nullopt;
 }
 
-[[maybe_unused]]
-/// Read an optional bool field.
-///
-/// Non-boolean values are returned as std::nullopt; callers rely on schema
-/// validation to catch malformed typed fields.
-std::optional<bool> asOptBool(const json::Object &obj, StringRef key,
-                              bool canBeNull = false) {
-  if (const json::Value *val = obj.get(key)) {
-    if (val->getAsNull()) {
-      if (canBeNull)
-        return std::nullopt;
-      REFOLD_LOG_FATAL("model",
-                       "encountered unexpected null for property '{0}'", key);
-    }
-    return val->getAsBoolean();
-  }
-  return std::nullopt;
-}
-
 /// Apply a typed parser to a required field, preserving Expected error flow.
 template <typename Fn>
 auto applyToField(Fn &&fn, const json::Object &obj, StringRef key,
@@ -223,6 +203,66 @@ auto applyToField(Fn &&fn, const json::Object &obj, StringRef key,
     return fieldOrErr.takeError();
   return std::forward<decltype(fn)>(fn)(**fieldOrErr, key);
 }
+
+/// Parse a required field into `out`, preserving Expected error flow.
+template <typename T, typename Fn>
+Error readRequiredField(T &out, Fn &&fn, const json::Object &obj, StringRef key,
+                        StringRef ctx = "root") {
+  auto valueOrErr = applyToField(std::forward<Fn>(fn), obj, key, ctx);
+  if (!valueOrErr)
+    return valueOrErr.takeError();
+  out = *valueOrErr;
+  return Error::success();
+}
+
+/// Reads the fields of one producer sub-record whose malformation is fatal.
+///
+/// A missing field stops the run with "<ctx>: <owner> missing <key>", and a
+/// field of the wrong type with "<ctx>: <path>.<key> is not <type>".
+struct FatalRecordReader {
+  const json::Object &obj;
+  StringRef ctx;
+  StringRef owner;
+  StringRef path;
+
+  /// Bind `val` as a sub-record; a non-object stops the run with
+  /// "<ctx>: <owner> is not an object".
+  static FatalRecordReader At(const json::Value &val, StringRef ctx,
+                              StringRef owner, StringRef path) {
+    const json::Object *obj = val.getAsObject();
+    if (!obj)
+      REFOLD_LOG_FATAL("model", "{0}: {1} is not an object", ctx, owner);
+    return {*obj, ctx, owner, path};
+  }
+
+  const json::Value &Get(StringRef key) const {
+    const json::Value *val = obj.get(key);
+    if (!val)
+      REFOLD_LOG_FATAL("model", "{0}: {1} missing {2}", ctx, owner, key);
+    return *val;
+  }
+
+  template <typename T>
+  T Read(StringRef key, Expected<T> (*parse)(const json::Value &, StringRef),
+         StringRef typeName) const {
+    Expected<T> value = parse(Get(key), key);
+    if (!value)
+      REFOLD_LOG_FATAL("model", "{0}: {1}.{2} is not {3}", ctx, path, key,
+                       typeName);
+    return *value;
+  }
+
+  StringRef String(StringRef key) const {
+    return Read(key, asString, "a string");
+  }
+  uint32_t UInt32(StringRef key) const {
+    return Read(key, asUInt32, "a uint32");
+  }
+  bool Bool(StringRef key) const { return Read(key, asBool, "a bool"); }
+  const json::Array &Array(StringRef key) const {
+    return *Read(key, asArray, "an array");
+  }
+};
 
 /// Return one array element as an object with contextual diagnostics.
 Expected<const json::Object *> arrayObjElemAt(const json::Array &arr,
@@ -280,10 +320,8 @@ parseIncludeSearchEntry(const json::Object &obj, uint32_t expectedIndex,
                         StringRef ctx) {
   RefoldModel::IncludeSearchEntry entry;
 
-  auto indexOrErr = applyToField(asUInt32, obj, "index", ctx);
-  if (!indexOrErr)
-    return indexOrErr.takeError();
-  entry.index = *indexOrErr;
+  if (Error err = readRequiredField(entry.index, asUInt32, obj, "index", ctx))
+    return std::move(err);
   if (entry.index != expectedIndex)
     return createStringError(
         inconvertibleErrorCode(),
@@ -304,15 +342,12 @@ parseIncludeSearchEntry(const json::Object &obj, uint32_t expectedIndex,
                              "include_search_chain at %s",
                              kindOrErr->str().c_str(), ctx.str().c_str());
 
-  auto spellingOrErr = applyToField(asString, obj, "spelling", ctx);
-  if (!spellingOrErr)
-    return spellingOrErr.takeError();
-  entry.spelling = *spellingOrErr;
+  if (Error err =
+          readRequiredField(entry.spelling, asString, obj, "spelling", ctx))
+    return std::move(err);
 
-  auto pathOrErr = applyToField(asString, obj, "path", ctx);
-  if (!pathOrErr)
-    return pathOrErr.takeError();
-  entry.path = *pathOrErr;
+  if (Error err = readRequiredField(entry.path, asString, obj, "path", ctx))
+    return std::move(err);
 
   return entry;
 }
@@ -453,19 +488,15 @@ parseOptionalIncludeNextProvenance(
   RefoldModel::IncludeNextProvenance provenance;
   if (*provenanceOrErr == "known") {
     provenance.known = true;
-    auto containingOrErr =
-        applyToField(asUInt64, nextObj, "containing_file_include_id",
-                     (Twine(ctx) + ".include_next").str());
-    if (!containingOrErr)
-      return containingOrErr.takeError();
-    provenance.containingFileIncludeId = *containingOrErr;
+    if (Error err = readRequiredField(
+            provenance.containingFileIncludeId, asUInt64, nextObj,
+            "containing_file_include_id", (Twine(ctx) + ".include_next").str()))
+      return std::move(err);
 
-    auto resumeOrErr =
-        applyToField(asUInt32, nextObj, "resume_search_chain_index",
-                     (Twine(ctx) + ".include_next").str());
-    if (!resumeOrErr)
-      return resumeOrErr.takeError();
-    provenance.resumeSearchChainIndex = *resumeOrErr;
+    if (Error err = readRequiredField(
+            provenance.resumeSearchChainIndex, asUInt32, nextObj,
+            "resume_search_chain_index", (Twine(ctx) + ".include_next").str()))
+      return std::move(err);
 
     if (!includeSearchChain.empty() &&
         *provenance.resumeSearchChainIndex >= includeSearchChain.size())
@@ -641,10 +672,9 @@ parseSpans(const json::Value &val, StringRef ctx,
       assert(argKind && "missing 'argKind' when parsing a PPArgSpan type");
       span.kind = *argKind;
 
-      auto argOrErr = applyToField(asUInt32, *obj, "arg_index", ctxItem);
-      if (!argOrErr)
-        return argOrErr.takeError();
-      span.argIdx = *argOrErr;
+      if (Error err = readRequiredField(span.argIdx, asUInt32, *obj,
+                                        "arg_index", ctxItem))
+        return std::move(err);
 
       // byte_begin/byte_end describe a token-internal slice within the
       // spelled output token.  They are required whenever a span identifies
@@ -652,10 +682,9 @@ parseSpans(const json::Value &val, StringRef ctx,
       // stringify spans such as L## #x.
       span.byteBegin = asOptUInt32(*obj, "byte_begin");
       if (span.byteBegin) {
-        auto beOrErr = applyToField(asUInt32, *obj, "byte_end", ctxItem);
-        if (!beOrErr)
-          return beOrErr.takeError();
-        span.byteEnd = *beOrErr;
+        if (Error err = readRequiredField(span.byteEnd, asUInt32, *obj,
+                                          "byte_end", ctxItem))
+          return std::move(err);
       } else if (obj->get("byte_end")) {
         return make_error<StringError>(
             formatv("{0}: field 'byte_end' requires 'byte_begin'", ctxItem)
@@ -666,10 +695,9 @@ parseSpans(const json::Value &val, StringRef ctx,
       // Check if there are pp_byte_begin/pp_byte_end pairs.
       span.ppByteBegin = asOptUInt64(*obj, "pp_byte_begin");
       if (span.ppByteBegin) {
-        auto pbeOrErr = applyToField(asUInt64, *obj, "pp_byte_end", ctxItem);
-        if (!pbeOrErr)
-          return pbeOrErr.takeError();
-        span.ppByteEnd = *pbeOrErr;
+        if (Error err = readRequiredField(span.ppByteEnd, asUInt64, *obj,
+                                          "pp_byte_end", ctxItem))
+          return std::move(err);
       }
     } else {
       assert(!argKind && "unexpected PPArgSpanKind on non-PPArgSpan type");
@@ -795,35 +823,12 @@ parseMacroDefParams(const json::Object &ownerObj, StringRef fieldName,
   std::vector<MacroDefParam> params;
   if (auto paramsArr = asOptArray(ownerObj, fieldName, /*canBeNull=*/true)) {
     params.reserve((**paramsArr).size());
+    const std::string owner = (Twine(fieldName) + " element").str();
     for (const json::Value &Elem : **paramsArr) {
-      auto objOrErrLocal =
-          asObject(Elem, (Twine(ctxItem) + ": " + fieldName + "[]").str());
-      if (!objOrErrLocal)
-        REFOLD_LOG_FATAL("model", "{0}: {1} element is not an object", ctxItem,
-                         fieldName);
-      const json::Object &ParamObj = **objOrErrLocal;
-
-      const json::Value *NameVal = ParamObj.get("name");
-      if (!NameVal)
-        REFOLD_LOG_FATAL("model", "{0}: {1} element missing name", ctxItem,
-                         fieldName);
-      auto nameOrErrLocal = asString(
-          *NameVal, (Twine(ctxItem) + ": " + fieldName + ".name").str());
-      if (!nameOrErrLocal)
-        REFOLD_LOG_FATAL("model", "{0}: {1}.name is not a string", ctxItem,
-                         fieldName);
-
-      const json::Value *VarVal = ParamObj.get("variadic");
-      if (!VarVal)
-        REFOLD_LOG_FATAL("model", "{0}: {1} element missing variadic", ctxItem,
-                         fieldName);
-      auto varOrErr = asBool(
-          *VarVal, (Twine(ctxItem) + ": " + fieldName + ".variadic").str());
-      if (!varOrErr)
-        REFOLD_LOG_FATAL("model", "{0}: {1}.variadic is not a bool", ctxItem,
-                         fieldName);
-
-      params.emplace_back(*nameOrErrLocal, *varOrErr);
+      FatalRecordReader param =
+          FatalRecordReader::At(Elem, ctxItem, owner, fieldName);
+      StringRef name = param.String("name");
+      params.emplace_back(name, param.Bool("variadic"));
     }
   }
   return params;
@@ -844,47 +849,21 @@ parseMacroReplacementTokens(const json::Object &ownerObj,
                                   /*canBeNull=*/true)) {
     tokens.reserve((**tokensArr).size());
     for (const json::Value &Elem : **tokensArr) {
-      auto objOrErrLocal =
-          asObject(Elem, (Twine(ctxItem) + ": replacement_tokens[]").str());
-      if (!objOrErrLocal)
-        REFOLD_LOG_FATAL("model",
-                         "{0}: replacement_tokens element is not an object",
-                         ctxItem);
-      const json::Object &TokObj = **objOrErrLocal;
-
-      const json::Value *KindVal = TokObj.get("kind");
-      if (!KindVal)
-        REFOLD_LOG_FATAL(
-            "model", "{0}: replacement_tokens element missing kind", ctxItem);
-      auto kindOrErrLocal = asString(
-          *KindVal, (Twine(ctxItem) + ": replacement_tokens.kind").str());
-      if (!kindOrErrLocal)
-        REFOLD_LOG_FATAL(
-            "model", "{0}: replacement_tokens.kind is not a string", ctxItem);
-
-      const json::Value *SpellingVal = TokObj.get("spelling");
-      if (!SpellingVal)
-        REFOLD_LOG_FATAL("model",
-                         "{0}: replacement_tokens element missing spelling",
-                         ctxItem);
-      auto spellingOrErr =
-          asString(*SpellingVal,
-                   (Twine(ctxItem) + ": replacement_tokens.spelling").str());
-      if (!spellingOrErr)
-        REFOLD_LOG_FATAL("model",
-                         "{0}: replacement_tokens.spelling is not a string",
-                         ctxItem);
+      FatalRecordReader tok = FatalRecordReader::At(
+          Elem, ctxItem, "replacement_tokens element", "replacement_tokens");
+      const json::Object &TokObj = tok.obj;
+      StringRef kind = tok.String("kind");
 
       MacroReplacementToken token;
-      token.spelling = *spellingOrErr;
-      if (*kindOrErrLocal == "literal") {
+      token.spelling = tok.String("spelling");
+      if (kind == "literal") {
         token.kind = MacroReplacementTokenKind::Literal;
         if (TokObj.get("param_index"))
           REFOLD_LOG_FATAL(
               "model",
               "{0}: literal replacement_tokens element has param_index",
               ctxItem);
-      } else if (*kindOrErrLocal == "param_ref") {
+      } else if (kind == "param_ref") {
         token.kind = MacroReplacementTokenKind::ParamRef;
         const json::Value *ParamVal = TokObj.get("param_index");
         if (!ParamVal)
@@ -914,7 +893,7 @@ parseMacroReplacementTokens(const json::Object &ownerObj,
         token.paramIndex = *paramOrErr;
       } else {
         REFOLD_LOG_FATAL("model", "{0}: invalid replacement_tokens.kind '{1}'",
-                         ctxItem, *kindOrErrLocal);
+                         ctxItem, kind);
       }
 
       tokens.push_back(std::move(token));
@@ -939,40 +918,14 @@ parseCalleeOriginParts(const json::Object &originObj, StringRef finalSpelling,
   parts.reserve((**partsArr).size());
   std::string tiled;
   for (const json::Value &Elem : **partsArr) {
-    auto objOrErrLocal =
-        asObject(Elem, (Twine(ctxItem) + ": callee_origin.parts[]").str());
-    if (!objOrErrLocal)
-      REFOLD_LOG_FATAL("model",
-                       "{0}: callee_origin.parts element is not an object",
-                       ctxItem);
-    const json::Object &PartObj = **objOrErrLocal;
-
-    const json::Value *KindVal = PartObj.get("kind");
-    if (!KindVal)
-      REFOLD_LOG_FATAL("model", "{0}: callee_origin.parts element missing kind",
-                       ctxItem);
-    auto kindOrErrLocal = asString(
-        *KindVal, (Twine(ctxItem) + ": callee_origin.parts.kind").str());
-    if (!kindOrErrLocal)
-      REFOLD_LOG_FATAL("model", "{0}: callee_origin.parts.kind is not a string",
-                       ctxItem);
-
-    const json::Value *SpellingVal = PartObj.get("spelling");
-    if (!SpellingVal)
-      REFOLD_LOG_FATAL("model",
-                       "{0}: callee_origin.parts element missing spelling",
-                       ctxItem);
-    auto spellingOrErr =
-        asString(*SpellingVal,
-                 (Twine(ctxItem) + ": callee_origin.parts.spelling").str());
-    if (!spellingOrErr)
-      REFOLD_LOG_FATAL("model",
-                       "{0}: callee_origin.parts.spelling is not a string",
-                       ctxItem);
+    FatalRecordReader record = FatalRecordReader::At(
+        Elem, ctxItem, "callee_origin.parts element", "callee_origin.parts");
+    const json::Object &PartObj = record.obj;
+    StringRef kind = record.String("kind");
 
     CalleeOriginPart part;
-    part.spelling = *spellingOrErr;
-    if (*kindOrErrLocal == "literal") {
+    part.spelling = record.String("spelling");
+    if (kind == "literal") {
       part.kind = CalleeOriginPartKind::Literal;
       if (PartObj.get("root_macro_id") || PartObj.get("root_param_index") ||
           PartObj.get("byte_begin") || PartObj.get("byte_end"))
@@ -980,7 +933,7 @@ parseCalleeOriginParts(const json::Object &originObj, StringRef finalSpelling,
             "model",
             "{0}: literal callee_origin part carries selector-slice fields",
             ctxItem);
-    } else if (*kindOrErrLocal == "caller_arg_slice") {
+    } else if (kind == "caller_arg_slice") {
       part.kind = CalleeOriginPartKind::CallerArgSlice;
       auto rootOrErr =
           applyToField(asUInt64, PartObj, "root_macro_id",
@@ -1018,7 +971,7 @@ parseCalleeOriginParts(const json::Object &originObj, StringRef finalSpelling,
       part.byteEnd = *endOrErrLocal;
     } else {
       REFOLD_LOG_FATAL("model", "{0}: invalid callee_origin.parts.kind '{1}'",
-                       ctxItem, *kindOrErrLocal);
+                       ctxItem, kind);
     }
 
     tiled.append(part.spelling.begin(), part.spelling.end());
@@ -1218,20 +1171,14 @@ parseMacroDirectiveItem(const json::Object &obj, StringRef skStr,
   MacroDirective md;
 
   // required
-  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
-  if (!idOrErr)
-    return idOrErr.takeError();
-  md.id = *idOrErr;
+  if (Error err = readRequiredField(md.id, asUInt64, obj, "id", ctxItem))
+    return std::move(err);
 
-  auto nameOrErr = applyToField(asString, obj, "name", ctxItem);
-  if (!nameOrErr)
-    return nameOrErr.takeError();
-  md.name = *nameOrErr;
+  if (Error err = readRequiredField(md.name, asString, obj, "name", ctxItem))
+    return std::move(err);
 
-  auto textOrErr = applyToField(asString, obj, "text", ctxItem);
-  if (!textOrErr)
-    return textOrErr.takeError();
-  md.text = *textOrErr;
+  if (Error err = readRequiredField(md.text, asString, obj, "text", ctxItem))
+    return std::move(err);
 
   // Load-bearing guard, not a parsing convenience: `functionLike` is assigned
   // only for a `#define`, which is what lets roughly two dozen call sites read
@@ -1240,17 +1187,14 @@ parseMacroDirectiveItem(const json::Object &obj, StringRef skStr,
   // stays false and those sites fail closed.  See
   // `RefoldModel::MacroDirective::IsFunctionLikeDefine`.
   if (skStr == "#define") {
-    auto functionLikeOrErr =
-        applyToField(asBool, obj, "function_like", ctxItem);
-    if (!functionLikeOrErr)
-      return functionLikeOrErr.takeError();
-    md.functionLike = *functionLikeOrErr;
+    if (Error err = readRequiredField(md.functionLike, asBool, obj,
+                                      "function_like", ctxItem))
+      return std::move(err);
   }
 
-  auto spOrErr = applyToField(asString, obj, "site_path", ctxItem);
-  if (!spOrErr)
-    return spOrErr.takeError();
-  md.sitePath = *spOrErr;
+  if (Error err =
+          readRequiredField(md.sitePath, asString, obj, "site_path", ctxItem))
+    return std::move(err);
 
   auto spansOrErr = requireField(obj, "spans", ctxItem);
   if (!spansOrErr)
@@ -1303,20 +1247,15 @@ parsePragmaDirectiveItem(const json::Object &obj, const std::string &ctxItem) {
   PragmaDirective pd;
 
   // required
-  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
-  if (!idOrErr)
-    return idOrErr.takeError();
-  pd.id = *idOrErr;
+  if (Error err = readRequiredField(pd.id, asUInt64, obj, "id", ctxItem))
+    return std::move(err);
 
-  auto textOrErr = applyToField(asString, obj, "text", ctxItem);
-  if (!textOrErr)
-    return textOrErr.takeError();
-  pd.text = *textOrErr;
+  if (Error err = readRequiredField(pd.text, asString, obj, "text", ctxItem))
+    return std::move(err);
 
-  auto spOrErr = applyToField(asString, obj, "site_path", ctxItem);
-  if (!spOrErr)
-    return spOrErr.takeError();
-  pd.sitePath = *spOrErr;
+  if (Error err =
+          readRequiredField(pd.sitePath, asString, obj, "site_path", ctxItem))
+    return std::move(err);
 
   // not really optional, but can be string or null (null values will
   // produce a fatal error)
@@ -1509,39 +1448,17 @@ parseMacroInvocationItem(const json::Object &obj, const std::string &ctxItem) {
   if (auto tokensArr = asOptArray(obj, "paste_tokens", /*allowNull=*/true)) {
     pasteTokens.reserve((**tokensArr).size());
     for (const json::Value &Entry : **tokensArr) {
-      auto objOrErrLocal = asObject(Entry, ctxItem);
-      if (!objOrErrLocal)
-        REFOLD_LOG_FATAL("model", "{0}: paste_tokens entry is not an object",
-                         ctxItem);
-      const json::Object &TokObj = **objOrErrLocal;
-
-      const json::Value *SpellingVal = TokObj.get("spelling");
-      if (!SpellingVal)
-        REFOLD_LOG_FATAL("model", "{0}: paste_tokens entry missing spelling",
-                         ctxItem);
-      auto spellingOrErr =
-          asString(*SpellingVal, ctxItem + ": paste_tokens.spelling");
-      if (!spellingOrErr)
-        REFOLD_LOG_FATAL("model", "{0}: paste_tokens.spelling is not a string",
-                         ctxItem);
-
-      const json::Value *PartsVal = TokObj.get("parts");
-      if (!PartsVal)
-        REFOLD_LOG_FATAL("model", "{0}: paste_tokens entry missing parts",
-                         ctxItem);
-      auto partsArrOrErr = asArray(*PartsVal, ctxItem + ": paste_tokens.parts");
-      if (!partsArrOrErr)
-        REFOLD_LOG_FATAL("model", "{0}: paste_tokens.parts is not an array",
-                         ctxItem);
+      FatalRecordReader token = FatalRecordReader::At(
+          Entry, ctxItem, "paste_tokens entry", "paste_tokens");
+      StringRef tokenSpelling = token.String("spelling");
+      const json::Array &partsArr = token.Array("parts");
 
       std::vector<RefoldModel::PastePart> parts;
-      parts.reserve((**partsArrOrErr).size());
-      for (const json::Value &PartVal : **partsArrOrErr) {
-        auto partObjOrErr = asObject(PartVal, ctxItem);
-        if (!partObjOrErr)
-          REFOLD_LOG_FATAL("model", "{0}: paste_tokens part is not an object",
-                           ctxItem);
-        const json::Object &PartObj = **partObjOrErr;
+      parts.reserve(partsArr.size());
+      for (const json::Value &PartVal : partsArr) {
+        FatalRecordReader part = FatalRecordReader::At(
+            PartVal, ctxItem, "paste_tokens part", "paste_tokens.part");
+        const json::Object &PartObj = part.obj;
 
         std::optional<uint32_t> argIndex =
             asOptUInt32(PartObj, "arg_index", /*canBeNull=*/true);
@@ -1571,28 +1488,9 @@ parseMacroInvocationItem(const json::Object &obj, const std::string &ctxItem) {
           REFOLD_LOG_FATAL(
               "model", "{0}: literal paste_tokens part has arg_index", ctxItem);
 
-        const json::Value *ByteBVal = PartObj.get("byte_begin");
-        if (!ByteBVal)
-          REFOLD_LOG_FATAL("model", "{0}: paste_tokens part missing byte_begin",
-                           ctxItem);
-        auto byteBOrErr =
-            asUInt32(*ByteBVal, ctxItem + ": paste_tokens.part.byte_begin");
-        if (!byteBOrErr)
-          REFOLD_LOG_FATAL("model",
-                           "{0}: paste_tokens.part.byte_begin is not a uint32",
-                           ctxItem);
-
-        const json::Value *ByteEVal = PartObj.get("byte_end");
-        if (!ByteEVal)
-          REFOLD_LOG_FATAL("model", "{0}: paste_tokens part missing byte_end",
-                           ctxItem);
-        auto byteEOrErr =
-            asUInt32(*ByteEVal, ctxItem + ": paste_tokens.part.byte_end");
-        if (!byteEOrErr)
-          REFOLD_LOG_FATAL("model",
-                           "{0}: paste_tokens.part.byte_end is not a uint32",
-                           ctxItem);
-        if (*byteEOrErr < *byteBOrErr || *byteEOrErr > spellingOrErr->size())
+        const uint32_t byteBegin = part.UInt32("byte_begin");
+        const uint32_t byteEnd = part.UInt32("byte_end");
+        if (byteEnd < byteBegin || byteEnd > tokenSpelling.size())
           REFOLD_LOG_FATAL(
               "model", "{0}: paste_tokens part byte range is invalid", ctxItem);
 
@@ -1600,8 +1498,7 @@ parseMacroInvocationItem(const json::Object &obj, const std::string &ctxItem) {
             asOptString(PartObj, "spelling", /*canBeNull=*/true);
         // The byte range is authoritative. A redundant part spelling is
         // accepted only when it exactly matches that slice.
-        StringRef derivedSpelling =
-            spellingOrErr->slice(*byteBOrErr, *byteEOrErr);
+        StringRef derivedSpelling = tokenSpelling.slice(byteBegin, byteEnd);
         if (partSpelling && *partSpelling != derivedSpelling)
           REFOLD_LOG_FATAL(
               "model",
@@ -1626,13 +1523,13 @@ parseMacroInvocationItem(const json::Object &obj, const std::string &ctxItem) {
                            "{0}: literal paste_tokens part has arg byte range",
                            ctxItem);
 
-        parts.push_back(RefoldModel::PastePart{kindLocal, argIndex, *byteBOrErr,
-                                               *byteEOrErr, storedSpelling,
+        parts.push_back(RefoldModel::PastePart{kindLocal, argIndex, byteBegin,
+                                               byteEnd, storedSpelling,
                                                argByteBegin, argByteEnd});
       }
 
       pasteTokens.push_back(
-          RefoldModel::PasteToken{*spellingOrErr, std::move(parts)});
+          RefoldModel::PasteToken{tokenSpelling, std::move(parts)});
     }
   }
 
@@ -1741,45 +1638,12 @@ parseMacroInvocationItem(const json::Object &obj, const std::string &ctxItem) {
       std::vector<RefoldModel::InvArgRef> refs;
       refs.reserve(a.size());
       for (const json::Value &Elem : a) {
-        auto objOrErrLocal = asObject(Elem, ctxItem);
-        if (!objOrErrLocal)
-          REFOLD_LOG_FATAL("model", "{0}: arg_refs element is not an object",
-                           ctxItem);
-        const json::Object &RefObj = **objOrErrLocal;
-
-        const json::Value *CallerIdxVal = RefObj.get("caller_param_index");
-        if (!CallerIdxVal)
-          REFOLD_LOG_FATAL("model",
-                           "{0}: arg_refs element missing caller_param_index",
-                           ctxItem);
-        auto callerIdxOrErr =
-            asUInt32(*CallerIdxVal, ctxItem + ": arg_refs.caller_param_index");
-        if (!callerIdxOrErr)
-          REFOLD_LOG_FATAL("model",
-                           "{0}: arg_refs.caller_param_index is not a uint32",
-                           ctxItem);
-
-        const json::Value *ByteBVal = RefObj.get("byte_begin");
-        if (!ByteBVal)
-          REFOLD_LOG_FATAL("model", "{0}: arg_refs element missing byte_begin",
-                           ctxItem);
-        auto byteBOrErr =
-            asUInt32(*ByteBVal, ctxItem + ": arg_refs.byte_begin");
-        if (!byteBOrErr)
-          REFOLD_LOG_FATAL("model", "{0}: arg_refs.byte_begin is not a uint32",
-                           ctxItem);
-
-        const json::Value *ByteEVal = RefObj.get("byte_end");
-        if (!ByteEVal)
-          REFOLD_LOG_FATAL("model", "{0}: arg_refs element missing byte_end",
-                           ctxItem);
-        auto byteEOrErr = asUInt32(*ByteEVal, ctxItem + ": arg_refs.byte_end");
-        if (!byteEOrErr)
-          REFOLD_LOG_FATAL("model", "{0}: arg_refs.byte_end is not a uint32",
-                           ctxItem);
-
-        refs.push_back(
-            RefoldModel::InvArgRef{*callerIdxOrErr, *byteBOrErr, *byteEOrErr});
+        FatalRecordReader ref = FatalRecordReader::At(
+            Elem, ctxItem, "arg_refs element", "arg_refs");
+        const uint32_t callerParamIndex = ref.UInt32("caller_param_index");
+        const uint32_t byteBegin = ref.UInt32("byte_begin");
+        refs.push_back(RefoldModel::InvArgRef{callerParamIndex, byteBegin,
+                                              ref.UInt32("byte_end")});
       }
       argRefs.push_back(std::move(refs));
     }
@@ -1798,57 +1662,12 @@ parseMacroInvocationItem(const json::Object &obj, const std::string &ctxItem) {
       std::vector<RefoldModel::TupleArgRef> refs;
       refs.reserve(a.size());
       for (const json::Value &Elem : a) {
-        auto objOrErrLocal = asObject(Elem, ctxItem);
-        if (!objOrErrLocal) {
-          REFOLD_LOG_FATAL(
-              "model", "{0}: arg_tuple_refs element is not an object", ctxItem);
-        }
-        const json::Object &RefObj = **objOrErrLocal;
-
-        const json::Value *CallerIdxVal = RefObj.get("caller_param_index");
-        if (!CallerIdxVal) {
-          REFOLD_LOG_FATAL(
-              "model", "{0}: arg_tuple_refs element missing caller_param_index",
-              ctxItem);
-        }
-        auto callerIdxOrErr = asUInt32(
-            *CallerIdxVal, ctxItem + ": arg_tuple_refs.caller_param_index");
-        if (!callerIdxOrErr) {
-          REFOLD_LOG_FATAL(
-              "model", "{0}: arg_tuple_refs.caller_param_index is not a uint32",
-              ctxItem);
-        }
-
-        const json::Value *ByteBVal = RefObj.get("caller_byte_begin");
-        if (!ByteBVal) {
-          REFOLD_LOG_FATAL(
-              "model", "{0}: arg_tuple_refs element missing caller_byte_begin",
-              ctxItem);
-        }
-        auto byteBOrErr =
-            asUInt32(*ByteBVal, ctxItem + ": arg_tuple_refs.caller_byte_begin");
-        if (!byteBOrErr) {
-          REFOLD_LOG_FATAL(
-              "model", "{0}: arg_tuple_refs.caller_byte_begin is not a uint32",
-              ctxItem);
-        }
-
-        const json::Value *ByteEVal = RefObj.get("caller_byte_end");
-        if (!ByteEVal) {
-          REFOLD_LOG_FATAL(
-              "model", "{0}: arg_tuple_refs element missing caller_byte_end",
-              ctxItem);
-        }
-        auto byteEOrErr =
-            asUInt32(*ByteEVal, ctxItem + ": arg_tuple_refs.caller_byte_end");
-        if (!byteEOrErr) {
-          REFOLD_LOG_FATAL(
-              "model", "{0}: arg_tuple_refs.caller_byte_end is not a uint32",
-              ctxItem);
-        }
-
-        refs.push_back(RefoldModel::TupleArgRef{*callerIdxOrErr, *byteBOrErr,
-                                                *byteEOrErr});
+        FatalRecordReader ref = FatalRecordReader::At(
+            Elem, ctxItem, "arg_tuple_refs element", "arg_tuple_refs");
+        const uint32_t callerParamIndex = ref.UInt32("caller_param_index");
+        const uint32_t byteBegin = ref.UInt32("caller_byte_begin");
+        refs.push_back(RefoldModel::TupleArgRef{callerParamIndex, byteBegin,
+                                                ref.UInt32("caller_byte_end")});
       }
       argTupleRefs.push_back(std::move(refs));
     }
@@ -1891,15 +1710,11 @@ static Expected<FileItem> parseFileItem(const json::Object &obj,
   FileItem fi;
 
   // required
-  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
-  if (!idOrErr)
-    return idOrErr.takeError();
-  fi.id = *idOrErr;
+  if (Error err = readRequiredField(fi.id, asUInt64, obj, "id", ctxItem))
+    return std::move(err);
 
-  auto pathOrErr = applyToField(asString, obj, "path", ctxItem);
-  if (!pathOrErr)
-    return pathOrErr.takeError();
-  fi.path = *pathOrErr;
+  if (Error err = readRequiredField(fi.path, asString, obj, "path", ctxItem))
+    return std::move(err);
 
   auto spansOrErr = requireField(obj, "spans", ctxItem);
   if (!spansOrErr)
@@ -1919,25 +1734,19 @@ static Expected<CondGroup> parseCondGroup(const json::Object &obj,
   CondGroup group;
 
   // required
-  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
-  if (!idOrErr)
-    return idOrErr.takeError();
-  group.id = *idOrErr;
+  if (Error err = readRequiredField(group.id, asUInt64, obj, "id", ctxItem))
+    return std::move(err);
 
-  auto fileOrErr = applyToField(asString, obj, "file", ctxItem);
-  if (!fileOrErr)
-    return fileOrErr.takeError();
-  group.file = *fileOrErr;
+  if (Error err = readRequiredField(group.file, asString, obj, "file", ctxItem))
+    return std::move(err);
 
-  auto gbOrErr = applyToField(asUInt64, obj, "group_b", ctxItem);
-  if (!gbOrErr)
-    return gbOrErr.takeError();
-  group.groupB = *gbOrErr;
+  if (Error err =
+          readRequiredField(group.groupB, asUInt64, obj, "group_b", ctxItem))
+    return std::move(err);
 
-  auto geOrErr = applyToField(asUInt64, obj, "group_e", ctxItem);
-  if (!geOrErr)
-    return geOrErr.takeError();
-  group.groupE = *geOrErr;
+  if (Error err =
+          readRequiredField(group.groupE, asUInt64, obj, "group_e", ctxItem))
+    return std::move(err);
 
   // optional
   group.parentArmId = asOptUInt64(obj, "parent_arm_id");
@@ -1962,30 +1771,24 @@ static Expected<CondGroup> parseCondGroup(const json::Object &obj,
     arm.groupId = group.id;
 
     // required
-    auto idOrErr = applyToField(asUInt64, *armObj, "id", ctxItem);
-    if (!idOrErr)
-      return idOrErr.takeError();
-    arm.id = *idOrErr;
+    if (Error err = readRequiredField(arm.id, asUInt64, *armObj, "id", ctxItem))
+      return std::move(err);
 
-    auto kindOrErr = applyToField(asString, *armObj, "kind", ctxItem);
-    if (!kindOrErr)
-      return kindOrErr.takeError();
-    arm.kind = *kindOrErr;
+    if (Error err =
+            readRequiredField(arm.kind, asString, *armObj, "kind", ctxItem))
+      return std::move(err);
 
-    auto bbOrErr = applyToField(asUInt64, *armObj, "body_b", ctxItem);
-    if (!bbOrErr)
-      return bbOrErr.takeError();
-    arm.bodyB = *bbOrErr;
+    if (Error err =
+            readRequiredField(arm.bodyB, asUInt64, *armObj, "body_b", ctxItem))
+      return std::move(err);
 
-    auto beOrErr = applyToField(asUInt64, *armObj, "body_e", ctxItem);
-    if (!beOrErr)
-      return beOrErr.takeError();
-    arm.bodyE = *beOrErr;
+    if (Error err =
+            readRequiredField(arm.bodyE, asUInt64, *armObj, "body_e", ctxItem))
+      return std::move(err);
 
-    auto selOrErr = applyToField(asBool, *armObj, "selected", ctxItem);
-    if (!selOrErr)
-      return selOrErr.takeError();
-    arm.selected = *selOrErr;
+    if (Error err = readRequiredField(arm.selected, asBool, *armObj, "selected",
+                                      ctxItem))
+      return std::move(err);
 
     // optional
     arm.cond = asOptString(*armObj, "cond");
@@ -2027,39 +1830,31 @@ static Expected<LineControlEvent>
 parseLineControlEvent(const json::Object &obj, const std::string &ctxItem) {
   LineControlEvent event;
 
-  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
-  if (!idOrErr)
-    return idOrErr.takeError();
-  event.id = *idOrErr;
+  if (Error err = readRequiredField(event.id, asUInt64, obj, "id", ctxItem))
+    return std::move(err);
 
-  auto fileOrErr = applyToField(asString, obj, "physical_file", ctxItem);
-  if (!fileOrErr)
-    return fileOrErr.takeError();
-  event.physicalFile = *fileOrErr;
+  if (Error err = readRequiredField(event.physicalFile, asString, obj,
+                                    "physical_file", ctxItem))
+    return std::move(err);
 
   event.siteB = asOptUInt64(obj, "site_b", /*canBeNull=*/true);
   event.siteE = asOptUInt64(obj, "site_e", /*canBeNull=*/true);
 
-  auto activeOrErr = applyToField(asBool, obj, "active", ctxItem);
-  if (!activeOrErr)
-    return activeOrErr.takeError();
-  event.active = *activeOrErr;
+  if (Error err =
+          readRequiredField(event.active, asBool, obj, "active", ctxItem))
+    return std::move(err);
 
-  auto provenOrErr = applyToField(asBool, obj, "producer_proven", ctxItem);
-  if (!provenOrErr)
-    return provenOrErr.takeError();
-  event.producerProven = *provenOrErr;
+  if (Error err = readRequiredField(event.producerProven, asBool, obj,
+                                    "producer_proven", ctxItem))
+    return std::move(err);
 
-  auto lineOrErr = applyToField(asUInt64, obj, "logical_line_after", ctxItem);
-  if (!lineOrErr)
-    return lineOrErr.takeError();
-  event.logicalLineAfter = *lineOrErr;
+  if (Error err = readRequiredField(event.logicalLineAfter, asUInt64, obj,
+                                    "logical_line_after", ctxItem))
+    return std::move(err);
 
-  auto logicalFileOrErr =
-      applyToField(asString, obj, "logical_file_after", ctxItem);
-  if (!logicalFileOrErr)
-    return logicalFileOrErr.takeError();
-  event.logicalFileAfter = *logicalFileOrErr;
+  if (Error err = readRequiredField(event.logicalFileAfter, asString, obj,
+                                    "logical_file_after", ctxItem))
+    return std::move(err);
 
   event.ownerIncludeId = asOptUInt64(obj, "owner_include_id");
   if (auto text = asOptString(obj, "text"))
@@ -2078,20 +1873,15 @@ static Expected<SkippedRange> parseSkippedRange(const json::Object &obj,
                                                 const std::string &ctxItem) {
   SkippedRange range;
 
-  auto fileOrErr = applyToField(asString, obj, "physical_file", ctxItem);
-  if (!fileOrErr)
-    return fileOrErr.takeError();
-  range.physicalFile = *fileOrErr;
+  if (Error err = readRequiredField(range.physicalFile, asString, obj,
+                                    "physical_file", ctxItem))
+    return std::move(err);
 
-  auto bOrErr = applyToField(asUInt64, obj, "b", ctxItem);
-  if (!bOrErr)
-    return bOrErr.takeError();
-  range.b = *bOrErr;
+  if (Error err = readRequiredField(range.b, asUInt64, obj, "b", ctxItem))
+    return std::move(err);
 
-  auto eOrErr = applyToField(asUInt64, obj, "e", ctxItem);
-  if (!eOrErr)
-    return eOrErr.takeError();
-  range.e = *eOrErr;
+  if (Error err = readRequiredField(range.e, asUInt64, obj, "e", ctxItem))
+    return std::move(err);
 
   range.ownerIncludeId = asOptUInt64(obj, "owner_include_id");
 
@@ -2108,30 +1898,20 @@ static Expected<Slot> parseSlot(const json::Object &obj,
   Slot slot;
 
   // required
-  auto idOrErr = applyToField(asUInt64, obj, "id", ctxItem);
-  if (!idOrErr)
-    return idOrErr.takeError();
-  slot.id = *idOrErr;
+  if (Error err = readRequiredField(slot.id, asUInt64, obj, "id", ctxItem))
+    return std::move(err);
 
-  auto fileOrErr = applyToField(asString, obj, "file", ctxItem);
-  if (!fileOrErr)
-    return fileOrErr.takeError();
-  slot.file = *fileOrErr;
+  if (Error err = readRequiredField(slot.file, asString, obj, "file", ctxItem))
+    return std::move(err);
 
-  auto kindOrErr = applyToField(asString, obj, "kind", ctxItem);
-  if (!kindOrErr)
-    return kindOrErr.takeError();
-  slot.kind = *kindOrErr;
+  if (Error err = readRequiredField(slot.kind, asString, obj, "kind", ctxItem))
+    return std::move(err);
 
-  auto bOrErr = applyToField(asUInt64, obj, "b", ctxItem);
-  if (!bOrErr)
-    return bOrErr.takeError();
-  slot.b = *bOrErr;
+  if (Error err = readRequiredField(slot.b, asUInt64, obj, "b", ctxItem))
+    return std::move(err);
 
-  auto eOrErr = applyToField(asUInt64, obj, "e", ctxItem);
-  if (!eOrErr)
-    return eOrErr.takeError();
-  slot.e = *eOrErr;
+  if (Error err = readRequiredField(slot.e, asUInt64, obj, "e", ctxItem))
+    return std::move(err);
 
   // optionals
   slot.pp = asOptUInt64(obj, "pp");
@@ -2147,30 +1927,22 @@ static Expected<TokMapEntry> parseTokMapEntry(const json::Object &obj,
   TokMapEntry entry;
 
   // required
-  auto fileOrErr = applyToField(asString, obj, "file", ctxItem);
-  if (!fileOrErr)
-    return fileOrErr.takeError();
-  entry.file = *fileOrErr;
+  if (Error err = readRequiredField(entry.file, asString, obj, "file", ctxItem))
+    return std::move(err);
 
-  auto bOrErr = applyToField(asUInt64, obj, "b", ctxItem);
-  if (!bOrErr)
-    return bOrErr.takeError();
-  entry.b = *bOrErr;
+  if (Error err = readRequiredField(entry.b, asUInt64, obj, "b", ctxItem))
+    return std::move(err);
 
-  auto eOrErr = applyToField(asUInt64, obj, "e", ctxItem);
-  if (!eOrErr)
-    return eOrErr.takeError();
-  entry.e = *eOrErr;
+  if (Error err = readRequiredField(entry.e, asUInt64, obj, "e", ctxItem))
+    return std::move(err);
 
   // `pp` (the A-token index this range maps to) is a required provenance
   // fact.  It must be read from the producer, never synthesized from stream
   // order: a positional index would fabricate provenance and could collide
   // with an explicit `pp` from another entry, silently corrupting
   // token->byte resolution.  Fail closed when it is absent.
-  auto ppOrErr = applyToField(asUInt64, obj, "pp", ctxItem);
-  if (!ppOrErr)
-    return ppOrErr.takeError();
-  entry.pp = *ppOrErr;
+  if (Error err = readRequiredField(entry.pp, asUInt64, obj, "pp", ctxItem))
+    return std::move(err);
 
   return entry;
 }
@@ -2180,10 +1952,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
   model.root_ = &root;
 
   // version
-  auto versOrErr = applyToField(asString, root, "version");
-  if (!versOrErr)
-    return versOrErr.takeError();
-  model.version_ = *versOrErr;
+  if (Error err = readRequiredField(model.version_, asString, root, "version"))
+    return std::move(err);
 
   // Whether the producer accounted for every pragma it printed.  Absent in an
   // older map, which is the fail-closed answer: a consumer may not read "this
@@ -2193,24 +1963,21 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
       root.getBoolean("pragma_images_complete").value_or(false);
 
   // source
-  auto srcPathOrErr = applyToField(asString, root, "source");
-  if (!srcPathOrErr)
-    return srcPathOrErr.takeError();
-  model.sourcePath_ = *srcPathOrErr;
+  if (Error err =
+          readRequiredField(model.sourcePath_, asString, root, "source"))
+    return std::move(err);
 
   // pp_ctx.cwd
   auto ppCtxOrErr = applyToField(asObject, root, "pp_ctx");
   if (!ppCtxOrErr)
     return ppCtxOrErr.takeError();
   const json::Object &ppCtxObj = **ppCtxOrErr;
-  auto cwdOrErr = applyToField(asString, ppCtxObj, "cwd", "pp_ctx.cwd");
-  if (!cwdOrErr)
-    return cwdOrErr.takeError();
-  model.ppCwd_ = *cwdOrErr;
-  auto langOrErr = applyToField(asString, ppCtxObj, "lang", "pp_ctx.lang");
-  if (!langOrErr)
-    return langOrErr.takeError();
-  model.ppLang_ = *langOrErr;
+  if (Error err = readRequiredField(model.ppCwd_, asString, ppCtxObj, "cwd",
+                                    "pp_ctx.cwd"))
+    return std::move(err);
+  if (Error err = readRequiredField(model.ppLang_, asString, ppCtxObj, "lang",
+                                    "pp_ctx.lang"))
+    return std::move(err);
 
   if (const json::Value *argvVal = ppCtxObj.get("argv")) {
     auto argvOrErr = asArray(*argvVal, "pp_ctx.argv");
@@ -2252,10 +2019,9 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
   if (!tokObjOrErr)
     return tokObjOrErr.takeError();
   const json::Object &tokObj = **tokObjOrErr;
-  auto cntOrErr = applyToField(asUInt64, tokObj, "count", "tokens.count");
-  if (!cntOrErr)
-    return cntOrErr.takeError();
-  model.tokensCountA_ = *cntOrErr;
+  if (Error err = readRequiredField(model.tokensCountA_, asUInt64, tokObj,
+                                    "count", "tokens.count"))
+    return std::move(err);
 
   // tokens.pp_byte_begin / tokens.pp_byte_end (optional)
   auto pbbOrErr = readUint64Array(tokObj, "pp_byte_begin");

@@ -426,7 +426,6 @@ std::optional<MacroPatch> RefoldMacroDAGLiftingPhase::Run(
       StringRef core =
           newTok.slice(leading.size(), newTok.size() - trailing.size());
 
-      SmallVector<StringRef, 4> curSegs;
       SmallVector<SmallVector<StringRef, 4>, 2> splitSolutions;
       auto addSplitSolution = [&](const SmallVectorImpl<StringRef> &parts) {
         SmallVector<StringRef, 4> copy(parts.begin(), parts.end());
@@ -549,47 +548,9 @@ std::optional<MacroPatch> RefoldMacroDAGLiftingPhase::Run(
       } else {
         // The normal case: split the rewritten core around the original
         // literal delimiters and require a unique segmentation.
-        auto suffixDelimiterNeed = [&](size_t delimIdx) -> uint64_t {
-          const StringRef delim = midBodies[delimIdx];
-          uint64_t need = 0;
-          for (size_t segIdx = delimIdx + 1; segIdx < oldSegs.size(); ++segIdx)
-            need += countSubstringOccurrences(oldSegs[segIdx], delim);
-          for (size_t later = delimIdx + 1; later < midBodies.size(); ++later)
-            if (midBodies[later] == delim)
-              ++need;
-          return need;
-        };
-
-        auto splitCore = [&](auto &&self, size_t delimIdx,
-                             StringRef rest) -> void {
-          if (splitSolutions.size() > 1)
-            return;
-          if (delimIdx == midBodies.size()) {
-            curSegs.push_back(rest);
-            addSplitSolution(curSegs);
-            curSegs.pop_back();
-            return;
-          }
-
-          const StringRef delim = midBodies[delimIdx];
-          const uint64_t needLeft =
-              countSubstringOccurrences(oldSegs[delimIdx], delim);
-          const uint64_t needRight = suffixDelimiterNeed(delimIdx);
-
-          for (size_t pos = 0; (pos = rest.find(delim, pos)) != StringRef::npos;
-               ++pos) {
-            StringRef left = rest.slice(0, pos);
-            StringRef tail = rest.drop_front(pos + delim.size());
-            if (countSubstringOccurrences(left, delim) < needLeft)
-              continue;
-            if (countSubstringOccurrences(tail, delim) < needRight)
-              continue;
-            curSegs.push_back(left);
-            self(self, delimIdx + 1, tail);
-            curSegs.pop_back();
-          }
-        };
-        splitCore(splitCore, 0, core);
+        if (std::optional<SmallVector<StringRef, 4>> split =
+                splitPastedCoreByDelimiters(core, oldSegs, midBodies))
+          splitSolutions.push_back(std::move(*split));
       }
 
       if (splitSolutions.size() != 1 ||

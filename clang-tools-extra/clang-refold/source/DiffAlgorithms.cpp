@@ -2288,6 +2288,17 @@ static std::vector<Score> computeSuffixRowWeighted(
 
 /// Solve a small weighted-LCS box with the full DP table and append anchors in
 /// forward order.
+///
+/// dpLen(i,j) is the max LCS length for A[0..i) vs B[0..j), and dpCost(i,j) the
+/// min accumulated gap cost among paths achieving it.  Transitions into (i,j):
+///
+///   match:     from (i-1,j-1), +1 length, +0 cost
+///   delete A:  from (i-1,j),   +0 length, +gap[i]
+///   insert B:  from (i,  j-1), +0 length, +gap[i]
+///
+/// Equal-core predecessor states keep the first considered transition, which
+/// preserves the deterministic order: diagonal, then delete, then insert.  The
+/// cost is uint64_t so accumulation cannot overflow.
 static Score solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
                                   const GapView &gapV,
                                   std::vector<int64_t> &outMap) {
@@ -3727,114 +3738,9 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
     return lcsMapABHirschbergWeighted(a, b, ownerDepthGap).map;
   }
 
-  // ---------------- DP path: (n+1) x (m+1) tables, row-major -----------------
-  // dpLen(i,j)  = max LCS length for A[0..i) vs B[0..j)
-  // dpCost(i,j) = min accumulated gap cost among paths achieving dpLen(i,j)
-  //
-  // Transitions into (i,j):
-  //   match:     from (i-1,j-1), +1 length, +0 cost
-  //   delete A:  from (i-1,j),   +0 length, +ownerDepthGap[i]
-  //   insert B:  from (i,  j-1), +0 length, +ownerDepthGap[i]
-  const size_t stride = m + 1;
-  const size_t cells = (n + 1) * (m + 1);
-
-  std::vector<uint32_t> dpLen(cells, 0);
-  // Using uint64_t for cost prevents overflow during accumulation.
-  std::vector<uint64_t> dpCost(cells, 0);
-
-  auto idx = [&](size_t i, size_t j) -> size_t { return i * stride + j; };
-  auto len = [&](size_t i, size_t j) -> uint32_t & { return dpLen[idx(i, j)]; };
-  auto cost = [&](size_t i, size_t j) -> uint64_t & {
-    return dpCost[idx(i, j)];
-  };
-
-  // Fill DP table forward. Equal-core predecessor states keep the first
-  // considered transition, preserving the existing deterministic order:
-  // diagonal, then delete, then insert.
-  for (size_t i = 0; i <= n; ++i) {
-    for (size_t j = 0; j <= m; ++j) {
-      if (i == 0 && j == 0)
-        continue;
-
-      uint32_t bestLen = 0;
-      uint64_t bestCost = std::numeric_limits<uint64_t>::max();
-
-      // 1) Match (diagonal).
-      if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
-        bestLen = len(i - 1, j - 1) + 1U;
-        bestCost = cost(i - 1, j - 1);
-      }
-
-      // 2) Delete A (vertical move: i-1 -> i), pay ownerDepthGap[i].
-      if (i > 0) {
-        const uint32_t candLen = len(i - 1, j);
-        const uint64_t candCost =
-            cost(i - 1, j) + static_cast<uint64_t>(ownerDepthGap[i]);
-        if (isCoreBetter(candLen, candCost, bestLen, bestCost)) {
-          bestLen = candLen;
-          bestCost = candCost;
-        }
-      }
-
-      // 3) Insert B (horizontal move: j-1 -> j), pay ownerDepthGap[i].
-      if (j > 0) {
-        const uint32_t candLen = len(i, j - 1);
-        const uint64_t candCost =
-            cost(i, j - 1) + static_cast<uint64_t>(ownerDepthGap[i]);
-        if (isCoreBetter(candLen, candCost, bestLen, bestCost)) {
-          bestLen = candLen;
-          bestCost = candCost;
-        }
-      }
-
-      len(i, j) = bestLen;
-      cost(i, j) = bestCost;
-    }
-  }
-
-  // ------------------- Backtrack: diag, then up, then left -------------------
   std::vector<int64_t> map(n, -1);
-
-  size_t i = n;
-  size_t j = m;
-  while (i > 0 || j > 0) {
-    const uint32_t curLen = len(i, j);
-    const uint64_t curCost = cost(i, j);
-
-    bool moved = false;
-
-    // Diagonal (match).
-    if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
-      if (len(i - 1, j - 1) == curLen - 1U && cost(i - 1, j - 1) == curCost) {
-        map[i - 1] = static_cast<int64_t>(j - 1);
-        --i;
-        --j;
-        moved = true;
-      }
-    }
-
-    // Up (delete A): from (i-1, j) paying ownerDepthGap[i].
-    if (!moved && i > 0) {
-      if (len(i - 1, j) == curLen &&
-          cost(i - 1, j) + static_cast<uint64_t>(ownerDepthGap[i]) == curCost) {
-        --i;
-        moved = true;
-      }
-    }
-
-    // Left (insert B): from (i, j-1) paying ownerDepthGap[i].
-    if (!moved && j > 0) {
-      if (len(i, j - 1) == curLen &&
-          cost(i, j - 1) + static_cast<uint64_t>(ownerDepthGap[i]) == curCost) {
-        --j;
-        moved = true;
-      }
-    }
-
-    if (!moved)
-      break;
-  }
-
+  solveSmallWeightedDP(SpanView{a, 0, n, false}, SpanView{b, 0, m, false},
+                       GapView{ownerDepthGap, 0, n + 1}, map);
   return map;
 }
 
@@ -3856,13 +3762,6 @@ certifiedLcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   return result;
 }
 
-std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                              ArrayRef<LcsAGapProvenance> gapProvenance,
-                              unsigned long long maxBytes) {
-  return certifiedLcsMapAB(a, b, gapProvenance, maxBytes).selectedMap;
-}
-
-[[maybe_unused]]
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                               unsigned long long maxBytes) {
   const size_t n = a.size(), m = b.size();
