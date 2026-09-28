@@ -1244,9 +1244,6 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
             MaterializationWorkClass::SidebandPragmaOnly;
         const size_t childEntryLineNo =
             includeExpansionStartLineNos.lookup(child->id);
-        LineDirectiveLocation parentResume =
-            LineDirectiveInserter::LogicalLocationAtOffset(
-                bytes, siteEnd, headerPath, model_, headerPath, includeId);
         ArrayRef<FinalLineControlPruneCandidate> childLineCandidates;
         if (auto childCandidatesIt =
                 includeExpansionLineControlPruneCandidates.find(child->id);
@@ -1260,10 +1257,9 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
           childLineSourceMappings = childMappingsIt->second;
         LineControlWrappedText wrapped =
             lineObserverLayout_.WrapIncludeExpansionForMaterialization(
-                *child, parentResume.fileSpelling, headerPath, includeId,
-                siteEnd, childEntryLineNo ? childEntryLineNo : 1,
-                parentResume.lineNo, childText, childLineCandidates,
-                childLineSourceMappings, sidebandOnly);
+                *child, headerPath, includeId, bytes, siteEnd,
+                childEntryLineNo ? childEntryLineNo : 1, childText,
+                childLineCandidates, childLineSourceMappings, sidebandOnly);
         TextEdit edit{siteStart,
                       siteEnd,
                       std::move(wrapped.text),

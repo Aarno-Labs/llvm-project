@@ -1717,7 +1717,7 @@ static constexpr const char *RefoldSchema = R"json(
             "null"
           ],
           "minimum": 0,
-          "description": "Begin byte offset of the physical directive line, or null when unavailable."
+          "description": "Byte offset of the directive introducer (`#` or `%:`), or null when the producer could not measure the directive."
         },
         "site_e": {
           "type": [
@@ -1725,7 +1725,7 @@ static constexpr const char *RefoldSchema = R"json(
             "null"
           ],
           "minimum": 0,
-          "description": "End byte offset of the physical directive line, or null when unavailable."
+          "description": "Byte offset just past the directive's terminating newline, or the end of the file for a directive without one; the presumed location there is (logical_file_after, logical_line_after). Null when the producer could not measure the directive."
         },
         "active": {
           "type": "boolean",
@@ -1752,6 +1752,24 @@ static constexpr const char *RefoldSchema = R"json(
         "text": {
           "type": "string",
           "description": "Exact source text for the physical directive line when available."
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "rename",
+            "enter",
+            "exit"
+          ],
+          "description": "How the directive changed the presumed file: `rename` for #line and a line marker without flag 1 or 2, `enter`/`exit` for a line marker with flag 1/2. Absent in maps produced before schema 3.7, which recorded only `rename` events."
+        },
+        "file_kind": {
+          "type": "string",
+          "enum": [
+            "user",
+            "system",
+            "extern_c_system"
+          ],
+          "description": "File characteristic the directive established. Absent in maps produced before schema 3.7."
         }
       }
     },

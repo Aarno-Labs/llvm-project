@@ -634,6 +634,12 @@ struct SkippedSourceRange {
 /// the time this event is recorded.  The consumer therefore does not need to
 /// parse or re-evaluate arbitrary `#line` expressions to recover the logical
 /// state established by this directive.
+///
+/// Every executed `#line` and GNU line marker is recorded, including a marker
+/// whose flag enters or exits a presumed file.  [SiteBegin, SiteEnd) runs from
+/// the directive introducer to the first byte after the directive, where the
+/// presumed location is (LogicalFileAfter, LogicalLineAfter); from there each
+/// physical line break advances the line by one until the next event.
 struct LineControlEvent {
   uint64_t ID = 0;
   std::string PhysicalFile;
@@ -645,6 +651,10 @@ struct LineControlEvent {
   std::string LogicalFileAfter;
   std::optional<uint64_t> OwnerIncludeId;
   std::string Text;
+  /// RenameFile, or EnterFile/ExitFile for a line marker with flag 1 or 2.
+  PPCallbacks::FileChangeReason Reason = PPCallbacks::RenameFile;
+  /// The file characteristic the directive established.
+  SrcMgr::CharacteristicKind FileKind = SrcMgr::C_User;
 };
 
 /// Builds a deterministic “refold map” by observing the Clang preprocessor.
@@ -770,20 +780,21 @@ class RefoldMapBuilder {
   std::optional<std::pair<uint64_t, uint64_t>>
   computeCurrentMacroStateDirectivePhysicalExtent(SourceLocation MacroNameLoc);
 
-  /// Return the complete physical extent of the `#line` or GNU line-marker
-  /// directive whose handling issued the current file-rename callback.
+  /// Return the complete physical extent of a `#line` or GNU line-marker
+  /// directive.
   ///
-  /// The begin is the introducer published by
-  /// Preprocessor::getCurrentDirectiveIntroducerLoc(), and the end is
-  /// \p AfterLoc, where Clang's lexer stands once it has read the directive's
-  /// end-of-directive token.  Both are Clang's own measurements, so the extent
-  /// covers line splices and block comments that continue the directive onto
-  /// later physical lines, which a physical-line scan cannot see.
+  /// \p HashLoc is the directive introducer and \p EndLoc is where Clang's
+  /// lexer stands once it has read the directive's end-of-directive token.
+  /// Both are Clang's own measurements, so the extent covers line splices and
+  /// block comments that continue the directive onto later physical lines,
+  /// which a physical-line scan cannot see.
   ///
   /// \returns (begin, end) in the directive's source file, or nullopt when the
-  ///          two locations do not describe one directive ending in a newline.
+  ///          two locations do not describe one directive that ends in a
+  ///          newline or at the end of its file.
   std::optional<std::pair<uint64_t, uint64_t>>
-  computeCurrentLineControlDirectiveExtent(SourceLocation AfterLoc);
+  computeLineControlDirectiveExtent(SourceLocation HashLoc,
+                                    SourceLocation EndLoc);
 
   /// Canonical absolute path for a file entry (when possible).
   ///
@@ -943,9 +954,12 @@ public:
   ///
   /// The preprocessor has already evaluated conditional activity and any macro
   /// operands before this callback is reached, so the recorded logical state is
-  /// producer-proven.  The source-site range is best-effort: it is present when
-  /// the physical directive line can be located deterministically.
-  void onLineControlDirective(SourceLocation Loc);
+  /// producer-proven.  The source-site range comes from \p HashLoc and
+  /// \p EndLoc alone; it is omitted, never guessed, when they fail
+  /// computeLineControlDirectiveExtent()'s checks.
+  void onLineControlDirective(SourceLocation HashLoc, SourceLocation EndLoc,
+                              PPCallbacks::FileChangeReason Reason,
+                              SrcMgr::CharacteristicKind FileKind);
 
   /// Callback for a conditional group body the preprocessor skipped.
   ///

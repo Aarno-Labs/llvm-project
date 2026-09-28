@@ -79,30 +79,6 @@ bool copyQuotedLiteral(StringRef text, size_t &pos, std::string &out) {
   return true;
 }
 
-std::string replaceCommentsWithWhitespacePreservingLiterals(StringRef text) {
-  std::string out;
-  out.reserve(text.size());
-  for (size_t i = 0; i < text.size();) {
-    if (copyQuotedLiteral(text, i, out))
-      continue;
-    if (i + 1 < text.size() && text[i] == '/' && text[i + 1] == '/') {
-      out.push_back(' ');
-      break;
-    }
-    if (i + 1 < text.size() && text[i] == '/' && text[i + 1] == '*') {
-      out.push_back(' ');
-      i += 2;
-      while (i + 1 < text.size() && !(text[i] == '*' && text[i + 1] == '/'))
-        ++i;
-      if (i + 1 < text.size())
-        i += 2;
-      continue;
-    }
-    out.push_back(text[i++]);
-  }
-  return out;
-}
-
 std::string escapeLineDirectivePath(StringRef path) {
   if (path.empty())
     return "";
@@ -173,18 +149,6 @@ bool lineStartsWithDirectiveKeyword(StringRef line, StringRef keyword) {
     return false;
   i += keyword.size();
   return i >= line.size() || !isIdentPart(line[i]);
-}
-
-bool lineSpellingIsLineControlDirective(StringRef line) {
-  const size_t to = line.size();
-  size_t p = 0;
-  if (!consumeDirectiveHash(line, p, to))
-    return false;
-
-  if (directiveKeywordAt(line, p, to, "line"))
-    return true;
-
-  return p < to && isDigit(line[p]);
 }
 
 bool physicalLineEndsWithSplice(StringRef bytes, uint64_t lineBegin,

@@ -176,36 +176,6 @@ inline constexpr bool intervalIsAloneOnItsLine(StringRef text, uint64_t begin,
   return true;
 }
 
-/// Advance over one C backslash-newline splice at \p pos.
-///
-/// The splice must be fully contained in the half-open byte range
-/// `[0, limit)`.  Both `\\\n` and `\\\r\n` are recognized.  The helper is
-/// deliberately byte-oriented and does not interpret comments or literals; the
-/// caller decides where backslash-newline splicing is admissible for its
-/// proof domain.
-template <typename OffsetT>
-inline bool skipBackslashNewlineSplice(StringRef text, OffsetT limit,
-                                       OffsetT &pos) {
-  const OffsetT size = static_cast<OffsetT>(text.size());
-  if (pos >= limit || pos >= size)
-    return false;
-  if (text[static_cast<size_t>(pos)] != '\\')
-    return false;
-
-  if (pos + 1 < limit && pos + 1 < size &&
-      text[static_cast<size_t>(pos + 1)] == '\n') {
-    pos += 2;
-    return true;
-  }
-  if (pos + 2 < limit && pos + 2 < size &&
-      text[static_cast<size_t>(pos + 1)] == '\r' &&
-      text[static_cast<size_t>(pos + 2)] == '\n') {
-    pos += 3;
-    return true;
-  }
-  return false;
-}
-
 /// Skip horizontal preprocessing whitespace in the half-open range [pos, end).
 inline void skipWsNoLF(StringRef text, size_t &pos, size_t end) {
   end = std::min(end, text.size());
@@ -260,9 +230,6 @@ inline bool skipQuotedLiteral(StringRef text, size_t &pos) {
   return copyQuotedLiteral(text, pos, ignored);
 }
 
-/// Replace each complete comment outside literals with one ASCII space.
-std::string replaceCommentsWithWhitespacePreservingLiterals(StringRef text);
-
 /// Return the basename portion of a slash- or backslash-separated path.
 inline StringRef pathBasename(StringRef path) {
   const size_t slash = path.find_last_of("/\\");
@@ -295,15 +262,6 @@ inline bool startsAfterLineIndent(StringRef text, size_t pos) {
 bool containsAtLineStartAfterIndent(StringRef text, StringRef needle);
 bool lineStartsWithDirectiveKeyword(StringRef line, StringRef keyword);
 
-/// True iff \p line spells a line-control directive: the standard
-/// `#line <pp-tokens>` or the Clang/GCC numeric line-marker `# 123 "file"`.
-///
-/// Only the directive class is decided here, never the operands: a digit after
-/// the introducer is enough, because the numeric operand may itself be
-/// macro-produced and is validated by the line-directive parser instead.  The
-/// scan is horizontal only, so \p line must be one physical or already-spliced
-/// logical directive line.
-bool lineSpellingIsLineControlDirective(StringRef line);
 bool physicalLineEndsWithSplice(StringRef bytes, uint64_t lineBegin,
                                 uint64_t lineEnd);
 uint64_t lineBeginContainingOffset(StringRef bytes, uint64_t byte);
@@ -514,26 +472,13 @@ inline bool rangeContainsNewline(StringRef text, size_t begin, size_t end) {
          StringRef::npos;
 }
 
-/// Return a view with leading/trailing PP whitespace other than LF removed.
-inline StringRef trimWsNoLF(StringRef text) {
-  size_t begin = 0;
-  while (begin < text.size() && isWsNoLF(text[begin]))
-    ++begin;
-
-  size_t end = text.size();
-  while (end > begin && isWsNoLF(text[end - 1]))
-    --end;
-  return text.slice(begin, end);
-}
-
 /// Return a view with only *leading* PP whitespace other than LF removed.
 ///
-/// Use this instead of trimWsNoLF() when the trailing whitespace run is
-/// significant.  Indentation is not token-bearing and may legitimately differ
-/// between two spellings of the same text, but the whitespace that terminates
-/// a run separates it from whatever follows: dropping it would let `int ` and
-/// `int` compare equal even though only one of them keeps the following bytes
-/// in a separate token.
+/// The trailing whitespace run is kept because it is significant.  Indentation
+/// is not token-bearing and may legitimately differ between two spellings of
+/// the same text, but the whitespace that terminates a run separates it from
+/// whatever follows: dropping it would let `int ` and `int` compare equal even
+/// though only one of them keeps the following bytes in a separate token.
 inline StringRef trimLeadingWsNoLF(StringRef text) {
   size_t begin = 0;
   while (begin < text.size() && isWsNoLF(text[begin]))
@@ -707,6 +652,28 @@ inline size_t countNewlines(StringRef text, uint64_t start, uint64_t end) {
   }
 
   return text.slice(s, e).count('\n');
+}
+
+/// Count the physical line breaks in the clamped half-open range [from, to)
+/// the way Clang's SourceManager numbers lines: each LF, each CRLF once, and
+/// each lone CR, including breaks inside line splices and comments.
+///
+/// A CR is counted only when no LF follows it, looking past \p to if needed,
+/// so a range ending between the two bytes of a CRLF counts neither: the LF
+/// byte still lies on the line the CR ended.
+inline size_t countPhysicalLineBreaks(StringRef s, size_t from, size_t to) {
+  const size_t n = s.size();
+  const size_t a = std::min(from, n);
+  const size_t b = std::clamp(to, a, n);
+
+  size_t count = 0;
+  for (size_t i = a; i < b; ++i) {
+    if (s[i] == '\n')
+      ++count;
+    else if (s[i] == '\r' && (i + 1 >= n || s[i + 1] != '\n'))
+      ++count;
+  }
+  return count;
 }
 
 /// Count LF bytes in [from,to) that are not escaped by a C line splice.

@@ -1,4 +1,3 @@
-#line 1 "tu_imported_line_macro_preserve_suffix.c"
 // RUN: %clang-refold-tester-with-lines tu_imported_line_macro_preserve_suffix
 #include "imported_line_macro.h"
 #line IMPORTED_LINE_LOC

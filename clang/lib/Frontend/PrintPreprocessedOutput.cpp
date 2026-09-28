@@ -226,6 +226,9 @@ public:
   void FileChanged(SourceLocation Loc, FileChangeReason Reason,
                    SrcMgr::CharacteristicKind FileType,
                    FileID PrevFID) override;
+  void LineControlDirective(SourceLocation HashLoc, SourceLocation EndLoc,
+                            FileChangeReason Reason,
+                            SrcMgr::CharacteristicKind FileType) override;
   void EmbedDirective(SourceLocation HashLoc, StringRef FileName, bool IsAngled,
                       OptionalFileEntryRef File,
                       const LexEmbedParametersResult &Params) override;
@@ -433,9 +436,6 @@ void PrintPPOutputPPCallbacks::FileChanged(SourceLocation Loc,
     SourceLocation IncludeLoc = UserLoc.getIncludeLoc();
     if (IncludeLoc.isValid())
       MoveToLine(IncludeLoc, /*RequireStartOfLine=*/false);
-  } else if (Reason == PPCallbacks::RenameFile) {
-    if (RefoldRecorder)
-      RefoldRecorder->onLineControlDirective(Loc);
   } else if (Reason == PPCallbacks::SystemHeaderPragma) {
     // `#pragma GCC system_header` is reported as a file-change reason rather
     // than through one of the ordinary pragma callbacks. Record it so the
@@ -493,6 +493,16 @@ void PrintPPOutputPPCallbacks::FileChanged(SourceLocation Loc,
     WriteLineInfo(CurLine);
     break;
   }
+}
+
+void PrintPPOutputPPCallbacks::LineControlDirective(
+    SourceLocation HashLoc, SourceLocation EndLoc, FileChangeReason Reason,
+    SrcMgr::CharacteristicKind FileType) {
+  // Record every executed `#line` and line marker, including the markers that
+  // enter or exit a presumed file.  FileChanged reports those with the same
+  // reasons as a real `#include`, so it cannot be the recording point.
+  if (RefoldRecorder)
+    RefoldRecorder->onLineControlDirective(HashLoc, EndLoc, Reason, FileType);
 }
 
 void PrintPPOutputPPCallbacks::EmbedDirective(

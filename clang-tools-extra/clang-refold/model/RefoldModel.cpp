@@ -1860,6 +1860,22 @@ parseLineControlEvent(const json::Object &obj, const std::string &ctxItem) {
   if (auto text = asOptString(obj, "text"))
     event.text = *text;
 
+  // Schema validation has already restricted both spellings to their enums.
+  if (std::optional<StringRef> reason = asOptString(obj, "reason")) {
+    if (*reason == "enter")
+      event.reason = RefoldModel::LineControlReason::Enter;
+    else if (*reason == "exit")
+      event.reason = RefoldModel::LineControlReason::Exit;
+  }
+  if (std::optional<StringRef> kind = asOptString(obj, "file_kind")) {
+    if (*kind == "system")
+      event.fileKind = RefoldModel::LineControlFileKind::System;
+    else if (*kind == "extern_c_system")
+      event.fileKind = RefoldModel::LineControlFileKind::ExternCSystem;
+    else
+      event.fileKind = RefoldModel::LineControlFileKind::User;
+  }
+
   if (event.siteB && event.siteE && *event.siteE < *event.siteB)
     return createStringError(inconvertibleErrorCode(),
                              "Invalid line-control site range at %s",

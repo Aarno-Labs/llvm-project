@@ -1,4 +1,3 @@
-#line 1 "tu_elif_proven_line_state_preserve_suffix.c"
 // RUN: %clang-refold-tester-with-lines tu_elif_proven_line_state_preserve_suffix
 #define TAKE_ELIF_LINE 1
 #if 0

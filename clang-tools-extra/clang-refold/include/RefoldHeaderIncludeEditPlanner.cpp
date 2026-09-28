@@ -110,42 +110,6 @@ static bool tokenRangesHaveSameSpelling(ArrayRef<PPTok> aToks,
   return true;
 }
 
-/// Returns whether an owner-local byte gap contains source-authored #line
-/// state.  This syntactic predicate guards boundary-token ties that would cross
-/// a gap capable of changing the copied suffix's logical location.
-static bool sourceIntervalContainsLineControlDirective(StringRef source,
-                                                       uint64_t begin,
-                                                       uint64_t end) {
-  if (begin >= end || end > source.size())
-    return false;
-
-  uint64_t lineBegin = begin;
-  while (lineBegin < end) {
-    std::string logicalLine;
-    uint64_t afterLine = lineBegin;
-    if (!collectLineSpliceLogicalLine(source, lineBegin, end, logicalLine,
-                                      afterLine))
-      return false;
-    if (afterLine <= lineBegin)
-      return false;
-
-    StringRef rest = StringRef(logicalLine).ltrim(" \t\v\f");
-    if (rest.consume_front("#")) {
-      rest = rest.ltrim(" \t\v\f");
-      if (rest.starts_with("line") &&
-          (rest.size() == StringRef("line").size() ||
-           !stringutils::isIdentPart(rest[StringRef("line").size()])))
-        return true;
-      if (!rest.empty() && '0' <= rest.front() && rest.front() <= '9')
-        return true;
-    }
-
-    lineBegin = afterLine;
-  }
-
-  return false;
-}
-
 /// Returns whether the suffix at `anchorByte` begins with a preprocessor line.
 /// Leading horizontal whitespace on that line is treated as part of the
 /// directive boundary.
@@ -1074,67 +1038,16 @@ bool RefoldHeaderIncludeEditPlanner::ProveHeaderSourceEnvelopeGap(
     uint64_t gapEnd,
     SmallVectorImpl<HeaderPreservedGapPiece> &preservedPieces) const {
 
-  SourceLineDirectiveLogicalLineRewriter headerSourceLineDirectiveLineRewriter =
-      [&](StringRef logicalLine, ArrayRef<uint64_t> sourceOffsets,
-          SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver)
-      -> std::optional<SourceLineDirectiveLogicalLineRewrite> {
-    return rewriteSourceLineDirectiveLogicalLineMacros(
-        model_, state.file, logicalLine, sourceOffsets, paths_, lexLang_,
-        state.include.id, std::move(builtinMacroResolver));
-  };
-
-  // A directive without a filename operand keeps the presumed file in effect
-  // at the gap, which an earlier `#line` in this include instance may have set.
-  std::optional<SourceLineControlState> stateAtGap =
-      sourceLineControlStateBefore(model_, paths_, structureIndex, state.file,
-                                   state.include.id, gapBegin, state.file);
-  std::optional<SourceLineDirectiveGapResume> lineResume;
-  if (stateAtGap)
-    lineResume = computeSourceLineDirectiveGapResume(
-        state.headerText, gapBegin, gapEnd, sourceEnvelope.end,
-        stateAtGap->fileSpelling, headerSourceLineDirectiveLineRewriter,
-        nullptr, model_.GetSourcePath(),
-        !sourceSuffixMayObservePresumedFileSpelling(
-            model_, state.file, sourceEnvelope.end, paths_, state.headerText),
-        stateAtGap->lineMarkerFlags);
-  if (lineResume) {
-    // Header full-envelope widening uses the same owner-piece gap proof as
-    // TU/include closure. A source-spelled line-control gap is not disposable
-    // trivia, but it is preservable by carrying its net line state forward to
-    // the untouched header suffix.  Submit the exact indexed line-control
-    // intervals to the common source-gap theorem so this specialized state
-    // proof does not bypass protected-structure inventory or byte coverage.
-    SmallVector<SourceGapProofPiece, 4> lineControlPieces;
-    for (const PreprocessingStructureInterval *interval :
-         structureIndex.FindOverlapping(gapBegin, gapEnd)) {
-      if (!interval ||
-          interval->kind != PreprocessingStructureKind::LineControl)
-        continue;
-      lineControlPieces.push_back(SourceGapProofPiece{
-          interval->begin, interval->end,
-          interval->modelItemId.value_or(lineControlPieces.size()),
-          static_cast<uint32_t>(PreprocessingStructureKind::LineControl),
-          /*nestingClass=*/0, /*absorbedNestingClasses=*/0,
-          lineControlPieces.size()});
-    }
-
-    std::string gapReason;
-    std::optional<SourceGapProofResult> lineControlGapProof;
-    if (!lineControlPieces.empty()) {
-      lineControlGapProof = proveSourceGapWithIndexedTrivia(
-          structureIndex, gapBegin, gapEnd, lineControlPieces, &gapReason);
-    }
-    if (!lineControlGapProof) {
-      REFOLD_LOG_TRACE(
-          "include",
-          "header source-envelope rejected line-control gap "
-          "source=[{0},{1}): {2}",
-          gapBegin, gapEnd,
-          gapReason.empty() ? "no exact indexed line-control cover"
-                            : gapReason);
-      return false;
-    }
-
+  // Header full-envelope widening uses the same owner-piece gap proof as
+  // TU/include closure.  A source-spelled line-control gap is not disposable
+  // trivia, but it is preservable by carrying its net line state forward to
+  // the untouched header suffix; the proof requires every indexed interval in
+  // the gap to be an executed line-control directive and every other byte to
+  // be trivia.
+  if (std::optional<SourceLineDirectiveGapResume> lineResume =
+          lineControlProof_.LineControlGapResume(state.file, state.include.id,
+                                                 state.headerText, gapBegin,
+                                                 gapEnd, sourceEnvelope.end)) {
     state.headerSourceLineDirectiveResume = std::move(lineResume);
     return true;
   }
@@ -1942,7 +1855,7 @@ void RefoldHeaderIncludeEditPlanner::
 
 void RefoldHeaderIncludeEditPlanner::
     NormalizeDuplicatedBoundaryTokenAcrossLineControlGap(
-        StringRef file, StringRef headerText, uint64_t ppHi,
+        StringRef file, uint64_t includeId, StringRef headerText, uint64_t ppHi,
         uint64_t &materialAStart, uint64_t &materialBStart,
         uint64_t &materialBEnd, uint64_t &materialInsertPos,
         std::string &materialInsertBytes) const {
@@ -1988,8 +1901,12 @@ void RefoldHeaderIncludeEditPlanner::
       sourceMapper_.ByteStartForPPInFile(file, *nextOwnerPP);
   if (!leftEnd || !rightBegin || *rightBegin < *leftEnd)
     return;
-  if (!sourceIntervalContainsLineControlDirective(headerText, *leftEnd,
-                                                  *rightBegin))
+  if (llvm::none_of(
+          GetHeaderOccurrenceStructureIndex(file, includeId, headerText)
+              .FindOverlapping(*leftEnd, *rightBegin),
+          [](const PreprocessingStructureInterval *interval) {
+            return interval->kind == PreprocessingStructureKind::LineControl;
+          }))
     return;
 
   const uint64_t normalizedBStart = materialBStart + 1;
@@ -2810,8 +2727,8 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
       // Normalize a duplicated boundary-token LCS tie across source-only #line
       // state before slicing and sideband-stripping the insertion payload.
       NormalizeDuplicatedBoundaryTokenAcrossLineControlGap(
-          file, StringRef(headerText), ppHi, materialAStart, materialBStart,
-          materialBEnd, materialInsertPos, materialInsertBytes);
+          file, ie.include->id, StringRef(headerText), ppHi, materialAStart,
+          materialBStart, materialBEnd, materialInsertPos, materialInsertBytes);
 
       std::optional<std::pair<uint64_t, uint64_t>> bBytes =
           sourceMapper_.BTokenRangeToByteRange(materialBStart, materialBEnd);

@@ -11,8 +11,12 @@
 
 #include "line-control/RefoldLineControlProof.h"
 
+#include "line-control/SourceLineDirectiveHelpers.h"
 #include "macro/RefoldMacroTopology.h"
 #include "model/RefoldPathIdentity.h"
+#include "source/RefoldPreprocessingStructureIndex.h"
+#include "source/RefoldPreprocessingStructureIndexProvider.h"
+#include "source/RefoldSourceGapProof.h"
 #include "support/RefoldLog.h"
 #include "support/StringUtils.h"
 
@@ -46,144 +50,20 @@ RefoldLineControlProof::LineStateObservableMacroSite(
   return site;
 }
 
-/// Return the original-source byte offset of the directive-introducing '#'
-/// for a physical source line.  The conditional model is expressed in original
-/// byte coordinates, so the activity query below must use the real source byte
-/// rather than the trimmed line-local position.
-static bool refoldIsHorizontalWhitespace(char c) {
-  return c == ' ' || c == '\t' || c == '\f' || c == '\v' || c == '\r';
-}
-
-static std::optional<uint64_t> refoldFindDirectiveHashOffset(StringRef src,
-                                                             uint64_t lineBegin,
-                                                             uint64_t lineEnd) {
-  uint64_t p = lineBegin;
-  while (p < lineEnd && p < src.size()) {
-    if (refoldIsHorizontalWhitespace(src[p])) {
-      ++p;
-      continue;
-    }
-
-    if (src[p] == '\\') {
-      if (p + 1 < lineEnd && src[p + 1] == '\n') {
-        p += 2;
-        continue;
-      }
-      if (p + 2 < lineEnd && src[p + 1] == '\r' && src[p + 2] == '\n') {
-        p += 3;
-        continue;
-      }
-    }
-
-    if (p + 1 < lineEnd && src[p] == '/' && src[p + 1] == '*') {
-      p += 2;
-      bool closed = false;
-      while (p + 1 < lineEnd) {
-        if (src[p] == '\\') {
-          if (p + 1 < lineEnd && src[p + 1] == '\n') {
-            p += 2;
-            continue;
-          }
-          if (p + 2 < lineEnd && src[p + 1] == '\r' && src[p + 2] == '\n') {
-            p += 3;
-            continue;
-          }
-        }
-        if (src[p] == '*' && src[p + 1] == '/') {
-          p += 2;
-          closed = true;
-          break;
-        }
-        ++p;
-      }
-      if (!closed)
-        return std::nullopt;
-      continue;
-    }
-
-    if (p + 1 < lineEnd && src[p] == '/' && src[p + 1] == '/')
-      return std::nullopt;
-
-    if (src[p] == '#')
-      return p;
-
-    return std::nullopt;
-  }
-  return std::nullopt;
-}
-
 bool RefoldLineControlProof::SourcePrefixHasProducerActiveLineControl(
     StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
     uint64_t offset) const {
-  auto bufOrErr = MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(ownerFile));
-  if (!bufOrErr) {
-    // This query is used only to suppress an otherwise demanded synthetic
-    // include-entry #line.  If the owner source cannot be read, fail closed and
-    // keep the wrapper rather than inferring that the real line-control stream
-    // will kill it.
-    return false;
-  }
-
-  const MemoryBuffer &mb = **bufOrErr;
-  StringRef src(mb.getBufferStart(), mb.getBufferSize());
-  const uint64_t limit = std::min<uint64_t>(offset, src.size());
-
-  auto directiveIsProducerActive = [&](uint64_t hashOffset) -> bool {
-    for (const RefoldModel::CondGroup &group : model_.GetConds()) {
-      if (!paths_.PathsEqual(group.file, ownerFile) ||
-          group.parentIncludeId != ownerIncludeId)
-        continue;
-      if (!group.ContainsByte(hashOffset))
-        continue;
-
-      bool selectedArmContainsDirective = false;
-      for (const RefoldModel::CondArm &arm : group.arms) {
-        if (!arm.selected)
-          continue;
-        if (arm.ContainsByte(hashOffset)) {
-          selectedArmContainsDirective = true;
-          break;
-        }
-      }
-
-      if (selectedArmContainsDirective)
-        continue;
-
-      // If a selected material-producing arm exists but does not contain the
-      // directive, the directive is proven inactive.  If no selected arm
-      // exists, the active branch may have produced only directive effects,
-      // which is unproven from CondArm::selected alone; keep the synthetic
-      // wrapper in that case as well.  Whether any selected arm was seen at
-      // all does not change that answer, so it is not tracked.
-      return false;
-    }
-    return true;
-  };
-
-  uint64_t lineBegin = 0;
-  while (lineBegin < limit) {
-    uint64_t lineEnd = lineBegin;
-    while (lineEnd < src.size() && src[lineEnd] != '\n')
-      ++lineEnd;
-
-    const uint64_t clampedEnd = std::min<uint64_t>(lineEnd, limit);
-    if (std::optional<uint64_t> hash =
-            refoldFindDirectiveHashOffset(src, lineBegin, clampedEnd)) {
-      // Only the directive class matters for entry-wrapper minimization: it is
-      // enough to know that the emitted child text will overwrite any
-      // synthetic entry #line before a later observer can consume it.
-      if (stringutils::lineSpellingIsLineControlDirective(
-              src.slice(*hash, clampedEnd)) &&
-          directiveIsProducerActive(*hash)) {
-        return true;
-      }
-    }
-
-    if (lineEnd >= limit || lineEnd >= src.size())
-      break;
-    lineBegin = lineEnd + 1;
-  }
-
+  // This query is used only to suppress an otherwise demanded synthetic
+  // include-entry #line.  Only the directive class matters: an executed
+  // directive of this owner that ends before `offset` is enough to know the
+  // emitted child text will overwrite any synthetic entry #line before a later
+  // observer can consume it.  A directive with no event either never executed
+  // or predates the producer recording it; both keep the wrapper.
+  for (const RefoldModel::LineControlEvent &event : model_.GetLineControls())
+    if (event.ownerIncludeId == ownerIncludeId && event.active &&
+        event.producerProven && event.siteE && *event.siteE <= offset &&
+        paths_.PathsEqual(event.physicalFile, ownerFile))
+      return true;
   return false;
 }
 
@@ -409,48 +289,248 @@ RefoldLineControlProof::LatestProducerLineControlEndBefore(
   return result;
 }
 
-std::optional<LineDirectiveLocation>
-RefoldLineControlProof::ProducerBackedLineControlLocationAt(
-    StringRef ownerBytes, StringRef ownerFile,
-    std::optional<uint64_t> ownerIncludeId, uint64_t eventEndLimit,
-    uint64_t locationOffset) const {
-  const RefoldModel::LineControlEvent *best = nullptr;
-  for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
-    if (!event.active || !event.producerProven || !event.siteE)
-      continue;
-    if (event.ownerIncludeId != ownerIncludeId)
-      continue;
-    if (!SameLineControlPhysicalFile(event.physicalFile, ownerFile))
-      continue;
-    if (*event.siteE > eventEndLimit)
-      continue;
-    if (!best || *event.siteE > *best->siteE ||
-        (*event.siteE == *best->siteE && event.id > best->id))
-      best = &event;
-  }
-
-  if (!best)
-    return std::nullopt;
-
-  const size_t delta = stringutils::countNonSplicedNewlines(
-      ownerBytes, *best->siteE, locationOffset);
-  return LineDirectiveLocation(best->logicalFileAfter,
-                               best->logicalLineAfter + delta, true);
+/// Return whether the producer skipped the owner occurrence's text at
+/// \p introducer, so a directive spelled there was never executed.
+///
+/// A skipped range starts at the `#` of the conditional directive that began
+/// skipping, so a directive inside the excluded group starts strictly after
+/// it.
+static bool lineControlIntroducerWasSkipped(
+    const RefoldModel &model, const RefoldPathIdentity &paths,
+    StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
+    uint64_t introducer) {
+  for (const RefoldModel::SkippedRange &range : model.GetSkippedRanges())
+    if (range.ownerIncludeId == ownerIncludeId && range.b < introducer &&
+        introducer < range.e && paths.PathsEqual(range.physicalFile, ownerFile))
+      return true;
+  return false;
 }
 
-LineDirectiveLocation RefoldLineControlProof::LogicalLocationAtOwnerOffset(
-    StringRef ownerBytes, StringRef ownerFile,
-    std::optional<uint64_t> ownerIncludeId, uint64_t offset) const {
-  LineDirectiveLocation loc = LineDirectiveInserter::LogicalLocationAtOffset(
-      ownerBytes, static_cast<size_t>(offset), ownerFile, model_, ownerFile,
-      ownerIncludeId);
-  if (loc.producerProven)
-    return loc;
-  if (std::optional<LineDirectiveLocation> producerLoc =
-          ProducerBackedLineControlLocationAt(ownerBytes, ownerFile,
-                                              ownerIncludeId, offset, offset))
-    return *producerLoc;
-  return loc;
+LineDirectiveLocation RefoldLineControlProof::OwnerLineStateAt(
+    StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
+    StringRef ownerBytes, uint64_t offset, StringRef defaultFile) const {
+  offset = std::min<uint64_t>(offset, ownerBytes.size());
+
+  bool proven = true;
+  std::optional<uint64_t> unprovenAt;
+  auto markUnproven = [&](std::optional<uint64_t> at) {
+    proven = false;
+    if (at && (!unprovenAt || *at > *unprovenAt))
+      unprovenAt = at;
+  };
+
+  // The owner's events that start before `offset`, and the latest of them
+  // whose effect has begun there.
+  size_t ownerEventsBefore = 0;
+  const RefoldModel::LineControlEvent *latest = nullptr;
+  for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
+    if (event.ownerIncludeId != ownerIncludeId ||
+        !paths_.PathsEqual(event.physicalFile, ownerFile))
+      continue;
+    if (!event.siteB || !event.siteE) {
+      // Where this directive sits is unknown, so it may precede `offset`.
+      markUnproven(std::nullopt);
+      continue;
+    }
+    if (*event.siteB >= offset)
+      continue;
+    ++ownerEventsBefore;
+    if (!event.active || !event.producerProven)
+      markUnproven(*event.siteB);
+    if (*event.siteE <= offset && (!latest || *event.siteE > *latest->siteE))
+      latest = &event;
+  }
+
+  // Every lexical line-control directive ahead of `offset` must be one of
+  // those events, or text Clang skipped; anything else was executed without a
+  // record, or its record could not be placed.
+  const RefoldPreprocessingStructureIndex *index =
+      structureIndexes_
+          ? structureIndexes_->Get(ownerFile, ownerIncludeId).index
+          : nullptr;
+  if (!index || index->GetSourceSize() != ownerBytes.size()) {
+    markUnproven(std::nullopt);
+  } else {
+    size_t boundBefore = 0;
+    for (const PreprocessingStructureInterval *interval :
+         index->FindOverlapping(0, offset)) {
+      if (interval->kind != PreprocessingStructureKind::LineControl ||
+          interval->structureSpellingBegin >= offset)
+        continue;
+      if (interval->end > offset) {
+        markUnproven(interval->structureSpellingBegin);
+        continue;
+      }
+      if (interval->modelKind ==
+              PreprocessingStructureModelKind::LineControlEvent &&
+          interval->IsProducerBound()) {
+        ++boundBefore;
+        continue;
+      }
+      if (!lineControlIntroducerWasSkipped(model_, paths_, ownerFile,
+                                           ownerIncludeId,
+                                           interval->structureSpellingBegin))
+        markUnproven(interval->structureSpellingBegin);
+    }
+    // An event the index could not bind has a site no lexical directive
+    // matches, so the count exposes it even though no interval names it.
+    if (boundBefore != ownerEventsBefore)
+      markUnproven(std::nullopt);
+  }
+
+  if (!latest)
+    return LineDirectiveLocation(
+        defaultFile,
+        1 + stringutils::countPhysicalLineBreaks(ownerBytes, 0, offset), proven,
+        unprovenAt);
+  return LineDirectiveLocation(latest->logicalFileAfter,
+                               latest->logicalLineAfter +
+                                   stringutils::countPhysicalLineBreaks(
+                                       ownerBytes, *latest->siteE, offset),
+                               proven, unprovenAt);
+}
+
+/// Return the line-marker flags that make a resume directive establish
+/// \p kind, or nullopt for an event whose map predates recording file kinds.
+static std::optional<StringRef>
+lineMarkerKindFlags(std::optional<RefoldModel::LineControlFileKind> kind) {
+  if (!kind)
+    return std::nullopt;
+  switch (*kind) {
+  case RefoldModel::LineControlFileKind::User:
+    return StringRef();
+  case RefoldModel::LineControlFileKind::System:
+    return StringRef("3");
+  case RefoldModel::LineControlFileKind::ExternCSystem:
+    return StringRef("3 4");
+  }
+  return std::nullopt;
+}
+
+std::optional<SourceLineDirectiveGapResume>
+RefoldLineControlProof::LineControlGapResume(
+    StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
+    StringRef ownerBytes, uint64_t gapBegin, uint64_t gapEnd,
+    uint64_t resumeOffset, SmallVectorImpl<uint64_t> *operandMacroIds) const {
+  if (gapBegin >= gapEnd || gapEnd > resumeOffset ||
+      resumeOffset > ownerBytes.size() || !structureIndexes_)
+    return std::nullopt;
+  const RefoldPreprocessingStructureIndex *index =
+      structureIndexes_->Get(ownerFile, ownerIncludeId).index;
+  if (!index || index->GetSourceSize() != ownerBytes.size())
+    return std::nullopt;
+
+  // The gap's directives, each an executed line-control directive of this
+  // owner; the shared gap theorem then proves every other byte is trivia.
+  SmallVector<SourceGapProofPiece, 4> pieces;
+  SmallVector<const RefoldModel::LineControlEvent *, 4> gapEvents;
+  for (const PreprocessingStructureInterval *interval :
+       index->FindOverlapping(gapBegin, gapEnd)) {
+    if (interval->kind != PreprocessingStructureKind::LineControl ||
+        interval->modelKind !=
+            PreprocessingStructureModelKind::LineControlEvent ||
+        !interval->IsProducerBound())
+      return std::nullopt;
+    const auto event = llvm::find_if(
+        model_.GetLineControls(), [&](const RefoldModel::LineControlEvent &e) {
+          return e.id == *interval->modelItemId;
+        });
+    if (event == model_.GetLineControls().end())
+      return std::nullopt;
+    gapEvents.push_back(&*event);
+    pieces.push_back(SourceGapProofPiece{
+        interval->begin, interval->end, event->id,
+        static_cast<uint32_t>(PreprocessingStructureKind::LineControl),
+        /*nestingClass=*/0, /*absorbedNestingClasses=*/0, pieces.size()});
+  }
+  if (pieces.empty() ||
+      !proveSourceGapWithIndexedTrivia(*index, gapBegin, gapEnd, pieces))
+    return std::nullopt;
+
+  const LineDirectiveLocation state = OwnerLineStateAt(
+      ownerFile, ownerIncludeId, ownerBytes, resumeOffset, ownerFile);
+  if (!state.producerProven)
+    return std::nullopt;
+
+  // What the directives from the gap on did to the presumed include stack,
+  // and the file kind in effect at the resume.
+  size_t entered = 0;
+  const RefoldModel::LineControlEvent *latest = nullptr;
+  for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
+    if (event.ownerIncludeId != ownerIncludeId || !event.siteB ||
+        !event.siteE || *event.siteE > resumeOffset ||
+        !paths_.PathsEqual(event.physicalFile, ownerFile))
+      continue;
+    if (!latest || *event.siteE > *latest->siteE)
+      latest = &event;
+    if (*event.siteB < gapBegin)
+      continue;
+    if (event.reason == RefoldModel::LineControlReason::Exit)
+      return std::nullopt;
+    if (event.reason == RefoldModel::LineControlReason::Enter)
+      ++entered;
+  }
+  std::optional<StringRef> kindFlags =
+      latest ? lineMarkerKindFlags(latest->fileKind) : std::nullopt;
+  if (entered > 1 || !kindFlags)
+    return std::nullopt;
+
+  SourceLineDirectiveGapResume resume;
+  resume.lineAtResume = state.lineNo;
+  resume.fileSpelling = state.fileSpelling;
+  if (entered)
+    resume.lineMarkerFlags = "1";
+  if (!kindFlags->empty()) {
+    if (!resume.lineMarkerFlags.empty())
+      resume.lineMarkerFlags += ' ';
+    resume.lineMarkerFlags += *kindFlags;
+  }
+
+  // The macro invocations the gap's directives evaluated: those spelled in a
+  // directive, closed over the recorded caller edges of their expansions.
+  SmallVector<uint64_t, 8> operandIds;
+  for (const RefoldModel::MacroInvocation &macro : model_.GetMacroInvocations())
+    if (macro.ownerIncludeId == ownerIncludeId && macro.invFile && macro.invB &&
+        macro.invE && paths_.PathsEqual(*macro.invFile, ownerFile) &&
+        llvm::any_of(gapEvents, [&](const RefoldModel::LineControlEvent *e) {
+          return *e->siteB <= *macro.invB && *macro.invE <= *e->siteE;
+        }))
+      operandIds.push_back(macro.id);
+  for (bool grew = !operandIds.empty(); grew;) {
+    grew = false;
+    for (const RefoldModel::MacroInvocation &macro :
+         model_.GetMacroInvocations())
+      if (macro.callerMacroId &&
+          llvm::is_contained(operandIds, *macro.callerMacroId) &&
+          !llvm::is_contained(operandIds, macro.id)) {
+        operandIds.push_back(macro.id);
+        grew = true;
+      }
+  }
+
+  // A `__DATE__`, `__TIME__` or `__TIMESTAMP__` operand names a file that
+  // depends on when A was produced, and replaying the recorded name would bake
+  // that moment into the output.  It is admitted only when the suffix cannot
+  // observe the presumed file, which makes any stable spelling
+  // token-equivalent; the one in effect before the gap is kept.
+  const bool clockDependentFile = llvm::any_of(operandIds, [&](uint64_t id) {
+    const RefoldModel::MacroInvocation *macro =
+        macroTopology_.FindMacroInvocationById(id);
+    return macro && (macro->name == "__DATE__" || macro->name == "__TIME__" ||
+                     macro->name == "__TIMESTAMP__");
+  });
+  if (clockDependentFile) {
+    if (sourceSuffixMayObservePresumedFileSpelling(
+            model_, ownerFile, resumeOffset, paths_, ownerBytes))
+      return std::nullopt;
+    resume.fileSpelling = OwnerLineStateAt(ownerFile, ownerIncludeId,
+                                           ownerBytes, gapBegin, ownerFile)
+                              .fileSpelling;
+  }
+
+  if (operandMacroIds)
+    operandMacroIds->append(operandIds.begin(), operandIds.end());
+  return resume;
 }
 
 bool RefoldLineControlProof::LineStateBuiltinInvocationIsPreservedObserver(

@@ -3,11 +3,9 @@
 // Source #line directive insertion and logical-location tracking.
 //
 // LineDirectiveInserter formats synthetic #line directives, suppresses no-op
-// resyncs, wraps materialized include bodies with entry/return directives, and
-// evaluates source-authored line-control state when a caller needs the logical
-// location at a source byte offset.  It does not own refold orchestration
-// state; callers provide source text, producer spellings, and candidate
-// offsets.
+// resyncs, and wraps materialized include bodies with entry/return
+// directives.  It does not own refold orchestration state; callers provide
+// source text, producer spellings, and candidate offsets.
 //
 //===----------------------------------------------------------------------===//
 
@@ -25,8 +23,6 @@ using namespace llvm;
 
 namespace clang {
 namespace refold {
-
-class RefoldModel;
 
 /// \brief Parsed state of an emitted #line directive sufficient to reason about
 /// whether a future directive would be a no-op.
@@ -64,10 +60,10 @@ struct LineDirectiveLocation {
   bool producerProven = true;
 
   /// Byte offset of the last source line-control directive before this location
-  /// whose effect could not be proven from the current model-backed owner-local
-  /// scan.  This distinguishes an unmodeled preserved prefix, where suppressing
-  /// an extra synthetic resync leaves the real source directive in force, from
-  /// a consumed unmodeled directive, which must fail closed.
+  /// whose effect the producer's line-control events do not account for.  This
+  /// distinguishes an unmodeled preserved prefix, where suppressing an extra
+  /// synthetic resync leaves the real source directive in force, from a
+  /// consumed unmodeled directive, which must fail closed.
   std::optional<uint64_t> unprovenLineControlDirectiveOffset;
 
   LineDirectiveLocation(StringRef file, size_t line, bool proven = true,
@@ -163,25 +159,6 @@ public:
     result += "\n";
     return result;
   }
-
-  /// \brief Computes the logical parent location using producer-proven
-  /// conditional activity from the refold map.
-  ///
-  /// Conditional groups are not re-evaluated from source text: a directive
-  /// effect is visible only when the RefoldModel proves that the directive byte
-  /// was executed for the requested owner file/include instance. Macro-state
-  /// directives use producer-observed MacroDirective items; line-control
-  /// directives use producer-proven selected conditional ownership.
-  ///
-  /// \param model producer refold map model containing conditional arm
-  /// selection
-  /// \param ownerFile file whose bytes are being scanned
-  /// \param ownerIncludeId include instance that owns \p ownerFile, or
-  ///        std::nullopt for the TU owner
-  static LineDirectiveLocation LogicalLocationAtOffset(
-      StringRef src, uint64_t offset, StringRef defaultFileSpelling,
-      const RefoldModel &model, StringRef ownerFile,
-      std::optional<uint64_t> ownerIncludeId = std::nullopt);
 
   /// \brief Attempts a *local* resynchronization by injecting a #line directive
   /// into the replacement text when (and only when) the replacement changes the

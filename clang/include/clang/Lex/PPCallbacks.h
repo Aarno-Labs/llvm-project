@@ -52,6 +52,28 @@ public:
                            FileID PrevFID = FileID()) {
   }
 
+  /// Callback invoked when a `#line` directive or GNU line marker has added
+  /// its line note, immediately before the FileChanged callback it also
+  /// issues.
+  ///
+  /// FileChanged cannot identify the directive: it reports only the location
+  /// after it, and a line marker whose flags enter or exit a presumed file is
+  /// reported with the same reasons as a real `#include`.  This callback names
+  /// the directive's physical extent, so a client that must attribute the new
+  /// presumed location to source bytes has an exact anchor.
+  ///
+  /// \param HashLoc The directive introducer, `#` or `%:`.
+  /// \param EndLoc The first location after the directive's end-of-directive
+  ///        token, which is also the location FileChanged reports.  The
+  ///        presumed location there is the one the directive established.
+  /// \param Reason RenameFile for `#line` and for a line marker without a flag
+  ///        1 or 2; EnterFile or ExitFile for a line marker with flag 1 or 2.
+  /// \param FileType The characteristic kind the directive established.
+  virtual void LineControlDirective(SourceLocation HashLoc,
+                                    SourceLocation EndLoc,
+                                    FileChangeReason Reason,
+                                    SrcMgr::CharacteristicKind FileType) {}
+
   enum class LexedFileChangeReason { EnterFile, ExitFile };
 
   /// Callback invoked whenever the \p Lexer moves to a different file for
@@ -506,6 +528,13 @@ public:
                         SourceLocation Loc) override {
     First->LexedFileChanged(FID, Reason, FileType, PrevFID, Loc);
     Second->LexedFileChanged(FID, Reason, FileType, PrevFID, Loc);
+  }
+
+  void LineControlDirective(SourceLocation HashLoc, SourceLocation EndLoc,
+                            FileChangeReason Reason,
+                            SrcMgr::CharacteristicKind FileType) override {
+    First->LineControlDirective(HashLoc, EndLoc, Reason, FileType);
+    Second->LineControlDirective(HashLoc, EndLoc, Reason, FileType);
   }
 
   void FileSkipped(const FileEntryRef &SkippedFile, const Token &FilenameTok,

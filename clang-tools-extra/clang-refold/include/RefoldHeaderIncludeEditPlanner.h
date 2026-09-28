@@ -666,8 +666,8 @@ private:
   /// The adjustment is local to include-owned insertions and fires only when
   /// the A-to-B token map proves the duplicate-token shape.
   void NormalizeDuplicatedBoundaryTokenAcrossLineControlGap(
-      llvm::StringRef file, llvm::StringRef headerText, uint64_t ppHi,
-      uint64_t &materialAStart, uint64_t &materialBStart,
+      llvm::StringRef file, uint64_t includeId, llvm::StringRef headerText,
+      uint64_t ppHi, uint64_t &materialAStart, uint64_t &materialBStart,
       uint64_t &materialBEnd, uint64_t &materialInsertPos,
       std::string &materialInsertBytes) const;
 

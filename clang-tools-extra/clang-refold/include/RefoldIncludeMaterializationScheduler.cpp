@@ -1054,9 +1054,6 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
   if (!definitionRepair.succeeded)
     return false;
 
-  LineDirectiveLocation parentResume =
-      LineDirectiveInserter::LogicalLocationAtOffset(
-          request_.tuBytes, siteEnd, request_.tuPath, model_, request_.tuPath);
   // The TU-root wrapper policy asks exactly the questions the include-subtree
   // work classifier answers, over the same staging buckets the materializer is
   // handed.  At TU scope the layout-only seeds play the "must expand" role:
@@ -1105,10 +1102,9 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
 
   LineControlWrappedText wrapped =
       lineObserverLayout_.WrapIncludeExpansionForMaterialization(
-          *include, parentResume.fileSpelling, request_.tuPath, std::nullopt,
-          siteEnd, childEntryLineNo ? childEntryLineNo : 1, parentResume.lineNo,
-          expansionText, includeLineCandidates, includeLineSourceMappings,
-          sidebandOnly);
+          *include, request_.tuPath, std::nullopt, request_.tuBytes, siteEnd,
+          childEntryLineNo ? childEntryLineNo : 1, expansionText,
+          includeLineCandidates, includeLineSourceMappings, sidebandOnly);
 
   TextEdit edit{siteBegin,
                 siteEnd,

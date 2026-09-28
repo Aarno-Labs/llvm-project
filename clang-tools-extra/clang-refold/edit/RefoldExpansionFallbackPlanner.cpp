@@ -3189,15 +3189,6 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
     }
 
 
-    SourceLineDirectiveLogicalLineRewriter sourceLineDirectiveLineRewriter =
-        [&](StringRef logicalLine, ArrayRef<uint64_t> sourceOffsets,
-            SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver)
-        -> std::optional<SourceLineDirectiveLogicalLineRewrite> {
-      return rewriteSourceLineDirectiveLogicalLineMacros(
-          model_, tuPath, logicalLine, sourceOffsets, paths_, lexLang_,
-          std::nullopt, std::move(builtinMacroResolver));
-    };
-
     DenseSet<uint64_t> mixedSourceLineDirectiveMacroIds;
     auto recordSourceLineDirectiveMacroIds = [&](ArrayRef<uint64_t> macroIds) {
       for (uint64_t macroId : macroIds)
@@ -3218,18 +3209,10 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
         if (*macro.invB < gapBegin || gapEnd < *macro.invE)
           continue;
 
-        std::optional<SourceLineControlState> stateAtGap =
-            sourceLineControlStateBefore(model_, paths_,
-                                         preprocessingStructureIndex_, tuPath,
-                                         std::nullopt, gapBegin, tuPath);
         SmallVector<uint64_t, 4> acceptedMacroIds;
-        if (!stateAtGap ||
-            !computeSourceLineDirectiveGapResume(
-                tuBytes, gapBegin, gapEnd, sourceEnd, stateAtGap->fileSpelling,
-                sourceLineDirectiveLineRewriter, &acceptedMacroIds, tuPath,
-                !sourceSuffixMayObservePresumedFileSpelling(
-                    model_, tuPath, sourceEnd, paths_, tuBytes),
-                stateAtGap->lineMarkerFlags))
+        if (!lineControlProof_.LineControlGapResume(
+                tuPath, std::nullopt, tuBytes, gapBegin, gapEnd, sourceEnd,
+                &acceptedMacroIds))
           continue;
 
         recordSourceLineDirectiveMacroIds(acceptedMacroIds);
@@ -3368,22 +3351,11 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
                   /*allowTUConditionalControl=*/true))
             return true;
 
-          // A directive without a filename operand keeps the presumed file in
-          // effect at the gap, which an earlier `#line` may have set.
-          std::optional<SourceLineControlState> stateAtGap =
-              sourceLineControlStateBefore(model_, paths_,
-                                           preprocessingStructureIndex_, tuPath,
-                                           std::nullopt, gapBegin, tuPath);
           SmallVector<uint64_t, 4> acceptedMacroIds;
-          const bool allowUnknownFilenameOperand =
-              !sourceSuffixMayObservePresumedFileSpelling(
-                  model_, tuPath, sourceEnd, paths_, tuBytes);
-          std::optional<SourceLineDirectiveGapResume> lineResume;
-          if (stateAtGap)
-            lineResume = computeSourceLineDirectiveGapResume(
-                tuBytes, gapBegin, gapEnd, sourceEnd, stateAtGap->fileSpelling,
-                sourceLineDirectiveLineRewriter, &acceptedMacroIds, tuPath,
-                allowUnknownFilenameOperand, stateAtGap->lineMarkerFlags);
+          std::optional<SourceLineDirectiveGapResume> lineResume =
+              lineControlProof_.LineControlGapResume(
+                  tuPath, std::nullopt, tuBytes, gapBegin, gapEnd, sourceEnd,
+                  &acceptedMacroIds);
           if (lineResume) {
             // A source-spelled line-control directive contributes no PP
             // tokens, but it is not disposable trivia.  If the copied
@@ -3411,12 +3383,9 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
                   proveSourceLineDirectiveGapRespelling(
                       model_, paths_, lexLang_, tuPath, tuBytes, sourceBegin,
                       gapBegin, gapEnd, *lineResume,
-                      computeSourceLineDirectiveGapResume(
-                          tuBytes, gapBegin, gapEnd, gapEnd,
-                          stateAtGap->fileSpelling,
-                          sourceLineDirectiveLineRewriter, nullptr, tuPath,
-                          allowUnknownFilenameOperand,
-                          stateAtGap->lineMarkerFlags));
+                      lineControlProof_.LineControlGapResume(
+                          tuPath, std::nullopt, tuBytes, gapBegin, gapEnd,
+                          gapEnd));
               mixedSourceLineDirectiveResume = std::move(lineResume);
               REFOLD_LOG_TRACE(
                   "fallback",

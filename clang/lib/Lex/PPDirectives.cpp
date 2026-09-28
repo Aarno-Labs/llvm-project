@@ -1583,9 +1583,12 @@ void Preprocessor::HandleLineDirective() {
   SourceMgr.AddLineNote(DigitTok.getLocation(), LineNo, FilenameID, false,
                         false, FileKind);
 
-  if (Callbacks)
-    Callbacks->FileChanged(CurPPLexer->getSourceLocation(),
-                           PPCallbacks::RenameFile, FileKind);
+  if (Callbacks) {
+    const SourceLocation EndLoc = CurPPLexer->getSourceLocation();
+    Callbacks->LineControlDirective(CurrentDirectiveIntroducerLoc, EndLoc,
+                                    PPCallbacks::RenameFile, FileKind);
+    Callbacks->FileChanged(EndLoc, PPCallbacks::RenameFile, FileKind);
+  }
 }
 
 /// ReadLineMarkerFlags - Parse and validate any flags at the end of a GNU line
@@ -1743,7 +1746,10 @@ void Preprocessor::HandleDigitDirective(Token &DigitTok) {
     else if (IsFileExit)
       Reason = PPCallbacks::ExitFile;
 
-    Callbacks->FileChanged(CurPPLexer->getSourceLocation(), Reason, FileKind);
+    const SourceLocation EndLoc = CurPPLexer->getSourceLocation();
+    Callbacks->LineControlDirective(CurrentDirectiveIntroducerLoc, EndLoc,
+                                    Reason, FileKind);
+    Callbacks->FileChanged(EndLoc, Reason, FileKind);
   }
 }
 

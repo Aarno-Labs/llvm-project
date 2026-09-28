@@ -808,8 +808,8 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
     if (!stringutils::outAtBOL(replacement))
       continue;
 
-    LineDirectiveLocation loc = lineControlProof_.LogicalLocationAtOwnerOffset(
-        tuBytes, tuPath, std::nullopt, observerLineBegin);
+    LineDirectiveLocation loc = lineControlProof_.OwnerLineStateAt(
+        tuPath, std::nullopt, tuBytes, observerLineBegin, tuPath);
     if (!loc.producerProven)
       continue;
     replacement += lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
@@ -1059,8 +1059,9 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
     if (!stringutils::outAtBOL(replacement))
       continue;
 
-    LineDirectiveLocation loc = lineControlProof_.LogicalLocationAtOwnerOffset(
-        headerBytes, ownerFile, site->ownerIncludeId, observerLineBegin);
+    LineDirectiveLocation loc = lineControlProof_.OwnerLineStateAt(
+        ownerFile, site->ownerIncludeId, headerBytes, observerLineBegin,
+        ownerFile);
     if (!loc.producerProven)
       continue;
     replacement += lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
@@ -1183,10 +1184,9 @@ ResyncOutcome RefoldLineObserverLayout::ApplyResyncOrPend(
   // line. Use the source-authored line-control state at `end`, not merely the
   // physical line in this owner file: `#line`, `# line`, and `# <number>` can
   // make a copied suffix observe a virtual file/line.
-  LineDirectiveLocation resumeLoc =
-      LineDirectiveInserter::LogicalLocationAtOffset(
-          originalFileText, end, fileSpellingForDirective, model_,
-          fileSpellingForDirective, ownerIncludeId);
+  LineDirectiveLocation resumeLoc = lineControlProof_.OwnerLineStateAt(
+      fileSpellingForDirective, ownerIncludeId, originalFileText, end,
+      fileSpellingForDirective);
 
   if (!resumeLoc.producerProven) {
     if (resumeLoc.unprovenLineControlDirectiveOffset &&
@@ -1204,14 +1204,10 @@ ResyncOutcome RefoldLineObserverLayout::ApplyResyncOrPend(
       return ResyncOutcome(replacement.str(), std::nullopt);
     }
 
-    if (std::optional<LineDirectiveLocation> producerLoc =
-            lineControlProof_.ProducerBackedLineControlLocationAt(
-                originalFileText, fileSpellingForDirective, ownerIncludeId,
-                start, end)) {
-      resumeLoc = std::move(*producerLoc);
-    } else {
-      return ResyncOutcome(replacement.str(), std::nullopt);
-    }
+    // The unaccounted directive precedes the replacement and stays in the
+    // copied source, so no state this proof could name is known to reach the
+    // suffix.  Emit no synthetic resync over it.
+    return ResyncOutcome(replacement.str(), std::nullopt);
   }
 
   const bool deferToConditionalJoin = LineResyncShouldDeferToConditionalJoin(
@@ -1285,10 +1281,9 @@ ResyncOutcome RefoldLineObserverLayout::ApplyResyncOrPend(
 
 LineControlWrappedText
 RefoldLineObserverLayout::WrapIncludeExpansionForMaterialization(
-    const RefoldModel::IncludeItem &child, StringRef parentFileSpelling,
-    StringRef parentOwnerFileForDemand,
-    std::optional<uint64_t> parentOwnerIncludeId, uint64_t parentResumeOffset,
-    size_t childEntryLineNo, size_t parentResumeLineNo, StringRef childBody,
+    const RefoldModel::IncludeItem &child, StringRef parentOwnerFileForDemand,
+    std::optional<uint64_t> parentOwnerIncludeId, StringRef parentBytes,
+    uint64_t parentResumeOffset, size_t childEntryLineNo, StringRef childBody,
     ArrayRef<FinalLineControlPruneCandidate> childBodyLineControlCandidates,
     ArrayRef<FinalLineControlSourceMapping> childBodyLineControlSourceMappings,
     bool allowUnobservableLineDirectiveSuppression) const {
@@ -1441,8 +1436,13 @@ RefoldLineObserverLayout::WrapIncludeExpansionForMaterialization(
                                          "linedir/include-return", detail,
                                          /*requireKnownObserver=*/true);
           });
+      const LineDirectiveLocation parentResume =
+          lineControlProof_.OwnerLineStateAt(
+              parentOwnerFileForDemand, parentOwnerIncludeId, parentBytes,
+              parentResumeOffset, parentOwnerFileForDemand);
       appendSyntheticDirective(
-          lineDirs_.FormatLineDirective(parentResumeLineNo, parentFileSpelling),
+          lineDirs_.FormatLineDirective(parentResume.lineNo,
+                                        parentResume.fileSpelling),
           FinalLineDirective::Origin::SyntheticIncludeReturn,
           FinalLineControlOwnerKey(parentOwnerFileForDemand.str(),
                                    parentOwnerIncludeId),

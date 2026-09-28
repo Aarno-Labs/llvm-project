@@ -20,6 +20,7 @@
 #include "proof/RefoldProofVocabulary.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
@@ -31,6 +32,8 @@ namespace refold {
 
 class RefoldMacroTopology;
 class RefoldPathIdentity;
+class RefoldPreprocessingStructureIndexProvider;
+struct SourceLineDirectiveGapResume;
 
 /// Earliest preserved line-state observer in an owner suffix.
 ///
@@ -58,6 +61,65 @@ public:
       : model_(model), paths_(paths), macroTopology_(macroTopology),
         lineDirs_(lineDirs), aToks_(aToks), bToks_(bToks),
         abTokMapA2B_(abTokMapA2B), abTokMapB2A_(abTokMapB2A) {}
+
+  /// Attach the structure-index provider through which OwnerLineStateAt()
+  /// binds lexical line-control directives to producer events.
+  ///
+  /// The engine builds the provider after this service, so it is attached
+  /// once the service graph exists.  Until then every owner line-state query
+  /// is unproven.
+  void BindStructureIndexes(
+      const RefoldPreprocessingStructureIndexProvider &structureIndexes) {
+    structureIndexes_ = &structureIndexes;
+  }
+
+  /// Return the presumed location Clang assigned at \p offset of one owner's
+  /// physical source, computed from producer line-control events alone.
+  ///
+  /// The result is proven when the owner's structure index accounts for every
+  /// lexical line-control directive ending at or before \p offset: each is
+  /// bound to a producer event of this owner or lies inside a range the
+  /// producer skipped, and each such event of the owner has a site.  The
+  /// latest event then gives `(logicalFileAfter, logicalLineAfter +
+  /// LB[siteE, offset))`, and with none the location is `(defaultFile,
+  /// 1 + LB[0, offset))`, where LB counts physical line breaks as
+  /// stringutils::countPhysicalLineBreaks() does.  \p ownerBytes must be the
+  /// bytes the producer lexed; a size that differs from the index's is
+  /// unproven.
+  ///
+  /// An unproven result still carries that location, computed from the latest
+  /// event whose site is known, and names the last directive that broke the
+  /// proof when one has a known offset: a directive straddling \p offset, an
+  /// unbound directive outside every skipped range, or an unbound event.
+  LineDirectiveLocation OwnerLineStateAt(llvm::StringRef ownerFile,
+                                         std::optional<uint64_t> ownerIncludeId,
+                                         llvm::StringRef ownerBytes,
+                                         uint64_t offset,
+                                         llvm::StringRef defaultFile) const;
+
+  /// Prove that the owner-source gap [\p gapBegin, \p gapEnd) consists of
+  /// complete executed line-control directives and lexical trivia, and return
+  /// the state a resume directive must re-establish for the source at
+  /// \p resumeOffset.
+  ///
+  /// Every protected interval the owner's structure index finds in the gap
+  /// must be a line-control directive wholly inside it and bound to a producer
+  /// event, the bytes between them must be lexical trivia, and there must be at
+  /// least one.  The file and line are OwnerLineStateAt(\p resumeOffset), which
+  /// must be proven.  The line-marker flags replay what the directives from
+  /// \p gapBegin on did to the presumed file: `1` for one entered file, then
+  /// `3` or `3 4` for the file kind in effect at \p resumeOffset.  A range that
+  /// exits a presumed file or enters more than one is refused, as is an event
+  /// from a map that predates recording file kinds.
+  ///
+  /// \p operandMacroIds, when non-null, receives every macro invocation of the
+  /// owner spelled inside one of the gap's directives: it contributed no token,
+  /// and consuming the directive consumes it.
+  std::optional<SourceLineDirectiveGapResume> LineControlGapResume(
+      llvm::StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
+      llvm::StringRef ownerBytes, uint64_t gapBegin, uint64_t gapEnd,
+      uint64_t resumeOffset,
+      llvm::SmallVectorImpl<uint64_t> *operandMacroIds = nullptr) const;
 
   /// Return the source spelling site that observes a line-state builtin.
   const RefoldModel::MacroInvocation *
@@ -88,19 +150,6 @@ public:
   LatestProducerLineControlEndBefore(std::optional<uint64_t> ownerIncludeId,
                                      llvm::StringRef ownerFile,
                                      uint64_t offset) const;
-
-  /// Compute the logical location at `locationOffset` from the latest eligible
-  /// producer-backed line-control event ending no later than `eventEndLimit`.
-  std::optional<LineDirectiveLocation> ProducerBackedLineControlLocationAt(
-      llvm::StringRef ownerBytes, llvm::StringRef ownerFile,
-      std::optional<uint64_t> ownerIncludeId, uint64_t eventEndLimit,
-      uint64_t locationOffset) const;
-
-  /// Compute the logical location at an owner byte offset, preferring
-  /// producer-proven line-control state when available.
-  LineDirectiveLocation LogicalLocationAtOwnerOffset(
-      llvm::StringRef ownerBytes, llvm::StringRef ownerFile,
-      std::optional<uint64_t> ownerIncludeId, uint64_t offset) const;
 
   /// Return whether a line-state builtin invocation survived token-identically
   /// into B and therefore remains a source observer.
@@ -155,6 +204,7 @@ private:
   llvm::ArrayRef<PPTok> bToks_;
   const std::vector<int64_t> &abTokMapA2B_;
   const std::vector<int64_t> &abTokMapB2A_;
+  const RefoldPreprocessingStructureIndexProvider *structureIndexes_ = nullptr;
 };
 
 } // namespace refold

@@ -1044,12 +1044,31 @@ public:
     const CondArm *arm;
   };
 
+  /// How a line-control directive changed the presumed file.
+  enum class LineControlReason {
+    /// `#line`, or a GNU line marker without flag 1 or 2.
+    Rename,
+    /// A GNU line marker with flag 1, which pushes a presumed include.
+    Enter,
+    /// A GNU line marker with flag 2, which pops a presumed include.
+    Exit
+  };
+
+  /// File characteristic a line-control directive established; GNU line
+  /// markers spell the non-user kinds as flags `3` and `3 4`.
+  enum class LineControlFileKind { User, System, ExternCSystem };
+
   /// Producer-proven active source line-control event.
   ///
   /// These records are emitted only after Clang has evaluated directive
   /// operands and conditional activity.  They are therefore model evidence for
   /// arbitrary source `#line` forms, including macro-expanded operands, without
   /// requiring the consumer to re-evaluate preprocessor expressions.
+  ///
+  /// From schema 3.7 the producer records every executed directive, and
+  /// `[siteB, siteE)` is exact: the introducer through the first byte after the
+  /// directive, where the presumed location is `(logicalFileAfter,
+  /// logicalLineAfter)`.
   struct LineControlEvent {
     /// Stable producer id for the event.
     uint64_t id = 0;
@@ -1071,6 +1090,12 @@ public:
     std::optional<uint64_t> ownerIncludeId;
     /// Full source directive text.
     StringRef text;
+    /// How the directive changed the presumed file.  A map produced before
+    /// schema 3.7 recorded only renaming directives, so absence means Rename.
+    LineControlReason reason = LineControlReason::Rename;
+    /// File characteristic the directive established, or nullopt when the map
+    /// predates schema 3.7.
+    std::optional<LineControlFileKind> fileKind;
   };
 
   /// Physical source range of one file instance that Clang skipped while

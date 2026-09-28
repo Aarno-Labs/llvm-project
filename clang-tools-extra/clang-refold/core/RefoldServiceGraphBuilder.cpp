@@ -260,6 +260,7 @@ void RefoldEngine::BuildServiceGraph() {
           RefoldPreprocessingStructureIndexProvider::Dependencies{
               model_, pathIdentity_, lineDirs_, lexLang_},
           model_.GetSourcePath(), *preprocessingStructureIndex_);
+  lineControlProof_.BindStructureIndexes(*preprocessingStructureIndexProvider_);
   printedPragmaCarriers_ = buildPrintedPragmaCarriers(
       model_, macroTopology_, pathIdentity_,
       *preprocessingStructureIndexProvider_, sidebandPragmaLinePairings_);

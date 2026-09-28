@@ -2620,25 +2620,12 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
         return originalFileText.str();
       }
 
-      LineDirectiveLocation loc =
-          LineDirectiveInserter::LogicalLocationAtOffset(
-              originalFileText, firstObserver->offset, emissionOwner, model_,
-              emissionOwner, ownerIncludeId);
-
       // Conditional-join repairs must describe the logical line state that
-      // reaches the first suffix observer after the conditional group rejoins.
-      // The lexical scanner above can reconstruct ordinary source-local #line
-      // state, but producer-backed recovery is needed for source-authored #line
-      // operands whose evaluated state was recorded by the producer.
-
-      if (!loc.producerProven) {
-        if (std::optional<LineDirectiveLocation> producerLoc =
-                lineControlProof_.ProducerBackedLineControlLocationAt(
-                    originalFileText, emissionOwner, ownerIncludeId,
-                    firstObserver->offset, firstObserver->offset)) {
-          loc = std::move(*producerLoc);
-        }
-      }
+      // reaches the first suffix observer after the conditional group rejoins,
+      // which the producer's line-control events give.
+      LineDirectiveLocation loc = lineControlProof_.OwnerLineStateAt(
+          emissionOwner, ownerIncludeId, originalFileText,
+          firstObserver->offset, emissionOwner);
 
       std::string directive =
           lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
@@ -2879,9 +2866,9 @@ RefoldTextEditAssembler::AppendOriginalSliceWithPending(
 
   auto logicalLocationForPendingFlush =
       [&](uint64_t pos) -> std::optional<LineDirectiveLocation> {
-    LineDirectiveLocation loc = LineDirectiveInserter::LogicalLocationAtOffset(
-        original, static_cast<size_t>(pos), pending->fileSpellingForDir, model_,
-        pending->fileSpellingForDir, pending->ownerIncludeId);
+    LineDirectiveLocation loc = lineControlProof_.OwnerLineStateAt(
+        pending->fileSpellingForDir, pending->ownerIncludeId, original, pos,
+        pending->fileSpellingForDir);
     if (loc.producerProven)
       return loc;
 

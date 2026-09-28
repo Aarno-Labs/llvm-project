@@ -110,11 +110,14 @@ public:
 
   /// Wrap materialized include text with the entry/return `#line` directives
   /// proven necessary for child and parent line-state observers.
+  ///
+  /// \p parentBytes is the parent owner's physical source; a return directive
+  /// names the presumed location at \p parentResumeOffset in it.
   LineControlWrappedText WrapIncludeExpansionForMaterialization(
-      const RefoldModel::IncludeItem &child, llvm::StringRef parentFileSpelling,
+      const RefoldModel::IncludeItem &child,
       llvm::StringRef parentOwnerFileForDemand,
-      std::optional<uint64_t> parentOwnerIncludeId, uint64_t parentResumeOffset,
-      size_t childEntryLineNo, size_t parentResumeLineNo,
+      std::optional<uint64_t> parentOwnerIncludeId, llvm::StringRef parentBytes,
+      uint64_t parentResumeOffset, size_t childEntryLineNo,
       llvm::StringRef childBody,
       llvm::ArrayRef<FinalLineControlPruneCandidate>
           childBodyLineControlCandidates,

@@ -329,8 +329,9 @@ bool FinalTUEmissionContext::SiteNeedsTUPrologue(
   // prologue.  Only observers whose active logical file is still the producer
   // TU need the prologue repair.
   if (site.invB) {
-    LineDirectiveLocation loc = LineDirectiveInserter::LogicalLocationAtOffset(
-        request_.tuBytes, *site.invB, request_.tuPath, model_, request_.tuPath);
+    LineDirectiveLocation loc = lineControlProof_.OwnerLineStateAt(
+        request_.tuPath, std::nullopt, request_.tuBytes, *site.invB,
+        request_.tuPath);
     if (lineDirs_.ToAbsolutePath(loc.fileSpelling) !=
         lineDirs_.ToAbsolutePath(request_.tuPath))
       return false;
