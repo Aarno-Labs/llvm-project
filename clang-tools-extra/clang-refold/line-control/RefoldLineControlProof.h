@@ -131,6 +131,20 @@ public:
       llvm::StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
       uint64_t offset) const;
 
+  /// Return whether an executed line-control directive of an include
+  /// occurrence, ending by `offset`, provably named the presumed file.
+  ///
+  /// A directive without a filename operand keeps the presumed file, so one
+  /// whose recorded file differs from the file in effect before it named one.
+  /// Before the occurrence's first directive that file is the producer's
+  /// entered-file spelling.  A directive naming the file already in effect is
+  /// not detected; that only keeps a wrapper.  A marker entering or leaving a
+  /// presumed file, or an occurrence with no recorded entered-file spelling,
+  /// answers false.
+  bool SourcePrefixNamesPresumedFile(llvm::StringRef ownerFile,
+                                     uint64_t ownerIncludeId,
+                                     uint64_t offset) const;
+
   /// Summarize preserved line-state builtin demand inside an include subtree.
   LineStateObserverDemand
   IncludeSubtreeLineStateObserverDemand(uint64_t includeId) const;

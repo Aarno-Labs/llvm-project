@@ -67,6 +67,42 @@ bool RefoldLineControlProof::SourcePrefixHasProducerActiveLineControl(
   return false;
 }
 
+bool RefoldLineControlProof::SourcePrefixNamesPresumedFile(
+    StringRef ownerFile, uint64_t ownerIncludeId, uint64_t offset) const {
+  const RefoldModel::IncludeItem *include =
+      model_.GetIncludeById(ownerIncludeId);
+  if (!include)
+    return false;
+  std::optional<std::string> presumedFile =
+      paths_.ProducerEnteredFileSpelling(*include);
+  if (!presumedFile)
+    return false;
+
+  SmallVector<const RefoldModel::LineControlEvent *, 4> events;
+  for (const RefoldModel::LineControlEvent &event : model_.GetLineControls())
+    if (event.ownerIncludeId == ownerIncludeId && event.active &&
+        event.producerProven && event.siteB && event.siteE &&
+        *event.siteE <= offset &&
+        paths_.PathsEqual(event.physicalFile, ownerFile))
+      events.push_back(&event);
+  llvm::sort(events, [](const RefoldModel::LineControlEvent *lhs,
+                        const RefoldModel::LineControlEvent *rhs) {
+    return *lhs->siteB < *rhs->siteB;
+  });
+
+  // Once a directive names a file, every later one either names another or
+  // keeps it, so the file stays independent of the includer from then on.
+  bool named = false;
+  for (const RefoldModel::LineControlEvent *event : events) {
+    if (event->reason != RefoldModel::LineControlReason::Rename)
+      return false;
+    if (event->logicalFileAfter != *presumedFile)
+      named = true;
+    *presumedFile = event->logicalFileAfter.str();
+  }
+  return named;
+}
+
 LineStateObserverDemand
 RefoldLineControlProof::IncludeSubtreeLineStateObserverDemand(
     uint64_t includeId) const {
@@ -116,15 +152,25 @@ RefoldLineControlProof::IncludeSubtreeLineStateObserverDemand(
       continue;
     }
 
-    if (site->invFile && site->invB &&
-        SourcePrefixHasProducerActiveLineControl(*site->invFile, owner,
-                                                 *site->invB)) {
+    // The child's own directive ahead of the observer re-establishes the line
+    // whatever the entry wrapper said, but the file only when it names one:
+    // without a filename operand it keeps the presumed file, which after
+    // inlining is the parent's rather than the child's.
+    const bool lineReestablished = site->invFile && site->invB &&
+                                   SourcePrefixHasProducerActiveLineControl(
+                                       *site->invFile, owner, *site->invB);
+    const bool fileReestablished =
+        lineReestablished &&
+        SourcePrefixNamesPresumedFile(*site->invFile, *owner, *site->invB);
+    const bool needsLine = observesLine && !lineReestablished;
+    const bool needsFile = observesFile && !fileReestablished;
+    const bool needsFileName = observesFileName && !fileReestablished;
+    if (!needsLine && !needsFile && !needsFileName)
       continue;
-    }
 
-    demand.needsLine |= observesLine;
-    demand.needsFile |= observesFile;
-    demand.needsFileName |= observesFileName;
+    demand.needsLine |= needsLine;
+    demand.needsFile |= needsFile;
+    demand.needsFileName |= needsFileName;
     demand.hasModelBackedLineStateDemand |=
         LineStateBuiltinInvocationNeedsModelBackedLineStateDemand(macro);
     if (demand.needsLine && demand.needsFile && demand.needsFileName &&
