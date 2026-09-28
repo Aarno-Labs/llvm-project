@@ -549,13 +549,6 @@ private:
   std::optional<uint64_t>
   ProducerEnteredIncludeIdForPath(llvm::StringRef canonicalPath) const;
 
-  /// Return the innermost conditional arm containing \p byteOffset for one
-  /// owner occurrence, or nullopt when the offset is unconditional there.
-  std::optional<uint64_t>
-  InnermostEnclosingArm(llvm::StringRef sourcePath,
-                        std::optional<uint64_t> ownerIncludeId,
-                        uint64_t byteOffset) const;
-
   /// Return whether \p physicalPath includes itself transitively.
   bool HeaderIncludesItself(llvm::StringRef physicalPath) const;
 

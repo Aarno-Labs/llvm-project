@@ -350,39 +350,6 @@ RefoldPragmaOnceGuardRewriter::LoadHeaderBytes(StringRef physicalPath,
   return StringRef(*headerBytesCache_[physicalPath]);
 }
 
-std::optional<uint64_t> RefoldPragmaOnceGuardRewriter::InnermostEnclosingArm(
-    StringRef sourcePath, std::optional<uint64_t> ownerIncludeId,
-    uint64_t byteOffset) const {
-  // Conditional groups are instance-scoped through parentIncludeId, so the
-  // owner occurrence must match exactly.  Two instances of one header carry
-  // separate groups over the same byte ranges, and answering from the wrong
-  // instance would attribute a site to an unrelated arm.
-  std::optional<uint64_t> innermost;
-  uint64_t innermostBodySize = 0;
-
-  for (const RefoldModel::CondGroup &group : deps_.model.GetConds()) {
-    if (!deps_.pathIdentity.PathsEqual(group.file, sourcePath))
-      continue;
-    if (group.parentIncludeId != ownerIncludeId)
-      continue;
-
-    for (const RefoldModel::CondArm &arm : group.arms) {
-      if (!arm.ContainsByte(byteOffset))
-        continue;
-      // Nested groups produce nested arms over the same offset; the smallest
-      // containing body is the innermost one.  Arm bodies of one group are
-      // disjoint, so this comparison never has to break a tie between siblings.
-      const uint64_t bodySize = arm.bodyE - arm.bodyB;
-      if (!innermost || bodySize < innermostBodySize) {
-        innermost = arm.id;
-        innermostBodySize = bodySize;
-      }
-    }
-  }
-
-  return innermost;
-}
-
 bool RefoldPragmaOnceGuardRewriter::DiscoverPragmaOnceSites(
     StringRef physicalPath, StringRef sourcePath,
     std::optional<uint64_t> ownerIncludeId, StringRef bytes,
@@ -444,8 +411,7 @@ bool RefoldPragmaOnceGuardRewriter::DiscoverPragmaOnceSites(
       site.spellingBegin = interval.structureSpellingBegin;
       site.spellingEnd = interval.structureSpellingEnd;
       site.modelItemId = interval.modelItemId;
-      site.enclosingArmId =
-          InnermostEnclosingArm(sourcePath, ownerIncludeId, interval.begin);
+      site.enclosingArmId = interval.ownerConditionalArmId;
       site.viaPragmaOperator = true;
       site.enclosedByProtectedStructure =
           IntervalIsEnclosedByAnotherStructure(index, interval);
@@ -465,8 +431,7 @@ bool RefoldPragmaOnceGuardRewriter::DiscoverPragmaOnceSites(
     site.spellingEnd = interval.structureSpellingEnd;
     if (interval.modelKind == PreprocessingStructureModelKind::PragmaDirective)
       site.modelItemId = interval.modelItemId;
-    site.enclosingArmId =
-        InnermostEnclosingArm(sourcePath, ownerIncludeId, interval.begin);
+    site.enclosingArmId = interval.ownerConditionalArmId;
     sites.push_back(site);
   }
 
