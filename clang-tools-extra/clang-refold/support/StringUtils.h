@@ -531,9 +531,6 @@ inline bool endsLineBeforeWs(StringRef text, size_t offset) {
   return rangeContainsOnlyWs(text, offset, lineEndOffset(text, offset));
 }
 
-/// Return true iff the first non-whitespace bytes of \p s start with \p lit.
-bool startsWithAfterWs(StringRef s, StringRef lit);
-
 /// Replace the substring in \p s spanning [begin, end) with \p repl.
 inline std::string replaceRange(StringRef s, size_t begin, size_t end,
                                 StringRef repl) {

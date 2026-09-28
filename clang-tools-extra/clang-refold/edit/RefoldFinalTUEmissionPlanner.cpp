@@ -281,9 +281,12 @@ void FinalTUEmissionContext::RepairTUPrologueForPreservedFileObservers(
     std::string &tuResult) const {
   if (!lineDirs_.Enabled() || tuResult.empty())
     return;
+  // A `#line` already leading the output is no reason to skip the prologue: one
+  // that names no file, such as `#line 10`, leaves every observer after it on
+  // the output path.  SiteNeedsTUPrologue() decides from producer state which
+  // observers still need the producer TU's name, and a prologue the output
+  // makes redundant is left to the line-control pruner.
   if (!NeedsTUPrologueForPreservedFileObservers())
-    return;
-  if (stringutils::startsWithAfterWs(llvm::StringRef(tuResult), "#line"))
     return;
 
   InsertTUPrologue(tuResult);
@@ -327,13 +330,16 @@ bool FinalTUEmissionContext::SiteNeedsTUPrologue(
 
   // A source-authored #line before the observer dominates the synthetic TU
   // prologue.  Only observers whose active logical file is still the producer
-  // TU need the prologue repair.
+  // TU need the prologue repair.  The exemption needs a proven line state: the
+  // prologue only restores the file Clang began the TU in, so an unneeded one
+  // is harmless, while one omitted on an unproven file would leave the
+  // observer naming the output path.
   if (site.invB) {
     LineDirectiveLocation loc = lineControlProof_.OwnerLineStateAt(
         request_.tuPath, std::nullopt, request_.tuBytes, *site.invB,
         request_.tuPath);
-    if (lineDirs_.ToAbsolutePath(loc.fileSpelling) !=
-        lineDirs_.ToAbsolutePath(request_.tuPath))
+    if (loc.producerProven && lineDirs_.ToAbsolutePath(loc.fileSpelling) !=
+                                  lineDirs_.ToAbsolutePath(request_.tuPath))
       return false;
   }
 

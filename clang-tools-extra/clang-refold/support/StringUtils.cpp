@@ -300,18 +300,6 @@ std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw0) {
   return out;
 }
 
-/// Return true iff \p lit appears after leading whitespace in \p s.
-bool startsWithAfterWs(StringRef s, StringRef lit) {
-  size_t i = 0;
-  while (i < s.size()) {
-    char c = s[i];
-    if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
-      break;
-    ++i;
-  }
-  return s.drop_front(i).starts_with(lit);
-}
-
 /// Quote and escape \p s as a C string literal spelling.
 std::string quoteCString(StringRef s) {
   std::string res = "\"";
