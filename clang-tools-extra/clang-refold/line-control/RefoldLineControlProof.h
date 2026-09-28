@@ -97,6 +97,18 @@ public:
                                          uint64_t offset,
                                          llvm::StringRef defaultFile) const;
 
+  /// Return the logical-line start of the owner's line-control directive whose
+  /// spelling contains \p offset after its introducer, or nullopt when
+  /// \p offset lies inside none.
+  ///
+  /// A token spelled there, such as a `__LINE__` operand, is expanded before
+  /// the directive takes effect, and nothing can be inserted inside the
+  /// directive, so a repair aimed at that token belongs at the returned
+  /// offset.
+  std::optional<uint64_t> LineControlDirectiveLineStartContaining(
+      llvm::StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
+      uint64_t offset) const;
+
   /// Prove that the owner-source gap [\p gapBegin, \p gapEnd) consists of
   /// complete executed line-control directives and lexical trivia, and return
   /// the state a resume directive must re-establish for the source at

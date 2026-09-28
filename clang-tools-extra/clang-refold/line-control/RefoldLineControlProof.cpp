@@ -436,6 +436,24 @@ LineDirectiveLocation RefoldLineControlProof::OwnerLineStateAt(
                                proven, unprovenAt);
 }
 
+std::optional<uint64_t>
+RefoldLineControlProof::LineControlDirectiveLineStartContaining(
+    StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
+    uint64_t offset) const {
+  const RefoldPreprocessingStructureIndex *index =
+      structureIndexes_
+          ? structureIndexes_->Get(ownerFile, ownerIncludeId).index
+          : nullptr;
+  if (!index)
+    return std::nullopt;
+  for (const PreprocessingStructureInterval *interval :
+       index->FindOverlapping(offset, offset + 1))
+    if (interval->kind == PreprocessingStructureKind::LineControl &&
+        interval->structureSpellingBegin < offset && offset < interval->end)
+      return interval->begin;
+  return std::nullopt;
+}
+
 /// Return the line-marker flags that make a resume directive establish
 /// \p kind, or nullopt for an event whose map predates recording file kinds.
 static std::optional<StringRef>

@@ -2500,6 +2500,25 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     return std::nullopt;
   };
 
+  // Map `sourceOffset` through the copied slice that holds `anchor`, which
+  // must hold `sourceOffset` too.  Unlike sourceOffsetToFinalOffset(), an
+  // offset where an edit meets that slice lands inside the slice rather than
+  // at the end of the copy before the edit.
+  auto sourceOffsetToFinalOffsetInCopyOf =
+      [&](uint64_t anchor, uint64_t sourceOffset) -> std::optional<uint64_t> {
+    if (!lineControlSourceMappings || sourceOffset > anchor)
+      return std::nullopt;
+    for (const FinalLineControlSourceMapping &mapping :
+         *lineControlSourceMappings) {
+      if (mapping.ownerIncludeId != ownerIncludeId ||
+          mapping.physicalFile != sourceMappingOwner)
+        continue;
+      if (mapping.sourceBegin <= sourceOffset && anchor < mapping.sourceEnd)
+        return mapping.finalBegin + (sourceOffset - mapping.sourceBegin);
+    }
+    return std::nullopt;
+  };
+
   struct ConditionalJoinLineRepair {
     uint64_t sourceOffset = 0;
     uint64_t finalOffset = 0;
@@ -2601,14 +2620,44 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
               fn(OwnerStateComponent::FileName);
           };
 
-      if (!finalOffset) {
+      // An observer spelled inside a line-control directive, such as the
+      // `__LINE__` of `#line __LINE__`, is expanded before that directive takes
+      // effect, and a repair placed at its physical line could split the
+      // directive.  Aim the repair at the directive's logical line start
+      // instead: the state there reaches the observer through the directive's
+      // own line breaks, as it did in the source.
+      uint64_t repairSourceOffset = firstObserver->offset;
+      if (std::optional<uint64_t> directiveLineStart =
+              lineControlProof_.LineControlDirectiveLineStartContaining(
+                  emissionOwner, ownerIncludeId, firstObserver->offset)) {
+        repairSourceOffset = *directiveLineStart;
+        finalOffset = sourceOffsetToFinalOffsetInCopyOf(firstObserver->offset,
+                                                        repairSourceOffset);
+      }
+
+      // Conditional-join repairs must describe the logical line state that
+      // reaches the first suffix observer after the conditional group rejoins,
+      // which the producer's line-control events give.  A state they do not
+      // prove, like an observer the output does not contain, fails closed.
+      LineDirectiveLocation loc = lineControlProof_.OwnerLineStateAt(
+          emissionOwner, ownerIncludeId, originalFileText, repairSourceOffset,
+          emissionOwner);
+      if (!finalOffset || !loc.producerProven) {
         forEachLineControlDemandComponent(
             firstObserver->demand, [&](OwnerStateComponent component) {
               const std::string detail =
-                  llvm::formatv("cannot map conditional join observer in {0}: "
-                                "group#{1} observerSource={2}",
-                                emissionOwner, group->id, firstObserver->offset)
-                      .str();
+                  !finalOffset
+                      ? llvm::formatv("cannot map conditional join observer "
+                                      "in {0}: group#{1} observerSource={2}",
+                                      emissionOwner, group->id,
+                                      repairSourceOffset)
+                            .str()
+                      : llvm::formatv("conditional join observer in {0}: "
+                                      "group#{1} observerSource={2} has no "
+                                      "producer-proven line state",
+                                      emissionOwner, group->id,
+                                      repairSourceOffset)
+                            .str();
               (void)ownerStateProof_.CheckStateTransitionAcrossEditBoundary(
                   observerBoundary, component, StateMutationKind::Replayed,
                   ownerStateProof_.BuildStateTransitionWitness(
@@ -2619,13 +2668,6 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
             });
         return originalFileText.str();
       }
-
-      // Conditional-join repairs must describe the logical line state that
-      // reaches the first suffix observer after the conditional group rejoins,
-      // which the producer's line-control events give.
-      LineDirectiveLocation loc = lineControlProof_.OwnerLineStateAt(
-          emissionOwner, ownerIncludeId, originalFileText,
-          firstObserver->offset, emissionOwner);
 
       std::string directive =
           lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
@@ -2749,7 +2791,7 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
           });
 
       joinRepairs.push_back(ConditionalJoinLineRepair{
-          firstObserver->offset, insertionOffset, std::move(directive)});
+          repairSourceOffset, insertionOffset, std::move(directive)});
     }
   }
 

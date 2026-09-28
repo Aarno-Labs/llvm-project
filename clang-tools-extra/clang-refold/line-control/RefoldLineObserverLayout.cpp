@@ -1422,24 +1422,42 @@ RefoldLineObserverLayout::WrapIncludeExpansionForMaterialization(
           OwnerStateBoundary::FromSource(OwnerSourceRange::From(
               parentOwnerFileForDemand, parentResumeOffset, parentResumeOffset,
               parentOwnerIncludeId));
+      const LineDirectiveLocation parentResume =
+          lineControlProof_.OwnerLineStateAt(
+              parentOwnerFileForDemand, parentOwnerIncludeId, parentBytes,
+              parentResumeOffset, parentOwnerFileForDemand);
+      // A return directive restores the parent's state for its suffix
+      // observers, so it must name the state the producer proves there; an
+      // unproven one fails closed instead of guessing.
       forEachLineControlDemandComponent(
           parentDemand, /*includeLayoutLineState=*/false,
           [&](OwnerStateComponent component) {
             const std::string detail =
                 llvm::formatv("synthetic include-return #line for inc#{0} "
-                              "component={1} parent='{2}' byte={3}",
+                              "component={1} parent='{2}' byte={3}{4}",
                               child.id, component, parentOwnerFileForDemand,
-                              parentResumeOffset)
+                              parentResumeOffset,
+                              parentResume.producerProven
+                                  ? ""
+                                  : " has no producer-proven line state")
                     .str();
-            (void)checkLineControlRepair(parentReturnBoundary, component,
-                                         StateMutationKind::Replayed,
-                                         "linedir/include-return", detail,
-                                         /*requireKnownObserver=*/true);
+            if (parentResume.producerProven) {
+              (void)checkLineControlRepair(parentReturnBoundary, component,
+                                           StateMutationKind::Replayed,
+                                           "linedir/include-return", detail,
+                                           /*requireKnownObserver=*/true);
+              return;
+            }
+            (void)OwnerStateProof().CheckStateTransitionAcrossEditBoundary(
+                parentReturnBoundary, component, StateMutationKind::Replayed,
+                OwnerStateProof().BuildStateTransitionWitness(
+                    SuffixStabilityWitnessKind::TerminalStateFailure, component,
+                    parentReturnBoundary, detail),
+                "linedir/include-return", detail,
+                /*requireKnownObserver=*/true);
           });
-      const LineDirectiveLocation parentResume =
-          lineControlProof_.OwnerLineStateAt(
-              parentOwnerFileForDemand, parentOwnerIncludeId, parentBytes,
-              parentResumeOffset, parentOwnerFileForDemand);
+      if (!parentResume.producerProven)
+        return;
       appendSyntheticDirective(
           lineDirs_.FormatLineDirective(parentResume.lineNo,
                                         parentResume.fileSpelling),
