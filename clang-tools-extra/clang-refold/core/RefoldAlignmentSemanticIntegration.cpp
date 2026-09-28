@@ -337,7 +337,6 @@ void appendConditionalStateIdentity(
   key.AddOptionalU64(identity.parentIncludeId);
   key.AddString(identity.armKind);
   key.AddOptionalString(identity.conditionText);
-  key.AddBool(identity.selected);
   key.AddOptionalU64(identity.aTokenBegin);
   key.AddOptionalU64(identity.aTokenEnd);
   key.AddBool(identity.conditionTruthProducerProven);

@@ -298,8 +298,7 @@ bool RefoldHeaderIncludeEditPlanner::HeaderConditionalGroupIsPreservableGap(
   HeaderIncludeNeutralityAdapter includeIsNeutral{*this, currentInclude, file,
                                                   headerText};
   NeutralConditionalIslandContext islandContext{
-      /*requireGroupBeginAtLineStart=*/true,
-      NeutralConditionalArmSpanMode::SelectedArmsOnly};
+      /*requireGroupBeginAtLineStart=*/true};
   return RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
       headerSourceNeutrality, group, gapBegin, gapEnd, islandContext,
       includeIsNeutral);
@@ -355,7 +354,7 @@ bool RefoldHeaderIncludeEditPlanner::
     return false;
   // The whole directive, through every splice or comment that continues it,
   // must lie in the gap; the one-physical-line site range can stop short.
-  const std::optional<RefoldModel::IncludeItem::ByteRange> site =
+  const std::optional<RefoldModel::ByteRange> site =
       includeDirectiveExtent(child, headerText);
   if (!site || site->begin < gapBegin || gapEnd < site->end)
     return false;
@@ -518,11 +517,11 @@ bool RefoldHeaderIncludeEditPlanner::
 
   // This is the source-bearing counterpart of the zero-token conditional gap
   // proof. The complete directive group may become a source-envelope piece only
-  // when the selected arm's effective PP material is wholly consumed by the
+  // when the taken arm's effective PP material is wholly consumed by the
   // A-side replacement material. Otherwise copying/removing the group would
   // move surviving tokens across conditional-control structure.
   for (const RefoldModel::CondArm &arm : group.arms) {
-    if (!arm.selected)
+    if (!arm.taken)
       continue;
     if (HeaderSelectedArmEffectiveMaterialInside(arm, materialBeginA,
                                                  materialEndA))
@@ -576,8 +575,7 @@ bool RefoldHeaderIncludeEditPlanner::
   if (!group.parentIncludeId || *group.parentIncludeId != currentInclude.id)
     return false;
   for (const RefoldModel::CondArm &arm : group.arms) {
-    if (!arm.selected || !arm.span || !arm.span->IsValid() ||
-        arm.span->begin >= arm.span->end)
+    if (!arm.span || !arm.span->IsValid() || arm.span->begin >= arm.span->end)
       continue;
     if (materialBeginA < arm.span->end && arm.span->begin < materialEndA)
       return true;
@@ -668,7 +666,7 @@ bool RefoldHeaderIncludeEditPlanner::PatchRunGapsLieInsideSelectedArm(
     const IncludeEdits &includeEdits, size_t firstIdx, size_t lastIdx,
     const RefoldModel::CondGroup &group) const {
   for (const RefoldModel::CondArm &arm : group.arms) {
-    if (!arm.selected)
+    if (!arm.taken)
       continue;
     bool gapsInsideArm = true;
     for (size_t idx = firstIdx; gapsInsideArm && idx < lastIdx; ++idx) {
@@ -2071,7 +2069,7 @@ RefoldHeaderIncludeEditPlanner::SelectedArmBeginBoundaryByte(
   auto rightArmRef = model_.FindArmRefAtPP(state.pos);
   if (!rightArmRef || !rightArmRef->group || !rightArmRef->arm)
     return std::nullopt;
-  if (!rightArmRef->arm->selected || !rightArmRef->arm->span)
+  if (!rightArmRef->arm->span)
     return std::nullopt;
   if (rightArmRef->arm->span->begin != state.pos)
     return std::nullopt;

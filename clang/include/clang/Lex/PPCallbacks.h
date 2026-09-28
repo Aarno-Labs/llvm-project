@@ -503,6 +503,41 @@ public:
   /// \param IfLoc the source location of the \#if/\#ifdef/\#ifndef directive.
   virtual void Endif(SourceLocation Loc, SourceLocation IfLoc) {
   }
+
+  /// What the preprocessor did with the arm a conditional directive opens.
+  enum class ConditionalArmOutcome {
+    /// The arm was entered: its condition held, or it is an \#else reached
+    /// with no earlier arm of its group taken.
+    Taken,
+    /// The condition was evaluated and did not hold.
+    NotTaken,
+    /// The directive was read but not evaluated: an arm after one that was
+    /// taken, or any directive nested inside an excluded block.
+    NotEvaluated,
+    /// An \#endif, which opens no arm.
+    NoArm
+  };
+
+  /// Hook called for every conditional directive the preprocessor reads,
+  /// including one it only scans past inside an excluded block.
+  ///
+  /// If, Elif, Else and Endif describe the directives the preprocessor acts
+  /// on.  Inside an excluded block, a nested group and any arm after a taken
+  /// one are only scanned, and none of them fires; this hook does, so a client
+  /// sees every conditional directive of every file instance it enters.
+  ///
+  /// \param HashLoc The directive introducer.
+  /// \param DirectiveTok The directive name token, such as `ifdef`.
+  /// \param EndLoc The first location after the directive's end-of-directive
+  ///        token.
+  /// \param Kind The directive: one of the \#if, \#elif and \#else family, or
+  ///        \#endif.
+  /// \param Outcome What happened to the arm the directive opens.
+  virtual void ConditionalDirective(SourceLocation HashLoc,
+                                    const Token &DirectiveTok,
+                                    SourceLocation EndLoc,
+                                    tok::PPKeywordKind Kind,
+                                    ConditionalArmOutcome Outcome) {}
 };
 
 /// Simple wrapper class for chaining callbacks.
@@ -810,6 +845,13 @@ public:
   void Endif(SourceLocation Loc, SourceLocation IfLoc) override {
     First->Endif(Loc, IfLoc);
     Second->Endif(Loc, IfLoc);
+  }
+
+  void ConditionalDirective(SourceLocation HashLoc, const Token &DirectiveTok,
+                            SourceLocation EndLoc, tok::PPKeywordKind Kind,
+                            ConditionalArmOutcome Outcome) override {
+    First->ConditionalDirective(HashLoc, DirectiveTok, EndLoc, Kind, Outcome);
+    Second->ConditionalDirective(HashLoc, DirectiveTok, EndLoc, Kind, Outcome);
   }
 };
 

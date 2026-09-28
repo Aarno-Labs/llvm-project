@@ -1011,7 +1011,7 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
   // The expansion replaces the whole directive, so a directive whose extent
   // was not recorded cannot be replaced soundly: a shorter range would leave
   // its continuation behind to include the header again.
-  const std::optional<RefoldModel::IncludeItem::ByteRange> site =
+  const std::optional<RefoldModel::ByteRange> site =
       includeDirectiveExtent(*include, request_.tuBytes);
   if (!site) {
     terminalSink_.RequestTerminalFallback(

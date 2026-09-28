@@ -260,10 +260,10 @@ RefoldStructuralGapCrossingProver::ProveConditionalControl(
 
   // No committed arm means the payload lands outside every conditional arm,
   // which the surrounding translation unit always reaches.  A committed arm
-  // must be one the producer selected.  The run carrying that arm contributed A
-  // tokens, so a producer record saying otherwise is an inconsistency, and
-  // checking it is what keeps the reachability argument evidence-backed rather
-  // than assumed.
+  // must be one the preprocessor entered.  The run carrying that arm
+  // contributed A tokens, so a producer record saying otherwise is an
+  // inconsistency, and checking it is what keeps the reachability argument
+  // evidence-backed rather than assumed.
   if (!query.committedArmId)
     return admitStructure(interval,
                           GapCrossingProofKind::ConditionalControlSelectedArm);
@@ -272,7 +272,7 @@ RefoldStructuralGapCrossingProver::ProveConditionalControl(
       deps_.model.GetArmRefById(*query.committedArmId);
   if (!armRef || !armRef->arm)
     return rejectStructure(interval, GapCrossingRejection::NoProducerRecord);
-  if (!armRef->arm->selected)
+  if (!armRef->arm->taken)
     return rejectStructure(interval, GapCrossingRejection::ArmNotSelected);
   return admitStructure(interval,
                         GapCrossingProofKind::ConditionalControlSelectedArm);
@@ -407,7 +407,7 @@ GapCrossingEvidence RefoldStructuralGapCrossingProver::ProveSkippedArmDirective(
   }
 
   // `ownerConditionalArmId` is the lexically nearest enclosing arm, bound to
-  // its producer record exactly.  An arm the producer did not select was
+  // its producer record exactly.  An arm the preprocessor did not enter was
   // skipped, and so was every directive in it however deeply it nests.
   if (!interval.ownerConditionalArmId)
     return rejectStructure(interval, GapCrossingRejection::NoProducerRecord);
@@ -415,7 +415,7 @@ GapCrossingEvidence RefoldStructuralGapCrossingProver::ProveSkippedArmDirective(
       deps_.model.GetArmRefById(*interval.ownerConditionalArmId);
   if (!armRef || !armRef->arm)
     return rejectStructure(interval, GapCrossingRejection::NoProducerRecord);
-  if (armRef->arm->selected)
+  if (armRef->arm->taken)
     return rejectStructure(interval, GapCrossingRejection::PayloadObservesState);
   return admitStructure(interval, proofKind);
 }

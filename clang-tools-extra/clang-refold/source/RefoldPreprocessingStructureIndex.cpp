@@ -18,7 +18,6 @@
 
 #include "clang/Basic/LangOptions.h"
 
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -28,6 +27,7 @@
 #include <cstddef>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -106,38 +106,13 @@ namespace {
 struct ScannedDirective {
   PreprocessingStructureInterval interval;
   uint64_t introducerBegin = 0;
-  std::optional<size_t> lexicalOwnerArmIndex;
   bool modelBindingAmbiguous = false;
-};
-
-/// One lexically balanced conditional group and its arm-control directives.
-struct ScannedConditionalGroup {
-  size_t openingDirectiveIndex = 0;
-  std::vector<size_t> armDirectiveIndices;
-  size_t endifDirectiveIndex = 0;
-  uint64_t begin = 0;
-  uint64_t end = 0;
-};
-
-/// Open conditional stack frame used while building lexical group topology.
-struct OpenConditionalGroup {
-  size_t openingDirectiveIndex = 0;
-  std::vector<size_t> armDirectiveIndices;
-  size_t currentArmDirectiveIndex = 0;
 };
 
 /// Return whether a producer record belongs to the concrete indexed owner.
 static bool ownerMatches(std::optional<uint64_t> recordOwner,
                          std::optional<uint64_t> requestedOwner) {
   return recordOwner == requestedOwner;
-}
-
-/// Return a stable diagnostic spelling for one physical source-owner domain.
-static std::string
-ownerDomainDescription(std::optional<uint64_t> ownerIncludeId) {
-  if (!ownerIncludeId)
-    return "TU";
-  return llvm::formatv("include:{0}", *ownerIncludeId).str();
 }
 
 /// Return whether `[begin,end)` is one nonempty range in `sourceBytes`.
@@ -185,25 +160,21 @@ static bool isDirectiveKind(PreprocessingStructureKind actual,
   return actual == expected;
 }
 
-/// Return whether `kind` opens a conditional group and its first arm.
-static bool isConditionalOpening(PreprocessingStructureKind kind) {
-  return kind == PreprocessingStructureKind::ConditionalIf ||
-         kind == PreprocessingStructureKind::ConditionalIfdef ||
-         kind == PreprocessingStructureKind::ConditionalIfndef;
-}
-
-/// Return whether `kind` switches the current arm of an open group.
-static bool isConditionalMiddle(PreprocessingStructureKind kind) {
-  return kind == PreprocessingStructureKind::ConditionalElif ||
-         kind == PreprocessingStructureKind::ConditionalElifdef ||
-         kind == PreprocessingStructureKind::ConditionalElifndef ||
-         kind == PreprocessingStructureKind::ConditionalElse;
-}
-
 /// Return whether `kind` participates in conditional-control topology.
 static bool isConditionalControl(PreprocessingStructureKind kind) {
-  return isConditionalOpening(kind) || isConditionalMiddle(kind) ||
-         kind == PreprocessingStructureKind::ConditionalEndif;
+  switch (kind) {
+  case PreprocessingStructureKind::ConditionalIf:
+  case PreprocessingStructureKind::ConditionalIfdef:
+  case PreprocessingStructureKind::ConditionalIfndef:
+  case PreprocessingStructureKind::ConditionalElif:
+  case PreprocessingStructureKind::ConditionalElifdef:
+  case PreprocessingStructureKind::ConditionalElifndef:
+  case PreprocessingStructureKind::ConditionalElse:
+  case PreprocessingStructureKind::ConditionalEndif:
+    return true;
+  default:
+    return false;
+  }
 }
 
 /// Classify one normalized preprocessing-directive head token.
@@ -346,354 +317,156 @@ static bool scannedDirectiveLess(const ScannedDirective &lhs,
   return lhs.interval.modelItemId < rhs.interval.modelItemId;
 }
 
-/// Deterministic physical-source ordering for balanced conditional groups.
-static bool scannedConditionalGroupLess(const ScannedConditionalGroup &lhs,
-                                        const ScannedConditionalGroup &rhs) {
-  if (lhs.begin != rhs.begin)
-    return lhs.begin < rhs.begin;
-  if (lhs.end != rhs.end)
-    return lhs.end < rhs.end;
-  return lhs.openingDirectiveIndex < rhs.openingDirectiveIndex;
-}
+/// One producer conditional directive, as the lexical census must find it.
+struct ProducerConditionalControl {
+  uint64_t end = 0;
+  PreprocessingStructureKind kind = PreprocessingStructureKind::OtherDirective;
+  uint64_t groupId = 0;
+  std::optional<uint64_t> armId;
+  bool bound = false;
+};
 
-/// Balance scanned conditional controls and record exact lexical ownership.
+/// Body of one producer conditional arm: from the end of its directive to the
+/// `#` of the next directive of its group.
+struct ProducerConditionalArmBody {
+  uint64_t begin = 0;
+  uint64_t end = 0;
+  uint64_t armId = 0;
+};
+
+/// Bind lexical conditional controls to the producer's conditional records, and
+/// give every interval its enclosing producer arm.
 ///
-/// Malformed control sequences are diagnosed, but their individual intervals
-/// remain in the census and therefore stay protected from generic edits.
-static std::vector<ScannedConditionalGroup>
-buildConditionalTopology(std::vector<ScannedDirective> &directives,
-                         std::vector<std::string> &diagnostics) {
-  std::vector<OpenConditionalGroup> stack;
-  std::vector<ScannedConditionalGroup> groups;
-
-  for (size_t directiveIndex = 0; directiveIndex < directives.size();
-       ++directiveIndex) {
-    ScannedDirective &directive = directives[directiveIndex];
-    const PreprocessingStructureKind kind = directive.interval.kind;
-
-    // A producer-backed pragma operator can be nested physically inside a
-    // conditional-control line.  Such an operator is owned by the control
-    // line's outer arm, not by the arm that the control line opens or selects.
-    // Copy that already-computed lexical owner before applying the ordinary
-    // stack rule below.
-    bool nestedInConditionalControl = false;
-    for (size_t priorIndex = directiveIndex; priorIndex > 0; --priorIndex) {
-      const ScannedDirective &prior = directives[priorIndex - 1];
-      if (prior.interval.begin > directive.interval.begin)
-        continue;
-      if (prior.interval.end <= directive.interval.begin)
-        continue;
-      if (!isConditionalControl(prior.interval.kind) ||
-          directive.interval.end > prior.interval.end)
-        continue;
-      directive.lexicalOwnerArmIndex = prior.lexicalOwnerArmIndex;
-      nestedInConditionalControl = true;
-      break;
-    }
-
-    // A group's own #elif/#else/#endif lines are outside its arm bodies.  Their
-    // lexical owner is therefore the current arm of the containing outer group,
-    // not the arm that precedes the control line in this group.
-    if (!nestedInConditionalControl &&
-        (isConditionalMiddle(kind) ||
-         kind == PreprocessingStructureKind::ConditionalEndif)) {
-      if (stack.size() > 1)
-        directive.lexicalOwnerArmIndex =
-            stack[stack.size() - 2].currentArmDirectiveIndex;
-    } else if (!nestedInConditionalControl && !stack.empty()) {
-      directive.lexicalOwnerArmIndex = stack.back().currentArmDirectiveIndex;
-    }
-
-    if (isConditionalOpening(kind)) {
-      OpenConditionalGroup open;
-      open.openingDirectiveIndex = directiveIndex;
-      open.armDirectiveIndices.push_back(directiveIndex);
-      open.currentArmDirectiveIndex = directiveIndex;
-      stack.push_back(std::move(open));
-      continue;
-    }
-
-    if (isConditionalMiddle(kind)) {
-      if (stack.empty()) {
-        diagnostics.push_back(
-            llvm::formatv("conditional control {0} at byte {1} has no open "
-                          "conditional group",
-                          toString(kind), directive.interval.begin)
-                .str());
-        continue;
-      }
-      stack.back().armDirectiveIndices.push_back(directiveIndex);
-      stack.back().currentArmDirectiveIndex = directiveIndex;
-      continue;
-    }
-
-    if (kind != PreprocessingStructureKind::ConditionalEndif)
-      continue;
-    if (stack.empty()) {
-      diagnostics.push_back(
-          llvm::formatv("#endif at byte {0} has no open conditional group",
-                        directive.interval.begin)
-              .str());
-      continue;
-    }
-
-    OpenConditionalGroup open = std::move(stack.back());
-    stack.pop_back();
-    groups.push_back(ScannedConditionalGroup{
-        open.openingDirectiveIndex, std::move(open.armDirectiveIndices),
-        directiveIndex, directives[open.openingDirectiveIndex].interval.begin,
-        directive.interval.end});
-  }
-
-  for (const OpenConditionalGroup &open : stack) {
-    diagnostics.push_back(
-        llvm::formatv("conditional group opened at byte {0} has no #endif",
-                      directives[open.openingDirectiveIndex].interval.begin)
-            .str());
-  }
-
-  llvm::sort(groups, scannedConditionalGroupLess);
-  return groups;
-}
-
-/// Return whether a producer conditional-group start names the exact lexical
-/// opening control line.
+/// The producer records every conditional directive the preprocessor read,
+/// including those it only scanned inside an excluded block, with the extent
+/// Clang's lexer measured.  A lexical control therefore binds to the record
+/// whose extent it shares: the same `#` and the same end.  Every lexical
+/// control must bind and every producer record must be found, or the index is
+/// incomplete.
 ///
-/// Current producer maps record `group_b` at the beginning of the physical
-/// logical-line prefix, so leading preprocessing trivia before `#` is included.
-/// The published schema historically described the same field as the exact
-/// directive-introducer byte.  Both coordinates are canonical boundaries
-/// already recovered by the shared scanner.  Accepting either preserves exact
-/// producer binding across both map conventions without permitting nearest-byte
-/// matching or any offset search through the leading trivia.
-static bool producerGroupBeginMatchesOpeningDirective(
-    const RefoldModel::CondGroup &producerGroup,
-    const ScannedDirective &openingDirective) {
-  return producerGroup.groupB == openingDirective.interval.begin ||
-         producerGroup.groupB == openingDirective.introducerBegin;
-}
-
-/// Return the producer schema spelling corresponding to one arm directive.
-static StringRef producerArmKind(PreprocessingStructureKind kind) {
-  switch (kind) {
-  case PreprocessingStructureKind::ConditionalIf:
-    return "if";
-  case PreprocessingStructureKind::ConditionalIfdef:
-    return "ifdef";
-  case PreprocessingStructureKind::ConditionalIfndef:
-    return "ifndef";
-  case PreprocessingStructureKind::ConditionalElif:
-    return "elif";
-  case PreprocessingStructureKind::ConditionalElifdef:
-    return "elifdef";
-  case PreprocessingStructureKind::ConditionalElifndef:
-    return "elifndef";
-  case PreprocessingStructureKind::ConditionalElse:
-    return "else";
-  default:
-    return StringRef();
-  }
-}
-
-/// Attach exact producer conditional group/arm identities to lexical controls.
-static void bindConditionalGroups(
+/// The enclosing arm of an interval is the innermost producer arm whose body
+/// holds it whole.  Arm bodies nest, and a group's own `#elif`/`#else`/`#endif`
+/// lines lie between its arm bodies, so they, like its opening line, belong to
+/// the enclosing group's arm.  That is the lexical ownership a nesting stack
+/// over the same controls computes.
+static void bindConditionalDirectives(
     const RefoldModel &model, const RefoldPathIdentity &paths,
     StringRef sourcePath, std::optional<uint64_t> ownerIncludeId,
     std::vector<ScannedDirective> &directives,
-    ArrayRef<ScannedConditionalGroup> scannedGroups,
     std::vector<std::string> &diagnostics) {
-  // `file` and `parentIncludeId` are the same for every scanned group in this
-  // call, so the producer groups belonging to this exact source-owner domain are
-  // collected once instead of re-filtered per scanned group.  The collection
-  // walks GetConds() in order, so candidate enumeration, the ambiguity count,
-  // and the unmatched-group diagnostics below all observe the same sequence the
-  // previous per-group scans did.
-  std::vector<const RefoldModel::CondGroup *> ownerDomainGroups;
-  for (const RefoldModel::CondGroup &producerGroup : model.GetConds()) {
-    if (!paths.PathsEqual(producerGroup.file, sourcePath) ||
-        producerGroup.parentIncludeId != ownerIncludeId)
+  // Keyed by introducer offset; ordered so unbound records are reported in
+  // source order.
+  std::map<uint64_t, ProducerConditionalControl> controls;
+  std::vector<ProducerConditionalArmBody> bodies;
+  auto addControl = [&](uint64_t begin, ProducerConditionalControl control) {
+    if (!controls.try_emplace(begin, control).second)
+      diagnostics.push_back(
+          llvm::formatv("producer conditional directives in group id={0} and "
+                        "id={1} share the introducer at byte {2}",
+                        controls[begin].groupId, control.groupId, begin)
+              .str());
+  };
+  for (const RefoldModel::CondGroup &group : model.GetConds()) {
+    if (!paths.PathsEqual(group.file, sourcePath) ||
+        !ownerMatches(group.parentIncludeId, ownerIncludeId))
       continue;
-    ownerDomainGroups.push_back(&producerGroup);
-  }
-
-  DenseSet<uint64_t> matchedProducerGroupIds;
-
-  for (const ScannedConditionalGroup &scannedGroup : scannedGroups) {
-    const ScannedDirective &openingDirective =
-        directives[scannedGroup.openingDirectiveIndex];
-    const PreprocessingStructureInterval &opening = openingDirective.interval;
-    const PreprocessingStructureInterval &ending =
-        directives[scannedGroup.endifDirectiveIndex].interval;
-
-    // Bind nested groups only after their lexical outer arm has itself acquired
-    // one exact producer id.  This proves the complete producer parent chain
-    // instead of accepting a coincident byte range in the wrong conditional
-    // topology.
-    std::optional<uint64_t> lexicalParentArmId;
-    if (openingDirective.lexicalOwnerArmIndex) {
-      const size_t parentArmIndex = *openingDirective.lexicalOwnerArmIndex;
-      if (parentArmIndex >= directives.size() ||
-          !directives[parentArmIndex].interval.conditionalArmId) {
+    const bool measured =
+        group.endif && llvm::all_of(group.arms, [](const auto &arm) {
+          return arm.directive.has_value();
+        });
+    if (!measured) {
+      diagnostics.push_back(
+          llvm::formatv("producer conditional group id={0} has no recorded "
+                        "directive extents",
+                        group.id)
+              .str());
+      continue;
+    }
+    for (size_t armIndex = 0; armIndex < group.arms.size(); ++armIndex) {
+      const RefoldModel::CondArm &arm = group.arms[armIndex];
+      // Arm kinds are spelled as directive keywords.
+      const PreprocessingStructureKind kind =
+          classifyDirectiveKeyword(arm.kind, /*numericHead=*/false);
+      if (!isConditionalControl(kind) ||
+          kind == PreprocessingStructureKind::ConditionalEndif) {
         diagnostics.push_back(
-            llvm::formatv("conditional group at range=[{0},{1}) has no exact "
-                          "lexical parent-arm binding",
-                          opening.begin, ending.end)
+            llvm::formatv("producer conditional arm id={0} has unknown kind "
+                          "'{1}'",
+                          arm.id, arm.kind)
                 .str());
         continue;
       }
-      lexicalParentArmId =
-          directives[parentArmIndex].interval.conditionalArmId;
+      addControl(arm.directive->begin,
+                 {arm.directive->end, kind, group.id, arm.id});
+      const uint64_t bodyEnd = armIndex + 1 < group.arms.size()
+                                   ? group.arms[armIndex + 1].directive->begin
+                                   : group.endif->begin;
+      bodies.push_back({arm.directive->end, bodyEnd, arm.id});
     }
+    addControl(group.endif->begin,
+               {group.endif->end, PreprocessingStructureKind::ConditionalEndif,
+                group.id, std::nullopt});
+  }
 
-    // The current producer schema does not serialize an independent record for
-    // every #elif/#else/#endif control. Recover those identities only through
-    // exact redundant boundaries: group_b must name either canonical opening
-    // boundary accepted by `producerGroupBeginMatchesOpeningDirective()`,
-    // group_e must equal the complete #endif logical-line end, and every arm's
-    // body_b must equal its scanned control-line end. No nearest directive or
-    // source-order fallback is permitted when any boundary disagrees.
-    std::vector<const RefoldModel::CondGroup *> candidates;
-    for (const RefoldModel::CondGroup *producerGroup : ownerDomainGroups) {
-      if (producerGroup->parentArmId != lexicalParentArmId)
-        continue;
-      if (producerGroupBeginMatchesOpeningDirective(*producerGroup,
-                                                    openingDirective) &&
-          producerGroup->groupE == ending.end) {
-        candidates.push_back(producerGroup);
-      }
-    }
-
-    if (candidates.empty()) {
+  for (ScannedDirective &directive : directives) {
+    if (!isConditionalControl(directive.interval.kind))
+      continue;
+    auto found = controls.find(directive.introducerBegin);
+    if (found == controls.end() ||
+        found->second.end != directive.interval.end ||
+        found->second.kind != directive.interval.kind || found->second.bound) {
       diagnostics.push_back(
-          llvm::formatv("lexical conditional group line=[{0},{1}) "
-                        "introducer={2} has no exact producer binding in owner "
-                        "domain {3}",
-                        openingDirective.interval.begin, ending.end,
-                        openingDirective.introducerBegin,
-                        ownerDomainDescription(ownerIncludeId))
+          llvm::formatv("conditional control {0} range=[{1},{2}) has no unique "
+                        "exact producer group/arm binding",
+                        toString(directive.interval.kind),
+                        directive.interval.begin, directive.interval.end)
               .str());
       continue;
     }
-    if (candidates.size() != 1) {
-      diagnostics.push_back(
-          llvm::formatv("lexical conditional group line=[{0},{1}) "
-                        "introducer={2} has {3} producer bindings; exact "
-                        "ownership is ambiguous",
-                        openingDirective.interval.begin, ending.end,
-                        openingDirective.introducerBegin, candidates.size())
-              .str());
+    found->second.bound = true;
+    directive.interval.modelKind =
+        PreprocessingStructureModelKind::ConditionalDirective;
+    directive.interval.conditionalGroupId = found->second.groupId;
+    directive.interval.conditionalArmId = found->second.armId;
+  }
+  for (const auto &entry : controls) {
+    if (entry.second.bound)
       continue;
-    }
+    diagnostics.push_back(
+        llvm::formatv("producer conditional directive of group id={0} at byte "
+                      "{1} has no exact lexical binding",
+                      entry.second.groupId, entry.first)
+            .str());
+  }
 
-    const RefoldModel::CondGroup &producerGroup = *candidates.front();
-    if (matchedProducerGroupIds.contains(producerGroup.id)) {
-      diagnostics.push_back(
-          llvm::formatv("conditional group id={0} was selected by more than "
-                        "one lexical source group",
-                        producerGroup.id)
-              .str());
-      continue;
+  // Sweep the source-ordered intervals against the nested arm bodies.  `open`
+  // holds the bodies that began at or before the current interval and have
+  // not yet ended, innermost last.
+  llvm::sort(bodies, [](const ProducerConditionalArmBody &lhs,
+                        const ProducerConditionalArmBody &rhs) {
+    if (lhs.begin != rhs.begin)
+      return lhs.begin < rhs.begin;
+    return lhs.end > rhs.end;
+  });
+  std::vector<const ProducerConditionalArmBody *> open;
+  size_t nextBody = 0;
+  for (ScannedDirective &directive : directives) {
+    const uint64_t begin = directive.interval.begin;
+    const uint64_t end = directive.interval.end;
+    for (; nextBody < bodies.size() && bodies[nextBody].begin <= begin;
+         ++nextBody) {
+      while (!open.empty() && open.back()->end <= bodies[nextBody].begin)
+        open.pop_back();
+      open.push_back(&bodies[nextBody]);
     }
-
-    if (producerGroup.arms.size() != scannedGroup.armDirectiveIndices.size()) {
-      diagnostics.push_back(
-          llvm::formatv(
-              "conditional group id={0} arm count mismatch: model={1} "
-              "source={2}",
-              producerGroup.id, producerGroup.arms.size(),
-              scannedGroup.armDirectiveIndices.size())
-              .str());
-      continue;
-    }
-
-    bool exactArms = true;
-    std::string armMismatch;
-    for (size_t armIndex = 0; armIndex < producerGroup.arms.size();
-         ++armIndex) {
-      const RefoldModel::CondArm &producerArm = producerGroup.arms[armIndex];
-      const ScannedDirective &scannedArm =
-          directives[scannedGroup.armDirectiveIndices[armIndex]];
-      if (producerArm.kind != producerArmKind(scannedArm.interval.kind) ||
-          producerArm.bodyB != scannedArm.interval.end) {
-        exactArms = false;
-        armMismatch =
-            llvm::formatv(" (arm index={0}: producer kind='{1}' body_b={2}; "
-                          "scanned kind='{3}' directive=[{4},{5}))",
-                          armIndex, producerArm.kind, producerArm.bodyB,
-                          producerArmKind(scannedArm.interval.kind),
-                          scannedArm.interval.begin, scannedArm.interval.end)
-                .str();
+    while (!open.empty() && open.back()->end <= begin)
+      open.pop_back();
+    for (auto body = open.rbegin(); body != open.rend(); ++body) {
+      if (end <= (*body)->end) {
+        directive.interval.ownerConditionalArmId = (*body)->armId;
         break;
       }
     }
-    if (!exactArms) {
-      diagnostics.push_back(
-          llvm::formatv("conditional group id={0} could not be bound to exact "
-                        "arm-control directive intervals{1}",
-                        producerGroup.id, armMismatch)
-              .str());
-      continue;
-    }
-
-    for (size_t armIndex = 0; armIndex < producerGroup.arms.size();
-         ++armIndex) {
-      ScannedDirective &scannedArm =
-          directives[scannedGroup.armDirectiveIndices[armIndex]];
-      scannedArm.interval.modelKind =
-          PreprocessingStructureModelKind::ConditionalDirective;
-      scannedArm.interval.conditionalGroupId = producerGroup.id;
-      scannedArm.interval.conditionalArmId = producerGroup.arms[armIndex].id;
-    }
-
-    ScannedDirective &scannedEndif =
-        directives[scannedGroup.endifDirectiveIndex];
-    scannedEndif.interval.modelKind =
-        PreprocessingStructureModelKind::ConditionalDirective;
-    scannedEndif.interval.conditionalGroupId = producerGroup.id;
-    matchedProducerGroupIds.insert(producerGroup.id);
-  }
-
-  // A producer group in this exact source-owner domain must have one complete
-  // lexical #if...#endif match.  Otherwise later state-aware reconstruction
-  // cannot use the index as producer authority, even though each individually
-  // scanned directive remains protected from generic edits.
-  for (const RefoldModel::CondGroup *producerGroup : ownerDomainGroups) {
-    if (matchedProducerGroupIds.contains(producerGroup->id))
-      continue;
-    diagnostics.push_back(
-        llvm::formatv("producer conditional group id={0} range=[{1},{2}) has "
-                      "no unique exact lexical binding",
-                      producerGroup->id, producerGroup->groupB,
-                      producerGroup->groupE)
-            .str());
-  }
-
-  // Every lexical conditional control must be producer-bound before the index
-  // can authorize conditional-state reconstruction.  The intervals remain in
-  // the protected census when a binding is absent, but the diagnostic makes
-  // IsComplete() false so all producer-authoritative consumers fail closed.
-  for (const ScannedDirective &directive : directives) {
-    if (!isConditionalControl(directive.interval.kind) ||
-        directive.interval.IsProducerBound())
-      continue;
-    diagnostics.push_back(
-        llvm::formatv("conditional control {0} range=[{1},{2}) has no unique "
-                      "exact producer group/arm binding",
-                      toString(directive.interval.kind),
-                      directive.interval.begin, directive.interval.end)
-            .str());
-  }
-
-  // Resolve lexical containing-arm links only after every exact group binding
-  // has assigned producer arm ids.
-  for (ScannedDirective &directive : directives) {
-    if (!directive.lexicalOwnerArmIndex)
-      continue;
-    const size_t ownerIndex = *directive.lexicalOwnerArmIndex;
-    if (ownerIndex >= directives.size())
-      continue;
-    directive.interval.ownerConditionalArmId =
-        directives[ownerIndex].interval.conditionalArmId;
   }
 }
 
@@ -884,7 +657,7 @@ static void bindIncludeDirectives(
               .str());
       continue;
     }
-    const RefoldModel::IncludeItem::ByteRange &line = *include.directiveLine;
+    const RefoldModel::ByteRange &line = *include.directiveLine;
 
     const PreprocessingStructureKind expectedKind =
         includeStructureKind(include);
@@ -1274,13 +1047,8 @@ RefoldPreprocessingStructureIndex RefoldPreprocessingStructureIndex::Build(
                                 protectionDiagnostics);
   llvm::sort(directives, scannedDirectiveLess);
 
-  std::vector<ScannedConditionalGroup> conditionalGroups =
-      buildConditionalTopology(directives, protectionDiagnostics);
-
-  // Conditional topology is bound before ordinary directives so every later
-  // interval can inherit the exact outer conditional-arm owner.
-  bindConditionalGroups(deps.model, deps.paths, sourcePath, ownerIncludeId,
-                        directives, conditionalGroups, protectionDiagnostics);
+  bindConditionalDirectives(deps.model, deps.paths, sourcePath, ownerIncludeId,
+                            directives, protectionDiagnostics);
   bindMacroDirectives(deps.model, deps.paths, sourcePath, sourceBytes,
                       ownerIncludeId, directives, index.diagnostics_);
   bindIncludeDirectives(deps.model, deps.paths, sourcePath, ownerIncludeId,

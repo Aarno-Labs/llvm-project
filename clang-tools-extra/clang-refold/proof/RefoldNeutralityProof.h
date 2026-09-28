@@ -46,10 +46,6 @@ class RefoldPathIdentity;
 // Conditional-island and balanced diagnostic-pragma neutrality proofs.
 //===----------------------------------------------------------------------===//
 
-/// Controls which conditional arms must have no materialized PP tokens for a
-/// preserved conditional island to be source-neutral.
-enum class NeutralConditionalArmSpanMode { AllArms, SelectedArmsOnly };
-
 /// One complete locally-neutral diagnostic pragma-state island.
 ///
 /// `#pragma clang/GCC diagnostic push/pop` forms a stack discipline: pushes
@@ -182,8 +178,6 @@ struct HeaderSourceNeutralityContext {
 /// path/owner matching lambdas.
 struct NeutralConditionalIslandContext {
   bool requireGroupBeginAtLineStart = false;
-  NeutralConditionalArmSpanMode armSpanMode =
-      NeutralConditionalArmSpanMode::SelectedArmsOnly;
 };
 
 /// Named adapter service for source-neutral zero-token proof wiring.

@@ -584,7 +584,7 @@ bool RefoldTUAnchorProof::IsPPGapAtSelectedConditionalArmExit(
 
   std::optional<RefoldModel::ArmRef> leftArm =
       deps_.model.FindArmRefAtPP(ppGap - 1);
-  if (!leftArm || !leftArm->arm || !leftArm->arm->selected)
+  if (!leftArm || !leftArm->arm)
     return false;
 
   if (leftArm->arm->span && leftArm->arm->span->end != ppGap)

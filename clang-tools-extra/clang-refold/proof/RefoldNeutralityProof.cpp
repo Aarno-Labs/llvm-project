@@ -915,8 +915,6 @@ canonicalBalancedDiagnosticPragmaStateIslandText(StringRef text,
 struct NeutralConditionalIslandPolicy {
   StringRef sourceText;
   bool requireGroupBeginAtLineStart = false;
-  NeutralConditionalArmSpanMode armSpanMode =
-      NeutralConditionalArmSpanMode::SelectedArmsOnly;
 
   function_ref<bool(const RefoldModel::CondGroup &)> groupBelongs;
   function_ref<bool(const RefoldModel::IncludeItem &)> includeBelongs;
@@ -927,19 +925,17 @@ struct NeutralConditionalIslandPolicy {
 };
 
 /// Return true iff \p arm has A-side PP material that would make a
-/// preserved conditional island source-bearing under \p mode.
+/// preserved conditional island source-bearing.
 bool neutralConditionalArmHasMaterializedTokens(
-    const RefoldModel::CondArm &arm, NeutralConditionalArmSpanMode mode) {
-  if (mode == NeutralConditionalArmSpanMode::SelectedArmsOnly && !arm.selected)
-    return false;
+    const RefoldModel::CondArm &arm) {
   return arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end;
 }
 
 /// Recursive implementation for neutral conditional-island proof.
 ///
 /// A complete conditional group may be preserved as neutral source iff it is
-/// wholly inside the source gap, has no materialized PP tokens under the
-/// caller-selected arm policy, and every recorded arm-body artifact is either
+/// wholly inside the source gap, has no arm with materialized PP tokens, and
+/// every recorded arm-body artifact is either
 /// owned by a recursively neutral nested conditional island or independently
 /// discharges the appropriate neutral macro/include proof.
 bool conditionalGroupIsNeutralIslandImpl(
@@ -962,7 +958,7 @@ bool conditionalGroupIsNeutralIslandImpl(
       return false;
 
   for (const RefoldModel::CondArm &arm : group.arms)
-    if (neutralConditionalArmHasMaterializedTokens(arm, policy.armSpanMode))
+    if (neutralConditionalArmHasMaterializedTokens(arm))
       return false;
 
   recursionStack.push_back(group.id);
@@ -1426,7 +1422,6 @@ bool RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
   NeutralConditionalIslandPolicy policy{
       context.tuBytes,
       islandContext.requireGroupBeginAtLineStart,
-      islandContext.armSpanMode,
       groupBelongs,
       includeBelongs,
       includeIsNeutral,
@@ -1466,7 +1461,6 @@ bool RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
   NeutralConditionalIslandPolicy policy{
       context.headerBytes,
       islandContext.requireGroupBeginAtLineStart,
-      islandContext.armSpanMode,
       groupBelongs,
       includeBelongs,
       includeIsNeutral,

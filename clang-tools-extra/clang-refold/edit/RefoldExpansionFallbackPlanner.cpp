@@ -1402,8 +1402,7 @@ public:
              IncludeIsPreservableConditionalStateInclude(inc);
     };
     NeutralConditionalIslandContext islandContext{
-        /*requireGroupBeginAtLineStart=*/false,
-        NeutralConditionalArmSpanMode::SelectedArmsOnly};
+        /*requireGroupBeginAtLineStart=*/false};
     return RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
         tuSourceNeutrality_, group, begin, end, islandContext,
         includeIsNeutral);
@@ -2154,8 +2153,7 @@ private:
              IncludeIsPreservableConditionalStateInclude(inc);
     };
     NeutralConditionalIslandContext islandContext{
-        /*requireGroupBeginAtLineStart=*/true,
-        NeutralConditionalArmSpanMode::AllArms};
+        /*requireGroupBeginAtLineStart=*/true};
     return RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
         tuSourceNeutrality_, group, gapBegin, gapEnd, islandContext,
         includeIsNeutral);
@@ -2868,7 +2866,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
     // byte-level gap proof can already consume neutral conditional-control
     // islands whose bodies produce no tokens, but it cannot balance an opening
     // #if in one inter-piece gap against a closing #endif after a real source
-    // piece.  A selected arm whose complete PP span is inside the replacement
+    // piece.  A taken arm whose complete PP span is inside the replacement
     // material is different: its directive wrapper is part of the same source
     // interval whose produced tokens are being replaced, so the whole group
     // must be considered a required piece of the closure rather than trivia
@@ -2879,7 +2877,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
 
       bool consumesSelectedArm = false;
       for (const RefoldModel::CondArm &arm : group.arms) {
-        if (!arm.selected)
+        if (!arm.taken)
           continue;
         if (selectedArmEffectiveMaterialInside(arm)) {
           consumesSelectedArm = true;

@@ -1540,7 +1540,7 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
 
   // The wrapper keeps the directive's own bytes, so it needs their exact
   // extent; the one-physical-line site range can end inside the directive.
-  const std::optional<RefoldModel::IncludeItem::ByteRange> site =
+  const std::optional<RefoldModel::ByteRange> site =
       includeDirectiveExtent(include, ownerBytes);
   if (!site) {
     return PragmaOnceGuardEditResult::Reject(

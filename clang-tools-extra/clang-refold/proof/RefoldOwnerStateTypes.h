@@ -605,7 +605,6 @@ struct ConditionalStateIdentity {
   std::optional<uint64_t> parentIncludeId = std::nullopt;
   std::string armKind;
   std::optional<std::string> conditionText = std::nullopt;
-  bool selected = false;
   std::optional<uint64_t> aTokenBegin = std::nullopt;
   std::optional<uint64_t> aTokenEnd = std::nullopt;
   bool conditionTruthProducerProven = true;
@@ -618,7 +617,7 @@ struct ConditionalStateIdentity {
            parentArmId == other.parentArmId &&
            parentIncludeId == other.parentIncludeId &&
            armKind == other.armKind && conditionText == other.conditionText &&
-           selected == other.selected && aTokenBegin == other.aTokenBegin &&
+           aTokenBegin == other.aTokenBegin &&
            aTokenEnd == other.aTokenEnd &&
            conditionTruthProducerProven == other.conditionTruthProducerProven &&
            reverseSolvedDirectiveRequired ==

@@ -843,43 +843,15 @@ pragmaIdentityFromPragma(const RefoldModel::PragmaDirective &pragma,
   return identity;
 }
 
-uint64_t conditionalSelectedArmCount(const RefoldModel::CondGroup &group) {
-  uint64_t selectedCount = 0;
-  for (const RefoldModel::CondArm &arm : group.arms)
-    if (arm.selected)
-      ++selectedCount;
-  return selectedCount;
-}
-
-bool conditionalGroupHasUniqueSelectedArm(const RefoldModel::CondGroup &group) {
-  return conditionalSelectedArmCount(group) == 1;
-}
-
-bool conditionalArmConditionWasProducerEvaluated(
-    const RefoldModel::CondGroup &group,
-    const RefoldModel::CondArm &queriedArm) {
-  // Only conditions reached by the producer's selected branch path are
-  // semantic observations.  For an #if/#elif/#else chain, conditions are
-  // evaluated until the selected arm is reached.  Later #elif conditions
-  // are source text, but they were not queried by the preprocessor and
-  // cannot be used as suffix-state proof.
-  bool reachedByProducer = true;
-  for (const RefoldModel::CondArm &arm : group.arms) {
-    if (arm.id == queriedArm.id)
-      return reachedByProducer && arm.cond.has_value();
-    if (arm.selected)
-      reachedByProducer = false;
-  }
-  return false;
-}
-
-bool conditionalArmSelectionTruthProducerProven(
-    const RefoldModel::CondGroup &group, const RefoldModel::CondArm &arm) {
-  if (!conditionalGroupHasUniqueSelectedArm(group))
-    return false;
-  if (arm.selected)
-    return true;
-  return conditionalArmConditionWasProducerEvaluated(group, arm);
+/// Return whether the producer's record of \p group states what the
+/// preprocessor did with it: the group was reached, which evaluates its opening
+/// arm, and at most one arm was entered.  A group nested in an excluded block
+/// was only scanned, so its arms record no decision.
+bool conditionalGroupOutcomeProducerProven(const RefoldModel::CondGroup &group) {
+  return !group.arms.empty() && group.arms.front().evaluated &&
+         llvm::count_if(group.arms, [](const RefoldModel::CondArm &arm) {
+           return arm.taken;
+         }) <= 1;
 }
 
 ConditionalStateIdentity
@@ -893,7 +865,7 @@ conditionalGroupIdentityFromGroup(const RefoldModel::CondGroup &group) {
   identity.parentArmId = group.parentArmId;
   identity.parentIncludeId = group.parentIncludeId;
   identity.conditionTruthProducerProven =
-      conditionalGroupHasUniqueSelectedArm(group);
+      conditionalGroupOutcomeProducerProven(group);
   return identity;
 }
 
@@ -902,8 +874,8 @@ conditionalArmIdentityFromArm(const RefoldModel::CondGroup &group,
                               const RefoldModel::CondArm &arm,
                               bool reverseSolvedDirectiveRequired) {
   ConditionalStateIdentity identity;
-  identity.role = arm.selected ? ConditionalStateRole::ActiveArm
-                               : ConditionalStateRole::InactiveArm;
+  identity.role = arm.taken ? ConditionalStateRole::ActiveArm
+                            : ConditionalStateRole::InactiveArm;
   identity.groupId = group.id;
   identity.armId = arm.id;
   identity.file = group.file.str();
@@ -914,13 +886,12 @@ conditionalArmIdentityFromArm(const RefoldModel::CondGroup &group,
   identity.armKind = arm.kind.str();
   if (arm.cond)
     identity.conditionText = arm.cond->str();
-  identity.selected = arm.selected;
   if (arm.span) {
     identity.aTokenBegin = arm.span->begin;
     identity.aTokenEnd = arm.span->end;
   }
   identity.conditionTruthProducerProven =
-      conditionalArmSelectionTruthProducerProven(group, arm);
+      conditionalGroupOutcomeProducerProven(group) && arm.evaluated;
   identity.reverseSolvedDirectiveRequired = reverseSolvedDirectiveRequired;
   return identity;
 }
@@ -1322,8 +1293,8 @@ public:
   }
 
   /// Record branch-selection state from the producer's active path.  A repair
-  /// may use a conditional arm as a source witness only when that arm is the
-  /// producer-selected arm; inactive-arm repair would reverse-solve
+  /// may use a conditional arm as a source witness only when the preprocessor
+  /// entered that arm; inactive-arm repair would reverse-solve
   /// source-only conditional text from downstream B tokens and therefore
   /// remains outside theorem authority.
   void recordConditionalArm(const RefoldModel::CondGroup &group,
@@ -1334,11 +1305,12 @@ public:
                    "conditional arm state fact");
 
     const bool reverseSolvedDirectiveRequired =
-        requireActiveOwner && !arm.selected;
-    facts.AddConditionalStateEvent(conditionalArmIdentityFromArm(
-        group, arm, reverseSolvedDirectiveRequired));
+        requireActiveOwner && !arm.taken;
+    const ConditionalStateIdentity identity =
+        conditionalArmIdentityFromArm(group, arm, reverseSolvedDirectiveRequired);
+    facts.AddConditionalStateEvent(identity);
 
-    if (!conditionalArmSelectionTruthProducerProven(group, arm)) {
+    if (!identity.conditionTruthProducerProven) {
       markMissing(MissingStateFactKind::MissingConditionalFacts,
                   "conditional arm selection was not producer-proven");
     }
@@ -1348,7 +1320,10 @@ public:
           "inactive conditional arm cannot serve as active source witness");
     }
 
-    if (arm.cond && conditionalArmConditionWasProducerEvaluated(group, arm)) {
+    // Only a condition the preprocessor evaluated is a semantic observation.
+    // An #elif after the taken arm is source text the preprocessor never
+    // queried, so it cannot serve as suffix-state proof.
+    if (arm.cond && arm.evaluated) {
       scanTextForBuiltins(*arm.cond);
       scanConditionalMacroState(*arm.cond);
     }
@@ -1358,28 +1333,23 @@ public:
   /// the directive island observes macro/conditional state, selects one arm,
   /// and mutates the conditional-state context seen by nested owners. This
   /// records only the arm predicates the producer actually evaluated; #elif
-  /// conditions after the selected arm are source text but not state reads.
+  /// conditions after the taken arm are source text but not state reads.
   void recordConditionalGroup(const RefoldModel::CondGroup &group) {
     auditDeltaFact(DirectStateCheckKind::ConditionalDirectiveState,
                    OwnerStateComponent::ConditionalState,
                    "conditional group state fact");
-    facts.AddConditionalStateEvent(conditionalGroupIdentityFromGroup(group));
+    const ConditionalStateIdentity identity =
+        conditionalGroupIdentityFromGroup(group);
+    facts.AddConditionalStateEvent(identity);
 
-    const bool uniqueSelectedArm = conditionalGroupHasUniqueSelectedArm(group);
-    if (!uniqueSelectedArm) {
-      markMissing(
-          MissingStateFactKind::MissingConditionalFacts,
-          "conditional group does not have exactly one producer-selected arm");
+    if (!identity.conditionTruthProducerProven) {
+      markMissing(MissingStateFactKind::MissingConditionalFacts,
+                  "conditional group outcome is not producer-proven");
     }
 
-    bool reachedSelectedArm = false;
-    for (const RefoldModel::CondArm &arm : group.arms) {
-      const bool reachedByProducer = !reachedSelectedArm;
-      if (!uniqueSelectedArm || reachedByProducer || arm.selected)
+    for (const RefoldModel::CondArm &arm : group.arms)
+      if (!identity.conditionTruthProducerProven || arm.evaluated)
         recordConditionalArm(group, arm, /*requireActiveOwner=*/false);
-      if (arm.selected)
-        reachedSelectedArm = true;
-    }
   }
 
   /// Record one macro invocation: its requirement, expansion, counter events

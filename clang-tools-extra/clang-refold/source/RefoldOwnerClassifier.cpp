@@ -179,8 +179,20 @@ Owner RefoldOwnerClassifier::ClassifyOwnerWithSegments(
         leftArmRef->arm->id == rightArmRef->arm->id)
       condArmId = leftArmRef->arm->id;
 
-    if (lcaInc)
+    if (lcaInc) {
+      // An include owner's arm says where in *that* include instance the edit
+      // lies.  FindArmRefAtPP() walks out through include sites, so it can
+      // answer with the includer's arm around the `#include` directive, which
+      // no byte of the included file lies in.  Keep only an arm of the same
+      // instance.
+      if (condArmId) {
+        const std::optional<RefoldModel::ArmRef> armRef =
+            deps_.model.GetArmRefById(*condArmId);
+        if (!armRef || armRef->group->parentIncludeId != lcaInc)
+          condArmId.reset();
+      }
       return Owner::Include(*lcaInc, condArmId);
+    }
 
     // No include owner could be recovered from PP structure; fall back to TU.
     return Owner::TU(condArmId);

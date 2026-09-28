@@ -52,6 +52,7 @@
 #include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/Preprocessor.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
@@ -593,15 +594,23 @@ struct TokMapEntry {
   std::optional<uint64_t> OwnerIncludeId;
 };
 
-/// One arm of a conditional group (#if/#elif/#else), with kind, condition text,
-/// and body byte range (exclusive of directive lines).
+/// One arm of a conditional group (#if/#elif/#else), as the preprocessor read
+/// it: its directive's kind, condition text and exact extent, the byte range of
+/// its body, and what the preprocessor did with it.
 struct CondArm {
   // "if","ifdef","ifndef","elif","elifdef","elifndef","else"
   std::string Kind;
   /// Optional: the if/elif expression, or the macro name for
   /// ifdef/ifndef/elifdef/elifndef.
   std::string Cond;
+  /// The arm's own directive, from its `#` to the first byte after its
+  /// end-of-directive token, as reported by PPCallbacks::ConditionalDirective.
+  uint64_t DirectiveB = 0, DirectiveE = 0;
+  /// Body bytes: from the end of the arm's directive to the start of the line
+  /// holding the next directive of the group.
   uint64_t BodyB = 0, BodyE = 0;
+  PPCallbacks::ConditionalArmOutcome Outcome =
+      PPCallbacks::ConditionalArmOutcome::NotEvaluated;
   /// True when this arm's condition actually evaluated `__has_include` /
   /// `__has_include_next` during the real preprocessing run.  Because it is
   /// captured from Clang's evaluation (via the HasInclude callback) rather than
@@ -612,12 +621,23 @@ struct CondArm {
   bool CondUsesHasInclude = false;
 };
 
-/// A conditional group (#if..#endif) within a file, holding arms in order and
-/// the byte range of the whole group.
+/// A conditional group (#if..#endif) of one file instance, holding arms in
+/// order and the byte range of the whole group.
 struct CondGroup {
-  std::string File;
-  uint64_t GroupB = 0, GroupE = 0; // [#if .. #endif] as bytes
+  /// The file instance the group was read in.
+  clang::FileID FID;
+  /// Include item id of that instance; nullopt for the translation unit.
+  std::optional<uint64_t> OwnerIncludeId;
+  /// From the start of the opening directive's line (its `#` when anything
+  /// but blanks precedes it) through the end of the `#endif` directive.
+  uint64_t GroupB = 0, GroupE = 0;
+  /// The `#endif` directive, from its `#` to the first byte after it.
+  uint64_t EndifB = 0, EndifE = 0;
+  /// (group index, arm index) of the arm this group is nested in, if any.
+  std::optional<std::pair<size_t, size_t>> ParentArm;
   std::vector<CondArm> Arms;
+  /// True once the group's `#endif` was read.
+  bool Closed = false;
 };
 
 /// Physical source bytes of one file instance that Clang skipped while
@@ -722,6 +742,14 @@ class RefoldMapBuilder {
 
   std::vector<TokMapEntry> TokMap;
   std::vector<LineControlEvent> LineControlEvents;
+  /// Conditional groups in the order their opening directives were read.
+  std::vector<CondGroup> CondGroups;
+  /// Indices into CondGroups of the groups still open in each file instance.
+  llvm::DenseMap<clang::FileID, std::vector<size_t>> OpenCondGroups;
+  /// File instances with a conditional directive whose extent could not be
+  /// measured.  Their groups are withheld: a consumer then finds its lexical
+  /// conditionals unbound and fails closed, rather than binding a guess.
+  llvm::DenseSet<clang::FileID> UnmeasuredCondFiles;
   std::vector<SkippedSourceRange> SkippedSourceRanges;
 
   /// (FileID, file-local byte offset) of each site where `__has_include` /
@@ -983,6 +1011,16 @@ public:
   void onLineControlDirective(SourceLocation HashLoc, SourceLocation EndLoc,
                               PPCallbacks::FileChangeReason Reason,
                               SrcMgr::CharacteristicKind FileKind);
+
+  /// Callback for every conditional directive the preprocessor reads, whether
+  /// it acts on the directive or only scans past it in an excluded block.
+  ///
+  /// Groups are assembled from these events per file instance, so their
+  /// topology, extents and arm outcomes are the preprocessor's own.  Only the
+  /// translation unit and include instances this builder bound record groups.
+  void onConditionalDirective(SourceLocation HashLoc, const Token &DirectiveTok,
+                              SourceLocation EndLoc, tok::PPKeywordKind Kind,
+                              PPCallbacks::ConditionalArmOutcome Outcome);
 
   /// Callback for a conditional group body the preprocessor skipped.
   ///

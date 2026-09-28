@@ -1,9 +1,8 @@
 // Record the source ranges the preprocessor skipped in excluded conditional
 // groups, per file instance.
 //
-// A conditional arm record's "selected" flag is a byte-overlap test against the
-// token map, not a takenness fact.  "skipped_ranges" is Clang's own
-// SourceRangeSkipped callback: [b, e) runs from the `#` of the directive that
+// A conditional arm record says whether the arm was taken; "skipped_ranges"
+// gives the bytes, from Clang's own SourceRangeSkipped callback: [b, e) runs from the `#` of the directive that
 // started skipping to the end of the directive that stopped it, and nothing in
 // between produced a token or changed preprocessor state.
 //

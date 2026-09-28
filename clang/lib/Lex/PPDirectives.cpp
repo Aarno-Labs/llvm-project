@@ -624,6 +624,16 @@ void Preprocessor::SkipExcludedConditionalBlock(SourceLocation HashTokenLoc,
     assert(Tok.is(tok::hash));
     const char *Hashptr = CurLexer->getBufferLocation() - Tok.getLength();
     assert(CurLexer->getSourceLocation(Hashptr) == Tok.getLocation());
+    const SourceLocation HashLoc = Tok.getLocation();
+
+    // Report a conditional directive read here.  `Tok` is then the directive
+    // name, and the lexer stands just past the end-of-directive token.
+    auto ReportConditional = [&](tok::PPKeywordKind Kind,
+                                 PPCallbacks::ConditionalArmOutcome Outcome) {
+      if (Callbacks)
+        Callbacks->ConditionalDirective(
+            HashLoc, Tok, CurLexer->getSourceLocation(), Kind, Outcome);
+    };
 
     // Read the next token, the directive flavor.
     LexUnexpandedToken(Tok);
@@ -681,6 +691,10 @@ void Preprocessor::SkipExcludedConditionalBlock(SourceLocation HashTokenLoc,
         // We know the entire #if/#ifdef/#ifndef block will be skipped, don't
         // bother parsing the condition.
         DiscardUntilEndOfDirective();
+        ReportConditional(Sub.empty()       ? tok::pp_if
+                          : Sub == "def" ? tok::pp_ifdef
+                                         : tok::pp_ifndef,
+                          PPCallbacks::ConditionalArmOutcome::NotEvaluated);
         CurPPLexer->pushConditionalLevel(Tok.getLocation(), /*wasskipping*/true,
                                        /*foundnonskip*/false,
                                        /*foundelse*/false);
@@ -706,9 +720,13 @@ void Preprocessor::SkipExcludedConditionalBlock(SourceLocation HashTokenLoc,
           CurPPLexer->LexingRawMode = true;
           if (Callbacks)
             Callbacks->Endif(Tok.getLocation(), CondInfo.IfLoc);
+          ReportConditional(tok::pp_endif,
+                            PPCallbacks::ConditionalArmOutcome::NoArm);
           break;
         } else {
           DiscardUntilEndOfDirective();
+          ReportConditional(tok::pp_endif,
+                            PPCallbacks::ConditionalArmOutcome::NoArm);
         }
       } else if (Sub == "lse") { // "else".
         // #else directive in a skipping conditional.  If not in some other
@@ -737,9 +755,13 @@ void Preprocessor::SkipExcludedConditionalBlock(SourceLocation HashTokenLoc,
           CurPPLexer->LexingRawMode = true;
           if (Callbacks)
             Callbacks->Else(Tok.getLocation(), CondInfo.IfLoc);
+          ReportConditional(tok::pp_else,
+                            PPCallbacks::ConditionalArmOutcome::Taken);
           break;
         } else {
           DiscardUntilEndOfDirective();  // C99 6.10p4.
+          ReportConditional(tok::pp_else,
+                            PPCallbacks::ConditionalArmOutcome::NotEvaluated);
         }
       } else if (Sub == "lif") {  // "elif".
         PPConditionalInfo &CondInfo = CurPPLexer->peekConditionalLevel();
@@ -759,6 +781,8 @@ void Preprocessor::SkipExcludedConditionalBlock(SourceLocation HashTokenLoc,
           // allows #elif* directives with completely malformed (or missing)
           // conditions.
           DiscardUntilEndOfDirective();
+          ReportConditional(tok::pp_elif,
+                            PPCallbacks::ConditionalArmOutcome::NotEvaluated);
         } else {
           // Restore the value of LexingRawMode so that identifiers are
           // looked up, etc, inside the #elif expression.
@@ -777,6 +801,10 @@ void Preprocessor::SkipExcludedConditionalBlock(SourceLocation HashTokenLoc,
                 (CondValue ? PPCallbacks::CVK_True : PPCallbacks::CVK_False),
                 CondInfo.IfLoc);
           }
+          ReportConditional(tok::pp_elif,
+                            CondValue
+                                ? PPCallbacks::ConditionalArmOutcome::Taken
+                                : PPCallbacks::ConditionalArmOutcome::NotTaken);
           // If this condition is true, enter it!
           if (CondValue) {
             CondInfo.FoundNonSkip = true;
@@ -816,6 +844,8 @@ void Preprocessor::SkipExcludedConditionalBlock(SourceLocation HashTokenLoc,
           // allows #elif* directives with completely malformed (or missing)
           // conditions.
           DiscardUntilEndOfDirective();
+          ReportConditional(IsElifDef ? tok::pp_elifdef : tok::pp_elifndef,
+                            PPCallbacks::ConditionalArmOutcome::NotEvaluated);
         } else {
           // Restore the value of LexingRawMode so that identifiers are
           // looked up, etc, inside the #elif[n]def expression.
@@ -850,6 +880,10 @@ void Preprocessor::SkipExcludedConditionalBlock(SourceLocation HashTokenLoc,
                                   MD);
             }
           }
+          ReportConditional(IsElifDef ? tok::pp_elifdef : tok::pp_elifndef,
+                            static_cast<bool>(MI) == IsElifDef
+                                ? PPCallbacks::ConditionalArmOutcome::Taken
+                                : PPCallbacks::ConditionalArmOutcome::NotTaken);
           // If this condition is true, enter it!
           if (static_cast<bool>(MI) == IsElifDef) {
             CondInfo.FoundNonSkip = true;
@@ -3463,6 +3497,11 @@ void Preprocessor::HandleIfdefDirective(Token &Result,
       Callbacks->Ifndef(DirectiveTok.getLocation(), MacroNameTok, MD);
     else
       Callbacks->Ifdef(DirectiveTok.getLocation(), MacroNameTok, MD);
+    Callbacks->ConditionalDirective(
+        HashToken.getLocation(), DirectiveTok, CurPPLexer->getSourceLocation(),
+        isIfndef ? tok::pp_ifndef : tok::pp_ifdef,
+        !MI == isIfndef ? PPCallbacks::ConditionalArmOutcome::Taken
+                        : PPCallbacks::ConditionalArmOutcome::NotTaken);
   }
 
   bool RetainExcludedCB = PPOpts.RetainExcludedConditionalBlocks &&
@@ -3515,10 +3554,16 @@ void Preprocessor::HandleIfDirective(Token &IfToken,
       CurPPLexer->MIOpt.EnterTopLevelConditional();
   }
 
-  if (Callbacks)
+  if (Callbacks) {
     Callbacks->If(
         IfToken.getLocation(), DER.ExprRange,
         (ConditionalTrue ? PPCallbacks::CVK_True : PPCallbacks::CVK_False));
+    Callbacks->ConditionalDirective(
+        HashToken.getLocation(), IfToken, CurPPLexer->getSourceLocation(),
+        tok::pp_if,
+        ConditionalTrue ? PPCallbacks::ConditionalArmOutcome::Taken
+                        : PPCallbacks::ConditionalArmOutcome::NotTaken);
+  }
 
   bool RetainExcludedCB = PPOpts.RetainExcludedConditionalBlocks &&
     getSourceManager().isInMainFile(IfToken.getLocation());
@@ -3563,8 +3608,13 @@ void Preprocessor::HandleEndifDirective(Token &EndifToken) {
   assert(!CondInfo.WasSkipping && !CurPPLexer->LexingRawMode &&
          "This code should only be reachable in the non-skipping case!");
 
-  if (Callbacks)
+  if (Callbacks) {
     Callbacks->Endif(EndifToken.getLocation(), CondInfo.IfLoc);
+    Callbacks->ConditionalDirective(
+        CurrentDirectiveIntroducerLoc, EndifToken,
+        CurPPLexer->getSourceLocation(), tok::pp_endif,
+        PPCallbacks::ConditionalArmOutcome::NoArm);
+  }
 }
 
 /// HandleElseDirective - Implements the \#else directive.
@@ -3588,8 +3638,12 @@ void Preprocessor::HandleElseDirective(Token &Result, const Token &HashToken) {
   // If this is a #else with a #else before it, report the error.
   if (CI.FoundElse) Diag(Result, diag::pp_err_else_after_else);
 
-  if (Callbacks)
+  if (Callbacks) {
     Callbacks->Else(Result.getLocation(), CI.IfLoc);
+    Callbacks->ConditionalDirective(
+        HashToken.getLocation(), Result, CurPPLexer->getSourceLocation(),
+        tok::pp_else, PPCallbacks::ConditionalArmOutcome::NotEvaluated);
+  }
 
   bool RetainExcludedCB = PPOpts.RetainExcludedConditionalBlocks &&
     getSourceManager().isInMainFile(Result.getLocation());
@@ -3669,6 +3723,9 @@ void Preprocessor::HandleElifFamilyDirective(Token &ElifToken,
       assert(false && "unexpected directive kind");
       break;
     }
+    Callbacks->ConditionalDirective(
+        HashToken.getLocation(), ElifToken, CurPPLexer->getSourceLocation(),
+        Kind, PPCallbacks::ConditionalArmOutcome::NotEvaluated);
   }
 
   bool RetainExcludedCB = PPOpts.RetainExcludedConditionalBlocks &&

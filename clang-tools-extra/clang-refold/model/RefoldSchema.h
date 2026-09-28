@@ -22,7 +22,7 @@
 //         * paste_spans     : slices sourced from argument token-paste (X##Y)
 //         * body_spans      : slices sourced from macro body (non-arguments)
 //       - macro definition/undef directives and pragmas
-//       - conditional groups (#if/#elif/#else/#endif) with selected arms
+//       - conditional groups (#if/#elif/#else/#endif) with taken arms
 //       - token→file byte mapping for A (absolute/canonical paths)
 //       - explicit “slots” (stable insertion anchors in original source)
 //
@@ -136,12 +136,15 @@
 //
 // * Cond / Arm
 //     Conditional groups with absolute byte bounds [group_b, group_e) in a
-//     file, plus ordered arms. Each Arm records:
+//     file, plus ordered arms, recorded from the preprocessor's own
+//     conditional-directive events, and the #endif directive
+//     [endif_b, endif_e). Each Arm records:
 //       - kind: if/ifdef/ifndef/elif/else
 //       - cond: textual condition / macro name (required except for else)
 //       - body byte range [body_b, body_e)
-//       - selected: true iff this arm contributed tokens to A
-//       - pp_span: present iff selected is true
+//       - its directive [directive_b, directive_e)
+//       - taken / evaluated: what the preprocessor did with the arm
+//       - pp_span: the A tokens spelled in the arm's body, when there are any
 //
 // Invariants & conventions
 // ------------------------
@@ -559,7 +562,8 @@ static constexpr const char *RefoldSchema = R"json(
         "kind",
         "body_b",
         "body_e",
-        "selected"
+        "taken",
+        "evaluated"
       ],
       "additionalProperties": false,
       "properties": {
@@ -597,43 +601,41 @@ static constexpr const char *RefoldSchema = R"json(
           "description": "Byte after the last byte belonging to this arms body (before next directive line)"
         },
         "pp_span": {
-          "description": "A-token span [begin,end) in the preprocessed stream for this arm.",
+          "description": "A-token span [begin,end) of the tokens spelled in this arm's body in this file instance. Absent when there are none, as for an arm that was not taken or one holding only directives.",
           "$ref": "#/$defs/PPSpan"
         },
-        "selected": {
+        "directive_b": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte offset of this arm's directive introducer '#'. Emitted with directive_e from schema 3.9."
+        },
+        "directive_e": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "First byte after this arm's directive: where Clang's lexer stood after reading its end-of-directive token, which covers every splice and comment continuing the directive."
+        },
+        "taken": {
           "type": "boolean",
-          "description": "True iff this arm contributed tokens in the preprocessed output for this file instance"
+          "description": "True iff the preprocessor entered this arm, including one whose body contributed no token. From schema 3.9."
+        },
+        "evaluated": {
+          "type": "boolean",
+          "description": "True iff the preprocessor decided this arm: its condition was evaluated, or it is an #else entered because no earlier arm was taken. False for an arm after a taken one and for any arm nested in an excluded block. From schema 3.9."
         },
         "cond_uses_has_include": {
           "type": "boolean",
           "description": "True iff the producer observed this arm's condition evaluate __has_include/__has_include_next. Optional; absent means false. Such arms are lookup-context sensitive and cannot be soundly source-replayed from a relocated (materialized) header."
         }
       },
+      "dependentRequired": {
+        "directive_b": [
+          "directive_e"
+        ],
+        "directive_e": [
+          "directive_b"
+        ]
+      },
       "allOf": [
-        {
-          "if": {
-            "properties": {
-              "selected": {
-                "const": true
-              }
-            },
-            "required": [
-              "selected"
-            ]
-          },
-          "then": {
-            "required": [
-              "pp_span"
-            ]
-          },
-          "else": {
-            "not": {
-              "required": [
-                "pp_span"
-              ]
-            }
-          }
-        },
         {
           "if": {
             "properties": {
@@ -696,6 +698,16 @@ static constexpr const char *RefoldSchema = R"json(
           "minimum": 0,
           "description": "Byte AFTER the newline ending the #endif line"
         },
+        "endif_b": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte offset of the #endif directive's introducer '#'. Emitted with endif_e from schema 3.9."
+        },
+        "endif_e": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "First byte after the #endif directive, measured like an arm's directive_e."
+        },
         "arms": {
           "type": "array",
           "minItems": 1,
@@ -704,6 +716,14 @@ static constexpr const char *RefoldSchema = R"json(
           },
           "description": "Conditional arms in source order."
         }
+      },
+      "dependentRequired": {
+        "endif_b": [
+          "endif_e"
+        ],
+        "endif_e": [
+          "endif_b"
+        ]
       }
     },
     "HeaderDecl": {

@@ -988,14 +988,14 @@ parseCalleeOriginParts(const json::Object &originObj, StringRef finalSpelling,
 
 /// Return the nonempty half-open byte range recorded under \p beginKey and
 /// \p endKey, or nullopt unless both are present and well formed.
-static std::optional<IncludeItem::ByteRange>
-parseOptIncludeByteRange(const json::Object &obj, StringRef beginKey,
+static std::optional<RefoldModel::ByteRange>
+parseOptSourceByteRange(const json::Object &obj, StringRef beginKey,
                          StringRef endKey) {
   std::optional<uint64_t> begin = asOptUInt64(obj, beginKey);
   std::optional<uint64_t> end = asOptUInt64(obj, endKey);
   if (!begin || !end || *begin >= *end)
     return std::nullopt;
-  return IncludeItem::ByteRange{*begin, *end};
+  return RefoldModel::ByteRange{*begin, *end};
 }
 
 /// Parse one `#include` / `#include_next` item.
@@ -1176,14 +1176,14 @@ parseIncludeItem(const json::Object &obj, StringRef skStr,
   // measurements of one directive, so a record where they disagree is dropped
   // rather than repaired.
   inc.directiveLine =
-      parseOptIncludeByteRange(obj, "directive_line_b", "directive_line_e");
+      parseOptSourceByteRange(obj, "directive_line_b", "directive_line_e");
   if (inc.directiveLine && (inc.directiveLine->begin != siteB ||
                             inc.directiveLine->end < siteE))
     inc.directiveLine.reset();
   if (inc.directiveLine) {
-    inc.keyword = parseOptIncludeByteRange(obj, "keyword_b", "keyword_e");
-    inc.operand = parseOptIncludeByteRange(obj, "operand_b", "operand_e");
-    const auto within = [&](const IncludeItem::ByteRange &range) {
+    inc.keyword = parseOptSourceByteRange(obj, "keyword_b", "keyword_e");
+    inc.operand = parseOptSourceByteRange(obj, "operand_b", "operand_e");
+    const auto within = [&](const RefoldModel::ByteRange &range) {
       return inc.directiveLine->begin < range.begin &&
              range.end <= inc.directiveLine->end;
     };
@@ -1787,6 +1787,7 @@ static Expected<CondGroup> parseCondGroup(const json::Object &obj,
   // optional
   group.parentArmId = asOptUInt64(obj, "parent_arm_id");
   group.parentIncludeId = asOptUInt64(obj, "parent_include_id");
+  group.endif = parseOptSourceByteRange(obj, "endif_b", "endif_e");
 
   // arms
   auto armsOrErr = applyToField(asArray, obj, "arms", ctxItem);
@@ -1822,12 +1823,18 @@ static Expected<CondGroup> parseCondGroup(const json::Object &obj,
             readRequiredField(arm.bodyE, asUInt64, *armObj, "body_e", ctxItem))
       return std::move(err);
 
-    if (Error err = readRequiredField(arm.selected, asBool, *armObj, "selected",
-                                      ctxItem))
+    if (Error err =
+            readRequiredField(arm.taken, asBool, *armObj, "taken", ctxItem))
+      return std::move(err);
+
+    if (Error err = readRequiredField(arm.evaluated, asBool, *armObj,
+                                      "evaluated", ctxItem))
       return std::move(err);
 
     // optional
     arm.cond = asOptString(*armObj, "cond");
+    arm.directive =
+        parseOptSourceByteRange(*armObj, "directive_b", "directive_e");
 
     // Optional; absent means the producer did not observe a lookup-context
     // sensitive `__has_include` in this arm's condition, so it defaults
@@ -3025,14 +3032,13 @@ RefoldModel::FindArmRefForByte(StringRef file,
       continue;
 
     for (const CondArm &arm : group->arms) {
-      // Only selected arms can describe emitted source when selection metadata
-      // is available.
-      if (!arm.selected)
+      // Only a taken arm can hold emitted source, or an `#include` that ran.
+      if (!arm.taken)
         continue;
       if (!arm.ContainsByte(byteOffset))
         continue;
 
-      // Prefer the deepest selected arm containing the byte. Nested
+      // Prefer the deepest taken arm containing the byte. Nested
       // conditionals should resolve to the most local arm witness, not an outer
       // enclosing arm.
       uint32_t depth = GetCondArmDepth(arm.id);

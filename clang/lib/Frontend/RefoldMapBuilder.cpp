@@ -157,41 +157,6 @@ static std::pair<size_t, size_t> lineSpanOf(StringRef S, size_t p) {
   return {L, R};
 }
 
-/// Return one past the end of the *logical* line whose first physical line ends
-/// at \p eol.
-///
-/// \p eol is what lineSpanOf() returns: one past the terminating newline, or
-/// the buffer size for an unterminated final line.  Translation phase 2 deletes
-/// a backslash that immediately precedes a newline and splices the next
-/// physical line on, so a single directive can extend well past its first
-/// newline:
-///
-/// \code
-///   #if !defined(offsetof) || \
-///       (__has_feature(modules) && !__building_module(_Builtin_stddef))
-/// \endcode
-///
-/// A conditional arm's body begins after the complete logical line, and the
-/// condition text of `#if`/`#elif` spans it, so both must be measured here
-/// rather than at the first newline.  Any backslash directly before the newline
-/// splices, including one that is itself preceded by a backslash, because phase
-/// 2 runs before escape sequences are interpreted.
-static size_t logicalLineEndOf(StringRef S, size_t eol) {
-  while (eol > 0 && eol < S.size() && S[eol - 1] == '\n') {
-    size_t backslash = eol - 1;
-    if (backslash > 0 && S[backslash - 1] == '\r')
-      --backslash;
-    if (backslash == 0 || S[backslash - 1] != '\\')
-      break;
-
-    const size_t next = lineSpanOf(S, eol).second;
-    if (next <= eol)
-      break;
-    eol = next;
-  }
-  return eol;
-}
-
 /// Return the refold-map spelling of a line-control event's reason.
 static StringRef
 lineControlReasonSpelling(PPCallbacks::FileChangeReason Reason) {
@@ -226,423 +191,6 @@ lineControlFileKindSpelling(SrcMgr::CharacteristicKind FileKind) {
   return "user";
 }
 
-/// \brief Scan a source buffer for top-level preprocessor conditional groups.
-///
-/// This is a lightweight, deterministic line scanner that discovers `#if` /
-/// `#ifdef` / `#ifndef`…`#endif` groups that occur at **nesting depth 0** in
-/// \p Buf. For each such group it emits a \c CondGroup with:
-///  - \c File set to \p FilePath,
-///  - \c GroupB / \c GroupE bounding the byte range of the whole group from
-///    the beginning of the opening directive line to the end of the closing
-///    `#endif` line (half-open),
-///  - an ordered list of arms (\c CondArm) for each peer directive at depth 0:
-///    the initial \c #if / \c #ifdef / \c #ifndef arm, any number of
-///    \c #elif / \c #elifdef / \c #elifndef arms, and an optional \c #else
-///    arm.
-///    Each arm carries:
-///      * \c Kind — the directive kind ("if", "ifdef", "ifndef", "elif",
-///      "elifdef", "elifndef", "else"),
-///      * \c Cond — the as-written controlling text: the expression for
-///      "if"/"elif", the macro name for "ifdef"/"ifndef"/"elifdef"/"elifndef"
-///                  (trimmed of leading spaces after the keyword),
-///      * \c BodyB / \c BodyE — the half-open byte interval of the arm’s body
-///        (the text after the directive line up to—but not including—the next
-///        peer directive line at depth 0 or the closing `#endif`).
-///
-/// The scanner is line-oriented:
-///  - It treats a line as a potential directive line if, after optional leading
-///    whitespace, it starts with \c '#'.
-///  - A helper checks for a keyword match with an identifier boundary
-///    (so \c "#ifdefx" does not match).
-///  - Nested conditionals are tracked with a stack; nested groups are recorded
-///    as their own CondGroup entries, while arm body ranges for outer groups
-///    naturally include the text of any nested groups.
-///
-/// Error tolerance and edge cases:
-///  - If a group is unterminated (missing \c #endif), the function closes it at
-///    end-of-file so the scan makes progress.
-///  - Non-directive lines, comments, and other directives inside a group are
-///    ignored except for depth tracking.
-///  - Body ranges exclude the directive lines themselves.
-///  - Offsets are byte indices into \p Buf; all intervals are half-open
-///    \f$[B,E)\f$.
-///
-/// This function performs **no** preprocessing or expression evaluation; it
-/// records only syntactic structure as spelled in the buffer.
-///
-/// \param Buf       The full source text to scan (bytes).
-/// \param FilePath  Path associated with \p Buf; copied into each \c CondGroup.
-/// \returns         A vector of top-level \c CondGroup entries in lexical
-///                  order.
-///
-/// \note This routine deliberately avoids any heuristic guessing and is fully
-///       deterministic: the same input buffer always produces the same groups.
-/// \sa CondGroup, CondArm
-/// Mark every byte of \p S that lies inside a comment.
-///
-/// A `#` that is commented out does not introduce a directive.  Scanning raw
-/// lines without tracking comment state invents conditional groups out of
-/// commented-out examples -- glibc headers document their own macros that way
-/// -- and a spurious `#if` or `#endif` unbalances the nesting stack, which then
-/// mis-attributes the extent of the *real* groups around it.
-///
-/// Comment state is resolved in one pass so it stays correct across the
-/// line-oriented scan below, which does not always advance one physical line at
-/// a time.  String and character literals are tracked because `/*` inside them
-/// opens nothing; escaped newlines are honoured because they continue a `//`
-/// comment onto the following physical line.
-///
-/// Being wrong in the permissive direction only preserves the previous
-/// behaviour, while being wrong in the restrictive direction would drop a real
-/// directive and unbalance the very nesting this protects, so anything not
-/// positively identified as a comment is left unmarked.
-static std::vector<char> computeCommentMask(StringRef S) {
-  std::vector<char> InComment(S.size(), 0);
-  const size_t N = S.size();
-
-  auto atEscapedNewline = [&](size_t I) -> size_t {
-    if (I >= N || S[I] != '\\')
-      return 0;
-    if (I + 1 < N && S[I + 1] == '\n')
-      return 2;
-    if (I + 2 < N && S[I + 1] == '\r' && S[I + 2] == '\n')
-      return 3;
-    return 0;
-  };
-
-  size_t I = 0;
-  while (I < N) {
-    if (size_t Splice = atEscapedNewline(I)) {
-      I += Splice;
-      continue;
-    }
-
-    if (S[I] == '"' || S[I] == '\'') {
-      const char Quote = S[I];
-      ++I;
-      while (I < N && S[I] != Quote) {
-        if (size_t Splice = atEscapedNewline(I)) {
-          I += Splice;
-          continue;
-        }
-        // An unterminated literal must not swallow the rest of the file.
-        if (S[I] == '\n')
-          break;
-        I += (S[I] == '\\' && I + 1 < N) ? 2 : 1;
-      }
-      if (I < N && S[I] == Quote)
-        ++I;
-      continue;
-    }
-
-    if (S[I] == '/' && I + 1 < N && S[I + 1] == '*') {
-      const size_t Begin = I;
-      I += 2;
-      while (I + 1 < N && !(S[I] == '*' && S[I + 1] == '/'))
-        ++I;
-      I = (I + 1 < N) ? I + 2 : N;
-      std::fill(InComment.begin() + Begin, InComment.begin() + I, 1);
-      continue;
-    }
-
-    if (S[I] == '/' && I + 1 < N && S[I + 1] == '/') {
-      const size_t Begin = I;
-      I += 2;
-      while (I < N) {
-        if (size_t Splice = atEscapedNewline(I)) {
-          I += Splice;
-          continue;
-        }
-        if (S[I] == '\n')
-          break;
-        ++I;
-      }
-      std::fill(InComment.begin() + Begin, InComment.begin() + I, 1);
-      continue;
-    }
-
-    ++I;
-  }
-  return InComment;
-}
-
-static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
-                                                llvm::StringRef FilePath) {
-  // Scans the raw source buffer for preprocessor conditional directive groups:
-  //
-  //   #if / #ifdef / #ifndef
-  //     ... arm body ...
-  //   #elif <cond>
-  //     ... arm body ...
-  //   #else
-  //     ... arm body ...
-  //   #endif
-  //
-  // For each group, we record:
-  //   - the byte span covering the whole group (GroupB..GroupE),
-  //   - and each arm’s directive kind, condition text, and body byte span.
-  //
-  // This is a lightweight, purely textual scan. It does *not* attempt to
-  // preprocess/evaluate conditions, and it does not parse tokens; it only
-  // recognizes directive keywords at the start of lines (after optional
-  // whitespace) and tracks nesting with a stack.
-  std::vector<CondGroup> Groups;
-  const size_t N = Buf.size();
-  size_t p = 0;
-
-  // Check whether keyword `s` appears at Buf[start..eol) with a word boundary.
-  // This prevents matching "#ifdefX" as "#ifdef", etc.
-  auto kw_at = [&](size_t start, size_t eol, const char *s) -> bool {
-    size_t t = start, k = 0;
-    while (t < eol && s[k] && Buf[t] == s[k]) {
-      ++t;
-      ++k;
-    }
-    if (s[k])
-      return false; // didn't consume full keyword
-    if (t < eol) {
-      unsigned char c = static_cast<unsigned char>(Buf[t]);
-      if (llvm::isAlnum(static_cast<char>(c)) || c == '_') {
-        return false; // word boundary: keyword must not be followed by ident
-                      // char
-      }
-    }
-    return true;
-  };
-
-  // Close the current (most recent) arm body for a group up to 'endAt'.
-  //
-  // We treat BodyB..BodyE as a half-open byte range in the file buffer,
-  // where BodyB is set to the end-of-line of the arm's directive and BodyE is
-  // extended when the next directive in the same group begins
-  // (elif/else/endif).
-  auto setPrevBodyEnd = [&](size_t groupIndex, size_t endAt) {
-    if (groupIndex >= Groups.size())
-      return;
-    auto &G = Groups[groupIndex];
-    if (!G.Arms.empty() && G.Arms.back().BodyE == G.Arms.back().BodyB)
-      G.Arms.back().BodyE = endAt;
-  };
-
-  // Active conditional groups (nesting stack). Each stack entry refers to an
-  // index in `Groups`. The top of the stack is the innermost active group.
-  struct Active {
-    size_t GroupIndex;
-  };
-  std::vector<Active> Stack;
-
-  const std::vector<char> InComment = computeCommentMask(Buf);
-
-  while (p < N) {
-    // Determine the [bol, eol) byte span for the current line containing `p`.
-    // lineSpanOf() returns the bounds *excluding* the newline.
-    auto span = lineSpanOf(Buf, p);
-    size_t bol = span.first, eol = span.second;
-    // A directive line may be spliced across several physical lines; every use
-    // that consumes the *directive* rather than the keyword must span them.
-    const size_t logicalEol = logicalLineEndOf(Buf, eol);
-    if (eol <= bol) {
-      // Degenerate or empty line; move past it safely.
-      p = std::min(N, eol + 1);
-      continue;
-    }
-
-    // Skip leading horizontal whitespace to detect directives that begin
-    // anywhere after indentation.
-    size_t s = bol;
-    while (s < eol && isSpace</*kWithCR=*/true>(Buf[s]))
-      ++s;
-
-    // Recognize directives only when we see '#" after optional indentation,
-    // and only when that '#' is not commented out.
-    if (s < eol && Buf[s] == '#' && !InComment[s]) {
-      // Skip whitespace after '#'.
-      size_t q = s + 1;
-      while (q < eol && isSpace</*kWithCR=*/true>(Buf[q]))
-        ++q;
-
-      // The directive "kind" we recognize on this line.
-      enum DirKind {
-        DK_None,
-        DK_If,
-        DK_Ifdef,
-        DK_Ifndef,
-        DK_Elif,
-        DK_Elifdef,
-        DK_Elifndef,
-        DK_Else,
-        DK_Endif
-      };
-      DirKind Kind = DK_None;
-      llvm::StringRef Tag;
-
-      // Identify which directive keyword appears after '#'.
-      if (kw_at(q, eol, "if")) {
-        Kind = DK_If;
-        Tag = "if";
-      } else if (kw_at(q, eol, "ifdef")) {
-        Kind = DK_Ifdef;
-        Tag = "ifdef";
-      } else if (kw_at(q, eol, "ifndef")) {
-        Kind = DK_Ifndef;
-        Tag = "ifndef";
-      } else if (kw_at(q, eol, "elifdef")) {
-        Kind = DK_Elifdef;
-        Tag = "elifdef";
-      } else if (kw_at(q, eol, "elifndef")) {
-        Kind = DK_Elifndef;
-        Tag = "elifndef";
-      } else if (kw_at(q, eol, "elif")) {
-        Kind = DK_Elif;
-        Tag = "elif";
-      } else if (kw_at(q, eol, "else")) {
-        Kind = DK_Else;
-        Tag = "else";
-      } else if (kw_at(q, eol, "endif")) {
-        Kind = DK_Endif;
-        Tag = "endif";
-      }
-
-      switch (Kind) {
-      case DK_If:
-      case DK_Ifdef:
-      case DK_Ifndef: {
-        // Start a new conditional group. This may be top-level or nested
-        // inside another active group (tracked by `Stack`).
-        CondGroup G;
-        G.File = FilePath.str();
-        G.GroupB = bol;      // group begins at the opener line
-        G.GroupE = G.GroupB; // filled when we see matching #endif
-
-        // Create the first arm for this group (#if/#ifdef/#ifndef).
-        CondArm A;
-        A.Kind = Tag.str();
-
-        // Extract the condition text for #if/#ifdef/#ifndef.
-        // For #ifdef/#ifndef this is just an identifier expression; we keep
-        // the raw remainder of the line verbatim (minus leading spaces).
-        size_t condBeg =
-            q + (Kind == DK_If ? 2
-                               : (Kind == DK_Ifdef
-                                      ? 5
-                                      : 6)); // lengths: "if", "ifdef", "ifndef"
-        while (condBeg < eol && isSpace</*kWithCR=*/true>(Buf[condBeg]))
-          ++condBeg;
-        A.Cond = std::string(Buf.substr(condBeg, logicalEol - condBeg));
-
-        // The arm body begins immediately after this directive line.
-        // We use the logical end (not `+1`) so that the newline remains part of
-        // the body depending on downstream reconstruction policy.
-        A.BodyB = std::min(N, logicalEol);
-        A.BodyE = A.BodyB;
-        G.Arms.push_back(std::move(A));
-
-        // Record the group and push it onto the nesting stack.
-        size_t idx = Groups.size();
-        Groups.push_back(std::move(G));
-        Stack.push_back(Active{idx});
-
-        // Advance past the whole directive, continuation lines included.
-        p = std::min(N, logicalEol);
-        continue;
-      }
-
-      case DK_Elif:
-      case DK_Elifdef:
-      case DK_Elifndef:
-      case DK_Else: {
-        // Transition to a new arm of the current innermost group.
-        // If there is no active group, this is a stray directive and we ignore
-        // it.
-        if (Stack.empty()) {
-          p = std::min(N, logicalEol);
-          continue;
-        }
-
-        size_t idx = Stack.back().GroupIndex;
-        CondGroup &G = Groups[idx];
-
-        // Close previous arm at the start of this directive line.
-        setPrevBodyEnd(idx, bol);
-
-        // Start the new arm.
-        CondArm A;
-        A.Kind = Tag.str();
-        if (Kind != DK_Else) {
-          // Capture the raw controlling text following the keyword: the
-          // expression for `#elif`, the macro name for `#elifdef` and
-          // `#elifndef`.  `Tag` is the keyword exactly as matched, so its
-          // length is the offset to skip regardless of which one it was.
-          size_t condBeg = q + Tag.size();
-          while (condBeg < eol && isSpace</*kWithCR=*/true>(Buf[condBeg]))
-            ++condBeg;
-          A.Cond = std::string(Buf.substr(condBeg, logicalEol - condBeg));
-        } else {
-          // "else" has no condition text.
-          A.Cond.clear();
-        }
-
-        // Arm body begins immediately after this directive line.
-        A.BodyB = std::min(N, logicalEol);
-        A.BodyE = A.BodyB;
-        G.Arms.push_back(std::move(A));
-
-        p = std::min(N, logicalEol);
-        continue;
-      }
-
-      case DK_Endif: {
-        // Close the current innermost group.
-        if (Stack.empty()) {
-          p = std::min(N, logicalEol);
-          continue; // stray endif
-        }
-
-        size_t idx = Stack.back().GroupIndex;
-        CondGroup &G = Groups[idx];
-
-        // Close the final arm at the start of this '#endif' line.
-        setPrevBodyEnd(idx, bol);
-
-        // Group extent: we record through the end of the '#endif' line.
-        // This allows downstream logic to treat the group as spanning the
-        // directives themselves, not just the arm bodies.
-        G.GroupE = std::min(N, logicalEol);
-
-        Stack.pop_back();
-
-        p = std::min(N, logicalEol);
-        continue;
-      }
-
-      case DK_None:
-        // Not a conditional directive we care about; treat it like a normal
-        // line.
-        break;
-      }
-    }
-
-    // Not a recognized directive line.  Advance past the whole logical line:
-    // a continuation spliced onto an ordinary line is part of that line, so a
-    // `#` at its start does not introduce a directive.
-    p = std::min(N, logicalEol);
-  }
-
-  // If the file ends without closing some groups, conservatively close them at
-  // EOF. This preserves best-effort structural information even for malformed
-  // files.
-  for (const auto &A : Stack) {
-    size_t idx = A.GroupIndex;
-    if (idx >= Groups.size())
-      continue;
-    CondGroup &G = Groups[idx];
-    setPrevBodyEnd(idx, N);
-    if (G.GroupE < G.GroupB || G.GroupE > N)
-      G.GroupE = N;
-  }
-
-  return Groups;
-}
 
 // Compute, for each *formal* parameter of a function-like macro invocation,
 // the byte offset range in the *spelled* source file that corresponds to the
@@ -3659,6 +3207,100 @@ void RefoldMapBuilder::onSourceRangeSkipped(SourceRange Range) {
   SkippedSourceRanges.push_back(std::move(Skipped));
 }
 
+/// Return where a conditional group or arm body boundary at a directive line
+/// begins: the start of the physical line holding the directive's `#` when only
+/// blanks precede it there, and the `#` itself otherwise.
+static uint64_t conditionalDirectiveLineBegin(StringRef Buf,
+                                              uint64_t HashOffset) {
+  uint64_t B = HashOffset;
+  while (B > 0 && isSpace</*kWithCR=*/true>(Buf[B - 1]))
+    --B;
+  return (B == 0 || Buf[B - 1] == '\n') ? B : HashOffset;
+}
+
+void RefoldMapBuilder::onConditionalDirective(
+    SourceLocation HashLoc, const Token &DirectiveTok, SourceLocation EndLoc,
+    tok::PPKeywordKind Kind, PPCallbacks::ConditionalArmOutcome Outcome) {
+  if (!enabled())
+    return;
+
+  // Identify the file instance as onSourceRangeSkipped() does: the main file,
+  // or an include instance this builder bound.
+  if (IncludeStack.empty())
+    return;
+  std::optional<uint64_t> OwnerIncludeId;
+  if (IncludeStack.back())
+    OwnerIncludeId = Items[*IncludeStack.back()].ID;
+  else if (IncludeStack.size() != 1)
+    return;
+
+  const FileID FID = SM.getFileID(SM.getFileLoc(HashLoc));
+  if (FID.isInvalid() || UnmeasuredCondFiles.contains(FID))
+    return;
+  bool Invalid = false;
+  StringRef Buf = SM.getBufferData(FID, &Invalid);
+  std::optional<std::pair<uint64_t, uint64_t>> Extent =
+      computeDirectiveExtent(HashLoc, EndLoc);
+  const SourceLocation KeywordLoc = DirectiveTok.getLocation();
+  if (Invalid || !Extent || !KeywordLoc.isFileID() ||
+      SM.getFileID(KeywordLoc) != FID) {
+    UnmeasuredCondFiles.insert(FID);
+    return;
+  }
+  const uint64_t LineBegin = conditionalDirectiveLineBegin(Buf, Extent->first);
+
+  std::vector<size_t> &Open = OpenCondGroups[FID];
+  if (Kind == tok::pp_endif) {
+    if (Open.empty())
+      return;
+    CondGroup &G = CondGroups[Open.back()];
+    G.Arms.back().BodyE = LineBegin;
+    G.EndifB = Extent->first;
+    G.EndifE = Extent->second;
+    G.GroupE = Extent->second;
+    G.Closed = true;
+    Open.pop_back();
+    return;
+  }
+
+  CondArm A;
+  A.Kind = std::string(tok::getPPKeywordSpelling(Kind));
+  A.DirectiveB = Extent->first;
+  A.DirectiveE = Extent->second;
+  A.BodyB = A.BodyE = Extent->second;
+  A.Outcome = Outcome;
+  if (Kind != tok::pp_else) {
+    // Everything after the keyword, as spelled: the expression for `#if` and
+    // `#elif`, the macro name for the `#ifdef` family.
+    uint64_t CondBegin =
+        SM.getFileOffset(KeywordLoc) + DirectiveTok.getLength();
+    while (CondBegin < Extent->second &&
+           isSpace</*kWithCR=*/true>(Buf[CondBegin]))
+      ++CondBegin;
+    A.Cond = Buf.slice(CondBegin, Extent->second).str();
+  }
+
+  if (Kind == tok::pp_if || Kind == tok::pp_ifdef || Kind == tok::pp_ifndef) {
+    CondGroup G;
+    G.FID = FID;
+    G.OwnerIncludeId = OwnerIncludeId;
+    G.GroupB = LineBegin;
+    if (!Open.empty())
+      G.ParentArm = std::make_pair(Open.back(),
+                                   CondGroups[Open.back()].Arms.size() - 1);
+    G.Arms.push_back(std::move(A));
+    Open.push_back(CondGroups.size());
+    CondGroups.push_back(std::move(G));
+    return;
+  }
+
+  if (Open.empty())
+    return;
+  CondGroup &G = CondGroups[Open.back()];
+  G.Arms.back().BodyE = LineBegin;
+  G.Arms.push_back(std::move(A));
+}
+
 void RefoldMapBuilder::onHasInclude(SourceLocation Loc) {
   if (!enabled())
     return;
@@ -5014,7 +4656,7 @@ void RefoldMapBuilder::writeJSON() {
       PragmaItemsWithImage == PragmasEmittedIntoOutput;
 
   JO.object([&] {
-    JO.attribute("version", "3.8");
+    JO.attribute("version", "3.9");
     JO.attribute("pragma_images_complete", PragmaImagesComplete);
 
     const auto &PPO = PP.getPreprocessorOpts();
@@ -6890,7 +6532,7 @@ void RefoldMapBuilder::writeJSON() {
           OwnerIncludeId; // nullopt => no owning include (TU)
 
       // Optional PP anchors for this arm's body in the A-side (preprocessed)
-      // token stream. Only populated for the selected arm in this run.
+      // token stream. Only populated for an arm with tokens in this run.
       std::optional<uint64_t> PPBegin;
       std::optional<uint64_t> PPEnd;
     };
@@ -6907,16 +6549,14 @@ void RefoldMapBuilder::writeJSON() {
       //
       // Return value:
       //   - true  => at least one PP token from this file overlapped
-      //   [BodyB,BodyE)
-      //             (we treat the arm as "selected" for this run).
+      //   [BodyB,BodyE), and the arm is given a pp_span.
       //   - false => no such token; PPBegin/PPEnd will still be set to a
-      //             deterministic insertion point, but the arm is not selected.
+      //             deterministic insertion point, but no pp_span is emitted.
       // `OwnerIncId` selects one include occurrence (std::nullopt for the TU).
       // Filtering on it as well as on `File` is what keeps a second occurrence
       // of the same header from being answered with the first occurrence's
-      // tokens -- which would report a non-taken arm as selected and hand it a
-      // pp_span, and the arm slots derived from it, that belong to the earlier
-      // occurrence.
+      // tokens -- which would hand a non-taken arm a pp_span, and the arm slots
+      // derived from it, that belong to the earlier occurrence.
       auto computeArmPPSpan = [&](llvm::StringRef File,
                                   std::optional<uint64_t> OwnerIncId,
                                   uint64_t BodyB, uint64_t BodyE,
@@ -6987,80 +6627,47 @@ void RefoldMapBuilder::writeJSON() {
         return FoundAny;
       };
 
-      // Helper: emit all conditional groups for a single file (TU or header),
-      // computing the enclosing *arm* parent (if any) and per-arm
-      // selected/pp_span. NOTE: FilePath must be non-empty
+      // Arm ids given to each recorded group's arms, filled as groups are
+      // emitted.  A nested group's parent arm belongs to a group opened
+      // earlier in the same file instance, so its id is known by then.
+      std::vector<std::vector<uint64_t>> CondArmIds(CondGroups.size());
+
+      // Helper: emit the conditional groups the preprocessor read in one file
+      // instance (the TU, or one include instance), with each arm's pp_span.
+      // NOTE: FilePath must be non-empty
       auto emitGroups = [&](llvm::StringRef FilePath,
-                            std::optional<uint64_t> parentIncId, bool isTU) {
-        llvm::StringRef Buf;
-
-        // Prefer SourceManager buffers (handles VFS and remaps).
-        if (auto FER = SM.getFileManager().getOptionalFileRef(FilePath)) {
-          FileID FID = SM.translateFile(*FER); // FileID, not Optional
-          if (FID.isValid()) {
-            if (auto MB = SM.getBufferOrNone(FID))
-              Buf = MB->getBuffer(); // Optional<MemoryBufferRef> ->
-                                     // MB->getBuffer()
-          }
-        }
-
-        // Fallback to filesystem read.
-        if (Buf.empty()) {
-          if (auto MB = llvm::MemoryBuffer::getFile(FilePath))
-            Buf = (*MB)->getMemBufferRef().getBuffer();
-        }
-        if (Buf.empty())
-          return;
-
-        // FileID of this file, used to match recorded __has_include evaluation
-        // sites (which carry FileID + file-local offset) against conditional-arm
-        // directive-line byte ranges scanned from the same buffer.
-        FileID EmitFID;
-        if (auto FER = SM.getFileManager().getOptionalFileRef(FilePath))
-          EmitFID = SM.translateFile(*FER);
-
-        auto Groups = scanTopLevelConds(Buf, FilePath);
-        llvm::errs() << "[refold] conds: " << (isTU ? "TU " : "") << FilePath
-                     << " -> " << Groups.size() << " group(s)\n";
-
-        for (const auto &G : Groups) {
-          if (G.Arms.empty())
+                            std::optional<uint64_t> parentIncId) {
+        for (size_t GroupIndex = 0; GroupIndex < CondGroups.size();
+             ++GroupIndex) {
+          const CondGroup &G = CondGroups[GroupIndex];
+          if (G.OwnerIncludeId != parentIncId || !G.Closed ||
+              UnmeasuredCondFiles.contains(G.FID))
             continue;
 
-          const uint64_t GroupB = G.GroupB;
-          const uint64_t GroupE = G.GroupE;
-
-          // Find the innermost arm (if any) that textually contains this group.
-          // We restrict to the same file + include-instance (parentIncId).
+          // A group whose enclosing group was withheld has no parent to name,
+          // and is withheld with it.
           std::optional<uint64_t> ParentArmId;
-          uint64_t ParentArmBodyB = 0;
-          bool HaveParent = false;
-          for (const auto &Seed : ArmSlotSeeds) {
-            if (Seed.File != G.File)
+          if (G.ParentArm) {
+            const std::vector<uint64_t> &ParentIds =
+                CondArmIds[G.ParentArm->first];
+            if (G.ParentArm->second >= ParentIds.size())
               continue;
-            if (Seed.OwnerIncludeId != parentIncId)
-              continue;
-
-            if (Seed.BodyB <= GroupB && GroupE <= Seed.BodyE) {
-              if (!HaveParent || Seed.BodyB >= ParentArmBodyB) {
-                HaveParent = true;
-                ParentArmBodyB = Seed.BodyB;
-                ParentArmId = Seed.ArmId;
-              }
-            }
+            ParentArmId = ParentIds[G.ParentArm->second];
           }
 
           uint64_t ThisGroupId = NextCondGroupId++;
           JO.object([&] {
             JO.attribute("id", ThisGroupId);
-            JO.attribute("file", G.File);
+            JO.attribute("file", FilePath);
 
             // parent = enclosing *arm* id, or elide if no parent
-            if (HaveParent)
+            if (ParentArmId)
               JO.attribute("parent_arm_id", *ParentArmId);
 
             JO.attribute("group_b", G.GroupB);
             JO.attribute("group_e", G.GroupE);
+            JO.attribute("endif_b", G.EndifB);
+            JO.attribute("endif_e", G.EndifE);
 
             if (parentIncId)
               JO.attribute("parent_include_id", *parentIncId);
@@ -7070,37 +6677,24 @@ void RefoldMapBuilder::writeJSON() {
             // that arm.
             const bool SingleArmGroup = (G.Arms.size() == 1);
 
-            // Byte offset where the current arm's directive line begins.  For
-            // the first arm this is the group start (`#if`/`#ifdef` line); for
-            // each subsequent arm it is the previous arm's raw body end, which
-            // is the byte-offset of the next `#elif`/`#else` directive line.
-            // The condition text of arm i therefore lives in
-            // [PrevArmBodyE, A.BodyB).
-            uint64_t PrevArmBodyE = GroupB;
-
             JO.attributeArray("arms", [&] {
               for (const auto &A : G.Arms) {
-                const uint64_t DirectiveStart = PrevArmBodyE;
-                PrevArmBodyE = A.BodyE;
-
                 // An arm is context-sensitive when a recorded __has_include /
-                // __has_include_next evaluation site falls on its directive
-                // line [DirectiveStart, A.BodyB).  Matching the real evaluation
-                // site catches macro-hidden and token-pasted operators that a
-                // textual scan of the condition would miss.
+                // __has_include_next evaluation site falls on its directive.
+                // Matching the real evaluation site catches macro-hidden and
+                // token-pasted operators that a textual scan of the condition
+                // would miss.
                 bool CondUsesHasInclude = false;
-                if (EmitFID.isValid()) {
-                  for (const auto &Site : HasIncludeSites) {
-                    if (Site.first == EmitFID && Site.second >= DirectiveStart &&
-                        Site.second < A.BodyB) {
-                      CondUsesHasInclude = true;
-                      break;
-                    }
+                for (const auto &Site : HasIncludeSites) {
+                  if (Site.first == G.FID && Site.second >= A.DirectiveB &&
+                      Site.second < A.DirectiveE) {
+                    CondUsesHasInclude = true;
+                    break;
                   }
                 }
                 // Compute the effective body range we will use for:
                 //  - computing pp_span (which tokens belong to this arm), and
-                //  - parent lookup for nested groups (ArmSlotSeeds).
+                //  - the arm_begin/arm_end slots (ArmSlotSeeds).
                 uint64_t ArmBodyB = A.BodyB;
                 uint64_t ArmBodyE = A.BodyE;
 
@@ -7109,20 +6703,18 @@ void RefoldMapBuilder::writeJSON() {
                   // group body belongs to this single arm, including any nested
                   // conditionals and trailing lines before the closing #endif.
                   //
-                  // We widen the body to [GroupB, GroupE) on the right, which:
-                  //  - makes pp_span for the outer arm cover all PP tokens
-                  //    produced under FOO, and
-                  //  - ensures nested groups' [GroupB,GroupE) fall inside this
-                  //    arm's [BodyB,BodyE) so they can correctly pick this as
-                  //    their parent arm.
-                  ArmBodyE = GroupE;
+                  // We widen the body to [GroupB, GroupE) on the right, which
+                  // makes pp_span for the outer arm cover all PP tokens
+                  // produced under FOO.
+                  ArmBodyE = G.GroupE;
                 }
 
                 uint64_t ArmId = NextCondArmId++;
+                CondArmIds[GroupIndex].push_back(ArmId);
 
                 uint64_t PPBegin = 0, PPEnd = 0;
-                bool IsSelected = computeArmPPSpan(
-                    G.File, parentIncId, ArmBodyB, ArmBodyE, PPBegin, PPEnd);
+                const bool HasTokens = computeArmPPSpan(
+                    FilePath, parentIncId, ArmBodyB, ArmBodyE, PPBegin, PPEnd);
 
                 JO.object([&] {
                   JO.attribute("id", ArmId);
@@ -7135,14 +6727,19 @@ void RefoldMapBuilder::writeJSON() {
                     JO.attribute("cond_uses_has_include", true);
                   JO.attribute("body_b", ArmBodyB);
                   JO.attribute("body_e", ArmBodyE);
+                  JO.attribute("directive_b", A.DirectiveB);
+                  JO.attribute("directive_e", A.DirectiveE);
 
-                  // Mark whether this arm actually contributed any PP tokens
-                  // in this preprocessing run.
-                  JO.attribute("selected", IsSelected);
+                  // What the preprocessor did with the arm: entered it, or
+                  // decided its condition at all.
+                  using Outcome = PPCallbacks::ConditionalArmOutcome;
+                  JO.attribute("taken", A.Outcome == Outcome::Taken);
+                  JO.attribute("evaluated", A.Outcome == Outcome::Taken ||
+                                                A.Outcome == Outcome::NotTaken);
 
-                  // Only emit pp_span for the taken arm; for untaken arms we
-                  // leave it out entirely.
-                  if (IsSelected) {
+                  // The PP tokens spelled in the arm's body, when there are
+                  // any.  A taken arm holding only directives has none.
+                  if (HasTokens) {
                     JO.attributeObject("pp_span", [&] {
                       JO.attribute("begin", PPBegin);
                       JO.attribute("end", PPEnd);
@@ -7150,19 +6747,19 @@ void RefoldMapBuilder::writeJSON() {
                   }
                 });
 
-                // Remember where this arm's body lives, so we can:
-                //  - resolve nested groups' parents deterministically, and
-                //  - emit arm_begin/arm_end slots later.
+                // Remember where this arm's body lives for the
+                // arm_begin/arm_end slots emitted later.
                 std::optional<uint64_t> ArmPPBegin;
                 std::optional<uint64_t> ArmPPEnd;
-                if (IsSelected) {
+                if (HasTokens) {
                   ArmPPBegin = PPBegin;
                   ArmPPEnd = PPEnd;
                 }
 
-                ArmSlotSeeds.push_back(ArmSlotSeed{G.File, ArmId, ArmBodyB,
-                                                   ArmBodyE, parentIncId,
-                                                   ArmPPBegin, ArmPPEnd});
+                ArmSlotSeeds.push_back(ArmSlotSeed{FilePath.str(), ArmId,
+                                                   ArmBodyB, ArmBodyE,
+                                                   parentIncId, ArmPPBegin,
+                                                   ArmPPEnd});
               }
             });
           });
@@ -7170,7 +6767,7 @@ void RefoldMapBuilder::writeJSON() {
       };
 
       // 1) Main translation unit groups.
-      emitGroups(TUSourcePath, /*parentIncId=*/std::nullopt, /*isTU=*/true);
+      emitGroups(TUSourcePath, /*parentIncId=*/std::nullopt);
 
       // 2) Each include/include_next instance (per-instance, no dedup).
       for (const auto &It : Items) {
@@ -7178,7 +6775,7 @@ void RefoldMapBuilder::writeJSON() {
           continue;
         if (It.ResolvedPath.empty())
           continue;
-        emitGroups(It.ResolvedPath, It.ID, /*isTU=*/false);
+        emitGroups(It.ResolvedPath, It.ID);
       }
     });
 

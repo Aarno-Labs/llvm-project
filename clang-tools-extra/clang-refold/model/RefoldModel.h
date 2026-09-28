@@ -179,8 +179,8 @@ static inline StringRef toString(MacroCalleeOriginKind kind) {
 /// * `slots`: deterministic insertion anchors (e.g., `file_begin`,
 ///   `after_last_include`, `arm_begin`/`arm_end`) for heuristic-free insertion
 ///   placement.
-/// * `conds`: conditional groups discovered in source files, with one arm
-///   marked `selected=true` for this preprocessing run.
+/// * `conds`: conditional groups the preprocessor read, with each arm marked
+///   `taken` and `evaluated` for this preprocessing run.
 ///
 /// ### Items
 /// Each element in `items` has a stable `id`, a `kind`, optional `subkind`,
@@ -427,6 +427,12 @@ public:
   };
 
   /// Producer record for one include directive instance.
+  /// Half-open physical source-byte range in one file.
+  struct ByteRange {
+    uint64_t begin = 0;
+    uint64_t end = 0;
+  };
+
   struct IncludeItem {
     /// Stable producer id for this include edge.
     uint64_t id;
@@ -448,11 +454,6 @@ public:
     /// directive continued by a splice or a block comment.
     uint64_t siteE;
 
-    /// Half-open physical source-byte range in `sitePath`.
-    struct ByteRange {
-      uint64_t begin = 0;
-      uint64_t end = 0;
-    };
     /// The directive's complete physical spelling: from its `#` through the
     /// end of its logical line, including the terminating newline when there
     /// is one.  Clang's lexer measured it, so it covers every splice and
@@ -997,36 +998,31 @@ public:
     StringRef kind;
     /// Source condition spelling when the arm has one.
     std::optional<StringRef> cond;
+    /// The arm's own directive, from its `#` to the first byte after its
+    /// end-of-directive token, as Clang's lexer measured it.  Absent in maps
+    /// written before schema 3.9.
+    std::optional<ByteRange> directive;
     /// Inclusive physical source-byte offset of the arm body.
     uint64_t bodyB;
     /// Exclusive physical source-byte offset of the arm body.
     uint64_t bodyE;
-    /// Optional A-token span recorded for this arm, present only when
-    /// `selected` is true.  It is the PP-index range of the tokens that
-    /// `selected` matched, so it inherits every caveat documented below.
+    /// A-token span of the tokens spelled in this arm's body in this file
+    /// instance; absent when there are none.  A taken arm holding only
+    /// directives, or an `#include` whose tokens belong to the included file,
+    /// has no span, so its absence says nothing about whether the arm ran.
     std::optional<PPSpan> span;
-    /// True when at least one A token whose spelling file equals this arm's
-    /// physical file overlaps `[bodyB, bodyE)`.
-    ///
-    /// This is NOT a takenness oracle, despite the field name.  The producer
-    /// computes it as a byte-range overlap against a token map keyed by physical
-    /// path, so it disagrees with preprocessor control flow in both directions:
-    ///
-    /// * A taken arm reports false whenever it contributed no token spelled in
-    ///   its own file: a body of only `#include` (those tokens are attributed to
-    ///   the included file), a body of only `#define`/`#undef`/`#pragma`, or an
-    ///   empty body.
-    /// * A non-taken arm reports true when a different include instance of the
-    ///   same physical header occupied the same body byte range.  Arm records
-    ///   are instance-scoped through `CondGroup::parentIncludeId`, but the token
-    ///   query behind this flag is not, so one instance's tokens are visible to
-    ///   another instance's arm.
-    ///
-    /// Proofs that need to know whether an arm was actually taken must obtain
-    /// that fact another way and fail closed without it.  Structural properties
-    /// such as conditional dominance are preferable precisely because they do
+    /// True when the preprocessor entered this arm: its condition held, or it
+    /// is an `#else` reached with no earlier arm taken.  Recorded from Clang's
+    /// own conditional-directive events, so it holds also for an arm that
+    /// contributed no token.  Structural properties such as conditional
+    /// dominance remain preferable where they apply, precisely because they do
     /// not depend on takenness at all.
-    bool selected;
+    bool taken = false;
+    /// True when the preprocessor decided this arm: it evaluated the arm's
+    /// condition, or entered the `#else`.  An arm after a taken one, and every
+    /// arm of a group inside an excluded block, was read without being
+    /// decided.
+    bool evaluated = false;
     /// True when the producer observed this arm's condition evaluate
     /// `__has_include` / `__has_include_next`.  Absent in the map means false.
     /// These operators are lookup-context sensitive, so an arm bearing one
@@ -1052,6 +1048,8 @@ public:
     uint64_t groupB;
     /// Exclusive physical source-byte offset of the whole conditional group.
     uint64_t groupE;
+    /// The group's `#endif` directive, measured like CondArm::directive.
+    std::optional<ByteRange> endif;
     /// Conditional arms in producer source order.
     std::vector<CondArm> arms;
 
@@ -1128,8 +1126,8 @@ public:
   /// excluding a conditional group.
   ///
   /// Recorded from `PPCallbacks::SourceRangeSkipped`, so it is the
-  /// preprocessor's own control-flow decision; unlike `CondArm::selected` it is
-  /// a takenness fact.  `[b, e)` begins at the `#` of the directive that
+  /// preprocessor's own control-flow decision, the byte-level counterpart of
+  /// `CondArm::taken`.  `[b, e)` begins at the `#` of the directive that
   /// started skipping and ends no earlier than the start of the directive that
   /// stopped it.  Every byte in it outside those two directives was scanned
   /// only for directive names: it produced no token and changed no
@@ -1310,7 +1308,7 @@ public:
     return it == condGroupById_.end() ? nullptr : it->second;
   }
 
-  /// Look up a selected or inactive conditional arm by stable arm ID.
+  /// Look up a conditional arm, taken or not, by stable arm ID.
   std::optional<ArmRef> GetArmRefById(uint64_t armId) const {
     auto it = armById_.find(armId);
     if (it == armById_.end())
@@ -1377,12 +1375,15 @@ public:
   std::vector<const CondGroup *>
   GetCondGroups(StringRef file, std::optional<uint64_t> parentIncludeId) const;
 
-  /// Find the innermost conditional arm containing a physical source byte.
+  /// Find the innermost taken conditional arm containing a physical source
+  /// byte.
   std::optional<ArmRef>
   FindArmRefForByte(StringRef file, std::optional<uint64_t> parentIncludeId,
                     uint64_t byteOffset) const;
 
-  /// Find the selected conditional arm that produced A-token `ppIndex`.
+  /// Find the innermost taken conditional arm that produced A-token `ppIndex`:
+  /// the one around its spelling, or else the one around the `#include` that
+  /// brought it in.
   std::optional<ArmRef> FindArmRefAtPP(uint64_t ppIndex) const;
 
 

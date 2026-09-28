@@ -1050,7 +1050,7 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
       const auto &childText = includeExpansion[child->id];
       // A directive without a recorded extent is a degenerate site: replacing
       // less than all of it would leave its continuation behind.
-      const std::optional<RefoldModel::IncludeItem::ByteRange> childSite =
+      const std::optional<RefoldModel::ByteRange> childSite =
           includeDirectiveExtent(*child, bytes);
       const uint64_t siteStart = childSite ? childSite->begin : child->siteB;
       const uint64_t siteEnd = childSite ? childSite->end : child->siteB;
@@ -1559,7 +1559,7 @@ RefoldIncludeMaterializer::MakeCleanChildIncludeOperandRewriteEdit(
   // macro-computed operand has no such token, and one whose bytes are not the
   // recorded target (a splice inside the header name) is not rewritten either;
   // the caller materializes the child instead.
-  const std::optional<RefoldModel::IncludeItem::ByteRange> site =
+  const std::optional<RefoldModel::ByteRange> site =
       includeDirectiveExtent(child, ownerBytes);
   if (!site || !child.operand ||
       ownerBytes.slice(child.operand->begin, child.operand->end) !=

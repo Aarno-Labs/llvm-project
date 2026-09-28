@@ -60,7 +60,7 @@ class RefoldPathIdentity;
 ///
 /// `conditionalGroupId` and `conditionalArmId` identify the group/arm opened by
 /// a conditional-control directive.  `ownerConditionalArmId` instead names the
-/// lexically enclosing producer arm, when that outer arm was bound exactly.
+/// innermost producer arm whose body holds the whole interval.
 struct PreprocessingStructureInterval {
   PreprocessingStructureKind kind =
       PreprocessingStructureKind::OtherDirective;
@@ -236,10 +236,10 @@ public:
   /// protective census incomplete: they remain explicit intervals and are
   /// therefore safe preserve-in-place boundaries.  Conditional controls are
   /// stricter because later state proofs require exact group/arm topology:
-  /// every lexical conditional control must bind uniquely to the producer, and
-  /// every producer conditional group in this owner must bind to one complete
-  /// lexical group.  Any scanner inconsistency or failed producer binding makes
-  /// the index incomplete.
+  /// every lexical conditional control must bind uniquely to the producer
+  /// directive with the same extent, and every producer conditional directive
+  /// in this owner must be found lexically.  Any scanner inconsistency or
+  /// failed producer binding makes the index incomplete.
   bool IsComplete() const { return diagnostics_.empty(); }
 
   /// Return whether the exact physical protection census is complete.

@@ -215,7 +215,7 @@ void appendConditionalIdentity(llvm::raw_ostream &os,
      << ":parent_include=" << formatOptionalU64(identity.parentIncludeId)
      << ":arm_kind=" << identity.armKind
      << ":cond=" << formatOptionalString(identity.conditionText)
-     << ":selected=" << (identity.selected ? 1 : 0) << ":atok=["
+     << ":atok=["
      << formatOptionalU64(identity.aTokenBegin) << ','
      << formatOptionalU64(identity.aTokenEnd) << ')'
      << ":producer_truth=" << (identity.conditionTruthProducerProven ? 1 : 0)

@@ -1378,6 +1378,13 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
         R->onHasInclude(Loc);
       }
 
+      void ConditionalDirective(SourceLocation HashLoc,
+                                const Token &DirectiveTok, SourceLocation EndLoc,
+                                tok::PPKeywordKind Kind,
+                                ConditionalArmOutcome Outcome) override {
+        R->onConditionalDirective(HashLoc, DirectiveTok, EndLoc, Kind, Outcome);
+      }
+
       void FileChanged(SourceLocation Loc, FileChangeReason Reason,
                        SrcMgr::CharacteristicKind, FileID) override {
         if (Reason == PPCallbacks::EnterFile) {

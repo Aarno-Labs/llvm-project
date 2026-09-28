@@ -85,7 +85,7 @@ inline bool safeSynthesizedRelativeIncludeOperandPath(llvm::StringRef path) {
 /// one-physical-line site range does not cover.  Nullopt means the directive's
 /// bytes are unknown, and a caller that would preserve, wrap or replace them
 /// must fail closed rather than fall back to the site range.
-inline std::optional<RefoldModel::IncludeItem::ByteRange>
+inline std::optional<RefoldModel::ByteRange>
 includeDirectiveExtent(const RefoldModel::IncludeItem &include,
                        llvm::StringRef ownerBytes) {
   if (!include.directiveLine || include.directiveLine->end > ownerBytes.size())

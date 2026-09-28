@@ -6,9 +6,9 @@
 // computed over the tokens of *this* include occurrence.
 //
 // cond_once_toggle.h disables itself, so the second inclusion takes no arm and
-// contributes no preprocessed tokens.  Selecting the arm's tokens by physical
-// path alone answered the second occurrence with the first occurrence's token
-// run: the non-taken arm was reported selected and was handed a `pp_span`, and
+// its arm body contributes no preprocessed tokens.  Selecting the arm's tokens
+// by physical path alone answered the second occurrence with the first
+// occurrence's token run: the non-taken arm was handed a `pp_span`, and
 // `arm_begin`/`arm_end` were handed PP indices, all belonging to the earlier
 // occurrence.
 
@@ -18,20 +18,22 @@ int between = 0;
 
 // The occurrence that really took the arm keeps its span.
 // ARMS:      "file": "{{.*}}cond_once_toggle.h"
-// ARMS:      "selected": true,
+// ARMS:      "taken": true,
+// ARMS-NEXT: "evaluated": true,
 // ARMS-NEXT: "pp_span": {
 
-// The occurrence that took no arm is not selected and gets no span at all;
-// `}` on the next line is what proves `pp_span` was not emitted.
+// The occurrence that took no arm gets no span at all; `}` on the next line is
+// what proves `pp_span` was not emitted.
 // ARMS:      "file": "{{.*}}cond_once_toggle.h"
-// ARMS:      "selected": false
+// ARMS:      "taken": false,
+// ARMS-NEXT: "evaluated": true
 // ARMS-NEXT: }
 
 // Same split for the slots seeded from that span.
 // SLOTS:      "kind": "arm_begin",
 // SLOTS:      "ref": 0,
 // SLOTS-NEXT: "owner_include_id": {{[0-9]+}},
-// SLOTS-NEXT: "pp": 0
+// SLOTS-NEXT: "pp": {{[0-9]+}}
 
 // SLOTS:      "kind": "arm_begin",
 // SLOTS:      "ref": 1,
