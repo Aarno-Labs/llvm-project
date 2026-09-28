@@ -83,6 +83,11 @@
 //     A single #include/#include_next instance, with:
 //       - site_path and directive byte range [site_b, site_e) in that file
 //         (site_b/site_e are present but may be null if unavailable)
+//       - optional [directive_line_b, directive_line_e): the directive's whole
+//         physical spelling as Clang's lexer measured it, with the keyword
+//         token [keyword_b, keyword_e) and the header-name operand
+//         [operand_b, operand_e) inside it.  `text` is synthesized, not the
+//         source spelling; these ranges are.
 //       - target (as written), optional resolved_path, angled, optional parent
 //       - spans[]: A-token spans produced by this include instance
 //       - optional decls[]: logical header-level declarations (requires
@@ -1288,7 +1293,7 @@ static constexpr const char *RefoldSchema = R"json(
         "text": {
           "type": "string",
           "minLength": 1,
-          "description": "Exact directive text as written (e.g., '#include <...>')."
+          "description": "Canonical rendering of the directive, '#<keyword> <target>' plus a newline, synthesized from the parsed directive. It is not the source spelling; directive_line_b/directive_line_e name the source bytes."
         },
         "site_path": {
           "type": "string",
@@ -1358,6 +1363,36 @@ static constexpr const char *RefoldSchema = R"json(
           "minimum": 0,
           "description": "End byte offset (exclusive) of the include directive within 'site_path'"
         },
+        "directive_line_b": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Begin byte offset of the directive's complete physical spelling within 'site_path': its '#' introducer, equal to site_b. Optional; emitted only together with directive_line_e, and only when the producer's self-consistency checks passed. Absent in maps before schema 3.8."
+        },
+        "directive_line_e": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "End byte offset (exclusive) of the directive's complete physical spelling: where Clang's lexer stood after reading the end-of-directive token, i.e. one past the terminating newline, or the end of the file. Unlike site_e, which stops at the first physical newline, this covers every splice and block comment that continues the directive."
+        },
+        "keyword_b": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Begin byte offset of the directive keyword token (include, include_next, import) as Clang lexed it, inside the directive_line range. Emitted only together with keyword_e and the directive_line pair."
+        },
+        "keyword_e": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "End byte offset (exclusive) of the directive keyword token."
+        },
+        "operand_b": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Begin byte offset of the header-name operand, delimiters included, inside the directive_line range. Absent when macro expansion produced the operand, which then has no source bytes of its own in the directive."
+        },
+        "operand_e": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "End byte offset (exclusive) of the header-name operand."
+        },
         "spans": {
           "type": "array",
           "items": {
@@ -1373,6 +1408,28 @@ static constexpr const char *RefoldSchema = R"json(
           },
           "description": "Logical header-level declarations for this include instance, in source order."
         }
+      },
+      "dependentRequired": {
+        "directive_line_b": [
+          "directive_line_e"
+        ],
+        "directive_line_e": [
+          "directive_line_b"
+        ],
+        "keyword_b": [
+          "keyword_e",
+          "directive_line_b"
+        ],
+        "keyword_e": [
+          "keyword_b"
+        ],
+        "operand_b": [
+          "operand_e",
+          "directive_line_b"
+        ],
+        "operand_e": [
+          "operand_b"
+        ]
       },
       "dependentSchemas": {
         "decls": {

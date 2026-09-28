@@ -218,10 +218,6 @@ macroStateStagedEditIntervals(
   return intervals;
 }
 
-static bool isIncludeDirectiveHorizontalWhitespace(char c) {
-  return c == '\r' || stringutils::isNonNewlineWs(c);
-}
-
 /// Adapter for include replay proof source slicing.
 /// The callable borrows the source mapper for the proof context lifetime.
 struct IncludeReplaySliceASource {
@@ -272,175 +268,6 @@ struct IncludeReplayLineStateBuiltinInvocationIsPreservedObserver {
         macro);
   }
 };
-
-struct IncludeDirectiveHeaderOperandRange {
-  size_t begin = 0;
-  size_t end = 0;
-};
-
-// Locate pieces of a source-spelled include directive without rebuilding the
-// directive from the normalized JSON spelling.  Comments are preprocessing
-// whitespace for directive recognition, so they must be skipped while finding
-// the syntactic header-name token, but preserved verbatim in the replacement
-// text.
-static bool consumeIncludeDirectiveEscapedNewline(StringRef text, size_t &pos) {
-  if (pos >= text.size() || text[pos] != '\\')
-    return false;
-
-  size_t cursor = pos + 1;
-  while (cursor < text.size() &&
-         isIncludeDirectiveHorizontalWhitespace(text[cursor]))
-    ++cursor;
-  if (cursor >= text.size())
-    return false;
-  if (text[cursor] == '\r') {
-    ++cursor;
-    if (cursor < text.size() && text[cursor] == '\n')
-      ++cursor;
-  } else if (text[cursor] == '\n') {
-    ++cursor;
-  } else {
-    return false;
-  }
-
-  pos = cursor;
-  return true;
-}
-
-static bool skipIncludeDirectiveHorizontalTrivia(StringRef text, size_t &pos) {
-  while (pos < text.size()) {
-    if (isIncludeDirectiveHorizontalWhitespace(text[pos])) {
-      ++pos;
-      continue;
-    }
-    if (consumeIncludeDirectiveEscapedNewline(text, pos))
-      continue;
-    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
-      pos += 2;
-      bool closed = false;
-      while (pos + 1 < text.size()) {
-        if (consumeIncludeDirectiveEscapedNewline(text, pos))
-          continue;
-        if (text[pos] == '*' && text[pos + 1] == '/') {
-          pos += 2;
-          closed = true;
-          break;
-        }
-        ++pos;
-      }
-      if (!closed)
-        return false;
-      continue;
-    }
-    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '/')
-      return false;
-    break;
-  }
-  return true;
-}
-
-static bool consumeIncludeDirectiveKeyword(StringRef text, size_t &pos,
-                                           StringRef keyword) {
-  if (!text.substr(pos).starts_with(keyword))
-    return false;
-  const size_t end = pos + keyword.size();
-  if (end < text.size() &&
-      (stringutils::isIdentPart(text[end]) || text[end] == '_'))
-    return false;
-  pos = end;
-  return true;
-}
-
-static std::optional<std::pair<size_t, size_t>>
-findIncludeDirectiveKeywordRange(StringRef directive) {
-  size_t pos = 0;
-  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
-    return std::nullopt;
-  if (pos >= directive.size() || directive[pos] != '#')
-    return std::nullopt;
-  ++pos;
-  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
-    return std::nullopt;
-
-  const size_t keywordBegin = pos;
-  if (consumeIncludeDirectiveKeyword(directive, pos, "include_next"))
-    return std::make_pair(keywordBegin, pos);
-  pos = keywordBegin;
-  if (consumeIncludeDirectiveKeyword(directive, pos, "include"))
-    return std::make_pair(keywordBegin, pos);
-  return std::nullopt;
-}
-
-// Return the exact byte range of the directive's syntactic header-name token.
-// `expectedTarget` includes its delimiters, e.g. `"leaf.h"` or `<leaf.h>`.
-// If the source uses a macro operand or any spelling the local proof does not
-// model exactly, the caller fails closed and materializes the child instead.
-static std::optional<IncludeDirectiveHeaderOperandRange>
-findIncludeDirectiveHeaderOperandRange(StringRef directive,
-                                       StringRef expectedTarget) {
-  size_t pos = 0;
-  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
-    return std::nullopt;
-  if (pos >= directive.size() || directive[pos] != '#')
-    return std::nullopt;
-  ++pos;
-  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
-    return std::nullopt;
-
-  if (!consumeIncludeDirectiveKeyword(directive, pos, "include_next")) {
-    if (!consumeIncludeDirectiveKeyword(directive, pos, "include"))
-      return std::nullopt;
-  }
-
-  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
-    return std::nullopt;
-  if (expectedTarget.empty())
-    return std::nullopt;
-  if (!directive.substr(pos).starts_with(expectedTarget))
-    return std::nullopt;
-
-  return IncludeDirectiveHeaderOperandRange{pos, pos + expectedTarget.size()};
-}
-
-/// Extends an include directive span through any physical line continuations.
-/// The returned end offset covers the complete directive line in `ownerBytes`.
-static uint64_t extendIncludeDirectiveEnd(const RefoldModel::IncludeItem &item,
-                                          StringRef ownerBytes,
-                                          uint64_t siteStart) {
-  uint64_t siteEnd =
-      std::clamp<uint64_t>(item.siteE, siteStart, ownerBytes.size());
-  if (siteStart >= static_cast<uint64_t>(ownerBytes.size()))
-    return siteEnd;
-
-  size_t cursor = static_cast<size_t>(siteStart);
-  while (true) {
-    size_t nl = ownerBytes.find('\n', cursor);
-    if (nl == StringRef::npos)
-      return static_cast<uint64_t>(ownerBytes.size());
-    cursor = nl + 1;
-    if (!stringutils::isLineSplice(ownerBytes, nl))
-      return std::max<uint64_t>(siteEnd, cursor);
-  }
-}
-
-/// Rewrites a leading `#include_next` directive keyword to ordinary `#include`.
-/// Returns whether the replacement text was changed.
-static bool
-rewriteIncludeNextDirectiveAsOrdinaryInclude(std::string &replacement) {
-  StringRef text(replacement);
-  std::optional<std::pair<size_t, size_t>> keyword =
-      findIncludeDirectiveKeywordRange(text);
-  if (!keyword)
-    return false;
-
-  StringRef spelling = text.slice(keyword->first, keyword->second);
-  if (spelling != "include_next")
-    return false;
-
-  replacement.replace(keyword->first, keyword->second - keyword->first,
-                      "include");
-  return true;
-}
 
 /// Orders text edits by source interval start, then end. This is used for
 /// deterministic traversal of edit pointers.
@@ -1054,11 +881,11 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
   // 3) Materialize child includes only when their subtree has work. For each
   // dirty child, recursively build the child's fully materialized text and then
   // replace the child's include directive in this header.
-  // Site ranges handled by the child loop below.  A skipped include edge carries
-  // no parent, so it never appears in `children`; the post-pass after this loop
-  // finds those by physical site instead and must not re-handle a site the loop
-  // already claimed.
-  SmallVector<std::pair<uint64_t, uint64_t>, 8> claimedChildSites;
+  // Directive sites, by the offset of their `#`, handled by the child loop
+  // below.  A skipped include edge carries no parent, so it never appears in
+  // `children`; the post-pass after this loop finds those by physical site
+  // instead and must not re-handle a site the loop already claimed.
+  SmallVector<uint64_t, 8> claimedChildSites;
 
   // Physical headers whose bodies are inlined with a synthetic guard.  A child
   // whose closure reaches one of these cannot survive as a directive.
@@ -1067,12 +894,7 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
 
   if (auto it = children.find(includeId); it != children.end()) {
     for (const auto *child : it->second) {
-      {
-        const uint64_t claimStart =
-            std::clamp<uint64_t>(child->siteB, 0ULL, bytes.size());
-        claimedChildSites.emplace_back(
-            claimStart, extendIncludeDirectiveEnd(*child, bytes, claimStart));
-      }
+      claimedChildSites.push_back(child->siteB);
       bool todo = subtreeWork.HasDescendantWork(child->id);
 
       // Forced include-next materialization follows relocation, not
@@ -1169,45 +991,37 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
           // materialized parent.  If it opens a header whose body was inlined
           // elsewhere, the directive must be guarded so it does not re-enter the
           // header that the inlined copy already emitted.
-          const size_t ownerSize = bytes.size();
-          const uint64_t childSiteStart =
-              std::clamp<uint64_t>(child->siteB, 0ULL, ownerSize);
-          const uint64_t childSiteEnd =
-              extendIncludeDirectiveEnd(*child, bytes, childSiteStart);
-          if (childSiteStart < childSiteEnd) {
-            if (PragmaOnceGuardEditResult guardResult =
-                    pragmaOnceGuards_.StageSurvivingIncludeGuardEdit(
-                        *child, headerPath, includeId, bytes, childSiteStart,
-                        childSiteEnd,
-                        ComputeAncestorArmForChildInclude(
-                            *child, includeId, ancestorArmIdAtIncludeSite),
-                        /*noInlinedCopyFollows=*/false, edits);
-                !guardResult.proven) {
-              // Leaving an empty expansion here would silently delete the
-              // *parent's* whole body while the caller consumed it as a
-              // legitimate "materialized to nothing".  A child-guard rejection
-              // is a proof failure for the emitted TU, so it must be terminal.
-              REFOLD_LOG_TRACE(
-                  "pragma/once/guard",
-                  "nested surviving include inc#{0} in inc#{1} rejected: "
-                  "{2} ({3})",
-                  child->id, includeId, toString(guardResult.rejection),
-                  guardResult.detail);
-              // Name the include whose guard could not be proved.  Expanding
-              // it is a repair -- it stops being a directive, so no surviving
-              // occurrence is left to guard -- and the fallback ladder can only
-              // try that for a region a request actually names.
-              terminalSink_.RequestTerminalFallback(
-                  MakeTerminalFallbackProofFailure(
-                      TerminalFallbackObligationKind::
-                          IncludeGuardStateStabilizable,
-                      TerminalFallbackFailureReason::
-                          IncludeGuardStateNotStabilizable,
-                      TerminalFallbackFailureContext::ForOwnerId(child->id)),
-                  "pragma/once/guard", guardResult.detail);
-              includeExpansion[includeId] = std::string();
-              return;
-            }
+          if (PragmaOnceGuardEditResult guardResult =
+                  pragmaOnceGuards_.StageSurvivingIncludeGuardEdit(
+                      *child, headerPath, includeId, bytes,
+                      ComputeAncestorArmForChildInclude(
+                          *child, includeId, ancestorArmIdAtIncludeSite),
+                      /*noInlinedCopyFollows=*/false, edits);
+              !guardResult.proven) {
+            // Leaving an empty expansion here would silently delete the
+            // *parent's* whole body while the caller consumed it as a
+            // legitimate "materialized to nothing".  A child-guard rejection
+            // is a proof failure for the emitted TU, so it must be terminal.
+            REFOLD_LOG_TRACE(
+                "pragma/once/guard",
+                "nested surviving include inc#{0} in inc#{1} rejected: "
+                "{2} ({3})",
+                child->id, includeId, toString(guardResult.rejection),
+                guardResult.detail);
+            // Name the include whose guard could not be proved.  Expanding
+            // it is a repair -- it stops being a directive, so no surviving
+            // occurrence is left to guard -- and the fallback ladder can only
+            // try that for a region a request actually names.
+            terminalSink_.RequestTerminalFallback(
+                MakeTerminalFallbackProofFailure(
+                    TerminalFallbackObligationKind::
+                        IncludeGuardStateStabilizable,
+                    TerminalFallbackFailureReason::
+                        IncludeGuardStateNotStabilizable,
+                    TerminalFallbackFailureContext::ForOwnerId(child->id)),
+                "pragma/once/guard", guardResult.detail);
+            includeExpansion[includeId] = std::string();
+            return;
           }
 
           // No descendant edits depend on this child.  Either the original
@@ -1234,11 +1048,14 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
           ownersMustExpand);
 
       const auto &childText = includeExpansion[child->id];
-      const size_t n = bytes.size();
-      const uint64_t siteStart = std::clamp<uint64_t>(child->siteB, 0ULL, n);
-      uint64_t siteEnd = extendIncludeDirectiveEnd(*child, bytes, siteStart);
+      // A directive without a recorded extent is a degenerate site: replacing
+      // less than all of it would leave its continuation behind.
+      const std::optional<RefoldModel::IncludeItem::ByteRange> childSite =
+          includeDirectiveExtent(*child, bytes);
+      const uint64_t siteStart = childSite ? childSite->begin : child->siteB;
+      const uint64_t siteEnd = childSite ? childSite->end : child->siteB;
 
-      if (siteStart < siteEnd) {
+      if (childSite) {
         const bool sidebandOnly =
             subtreeWork.ClassifyMaterializationWork(child->id) ==
             MaterializationWorkClass::SidebandPragmaOnly;
@@ -1346,17 +1163,7 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
     for (const RefoldModel::IncludeItem &candidate : model_.GetIncludes()) {
       if (!paths_.PathsEqual(candidate.sitePath, headerPath))
         continue;
-      const uint64_t siteStart =
-          std::clamp<uint64_t>(candidate.siteB, 0ULL, bytes.size());
-      const uint64_t siteEnd =
-          extendIncludeDirectiveEnd(candidate, bytes, siteStart);
-      if (siteStart >= siteEnd)
-        continue;
-      const bool claimed = llvm::any_of(
-          claimedChildSites, [&](const std::pair<uint64_t, uint64_t> &claim) {
-            return claim.first == siteStart && claim.second == siteEnd;
-          });
-      if (claimed)
+      if (llvm::is_contained(claimedChildSites, candidate.siteB))
         continue;
       if (!pragmaOnceGuards_.FindGuardForInclude(candidate))
         continue;
@@ -1374,13 +1181,9 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
     for (const RefoldModel::IncludeItem *sibling : skippedSiblings) {
       if (lastStagedSiteB && *lastStagedSiteB == sibling->siteB)
         continue;
-      const uint64_t siteStart =
-          std::clamp<uint64_t>(sibling->siteB, 0ULL, bytes.size());
-      const uint64_t siteEnd =
-          extendIncludeDirectiveEnd(*sibling, bytes, siteStart);
       if (PragmaOnceGuardEditResult guardResult =
               pragmaOnceGuards_.StageSurvivingIncludeGuardEdit(
-                  *sibling, headerPath, includeId, bytes, siteStart, siteEnd,
+                  *sibling, headerPath, includeId, bytes,
                   ComputeAncestorArmForChildInclude(*sibling, includeId,
                                                     ancestorArmIdAtIncludeSite),
                   /*noInlinedCopyFollows=*/false, edits);
@@ -1752,22 +1555,22 @@ RefoldIncludeMaterializer::MakeCleanChildIncludeOperandRewriteEdit(
     const RefoldModel::IncludeItem &child, StringRef rewrittenOperand,
     IncludeReplayProofContext::OrdinaryIncludeDelimiterKind delimiterKind,
     StringRef ownerBytes) const {
-  const size_t n = ownerBytes.size();
-  const uint64_t siteStart = std::clamp<uint64_t>(child.siteB, 0ULL, n);
-  const uint64_t siteEnd =
-      extendIncludeDirectiveEnd(child, ownerBytes, siteStart);
-  if (siteStart >= siteEnd)
+  // The rewrite replaces exactly the producer-recorded operand token.  A
+  // macro-computed operand has no such token, and one whose bytes are not the
+  // recorded target (a splice inside the header name) is not rewritten either;
+  // the caller materializes the child instead.
+  const std::optional<RefoldModel::IncludeItem::ByteRange> site =
+      includeDirectiveExtent(child, ownerBytes);
+  if (!site || !child.operand ||
+      ownerBytes.slice(child.operand->begin, child.operand->end) !=
+          child.target)
     return std::nullopt;
   if (!child.cover.IsValid() || child.cover.begin >= child.cover.end)
     return std::nullopt;
+  const uint64_t siteStart = site->begin;
+  const uint64_t siteEnd = site->end;
 
-  StringRef directiveBytes = ownerBytes.slice(siteStart, siteEnd);
-  std::optional<IncludeDirectiveHeaderOperandRange> targetRange =
-      findIncludeDirectiveHeaderOperandRange(directiveBytes, child.target);
-  if (!targetRange)
-    return std::nullopt;
-
-  std::string replacement = directiveBytes.str();
+  std::string replacement = ownerBytes.slice(siteStart, siteEnd).str();
   std::string headerOperand;
   headerOperand.push_back(
       IncludeReplayProofContext::OrdinaryIncludeDelimiterOpen(delimiterKind));
@@ -1775,11 +1578,21 @@ RefoldIncludeMaterializer::MakeCleanChildIncludeOperandRewriteEdit(
     headerOperand.append(rewrittenOperand.data(), rewrittenOperand.size());
   headerOperand.push_back(
       IncludeReplayProofContext::OrdinaryIncludeDelimiterClose(delimiterKind));
-  replacement.replace(targetRange->begin, targetRange->end - targetRange->begin,
+  // The keyword precedes the operand, so replacing the operand first leaves
+  // the keyword's offsets valid.
+  replacement.replace(child.operand->begin - siteStart,
+                      child.operand->end - child.operand->begin,
                       headerOperand);
-  if (child.subkind == "#include_next" &&
-      !rewriteIncludeNextDirectiveAsOrdinaryInclude(replacement))
-    return std::nullopt;
+  if (child.subkind == "#include_next") {
+    // Only an unspliced keyword is rewritten, so the directive keeps its
+    // physical line count.
+    if (!child.keyword || ownerBytes.slice(child.keyword->begin,
+                                           child.keyword->end) !=
+                              "include_next")
+      return std::nullopt;
+    replacement.replace(child.keyword->begin - siteStart,
+                        child.keyword->end - child.keyword->begin, "include");
+  }
 
   // Rewriting a clean child include operand is a parent-surface source edit,
   // not child expansion.  The proof witness is the child's own mapped token

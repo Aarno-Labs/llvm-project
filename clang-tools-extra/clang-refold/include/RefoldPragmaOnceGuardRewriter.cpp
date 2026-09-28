@@ -11,6 +11,7 @@
 #include "proof/RefoldPragmaTaxonomy.h"
 
 #include "edit/RefoldTextEditCertifier.h"
+#include "include/IncludeSpellingHelpers.h"
 #include "line-control/LineDirectiveInserter.h"
 #include "line-control/RefoldLineControlProof.h"
 #include "line-control/RefoldLineObserverLayout.h"
@@ -1467,8 +1468,8 @@ PragmaOnceGuardEditResult
 RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
     const RefoldModel::IncludeItem &include, StringRef ownerPath,
     std::optional<uint64_t> ownerIncludeId, StringRef ownerBytes,
-    uint64_t siteBegin, uint64_t siteEnd, std::optional<uint64_t> ancestorArmId,
-    bool noInlinedCopyFollows, std::vector<TextEdit> &edits) const {
+    std::optional<uint64_t> ancestorArmId, bool noInlinedCopyFollows,
+    std::vector<TextEdit> &edits) const {
   if (!activeSetRecorded_) {
     REFOLD_LOG_FATAL("pragma/once/guard",
                      "guard staging requested before the active header set was "
@@ -1537,14 +1538,20 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
             .str());
   }
 
-  if (siteBegin >= siteEnd || siteEnd > ownerBytes.size()) {
+  // The wrapper keeps the directive's own bytes, so it needs their exact
+  // extent; the one-physical-line site range can end inside the directive.
+  const std::optional<RefoldModel::IncludeItem::ByteRange> site =
+      includeDirectiveExtent(include, ownerBytes);
+  if (!site) {
     return PragmaOnceGuardEditResult::Reject(
         PragmaOnceGuardRejection::IncompleteStructureCensus,
-        formatv("surviving include inc#{0} has an invalid site [{1},{2}) in "
-                "'{3}' (size {4})",
-                include.id, siteBegin, siteEnd, ownerPath, ownerBytes.size())
+        formatv("surviving include inc#{0} has no recorded directive extent "
+                "inside '{1}' (size {2})",
+                include.id, ownerPath, ownerBytes.size())
             .str());
   }
+  const uint64_t siteBegin = site->begin;
+  const uint64_t siteEnd = site->end;
 
   // The wrapper adds two or three physical lines around the directive, in TU or
   // parent-header bytes: user source whose suffix may observe line state.

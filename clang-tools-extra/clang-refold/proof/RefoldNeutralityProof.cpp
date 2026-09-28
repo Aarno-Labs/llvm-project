@@ -1452,7 +1452,8 @@ bool RefoldSourceNeutralityProof::ConditionalGroupIsNeutralIsland(
            include.parent && *include.parent == context.includeId;
   };
   auto pragmaBelongs = [&](const RefoldModel::PragmaDirective &pragma) {
-    return context.paths.PathsEqual(pragma.sitePath, context.headerPath);
+    return context.paths.PathsEqual(pragma.sitePath, context.headerPath) &&
+           pragma.ownerIncludeId && *pragma.ownerIncludeId == context.includeId;
   };
   auto macroBelongs = [&](const RefoldModel::MacroInvocation &macro) {
     return macro.invFile &&

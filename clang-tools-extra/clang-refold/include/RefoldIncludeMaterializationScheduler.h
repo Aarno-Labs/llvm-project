@@ -329,11 +329,6 @@ private:
   /// obligation that source-graph sidecar preservation cannot discharge.
   bool IncludeSubtreeHasLayoutOnlyMaterializationSeed(uint64_t includeId) const;
 
-  /// Returns the producer site range extended to the full physical include
-  /// directive when line-spliced source made the recorded range too short.
-  std::pair<uint64_t, uint64_t>
-  ExtendedTUSiteRange(const RefoldModel::IncludeItem &include) const;
-
 
   /// Lowers one realized TU-root include expansion into a final TU text edit.
   bool StageTURootIncludeExpansionEdit(

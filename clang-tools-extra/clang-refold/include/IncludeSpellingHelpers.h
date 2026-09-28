@@ -77,6 +77,22 @@ inline bool safeSynthesizedRelativeIncludeOperandPath(llvm::StringRef path) {
          refoldHasSafeSynthesizedRelativeComponents(path);
 }
 
+/// Return the complete physical spelling of \p include's directive inside
+/// \p ownerBytes, the bytes of the file that contains it.
+///
+/// This is the producer's `directiveLine`: Clang's lexer measured it through
+/// every splice and comment that continues the directive, which the
+/// one-physical-line site range does not cover.  Nullopt means the directive's
+/// bytes are unknown, and a caller that would preserve, wrap or replace them
+/// must fail closed rather than fall back to the site range.
+inline std::optional<RefoldModel::IncludeItem::ByteRange>
+includeDirectiveExtent(const RefoldModel::IncludeItem &include,
+                       llvm::StringRef ownerBytes) {
+  if (!include.directiveLine || include.directiveLine->end > ownerBytes.size())
+    return std::nullopt;
+  return include.directiveLine;
+}
+
 /// Return the logical filename spelling to restore for an include edge.
 ///
 /// This is the spelling observed by preserved `__FILE__` / `__FILE_NAME__`

@@ -432,15 +432,41 @@ public:
     uint64_t id;
     /// Directive spelling class, either `#include` or `#include_next`.
     StringRef subkind;
-    /// Full source directive line text, when serialized by the producer.
-    /// Full source directive line text.
+    /// Canonical rendering of the directive, `#<keyword> <target>\n`.
+    ///
+    /// The producer synthesizes this from the parsed directive, so it is not
+    /// the source spelling: blanks, comments and splices are gone.  Use
+    /// `directiveLine` for the source bytes.
     StringRef text;
     /// Physical source file that contains the directive site.
     StringRef sitePath;
-    /// Inclusive physical source-byte offset of the directive site.
+    /// Inclusive physical source-byte offset of the directive site, its `#`.
     uint64_t siteB;
     /// Exclusive physical source-byte offset of the directive site.
+    ///
+    /// This stops at the first physical newline, so it can end inside a
+    /// directive continued by a splice or a block comment.
     uint64_t siteE;
+
+    /// Half-open physical source-byte range in `sitePath`.
+    struct ByteRange {
+      uint64_t begin = 0;
+      uint64_t end = 0;
+    };
+    /// The directive's complete physical spelling: from its `#` through the
+    /// end of its logical line, including the terminating newline when there
+    /// is one.  Clang's lexer measured it, so it covers every splice and
+    /// comment that continues the directive.  Absent in maps written before
+    /// schema 3.8, and wherever the producer's own checks failed; a consumer
+    /// that needs the directive's bytes must then fail closed.
+    std::optional<ByteRange> directiveLine;
+    /// The directive keyword token (`include`, `include_next`), inside
+    /// `directiveLine`.  Present only together with `directiveLine`.
+    std::optional<ByteRange> keyword;
+    /// The header-name operand with its delimiters, inside `directiveLine`.
+    /// Absent when macro expansion produced the operand, which then has no
+    /// bytes of its own in the directive.
+    std::optional<ByteRange> operand;
     /// As-written include target token, e.g. `"e.h"` or `<vector>`.
     StringRef target;
 

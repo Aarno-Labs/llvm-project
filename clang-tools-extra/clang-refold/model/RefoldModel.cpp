@@ -986,6 +986,18 @@ parseCalleeOriginParts(const json::Object &originObj, StringRef finalSpelling,
   return parts;
 }
 
+/// Return the nonempty half-open byte range recorded under \p beginKey and
+/// \p endKey, or nullopt unless both are present and well formed.
+static std::optional<IncludeItem::ByteRange>
+parseOptIncludeByteRange(const json::Object &obj, StringRef beginKey,
+                         StringRef endKey) {
+  std::optional<uint64_t> begin = asOptUInt64(obj, beginKey);
+  std::optional<uint64_t> end = asOptUInt64(obj, endKey);
+  if (!begin || !end || *begin >= *end)
+    return std::nullopt;
+  return IncludeItem::ByteRange{*begin, *end};
+}
+
 /// Parse one `#include` / `#include_next` item.
 ///
 /// \p includeSearchChain is the producer's recorded search chain; the lookup
@@ -1157,6 +1169,30 @@ parseIncludeItem(const json::Object &obj, StringRef skStr,
                   /*parent*/ parent,
                   /*spans*/ std::move(spans),
                   /*decls*/ std::move(decls));
+
+  // Producer-measured spellings (schema 3.8).  The extent must begin at the
+  // same `#` as the site and reach at least as far, and the keyword and
+  // operand must lie inside it in that order: these are independent producer
+  // measurements of one directive, so a record where they disagree is dropped
+  // rather than repaired.
+  inc.directiveLine =
+      parseOptIncludeByteRange(obj, "directive_line_b", "directive_line_e");
+  if (inc.directiveLine && (inc.directiveLine->begin != siteB ||
+                            inc.directiveLine->end < siteE))
+    inc.directiveLine.reset();
+  if (inc.directiveLine) {
+    inc.keyword = parseOptIncludeByteRange(obj, "keyword_b", "keyword_e");
+    inc.operand = parseOptIncludeByteRange(obj, "operand_b", "operand_e");
+    const auto within = [&](const IncludeItem::ByteRange &range) {
+      return inc.directiveLine->begin < range.begin &&
+             range.end <= inc.directiveLine->end;
+    };
+    if (inc.keyword && !within(*inc.keyword))
+      inc.keyword.reset();
+    if (inc.operand && (!within(*inc.operand) || !inc.keyword ||
+                        inc.operand->begin < inc.keyword->end))
+      inc.operand.reset();
+  }
 
   return inc;
 }

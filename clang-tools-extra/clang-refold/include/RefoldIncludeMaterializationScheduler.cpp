@@ -7,6 +7,7 @@
 #include "include/RefoldIncludeMaterializationScheduler.h"
 
 #include "edit/RefoldTextEditCertifier.h"
+#include "include/IncludeSpellingHelpers.h"
 #include "include/RefoldIncludeInsertionPlanner.h"
 #include "include/RefoldIncludeMaterializer.h"
 #include "include/RefoldIncludeSubtreeWorkClassifier.h"
@@ -21,7 +22,6 @@
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
 #include "support/RefoldLog.h"
-#include "support/StringUtils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -549,7 +549,6 @@ bool RefoldIncludeMaterializationScheduler::StageTURootSurvivingIncludeGuards() 
   });
 
   for (const RefoldModel::IncludeItem *include : survivors) {
-    auto [siteBegin, siteEnd] = ExtendedTUSiteRange(*include);
     // A TU-owned site has no include ancestry, so its only enclosing arm is the
     // one inside the TU itself.
     const std::optional<uint64_t> ancestorArm =
@@ -558,8 +557,7 @@ bool RefoldIncludeMaterializationScheduler::StageTURootSurvivingIncludeGuards() 
     if (PragmaOnceGuardEditResult guardResult =
             pragmaOnceGuards_.StageSurvivingIncludeGuardEdit(
                 *include, request_.tuPath, std::nullopt, request_.tuBytes,
-                siteBegin, siteEnd, ancestorArm,
-                NoInlinedCopyFollowsTUSite(*include), tuEdits_);
+                ancestorArm, NoInlinedCopyFollowsTUSite(*include), tuEdits_);
         !guardResult.proven) {
       REFOLD_LOG_TRACE("pragma/once/guard",
                        "TU surviving include inc#{0} rejected: {1} ({2})",
@@ -991,37 +989,6 @@ bool RefoldIncludeMaterializationScheduler::
   return false;
 }
 
-std::pair<uint64_t, uint64_t>
-RefoldIncludeMaterializationScheduler::ExtendedTUSiteRange(
-    const RefoldModel::IncludeItem &include) const {
-  // The producer's [siteB, siteE) range is supposed to cover the entire
-  // physical `#include` directive in the TU. In some cases involving leading
-  // line splices just before the directive, that recorded end can stop too
-  // early. If we replace only the truncated range, part of the original
-  // `#include` can remain in the TU, and checker replay may include the header
-  // again.
-  uint64_t siteBegin = include.siteB;
-  uint64_t siteEnd = include.siteE;
-  if (siteBegin < request_.tuBytes.size()) {
-    size_t i = static_cast<size_t>(siteBegin);
-    while (true) {
-      size_t nl = request_.tuBytes.find('\n', i);
-      if (nl == StringRef::npos) {
-        siteEnd = request_.tuBytes.size();
-        break;
-      }
-      i = nl + 1;
-      if (!stringutils::isLineSplice(request_.tuBytes, nl)) {
-        uint64_t extended = static_cast<uint64_t>(i);
-        if (extended > siteEnd)
-          siteEnd = extended;
-        break;
-      }
-    }
-  }
-  return {siteBegin, siteEnd};
-}
-
 bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
     uint64_t includeId,
     RefoldMacroStateRepairPlanner::MacroStateRepairPlan &macroStatePlan,
@@ -1041,8 +1008,27 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
       !pathIdentity_.PathsEqual(include->sitePath, request_.tuPath))
     return true;
 
+  // The expansion replaces the whole directive, so a directive whose extent
+  // was not recorded cannot be replaced soundly: a shorter range would leave
+  // its continuation behind to include the header again.
+  const std::optional<RefoldModel::IncludeItem::ByteRange> site =
+      includeDirectiveExtent(*include, request_.tuBytes);
+  if (!site) {
+    terminalSink_.RequestTerminalFallback(
+        MakeTerminalFallbackProofFailure(
+            TerminalFallbackObligationKind::ProducerFactsAvailable,
+            TerminalFallbackFailureReason::MissingProducerFacts,
+            TerminalFallbackFailureContext::ForOwnerId(include->id)),
+        "include/mat",
+        llvm::formatv("TU include inc#{0} has no recorded directive extent",
+                      include->id)
+            .str());
+    return false;
+  }
+  const uint64_t siteBegin = site->begin;
+  const uint64_t siteEnd = site->end;
+
   std::string expansionText = expansionIt->second;
-  auto [siteBegin, siteEnd] = ExtendedTUSiteRange(*include);
 
   // Repair consumed macro-state directives before wrapping the expansion so the
   // final TU edit carries the macro state required by the materialized header.

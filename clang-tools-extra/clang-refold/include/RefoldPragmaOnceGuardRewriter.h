@@ -460,9 +460,10 @@ public:
   ///
   /// \p ownerBytes is the byte space containing the directive: TU bytes for a
   /// TU-owned site, or the materialized parent copy for a nested site.  The
-  /// original directive spelling inside `[siteBegin,siteEnd)` is preserved
-  /// verbatim, including comments, delimiters, macro-computed operands, and
-  /// `#include_next`.
+  /// original directive spelling, the producer-measured extent returned by
+  /// includeDirectiveExtent(), is preserved verbatim, including comments,
+  /// splices, delimiters, macro-computed operands, and `#include_next`.  A
+  /// guarded include without that extent is rejected.
   ///
   /// An unconditional pragma gets the eager wrapper, which defines the macro
   /// before entering the header.  A conditional pragma cannot license that:
@@ -477,7 +478,6 @@ public:
   PragmaOnceGuardEditResult StageSurvivingIncludeGuardEdit(
       const RefoldModel::IncludeItem &include, llvm::StringRef ownerPath,
       std::optional<uint64_t> ownerIncludeId, llvm::StringRef ownerBytes,
-      uint64_t siteBegin, uint64_t siteEnd,
       std::optional<uint64_t> ancestorArmId, bool noInlinedCopyFollows,
       std::vector<TextEdit> &edits) const;
 

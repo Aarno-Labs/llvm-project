@@ -859,10 +859,16 @@ includeStructureKind(const RefoldModel::IncludeItem &include) {
 }
 
 /// Bind exact #include/#include_next producer lines in one owner domain.
+///
+/// The producer's `directiveLine` and this scanner measure the same directive
+/// by two independent routes: Clang's lexer position after the end-of-directive
+/// token, against a language-mode-aware lexical scan of the file bytes.  As for
+/// macro-state directives, only exact agreement binds the record.  The
+/// directive's `text` plays no part: the producer synthesizes it, so it matches
+/// the source only for a canonically spelled directive.
 static void bindIncludeDirectives(
     const RefoldModel &model, const RefoldPathIdentity &paths,
-    StringRef sourcePath, StringRef sourceBytes,
-    std::optional<uint64_t> ownerIncludeId,
+    StringRef sourcePath, std::optional<uint64_t> ownerIncludeId,
     std::vector<ScannedDirective> &directives,
     std::vector<std::string> &diagnostics) {
   for (const RefoldModel::IncludeItem &include : model.GetIncludes()) {
@@ -870,37 +876,45 @@ static void bindIncludeDirectives(
         !ownerMatches(include.parent, ownerIncludeId))
       continue;
 
-    std::optional<ExactProducerTextRange> recovered =
-        recoverExactProducerTextRange(sourceBytes, include.siteB,
-                                      include.siteE, include.text);
-    if (!recovered) {
+    if (!include.directiveLine) {
       diagnostics.push_back(
-          llvm::formatv("include directive id={0} source range=[{1},{2}) does "
-                        "not recover its producer text exactly",
-                        include.id, include.siteB, include.siteE)
+          llvm::formatv("include directive id={0} has no recorded directive "
+                        "extent",
+                        include.id)
               .str());
       continue;
     }
+    const RefoldModel::IncludeItem::ByteRange &line = *include.directiveLine;
 
     const PreprocessingStructureKind expectedKind =
         includeStructureKind(include);
     std::optional<size_t> scannedIndex = findUniqueDirectiveForProducerRange(
-        directives, recovered->begin, recovered->end, expectedKind);
+        directives, line.begin, line.end, expectedKind);
     if (!scannedIndex) {
       diagnostics.push_back(
-          llvm::formatv("include directive id={0} recovered range=[{1},{2}) "
+          llvm::formatv("include directive id={0} recorded range=[{1},{2}) "
                         "does not select one lexical {3} directive",
-                        include.id, recovered->begin, recovered->end,
+                        include.id, line.begin, line.end,
                         toString(expectedKind))
               .str());
       continue;
     }
 
     ScannedDirective &scanned = directives[*scannedIndex];
+    if (line.begin != scanned.introducerBegin ||
+        line.end != scanned.interval.end) {
+      diagnostics.push_back(
+          llvm::formatv("include directive id={0} recorded extent [{1},{2}) "
+                        "disagrees with the scanned logical line "
+                        "introducer={3} end={4}",
+                        include.id, line.begin, line.end,
+                        scanned.introducerBegin, scanned.interval.end)
+              .str());
+      continue;
+    }
     attachModelBinding(scanned,
                        PreprocessingStructureModelKind::IncludeDirective,
-                       include.id, recovered->begin, recovered->end,
-                       diagnostics);
+                       include.id, line.begin, line.end, diagnostics);
   }
 }
 
@@ -1269,8 +1283,8 @@ RefoldPreprocessingStructureIndex RefoldPreprocessingStructureIndex::Build(
                         directives, conditionalGroups, protectionDiagnostics);
   bindMacroDirectives(deps.model, deps.paths, sourcePath, sourceBytes,
                       ownerIncludeId, directives, index.diagnostics_);
-  bindIncludeDirectives(deps.model, deps.paths, sourcePath, sourceBytes,
-                        ownerIncludeId, directives, index.diagnostics_);
+  bindIncludeDirectives(deps.model, deps.paths, sourcePath, ownerIncludeId,
+                        directives, index.diagnostics_);
   bindLineControlDirectives(deps.model, deps.paths, sourcePath, sourceBytes,
                             ownerIncludeId, directives, index.diagnostics_);
   bindPragmaDirectives(deps.model, deps.paths, sourcePath, sourceBytes,

@@ -353,14 +353,13 @@ bool RefoldHeaderIncludeEditPlanner::
     return false;
   if (!paths_.PathsEqual(child.sitePath, file))
     return false;
-  if (child.siteB >= child.siteE || child.siteE > headerText.size())
-    return false;
-  if (child.siteB < gapBegin || gapEnd < child.siteE)
+  // The whole directive, through every splice or comment that continues it,
+  // must lie in the gap; the one-physical-line site range can stop short.
+  const std::optional<RefoldModel::IncludeItem::ByteRange> site =
+      includeDirectiveExtent(child, headerText);
+  if (!site || site->begin < gapBegin || gapEnd < site->end)
     return false;
   if (child.cover.IsValid())
-    return false;
-  if (child.text.empty() ||
-      headerText.slice(child.siteB, child.siteE) != child.text)
     return false;
 
   // A zero-token include subtree may contain nested include directives, but
@@ -1091,12 +1090,16 @@ bool RefoldHeaderIncludeEditPlanner::ProveHeaderSourceEnvelopeGap(
   // Every pragma the gap covers is preserved.  A pragma is opaque
   // preprocessor state: what it does is knowable only for the pragmas this
   // tool models, so deleting the bytes around one must not delete it.
-  // `#pragma once` is the exception, owned by the once-guard rewriter.
+  // `#pragma once` is the exception, owned by the once-guard rewriter.  The
+  // producer records a pragma once per inclusion of its header, so only this
+  // inclusion's record names each interval.
   SmallVector<BalancedDiagnosticPragmaStateIsland, 4> pragmaIslands;
   collectPreservedPragmaStateIntervals(
       model_, state.headerText, gapBegin, gapEnd,
       [&](const RefoldModel::PragmaDirective &pragma) {
-        return paths_.PathsEqual(pragma.sitePath, state.file);
+        return paths_.PathsEqual(pragma.sitePath, state.file) &&
+               pragma.ownerIncludeId &&
+               *pragma.ownerIncludeId == state.include.id;
       },
       pragmaIslands, lexLang_);
   for (const BalancedDiagnosticPragmaStateIsland &island : pragmaIslands) {

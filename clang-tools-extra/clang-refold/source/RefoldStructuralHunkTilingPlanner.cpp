@@ -3714,10 +3714,9 @@ private:
           aBoundary, bBoundary));
     }
 
-    // Pragma candidates are narrowed by path only: the binding below resolves
-    // the include occurrence from segment facts rather than trusting the
-    // serialized one, so an occurrence-keyed lookup would hide exactly the
-    // records it is there to recover.
+    // Pragma candidates are narrowed by path only: an ownerless record, from a
+    // map older than the owner field, is bound to its occurrence through
+    // segment facts below, and an occurrence-keyed lookup would hide it.
     const ArrayRef<RefoldModel::PragmaDirective> pragmas =
         deps_.model.GetPragmas();
     for (uint32_t index : pragmaGapIndex_.RecordsWithSiteBeginInRange(
@@ -3740,19 +3739,12 @@ private:
           gapSource, pragma.sitePath, pragma.siteB, pragma.siteE);
       if (!identity)
         continue;
-      if (pragma.ownerIncludeId &&
-          *pragma.ownerIncludeId != identity->includeId.value_or(
-                                        std::numeric_limits<uint64_t>::max()) &&
-          !identity->includeId) {
+      // The producer records a pragma once per inclusion of its header, so a
+      // record owned by another occurrence is that occurrence's event over
+      // the same bytes, not this gap's.
+      if (pragma.ownerIncludeId && pragma.ownerIncludeId != identity->includeId)
         continue;
-      }
 
-      // A header pragma item describes a physical directive, not necessarily
-      // a unique replay occurrence.  When segment facts prove that this
-      // source gap belongs to a concrete repeated include instance, bind the
-      // state-gap closure to that occurrence even if the serialized
-      // owner_include_id names another replay of the same physical pragma.
-      // The segment-derived identity is the stronger proof here.
       gaps.push_back(MakeStateGapEdge(
           Owner::PragmaIsland(pragma.id, identity->condArmId),
           OwnerSourceRange::From(pragma.sitePath, pragma.siteB, pragma.siteE,
