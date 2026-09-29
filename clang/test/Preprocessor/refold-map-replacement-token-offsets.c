@@ -46,16 +46,20 @@
 // CHECK-NEXT:   }
 // CHECK-NEXT: ],
 
-// The physical-extent scan does not model a block comment that crosses a
-// newline, so SPLIT has no extent, and its tokens get no ranges either.
+// SPLIT's block comment crosses a newline, and its only token follows it.  The
+// extent runs to where Clang's lexer stands after the directive, so it covers
+// both physical lines, and `x` gets its range at 99.
 
 // CHECK:      "name": "SPLIT",
-// CHECK-NOT:  "directive_line_b"
+// CHECK:      "directive_line_b": 55,
+// CHECK-NEXT: "directive_line_e": 101,
 // CHECK:      "replacement_tokens": [
 // CHECK-NEXT:   {
 // CHECK-NEXT:     "kind": "param_ref",
 // CHECK-NEXT:     "param_index": 0,
-// CHECK-NEXT:     "spelling": "x"
+// CHECK-NEXT:     "spelling": "x",
+// CHECK-NEXT:     "site_b": 99,
+// CHECK-NEXT:     "site_e": 100
 // CHECK-NEXT:   }
 // CHECK-NEXT: ],
 

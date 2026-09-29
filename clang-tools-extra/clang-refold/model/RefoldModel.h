@@ -811,16 +811,15 @@ public:
     /// Inclusive physical source-byte offset of the directive's `#` introducer.
     ///
     /// Together with `directiveLineE` this is the producer's record of the
-    /// directive's complete physical spelling, spanning every
-    /// translation-phase-2 splice.  The pair is present or absent as a unit,
-    /// and it is absent in maps written before the producer recorded it;
-    /// consumers must then fall back to recovering the interval from `text`,
-    /// which cannot succeed for a directive whose source spelling is not
-    /// canonical.
-    std::optional<uint64_t> directiveLineB;
-    /// Exclusive physical source-byte offset one past the directive's logical
-    /// line, including its terminating newline when the file has one.
-    std::optional<uint64_t> directiveLineE;
+    /// directive's complete physical spelling, spanning every splice and block
+    /// comment that continues it.  The parser guarantees
+    /// `directiveLineB < directiveLineE` and that the pair contains
+    /// [`siteB`, `siteE`); a map that violates either is rejected.
+    uint64_t directiveLineB = 0;
+    /// Exclusive physical source-byte offset one past the directive: where
+    /// Clang's lexer stood after the end-of-directive token, which is past the
+    /// terminating newline when the file has one.
+    uint64_t directiveLineE = 0;
     /// Include instance that owns the directive site, or nullopt for TU.
     std::optional<uint64_t> ownerIncludeId;
     /// A-token spans contributed by this directive, when any.

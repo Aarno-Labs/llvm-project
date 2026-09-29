@@ -97,10 +97,10 @@
 //     A #define/#undef directive line (definition), with:
 //       - name: the producer-recorded macro-state key for the directive
 //       - site_path and directive byte range [site_b, site_e) (nullable bounds)
-//       - optional [directive_line_b, directive_line_e): the directive's whole
-//         physical spelling, from its `#` through the end of the logical line
-//         after phase-two splicing.  `text` is rendered from parsed tokens and
-//         so cannot be compared against source bytes; this range can.
+//       - [directive_line_b, directive_line_e): the directive's whole
+//         physical spelling, from its `#` to where Clang's lexer stood after
+//         the end-of-directive token.  `text` is rendered from parsed tokens
+//         and so cannot be compared against source bytes; this range can.
 //       - spans[]: A-token spans this directive contributed to (may be empty)
 //       - optional owner_include_id to disambiguate repeated header instances
 //       - function_like for #define shape, def_params for a function-like
@@ -1502,7 +1502,9 @@ static constexpr const char *RefoldSchema = R"json(
         "spans",
         "site_path",
         "site_b",
-        "site_e"
+        "site_e",
+        "directive_line_b",
+        "directive_line_e"
       ],
       "additionalProperties": false,
       "properties": {
@@ -1568,12 +1570,12 @@ static constexpr const char *RefoldSchema = R"json(
         "directive_line_b": {
           "type": "integer",
           "minimum": 0,
-          "description": "Begin byte offset of the directive's complete physical spelling within 'site_path': the '#' introducer Clang tokenized for this directive. Unlike site_b, which is anchored on the macro name token, this is the first byte a consumer must preserve to keep the directive. Optional; emitted only together with directive_line_e, and only when the producer's self-consistency checks passed. Older maps omit both, and consumers must then recover the interval from 'text'."
+          "description": "Begin byte offset of the directive's complete physical spelling within 'site_path': the '#' introducer Clang tokenized for this directive. Unlike site_b, which is anchored on the macro name token, this is the first byte a consumer must preserve to keep the directive. Required: 'text' is a canonical rendering, so no consumer can recover the interval from it."
         },
         "directive_line_e": {
           "type": "integer",
           "minimum": 0,
-          "description": "End byte offset (exclusive) of the directive's complete physical spelling within 'site_path': one past the terminating newline of the logical line reached after every translation-phase-2 backslash-newline splice. For a backslash-continued directive this is strictly greater than site_e, which stops at the first physical newline. Optional; emitted only together with directive_line_b."
+          "description": "End byte offset (exclusive) of the directive's complete physical spelling within 'site_path': where Clang's lexer stood after reading the end-of-directive token, i.e. one past the terminating newline, or the end of the file. Unlike site_e, which stops at the first physical newline, this covers every splice and block comment that continues the directive. Required."
         },
         "owner_include_id": {
           "type": "integer",

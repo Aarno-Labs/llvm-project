@@ -849,9 +849,8 @@ MacroStateRepairContext::MacroDirectiveFullSourceInterval(
 /// emitted payload for a directive and re-emitting one need the real spelling,
 /// which the producer's recorded physical extent identifies exactly.
 ///
-/// The defining file is read on first use and cached.  A map without the
-/// extent, or a file that cannot be read, falls back to the recorded text and
-/// therefore to the previous behaviour.
+/// The defining file is read on first use and cached.  A file that cannot be
+/// read, or whose bytes end before the extent, falls back to the recorded text.
 StringRef MacroStateRepairContext::ExactDirectiveSourceText(
     const RefoldModel::MacroDirective &directive) const {
   auto cached = exactDirectiveSourceText_.find(directive.id);
@@ -859,9 +858,7 @@ StringRef MacroStateRepairContext::ExactDirectiveSourceText(
     return cached->second;
 
   std::string text = directive.text.str();
-  if (directive.directiveLineB && directive.directiveLineE &&
-      *directive.directiveLineB < *directive.directiveLineE &&
-      !directive.sitePath.empty()) {
+  if (!directive.sitePath.empty()) {
     StringRef bytes;
     std::unique_ptr<llvm::MemoryBuffer> owned;
     if (PathIdentity().PathsEqual(directive.sitePath, tuPath_)) {
@@ -871,10 +868,9 @@ StringRef MacroStateRepairContext::ExactDirectiveSourceText(
       owned = std::move(*bufOrErr);
       bytes = owned->getBuffer();
     }
-    if (*directive.directiveLineE <= bytes.size()) {
-      text = bytes.slice(*directive.directiveLineB, *directive.directiveLineE)
-                 .str();
-    }
+    if (directive.directiveLineE <= bytes.size())
+      text =
+          bytes.slice(directive.directiveLineB, directive.directiveLineE).str();
   }
 
   return exactDirectiveSourceText_.try_emplace(directive.id, std::move(text))
@@ -1548,12 +1544,8 @@ bool MacroStateRepairContext::AuthorizeMaterializedDefinitionTransitions() {
       if (state.definition->ownerIncludeId)
         context.ownerId = *state.definition->ownerIncludeId;
       context.sourcePath = state.definition->sitePath;
-      context.sourceBegin = state.definition->directiveLineB
-                                ? *state.definition->directiveLineB
-                                : state.definition->siteB;
-      context.sourceEnd = state.definition->directiveLineE
-                              ? *state.definition->directiveLineE
-                              : state.definition->siteE;
+      context.sourceBegin = state.definition->directiveLineB;
+      context.sourceEnd = state.definition->directiveLineE;
       TerminalSink().RequestTerminalFallback(
           MakeTerminalFallbackProofFailure(
               TerminalFallbackObligationKind::EmissionEditSetComposable,

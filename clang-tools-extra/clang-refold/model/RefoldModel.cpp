@@ -1202,15 +1202,13 @@ parseIncludeItem(const json::Object &obj, StringRef skStr,
 /// the ranges ascend without overlap from the end of the macro name to the end
 /// of the directive's recorded physical extent.
 static bool replacementTokenSourcesAreConsistent(const MacroDirective &md) {
-  if (!md.directiveLineE)
-    return false;
   uint64_t cursor = md.siteB + md.name.size();
   for (const MacroReplacementToken &token : md.replacementTokens) {
     if (!token.source || token.source->begin < cursor)
       return false;
     cursor = token.source->end;
   }
-  return cursor <= *md.directiveLineE;
+  return cursor <= md.directiveLineE;
 }
 
 /// Parse one `#define` / `#undef` item.
@@ -1261,20 +1259,27 @@ parseMacroDirectiveItem(const json::Object &obj, StringRef skStr,
   md.siteB = *asOptUInt64(obj, "site_b");
   md.siteE = *asOptUInt64(obj, "site_e");
 
-  // Optional producer-recorded physical extent of the whole directive
-  // spelling.  Accept it only as a well-formed pair that also contains
-  // the name-anchored site range: those are two independent producer
-  // measurements of one directive, and a map where they disagree is not
-  // evidence of anything.  A partial or inconsistent record is dropped
-  // rather than repaired, which leaves the pre-existing text-based
-  // recovery path in charge.
-  std::optional<uint64_t> directiveLineB = asOptUInt64(obj, "directive_line_b");
-  std::optional<uint64_t> directiveLineE = asOptUInt64(obj, "directive_line_e");
-  if (directiveLineB && directiveLineE && *directiveLineB < *directiveLineE &&
-      *directiveLineB <= md.siteB && md.siteE <= *directiveLineE) {
-    md.directiveLineB = directiveLineB;
-    md.directiveLineE = directiveLineE;
-  }
+  // Producer-recorded physical extent of the whole directive spelling.  It
+  // must be a well-formed pair that also contains the name-anchored site
+  // range: those are two independent producer measurements of one directive,
+  // and a map where they disagree is not evidence of anything.  The directive
+  // text is a canonical rendering that no consumer can place in the source,
+  // so there is nothing to fall back on and the map is rejected.
+  if (Error err = readRequiredField(md.directiveLineB, asUInt64, obj,
+                                    "directive_line_b", ctxItem))
+    return std::move(err);
+  if (Error err = readRequiredField(md.directiveLineE, asUInt64, obj,
+                                    "directive_line_e", ctxItem))
+    return std::move(err);
+  if (md.directiveLineB >= md.directiveLineE || md.directiveLineB > md.siteB ||
+      md.siteE > md.directiveLineE)
+    return createStringError(
+        inconvertibleErrorCode(),
+        "Directive extent [%llu,%llu) does not contain site [%llu,%llu) at %s",
+        static_cast<unsigned long long>(md.directiveLineB),
+        static_cast<unsigned long long>(md.directiveLineE),
+        static_cast<unsigned long long>(md.siteB),
+        static_cast<unsigned long long>(md.siteE), ctxItem.c_str());
 
   // Optional producer-owned replay data for #define directives.
   // #undef records intentionally keep these vectors empty: their only

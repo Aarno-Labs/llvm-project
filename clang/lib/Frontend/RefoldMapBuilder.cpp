@@ -2007,74 +2007,34 @@ RefoldMapBuilder::computeDirectiveLine(SourceLocation HashLoc) {
   return {{B, E}};
 }
 
-// Return one past the end of the complete logical line containing `Offset`.
-//
-// Translation phase 2 deletes a backslash-newline pair and splices the next
-// physical line on, so the logical line ends at the first physical newline that
-// is *not* spliced.  Clang additionally splices a backslash separated from its
-// newline by horizontal whitespace, so membership is decided by
-// Lexer::getEscapedNewLineSize() rather than by testing for a backslash
-// immediately before the newline.  Reusing Clang's own predicate is what lets a
-// recorded extent agree with an independent lexical scan of the same bytes.
-//
-// The scan is byte-domain and therefore does not model a block comment that
-// crosses a physical newline inside a directive.  Such a directive reports a
-// short extent, which the consumer's agreement check rejects; the failure
-// direction is a lost preservation, never a range that overruns the directive.
-static size_t logicalLineEndAtOffset(StringRef S, size_t Offset) {
-  const size_t N = S.size();
-  size_t P = Offset;
-  while (P < N) {
-    if (S[P] == '\\') {
-      // getEscapedNewLineSize() expects a pointer just past the backslash and
-      // relies on the buffer's null terminator to stop at end-of-file.
-      if (unsigned Splice = Lexer::getEscapedNewLineSize(S.data() + P + 1)) {
-        P += 1 + Splice;
-        continue;
-      }
-      ++P;
-      continue;
-    }
-    if (S[P] == '\n')
-      return P + 1;
-    if (S[P] == '\r')
-      return (P + 1 < N && S[P + 1] == '\n') ? P + 2 : P + 1;
-    ++P;
-  }
-  return N;
-}
-
 std::optional<std::pair<uint64_t, uint64_t>>
 RefoldMapBuilder::computeCurrentMacroStateDirectivePhysicalExtent(
     SourceLocation MacroNameLoc) {
-  const SourceLocation HashLoc =
-      SM.getFileLoc(PP.getCurrentDirectiveIntroducerLoc());
-  const SourceLocation NameLoc = SM.getFileLoc(MacroNameLoc);
-  if (!HashLoc.isValid() || !NameLoc.isValid())
+  // Clang reports a #define or #undef only after reading the directive's
+  // end-of-directive token, so the lexer already stands on the first byte past
+  // the directive, as it does for an include.  `Lexer` is the only concrete
+  // PreprocessorLexer, and only it exposes its position publicly.
+  PreprocessorLexer *DirectiveLexer = PP.getCurrentLexer();
+  if (!DirectiveLexer)
+    return std::nullopt;
+  const SourceLocation IntroducerLoc = PP.getCurrentDirectiveIntroducerLoc();
+  std::optional<std::pair<uint64_t, uint64_t>> Extent = computeDirectiveExtent(
+      IntroducerLoc, static_cast<Lexer *>(DirectiveLexer)->getSourceLocation());
+  if (!Extent)
     return std::nullopt;
 
   // The introducer is only meaningful for this record when Clang published it
-  // for the very directive that is defining or undefining this macro name.  A
-  // different file means the side channel was observed outside its window.
-  const FileID FID = SM.getFileID(NameLoc);
-  if (SM.getFileID(HashLoc) != FID)
+  // for the very directive that is defining or undefining this macro name, so
+  // the name must be spelled inside the extent, in the same file.  A different
+  // file means the side channel was observed outside its window.
+  const SourceLocation NameLoc = SM.getFileLoc(MacroNameLoc);
+  if (!NameLoc.isValid() ||
+      SM.getFileID(NameLoc) != SM.getFileID(SM.getFileLoc(IntroducerLoc)))
     return std::nullopt;
-
-  bool Invalid = false;
-  StringRef Buf = SM.getBufferData(FID, &Invalid);
-  if (Invalid)
+  const uint64_t NameOffset = SM.getFileOffset(NameLoc);
+  if (NameOffset <= Extent->first || NameOffset >= Extent->second)
     return std::nullopt;
-
-  const size_t HashOffset = SM.getFileOffset(HashLoc);
-  const size_t NameOffset = SM.getFileOffset(NameLoc);
-  if (HashOffset >= NameOffset || NameOffset >= Buf.size())
-    return std::nullopt;
-
-  const size_t End = logicalLineEndAtOffset(Buf, HashOffset);
-  if (NameOffset >= End)
-    return std::nullopt;
-
-  return {{HashOffset, End}};
+  return Extent;
 }
 
 std::optional<std::pair<uint64_t, uint64_t>>
@@ -2638,18 +2598,17 @@ void RefoldMapBuilder::onMacroDefined(const Token &MacroNameTok,
   // continuations, and no transform recovers those bytes from it.
   //
   // A recorded extent must contain the narrow name-anchored site range, which
-  // is the producer's independent measurement of the same directive.  A short
-  // logical-line scan cannot silently widen protection past what Clang
-  // consumed: it fails the containment check instead, and the field is then
-  // omitted.
+  // is the producer's independent measurement of the same directive.  An
+  // extent that failed to contain it would belong to some other directive, and
+  // the field is then omitted.
   if (auto Physical = computeCurrentMacroStateDirectivePhysicalExtent(
           MI->getDefinitionLoc())) {
     const bool ContainsSite = !Line || (Physical->first <= Line->first &&
                                         Line->second <= Physical->second);
 
     // getDefinitionEndLoc() names the last replacement-list token, a fact taken
-    // from the parsed definition rather than from the line scan.  An extent
-    // that ended before it would not describe the whole definition.
+    // from the parsed definition rather than from the lexer position.  An
+    // extent that ended before it would not describe the whole definition.
     bool ContainsDefinitionEnd = true;
     const SourceLocation DefBegin = SM.getFileLoc(MI->getDefinitionLoc());
     const SourceLocation DefEnd = SM.getFileLoc(MI->getDefinitionEndLoc());

@@ -595,17 +595,16 @@ static void bindMacroDirectives(const RefoldModel &model,
 
     // A producer-recorded physical extent and this scanner measure the same
     // thing by two independent routes: Clang's own directive introducer token
-    // plus its escaped-newline predicate, against a language-mode-aware lexical
-    // scan of the file bytes.  Requiring exact agreement is what keeps the
+    // plus the lexer position past the directive, against a language-mode-aware
+    // lexical scan of the file bytes.  Requiring exact agreement keeps the
     // recorded extent a fact rather than a second opinion, and it is checked
     // here because this is the only place both are in hand.
     //
     // The recorded begin is the `#` itself, so it is compared against
     // introducerBegin rather than against the lexical interval begin, which
     // also covers any leading trivia on the logical-line prefix.
-    if (modelDirective.directiveLineB && modelDirective.directiveLineE &&
-        (recovered->begin != scanned.introducerBegin ||
-         recovered->end != scanned.interval.end)) {
+    if (recovered->begin != scanned.introducerBegin ||
+        recovered->end != scanned.interval.end) {
       diagnostics.push_back(
           llvm::formatv("macro directive id={0} recorded physical extent "
                         "[{1},{2}) disagrees with the scanned logical line "
@@ -921,23 +920,14 @@ static bool intervalLess(const PreprocessingStructureInterval &lhs,
 
 } // namespace
 
-/// Recover the complete physical source interval for a recorded macro-state
+/// Return the complete physical source interval of a recorded macro-state
 /// directive line.
 ///
-/// When the producer recorded the directive's physical extent, that pair *is*
-/// the interval and is returned directly.  Otherwise the interval is recovered
-/// from the recorded spelling: MacroDirective::siteB is anchored at the macro
-/// name rather than at the `#`, so this reparses MacroDirective::text to find
-/// the name offset, translates that anchor back to the line start, and accepts
-/// the result only if the file bytes there equal the recorded text exactly.
-///
-/// The two paths are not interchangeable in strength.  MacroDirective::text is
-/// rendered from parsed macro tokens with canonical spacing, so the text
-/// comparison is a proof only for a directive whose source spelling already
-/// matches that rendering; it necessarily fails for tabs, runs of spaces, and
-/// backslash continuations, and no transform recovers the source bytes from a
-/// pretty-printer's output.  The recorded extent replaces that inference with a
-/// fact and therefore does not need the comparison.
+/// The interval is the producer's recorded physical extent: Clang's directive
+/// introducer through where its lexer stood after the end-of-directive token.
+/// MacroDirective::text cannot stand in for it, because it is rendered from
+/// parsed macro tokens with canonical spacing and no transform recovers the
+/// source bytes from a pretty-printer's output.
 std::optional<MacroStateDirectiveLineInterval>
 recoverMacroStateDirectiveLineInterval(
     const RefoldPathIdentity &paths,
@@ -945,7 +935,7 @@ recoverMacroStateDirectiveLineInterval(
     StringRef fileBytes, std::optional<uint64_t> requiredOwnerIncludeId) {
   if (!directive.IsMacroStateDirective())
     return std::nullopt;
-  if (directive.name.empty() || directive.text.empty())
+  if (directive.name.empty())
     return std::nullopt;
   if (!paths.PathsEqual(directive.sitePath, expectedPath))
     return std::nullopt;
@@ -958,60 +948,16 @@ recoverMacroStateDirectiveLineInterval(
     return std::nullopt;
   }
 
-  // Producer-recorded physical extent.  The model parser already proved the
-  // pair is ordered and contains the name-anchored site range; only its fit to
-  // these particular file bytes remains to be checked here, because the caller
-  // supplies the buffer.
-  if (directive.directiveLineB && directive.directiveLineE) {
-    if (*directive.directiveLineE > fileBytes.size())
-      return std::nullopt;
-
-    MacroStateDirectiveLineInterval recorded;
-    recorded.directive = &directive;
-    recorded.begin = *directive.directiveLineB;
-    recorded.end = *directive.directiveLineE;
-    recorded.name = directive.name;
-    return recorded;
-  }
-
-  StringRef text = directive.text;
-  size_t pos = 0;
-  stringutils::skipNonNewlineWs(text, pos);
-  if (pos >= text.size() || text[pos] != '#')
-    return std::nullopt;
-  ++pos;
-  stringutils::skipNonNewlineWs(text, pos);
-
-  StringRef keyword = directive.subkind.drop_front();
-  if (!text.substr(pos).starts_with(keyword))
-    return std::nullopt;
-  pos += keyword.size();
-  if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-    return std::nullopt;
-  stringutils::skipNonNewlineWs(text, pos);
-
-  const size_t nameTextBegin = pos;
-  if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
-    return std::nullopt;
-  ++pos;
-  while (pos < text.size() && stringutils::isIdentPart(text[pos]))
-    ++pos;
-  if (text.slice(nameTextBegin, pos) != directive.name)
-    return std::nullopt;
-
-  if (directive.siteB < nameTextBegin)
-    return std::nullopt;
-  const uint64_t fileBegin = directive.siteB - nameTextBegin;
-  const uint64_t fileEnd = fileBegin + text.size();
-  if (fileBegin >= fileEnd || fileEnd > fileBytes.size())
-    return std::nullopt;
-  if (fileBytes.slice(fileBegin, fileEnd) != text)
+  // The model parser already proved the pair is ordered and contains the
+  // name-anchored site range; only its fit to these particular file bytes
+  // remains to be checked here, because the caller supplies the buffer.
+  if (directive.directiveLineE > fileBytes.size())
     return std::nullopt;
 
   MacroStateDirectiveLineInterval result;
   result.directive = &directive;
-  result.begin = fileBegin;
-  result.end = fileEnd;
+  result.begin = directive.directiveLineB;
+  result.end = directive.directiveLineE;
   result.name = directive.name;
   return result;
 }

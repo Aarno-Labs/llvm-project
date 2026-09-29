@@ -802,27 +802,31 @@ class RefoldMapBuilder {
   /// Clang is handling right now.
   ///
   /// The returned half-open byte range starts at the `#` token Clang tokenized
-  /// as this directive's introducer and ends one past the terminating newline
-  /// of the logical line reached after every translation-phase-2 splice.  A
-  /// backslash-continued `#define` therefore reports its whole span rather than
-  /// stopping at its first physical newline, which is what
-  /// computeDirectiveLine() reports for the same directive.
+  /// as this directive's introducer and ends where Clang's lexer stands once
+  /// the directive handler has read the end-of-directive token: one past the
+  /// newline that ends the directive, or the end of its file.  A `#define`
+  /// continued by a line splice or by a block comment that crosses a newline
+  /// therefore reports its whole span rather than stopping at its first
+  /// physical newline, which is what computeDirectiveLine() reports for the
+  /// same directive.
   ///
   /// This is recorded as a fact rather than reconstructed later: the introducer
   /// comes from Preprocessor::getCurrentDirectiveIntroducerLoc() and the end
-  /// comes from Clang's own escaped-newline predicate, so no consumer has to
+  /// from the lexer through computeDirectiveExtent(), so no consumer has to
   /// recover the extent from a rendered directive spelling.
   ///
   /// \param MacroNameLoc spelling location of the directive's macro name token,
   ///        used to prove the introducer and the extent describe one directive.
   /// \returns (begin, end) in the directive's source file, or nullopt when any
   ///          self-consistency check fails, in which case the field is omitted
-  ///          and consumers keep their pre-existing recovery path.
+  ///          and a consumer rejects the map: the rendered directive text
+  ///          cannot stand in for the source bytes.
   std::optional<std::pair<uint64_t, uint64_t>>
   computeCurrentMacroStateDirectivePhysicalExtent(SourceLocation MacroNameLoc);
 
   /// Return the complete physical extent of a directive whose handler has read
-  /// its end-of-directive token: a `#line` or GNU line marker, or an include.
+  /// its end-of-directive token: a `#line` or GNU line marker, an include, or
+  /// a `#define` or `#undef`.
   ///
   /// \p HashLoc is the directive introducer and \p EndLoc is where Clang's
   /// lexer stands once it has read the directive's end-of-directive token.

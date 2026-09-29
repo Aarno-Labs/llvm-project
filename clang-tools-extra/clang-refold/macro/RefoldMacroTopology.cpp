@@ -14,12 +14,10 @@
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
 #include "support/RefoldLog.h"
-#include "support/StringUtils.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -201,8 +199,6 @@ void RefoldMacroTopology::BuildDefineDirectiveIndex() const {
   // Mark the index built before populating it so this block remains a one-shot
   // cache initializer for the current model instance.
   definesIndexBuilt_ = true;
-  defineFileTextCache_.clear();
-  defineEndCache_.clear();
   definesByAbsPath_.clear();
 
   for (const auto &d : model_.GetMacroDirectives()) {
@@ -215,62 +211,13 @@ void RefoldMacroTopology::BuildDefineDirectiveIndex() const {
     if (d.sitePath.empty())
       continue;
 
-    uint64_t defineEnd = d.siteE;
-
-    auto itEnd = defineEndCache_.find(d.id);
-    if (itEnd != defineEndCache_.end()) {
-      defineEnd = itEnd->second;
-    } else {
-      const std::string absPath = ToAbsolutePath(d.sitePath);
-
-      auto itTxt = defineFileTextCache_.find(absPath);
-      if (itTxt == defineFileTextCache_.end()) {
-        auto bufOrErr = MemoryBuffer::getFile(absPath);
-        if (!bufOrErr) {
-          // Best effort: keep the producer-provided one-line extent if the
-          // replay-time source file cannot be loaded.
-          defineEndCache_[d.id] = d.siteE;
-          defineEnd = d.siteE;
-        } else {
-          defineFileTextCache_[absPath] = (**bufOrErr).getBuffer().str();
-          itTxt = defineFileTextCache_.find(absPath);
-        }
-      }
-
-      if (itTxt != defineFileTextCache_.end()) {
-        StringRef bytes(itTxt->second);
-
-        // Begin scanning at the directive start, clamped defensively in case
-        // the producer offset is outside the replay-time source buffer.
-        uint64_t i = d.siteB;
-        if (i > bytes.size())
-          i = bytes.size();
-
-        // Walk physical lines until reaching a newline that is not escaped by a
-        // C line splice.  Every escaped newline keeps the macro definition's
-        // logical replacement list alive on the next physical line.
-        while (i < bytes.size()) {
-          size_t nl = bytes.find('\n', static_cast<size_t>(i));
-          if (nl == StringRef::npos) {
-            i = bytes.size();
-            break;
-          }
-
-          i = static_cast<uint64_t>(nl + 1);
-          if (!stringutils::isLineSplice(bytes, nl))
-            break;
-        }
-
-        defineEnd = i;
-        defineEndCache_[d.id] = defineEnd;
-      }
-    }
-
-    // Store the widened extent under the replay-time absolute path used for
-    // lookup.  The interval is half-open: [siteB, defineEnd).
-    const std::string absPath = ToAbsolutePath(d.sitePath);
-    definesByAbsPath_[absPath].push_back(
-        DefineDirectiveExtent{d.siteB, defineEnd});
+    // The producer's extent ends where Clang's lexer stood after the
+    // definition's end-of-directive token, so it covers every splice and block
+    // comment that continues the replacement list onto a later physical line.
+    // Store it under the replay-time absolute path used for lookup.  The
+    // interval is half-open: [siteB, directiveLineE).
+    definesByAbsPath_[ToAbsolutePath(d.sitePath)].push_back(
+        DefineDirectiveExtent{d.siteB, d.directiveLineE});
   }
 
   // Keep each per-file extent list ordered so containment queries remain

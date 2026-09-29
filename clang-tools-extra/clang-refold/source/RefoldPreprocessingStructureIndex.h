@@ -137,15 +137,13 @@ struct PreprocessingStructureInterval {
 /// MacroDirective::siteB is anchored at the macro name, not necessarily at the
 /// beginning of the physical directive line, and it stops at the first physical
 /// newline.  This witness records the validated interval for the whole
-/// directive spelling: the producer-recorded physical extent when the map
-/// carries it, and otherwise the interval recovered from the recorded directive
-/// text.
+/// directive spelling: the producer-recorded physical extent.
 ///
-/// `[begin,end)` spans the directive from its `#` through the end of its
-/// logical line, so it may cover several physical lines when the spelling is
-/// backslash-continued.  It is not in general `directive->text.size()` bytes
-/// long: the recorded text is a canonical rendering of the parsed definition,
-/// not a slice of the source.
+/// `[begin,end)` spans the directive from its `#` to where Clang's lexer stood
+/// after the end-of-directive token, so it may cover several physical lines
+/// when a splice or a block comment continues the spelling.  It is not in
+/// general `directive->text.size()` bytes long: the recorded text is a
+/// canonical rendering of the parsed definition, not a slice of the source.
 struct MacroStateDirectiveLineInterval {
   const RefoldModel::MacroDirective *directive = nullptr;
   uint64_t begin = 0;
@@ -162,12 +160,8 @@ struct MacroStateDirectiveLineInterval {
 /// the requested include-owner instance, and have a producer-recorded macro
 /// name.
 ///
-/// The extent itself comes from whichever evidence the map carries.  A
-/// producer-recorded physical extent is returned as the interval directly,
-/// bounds-checked against \p fileBytes.  Without one, the interval is
-/// reconstructed from the macro-name anchor and admitted only when those file
-/// bytes exactly equal MacroDirective::text, which restricts the legacy path
-/// to directives already spelled the way Clang renders them.
+/// The extent itself is the producer-recorded physical extent, returned as the
+/// interval directly once it is bounds-checked against \p fileBytes.
 std::optional<MacroStateDirectiveLineInterval>
 recoverMacroStateDirectiveLineInterval(
     const RefoldPathIdentity &paths,

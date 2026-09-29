@@ -231,14 +231,6 @@ private:
       pragmaExpansionAncestorsByGap_;
   llvm::DenseSet<uint64_t> unresolvedPragmaExpansionGaps_;
 
-  /// Per-run source-text cache used while building #define containment extents.
-  /// It is intentionally not process-global because the producer working
-  /// directory and directive spellings are model-specific.
-  mutable llvm::StringMap<std::string> defineFileTextCache_;
-
-  /// Cache widened #define end offsets by producer directive ID.
-  mutable llvm::DenseMap<uint64_t, uint64_t> defineEndCache_;
-
   /// Index of widened #define extents keyed by replay-time absolute source
   /// path.
   mutable llvm::StringMap<std::vector<DefineDirectiveExtent>> definesByAbsPath_;
