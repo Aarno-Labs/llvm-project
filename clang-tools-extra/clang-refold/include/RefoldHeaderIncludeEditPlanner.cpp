@@ -1275,6 +1275,14 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
   const uint64_t fullLo = std::max(state.materialAStart, state.coverBegin);
   const uint64_t fullHi = std::min(state.materialAEnd, state.coverEnd);
 
+  // The mapped-token range covers only the material inside the owning
+  // declaration, and the edit replaces it with the whole B payload.  Material
+  // inside this include's cover but outside that declaration would be left
+  // behind as stale source (`int before = 10, M() int after`), so only the
+  // full source envelope below can admit the patch.
+  const bool declClipLeavesIncludeMaterial =
+      state.decl && (fullLo < state.ppLo || state.ppHi < fullHi);
+
   // Build one immutable occurrence-local structure inventory for every source
   // theorem in this candidate.  Conditional-wrapper classification and all
   // inter-piece gap proofs must observe the same raw-lexer census; rebuilding
@@ -1469,8 +1477,8 @@ bool RefoldHeaderIncludeEditPlanner::TryApplyDeleteReplaceSourceEnvelope(
       (hasPartialChildIncludeOverlap || hasPartialMacroInvocationOverlap ||
        hasPartialConditionalGroupOverlap);
   const bool mustUseFullHeaderEnvelope =
-      hasCompleteChildIncludePiece || hasCompleteMacroInvocationPiece ||
-      hasCompleteConditionalGroupPiece ||
+      declClipLeavesIncludeMaterial || hasCompleteChildIncludePiece ||
+      hasCompleteMacroInvocationPiece || hasCompleteConditionalGroupPiece ||
       fullHeaderEnvelopeBlockedByPartialOverlap;
 
   if (shouldTryFullHeaderEnvelope &&
