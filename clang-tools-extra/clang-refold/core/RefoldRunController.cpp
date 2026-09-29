@@ -388,6 +388,32 @@ takeTerminalCarrier(std::string carrier,
       static_cast<unsigned long long>(requests.size()));
 }
 
+/// Build the closing assembly check for one run, or return why it cannot be
+/// built.
+///
+/// Each failure is kept rather than consumed: under `fatal` a missing check
+/// fails the run, and the failure has to say what was missing.
+static Expected<RefoldFinalAssemblyVerifier>
+buildAssemblyVerifier(const json::Object &rootJson, StringRef bSource,
+                      bool noLines, bool strict,
+                      ArrayRef<std::string> verifyIncludeDirs) {
+  auto ctxOrErr = RefoldModel::ParsePreprocessContext(rootJson);
+  if (!ctxOrErr)
+    return ctxOrErr.takeError();
+  auto sourceOrErr = RefoldModel::ParseSourcePath(rootJson);
+  if (!sourceOrErr)
+    return sourceOrErr.takeError();
+  const std::optional<std::string> anchor =
+      producerSourceAnchorPath(*sourceOrErr, *ctxOrErr);
+  if (!anchor)
+    return createStringError(
+        inconvertibleErrorCode(),
+        "the producer's source path could not be resolved");
+  return RefoldFinalAssemblyVerifier::Create(rootJson, *ctxOrErr, bSource,
+                                             noLines, strict, *anchor,
+                                             verifyIncludeDirs);
+}
+
 Expected<std::string> refoldTranslationUnit(
     const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
     ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
@@ -406,8 +432,8 @@ Expected<std::string> refoldTranslationUnit(
 
   // Build the closing assembly check before the engine runs.  Everything it
   // needs is already here: the producer context, the edited stream, and this
-  // run's relaxation mode.  A verifier that cannot be built simply leaves the
-  // check absent.
+  // run's relaxation mode.  A verifier that cannot be built leaves the check
+  // absent, and the reason is kept for the verdict disposition below.
   //
   // `Off` builds nothing at all: constructing the verifier preprocesses the
   // edited stream, so a caller that does not want the check should not pay for
@@ -420,20 +446,16 @@ Expected<std::string> refoldTranslationUnit(
   // read.  Without that anchor the check is left absent rather than answered
   // wrongly.
   std::optional<RefoldFinalAssemblyVerifier> assemblyVerifier;
+  // Why a requested check could not be built.  Empty when the check exists or
+  // was not requested.
+  std::string assemblyVerifierUnavailable;
   if (verifyMode != OutputVerificationMode::Off) {
-    if (auto ctxOrErr = RefoldModel::ParsePreprocessContext(rootJson)) {
-      if (auto sourceOrErr = RefoldModel::ParseSourcePath(rootJson)) {
-        if (std::optional<std::string> anchor =
-                producerSourceAnchorPath(*sourceOrErr, *ctxOrErr))
-          assemblyVerifier = RefoldFinalAssemblyVerifier::Create(
-              rootJson, *ctxOrErr, bSource, noLines, strict, *anchor,
-              verifyIncludeDirs);
-      } else {
-        consumeError(sourceOrErr.takeError());
-      }
-    } else {
-      consumeError(ctxOrErr.takeError());
-    }
+    Expected<RefoldFinalAssemblyVerifier> verifierOrErr = buildAssemblyVerifier(
+        rootJson, bSource, noLines, strict, verifyIncludeDirs);
+    if (verifierOrErr)
+      assemblyVerifier = std::move(*verifierOrErr);
+    else
+      assemblyVerifierUnavailable = toString(verifierOrErr.takeError());
   }
 
   // Narrowing loop.  Each attempt gets a *fresh* engine rather than re-running
@@ -828,12 +850,18 @@ Expected<std::string> refoldTranslationUnit(
                                  engine.TerminalSink().Requests());
     }
 
-    // Without a verifier the result stands exactly as it would without this
-    // loop.
-    if (!assemblyVerifier)
+    // `Off` builds no check, so no verdict exists to dispose of.
+    if (verifyMode == OutputVerificationMode::Off)
       return out;
 
-    const FinalAssemblyVerdict verdict = assemblyVerifier->Verify(out);
+    // A check that could not be built is a comparison that was never
+    // performed, which is exactly what `Inconclusive` records -- and what a
+    // default-constructed verdict claims.  Disposing of it through the same
+    // table keeps the option's contract in one place: `fatal` fails without a
+    // check just as it fails with one that could not run.
+    const FinalAssemblyVerdict verdict = assemblyVerifier
+                                             ? assemblyVerifier->Verify(out)
+                                             : FinalAssemblyVerdict();
     // Only a proven divergence names a region to narrow, so only `Diverged`
     // reaches the repair ladder below.
     if (verdict.kind != FinalAssemblyVerdictKind::Diverged) {
@@ -846,15 +874,21 @@ Expected<std::string> refoldTranslationUnit(
         // option asking for it.  This is the option's contract, not a
         // soundness claim: the check is defense in depth, and its absence
         // leaves the proof paths exactly as they would be with the check off.
+        const std::string unchecked =
+            assemblyVerifier
+                ? std::string("the refolded source could not be preprocessed "
+                              "for verification")
+                : "the closing check could not be built: " +
+                      assemblyVerifierUnavailable;
         if (DispositionForVerdict(verifyMode, verdict.kind) ==
             FinalAssemblyDisposition::Fail)
           return createStringError(
               std::make_error_code(std::errc::illegal_byte_sequence),
-              "refolded source could not be preprocessed for verification, so "
-              "--verify-output=fatal has nothing to compare it against and "
-              "cannot report it as verified. Re-run with "
-              "--verify-output=repair to take the unchecked result, or with "
-              "--verify-output=off to skip the check");
+              Twine(unchecked) +
+                  "; --verify-output=fatal has nothing to compare the "
+                  "refolded source against and cannot report it as verified. "
+                  "Re-run with --verify-output=repair to take the unchecked "
+                  "result, or with --verify-output=off to skip the check");
 
         // `repair` keeps it.  An inconclusive verdict names no diverging
         // region, so there is nothing for the ladder to expand, and rejecting
@@ -863,9 +897,9 @@ Expected<std::string> refoldTranslationUnit(
         // verification will see it: at debug level the one signal that the
         // check did not happen is indistinguishable from the check passing.
         REFOLD_LOG_WARN("assembly-verify",
-                        "assembly NOT verified: the final source could not be "
-                        "preprocessed for checking, so --verify-output has "
-                        "nothing to compare and the result stands unchecked");
+                        "assembly NOT verified: {0}; --verify-output has "
+                        "nothing to compare and the result stands unchecked",
+                        unchecked);
       } else if (attempt > 0) {
         REFOLD_LOG_INFO("assembly-verify",
                         "verified after {0} narrowing step(s)", attempt);

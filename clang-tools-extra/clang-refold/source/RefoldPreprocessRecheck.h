@@ -31,10 +31,34 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
+#include <cstdint>
 #include <string>
 
 namespace clang {
 namespace refold {
+
+/// Whether a replay enters the producer's command-line forced includes.
+///
+/// `-include <file>` enters <file> ahead of the first byte of the input, so the
+/// producer's preprocessed stream -- and every edited stream derived from it --
+/// already carries that header's tokens.
+enum class ForcedIncludeReplay : uint8_t {
+  /// Enter each forced include ahead of the input, as the producer did.  This
+  /// is the replay of source: the producer's own translation unit, or a
+  /// refold of it.
+  Enter,
+
+  /// Enter none.  This is the replay of an edited preprocessed stream, which
+  /// already holds every forced include's expansion.  Entering them again
+  /// would emit their tokens a second time, and would re-read the header's
+  /// own declarations under the macros it defined: a header may declare a
+  /// function and then define a function-like macro of the same name, and the
+  /// second pass reads that declaration as a malformed invocation.
+  ///
+  /// `-imacros`, `-D` and `-U` contribute macro state but no tokens, so they
+  /// are replayed on both sides as before.
+  Omit
+};
 
 /// Re-invoke the producer-recorded preprocessor on \p inputPath under \p ctx
 /// and return the resulting `-E -P` output bytes.
@@ -48,10 +72,13 @@ namespace refold {
 /// missed.  The ordering is the contract: a replay resolves a header the way the
 /// producer resolved it whenever it can, and reaches a caller-declared directory
 /// only for headers the producer never saw.
-llvm::Expected<std::string>
-preprocessToBytes(llvm::StringRef inputPath,
-                  const RefoldModel::PreprocessContext &ctx,
-                  llvm::ArrayRef<std::string> extraArgs = {});
+///
+/// \p forcedIncludes selects whether the producer's `-include` files are
+/// entered; see `ForcedIncludeReplay`.
+llvm::Expected<std::string> preprocessToBytes(
+    llvm::StringRef inputPath, const RefoldModel::PreprocessContext &ctx,
+    llvm::ArrayRef<std::string> extraArgs = {},
+    ForcedIncludeReplay forcedIncludes = ForcedIncludeReplay::Enter);
 
 /// Build a callback that preprocesses an assembled final source through the
 /// producer-recorded context, using one stable temporary path beside \p
@@ -67,9 +94,13 @@ preprocessToBytes(llvm::StringRef inputPath,
 /// producer-recorded search path can find it.  Where such a header lives is not
 /// derivable from the refold map, so it is declared rather than guessed; each
 /// directory is searched only after every producer-recorded path has missed.
+///
+/// \p forcedIncludes is passed to every `preprocessToBytes()` call the
+/// callback makes: `Omit` for a callback that replays an edited stream.
 FinalSourcePreprocessCallback buildFinalSourcePreprocessCallback(
     llvm::StringRef anchorPath, const RefoldModel::PreprocessContext &ctx,
-    llvm::ArrayRef<std::string> verifyIncludeDirs = {});
+    llvm::ArrayRef<std::string> verifyIncludeDirs = {},
+    ForcedIncludeReplay forcedIncludes = ForcedIncludeReplay::Enter);
 
 /// Build the executable oracle that validates one proposed final-stream
 /// `#line` deletion.

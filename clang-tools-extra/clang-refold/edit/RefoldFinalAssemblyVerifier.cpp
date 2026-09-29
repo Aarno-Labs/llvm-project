@@ -11,7 +11,6 @@
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldPreprocessRecheck.h"
 #include "support/RefoldLangOptions.h"
-#include "support/RefoldLog.h"
 
 #include "llvm/Support/Error.h"
 
@@ -27,7 +26,9 @@ namespace {
 /// Both sides of the comparison go through this one helper so neither can drift
 /// from the other in preprocessing flags, temporary-file placement, or lexer
 /// language options -- a difference in any of those would show up as a token
-/// divergence and be mistaken for an unsound refold.
+/// divergence and be mistaken for an unsound refold.  The one intended
+/// difference is chosen where \p preprocess is built: the edited stream's
+/// replay enters no forced include (`ForcedIncludeReplay::Omit`).
 bool preprocessAndLex(const FinalSourcePreprocessCallback &preprocess,
                       const RefoldModel::PreprocessContext &ctx,
                       StringRef bytes, std::vector<PPTok> &toks,
@@ -63,7 +64,7 @@ void mergeIgnoreMask(std::vector<std::uint8_t> &combined,
 
 } // namespace
 
-std::optional<RefoldFinalAssemblyVerifier> RefoldFinalAssemblyVerifier::Create(
+Expected<RefoldFinalAssemblyVerifier> RefoldFinalAssemblyVerifier::Create(
     const json::Object &rootJson, const RefoldModel::PreprocessContext &ctx,
     StringRef editedStreamBytes, bool noLines, bool strict,
     StringRef scratchNeighborPath, ArrayRef<std::string> verifyIncludeDirs) {
@@ -73,19 +74,21 @@ std::optional<RefoldFinalAssemblyVerifier> RefoldFinalAssemblyVerifier::Create(
   verifier.verifyIncludeDirs_.assign(verifyIncludeDirs.begin(),
                                      verifyIncludeDirs.end());
 
-  const FinalSourcePreprocessCallback preprocess =
+  // The edited stream already carries every forced include's tokens, so its
+  // replay enters none of them; `Verify()` replays the assembly, which is
+  // source, with the producer's forced includes.
+  const FinalSourcePreprocessCallback preprocessEdited =
       buildFinalSourcePreprocessCallback(scratchNeighborPath, ctx,
-                                         verifyIncludeDirs);
+                                         verifyIncludeDirs,
+                                         ForcedIncludeReplay::Omit);
 
   // Preprocess the edited stream once.  This is the fixed side of every later
   // comparison, and it is what makes the relation idempotence rather than
   // equality against the stream as written.
-  if (!preprocessAndLex(preprocess, ctx, editedStreamBytes,
-                        verifier.editedTokens_, verifier.editedTokenOffsets_)) {
-    REFOLD_LOG_DEBUG("assembly-verify",
-                     "unavailable: the edited stream could not be preprocessed");
-    return std::nullopt;
-  }
+  if (!preprocessAndLex(preprocessEdited, ctx, editedStreamBytes,
+                        verifier.editedTokens_, verifier.editedTokenOffsets_))
+    return createStringError(inconvertibleErrorCode(),
+                             "the edited stream could not be preprocessed");
 
   // Relaxations must match `--check` exactly, or this check would reject
   // assemblies that mode accepts.  Both are indexed by the *preprocessed*
@@ -98,10 +101,10 @@ std::optional<RefoldFinalAssemblyVerifier> RefoldFinalAssemblyVerifier::Create(
       // A mask that cannot be built would make location-sensitive builtins
       // compare exactly, which is not this run's contract.  Verifying under the
       // wrong contract is worse than not verifying.
-      consumeError(maskOrErr.takeError());
-      REFOLD_LOG_DEBUG("assembly-verify",
-                       "unavailable: --no-lines relaxation mask unavailable");
-      return std::nullopt;
+      return createStringError(
+          inconvertibleErrorCode(),
+          Twine("the --no-lines relaxation mask could not be built: ") +
+              toString(maskOrErr.takeError()));
     }
   }
   if (!strict) {
@@ -109,10 +112,10 @@ std::optional<RefoldFinalAssemblyVerifier> RefoldFinalAssemblyVerifier::Create(
             rootJson, ctx, verifier.editedTokens_)) {
       mergeIgnoreMask(verifier.ignoreMask_, std::move(*maskOrErr));
     } else {
-      consumeError(maskOrErr.takeError());
-      REFOLD_LOG_DEBUG("assembly-verify",
-                       "unavailable: relaxed stringify mask unavailable");
-      return std::nullopt;
+      return createStringError(
+          inconvertibleErrorCode(),
+          Twine("the relaxed stringify mask could not be built: ") +
+              toString(maskOrErr.takeError()));
     }
   }
 

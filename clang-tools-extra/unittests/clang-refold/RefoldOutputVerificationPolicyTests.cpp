@@ -20,6 +20,11 @@
 // that cannot be created, a header gone between production and verification
 // -- which a lit test cannot stage.
 //
+// A check that could not be built at all is disposed of through the same
+// `Inconclusive` cell, and that route is reachable: an edited stream naming a
+// header no search path finds cannot be preprocessed.  Lit pins it
+// (verify_output_fatal_fails_without_closing_check.c).
+//
 // So the contract is pinned here instead: which disposition each mode
 // requires for each verdict, as one table, so no caller can implement half of
 // it and no new mode or verdict can be added without deciding its cell.

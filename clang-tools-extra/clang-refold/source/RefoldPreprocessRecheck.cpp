@@ -27,6 +27,7 @@
 #include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Lex/Lexer.h"
+#include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Lex/Token.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -75,10 +76,9 @@ void readTempFileForPreprocessRecheck(StringRef path, std::string &out) {
 
 } // namespace
 
-Expected<std::string>
-preprocessToBytes(StringRef inputPath,
-                  const RefoldModel::PreprocessContext &ctx,
-                  ArrayRef<std::string> extraArgs) {
+Expected<std::string> preprocessToBytes(
+    StringRef inputPath, const RefoldModel::PreprocessContext &ctx,
+    ArrayRef<std::string> extraArgs, ForcedIncludeReplay forcedIncludes) {
   // Force an absolute input path so it remains valid after we chdir.
   SmallString<256> absInput(inputPath);
   if (std::error_code ec = sys::fs::make_absolute(absInput)) {
@@ -197,6 +197,12 @@ preprocessToBytes(StringRef inputPath,
                              "failed to parse clang invocation");
   }
 
+  // Dropped from the parsed options rather than from the argv, so the one set
+  // removed is exactly what Clang itself read as `-include`, whatever its
+  // spelling.  See `ForcedIncludeReplay::Omit`.
+  if (forcedIncludes == ForcedIncludeReplay::Omit)
+    ci.getPreprocessorOpts().Includes.clear();
+
   // Be explicit: '-P' should suppress line markers.
   ci.getPreprocessorOutputOpts().ShowLineMarkers = false;
   ci.getFileSystemOpts().WorkingDir = ctx.cwd;
@@ -300,7 +306,8 @@ preprocessedTokensEqualForLinePrune(StringRef currentPP, StringRef candidatePP,
 FinalSourcePreprocessCallback
 buildFinalSourcePreprocessCallback(StringRef anchorPath,
                                    const RefoldModel::PreprocessContext &ctx,
-                                   ArrayRef<std::string> verifyIncludeDirs) {
+                                   ArrayRef<std::string> verifyIncludeDirs,
+                                   ForcedIncludeReplay forcedIncludes) {
   SmallString<256> outputDir(anchorPath);
   sys::path::remove_filename(outputDir);
   if (outputDir.empty())
@@ -317,8 +324,8 @@ buildFinalSourcePreprocessCallback(StringRef anchorPath,
     extraArgs.push_back(dir);
   }
 
-  return [modelText, ctx,
-          extraArgs](StringRef finalSource) -> std::optional<std::string> {
+  return [modelText, ctx, extraArgs,
+          forcedIncludes](StringRef finalSource) -> std::optional<std::string> {
     SmallString<256> tmpPath;
     int tmpFD = -1;
     if (sys::fs::createUniqueFile(modelText, tmpFD, tmpPath))
@@ -333,7 +340,7 @@ buildFinalSourcePreprocessCallback(StringRef anchorPath,
       consumeError(std::move(err));
       return std::nullopt;
     }
-    auto ppOrErr = preprocessToBytes(tmpPath, ctx, extraArgs);
+    auto ppOrErr = preprocessToBytes(tmpPath, ctx, extraArgs, forcedIncludes);
     if (!ppOrErr) {
       consumeError(ppOrErr.takeError());
       return std::nullopt;

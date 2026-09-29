@@ -17,6 +17,11 @@
 // preprocessor, and in practice carries comments and spacing that no replay can
 // reproduce.
 //
+// The two replays differ in one respect: the edited stream's enters none of the
+// producer's `-include` files.  Their tokens precede the first byte of the
+// source, so the edited stream already carries them, and replaying them over it
+// would emit them twice (`ForcedIncludeReplay`).
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDFINALASSEMBLYVERIFIER_H
@@ -27,6 +32,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
 
 #include <cstdint>
@@ -65,7 +71,8 @@ enum class OutputVerificationMode {
   /// nothing observes -- the output stays correct, so the defective theorem
   /// survives.  An inconclusive check fails too: this mode asks for a
   /// verified assembly, and a comparison that could not be performed does not
-  /// produce one.
+  /// produce one.  A check that could not be built at all is disposed of as
+  /// inconclusive.
   Fatal
 };
 
@@ -178,7 +185,8 @@ public:
   /// Build a verifier for one refold run.
   ///
   /// \param rootJson producer refold map, used only to build relaxation masks
-  /// \param ctx producer preprocessing context, replayed for both sides
+  /// \param ctx producer preprocessing context, replayed for both sides; the
+  ///        edited stream's replay enters no forced include
   /// \param editedStreamBytes the edited preprocessed stream, as written
   /// \param noLines whether the run prunes line directives
   /// \param strict whether the run is byte-exact about stringified operands
@@ -193,9 +201,11 @@ public:
   ///        for headers the edit introduced, which no producer-recorded search
   ///        path can find; see `buildFinalSourcePreprocessCallback()`
   ///
-  /// Returns nullopt when the edited stream cannot be preprocessed, which
-  /// leaves the caller with no verifier rather than a failing one.
-  static std::optional<RefoldFinalAssemblyVerifier>
+  /// Returns an error naming what could not be prepared -- the edited stream's
+  /// replay or a relaxation mask -- when the check cannot be built.  The caller
+  /// then has no verifier rather than a failing one, and the reason is what
+  /// `fatal` reports.
+  static llvm::Expected<RefoldFinalAssemblyVerifier>
   Create(const llvm::json::Object &rootJson,
          const RefoldModel::PreprocessContext &ctx,
          llvm::StringRef editedStreamBytes, bool noLines, bool strict,

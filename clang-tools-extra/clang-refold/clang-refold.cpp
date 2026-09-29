@@ -533,9 +533,11 @@ int main(int argc, char **argv) {
       aBytes = std::move(*ppOrErr);
     }
 
-    // Preprocess the edited preprocessed replay file.
+    // Preprocess the edited preprocessed replay file.  It already carries every
+    // forced include's tokens, so the replay enters none of them.
     {
-      auto ppOrErr = preprocessToBytes(PPModPath, ctx, verifyIncludeArgs);
+      auto ppOrErr = preprocessToBytes(PPModPath, ctx, verifyIncludeArgs,
+                                       ForcedIncludeReplay::Omit);
       if (!ppOrErr) {
         handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
           REFOLD_LOG_ERROR("pp", "failed to preprocess --pp-mod input: {0}",
