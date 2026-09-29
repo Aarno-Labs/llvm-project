@@ -430,20 +430,6 @@ IncludeReplayProofContext::MakeIncludeReplaySearchDir(
   return dir;
 }
 
-void IncludeReplayProofContext::AppendLegacySearchDirIfSafe(
-    SmallVectorImpl<IncludeReplaySearchDir> &dirs, StringRef path,
-    IncludeReplayCandidate::LookupKind kind) const {
-  // Legacy argv reconstruction has only one spelling/path token per entry.
-  // Use that token for both the physical lookup directory and the entered-file
-  // spelling prefix, matching the old-map behavior.  The search-chain index is
-  // intentionally empty: argv reconstruction is a compatibility replay aid for
-  // ordinary includes, not producer-proven HeaderSearch cursor state for
-  // #include_next.
-  if (std::optional<IncludeReplaySearchDir> dir =
-          MakeIncludeReplaySearchDir(path, path, kind))
-    dirs.push_back(std::move(*dir));
-}
-
 void IncludeReplayProofContext::AppendUnsupportedOrdinarySearchEntryBarrier(
     RecordedIncludeSearchDirs &dirs,
     const RefoldModel::IncludeSearchEntry &entry) {
@@ -496,22 +482,6 @@ void IncludeReplayProofContext::AppendProducerSearchEntryIfSafe(
   }
 }
 
-bool IncludeReplayProofContext::TryConsumeJoinedOrSeparateIncludeArg(
-    StringRef arg, ArrayRef<std::string> argv, size_t &index,
-    StringRef joinedPrefix, SmallVectorImpl<IncludeReplaySearchDir> &out,
-    IncludeReplayCandidate::LookupKind kind) const {
-  if (arg == joinedPrefix) {
-    if (index + 1 < argv.size())
-      AppendLegacySearchDirIfSafe(out, argv[++index], kind);
-    return true;
-  }
-  if (arg.starts_with(joinedPrefix) && arg.size() > joinedPrefix.size()) {
-    AppendLegacySearchDirIfSafe(out, arg.drop_front(joinedPrefix.size()), kind);
-    return true;
-  }
-  return false;
-}
-
 IncludeReplayProofContext::RecordedIncludeSearchDirs
 IncludeReplayProofContext::ComputeProducerIncludeSearchDirs() const {
   RecordedIncludeSearchDirs dirs;
@@ -548,76 +518,14 @@ IncludeReplayProofContext::ComputeProducerIncludeSearchDirs() const {
   return dirs;
 }
 
-IncludeReplayProofContext::RecordedIncludeSearchDirs
-IncludeReplayProofContext::ComputeLegacyArgvIncludeSearchDirs() const {
-  SmallVector<IncludeReplaySearchDir, 16> quoteDirs;
-  SmallVector<IncludeReplaySearchDir, 32> includeDirs;
-  ArrayRef<std::string> argv = model_.GetPPArgv();
-
-  for (size_t i = 0; i < argv.size(); ++i) {
-    StringRef arg(argv[i]);
-    if (TryConsumeJoinedOrSeparateIncludeArg(
-            arg, argv, i, "-iquote", quoteDirs,
-            IncludeReplayCandidate::LookupKind::QuoteDir))
-      continue;
-    if (TryConsumeJoinedOrSeparateIncludeArg(
-            arg, argv, i, "-I", includeDirs,
-            IncludeReplayCandidate::LookupKind::UserI))
-      continue;
-    if (arg == "-isystem" && i + 1 < argv.size()) {
-      AppendLegacySearchDirIfSafe(includeDirs, argv[++i],
-                                  IncludeReplayCandidate::LookupKind::System);
-      continue;
-    }
-    if (arg == "-idirafter" && i + 1 < argv.size()) {
-      AppendLegacySearchDirIfSafe(
-          includeDirs, argv[++i],
-          IncludeReplayCandidate::LookupKind::IdirAfter);
-      continue;
-    }
-    const StringRef isystemPrefix("-isystem");
-    const StringRef idirafterPrefix("-idirafter");
-    if (arg.starts_with(isystemPrefix) && arg.size() > isystemPrefix.size()) {
-      AppendLegacySearchDirIfSafe(includeDirs,
-                                  arg.drop_front(isystemPrefix.size()),
-                                  IncludeReplayCandidate::LookupKind::System);
-      continue;
-    }
-    if (arg.starts_with(idirafterPrefix) &&
-        arg.size() > idirafterPrefix.size()) {
-      AppendLegacySearchDirIfSafe(
-          includeDirs, arg.drop_front(idirafterPrefix.size()),
-          IncludeReplayCandidate::LookupKind::IdirAfter);
-      continue;
-    }
-  }
-
-  RecordedIncludeSearchDirs dirs;
-  // Preserve the legacy replay order: quoted lookup searches -iquote first,
-  // then the ordinary include dirs; angled lookup uses only the ordinary
-  // include dirs.
-  dirs.quotedLookupDirs.append(quoteDirs.begin(), quoteDirs.end());
-  dirs.quotedLookupDirs.append(includeDirs.begin(), includeDirs.end());
-  dirs.angledLookupDirs.append(includeDirs.begin(), includeDirs.end());
-  return dirs;
-}
-
-IncludeReplayProofContext::RecordedIncludeSearchDirs
-IncludeReplayProofContext::ComputeRecordedIncludeSearchDirs() const {
-  // Prefer the producer-normalized HeaderSearch chain when present.  It is
-  // already parsed and validated by RefoldModel, and unlike argv parsing it
-  // preserves Clang's effective order plus each entry's physical path and
-  // entered spelling.  The argv parser remains only for old maps that lack
-  // pp_ctx.include_search_chain.
-  if (!model_.GetIncludeSearchChain().empty())
-    return ComputeProducerIncludeSearchDirs();
-  return ComputeLegacyArgvIncludeSearchDirs();
-}
-
 const IncludeReplayProofContext::RecordedIncludeSearchDirs &
 IncludeReplayProofContext::RecordedIncludeSearchDirsForReplay() const {
+  // The producer-normalized HeaderSearch chain, which the schema requires, is
+  // already parsed and validated by RefoldModel.  It preserves Clang's
+  // effective order plus each entry's physical path and entered spelling.  An
+  // empty chain means Clang searched no directory, so replay searches none.
   if (!recordedIncludeSearchDirsCache_)
-    recordedIncludeSearchDirsCache_ = ComputeRecordedIncludeSearchDirs();
+    recordedIncludeSearchDirsCache_ = ComputeProducerIncludeSearchDirs();
   return *recordedIncludeSearchDirsCache_;
 }
 
@@ -828,9 +736,9 @@ IncludeReplayProofContext::ComputeIncludeNextReplayCandidate(
     return std::nullopt;
 
   // A general include_next proof must start from producer-proven HeaderSearch
-  // cursor state.  Source-relative, absolute-operand, unknown, and legacy
-  // argv-derived containing-file provenance do not identify a search-chain
-  // position, so they cannot prove where lookup should resume.
+  // cursor state.  Source-relative, absolute-operand, and unknown
+  // containing-file provenance do not identify a search-chain position, so
+  // they cannot prove where lookup should resume.
   if (!isSearchChainIncludeLookupKind(containingFile.kind) ||
       !containingFile.searchChainIndex)
     return std::nullopt;
@@ -961,9 +869,8 @@ bool IncludeReplayProofContext::IncludeReplayCandidateMatchesProducerLookup(
 
   // Search-chain provenance is the state later #include_next proof consumes.
   // If the producer selected this edge through pp_ctx.include_search_chain,
-  // replay must select the exact same entry.  Legacy argv-derived candidates
-  // intentionally lack SearchChainIndex and therefore cannot satisfy this
-  // new-schema proof.
+  // replay must select the exact same entry.  A candidate without a
+  // SearchChainIndex cannot satisfy this proof.
   if (isSearchChainIncludeLookupKind(producer.kind))
     return candidate.searchChainIndex && producer.searchChainIndex &&
            *candidate.searchChainIndex == *producer.searchChainIndex;

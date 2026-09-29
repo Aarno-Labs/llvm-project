@@ -220,7 +220,8 @@ static constexpr const char *RefoldSchema = R"json(
       "required": [
         "cwd",
         "argv",
-        "lang"
+        "lang",
+        "include_search_chain"
       ],
       "additionalProperties": false,
       "properties": {
@@ -244,7 +245,7 @@ static constexpr const char *RefoldSchema = R"json(
         },
         "include_search_chain": {
           "type": "array",
-          "description": "Producer-normalized effective include search chain in the exact order Clang used for header lookup. Entries are indexed by 'index'. This is optional for backward compatibility; when present, consumers should prefer it over reconstructing include lookup order from argv.",
+          "description": "Producer-normalized effective include search chain in the exact order Clang used for header lookup. Entries are indexed by 'index'. Required: consumers replay include lookup only through this chain, never by reconstructing it from argv. Empty when Clang searched no directory, e.g. with -nostdinc and only nonexistent -I directories, which Clang drops.",
           "items": {
             "$ref": "#/$defs/IncludeSearchEntry"
           }

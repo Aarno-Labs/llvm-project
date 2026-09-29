@@ -360,8 +360,7 @@ public:
   ///
   /// Entries are stored in the exact zero-based order emitted under
   /// pp_ctx.include_search_chain. Include lookup provenance references these
-  /// entries by index; consumers must not reconstruct this order from argv when
-  /// the producer provided it.
+  /// entries by index; consumers must not reconstruct this order from argv.
   struct IncludeSearchEntry {
     /// Zero-based entry index in `pp_ctx.include_search_chain`.
     uint32_t index = 0;
@@ -476,9 +475,10 @@ public:
     // identity and enteredFileSpelling for filename observers.
     std::optional<StringRef> resolvedPath;
 
-    // New normalized include-resolution metadata. All fields are optional so
-    // old maps remain loadable. When present, consumers should prefer them over
-    // legacy resolved_path and argv-derived lookup reconstruction.
+    // New normalized include-resolution metadata. The schema requires
+    // entered_file_spelling on an include edge that has a parent; the others
+    // are optional. When present, consumers should prefer them over legacy
+    // resolved_path.
     std::optional<StringRef> openedPath;
     std::optional<StringRef> enteredFileSpelling;
     std::optional<StringRef> enteredFileName;
@@ -1245,7 +1245,8 @@ public:
   StringRef GetPPLang() const { return ppLang_; }
   /// Return the producer preprocessor argv captured in the map.
   ArrayRef<std::string> GetPPArgv() const { return ppArgv_; }
-  /// Return the producer include-search chain in recorded lookup order.
+  /// Return the producer include-search chain in recorded lookup order.  Empty
+  /// when Clang searched no directory.
   ArrayRef<IncludeSearchEntry> GetIncludeSearchChain() const {
     return includeSearchChain_;
   }

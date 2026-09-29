@@ -209,11 +209,10 @@ private:
 
     LookupKind kind = LookupKind::Unknown;
 
-    // Present only when Kind names a producer/legacy include-search entry.
-    // New-schema candidates use the exact pp_ctx.include_search_chain index;
-    // legacy argv-reconstructed candidates intentionally leave this empty so
-    // future include-next proof cannot mistake argv inference for producer
-    // cursor provenance.
+    // Present only when Kind names a producer include-search entry, as the
+    // exact pp_ctx.include_search_chain index.  Source-relative and
+    // absolute-operand candidates leave it empty, so include-next proof cannot
+    // mistake them for producer cursor provenance.
     std::optional<uint32_t> searchChainIndex;
   };
 
@@ -221,8 +220,8 @@ private:
   ///
   /// Include-next replay is a proof about where HeaderSearch resumes.  Both the
   /// containing-file cursor and the selected target cursor must come from the
-  /// producer search-chain metadata; argv reconstruction and physical identity
-  /// matches are intentionally insufficient.
+  /// producer search-chain metadata; physical identity matches are
+  /// intentionally insufficient.
   struct IncludeNextReplayCandidate {
     std::filesystem::path physicalPath;
     std::string enteredFileSpelling;
@@ -236,9 +235,8 @@ private:
     uint32_t resumeSearchChainIndex = 0;
 
     // The producer search-chain entry that replay selected.  This must be an
-    // actual pp_ctx.include_search_chain index, not a legacy argv-derived
-    // approximation, because descendant #include_next proof is a proof about
-    // HeaderSearch cursor state.
+    // actual pp_ctx.include_search_chain index, because descendant
+    // #include_next proof is a proof about HeaderSearch cursor state.
     uint32_t selectedSearchChainIndex = 0;
     IncludeLookupKind selectedKind = IncludeLookupKind::Unknown;
   };
@@ -344,7 +342,7 @@ private:
 
     // Present only for results selected by a modeled producer search-chain
     // entry.  Source-relative and absolute-operand hits have no HeaderSearch
-    // cursor; legacy argv-reconstructed hits intentionally leave this empty.
+    // cursor.
     std::optional<uint32_t> searchChainIndex;
   };
 
@@ -460,13 +458,6 @@ private:
       IncludeReplayCandidate::LookupKind kind,
       std::optional<uint32_t> searchChainIndex = std::nullopt) const;
 
-  /// Append a legacy argv-reconstructed search directory when its single token
-  /// can safely serve as both the physical directory and entered spelling.
-  void
-  AppendLegacySearchDirIfSafe(SmallVectorImpl<IncludeReplaySearchDir> &dirs,
-                              StringRef path,
-                              IncludeReplayCandidate::LookupKind kind) const;
-
   /// Install an ordinary-include lookup barrier for producer search entries
   /// whose selection semantics cannot be replayed as a concrete directory.
   static void AppendUnsupportedOrdinarySearchEntryBarrier(
@@ -479,25 +470,9 @@ private:
       RecordedIncludeSearchDirs &dirs,
       const RefoldModel::IncludeSearchEntry &entry) const;
 
-  /// Reconstruct one joined or separate include-directory argv option.
-  ///
-  /// On success, this consumes the following argv element only for the separate
-  /// spelling form, preserving the legacy parser's exact cursor behavior.
-  bool TryConsumeJoinedOrSeparateIncludeArg(
-      StringRef arg, ArrayRef<std::string> argv, size_t &index,
-      StringRef joinedPrefix, SmallVectorImpl<IncludeReplaySearchDir> &out,
-      IncludeReplayCandidate::LookupKind kind) const;
-
   /// Build replay search directories from the producer-normalized HeaderSearch
   /// chain, preserving ordinary lookup order and unsupported-entry barriers.
   RecordedIncludeSearchDirs ComputeProducerIncludeSearchDirs() const;
-
-  /// Build replay search directories from legacy preprocessor argv data for
-  /// maps that do not carry a normalized include-search chain.
-  RecordedIncludeSearchDirs ComputeLegacyArgvIncludeSearchDirs() const;
-
-  /// Select the best available source for recorded include-search directories.
-  RecordedIncludeSearchDirs ComputeRecordedIncludeSearchDirs() const;
 
   /// Return the lazily cached recorded include-search directories for this
   /// proof context, preserving the old one-context cache behavior exactly.
