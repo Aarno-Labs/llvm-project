@@ -54,7 +54,7 @@ RefoldPreprocessingStructureIndexProvider::LookupResult
 RefoldPreprocessingStructureIndexProvider::Get(
     StringRef sourcePath, std::optional<uint64_t> ownerIncludeId) const {
   if (sourcePath.empty()) {
-    return {nullptr, {}, "physical source path is unavailable"};
+    return {nullptr, {}, "physical source path is unavailable", {}};
   }
 
   std::string physicalSourcePath = CanonicalPhysicalPath(sourcePath);
@@ -79,7 +79,7 @@ RefoldPreprocessingStructureIndexProvider::Get(
   const StringRef cachedPhysicalPath = sourceInsertion.first->first;
   if (!sourceEntry.buffer) {
     return {nullptr, cachedPhysicalPath,
-            sourceEntry.incompleteEvidenceReason};
+            sourceEntry.incompleteEvidenceReason, {}};
   }
 
   OccurrenceKey key{physicalSourcePath, ownerIncludeId};

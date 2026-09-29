@@ -3467,7 +3467,7 @@ private:
   RefoldPreprocessingStructureIndexProvider::LookupResult
   LookupStructureIndexForSource(const OwnerSourceRange &source) const {
     if (!source.IsComplete())
-      return {nullptr, {}, "source coordinates are incomplete"};
+      return {nullptr, {}, "source coordinates are incomplete", {}};
     return deps_.preprocessingStructureIndexes.Get(source.path,
                                                    source.includeId);
   }
