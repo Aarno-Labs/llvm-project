@@ -39,6 +39,7 @@ class RefoldMacroStateProof;
 class RefoldMacroTopology;
 class RefoldOwnerStateProof;
 class RefoldPathIdentity;
+class RefoldPreprocessingStructureIndexProvider;
 class RefoldAcceptedCandidateBuilder;
 class RefoldMacroPatchProofClassifier;
 class RefoldStructuralHunkDispatcher;
@@ -64,6 +65,9 @@ public:
     const RefoldLineObserverLayout *lineObserverLayout = nullptr;
     RefoldTerminalProofSink *terminalSink = nullptr;
     const clang::LangOptions *lexLang = nullptr;
+    /// Source-owner indexes; a directive's bytes are re-emitted only where
+    /// its owner's index bound the recorded extent.
+    const RefoldPreprocessingStructureIndexProvider *structureIndexes = nullptr;
   };
 
   struct MacroStateRepairRequest {

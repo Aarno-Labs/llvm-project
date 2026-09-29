@@ -482,7 +482,8 @@ private:
                             const RefoldModel::IncludeItem &root) const;
 
   /// Verifies that a recorded macro directive can be recovered from its owner
-  /// file spelling.  Failure keeps macro-state preservation fail-closed.
+  /// file spelling: the owner occurrence's structure index must have bound its
+  /// recorded extent.  Failure keeps macro-state preservation fail-closed.
   ///
   /// \param exactSourceText when non-null, receives the directive's exact
   ///        source spelling read from the owner file.

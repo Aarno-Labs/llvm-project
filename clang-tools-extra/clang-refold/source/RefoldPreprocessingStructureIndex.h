@@ -161,7 +161,10 @@ struct MacroStateDirectiveLineInterval {
 /// name.
 ///
 /// The extent itself is the producer-recorded physical extent, returned as the
-/// interval directly once it is bounds-checked against \p fileBytes.
+/// interval directly once it is bounds-checked against \p fileBytes.  It is
+/// not compared with the file's lexical structure, so it suits position
+/// questions; re-emitting the directive's bytes needs
+/// `RefoldPreprocessingStructureIndex::BoundMacroStateDirectiveSourceText`.
 std::optional<MacroStateDirectiveLineInterval>
 recoverMacroStateDirectiveLineInterval(
     const RefoldPathIdentity &paths,
@@ -323,6 +326,24 @@ public:
   bool CollectExactMacroStateIntervals(
       uint64_t begin, uint64_t end,
       std::vector<const PreprocessingStructureInterval *> &intervals) const;
+
+  /// Return the source spelling of a recorded `#define` or `#undef`, from its
+  /// `#` through the end of its logical line, when this index bound the
+  /// directive's producer-recorded extent.
+  ///
+  /// Binding requires the recorded extent to equal this index's own lexical
+  /// scan of the directive, so the returned bytes are a fact about the file
+  /// rather than the producer's account of it.  Nothing else checks the extent
+  /// against the file: a map from an older producer can record one that ends
+  /// inside a trailing block comment, and it passes the schema and the model.
+  /// Code that re-emits a directive's bytes must therefore take them from here.
+  ///
+  /// \p sourceBytes must be the bytes this index was built from.  Returns
+  /// std::nullopt when their size differs from the indexed size, or when the
+  /// directive is unbound, bound more than once, or bound to another extent.
+  std::optional<llvm::StringRef> BoundMacroStateDirectiveSourceText(
+      const RefoldModel::MacroDirective &directive,
+      llvm::StringRef sourceBytes) const;
 
 private:
   /// Return the first interval index that can still reach byte \p begin.

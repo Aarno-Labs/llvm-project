@@ -63,12 +63,16 @@ public:
     const RefoldPreprocessingStructureIndex *index = nullptr;
     llvm::StringRef physicalSourcePath;
     llvm::StringRef incompleteEvidenceReason;
+    /// The bytes `index` was built from; empty when `index` is null.
+    llvm::StringRef sourceBytes;
 
     bool HasIndex() const { return index != nullptr; }
   };
 
+  /// \p tuBytes must be the bytes \p tuIndex was built from, and must outlive
+  /// the provider.
   RefoldPreprocessingStructureIndexProvider(
-      Dependencies deps, llvm::StringRef tuPath,
+      Dependencies deps, llvm::StringRef tuPath, llvm::StringRef tuBytes,
       const RefoldPreprocessingStructureIndex &tuIndex);
   ~RefoldPreprocessingStructureIndexProvider();
 
@@ -104,6 +108,7 @@ private:
 
   Dependencies deps_;
   const RefoldPreprocessingStructureIndex &tuIndex_;
+  llvm::StringRef tuBytes_;
   std::string tuPhysicalSourcePath_;
 
   mutable std::map<std::string, SourceBufferCacheEntry> sourceBufferCache_;

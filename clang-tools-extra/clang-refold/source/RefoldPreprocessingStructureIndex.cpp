@@ -1229,5 +1229,32 @@ bool RefoldPreprocessingStructureIndex::CollectExactMacroStateIntervals(
   return true;
 }
 
+std::optional<StringRef>
+RefoldPreprocessingStructureIndex::BoundMacroStateDirectiveSourceText(
+    const RefoldModel::MacroDirective &directive, StringRef sourceBytes) const {
+  const uint64_t begin = directive.directiveLineB;
+  const uint64_t end = directive.directiveLineE;
+  if (sourceBytes.size() != sourceSize_ || end <= begin || end > sourceSize_)
+    return std::nullopt;
+
+  // A bound interval contains its producer range, which is the recorded
+  // extent, so it overlaps that extent.  An unbound one carries no model
+  // record and is skipped.
+  const PreprocessingStructureInterval *bound = nullptr;
+  for (const PreprocessingStructureInterval *interval :
+       FindOverlapping(begin, end)) {
+    if (!isExactProducerBoundMacroStateInterval(*interval) ||
+        interval->modelItemId != directive.id)
+      continue;
+    if (bound)
+      return std::nullopt;
+    bound = interval;
+  }
+  if (!bound || *bound->producerTextBegin != begin ||
+      *bound->producerTextEnd != end)
+    return std::nullopt;
+  return sourceBytes.slice(begin, end);
+}
+
 } // namespace refold
 } // namespace clang

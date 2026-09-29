@@ -27,14 +27,16 @@ namespace refold {
 
 RefoldPreprocessingStructureIndexProvider::
     RefoldPreprocessingStructureIndexProvider(
-        Dependencies deps, StringRef tuPath,
+        Dependencies deps, StringRef tuPath, StringRef tuBytes,
         const RefoldPreprocessingStructureIndex &tuIndex)
-    : deps_(deps), tuIndex_(tuIndex),
+    : deps_(deps), tuIndex_(tuIndex), tuBytes_(tuBytes),
       tuPhysicalSourcePath_(CanonicalPhysicalPath(tuPath)) {
   assert(!tuIndex_.GetOwnerIncludeId() &&
          "engine-owned TU structure index must not have an include owner");
   assert(deps_.pathIdentity.PathsEqual(tuIndex_.GetSourcePath(), tuPath) &&
          "engine-owned TU structure index must match the TU path");
+  assert(tuIndex_.GetSourceSize() == tuBytes_.size() &&
+         "engine-owned TU structure index must match the TU bytes");
 }
 
 RefoldPreprocessingStructureIndexProvider::
@@ -57,7 +59,7 @@ RefoldPreprocessingStructureIndexProvider::Get(
 
   std::string physicalSourcePath = CanonicalPhysicalPath(sourcePath);
   if (!ownerIncludeId && physicalSourcePath == tuPhysicalSourcePath_)
-    return {&tuIndex_, tuPhysicalSourcePath_, {}};
+    return {&tuIndex_, tuPhysicalSourcePath_, {}, tuBytes_};
 
   auto sourceInsertion = sourceBufferCache_.try_emplace(physicalSourcePath);
   SourceBufferCacheEntry &sourceEntry = sourceInsertion.first->second;
@@ -94,7 +96,10 @@ RefoldPreprocessingStructureIndexProvider::Get(
                 .first;
   }
 
-  return {found->second.get(), cachedPhysicalPath, {}};
+  return {found->second.get(),
+          cachedPhysicalPath,
+          {},
+          sourceEntry.buffer->getBuffer()};
 }
 
 } // namespace refold

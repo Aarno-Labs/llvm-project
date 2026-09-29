@@ -610,10 +610,15 @@ bool RefoldHeaderIncludeEditPlanner::RecordedMacroDirectiveMatchesOwnerFile(
     return false;
   const MemoryBuffer &mb = **bufOrErr;
   StringRef ownerBytes(mb.getBufferStart(), mb.getBufferSize());
-  std::optional<MacroStateDirectiveLineInterval> interval =
-      recoverMacroStateDirectiveLineInterval(
-          paths_, directive, ownerPath, ownerBytes, directive.ownerIncludeId);
-  if (!interval)
+
+  // Only an extent the owner occurrence's structure index bound is a fact about
+  // these bytes.  A stale map can record one that ends inside a trailing block
+  // comment, and re-emitting that slice would leave the comment unterminated.
+  std::optional<StringRef> spelling =
+      GetHeaderOccurrenceStructureIndex(ownerPath, *directive.ownerIncludeId,
+                                        ownerBytes)
+          .BoundMacroStateDirectiveSourceText(directive, ownerBytes);
+  if (!spelling)
     return false;
 
   // The owner buffer is only open here, so capture the directive's exact
@@ -622,7 +627,7 @@ bool RefoldHeaderIncludeEditPlanner::RecordedMacroDirectiveMatchesOwnerFile(
   // MacroDirective::text would rewrite its whitespace and fold away any line
   // continuation.
   if (exactSourceText)
-    *exactSourceText = ownerBytes.slice(interval->begin, interval->end).str();
+    *exactSourceText = spelling->str();
   return true;
 }
 

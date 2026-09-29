@@ -259,7 +259,8 @@ void RefoldEngine::BuildServiceGraph() {
       std::make_unique<RefoldPreprocessingStructureIndexProvider>(
           RefoldPreprocessingStructureIndexProvider::Dependencies{
               model_, pathIdentity_, lineDirs_, lexLang_},
-          model_.GetSourcePath(), *preprocessingStructureIndex_);
+          model_.GetSourcePath(), tuSourceBytes_,
+          *preprocessingStructureIndex_);
   lineControlProof_.BindStructureIndexes(*preprocessingStructureIndexProvider_);
   printedPragmaCarriers_ = buildPrintedPragmaCarriers(
       model_, macroTopology_, pathIdentity_,
@@ -462,6 +463,7 @@ void RefoldEngine::BuildServiceGraph() {
   repairDeps.lineObserverLayout = lineObserverLayout_.get();
   repairDeps.terminalSink = &terminalSink_;
   repairDeps.lexLang = &lexLang_;
+  repairDeps.structureIndexes = preprocessingStructureIndexProvider_.get();
   macroStateRepairPlanner_ =
       std::make_unique<RefoldMacroStateRepairPlanner>(std::move(repairDeps));
 

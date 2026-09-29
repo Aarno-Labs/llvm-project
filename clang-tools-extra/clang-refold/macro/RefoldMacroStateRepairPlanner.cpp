@@ -28,6 +28,8 @@
 #include "proof/RefoldTerminalProofSink.h"
 #include "proof/RefoldTheoremTypes.h"
 #include "source/RefoldPreprocessingDirectiveScanner.h"
+#include "source/RefoldPreprocessingStructureIndex.h"
+#include "source/RefoldPreprocessingStructureIndexProvider.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
 #include "source/RefoldTokenTextAnalysis.h"
 #include "source/TokenTextHelpers.h"
@@ -39,7 +41,6 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
-#include "llvm/Support/MemoryBuffer.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -339,14 +340,19 @@ private:
   bool MacroDirectiveTouchedByTUEdit(
       const RefoldModel::MacroDirective &directive) const;
   /// Builds the directive spelling used when preserving a consumed macro-state
-  /// transition in a repair edit.
+  /// transition in a repair edit, ending in a newline.  Empty when the
+  /// directive has no exact source spelling, which callers must refuse.
   std::string DirectiveTextForPreservation(
       const RefoldModel::MacroDirective &directive) const;
 
-  /// Returns the directive's exact source spelling, or its recorded canonical
-  /// text when the map has no physical extent or the file cannot be read.
+  /// Returns the directive's exact source spelling, or an empty string unless
+  /// its owner's structure index bound the recorded physical extent.
   StringRef
   ExactDirectiveSourceText(const RefoldModel::MacroDirective &directive) const;
+  /// Refuses a repair that has to re-emit \p directive but has no exact
+  /// spelling for it.
+  void RequestTerminalForUnspelledDirective(
+      const RefoldModel::MacroDirective &directive, StringRef stage) const;
 
   /// Reconstructs the macro-state transition represented by a source directive.
   /// Memoized; see the definition for why the answer is stable per directive.
@@ -849,29 +855,32 @@ MacroStateRepairContext::MacroDirectiveFullSourceInterval(
 /// emitted payload for a directive and re-emitting one need the real spelling,
 /// which the producer's recorded physical extent identifies exactly.
 ///
-/// The defining file is read on first use and cached.  A file that cannot be
-/// read, or whose bytes end before the extent, falls back to the recorded text.
+/// The extent is trusted only where the directive's owner index bound it, which
+/// requires it to equal the index's own lexical scan of the file.  Otherwise
+/// the result is empty and every re-emitting caller fails closed.  A stale map
+/// can record an extent ending inside a trailing block comment, and slicing it
+/// would emit an unterminated comment.  The rendered text is no substitute: it
+/// has the same tokens but loses the directive's comments and layout.
 StringRef MacroStateRepairContext::ExactDirectiveSourceText(
     const RefoldModel::MacroDirective &directive) const {
   auto cached = exactDirectiveSourceText_.find(directive.id);
   if (cached != exactDirectiveSourceText_.end())
     return cached->second;
 
-  std::string text = directive.text.str();
-  if (!directive.sitePath.empty()) {
-    StringRef bytes;
-    std::unique_ptr<llvm::MemoryBuffer> owned;
-    if (PathIdentity().PathsEqual(directive.sitePath, tuPath_)) {
-      bytes = tuBytes_;
-    } else if (auto bufOrErr =
-                   llvm::MemoryBuffer::getFile(directive.sitePath)) {
-      owned = std::move(*bufOrErr);
-      bytes = owned->getBuffer();
-    }
-    if (directive.directiveLineE <= bytes.size())
-      text =
-          bytes.slice(directive.directiveLineB, directive.directiveLineE).str();
+  std::string text;
+  const RefoldPreprocessingStructureIndexProvider::LookupResult owner =
+      deps_.structureIndexes->Get(directive.sitePath, directive.ownerIncludeId);
+  if (owner.index) {
+    if (std::optional<StringRef> bound =
+            owner.index->BoundMacroStateDirectiveSourceText(directive,
+                                                            owner.sourceBytes))
+      text = bound->str();
   }
+  if (text.empty())
+    REFOLD_LOG_DEBUG("macro/state-repair",
+                     "directive #{0} has no bound source extent in {1}; it "
+                     "cannot be re-emitted",
+                     directive.id, directive.sitePath);
 
   return exactDirectiveSourceText_.try_emplace(directive.id, std::move(text))
       .first->second;
@@ -938,9 +947,27 @@ std::string MacroStateRepairContext::DirectiveTextForPreservation(
   // source-fidelity operation, so it must not rewrite the spelling into
   // MacroDirective::text's canonical rendering.
   std::string textLocal = ExactDirectiveSourceText(directive).str();
-  if (textLocal.empty() || textLocal.back() != '\n')
+  if (!textLocal.empty() && textLocal.back() != '\n')
     textLocal.push_back('\n');
   return textLocal;
+}
+
+/// Declining such a repair instead would leave the observation to
+/// `RequireEveryObservedGapDefinitionRepaired`, which does not speak for a
+/// replacement that mixes preserved source with B payload.
+void MacroStateRepairContext::RequestTerminalForUnspelledDirective(
+    const RefoldModel::MacroDirective &directive, StringRef stage) const {
+  TerminalSink().RequestTerminalFallback(
+      MakeTerminalFallbackProofFailure(
+          TerminalFallbackObligationKind::ProducerFactsAvailable,
+          TerminalFallbackFailureReason::MissingProducerFacts,
+          TerminalFallbackFailureContext::ForStateComponent(
+              "MacroDirective.boundSourceExtent")),
+      stage,
+      llvm::formatv("{0} #{1} for macro '{2}' must be re-emitted, but its "
+                    "owner's structure index did not bind its source extent",
+                    directive.subkind, directive.id, directive.name)
+          .str());
 }
 
 std::optional<MacroStateSourceTransition>
@@ -2170,6 +2197,12 @@ void MacroStateRepairContext::
               tuBytes_.drop_front(undefTransition->interval.begin)))
         continue;
 
+      if (undefTransition->text.empty()) {
+        RequestTerminalForUnspelledDirective(undefDirective,
+                                             "macro-undef-liveness");
+        return;
+      }
+
       std::string replacement;
       replacement.reserve(undefTransition->text.size() + crossedPrefix.size() +
                           ReplacementText.size() + carriedSuffix.size());
@@ -2267,6 +2300,8 @@ MacroStateRepairContext::TryAdvanceConsumedUndefBeforeObservedReplacement(
   std::string replacement;
   const std::string directiveText =
       DirectiveTextForPreservation(undefDirective);
+  if (directiveText.empty())
+    return std::nullopt;
   replacement.reserve(directiveText.size() + crossedPrefix.size() +
                       ReplacementText.size());
   replacement += directiveText;
@@ -2999,6 +3034,16 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
     if (!replacement.empty() && replacement.back() != '\n')
       replacement.push_back('\n');
 
+    // Every other obligation is met, so the carry is the repair; it must not
+    // proceed without the spelling it re-emits.
+    for (const MacroStateGapCarryCandidate &candidate : candidates) {
+      if (candidate.preservationText.empty()) {
+        RequestTerminalForUnspelledDirective(*candidate.directive,
+                                             "macro-gap-definition-carry");
+        return;
+      }
+    }
+
     const uint64_t oldStart = edit.start;
     const uint64_t oldEnd = edit.end;
     SmallVector<ProvenMacroStateSourceTransition, 4> repairedTransitions;
@@ -3452,15 +3497,21 @@ bool MacroStateRepairContext::ApplyQueuedMacroStatePreservations() {
     std::string repairedReplacement;
     SmallVector<PreservationEmission, 8> emissions;
     DenseSet<uint64_t> emittedDirectiveIds;
+    const RefoldModel::MacroDirective *unspelledDirective = nullptr;
 
     auto appendPreservation = [&](const MacroStatePreservation &preservation) {
       if (!preservation.directive ||
           !emittedDirectiveIds.insert(preservation.directive->id).second)
         return;
+      std::string directiveText =
+          DirectiveTextForPreservation(*preservation.directive);
+      if (directiveText.empty()) {
+        unspelledDirective = preservation.directive;
+        return;
+      }
       emissions.push_back(
           PreservationEmission{&preservation, repairedReplacement.size()});
-      repairedReplacement +=
-          DirectiveTextForPreservation(*preservation.directive);
+      repairedReplacement += directiveText;
     };
 
     for (const MacroStatePreservation &preservation : preservations) {
@@ -3504,6 +3555,14 @@ bool MacroStateRepairContext::ApplyQueuedMacroStatePreservations() {
         appendedAfterReplacementSeparator = true;
       }
       appendPreservation(preservation);
+    }
+
+    // The preservation was queued as the only way to keep the directive's
+    // transition, so a directive with no bound spelling cannot be dropped.
+    if (unspelledDirective) {
+      RequestTerminalForUnspelledDirective(*unspelledDirective,
+                                           "macro-state-preservation");
+      return false;
     }
 
     SmallVector<ProvenMacroStateSourceTransition, 8> provedTransitions;
@@ -3854,8 +3913,11 @@ MacroStateRepairContext::RepairConsumedDefinitionsForMaterializedInclude(
     }
 
     std::string directiveText = DirectiveTextForPreservation(definition);
-    if (directiveText.empty())
-      continue;
+    if (directiveText.empty()) {
+      RequestTerminalForUnspelledDirective(definition,
+                                           "include/materialized-macro-state");
+      return MaterializedIncludeDefinitionRepair();
+    }
     if (!directiveText.empty() && directiveText.back() != '\n')
       directiveText.push_back('\n');
 
