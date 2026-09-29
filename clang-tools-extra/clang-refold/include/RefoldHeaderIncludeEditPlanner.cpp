@@ -2558,8 +2558,8 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
 
   const HeaderSourceNeutralityContext headerSourceNeutrality =
       RefoldSourceNeutralityProof::BuildHeaderSourceNeutralityContext(
-          model_, macroStateProof_, paths_, StringRef(headerText), file,
-          ie.include->id, isWsOrCompleteCommentTrivia);
+          model_, paths_, StringRef(headerText), file, ie.include->id,
+          isWsOrCompleteCommentTrivia);
 
   // Header source-neutrality, source-envelope, macro-state carry, and
   // line-control predicates are named planner methods so proof obligations

@@ -626,6 +626,13 @@ public:
     MacroReplacementTokenKind kind = MacroReplacementTokenKind::Literal;
     StringRef spelling;
     std::optional<uint32_t> paramIndex;
+    /// Source bytes of the token in the directive's `sitePath`.
+    ///
+    /// Either every token of a directive has one or none does.  When present
+    /// they ascend without overlap, follow the macro name, and lie inside the
+    /// directive's `directiveLineB`/`directiveLineE` extent; the bytes between
+    /// two of them are trivia of the definition.
+    std::optional<ByteRange> source;
   };
 
   /// One producer-proven segment of a macro callee token spelling.

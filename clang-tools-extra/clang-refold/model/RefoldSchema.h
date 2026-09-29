@@ -103,8 +103,9 @@
 //         so cannot be compared against source bytes; this range can.
 //       - spans[]: A-token spans this directive contributed to (may be empty)
 //       - optional owner_include_id to disambiguate repeated header instances
-//       - function_like for #define shape, plus optional #define replay proof
-//         data: def_params and replacement_tokens
+//       - function_like for #define shape, def_params for a function-like
+//         #define, and replacement_tokens for every #define: the parsed
+//         replacement list, each token with its source bytes when measured
 //
 // * DirectivePragmaItem
 //     A #pragma line with exact text and location (site_path, [site_b, site_e))
@@ -1591,7 +1592,7 @@ static constexpr const char *RefoldSchema = R"json(
           "items": {
             "$ref": "#/$defs/MacroReplacementToken"
           },
-          "description": "Producer-owned replay tape for the macro replacement list, in definition order. Parameter references point at def_params by param_index; other tokens are fixed literal spellings."
+          "description": "Producer-owned replay tape for the macro replacement list, in definition order. Parameter references point at def_params by param_index; other tokens are fixed literal spellings. Required on every #define from schema 3.10, so an empty array is an empty replacement list."
         }
       },
       "allOf": [
@@ -1608,7 +1609,8 @@ static constexpr const char *RefoldSchema = R"json(
           },
           "then": {
             "required": [
-              "function_like"
+              "function_like",
+              "replacement_tokens"
             ]
           },
           "else": {
@@ -2142,6 +2144,16 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "integer",
           "minimum": 0,
           "description": "For param_ref tokens, the zero-based formal parameter index referenced by this replacement-list token."
+        },
+        "site_b": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Begin byte offset of this token's spelling within the directive's 'site_path'. Emitted with site_e from schema 3.10, on every token of a definition or on none, and only when the directive's directive_line_b/directive_line_e extent is recorded. The directive 'text' is a canonical re-rendering, so these are the only source coordinates of the replacement list."
+        },
+        "site_e": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "End byte offset (exclusive) of this token's spelling within the directive's 'site_path'. Emitted with site_b."
         }
       },
       "allOf": [

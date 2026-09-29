@@ -17,12 +17,11 @@
 
 #include "proof/RefoldNeutralityProof.h"
 
-#include "macro/RefoldMacroStateProof.h"
+#include "macro/RefoldMacroPlannerHelpers.h"
 #include "model/RefoldPathIdentity.h"
 #include "proof/RefoldOwnerStateProof.h"
 #include "support/StringUtils.h"
 
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -63,133 +62,60 @@ bool refoldMacroInvocationHasMaterializedPPTokens(
   return false;
 }
 
-/// Source surface being checked by a zero-token macro-neutrality proof.
+/// Return the #define that created \p invocation when the proof can walk its
+/// replacement list in source coordinates.
 ///
-/// Definition-site checks slice the producer-recorded #define directive text;
-/// invocation-argument checks slice the caller-provided materialized callsite
-/// bytes.  The explicit origin prevents path equality alone from choosing
-/// between two byte spaces that may share one physical file.
-enum class RefoldZeroTokenRangeSurface {
-  DefinitionReplacementList,
-  InvocationArgument
-};
+/// That needs the producer's source range on every replacement-list token.
+/// The directive's `text` cannot stand in for them: it is a canonical
+/// re-rendering, so for a definition written with extra blanks, comments or
+/// continuations no offset in it names a source byte.  A non-empty list
+/// without ranges fails closed.
+const RefoldModel::MacroDirective *refoldRecoverWalkableDefinition(
+    const RefoldModel &model, const RefoldModel::MacroInvocation &invocation) {
+  if (!invocation.definitionDirectiveId)
+    return nullptr;
 
-/// Return the byte offset immediately after the balanced __VA_OPT__ payload.
-///
-/// \p openParen must name the opening parenthesis following `__VA_OPT__` in a
-/// macro replacement list.  The scanner recognizes balanced parentheses while
-/// skipping string/character literals and block comments.  Newlines, line
-/// comments, unterminated literals/comments, and unbalanced parentheses reject
-/// the payload because the caller's zero-token proof is intentionally lexical
-/// and fail-closed.
-std::optional<size_t> refoldParseVaOptPayloadEnd(StringRef replacementText,
-                                                 size_t openParen) {
-  if (openParen >= replacementText.size() || replacementText[openParen] != '(')
-    return std::nullopt;
-
-  unsigned depth = 1;
-  for (size_t pos = openParen + 1; pos < replacementText.size();) {
-    const char ch = replacementText[pos];
-    if (ch == '\n' || ch == '\r')
-      return std::nullopt;
-
-    if (ch == '"' || ch == '\'') {
-      const char quote = ch;
-      ++pos;
-      bool closed = false;
-      while (pos < replacementText.size()) {
-        const char litCh = replacementText[pos++];
-        if (litCh == '\n' || litCh == '\r')
-          return std::nullopt;
-        if (litCh == '\\') {
-          if (pos >= replacementText.size())
-            return std::nullopt;
-          ++pos;
-          continue;
-        }
-        if (litCh == quote) {
-          closed = true;
-          break;
-        }
-      }
-      if (!closed)
-        return std::nullopt;
-      continue;
-    }
-
-    if (pos + 1 < replacementText.size() && ch == '/') {
-      if (replacementText[pos + 1] == '*') {
-        pos += 2;
-        bool closed = false;
-        while (pos + 1 < replacementText.size()) {
-          if (replacementText[pos] == '*' && replacementText[pos + 1] == '/') {
-            pos += 2;
-            closed = true;
-            break;
-          }
-          ++pos;
-        }
-        if (!closed)
-          return std::nullopt;
-        continue;
-      }
-      if (replacementText[pos + 1] == '/')
-        return std::nullopt;
-    }
-
-    if (ch == '(') {
-      ++depth;
-      ++pos;
-      continue;
-    }
-    if (ch == ')') {
-      --depth;
-      if (depth == 0)
-        return pos + 1;
-      ++pos;
-      continue;
-    }
-    ++pos;
-  }
-  return std::nullopt;
+  const RefoldModel::MacroDirective *definition =
+      model.GetMacroDirectiveById(*invocation.definitionDirectiveId);
+  if (!definition || !definition->IsDefine() ||
+      definition->name != invocation.name)
+    return nullptr;
+  if (!definition->replacementTokens.empty() &&
+      !definition->replacementTokens.front().source)
+    return nullptr;
+  return definition;
 }
 
-/// Advance \p pos over replacement-list trivia until a non-trivia byte or
-/// \p limit is reached.
-///
-/// This intentionally mirrors the local replacement-list trivia scanner:
-/// horizontal and newline whitespace are trivia, block comments must be
-/// complete before \p limit, and a line comment is trivia only when it
-/// extends exactly to the requested limit.  Returning false means the
-/// replacement fragment cannot be proved neutral by this lexical scanner.
-bool refoldSkipReplacementTriviaUntil(StringRef text, size_t &pos,
-                                      size_t limit) {
-  if (limit > text.size())
-    return false;
-  while (pos < limit) {
-    if (stringutils::isWs(text[pos])) {
-      ++pos;
-      continue;
-    }
+/// Return true when \p token is the literal replacement-list token
+/// \p spelling.
+bool refoldIsLiteralToken(const RefoldModel::MacroReplacementToken &token,
+                          StringRef spelling) {
+  return token.kind == RefoldModel::MacroReplacementTokenKind::Literal &&
+         token.spelling == spelling;
+}
 
-    StringRef tail = text.substr(pos, limit - pos);
-    if (tail.starts_with("/*")) {
-      const size_t commentEnd = text.find("*/", pos + 2);
-      if (commentEnd == StringRef::npos || commentEnd + 2 > limit)
-        return false;
-      pos = commentEnd + 2;
-      continue;
-    }
-    if (tail.starts_with("//")) {
-      const size_t commentEnd = text.find('\n', pos + 2);
-      if (commentEnd != StringRef::npos && commentEnd < limit)
-        return false;
-      pos = limit;
-      continue;
-    }
-    return true;
-  }
-  return true;
+/// Return true when no replacement-list token overlaps [begin, end).
+///
+/// Every non-trivia byte of a replacement list belongs to one of its tokens,
+/// so a token-free interval of the definition holds only blanks, comments and
+/// line splices.  An empty interval strictly inside a token overlaps it, so a
+/// tiling can change hands only on a token boundary.
+bool refoldReplacementListGapIsTokenFree(
+    ArrayRef<RefoldModel::MacroReplacementToken> tokens, uint64_t begin,
+    uint64_t end) {
+  return llvm::none_of(
+      tokens, [&](const RefoldModel::MacroReplacementToken &token) {
+        return token.source->begin < end && begin < token.source->end;
+      });
+}
+
+/// Return true when \p invocation is recorded on a file that \p pathEqual
+/// identifies with \p file.
+template <typename PathEqual>
+bool refoldInvocationIsOnFile(const RefoldModel::MacroInvocation &invocation,
+                              StringRef file, PathEqual &&pathEqual) {
+  return invocation.invFile && !invocation.invFile->empty() &&
+         pathEqual(*invocation.invFile, file);
 }
 
 /// Consume a token-paste chain only in the placemarker domain.
@@ -200,46 +126,26 @@ bool refoldSkipReplacementTriviaUntil(StringRef text, size_t &pos,
 /// `#define CAT(a,b) a ## b` with `CAT(,)`, while still rejecting literals,
 /// non-empty operands, unrecorded identifiers, and paste chains that
 /// synthesize real PP-token material.
-bool refoldConsumeNeutralPlacemarkerPasteChain(
-    StringRef text, size_t &pos, size_t end, unsigned firstParam,
-    const DenseMap<StringRef, unsigned> &paramIndexByName,
+///
+/// \p pos indexes the chain's first operand in \p tokens, which end where the
+/// walked fragment ends.  Returns the index one past the last operand.
+std::optional<size_t> refoldConsumeNeutralPlacemarkerPasteChain(
+    ArrayRef<RefoldModel::MacroReplacementToken> tokens, size_t pos,
     function_ref<bool(unsigned)> invocationArgumentIsNeutral,
     SmallVectorImpl<unsigned> &usedParams) {
-  size_t cursor = pos;
-  if (!refoldSkipReplacementTriviaUntil(text, cursor, end))
-    return false;
-  if (cursor + 1 >= end || text[cursor] != '#' || text[cursor + 1] != '#')
-    return false;
+  for (;; pos += 2) {
+    const RefoldModel::MacroReplacementToken &operand = tokens[pos];
+    if (operand.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+        !invocationArgumentIsNeutral(*operand.paramIndex))
+      return std::nullopt;
+    usedParams.push_back(*operand.paramIndex);
 
-  if (!invocationArgumentIsNeutral(firstParam))
-    return false;
-  usedParams.push_back(firstParam);
-
-  while (cursor + 1 < end && text[cursor] == '#' && text[cursor + 1] == '#') {
-    cursor += 2;
-    if (!refoldSkipReplacementTriviaUntil(text, cursor, end))
-      return false;
-    if (cursor >= end || !stringutils::isIdentStart(text[cursor]))
-      return false;
-
-    const size_t operandBegin = cursor++;
-    while (cursor < end && stringutils::isIdentPart(text[cursor]))
-      ++cursor;
-    StringRef operand = text.slice(operandBegin, cursor);
-
-    auto paramIt = paramIndexByName.find(operand);
-    if (paramIt == paramIndexByName.end())
-      return false;
-    if (!invocationArgumentIsNeutral(paramIt->second))
-      return false;
-    usedParams.push_back(paramIt->second);
-
-    if (!refoldSkipReplacementTriviaUntil(text, cursor, end))
-      return false;
+    if (pos + 1 == tokens.size() ||
+        !refoldIsLiteralToken(tokens[pos + 1], "##"))
+      return pos + 1;
+    if (pos + 2 == tokens.size())
+      return std::nullopt;
   }
-
-  pos = cursor;
-  return true;
 }
 
 /// Source interval occupied by a nested macro invocation that may tile part of
@@ -252,42 +158,6 @@ struct RefoldNeutralMacroChildPiece {
   uint64_t end = 0;
   const RefoldModel::MacroInvocation *child = nullptr;
 };
-
-/// Slice one of the two byte surfaces used by zero-token macro-neutrality
-/// checks.
-///
-/// This centralizes only the common bounds mechanics.  The caller still proves
-/// which physical path names the requested surface before passing the boolean
-/// match facts, so path identity remains in the owning proof domain.
-template <typename ReplacementList>
-std::optional<StringRef> refoldSliceZeroTokenRangeSurfaceText(
-    const ReplacementList &replacement, RefoldZeroTokenRangeSurface surface,
-    uint64_t sliceBegin, uint64_t sliceEnd, StringRef invocationSurfaceText,
-    bool rangeNamesReplacementDirective, bool rangeNamesInvocationSurface) {
-  if (sliceEnd < sliceBegin)
-    return std::nullopt;
-
-  switch (surface) {
-  case RefoldZeroTokenRangeSurface::DefinitionReplacementList: {
-    if (!rangeNamesReplacementDirective)
-      return std::nullopt;
-    const uint64_t textBegin = replacement.fileBase;
-    const uint64_t textEnd =
-        replacement.fileBase + replacement.directive->text.size();
-    if (sliceBegin < textBegin || sliceEnd > textEnd)
-      return std::nullopt;
-    return replacement.directive->text.slice(
-        static_cast<size_t>(sliceBegin - replacement.fileBase),
-        static_cast<size_t>(sliceEnd - replacement.fileBase));
-  }
-  case RefoldZeroTokenRangeSurface::InvocationArgument:
-    if (!rangeNamesInvocationSurface || sliceEnd > invocationSurfaceText.size())
-      return std::nullopt;
-    return invocationSurfaceText.slice(sliceBegin, sliceEnd);
-  }
-
-  return std::nullopt;
-}
 
 /// Sort source-interval child pieces by begin/end/id so overlap checks are
 /// deterministic across TU and header neutrality proofs.
@@ -307,16 +177,14 @@ void refoldSortNeutralChildPieces(
 /// This is only the shared mechanics: collect direct nested invocations on the
 /// requested file, sort them deterministically, reject overlaps, and require
 /// every gap/suffix plus every child to satisfy caller-provided proofs.
-/// Surface slicing, range-file membership, trivia classification, and
-/// recursion remain local.
-template <typename MacroInvocations, typename ChildBelongsToRange,
-          typename SliceTrivia, typename IsNeutralGapTrivia,
+/// Gap classification and recursion remain with the caller's surface.
+template <typename MacroInvocations, typename PathEqual, typename GapIsNeutral,
           typename ChildIsNeutral>
 bool refoldSourceRangeIsTiledByNeutralNestedMacros(
     const MacroInvocations &macroInvocations, uint64_t parentMacroId,
-    uint64_t rangeBegin, uint64_t rangeEnd,
-    ChildBelongsToRange &&childBelongsToRange, SliceTrivia &&sliceTrivia,
-    IsNeutralGapTrivia &&isNeutralGapTrivia, ChildIsNeutral &&childIsNeutral) {
+    StringRef rangeFile, uint64_t rangeBegin, uint64_t rangeEnd,
+    PathEqual &&pathEqual, GapIsNeutral &&gapIsNeutral,
+    ChildIsNeutral &&childIsNeutral) {
   if (rangeBegin > rangeEnd)
     return false;
 
@@ -325,14 +193,12 @@ bool refoldSourceRangeIsTiledByNeutralNestedMacros(
     if (!candidate.callerMacroId || *candidate.callerMacroId != parentMacroId)
       continue;
 
-    if (!childBelongsToRange(candidate))
+    if (!refoldInvocationIsOnFile(candidate, rangeFile, pathEqual))
       continue;
     if (!candidate.invB || !candidate.invE ||
         *candidate.invB >= *candidate.invE)
       continue;
     if (*candidate.invB < rangeBegin || rangeEnd < *candidate.invE)
-      continue;
-    if (!sliceTrivia(*candidate.invB, *candidate.invE))
       continue;
 
     children.push_back({*candidate.invB, *candidate.invE, &candidate});
@@ -345,8 +211,7 @@ bool refoldSourceRangeIsTiledByNeutralNestedMacros(
     if (piece.begin < cursor)
       return false;
 
-    std::optional<StringRef> gap = sliceTrivia(cursor, piece.begin);
-    if (!gap || !isNeutralGapTrivia(*gap))
+    if (!gapIsNeutral(cursor, piece.begin))
       return false;
 
     if (!childIsNeutral(*piece.child))
@@ -355,141 +220,118 @@ bool refoldSourceRangeIsTiledByNeutralNestedMacros(
     cursor = piece.end;
   }
 
-  std::optional<StringRef> suffix = sliceTrivia(cursor, rangeEnd);
-  return suffix && isNeutralGapTrivia(*suffix);
+  return gapIsNeutral(cursor, rangeEnd);
 }
 
-/// Prove that a requested zero-token byte range is tiled by neutral nested
-/// macro invocations on either the definition replacement-list surface or the
-/// invocation-argument surface.
+/// Prove that source interval [begin, end) of \p definition's replacement list
+/// is tiled by neutral direct children of \p parent.
 ///
-/// The helper centralizes the byte-surface dispatch that was duplicated
-/// between TU fallback and header materialization.  Callers still provide the
-/// concrete invocation surface bytes/path, path-equivalence predicate,
-/// neutral-trivia predicate, and recursive child proof, so this does not
-/// change which ranges are considered replayable in either domain.
-template <typename ReplacementList, typename MacroInvocations,
-          typename PathEqual, typename IsNeutralTrivia, typename ChildIsNeutral>
-bool refoldZeroTokenRangeIsTiledByNeutralNestedMacros(
+/// The definition surface is token-shaped: a gap is neutral when it meets no
+/// replacement-list token.  It is kept apart from the invocation-argument
+/// surface below, which is caller-provided bytes, so that path equality alone
+/// never chooses between two byte spaces that may share one physical file.
+template <typename MacroInvocations, typename PathEqual,
+          typename ChildIsNeutral>
+bool refoldDefinitionRangeIsTiledByNeutralNestedMacros(
     const MacroInvocations &macroInvocations,
     const RefoldModel::MacroInvocation &parent,
-    const ReplacementList &replacement, uint64_t begin, uint64_t end,
-    StringRef rangeFile, RefoldZeroTokenRangeSurface surface,
-    StringRef invocationSurfaceText, StringRef invocationSurfacePath,
-    PathEqual &&pathEqual, IsNeutralTrivia &&isNeutralTrivia,
-    ChildIsNeutral &&childIsNeutral) {
-  auto sliceSurfaceText = [&](uint64_t sliceBegin,
-                              uint64_t sliceEnd) -> std::optional<StringRef> {
-    return refoldSliceZeroTokenRangeSurfaceText(
-        replacement, surface, sliceBegin, sliceEnd, invocationSurfaceText,
-        pathEqual(rangeFile, replacement.directive->sitePath),
-        pathEqual(rangeFile, invocationSurfacePath));
-  };
-
+    const RefoldModel::MacroDirective &definition, uint64_t begin, uint64_t end,
+    PathEqual &&pathEqual, ChildIsNeutral &&childIsNeutral) {
   return refoldSourceRangeIsTiledByNeutralNestedMacros(
-      macroInvocations, parent.id, begin, end,
-      [&](const RefoldModel::MacroInvocation &candidate) {
-        return candidate.invFile && !candidate.invFile->empty() &&
-               pathEqual(*candidate.invFile, rangeFile);
+      macroInvocations, parent.id, definition.sitePath, begin, end, pathEqual,
+      [&](uint64_t gapBegin, uint64_t gapEnd) {
+        return refoldReplacementListGapIsTokenFree(definition.replacementTokens,
+                                                   gapBegin, gapEnd);
       },
-      sliceSurfaceText, isNeutralTrivia, childIsNeutral);
+      childIsNeutral);
+}
+
+/// Prove that invocation-argument interval [begin, end) of \p parent is tiled
+/// by its neutral direct children.
+///
+/// The argument surface is the caller's materialized callsite bytes, which
+/// must be the file \p parent was recorded on; a gap is neutral when
+/// \p isNeutralTrivia accepts its bytes.
+template <typename MacroInvocations, typename PathEqual,
+          typename IsNeutralTrivia, typename ChildIsNeutral>
+bool refoldArgumentRangeIsTiledByNeutralNestedMacros(
+    const MacroInvocations &macroInvocations,
+    const RefoldModel::MacroInvocation &parent, uint64_t begin, uint64_t end,
+    StringRef surfaceText, StringRef surfacePath, PathEqual &&pathEqual,
+    IsNeutralTrivia &&isNeutralTrivia, ChildIsNeutral &&childIsNeutral) {
+  if (!refoldInvocationIsOnFile(parent, surfacePath, pathEqual))
+    return false;
+  return refoldSourceRangeIsTiledByNeutralNestedMacros(
+      macroInvocations, parent.id, *parent.invFile, begin, end, pathEqual,
+      [&](uint64_t gapBegin, uint64_t gapEnd) {
+        return gapEnd <= surfaceText.size() &&
+               isNeutralTrivia(surfaceText.slice(gapBegin, gapEnd));
+      },
+      childIsNeutral);
 }
 
 /// Prove the narrow object-like zero-token wrapper rule.
 ///
 /// Object-like wrappers have no formal-argument substitution surface.  A
-/// non-empty replacement list is source-neutral only when every non-trivia
-/// byte in the defining directive's replacement-list interval is occupied by
-/// a direct nested macro invocation, and every such child recursively proves
-/// the same zero-token neutrality predicate.  Any malformed direct child,
-/// child on a different source file, child outside the replacement interval,
-/// overlap, or non-trivia gap rejects fail-closed.
+/// non-empty replacement list is source-neutral only when every one of its
+/// tokens is occupied by a direct nested macro invocation, and every such
+/// child recursively proves the same zero-token neutrality predicate.  Any
+/// malformed direct child, child on a different source file, child outside
+/// the replacement list, overlap, or token left between children rejects
+/// fail-closed.
 ///
-/// The helper owns only this deterministic tiling rule.  It receives the
-/// producer-recorded replacement-list bounds/text plus caller-supplied
-/// direct-child membership, trivia, and recursive-child proofs; it does not
-/// inspect RefoldEngine state or decide whether a TU/header proof should be
-/// accepted.
-template <typename MacroInvocations, typename ChildBelongsToReplacementFile,
-          typename IsNeutralTrivia, typename ChildIsNeutral>
+/// The helper owns only the direct-child admission rule.  The tiling over
+/// [listBegin, listEnd) is the caller's definition-surface proof, and the
+/// caller has already accepted an empty list, so a list with no child is left
+/// with tokens in a gap and rejects.
+template <typename MacroInvocations, typename PathEqual,
+          typename DefinitionRangeIsTiled>
 bool refoldObjectLikeNestedWrapperIsNeutral(
     const MacroInvocations &macroInvocations, uint64_t parentMacroId,
-    uint64_t replacementFileBegin, uint64_t replacementFileEnd,
-    uint64_t replacementFileBase, StringRef replacementDirectiveText,
-    ChildBelongsToReplacementFile &&childBelongsToReplacementFile,
-    IsNeutralTrivia &&isNeutralTrivia, ChildIsNeutral &&childIsNeutral) {
-  if (replacementFileBegin > replacementFileEnd)
-    return false;
-
-  SmallVector<RefoldNeutralMacroChildPiece, 8> children;
+    StringRef definitionFile, uint64_t listBegin, uint64_t listEnd,
+    PathEqual &&pathEqual, DefinitionRangeIsTiled &&definitionRangeIsTiled) {
   for (const auto &candidate : macroInvocations) {
     if (!candidate.callerMacroId || *candidate.callerMacroId != parentMacroId)
       continue;
 
     // Direct children of the wrapper are the only source intervals allowed to
-    // account for non-trivia replacement-list bytes.  If the map records a
-    // direct child that cannot participate in this exact definition-site
-    // tiling, reject the wrapper rather than ignoring contradictory provenance.
-    if (!childBelongsToReplacementFile(candidate))
+    // account for replacement-list tokens.  If the map records a direct child
+    // that cannot participate in this exact definition-site tiling, reject the
+    // wrapper rather than ignoring contradictory provenance.
+    if (!refoldInvocationIsOnFile(candidate, definitionFile, pathEqual))
       return false;
     if (!candidate.invB || !candidate.invE ||
         *candidate.invB >= *candidate.invE)
       return false;
-    if (*candidate.invB < replacementFileBegin ||
-        replacementFileEnd < *candidate.invE)
+    if (*candidate.invB < listBegin || listEnd < *candidate.invE)
       return false;
-
-    children.push_back({*candidate.invB, *candidate.invE, &candidate});
   }
 
-  if (children.empty())
-    return false;
-
-  refoldSortNeutralChildPieces(children);
-
-  uint64_t cursor = replacementFileBegin;
-  for (const RefoldNeutralMacroChildPiece &piece : children) {
-    if (piece.begin < cursor)
-      return false;
-
-    const size_t gapBegin = static_cast<size_t>(cursor - replacementFileBase);
-    const size_t gapEnd =
-        static_cast<size_t>(piece.begin - replacementFileBase);
-    if (!isNeutralTrivia(replacementDirectiveText.slice(gapBegin, gapEnd)))
-      return false;
-
-    if (!childIsNeutral(*piece.child))
-      return false;
-
-    cursor = piece.end;
-  }
-
-  const size_t suffixBegin = static_cast<size_t>(cursor - replacementFileBase);
-  return isNeutralTrivia(replacementDirectiveText.slice(
-      suffixBegin, replacementDirectiveText.size()));
+  return definitionRangeIsTiled(listBegin, listEnd);
 }
 
-/// Walk a function-like macro replacement-list fragment in the zero-token
-/// forwarding domain.
+/// Walk replacement-list tokens [begin, end) of a function-like macro in the
+/// zero-token forwarding domain.
 ///
-/// This helper factors only the lexical/control-flow skeleton shared by TU
-/// fallback and header materialization.  It deliberately delegates every
-/// surface-specific proof obligation to caller-supplied callbacks: tiling by
-/// nested zero-token children, direct nested-child lookup, variadic-tail
-/// neutrality, and invocation-argument neutrality.  Therefore this routine
-/// does not broaden the proof domain; it merely keeps both callers using the
-/// same fail-closed replacement-list scanner.
+/// This helper factors only the token-walk skeleton shared by TU fallback and
+/// header materialization.  It deliberately delegates every surface-specific
+/// proof obligation to caller-supplied callbacks: tiling by nested zero-token
+/// children, direct nested-child lookup, variadic-tail neutrality, and
+/// invocation-argument neutrality.  Therefore this routine does not broaden
+/// the proof domain; it merely keeps both callers using the same fail-closed
+/// replacement-list walk.
 template <typename FragmentTilingProof, typename NeutralNestedChildProof,
           typename VariadicTailProof, typename ArgumentNeutralityProof>
 bool refoldReplacementFragmentIsNeutral(
-    StringRef text, size_t begin, size_t end,
-    const DenseMap<StringRef, unsigned> &paramIndexByName,
+    const RefoldModel::MacroDirective &definition, size_t begin, size_t end,
     SmallVectorImpl<unsigned> &usedParams,
     FragmentTilingProof &fragmentIsTiledByNeutralChildren,
     NeutralNestedChildProof &neutralNestedChildEndAt,
     VariadicTailProof &proveVariadicTailNeutral,
     ArgumentNeutralityProof &invocationArgumentIsNeutral) {
-  if (begin > end || end > text.size())
+  ArrayRef<RefoldModel::MacroReplacementToken> tokens =
+      definition.replacementTokens;
+  if (begin > end || end > tokens.size())
     return false;
 
   // A fragment made entirely of nested recorded zero-token macro invocations
@@ -501,32 +343,16 @@ bool refoldReplacementFragmentIsNeutral(
 
   size_t pos = begin;
   while (pos < end) {
-    if (!refoldSkipReplacementTriviaUntil(text, pos, end))
-      return false;
-    if (pos >= end)
-      break;
-
-    if (std::optional<size_t> childEnd = neutralNestedChildEndAt(pos, end)) {
-      pos = *childEnd;
+    if (std::optional<size_t> next = neutralNestedChildEndAt(pos, end)) {
+      pos = *next;
       continue;
     }
 
-    if (!stringutils::isIdentStart(text[pos]))
-      return false;
-    const size_t identBegin = pos++;
-    while (pos < end && stringutils::isIdentPart(text[pos]))
-      ++pos;
-    StringRef ident = text.slice(identBegin, pos);
-
-    if (ident == "__VA_OPT__") {
-      if (!refoldSkipReplacementTriviaUntil(text, pos, end))
+    const RefoldModel::MacroReplacementToken &token = tokens[pos];
+    if (refoldIsLiteralToken(token, "__VA_OPT__")) {
+      std::optional<size_t> close = findVaOptPayloadClose(definition, pos, end);
+      if (!close)
         return false;
-      std::optional<size_t> afterVaOpt = refoldParseVaOptPayloadEnd(text, pos);
-      if (!afterVaOpt || *afterVaOpt > end)
-        return false;
-
-      const size_t payloadBegin = pos + 1;
-      const size_t payloadEnd = *afterVaOpt - 1;
 
       // __VA_OPT__ is neutral in either of two proof-bounded cases:
       //   * the variadic tail is proved token-empty, so the payload is erased
@@ -538,40 +364,46 @@ bool refoldReplacementFragmentIsNeutral(
       // arbitrary payload semantics.
       if (!proveVariadicTailNeutral() &&
           !refoldReplacementFragmentIsNeutral(
-              text, payloadBegin, payloadEnd, paramIndexByName, usedParams,
+              definition, pos + 2, *close, usedParams,
               fragmentIsTiledByNeutralChildren, neutralNestedChildEndAt,
               proveVariadicTailNeutral, invocationArgumentIsNeutral))
         return false;
 
-      pos = *afterVaOpt;
+      pos = *close + 1;
       continue;
     }
 
-    // Outside __VA_OPT__, the only non-trivia replacement-list identifiers
-    // admitted by the function-like wrapper proof are formal parameter names.
-    // Their invocation argument ranges are checked once after the fragment
-    // walk completes.
-    auto it = paramIndexByName.find(ident);
-    if (it == paramIndexByName.end())
+    // Outside __VA_OPT__, the only other tokens admitted by the function-like
+    // wrapper proof are formal parameter references.  Their invocation
+    // argument ranges are checked once after the fragment walk completes.
+    if (token.kind != RefoldModel::MacroReplacementTokenKind::ParamRef)
       return false;
 
     // Token pasting can still be source-neutral in the placemarker domain.
     // The shared helper admits only paste chains whose operands are formals
     // with token-empty invocation arguments; any paste that could synthesize
     // real PP-token material remains outside this proof.
-    if (refoldConsumeNeutralPlacemarkerPasteChain(
-            text, pos, end, it->second, paramIndexByName,
-            invocationArgumentIsNeutral, usedParams))
+    if (pos + 1 < end && refoldIsLiteralToken(tokens[pos + 1], "##")) {
+      std::optional<size_t> chainEnd =
+          refoldConsumeNeutralPlacemarkerPasteChain(tokens.take_front(end), pos,
+                                                    invocationArgumentIsNeutral,
+                                                    usedParams);
+      if (!chainEnd)
+        return false;
+      pos = *chainEnd;
       continue;
+    }
 
-    usedParams.push_back(it->second);
+    usedParams.push_back(*token.paramIndex);
+    ++pos;
   }
 
   return true;
 }
 
-/// Find a direct nested macro invocation that starts exactly at a replacement
-/// list byte offset and recursively proves zero-token neutrality.
+/// Find a direct nested macro invocation that starts exactly at replacement
+/// list token \p pos, ends where a token before \p limit ends, and recursively
+/// proves zero-token neutrality; return the index of the token after it.
 ///
 /// This helper owns the duplicate-ownership rule shared by TU fallback and
 /// header materialization: if two direct children claim the same local
@@ -583,22 +415,22 @@ template <typename MacroInvocations, typename PathEqual,
           typename ChildIsNeutral>
 std::optional<size_t> refoldNeutralNestedReplacementChildEndAt(
     const MacroInvocations &macroInvocations,
-    const RefoldModel::MacroInvocation &parent, uint64_t replacementFileBase,
-    StringRef replacementDirectiveText, StringRef replacementDirectivePath,
-    size_t pos, size_t limit, PathEqual &&pathEqual,
-    ChildIsNeutral &&childIsNeutral) {
-  if (limit > replacementDirectiveText.size())
+    const RefoldModel::MacroInvocation &parent,
+    const RefoldModel::MacroDirective &definition, size_t pos, size_t limit,
+    PathEqual &&pathEqual, ChildIsNeutral &&childIsNeutral) {
+  ArrayRef<RefoldModel::MacroReplacementToken> tokens =
+      definition.replacementTokens;
+  if (pos >= limit || limit > tokens.size())
     return std::nullopt;
 
-  const uint64_t filePos = replacementFileBase + static_cast<uint64_t>(pos);
-  const uint64_t fileLimit = replacementFileBase + static_cast<uint64_t>(limit);
+  const uint64_t filePos = tokens[pos].source->begin;
+  const uint64_t fileLimit = tokens[limit - 1].source->end;
 
   const RefoldModel::MacroInvocation *matched = nullptr;
   for (const auto &candidate : macroInvocations) {
     if (!candidate.callerMacroId || *candidate.callerMacroId != parent.id)
       continue;
-    if (!candidate.invFile || candidate.invFile->empty() ||
-        !pathEqual(*candidate.invFile, replacementDirectivePath))
+    if (!refoldInvocationIsOnFile(candidate, definition.sitePath, pathEqual))
       continue;
     if (!candidate.invB || !candidate.invE ||
         *candidate.invB >= *candidate.invE)
@@ -613,41 +445,49 @@ std::optional<size_t> refoldNeutralNestedReplacementChildEndAt(
 
   if (!matched)
     return std::nullopt;
+
+  // The walk resumes after the child, so the child must end where one of the
+  // fragment's tokens ends.
+  size_t next = pos;
+  while (next < limit && tokens[next].source->end <= *matched->invE)
+    ++next;
+  if (next == pos || tokens[next - 1].source->end != *matched->invE)
+    return std::nullopt;
+
   if (!childIsNeutral(*matched))
     return std::nullopt;
-  return static_cast<size_t>(*matched->invE - replacementFileBase);
+  return next;
 }
 
 /// Prove the shared function-like zero-token forwarding rule.
 ///
 /// TU fallback and header materialization have different byte surfaces and
 /// recursive domains, but once those are supplied as callbacks the forwarding
-/// rule is identical: every replacement-list formal that survives the lexical
+/// rule is identical: every replacement-list formal that survives the token
 /// walk must have an invocation argument tiled by neutral nested macro calls;
 /// variadic formals and __VA_OPT__ are admitted only through that same
 /// token-empty argument proof.  The helper deliberately returns only a
 /// boolean and does not report why a proof failed, preserving the existing
 /// fail-closed behavior of both callers.
-template <typename ReplacementList, typename FragmentTilingProof,
-          typename NeutralNestedChildProof,
+template <typename FragmentTilingProof, typename NeutralNestedChildProof,
           typename InvocationArgumentNeutralityProof>
 bool refoldFunctionLikeZeroTokenForwardingIsNeutral(
-    const RefoldModel::MacroInvocation &m, const ReplacementList &replacement,
+    const RefoldModel::MacroInvocation &m,
+    const RefoldModel::MacroDirective &definition,
     FragmentTilingProof &&fragmentIsTiledByNeutralChildren,
     NeutralNestedChildProof &&neutralNestedChildEndAt,
     InvocationArgumentNeutralityProof &&invocationArgumentIsNeutral) {
-  if (m.defParams.empty() || m.invArgRanges.size() < m.defParams.size())
+  ArrayRef<RefoldModel::MacroDefParam> params = definition.defParams;
+  if (params.empty() || m.invArgRanges.size() < params.size())
     return false;
 
-  DenseMap<StringRef, unsigned> paramIndexByName;
   std::optional<unsigned> variadicParamIndex;
-  for (unsigned i = 0, e = m.defParams.size(); i != e; ++i) {
-    paramIndexByName.try_emplace(m.defParams[i].name, i);
-    if (m.defParams[i].variadic) {
-      if (variadicParamIndex)
-        return false;
-      variadicParamIndex = i;
-    }
+  for (unsigned i = 0, e = params.size(); i != e; ++i) {
+    if (!params[i].variadic)
+      continue;
+    if (variadicParamIndex)
+      return false;
+    variadicParamIndex = i;
   }
 
   std::optional<bool> variadicTailIsNeutral;
@@ -663,10 +503,9 @@ bool refoldFunctionLikeZeroTokenForwardingIsNeutral(
   };
 
   SmallVector<unsigned, 4> usedParams;
-  StringRef text = replacement.directive->text;
   if (!refoldReplacementFragmentIsNeutral(
-          text, replacement.replacementTextBegin, text.size(), paramIndexByName,
-          usedParams, fragmentIsTiledByNeutralChildren, neutralNestedChildEndAt,
+          definition, 0, definition.replacementTokens.size(), usedParams,
+          fragmentIsTiledByNeutralChildren, neutralNestedChildEndAt,
           proveVariadicTailNeutral, invocationArgumentIsNeutral))
     return false;
 
@@ -685,19 +524,17 @@ bool refoldFunctionLikeZeroTokenForwardingIsNeutral(
 ///
 /// TU fallback and header materialization use the same structural proof for a
 /// zero-token macro invocation: the invocation must emit no material PP
-/// tokens, its defining replacement list must be recoverable, recursive child
-/// proofs must form an acyclic source tiling, and function-like forwarding
-/// must only forward token-empty arguments.  The remaining differences are
-/// true policy inputs supplied by the caller: the invocation source surface,
-/// path equality, neutral-trivia classification, replacement-list recovery,
+/// tokens, its defining replacement list must be walkable in source
+/// coordinates, recursive child proofs must form an acyclic source tiling, and
+/// function-like forwarding must only forward token-empty arguments.  The
+/// remaining differences are true policy inputs supplied by the caller: the
+/// invocation source surface, path equality, neutral-trivia classification,
 /// and whether the caller admits the whole-definition-list tiling shortcut
 /// before subkind-specific wrapper checks.
-template <typename MacroInvocations, typename RecoverReplacement,
-          typename PathEqual, typename IsNeutralTrivia, typename ChildIsNeutral>
+template <typename PathEqual, typename IsNeutralTrivia, typename ChildIsNeutral>
 bool refoldMacroInvocationIsSourceNeutralZeroToken(
-    const MacroInvocations &macroInvocations,
-    const RefoldModel::MacroInvocation &m, DenseSet<uint64_t> &visiting,
-    RecoverReplacement &&recoverReplacement, StringRef invocationSurfaceText,
+    const RefoldModel &model, const RefoldModel::MacroInvocation &m,
+    DenseSet<uint64_t> &visiting, StringRef invocationSurfaceText,
     StringRef invocationSurfacePath, PathEqual &&pathEqual,
     IsNeutralTrivia &&isNeutralTrivia,
     bool allowWholeDefinitionListTilingBeforeSubkindCheck,
@@ -717,36 +554,34 @@ bool refoldMacroInvocationIsSourceNeutralZeroToken(
     return result;
   };
 
-  auto replacement = recoverReplacement(m);
-  if (!replacement)
+  const RefoldModel::MacroDirective *definition =
+      refoldRecoverWalkableDefinition(model, m);
+  if (!definition)
     return finish(false);
 
-  StringRef replacementText =
-      replacement->directive->text.substr(replacement->replacementTextBegin);
-
   // A literal empty replacement list is source-neutral by construction.
-  if (isNeutralTrivia(replacementText))
+  ArrayRef<RefoldModel::MacroReplacementToken> tokens =
+      definition->replacementTokens;
+  if (tokens.empty())
     return finish(true);
 
-  auto rangeIsTiledByNeutralNestedMacros =
-      [&](uint64_t begin, uint64_t end, StringRef rangeFile,
-          RefoldZeroTokenRangeSurface surface) -> bool {
-    return refoldZeroTokenRangeIsTiledByNeutralNestedMacros(
-        macroInvocations, m, *replacement, begin, end, rangeFile, surface,
-        invocationSurfaceText, invocationSurfacePath, pathEqual,
-        isNeutralTrivia, [&](const RefoldModel::MacroInvocation &child) {
-          return childIsNeutral(child, visiting);
-        });
+  ArrayRef<RefoldModel::MacroInvocation> macroInvocations =
+      model.GetMacroInvocations();
+  auto childProof = [&](const RefoldModel::MacroInvocation &child) {
+    return childIsNeutral(child, visiting);
   };
+  auto definitionRangeIsTiled = [&](uint64_t begin, uint64_t end) {
+    return refoldDefinitionRangeIsTiledByNeutralNestedMacros(
+        macroInvocations, m, *definition, begin, end, pathEqual, childProof);
+  };
+  const uint64_t listBegin = tokens.front().source->begin;
+  const uint64_t listEnd = tokens.back().source->end;
 
   // Header materialization accepts a whole replacement-list tiling before
   // subkind-specific checks.  TU fallback leaves this disabled so this shared
   // helper keeps both proof domains explicit.
   if (allowWholeDefinitionListTilingBeforeSubkindCheck &&
-      rangeIsTiledByNeutralNestedMacros(
-          replacement->fileBegin, replacement->fileEnd,
-          replacement->directive->sitePath,
-          RefoldZeroTokenRangeSurface::DefinitionReplacementList))
+      definitionRangeIsTiled(listBegin, listEnd))
     return finish(true);
 
   if (m.subkind == "func") {
@@ -754,37 +589,27 @@ bool refoldMacroInvocationIsSourceNeutralZeroToken(
       const auto &range = m.invArgRanges[argIdx];
       if (!range.first || !range.second || *range.first > *range.second)
         return false;
-      if (!m.invFile || m.invFile->empty())
-        return false;
-      return rangeIsTiledByNeutralNestedMacros(
-          *range.first, *range.second, *m.invFile,
-          RefoldZeroTokenRangeSurface::InvocationArgument);
+      return refoldArgumentRangeIsTiledByNeutralNestedMacros(
+          macroInvocations, m, *range.first, *range.second,
+          invocationSurfaceText, invocationSurfacePath, pathEqual,
+          isNeutralTrivia, childProof);
     };
 
-    StringRef text = replacement->directive->text;
     auto replacementFragmentIsTiledByNeutralChildren = [&](size_t begin,
-                                                           size_t end) -> bool {
-      if (begin > end || end > text.size())
-        return false;
-      return rangeIsTiledByNeutralNestedMacros(
-          replacement->fileBase + static_cast<uint64_t>(begin),
-          replacement->fileBase + static_cast<uint64_t>(end),
-          replacement->directive->sitePath,
-          RefoldZeroTokenRangeSurface::DefinitionReplacementList);
+                                                           size_t end) {
+      return begin == end ||
+             definitionRangeIsTiled(tokens[begin].source->begin,
+                                    tokens[end - 1].source->end);
     };
 
     auto neutralNestedReplacementChildEndAt =
         [&](size_t pos, size_t limit) -> std::optional<size_t> {
       return refoldNeutralNestedReplacementChildEndAt(
-          macroInvocations, m, replacement->fileBase, text,
-          replacement->directive->sitePath, pos, limit, pathEqual,
-          [&](const RefoldModel::MacroInvocation &child) {
-            return childIsNeutral(child, visiting);
-          });
+          macroInvocations, m, *definition, pos, limit, pathEqual, childProof);
     };
 
     return finish(refoldFunctionLikeZeroTokenForwardingIsNeutral(
-        m, *replacement, replacementFragmentIsTiledByNeutralChildren,
+        m, *definition, replacementFragmentIsTiledByNeutralChildren,
         neutralNestedReplacementChildEndAt, invocationArgumentRangeIsNeutral));
   }
 
@@ -793,18 +618,10 @@ bool refoldMacroInvocationIsSourceNeutralZeroToken(
 
   // Object-like wrappers are neutral only when their definition-site
   // replacement list is tiled entirely by direct nested zero-token macro
-  // invocations plus trivia.
+  // invocations.
   return finish(refoldObjectLikeNestedWrapperIsNeutral(
-      macroInvocations, m.id, replacement->fileBegin, replacement->fileEnd,
-      replacement->fileBase, replacement->directive->text,
-      [&](const RefoldModel::MacroInvocation &candidate) {
-        return candidate.invFile && !candidate.invFile->empty() &&
-               pathEqual(*candidate.invFile, replacement->directive->sitePath);
-      },
-      isNeutralTrivia,
-      [&](const RefoldModel::MacroInvocation &child) {
-        return childIsNeutral(child, visiting);
-      }));
+      macroInvocations, m.id, definition->sitePath, listBegin, listEnd,
+      pathEqual, definitionRangeIsTiled));
 }
 
 //===----------------------------------------------------------------------===//
@@ -1068,7 +885,6 @@ bool conditionalGroupIsNeutralIsland(
 /// dependency merely to classify whitespace/comments.
 struct ZeroTokenMacroNeutralityContext {
   const RefoldModel &model;
-  const RefoldMacroStateProof &macroStateProof;
   const RefoldPathIdentity &paths;
   StringRef sourceText;
   StringRef sourcePath;
@@ -1081,12 +897,8 @@ bool macroInvocationIsSourceNeutralZeroTokenImpl(
     const RefoldModel::MacroInvocation &invocation,
     DenseSet<uint64_t> &visiting) {
   return refoldMacroInvocationIsSourceNeutralZeroToken(
-      context.model.GetMacroInvocations(), invocation, visiting,
-      [&](const RefoldModel::MacroInvocation &candidate) {
-        return context.macroStateProof
-            .RecoverMacroDefinitionReplacementListInterval(candidate);
-      },
-      context.sourceText, context.sourcePath,
+      context.model, invocation, visiting, context.sourceText,
+      context.sourcePath,
       [&](StringRef lhs, StringRef rhs) {
         return context.paths.PathsEqual(lhs, rhs);
       },
@@ -1347,20 +1159,17 @@ bool balancedDiagnosticPragmaStateIslandIsCarriedByReplacement(
 
 TUSourceNeutralityContext
 RefoldSourceNeutralityProof::BuildTUSourceNeutralityContext(
-    const RefoldModel &model, const RefoldMacroStateProof &macroStateProof,
-    const RefoldPathIdentity &paths, StringRef tuBytes, StringRef tuPath,
-    bool (*isNeutralTrivia)(StringRef)) {
-  return {model, macroStateProof, paths, tuBytes, tuPath, isNeutralTrivia};
+    const RefoldModel &model, const RefoldPathIdentity &paths,
+    StringRef tuBytes, StringRef tuPath, bool (*isNeutralTrivia)(StringRef)) {
+  return {model, paths, tuBytes, tuPath, isNeutralTrivia};
 }
 
 HeaderSourceNeutralityContext
 RefoldSourceNeutralityProof::BuildHeaderSourceNeutralityContext(
-    const RefoldModel &model, const RefoldMacroStateProof &macroStateProof,
-    const RefoldPathIdentity &paths, StringRef headerBytes,
-    StringRef headerPath, uint64_t includeId,
+    const RefoldModel &model, const RefoldPathIdentity &paths,
+    StringRef headerBytes, StringRef headerPath, uint64_t includeId,
     bool (*isNeutralTrivia)(StringRef)) {
-  return {model,      macroStateProof, paths,    headerBytes,
-          headerPath, isNeutralTrivia, includeId};
+  return {model, paths, headerBytes, headerPath, isNeutralTrivia, includeId};
 }
 
 bool RefoldSourceNeutralityProof::MacroInvocationHasMaterializedPPTokens(
@@ -1373,7 +1182,6 @@ bool RefoldSourceNeutralityProof::MacroInvocationIsSourceNeutralZeroToken(
     const RefoldModel::MacroInvocation &invocation) {
   ZeroTokenMacroNeutralityContext zeroContext{
       context.model,
-      context.macroStateProof,
       context.paths,
       context.tuBytes,
       context.tuPath,
@@ -1387,7 +1195,6 @@ bool RefoldSourceNeutralityProof::MacroInvocationIsSourceNeutralZeroToken(
     const RefoldModel::MacroInvocation &invocation) {
   ZeroTokenMacroNeutralityContext zeroContext{
       context.model,
-      context.macroStateProof,
       context.paths,
       context.headerBytes,
       context.headerPath,

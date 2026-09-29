@@ -834,6 +834,18 @@ parseMacroDefParams(const json::Object &ownerObj, StringRef fieldName,
   return params;
 }
 
+/// Return the nonempty half-open byte range recorded under \p beginKey and
+/// \p endKey, or nullopt unless both are present and well formed.
+static std::optional<RefoldModel::ByteRange>
+parseOptSourceByteRange(const json::Object &obj, StringRef beginKey,
+                         StringRef endKey) {
+  std::optional<uint64_t> begin = asOptUInt64(obj, beginKey);
+  std::optional<uint64_t> end = asOptUInt64(obj, endKey);
+  if (!begin || !end || *begin >= *end)
+    return std::nullopt;
+  return RefoldModel::ByteRange{*begin, *end};
+}
+
 /// Parse a macro directive's replacement-list replay tokens.
 ///
 /// Each `param_ref` token is checked against \p defParams: the index must name
@@ -856,6 +868,7 @@ parseMacroReplacementTokens(const json::Object &ownerObj,
 
       MacroReplacementToken token;
       token.spelling = tok.String("spelling");
+      token.source = parseOptSourceByteRange(TokObj, "site_b", "site_e");
       if (kind == "literal") {
         token.kind = MacroReplacementTokenKind::Literal;
         if (TokObj.get("param_index"))
@@ -984,18 +997,6 @@ parseCalleeOriginParts(const json::Object &originObj, StringRef finalSpelling,
         "{0}: callee_origin.parts do not tile the final callee spelling",
         ctxItem);
   return parts;
-}
-
-/// Return the nonempty half-open byte range recorded under \p beginKey and
-/// \p endKey, or nullopt unless both are present and well formed.
-static std::optional<RefoldModel::ByteRange>
-parseOptSourceByteRange(const json::Object &obj, StringRef beginKey,
-                         StringRef endKey) {
-  std::optional<uint64_t> begin = asOptUInt64(obj, beginKey);
-  std::optional<uint64_t> end = asOptUInt64(obj, endKey);
-  if (!begin || !end || *begin >= *end)
-    return std::nullopt;
-  return RefoldModel::ByteRange{*begin, *end};
 }
 
 /// Parse one `#include` / `#include_next` item.
@@ -1197,6 +1198,21 @@ parseIncludeItem(const json::Object &obj, StringRef skStr,
   return inc;
 }
 
+/// Return true when every replacement token of \p md has a source range and
+/// the ranges ascend without overlap from the end of the macro name to the end
+/// of the directive's recorded physical extent.
+static bool replacementTokenSourcesAreConsistent(const MacroDirective &md) {
+  if (!md.directiveLineE)
+    return false;
+  uint64_t cursor = md.siteB + md.name.size();
+  for (const MacroReplacementToken &token : md.replacementTokens) {
+    if (!token.source || token.source->begin < cursor)
+      return false;
+    cursor = token.source->end;
+  }
+  return cursor <= *md.directiveLineE;
+}
+
 /// Parse one `#define` / `#undef` item.
 ///
 /// The formal list and replacement-list replay tokens are read only for a
@@ -1268,6 +1284,12 @@ parseMacroDirectiveItem(const json::Object &obj, StringRef skStr,
     md.defParams = parseMacroDefParams(obj, "def_params", ctxItem);
     md.replacementTokens =
         parseMacroReplacementTokens(obj, md.defParams, ctxItem);
+
+    // Token source ranges (schema 3.10) are one producer measurement of the
+    // whole list, so a partial or disordered record is dropped as a unit.
+    if (!replacementTokenSourcesAreConsistent(md))
+      for (MacroReplacementToken &token : md.replacementTokens)
+        token.source.reset();
   }
 
   // optional

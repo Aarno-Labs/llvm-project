@@ -2662,6 +2662,29 @@ void RefoldMapBuilder::onMacroDefined(const Token &MacroNameTok,
     }
   }
 
+  // Record where each replacement-list token is spelled, so the consumer can
+  // tile the definition's source bytes by token instead of re-lexing It.Text,
+  // whose canonical spacing shifts every offset of a definition written with
+  // extra blanks, comments or continuations.  The ranges are one measurement:
+  // each token must lie inside the physical extent, after the previous one,
+  // or no token gets a range.
+  if (It.DirectiveLineBegin && It.DirectiveLineEnd) {
+    const std::pair<uint64_t, uint64_t> Extent{*It.DirectiveLineBegin,
+                                               *It.DirectiveLineEnd};
+    uint64_t Cursor = Extent.first;
+    for (auto [RTok, ReplayTok] :
+         llvm::zip_equal(MI->tokens(), It.ReplacementTokens)) {
+      ReplayTok.SourceRange = computeDirectiveTokenRange(
+          MI->getDefinitionLoc(), RTok.getLocation(), RTok.getEndLoc(), Extent);
+      if (!ReplayTok.SourceRange || ReplayTok.SourceRange->first < Cursor) {
+        for (MacroReplacementToken &Recorded : It.ReplacementTokens)
+          Recorded.SourceRange.reset();
+        break;
+      }
+      Cursor = ReplayTok.SourceRange->second;
+    }
+  }
+
   // Absolute (or configured) path of the file containing the #define.
   It.SitePath = filePathForLocAbs(SM, MI->getDefinitionLoc(), EmitAbsPaths);
 
@@ -4656,7 +4679,7 @@ void RefoldMapBuilder::writeJSON() {
       PragmaItemsWithImage == PragmasEmittedIntoOutput;
 
   JO.object([&] {
-    JO.attribute("version", "3.9");
+    JO.attribute("version", "3.10");
     JO.attribute("pragma_images_complete", PragmaImagesComplete);
 
     const auto &PPO = PP.getPreprocessorOpts();
@@ -6242,25 +6265,29 @@ void RefoldMapBuilder::writeJSON() {
               });
             }
 
-            if (!It.ReplacementTokens.empty()) {
-              JO.attributeArray("replacement_tokens", [&] {
-                for (const MacroReplacementToken &RT : It.ReplacementTokens) {
-                  JO.object([&] {
-                    switch (RT.Kind) {
-                    case MRT_Literal:
-                      JO.attribute("kind", "literal");
-                      break;
-                    case MRT_ParamRef:
-                      JO.attribute("kind", "param_ref");
-                      if (RT.ParamIndex)
-                        JO.attribute("param_index", *RT.ParamIndex);
-                      break;
-                    }
-                    JO.attribute("spelling", RT.Spelling);
-                  });
-                }
-              });
-            }
+            // Emitted even when empty, so an absent tape is never mistaken for
+            // an empty replacement list.
+            JO.attributeArray("replacement_tokens", [&] {
+              for (const MacroReplacementToken &RT : It.ReplacementTokens) {
+                JO.object([&] {
+                  switch (RT.Kind) {
+                  case MRT_Literal:
+                    JO.attribute("kind", "literal");
+                    break;
+                  case MRT_ParamRef:
+                    JO.attribute("kind", "param_ref");
+                    if (RT.ParamIndex)
+                      JO.attribute("param_index", *RT.ParamIndex);
+                    break;
+                  }
+                  JO.attribute("spelling", RT.Spelling);
+                  if (RT.SourceRange) {
+                    JO.attribute("site_b", RT.SourceRange->first);
+                    JO.attribute("site_e", RT.SourceRange->second);
+                  }
+                });
+              }
+            });
           }
 
           // Macro-token origin spans

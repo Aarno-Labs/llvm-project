@@ -39,7 +39,6 @@
 namespace clang {
 namespace refold {
 
-class RefoldMacroStateProof;
 class RefoldPathIdentity;
 
 //===----------------------------------------------------------------------===//
@@ -143,12 +142,11 @@ bool balancedDiagnosticPragmaStateIslandIsCarriedByReplacement(
 
 /// Source-neutrality context for TU-owned fallback gaps.
 ///
-/// The context binds the immutable producer model, TU source bytes, path
-/// identity service, and macro-state proof used to prove zero-token source
-/// islands neutral without reintroducing RefoldEngine-local policy lambdas.
+/// The context binds the immutable producer model, TU source bytes, and path
+/// identity service used to prove zero-token source islands neutral without
+/// reintroducing RefoldEngine-local policy lambdas.
 struct TUSourceNeutralityContext {
   const RefoldModel &model;
-  const RefoldMacroStateProof &macroStateProof;
   const RefoldPathIdentity &paths;
   llvm::StringRef tuBytes;
   llvm::StringRef tuPath;
@@ -161,7 +159,6 @@ struct TUSourceNeutralityContext {
 /// source policy or unrelated include-instance facts.
 struct HeaderSourceNeutralityContext {
   const RefoldModel &model;
-  const RefoldMacroStateProof &macroStateProof;
   const RefoldPathIdentity &paths;
   llvm::StringRef headerBytes;
   llvm::StringRef headerPath;
@@ -184,16 +181,15 @@ struct NeutralConditionalIslandContext {
 struct RefoldSourceNeutralityProof {
   /// Build the context used by TU fallback source-neutrality checks.
   static TUSourceNeutralityContext BuildTUSourceNeutralityContext(
-      const RefoldModel &model, const RefoldMacroStateProof &macroStateProof,
-      const RefoldPathIdentity &paths, llvm::StringRef tuBytes,
-      llvm::StringRef tuPath, bool (*isNeutralTrivia)(llvm::StringRef));
+      const RefoldModel &model, const RefoldPathIdentity &paths,
+      llvm::StringRef tuBytes, llvm::StringRef tuPath,
+      bool (*isNeutralTrivia)(llvm::StringRef));
 
   /// Build the context used by materialized-header source-neutrality checks.
   static HeaderSourceNeutralityContext BuildHeaderSourceNeutralityContext(
-      const RefoldModel &model, const RefoldMacroStateProof &macroStateProof,
-      const RefoldPathIdentity &paths, llvm::StringRef headerBytes,
-      llvm::StringRef headerPath, uint64_t includeId,
-      bool (*isNeutralTrivia)(llvm::StringRef));
+      const RefoldModel &model, const RefoldPathIdentity &paths,
+      llvm::StringRef headerBytes, llvm::StringRef headerPath,
+      uint64_t includeId, bool (*isNeutralTrivia)(llvm::StringRef));
 
   /// Return true iff the recorded macro invocation emitted material PP
   /// tokens.

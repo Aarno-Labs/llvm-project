@@ -98,22 +98,6 @@ enum class PayloadIdentifierExpansionPolicy {
   NeutralisedByLivenessAudit,
 };
 
-/// File-byte interval for the replacement list of the #define that created a
-/// recorded macro invocation.
-///
-/// The interval is expressed both in directive-text coordinates and in source
-/// file coordinates.  Source-neutral macro-gap proofs use this to tile only the
-/// replacement-list body while still translating nested callsite byte ranges
-/// back through the producer's macro-name source anchor.
-struct MacroDefinitionReplacementListInterval {
-  const RefoldModel::MacroDirective *directive = nullptr;
-  size_t nameTextBegin = 0;
-  size_t replacementTextBegin = 0;
-  uint64_t fileBase = 0;
-  uint64_t fileBegin = 0;
-  uint64_t fileEnd = 0;
-};
-
 /// Minimal macro-patch surface needed by materialized-header macro-state proof.
 ///
 /// The full MacroPatch carrier is still an edit/planning type.  Macro-state
@@ -291,13 +275,6 @@ public:
       const RefoldModel::MacroDirective &definition, llvm::StringRef macroName,
       llvm::StringRef expectedPath, llvm::StringRef fileBytes,
       std::optional<uint64_t> requiredOwnerIncludeId, uint64_t offset) const;
-
-  /// Recover the source interval for the replacement list of the #define used
-  /// by \p invocation, if the defining directive and invocation shape are
-  /// producer-proven and byte-coordinate translation is well-formed.
-  std::optional<MacroDefinitionReplacementListInterval>
-  RecoverMacroDefinitionReplacementListInterval(
-      const RefoldModel::MacroInvocation &invocation) const;
 
   /// Stabilize an include-owned macro patch against the macro state at its
   /// final replay position.

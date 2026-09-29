@@ -1202,8 +1202,7 @@ public:
             pragmaIsConsumableIncludeLocalState),
         tuSourceNeutrality_(
             RefoldSourceNeutralityProof::BuildTUSourceNeutralityContext(
-                model, macroStateProof, paths, tuBytes, tuPath,
-                isWsOrCompleteCommentTrivia)) {}
+                model, paths, tuBytes, tuPath, isWsOrCompleteCommentTrivia)) {}
 
   /// True when the source gap [begin, end) is exactly indexed lexer trivia.
   ///

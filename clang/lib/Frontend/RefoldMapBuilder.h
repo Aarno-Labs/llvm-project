@@ -115,15 +115,18 @@ enum MacroReplacementTokenKind {
 /// definition time.
 ///
 /// The consumer can use this as a producer-owned replay tape for simple macro
-/// expansion proofs instead of reparsing the textual #define directive.  The
-/// tape intentionally records token spellings, not source byte ranges: macro
-/// definition editing is outside clang-refold's core refolding domain, while
-/// deterministic replay only needs to know which replacement-list tokens are
-/// fixed literals and which are formal-parameter references.
+/// expansion proofs instead of reparsing the textual #define directive.
+/// Deterministic replay only needs to know which replacement-list tokens are
+/// fixed literals and which are formal-parameter references.  Proofs that tile
+/// the definition's source bytes also need where each token is spelled, which
+/// the directive text cannot say: it is a canonical re-rendering.
 struct MacroReplacementToken {
   MacroReplacementTokenKind Kind = MRT_Literal;
   std::string Spelling;
   std::optional<uint32_t> ParamIndex;
+  /// Half-open byte range of the token's spelling in the defining file.
+  /// Recorded for every token of a definition or for none.
+  std::optional<std::pair<uint64_t, uint64_t>> SourceRange;
 };
 
 enum MacroCalleeOriginKind {
