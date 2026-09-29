@@ -30,8 +30,8 @@ namespace refold {
 /// New-schema maps carry this exact `__FILE__` entry spelling in
 /// entered_file_spelling.  This helper intentionally does not fall back to
 /// resolved_path: file-spelling proofs need to distinguish an explicit producer
-/// fact from legacy spelling data and from independently recovered observer or
-/// replay witnesses.
+/// fact from legacy spelling data.  The schema requires the field on every
+/// include edge that has a parent.
 inline llvm::StringRef
 explicitProducerEnteredFileSpelling(const RefoldModel::IncludeItem &include) {
   return include.enteredFileSpelling ? *include.enteredFileSpelling
@@ -42,8 +42,7 @@ explicitProducerEnteredFileSpelling(const RefoldModel::IncludeItem &include) {
 ///
 /// Older maps only had resolved_path, whose meaning drifted between physical
 /// identity and entered-file spelling.  New proof code should consult this
-/// helper only after exhausting stronger new-schema metadata and recovered
-/// observer/replay witnesses.
+/// helper only after exhausting stronger new-schema metadata.
 inline llvm::StringRef
 legacyResolvedIncludePath(const RefoldModel::IncludeItem &include) {
   return include.resolvedPath ? *include.resolvedPath : llvm::StringRef();
@@ -52,10 +51,8 @@ legacyResolvedIncludePath(const RefoldModel::IncludeItem &include) {
 /// Return the best available producer-entered filename spelling for an include.
 ///
 /// This is a convenience for legacy-neutral callers that only need a spelling
-/// anchor.  Proof-sensitive code that implements the full file-spelling
-/// fallback hierarchy should prefer explicitProducerEnteredFileSpelling(), then
-/// any context-specific observer/replay witnesses, and only then
-/// legacyResolvedIncludePath().
+/// anchor.  Proof-sensitive code that must not accept resolved_path as a
+/// spelling should call explicitProducerEnteredFileSpelling() instead.
 inline llvm::StringRef
 producerEnteredFileSpelling(const RefoldModel::IncludeItem &include) {
   llvm::StringRef explicitSpelling =

@@ -13,7 +13,6 @@ add_clang_library(clangRefold STATIC
   source/RefoldLegacyAlignmentDiagnostic.cpp
   line-control/FinalLineControlModel.cpp
   line-control/LineDirectiveInserter.cpp
-  line-control/RefoldLineControlFilename.cpp
   line-control/RefoldLineControlRewrite.cpp
   line-control/RefoldNoLinesPruning.cpp
   edit/RefoldExpansionFallbackPlanner.cpp

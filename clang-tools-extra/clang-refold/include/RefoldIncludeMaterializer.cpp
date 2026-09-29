@@ -218,18 +218,6 @@ macroStateStagedEditIntervals(
   return intervals;
 }
 
-/// Adapter for include replay proof source slicing.
-/// The callable borrows the source mapper for the proof context lifetime.
-struct IncludeReplaySliceASource {
-  /// Source-mapping service used to slice the original A source.
-  const RefoldSourceMapper &sourceMapper_;
-
-  /// Returns the A-source slice for the requested byte interval.
-  StringRef operator()(uint64_t begin, uint64_t end) const {
-    return sourceMapper_.SliceASource(begin, end);
-  }
-};
-
 /// Adapter for include replay proof physical-file comparison.
 /// The callable keeps path identity policy outside the proof layer.
 struct IncludeReplaySamePhysicalIncludeFile {
@@ -860,7 +848,6 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
 
   // Include replay proof is read-only.  The function_ref services borrow
   // named adapter objects whose storage outlives the short-lived proof context.
-  IncludeReplaySliceASource includeReplaySliceASource{sourceMapper_};
   IncludeReplaySamePhysicalIncludeFile includeReplaySamePhysicalIncludeFile{
       paths_};
   IncludeReplayLineStateObservableMacroSite
@@ -869,10 +856,10 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
       includeReplayLineStateBuiltinInvocationIsPreservedObserver{
           lineControlProof_};
 
-  IncludeReplayProofInputs includeReplayProofInputs{model_, aSource_, lineDirs_,
+  IncludeReplayProofInputs includeReplayProofInputs{model_, lineDirs_,
                                                     finalReplaySurface_};
   IncludeReplayProofServices includeReplayProofServices{
-      includeReplaySliceASource, includeReplaySamePhysicalIncludeFile,
+      includeReplaySamePhysicalIncludeFile,
       includeReplayLineStateObservableMacroSite,
       includeReplayLineStateBuiltinInvocationIsPreservedObserver};
   IncludeReplayProofContext includeReplayProof(includeReplayProofInputs,

@@ -481,9 +481,9 @@ void RefoldEngine::BuildServiceGraph() {
   // Include proof, topology and terminal services are named constructor
   // dependencies of the materializer.
   includeMaterializer_ = std::make_unique<RefoldIncludeMaterializer>(
-      model_, aSource_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_,
-      lineDirs_, finalReplaySurface_, sidebandPragmaEdits_, sourceMapper_,
-      pathIdentity_, macroTopology_, lineControlProof_, *lineObserverLayout_,
+      model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, lineDirs_,
+      finalReplaySurface_, sidebandPragmaEdits_, sourceMapper_, pathIdentity_,
+      macroTopology_, lineControlProof_, *lineObserverLayout_,
       *macroStateProof_, *ownerStateProof_, *includeInsertionPlanner_,
       proofServices_->AcceptedCandidateBuilder(),
       proofServices_->AcceptedResultRanker(), *textEditAssembler_,

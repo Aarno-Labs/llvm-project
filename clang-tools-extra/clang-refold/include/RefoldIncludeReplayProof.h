@@ -52,7 +52,6 @@ buildFinalReplaySurface(const RefoldModel &model, StringRef finalOutputPath);
 /// context constructed for one materialization operation.
 struct IncludeReplayProofInputs {
   const RefoldModel &model;
-  StringRef aSource;
   const LineDirectiveInserter &lineDirs;
   const std::optional<FinalReplaySurface> &finalReplaySurface;
 };
@@ -61,8 +60,6 @@ struct IncludeReplayProofInputs {
 /// are deliberately non-owning so this layer cannot retain mutable state beyond
 /// the caller's materialization scope.
 struct IncludeReplayProofServices {
-  llvm::function_ref<StringRef(uint64_t begin, uint64_t end)> sliceASource;
-
   llvm::function_ref<bool(StringRef candidatePath,
                           const RefoldModel::IncludeItem &include)>
       samePhysicalIncludeFile;
@@ -125,8 +122,7 @@ public:
 
   IncludeReplayProofContext(IncludeReplayProofInputs inputs,
                             IncludeReplayProofServices services)
-      : services_(services), model_(inputs.model), aSource_(inputs.aSource),
-        lineDirs_(inputs.lineDirs),
+      : services_(services), model_(inputs.model), lineDirs_(inputs.lineDirs),
         finalReplaySurface_(inputs.finalReplaySurface) {}
 
   /// Decide whether a clean child include can remain source-spelled after its
@@ -278,7 +274,7 @@ private:
 
   /// Clean-child replay demand accumulated from preserved observers.
   ///
-  /// These flags and payloads describe every observable property that ordinary
+  /// These flags and targets describe every observable property that ordinary
   /// include replay must preserve before a materialized child subtree can be
   /// kept as a clean include.  The include-next obligations are intentionally
   /// part of the demand because they require search-chain cursor proof, not
@@ -298,38 +294,22 @@ private:
     // physical/spelling mismatch keeps materialization fail-closed.
     SmallVector<IncludeNextObligation, 4> includeNextObligations;
 
-    // Exact producer-observed payloads of preserved file-spelling observers in
-    // this include subtree.  These come from the macro expansion tokens in the
-    // original preprocessed stream, not from IncludeItem::resolvedPath: current
-    // maps may store an absolute physical-ish path in resolvedPath even when
-    // Clang exposed a direct source-relative spelling such as
-    // "./headers/child.h" through __FILE__.
-    SmallVector<std::string, 4> fileSpellingPayloads;
-    SmallVector<std::string, 4> fileNamePayloads;
-
-    // Producer-side entered spelling for the child edge itself.  New maps fill
-    // this from IncludeItem::enteredFileSpelling.  Legacy maps fill it later
-    // from recovered observer payloads, a producer-replay reconstruction, or
-    // resolved_path, in that order.  The child edge must be re-entered with the
-    // same spelling before descendant quoted lookup and file observers can be
-    // considered stable.
+    // Producer-side entered spelling for the child edge itself, from
+    // IncludeItem::enteredFileSpelling.  The child edge must be re-entered with
+    // the same spelling before descendant quoted lookup and file observers can
+    // be considered stable.  The schema requires the field on every child
+    // this demand is built for; if it is absent anyway, a file observer is
+    // unproven.
     std::optional<std::string> producerChildFileSpelling;
 
     // Producer-side __FILE_NAME__ spelling for the child edge.  Prefer the
     // producer-emitted entered_file_name when present because it was computed
     // with Clang's own processPathToFileName() logic; otherwise derive a
-    // compatibility basename from the selected spelling witness.
+    // compatibility basename from the entered spelling.
     std::optional<std::string> producerChildFileName;
 
-    // A preserved file-spelling observer was present, but its exact expansion
-    // payload could not be recovered from the producer token stream.  Include
-    // replay cannot prove that observer family in that case, so the clean child
-    // must fail closed to materialization/line-state repair.
-    bool hasUnprovenFileSpellingObserver = false;
-
     bool observesFileSpelling() const {
-      return observesFile || observesFileName ||
-             hasUnprovenFileSpellingObserver;
+      return observesFile || observesFileName;
     }
 
     bool requiresReplayCandidateProof() const {
@@ -401,7 +381,6 @@ private:
       return samePhysicalFile &&
              (!demand.observesFile || sameEnteredFileSpelling) &&
              (!demand.observesFileName || sameEnteredFileName) &&
-             !demand.hasUnprovenFileSpellingObserver &&
              (demand.includeNextObligations.empty() || sameIncludeNextStack);
     }
   };
@@ -572,11 +551,6 @@ private:
   /// include-search model.
   std::optional<IncludeReplayCandidate>
   ComputeAngledIncludeReplayCandidate(StringRef operand) const;
-
-  /// Reconstruct the producer-side ordinary include candidate for an include
-  /// edge using the same replay evaluator used for final-source proof.
-  std::optional<IncludeReplayCandidate> ComputeProducerIncludeReplayCandidate(
-      const RefoldModel::IncludeItem &include) const;
 
   /// Replay a `#include_next` operand from a producer-proven containing-file
   /// search-chain cursor.  The surface parameter documents the containing-file
@@ -766,10 +740,6 @@ private:
       const RefoldModel::IncludeItem &child,
       const CleanChildIncludeReplayDemand &demand) const;
 
-  /// Recover the producer-side spelling payload emitted by a file observer.
-  std::optional<std::string> ProducerObservedFileSpellingPayload(
-      const RefoldModel::MacroInvocation &macro) const;
-
   /// Return the preserved observable macro owner inside an include subtree.
   std::optional<uint64_t> ObservableMacroOwnerInIncludeSubtree(
       const RefoldModel::MacroInvocation &macro, uint64_t includeId) const;
@@ -806,7 +776,6 @@ private:
 
   IncludeReplayProofServices services_;
   const RefoldModel &model_;
-  StringRef aSource_;
   const LineDirectiveInserter &lineDirs_;
   const std::optional<FinalReplaySurface> &finalReplaySurface_;
 };

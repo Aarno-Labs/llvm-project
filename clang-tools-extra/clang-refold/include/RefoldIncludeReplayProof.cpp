@@ -12,7 +12,6 @@
 #include "include/RefoldIncludeReplayProof.h"
 
 #include "include/IncludeSpellingHelpers.h"
-#include "line-control/RefoldLineControlFilename.h"
 #include "support/RefoldLog.h"
 
 #include "llvm/ADT/SmallString.h"
@@ -243,29 +242,6 @@ static bool safeOrdinaryIncludeRewriteOperand(StringRef path) {
 static bool pathExists(const std::filesystem::path &path) {
   const std::string spelling = path.generic_string();
   return llvm::sys::fs::exists(StringRef(spelling));
-}
-
-/// Append value only if the same spelling is not already present.  Demand
-/// construction uses this to keep observer payload lists deterministic without
-/// turning duplicate macro observations into separate proof obligations.
-static void appendUniqueString(SmallVectorImpl<std::string> &values,
-                               StringRef value) {
-  if (!llvm::any_of(values, [&](const std::string &existing) {
-        return StringRef(existing) == value;
-      }))
-    values.push_back(value.str());
-}
-
-/// Decode one producer-emitted file-observer string literal payload.  The parse
-/// must consume the whole trimmed spelling so malformed or concatenated tokens
-/// remain unproven instead of partially decoded.
-static std::optional<std::string>
-decodeObservedFileStringLiteralPayload(StringRef spelling) {
-  StringRef rest = spelling.trim();
-  std::optional<std::string> decoded = parseLineControlFilenameLiteral(rest);
-  if (!decoded || !rest.trim().empty())
-    return std::nullopt;
-  return decoded;
 }
 
 } // namespace
@@ -818,9 +794,9 @@ IncludeReplayProofContext::ComputeQuotedIncludeReplayCandidate(
     StringRef operand) const {
   // Ordinary quoted includes preserved or synthesized into the final output
   // must replay from the emitted .c.mod location.  Producer-source surfaces
-  // are still used by ComputeProducerIncludeReplayCandidate() when recovering
-  // producer spelling witnesses, but they are not valid acceptance surfaces
-  // for final-source include rewrites.
+  // are still used by the preserved-child replay resolver when re-deriving
+  // producer lookup state, but they are not valid acceptance surfaces for
+  // final-source include rewrites.
   std::optional<IncludeReplaySurface> surface =
       FinalOutputIncludeReplaySurface();
   if (!surface)
@@ -837,31 +813,6 @@ IncludeReplayProofContext::ComputeAngledIncludeReplayCandidate(
   if (!replay)
     return std::nullopt;
   return IncludeReplayCandidateFromOrdinaryResult(*replay);
-}
-
-std::optional<IncludeReplayProofContext::IncludeReplayCandidate>
-IncludeReplayProofContext::ComputeProducerIncludeReplayCandidate(
-    const RefoldModel::IncludeItem &include) const {
-  if (include.subkind != "#include")
-    return std::nullopt;
-
-  if (include.angled) {
-    std::optional<std::string> operand =
-        angledIncludeReplayLookupOperand(include);
-    if (!operand)
-      return std::nullopt;
-    return ComputeAngledIncludeReplayCandidate(*operand);
-  }
-
-  std::optional<std::string> operand =
-      quotedIncludeReplayLookupOperand(include);
-  if (!operand)
-    return std::nullopt;
-  std::optional<IncludeReplaySurface> surface =
-      IncludeReplaySurfaceForFile(include.sitePath);
-  if (!surface)
-    return std::nullopt;
-  return ComputeQuotedIncludeReplayCandidateOnSurface(*operand, *surface);
 }
 
 std::optional<IncludeReplayProofContext::IncludeNextReplayCandidate>
@@ -1110,29 +1061,6 @@ bool IncludeReplayProofContext::
              *include.includeNext->selectedSearchChainIndex;
 }
 
-std::optional<std::string>
-IncludeReplayProofContext::ProducerObservedFileSpellingPayload(
-    const RefoldModel::MacroInvocation &macro) const {
-  if (macro.cover.IsValid()) {
-    if (std::optional<std::string> decoded =
-            decodeObservedFileStringLiteralPayload(
-                services_.sliceASource(macro.cover.begin, macro.cover.end)))
-      return decoded;
-  }
-
-  if (macro.invPPByteBegin && macro.invPPByteEnd &&
-      *macro.invPPByteBegin <= *macro.invPPByteEnd &&
-      *macro.invPPByteEnd <= aSource_.size()) {
-    if (std::optional<std::string> decoded =
-            decodeObservedFileStringLiteralPayload(
-                aSource_.slice(static_cast<size_t>(*macro.invPPByteBegin),
-                               static_cast<size_t>(*macro.invPPByteEnd))))
-      return decoded;
-  }
-
-  return std::nullopt;
-}
-
 std::optional<uint64_t>
 IncludeReplayProofContext::ObservableMacroOwnerInIncludeSubtree(
     const RefoldModel::MacroInvocation &macro, uint64_t includeId) const {
@@ -1156,11 +1084,11 @@ IncludeReplayProofContext::BuildCleanChildIncludeReplayDemand(
   const RefoldModel::IncludeItem *rootInclude =
       model_.GetIncludeById(includeId);
   if (rootInclude) {
-    // File-spelling proof hierarchy: new-schema maps carry the exact
-    // include-entry spelling directly.  Prefer that producer fact over any
-    // recovered macro payloads or replay reconstruction.  Later #line changes
-    // are handled by the line-state proof layer; this field proves only the
-    // spelling assigned when the child include is entered.
+    // File-spelling proof target: the exact include-entry spelling, which the
+    // schema requires on every include edge that has a parent, and so on
+    // every child this demand is built for.  Later #line changes are handled
+    // by the line-state proof layer; this field proves only the spelling
+    // assigned when the child include is entered.
     StringRef explicitSpelling =
         explicitProducerEnteredFileSpelling(*rootInclude);
     if (!explicitSpelling.empty()) {
@@ -1235,79 +1163,10 @@ IncludeReplayProofContext::BuildCleanChildIncludeReplayDemand(
     demand.observesBaseFile |= observesBaseFile;
     demand.observesIncludeLevel |= observesIncludeLevel;
 
-    if (lineSensitiveDemandEnabled && (observesFile || observesFileName) &&
-        *observableOwner == includeId) {
-      if (std::optional<std::string> payload =
-              ProducerObservedFileSpellingPayload(macro)) {
-        if (observesFile)
-          appendUniqueString(demand.fileSpellingPayloads, *payload);
-        if (observesFileName)
-          appendUniqueString(demand.fileNamePayloads, *payload);
-      } else if ((observesFile && !demand.producerChildFileSpelling) ||
-                 (observesFileName && !demand.producerChildFileName)) {
-        // New-schema entered_file_spelling / entered_file_name are primary
-        // proof targets.  Missing decoded payloads only make the demand
-        // unproven when no stronger include-entry metadata is available.
-        demand.hasUnprovenFileSpellingObserver = true;
-      }
-    }
-
     if (demand.observesLine && demand.observesFile && demand.observesFileName &&
-        demand.observesBaseFile && demand.observesIncludeLevel &&
-        demand.hasUnprovenFileSpellingObserver)
+        demand.observesBaseFile && demand.observesIncludeLevel)
       break;
   }
-
-  // Fallback file-spelling proof hierarchy: old maps without
-  // entered_file_spelling may still prove spelling through preserved builtin
-  // expansion payloads.  A single unique payload becomes the proof target;
-  // multiple distinct payloads are left in the payload vectors so candidate
-  // evaluation must satisfy all of them and will fail closed if they conflict.
-  if (!demand.producerChildFileSpelling &&
-      demand.fileSpellingPayloads.size() == 1)
-    demand.producerChildFileSpelling = demand.fileSpellingPayloads.front();
-  if (!demand.producerChildFileName && demand.fileNamePayloads.size() == 1)
-    demand.producerChildFileName = demand.fileNamePayloads.front();
-
-  // File-spelling proof hierarchy, final fallbacks: if neither explicit
-  // metadata nor recovered payloads selected a target, fall back to replaying
-  // the original include from the producer surface.  If replay is unavailable,
-  // resolved_path remains the final legacy compatibility witness.
-  const bool mayUseReplaySpelling = demand.fileSpellingPayloads.empty();
-  const bool mayUseReplayFileName = demand.fileNamePayloads.empty();
-  if (rootInclude && (mayUseReplaySpelling || mayUseReplayFileName)) {
-    std::optional<IncludeReplayCandidate> producerCandidate;
-    if ((!demand.producerChildFileSpelling && mayUseReplaySpelling) ||
-        (!demand.producerChildFileName && mayUseReplayFileName))
-      producerCandidate = ComputeProducerIncludeReplayCandidate(*rootInclude);
-
-    if (!demand.producerChildFileSpelling && mayUseReplaySpelling &&
-        producerCandidate)
-      demand.producerChildFileSpelling = producerCandidate->enteredFileSpelling;
-    if (!demand.producerChildFileName && mayUseReplayFileName &&
-        producerCandidate)
-      demand.producerChildFileName =
-          stringutils::pathBasename(producerCandidate->enteredFileSpelling)
-              .str();
-  }
-
-  if (rootInclude) {
-    StringRef legacySpelling = legacyResolvedIncludePath(*rootInclude);
-    if (!legacySpelling.empty()) {
-      if (!demand.producerChildFileSpelling && mayUseReplaySpelling)
-        demand.producerChildFileSpelling = legacySpelling.str();
-      if (!demand.producerChildFileName && mayUseReplayFileName)
-        demand.producerChildFileName =
-            stringutils::pathBasename(legacySpelling).str();
-    }
-  }
-
-  if (demand.observesFile && demand.fileSpellingPayloads.empty() &&
-      !demand.producerChildFileSpelling)
-    demand.hasUnprovenFileSpellingObserver = true;
-  if (demand.observesFileName && demand.fileNamePayloads.empty() &&
-      !demand.producerChildFileName)
-    demand.hasUnprovenFileSpellingObserver = true;
 
   return demand;
 }
@@ -1577,43 +1436,23 @@ IncludeReplayProofContext::EvaluateIncludeReplayCandidate(
   result.sameIncludeNextStack =
       IncludeNextObligationsAreProven(candidate, child, demand);
   if (demand.observesFileSpelling()) {
-    if (demand.hasUnprovenFileSpellingObserver) {
-      result.sameEnteredFileSpelling = false;
-      result.sameEnteredFileName = false;
-    }
-
-    // File-spelling proof hierarchy: explicit entered_file_spelling (or the
-    // best legacy witness selected when building the demand) is the primary
-    // target for __FILE__ preservation.  Recovered macro payloads are used only
-    // when no include-entry spelling witness exists, which keeps old maps
-    // conservative without letting payload recovery override new-schema
-    // producer metadata.
-    if (demand.observesFile) {
-      if (demand.producerChildFileSpelling) {
-        result.sameEnteredFileSpelling &=
-            StringRef(candidate.enteredFileSpelling) ==
-            StringRef(*demand.producerChildFileSpelling);
-      } else {
-        for (const std::string &expected : demand.fileSpellingPayloads)
-          result.sameEnteredFileSpelling &=
-              StringRef(candidate.enteredFileSpelling) == StringRef(expected);
-      }
-    }
+    // The producer's include-entry spelling is the target for __FILE__
+    // preservation.  A demand without one proves nothing, so the observer
+    // fails closed.
+    if (demand.observesFile)
+      result.sameEnteredFileSpelling =
+          demand.producerChildFileSpelling &&
+          StringRef(candidate.enteredFileSpelling) ==
+              StringRef(*demand.producerChildFileSpelling);
 
     const std::string candidateFileName =
         !candidate.enteredFileName.empty()
             ? candidate.enteredFileName
             : stringutils::pathBasename(candidate.enteredFileSpelling).str();
-    if (demand.observesFileName) {
-      if (demand.producerChildFileName) {
-        result.sameEnteredFileName &= StringRef(candidateFileName) ==
-                                      StringRef(*demand.producerChildFileName);
-      } else {
-        for (const std::string &expected : demand.fileNamePayloads)
-          result.sameEnteredFileName &=
-              StringRef(candidateFileName) == StringRef(expected);
-      }
-    }
+    if (demand.observesFileName)
+      result.sameEnteredFileName = demand.producerChildFileName &&
+                                   StringRef(candidateFileName) ==
+                                       StringRef(*demand.producerChildFileName);
   }
   return result;
 }
@@ -1691,15 +1530,6 @@ IncludeReplayProofContext::GenerateQuotedChildIncludeRewriteCandidates(
   if (!explicitEnteredSpelling.empty())
     AppendQuotedChildIncludeRewriteCandidate(candidates,
                                              explicitEnteredSpelling);
-
-  // Legacy maps may have only resolved_path as the producer spelling.  Keep
-  // this behind the split-schema path so resolved_path remains a compatibility
-  // fallback without competing with explicit metadata.
-  if (!child.enteredFileSpelling) {
-    StringRef legacySpelling = legacyResolvedIncludePath(child);
-    if (!legacySpelling.empty())
-      AppendQuotedChildIncludeRewriteCandidate(candidates, legacySpelling);
-  }
 
   return candidates;
 }
@@ -1874,18 +1704,6 @@ IncludeReplayProofContext::GenerateDirectIncludeNextOrdinaryRewriteCandidates(
         candidates, explicitEnteredSpelling, "producer-entered-file-spelling",
         preferAngledDelimiter);
 
-  // 6. Legacy resolved_path spelling, only for maps that lack the split
-  // entered_file_spelling/opened_path facts.  When both split fields and
-  // resolved_path are present, resolved_path remains weaker compatibility
-  // evidence.
-  if (!child.enteredFileSpelling) {
-    StringRef legacySpelling = legacyResolvedIncludePath(child);
-    if (!legacySpelling.empty())
-      AppendDirectIncludeNextWithPreferredDelimiters(candidates, legacySpelling,
-                                                     "legacy-resolved-path",
-                                                     preferAngledDelimiter);
-  }
-
   return candidates;
 }
 
@@ -1917,8 +1735,7 @@ IncludeReplayProofContext::DirectIncludeNextOrdinaryRewriteRejectReason(
     return "shadowed-by-earlier-search-entry";
   }
 
-  if ((demand.observesFile || demand.hasUnprovenFileSpellingObserver) &&
-      !proof->sameEnteredFileSpelling)
+  if (demand.observesFile && !proof->sameEnteredFileSpelling)
     return "entered-file-spelling-mismatch";
   if (demand.observesFileName && !proof->sameEnteredFileName)
     return "entered-file-name-mismatch";
@@ -1980,9 +1797,9 @@ void IncludeReplayProofContext::TraceDirectIncludeNextOrdinaryRewriteCandidate(
       "replay_physical={6} producer_physical={7} "
       "replay_lookup={8}/{9} producer_lookup={10}/{11} "
       "producer_include_next_selected_index={12} "
-      "observers(file={13}, file_name={14}, unproven_file={15}) "
-      "descendant_include_next(count={16}, result={17}) "
-      "selected_target_proven={18} decision={19}",
+      "observers(file={13}, file_name={14}) "
+      "descendant_include_next(count={15}, result={16}) "
+      "selected_target_proven={17} decision={18}",
       child.id, rewrite.origin,
       IncludeReplayProofContext::OrdinaryIncludeDelimiterName(
           rewrite.delimiterKind),
@@ -1994,9 +1811,8 @@ void IncludeReplayProofContext::TraceDirectIncludeNextOrdinaryRewriteCandidate(
       replayPhysicalPath, producerPhysicalPath, replayLookupKind,
       replaySearchChainIndex, producerLookupKind, producerSearchChainIndex,
       producerIncludeNextSelectedIndex, demand.observesFile,
-      demand.observesFileName, demand.hasUnprovenFileSpellingObserver,
-      demand.includeNextObligations.size(), descendantObligationResult,
-      selectedTargetProven, decisionReason);
+      demand.observesFileName, demand.includeNextObligations.size(),
+      descendantObligationResult, selectedTargetProven, decisionReason);
 }
 
 void IncludeReplayProofContext::
@@ -2289,17 +2105,11 @@ IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
   if (!child.parent)
     return plan;
 
+  // A direct #include_next is different from an ordinary include once its
+  // parent is materialized.  Preserving that directive would replay it from a
+  // different HeaderSearch cursor, so it must either be rewritten to a
+  // separately-proven ordinary include or materialized.
   const bool isDirectIncludeNext = child.subkind == "#include_next";
-
-  // Ordinary clean includes may still be safely left in place on old or
-  // partially-populated maps when no entered-file spelling witness exists: the
-  // directive itself remains an ordinary include, so the existing conservative
-  // behavior is to avoid inventing a repair.  A direct #include_next is
-  // different once its parent is materialized.  Preserving that directive would
-  // replay it from a different HeaderSearch cursor, so it must either be
-  // rewritten to a separately-proven ordinary include or materialized.
-  if (!isDirectIncludeNext && producerEnteredFileSpelling(child).empty())
-    return plan;
 
   const CleanChildIncludeReplayDemand demand =
       BuildCleanChildIncludeReplayDemand(child.id);

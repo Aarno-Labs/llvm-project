@@ -75,10 +75,9 @@ public:
   /// maps to the realization methods so recursive include materialization stays
   /// deterministic and run-scoped.
   RefoldIncludeMaterializer(
-      const RefoldModel &model, llvm::StringRef aSource,
-      llvm::StringRef bSource, llvm::ArrayRef<PPTok> aToks,
-      llvm::ArrayRef<PPTok> bToks, llvm::ArrayRef<size_t> bTokOff,
-      const std::vector<int64_t> &abTokMapA2B,
+      const RefoldModel &model, llvm::StringRef bSource,
+      llvm::ArrayRef<PPTok> aToks, llvm::ArrayRef<PPTok> bToks,
+      llvm::ArrayRef<size_t> bTokOff, const std::vector<int64_t> &abTokMapA2B,
       const LineDirectiveInserter &lineDirs,
       const std::optional<FinalReplaySurface> &finalReplaySurface,
       const std::vector<SidebandPragmaEdit> &sidebandPragmaEdits,
@@ -98,9 +97,9 @@ public:
       const clang::LangOptions &lexLang,
       llvm::ArrayRef<SidebandPragmaLinePairing> sidebandPragmaLinePairings = {},
       llvm::ArrayRef<PrintedPragmaCarrier> printedPragmaCarriers = {})
-      : model_(model), aSource_(aSource), bSource_(bSource), aToks_(aToks),
-        bToks_(bToks), bTokOff_(bTokOff), abTokMapA2B_(abTokMapA2B),
-        lineDirs_(lineDirs), finalReplaySurface_(finalReplaySurface),
+      : model_(model), bSource_(bSource), aToks_(aToks), bToks_(bToks),
+        bTokOff_(bTokOff), abTokMapA2B_(abTokMapA2B), lineDirs_(lineDirs),
+        finalReplaySurface_(finalReplaySurface),
         sidebandPragmaEdits_(sidebandPragmaEdits), sourceMapper_(sourceMapper),
         paths_(paths), macroTopology_(macroTopology),
         lineControlProof_(lineControlProof),
@@ -249,7 +248,6 @@ private:
       llvm::StringRef ownerBytes) const;
 
   const RefoldModel &model_;
-  llvm::StringRef aSource_;
   llvm::StringRef bSource_;
   llvm::ArrayRef<PPTok> aToks_;
   llvm::ArrayRef<PPTok> bToks_;

@@ -1344,7 +1344,7 @@ static constexpr const char *RefoldSchema = R"json(
         "entered_file_spelling": {
           "type": "string",
           "minLength": 1,
-          "description": "Exact file spelling Clang exposed through __FILE__ while preprocessing this include instance. This is the preferred proof source for filename observers and intentionally preserves relative, symlink, search-directory, or absolute spelling."
+          "description": "Exact file spelling Clang exposed through __FILE__ while preprocessing this include instance. This is the proof source for filename observers and intentionally preserves relative, symlink, search-directory, or absolute spelling. Required on every include edge that carries 'parent': such an edge was entered, and re-entering it from a relocated site is proved only against this spelling."
         },
         "entered_file_name": {
           "type": "string",
@@ -1450,6 +1450,9 @@ static constexpr const char *RefoldSchema = R"json(
         ],
         "operand_e": [
           "operand_b"
+        ],
+        "parent": [
+          "entered_file_spelling"
         ]
       },
       "dependentSchemas": {
