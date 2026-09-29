@@ -310,6 +310,17 @@ private:
   /// Finds the TU-visible include site that owns a macro directive, if any.
   const RefoldModel::IncludeItem *
   OwningIncludeSiteInTU(const RefoldModel::MacroDirective &directive) const;
+  /// Returns whether \p directive is inside a file entered by `-include`.
+  ///
+  /// Such a directive has no position in the translation unit's source, yet it
+  /// ran before the unit's first byte, so its state holds from there until a
+  /// later directive displaces it.  The edited stream is replayed without
+  /// forced includes (`ForcedIncludeReplay::Omit`), so a macro defined here is
+  /// bound where the refold lands a payload but not on the edited stream's
+  /// side.  Builtin and `-D` definitions are replayed on both sides, so a
+  /// payload naming one expands alike in both and needs no repair.
+  bool
+  DirectiveInForcedInclude(const RefoldModel::MacroDirective &directive) const;
   /// Returns the original include directive text for an include item.
   StringRef IncludeDirectiveText(const RefoldModel::IncludeItem &inc) const;
   /// Returns whether an include directive is preserved at a line-start boundary
@@ -417,10 +428,21 @@ private:
   /// Unlike `ActiveDefinitionAtSourceOffset()`, a definition inside an include
   /// the ladder has ruled out still counts: it is emitted where the include
   /// stood, so it binds everything after that site, even though no repair may
-  /// consume it as a transition surface.
+  /// consume it as a transition surface.  So does a definition inside a
+  /// forced include, which binds from the unit's first byte; see
+  /// `DirectiveBindingOffsetForAudit()`.
   const RefoldModel::MacroDirective *
   DefinitionBoundAtSourceOffsetForAudit(StringRef macroName,
                                         uint64_t offset) const;
+  /// Returns the TU offset from which \p directive's state holds for the
+  /// liveness audit, or nothing when no TU offset is established.
+  ///
+  /// A directive with a movable transition surface holds from the end of that
+  /// surface, and one inside a TU-visible include from the end of the
+  /// include's site.  One inside a forced include holds from offset 0, ahead
+  /// of anything the translation unit itself spells.
+  std::optional<uint64_t> DirectiveBindingOffsetForAudit(
+      const RefoldModel::MacroDirective &directive) const;
   /// Returns whether a consumed macro-state directive can be delayed after a
   /// replacement edit without changing observer semantics.
   bool MacroStateDirectiveCanBeDelayedAfterEdit(
@@ -779,6 +801,21 @@ MacroStateRepairContext::OutermostOwningIncludeSiteInTU(
 const RefoldModel::IncludeItem *MacroStateRepairContext::OwningIncludeSiteInTU(
     const RefoldModel::MacroDirective &directive) const {
   return OutermostOwningIncludeSiteInTU(directive.ownerIncludeId);
+}
+
+bool MacroStateRepairContext::DirectiveInForcedInclude(
+    const RefoldModel::MacroDirective &directive) const {
+  if (!directive.ownerIncludeId)
+    return false;
+
+  // Clang enters a forced include from its predefines buffer, so the root of
+  // the include chain is spelled in `<built-in>` rather than in any file.
+  const RefoldModel::IncludeItem *root =
+      Model().GetIncludeById(*directive.ownerIncludeId);
+  while (root && root->parent)
+    root = Model().GetIncludeById(*root->parent);
+  return root && RefoldOwnerStateProof::IsVirtualInitialMacroDirectiveSource(
+                     root->sitePath);
 }
 
 StringRef MacroStateRepairContext::IncludeDirectiveText(
@@ -1405,13 +1442,8 @@ MacroStateRepairContext::DefinitionBoundAtSourceOffsetForAudit(
   for (uint32_t position : bucket->second) {
     const RefoldModel::MacroDirective &candidate =
         *plan_.namedMacroDirectives[position].directive;
-    std::optional<uint64_t> end;
-    if (std::optional<MacroStateSourceTransition> transition =
-            MacroStateSourceTransitionFor(candidate))
-      end = transition->interval.end;
-    else if (const RefoldModel::IncludeItem *inc =
-                 OwningIncludeSiteInTU(candidate))
-      end = inc->siteE;
+    const std::optional<uint64_t> end =
+        DirectiveBindingOffsetForAudit(candidate);
     if (!end || *end > offset)
       continue;
     if (!active || *end > activeEnd ||
@@ -1421,6 +1453,21 @@ MacroStateRepairContext::DefinitionBoundAtSourceOffsetForAudit(
     }
   }
   return active && active->IsDefine() ? active : nullptr;
+}
+
+std::optional<uint64_t> MacroStateRepairContext::DirectiveBindingOffsetForAudit(
+    const RefoldModel::MacroDirective &directive) const {
+  if (std::optional<MacroStateSourceTransition> transition =
+          MacroStateSourceTransitionFor(directive))
+    return transition->interval.end;
+  if (const RefoldModel::IncludeItem *inc = OwningIncludeSiteInTU(directive))
+    return inc->siteE;
+  // Every forced-include directive ties at offset 0, where the lookup's id
+  // tie-break selects the latest.  The producer numbers them in the order
+  // Clang ran them, which is command-line order across forced includes.
+  if (DirectiveInForcedInclude(directive))
+    return uint64_t{0};
+  return std::nullopt;
 }
 
 bool MacroStateRepairContext::MacroStateDirectiveCanBeDelayedAfterEdit(
@@ -2534,7 +2581,8 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
 
       // A definition inside an include the ladder has ruled out has no
       // movable transition surface, but it is still bound after the include's
-      // site, and an undef/restore consumes no surface at all.
+      // site, and an undef/restore consumes no surface at all.  The same holds
+      // for one inside a forced include, bound from the unit's first byte.
       const RefoldModel::MacroDirective *bound =
           DefinitionBoundAtSourceOffsetForAudit(ref.name, lineStart);
       if (bound != &definitionLocal)
@@ -2598,9 +2646,9 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
         if (StringRef(restoreText).trim().empty())
           continue;
       }
+      // Bound above, so a binding offset exists.
       const uint64_t boundFrom =
-          transition ? transition->interval.end
-                     : OwningIncludeSiteInTU(definitionLocal)->siteE;
+          *DirectiveBindingOffsetForAudit(definitionLocal);
       candidates.push_back(SyntheticUndefCandidate{
           &definitionLocal, boundFrom, ref.name.str(), std::move(restoreText)});
     }
@@ -2733,6 +2781,14 @@ std::optional<size_t> MacroStateRepairContext::ReplacementReadsMacroWhileBound(
     return std::nullopt;
 
   const StringRef text(edit.text);
+  const StringRef suffix = tuBytes_.drop_front(edit.end);
+  // Most bound definitions are named nowhere in a given replacement, and the
+  // first search below would say so; ask it before paying for the directive
+  // census, which has nothing to classify without a mention.
+  if (!MacroStateProof().FirstMacroStateObservationOffsetInText(
+          definition, macroName, text, suffix))
+    return std::nullopt;
+
   const PreprocessingDirectiveScanResult scan =
       scanPreprocessingDirectives(text, LexLang());
   // An incomplete census proves nothing about what the replacement contains, so
@@ -2778,7 +2834,6 @@ std::optional<size_t> MacroStateRepairContext::ReplacementReadsMacroWhileBound(
     return false;
   };
 
-  const StringRef suffix = tuBytes_.drop_front(edit.end);
   size_t cursor = 0;
   while (cursor <= text.size()) {
     const std::optional<size_t> hit =
