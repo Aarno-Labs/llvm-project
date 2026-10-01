@@ -146,7 +146,9 @@ struct AlignmentSemanticAnchorEvidence {
 enum class AlignmentSemanticResolutionKind : uint8_t {
   /// Every core-optimal map of the window was enumerated and realized, and the
   /// observational-irrelevance or least-source-mutation rule reduced them to
-  /// one realized-source class.
+  /// one realized-source class.  When the candidate domain is
+  /// `PlainQuotientedOptimalMaps`, plain sub-rectangles were held at their
+  /// forced-only envelope and only the rest were varied.
   CompleteGroundSetEquivalence,
   /// Each of the legacy boundary proposal's required anchors was proved
   /// necessary by its counterfactual, and every core-optimal map carrying all
@@ -183,6 +185,13 @@ enum class AlignmentSemanticCandidateDomain : uint8_t {
   /// The combinations of the structure-respecting repair's preferred
   /// sub-rectangle maps.
   StructureRepairCandidates,
+  /// Every core-optimal map of the window's non-plain sub-rectangles, with
+  /// each plain sub-rectangle held at its forced-only envelope.  A plain
+  /// sub-rectangle's optimal maps can differ in whitespace alone, so this
+  /// domain stands in for `AllOptimalMaps` when that set exceeds the proof
+  /// budget only because of them; see
+  /// `AlignmentSourceLayoutQueries::aRangeIsPlainSource`.
+  PlainQuotientedOptimalMaps,
 };
 
 /// Which preferred sub-rectangles a structure-respecting repair varied.
@@ -208,9 +217,10 @@ enum class AlignmentSemanticEquivalenceKeyKind : uint8_t {
 ///
 /// `resolutionKind` names that theorem, and `candidateDomain` the set it
 /// quantified over; only `CompleteGroundSetEquivalence` is a statement about
-/// every core-optimal map of the window.  The witness names the window it
-/// resolved, and its anchor evidence lies inside that window's half-open A and
-/// B ranges.
+/// every core-optimal map of the window, and under `PlainQuotientedOptimalMaps`
+/// only up to the plain sub-rectangles it held at their envelope.  The witness
+/// names the window it resolved, and its anchor evidence lies inside that
+/// window's half-open A and B ranges.
 struct AlignmentSemanticResolutionWitness {
   uint64_t witnessId = 0;
   /// Index into the core alignment's certification windows, and that
@@ -307,6 +317,19 @@ struct AlignmentSourceLayoutQueries {
   /// ordinary trivia holding a comment the comment-seam splitter preserves.
   std::function<std::vector<uint64_t>(uint64_t aBegin, uint64_t aEnd)>
       collectCommentGaps;
+  /// Whether A tokens `[aBegin, aEnd)` are plain source: each is the exact
+  /// spelling of one producer token outside every macro expansion, all lie in
+  /// one file, include occurrence and conditional arm in source order, and
+  /// the bytes between consecutive tokens are whitespace alone.
+  ///
+  /// When a sub-rectangle and both tokens bounding it are plain, nothing a
+  /// realization preserves or loses -- a comment, directive, macro invocation,
+  /// zero-token invocation, or line splice -- lies anywhere its optimal maps
+  /// disagree, so they can differ in whitespace alone.  The resolver may then
+  /// hold it at its forced-only envelope, which is exactly how every attempt
+  /// that does not resolve the window realizes it.  May be empty, in which
+  /// case nothing is held.
+  std::function<bool(uint64_t aBegin, uint64_t aEnd)> aRangeIsPlainSource;
 };
 
 /// Exact semantic resolver for ambiguity left by the core LCS theorem.

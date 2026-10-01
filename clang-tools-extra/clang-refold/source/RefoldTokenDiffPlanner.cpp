@@ -827,6 +827,67 @@ RefoldTokenDiffPlanner::CollectPreservableCommentGaps(uint64_t aBegin,
   return gaps;
 }
 
+bool RefoldTokenDiffPlanner::ARangeIsPlainSource(uint64_t aBegin,
+                                                 uint64_t aEnd) const {
+  if (aBegin >= aEnd || aEnd > deps_.aToks.size())
+    return false;
+
+  // One tokmap entry per token: a token claimed twice has no single source
+  // position to be plain at.
+  DenseSet<uint64_t> claimed;
+  for (const RefoldModel::TokMapEntry &entry : deps_.model.GetTokmap())
+    if (entry.pp >= aBegin && entry.pp < aEnd &&
+        !claimed.insert(entry.pp).second)
+      return false;
+
+  const std::optional<RefoldModel::TokMapEntry> first =
+      deps_.model.MapPP(aBegin);
+  if (!first)
+    return false;
+  const std::optional<uint64_t> includeId =
+      deps_.model.InnermostIncludeAtPP(aBegin);
+  const std::optional<RefoldModel::ArmRef> arm =
+      deps_.model.FindArmRefAtPP(aBegin);
+  const RefoldPreprocessingStructureIndexProvider::LookupResult structure =
+      deps_.preprocessingStructureIndexes.Get(first->file, includeId);
+  if (!structure.HasIndex())
+    return false;
+
+  uint64_t previousEnd = 0;
+  for (uint64_t pp = aBegin; pp < aEnd; ++pp) {
+    const std::optional<RefoldModel::TokMapEntry> entry = deps_.model.MapPP(pp);
+    if (!entry || entry->file != first->file || entry->b >= entry->e ||
+        entry->e > structure.sourceBytes.size() ||
+        deps_.model.InnermostIncludeAtPP(pp) != includeId)
+      return false;
+    const std::optional<RefoldModel::ArmRef> tokenArm =
+        deps_.model.FindArmRefAtPP(pp);
+    if (tokenArm.has_value() != arm.has_value() ||
+        (tokenArm && tokenArm->arm != arm->arm))
+      return false;
+    if (!structure.index->IsExactTokenSpellingInterval(entry->b, entry->e) ||
+        structure.sourceBytes.slice(entry->b, entry->e) !=
+            deps_.aToks[pp].spelling)
+      return false;
+    if (pp != aBegin) {
+      if (entry->b < previousEnd)
+        return false;
+      const StringRef gap = structure.sourceBytes.slice(previousEnd, entry->b);
+      if (gap.find_first_not_of(" \t\n\r\f\v") != StringRef::npos)
+        return false;
+    }
+    previousEnd = entry->e;
+  }
+
+  return llvm::none_of(deps_.model.GetMacroInvocations(),
+                       [&](const RefoldModel::MacroInvocation &invocation) {
+                         for (uint64_t pp = aBegin; pp < aEnd; ++pp)
+                           if (invocation.Covers(pp, pp + 1))
+                             return true;
+                         return false;
+                       });
+}
+
 void RefoldTokenDiffPlanner::TraceProtectedAlignmentBoundaryIdentities(
     ArrayRef<AlignmentProtectedBoundaryIdentity> identities) const {
   if (!inTraceMode())

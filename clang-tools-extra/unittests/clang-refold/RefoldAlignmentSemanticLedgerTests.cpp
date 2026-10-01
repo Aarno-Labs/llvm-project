@@ -179,6 +179,27 @@ TEST(RefoldAlignmentSemanticLedger,
   expectDefect(ledger.audit(), "candidate domain");
 }
 
+TEST(RefoldAlignmentSemanticLedger,
+     CompleteGroundSetMayBeQuotientedByPlainSubRectangles) {
+  WellFormedLedger ledger;
+  ledger.witnesses[0].candidateDomain =
+      AlignmentSemanticCandidateDomain::PlainQuotientedOptimalMaps;
+  EXPECT_FALSE(ledger.audit().has_value());
+}
+
+TEST(RefoldAlignmentSemanticLedger,
+     OnlyTheCompleteGroundSetMayBeQuotientedByPlainSubRectangles) {
+  WellFormedLedger requiredAnchor;
+  requiredAnchor.witnesses[1].candidateDomain =
+      AlignmentSemanticCandidateDomain::PlainQuotientedOptimalMaps;
+  expectDefect(requiredAnchor.audit(), "candidate domain");
+
+  WellFormedLedger structureRecovery;
+  structureRecovery.witnesses[2].candidateDomain =
+      AlignmentSemanticCandidateDomain::PlainQuotientedOptimalMaps;
+  expectDefect(structureRecovery.audit(), "candidate domain");
+}
+
 TEST(RefoldAlignmentSemanticLedger, RequiredAnchorCarrierHoldsARealizationKey) {
   WellFormedLedger ledger;
   ledger.witnesses[1].equivalenceKeyKind =

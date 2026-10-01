@@ -236,6 +236,16 @@ public:
   std::vector<uint64_t> CollectPreservableCommentGaps(uint64_t aBegin,
                                                       uint64_t aEnd) const;
 
+  /// Return whether A tokens `[aBegin, aEnd)` are plain source.
+  ///
+  /// Each token must have exactly one tokmap entry, be the exact spelling of
+  /// one raw token in its owner's source, and lie outside every macro
+  /// expansion.  All of them must share one file, include occurrence and
+  /// conditional arm, appear in source order, and be separated by whitespace
+  /// alone: no comment, line splice, directive, or zero-token invocation.
+  /// Empty and single-token ranges are judged on their tokens alone.
+  bool ARangeIsPlainSource(uint64_t aBegin, uint64_t aEnd) const;
+
 private:
   /// Certify the core A-to-B alignment and collect its evidence transcript.
   ///
