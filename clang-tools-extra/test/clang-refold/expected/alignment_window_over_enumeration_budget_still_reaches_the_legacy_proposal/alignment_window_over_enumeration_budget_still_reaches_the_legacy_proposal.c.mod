@@ -13,8 +13,11 @@
 // `) ; }` tail that `first` already ends with, and the number of distinct
 // optimal maps grows with them: 91, 140 and 204 for five, six and seven.  At
 // eight, one forced-anchor sub-window alone exceeds the per-sub-window budget,
-// so the observational-irrelevance and least-source-mutation rules, which
-// quantify over every optimal map, cannot be decided.
+// so the observational-irrelevance and least-source-mutation rules cannot be
+// decided over every optimal map.  Reduced to static realization classes --
+// that sub-window's 285 maps fall into 17 classes, and four plain sub-windows
+// are held at their envelope -- they can, and both decline: the 17
+// representatives realize 9 outputs with no unique least source mutation.
 //
 // The legacy proposal is still a complete jointly core-optimal map, and its
 // three counterfactuals prove three anchors necessary exactly as they do at
@@ -24,7 +27,9 @@
 // line, which is the same choice the five-wrapper test pins.
 //
 // CHECK: exact map enumeration incomplete for A=[45,48) B=[65,244) through 72 anchor(s)
-// CHECK: could not be enumerated within the proof budget; only the legacy boundary proposal, which enumerates the maps carrying its required anchors, remains decidable
+// CHECK: 285 optimal map(s) in 17 static realization class(es)
+// CHECK: 17 static realization class representative(s) enumerated; 4 plain sub-rectangle(s) held at their forced-only envelope, 1 reduced to their classes
+// CHECK: has no unique least source-mutation class
 // CHECK: 1 core-optimal map(s) carry the 3 required anchor(s)
 // CHECK: committed RequiredAnchorCarrierEquivalence: 1 of 1 required-anchor-carrying map(s) share its output, 3 anchor(s) proved
 #define NIL ((void*)0)

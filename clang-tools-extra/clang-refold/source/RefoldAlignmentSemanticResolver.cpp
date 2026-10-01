@@ -232,11 +232,11 @@ constexpr CommitTheorem CompleteGroundSetTheorem{
     AlignmentSemanticEquivalenceKeyKind::ConcreteOutput,
     AlignmentSemanticAnchorBasis::EquivalentRealizationRepresentative};
 
-/// The same two rules over a ground set whose plain sub-rectangles were held
-/// at their forced-only envelope; see `subRectangleIsPlain()`.
-constexpr CommitTheorem PlainQuotientGroundSetTheorem{
+/// The same two rules over one map per static realization class of each
+/// sub-rectangle; see `staticClassRepresentatives()`.
+constexpr CommitTheorem StaticClassGroundSetTheorem{
     AlignmentSemanticResolutionKind::CompleteGroundSetEquivalence,
-    AlignmentSemanticCandidateDomain::PlainQuotientedOptimalMaps,
+    AlignmentSemanticCandidateDomain::StaticClassRepresentativeMaps,
     AlignmentSemanticEquivalenceKeyKind::ConcreteOutput,
     AlignmentSemanticAnchorBasis::EquivalentRealizationRepresentative};
 
@@ -281,6 +281,31 @@ collectForcedAnchors(const diffutils::CertifiedLcsResult &alignment,
   return anchors;
 }
 
+/// Enumerate the distinct optimal maps of the sub-rectangle
+/// `[aBegin, aEnd) x [bBegin, bEnd)` of \p window, with absolute B indices.
+///
+/// Returns `std::nullopt` when it has more than \p maxMaps maps or the oracle
+/// cannot enumerate it.
+std::optional<std::vector<std::vector<int64_t>>>
+enumerateSubRectangleMaps(const diffutils::OptimalTokenAlignmentOracle &oracle,
+                          const diffutils::LcsCertificationWindow &window,
+                          uint64_t aBegin, uint64_t aEnd, uint64_t bBegin,
+                          uint64_t bEnd, size_t maxMaps) {
+  // Oracle coordinates are window-local, so the rectangle is translated into
+  // the oracle's frame and every returned B index back out of it.
+  diffutils::OptimalLcsMapEnumeration enumeration =
+      oracle.EnumerateOptimalMapsForWindow(
+          aBegin - window.aBegin, aEnd - window.aBegin, bBegin - window.bBegin,
+          bEnd - window.bBegin, maxMaps);
+  if (!enumeration.complete || enumeration.maps.empty())
+    return std::nullopt;
+  for (std::vector<int64_t> &map : enumeration.maps)
+    for (int64_t &mapped : map)
+      if (mapped >= 0)
+        mapped += static_cast<int64_t>(window.bBegin);
+  return std::move(enumeration.maps);
+}
+
 /// Enumerate every distinct core-optimal complete-stream map of one
 /// certification window that carries each pair of \p anchors.
 ///
@@ -307,23 +332,17 @@ collectForcedAnchors(const diffutils::CertifiedLcsResult &alignment,
 /// product exceeding `MaxGlobalSemanticCandidateMaps`.  A refusal is not an
 /// empty set; callers must not read it as one.
 ///
-/// A sub-rectangle \p holdAtEnvelope accepts, given its half-open A range, is
-/// not enumerated: it contributes its forced-only envelope, every A token
-/// unmatched, as its one map, and \p heldSubRectangles counts it.  The result
-/// is then not the set of optimal maps but its quotient by those
-/// sub-rectangles; see `PlainQuotientedOptimalMaps`.
+/// When \p subRectangleMaps is given, it supplies each sub-rectangle's maps,
+/// given the sub-rectangle's half-open A and B ranges, in place of its exact
+/// enumeration.  The result is then the product of what it supplies, not
+/// necessarily the set of optimal maps; see `staticClassRepresentatives()`.
 std::optional<std::vector<std::vector<int64_t>>> enumerateMapsThroughAnchors(
     const diffutils::OptimalTokenAlignmentOracle &oracle,
     const diffutils::LcsCertificationWindow &window, ArrayRef<int64_t> baseMap,
     ArrayRef<MatchAnchor> anchors, size_t windowIndex,
-    function_ref<bool(uint64_t, uint64_t)> holdAtEnvelope = nullptr,
-    size_t *heldSubRectangles = nullptr) {
-  // Oracle coordinates are window-local; the enumeration below therefore
-  // translates each stream rectangle into the oracle's frame and translates
-  // every returned B index back.
-  const uint64_t oracleABegin = window.aBegin;
-  const uint64_t oracleBBegin = window.bBegin;
-
+    function_ref<std::optional<std::vector<std::vector<int64_t>>>(
+        uint64_t, uint64_t, uint64_t, uint64_t)>
+        subRectangleMaps = nullptr) {
   std::vector<std::vector<std::vector<int64_t>>> subWindowMaps;
   std::vector<uint64_t> subWindowABegins;
   uint64_t aBegin = window.aBegin;
@@ -339,37 +358,20 @@ std::optional<std::vector<std::vector<int64_t>>> enumerateMapsThroughAnchors(
         bEnd > window.bEnd)
       return std::nullopt;
 
-    if (holdAtEnvelope && aBegin < aEnd && bBegin < bEnd &&
-        holdAtEnvelope(aBegin, aEnd)) {
-      REFOLD_LOG_TRACE("lcs/semantic-resolver",
-                       "window {0}: sub-rectangle A=[{1},{2}) B=[{3},{4}) is "
-                       "plain source; held at its forced-only envelope",
-                       windowIndex, aBegin, aEnd, bBegin, bEnd);
-      subWindowMaps.push_back(
-          {std::vector<int64_t>(static_cast<size_t>(aEnd - aBegin), -1)});
-      if (heldSubRectangles)
-        ++*heldSubRectangles;
-    } else {
-      diffutils::OptimalLcsMapEnumeration enumeration =
-          oracle.EnumerateOptimalMapsForWindow(
-              aBegin - oracleABegin, aEnd - oracleABegin, bBegin - oracleBBegin,
-              bEnd - oracleBBegin, MaxUniqueMapsPerForcedWindow);
-      if (!enumeration.complete || enumeration.maps.empty()) {
-        REFOLD_LOG_TRACE(
-            "lcs/semantic-resolver",
-            "window {0}: exact map enumeration incomplete for A=[{1},{2}) "
-            "B=[{3},{4}) through {5} anchor(s)",
-            windowIndex, aBegin, aEnd, bBegin, bEnd, anchors.size());
-        return std::nullopt;
-      }
-      for (std::vector<int64_t> &map : enumeration.maps) {
-        for (int64_t &mapped : map) {
-          if (mapped >= 0)
-            mapped += static_cast<int64_t>(oracleBBegin);
-        }
-      }
-      subWindowMaps.push_back(std::move(enumeration.maps));
+    std::optional<std::vector<std::vector<int64_t>>> maps =
+        subRectangleMaps
+            ? subRectangleMaps(aBegin, aEnd, bBegin, bEnd)
+            : enumerateSubRectangleMaps(oracle, window, aBegin, aEnd, bBegin,
+                                        bEnd, MaxUniqueMapsPerForcedWindow);
+    if (!maps) {
+      REFOLD_LOG_TRACE(
+          "lcs/semantic-resolver",
+          "window {0}: exact map enumeration incomplete for A=[{1},{2}) "
+          "B=[{3},{4}) through {5} anchor(s)",
+          windowIndex, aBegin, aEnd, bBegin, bEnd, anchors.size());
+      return std::nullopt;
     }
+    subWindowMaps.push_back(std::move(*maps));
     subWindowABegins.push_back(aBegin);
     if (anchorIndex < anchors.size()) {
       aBegin = anchors[anchorIndex].aToken + 1;
@@ -430,17 +432,110 @@ std::optional<std::vector<std::vector<int64_t>>> enumerateMapsThroughAnchors(
   return globalMaps;
 }
 
-/// Return whether the sub-rectangle over A tokens `[aBegin, aEnd)` may be held
-/// at its forced-only envelope: the source query proves it and both tokens
-/// bounding it plain.
+/// The most optimal maps one sub-rectangle may have for its static realization
+/// classes to be computed.
 ///
-/// The bounding tokens are included because a map's hunks may begin or end in
-/// the gaps beside them.  A sub-rectangle at either end of the stream has no
-/// bounding token there and is never held.
-bool subRectangleIsPlain(const AlignmentSourceLayoutQueries &layout,
-                         size_t aTokenCount, uint64_t aBegin, uint64_t aEnd) {
-  return layout.aRangeIsPlainSource && aBegin > 0 && aBegin < aEnd &&
-         aEnd < aTokenCount && layout.aRangeIsPlainSource(aBegin - 1, aEnd + 1);
+/// It is larger than `MaxUniqueMapsPerForcedWindow` for the reason
+/// `MaxStructureRepairMapsPerSubRectangle` is: only one map per class is
+/// realized, not every enumerated one.  A sub-rectangle over it is refused,
+/// which leaves the window where the unreduced enumeration left it.
+constexpr size_t MaxStaticClassifiedMapsPerSubRectangle = 4096;
+
+/// How a window's sub-rectangles were reduced to static realization classes.
+struct StaticClassReductionCounts {
+  /// Sub-rectangles with nothing non-plain, held at their forced-only envelope.
+  size_t heldAtEnvelope = 0;
+  /// Sub-rectangles whose optimal maps fell into fewer classes than maps.
+  size_t classified = 0;
+};
+
+/// Return whether \p facts, covering a sub-rectangle of \p width tokens and the
+/// token bounding it on each side, records nothing non-plain that a map of the
+/// sub-rectangle could keep or place differently.
+bool subRectangleHasNoNonPlainPosition(const AlignmentPlainSourceFacts &facts,
+                                       size_t width) {
+  for (size_t position = 1; position <= width; ++position)
+    if (!facts.plainTokens[position])
+      return false;
+  for (size_t gap = 1; gap <= width + 1; ++gap)
+    if (!facts.plainGaps[gap])
+      return false;
+  return true;
+}
+
+/// Return one map per static realization class of the sub-rectangle
+/// `[aBegin, aEnd) x [bBegin, bEnd)`, or `std::nullopt` when its maps cannot be
+/// enumerated.  See `computeStaticRealizationSignature()`.
+///
+/// A sub-rectangle with nothing non-plain is one class, and contributes its
+/// forced-only envelope without being enumerated: that is how every attempt
+/// that does not resolve the window realizes it.  Any other sub-rectangle is
+/// enumerated up to `MaxStaticClassifiedMapsPerSubRectangle` maps and
+/// contributes the lexicographically least map of each class.  A sub-rectangle
+/// at either end of the stream has no bounding token there; it, and one whose
+/// source cannot be classified, contributes every optimal map, exactly as the
+/// unreduced enumeration would.
+std::optional<std::vector<std::vector<int64_t>>>
+staticClassRepresentatives(const diffutils::OptimalTokenAlignmentOracle &oracle,
+                           const diffutils::LcsCertificationWindow &window,
+                           const AlignmentSourceLayoutQueries &layout,
+                           ArrayRef<int64_t> baseMap, size_t windowIndex,
+                           uint64_t aBegin, uint64_t aEnd, uint64_t bBegin,
+                           uint64_t bEnd, StaticClassReductionCounts &counts) {
+  const size_t width = static_cast<size_t>(aEnd - aBegin);
+  std::optional<AlignmentPlainSourceFacts> facts;
+  if (layout.classifyPlainSource && aBegin < aEnd && bBegin < bEnd &&
+      aBegin > 0 && aEnd < baseMap.size()) {
+    facts = layout.classifyPlainSource(aBegin - 1, aEnd + 1);
+    if (facts->plainTokens.size() != width + 2 ||
+        facts->plainGaps.size() != width + 2)
+      facts.reset();
+  }
+  if (!facts)
+    return enumerateSubRectangleMaps(oracle, window, aBegin, aEnd, bBegin, bEnd,
+                                     MaxUniqueMapsPerForcedWindow);
+
+  if (subRectangleHasNoNonPlainPosition(*facts, width)) {
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "window {0}: sub-rectangle A=[{1},{2}) B=[{3},{4}) is "
+                     "plain source; held at its forced-only envelope",
+                     windowIndex, aBegin, aEnd, bBegin, bEnd);
+    ++counts.heldAtEnvelope;
+    return std::vector<std::vector<int64_t>>{std::vector<int64_t>(width, -1)};
+  }
+
+  std::optional<std::vector<std::vector<int64_t>>> maps =
+      enumerateSubRectangleMaps(oracle, window, aBegin, aEnd, bBegin, bEnd,
+                                MaxStaticClassifiedMapsPerSubRectangle);
+  if (!maps || maps->size() <= 1)
+    return maps;
+
+  // Classes are ordered by signature, and each keeps its least member, so the
+  // representatives do not depend on the oracle's enumeration order.
+  const int64_t leftBoundB = baseMap[static_cast<size_t>(aBegin - 1)];
+  const int64_t rightBoundB = baseMap[static_cast<size_t>(aEnd)];
+  std::map<std::vector<int64_t>, std::vector<int64_t>> classes;
+  for (std::vector<int64_t> &map : *maps) {
+    std::optional<std::vector<int64_t>> signature =
+        computeStaticRealizationSignature(map, leftBoundB, rightBoundB, *facts);
+    if (!signature)
+      return std::nullopt;
+    auto [member, inserted] = classes.try_emplace(std::move(*signature), map);
+    if (!inserted && map < member->second)
+      member->second = std::move(map);
+  }
+  REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                   "window {0}: sub-rectangle A=[{1},{2}) B=[{3},{4}): {5} "
+                   "optimal map(s) in {6} static realization class(es)",
+                   windowIndex, aBegin, aEnd, bBegin, bEnd, maps->size(),
+                   classes.size());
+  if (classes.size() < maps->size())
+    ++counts.classified;
+  std::vector<std::vector<int64_t>> representatives;
+  representatives.reserve(classes.size());
+  for (auto &[signature, representative] : classes)
+    representatives.push_back(std::move(representative));
+  return representatives;
 }
 
 bool isStrictlyMonotoneMap(ArrayRef<int64_t> map, size_t bTokenCount) {
@@ -777,8 +872,8 @@ StringRef describeCandidateDomain(AlignmentSemanticCandidateDomain domain) {
     return "required-anchor-carrying";
   case AlignmentSemanticCandidateDomain::StructureRepairCandidates:
     return "structure-repair candidate";
-  case AlignmentSemanticCandidateDomain::PlainQuotientedOptimalMaps:
-    return "plain-quotiented";
+  case AlignmentSemanticCandidateDomain::StaticClassRepresentativeMaps:
+    return "static-class representative";
   }
   llvm_unreachable("invalid alignment semantic candidate domain");
 }
@@ -1604,38 +1699,39 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
       enumerateMapsThroughAnchors(oracle, window, baseMap, forcedAnchors,
                                   windowIndex);
 
-  // A ground set over the proof budget is often over it only because plain
-  // sub-rectangles multiply it: independent repeated-token choices whose maps
-  // differ in whitespace alone.  Holding each at its forced-only envelope, as
-  // every unresolved attempt realizes it, leaves only the choices that can
-  // change what the output preserves.  This is tried only after the complete
-  // set was refused, so a window that enumerates today is untouched, and only
-  // the two rules that read the ground set use it; the legacy boundary
-  // proposal keeps its own enumeration below.
-  size_t heldPlainSubRectangles = 0;
-  if (!enumeration && deps_.sourceLayout.aRangeIsPlainSource) {
+  // A ground set over the proof budget is often over it only because maps
+  // that realize alike multiply it: independent repeated-token choices that
+  // differ in whitespace, or in plain tokens kept rather than re-spelled.
+  // Reducing each sub-rectangle to one map per static realization class
+  // leaves only the choices that can change what the output keeps or where
+  // it places it.  This is tried only after the complete set was refused, so
+  // a window that enumerates today is untouched, and only the two rules that
+  // read the ground set use it; the legacy boundary proposal keeps its own
+  // enumeration below.
+  StaticClassReductionCounts reduction;
+  if (!enumeration && deps_.sourceLayout.classifyPlainSource) {
     enumeration = enumerateMapsThroughAnchors(
         oracle, window, baseMap, forcedAnchors, windowIndex,
-        [&](uint64_t aBegin, uint64_t aEnd) {
-          return subRectangleIsPlain(deps_.sourceLayout, deps_.aLexemes.size(),
-                                     aBegin, aEnd);
-        },
-        &heldPlainSubRectangles);
+        [&](uint64_t aBegin, uint64_t aEnd, uint64_t bBegin, uint64_t bEnd) {
+          return staticClassRepresentatives(oracle, window, deps_.sourceLayout,
+                                            baseMap, windowIndex, aBegin, aEnd,
+                                            bBegin, bEnd, reduction);
+        });
     if (!enumeration)
       REFOLD_LOG_TRACE("lcs/semantic-resolver",
-                       "window {0}: holding its plain sub-rectangles at their "
-                       "forced-only envelope does not bring its ground set "
+                       "window {0}: reducing its sub-rectangles to static "
+                       "realization classes does not bring its ground set "
                        "within the proof budget",
                        windowIndex);
-    if (heldPlainSubRectangles == 0)
+    else if (reduction.heldAtEnvelope + reduction.classified == 0)
       enumeration.reset();
   }
   const bool groundSetEnumerated = enumeration.has_value();
-  const bool groundSetQuotiented =
-      groundSetEnumerated && heldPlainSubRectangles != 0;
-  const CommitTheorem &groundSetTheorem = groundSetQuotiented
-                                              ? PlainQuotientGroundSetTheorem
-                                              : CompleteGroundSetTheorem;
+  const bool groundSetReduced =
+      groundSetEnumerated &&
+      reduction.heldAtEnvelope + reduction.classified != 0;
+  const CommitTheorem &groundSetTheorem =
+      groundSetReduced ? StaticClassGroundSetTheorem : CompleteGroundSetTheorem;
   std::vector<std::vector<int64_t>> globalMaps;
   if (groundSetEnumerated) {
     globalMaps = std::move(*enumeration);
@@ -1659,15 +1755,17 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     // last point before the run starts spending it.  Every map counted here is
     // a distinct optimal alignment of the same rectangle, and deciding between
     // them is what the realizations below pay for.
-    if (groundSetQuotiented)
+    if (groundSetReduced)
       REFOLD_LOG_DEBUG(
           "lcs/semantic-resolver",
           "window {0} carries alignment ambiguity over A=[{1},{2}) "
-          "B=[{3},{4}): {5} map(s) enumerated with {6} plain sub-rectangle(s) "
-          "held at their forced-only envelope",
+          "B=[{3},{4}): {5} static realization class representative(s) "
+          "enumerated; {6} plain sub-rectangle(s) held at their forced-only "
+          "envelope, {7} reduced to their classes",
           windowIndex, window.aBegin, window.aEnd, window.bBegin, window.bEnd,
           static_cast<uint64_t>(globalMaps.size()),
-          static_cast<uint64_t>(heldPlainSubRectangles));
+          static_cast<uint64_t>(reduction.heldAtEnvelope),
+          static_cast<uint64_t>(reduction.classified));
     else
       REFOLD_LOG_DEBUG(
           "lcs/semantic-resolver",
@@ -2324,11 +2422,11 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     }
   }
 
-  // A quotiented ground set holds plain sub-rectangles at their envelope, so a
-  // required anchor inside one would filter out every map; this rule
+  // A reduced ground set keeps one map per static class, so a required anchor
+  // another member carries would filter out its whole class; this rule
   // enumerates its own survivors instead, exactly as for an unenumerated set.
   std::vector<size_t> survivingMaps;
-  if (groundSetEnumerated && !groundSetQuotiented) {
+  if (groundSetEnumerated && !groundSetReduced) {
     for (size_t mapIndex = 0; mapIndex < globalMaps.size(); ++mapIndex) {
       if (mapContainsRequiredAnchors(globalMaps[mapIndex], requiredAnchors))
         survivingMaps.push_back(mapIndex);
@@ -2527,6 +2625,51 @@ void AlignmentSemanticResolutionMemo::Record(
   recorded = true;
 }
 
+std::optional<std::vector<int64_t>>
+computeStaticRealizationSignature(ArrayRef<int64_t> localMap,
+                                  int64_t leftBoundB, int64_t rightBoundB,
+                                  const AlignmentPlainSourceFacts &facts) {
+  const size_t width = localMap.size();
+  if (facts.plainTokens.size() != width + 2 ||
+      facts.plainGaps.size() != width + 2)
+    return std::nullopt;
+
+  // Position 0 is the left bounding token, `width + 1` the right one, and the
+  // sub-rectangle's own tokens lie between them.
+  std::vector<int64_t> partners;
+  partners.reserve(width + 2);
+  partners.push_back(leftBoundB);
+  partners.insert(partners.end(), localMap.begin(), localMap.end());
+  partners.push_back(rightBoundB);
+
+  // The nearest kept position at or before, and at or after, each position.
+  // The bounding tokens end both searches whether or not they are kept: they
+  // are the same in every map being classified, and so is whatever lies past
+  // them.
+  std::vector<size_t> keptAtOrBefore(width + 2, 0);
+  for (size_t position = 1; position <= width + 1; ++position)
+    keptAtOrBefore[position] =
+        partners[position] >= 0 ? position : keptAtOrBefore[position - 1];
+  std::vector<size_t> keptAtOrAfter(width + 2, width + 1);
+  for (size_t position = width; position >= 1; --position)
+    keptAtOrAfter[position] =
+        partners[position] >= 0 ? position : keptAtOrAfter[position + 1];
+
+  std::vector<int64_t> signature;
+  for (size_t position = 1; position <= width; ++position)
+    if (!facts.plainTokens[position])
+      signature.push_back(partners[position]);
+  for (size_t gap = 1; gap <= width + 1; ++gap) {
+    if (facts.plainGaps[gap])
+      continue;
+    for (size_t kept : {keptAtOrBefore[gap - 1], keptAtOrAfter[gap]}) {
+      signature.push_back(static_cast<int64_t>(kept));
+      signature.push_back(partners[kept]);
+    }
+  }
+  return signature;
+}
+
 namespace {
 
 /// Return whether a `kind` witness may record an anchor with \p basis.
@@ -2562,10 +2705,10 @@ findWitnessTheoremDefect(const AlignmentSemanticResolutionWitness &witness) {
   bool structureRecovery = false;
   switch (witness.resolutionKind) {
   case AlignmentSemanticResolutionKind::CompleteGroundSetEquivalence:
-    // The same rules may read a ground set quotiented by plain sub-rectangles.
+    // The same rules may read one map per static realization class.
     if (witness.candidateDomain ==
-        AlignmentSemanticCandidateDomain::PlainQuotientedOptimalMaps)
-      domain = AlignmentSemanticCandidateDomain::PlainQuotientedOptimalMaps;
+        AlignmentSemanticCandidateDomain::StaticClassRepresentativeMaps)
+      domain = AlignmentSemanticCandidateDomain::StaticClassRepresentativeMaps;
     break;
   case AlignmentSemanticResolutionKind::RequiredAnchorCarrierEquivalence:
     domain = AlignmentSemanticCandidateDomain::RequiredAnchorCarriers;

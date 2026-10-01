@@ -236,15 +236,18 @@ public:
   std::vector<uint64_t> CollectPreservableCommentGaps(uint64_t aBegin,
                                                       uint64_t aEnd) const;
 
-  /// Return whether A tokens `[aBegin, aEnd)` are plain source.
+  /// Return which of A tokens `[aBegin, aEnd)` and the gaps between them are
+  /// plain source.
   ///
-  /// Each token must have exactly one tokmap entry, be the exact spelling of
-  /// one raw token in its owner's source, and lie outside every macro
-  /// expansion.  All of them must share one file, include occurrence and
-  /// conditional arm, appear in source order, and be separated by whitespace
-  /// alone: no comment, line splice, directive, or zero-token invocation.
-  /// Empty and single-token ranges are judged on their tokens alone.
-  bool ARangeIsPlainSource(uint64_t aBegin, uint64_t aEnd) const;
+  /// A token is plain when it has exactly one tokmap entry, is the exact
+  /// spelling of one raw token in its owner's source, and lies outside every
+  /// macro expansion.  A gap is plain when the tokens on either side each have
+  /// exactly one tokmap entry, lie in one file, include occurrence and
+  /// conditional arm in source order, and are separated by whitespace alone:
+  /// no comment, line splice, directive, or zero-token invocation.  An empty
+  /// or out-of-range run yields empty facts.
+  AlignmentPlainSourceFacts ClassifyPlainSource(uint64_t aBegin,
+                                                uint64_t aEnd) const;
 
 private:
   /// Certify the core A-to-B alignment and collect its evidence transcript.
@@ -367,8 +370,15 @@ private:
       const diffutils::LcsCertificationDiagnosticEvidence &diagnosticEvidence,
       uint64_t aTokenCount, uint64_t bTokenCount) const;
 
+  /// Return the A tokens claimed by more than one tokmap entry, computed once
+  /// per planner: such a token has no single source position.
+  const llvm::DenseSet<uint64_t> &DuplicateTokmapTokens() const;
+
   /// Borrowed construction-time service graph for token-diff planning.
   Dependencies deps_;
+
+  /// Lazily computed result of `DuplicateTokmapTokens()`.
+  mutable std::optional<llvm::DenseSet<uint64_t>> duplicateTokmapTokens_;
 };
 
 } // namespace refold
