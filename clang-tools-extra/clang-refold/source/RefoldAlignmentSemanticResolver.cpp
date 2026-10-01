@@ -938,6 +938,45 @@ collectUnmatchedRuns(ArrayRef<int64_t> localMap, uint64_t aBegin,
   return runs;
 }
 
+/// Return the runs of B tokens a sub-rectangle map leaves unmatched, as
+/// absolute half-open B ranges: the text its hunks insert.
+///
+/// \p localMap covers the A tokens of a sub-rectangle whose B tokens are
+/// `[bBegin, bEnd)`.  A run touching either end is extended through the B
+/// tokens \p bMatchedByBase leaves unmatched beyond it, for the reason
+/// `collectUnmatchedRuns()` extends A runs.
+std::vector<std::pair<uint64_t, uint64_t>>
+collectUnmatchedBRuns(ArrayRef<int64_t> localMap, uint64_t bBegin,
+                      uint64_t bEnd, const std::vector<bool> &bMatchedByBase) {
+  std::vector<bool> matched(static_cast<size_t>(bEnd - bBegin), false);
+  for (int64_t mapped : localMap)
+    if (mapped >= 0 && static_cast<uint64_t>(mapped) >= bBegin &&
+        static_cast<uint64_t>(mapped) < bEnd)
+      matched[static_cast<size_t>(mapped) - bBegin] = true;
+
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  uint64_t bToken = bBegin;
+  while (bToken < bEnd) {
+    if (matched[bToken - bBegin]) {
+      ++bToken;
+      continue;
+    }
+    uint64_t runBegin = bToken;
+    uint64_t runEnd = bToken + 1;
+    while (runEnd < bEnd && !matched[runEnd - bBegin])
+      ++runEnd;
+    bToken = runEnd;
+    if (runBegin == bBegin)
+      while (runBegin > 0 && !bMatchedByBase[runBegin - 1])
+        --runBegin;
+    if (runEnd == bEnd)
+      while (runEnd < bMatchedByBase.size() && !bMatchedByBase[runEnd])
+        ++runEnd;
+    runs.emplace_back(runBegin, runEnd);
+  }
+  return runs;
+}
+
 /// Return the members of sorted \p gaps lying strictly inside one of \p runs.
 ///
 /// A gap strictly inside a run sits between two A tokens one hunk removes, so
@@ -961,6 +1000,8 @@ struct RepairMapFacts {
   bool lineAligned = false;
   size_t runCount = 0;
   std::vector<uint64_t> straddledComments;
+  /// Every run of unmatched B tokens begins and ends a line of B.
+  bool insertedLinesWhole = false;
 };
 
 /// Narrow \p candidates to the members whose \p set is contained in every
@@ -993,7 +1034,8 @@ std::vector<size_t> keepLeastByInclusion(
 /// The keys apply in order, each narrowing what the previous one kept, and a
 /// key that cannot tell the maps apart keeps them all: least straddled
 /// protected structure, then line-aligned runs, then fewest runs, then least
-/// straddled comments.  See `SelectStructureRespectingRepair()`.
+/// straddled comments, then inserted text in whole lines of B.  See
+/// `SelectStructureRespectingRepair()`.
 std::vector<size_t> selectPreferredRepairMaps(ArrayRef<RepairMapFacts> facts) {
   std::vector<size_t> kept(facts.size());
   for (size_t index = 0; index < facts.size(); ++index)
@@ -1015,7 +1057,15 @@ std::vector<size_t> selectPreferredRepairMaps(ArrayRef<RepairMapFacts> facts) {
   llvm::erase_if(kept,
                  [&](size_t index) { return facts[index].runCount != fewestRuns; });
 
-  return keepLeastByInclusion(kept, facts, &RepairMapFacts::straddledComments);
+  kept = keepLeastByInclusion(kept, facts, &RepairMapFacts::straddledComments);
+
+  std::vector<size_t> wholeLines;
+  for (size_t index : kept)
+    if (facts[index].insertedLinesWhole)
+      wholeLines.push_back(index);
+  if (!wholeLines.empty())
+    kept = std::move(wholeLines);
+  return kept;
 }
 
 /// One forced-anchor sub-rectangle whose structure-respecting keys kept a
@@ -1438,6 +1488,16 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
       deps_.coreAlignment.certificationWindows[windowIndex];
   const ArrayRef<uint64_t> boundaries = ProtectedABoundaries();
 
+  // Which B tokens the decline configuration matches, read past a
+  // sub-rectangle's edge, where every one of its maps agrees with it.  Without
+  // B's line facts the inserted-text key prefers nothing.
+  std::vector<bool> bMatchedByBase(deps_.bLexemes.size(), false);
+  for (int64_t mapped : baseMap)
+    if (mapped >= 0 && static_cast<size_t>(mapped) < bMatchedByBase.size())
+      bMatchedByBase[static_cast<size_t>(mapped)] = true;
+  const bool bLinesKnown =
+      deps_.bGapProvenance.size() == deps_.bLexemes.size() + 1;
+
   std::vector<PreferredSubRectangle> preferred;
 
   // Split exactly where enumeration splits: every optimal map carries the
@@ -1498,6 +1558,14 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
           });
       mapFacts.runCount = runs.size();
       mapFacts.straddledComments = collectStraddledGaps(runs, commentGaps);
+      mapFacts.insertedLinesWhole =
+          bLinesKnown &&
+          llvm::all_of(
+              collectUnmatchedBRuns(map, subBBegin, bEnd, bMatchedByBase),
+              [&](const std::pair<uint64_t, uint64_t> &run) {
+                return deps_.bGapProvenance[run.first].rightTokenStartsLine &&
+                       deps_.bGapProvenance[run.second - 1].rightTokenEndsLine;
+              });
       facts.push_back(std::move(mapFacts));
     }
 

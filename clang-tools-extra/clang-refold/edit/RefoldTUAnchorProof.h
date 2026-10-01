@@ -75,6 +75,10 @@ enum class TUInsertionAnchorAdjustmentKind : uint8_t {
   /// `placeTUInsertionAmongPrintedPragmas`.  Unlike a line-control prefix,
   /// this may move the anchor backwards.
   PrintedPragmaPlacement,
+  /// A whole-line insertion was moved back to the start of its anchor's
+  /// logical line, across zero-token macro invocations and trivia only; see
+  /// `RefoldTUAnchorProof::ZeroTokenLinePrefixStart`.
+  ZeroTokenLinePrefix,
 };
 
 /// Typed proof input for moving a pure insertion across preserved source
@@ -93,6 +97,8 @@ struct TUInsertionAnchorAdjustment {
       return originalTUByteOffset <= adjustedTUByteOffset;
     case TUInsertionAnchorAdjustmentKind::PrintedPragmaPlacement:
       return originalTUByteOffset != adjustedTUByteOffset;
+    case TUInsertionAnchorAdjustmentKind::ZeroTokenLinePrefix:
+      return adjustedTUByteOffset < originalTUByteOffset;
     }
     return false;
   }
@@ -305,6 +311,21 @@ public:
   /// printed.  Every preprocessing structure in the range must lie inside one
   /// of the carriers.
   bool RangeHoldsOnlyPrintedPragmas(uint64_t begin, uint64_t end) const;
+
+  /// Return the start of the logical source line holding TU byte \p anchor
+  /// when the bytes from there to \p anchor are at least one complete
+  /// source-neutral zero-token macro invocation and otherwise only ordinary
+  /// lexer trivia; otherwise `std::nullopt`.
+  ///
+  /// Such an invocation materializes no token, and its definition is empty or
+  /// tiled by invocations that are themselves neutral, so it neither emits a
+  /// token nor changes preprocessor state; see
+  /// `RefoldSourceNeutralityProof::MacroInvocationIsSourceNeutralZeroToken`.
+  /// A pure insertion anchored at \p anchor therefore produces the same token
+  /// stream when it is moved back to the returned offset.  The line ends at a
+  /// newline that is neither part of a line splice nor inside a comment, and
+  /// no preprocessing structure lies between the two offsets.
+  std::optional<uint64_t> ZeroTokenLinePrefixStart(uint64_t anchor) const;
 
   /// Return true iff a PP gap sits at the exit of a selected conditional arm.
   bool IsPPGapAtSelectedConditionalArmExit(uint64_t ppGap) const;

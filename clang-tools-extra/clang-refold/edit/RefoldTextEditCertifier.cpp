@@ -1153,14 +1153,19 @@ bool RefoldTextEditCertifier::AuditGlobalSourceEditInvariant(
       }
 
       if (adjustedPureInsertion) {
-        // Two movements of a direct insertion anchor are admitted, each across
-        // structure that remains physically in place: in either direction
-        // across printed pragmas, placing the insertion on the side of each
-        // that B prints it; or forward past a source-authored line-control
-        // prefix.  Recompute that exact topology here instead of trusting the
-        // earlier adjustment witness after edit normalization.
+        // Three movements of a direct insertion anchor are admitted, each
+        // across structure that remains physically in place: in either
+        // direction across printed pragmas, placing the insertion on the side
+        // of each that B prints it; backwards to the start of a line that
+        // begins with source-neutral zero-token macro invocations; or forward
+        // past a source-authored line-control prefix.  Recompute that exact
+        // topology here instead of trusting the earlier adjustment witness
+        // after edit normalization.
         if (tuAnchorProof_.RangeHoldsOnlyPrintedPragmas(
                 std::min(rawBegin, finalBegin), std::max(rawBegin, finalBegin)))
+          continue;
+        if (finalBegin < rawBegin &&
+            tuAnchorProof_.ZeroTokenLinePrefixStart(rawBegin) == finalBegin)
           continue;
         if (finalBegin < rawBegin)
           return reject("direct TU insertion moved backwards across structure "

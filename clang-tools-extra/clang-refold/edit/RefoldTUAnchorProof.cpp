@@ -13,11 +13,13 @@
 #include "edit/RefoldTUAnchorProof.h"
 
 #include "line-control/LineDirectiveInserter.h"
+#include "line-control/SourceLineDirectiveHelpers.h"
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroTopology.h"
 #include "model/RefoldModel.h"
 #include "model/RefoldPathIdentity.h"
 #include "proof/RefoldAcceptedResultPredicates.h"
+#include "proof/RefoldNeutralityProof.h"
 #include "proof/RefoldSidebandReplayProof.h"
 #include "proof/RefoldTheoremAudit.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
@@ -489,6 +491,91 @@ bool RefoldTUAnchorProof::RangeHoldsOnlyPrintedPragmas(uint64_t begin,
         }))
       return false;
   return true;
+}
+
+namespace {
+
+/// Return whether the byte at \p offset is a newline that ends a logical
+/// source line: one outside every comment and not ending a line splice.
+bool newlineEndsLogicalLine(const RefoldPreprocessingStructureIndex &index,
+                            StringRef bytes, uint64_t offset) {
+  if (offset >= bytes.size() || bytes[offset] != '\n')
+    return false;
+  // A CRLF line end is one indivisible lexical component, so the boundary to
+  // ask about is the one before its `\r`.
+  const uint64_t lineEnd =
+      offset > 0 && bytes[offset - 1] == '\r' ? offset - 1 : offset;
+  return index.IsExactLexicalBoundary(lineEnd);
+}
+
+/// Order invocation spellings by begin, an enclosing spelling before the ones
+/// it contains.
+bool precedesInSourceOrder(const RefoldModel::MacroInvocation *lhs,
+                           const RefoldModel::MacroInvocation *rhs) {
+  if (*lhs->invB != *rhs->invB)
+    return *lhs->invB < *rhs->invB;
+  if (*lhs->invE != *rhs->invE)
+    return *lhs->invE > *rhs->invE;
+  return lhs->id < rhs->id;
+}
+
+} // namespace
+
+std::optional<uint64_t>
+RefoldTUAnchorProof::ZeroTokenLinePrefixStart(uint64_t anchor) const {
+  const StringRef bytes = deps_.tuSourceBytes;
+  const RefoldPreprocessingStructureIndex &index =
+      deps_.preprocessingStructureIndex;
+  if (anchor > bytes.size() || !index.IsDirectTUProtectionCensusComplete())
+    return std::nullopt;
+
+  uint64_t lineStart = anchor;
+  while (lineStart > 0 && !newlineEndsLogicalLine(index, bytes, lineStart - 1))
+    --lineStart;
+  if (lineStart == anchor)
+    return std::nullopt;
+
+  const StringRef tuPath = deps_.model.GetSourcePath();
+  SmallVector<const RefoldModel::MacroInvocation *, 2> invocations;
+  for (const RefoldModel::MacroInvocation &invocation :
+       deps_.model.GetMacroInvocations())
+    if (invocation.invFile && invocation.invB && invocation.invE &&
+        !invocation.ownerIncludeId &&
+        deps_.pathIdentity.PathsEqual(*invocation.invFile, tuPath) &&
+        lineStart <= *invocation.invB && *invocation.invE <= anchor)
+      invocations.push_back(&invocation);
+  llvm::sort(invocations, precedesInSourceOrder);
+
+  // Tile the prefix with the outermost invocation spellings and the trivia
+  // between them.  An invocation spelled inside an outer one's arguments is
+  // part of the outer one's neutrality proof.
+  const TUSourceNeutralityContext neutrality =
+      RefoldSourceNeutralityProof::BuildTUSourceNeutralityContext(
+          deps_.model, deps_.pathIdentity, bytes, tuPath,
+          isWsOrCompleteCommentTrivia);
+  uint64_t cursor = lineStart;
+  bool crossesInvocation = false;
+  for (const RefoldModel::MacroInvocation *invocation : invocations) {
+    const uint64_t begin = *invocation->invB;
+    const uint64_t end = *invocation->invE;
+    if (begin < cursor) {
+      if (end <= cursor)
+        continue;
+      return std::nullopt;
+    }
+    if (!index.ProveOrdinaryDirectTUInternalGap(cursor, begin) ||
+        index.HasOverlapping(begin, end) ||
+        deps_.macroTopology.IsInvocationInsideDefineDirective(*invocation) ||
+        !RefoldSourceNeutralityProof::MacroInvocationIsSourceNeutralZeroToken(
+            neutrality, *invocation))
+      return std::nullopt;
+    cursor = end;
+    crossesInvocation = true;
+  }
+  if (!crossesInvocation ||
+      !index.ProveOrdinaryDirectTUInternalGap(cursor, anchor))
+    return std::nullopt;
+  return lineStart;
 }
 
 bool RefoldTUAnchorProof::ValidateOrdinaryDirectTUEnvelope(
@@ -1631,6 +1718,14 @@ bool RefoldTUAnchorProof::ValidateTUOwnerRealizationCarrier(
                    adjustment.adjustedTUByteOffset),
           std::max(adjustment.originalTUByteOffset,
                    adjustment.adjustedTUByteOffset));
+    }
+    // A zero-token line prefix is re-derived from the source index and the
+    // producer's invocation records alone.
+    if (adjustment.kind ==
+        TUInsertionAnchorAdjustmentKind::ZeroTokenLinePrefix) {
+      const std::optional<uint64_t> lineStart =
+          ZeroTokenLinePrefixStart(adjustment.originalTUByteOffset);
+      return lineStart && *lineStart == adjustment.adjustedTUByteOffset;
     }
     if (adjustment.kind !=
         TUInsertionAnchorAdjustmentKind::SourceLineControlPrefix)

@@ -1381,10 +1381,12 @@ RefoldTokenDiffPlanner::ComputeLcsBGapProvenanceForPP() const {
   using diffutils::LcsBGapProvenance;
 
   // B-side tokens have no producer ownership graph, so this records only
-  // source-surface facts around each edited token gap.  The evidence-only
-  // Legacy shadow reconstruction consumes the profile to reproduce the last
-  // known regression-passing frontier policy exactly. Production alignment
-  // certification and semantic class construction never consult these facts.
+  // source-surface facts around each edited token gap.  The legacy boundary
+  // proposal consumes the profile to reproduce the last known
+  // regression-passing frontier policy exactly, and the structure-respecting
+  // repair reads its token line facts to order candidates it then realizes.
+  // Production alignment certification and semantic class construction never
+  // consult these facts.
 
   const size_t n = deps_.bToks.size();
   std::vector<LcsBGapProvenance> profiles(n + 1);
@@ -1473,8 +1475,8 @@ RefoldTokenDiffPlanner::ComputeLcsBGapProvenanceForPP() const {
           stringutils::endsLineBeforeWs(deps_.bSource, rightEnd);
     }
 
-    // Store the completed B-gap profile for the trace-only historical shadow.
-    // No production LCS or edit-frontier decision consumes this profile.
+    // Store the completed B-gap profile.  No LCS certification or
+    // edit-frontier decision consumes it.
     profiles[gap] = profile;
   }
 

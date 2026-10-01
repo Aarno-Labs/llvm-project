@@ -70,17 +70,31 @@ std::optional<TextEdit> RefoldDirectTUEditBuilder::Build(
             : PlaceTUInsertionAmongPrintedPragmas(h, span.first);
   if (pragmaPlacement.kind == PrintedPragmaInsertionPlacement::Kind::Refused)
     return std::nullopt;
+  std::optional<uint64_t> envelopeBByteEnd;
   if (pragmaPlacement.kind == PrintedPragmaInsertionPlacement::Kind::Placed) {
     span = {pragmaPlacement.tuByteOffset, pragmaPlacement.tuByteOffset};
-    if (pragmaPlacement.bByteEnd)
-      materializedBByteEnd = *pragmaPlacement.bByteEnd;
+    envelopeBByteEnd = pragmaPlacement.bByteEnd;
   }
+  const std::optional<ZeroTokenLinePrefixPlacement> linePrefixPlacement =
+      !isDel &&
+              pragmaPlacement.kind ==
+                  PrintedPragmaInsertionPlacement::Kind::NotApplicable &&
+              span.first == span.second
+          ? PlaceWholeLineInsertionBeforeZeroTokenLinePrefix(h, span.first)
+          : std::nullopt;
+  if (linePrefixPlacement) {
+    span = {linePrefixPlacement->tuByteOffset,
+            linePrefixPlacement->tuByteOffset};
+    envelopeBByteEnd = linePrefixPlacement->bByteEnd;
+  }
+  if (envelopeBByteEnd)
+    materializedBByteEnd = *envelopeBByteEnd;
   if (isDel) {
     repl = "";
   } else {
     StringRef bSlice =
         h.isInsertOnly()
-            ? InsertionEnvelope(h, pragmaPlacement)
+            ? InsertionEnvelope(h, envelopeBByteEnd)
             : refoldSliceExactTokenCoverage(deps_.bTokOff, deps_.bToks,
                                             deps_.bSource, h.bStart, h.bEnd);
     repl.assign(bSlice.data(), bSlice.data() + bSlice.size());
@@ -153,13 +167,14 @@ std::optional<TextEdit> RefoldDirectTUEditBuilder::Build(
 
   const bool advancedOverSourceLineControlPrefix =
       pragmaPlacement.kind != PrintedPragmaInsertionPlacement::Kind::Placed &&
+      !linePrefixPlacement &&
       maybeAdvanceTUInsertionPastSourceLineControlPrefix(
           deps_.tuAnchorProof, deps_.lineControlProof, h, tuPath, tuBytes,
           span);
   std::optional<TUInsertionAnchorAdjustment> insertionAnchorAdjustment =
-      InsertionAnchorAdjustment(pragmaPlacement,
-                                advancedOverSourceLineControlPrefix, rawTUStart,
-                                span.first);
+      InsertionAnchorAdjustment(
+          pragmaPlacement, linePrefixPlacement.has_value(),
+          advancedOverSourceLineControlPrefix, rawTUStart, span.first);
 
   // If we are replacing whitespace-only text in the TU, we prefer to
   // preserve the existing TU gap whitespace rather than introducing new
@@ -244,26 +259,66 @@ RefoldDirectTUEditBuilder::PlaceTUInsertionAmongPrintedPragmas(
   return placement;
 }
 
+std::optional<RefoldDirectTUEditBuilder::ZeroTokenLinePrefixPlacement>
+RefoldDirectTUEditBuilder::PlaceWholeLineInsertionBeforeZeroTokenLinePrefix(
+    const diffutils::Hunk &h, uint64_t baseAnchor) const {
+  if (!h.isInsertOnly() || h.bStart >= h.bEnd || h.bEnd >= deps_.bToks.size() ||
+      h.bEnd >= deps_.bTokOff.size())
+    return std::nullopt;
+
+  const StringRef bSource = deps_.bSource;
+  const size_t lastToken = static_cast<size_t>(h.bEnd - 1);
+  const size_t firstBegin = deps_.bTokOff[static_cast<size_t>(h.bStart)];
+  const size_t lastEnd =
+      deps_.bTokOff[lastToken] + deps_.bToks[lastToken].spelling.size();
+  const size_t nextBegin = deps_.bTokOff[static_cast<size_t>(h.bEnd)];
+  if (lastEnd > nextBegin || nextBegin > bSource.size() ||
+      !stringutils::beginsLineAfterWs(bSource, firstBegin) ||
+      !stringutils::beginsLineAfterWs(bSource, nextBegin))
+    return std::nullopt;
+  const size_t nextLineStart = stringutils::lineStartOffset(bSource, nextBegin);
+  if (nextLineStart <= lastEnd ||
+      !stringutils::rangeContainsOnlyWs(bSource, lastEnd, nextLineStart))
+    return std::nullopt;
+
+  const std::optional<uint64_t> lineStart =
+      deps_.tuAnchorProof.ZeroTokenLinePrefixStart(baseAnchor);
+  if (!lineStart)
+    return std::nullopt;
+  REFOLD_LOG_TRACE("tu/insertion",
+                   "insertion A={0} B=[{1},{2}) placed at source byte {3} "
+                   "(base anchor {4}), before the zero-token macro "
+                   "invocations that begin its line; replaying B up to byte "
+                   "{5}",
+                   h.aStart, h.bStart, h.bEnd, *lineStart, baseAnchor,
+                   nextLineStart);
+  return ZeroTokenLinePrefixPlacement{*lineStart,
+                                      static_cast<uint64_t>(nextLineStart)};
+}
+
 StringRef RefoldDirectTUEditBuilder::InsertionEnvelope(
-    const diffutils::Hunk &h,
-    const PrintedPragmaInsertionPlacement &placement) const {
-  if (placement.kind != PrintedPragmaInsertionPlacement::Kind::Placed ||
-      !placement.bByteEnd)
+    const diffutils::Hunk &h, std::optional<uint64_t> bByteEnd) const {
+  if (!bByteEnd)
     return refoldSliceTokenEnvelope(deps_.bTokOff, deps_.bSource, h.bStart,
                                     h.bEnd);
   const uint64_t begin = deps_.bTokOff[static_cast<size_t>(h.bStart)];
-  return deps_.bSource.slice(begin, *placement.bByteEnd);
+  return deps_.bSource.slice(begin, *bByteEnd);
 }
 
 std::optional<TUInsertionAnchorAdjustment>
 RefoldDirectTUEditBuilder::InsertionAnchorAdjustment(
     const PrintedPragmaInsertionPlacement &placement,
+    bool placedBeforeZeroTokenLinePrefix,
     bool advancedOverSourceLineControlPrefix, uint64_t rawTUStart,
     uint64_t anchor) {
   if (placement.kind == PrintedPragmaInsertionPlacement::Kind::Placed &&
       anchor != rawTUStart)
     return TUInsertionAnchorAdjustment{
         TUInsertionAnchorAdjustmentKind::PrintedPragmaPlacement, rawTUStart,
+        anchor};
+  if (placedBeforeZeroTokenLinePrefix)
+    return TUInsertionAnchorAdjustment{
+        TUInsertionAnchorAdjustmentKind::ZeroTokenLinePrefix, rawTUStart,
         anchor};
   if (advancedOverSourceLineControlPrefix)
     return TUInsertionAnchorAdjustment{

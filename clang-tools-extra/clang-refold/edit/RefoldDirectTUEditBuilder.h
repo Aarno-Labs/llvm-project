@@ -104,6 +104,31 @@ public:
                                 AcceptedPathKind acceptedPath) const;
 
 private:
+  /// Where a whole-line pure insertion lands ahead of the zero-token macro
+  /// invocations that begin its anchor's source line.
+  struct ZeroTokenLinePrefixPlacement {
+    /// Start of the anchor's logical source line.
+    uint64_t tuByteOffset = 0;
+    /// End of the B bytes replayed: the start of the B line holding the first
+    /// B token after the insertion.
+    uint64_t bByteEnd = 0;
+  };
+
+  /// Place a pure TU insertion that B prints as whole lines at the start of
+  /// its anchor's source line, when only zero-token macro invocations and
+  /// trivia precede the anchor on that line; see
+  /// `RefoldTUAnchorProof::ZeroTokenLinePrefixStart`.  Otherwise, and for
+  /// any other hunk, `std::nullopt`.
+  ///
+  /// The insertion's B text is whole lines when its first token begins a B
+  /// line and only whitespace separates its last token from the start of the
+  /// B line holding the next token.  The source line then receives exactly
+  /// those lines in front of it, rather than having them spliced between the
+  /// invocations and the anchor.
+  std::optional<ZeroTokenLinePrefixPlacement>
+  PlaceWholeLineInsertionBeforeZeroTokenLinePrefix(const diffutils::Hunk &h,
+                                                   uint64_t baseAnchor) const;
+
   /// Place a pure TU insertion among the printed pragma lines preserved at
   /// its A gap; see `placeTUInsertionAmongPrintedPragmas`.  Non-insertions
   /// and gaps without such lines report `NotApplicable`.
@@ -111,17 +136,16 @@ private:
   PlaceTUInsertionAmongPrintedPragmas(const diffutils::Hunk &h,
                                       uint64_t baseAnchor) const;
 
-  /// Return the B bytes a pure insertion replays: its token envelope, cut
-  /// before the first preserved pragma line B prints after it when
-  /// \p placement placed it.
-  llvm::StringRef
-  InsertionEnvelope(const diffutils::Hunk &h,
-                    const PrintedPragmaInsertionPlacement &placement) const;
+  /// Return the B bytes a pure insertion replays: its token envelope, or the
+  /// bytes from its first token to \p bByteEnd when a placement cut it there.
+  llvm::StringRef InsertionEnvelope(const diffutils::Hunk &h,
+                                    std::optional<uint64_t> bByteEnd) const;
 
   /// Return the typed anchor adjustment an insertion's final site carries,
   /// or std::nullopt when it still sits on its base anchor.
   static std::optional<TUInsertionAnchorAdjustment>
   InsertionAnchorAdjustment(const PrintedPragmaInsertionPlacement &placement,
+                            bool placedBeforeZeroTokenLinePrefix,
                             bool advancedOverSourceLineControlPrefix,
                             uint64_t rawTUStart, uint64_t anchor);
 

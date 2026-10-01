@@ -388,7 +388,9 @@ public:
     /// only to explain the structural identity of candidate hunk frontiers.
     llvm::ArrayRef<diffutils::LcsAGapProvenance> aGapProvenance;
     /// Edited-side surface facts used to reconstruct the historical boundary
-    /// map strictly as a proposal. These ranks never grant anchor authority.
+    /// map strictly as a proposal, and whose line facts order the
+    /// structure-respecting repair's candidates. These ranks never grant
+    /// anchor authority.
     llvm::ArrayRef<diffutils::LcsBGapProvenance> bGapProvenance;
     SimulationCallback simulate;
     /// Materialize one certification window's all-optimal pair facts, which
@@ -589,16 +591,20 @@ private:
   /// The window is split at its forced anchors, exactly as enumeration splits
   /// it, and each sub-rectangle's optimal maps are enumerated up to the repair's
   /// own bound.  A sub-rectangle's runs of unmatched A tokens are its hunks, and
-  /// its maps are narrowed by four keys in order, each applied only where it
+  /// its maps are narrowed by five keys in order, each applied only where it
   /// expresses a preference:
   ///
   ///   1. the least set, under inclusion, of straddled protected boundaries;
   ///   2. every run begins and ends a source line;
   ///   3. the fewest runs;
-  ///   4. the least set, under inclusion, of straddled preservable comments.
+  ///   4. the least set, under inclusion, of straddled preservable comments;
+  ///   5. every run of unmatched B tokens begins and ends a line of B.
   ///
   /// A boundary or comment gap is straddled when it lies strictly inside a
-  /// run.  A sub-rectangle whose keys keep every map expresses no preference and
+  /// run.  The first four keys read only what a map removes, so maps that
+  /// differ only in where they insert tie on all of them; the fifth reads the
+  /// line breaks the edit wrote into B, which the token alignment discards.
+  /// A sub-rectangle whose keys keep every map expresses no preference and
   /// stays at \p baseMap; the others vary over the maps they keep, and every
   /// combination is realized.  The window commits when those realizations
   /// accept exactly one concrete output and \p baseMap requests terminal
