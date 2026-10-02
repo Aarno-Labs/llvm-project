@@ -180,23 +180,23 @@ TEST(RefoldAlignmentSemanticLedger,
 }
 
 TEST(RefoldAlignmentSemanticLedger,
-     CompleteGroundSetMayReadStaticClassRepresentatives) {
+     CompleteGroundSetMayBeQuotientedByPlainSubRectangles) {
   WellFormedLedger ledger;
   ledger.witnesses[0].candidateDomain =
-      AlignmentSemanticCandidateDomain::StaticClassRepresentativeMaps;
+      AlignmentSemanticCandidateDomain::PlainQuotientedOptimalMaps;
   EXPECT_FALSE(ledger.audit().has_value());
 }
 
 TEST(RefoldAlignmentSemanticLedger,
-     OnlyTheCompleteGroundSetMayReadStaticClassRepresentatives) {
+     OnlyTheCompleteGroundSetMayBeQuotientedByPlainSubRectangles) {
   WellFormedLedger requiredAnchor;
   requiredAnchor.witnesses[1].candidateDomain =
-      AlignmentSemanticCandidateDomain::StaticClassRepresentativeMaps;
+      AlignmentSemanticCandidateDomain::PlainQuotientedOptimalMaps;
   expectDefect(requiredAnchor.audit(), "candidate domain");
 
   WellFormedLedger structureRecovery;
   structureRecovery.witnesses[2].candidateDomain =
-      AlignmentSemanticCandidateDomain::StaticClassRepresentativeMaps;
+      AlignmentSemanticCandidateDomain::PlainQuotientedOptimalMaps;
   expectDefect(structureRecovery.audit(), "candidate domain");
 }
 

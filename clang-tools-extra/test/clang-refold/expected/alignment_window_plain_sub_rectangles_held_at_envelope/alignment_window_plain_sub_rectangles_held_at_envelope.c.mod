@@ -22,8 +22,8 @@
 //
 // CHECK: window 0: sub-rectangle A=[{{[0-9]+}},{{[0-9]+}}) B=[{{[0-9]+}},{{[0-9]+}}) is plain source; held at its forced-only envelope
 // CHECK: window 0: sub-rectangle A=[{{[0-9]+}},{{[0-9]+}}) B=[{{[0-9]+}},{{[0-9]+}}) is plain source; held at its forced-only envelope
-// CHECK: window 0 carries alignment ambiguity over A=[{{[0-9]+}},{{[0-9]+}}) B=[{{[0-9]+}},{{[0-9]+}}): 54 static realization class representative(s) enumerated; 2 plain sub-rectangle(s) held at their forced-only envelope, 0 reduced to their classes
-// CHECK: window 0 committed CompleteGroundSetEquivalence: 1 of 54 static-class representative map(s) share its output
+// CHECK: window 0 carries alignment ambiguity over A=[{{[0-9]+}},{{[0-9]+}}) B=[{{[0-9]+}},{{[0-9]+}}): 54 map(s) enumerated with 2 plain sub-rectangle(s) held at their forced-only envelope
+// CHECK: window 0 committed CompleteGroundSetEquivalence: 1 of 54 plain-quotiented map(s) share its output
 
 #define ADD(x, y) ((x) + (y))
 #define LEFT_COUNTED(x) ADD(x, __COUNTER__)

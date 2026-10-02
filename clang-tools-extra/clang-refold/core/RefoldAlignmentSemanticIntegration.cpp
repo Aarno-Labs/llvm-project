@@ -817,7 +817,7 @@ void RefoldEngine::ResolveSemanticAlignment(
                       aBegin, aEnd);
                 },
                 [this](uint64_t aBegin, uint64_t aEnd) {
-                  return tokenDiffPlanner_->ClassifyPlainSource(aBegin, aEnd);
+                  return tokenDiffPlanner_->ARangeIsPlainSource(aBegin, aEnd);
                 }}});
     resolution = resolver.Resolve();
 

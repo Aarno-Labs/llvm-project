@@ -147,8 +147,8 @@ enum class AlignmentSemanticResolutionKind : uint8_t {
   /// Every core-optimal map of the window was enumerated and realized, and the
   /// observational-irrelevance or least-source-mutation rule reduced them to
   /// one realized-source class.  When the candidate domain is
-  /// `StaticClassRepresentativeMaps`, one map per static realization class of
-  /// each sub-rectangle stood in for that class's members.
+  /// `PlainQuotientedOptimalMaps`, plain sub-rectangles were held at their
+  /// forced-only envelope and only the rest were varied.
   CompleteGroundSetEquivalence,
   /// Each of the legacy boundary proposal's required anchors was proved
   /// necessary by its counterfactual, and every core-optimal map carrying all
@@ -185,16 +185,13 @@ enum class AlignmentSemanticCandidateDomain : uint8_t {
   /// The combinations of the structure-respecting repair's preferred
   /// sub-rectangle maps.
   StructureRepairCandidates,
-  /// One map per static realization class of each sub-rectangle, combined
-  /// across the window's sub-rectangles.  Maps of one class agree on every
-  /// non-plain token's partner and on the edit around every non-plain gap, so
-  /// they differ only in plain tokens and whitespace gaps, and a sub-rectangle
-  /// with nothing non-plain is one class held at its forced-only envelope.  The
-  /// class is a static choice of which maps to realize, not a proof that its
-  /// members realize alike.  This domain stands in for
-  /// `AllOptimalMaps` when that set exceeds the proof budget; see
-  /// `computeStaticRealizationSignature()`.
-  StaticClassRepresentativeMaps,
+  /// Every core-optimal map of the window's non-plain sub-rectangles, with
+  /// each plain sub-rectangle held at its forced-only envelope.  A plain
+  /// sub-rectangle's optimal maps can differ in whitespace alone, so this
+  /// domain stands in for `AllOptimalMaps` when that set exceeds the proof
+  /// budget only because of them; see
+  /// `AlignmentSourceLayoutQueries::aRangeIsPlainSource`.
+  PlainQuotientedOptimalMaps,
 };
 
 /// Which preferred sub-rectangles a structure-respecting repair varied.
@@ -220,10 +217,10 @@ enum class AlignmentSemanticEquivalenceKeyKind : uint8_t {
 ///
 /// `resolutionKind` names that theorem, and `candidateDomain` the set it
 /// quantified over; only `CompleteGroundSetEquivalence` is a statement about
-/// every core-optimal map of the window, and under
-/// `StaticClassRepresentativeMaps` only up to static realization class.  The
-/// witness names the window it resolved, and its anchor evidence lies inside
-/// that window's half-open A and B ranges.
+/// every core-optimal map of the window, and under `PlainQuotientedOptimalMaps`
+/// only up to the plain sub-rectangles it held at their envelope.  The witness
+/// names the window it resolved, and its anchor evidence lies inside that
+/// window's half-open A and B ranges.
 struct AlignmentSemanticResolutionWitness {
   uint64_t witnessId = 0;
   /// Index into the core alignment's certification windows, and that
@@ -304,45 +301,6 @@ struct AlignmentSemanticLedger {
 std::optional<std::string>
 findAlignmentSemanticLedgerDefect(const AlignmentSemanticLedger &ledger);
 
-/// Which A tokens and A gaps of one run are plain source; see
-/// `AlignmentSourceLayoutQueries::classifyPlainSource`.
-struct AlignmentPlainSourceFacts {
-  /// One entry per token of the run.
-  std::vector<bool> plainTokens;
-  /// Entry `k` describes the gap between tokens `k - 1` and `k` of the run, so
-  /// entry 0 is unused.  It has as many entries as `plainTokens`.
-  std::vector<bool> plainGaps;
-};
-
-/// Return the static realization class of one sub-rectangle map, or
-/// `std::nullopt` when \p facts does not cover the sub-rectangle.
-///
-/// \p localMap holds the B partner, or -1, of each A token of the
-/// sub-rectangle.  \p facts covers those tokens together with the one bounding
-/// the sub-rectangle on each side, so it has `localMap.size() + 2` entries,
-/// and \p leftBoundB and \p rightBoundB are the bounding tokens' B partners,
-/// or -1.
-///
-/// The class records the B partner, or -1, of each non-plain A token, and for
-/// each non-plain A gap the nearest kept token on either side of it, by
-/// position and B partner, where a bounding token ends the search whether or
-/// not it is kept.  Those two tokens fix the B tokens inserted into the gap, or
-/// the hunk it lies in, so two maps of one class keep the same non-plain
-/// tokens at the same B partners and surround every non-plain gap with the same
-/// edit.  Every token and gap at which they differ is plain: a direct spelling,
-/// which reads the same kept or re-spelled from B, or whitespace.  Their
-/// realizations are therefore expected to differ in whitespace alone, though
-/// nothing here proves that of the realizer; the class only chooses which maps
-/// are realized, and each realized map is verified in full.  An empty class
-/// means the sub-rectangle has nothing non-plain.
-///
-/// Every map classified together must share the bounding tokens, and with them
-/// \p leftBoundB and \p rightBoundB.
-std::optional<std::vector<int64_t>>
-computeStaticRealizationSignature(llvm::ArrayRef<int64_t> localMap,
-                                  int64_t leftBoundB, int64_t rightBoundB,
-                                  const AlignmentPlainSourceFacts &facts);
-
 /// Source-layout queries read by the structure-respecting repair's preference
 /// keys.
 ///
@@ -359,19 +317,19 @@ struct AlignmentSourceLayoutQueries {
   /// ordinary trivia holding a comment the comment-seam splitter preserves.
   std::function<std::vector<uint64_t>(uint64_t aBegin, uint64_t aEnd)>
       collectCommentGaps;
-  /// Which of A tokens `[aBegin, aEnd)` and the gaps between them are plain
-  /// source.  A token is plain when it is the exact spelling of its one
-  /// producer token outside every macro expansion.  A gap is plain when the
-  /// tokens on either side lie in one file, include occurrence and conditional
-  /// arm, in source order, with whitespace alone between them: no comment,
-  /// line splice, directive or zero-token invocation.
+  /// Whether A tokens `[aBegin, aEnd)` are plain source: each is the exact
+  /// spelling of one producer token outside every macro expansion, all lie in
+  /// one file, include occurrence and conditional arm in source order, and
+  /// the bytes between consecutive tokens are whitespace alone.
   ///
-  /// The resolver reads these facts to reduce a sub-rectangle's optimal maps
-  /// to their static realization classes; see
-  /// `computeStaticRealizationSignature()`.  May be empty, in which case
-  /// nothing is reduced.
-  std::function<AlignmentPlainSourceFacts(uint64_t aBegin, uint64_t aEnd)>
-      classifyPlainSource;
+  /// When a sub-rectangle and both tokens bounding it are plain, nothing a
+  /// realization preserves or loses -- a comment, directive, macro invocation,
+  /// zero-token invocation, or line splice -- lies anywhere its optimal maps
+  /// disagree, so they can differ in whitespace alone.  The resolver may then
+  /// hold it at its forced-only envelope, which is exactly how every attempt
+  /// that does not resolve the window realizes it.  May be empty, in which
+  /// case nothing is held.
+  std::function<bool(uint64_t aBegin, uint64_t aEnd)> aRangeIsPlainSource;
 };
 
 /// Exact semantic resolver for ambiguity left by the core LCS theorem.

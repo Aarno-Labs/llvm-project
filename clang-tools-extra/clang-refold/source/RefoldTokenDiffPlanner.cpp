@@ -827,94 +827,65 @@ RefoldTokenDiffPlanner::CollectPreservableCommentGaps(uint64_t aBegin,
   return gaps;
 }
 
-const DenseSet<uint64_t> &
-RefoldTokenDiffPlanner::DuplicateTokmapTokens() const {
-  if (!duplicateTokmapTokens_) {
-    duplicateTokmapTokens_.emplace();
-    DenseSet<uint64_t> seen;
-    for (const RefoldModel::TokMapEntry &entry : deps_.model.GetTokmap())
-      if (!seen.insert(entry.pp).second)
-        duplicateTokmapTokens_->insert(entry.pp);
-  }
-  return *duplicateTokmapTokens_;
-}
-
-namespace {
-
-/// The source facts of one A token that plain-source classification reads.
-struct PlainSourceTokenSite {
-  std::optional<RefoldModel::TokMapEntry> entry;
-  std::optional<uint64_t> includeId;
-  std::optional<RefoldModel::ArmRef> arm;
-  RefoldPreprocessingStructureIndexProvider::LookupResult structure;
-};
-
-/// Return whether \p left and \p right lie in one file, include occurrence and
-/// conditional arm, in source order, with whitespace alone between them.
-bool plainSourceGapBetween(const PlainSourceTokenSite &left,
-                           const PlainSourceTokenSite &right) {
-  if (!left.entry || !right.entry || !left.structure.HasIndex() ||
-      left.entry->file != right.entry->file ||
-      left.includeId != right.includeId ||
-      left.arm.has_value() != right.arm.has_value() ||
-      (left.arm && left.arm->arm != right.arm->arm) ||
-      left.entry->e > right.entry->b ||
-      right.entry->b > left.structure.sourceBytes.size())
-    return false;
-  return left.structure.sourceBytes.slice(left.entry->e, right.entry->b)
-             .find_first_not_of(" \t\n\r\f\v") == StringRef::npos;
-}
-
-} // namespace
-
-AlignmentPlainSourceFacts
-RefoldTokenDiffPlanner::ClassifyPlainSource(uint64_t aBegin,
-                                            uint64_t aEnd) const {
-  AlignmentPlainSourceFacts facts;
+bool RefoldTokenDiffPlanner::ARangeIsPlainSource(uint64_t aBegin,
+                                                 uint64_t aEnd) const {
   if (aBegin >= aEnd || aEnd > deps_.aToks.size())
-    return facts;
-  const size_t count = static_cast<size_t>(aEnd - aBegin);
-  facts.plainTokens.assign(count, false);
-  facts.plainGaps.assign(count, false);
+    return false;
 
-  const DenseSet<uint64_t> &duplicates = DuplicateTokmapTokens();
-  std::vector<PlainSourceTokenSite> sites(count);
-  for (size_t index = 0; index < count; ++index) {
-    const uint64_t pp = aBegin + index;
-    if (duplicates.contains(pp))
-      continue;
-    PlainSourceTokenSite &site = sites[index];
-    site.entry = deps_.model.MapPP(pp);
-    if (!site.entry)
-      continue;
-    site.includeId = deps_.model.InnermostIncludeAtPP(pp);
-    site.arm = deps_.model.FindArmRefAtPP(pp);
-    site.structure = deps_.preprocessingStructureIndexes.Get(site.entry->file,
-                                                             site.includeId);
+  // One tokmap entry per token: a token claimed twice has no single source
+  // position to be plain at.
+  DenseSet<uint64_t> claimed;
+  for (const RefoldModel::TokMapEntry &entry : deps_.model.GetTokmap())
+    if (entry.pp >= aBegin && entry.pp < aEnd &&
+        !claimed.insert(entry.pp).second)
+      return false;
+
+  const std::optional<RefoldModel::TokMapEntry> first =
+      deps_.model.MapPP(aBegin);
+  if (!first)
+    return false;
+  const std::optional<uint64_t> includeId =
+      deps_.model.InnermostIncludeAtPP(aBegin);
+  const std::optional<RefoldModel::ArmRef> arm =
+      deps_.model.FindArmRefAtPP(aBegin);
+  const RefoldPreprocessingStructureIndexProvider::LookupResult structure =
+      deps_.preprocessingStructureIndexes.Get(first->file, includeId);
+  if (!structure.HasIndex())
+    return false;
+
+  uint64_t previousEnd = 0;
+  for (uint64_t pp = aBegin; pp < aEnd; ++pp) {
+    const std::optional<RefoldModel::TokMapEntry> entry = deps_.model.MapPP(pp);
+    if (!entry || entry->file != first->file || entry->b >= entry->e ||
+        entry->e > structure.sourceBytes.size() ||
+        deps_.model.InnermostIncludeAtPP(pp) != includeId)
+      return false;
+    const std::optional<RefoldModel::ArmRef> tokenArm =
+        deps_.model.FindArmRefAtPP(pp);
+    if (tokenArm.has_value() != arm.has_value() ||
+        (tokenArm && tokenArm->arm != arm->arm))
+      return false;
+    if (!structure.index->IsExactTokenSpellingInterval(entry->b, entry->e) ||
+        structure.sourceBytes.slice(entry->b, entry->e) !=
+            deps_.aToks[pp].spelling)
+      return false;
+    if (pp != aBegin) {
+      if (entry->b < previousEnd)
+        return false;
+      const StringRef gap = structure.sourceBytes.slice(previousEnd, entry->b);
+      if (gap.find_first_not_of(" \t\n\r\f\v") != StringRef::npos)
+        return false;
+    }
+    previousEnd = entry->e;
   }
 
-  // One pass over the invocations marks every token inside an expansion.
-  std::vector<bool> insideExpansion(count, false);
-  for (const RefoldModel::MacroInvocation &invocation :
-       deps_.model.GetMacroInvocations())
-    for (size_t index = 0; index < count; ++index)
-      if (invocation.Covers(aBegin + index, aBegin + index + 1))
-        insideExpansion[index] = true;
-
-  for (size_t index = 0; index < count; ++index) {
-    const PlainSourceTokenSite &site = sites[index];
-    facts.plainTokens[index] =
-        site.entry && !insideExpansion[index] && site.structure.HasIndex() &&
-        site.entry->b < site.entry->e &&
-        site.entry->e <= site.structure.sourceBytes.size() &&
-        site.structure.index->IsExactTokenSpellingInterval(site.entry->b,
-                                                           site.entry->e) &&
-        site.structure.sourceBytes.slice(site.entry->b, site.entry->e) ==
-            deps_.aToks[aBegin + index].spelling;
-    if (index != 0)
-      facts.plainGaps[index] = plainSourceGapBetween(sites[index - 1], site);
-  }
-  return facts;
+  return llvm::none_of(deps_.model.GetMacroInvocations(),
+                       [&](const RefoldModel::MacroInvocation &invocation) {
+                         for (uint64_t pp = aBegin; pp < aEnd; ++pp)
+                           if (invocation.Covers(pp, pp + 1))
+                             return true;
+                         return false;
+                       });
 }
 
 void RefoldTokenDiffPlanner::TraceProtectedAlignmentBoundaryIdentities(
