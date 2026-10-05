@@ -42,6 +42,7 @@ class LangOptions;
 namespace refold {
 
 class RefoldMacroPatchProofCertifier;
+class RefoldMacroTopology;
 class RefoldSourceMapper;
 
 /// Explicit context for generated-leaf replay.
@@ -81,6 +82,9 @@ public:
   struct Dependencies {
     const RefoldModel &model;
     const RefoldSourceMapper &sourceMapper;
+    /// Caller-graph index used to prove which root formals an unchanged
+    /// generated leaf depends on.
+    const RefoldMacroTopology &macroTopology;
     const clang::LangOptions &lexLang;
     RefoldMacroPatchProofCertifier &proofCertifier;
 

@@ -106,8 +106,8 @@ RefoldMacroPatchPlanner::RefoldMacroPatchPlanner(Dependencies deps)
               }}),
       generatedLeafReplayEngine_(
           RefoldMacroGeneratedLeafReplayEngine::Dependencies{
-              *deps_.model, *deps_.sourceMapper, *deps_.lexLang,
-              proofCertifier_,
+              *deps_.model, *deps_.sourceMapper, *deps_.macroTopology,
+              *deps_.lexLang, proofCertifier_,
               [this](
                   llvm::StringRef name) -> const RefoldModel::MacroDirective * {
                 return ResolveFunctionLikeMacroForReplay(name);
