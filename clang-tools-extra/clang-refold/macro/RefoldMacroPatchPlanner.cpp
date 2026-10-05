@@ -76,7 +76,8 @@ RefoldMacroPatchPlanner::RefoldMacroPatchPlanner(Dependencies deps)
           *deps_.macroPatchProofClassifier, *deps_.acceptedCandidateBuilder}),
       subtreeReplayValidator_(RefoldMacroSubtreeReplayValidator::Dependencies{
           *deps_.model, *deps_.macroTopology, *deps_.sourceMapper,
-          *deps_.argTextRecovery, *deps_.lexLang, *deps_.abTokHunks}),
+          *deps_.argTextRecovery, *deps_.lexLang, *deps_.abTokHunks,
+          deps_.strict}),
       replayStabilityValidator_(
           RefoldMacroReplayStabilityValidator::Dependencies{
               *deps_.model, *deps_.macroTopology, *deps_.sourceMapper,

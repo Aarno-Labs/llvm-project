@@ -12,6 +12,7 @@
 #include "macro/RefoldMacroSubtreeReplayValidator.h"
 
 #include "macro/RefoldArgTextRecovery.h"
+#include "macro/RefoldMacroFormalDependenceProof.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroTopology.h"
@@ -20,6 +21,7 @@
 #include "support/RefoldLog.h"
 #include "support/StringUtils.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -303,6 +305,16 @@ bool RefoldMacroSubtreeReplayValidator::
     rootActuals.push_back(
         StringRef(patch.replacement).slice(range.first, range.second).str());
 
+  if (deps_.strict && !StaleStringifySurfacesIgnoreRewrite(root, rootActuals)) {
+    REFOLD_LOG_TRACE("macro/proof",
+                     "suppress DAG subtree root replay: an untouched stringify "
+                     "surface observes a rewritten actual of inv id={0} "
+                     "name={1} replacement='{2}'",
+                     root.id, root.name,
+                     stringutils::showWsWithClip(patch.replacement, 220));
+    return false;
+  }
+
   for (const RefoldModel::MacroInvocation &inv :
        deps_.model.GetMacroInvocations()) {
     if (deps_.macroTopology.GetRootMacroId(inv.id) != root.id)
@@ -351,6 +363,43 @@ bool RefoldMacroSubtreeReplayValidator::
   }
 
   return true;
+}
+
+bool RefoldMacroSubtreeReplayValidator::StaleStringifySurfacesIgnoreRewrite(
+    const RefoldModel::MacroInvocation &root,
+    ArrayRef<std::string> rootActuals) const {
+  SmallVector<uint64_t, 16> staleTokens;
+  for (const RefoldModel::MacroInvocation &inv :
+       deps_.model.GetMacroInvocations()) {
+    if (deps_.macroTopology.GetRootMacroId(inv.id) != root.id)
+      continue;
+    for (const RefoldModel::PPArgSpan &span : inv.stringifySpans)
+      if (!HunkTouchesASpan(span.begin, span.end))
+        for (uint64_t tok = span.begin; tok < span.end; ++tok)
+          staleTokens.push_back(tok);
+  }
+  if (staleTokens.empty())
+    return true;
+
+  // Without the recorded actuals nothing says which formals the rewrite
+  // leaves alone.
+  if (!root.invText)
+    return false;
+  std::optional<std::vector<std::pair<size_t, size_t>>> baseRanges =
+      RefoldMacroActualLayout({&deps_.lexLang})
+          .GetMacroInvocationFormalArgContentRanges(root, *root.invText);
+  if (!baseRanges)
+    return false;
+  DenseMap<uint32_t, std::string> replByArgIdx;
+  for (size_t i = 0; i < rootActuals.size(); ++i)
+    replByArgIdx[static_cast<uint32_t>(i)] = rootActuals[i];
+  const SmallVector<uint32_t, 4> rewrittenFormals =
+      RefoldMacroFormalDependenceProof::RewrittenFormals(
+          *root.invText, *baseRanges, replByArgIdx, deps_.lexLang);
+  return RefoldMacroFormalDependenceProof({deps_.model, deps_.macroTopology})
+      .TokensIgnoreRewrittenFormals(
+          root, staleTokens, rewrittenFormals,
+          RefoldMacroFormalDependenceProof::RootOccurrences::Observed);
 }
 
 bool RefoldMacroSubtreeReplayValidator::ClaimedWholeEnvelopeIsReplaySafe(

@@ -747,15 +747,21 @@ RefoldMacroArgsOnlyTemplateSolver::GetCurrentLevelTemplateSurfaceForInvocation(
   if (cursor != coverEnd)
     return std::nullopt;
 
+  // The producer names each span's formal by where the token is spelled
+  // inside the recorded actuals, so expansion order says nothing about it:
+  // `#define SWAP(a, b) b - a` emits `b` first.  Keep that index, and require
+  // the maximal spans to name every formal exactly once.
+  SmallVector<bool, 8> formalSeen(formalRanges.size(), false);
+  for (const RefoldModel::PPArgSpan &span : maximal) {
+    if (span.argIdx >= formalSeen.size() || formalSeen[span.argIdx])
+      return std::nullopt;
+    formalSeen[span.argIdx] = true;
+  }
+
   CurrentLevelTemplateSurface surface;
   surface.coverBegin = coverBegin;
   surface.coverEnd = coverEnd;
-  surface.standardSpans.reserve(maximal.size());
-  for (size_t i = 0; i < maximal.size(); ++i) {
-    RefoldModel::PPArgSpan span = maximal[i];
-    span.argIdx = static_cast<uint32_t>(i);
-    surface.standardSpans.push_back(span);
-  }
+  surface.standardSpans.assign(maximal.begin(), maximal.end());
   return surface;
 }
 

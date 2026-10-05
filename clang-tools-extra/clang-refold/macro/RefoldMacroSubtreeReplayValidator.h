@@ -83,6 +83,9 @@ public:
     /// vector after the planner — and therefore this validator — is
     /// constructed.
     const std::vector<diffutils::Hunk> &abTokHunks;
+    /// Whether a stringified observer must be regenerated rather than left
+    /// stale, as `--strict` requires of every occurrence replay.
+    bool strict = false;
   };
 
   explicit RefoldMacroSubtreeReplayValidator(Dependencies deps);
@@ -121,6 +124,18 @@ private:
   /// True iff any cached A/B token hunk overlaps the half-open span
   /// `[begin, end)`.
   bool HunkTouchesASpan(uint64_t begin, uint64_t end) const;
+
+  /// True when no stringify span under \p root that B left untouched
+  /// depends on a root formal whose actual \p rootActuals rewrites.
+  ///
+  /// Occurrence consistency is deferred for subtree lifts, and the sibling
+  /// check replays only stringify spans some hunk touches.  A literal B left
+  /// alone observes the rewritten actual too: the root's own `#x` spells its
+  /// text, and a descendant's `#y` spells its expansion.  Missing producer
+  /// provenance for such a span fails closed.
+  bool StaleStringifySurfacesIgnoreRewrite(
+      const RefoldModel::MacroInvocation &root,
+      llvm::ArrayRef<std::string> rootActuals) const;
 
   /// Replay a single direct-stringify argument through the candidate root's
   /// actuals, returning the canonicalized inverse-stringify payload when the
