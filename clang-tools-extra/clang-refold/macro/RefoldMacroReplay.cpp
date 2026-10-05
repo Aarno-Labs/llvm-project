@@ -186,6 +186,23 @@ RefoldMacroOccurrenceReplay::GetOwnedPureInsertionBRangeForArgSpan(
   return std::nullopt;
 }
 
+std::optional<StringRef> RefoldMacroOccurrenceReplay::RecordedSourceActual(
+    const RefoldModel::MacroInvocation &m, uint32_t argIdx) const {
+  if (!m.invText || !deps_.macroTopology ||
+      m.calleeOrigin.kind != MacroCalleeOriginKind::LiteralMacroName ||
+      deps_.macroTopology->IsInvocationInsideDefineDirective(m))
+    return std::nullopt;
+  std::optional<std::vector<std::pair<size_t, size_t>>> ranges =
+      RefoldMacroActualLayout({deps_.lexLang})
+          .GetMacroInvocationFormalArgContentRanges(m, *m.invText);
+  if (!ranges || argIdx >= ranges->size())
+    return std::nullopt;
+  const auto [begin, end] = (*ranges)[argIdx];
+  if (begin > end || end > m.invText->size())
+    return std::nullopt;
+  return m.invText->slice(begin, end).trim();
+}
+
 bool RefoldMacroOccurrenceReplay::
     MacroArgReplacementMatchesAllOccurrencesInBImpl(
         const RefoldModel::MacroInvocation &m, uint32_t argIdx,
@@ -469,6 +486,15 @@ bool RefoldMacroOccurrenceReplay::
     }
   }
 
+  // Classify each pasted A segment against the actual A was expanded from.
+  // For a source callsite that is the producer's record, not `baseArg`: an
+  // earlier hunk of this pass may already have rewritten the invocation
+  // `baseArg` is read from, and an idempotent re-check then compares `OPEN`
+  // with a pasted `open` and can never classify it.  A call spelled inside a
+  // replacement list has no such record, and its caller passes the actual.
+  const StringRef pasteOriginTrim =
+      RecordedSourceActual(m, argIdx).value_or(baseTrim);
+
   // Determine whether token pasting consumes a prefix/suffix/whole segment of
   // this argument. 0=none/unknown, 1=prefix, 2=suffix, 3=whole, 4=ambiguous
   enum PasteType : unsigned { Unknown, Prefix, Suffix, Whole, Ambiguous };
@@ -488,11 +514,11 @@ bool RefoldMacroOccurrenceReplay::
     if (segA.empty())
       continue;
 
-    bool starts = baseTrim.starts_with(segA);
-    bool ends = baseTrim.ends_with(segA);
+    bool starts = pasteOriginTrim.starts_with(segA);
+    bool ends = pasteOriginTrim.ends_with(segA);
 
     PasteType dir = Unknown;
-    if (baseTrim == segA)
+    if (pasteOriginTrim == segA)
       dir = Whole;
     else if (starts && !ends)
       dir = Prefix;
@@ -593,23 +619,6 @@ bool RefoldMacroOccurrenceReplay::
   // is no exception: its literal says nothing about the tokens it pastes.
   if (!checkPasteSpans)
     return true;
-
-  // Classify each pasted A segment against the actual the producer recorded,
-  // not `baseArg`.  The segment was pasted from that original spelling, while
-  // an earlier hunk of this pass may already have rewritten the invocation
-  // `baseArg` is read from; an idempotent re-check then compares `OPEN` with a
-  // pasted `open` and can never classify it.
-  StringRef pasteOriginTrim = baseTrim;
-  if (m.invText) {
-    if (std::optional<std::vector<std::pair<size_t, size_t>>> origRanges =
-            RefoldMacroActualLayout({deps_.lexLang})
-                .GetMacroInvocationFormalArgContentRanges(m, *m.invText);
-        origRanges && argIdx < origRanges->size()) {
-      const auto [origBegin, origEnd] = (*origRanges)[argIdx];
-      if (origBegin <= origEnd && origEnd <= m.invText->size())
-        pasteOriginTrim = m.invText->slice(origBegin, origEnd).trim();
-    }
-  }
 
   // Verify all paste-span occurrences.
   for (const auto &ps : m.pasteSpans) {

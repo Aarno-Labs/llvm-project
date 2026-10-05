@@ -144,6 +144,15 @@ public:
       std::pair<size_t, size_t> mappedEnv, const diffutils::Hunk &h) const;
 
 private:
+  /// Return the trimmed actual of formal \p argIdx exactly as the producer
+  /// recorded it at \p m's callsite, when that callsite is source text: a
+  /// literal callee spelled outside every `#define`.  A call spelled inside a
+  /// replacement list records the caller's formal names there, not the actual
+  /// it received.
+  std::optional<llvm::StringRef>
+  RecordedSourceActual(const RefoldModel::MacroInvocation &m,
+                       uint32_t argIdx) const;
+
   Dependencies deps_;
 };
 
