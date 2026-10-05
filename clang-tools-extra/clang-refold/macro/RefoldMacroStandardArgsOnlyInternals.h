@@ -249,6 +249,20 @@ struct ArgsOnlyFinalArgumentRewriteSet {
 /// caller's pure-paste admission guard, and fails closed on every ambiguous
 /// segment split, arity-changing comma introduction, conflicting repeated paste
 /// occurrence, or failed invocation reconstruction.
+/// Return whether no token of \p invocation's cover that B left unchanged
+/// depends, through an invocation its expansion generated, on a formal that
+/// \p replByArgIdx rewrites.
+///
+/// Every args-only admission replays the root's own occurrences of the formals
+/// it rewrites, and none of them looks further.  A rewritten actual also
+/// reaches what the expansion generates from it: the callee selected by
+/// `CAT(impl_, n)` or `SEL_##n`, and a descendant's occurrence of a forwarded
+/// actual.  Missing producer provenance for such a token fails closed.
+bool descendantObserversIgnoreRewrite(
+    const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
+    const InvocationActualRecoveryContext &actualCtx,
+    const llvm::DenseMap<uint32_t, std::string> &replByArgIdx);
+
 class PurePasteOnlyArgsOnlyCandidateBuilder {
 public:
   PurePasteOnlyArgsOnlyCandidateBuilder(

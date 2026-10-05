@@ -1370,6 +1370,9 @@ RefoldMacroStandardArgsOnlyPatchBuilder::AcceptPasteReplayedRewrite(
     const InvocationActualRecoveryContext &actualRecoveryCtx,
     const DenseMap<uint32_t, std::string> &replByArgIdx,
     MacroPatchProofKind proofKind) const {
+  // The paste replay above proves the root's own occurrences only.
+  if (!descendantObserversIgnoreRewrite(deps_, actualRecoveryCtx, replByArgIdx))
+    return ArgsOnlyPatchAttempt::RejectResult();
   std::optional<InvocationRewriteWithRange> rewrite =
       deps_.buildInvocationRewriteWithRange(
           actualRecoveryCtx, replByArgIdx,

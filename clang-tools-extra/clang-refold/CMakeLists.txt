@@ -53,6 +53,7 @@ add_clang_library(clangRefold STATIC
   macro/RefoldMacroReplay.cpp
   macro/RefoldMacroArgsOnlyTemplateSolver.cpp
   macro/RefoldMacroDefinitionTapeSolver.cpp
+  macro/RefoldMacroFormalDependenceProof.cpp
   macro/RefoldMacroGeneratedLeafReplayEngine.cpp
   macro/RefoldMacroOccurrenceProofValidator.cpp
   macro/RefoldMacroPasteArgumentBuilder.cpp

@@ -15,6 +15,7 @@
 
 #include "macro/RefoldMacroStandardArgsOnlyInternals.h"
 
+#include "macro/RefoldMacroFormalDependenceProof.h"
 #include "macro/RefoldMacroPatchProofCertifier.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "proof/RefoldMacroPatchProofClassifier.h"
@@ -50,6 +51,25 @@ PurePasteOnlyArgsOnlyCandidateBuilder::
         const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
         RefoldMacroPasteArgumentBuilder pasteBuilder)
     : deps_(deps), pasteBuilder_(std::move(pasteBuilder)) {}
+
+bool descendantObserversIgnoreRewrite(
+    const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
+    const InvocationActualRecoveryContext &actualCtx,
+    const DenseMap<uint32_t, std::string> &replByArgIdx) {
+  const SmallVector<uint32_t, 4> rewrittenFormals =
+      RefoldMacroFormalDependenceProof::RewrittenFormals(
+          actualCtx.baseInvocationText, actualCtx.invocationArgRanges,
+          replByArgIdx, deps.lexLang);
+  if (rewrittenFormals.empty())
+    return true;
+  return RefoldMacroFormalDependenceProof({deps.model, deps.macroTopology})
+      .TokensIgnoreRewrittenFormals(
+          actualCtx.invocation,
+          RefoldMacroFormalDependenceProof::CoverTokensOutsideHunks(
+              actualCtx.invocation, deps.abTokHunks),
+          rewrittenFormals,
+          RefoldMacroFormalDependenceProof::RootOccurrences::Validated);
+}
 
 std::optional<MacroPatch> PurePasteOnlyArgsOnlyCandidateBuilder::TryBuild(
     const RefoldModel::MacroInvocation &invocation, const diffutils::Hunk &hunk,
@@ -128,6 +148,8 @@ std::optional<MacroPatch> PurePasteOnlyArgsOnlyCandidateBuilder::TryBuild(
   if (!pasteBuilder_.PasteArgReplacementsMatchAllPasteTokensInB(
           invocation, baseInvocationText, invocationArgRanges, replByArgIdx))
     return std::nullopt;
+  if (!descendantObserversIgnoreRewrite(deps_, actualCtx, replByArgIdx))
+    return std::nullopt;
 
   std::optional<InvocationRewriteWithRange> rewrite =
       deps_.buildInvocationRewriteWithRange(
@@ -164,6 +186,10 @@ std::optional<MacroPatch> ArgsOnlyProofCertifier::BuildAcceptedCandidate(
     const InvocationActualRecoveryContext &actualCtx,
     const ArgsOnlyFinalArgumentRewriteSet &rewriteSet) const {
   if (rewriteSet.Empty())
+    return std::nullopt;
+  // Occurrence replay proved the root's own occurrences only.
+  if (!descendantObserversIgnoreRewrite(deps_, actualCtx,
+                                        rewriteSet.replacementsByArgIdx))
     return std::nullopt;
 
   std::optional<InvocationRewriteWithRange> rewrite =
