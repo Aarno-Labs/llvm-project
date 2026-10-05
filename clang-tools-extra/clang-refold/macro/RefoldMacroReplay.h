@@ -65,6 +65,10 @@ public:
     /// validating stringified-argument replays.  May be null in unit contexts;
     /// callers that need faithful stringization must provide it.
     const clang::LangOptions *lexLang = nullptr;
+    /// Producer model used to tell an occurrence that copies an actual from
+    /// one holding a callee that actual selected.  May be null in unit
+    /// contexts, which then compare every standard occurrence as a copy.
+    const RefoldModel *model = nullptr;
   };
 
   explicit RefoldMacroOccurrenceReplay(Dependencies deps);

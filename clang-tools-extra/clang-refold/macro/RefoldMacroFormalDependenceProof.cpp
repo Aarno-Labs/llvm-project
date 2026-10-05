@@ -122,6 +122,18 @@ bool tokenEquivalent(StringRef lhs, StringRef rhs,
 
 } // namespace
 
+bool RefoldMacroFormalDependenceProof::RootOccurrencesObserve(
+    const RefoldModel::MacroInvocation &root, ArrayRef<uint64_t> tokens,
+    ArrayRef<uint32_t> formals) {
+  return llvm::any_of(tokens, [&](uint64_t tok) {
+    SmallVector<uint32_t, 4> observed;
+    appendFormalsObservedAtToken(root, tok, observed);
+    return llvm::any_of(observed, [&](uint32_t formal) {
+      return llvm::is_contained(formals, formal);
+    });
+  });
+}
+
 SmallVector<uint32_t, 4> RefoldMacroFormalDependenceProof::RewrittenFormals(
     StringRef invocationText, ArrayRef<std::pair<size_t, size_t>> argRanges,
     const DenseMap<uint32_t, std::string> &replByArgIdx,
@@ -184,7 +196,27 @@ RefoldMacroFormalDependenceProof::ClassifyCoverInvocation(
       return CoverRole::ActualMaterial;
   if (IsCallerDescendant(inv, root.id))
     return CoverRole::Descendant;
+  if (SelectedOutsideRoot(inv, rootAncestors))
+    return CoverRole::Enclosing;
   return CoverRole::Unattributed;
+}
+
+bool RefoldMacroFormalDependenceProof::SelectedOutsideRoot(
+    const RefoldModel::MacroInvocation &inv,
+    ArrayRef<uint64_t> rootAncestors) const {
+  const RefoldModel::MacroInvocation *cur = &inv;
+  for (size_t hops = 0, limit = deps_.model.GetMacroInvocations().size();
+       hops <= limit; ++hops) {
+    if (cur->calleeOrigin.kind != MacroCalleeOriginKind::LiteralMacroName)
+      return false;
+    if (!cur->callerMacroId ||
+        llvm::is_contained(rootAncestors, *cur->callerMacroId))
+      return true;
+    cur = deps_.macroTopology.FindMacroInvocationById(*cur->callerMacroId);
+    if (!cur)
+      return false;
+  }
+  return false;
 }
 
 void RefoldMacroFormalDependenceProof::AddFormalRootDependence(
@@ -222,7 +254,8 @@ void RefoldMacroFormalDependenceProof::AddFormalRootDependence(
 void RefoldMacroFormalDependenceProof::AddCalleeRootDependence(
     const RefoldModel::MacroInvocation &root,
     const RefoldModel::MacroInvocation &inv,
-    bool opaqueSelectorAttributedByRoot, Dependence &dependence) const {
+    const SmallVectorImpl<uint32_t> *opaqueSelectorRootFormals,
+    Dependence &dependence) const {
   const RefoldModel::MacroCalleeOrigin &origin = inv.calleeOrigin;
   switch (origin.kind) {
   case MacroCalleeOriginKind::LiteralMacroName:
@@ -263,18 +296,28 @@ void RefoldMacroFormalDependenceProof::AddCalleeRootDependence(
     }
     return;
   case MacroCalleeOriginKind::Opaque:
-    // A resolved opaque edge adds nothing here: the attributed root formals
-    // are either already in `dependence` or replayed by the caller.
-    if (!opaqueSelectorAttributedByRoot)
+    if (!opaqueSelectorRootFormals)
       dependence.known = false;
+    else
+      append_range(dependence.formals, *opaqueSelectorRootFormals);
     return;
   }
 }
 
-bool RefoldMacroFormalDependenceProof::TokensIgnoreRewrittenFormals(
+bool RefoldMacroFormalDependenceProof::SelectionIgnoresFormals(
+    const RefoldModel::MacroInvocation &root, uint64_t begin, uint64_t end,
+    ArrayRef<uint32_t> formals) const {
+  SmallVector<uint64_t, 8> tokens;
+  for (uint64_t tok = begin; tok < end; ++tok)
+    tokens.push_back(tok);
+  return TokensAvoidFormals(root, tokens, formals, RootOccurrences::Validated,
+                            /*countArgumentOccurrences=*/false);
+}
+
+bool RefoldMacroFormalDependenceProof::TokensAvoidFormals(
     const RefoldModel::MacroInvocation &root, ArrayRef<uint64_t> tokens,
-    ArrayRef<uint32_t> rewrittenFormals,
-    RootOccurrences rootOccurrences) const {
+    ArrayRef<uint32_t> rewrittenFormals, RootOccurrences rootOccurrences,
+    bool countArgumentOccurrences) const {
   if (rewrittenFormals.empty() || tokens.empty())
     return true;
   const std::optional<std::pair<uint64_t, uint64_t>> cover =
@@ -350,17 +393,25 @@ bool RefoldMacroFormalDependenceProof::TokensIgnoreRewrittenFormals(
     for (const RefoldModel::MacroInvocation *inv : descendants) {
       SmallVector<uint32_t, 4> observed;
       appendFormalsObservedAtToken(*inv, tok, observed);
-      for (uint32_t formal : observed)
-        AddFormalRootDependence(root, *inv, formal, dependence);
+      if (countArgumentOccurrences)
+        for (uint32_t formal : observed)
+          AddFormalRootDependence(root, *inv, formal, dependence);
       const bool ownReplacementListToken =
           observed.empty() &&
           llvm::none_of(
               descendants, [&](const RefoldModel::MacroInvocation *other) {
                 return other != inv && IsCallerDescendant(*other, inv->id);
               });
+      // A resolved opaque edge is selected by the attributing root formals.
+      // `Observed` already counts them, and under `Validated` the caller
+      // replayed those very occurrences; only the selection query adds them.
+      const SmallVector<uint32_t, 4> noFormals;
       AddCalleeRootDependence(root, *inv,
-                              ownReplacementListToken && rootAttributed &&
-                                  !expansionPastes,
+                              !ownReplacementListToken || !rootAttributed ||
+                                      expansionPastes
+                                  ? nullptr
+                              : countArgumentOccurrences ? &noFormals
+                                                         : &rootFormals,
                               dependence);
       // The invocations between `inv` and the root selected it too.
       for (const RefoldModel::MacroInvocation *cur = inv;
@@ -371,7 +422,7 @@ bool RefoldMacroFormalDependenceProof::TokensIgnoreRewrittenFormals(
           break;
         }
         AddCalleeRootDependence(root, *cur,
-                                /*opaqueSelectorAttributedByRoot=*/false,
+                                /*opaqueSelectorRootFormals=*/nullptr,
                                 dependence);
       }
     }

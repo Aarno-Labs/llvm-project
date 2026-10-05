@@ -11,6 +11,7 @@
 #include "macro/RefoldMacroReplay.h"
 
 #include "macro/RefoldArgTextRecovery.h"
+#include "macro/RefoldMacroFormalDependenceProof.h"
 #include "macro/RefoldMacroTopology.h"
 #include "source/RefoldSourceMapper.h"
 #include "support/StringUtils.h"
@@ -512,6 +513,14 @@ bool RefoldMacroOccurrenceReplay::
   for (const auto &s : m.argSpans) {
     if (s.argIdx != argIdx || s.kind != PPArgSpanKind::Standard)
       continue;
+
+    // B's text at this span equals the new actual only when the span copies
+    // the actual.  A callee the actual selects lands in its span too -- `G`
+    // selecting `g` -- and B spells that expansion there, never the actual.
+    if (deps_.model && deps_.macroTopology &&
+        !RefoldMacroFormalDependenceProof({*deps_.model, *deps_.macroTopology})
+             .SelectionIgnoresFormals(m, s.begin, s.end, {argIdx}))
+      return false;
 
     auto bEnv = deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(s);
     if (!bEnv)

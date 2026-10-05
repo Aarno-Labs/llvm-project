@@ -82,9 +82,9 @@ RefoldMacroStandardArgsOnlyPatchBuilder::TemplateSolver() const {
 
 RefoldMacroOccurrenceReplay
 RefoldMacroStandardArgsOnlyPatchBuilder::OccurrenceReplay() const {
-  return RefoldMacroOccurrenceReplay({deps_.aToks, deps_.bTokOff,
-                                      &deps_.macroTopology, &deps_.sourceMapper,
-                                      deps_.strict, &deps_.lexLang});
+  return RefoldMacroOccurrenceReplay(
+      {deps_.aToks, deps_.bTokOff, &deps_.macroTopology, &deps_.sourceMapper,
+       deps_.strict, &deps_.lexLang, &deps_.model});
 }
 
 RefoldMacroPasteArgumentBuilder

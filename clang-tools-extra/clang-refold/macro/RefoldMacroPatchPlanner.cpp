@@ -200,9 +200,9 @@ RefoldOwnerStateProof &RefoldMacroPatchPlanner::GetOwnerStateProof() const {
 // engine and out of the planner's main algorithm body.
 
 RefoldMacroOccurrenceReplay RefoldMacroPatchPlanner::OccurrenceReplay() const {
-  return RefoldMacroOccurrenceReplay({deps_.aToks, deps_.bTokOff,
-                                      deps_.macroTopology, deps_.sourceMapper,
-                                      deps_.strict, deps_.lexLang});
+  return RefoldMacroOccurrenceReplay(
+      {deps_.aToks, deps_.bTokOff, deps_.macroTopology, deps_.sourceMapper,
+       deps_.strict, deps_.lexLang, deps_.model});
 }
 
 RefoldMacroActualLayout RefoldMacroPatchPlanner::ActualLayout() const {

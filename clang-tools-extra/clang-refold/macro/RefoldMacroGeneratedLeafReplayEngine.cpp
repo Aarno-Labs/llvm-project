@@ -403,6 +403,26 @@ private:
       ArrayRef<LeafTok> oldToks, ArrayRef<size_t> unchangedLeafIdxs,
       ArrayRef<uint32_t> rewrittenFormals) const;
 
+  /// Return the A tokens of the old leaves listed in \p unchangedLeafIdxs, or
+  /// nullopt unless the old leaves are exactly the root cover's tokens.
+  std::optional<SmallVector<uint64_t, 32>>
+  UnchangedLeafTokens(const GeneratedLeafReplayContext &generatedLeafCtx,
+                      ArrayRef<LeafTok> oldToks,
+                      ArrayRef<size_t> unchangedLeafIdxs) const;
+
+  /// Return whether rewriting the variadic formal \p variadicFormal leaves no
+  /// unchanged old leaf that a root occurrence of it produced.
+  ///
+  /// Activating or removing the variadic actual re-expands the root's own
+  /// occurrences of it, such as `#__VA_ARGS__`.  Descendant observers are not
+  /// audited on these paths: generated callees carry no `arg_deps`, so failing
+  /// closed there would refuse folds that no producer fact distinguishes from
+  /// stale ones.
+  bool UnchangedLeavesIgnoreRootVariadicOccurrences(
+      const GeneratedLeafReplayContext &generatedLeafCtx,
+      ArrayRef<LeafTok> oldToks, ArrayRef<LeafTok> newToks,
+      uint32_t variadicFormal) const;
+
   /// Returns whether a stable root occurrence still observes the old leaf.
   ///
   /// Missing or inverted B-side source mapping is treated as proof failure,
@@ -576,6 +596,9 @@ GeneratedLeafReplayResolver::TryRemoveTrailingVariadicActual(
   const auto last = invArgRanges[lastIdx];
   if (last.second < last.first || last.second > baseInvText.size() ||
       last.first == last.second)
+    return std::nullopt;
+  if (!UnchangedLeavesIgnoreRootVariadicOccurrences(generatedLeafCtx, oldToks,
+                                                    newToks, lastIdx))
     return std::nullopt;
 
   // Deactivating a trailing `__VA_OPT__` tail removes the variadic root
@@ -912,19 +935,16 @@ GeneratedLeafReplayResolver::TryStableRootScalarLeafRewrite(
   return patch;
 }
 
-bool GeneratedLeafReplayResolver::UnchangedLeavesIgnoreRewrittenFormals(
+std::optional<SmallVector<uint64_t, 32>>
+GeneratedLeafReplayResolver::UnchangedLeafTokens(
     const GeneratedLeafReplayContext &generatedLeafCtx,
-    ArrayRef<LeafTok> oldToks, ArrayRef<size_t> unchangedLeafIdxs,
-    ArrayRef<uint32_t> rewrittenFormals) const {
-  if (rewrittenFormals.empty() || unchangedLeafIdxs.empty())
-    return true;
-
-  const RefoldModel::MacroInvocation &root = generatedLeafCtx.invocation;
+    ArrayRef<LeafTok> oldToks, ArrayRef<size_t> unchangedLeafIdxs) const {
   const std::optional<std::pair<uint64_t, uint64_t>> cover =
-      RefoldMacroWholeCoverProof::GetWholeCoverATokRange(root);
+      RefoldMacroWholeCoverProof::GetWholeCoverATokRange(
+          generatedLeafCtx.invocation);
   if (!cover || cover->first > cover->second ||
       cover->second - cover->first != oldToks.size())
-    return false;
+    return std::nullopt;
 
   SmallVector<uint64_t, 32> tokens;
   for (size_t leaf : unchangedLeafIdxs) {
@@ -932,13 +952,36 @@ bool GeneratedLeafReplayResolver::UnchangedLeavesIgnoreRewrittenFormals(
     if (leaf >= oldToks.size() ||
         deps_.sourceMapper.SliceASource(tok, tok + 1).trim() !=
             oldToks[leaf].spelling)
-      return false;
+      return std::nullopt;
     tokens.push_back(tok);
   }
+  return tokens;
+}
+
+bool GeneratedLeafReplayResolver::UnchangedLeavesIgnoreRewrittenFormals(
+    const GeneratedLeafReplayContext &generatedLeafCtx,
+    ArrayRef<LeafTok> oldToks, ArrayRef<size_t> unchangedLeafIdxs,
+    ArrayRef<uint32_t> rewrittenFormals) const {
+  if (rewrittenFormals.empty() || unchangedLeafIdxs.empty())
+    return true;
+  std::optional<SmallVector<uint64_t, 32>> tokens =
+      UnchangedLeafTokens(generatedLeafCtx, oldToks, unchangedLeafIdxs);
+  if (!tokens)
+    return false;
   return RefoldMacroFormalDependenceProof({deps_.model, deps_.macroTopology})
       .TokensIgnoreRewrittenFormals(
-          root, tokens, rewrittenFormals,
+          generatedLeafCtx.invocation, *tokens, rewrittenFormals,
           RefoldMacroFormalDependenceProof::RootOccurrences::Observed);
+}
+
+bool GeneratedLeafReplayResolver::UnchangedLeavesIgnoreRootVariadicOccurrences(
+    const GeneratedLeafReplayContext &generatedLeafCtx,
+    ArrayRef<LeafTok> oldToks, ArrayRef<LeafTok> newToks,
+    uint32_t variadicFormal) const {
+  std::optional<SmallVector<uint64_t, 32>> tokens = UnchangedLeafTokens(
+      generatedLeafCtx, oldToks, unchangedLeafIndices(oldToks, newToks));
+  return tokens && !RefoldMacroFormalDependenceProof::RootOccurrencesObserve(
+                       generatedLeafCtx.invocation, *tokens, {variadicFormal});
 }
 
 std::optional<MacroPatch> GeneratedLeafReplayResolver::TryBuild(
@@ -1103,6 +1146,10 @@ std::optional<MacroPatch> GeneratedLeafReplayResolver::TryBuild(
         sawInsertedData = true;
       }
       if (sawInsertedData && !StringRef(insertedActual).trim().empty()) {
+        if (!UnchangedLeavesIgnoreRootVariadicOccurrences(
+                generatedLeafCtx, oldToks, newToks,
+                static_cast<uint32_t>(rootDefinition->defParams.size() - 1)))
+          return std::nullopt;
         size_t close = baseInvText.rfind(')');
         if (close == StringRef::npos)
           return std::nullopt;
