@@ -345,15 +345,6 @@ bool RefoldMacroOccurrenceReplay::
     }
   }
 
-  // If this arg is stringified anywhere, accept args-only without enforcing
-  // paste-span checks.
-  //
-  // Deliberately still strict-only.  This flag also waives the paste
-  // obligations below, and only strict has ever taken that waiver; widening it
-  // here would change which paste facts the relaxed pipeline discharges, which
-  // is a different question from the one the stringify block decides.
-  bool argIsStringified = deps_.strict && argHasStringifySpan;
-
   // A stringified occurrence constrains the argument independently of every
   // evaluated use, so validate the spans in both modes.  The replacement must
   // regenerate the literal B spells at each span, or B must have left that
@@ -589,9 +580,27 @@ bool RefoldMacroOccurrenceReplay::
 
   // Paste-span verification is optional for callers that validate paste-token
   // correctness as a group (e.g., multi-span paste edits). When disabled, we
-  // only validate standard+stringify occurrences above.
-  if (argIsStringified || !checkPasteSpans)
+  // only validate standard+stringify occurrences above.  A stringified formal
+  // is no exception: its literal says nothing about the tokens it pastes.
+  if (!checkPasteSpans)
     return true;
+
+  // Classify each pasted A segment against the actual the producer recorded,
+  // not `baseArg`.  The segment was pasted from that original spelling, while
+  // an earlier hunk of this pass may already have rewritten the invocation
+  // `baseArg` is read from; an idempotent re-check then compares `OPEN` with a
+  // pasted `open` and can never classify it.
+  StringRef pasteOriginTrim = baseTrim;
+  if (m.invText) {
+    if (std::optional<std::vector<std::pair<size_t, size_t>>> origRanges =
+            RefoldMacroActualLayout({deps_.lexLang})
+                .GetMacroInvocationFormalArgContentRanges(m, *m.invText);
+        origRanges && argIdx < origRanges->size()) {
+      const auto [origBegin, origEnd] = (*origRanges)[argIdx];
+      if (origBegin <= origEnd && origEnd <= m.invText->size())
+        pasteOriginTrim = m.invText->slice(origBegin, origEnd).trim();
+    }
+  }
 
   // Verify all paste-span occurrences.
   for (const auto &ps : m.pasteSpans) {
@@ -653,13 +662,13 @@ bool RefoldMacroOccurrenceReplay::
 
     // Determine where this pasted segment comes from within the original
     // argument spelling.
-    bool starts = baseTrim.starts_with(oldSeg);
-    bool ends = baseTrim.ends_with(oldSeg);
+    bool starts = pasteOriginTrim.starts_with(oldSeg);
+    bool ends = pasteOriginTrim.ends_with(oldSeg);
 
     // Accept either an exact projected replacement or the corresponding
     // prefix/suffix match when this segment represents a trimmed edge.
     bool ok = false;
-    if (baseTrim == oldSeg)
+    if (pasteOriginTrim == oldSeg)
       ok = (argTrim == segB);
     else if (starts && !ends)
       ok = argTrim.starts_with(segB);
