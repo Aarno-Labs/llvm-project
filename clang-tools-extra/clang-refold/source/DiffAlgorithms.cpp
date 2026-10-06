@@ -2122,17 +2122,77 @@ struct GapView {
 using WeightedRowObserver =
     llvm::function_ref<void(size_t aBoundary, ArrayRef<Score> row)>;
 
+/// The states `(i, j)` of an A-boundary by B-boundary grid whose diagonal
+/// `j - i` lies in `[lowDiagonal, highDiagonal]`.
+///
+/// A linear-space sweep confined to a band fills only band states and reads a
+/// predecessor only inside the band, so each state holds the best objective
+/// over the monotone paths that stay in the band. Columns outside a row's band
+/// are left unspecified, and readers must stay inside `FirstColumn()` and
+/// `LastColumn()`.
+struct WeightedBand {
+  int64_t lowDiagonal = 0;
+  int64_t highDiagonal = 0;
+
+  /// Return the band holding every state of an `aWidth` by `bWidth` grid.
+  static WeightedBand Full(size_t aWidth, size_t bWidth) {
+    return WeightedBand{-static_cast<int64_t>(aWidth),
+                        static_cast<int64_t>(bWidth)};
+  }
+
+  /// Return the first B boundary the band holds on A boundary \p aBoundary.
+  size_t FirstColumn(size_t aBoundary) const {
+    const int64_t first = static_cast<int64_t>(aBoundary) + lowDiagonal;
+    return first > 0 ? static_cast<size_t>(first) : 0;
+  }
+
+  /// Return the last B boundary the band holds on A boundary \p aBoundary.
+  size_t LastColumn(size_t aBoundary, size_t bWidth) const {
+    const int64_t last = static_cast<int64_t>(aBoundary) + highDiagonal;
+    return last < static_cast<int64_t>(bWidth) ? static_cast<size_t>(last)
+                                               : bWidth;
+  }
+
+  /// Return whether both sweeps over an `aWidth` by `bWidth` grid, and over
+  /// any prefix or suffix of its A rows, reach every band state from a band
+  /// predecessor.
+  ///
+  /// The band must hold both corners' diagonals, `0` and `bWidth - aWidth`,
+  /// and at least two diagonals. Then every row's band is non-empty, its first
+  /// state can be entered by deleting from the row above and its last by
+  /// deleting into the row below, and a row that gains a column gains it next
+  /// to an insertion predecessor.
+  bool SweepsGrid(size_t aWidth, size_t bWidth) const {
+    const int64_t endDiagonal =
+        static_cast<int64_t>(bWidth) - static_cast<int64_t>(aWidth);
+    return lowDiagonal <= std::min<int64_t>(0, endDiagonal) &&
+           highDiagonal >= std::max<int64_t>(0, endDiagonal) &&
+           highDiagonal - lowDiagonal >= 1;
+  }
+
+  /// Return whether the band holds every state of an `aWidth` by `bWidth`
+  /// grid.
+  bool CoversGrid(size_t aWidth, size_t bWidth) const {
+    return lowDiagonal <= -static_cast<int64_t>(aWidth) &&
+           highDiagonal >= static_cast<int64_t>(bWidth);
+  }
+};
+
 /// Compute one weighted Hirschberg LCS DP row for the given span views.
 ///
 /// When \p observeRow is set it is shown the row of every A boundary the sweep
-/// completes, from boundary 0 up to the returned final row.
+/// completes, from boundary 0 up to the returned final row. A \p band confines
+/// the sweep to its states; it must satisfy `WeightedBand::SweepsGrid()` for a
+/// grid this sweep is a row prefix of.
 static std::vector<Score>
 computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
-                   WeightedRowObserver observeRow = nullptr) {
+                   WeightedRowObserver observeRow = nullptr,
+                   std::optional<WeightedBand> band = std::nullopt) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (gapV.size() != n + 1)
     REFOLD_LOG_FATAL("lcs/map", "internal: gap view length must be A.len+1");
+  const WeightedBand states = band ? *band : WeightedBand::Full(n, m);
 
   // Both gap transitions into row `i` pay `gapV.at(i)`, and the A token the
   // diagonal tests is `aV.at(i - 1)`; both are invariant across the row, so
@@ -2153,7 +2213,7 @@ computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
   dp[0] = Score{0, 0};
   // Row 0: only insertions, charged at boundary 0.
   const uint64_t firstRowGapCost = static_cast<uint64_t>(gapV.at(0));
-  for (size_t j = 1; j <= m; ++j) {
+  for (size_t j = 1; j <= states.LastColumn(0, m); ++j) {
     dp[j] = dp[j - 1];
     dp[j].cost += firstRowGapCost;
   }
@@ -2163,14 +2223,28 @@ computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
   for (size_t i = 1; i <= n; ++i) {
     const uint64_t gapCost = static_cast<uint64_t>(gapV.at(i));
     const uint32_t aId = aIds[i - 1];
+    const size_t first = states.FirstColumn(i);
+    const size_t last = states.LastColumn(i, m);
+    const size_t interiorLast = std::min(last, states.LastColumn(i - 1, m));
+    assert(first <= interiorLast && last <= interiorLast + 1 &&
+           "weighted-LCS band rows must overlap their predecessors");
 
-    // Col 0: only deletions, charged at boundary i.
-    ndp[0] = dp[0];
-    ndp[0].cost += gapCost;
+    // First column: no insertion predecessor lies in the band, and deleting
+    // A[i - 1] from the row above always does.  Without a band this is column
+    // 0, which has no match predecessor either.
+    ndp[first] = dp[first];
+    ndp[first].cost += gapCost;
+    if (first > 0 && aId == bIds[first - 1]) {
+      Score match = dp[first - 1];
+      ++match.len;
+      if (isCoreBetter(match.len, match.cost, ndp[first].len,
+                       ndp[first].cost))
+        ndp[first] = match;
+    }
 
-    Score diagPrev = dp[0];
-    Score insertPrev = ndp[0];
-    for (size_t j = 1; j <= m; ++j) {
+    Score diagPrev = dp[first];
+    Score insertPrev = ndp[first];
+    for (size_t j = first + 1; j <= interiorLast; ++j) {
       Score best;
       best.len = 0;
       best.cost = std::numeric_limits<uint64_t>::max();
@@ -2203,6 +2277,20 @@ computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
       insertPrev = best;
     }
 
+    // A band row one column wider than the row above ends on a state whose
+    // deletion predecessor lies outside the band.
+    if (last > interiorLast) {
+      Score best = insertPrev;
+      best.cost += gapCost;
+      if (aId == bIds[last - 1]) {
+        Score match = diagPrev;
+        ++match.len;
+        if (isCoreBetter(match.len, match.cost, best.len, best.cost))
+          best = match;
+      }
+      ndp[last] = best;
+    }
+
     dp.swap(ndp);
     if (observeRow)
       observeRow(i, dp);
@@ -2221,15 +2309,19 @@ computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
 ///
 /// When \p observeRow is set it is shown the suffix row of every A boundary the
 /// sweep completes, from boundary `aV.size()` down to the returned boundary-0
-/// row.
+/// row. A \p band confines the sweep to its states, in this sweep's own
+/// coordinates; it must satisfy `WeightedBand::SweepsGrid()` for a grid this
+/// sweep is a row suffix of, shifted to those coordinates.
 static std::vector<Score>
 computeSuffixRowWeighted(const SpanView &aV, const SpanView &bV,
                          const GapView &gapV,
-                         WeightedRowObserver observeRow = nullptr) {
+                         WeightedRowObserver observeRow = nullptr,
+                         std::optional<WeightedBand> band = std::nullopt) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (gapV.size() != n + 1)
     REFOLD_LOG_FATAL("lcs/map", "internal: gap view length must be A.len+1");
+  const WeightedBand states = band ? *band : WeightedBand::Full(n, m);
 
   // The same row-invariant hoists as the prefix row, with the two gap
   // transitions paying different boundaries: the delete pays `gapV.at(i + 1)`
@@ -2247,7 +2339,7 @@ computeSuffixRowWeighted(const SpanView &aV, const SpanView &bV,
   // S[n][j]: only B insertions remain, all charged at the terminal A gap.
   next[m] = Score{0, 0};
   const uint64_t terminalGapCost = static_cast<uint64_t>(gapV.at(n));
-  for (size_t jj = m; jj > 0; --jj) {
+  for (size_t jj = m; jj > states.FirstColumn(n); --jj) {
     const size_t j = jj - 1;
     next[j] = next[j + 1];
     next[j].cost += terminalGapCost;
@@ -2260,12 +2352,27 @@ computeSuffixRowWeighted(const SpanView &aV, const SpanView &bV,
     const uint64_t deleteGapCost = static_cast<uint64_t>(gapV.at(i + 1));
     const uint64_t insertGapCost = static_cast<uint64_t>(gapV.at(i));
     const uint32_t aId = aIds[i];
+    const size_t first = states.FirstColumn(i);
+    const size_t last = states.LastColumn(i, m);
+    const size_t interiorFirst = std::max(first, states.FirstColumn(i + 1));
+    assert(interiorFirst <= last && interiorFirst <= first + 1 &&
+           "weighted-LCS band rows must overlap their successors");
 
-    current[m] = next[m];
-    current[m].cost += deleteGapCost;
+    // Last column: no insertion predecessor lies in the band, and deleting
+    // A[i] into the row below always does.  Without a band this is column m,
+    // which has no match predecessor either.
+    current[last] = next[last];
+    current[last].cost += deleteGapCost;
+    if (last < m && aId == bIds[last]) {
+      Score match = next[last + 1];
+      ++match.len;
+      if (isCoreBetter(match.len, match.cost, current[last].len,
+                       current[last].cost))
+        current[last] = match;
+    }
 
-    Score insertPrev = current[m];
-    for (size_t jj = m; jj > 0; --jj) {
+    Score insertPrev = current[last];
+    for (size_t jj = last; jj > interiorFirst; --jj) {
       const size_t j = jj - 1;
       Score best{0, std::numeric_limits<uint64_t>::max()};
 
@@ -2286,6 +2393,20 @@ computeSuffixRowWeighted(const SpanView &aV, const SpanView &bV,
 
       current[j] = best;
       insertPrev = best;
+    }
+
+    // A band row starting one column before the row below starts on a state
+    // whose deletion predecessor lies outside the band.
+    if (first < interiorFirst) {
+      Score best = insertPrev;
+      best.cost += insertGapCost;
+      if (aId == bIds[first]) {
+        Score match = next[first + 1];
+        ++match.len;
+        if (isCoreBetter(match.len, match.cost, best.len, best.cost))
+          best = match;
+      }
+      current[first] = best;
     }
     next.swap(current);
     if (observeRow)
@@ -2531,18 +2652,18 @@ static LcsObjective objectiveFromScore(const Score &score) {
   return LcsObjective{score.len, score.cost};
 }
 
-/// Record every B frontier at which one A boundary's prefix and suffix rows
-/// attain their best combined objective.
+/// Record every B frontier in [\p firstB, \p lastB] at which one A boundary's
+/// prefix and suffix rows attain their best combined objective.
 static bool collectOptimalBFrontiers(ArrayRef<Score> forward,
-                                     ArrayRef<Score> suffix,
-                                     uint64_t absoluteBBegin,
+                                     ArrayRef<Score> suffix, size_t firstB,
+                                     size_t lastB, uint64_t absoluteBBegin,
                                      LcsBoundaryFrontierProjection &result) {
-  assert(forward.size() == suffix.size() &&
+  assert(forward.size() == suffix.size() && lastB < forward.size() &&
          "linear-space frontier rows must cover every B boundary");
 
   bool haveObjective = false;
   LcsObjective best;
-  for (size_t localB = 0; localB < forward.size(); ++localB) {
+  for (size_t localB = firstB; localB <= lastB; ++localB) {
     LcsObjective combined;
     if (!addObjectivesChecked(objectiveFromScore(forward[localB]),
                               objectiveFromScore(suffix[localB]),
@@ -2583,15 +2704,27 @@ static bool collectOptimalBFrontiers(ArrayRef<Score> forward,
 /// rows a lone projection of each boundary computes, so every result equals
 /// that lone projection. \p localABoundaries must be strictly increasing, and
 /// \p results is parallel to it.
+///
+/// A \p band, in window coordinates, confines both sweeps and the frontier
+/// search to its states. It is sound only when it contains every optimal path
+/// of the window: a state some optimal path crosses then keeps its exact
+/// prefix and suffix objectives, because a best prefix or suffix through it
+/// composes with that path into another optimal path, which the band also
+/// holds; every other state combines to strictly less than the optimum, as it
+/// does without the band. Each result is then identical to the unbanded one.
 static bool projectBoundariesWithOwnerDepth(
     ArrayRef<StringRef> aWindow, ArrayRef<StringRef> bWindow,
     ArrayRef<uint32_t> ownerDepthGap, uint64_t absoluteABegin,
     uint64_t absoluteBBegin, ArrayRef<size_t> localABoundaries,
-    std::vector<LcsBoundaryFrontierProjection> &results) {
+    std::vector<LcsBoundaryFrontierProjection> &results,
+    std::optional<WeightedBand> band = std::nullopt) {
   results.assign(localABoundaries.size(), LcsBoundaryFrontierProjection{});
   if (!hasBoundaryVectorSize(aWindow.size(), ownerDepthGap.size()) ||
-      absoluteBBegin > std::numeric_limits<uint64_t>::max() - bWindow.size())
+      absoluteBBegin > std::numeric_limits<uint64_t>::max() - bWindow.size() ||
+      (band && !band->SweepsGrid(aWindow.size(), bWindow.size())))
     return false;
+  const WeightedBand states =
+      band ? *band : WeightedBand::Full(aWindow.size(), bWindow.size());
   for (size_t index = 0; index < localABoundaries.size(); ++index) {
     const size_t localABoundary = localABoundaries[index];
     if (localABoundary > aWindow.size() ||
@@ -2616,10 +2749,11 @@ static bool projectBoundariesWithOwnerDepth(
   };
   (void)computeRowWeighted(SpanView{aWindow, 0, lastBoundary, false}, bForward,
                            GapView{ownerDepthGap, 0, lastBoundary + 1},
-                           keepForwardRow);
+                           keepForwardRow, band);
 
   // The backward sweep meets the boundaries in decreasing order, and each
-  // forward row is released as soon as its boundary is combined.
+  // forward row is released as soon as its boundary is combined.  Its rows are
+  // numbered from `firstBoundary`, so the band's diagonals shift by as much.
   bool collected = nextForward == localABoundaries.size();
   size_t nextSuffix = localABoundaries.size();
   auto combineSuffixRow = [&](size_t suffixBoundary, ArrayRef<Score> row) {
@@ -2627,16 +2761,24 @@ static bool projectBoundariesWithOwnerDepth(
         localABoundaries[nextSuffix - 1] != firstBoundary + suffixBoundary)
       return;
     --nextSuffix;
-    collected = collectOptimalBFrontiers(forwardRows[nextSuffix], row,
-                                         absoluteBBegin, results[nextSuffix]);
+    const size_t aBoundary = localABoundaries[nextSuffix];
+    collected = collectOptimalBFrontiers(
+        forwardRows[nextSuffix], row, states.FirstColumn(aBoundary),
+        states.LastColumn(aBoundary, bWindow.size()), absoluteBBegin,
+        results[nextSuffix]);
     forwardRows[nextSuffix] = {};
   };
+  std::optional<WeightedBand> suffixBand;
+  if (band)
+    suffixBand = WeightedBand{
+        band->lowDiagonal + static_cast<int64_t>(firstBoundary),
+        band->highDiagonal + static_cast<int64_t>(firstBoundary)};
   (void)computeSuffixRowWeighted(
       SpanView{aWindow, firstBoundary, aWindow.size() - firstBoundary, false},
       bForward,
       GapView{ownerDepthGap, firstBoundary,
               aWindow.size() - firstBoundary + 1},
-      combineSuffixRow);
+      combineSuffixRow, suffixBand);
   return collected && nextSuffix == 0;
 }
 
@@ -3514,9 +3656,108 @@ static bool certifyPartitionWindows(
   return true;
 }
 
+/// Diagonal margin of the narrow sweep that bounds a stream's optimum from
+/// below. It schedules work only: any margin yields a band that provably holds
+/// every optimal path, and a margin narrower than the stream's edit drift only
+/// widens that band.
+constexpr int64_t OptimalPathBandProbeMargin = 64;
+
+/// Return a band of the complete \p a by \p b grid that contains every optimal
+/// path, or nullopt when none narrower than the grid is proven.
+///
+/// A sweep confined to a narrow band around the grid's own diagonal span still
+/// ends at `(n, m)`, so its matched-token count `L` is the length of an actual
+/// common subsequence and bounds the optimum's count `L*` from below. Every
+/// optimal path matches `L*` tokens, so it deletes exactly `n - L*` A tokens
+/// and inserts exactly `m - L*` B tokens. Its diagonal `j - i` at any state is
+/// the insertions so far minus the deletions so far, so it stays in
+/// `[L* - n, m - L*]`, which lies in `[L - n, m - L]`.
+static std::optional<WeightedBand>
+optimalPathBandForGrid(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                       ArrayRef<uint32_t> ownerDepthGap) {
+  const size_t n = a.size();
+  const size_t m = b.size();
+  const int64_t aWidth = static_cast<int64_t>(n);
+  const int64_t bWidth = static_cast<int64_t>(m);
+  const int64_t endDiagonal = bWidth - aWidth;
+  const WeightedBand probe{
+      std::max(-aWidth,
+               std::min<int64_t>(0, endDiagonal) - OptimalPathBandProbeMargin),
+      std::min(bWidth,
+               std::max<int64_t>(0, endDiagonal) + OptimalPathBandProbeMargin)};
+  if (n == 0 || m == 0 || !hasBoundaryVectorSize(n, ownerDepthGap.size()) ||
+      probe.CoversGrid(n, m))
+    return std::nullopt;
+
+  const std::vector<Score> lastRow =
+      computeRowWeighted(SpanView{a, 0, n, false}, SpanView{b, 0, m, false},
+                         GapView{ownerDepthGap, 0, n + 1}, nullptr, probe);
+  const int64_t matched = static_cast<int64_t>(lastRow[m].len);
+  WeightedBand band{matched - aWidth, bWidth - matched};
+  // Identical streams leave one diagonal; sweeps need a second to move on.
+  if (band.highDiagonal - band.lowDiagonal < 1)
+    band = WeightedBand{-1, 1};
+  if (band.CoversGrid(n, m) || !band.SweepsGrid(n, m))
+    return std::nullopt;
+  return band;
+}
+
+/// Return \p streamBand in the coordinates of the rectangle with A boundaries
+/// [\p aBegin, \p aEnd) and B boundaries [\p bBegin, \p bEnd), or nullopt when
+/// it does not confine that rectangle's sweeps.
+///
+/// Sound only for a rectangle whose corners every optimal stream path crosses.
+/// Each of its optimal paths then composes with optimal stream pieces outside
+/// it into an optimal stream path, so the stream band holds it as well.
+static std::optional<WeightedBand>
+bandForBudgetRectangle(std::optional<WeightedBand> streamBand, uint64_t aBegin,
+                       uint64_t aEnd, uint64_t bBegin, uint64_t bEnd) {
+  if (!streamBand)
+    return std::nullopt;
+  const size_t aWidth = static_cast<size_t>(aEnd - aBegin);
+  const size_t bWidth = static_cast<size_t>(bEnd - bBegin);
+  const int64_t originDiagonal =
+      static_cast<int64_t>(bBegin) - static_cast<int64_t>(aBegin);
+  const WeightedBand band{
+      std::max(streamBand->lowDiagonal - originDiagonal,
+               -static_cast<int64_t>(aWidth)),
+      std::min(streamBand->highDiagonal - originDiagonal,
+               static_cast<int64_t>(bWidth))};
+  if (band.CoversGrid(aWidth, bWidth) || !band.SweepsGrid(aWidth, bWidth))
+    return std::nullopt;
+  return band;
+}
+
 struct LcsBudgetPartitionPlan {
   SmallVector<LcsCertifiedBoundary, 8> certifiedBoundaries;
   SmallVector<LcsCertificationWindow, 8> windows;
+  /// Band holding every optimal path of the complete stream, settled by the
+  /// first rectangle that projects a row, which is always the stream itself.
+  std::optional<WeightedBand> streamBand;
+  bool streamBandSettled = false;
+};
+
+/// One oversized rectangle of the budget partition, ready to project rows of.
+struct BudgetPartitionRectangle {
+  ArrayRef<StringRef> aWindow;
+  ArrayRef<StringRef> bWindow;
+  std::vector<uint32_t> ownerDepthGap;
+  uint64_t aBegin = 0;
+  uint64_t bBegin = 0;
+  /// Band holding every optimal path of the rectangle, in its coordinates.
+  std::optional<WeightedBand> band;
+
+  /// Project the absolute A rows \p aBoundaries, which must be strictly
+  /// increasing, into \p projections in the same order.
+  bool Project(ArrayRef<uint64_t> aBoundaries,
+               std::vector<LcsBoundaryFrontierProjection> &projections) const {
+    SmallVector<size_t, 32> localBoundaries;
+    for (uint64_t aBoundary : aBoundaries)
+      localBoundaries.push_back(static_cast<size_t>(aBoundary - aBegin));
+    return projectBoundariesWithOwnerDepth(aWindow, bWindow, ownerDepthGap,
+                                           aBegin, bBegin, localBoundaries,
+                                           projections, band);
+  }
 };
 
 /// Insert one evidence-only candidate while retaining normalized order.
@@ -3601,17 +3842,14 @@ sweptBudgetSeamSchedule(uint64_t aBegin, uint64_t aEnd, uint64_t midpoint,
 /// first, to the rows whose held vectors fit \p maxBytes. Returns false only
 /// when a projection itself fails; finding no seam is not a failure.
 static bool projectSweptBudgetSeam(
-    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-    ArrayRef<LcsAGapProvenance> gapProvenance, uint64_t aBegin, uint64_t aEnd,
-    uint64_t bBegin, uint64_t bEnd, ArrayRef<uint64_t> schedule,
+    const BudgetPartitionRectangle &rectangle, ArrayRef<uint64_t> schedule,
     unsigned long long maxBytes,
     LcsCertificationDiagnosticEvidence *diagnosticEvidence,
     std::optional<LcsBoundaryFrontierProjection> &seam) {
   seam.reset();
-  const size_t aWidth = static_cast<size_t>(aEnd - aBegin);
-  const size_t bWidth = static_cast<size_t>(bEnd - bBegin);
   uint64_t heldRowBytes = 0;
-  if (!arrayBytesChecked<Score>(bWidth + 1, heldRowBytes) || heldRowBytes == 0)
+  if (!arrayBytesChecked<Score>(rectangle.bWindow.size() + 1, heldRowBytes) ||
+      heldRowBytes == 0)
     return true;
   const ArrayRef<uint64_t> triedRows = schedule.take_front(
       static_cast<size_t>(std::min<uint64_t>(schedule.size(),
@@ -3619,25 +3857,15 @@ static bool projectSweptBudgetSeam(
   if (triedRows.empty())
     return true;
 
-  SmallVector<size_t, 32> localBoundaries;
-  for (uint64_t aBoundary : triedRows)
-    localBoundaries.push_back(static_cast<size_t>(aBoundary - aBegin));
-  llvm::sort(localBoundaries);
-
-  const std::vector<uint32_t> ownerDepthGap = copyOwnerDepthGaps(
-      gapProvenance, static_cast<size_t>(aBegin),
-      static_cast<size_t>(aBegin) + aWidth);
+  SmallVector<uint64_t, 32> sortedRows(triedRows.begin(), triedRows.end());
+  llvm::sort(sortedRows);
   std::vector<LcsBoundaryFrontierProjection> projections;
-  if (!projectBoundariesWithOwnerDepth(
-          a.slice(static_cast<size_t>(aBegin), aWidth),
-          b.slice(static_cast<size_t>(bBegin), bWidth), ownerDepthGap, aBegin,
-          bBegin, localBoundaries, projections))
+  if (!rectangle.Project(sortedRows, projections))
     return false;
 
   for (uint64_t aBoundary : triedRows) {
     const size_t index = static_cast<size_t>(
-        llvm::lower_bound(localBoundaries, aBoundary - aBegin) -
-        localBoundaries.begin());
+        llvm::lower_bound(sortedRows, aBoundary) - sortedRows.begin());
     LcsBoundaryFrontierProjection &projection = projections[index];
     if (!projection.objectiveIsExact)
       return false;
@@ -3663,6 +3891,10 @@ static bool projectSweptBudgetSeam(
 /// sum of child grid areas decreases geometrically regardless of the unique B
 /// frontier. This hard work bound is the wall-time property missing from the
 /// former one-full-pass-per-candidate implementation.
+///
+/// Each pass covers only the diagonal band the stream's optimal paths are
+/// proven to stay in, which leaves every projection's frontiers and objective
+/// exactly as a full pass computes them.
 static bool appendBudgetPartition(
     ArrayRef<StringRef> a, ArrayRef<StringRef> b,
     ArrayRef<LcsAGapProvenance> gapProvenance,
@@ -3697,6 +3929,29 @@ static bool appendBudgetPartition(
     return true;
   }
 
+  BudgetPartitionRectangle rectangle;
+  rectangle.aWindow =
+      a.slice(static_cast<size_t>(aBegin), static_cast<size_t>(aWidth));
+  rectangle.bWindow =
+      b.slice(static_cast<size_t>(bBegin), static_cast<size_t>(bWidth));
+  rectangle.ownerDepthGap =
+      copyOwnerDepthGaps(gapProvenance, static_cast<size_t>(aBegin),
+                         static_cast<size_t>(aEnd));
+  rectangle.aBegin = aBegin;
+  rectangle.bBegin = bBegin;
+
+  // Every rectangle below the stream is cut at seams that every optimal stream
+  // path crosses, so the stream's band confines them all.  The stream itself
+  // is the first rectangle to project a row.
+  if (!plan.streamBandSettled) {
+    plan.streamBandSettled = true;
+    if (aBegin == 0 && bBegin == 0 && aEnd == a.size() && bEnd == b.size())
+      plan.streamBand = optimalPathBandForGrid(
+          rectangle.aWindow, rectangle.bWindow, rectangle.ownerDepthGap);
+  }
+  rectangle.band =
+      bandForBudgetRectangle(plan.streamBand, aBegin, aEnd, bBegin, bEnd);
+
   const uint64_t midpoint = aBegin + aWidth / 2;
   SmallVector<uint64_t, 2> scheduledBoundaries;
   scheduledBoundaries.push_back(midpoint);
@@ -3708,12 +3963,11 @@ static bool appendBudgetPartition(
   std::optional<LcsBoundaryFrontierProjection> seam;
   for (uint64_t aBoundary : scheduledBoundaries) {
     recordDiagnosticCandidate(aBoundary, diagnosticEvidence);
-    LcsBoundaryFrontierProjection projection;
-    if (!projectLcsBoundaryToOptimalBFrontiers(
-            a, aBegin, aEnd, b, bBegin, bEnd, aBoundary, gapProvenance,
-            projection) ||
-        !projection.objectiveIsExact)
+    std::vector<LcsBoundaryFrontierProjection> projections;
+    if (!rectangle.Project({aBoundary}, projections) ||
+        !projections.front().objectiveIsExact)
       return false;
+    LcsBoundaryFrontierProjection &projection = projections.front();
     if (diagnosticEvidence)
       diagnosticEvidence->boundaryFrontierProjections.push_back(projection);
     if (projection.ProvesUniqueBoundary()) {
@@ -3730,7 +3984,7 @@ static bool appendBudgetPartition(
   // before conceding the rectangle.
   if (!seam &&
       !projectSweptBudgetSeam(
-          a, b, gapProvenance, aBegin, aEnd, bBegin, bEnd,
+          rectangle,
           sweptBudgetSeamSchedule(aBegin, aEnd, midpoint, scheduledBoundaries),
           maxBytes, diagnosticEvidence, seam))
     return false;
