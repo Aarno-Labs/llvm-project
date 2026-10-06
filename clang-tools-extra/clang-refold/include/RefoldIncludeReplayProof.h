@@ -21,6 +21,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -374,6 +375,9 @@ private:
 
   /// Proof bits produced by evaluating one include replay candidate.
   struct IncludeReplayProofResult {
+    /// The candidate is the producer's header, or a guarded byte-identical
+    /// copy of it whose includes replay the same way; see
+    /// `CandidateSelectsProducerHeader()`.
     bool samePhysicalFile = false;
 
     // `__FILE__` and `__FILE_NAME__` are related, but they are distinct
@@ -755,9 +759,55 @@ private:
   static const char *
   IncludeReplayLookupKindName(IncludeReplayCandidate::LookupKind kind);
 
+  /// Return whether \p candidatePath, a header an output-side lookup selected,
+  /// stands for the header the producer entered through \p include.
+  ///
+  /// The producer's own file always does.  A different file does when it is a
+  /// guarded copy (`IsByteIdenticalGuardedCopy()`) and, when
+  /// \p followClosure is set, every include the copy executes selects the
+  /// producer's header or such a copy in turn
+  /// (`CopyClosureReplaysProducerIncludes()`).  A skipped edge enters no
+  /// header, so it needs no closure.
+  bool CandidateSelectsProducerHeader(const std::filesystem::path &candidatePath,
+                                      const RefoldModel::IncludeItem &include,
+                                      bool followClosure) const;
+
+  /// Return whether \p candidatePath holds exactly the bytes of the header the
+  /// producer opened through \p include, and that header carries a recorded
+  /// controlling macro.
+  ///
+  /// Equal bytes lex to equal tokens under equal macro state.  The macro is
+  /// what makes the copy interchangeable with the original in one compile:
+  /// a header whose whole text is guarded by it is deduplicated by the macro,
+  /// whichever file is entered, whereas `#pragma once` deduplicates by
+  /// physical file and would admit both copies.
+  bool IsByteIdenticalGuardedCopy(const std::filesystem::path &candidatePath,
+                                  const RefoldModel::IncludeItem &include) const;
+
+  /// Return whether every include the producer executed inside \p include's
+  /// header, replayed from the directory of \p copyPath, selects the
+  /// producer's header for it or a guarded copy whose own includes do the
+  /// same.
+  ///
+  /// The executed includes are the edges the producer entered from this
+  /// instance and the skipped edges sited in the header.  `#include_next`,
+  /// macro-computed operands, and a closure deeper than the fixed limit fail.
+  bool
+  CopyClosureReplaysProducerIncludes(const std::filesystem::path &copyPath,
+                                     const RefoldModel::IncludeItem &include,
+                                     unsigned depth) const;
+
+  /// Return the bytes of \p path, read once per proof context, or nullopt
+  /// when the file cannot be read.
+  std::optional<llvm::StringRef>
+  FileBytesForProof(const std::filesystem::path &path) const;
+
   /// Lazily constructed per-context view of modeled include search dirs.
   mutable std::optional<RecordedIncludeSearchDirs>
       recordedIncludeSearchDirsCache_;
+
+  /// Memo for `FileBytesForProof()`, keyed by normalized absolute path.
+  mutable llvm::StringMap<std::optional<std::string>> fileBytesCache_;
 
   IncludeReplayProofServices services_;
   const RefoldModel &model_;

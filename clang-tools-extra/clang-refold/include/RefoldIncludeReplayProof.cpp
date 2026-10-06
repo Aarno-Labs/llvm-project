@@ -16,6 +16,7 @@
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 
 #include <cctype>
@@ -1337,9 +1338,8 @@ IncludeReplayProofContext::EvaluateIncludeReplayCandidate(
     const RefoldModel::IncludeItem &child,
     const CleanChildIncludeReplayDemand &demand) const {
   IncludeReplayProofResult result;
-  const std::string physicalPath = candidate.physicalPath.generic_string();
-  result.samePhysicalFile =
-      services_.samePhysicalIncludeFile(physicalPath, child);
+  result.samePhysicalFile = CandidateSelectsProducerHeader(
+      candidate.physicalPath, child, /*followClosure=*/true);
   result.sameIncludeNextStack =
       IncludeNextObligationsAreProven(candidate, child, demand);
   if (demand.observesFileSpelling()) {
@@ -1437,6 +1437,17 @@ IncludeReplayProofContext::GenerateQuotedChildIncludeRewriteCandidates(
   if (!explicitEnteredSpelling.empty())
     AppendQuotedChildIncludeRewriteCandidate(candidates,
                                              explicitEnteredSpelling);
+
+  // An output placed in a copy of the producer's tree reaches the child's copy
+  // by the path the producer's own source directory reached the child.  It
+  // must still replay to the producer's header or a guarded copy of it.
+  if (!model_.GetSourcePath().empty()) {
+    const std::filesystem::path producerSourceDirectory =
+        AbsolutePathInPPCwd(model_.GetSourcePath()).parent_path();
+    if (std::optional<std::string> operand = StableContainedRelativeOperand(
+            *producerPhysicalPath, producerSourceDirectory))
+      AppendQuotedChildIncludeRewriteCandidate(candidates, *operand);
+  }
 
   return candidates;
 }
@@ -2016,8 +2027,116 @@ bool IncludeReplayProofContext::SkippedIncludeReplaysFromFinalSurface(
   const std::optional<IncludeReplayCandidate> candidate =
       skipped.angled ? ComputeAngledIncludeReplayCandidate(*operand)
                      : ComputeQuotedIncludeReplayCandidate(*operand);
-  return candidate && services_.samePhysicalIncludeFile(
-                          candidate->physicalPath.generic_string(), skipped);
+  return candidate &&
+         CandidateSelectsProducerHeader(candidate->physicalPath, skipped,
+                                        /*followClosure=*/false);
+}
+
+/// Deepest include nesting a copy closure follows before it fails closed.
+static constexpr unsigned MaxCopyClosureDepth = 64;
+
+bool IncludeReplayProofContext::CandidateSelectsProducerHeader(
+    const std::filesystem::path &candidatePath,
+    const RefoldModel::IncludeItem &include, bool followClosure) const {
+  if (services_.samePhysicalIncludeFile(candidatePath.generic_string(),
+                                        include))
+    return true;
+  if (!IsByteIdenticalGuardedCopy(candidatePath, include))
+    return false;
+  return !followClosure ||
+         CopyClosureReplaysProducerIncludes(candidatePath, include, 0);
+}
+
+bool IncludeReplayProofContext::IsByteIdenticalGuardedCopy(
+    const std::filesystem::path &candidatePath,
+    const RefoldModel::IncludeItem &include) const {
+  if (!include.controllingMacro || include.controllingMacro->empty())
+    return false;
+  const std::optional<std::filesystem::path> producerPath =
+      producerPhysicalIncludePath(include);
+  if (!producerPath)
+    return false;
+  const std::optional<StringRef> copyBytes = FileBytesForProof(candidatePath);
+  const std::optional<StringRef> producerBytes =
+      FileBytesForProof(*producerPath);
+  return copyBytes && producerBytes && *copyBytes == *producerBytes;
+}
+
+bool IncludeReplayProofContext::CopyClosureReplaysProducerIncludes(
+    const std::filesystem::path &copyPath,
+    const RefoldModel::IncludeItem &include, unsigned depth) const {
+  if (depth >= MaxCopyClosureDepth)
+    return false;
+  const std::optional<std::filesystem::path> producerPath =
+      producerPhysicalIncludePath(include);
+  if (!producerPath)
+    return false;
+  const std::optional<std::filesystem::path> producerHeader =
+      CanonicalizeForLookupProof(producerPath->generic_string());
+  if (!producerHeader)
+    return false;
+
+  // Quoted lookup inside the copy starts beside the copy, exactly where it
+  // started beside the producer's header.
+  IncludeReplaySurface copySurface;
+  copySurface.sourceDirectoryPath = copyPath.parent_path();
+  copySurface.sourceDirectorySpelling =
+      copySurface.sourceDirectoryPath.generic_string();
+
+  for (const RefoldModel::IncludeItem &nested : model_.GetIncludes()) {
+    const bool entered = nested.parent && *nested.parent == include.id;
+    // Skipped edges carry no parent, so every record sited in this header
+    // counts, whichever instance of it the producer skipped it in.
+    const bool skipped =
+        !nested.parent &&
+        CanonicalizeForLookupProof(nested.sitePath) == producerHeader;
+    if (!entered && !skipped)
+      continue;
+    if (nested.subkind != "#include")
+      return false;
+
+    const std::optional<std::string> operand =
+        nested.angled ? angledIncludeReplayLookupOperand(nested)
+                      : quotedIncludeReplayLookupOperand(nested);
+    if (!operand)
+      return false;
+    const std::optional<OrdinaryIncludeReplayResult> replay =
+        ComputeOrdinaryIncludeReplayResult(
+            *operand,
+            nested.angled ? OrdinaryIncludeDelimiterKind::Angled
+                          : OrdinaryIncludeDelimiterKind::Quoted,
+            &copySurface, /*failureKind=*/nullptr);
+    if (!replay)
+      return false;
+    // The producer's own header resolves its includes from its own location,
+    // exactly as the producer did, so only a further copy needs the closure.
+    if (services_.samePhysicalIncludeFile(replay->physicalPath.generic_string(),
+                                          nested))
+      continue;
+    if (!IsByteIdenticalGuardedCopy(replay->physicalPath, nested))
+      return false;
+    if (entered && !CopyClosureReplaysProducerIncludes(replay->physicalPath,
+                                                       nested, depth + 1))
+      return false;
+  }
+  return true;
+}
+
+std::optional<StringRef> IncludeReplayProofContext::FileBytesForProof(
+    const std::filesystem::path &path) const {
+  const std::string key = AbsolutePathInPPCwd(path.generic_string())
+                              .lexically_normal()
+                              .generic_string();
+  auto [entry, inserted] = fileBytesCache_.try_emplace(key);
+  if (inserted) {
+    if (llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
+            llvm::MemoryBuffer::getFile(key, /*IsText=*/false,
+                                        /*RequiresNullTerminator=*/false))
+      entry->second = (*buffer)->getBuffer().str();
+  }
+  if (!entry->second)
+    return std::nullopt;
+  return StringRef(*entry->second);
 }
 
 IncludeReplayProofContext::CleanChildIncludeReplayPlan
