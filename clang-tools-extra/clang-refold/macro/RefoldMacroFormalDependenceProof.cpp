@@ -122,18 +122,6 @@ bool tokenEquivalent(StringRef lhs, StringRef rhs,
 
 } // namespace
 
-bool RefoldMacroFormalDependenceProof::RootOccurrencesObserve(
-    const RefoldModel::MacroInvocation &root, ArrayRef<uint64_t> tokens,
-    ArrayRef<uint32_t> formals) {
-  return llvm::any_of(tokens, [&](uint64_t tok) {
-    SmallVector<uint32_t, 4> observed;
-    appendFormalsObservedAtToken(root, tok, observed);
-    return llvm::any_of(observed, [&](uint32_t formal) {
-      return llvm::is_contained(formals, formal);
-    });
-  });
-}
-
 SmallVector<uint32_t, 4> RefoldMacroFormalDependenceProof::RewrittenFormals(
     StringRef invocationText, ArrayRef<std::pair<size_t, size_t>> argRanges,
     const DenseMap<uint32_t, std::string> &replByArgIdx,

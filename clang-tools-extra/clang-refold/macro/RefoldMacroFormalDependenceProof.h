@@ -92,12 +92,6 @@ public:
                                uint64_t begin, uint64_t end,
                                llvm::ArrayRef<uint32_t> formals) const;
 
-  /// Return whether one of \p root's own occurrence spans of a formal in
-  /// \p formals produced an A token in \p tokens.
-  static bool RootOccurrencesObserve(const RefoldModel::MacroInvocation &root,
-                                     llvm::ArrayRef<uint64_t> tokens,
-                                     llvm::ArrayRef<uint32_t> formals);
-
   /// Return, ascending, the formals whose replacement in \p replByArgIdx is not
   /// token-equivalent to the actual spelled at \p argRanges in
   /// \p invocationText.
