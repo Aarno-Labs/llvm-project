@@ -110,17 +110,29 @@ void repairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
 /// the gap after it belongs to the including file: a header's last token (the
 /// first shape, typically a `;`), or a header whose only token sits in the
 /// including file's gap (the second, typically an included initializer value).
-/// The mirror images -- a hunk ending strictly inside a cover, or beginning on
-/// a whole instance -- would need a header token whose deletion pays the
-/// header's own depth, and neither has been reproduced, so neither is repaired.
+/// The tie-break goes further and prefers the first shape when the edit writes
+/// tokens into the header just before its tail: keeping the tail pays the
+/// header's depth for every inserted token, while deleting it pays that depth
+/// at most once per tail token, so an edit inserting more tokens than the tail
+/// holds -- a parameter added before a header's closing `);` -- straddles
+/// rather than stays inside the header.  The mirror images -- a hunk ending
+/// strictly inside a cover, or beginning on a whole instance -- would need a
+/// header token whose deletion pays the header's own depth, and neither has
+/// been reproduced, so neither is repaired.
 ///
-/// The repair is retraction only: the edge walks inward to the cover boundary,
-/// handing back tokens that are the same lexeme on both sides, so the untouched
-/// region still reproduces them through the kept `#include` and the edit script
-/// produces exactly the same B.  The move is taken whole or not at all -- every
-/// token between the edge and the cover boundary must match -- so an edge that
-/// cannot leave the include this way is left unchanged for the ordinary
-/// realizer lattice.
+/// Every move leaves the straddled tokens unchanged, so they stay with the
+/// include that produced them and the edit script still produces exactly the
+/// same B.  At a whole trailing instance the edge retracts inward to the cover
+/// boundary, handing back tokens that are the same lexeme on both sides.  At a
+/// straddled cover, B must reproduce the tail -- the hunk's tokens up to the
+/// cover's end -- as one contiguous run.  When that run begins the B side the
+/// edge retracts across it; when B writes tokens first, the hunk splits around
+/// the run's first occurrence into an insertion of those tokens at the edge,
+/// inside the include, and a replacement of the including file's tokens by the
+/// rest.  That occurrence moves the fewest B tokens into the include, which is
+/// the owner-depth tie-break's own order.  A move is taken whole or not at all
+/// -- every tail token must be reproduced -- so an edge that cannot leave the
+/// include this way is left unchanged for the ordinary realizer lattice.
 ///
 /// The move may consume the hunk's whole B side, turning the replacement into
 /// a deletion.  That is the shape of an edit deleting a declaration that ends
@@ -135,8 +147,10 @@ void repairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
 /// slide itself cannot stand in for this move: it moves only a
 /// pure deletion, and only after a terminal request names it, while a
 /// replacement straddling an include is typically realized, with no request,
-/// by giving the include up.
-void retractHunkEdgesOutOfPartiallyOwnedIncludes(
+/// by giving the include up.  Giving the include up in turn fails when another
+/// hunk edits the same instance, because the closure would absorb that edit;
+/// a split leaves both as edits inside the instance.
+void repairHunkEdgesOutOfPartiallyOwnedIncludes(
     const RefoldModel &model, llvm::ArrayRef<PPTok> aToks,
     llvm::ArrayRef<PPTok> bToks, std::vector<diffutils::Hunk> &hunks);
 

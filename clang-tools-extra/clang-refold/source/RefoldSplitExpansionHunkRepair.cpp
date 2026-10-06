@@ -305,39 +305,87 @@ static bool deletionHasOneOwner(const RefoldModel &model, uint64_t aBegin,
   return true;
 }
 
-/// Return how far a hunk's left edge must move inward for it to leave every
-/// include instance it straddles, zero when it straddles none, or
-/// `std::nullopt` when the move is not admissible.
+/// Return the end of the outermost include instance whose A-token cover a
+/// hunk's left edge falls strictly inside while the hunk ends past it, or
+/// `std::nullopt` when the edge straddles none.
 ///
-/// Each crossed token pair must be the same lexeme on both sides, so the
-/// untouched region on the left reproduces it.  When the edge sits inside
-/// nested instances the walk continues until no straddled cover contains it;
-/// an inner cover never extends past the outer one, so the walk stops at the
-/// outermost straddled boundary whichever instance is examined first.  The walk
-/// may consume the whole B side only when the deletion it leaves has one owner;
-/// see `deletionHasOneOwner`.
-static std::optional<uint64_t> leftEdgeRetractDistanceOutOfSplitInclude(
-    const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
-    const diffutils::Hunk &hunk) {
-  uint64_t aStart = hunk.aStart;
-  uint64_t bStart = hunk.bStart;
+/// When the edge sits inside nested instances the walk continues until no
+/// straddled cover contains it; an inner cover never extends past the outer
+/// one, so the walk stops at the outermost straddled boundary whichever
+/// instance is examined first.  A left-edge straddle means the cover ends
+/// inside the hunk, so the result is a token of the hunk's A side.
+static std::optional<uint64_t> straddledIncludeTailEnd(const RefoldModel &model,
+                                                       uint64_t aStart,
+                                                       uint64_t aEnd) {
+  std::optional<uint64_t> tailEnd;
   while (const RefoldModel::IncludeItem *include =
-             includeStraddledAtLeftEdge(model, aStart, hunk.aEnd)) {
-    // A left-edge straddle means the cover ends inside the hunk, so the walk
-    // stays within the hunk's A side.
-    const uint64_t distance = include->cover.end - aStart;
-    if (distance > hunk.bEnd - bStart)
-      return std::nullopt;
-    for (uint64_t offset = 0; offset < distance; ++offset)
-      if (!aAndBTokensAreIdentical(aToks, bToks, aStart + offset,
-                                   bStart + offset))
-        return std::nullopt;
-    aStart += distance;
-    bStart += distance;
+             includeStraddledAtLeftEdge(model, aStart, aEnd)) {
+    aStart = include->cover.end;
+    tailEnd = aStart;
   }
-  if (bStart == hunk.bEnd && !deletionHasOneOwner(model, aStart, hunk.aEnd))
+  return tailEnd;
+}
+
+/// Where a hunk whose left edge straddles an include instance keeps the
+/// instance's trailing tokens.
+struct IncludeTailKeep {
+  /// The first A token past the outermost straddled cover.  The hunk's A tokens
+  /// `[aStart, tailEnd)` are the tail, and they are kept untouched.
+  uint64_t tailEnd = 0;
+  /// The first B token of the run that reproduces the tail.  It is the hunk's
+  /// `bStart` when the edge simply retracts; past it, the B tokens before it
+  /// are inserted at the edge, inside the include.
+  uint64_t tailCopyBegin = 0;
+};
+
+/// Return where a hunk whose left edge straddles an include instance keeps the
+/// instance's trailing tokens, or `std::nullopt` when it straddles none or the
+/// tail cannot be kept.
+///
+/// The tail is kept only where B reproduces it: as a contiguous run of the
+/// same lexemes inside the hunk's B side, so the untouched region reproduces
+/// that run through the kept tokens.  When the run begins the B side the edge
+/// simply retracts across it.  When B first writes tokens of its own -- an edit
+/// adding a parameter to a header declaration does, before the closing `);` --
+/// the hunk splits around the run: the B tokens before it are inserted at the
+/// edge, where both neighbouring A tokens belong to the include, and the B
+/// tokens after it replace the including file's tokens.  The three pieces
+/// concatenate to exactly the hunk's B side, so the edit script still produces
+/// the same B, and no piece holds tokens of both the include and the including
+/// file.
+///
+/// The first run is taken.  Every run keeps the same tail, and the first one
+/// inserts the fewest B tokens into the include and leaves the most to the
+/// including file's replacement, which is the order the owner-depth tie-break
+/// ranks alignments in; a later run would only move more of B into the deeper
+/// owner.
+///
+/// The run may end the B side only when the deletion it leaves has one owner;
+/// see `deletionHasOneOwner`.  No later run exists then, so that refusal is
+/// final.
+static std::optional<IncludeTailKeep>
+leftEdgeTailKeepOutOfSplitInclude(const RefoldModel &model,
+                                  ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
+                                  const diffutils::Hunk &hunk) {
+  const std::optional<uint64_t> tailEnd =
+      straddledIncludeTailEnd(model, hunk.aStart, hunk.aEnd);
+  if (!tailEnd)
     return std::nullopt;
-  return aStart - hunk.aStart;
+  const uint64_t tailLength = *tailEnd - hunk.aStart;
+  for (uint64_t copyBegin = hunk.bStart; copyBegin + tailLength <= hunk.bEnd;
+       ++copyBegin) {
+    bool reproduced = true;
+    for (uint64_t offset = 0; reproduced && offset < tailLength; ++offset)
+      reproduced = aAndBTokensAreIdentical(aToks, bToks, hunk.aStart + offset,
+                                           copyBegin + offset);
+    if (!reproduced)
+      continue;
+    if (copyBegin + tailLength == hunk.bEnd &&
+        !deletionHasOneOwner(model, *tailEnd, hunk.aEnd))
+      return std::nullopt;
+    return IncludeTailKeep{*tailEnd, copyBegin};
+  }
+  return std::nullopt;
 }
 
 /// Return the first A token of the outermost include instance whose cover ends
@@ -367,10 +415,10 @@ std::optional<uint64_t> wholeIncludeBeginAtRightEdge(const RefoldModel &model,
 /// include instance it holds whole at that edge, zero when it holds none, or
 /// `std::nullopt` when the move is not admissible.
 ///
-/// The admissibility conditions are those of
-/// `leftEdgeRetractDistanceOutOfSplitInclude`: every crossed token pair is the
-/// same lexeme on both sides, so the untouched region after the hunk reproduces
-/// it through the kept `#include`, and the walk consumes the whole B side only
+/// The admissibility conditions are those of a left-edge retraction by
+/// `leftEdgeTailKeepOutOfSplitInclude`: every crossed token pair is the same
+/// lexeme on both sides, so the untouched region after the hunk reproduces it
+/// through the kept `#include`, and the walk consumes the whole B side only
 /// when the deletion it leaves has one owner.  Adjacent instances at the edge
 /// are handed back one after another.
 static std::optional<uint64_t> rightEdgeRetractDistanceOutOfWholeInclude(
@@ -396,29 +444,46 @@ static std::optional<uint64_t> rightEdgeRetractDistanceOutOfWholeInclude(
 
 } // namespace
 
-void retractHunkEdgesOutOfPartiallyOwnedIncludes(
+void repairHunkEdgesOutOfPartiallyOwnedIncludes(
     const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
     std::vector<diffutils::Hunk> &hunks) {
   for (size_t index = 0; index < hunks.size(); ++index) {
-    diffutils::Hunk &hunk = hunks[index];
-
     // Only a replacement is repaired here, for the reasons given in
     // `repairHunkEdgesOutOfPartiallyOwnedMacroExpansions`.
-    if (hunk.aStart >= hunk.aEnd || hunk.bStart >= hunk.bEnd)
+    if (hunks[index].aStart >= hunks[index].aEnd ||
+        hunks[index].bStart >= hunks[index].bEnd)
       continue;
 
-    if (std::optional<uint64_t> distance =
-            leftEdgeRetractDistanceOutOfSplitInclude(model, aToks, bToks, hunk);
-        distance && *distance != 0) {
-      REFOLD_LOG_DEBUG(
-          "plan/hunk-edge",
-          "hunk #{0} A=[{1},{2}) starts inside an include instance it does not "
-          "end in; retracting the left edge by {3} identical token(s) to A={4} "
-          "so the include is left untouched",
-          index, hunk.aStart, hunk.aEnd, *distance, hunk.aStart + *distance);
-      hunk.aStart += *distance;
-      hunk.bStart += *distance;
+    if (std::optional<IncludeTailKeep> keep = leftEdgeTailKeepOutOfSplitInclude(
+            model, aToks, bToks, hunks[index])) {
+      const diffutils::Hunk original = hunks[index];
+      const uint64_t tailLength = keep->tailEnd - original.aStart;
+      if (keep->tailCopyBegin == original.bStart) {
+        REFOLD_LOG_DEBUG(
+            "plan/hunk-edge",
+            "hunk #{0} A=[{1},{2}) starts inside an include instance it does "
+            "not end in; retracting the left edge by {3} identical token(s) to "
+            "A={4} so the include is left untouched",
+            index, original.aStart, original.aEnd, tailLength, keep->tailEnd);
+      } else {
+        REFOLD_LOG_DEBUG(
+            "plan/hunk-edge",
+            "hunk #{0} A=[{1},{2}) starts inside an include instance it does "
+            "not end in; B reproduces the instance's {3} trailing token(s) at "
+            "B={4}, so inserting B=[{5},{4}) at A={1} inside the include and "
+            "resuming the hunk at A={6}",
+            index, original.aStart, original.aEnd, tailLength,
+            keep->tailCopyBegin, original.bStart, keep->tailEnd);
+        hunks.insert(hunks.begin() + index,
+                     diffutils::Hunk{original.aStart, original.aStart,
+                                     original.bStart, keep->tailCopyBegin});
+        ++index;
+      }
+      hunks[index].aStart = keep->tailEnd;
+      hunks[index].bStart = keep->tailCopyBegin + tailLength;
     }
+
+    diffutils::Hunk &hunk = hunks[index];
     if (std::optional<uint64_t> distance =
             rightEdgeRetractDistanceOutOfWholeInclude(model, aToks, bToks,
                                                       hunk);

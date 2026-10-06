@@ -638,7 +638,7 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   // Include edges first: an edge that leaves an include lands in the file that
   // includes it, where it may still split a macro expansion the macro repair
   // must then see.
-  retractHunkEdgesOutOfPartiallyOwnedIncludes(model_, aToks_, bToks_, hunks);
+  repairHunkEdgesOutOfPartiallyOwnedIncludes(model_, aToks_, bToks_, hunks);
   repairHunkEdgesOutOfPartiallyOwnedMacroExpansions(model_, aToks_, bToks_,
                                                     abTokMapA2B_, hunks);
 
