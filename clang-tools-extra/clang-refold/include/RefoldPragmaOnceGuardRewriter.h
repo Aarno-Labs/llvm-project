@@ -481,7 +481,35 @@ public:
       std::optional<uint64_t> ancestorArmId, bool noInlinedCopyFollows,
       std::vector<TextEdit> &edits) const;
 
+  /// Stage the wrapper that keeps one relocated skipped `#include` directive
+  /// from being looked up at its new location.
+  ///
+  /// \p include must be a skipped edge: one the producer recorded with no
+  /// parent, because Clang never entered the header. Outside `#pragma once`,
+  /// Clang skips a header only when the controlling macro of its whole-file
+  /// `#ifndef` guard is defined, and the producer records that macro. Testing
+  /// it around the verbatim directive therefore leaves the directive inert
+  /// wherever the original skip happened, so it is never looked up, and a
+  /// quoted operand that resolved beside the header's own directory cannot
+  /// fail or select another file from the directory it is moved to. An edge
+  /// without a recorded controlling macro is rejected.
+  PragmaOnceGuardEditResult StageSkippedIncludeControllingMacroGuardEdit(
+      const RefoldModel::IncludeItem &include, llvm::StringRef ownerPath,
+      std::optional<uint64_t> ownerIncludeId, llvm::StringRef ownerBytes,
+      std::vector<TextEdit> &edits) const;
+
 private:
+  /// Replace one include directive's producer-measured extent in
+  /// \p ownerBytes with the same bytes inside `#ifndef macroName` and
+  /// `#endif`, defining the macro first when \p defineMacro is set, and stage
+  /// the edit after proving its line drift repairable and its site
+  /// authorizable.
+  PragmaOnceGuardEditResult StageIncludeMacroTestWrapper(
+      const RefoldModel::IncludeItem &include, llvm::StringRef macroName,
+      bool defineMacro, llvm::StringRef ownerPath,
+      std::optional<uint64_t> ownerIncludeId, llvm::StringRef ownerBytes,
+      std::vector<TextEdit> &edits) const;
+
   /// Mutable build state for one physical header before the catalog is frozen.
   struct HeaderCandidate {
     PragmaOnceGuard guard;

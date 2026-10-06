@@ -1198,6 +1198,93 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
     }
   }
 
+  // 3c) Keep the remaining relocated skipped includes from being looked up.
+  //
+  // Materializing this header moves every directive in it out of the header's
+  // own directory, so a quoted operand that Clang resolved beside this header
+  // can fail, or select another file, at the directory it lands in.  The child
+  // loop proves or repairs that for entered children; a skipped edge is not a
+  // child, and nothing proved it.  A directive whose operand still selects the
+  // producer's header from the final output surface stays as written.  Any
+  // other is wrapped in a test of the controlling macro Clang found defined
+  // when it skipped the header, so it is never looked up.  A site whose
+  // skipped records do not all carry that one macro fails closed.  Sites the
+  // once-guard wrapper above reaches are left to it.
+  {
+    SmallVector<const RefoldModel::IncludeItem *, 8> skippedRecords;
+    for (const RefoldModel::IncludeItem &candidate : model_.GetIncludes()) {
+      if (candidate.parent || !paths_.PathsEqual(candidate.sitePath, headerPath))
+        continue;
+      if (llvm::is_contained(claimedChildSites, candidate.siteB))
+        continue;
+      skippedRecords.push_back(&candidate);
+    }
+    llvm::sort(skippedRecords, [](const RefoldModel::IncludeItem *lhs,
+                                  const RefoldModel::IncludeItem *rhs) {
+      return std::tie(lhs->siteB, lhs->id) < std::tie(rhs->siteB, rhs->id);
+    });
+
+    for (size_t first = 0; first < skippedRecords.size();) {
+      size_t last = first + 1;
+      while (last < skippedRecords.size() &&
+             skippedRecords[last]->siteB == skippedRecords[first]->siteB)
+        ++last;
+      const ArrayRef<const RefoldModel::IncludeItem *> site(
+          skippedRecords.data() + first, last - first);
+      first = last;
+
+      if (llvm::any_of(site, [&](const RefoldModel::IncludeItem *record) {
+            return pragmaOnceGuards_.FindGuardForInclude(*record) != nullptr;
+          }))
+        continue;
+      if (llvm::all_of(site, [&](const RefoldModel::IncludeItem *record) {
+            return includeReplayProof.SkippedIncludeReplaysFromFinalSurface(
+                *record);
+          }))
+        continue;
+
+      const RefoldModel::IncludeItem &representative = *site.front();
+      const bool macrosAgree =
+          llvm::all_of(site, [&](const RefoldModel::IncludeItem *record) {
+            return record->controllingMacro ==
+                   representative.controllingMacro;
+          });
+      PragmaOnceGuardEditResult guardResult =
+          macrosAgree
+              ? pragmaOnceGuards_.StageSkippedIncludeControllingMacroGuardEdit(
+                    representative, headerPath, includeId, bytes, edits)
+              : PragmaOnceGuardEditResult::Reject(
+                    PragmaOnceGuardRejection::UnaccountedIncludeDirective,
+                    formatv("skipped include records at [{0}] in '{1}' name "
+                            "different controlling macros",
+                            representative.siteB, headerPath)
+                        .str());
+      if (!guardResult.proven) {
+        // As for the once-guard wrapper: an empty expansion would drop this
+        // header's whole body rather than fail.
+        REFOLD_LOG_TRACE("include/lookup",
+                         "relocated skipped include inc#{0} in inc#{1} "
+                         "rejected: {2} ({3})",
+                         representative.id, includeId,
+                         toString(guardResult.rejection), guardResult.detail);
+        terminalSink_.RequestTerminalFallback(
+            MakeTerminalFallbackProofFailure(
+                TerminalFallbackObligationKind::IncludeGuardStateStabilizable,
+                TerminalFallbackFailureReason::
+                    IncludeGuardStateNotStabilizable,
+                TerminalFallbackFailureContext::ForOwnerId(representative.id)),
+            "include/lookup", guardResult.detail);
+        includeExpansion[includeId] = std::string();
+        return;
+      }
+      REFOLD_LOG_TRACE("include/lookup",
+                       "relocated skipped include inc#{0} in inc#{1} guarded "
+                       "by its controlling macro '{2}'",
+                       representative.id, includeId,
+                       *representative.controllingMacro);
+    }
+  }
+
   const size_t firstEmittedHeaderLine =
       computeFirstEmittedHeaderLine(bytes, edits);
 

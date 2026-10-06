@@ -2004,6 +2004,22 @@ IncludeReplayProofContext::PlanQuotedOrdinaryChildReplay(
   return plan;
 }
 
+bool IncludeReplayProofContext::SkippedIncludeReplaysFromFinalSurface(
+    const RefoldModel::IncludeItem &skipped) const {
+  if (skipped.subkind != "#include")
+    return false;
+  const std::optional<std::string> operand =
+      skipped.angled ? angledIncludeReplayLookupOperand(skipped)
+                     : quotedIncludeReplayLookupOperand(skipped);
+  if (!operand)
+    return false;
+  const std::optional<IncludeReplayCandidate> candidate =
+      skipped.angled ? ComputeAngledIncludeReplayCandidate(*operand)
+                     : ComputeQuotedIncludeReplayCandidate(*operand);
+  return candidate && services_.samePhysicalIncludeFile(
+                          candidate->physicalPath.generic_string(), skipped);
+}
+
 IncludeReplayProofContext::CleanChildIncludeReplayPlan
 IncludeReplayProofContext::PlanCleanChildIncludeReplayFromMaterializedParent(
     const RefoldModel::IncludeItem &child) const {

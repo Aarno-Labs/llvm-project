@@ -1503,6 +1503,37 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
             .str());
   }
 
+  return StageIncludeMacroTestWrapper(include, guard->macroName, eagerDefine,
+                                      ownerPath, ownerIncludeId, ownerBytes,
+                                      edits);
+}
+
+PragmaOnceGuardEditResult
+RefoldPragmaOnceGuardRewriter::StageSkippedIncludeControllingMacroGuardEdit(
+    const RefoldModel::IncludeItem &include, StringRef ownerPath,
+    std::optional<uint64_t> ownerIncludeId, StringRef ownerBytes,
+    std::vector<TextEdit> &edits) const {
+  if (include.parent || !include.controllingMacro ||
+      include.controllingMacro->empty()) {
+    return PragmaOnceGuardEditResult::Reject(
+        PragmaOnceGuardRejection::UnaccountedIncludeDirective,
+        formatv("relocated include inc#{0} in '{1}' is not a skipped edge "
+                "with a recorded controlling macro",
+                include.id, ownerPath)
+            .str());
+  }
+  return StageIncludeMacroTestWrapper(include, *include.controllingMacro,
+                                      /*defineMacro=*/false, ownerPath,
+                                      ownerIncludeId, ownerBytes, edits);
+}
+
+PragmaOnceGuardEditResult RefoldPragmaOnceGuardRewriter::
+    StageIncludeMacroTestWrapper(const RefoldModel::IncludeItem &include,
+                                 StringRef macroName, bool defineMacro,
+                                 StringRef ownerPath,
+                                 std::optional<uint64_t> ownerIncludeId,
+                                 StringRef ownerBytes,
+                                 std::vector<TextEdit> &edits) const {
   // The wrapper keeps the directive's own bytes, so it needs their exact
   // extent; the one-physical-line site range can end inside the directive.
   const std::optional<RefoldModel::ByteRange> site =
@@ -1537,13 +1568,13 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
   const bool originalEndsWithNewline = original.ends_with("\n");
 
   std::string text;
-  text.reserve(original.size() + 3 * guard->macroName.size() + 48);
+  text.reserve(original.size() + 3 * macroName.size() + 48);
   text += "#ifndef ";
-  text += guard->macroName;
+  text += macroName;
   text += "\n";
-  if (eagerDefine) {
+  if (defineMacro) {
     text += "#define ";
-    text += guard->macroName;
+    text += macroName;
     text += "\n";
   }
   text += original;
@@ -1565,7 +1596,7 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
     return PragmaOnceGuardEditResult::Reject(
         PragmaOnceGuardRejection::UnauthorizableIncludeSite,
         formatv("surviving include inc#{0} at [{1},{2}) in '{3}' is not an "
-                "authorizable include directive for a once guard",
+                "authorizable include directive for an include guard",
                 include.id, siteBegin, siteEnd, ownerPath)
             .str());
   }
@@ -1578,9 +1609,9 @@ RefoldPragmaOnceGuardRewriter::StageSurvivingIncludeGuardEdit(
 
   REFOLD_LOG_TRACE("pragma/once/guard",
                    "staged surviving-include guard '{0}' for inc#{1} at "
-                   "[{2},{3}) in '{4}' (eagerDefine={5})",
-                   guard->macroName, include.id, siteBegin, siteEnd, ownerPath,
-                   eagerDefine);
+                   "[{2},{3}) in '{4}' (define={5})",
+                   macroName, include.id, siteBegin, siteEnd, ownerPath,
+                   defineMacro);
   return PragmaOnceGuardEditResult::Proven();
 }
 

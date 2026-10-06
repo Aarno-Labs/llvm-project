@@ -137,6 +137,16 @@ public:
   CleanChildIncludeReplayPlan PlanCleanChildIncludeReplayFromMaterializedParent(
       const RefoldModel::IncludeItem &child) const;
 
+  /// Return whether the verbatim directive of a skipped include edge, moved
+  /// into a materialized parent, still selects the producer's physical header
+  /// from the final output surface.
+  ///
+  /// A skipped edge enters no header, so it carries no file-observer or
+  /// `#include_next` resume obligation: the lookup is the whole question.
+  /// `#include_next` and operands this replay does not model answer false.
+  bool SkippedIncludeReplaysFromFinalSurface(
+      const RefoldModel::IncludeItem &skipped) const;
+
   /// Return the stable diagnostic name for an ordinary include delimiter.
   static const char *
   OrdinaryIncludeDelimiterName(OrdinaryIncludeDelimiterKind kind) {
