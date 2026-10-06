@@ -20,6 +20,7 @@
 #include "llvm/ADT/ArrayRef.h"
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace clang {
@@ -82,6 +83,30 @@ void repairHunkEdgesOutOfPartiallyOwnedMacroExpansions(
     const RefoldModel &model, llvm::ArrayRef<PPTok> aToks,
     llvm::ArrayRef<PPTok> bToks, llvm::ArrayRef<int64_t> aToBMap,
     std::vector<diffutils::Hunk> &hunks);
+
+/// Return the end of the outermost include instance whose A-token cover
+/// \p aStart falls strictly inside while `[aStart, aEnd)` runs past that cover,
+/// or `std::nullopt` when the run straddles none.
+///
+/// The A tokens `[aStart, result)` are the instance's trailing tokens that a
+/// run beginning at \p aStart holds -- its *tail*.  When \p aStart sits inside
+/// nested instances the walk continues until no straddled cover contains it;
+/// an inner cover never extends past the outer one, so the walk stops at the
+/// outermost straddled boundary whichever instance is examined first.  Covers
+/// are half-open, so a token-less instance straddles nothing.
+std::optional<uint64_t> straddledIncludeTailEnd(const RefoldModel &model,
+                                                uint64_t aStart, uint64_t aEnd);
+
+/// Return the first B token of `[bBegin, bEnd)` that begins a contiguous run
+/// reproducing A tokens `[aBegin, aEnd)` as the same lexemes and ends within
+/// `bEnd`, or `std::nullopt` when there is none.
+///
+/// Lexemes compare by token kind and spelling, which implies the spelling
+/// equality an alignment anchor requires.
+std::optional<uint64_t> firstBRunReproducingA(llvm::ArrayRef<PPTok> aToks,
+                                              llvm::ArrayRef<PPTok> bToks,
+                                              uint64_t aBegin, uint64_t aEnd,
+                                              uint64_t bBegin, uint64_t bEnd);
 
 /// Move hunk edges off include instances the hunk shares with the including
 /// file, when the tokens at the edge allow it.

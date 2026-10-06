@@ -11,15 +11,17 @@
 //
 // Each pass is a fresh engine fixed at construction by a `RefoldPassConfig`.
 // Between passes the controller resolves alignment ambiguity on demand,
-// repairs an owner-straddling deletion run, and narrows the regions a terminal
-// request or the closing assembly check names.  It reads a finished pass only
-// through the engine's public post-pass queries.
+// repairs an owner-straddling deletion run or include tail, and narrows the
+// regions a terminal request or the closing assembly check names.  It reads a
+// finished pass only through the engine's public post-pass queries.
 //
 //===----------------------------------------------------------------------===//
 
 #include "core/RefoldEngine.h"
 
 #include "proof/RefoldOwnerStateProof.h"
+#include "source/DiffAlgorithms.h"
+#include "source/RefoldSplitExpansionHunkRepair.h"
 #include "source/RefoldTokenDiffPlanner.h"
 #include "support/RefoldLog.h"
 
@@ -279,18 +281,188 @@ buildOwnerAlignedDeletionSlide(const RefoldModel &model, ArrayRef<PPTok> aToks,
   return std::nullopt;
 }
 
+/// One include tail a failed hunk began on, re-anchored onto B's first copy of
+/// it.
+struct OwnerAlignedIncludeTailKeep {
+  std::vector<int64_t> map;
+  /// The tail `A=[tailBegin, tailEnd)` and the first B token of its copy.
+  uint64_t tailBegin = 0;
+  uint64_t tailEnd = 0;
+  uint64_t copyBegin = 0;
+  /// Exclusive ends of the re-aligned rectangle, which begins just past the
+  /// anchor before the tail: the first anchor kept after the copy, or the end
+  /// of the certification window.
+  uint64_t rectangleAEnd = 0;
+  uint64_t rectangleBEnd = 0;
+  /// Anchors inside the rectangle the repair released.
+  uint64_t releasedAnchors = 0;
+  /// The tail's A tokens, whose anchors the repair created.
+  SmallVector<uint64_t, 4> keptAnchors;
+};
+
+/// Return the length of a longest common subsequence of the A tokens
+/// `[aBegin, aEnd)` and the B tokens `[bBegin, bEnd)`, comparing spellings as
+/// the alignment's lexemes do.
+///
+/// `diffutils::diff` computes a shortest edit script, and the tokens such a
+/// script keeps equal form a longest common subsequence.
+static uint64_t longestCommonSubsequenceLength(ArrayRef<PPTok> aToks,
+                                               ArrayRef<PPTok> bToks,
+                                               uint64_t aBegin, uint64_t aEnd,
+                                               uint64_t bBegin, uint64_t bEnd) {
+  std::vector<StringRef> aSpellings;
+  aSpellings.reserve(aEnd - aBegin);
+  for (uint64_t aToken = aBegin; aToken < aEnd; ++aToken)
+    aSpellings.push_back(aToks[aToken].spelling);
+  std::vector<StringRef> bSpellings;
+  bSpellings.reserve(bEnd - bBegin);
+  for (uint64_t bToken = bBegin; bToken < bEnd; ++bToken)
+    bSpellings.push_back(bToks[bToken].spelling);
+
+  uint64_t length = 0;
+  for (const diffutils::Step &step : diffutils::diff(aSpellings, bSpellings))
+    if (step.op == diffutils::Op::Equal)
+      length += step.aHi - step.aLo;
+  return length;
+}
+
+/// Keep an include tail a failed hunk began on, when B reproduces it and
+/// keeping it costs the alignment no matched tokens.
+///
+/// A hunk that begins strictly inside an include instance's cover and runs
+/// past its end holds the instance's trailing tokens together with tokens of
+/// the including file, so no owner can realize it.  The owner-depth tie-break
+/// produces that shape when an edit writes tokens into the header just before
+/// the tail: keeping the tail charges the header's depth for every written
+/// token, so the core objective prefers to delete the tail and match B's copy
+/// of its tokens to the including file's.  The hunk-edge repair splits such a
+/// hunk around the copy when the copy lies in the hunk's own B side.  When the
+/// matches that took the copy are forced, the copy lies past them, in a later
+/// hunk, and only a different alignment can keep the tail.
+///
+/// The repair anchors the tail to B's first copy of it after the anchor before
+/// the tail, inside that anchor's certification window.  Every anchor after
+/// the tail whose B token precedes the end of the copy would cross it, so those
+/// are released, up to the first anchor past the copy, which bounds the
+/// re-aligned rectangle; with none, the window's end does.  The map is
+/// admitted only when some longest common subsequence of that rectangle keeps
+/// the tail at its copy -- the tail plus a longest common subsequence of what
+/// follows it on both sides is as long as the rectangle's own -- so the
+/// alignment stays maximum-length there and is merely not optimal under the
+/// owner-depth tie-break, which is the whole point.  What follows the tail is
+/// left unanchored, as an unforced region of the core-forced map is: nothing
+/// proves one of its matchings over another.  The B tokens before the copy then
+/// become an insertion inside the include, and the rest of the rectangle a
+/// replacement in the including file, so no hunk straddles the instance's end.
+///
+/// The first copy is taken: it inserts the fewest B tokens into the include,
+/// which is the order the owner-depth tie-break ranks alignments in.  When the
+/// copy ends the rectangle's B side, the including file's tokens become a
+/// deletion, admitted only when one owner covers it, as the hunk-edge
+/// retraction requires of the deletion it leaves.
+///
+/// Returns nullopt when no request names such a hunk or no repair is admitted;
+/// the caller then proceeds to the existing narrowing ladder unchanged.
+static std::optional<OwnerAlignedIncludeTailKeep>
+buildOwnerAlignedIncludeTailKeep(
+    const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
+    const diffutils::CertifiedLcsResult &coreAlignment,
+    ArrayRef<TerminalFallbackRequest> requests) {
+  ArrayRef<int64_t> baseMap = coreAlignment.selectedMap;
+  for (const TerminalFallbackRequest &request : requests) {
+    const TerminalFallbackFailureContext &context = request.failure.context;
+    if (!context.aTokenBegin || !context.aTokenEnd)
+      continue;
+    const uint64_t tailBegin = *context.aTokenBegin;
+    if (tailBegin == 0 || *context.aTokenEnd > baseMap.size())
+      continue;
+    const std::optional<uint64_t> tailEnd =
+        straddledIncludeTailEnd(model, tailBegin, *context.aTokenEnd);
+    if (!tailEnd)
+      continue;
+    const uint64_t tailLength = *tailEnd - tailBegin;
+
+    // The core alignment must have drawn the hunk's edge here: the tail is
+    // unmatched and the token before it anchored.
+    const int64_t leftAnchor = baseMap[tailBegin - 1];
+    if (leftAnchor < 0 || llvm::any_of(
+                              baseMap.slice(tailBegin, tailLength),
+                              [](int64_t mapped) { return mapped >= 0; }))
+      continue;
+    const auto *window =
+        llvm::find_if(coreAlignment.certificationWindows,
+                      [&](const diffutils::LcsCertificationWindow &candidate) {
+                        return candidate.ContainsAnchor(
+                            tailBegin - 1, static_cast<uint64_t>(leftAnchor));
+                      });
+    if (window == coreAlignment.certificationWindows.end() ||
+        *tailEnd > window->aEnd)
+      continue;
+
+    const uint64_t rectangleBBegin = static_cast<uint64_t>(leftAnchor) + 1;
+    const std::optional<uint64_t> copyBegin = firstBRunReproducingA(
+        aToks, bToks, tailBegin, *tailEnd, rectangleBBegin, window->bEnd);
+    if (!copyBegin)
+      continue;
+    const uint64_t copyEnd = *copyBegin + tailLength;
+
+    OwnerAlignedIncludeTailKeep keep;
+    keep.tailBegin = tailBegin;
+    keep.tailEnd = *tailEnd;
+    keep.copyBegin = *copyBegin;
+    keep.rectangleAEnd = window->aEnd;
+    keep.rectangleBEnd = window->bEnd;
+    for (uint64_t aToken = *tailEnd; aToken < window->aEnd; ++aToken) {
+      if (baseMap[aToken] < 0)
+        continue;
+      if (static_cast<uint64_t>(baseMap[aToken]) >= copyEnd) {
+        keep.rectangleAEnd = aToken;
+        keep.rectangleBEnd = static_cast<uint64_t>(baseMap[aToken]);
+        break;
+      }
+      ++keep.releasedAnchors;
+    }
+
+    if (copyEnd == keep.rectangleBEnd && *tailEnd < keep.rectangleAEnd &&
+        !runHasOneOwner(model, *tailEnd, keep.rectangleAEnd))
+      continue;
+    // Keeping the tail at its copy leaves the B tokens before the copy no A
+    // tokens to match, so the best alignment that keeps it adds only what the
+    // including file's tokens can match after the copy.
+    const uint64_t remainderLength = longestCommonSubsequenceLength(
+        aToks, bToks, *tailEnd, keep.rectangleAEnd, copyEnd,
+        keep.rectangleBEnd);
+    if (tailLength + remainderLength !=
+        longestCommonSubsequenceLength(aToks, bToks, tailBegin,
+                                       keep.rectangleAEnd, rectangleBBegin,
+                                       keep.rectangleBEnd))
+      continue;
+
+    keep.map.assign(baseMap.begin(), baseMap.end());
+    for (uint64_t aToken = *tailEnd; aToken < keep.rectangleAEnd; ++aToken)
+      keep.map[aToken] = -1;
+    for (uint64_t offset = 0; offset < tailLength; ++offset) {
+      keep.map[tailBegin + offset] = static_cast<int64_t>(*copyBegin + offset);
+      keep.keptAnchors.push_back(tailBegin + offset);
+    }
+    return keep;
+  }
+  return std::nullopt;
+}
+
 /// Build the alignment override that realizes one owner-alignment repair.
 ///
-/// Anchors the core theorem forced keep that proof. The anchors the slide
-/// created carry `OwnerAlignedDeletionSlide` instead, because they are not on
-/// every core-optimal path -- the map is match-count optimal but deliberately
-/// not depth-optimal.
-static AlignmentSelectionOverride buildOwnerAlignedSlideOverride(
-    const OwnerAlignedDeletionSlide &slide,
+/// Anchors the core theorem forced keep that proof. The anchors the repair
+/// created carry \p repairProof instead, because they are not on every
+/// core-optimal path -- the map is match-count optimal but deliberately not
+/// depth-optimal.
+static AlignmentSelectionOverride buildOwnerAlignmentRepairOverride(
+    ArrayRef<int64_t> map, ArrayRef<uint64_t> repairedAnchors,
+    diffutils::LcsAnchorProofKind repairProof,
     const diffutils::CertifiedLcsResult &coreAlignment) {
   AlignmentSelectionOverride selection;
-  selection.selectedMap = slide.map;
-  selection.selectedAnchorProofs.assign(slide.map.size(),
+  selection.selectedMap.assign(map.begin(), map.end());
+  selection.selectedAnchorProofs.assign(map.size(),
                                         diffutils::LcsAnchorProof{});
   selection.globalObjective = coreAlignment.globalObjective;
   selection.globalObjectiveIsExact = coreAlignment.globalObjectiveIsExact;
@@ -298,21 +470,17 @@ static AlignmentSelectionOverride buildOwnerAlignedSlideOverride(
   selection.certifiedBoundaries = coreAlignment.certifiedBoundaries;
   selection.certificationWindows = coreAlignment.certificationWindows;
 
-  for (size_t aToken = 0; aToken < slide.map.size(); ++aToken) {
-    if (slide.map[aToken] < 0)
+  for (size_t aToken = 0; aToken < map.size(); ++aToken) {
+    if (map[aToken] < 0)
       continue;
-    if (llvm::is_contained(slide.movedAnchors, aToken)) {
-      selection.selectedAnchorProofs[aToken] = diffutils::LcsAnchorProof{
-          diffutils::LcsAnchorProofKind::OwnerAlignedDeletionSlide, 0};
-      continue;
-    }
-    if (aToken < coreAlignment.selectedAnchorProofs.size()) {
+    if (!llvm::is_contained(repairedAnchors, aToken) &&
+        aToken < coreAlignment.selectedAnchorProofs.size()) {
       selection.selectedAnchorProofs[aToken] =
           coreAlignment.selectedAnchorProofs[aToken];
       continue;
     }
-    selection.selectedAnchorProofs[aToken] = diffutils::LcsAnchorProof{
-        diffutils::LcsAnchorProofKind::OwnerAlignedDeletionSlide, 0};
+    selection.selectedAnchorProofs[aToken] =
+        diffutils::LcsAnchorProof{repairProof, 0};
   }
   return selection;
 }
@@ -742,14 +910,15 @@ Expected<std::string> refoldTranslationUnit(
     // no verification still wants the smaller answer.
     if (engine.TerminalSink().HasRequest()) {
       // Before giving any region up, see whether a request failed only because
-      // its deletion run sits across an owner boundary rather than on one.
+      // its deletion run, or an include's trailing tokens, sit across an owner
+      // boundary rather than on one.
       //
       // This runs ahead of the narrowing ladder for the same reason resolution
-      // does: moving a run costs nothing -- the alignment keeps its exact
-      // matched-token count -- while expanding a region trades away a preserved
-      // include or macro permanently. It is attempted once per run, because a
-      // second attempt would put the identical question to the identical
-      // alignment.
+      // does: re-aligning costs nothing -- the alignment keeps a maximum
+      // matched-token count -- while expanding a region trades away a
+      // preserved include or macro permanently. It is attempted once per run,
+      // because a second attempt would put the identical question to the
+      // identical alignment.
       if (!attemptedOwnerAlignedSlide &&
           alignmentCertificationMemo.recorded) {
         attemptedOwnerAlignedSlide = true;
@@ -765,8 +934,30 @@ Expected<std::string> refoldTranslationUnit(
               "A=[{3},{4}), where one owner covers it, and re-planning",
               slide->originalABegin, slide->originalAEnd, slide->offset,
               slide->repairedABegin, slide->repairedAEnd);
-          ownerAlignedSlideOverride = buildOwnerAlignedSlideOverride(
-              *slide, alignmentCertificationMemo.facts.alignment);
+          ownerAlignedSlideOverride = buildOwnerAlignmentRepairOverride(
+              slide->map, slide->movedAnchors,
+              diffutils::LcsAnchorProofKind::OwnerAlignedDeletionSlide,
+              alignmentCertificationMemo.facts.alignment);
+          continue;
+        }
+
+        if (std::optional<OwnerAlignedIncludeTailKeep> keep =
+                buildOwnerAlignedIncludeTailKeep(
+                    *mOrErr, aToks, bToks,
+                    alignmentCertificationMemo.facts.alignment,
+                    engine.TerminalSink().Requests())) {
+          REFOLD_LOG_INFO(
+              "fallback",
+              "terminal fallback names a hunk that begins on an include "
+              "instance's trailing tokens A=[{0},{1}); anchoring them to B's "
+              "first copy at B={2}, releasing {3} anchor(s) before A={4}, and "
+              "re-planning",
+              keep->tailBegin, keep->tailEnd, keep->copyBegin,
+              keep->releasedAnchors, keep->rectangleAEnd);
+          ownerAlignedSlideOverride = buildOwnerAlignmentRepairOverride(
+              keep->map, keep->keptAnchors,
+              diffutils::LcsAnchorProofKind::OwnerAlignedIncludeTailKeep,
+              alignmentCertificationMemo.facts.alignment);
           continue;
         }
 

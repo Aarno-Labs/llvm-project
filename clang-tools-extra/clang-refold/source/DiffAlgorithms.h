@@ -212,6 +212,18 @@ enum class LcsAnchorProofKind : uint8_t {
   /// the terminal carrier, so it can only replace surrendering the whole
   /// translation unit.
   OwnerAlignedDeletionSlide,
+  /// The owner-alignment repair anchored this token, one of an include
+  /// instance's trailing tokens, to B's first copy of that tail, so the hunk
+  /// that began on the tail stops straddling the instance's end.
+  ///
+  /// The core objective left the tail unmatched because keeping it charges the
+  /// header's depth for every token an edit writes before it.  The repair
+  /// releases the forced anchors that cross the copy and is admitted only when
+  /// some longest common subsequence of the rectangle it re-aligns keeps the
+  /// tail at the copy, so the alignment stays maximum-length there.  Like the
+  /// deletion slide, it is requested only after an attempt asked for the
+  /// terminal carrier.
+  OwnerAlignedIncludeTailKeep,
 };
 
 inline StringRef toString(LcsAnchorProofKind kind) {
@@ -224,6 +236,8 @@ inline StringRef toString(LcsAnchorProofKind kind) {
     return "SemanticResolutionWitness";
   case LcsAnchorProofKind::OwnerAlignedDeletionSlide:
     return "OwnerAlignedDeletionSlide";
+  case LcsAnchorProofKind::OwnerAlignedIncludeTailKeep:
+    return "OwnerAlignedIncludeTailKeep";
   }
   llvm_unreachable("invalid LCS anchor proof kind");
 }
@@ -246,7 +260,8 @@ struct LcsAnchorProof {
       return semanticWitnessId == 0;
     if (IsSemanticWitnessBacked())
       return semanticWitnessId != 0;
-    if (kind == LcsAnchorProofKind::OwnerAlignedDeletionSlide)
+    if (kind == LcsAnchorProofKind::OwnerAlignedDeletionSlide ||
+        kind == LcsAnchorProofKind::OwnerAlignedIncludeTailKeep)
       return semanticWitnessId == 0;
     return false;
   }

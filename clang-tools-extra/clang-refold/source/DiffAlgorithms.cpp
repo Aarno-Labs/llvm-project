@@ -747,6 +747,7 @@ describeLcsCertificationRun(
   uint64_t coreForcedAnchors = 0;
   uint64_t semanticAnchors = 0;
   uint64_t ownerAlignedSlideAnchors = 0;
+  uint64_t ownerAlignedTailAnchors = 0;
   for (size_t aToken = 0; aToken < result.selectedMap.size(); ++aToken) {
     if (result.selectedMap[aToken] < 0)
       continue;
@@ -765,6 +766,9 @@ describeLcsCertificationRun(
     case LcsAnchorProofKind::OwnerAlignedDeletionSlide:
       ++ownerAlignedSlideAnchors;
       break;
+    case LcsAnchorProofKind::OwnerAlignedIncludeTailKeep:
+      ++ownerAlignedTailAnchors;
+      break;
     }
   }
   // Every retained anchor is reported under the proof that authorized it, so
@@ -774,9 +778,9 @@ describeLcsCertificationRun(
   lines.push_back(
       formatv("retained anchors total={0} CoreOptimalPathForced={1} "
               "SemanticResolutionWitness={2} "
-              "OwnerAlignedDeletionSlide={3}",
+              "OwnerAlignedDeletionSlide={3} OwnerAlignedIncludeTailKeep={4}",
               retainedAnchors, coreForcedAnchors, semanticAnchors,
-              ownerAlignedSlideAnchors)
+              ownerAlignedSlideAnchors, ownerAlignedTailAnchors)
           .str());
 
   for (size_t index = 0; index < result.certificationWindows.size(); ++index) {

@@ -305,27 +305,6 @@ static bool deletionHasOneOwner(const RefoldModel &model, uint64_t aBegin,
   return true;
 }
 
-/// Return the end of the outermost include instance whose A-token cover a
-/// hunk's left edge falls strictly inside while the hunk ends past it, or
-/// `std::nullopt` when the edge straddles none.
-///
-/// When the edge sits inside nested instances the walk continues until no
-/// straddled cover contains it; an inner cover never extends past the outer
-/// one, so the walk stops at the outermost straddled boundary whichever
-/// instance is examined first.  A left-edge straddle means the cover ends
-/// inside the hunk, so the result is a token of the hunk's A side.
-static std::optional<uint64_t> straddledIncludeTailEnd(const RefoldModel &model,
-                                                       uint64_t aStart,
-                                                       uint64_t aEnd) {
-  std::optional<uint64_t> tailEnd;
-  while (const RefoldModel::IncludeItem *include =
-             includeStraddledAtLeftEdge(model, aStart, aEnd)) {
-    aStart = include->cover.end;
-    tailEnd = aStart;
-  }
-  return tailEnd;
-}
-
 /// Where a hunk whose left edge straddles an include instance keeps the
 /// instance's trailing tokens.
 struct IncludeTailKeep {
@@ -371,21 +350,14 @@ leftEdgeTailKeepOutOfSplitInclude(const RefoldModel &model,
       straddledIncludeTailEnd(model, hunk.aStart, hunk.aEnd);
   if (!tailEnd)
     return std::nullopt;
-  const uint64_t tailLength = *tailEnd - hunk.aStart;
-  for (uint64_t copyBegin = hunk.bStart; copyBegin + tailLength <= hunk.bEnd;
-       ++copyBegin) {
-    bool reproduced = true;
-    for (uint64_t offset = 0; reproduced && offset < tailLength; ++offset)
-      reproduced = aAndBTokensAreIdentical(aToks, bToks, hunk.aStart + offset,
-                                           copyBegin + offset);
-    if (!reproduced)
-      continue;
-    if (copyBegin + tailLength == hunk.bEnd &&
-        !deletionHasOneOwner(model, *tailEnd, hunk.aEnd))
-      return std::nullopt;
-    return IncludeTailKeep{*tailEnd, copyBegin};
-  }
-  return std::nullopt;
+  const std::optional<uint64_t> copyBegin = firstBRunReproducingA(
+      aToks, bToks, hunk.aStart, *tailEnd, hunk.bStart, hunk.bEnd);
+  if (!copyBegin)
+    return std::nullopt;
+  if (*copyBegin + (*tailEnd - hunk.aStart) == hunk.bEnd &&
+      !deletionHasOneOwner(model, *tailEnd, hunk.aEnd))
+    return std::nullopt;
+  return IncludeTailKeep{*tailEnd, *copyBegin};
 }
 
 /// Return the first A token of the outermost include instance whose cover ends
@@ -443,6 +415,34 @@ static std::optional<uint64_t> rightEdgeRetractDistanceOutOfWholeInclude(
 }
 
 } // namespace
+
+std::optional<uint64_t> straddledIncludeTailEnd(const RefoldModel &model,
+                                                uint64_t aStart,
+                                                uint64_t aEnd) {
+  std::optional<uint64_t> tailEnd;
+  while (const RefoldModel::IncludeItem *include =
+             includeStraddledAtLeftEdge(model, aStart, aEnd)) {
+    aStart = include->cover.end;
+    tailEnd = aStart;
+  }
+  return tailEnd;
+}
+
+std::optional<uint64_t> firstBRunReproducingA(ArrayRef<PPTok> aToks,
+                                              ArrayRef<PPTok> bToks,
+                                              uint64_t aBegin, uint64_t aEnd,
+                                              uint64_t bBegin, uint64_t bEnd) {
+  const uint64_t length = aEnd - aBegin;
+  for (uint64_t copyBegin = bBegin; copyBegin + length <= bEnd; ++copyBegin) {
+    bool reproduced = true;
+    for (uint64_t offset = 0; reproduced && offset < length; ++offset)
+      reproduced = aAndBTokensAreIdentical(aToks, bToks, aBegin + offset,
+                                           copyBegin + offset);
+    if (reproduced)
+      return copyBegin;
+  }
+  return std::nullopt;
+}
 
 void repairHunkEdgesOutOfPartiallyOwnedIncludes(
     const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
