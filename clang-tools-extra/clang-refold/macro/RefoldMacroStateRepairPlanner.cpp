@@ -321,7 +321,8 @@ private:
   /// payload naming one expands alike in both and needs no repair.
   bool
   DirectiveInForcedInclude(const RefoldModel::MacroDirective &directive) const;
-  /// Returns the original include directive text for an include item.
+  /// Returns the include directive's exact source spelling, or an empty string
+  /// unless its owner's structure index bound the recorded physical extent.
   StringRef IncludeDirectiveText(const RefoldModel::IncludeItem &inc) const;
   /// Returns whether an include directive is preserved at a line-start boundary
   /// inside a replacement edit.
@@ -691,6 +692,9 @@ private:
       macroStatePreservationsByEdit_;
   /// Exact source spelling per macro-directive id, read on first use.
   mutable llvm::DenseMap<uint64_t, std::string> exactDirectiveSourceText_;
+  /// Exact source spelling per include id, read on first use.  The bytes are
+  /// owned by the structure-index provider, which outlives this context.
+  mutable llvm::DenseMap<uint64_t, StringRef> exactIncludeDirectiveText_;
   /// Memoized `MacroStateSourceTransitionFor()` results, keyed on directive id.
   /// Absent transitions are cached too: proving one absent costs the same
   /// interval recovery as proving one present.
@@ -818,14 +822,30 @@ bool MacroStateRepairContext::DirectiveInForcedInclude(
                      root->sitePath);
 }
 
+/// The producer synthesizes an include's `text` from its keyword and operand,
+/// so it is not the bytes any emitted source contains once the directive
+/// carries a trailing comment or non-canonical layout.  Searching an emitted
+/// payload for it then misses a directive the payload preserves, and the
+/// definitions reached through that directive are wrongly treated as consumed.
+/// As for macro-state directives, the spelling is taken only from the
+/// directive's owner index, which binds the recorded extent to its own lexical
+/// scan of the file.
 StringRef MacroStateRepairContext::IncludeDirectiveText(
     const RefoldModel::IncludeItem &inc) const {
-  if (!inc.text.empty())
-    return inc.text;
-  if (PathIdentity().PathsEqual(inc.sitePath, tuPath_) &&
-      inc.siteE <= tuBytes_.size())
-    return tuBytes_.slice(inc.siteB, inc.siteE);
-  return StringRef();
+  auto cached = exactIncludeDirectiveText_.find(inc.id);
+  if (cached != exactIncludeDirectiveText_.end())
+    return cached->second;
+
+  StringRef text;
+  const RefoldPreprocessingStructureIndexProvider::LookupResult owner =
+      deps_.structureIndexes->Get(inc.sitePath, inc.parent);
+  if (owner.index) {
+    if (std::optional<StringRef> bound =
+            owner.index->BoundIncludeDirectiveSourceText(inc,
+                                                         owner.sourceBytes))
+      text = *bound;
+  }
+  return exactIncludeDirectiveText_.try_emplace(inc.id, text).first->second;
 }
 
 bool MacroStateRepairContext::IncludeDirectiveAppearsAtLineStart(

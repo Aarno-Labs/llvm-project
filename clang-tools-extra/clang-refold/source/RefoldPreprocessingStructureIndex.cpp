@@ -1185,6 +1185,20 @@ static bool isExactProducerBoundMacroStateInterval(
          interval.IsProducerBound();
 }
 
+/// Return whether one protected interval is an `#include` or `#include_next`
+/// bound to its producer record by exact extent agreement.
+static bool isExactProducerBoundIncludeInterval(
+    const PreprocessingStructureInterval &interval) {
+  if (interval.kind != PreprocessingStructureKind::Include &&
+      interval.kind != PreprocessingStructureKind::IncludeNext) {
+    return false;
+  }
+  return interval.IsValid() &&
+         interval.modelKind ==
+             PreprocessingStructureModelKind::IncludeDirective &&
+         interval.IsProducerBound();
+}
+
 } // namespace
 
 bool RefoldPreprocessingStructureIndex::ProveOrdinaryDirectTUInternalGap(
@@ -1232,8 +1246,26 @@ bool RefoldPreprocessingStructureIndex::CollectExactMacroStateIntervals(
 std::optional<StringRef>
 RefoldPreprocessingStructureIndex::BoundMacroStateDirectiveSourceText(
     const RefoldModel::MacroDirective &directive, StringRef sourceBytes) const {
-  const uint64_t begin = directive.directiveLineB;
-  const uint64_t end = directive.directiveLineE;
+  return BoundProducerRecordSourceText(isExactProducerBoundMacroStateInterval,
+                                       directive.id, directive.directiveLineB,
+                                       directive.directiveLineE, sourceBytes);
+}
+
+std::optional<StringRef>
+RefoldPreprocessingStructureIndex::BoundIncludeDirectiveSourceText(
+    const RefoldModel::IncludeItem &include, StringRef sourceBytes) const {
+  if (!include.directiveLine)
+    return std::nullopt;
+  return BoundProducerRecordSourceText(isExactProducerBoundIncludeInterval,
+                                       include.id, include.directiveLine->begin,
+                                       include.directiveLine->end, sourceBytes);
+}
+
+std::optional<StringRef>
+RefoldPreprocessingStructureIndex::BoundProducerRecordSourceText(
+    bool (*isBound)(const PreprocessingStructureInterval &),
+    uint64_t modelItemId, uint64_t begin, uint64_t end,
+    StringRef sourceBytes) const {
   if (sourceBytes.size() != sourceSize_ || end <= begin || end > sourceSize_)
     return std::nullopt;
 
@@ -1243,8 +1275,7 @@ RefoldPreprocessingStructureIndex::BoundMacroStateDirectiveSourceText(
   const PreprocessingStructureInterval *bound = nullptr;
   for (const PreprocessingStructureInterval *interval :
        FindOverlapping(begin, end)) {
-    if (!isExactProducerBoundMacroStateInterval(*interval) ||
-        interval->modelItemId != directive.id)
+    if (!isBound(*interval) || interval->modelItemId != modelItemId)
       continue;
     if (bound)
       return std::nullopt;

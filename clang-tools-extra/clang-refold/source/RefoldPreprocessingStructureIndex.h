@@ -345,7 +345,29 @@ public:
       const RefoldModel::MacroDirective &directive,
       llvm::StringRef sourceBytes) const;
 
+  /// Return the source spelling of a recorded `#include` or `#include_next`,
+  /// from its `#` through the end of its logical line, when this index bound
+  /// the directive's producer-recorded extent.
+  ///
+  /// The producer's `text` for an include is synthesized from its keyword and
+  /// operand, so it equals these bytes only for a canonically spelled
+  /// directive.  Code that looks for the directive in emitted text, where
+  /// trailing comments and layout are preserved, must search for these bytes
+  /// instead.  The binding and failure conditions are those of
+  /// `BoundMacroStateDirectiveSourceText`.
+  std::optional<llvm::StringRef>
+  BoundIncludeDirectiveSourceText(const RefoldModel::IncludeItem &include,
+                                  llvm::StringRef sourceBytes) const;
+
 private:
+  /// Shared body of the bound-spelling queries: the bytes of the unique
+  /// interval accepted by \p isBound whose model record is \p modelItemId,
+  /// provided its producer text range is exactly `[begin,end)`.
+  std::optional<llvm::StringRef> BoundProducerRecordSourceText(
+      bool (*isBound)(const PreprocessingStructureInterval &),
+      uint64_t modelItemId, uint64_t begin, uint64_t end,
+      llvm::StringRef sourceBytes) const;
+
   /// Return the first interval index that can still reach byte \p begin.
   ///
   /// Shared binary-search prologue of the overlap queries: every earlier
