@@ -21,6 +21,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
@@ -222,6 +223,14 @@ public:
       uint64_t anchor) const;
 
 private:
+  /// Return the sorted begin offsets of every token-map entry whose file is
+  /// \p ownerFile under `RefoldPathIdentity::PathsEqual()`.
+  ///
+  /// The answer depends only on the immutable model, so it is built once per
+  /// owner spelling and kept for this service's lifetime.
+  llvm::ArrayRef<uint64_t> MappedTokenBeginsInFile(
+      llvm::StringRef ownerFile) const;
+
   const RefoldModel &model_;
   const RefoldPathIdentity &paths_;
   const RefoldMacroTopology &macroTopology_;
@@ -231,6 +240,8 @@ private:
   const std::vector<int64_t> &abTokMapA2B_;
   const std::vector<int64_t> &abTokMapB2A_;
   const RefoldPreprocessingStructureIndexProvider *structureIndexes_ = nullptr;
+  /// Memo for `MappedTokenBeginsInFile()`, keyed by the queried spelling.
+  mutable llvm::StringMap<std::vector<uint64_t>> mappedTokenBeginsByFile_;
 };
 
 } // namespace refold

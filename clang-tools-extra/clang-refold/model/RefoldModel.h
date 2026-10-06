@@ -1478,9 +1478,21 @@ private:
   // caches (computed on demand)
   mutable DenseMap<uint64_t, uint32_t> includeDepthCache_;
   mutable DenseMap<uint64_t, uint32_t> condGroupDepthCache_;
+  /// `InnermostIncludeAtPP()` answers for every A token below
+  /// `tokensCountA_`, built on first use.
+  mutable std::vector<std::optional<uint64_t>> innermostIncludeByPPCache_;
+  mutable bool innermostIncludeByPPCacheBuilt_ = false;
 
   // Internal helper to finalize indices and perform deterministic ordering.
   void BuildIndicesAndSort();
+
+  /// Return the innermost include whose cover holds \p ppIndex by scanning
+  /// every include, the definition `InnermostIncludeAtPP()` caches.
+  std::optional<uint64_t> ScanInnermostIncludeAtPP(uint64_t ppIndex) const;
+
+  /// Fill `innermostIncludeByPPCache_` with exactly the answers
+  /// `ScanInnermostIncludeAtPP()` gives.
+  void BuildInnermostIncludeByPPCache() const;
 
   /// Populate derived include_next cursor fields after include ids and lookup
   /// metadata have been indexed.  This is a model-finalization step, not JSON

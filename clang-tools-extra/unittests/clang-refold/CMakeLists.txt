@@ -19,6 +19,7 @@ add_extra_unittest(ClangRefoldTests
   RefoldWitnessJoinTests.cpp
   RefoldProofOrderTests.cpp
   RefoldTerminalObligationTests.cpp
+  RefoldLcsBudgetPartitionTests.cpp
   RefoldLcsOracleObjectiveTests.cpp
   RefoldHirschbergProgressTests.cpp
   RefoldLineControlLookbackTests.cpp

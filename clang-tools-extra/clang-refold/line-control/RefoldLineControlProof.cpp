@@ -181,6 +181,29 @@ RefoldLineControlProof::IncludeSubtreeLineStateObserverDemand(
   return demand;
 }
 
+/// Return whether some offset of the sorted \p offsets lies in the half-open
+/// range [\p begin, \p end).
+static bool sortedOffsetsMeetRange(ArrayRef<uint64_t> offsets, uint64_t begin,
+                                   uint64_t end) {
+  const auto first = llvm::lower_bound(offsets, begin);
+  return first != offsets.end() && *first < end;
+}
+
+ArrayRef<uint64_t>
+RefoldLineControlProof::MappedTokenBeginsInFile(StringRef ownerFile) const {
+  auto [entry, inserted] = mappedTokenBeginsByFile_.try_emplace(ownerFile);
+  std::vector<uint64_t> &begins = entry->second;
+  if (inserted) {
+    for (const auto &it : model_.GetTokmapByPP()) {
+      const RefoldModel::TokMapEntry &tok = it.second;
+      if (paths_.PathsEqual(tok.file, ownerFile))
+        begins.push_back(tok.b);
+    }
+    llvm::sort(begins);
+  }
+  return begins;
+}
+
 bool RefoldLineControlProof::IncludeEntryLineDirectiveDischargesLayoutBarrier(
     const RefoldModel::IncludeItem &child,
     StringRef parentOwnerFileForDemand) const {
@@ -199,36 +222,23 @@ bool RefoldLineControlProof::IncludeEntryLineDirectiveDischargesLayoutBarrier(
   if (includeSite == 0)
     return false;
 
-  const auto &tokmapByPP = model_.GetTokmapByPP();
-
-  auto ownerLineHasMappedToken = [&](uint64_t lineBegin,
-                                     uint64_t lineEnd) -> bool {
-    for (const auto &it : tokmapByPP) {
-      const RefoldModel::TokMapEntry &tok = it.second;
-      if (!paths_.PathsEqual(tok.file, parentOwnerFileForDemand))
-        continue;
-      if (tok.b >= lineBegin && tok.b < lineEnd)
-        return true;
-    }
-    return false;
-  };
-
-  auto lineHasActiveIncludeSite = [&](uint64_t lineBegin,
-                                      uint64_t lineEnd) -> bool {
-    for (const RefoldModel::IncludeItem &inc : model_.GetIncludes()) {
-      if (!paths_.PathsEqual(inc.sitePath, parentOwnerFileForDemand))
-        continue;
-      if (inc.siteB >= lineBegin && inc.siteB < lineEnd)
-        return true;
-    }
-    return false;
-  };
+  // Every line below asks whether some mapped token or include site of the
+  // parent begins inside it. Collect both offset sets once, sorted, so each
+  // line asks a binary search rather than rescanning the whole token map.
+  const ArrayRef<uint64_t> mappedTokenBegins =
+      MappedTokenBeginsInFile(parentOwnerFileForDemand);
+  std::vector<uint64_t> includeSiteBegins;
+  for (const RefoldModel::IncludeItem &inc : model_.GetIncludes()) {
+    if (paths_.PathsEqual(inc.sitePath, parentOwnerFileForDemand))
+      includeSiteBegins.push_back(inc.siteB);
+  }
+  llvm::sort(includeSiteBegins);
 
   auto lineCanEmitPreprocessedOutput = [&](StringRef line, uint64_t lineBegin,
                                            uint64_t lineEnd) -> bool {
-    if (ownerLineHasMappedToken(lineBegin, lineEnd))
+    if (sortedOffsetsMeetRange(mappedTokenBegins, lineBegin, lineEnd))
       return true;
-    if (lineHasActiveIncludeSite(lineBegin, lineEnd))
+    if (sortedOffsetsMeetRange(includeSiteBegins, lineBegin, lineEnd))
       return true;
 
     // Pragmas are not part of the ordinary token map, but preserved active

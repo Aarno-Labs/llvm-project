@@ -2879,6 +2879,8 @@ void RefoldModel::BuildIndicesAndSort() {
   // Invalidate caches/indices derived from the raw parsed vectors.
   includeDepthCache_.clear();
   condGroupDepthCache_.clear();
+  innermostIncludeByPPCache_.clear();
+  innermostIncludeByPPCacheBuilt_ = false;
 
   condGroupById_.clear();
   armById_.clear();
@@ -3177,8 +3179,8 @@ uint32_t RefoldModel::GetIncludeDepth(std::optional<uint64_t> includeId) const {
 }
 
 std::optional<uint64_t>
-RefoldModel::InnermostIncludeAtPP(uint64_t ppIndex) const {
-  std::optional<int> bestId;
+RefoldModel::ScanInnermostIncludeAtPP(uint64_t ppIndex) const {
+  std::optional<uint64_t> bestId;
   uint32_t bestDepth = 0;
 
   // Multiple include covers can contain the same PP token when includes are
@@ -3195,6 +3197,38 @@ RefoldModel::InnermostIncludeAtPP(uint64_t ppIndex) const {
   }
 
   return bestId;
+}
+
+void RefoldModel::BuildInnermostIncludeByPPCache() const {
+  // Visit the covers in the scan's own order and replace an answer only on
+  // strictly greater depth, so every token keeps the first deepest cover the
+  // scan would have kept, and a depth-0 cover never answers.
+  innermostIncludeByPPCache_.assign(tokensCountA_, std::nullopt);
+  std::vector<uint32_t> bestDepth(tokensCountA_, 0);
+  for (const auto &inc : includes_) {
+    const uint64_t coverEnd = std::min<uint64_t>(inc.cover.end, tokensCountA_);
+    if (inc.cover.begin >= coverEnd)
+      continue;
+    const uint32_t depth = GetIncludeDepth(inc.id);
+    for (uint64_t pp = inc.cover.begin; pp < coverEnd; ++pp) {
+      if (depth > bestDepth[pp]) {
+        bestDepth[pp] = depth;
+        innermostIncludeByPPCache_[pp] = inc.id;
+      }
+    }
+  }
+  innermostIncludeByPPCacheBuilt_ = true;
+}
+
+std::optional<uint64_t>
+RefoldModel::InnermostIncludeAtPP(uint64_t ppIndex) const {
+  // Every caller walks A tokens, and the scan visits every include per token.
+  // Tokens past the cached A-token range keep the scan.
+  if (ppIndex >= tokensCountA_)
+    return ScanInnermostIncludeAtPP(ppIndex);
+  if (!innermostIncludeByPPCacheBuilt_)
+    BuildInnermostIncludeByPPCache();
+  return innermostIncludeByPPCache_[ppIndex];
 }
 
 std::optional<uint64_t>
@@ -3264,11 +3298,12 @@ uint32_t RefoldModel::GetCondGroupDepth(uint64_t groupId) const {
 
 std::optional<RefoldModel::ArmRef>
 RefoldModel::FindArmRefAtPP(uint64_t ppIndex) const {
-  auto ent = MapPP(ppIndex);
-  if (!ent)
+  // Read the entry in place: `MapPP()` returns a copy, path spelling included.
+  auto ent = tokmapByPP_.find(ppIndex);
+  if (ent == tokmapByPP_.end())
     return std::nullopt;
 
-  const TokMapEntry &t = *ent;
+  const TokMapEntry &t = ent->second;
   const std::optional<uint64_t> ownerIncId = InnermostIncludeAtPP(ppIndex);
 
   if (auto direct = FindArmRefForByte(t.file, ownerIncId, t.b))

@@ -2117,10 +2117,18 @@ struct GapView {
   uint32_t at(size_t i) const { return base[off + i]; }
 };
 
+/// Receives each completed linear-space row together with the A boundary,
+/// local to the swept span, that the row belongs to.
+using WeightedRowObserver =
+    llvm::function_ref<void(size_t aBoundary, ArrayRef<Score> row)>;
+
 /// Compute one weighted Hirschberg LCS DP row for the given span views.
-static std::vector<Score> computeRowWeighted(const SpanView &aV,
-                                             const SpanView &bV,
-                                             const GapView &gapV) {
+///
+/// When \p observeRow is set it is shown the row of every A boundary the sweep
+/// completes, from boundary 0 up to the returned final row.
+static std::vector<Score>
+computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
+                   WeightedRowObserver observeRow = nullptr) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (gapV.size() != n + 1)
@@ -2149,6 +2157,8 @@ static std::vector<Score> computeRowWeighted(const SpanView &aV,
     dp[j] = dp[j - 1];
     dp[j].cost += firstRowGapCost;
   }
+  if (observeRow)
+    observeRow(0, dp);
 
   for (size_t i = 1; i <= n; ++i) {
     const uint64_t gapCost = static_cast<uint64_t>(gapV.at(i));
@@ -2194,6 +2204,8 @@ static std::vector<Score> computeRowWeighted(const SpanView &aV,
     }
 
     dp.swap(ndp);
+    if (observeRow)
+      observeRow(i, dp);
   }
 
   return dp;
@@ -2206,9 +2218,14 @@ static std::vector<Score> computeRowWeighted(const SpanView &aV,
 /// objective is asymmetric at an A token, because deleting `A[i]` pays gap
 /// `i+1`, while inserting B at state `(i,j)` pays gap `i`. Reversing A, B, and
 /// the gap vector cannot preserve both transition charges simultaneously.
-static std::vector<Score> computeSuffixRowWeighted(const SpanView &aV,
-                                                   const SpanView &bV,
-                                                   const GapView &gapV) {
+///
+/// When \p observeRow is set it is shown the suffix row of every A boundary the
+/// sweep completes, from boundary `aV.size()` down to the returned boundary-0
+/// row.
+static std::vector<Score>
+computeSuffixRowWeighted(const SpanView &aV, const SpanView &bV,
+                         const GapView &gapV,
+                         WeightedRowObserver observeRow = nullptr) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (gapV.size() != n + 1)
@@ -2235,6 +2252,8 @@ static std::vector<Score> computeSuffixRowWeighted(const SpanView &aV,
     next[j] = next[j + 1];
     next[j].cost += terminalGapCost;
   }
+  if (observeRow)
+    observeRow(n, next);
 
   for (size_t ii = n; ii > 0; --ii) {
     const size_t i = ii - 1;
@@ -2269,25 +2288,10 @@ static std::vector<Score> computeSuffixRowWeighted(const SpanView &aV,
       insertPrev = best;
     }
     next.swap(current);
+    if (observeRow)
+      observeRow(i, next);
   }
   return next;
-}
-
-/// Compute `S[aBoundary][j]` for an ordinary contiguous A/B window.
-static std::vector<Score> computeSuffixRowWeighted(
-    ArrayRef<StringRef> aWindow, ArrayRef<StringRef> bWindow,
-    ArrayRef<uint32_t> ownerDepthGap, size_t aBoundary) {
-  if (!hasBoundaryVectorSize(aWindow.size(), ownerDepthGap.size()) ||
-      aBoundary > aWindow.size())
-    REFOLD_LOG_FATAL("lcs/map",
-                     "internal: invalid weighted-LCS suffix row bounds");
-
-  const SpanView aSuffix{aWindow, aBoundary, aWindow.size() - aBoundary,
-                         false};
-  const SpanView bFull{bWindow, 0, bWindow.size(), false};
-  const GapView gapSuffix{ownerDepthGap, aBoundary,
-                          aWindow.size() - aBoundary + 1};
-  return computeSuffixRowWeighted(aSuffix, bFull, gapSuffix);
 }
 
 /// Solve a small weighted-LCS box with the full DP table and append anchors in
@@ -2527,43 +2531,18 @@ static LcsObjective objectiveFromScore(const Score &score) {
   return LcsObjective{score.len, score.cost};
 }
 
-/// Project one local A boundary through the complete weighted objective.
-///
-/// Every monotone source-to-sink path crosses the requested A row at some B
-/// frontier. The exact enclosing objective is therefore the best additive
-/// combination of the left-prefix and right-suffix rows. Retaining every
-/// frontier that attains that objective proves uniqueness without selecting a
-/// Hirschberg split.
-static bool projectBoundaryWithOwnerDepth(
-    ArrayRef<StringRef> aWindow, ArrayRef<StringRef> bWindow,
-    ArrayRef<uint32_t> ownerDepthGap, uint64_t absoluteABegin,
-    uint64_t absoluteBBegin, size_t localABoundary,
-    LcsBoundaryFrontierProjection &result) {
-  result = LcsBoundaryFrontierProjection{};
-  if (!hasBoundaryVectorSize(aWindow.size(), ownerDepthGap.size()) ||
-      localABoundary > aWindow.size() ||
-      absoluteABegin > std::numeric_limits<uint64_t>::max() -
-                           localABoundary ||
-      absoluteBBegin > std::numeric_limits<uint64_t>::max() -
-                           bWindow.size())
-    return false;
-
-  result.aBoundary = absoluteABegin + localABoundary;
-  const size_t bWidth = bWindow.size();
-  const SpanView aLeft{aWindow, 0, localABoundary, false};
-  const SpanView bForward{bWindow, 0, bWidth, false};
-  const GapView gapLeft{ownerDepthGap, 0, localABoundary + 1};
-  const std::vector<Score> forward =
-      computeRowWeighted(aLeft, bForward, gapLeft);
-  const std::vector<Score> suffix = computeSuffixRowWeighted(
-      aWindow, bWindow, ownerDepthGap, localABoundary);
-
-  assert(forward.size() == bWidth + 1 && suffix.size() == bWidth + 1 &&
+/// Record every B frontier at which one A boundary's prefix and suffix rows
+/// attain their best combined objective.
+static bool collectOptimalBFrontiers(ArrayRef<Score> forward,
+                                     ArrayRef<Score> suffix,
+                                     uint64_t absoluteBBegin,
+                                     LcsBoundaryFrontierProjection &result) {
+  assert(forward.size() == suffix.size() &&
          "linear-space frontier rows must cover every B boundary");
 
   bool haveObjective = false;
   LcsObjective best;
-  for (size_t localB = 0; localB <= bWidth; ++localB) {
+  for (size_t localB = 0; localB < forward.size(); ++localB) {
     LcsObjective combined;
     if (!addObjectivesChecked(objectiveFromScore(forward[localB]),
                               objectiveFromScore(suffix[localB]),
@@ -2588,6 +2567,92 @@ static bool projectBoundaryWithOwnerDepth(
   result.windowObjective = best;
   result.objectiveIsExact = true;
   return true;
+}
+
+/// Project local A boundaries through the complete weighted objective.
+///
+/// Every monotone source-to-sink path crosses each requested A row at some B
+/// frontier. The exact enclosing objective is therefore the best additive
+/// combination of that row's left-prefix and right-suffix rows. Retaining every
+/// frontier that attains that objective proves uniqueness without selecting a
+/// Hirschberg split.
+///
+/// A prefix row depends only on the A rows above its boundary and a suffix row
+/// only on the rows below it. One forward sweep to the last requested boundary
+/// and one backward sweep to the first therefore pass through exactly the two
+/// rows a lone projection of each boundary computes, so every result equals
+/// that lone projection. \p localABoundaries must be strictly increasing, and
+/// \p results is parallel to it.
+static bool projectBoundariesWithOwnerDepth(
+    ArrayRef<StringRef> aWindow, ArrayRef<StringRef> bWindow,
+    ArrayRef<uint32_t> ownerDepthGap, uint64_t absoluteABegin,
+    uint64_t absoluteBBegin, ArrayRef<size_t> localABoundaries,
+    std::vector<LcsBoundaryFrontierProjection> &results) {
+  results.assign(localABoundaries.size(), LcsBoundaryFrontierProjection{});
+  if (!hasBoundaryVectorSize(aWindow.size(), ownerDepthGap.size()) ||
+      absoluteBBegin > std::numeric_limits<uint64_t>::max() - bWindow.size())
+    return false;
+  for (size_t index = 0; index < localABoundaries.size(); ++index) {
+    const size_t localABoundary = localABoundaries[index];
+    if (localABoundary > aWindow.size() ||
+        (index > 0 && localABoundary <= localABoundaries[index - 1]) ||
+        absoluteABegin > std::numeric_limits<uint64_t>::max() - localABoundary)
+      return false;
+    results[index].aBoundary = absoluteABegin + localABoundary;
+  }
+  if (localABoundaries.empty())
+    return true;
+
+  const size_t firstBoundary = localABoundaries.front();
+  const size_t lastBoundary = localABoundaries.back();
+  const SpanView bForward{bWindow, 0, bWindow.size(), false};
+
+  std::vector<std::vector<Score>> forwardRows(localABoundaries.size());
+  size_t nextForward = 0;
+  auto keepForwardRow = [&](size_t aBoundary, ArrayRef<Score> row) {
+    if (nextForward < localABoundaries.size() &&
+        localABoundaries[nextForward] == aBoundary)
+      forwardRows[nextForward++].assign(row.begin(), row.end());
+  };
+  (void)computeRowWeighted(SpanView{aWindow, 0, lastBoundary, false}, bForward,
+                           GapView{ownerDepthGap, 0, lastBoundary + 1},
+                           keepForwardRow);
+
+  // The backward sweep meets the boundaries in decreasing order, and each
+  // forward row is released as soon as its boundary is combined.
+  bool collected = nextForward == localABoundaries.size();
+  size_t nextSuffix = localABoundaries.size();
+  auto combineSuffixRow = [&](size_t suffixBoundary, ArrayRef<Score> row) {
+    if (!collected || nextSuffix == 0 ||
+        localABoundaries[nextSuffix - 1] != firstBoundary + suffixBoundary)
+      return;
+    --nextSuffix;
+    collected = collectOptimalBFrontiers(forwardRows[nextSuffix], row,
+                                         absoluteBBegin, results[nextSuffix]);
+    forwardRows[nextSuffix] = {};
+  };
+  (void)computeSuffixRowWeighted(
+      SpanView{aWindow, firstBoundary, aWindow.size() - firstBoundary, false},
+      bForward,
+      GapView{ownerDepthGap, firstBoundary,
+              aWindow.size() - firstBoundary + 1},
+      combineSuffixRow);
+  return collected && nextSuffix == 0;
+}
+
+/// Project one local A boundary through the complete weighted objective.
+static bool projectBoundaryWithOwnerDepth(
+    ArrayRef<StringRef> aWindow, ArrayRef<StringRef> bWindow,
+    ArrayRef<uint32_t> ownerDepthGap, uint64_t absoluteABegin,
+    uint64_t absoluteBBegin, size_t localABoundary,
+    LcsBoundaryFrontierProjection &result) {
+  std::vector<LcsBoundaryFrontierProjection> results;
+  const bool projected = projectBoundariesWithOwnerDepth(
+      aWindow, bWindow, ownerDepthGap, absoluteABegin, absoluteBBegin,
+      {localABoundary}, results);
+  result = results.empty() ? LcsBoundaryFrontierProjection{}
+                           : std::move(results.front());
+  return projected;
 }
 
 /// Compute one unweighted Hirschberg LCS length row.
@@ -3500,16 +3565,104 @@ static std::optional<uint64_t> nearestInteriorCandidate(
   return lowerDistance <= upperDistance ? lowerBoundary : upperBoundary;
 }
 
+/// Return the further A rows one oversized rectangle projects once its midpoint
+/// and producer nomination have both failed, in the order they are tried.
+///
+/// The rows are the midpoint offset by 1, 2, 4, ..., lower row first at each
+/// offset, confined to the open middle half the producer fallback uses and
+/// skipping rows already projected. The schedule is arithmetic: no row is
+/// ranked by what it contains, and the confinement keeps an accepted seam's
+/// children within three quarters of the parent's A width.
+static SmallVector<uint64_t, 32>
+sweptBudgetSeamSchedule(uint64_t aBegin, uint64_t aEnd, uint64_t midpoint,
+                        ArrayRef<uint64_t> projectedBoundaries) {
+  const uint64_t quarterWidth = (aEnd - aBegin) / 4;
+  const uint64_t lowerReach = midpoint - (aBegin + quarterWidth);
+  const uint64_t upperReach = (aEnd - quarterWidth) - midpoint;
+  SmallVector<uint64_t, 32> schedule;
+  for (uint64_t offset = 1; offset < std::max(lowerReach, upperReach);
+       offset *= 2) {
+    if (offset < lowerReach &&
+        !llvm::is_contained(projectedBoundaries, midpoint - offset))
+      schedule.push_back(midpoint - offset);
+    if (offset < upperReach &&
+        !llvm::is_contained(projectedBoundaries, midpoint + offset))
+      schedule.push_back(midpoint + offset);
+  }
+  return schedule;
+}
+
+/// Project one oversized rectangle's swept schedule and set \p seam to the
+/// first row, in schedule order, that proves a singleton B frontier.
+///
+/// The rows share one pair of linear-space sweeps, so trying all of them costs
+/// at most two passes over the rectangle. Each row's prefix vector is held
+/// until the backward sweep reaches it, so the schedule is cut, farthest rows
+/// first, to the rows whose held vectors fit \p maxBytes. Returns false only
+/// when a projection itself fails; finding no seam is not a failure.
+static bool projectSweptBudgetSeam(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<LcsAGapProvenance> gapProvenance, uint64_t aBegin, uint64_t aEnd,
+    uint64_t bBegin, uint64_t bEnd, ArrayRef<uint64_t> schedule,
+    unsigned long long maxBytes,
+    LcsCertificationDiagnosticEvidence *diagnosticEvidence,
+    std::optional<LcsBoundaryFrontierProjection> &seam) {
+  seam.reset();
+  const size_t aWidth = static_cast<size_t>(aEnd - aBegin);
+  const size_t bWidth = static_cast<size_t>(bEnd - bBegin);
+  uint64_t heldRowBytes = 0;
+  if (!arrayBytesChecked<Score>(bWidth + 1, heldRowBytes) || heldRowBytes == 0)
+    return true;
+  const ArrayRef<uint64_t> triedRows = schedule.take_front(
+      static_cast<size_t>(std::min<uint64_t>(schedule.size(),
+                                             maxBytes / heldRowBytes)));
+  if (triedRows.empty())
+    return true;
+
+  SmallVector<size_t, 32> localBoundaries;
+  for (uint64_t aBoundary : triedRows)
+    localBoundaries.push_back(static_cast<size_t>(aBoundary - aBegin));
+  llvm::sort(localBoundaries);
+
+  const std::vector<uint32_t> ownerDepthGap = copyOwnerDepthGaps(
+      gapProvenance, static_cast<size_t>(aBegin),
+      static_cast<size_t>(aBegin) + aWidth);
+  std::vector<LcsBoundaryFrontierProjection> projections;
+  if (!projectBoundariesWithOwnerDepth(
+          a.slice(static_cast<size_t>(aBegin), aWidth),
+          b.slice(static_cast<size_t>(bBegin), bWidth), ownerDepthGap, aBegin,
+          bBegin, localBoundaries, projections))
+    return false;
+
+  for (uint64_t aBoundary : triedRows) {
+    const size_t index = static_cast<size_t>(
+        llvm::lower_bound(localBoundaries, aBoundary - aBegin) -
+        localBoundaries.begin());
+    LcsBoundaryFrontierProjection &projection = projections[index];
+    if (!projection.objectiveIsExact)
+      return false;
+    recordDiagnosticCandidate(aBoundary, diagnosticEvidence);
+    if (diagnosticEvidence)
+      diagnosticEvidence->boundaryFrontierProjections.push_back(projection);
+    if (projection.ProvesUniqueBoundary()) {
+      seam = std::move(projection);
+      return true;
+    }
+  }
+  return true;
+}
+
 /// Recursively split one oversized rectangle at exact balanced state seams.
 ///
-/// At most two boundaries are projected per oversized node: its arithmetic A
-/// midpoint and, only if necessary, one producer nomination in the middle half
-/// of the A range. An accepted midpoint leaves children with at most half the
-/// parent's A width; an accepted producer fallback leaves children with at
-/// most three quarters. Thus the sum of child grid areas decreases
-/// geometrically regardless of the unique B frontier. This hard work bound is
-/// the wall-time property missing from the former one-full-pass-per-candidate
-/// implementation.
+/// Each oversized node projects its arithmetic A midpoint, then, only if
+/// necessary, one producer nomination in the middle half of the A range, and
+/// then, only if both fail, the bounded swept schedule in one shared pair of
+/// sweeps. A node therefore costs at most four passes over its rectangle. An
+/// accepted midpoint leaves children with at most half the parent's A width;
+/// an accepted fallback leaves children with at most three quarters. Thus the
+/// sum of child grid areas decreases geometrically regardless of the unique B
+/// frontier. This hard work bound is the wall-time property missing from the
+/// former one-full-pass-per-candidate implementation.
 static bool appendBudgetPartition(
     ArrayRef<StringRef> a, ArrayRef<StringRef> b,
     ArrayRef<LcsAGapProvenance> gapProvenance,
@@ -3552,6 +3705,7 @@ static bool appendBudgetPartition(
   if (producerBoundary && *producerBoundary != midpoint)
     scheduledBoundaries.push_back(*producerBoundary);
 
+  std::optional<LcsBoundaryFrontierProjection> seam;
   for (uint64_t aBoundary : scheduledBoundaries) {
     recordDiagnosticCandidate(aBoundary, diagnosticEvidence);
     LcsBoundaryFrontierProjection projection;
@@ -3562,34 +3716,52 @@ static bool appendBudgetPartition(
       return false;
     if (diagnosticEvidence)
       diagnosticEvidence->boundaryFrontierProjections.push_back(projection);
-    if (!projection.ProvesUniqueBoundary())
-      continue;
-
-    const uint64_t bBoundary = projection.admissibleBFrontiers.front();
-    if (bBoundary < bBegin || bBoundary > bEnd)
-      return false;
-
-    if (!appendBudgetPartition(a, b, gapProvenance, normalizedCandidates,
-                               aBegin, aBoundary, bBegin, bBoundary, maxBytes,
-                               plan, diagnosticEvidence))
-      return false;
-    plan.certifiedBoundaries.push_back(LcsCertifiedBoundary{
-        aBoundary, bBoundary,
-        LcsBoundaryProofKind::EveryOptimalPathCrossesState});
-    return appendBudgetPartition(
-        a, b, gapProvenance, normalizedCandidates, aBoundary, aEnd, bBoundary,
-        bEnd, maxBytes, plan, diagnosticEvidence);
+    if (projection.ProvesUniqueBoundary()) {
+      seam = std::move(projection);
+      break;
+    }
   }
 
-  // Neither exact projection proved a singleton frontier. Do not search an
-  // unbounded number of alternative rows: that was the catastrophic
+  // Both rows can fail for a reason local to them. A row beside a replaced
+  // token is crossed by optimal paths that order its deletion and insertion
+  // differently, so it admits two frontiers however separable the rest of the
+  // rectangle is -- and when the midpoint is itself the producer nomination,
+  // that one row was the whole schedule. Try the bounded swept schedule
+  // before conceding the rectangle.
+  if (!seam &&
+      !projectSweptBudgetSeam(
+          a, b, gapProvenance, aBegin, aEnd, bBegin, bEnd,
+          sweptBudgetSeamSchedule(aBegin, aEnd, midpoint, scheduledBoundaries),
+          maxBytes, diagnosticEvidence, seam))
+    return false;
+
+  // No scheduled row proved a singleton frontier. Do not search an unbounded
+  // number of alternative rows: that was the catastrophic
   // O(candidateCount*N*M) behavior this path is designed to eliminate. The
   // unresolved rectangle remains fail closed and contributes no anchors.
-  plan.windows.push_back(LcsCertificationWindow{
-      aBegin, aEnd, bBegin, bEnd,
-      LcsWindowCertificationStatus::PartitionUnresolved,
-      /*requiredBytes=*/0, /*proofBudgetBytes=*/0});
-  return true;
+  if (!seam) {
+    plan.windows.push_back(LcsCertificationWindow{
+        aBegin, aEnd, bBegin, bEnd,
+        LcsWindowCertificationStatus::PartitionUnresolved,
+        /*requiredBytes=*/0, /*proofBudgetBytes=*/0});
+    return true;
+  }
+
+  const uint64_t aBoundary = seam->aBoundary;
+  const uint64_t bBoundary = seam->admissibleBFrontiers.front();
+  if (aBoundary <= aBegin || aBoundary >= aEnd || bBoundary < bBegin ||
+      bBoundary > bEnd)
+    return false;
+
+  if (!appendBudgetPartition(a, b, gapProvenance, normalizedCandidates,
+                             aBegin, aBoundary, bBegin, bBoundary, maxBytes,
+                             plan, diagnosticEvidence))
+    return false;
+  plan.certifiedBoundaries.push_back(LcsCertifiedBoundary{
+      aBoundary, bBoundary, LcsBoundaryProofKind::EveryOptimalPathCrossesState});
+  return appendBudgetPartition(a, b, gapProvenance, normalizedCandidates,
+                               aBoundary, aEnd, bBoundary, bEnd, maxBytes, plan,
+                               diagnosticEvidence);
 }
 
 bool certifyLcsWindowsIndependently(
