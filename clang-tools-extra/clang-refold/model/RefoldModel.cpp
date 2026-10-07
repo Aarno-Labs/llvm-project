@@ -2378,6 +2378,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
     model.tokmapEntryIsTUOwned_[index] =
         refoldPathsEqual(model.tokmap_[index].file, model.sourcePath_);
   }
+  model.tuOwnedTokenIndexBuilt_ = false;
   return model;
 }
 
@@ -2881,6 +2882,7 @@ void RefoldModel::BuildIndicesAndSort() {
   condGroupDepthCache_.clear();
   innermostIncludeByPPCache_.clear();
   innermostIncludeByPPCacheBuilt_ = false;
+  tuOwnedTokenIndexBuilt_ = false;
 
   condGroupById_.clear();
   armById_.clear();
@@ -3229,6 +3231,72 @@ RefoldModel::InnermostIncludeAtPP(uint64_t ppIndex) const {
   if (!innermostIncludeByPPCacheBuilt_)
     BuildInnermostIncludeByPPCache();
   return innermostIncludeByPPCache_[ppIndex];
+}
+
+void RefoldModel::BuildTUOwnedTokenIndex() const {
+  // An unmapped token, and a token another file contributed, leave the min/max
+  // identities at their leaves, so the trees fold TU-contributed entries only.
+  const std::size_t n = static_cast<std::size_t>(tokensCountA_);
+  std::vector<uint8_t> tuOwned(n, 0);
+  std::vector<uint8_t> otherFile(n, 0);
+  tuByteBeginTree_.assign(2 * n, std::numeric_limits<uint64_t>::max());
+  tuByteEndTree_.assign(2 * n, 0);
+  for (std::size_t index = 0; index < tokmap_.size(); ++index) {
+    const TokMapEntry &entry = tokmap_[index];
+    if (entry.pp >= tokensCountA_)
+      continue;
+    const std::size_t pp = static_cast<std::size_t>(entry.pp);
+    const bool entryIsTUOwned = TokmapEntryIsTUOwned(index);
+    tuOwned[pp] = entryIsTUOwned;
+    otherFile[pp] = !entryIsTUOwned;
+    tuByteBeginTree_[n + pp] =
+        entryIsTUOwned ? entry.b : std::numeric_limits<uint64_t>::max();
+    tuByteEndTree_[n + pp] = entryIsTUOwned ? entry.e : 0;
+  }
+  for (std::size_t node = n; node-- > 1;) {
+    tuByteBeginTree_[node] =
+        std::min(tuByteBeginTree_[2 * node], tuByteBeginTree_[2 * node + 1]);
+    tuByteEndTree_[node] =
+        std::max(tuByteEndTree_[2 * node], tuByteEndTree_[2 * node + 1]);
+  }
+  tuOwnedTokenPrefix_.assign(n + 1, 0);
+  otherFileTokenPrefix_.assign(n + 1, 0);
+  for (std::size_t pp = 0; pp < n; ++pp) {
+    tuOwnedTokenPrefix_[pp + 1] = tuOwnedTokenPrefix_[pp] + tuOwned[pp];
+    otherFileTokenPrefix_[pp + 1] = otherFileTokenPrefix_[pp] + otherFile[pp];
+  }
+  tuOwnedTokenIndexBuilt_ = true;
+}
+
+std::optional<RefoldModel::TUOwnedTokenSummary>
+RefoldModel::SummarizeTUOwnedTokens(uint64_t a0, uint64_t a1) const {
+  if (a0 >= a1 || a1 > tokensCountA_)
+    return std::nullopt;
+  if (!tuOwnedTokenIndexBuilt_)
+    BuildTUOwnedTokenIndex();
+
+  TUOwnedTokenSummary summary;
+  summary.tuOwnedTokens = tuOwnedTokenPrefix_[a1] - tuOwnedTokenPrefix_[a0];
+  summary.otherFileTokens =
+      otherFileTokenPrefix_[a1] - otherFileTokenPrefix_[a0];
+  // Min and max commute, so the bottom-up walk may fold the interval's
+  // canonical nodes in any order, and it holds for any leaf count.
+  const std::size_t n = static_cast<std::size_t>(tokensCountA_);
+  for (std::size_t lo = static_cast<std::size_t>(a0) + n,
+                   hi = static_cast<std::size_t>(a1) + n;
+       lo < hi; lo /= 2, hi /= 2) {
+    if (lo & 1) {
+      summary.tuByteBegin = std::min(summary.tuByteBegin, tuByteBeginTree_[lo]);
+      summary.tuByteEnd = std::max(summary.tuByteEnd, tuByteEndTree_[lo]);
+      ++lo;
+    }
+    if (hi & 1) {
+      --hi;
+      summary.tuByteBegin = std::min(summary.tuByteBegin, tuByteBeginTree_[hi]);
+      summary.tuByteEnd = std::max(summary.tuByteEnd, tuByteEndTree_[hi]);
+    }
+  }
+  return summary;
 }
 
 std::optional<uint64_t>

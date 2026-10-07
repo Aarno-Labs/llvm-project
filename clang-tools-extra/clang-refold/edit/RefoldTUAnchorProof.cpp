@@ -1294,6 +1294,18 @@ RefoldTUAnchorProof::ProjectTUByteEnvelopeForOwnership(
   // min/max TU-owned subset behavior used by owner classification and does not
   // authorize a source edit.  Concrete direct realization must call
   // PlanTUByteSpan(), whose theorem is strictly stronger.
+  //
+  // The model indexes the walk below against its own source path.  Path
+  // equality is an equivalence, so when `tuPath` names that file each entry's
+  // precomputed TU ownership is exactly the comparison the walk makes.
+  if (deps_.pathIdentity.PathsEqual(tuPath, deps_.model.GetSourcePath())) {
+    if (const std::optional<RefoldModel::TUOwnedTokenSummary> summary =
+            deps_.model.SummarizeTUOwnedTokens(a0, a1)) {
+      if (summary->tuOwnedTokens == 0)
+        return std::nullopt;
+      return TUByteSpanPlan(a0, a1, summary->tuByteBegin, summary->tuByteEnd);
+    }
+  }
   uint64_t minimumBegin = std::numeric_limits<uint64_t>::max();
   uint64_t maximumEnd = 0;
   bool foundTUToken = false;

@@ -279,6 +279,14 @@ bool RefoldOwnerClassifier::HunkMapsToTU(uint64_t a0, uint64_t a1,
   // questions would make an unrelated producer-binding diagnostic change macro
   // candidate ranking and force terminal expansion before the specialized
   // realization paths can run.
+  //
+  // The model indexes this walk against its own source path, which answers
+  // the same question whenever `tuPath` names that file.
+  if (deps_.pathIdentity.PathsEqual(tuPath, deps_.model.GetSourcePath())) {
+    if (const std::optional<RefoldModel::TUOwnedTokenSummary> summary =
+            deps_.model.SummarizeTUOwnedTokens(a0, a1))
+      return summary->otherFileTokens == 0 && summary->tuOwnedTokens != 0;
+  }
   for (uint64_t pp = a0; pp < a1; ++pp) {
     auto entryIt = tokmapByPP.find(pp);
     if (entryIt == tokmapByPP.end())

@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -1272,6 +1273,32 @@ public:
     return index < tokmapEntryIsTUOwned_.size() && tokmapEntryIsTUOwned_[index];
   }
 
+  /// What walking `MapPP()` over an A-token interval learns about the
+  /// translation unit's own source: how many mapped tokens it contributed, how
+  /// many another file did, and the byte hull of its own.
+  struct TUOwnedTokenSummary {
+    /// Mapped tokens whose entry the TU contributed; see
+    /// `TokmapEntryIsTUOwned()`.
+    uint64_t tuOwnedTokens = 0;
+    /// Mapped tokens whose entry another file contributed.
+    uint64_t otherFileTokens = 0;
+    /// Least `b` and greatest `e` over the TU-contributed entries; meaningful
+    /// only when `tuOwnedTokens` is nonzero.
+    uint64_t tuByteBegin = std::numeric_limits<uint64_t>::max();
+    uint64_t tuByteEnd = 0;
+  };
+
+  /// Summarize the token-map entries of the A tokens [\p a0, \p a1) exactly as
+  /// walking `MapPP()` over them and testing each entry's file against the
+  /// source path would, or return nullopt, answering nothing, when the
+  /// interval is empty or reaches past the A-token count.
+  ///
+  /// Owner classification asks this of every subrange of a hunk, so the walk
+  /// cost the cube of the hunk's width.  An index built on first use answers
+  /// it in O(log n) instead.
+  std::optional<TUOwnedTokenSummary> SummarizeTUOwnedTokens(uint64_t a0,
+                                                            uint64_t a1) const;
+
   /// Return producer include instances.
   ArrayRef<IncludeItem> GetIncludes() const { return includes_; }
   /// Return producer macro invocation instances.
@@ -1482,6 +1509,16 @@ private:
   /// `tokensCountA_`, built on first use.
   mutable std::vector<std::optional<uint64_t>> innermostIncludeByPPCache_;
   mutable bool innermostIncludeByPPCacheBuilt_ = false;
+  /// `SummarizeTUOwnedTokens()` index over the A tokens below
+  /// `tokensCountA_`, built on first use: prefix counts of TU-contributed and
+  /// other-file mapped tokens, and bottom-up segment trees, leaf `pp` at
+  /// `tokensCountA_ + pp`, of the TU-contributed entries' least `b` and
+  /// greatest `e`.
+  mutable std::vector<uint64_t> tuOwnedTokenPrefix_;
+  mutable std::vector<uint64_t> otherFileTokenPrefix_;
+  mutable std::vector<uint64_t> tuByteBeginTree_;
+  mutable std::vector<uint64_t> tuByteEndTree_;
+  mutable bool tuOwnedTokenIndexBuilt_ = false;
 
   // Internal helper to finalize indices and perform deterministic ordering.
   void BuildIndicesAndSort();
@@ -1493,6 +1530,10 @@ private:
   /// Fill `innermostIncludeByPPCache_` with exactly the answers
   /// `ScanInnermostIncludeAtPP()` gives.
   void BuildInnermostIncludeByPPCache() const;
+
+  /// Fill the `SummarizeTUOwnedTokens()` index from `tokmap_`, letting a later
+  /// entry for an A token replace an earlier one, as it does in `tokmapByPP_`.
+  void BuildTUOwnedTokenIndex() const;
 
   /// Populate derived include_next cursor fields after include ids and lookup
   /// metadata have been indexed.  This is a model-finalization step, not JSON
