@@ -133,12 +133,13 @@ public:
   ~RefoldMacroStandardArgsOnlyPatchBuilder();
 
   /// While alive, lets the builder reuse synthetic insertion-envelope searches
-  /// across args-only attempts.
+  /// and touched-formal hunk closures across args-only attempts.
   ///
-  /// Those searches read the token-hunk plan, which `Dependencies::abTokHunks`
-  /// observes by reference and which is republished between passes.  Open the
-  /// scope only where that plan is final and cannot change before the scope
-  /// ends; outside a scope nothing is cached.  Scopes do not nest.
+  /// Both read the token-hunk plan, which `Dependencies::abTokHunks` observes
+  /// by reference and which is republished between passes, and closures also
+  /// read the source mapper's projections of it.  Open the scope only where
+  /// that plan is final and cannot change before the scope ends; outside a
+  /// scope nothing is cached.  Scopes do not nest.
   class EnvelopeCacheScope {
   public:
     explicit EnvelopeCacheScope(

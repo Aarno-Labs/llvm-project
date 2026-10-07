@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -58,6 +59,16 @@ bool tokenHunkLess(const diffutils::Hunk &lhs, const diffutils::Hunk &rhs) {
   if (lhs.bStart != rhs.bStart)
     return lhs.bStart < rhs.bStart;
   return lhs.bEnd < rhs.bEnd;
+}
+
+/// Order argument occurrences by every recorded field, so that two occurrences
+/// compare equivalent only when no field a closure could read differs.
+bool ppArgSpanFieldsLess(const RefoldModel::PPArgSpan &lhs,
+                         const RefoldModel::PPArgSpan &rhs) {
+  return std::tie(lhs.begin, lhs.end, lhs.kind, lhs.argIdx, lhs.byteBegin,
+                  lhs.byteEnd, lhs.ppByteBegin, lhs.ppByteEnd) <
+         std::tie(rhs.begin, rhs.end, rhs.kind, rhs.argIdx, rhs.byteBegin,
+                  rhs.byteEnd, rhs.ppByteBegin, rhs.ppByteEnd);
 }
 
 /// Raw delimiter-balance summary used only by local recovery checks that have
@@ -172,6 +183,17 @@ std::pair<size_t, size_t> maybeExtendRightBoundaryClosers(
 // Standard args-only occurrence resolver implementations
 //===----------------------------------------------------------------------===//
 
+bool TouchedFormalClosureKey::operator<(
+    const TouchedFormalClosureKey &other) const {
+  if (std::tie(coverBegin, coverEnd, touchedFormals) !=
+      std::tie(other.coverBegin, other.coverEnd, other.touchedFormals))
+    return std::tie(coverBegin, coverEnd, touchedFormals) <
+           std::tie(other.coverBegin, other.coverEnd, other.touchedFormals);
+  return std::lexicographical_compare(
+      occurrences.begin(), occurrences.end(), other.occurrences.begin(),
+      other.occurrences.end(), ppArgSpanFieldsLess);
+}
+
 TouchedFormalHunkCollector::TouchedFormalHunkCollector(
     const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
     const RefoldMacroOccurrenceReplay &occurrenceReplay,
@@ -241,24 +263,77 @@ TouchedFormalHunkCollector::Collect(TouchedFormalHunkCollection collection,
   SmallVector<diffutils::Hunk, 8> &tokenHunks = collection.tokenHunks;
   tokenHunks.push_back(primaryHunk);
 
-  // A-token bounds of the occurrences of the formals this hunk touched.  Both
-  // arms of `HunkTouchesFormalOccurrence()` confine a touching candidate to
-  // these bounds: a candidate with A width touches only by overlapping an
+  SmallVector<size_t, 16> touchedOccIdxs;
+  for (size_t occIdx = 0; occIdx < occs.size(); ++occIdx) {
+    const auto &sp = occs[occIdx];
+    if (sp.argIdx < touched.size() && touched[sp.argIdx])
+      touchedOccIdxs.push_back(occIdx);
+  }
+
+  // Everything else the replay must explain -- the sibling hunks touching the
+  // same formals and the synthetic envelopes they anchor -- is determined by
+  // the cover, the occurrences and the touched formals, not by the seed.  The
+  // seed joins that closure on equal terms: a sibling equal to it adds nothing
+  // to the normalized set, and it anchors its own envelopes below exactly as a
+  // sibling insertion does.  Thousands of args-only attempts share one closure
+  // on a macro-dense unit (32156 attempts, 87 closures per uxnmin pass), so an
+  // open cache scope computes each closure once.
+  if (envelopeCache_) {
+    TouchedFormalClosureKey key{invocation.cover.begin, invocation.cover.end,
+                                occs, touched};
+    auto it = envelopeCache_->touchedFormalClosures.find(key);
+    if (it == envelopeCache_->touchedFormalClosures.end()) {
+      SmallVector<diffutils::Hunk, 8> closure;
+      AppendTouchedFormalClosure(invocation, occs, touched, touchedOccIdxs,
+                                 closure);
+      it = envelopeCache_->touchedFormalClosures
+               .emplace(std::move(key), std::move(closure))
+               .first;
+    }
+    append_range(tokenHunks, it->second);
+  } else {
+    AppendTouchedFormalClosure(invocation, occs, touched, touchedOccIdxs,
+                               tokenHunks);
+  }
+
+  // Only a zero-width A-side insertion frontier anchors synthetic envelopes;
+  // any other seed already exposes its A range.
+  if (!touchedOccIdxs.empty() && primaryHunk.aStart == primaryHunk.aEnd)
+    MaybeAddSyntheticTouchedFormalEnvelopes(invocation, primaryHunk, occs,
+                                            touchedOccIdxs, tokenHunks);
+
+  // Normalize the hunk set after adding synthetic envelopes. This prevents the
+  // same physical edit from being observed multiple times through equivalent
+  // primary/synthetic paths.
+  llvm::sort(tokenHunks, tokenHunkLess);
+  tokenHunks.erase(std::unique(tokenHunks.begin(), tokenHunks.end(),
+                               sameTokenHunk),
+                   tokenHunks.end());
+
+  return collection;
+}
+
+void TouchedFormalHunkCollector::AppendTouchedFormalClosure(
+    const RefoldModel::MacroInvocation &invocation,
+    llvm::ArrayRef<RefoldModel::PPArgSpan> occs,
+    const std::vector<char> &touched, llvm::ArrayRef<size_t> touchedOccIdxs,
+    SmallVector<diffutils::Hunk, 8> &out) const {
+  // A-token bounds of the occurrences of the touched formals.  Both arms of
+  // `HunkTouchesFormalOccurrence()` confine a touching candidate to these
+  // bounds: a candidate with A width touches only by overlapping an
   // occurrence, and a pure insertion is owned by one only at a position inside
   // it, immediately before its first token, or exactly at its end.  A candidate
   // outside the bounds therefore cannot touch any touched formal, whichever arm
   // applies, so skipping it is a proof rather than a filter.
   //
-  // The scan is over every hunk in the stream and runs once per args-only
-  // candidate, so on a macro-dense unit it is quadratic in the hunk count --
-  // 3292 hunks against 18000 calls on uxnmin.  Deciding the cheap bound first
-  // keeps the expensive arm, which maps an occurrence into B, for candidates
-  // that can still qualify.
+  // The scan is over every hunk in the stream, so on a macro-dense unit it is
+  // quadratic in the hunk count wherever the closure is not cached.  Deciding
+  // the cheap bound first keeps the expensive arm, which maps an occurrence
+  // into B, for candidates that can still qualify.
   std::optional<uint64_t> touchedOccBegin;
   std::optional<uint64_t> touchedOccEnd;
-  for (const auto &sp : occs) {
-    if (sp.argIdx >= touched.size() || !touched[sp.argIdx])
-      continue;
+  for (size_t occIdx : touchedOccIdxs) {
+    const RefoldModel::PPArgSpan &sp = occs[occIdx];
     touchedOccBegin = touchedOccBegin
                           ? std::min(*touchedOccBegin, sp.begin)
                           : sp.begin;
@@ -282,50 +357,30 @@ TouchedFormalHunkCollector::Collect(TouchedFormalHunkCollection collection,
   // Add sibling token hunks that also touch the same formal arguments. The
   // eventual argument replacement must explain the complete set of token edits
   // for those formals, otherwise we could accept a partial rewrite.
+  const size_t firstSibling = out.size();
   for (const auto &cand : deps_.abTokHunks) {
-    if (sameTokenHunk(cand, primaryHunk))
-      continue;
     if (!candidateCanTouchTouchedFormal(cand))
       continue;
     if (!HunkTouchesTouchedFormal(cand, occs, touched))
       continue;
-    tokenHunks.push_back(cand);
+    out.push_back(cand);
   }
+  const size_t endSibling = out.size();
+  if (touchedOccIdxs.empty())
+    return;
 
-  // Iterate over a snapshot of the currently known hunks. Synthetic-envelope
-  // discovery may append to `tokenHunks`, so the seed copy avoids recursively
-  // pairing newly synthesized hunks in the same pass.
-  SmallVector<diffutils::Hunk, 8> seedTokenHunks(tokenHunks.begin(),
-                                                 tokenHunks.end());
-
-  SmallVector<size_t, 16> touchedOccIdxs;
-  for (size_t occIdx = 0; occIdx < occs.size(); ++occIdx) {
-    const auto &sp = occs[occIdx];
-    if (sp.argIdx < touched.size() && touched[sp.argIdx])
-      touchedOccIdxs.push_back(occIdx);
+  // Only the plan hunks found above seed synthetic envelopes, never an
+  // envelope synthesized from one of them, so pairing does not recurse.  Only
+  // zero-width A-side insertion frontiers participate; other hunks already
+  // expose their A range.
+  for (size_t i = firstSibling; i < endSibling; ++i) {
+    if (out[i].aStart != out[i].aEnd)
+      continue;
+    // Copied because synthesis appends to `out`, which may reallocate.
+    const diffutils::Hunk seed = out[i];
+    MaybeAddSyntheticTouchedFormalEnvelopes(invocation, seed, occs,
+                                            touchedOccIdxs, out);
   }
-
-  if (!touchedOccIdxs.empty()) {
-    for (const auto &cand : seedTokenHunks) {
-      // Only zero-width A-side insertion frontiers can participate in
-      // synthetic envelope construction. Non-insertion hunks already expose
-      // their A range.
-      if (cand.aStart != cand.aEnd)
-        continue;
-      MaybeAddSyntheticTouchedFormalEnvelopes(invocation, cand, occs,
-                                              touchedOccIdxs, tokenHunks);
-    }
-  }
-
-  // Normalize the hunk set after adding synthetic envelopes. This prevents the
-  // same physical edit from being observed multiple times through equivalent
-  // primary/synthetic paths.
-  llvm::sort(tokenHunks, tokenHunkLess);
-  tokenHunks.erase(std::unique(tokenHunks.begin(), tokenHunks.end(),
-                               sameTokenHunk),
-                   tokenHunks.end());
-
-  return collection;
 }
 
 bool TouchedFormalHunkCollector::HunkTouchesFormalOccurrence(

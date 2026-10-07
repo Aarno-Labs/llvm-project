@@ -93,11 +93,28 @@ struct SyntheticEnvelopeSearchKey {
   }
 };
 
-/// Envelope searches memoized for one `EnvelopeCacheScope`, keyed by their
-/// complete variable input.
+/// Every touched-formal closure input that is not fixed for the lifetime of a
+/// builder cache scope: the invocation cover, every recorded field of each
+/// occurrence in order, and the touched-formal bitmap.  The closure also reads
+/// the token-hunk plan, the A/B token streams and the source mapper's
+/// projections of that plan, none of which varies while the plan is final.
+/// A field added to `PPArgSpan` must be added to the comparison as well.
+struct TouchedFormalClosureKey {
+  uint64_t coverBegin = 0;
+  uint64_t coverEnd = 0;
+  std::vector<RefoldModel::PPArgSpan> occurrences;
+  std::vector<char> touchedFormals;
+
+  bool operator<(const TouchedFormalClosureKey &other) const;
+};
+
+/// Envelope searches and touched-formal closures memoized for one
+/// `EnvelopeCacheScope`, each keyed by its complete variable input.
 struct SyntheticEnvelopeCache {
   std::map<SyntheticEnvelopeSearchKey, std::vector<SyntheticEnvelopeCandidate>>
       searches;
+  std::map<TouchedFormalClosureKey, llvm::SmallVector<diffutils::Hunk, 8>>
+      touchedFormalClosures;
 };
 
 /// Collects every token hunk that must be explained by the touched-formal
@@ -138,6 +155,17 @@ private:
   bool HunkTouchesTouchedFormal(const diffutils::Hunk &cand,
                                 llvm::ArrayRef<RefoldModel::PPArgSpan> occs,
                                 const std::vector<char> &touched) const;
+
+  /// Append the part of the collection that does not depend on the seed hunk:
+  /// every plan hunk touching an occurrence of a touched formal, then the
+  /// synthetic envelopes those hunks anchor as insertion frontiers.  The
+  /// output may repeat a hunk; the caller canonicalizes it.
+  void
+  AppendTouchedFormalClosure(const RefoldModel::MacroInvocation &invocation,
+                             llvm::ArrayRef<RefoldModel::PPArgSpan> occs,
+                             const std::vector<char> &touched,
+                             llvm::ArrayRef<size_t> touchedOccIdxs,
+                             llvm::SmallVector<diffutils::Hunk, 8> &out) const;
 
   /// Pair the insertion `anchor` with every other insertion of the invocation
   /// cover, in plan order, and return the pairs whose trimmed envelope is a
