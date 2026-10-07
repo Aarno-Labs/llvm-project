@@ -1034,6 +1034,19 @@ RefoldSourceMapper::MapAToBTokenEnvelopeByPPArgSpan(
   return MapAByteRangeToBTokenEnvelope(aByte, aByte);
 }
 
+ArrayRef<diffutils::Hunk>
+RefoldSourceMapper::TokenHunksStartingAt(uint64_t aPos) const {
+  const ArrayRef<diffutils::Hunk> hunks = abTokHunks_;
+  const auto first = llvm::partition_point(
+      hunks, [&](const diffutils::Hunk &h) { return h.aStart < aPos; });
+  const auto last =
+      std::partition_point(first, hunks.end(), [&](const diffutils::Hunk &h) {
+        return h.aStart == aPos;
+      });
+  return hunks.slice(static_cast<size_t>(first - hunks.begin()),
+                     static_cast<size_t>(last - first));
+}
+
 bool RefoldSourceMapper::TrimPureBoundaryInsertionsFromTokenEnvelope(
     uint64_t beginTok, uint64_t endTok, std::pair<size_t, size_t> &env) const {
   if (abTokHunks_.empty())
@@ -1044,11 +1057,11 @@ bool RefoldSourceMapper::TrimPureBoundaryInsertionsFromTokenEnvelope(
   bool trimmedTokenBoundaryInsertion = false;
 
   auto trimTokenInsertionAtBoundary = [&](uint64_t aPos, bool isBegin) {
-    for (const diffutils::Hunk &h : abTokHunks_) {
+    for (const diffutils::Hunk &h : TokenHunksStartingAt(aPos)) {
       // Only pure token insertions at this exact A boundary are edge material.
       // Replacements and deletions consume covered A tokens and remain part of
       // the owner envelope.
-      if (h.aStart != aPos || h.aEnd != aPos || h.bEnd <= h.bStart)
+      if (h.aEnd != aPos || h.bEnd <= h.bStart)
         continue;
 
       const size_t hb0 = static_cast<size_t>(h.bStart);
@@ -1267,11 +1280,11 @@ RefoldSourceMapper::MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(
   size_t bEnd = envOpt->second;
 
   auto trimAt = [&](uint64_t aPos, bool isBegin) {
-    for (const auto &h : abTokHunks_) {
+    for (const auto &h : TokenHunksStartingAt(aPos)) {
       // Only token-level pure insertions can be edge-only material.
       // Replacements and deletions consume A tokens and therefore belong to the
       // mapped cover.
-      if (h.aStart != aPos || h.aEnd != aPos)
+      if (h.aEnd != aPos)
         continue;
       if (h.bEnd <= h.bStart)
         continue;

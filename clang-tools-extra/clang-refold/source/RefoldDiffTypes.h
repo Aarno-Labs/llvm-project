@@ -18,6 +18,8 @@
 
 #include "support/RefoldFormatProviders.h"
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -144,6 +146,16 @@ struct Hunk {
     }
   }
 };
+
+/// Return whether \p hunks is ordered by A start.
+///
+/// Every publication of the shared token-hunk cache must be: its readers
+/// locate hunks by binary search on the A start.
+inline bool hunksOrderedByAStart(llvm::ArrayRef<Hunk> hunks) {
+  return llvm::is_sorted(hunks, [](const Hunk &lhs, const Hunk &rhs) {
+    return lhs.aStart < rhs.aStart;
+  });
+}
 
 } // namespace diffutils
 } // namespace refold

@@ -350,6 +350,10 @@ RefoldTokenDiffPlanner::Plan(AlignmentCertificationMemo *certificationMemo,
     }
   }
 
+  if (!diffutils::hunksOrderedByAStart(hunks))
+    REFOLD_LOG_FATAL("plan/order",
+                     "the token diff would publish {0} hunk(s) out of A order",
+                     hunks.size());
   deps_.abTokHunks = hunks;
 
   // Raw byte hunks are built alongside the token diff so every later

@@ -651,6 +651,11 @@ RefoldEngine::PlanTokenDiff(StringRef tuPath) {
   // hunk boundaries that no longer exist; the cache would then be corrected
   // only as a side effect of tiling publishing a split, which is not a
   // correction any theorem asked for.
+  if (!diffutils::hunksOrderedByAStart(hunks))
+    REFOLD_LOG_FATAL(
+        "plan/order",
+        "hunk-edge repair would publish {0} hunk(s) out of A order",
+        hunks.size());
   abTokHunks_ = hunks;
 
   structuralHunkPlanningPhase_ =
@@ -842,10 +847,7 @@ bool RefoldEngine::DispatchStructuralHunks(
       std::equal(hunks.begin(), hunks.end(), abTokHunks_.begin());
   // Owner services locate hunks by binary search on the A start, so the
   // dispatched plan must be ordered by it.
-  const bool dispatchOrderedByAStart = llvm::is_sorted(
-      hunks, [](const diffutils::Hunk &lhs, const diffutils::Hunk &rhs) {
-        return lhs.aStart < rhs.aStart;
-      });
+  const bool dispatchOrderedByAStart = diffutils::hunksOrderedByAStart(hunks);
   if (structuralHunkPlanningPhase_ !=
           StructuralHunkPlanningPhase::InsertionLedgerReady ||
       !dispatchMatchesNormalizedCache || !dispatchOrderedByAStart) {

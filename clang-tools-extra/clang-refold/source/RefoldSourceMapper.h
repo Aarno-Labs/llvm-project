@@ -440,6 +440,14 @@ private:
   std::optional<size_t> FindExactOwningArgSpanForPureInsertion(
       uint64_t aPos, llvm::ArrayRef<RefoldModel::PPArgSpan> argSpans) const;
 
+  /// Return the token hunks that start at A position \p aPos, in published
+  /// order.
+  ///
+  /// Every publication of the cache is ordered by A start (see
+  /// `diffutils::hunksOrderedByAStart`), so they are one contiguous run, and a
+  /// binary search finds exactly the hunks a filter of the whole cache would.
+  llvm::ArrayRef<diffutils::Hunk> TokenHunksStartingAt(uint64_t aPos) const;
+
   const RefoldModel &model_;
   const RefoldPathIdentity &paths_;
   llvm::StringRef aSource_;

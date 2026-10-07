@@ -4444,6 +4444,11 @@ RefoldStructuralHunkTilingPlanner::StructuralHunkTilingPlan
 RefoldStructuralHunkTilingPlanner::FinishPlan(
     std::vector<diffutils::Hunk> hunks) {
   // Refresh the token-level hunk cache after normalization.
+  if (!diffutils::hunksOrderedByAStart(hunks))
+    REFOLD_LOG_FATAL("plan/order",
+                     "structural tiling would publish {0} hunk(s) out of A "
+                     "order",
+                     hunks.size());
   deps_.abTokHunks = hunks;
 
   StructuralHunkTilingPlan plan;
@@ -4574,6 +4579,10 @@ RefoldStructuralHunkTilingPlanner::Plan(std::vector<diffutils::Hunk> hunks) {
 
     if (changed) {
       hunks = std::move(splitHunks);
+      if (!diffutils::hunksOrderedByAStart(hunks))
+        REFOLD_LOG_FATAL("plan/order",
+                         "structural tiling split {0} hunk(s) out of A order",
+                         hunks.size());
       deps_.abTokHunks = hunks;
     }
   }
