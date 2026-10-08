@@ -318,11 +318,13 @@ bool RefoldHeaderIncludeEditPlanner::HeaderMacroInvocationIsPreservableGap(
     StringRef headerText, const RefoldModel::MacroInvocation &macro,
     uint64_t gapBegin, uint64_t gapEnd) const {
   // The invocation must be physically spelled in this materialized header gap
-  // and owned by the include instance currently being rewritten.
+  // and owned by the include instance currently being rewritten.  The caller
+  // walks every invocation, so the owner test runs before path identity, which
+  // may have to canonicalize both spellings.
+  if (!macro.ownerIncludeId || *macro.ownerIncludeId != currentInclude.id)
+    return false;
   if (!macro.invFile || macro.invFile->empty() ||
       !paths_.PathsEqual(*macro.invFile, file))
-    return false;
-  if (!macro.ownerIncludeId || *macro.ownerIncludeId != currentInclude.id)
     return false;
   if (!macro.invB || !macro.invE || *macro.invB >= *macro.invE)
     return false;
@@ -434,43 +436,32 @@ bool RefoldHeaderIncludeEditPlanner::PPSpanInsideHeaderMaterial(
   return materialBeginA <= span.begin && span.end <= materialEndA;
 }
 
-bool RefoldHeaderIncludeEditPlanner::HeaderArmIsSameOrNestedUnder(
-    const RefoldModel::ArmRef &candidate, uint64_t ancestorArmId) const {
-  if (!candidate.group || !candidate.arm)
-    return false;
-  if (candidate.arm->id == ancestorArmId)
-    return true;
-
-  // FindArmRefAtPP() reports the innermost selected arm that owns a token. When
-  // proving that an outer header conditional group is wholly consumed, tokens
-  // in nested selected arms still count as effective material of the outer arm.
-  // Walk parent-arm links until either the queried arm is found or the chain
-  // leaves the nested conditional tree.
-  const RefoldModel::CondGroup *group = candidate.group;
-  while (group && group->parentArmId) {
-    if (*group->parentArmId == ancestorArmId)
-      return true;
-    std::optional<RefoldModel::ArmRef> parent =
-        model_.GetArmRefById(*group->parentArmId);
-    if (!parent || !parent->group)
-      break;
-    group = parent->group;
-  }
-  return false;
-}
-
 bool RefoldHeaderIncludeEditPlanner::HeaderSelectedArmEffectiveMaterialInside(
     const RefoldModel::CondArm &arm, uint64_t materialBeginA,
     uint64_t materialEndA) const {
+  // Tokens in nested selected arms still count as effective material of the
+  // outer arm.  Every one of them lies inside the material exactly when their
+  // hull does.  The model's hull covers the A tokens below its own count; the
+  // engine plans only once that count is the lexed one, and any other surface
+  // keeps the token-by-token scan.
   bool sawEffectiveMaterial = false;
-  for (uint64_t pp = 0; pp < aToks_.size(); ++pp) {
-    std::optional<RefoldModel::ArmRef> owner = model_.FindArmRefAtPP(pp);
-    if (!owner || !HeaderArmIsSameOrNestedUnder(*owner, arm.id))
-      continue;
+  if (aToks_.size() == model_.GetTokensCountA()) {
+    if (std::optional<RefoldModel::PPSpan> hull =
+            model_.ArmOwnedPPHull(arm.id)) {
+      if (hull->begin < materialBeginA || hull->end > materialEndA)
+        return false;
+      sawEffectiveMaterial = true;
+    }
+  } else {
+    for (uint64_t pp = 0; pp < aToks_.size(); ++pp) {
+      std::optional<RefoldModel::ArmRef> owner = model_.FindArmRefAtPP(pp);
+      if (!owner || !model_.ArmRefIsSameOrNestedUnder(*owner, arm.id))
+        continue;
 
-    sawEffectiveMaterial = true;
-    if (pp < materialBeginA || pp >= materialEndA)
-      return false;
+      sawEffectiveMaterial = true;
+      if (pp < materialBeginA || pp >= materialEndA)
+        return false;
+    }
   }
 
   // Prefer effective PP ownership when the map can answer it, because the
@@ -679,7 +670,7 @@ bool RefoldHeaderIncludeEditPlanner::PatchRunGapsLieInsideSelectedArm(
       const uint64_t gapEnd = includeEdits.patches[idx + 1].aStart;
       for (uint64_t pp = gapBegin; pp < gapEnd; ++pp) {
         std::optional<RefoldModel::ArmRef> owner = model_.FindArmRefAtPP(pp);
-        if (!owner || !HeaderArmIsSameOrNestedUnder(*owner, arm.id)) {
+        if (!owner || !model_.ArmRefIsSameOrNestedUnder(*owner, arm.id)) {
           gapsInsideArm = false;
           break;
         }

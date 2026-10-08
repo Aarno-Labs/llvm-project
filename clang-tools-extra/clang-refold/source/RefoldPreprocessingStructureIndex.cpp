@@ -937,9 +937,9 @@ recoverMacroStateDirectiveLineInterval(
     return std::nullopt;
   if (directive.name.empty())
     return std::nullopt;
-  if (!paths.PathsEqual(directive.sitePath, expectedPath))
-    return std::nullopt;
 
+  // Callers walk every recorded directive.  Rule out another include's first:
+  // path identity may have to canonicalize both spellings to answer.
   if (requiredOwnerIncludeId) {
     if (!directive.ownerIncludeId ||
         *directive.ownerIncludeId != *requiredOwnerIncludeId)
@@ -947,6 +947,8 @@ recoverMacroStateDirectiveLineInterval(
   } else if (directive.ownerIncludeId) {
     return std::nullopt;
   }
+  if (!paths.PathsEqual(directive.sitePath, expectedPath))
+    return std::nullopt;
 
   // The model parser already proved the pair is ordered and contains the
   // name-anchored site range; only its fit to these particular file bytes

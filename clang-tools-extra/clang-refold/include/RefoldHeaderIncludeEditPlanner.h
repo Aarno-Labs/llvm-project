@@ -429,12 +429,6 @@ private:
                                          uint64_t materialBeginA,
                                          uint64_t materialEndA);
 
-  /// Returns whether an arm is the queried arm or nested beneath it.
-  /// Parent-arm links let outer conditional proofs account for nested selected
-  /// material reported by innermost ownership queries.
-  bool HeaderArmIsSameOrNestedUnder(const RefoldModel::ArmRef &candidate,
-                                    uint64_t ancestorArmId) const;
-
   /// Returns whether a selected arm's effective PP material is fully consumed.
   /// Effective ownership is preferred over direct spans when the model can map
   /// tokens to nested conditional arms.

@@ -3366,6 +3366,84 @@ uint32_t RefoldModel::GetCondGroupDepth(uint64_t groupId) const {
 
 std::optional<RefoldModel::ArmRef>
 RefoldModel::FindArmRefAtPP(uint64_t ppIndex) const {
+  // Callers walk whole A-token ranges, and each scan hashes the token's path
+  // and searches its file's groups.  Tokens past the cached range keep the
+  // scan.
+  if (ppIndex >= tokensCountA_)
+    return ScanArmRefAtPP(ppIndex);
+  if (!armRefByPPCacheBuilt_) {
+    armRefByPPCache_.resize(tokensCountA_);
+    for (uint64_t pp = 0; pp < tokensCountA_; ++pp)
+      armRefByPPCache_[pp] = ScanArmRefAtPP(pp);
+    armRefByPPCacheBuilt_ = true;
+  }
+  return armRefByPPCache_[ppIndex];
+}
+
+void RefoldModel::AppendSameOrEnclosingArmIds(
+    const ArmRef &candidate, SmallVectorImpl<uint64_t> &armIds) const {
+  if (!candidate.group || !candidate.arm)
+    return;
+  armIds.push_back(candidate.arm->id);
+
+  // A group nested in a conditional names the arm holding it; that arm's own
+  // group may in turn be nested.  Stop when the chain leaves the tree.  The
+  // group is the walk's whole state, so reaching one again could only repeat
+  // the ids already appended.
+  SmallVector<const CondGroup *, 4> visitedGroups;
+  const CondGroup *group = candidate.group;
+  while (group && group->parentArmId) {
+    if (llvm::is_contained(visitedGroups, group))
+      return;
+    visitedGroups.push_back(group);
+    armIds.push_back(*group->parentArmId);
+    std::optional<ArmRef> parent = GetArmRefById(*group->parentArmId);
+    if (!parent || !parent->group)
+      return;
+    group = parent->group;
+  }
+}
+
+bool RefoldModel::ArmRefIsSameOrNestedUnder(const ArmRef &candidate,
+                                            uint64_t ancestorArmId) const {
+  SmallVector<uint64_t, 4> armIds;
+  AppendSameOrEnclosingArmIds(candidate, armIds);
+  return llvm::is_contained(armIds, ancestorArmId);
+}
+
+void RefoldModel::BuildArmOwnedPPHulls() const {
+  // Tokens are visited in ascending order, so an arm's first token opens its
+  // hull and every later one moves the end.
+  armOwnedPPHulls_.clear();
+  SmallVector<uint64_t, 4> armIds;
+  for (uint64_t pp = 0; pp < tokensCountA_; ++pp) {
+    std::optional<ArmRef> owner = FindArmRefAtPP(pp);
+    if (!owner)
+      continue;
+    armIds.clear();
+    AppendSameOrEnclosingArmIds(*owner, armIds);
+    for (uint64_t armId : armIds) {
+      auto [it, inserted] =
+          armOwnedPPHulls_.try_emplace(armId, PPSpan{pp, pp + 1});
+      if (!inserted)
+        it->second.end = pp + 1;
+    }
+  }
+  armOwnedPPHullsBuilt_ = true;
+}
+
+std::optional<RefoldModel::PPSpan>
+RefoldModel::ArmOwnedPPHull(uint64_t armId) const {
+  if (!armOwnedPPHullsBuilt_)
+    BuildArmOwnedPPHulls();
+  auto it = armOwnedPPHulls_.find(armId);
+  if (it == armOwnedPPHulls_.end())
+    return std::nullopt;
+  return it->second;
+}
+
+std::optional<RefoldModel::ArmRef>
+RefoldModel::ScanArmRefAtPP(uint64_t ppIndex) const {
   // Read the entry in place: `MapPP()` returns a copy, path spelling included.
   auto ent = tokmapByPP_.find(ppIndex);
   if (ent == tokmapByPP_.end())

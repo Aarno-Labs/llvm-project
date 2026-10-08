@@ -1420,6 +1420,24 @@ public:
   /// brought it in.
   std::optional<ArmRef> FindArmRefAtPP(uint64_t ppIndex) const;
 
+  /// Return whether \p candidate is the arm \p ancestorArmId or is nested
+  /// beneath it.
+  ///
+  /// `FindArmRefAtPP()` reports the innermost arm, so a proof about an outer
+  /// arm has to count tokens of the arms nested in it as its own; parent-arm
+  /// links of the enclosing groups name those outer arms.
+  bool ArmRefIsSameOrNestedUnder(const ArmRef &candidate,
+                                 uint64_t ancestorArmId) const;
+
+  /// Return the A-token hull of the tokens below `GetTokensCountA()` whose
+  /// `FindArmRefAtPP()` arm is \p armId or nested beneath it, as
+  /// `ArmRefIsSameOrNestedUnder()` decides, or std::nullopt when there are
+  /// none.
+  ///
+  /// The hull runs from the first such token to one past the last, so every
+  /// one of them lies inside a range exactly when the hull does; tokens
+  /// strictly inside it need not belong to the arm.
+  std::optional<PPSpan> ArmOwnedPPHull(uint64_t armId) const;
 
   // --- Slot queries ---
   /// Return all slots matching the supplied exact-match filters.
@@ -1509,6 +1527,14 @@ private:
   /// `tokensCountA_`, built on first use.
   mutable std::vector<std::optional<uint64_t>> innermostIncludeByPPCache_;
   mutable bool innermostIncludeByPPCacheBuilt_ = false;
+  /// `FindArmRefAtPP()` answers for every A token below `tokensCountA_`,
+  /// built on first use.  The pointers are into this model's own `conds_`.
+  mutable std::vector<std::optional<ArmRef>> armRefByPPCache_;
+  mutable bool armRefByPPCacheBuilt_ = false;
+  /// `ArmOwnedPPHull()` answers, keyed by arm id, built on first use; an arm
+  /// with no entry owns no A token.
+  mutable DenseMap<uint64_t, PPSpan> armOwnedPPHulls_;
+  mutable bool armOwnedPPHullsBuilt_ = false;
   /// `SummarizeTUOwnedTokens()` index over the A tokens below
   /// `tokensCountA_`, built on first use: prefix counts of TU-contributed and
   /// other-file mapped tokens, and bottom-up segment trees, leaf `pp` at
@@ -1530,6 +1556,21 @@ private:
   /// Fill `innermostIncludeByPPCache_` with exactly the answers
   /// `ScanInnermostIncludeAtPP()` gives.
   void BuildInnermostIncludeByPPCache() const;
+
+  /// Find the arm `FindArmRefAtPP()` reports by searching the conditional
+  /// groups of the token's file, the definition `armRefByPPCache_` caches.
+  std::optional<ArmRef> ScanArmRefAtPP(uint64_t ppIndex) const;
+
+  /// Append \p candidate's arm id and then the id of every arm enclosing it,
+  /// innermost first: exactly the arms `ArmRefIsSameOrNestedUnder()` places
+  /// \p candidate under.  A group already walked ends the walk, so a
+  /// malformed parent cycle cannot loop.
+  void AppendSameOrEnclosingArmIds(const ArmRef &candidate,
+                                   SmallVectorImpl<uint64_t> &armIds) const;
+
+  /// Fill `armOwnedPPHulls_` from `FindArmRefAtPP()` over every A token below
+  /// `tokensCountA_`.
+  void BuildArmOwnedPPHulls() const;
 
   /// Fill the `SummarizeTUOwnedTokens()` index from `tokmap_`, letting a later
   /// entry for an A token replace an earlier one, as it does in `tokmapByPP_`.
