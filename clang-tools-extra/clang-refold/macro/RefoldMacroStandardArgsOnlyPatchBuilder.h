@@ -132,14 +132,14 @@ public:
   explicit RefoldMacroStandardArgsOnlyPatchBuilder(Dependencies deps);
   ~RefoldMacroStandardArgsOnlyPatchBuilder();
 
-  /// While alive, lets the builder reuse synthetic insertion-envelope searches
-  /// and touched-formal hunk closures across args-only attempts.
+  /// While alive, lets the builder reuse synthetic insertion-envelope searches,
+  /// touched-formal hunk closures and failed builds across args-only attempts.
   ///
-  /// Both read the token-hunk plan, which `Dependencies::abTokHunks` observes
-  /// by reference and which is republished between passes, and closures also
-  /// read the source mapper's projections of it.  Open the scope only where
-  /// that plan is final and cannot change before the scope ends; outside a
-  /// scope nothing is cached.  Scopes do not nest.
+  /// All of them read the token-hunk plan, which `Dependencies::abTokHunks`
+  /// observes by reference and which is republished between passes, and the
+  /// state published with it.  Open the scope only where that plan is final and
+  /// cannot change before the scope ends; outside a scope nothing is cached.
+  /// Scopes do not nest.
   class EnvelopeCacheScope {
   public:
     explicit EnvelopeCacheScope(
@@ -158,7 +158,8 @@ public:
   /// Tries definition-tape replay, the current-level template solver,
   /// paste-aware replay and `BuildStandardArgsOnlyPatch`, in that order.  The
   /// first admitted candidate is returned; a paste-surface rejection returns
-  /// nullopt without trying the standard slot.
+  /// nullopt without trying the standard slot.  Inside an `EnvelopeCacheScope`
+  /// a build that failed is answered from the scope instead of being repeated.
   std::optional<MacroPatch>
   BuildMacroInvocationPatchArgsOnly(const RefoldModel::MacroInvocation &m,
                                     const diffutils::Hunk &h,
@@ -192,6 +193,12 @@ public:
       llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
 
 private:
+  /// `BuildMacroInvocationPatchArgsOnly()` without consulting or recording the
+  /// scope's failed builds.
+  std::optional<MacroPatch> BuildMacroInvocationPatchArgsOnlyUncached(
+      const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
+      llvm::StringRef baseInvocationText) const;
+
   /// Result of one args-only candidate attempt.
   ///
   /// Paste-aware replay needs to distinguish "no candidate, keep trying" from

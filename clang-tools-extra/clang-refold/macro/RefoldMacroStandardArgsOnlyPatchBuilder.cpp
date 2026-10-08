@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -111,6 +112,20 @@ struct DefinitionReplayedStandardArgSpanRepair {
   /// Whether the definition-tape proof changed any recorded formal index.
   bool replayedFormalIndices = false;
 };
+
+/// Return the index of \p m in the model's invocation array, or nullopt when
+/// \p m is a copy that lives elsewhere.
+std::optional<size_t>
+modelInvocationIndex(const RefoldModel &model,
+                     const RefoldModel::MacroInvocation &m) {
+  const ArrayRef<RefoldModel::MacroInvocation> invocations =
+      model.GetMacroInvocations();
+  const std::less<const RefoldModel::MacroInvocation *> before;
+  if (invocations.empty() || before(&m, invocations.begin()) ||
+      !before(&m, invocations.end()))
+    return std::nullopt;
+  return static_cast<size_t>(&m - invocations.begin());
+}
 
 /// Return the unmodified recorded span set for definition replay fallback.
 ///
@@ -1660,6 +1675,34 @@ std::optional<MacroPatch>
 RefoldMacroStandardArgsOnlyPatchBuilder::BuildMacroInvocationPatchArgsOnly(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
     StringRef baseInvText) const {
+  // A build is a function of its arguments and of state that is final while a
+  // scope is open (see `ArgsOnlyBuildKey`), so a build that failed in this
+  // scope fails again on the same arguments.  Macro-dense units repeat failed
+  // builds by the thousand -- 14536 of 35297 builds per uxnmin pass, every one
+  // a failure -- since, for one, a paired-insertion envelope is the same hunk
+  // from either insertion of the pair.  An invocation outside the model's array
+  // is a copy with no identity to key, and is always rebuilt.
+  std::optional<ArgsOnlyBuildKey> key;
+  if (envelopeCache_) {
+    if (std::optional<size_t> index = modelInvocationIndex(deps_.model, m)) {
+      key = ArgsOnlyBuildKey{*index, h, baseInvText.data() == nullptr,
+                             baseInvText.str()};
+      if (envelopeCache_->failedBuilds.count(*key))
+        return std::nullopt;
+    }
+  }
+
+  std::optional<MacroPatch> patch =
+      BuildMacroInvocationPatchArgsOnlyUncached(m, h, baseInvText);
+  if (!patch && key)
+    envelopeCache_->failedBuilds.insert(std::move(*key));
+  return patch;
+}
+
+std::optional<MacroPatch> RefoldMacroStandardArgsOnlyPatchBuilder::
+    BuildMacroInvocationPatchArgsOnlyUncached(
+        const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
+        StringRef baseInvText) const {
   std::optional<InvocationActualLayout> recoveredActualLayout =
       RecoverInvocationActuals(m, baseInvText);
   if (!recoveredActualLayout)

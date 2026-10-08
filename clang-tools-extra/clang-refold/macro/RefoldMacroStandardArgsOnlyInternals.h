@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -108,13 +109,40 @@ struct TouchedFormalClosureKey {
   bool operator<(const TouchedFormalClosureKey &other) const;
 };
 
-/// Envelope searches and touched-formal closures memoized for one
-/// `EnvelopeCacheScope`, each keyed by its complete variable input.
+/// Every input of one args-only build that is not fixed for the lifetime of a
+/// builder cache scope: the invocation, by its index in the model's invocation
+/// array, the hunk, and the base invocation spelling, including whether it is
+/// a null reference.  The build otherwise reads the immutable model and the
+/// A/B token streams, the token-hunk plan and the byte hunks published with it,
+/// the B-insertion ledger, which is claimed before dispatch, and witness-trace
+/// state that only gates logging.  All of it is final before dispatch, the
+/// only place a scope is opened.
+struct ArgsOnlyBuildKey {
+  size_t invocationIndex = 0;
+  diffutils::Hunk hunk = {};
+  bool baseInvocationTextIsNull = false;
+  std::string baseInvocationText;
+
+  bool operator<(const ArgsOnlyBuildKey &other) const {
+    return std::tie(invocationIndex, hunk.aStart, hunk.aEnd, hunk.bStart,
+                    hunk.bEnd, baseInvocationTextIsNull, baseInvocationText) <
+           std::tie(other.invocationIndex, other.hunk.aStart, other.hunk.aEnd,
+                    other.hunk.bStart, other.hunk.bEnd,
+                    other.baseInvocationTextIsNull, other.baseInvocationText);
+  }
+};
+
+/// Envelope searches, touched-formal closures and failed args-only builds
+/// memoized for one `EnvelopeCacheScope`, each keyed by its complete variable
+/// input.
 struct SyntheticEnvelopeCache {
   std::map<SyntheticEnvelopeSearchKey, std::vector<SyntheticEnvelopeCandidate>>
       searches;
   std::map<TouchedFormalClosureKey, llvm::SmallVector<diffutils::Hunk, 8>>
       touchedFormalClosures;
+  /// Builds that produced no patch.  A success is never recorded, so no caller
+  /// is handed a patch another caller may have changed.
+  std::set<ArgsOnlyBuildKey> failedBuilds;
 };
 
 /// Collects every token hunk that must be explained by the touched-formal
