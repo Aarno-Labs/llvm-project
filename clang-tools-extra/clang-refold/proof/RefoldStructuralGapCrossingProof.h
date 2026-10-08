@@ -78,9 +78,11 @@ enum class GapCrossingProofKind : uint8_t {
   /// observer of, directly or through a live macro's replacement list.
   LineControlUnobserved,
 
-  /// An unrecognized directive the producer recorded inside a conditional arm
-  /// it did not select.  A skipped group's directives are read only for their
-  /// names, to track conditional nesting (C11 6.10.1p6), so it never executed.
+  /// An unrecognized directive, or a `#define`/`#undef` with no producer
+  /// record, inside a conditional arm the producer recorded as not selected.
+  /// A skipped group's directives are read only for their names, to track
+  /// conditional nesting (C11 6.10.1p6), so it never executed and bound
+  /// nothing.
   SkippedArmDirective,
 };
 
@@ -141,10 +143,13 @@ struct GapCrossingProof {
 
   /// False when a `#define`/`#undef` in the gap had no recoverable producer
   /// record, so `macroBindings` is not the complete set and no rule may
-  /// conclude anything from a name's absence.
+  /// conclude anything from a name's absence.  An unrecorded one inside an arm
+  /// the producer recorded as not entered never executed; it binds nothing and
+  /// does not make the set incomplete.
   bool macroBindingsComplete = true;
 
-  /// True when the gap preserves at least one `#define`/`#undef`.
+  /// True when the gap preserves at least one `#define`/`#undef` other than an
+  /// unrecorded one inside an arm the producer recorded as not entered.
   bool carriesMacroStateDirective = false;
 
   /// Return whether every structure in a non-empty gap is crossable.
@@ -261,8 +266,9 @@ private:
   ProveDiagnosticDirective(const PreprocessingStructureInterval &interval,
                            const Query &query) const;
 
-  /// Answer an `#error` or unrecognized directive, which is admissible only
-  /// when the producer recorded it inside a conditional arm it did not select.
+  /// Answer an `#error`, an unrecognized directive, or an unrecorded
+  /// `#define`/`#undef`, which is admissible only when the producer recorded it
+  /// inside a conditional arm it did not select.
   /// A directive in a skipped group is never executed, and preserving the
   /// gap's bytes in place leaves it unexecuted.
   GapCrossingEvidence

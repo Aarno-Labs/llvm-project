@@ -14,6 +14,7 @@
 #include "support/RefoldLog.h"
 #include "support/StringUtils.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
@@ -72,6 +73,25 @@ GapCrossingEvidence admitStructure(
 bool pragmaEmitsNoImage(const RefoldModel &model,
                         const RefoldModel::PragmaDirective &pragma) {
   return model.PragmaImagesComplete() && !pragma.HasEmittedImage();
+}
+
+/// Return the producer's record of whether the preprocessor entered the
+/// innermost conditional arm holding \p interval, or `std::nullopt` when no
+/// recorded arm holds it.
+///
+/// `ownerConditionalArmId` is the lexically nearest enclosing arm, bound to its
+/// producer record exactly.  An arm the preprocessor did not enter was skipped,
+/// and so was every directive in it however deeply it nests.
+std::optional<bool>
+ownerArmTaken(const RefoldModel &model,
+              const PreprocessingStructureInterval &interval) {
+  if (!interval.ownerConditionalArmId)
+    return std::nullopt;
+  std::optional<RefoldModel::ArmRef> armRef =
+      model.GetArmRefById(*interval.ownerConditionalArmId);
+  if (!armRef || !armRef->arm)
+    return std::nullopt;
+  return armRef->arm->taken;
 }
 
 /// Return whether a structure kind is a conditional-control directive.
@@ -406,16 +426,10 @@ GapCrossingEvidence RefoldStructuralGapCrossingProver::ProveSkippedArmDirective(
                            GapCrossingRejection::PayloadCarriesDirective);
   }
 
-  // `ownerConditionalArmId` is the lexically nearest enclosing arm, bound to
-  // its producer record exactly.  An arm the preprocessor did not enter was
-  // skipped, and so was every directive in it however deeply it nests.
-  if (!interval.ownerConditionalArmId)
+  const std::optional<bool> taken = ownerArmTaken(deps_.model, interval);
+  if (!taken)
     return rejectStructure(interval, GapCrossingRejection::NoProducerRecord);
-  std::optional<RefoldModel::ArmRef> armRef =
-      deps_.model.GetArmRefById(*interval.ownerConditionalArmId);
-  if (!armRef || !armRef->arm)
-    return rejectStructure(interval, GapCrossingRejection::NoProducerRecord);
-  if (armRef->arm->taken)
+  if (*taken)
     return rejectStructure(interval, GapCrossingRejection::PayloadObservesState);
   return admitStructure(interval, proofKind);
 }
@@ -474,7 +488,16 @@ RefoldStructuralGapCrossingProver::Prove(const Query &query) const {
   // in the payload may expand to a name bound by one directive in the gap while
   // spelling another, so answering the directives one at a time would ask a
   // weaker question than the one that must hold.
-  SmallVector<const PreprocessingStructureInterval *, 2> macroStateIntervals;
+  //
+  // A `#define`/`#undef` in an arm the preprocessor never entered was read only
+  // for its name, to track conditional nesting (C11 6.10.1p6), so it bound
+  // nothing and the producer has no record of it.  It is not a member of the
+  // binding set, where its missing record would leave every macro-state
+  // directive in the gap unanswerable; the skipped-arm rule answers it from the
+  // producer's arm record instead.  A directive the producer did record stays
+  // in the set whatever its arm says, so contradictory evidence fails closed.
+  SmallPtrSet<const PreprocessingStructureInterval *, 2>
+      skippedMacroStateIntervals;
   for (const PreprocessingStructureInterval *interval : query.structures) {
     if (!interval)
       continue;
@@ -482,8 +505,6 @@ RefoldStructuralGapCrossingProver::Prove(const Query &query) const {
         interval->kind != PreprocessingStructureKind::MacroUndef) {
       continue;
     }
-    proof.carriesMacroStateDirective = true;
-    macroStateIntervals.push_back(interval);
 
     const RefoldModel::MacroDirective *directive =
         interval->modelKind ==
@@ -491,6 +512,13 @@ RefoldStructuralGapCrossingProver::Prove(const Query &query) const {
                 interval->modelItemId
             ? deps_.model.GetMacroDirectiveById(*interval->modelItemId)
             : nullptr;
+    const std::optional<bool> armTaken = ownerArmTaken(deps_.model, *interval);
+    if (!directive && armTaken && !*armTaken) {
+      skippedMacroStateIntervals.insert(interval);
+      continue;
+    }
+
+    proof.carriesMacroStateDirective = true;
     if (directive && !directive->name.empty())
       proof.macroBindings.push_back(
           MacroStateBinding{directive->name, directive});
@@ -520,6 +548,12 @@ RefoldStructuralGapCrossingProver::Prove(const Query &query) const {
       GapCrossingEvidence evidence;
       evidence.rejection = GapCrossingRejection::NoProducerRecord;
       proof.structures.push_back(evidence);
+      continue;
+    }
+
+    if (skippedMacroStateIntervals.contains(interval)) {
+      proof.structures.push_back(ProveSkippedArmDirective(
+          *interval, query, GapCrossingProofKind::SkippedArmDirective));
       continue;
     }
 
