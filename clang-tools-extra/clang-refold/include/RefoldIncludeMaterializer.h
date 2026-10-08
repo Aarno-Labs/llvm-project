@@ -228,6 +228,23 @@ private:
       const RefoldModel::IncludeItem &include, llvm::StringRef headerPath,
       llvm::StringRef headerLoadPath) const;
 
+  /// The producer records of one skipped include directive site, one per
+  /// instance of the containing header that skipped it, ordered by id.
+  using SkippedIncludeSiteRecords =
+      llvm::SmallVector<const RefoldModel::IncludeItem *, 2>;
+
+  /// Return, in site order, the skipped include sites of \p headerPath that
+  /// materializing it relocates and that only a test of the opened header's
+  /// controlling macro can keep from being looked up.
+  ///
+  /// A site qualifies when it is not a child site in \p claimedChildSites, the
+  /// once-guard wrapper does not reach it, and its operand does not select the
+  /// producer's header from the final output surface for every record.
+  std::vector<SkippedIncludeSiteRecords>
+  RelocatedSkippedIncludeSitesNeedingMacroTest(
+      llvm::StringRef headerPath, llvm::ArrayRef<uint64_t> claimedChildSites,
+      const IncludeReplayProofContext &includeReplayProof) const;
+
   /// Records an inline include realization from the producer-proven B envelope.
   /// The caller-owned realization maps are updated together so recursive
   /// include materialization observes a complete memoized result.

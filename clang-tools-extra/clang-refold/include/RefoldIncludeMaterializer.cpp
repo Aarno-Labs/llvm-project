@@ -873,6 +873,36 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
   // `children`; the post-pass after this loop finds those by physical site
   // instead and must not re-handle a site the loop already claimed.
   SmallVector<uint64_t, 8> claimedChildSites;
+  if (auto it = children.find(includeId); it != children.end())
+    for (const RefoldModel::IncludeItem *child : it->second)
+      claimedChildSites.push_back(child->siteB);
+
+  // A relocated skipped include that only a test of its header's controlling
+  // macro could keep inert (3c below) is left inert by no test when Clang
+  // skipped it with that macro undefined, which an include-once header allows.
+  // Its directive did nothing in the producer, so realizing this header from B,
+  // which drops it, is exact.  Decide that before any child is materialized.
+  const std::vector<SkippedIncludeSiteRecords> relocatedSkippedSites =
+      RelocatedSkippedIncludeSitesNeedingMacroTest(
+          headerPath, claimedChildSites, includeReplayProof);
+  for (const SkippedIncludeSiteRecords &site : relocatedSkippedSites) {
+    const auto unproven =
+        llvm::find_if(site, [](const RefoldModel::IncludeItem *record) {
+          return record->controllingMacro &&
+                 !record->skipControllingMacroDefined.value_or(false);
+        });
+    if (unproven == site.end())
+      continue;
+    (void)TryRecordInlineIncludeRealizationFromB(
+        *inc,
+        formatv("relocated skipped include inc#{0} was not skipped with "
+                "controlling macro '{1}' defined",
+                (*unproven)->id, *(*unproven)->controllingMacro)
+            .str(),
+        includeExpansion, includeExpansionStartLineNos,
+        includeExpansionAcceptedResults, ancestorArmIdAtIncludeSite);
+    return;
+  }
 
   // Physical headers whose bodies are inlined with a synthetic guard.  A child
   // whose closure reaches one of these cannot survive as a directive.
@@ -881,7 +911,6 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
 
   if (auto it = children.find(includeId); it != children.end()) {
     for (const auto *child : it->second) {
-      claimedChildSites.push_back(child->siteB);
       bool todo = subtreeWork.HasDescendantWork(child->id);
 
       // Forced include-next materialization follows relocation, not
@@ -1207,87 +1236,51 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
   // child, and nothing proved it.  A directive whose operand still selects the
   // producer's header from the final output surface stays as written.  Any
   // other is wrapped in a test of the controlling macro Clang found defined
-  // when it skipped the header, so it is never looked up.  A site whose
-  // skipped records do not all carry that one macro, each seen defined at its
-  // skip, fails closed: an include-once header can be skipped with its macro
-  // undefined, and the test would then admit the directive.  Sites the
-  // once-guard wrapper above reaches are left to it.
-  {
-    SmallVector<const RefoldModel::IncludeItem *, 8> skippedRecords;
-    for (const RefoldModel::IncludeItem &candidate : model_.GetIncludes()) {
-      if (candidate.parent || !paths_.PathsEqual(candidate.sitePath, headerPath))
-        continue;
-      if (llvm::is_contained(claimedChildSites, candidate.siteB))
-        continue;
-      skippedRecords.push_back(&candidate);
-    }
-    llvm::sort(skippedRecords, [](const RefoldModel::IncludeItem *lhs,
-                                  const RefoldModel::IncludeItem *rhs) {
-      return std::tie(lhs->siteB, lhs->id) < std::tie(rhs->siteB, rhs->id);
-    });
-
-    for (size_t first = 0; first < skippedRecords.size();) {
-      size_t last = first + 1;
-      while (last < skippedRecords.size() &&
-             skippedRecords[last]->siteB == skippedRecords[first]->siteB)
-        ++last;
-      const ArrayRef<const RefoldModel::IncludeItem *> site(
-          skippedRecords.data() + first, last - first);
-      first = last;
-
-      if (llvm::any_of(site, [&](const RefoldModel::IncludeItem *record) {
-            return pragmaOnceGuards_.FindGuardForInclude(*record) != nullptr;
-          }))
-        continue;
-      if (llvm::all_of(site, [&](const RefoldModel::IncludeItem *record) {
-            return includeReplayProof.SkippedIncludeReplaysFromFinalSurface(
-                *record);
-          }))
-        continue;
-
-      const RefoldModel::IncludeItem &representative = *site.front();
-      const bool recordsAgree =
-          llvm::all_of(site, [&](const RefoldModel::IncludeItem *record) {
-            return record->controllingMacro ==
-                       representative.controllingMacro &&
-                   record->skipControllingMacroDefined ==
-                       representative.skipControllingMacroDefined;
-          });
-      PragmaOnceGuardEditResult guardResult =
-          recordsAgree
-              ? pragmaOnceGuards_.StageSkippedIncludeControllingMacroGuardEdit(
-                    representative, headerPath, includeId, bytes, edits)
-              : PragmaOnceGuardEditResult::Reject(
-                    PragmaOnceGuardRejection::UnaccountedIncludeDirective,
-                    formatv("skipped include records at [{0}] in '{1}' "
-                            "disagree on the controlling macro or on whether "
-                            "it was defined at the skip",
-                            representative.siteB, headerPath)
-                        .str());
-      if (!guardResult.proven) {
-        // As for the once-guard wrapper: an empty expansion would drop this
-        // header's whole body rather than fail.
-        REFOLD_LOG_TRACE("include/lookup",
-                         "relocated skipped include inc#{0} in inc#{1} "
-                         "rejected: {2} ({3})",
-                         representative.id, includeId,
-                         toString(guardResult.rejection), guardResult.detail);
-        terminalSink_.RequestTerminalFallback(
-            MakeTerminalFallbackProofFailure(
-                TerminalFallbackObligationKind::IncludeGuardStateStabilizable,
-                TerminalFallbackFailureReason::
-                    IncludeGuardStateNotStabilizable,
-                TerminalFallbackFailureContext::ForOwnerId(representative.id)),
-            "include/lookup", guardResult.detail);
-        includeExpansion[includeId] = std::string();
-        return;
-      }
+  // when it skipped the header, so it is never looked up.  A site with a
+  // record skipped while that macro was undefined was realized from B before
+  // the child loop; one whose records lack the macro or disagree on it fails
+  // closed here.  Sites the once-guard wrapper above reaches are left to it.
+  for (const SkippedIncludeSiteRecords &site : relocatedSkippedSites) {
+    const RefoldModel::IncludeItem &representative = *site.front();
+    const bool recordsAgree =
+        llvm::all_of(site, [&](const RefoldModel::IncludeItem *record) {
+          return record->controllingMacro == representative.controllingMacro &&
+                 record->skipControllingMacroDefined ==
+                     representative.skipControllingMacroDefined;
+        });
+    PragmaOnceGuardEditResult guardResult =
+        recordsAgree
+            ? pragmaOnceGuards_.StageSkippedIncludeControllingMacroGuardEdit(
+                  representative, headerPath, includeId, bytes, edits)
+            : PragmaOnceGuardEditResult::Reject(
+                  PragmaOnceGuardRejection::UnaccountedIncludeDirective,
+                  formatv("skipped include records at [{0}] in '{1}' "
+                          "disagree on the controlling macro or on whether "
+                          "it was defined at the skip",
+                          representative.siteB, headerPath)
+                      .str());
+    if (!guardResult.proven) {
+      // As for the once-guard wrapper: an empty expansion would drop this
+      // header's whole body rather than fail.
       REFOLD_LOG_TRACE("include/lookup",
-                       "relocated skipped include inc#{0} in inc#{1} guarded "
-                       "by its controlling macro '{2}'",
+                       "relocated skipped include inc#{0} in inc#{1} "
+                       "rejected: {2} ({3})",
                        representative.id, includeId,
-                       *representative.controllingMacro);
+                       toString(guardResult.rejection), guardResult.detail);
+      terminalSink_.RequestTerminalFallback(
+          MakeTerminalFallbackProofFailure(
+              TerminalFallbackObligationKind::IncludeGuardStateStabilizable,
+              TerminalFallbackFailureReason::IncludeGuardStateNotStabilizable,
+              TerminalFallbackFailureContext::ForOwnerId(representative.id)),
+          "include/lookup", guardResult.detail);
+      includeExpansion[includeId] = std::string();
+      return;
     }
+    REFOLD_LOG_TRACE("include/lookup",
+                     "relocated skipped include inc#{0} in inc#{1} guarded "
+                     "by its controlling macro '{2}'",
+                     representative.id, includeId,
+                     *representative.controllingMacro);
   }
 
   const size_t firstEmittedHeaderLine =
@@ -1559,6 +1552,49 @@ RefoldIncludeMaterializer::MaterializedHeaderRequiresBRealizationReason(
   }
 
   return std::nullopt;
+}
+
+std::vector<RefoldIncludeMaterializer::SkippedIncludeSiteRecords>
+RefoldIncludeMaterializer::RelocatedSkippedIncludeSitesNeedingMacroTest(
+    StringRef headerPath, ArrayRef<uint64_t> claimedChildSites,
+    const IncludeReplayProofContext &includeReplayProof) const {
+  // A skipped edge carries no parent, so it is found by physical site, once
+  // per instance of this header that skipped it.
+  SmallVector<const RefoldModel::IncludeItem *, 8> skippedRecords;
+  for (const RefoldModel::IncludeItem &candidate : model_.GetIncludes()) {
+    if (candidate.parent || !paths_.PathsEqual(candidate.sitePath, headerPath))
+      continue;
+    if (llvm::is_contained(claimedChildSites, candidate.siteB))
+      continue;
+    skippedRecords.push_back(&candidate);
+  }
+  llvm::sort(skippedRecords, [](const RefoldModel::IncludeItem *lhs,
+                                const RefoldModel::IncludeItem *rhs) {
+    return std::tie(lhs->siteB, lhs->id) < std::tie(rhs->siteB, rhs->id);
+  });
+
+  std::vector<SkippedIncludeSiteRecords> sites;
+  for (size_t first = 0; first < skippedRecords.size();) {
+    size_t last = first + 1;
+    while (last < skippedRecords.size() &&
+           skippedRecords[last]->siteB == skippedRecords[first]->siteB)
+      ++last;
+    SkippedIncludeSiteRecords site(skippedRecords.begin() + first,
+                                   skippedRecords.begin() + last);
+    first = last;
+
+    if (llvm::any_of(site, [&](const RefoldModel::IncludeItem *record) {
+          return pragmaOnceGuards_.FindGuardForInclude(*record) != nullptr;
+        }))
+      continue;
+    if (llvm::all_of(site, [&](const RefoldModel::IncludeItem *record) {
+          return includeReplayProof.SkippedIncludeReplaysFromFinalSurface(
+              *record);
+        }))
+      continue;
+    sites.push_back(std::move(site));
+  }
+  return sites;
 }
 
 bool RefoldIncludeMaterializer::TryRecordInlineIncludeRealizationFromB(
