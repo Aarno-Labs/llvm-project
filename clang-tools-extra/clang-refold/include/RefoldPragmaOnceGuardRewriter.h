@@ -138,6 +138,10 @@ enum class PragmaOnceGuardRejection : uint8_t {
   UnrepairableLineDrift,
   /// The include site could not be authorized as a rewritable include directive.
   UnauthorizableIncludeSite,
+  /// A skipped include is not proven to have been skipped by its controlling
+  /// macro: Clang tests include-once state first, and the producer did not
+  /// record the macro defined at the skip.
+  SkipNotByControllingMacro,
 };
 
 /// How one physical header's once-state is re-expressed in the refolded TU.
@@ -485,14 +489,16 @@ public:
   /// from being looked up at its new location.
   ///
   /// \p include must be a skipped edge: one the producer recorded with no
-  /// parent, because Clang never entered the header. Outside `#pragma once`,
-  /// Clang skips a header only when the controlling macro of its whole-file
-  /// `#ifndef` guard is defined, and the producer records that macro. Testing
-  /// it around the verbatim directive therefore leaves the directive inert
-  /// wherever the original skip happened, so it is never looked up, and a
-  /// quoted operand that resolved beside the header's own directory cannot
-  /// fail or select another file from the directory it is moved to. An edge
-  /// without a recorded controlling macro is rejected.
+  /// parent, because Clang never entered the header. Clang skips a header
+  /// when it is include-once and already entered, or when the controlling
+  /// macro of its whole-file `#ifndef` guard is defined; it tests the first
+  /// before the second. The producer records the macro and whether it was
+  /// defined at this skip, and only a skip it saw with the macro defined is
+  /// accepted. Testing that macro around the verbatim directive then leaves
+  /// the directive inert wherever the original skip happened, so it is never
+  /// looked up, and a quoted operand that resolved beside the header's own
+  /// directory cannot fail or select another file from the directory it is
+  /// moved to. Any other edge is rejected.
   PragmaOnceGuardEditResult StageSkippedIncludeControllingMacroGuardEdit(
       const RefoldModel::IncludeItem &include, llvm::StringRef ownerPath,
       std::optional<uint64_t> ownerIncludeId, llvm::StringRef ownerBytes,

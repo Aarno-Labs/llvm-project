@@ -480,6 +480,39 @@ struct Item {
   // later path back to the same physical file re-enters it.  Recording the name
   // lets the consumer restore that state explicitly instead of failing closed.
   std::string ControllingMacro;
+
+  // Whether HeaderSearch had marked the opened file include-once, by
+  // `#pragma once`, `_Pragma("once")` or `#import`, once the whole translation
+  // unit was read.  Clang tests that state before the controlling macro, and
+  // it belongs to one physical file, so it is the fact that tells a consumer
+  // whether a different file with the same bytes can stand in for this one.
+  bool OnceOnly = false;
+
+  // Whether Clang skipped this include rather than entering the opened file.
+  bool Skipped = false;
+
+  // Whether Clang entered the opened file and this builder bound the entered
+  // instance to this item, so that the instance's own events are attributed
+  // to it.
+  bool Entered = false;
+
+  // For a skipped include, the controlling macro HeaderSearch knew for the
+  // opened file at the moment of the skip, recorded only when that macro was
+  // defined then.  Clang tests include-once state first, so an include-once
+  // header can be skipped while its macro is undefined; this records which of
+  // the two states the skip is evidence of.
+  std::string SkipDefinedControllingMacro;
+
+  // Whether, while the file this include opened was being read, Clang searched
+  // for a file other than through an include edge: `__has_include`,
+  // `__has_include_next`, `__has_embed` or `#embed`.  Each such search starts
+  // beside this physical file or resumes from the search-chain entry it was
+  // found through, so its outcome depends on where and how the file was found
+  // and not only on its bytes.  Meaningful only when `Entered` is set: a
+  // search inside an instance this builder could not bind has no item to
+  // mark.
+  bool ObservesLookupContext = false;
+
   std::string LookupKind;
   std::optional<unsigned> LookupSearchChainIndex;
   std::string LookupDirectorySpelling;
@@ -741,6 +774,9 @@ class RefoldMapBuilder {
   llvm::StringMap<size_t> IncludeKey2Item;
   std::vector<std::optional<size_t>> IncludeStack; // item indices (include
                                                    // items), nullopt for none
+  /// Index of the include item recorded by the latest InclusionDirective
+  /// callback, which a following FileSkipped callback refers to.
+  std::optional<size_t> LastIncludeItemIdx;
   std::optional<size_t> CurrentFileItem;
 
   std::vector<TokMapEntry> TokMap;
@@ -1089,6 +1125,19 @@ public:
   /// context-sensitive.  Captured from Clang's evaluation, so it observes the
   /// operator even when it is produced by macro expansion or token pasting.
   void onHasInclude(SourceLocation Loc);
+
+  /// Mark the include instance whose file is being read as having searched for
+  /// a file outside an include edge (`__has_include`, `__has_include_next`,
+  /// `__has_embed` or `#embed`).
+  void onLookupObservation();
+
+  /// Callback for an include Clang decided not to enter.
+  ///
+  /// Clang reports the skip immediately after the include's
+  /// InclusionDirective callback, so it belongs to the include item recorded
+  /// last, provided that item opened \p SkippedFile.  Records whether the
+  /// file's controlling macro was defined at the skip.
+  void onIncludeSkipped(FileEntryRef SkippedFile);
 
   /// Entering a file (either TU or an included header).
   ///

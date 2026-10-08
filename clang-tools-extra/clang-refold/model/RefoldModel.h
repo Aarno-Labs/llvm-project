@@ -492,6 +492,27 @@ public:
     /// own directives: defining this macro beside such a body restores the skip
     /// behaviour that the lost `#define` would have produced.
     std::optional<StringRef> controllingMacro;
+    /// Whether HeaderSearch had marked the opened file include-once
+    /// (`#pragma once`, `_Pragma("once")` or `#import`) by the end of the
+    /// translation unit.  That state belongs to one physical file, so a copy
+    /// of the file does not share it.  Absent in maps written before schema
+    /// 3.11: unknown, never "no".
+    std::optional<bool> onceOnly;
+    /// Present exactly on an include Clang skipped: whether the opened file's
+    /// controlling macro was defined at that moment.  Clang tests include-once
+    /// state first, so an include-once header can be skipped while its macro
+    /// is undefined, and only `true` proves that testing the macro reproduces
+    /// the skip.  Absent on an entered include and in maps before 3.11.
+    std::optional<bool> skipControllingMacroDefined;
+    /// Present on an include Clang entered: whether, while reading the opened
+    /// file in this instance, Clang searched for a file outside an include
+    /// edge -- `__has_include`, `__has_include_next`, `__has_embed` or
+    /// `#embed`.  Such a search starts beside the physical file or resumes from
+    /// the search-chain entry the file was found through, so the instance's
+    /// tokens are reproduced only by the same file found the same way.  Absent
+    /// on a skipped include, on one whose entered instance the producer could
+    /// not bind, and in maps before 3.11: unknown.
+    std::optional<bool> observesLookupContext;
     std::optional<IncludeLookupProvenance> lookup;
     std::optional<IncludeNextProvenance> includeNext;
 
@@ -1030,11 +1051,6 @@ public:
     /// arm of a group inside an excluded block, was read without being
     /// decided.
     bool evaluated = false;
-    /// True when the producer observed this arm's condition evaluate
-    /// `__has_include` / `__has_include_next`.  Absent in the map means false.
-    /// These operators are lookup-context sensitive, so an arm bearing one
-    /// cannot be soundly source-replayed from a relocated (materialized) header.
-    bool condUsesHasInclude = false;
 
     bool ContainsByte(uint64_t byteOffset) const {
       return bodyB <= byteOffset && byteOffset < bodyE;

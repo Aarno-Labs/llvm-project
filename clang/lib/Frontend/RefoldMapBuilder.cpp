@@ -2505,6 +2505,27 @@ void RefoldMapBuilder::onIncludeDirective(
   IncludeKey2Item[keyForLoc(SM, HashLoc)] = ThisIdx;
   IncludeKey2Item[keyForLoc(SM, FilenameRange.getBegin())] = ThisIdx;
   IncludeKey2Item[keyForLoc(SM, FilenameRange.getEnd())] = ThisIdx;
+  LastIncludeItemIdx = ThisIdx;
+}
+
+void RefoldMapBuilder::onIncludeSkipped(FileEntryRef SkippedFile) {
+  if (!enabled() || !LastIncludeItemIdx)
+    return;
+  Item &It = Items[*LastIncludeItemIdx];
+  LastIncludeItemIdx.reset();
+  if (!It.OpenedFileEntry || *It.OpenedFileEntry != SkippedFile)
+    return;
+
+  It.Skipped = true;
+  // HeaderSearch learns a header's controlling macro when it finishes reading
+  // the header, so a skip during its first inclusion finds none and records
+  // nothing.
+  if (const IdentifierInfo *Guard =
+          PP.getHeaderSearchInfo()
+              .getFileInfo(SkippedFile)
+              .getControllingMacro(PP.getExternalSource());
+      Guard && PP.isMacroDefined(Guard))
+    It.SkipDefinedControllingMacro = Guard->getName().str();
 }
 
 void RefoldMapBuilder::onMacroDefined(const Token &MacroNameTok,
@@ -3283,9 +3304,19 @@ void RefoldMapBuilder::onConditionalDirective(
   G.Arms.push_back(std::move(A));
 }
 
+void RefoldMapBuilder::onLookupObservation() {
+  if (!enabled())
+    return;
+  // The top of the stack is the instance whose directive is being handled;
+  // the main file has no include item.
+  if (!IncludeStack.empty() && IncludeStack.back())
+    Items[*IncludeStack.back()].ObservesLookupContext = true;
+}
+
 void RefoldMapBuilder::onHasInclude(SourceLocation Loc) {
   if (!enabled())
     return;
+  onLookupObservation();
   if (Loc.isInvalid())
     return;
 
@@ -3655,6 +3686,8 @@ void RefoldMapBuilder::onEnterFile(SourceLocation IncludeLoc,
   // conceptually a child of the current top of the stack (if any).
   if (Idx && !IncludeStack.empty() && IncludeStack.back())
     Items[*Idx].Parent = static_cast<uint64_t>(*IncludeStack.back());
+  if (Idx)
+    Items[*Idx].Entered = true;
   IncludeStack.push_back(Idx);
 }
 
@@ -4638,7 +4671,7 @@ void RefoldMapBuilder::writeJSON() {
       PragmaItemsWithImage == PragmasEmittedIntoOutput;
 
   JO.object([&] {
-    JO.attribute("version", "3.10");
+    JO.attribute("version", "3.11");
     JO.attribute("pragma_images_complete", PragmaImagesComplete);
 
     const auto &PPO = PP.getPreprocessorOpts();
@@ -5911,10 +5944,11 @@ void RefoldMapBuilder::writeJSON() {
       for (Item &It : Items) {
         if (It.Kind != IK_Directive || !It.OpenedFileEntry)
           continue;
+        HeaderFileInfo &Info = HS.getFileInfo(*It.OpenedFileEntry);
         if (const IdentifierInfo *Guard =
-                HS.getFileInfo(*It.OpenedFileEntry)
-                    .getControllingMacro(PP.getExternalSource()))
+                Info.getControllingMacro(PP.getExternalSource()))
           It.ControllingMacro = Guard->getName().str();
+        It.OnceOnly = Info.isPragmaOnce || Info.isImport;
       }
     }
 
@@ -6117,6 +6151,21 @@ void RefoldMapBuilder::writeJSON() {
               JO.attribute("opened_path", It.OpenedPath);
             if (!It.ControllingMacro.empty())
               JO.attribute("controlling_macro", It.ControllingMacro);
+            // Written explicitly, false included: a consumer reads an absent
+            // field as unknown and fails closed rather than assuming the
+            // common case.  An include entered into an instance this builder
+            // could not bind carries neither per-occurrence fact.
+            if (It.OpenedFileEntry) {
+              JO.attribute("once_only", It.OnceOnly);
+              if (It.Skipped)
+                JO.attribute("skip_controlling_macro_defined",
+                             !It.SkipDefinedControllingMacro.empty() &&
+                                 It.SkipDefinedControllingMacro ==
+                                     It.ControllingMacro);
+              else if (It.Entered)
+                JO.attribute("observes_lookup_context",
+                             It.ObservesLookupContext);
+            }
             if (!It.EnteredFileSpelling.empty())
               JO.attribute("entered_file_spelling", It.EnteredFileSpelling);
             if (!It.EnteredFileName.empty())

@@ -1171,6 +1171,20 @@ parseIncludeItem(const json::Object &obj, StringRef skStr,
                   /*spans*/ std::move(spans),
                   /*decls*/ std::move(decls));
 
+  // HeaderSearch state facts (schema 3.11).  A skipped include carries the
+  // skip fact and an entered one the lookup-context fact, never both.
+  inc.onceOnly = obj.getBoolean("once_only");
+  inc.skipControllingMacroDefined =
+      obj.getBoolean("skip_controlling_macro_defined");
+  inc.observesLookupContext = obj.getBoolean("observes_lookup_context");
+  if (inc.skipControllingMacroDefined && inc.observesLookupContext)
+    return createStringError(inconvertibleErrorCode(),
+                             "Include item at %s carries both "
+                             "skip_controlling_macro_defined and "
+                             "observes_lookup_context; an include is either "
+                             "skipped or entered",
+                             ctxItem.c_str());
+
   // Producer-measured spellings (schema 3.8).  The extent must begin at the
   // same `#` as the site and reach at least as far, and the keyword and
   // operand must lie inside it in that order: these are independent producer
@@ -1862,13 +1876,6 @@ static Expected<CondGroup> parseCondGroup(const json::Object &obj,
     arm.cond = asOptString(*armObj, "cond");
     arm.directive =
         parseOptSourceByteRange(*armObj, "directive_b", "directive_e");
-
-    // Optional; absent means the producer did not observe a lookup-context
-    // sensitive `__has_include` in this arm's condition, so it defaults
-    // false and older maps remain compatible.
-    if (std::optional<bool> usesHasInc =
-            armObj->getBoolean("cond_uses_has_include"))
-      arm.condUsesHasInclude = *usesHasInc;
 
     if (const json::Value *ppSpanVal = armObj->get("pp_span")) {
       if (!ppSpanVal->getAsNull()) {

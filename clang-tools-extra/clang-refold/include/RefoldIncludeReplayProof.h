@@ -303,6 +303,15 @@ private:
     // physical/spelling mismatch keeps materialization fail-closed.
     SmallVector<IncludeNextObligation, 4> includeNextObligations;
 
+    // Include instances of the child subtree, the child included, that searched
+    // for a file outside an include edge (`__has_include`,
+    // `__has_include_next`, `__has_embed`, `#embed`), or whose record does not
+    // say.  Such a search starts beside the instance's physical file or resumes
+    // from the search-chain entry it was found through, so equal bytes do not
+    // give equal tokens: each instance must be re-entered as the producer's
+    // physical file selected through the producer's lookup.
+    SmallVector<uint64_t, 4> lookupContextObservers;
+
     // Producer-side entered spelling for the child edge itself, from
     // IncludeItem::enteredFileSpelling.  The child edge must be re-entered with
     // the same spelling before descendant quoted lookup and file observers can
@@ -323,7 +332,8 @@ private:
 
     bool requiresReplayCandidateProof() const {
       return observesLine || observesFileSpelling() || observesBaseFile ||
-             observesIncludeLevel || !includeNextObligations.empty();
+             observesIncludeLevel || !includeNextObligations.empty() ||
+             !lookupContextObservers.empty();
     }
   };
 
@@ -389,11 +399,17 @@ private:
 
     bool sameIncludeNextStack = true;
 
+    /// Every lookup-context observer in the subtree is re-entered as the
+    /// producer's file through the producer's lookup; see
+    /// `LookupContextObligationsAreProven()`.
+    bool sameLookupContext = true;
+
     bool proves(const CleanChildIncludeReplayDemand &demand) const {
       return samePhysicalFile &&
              (!demand.observesFile || sameEnteredFileSpelling) &&
              (!demand.observesFileName || sameEnteredFileName) &&
-             (demand.includeNextObligations.empty() || sameIncludeNextStack);
+             (demand.includeNextObligations.empty() || sameIncludeNextStack) &&
+             (demand.lookupContextObservers.empty() || sameLookupContext);
     }
   };
 
@@ -629,6 +645,23 @@ private:
       const RefoldModel::IncludeItem &child,
       const CleanChildIncludeReplayDemand &demand) const;
 
+  /// Return whether every lookup-context observer in \p demand is re-entered,
+  /// when \p child is kept as \p childCandidate, as the producer's physical
+  /// file selected through the producer's recorded lookup.
+  ///
+  /// Same file and same lookup together fix the two inputs such a search
+  /// reads: the directory a quoted operand starts beside, and the cursor
+  /// `__has_include_next` resumes from.  The cursor is the one Clang leaves
+  /// behind for a source-relative hit too, which is the includer's, and the
+  /// replay model does not reproduce that inheritance; the proof therefore
+  /// requires the producer's lookup on the child itself and on every include
+  /// between it and an observer, so that each inherited cursor is the
+  /// producer's.  A copy of the producer's header fails the first test.
+  bool LookupContextObligationsAreProven(
+      const IncludeReplayCandidate &childCandidate,
+      const RefoldModel::IncludeItem &child,
+      const CleanChildIncludeReplayDemand &demand) const;
+
   /// Evaluate whether one replay candidate preserves the child include edge
   /// under the active observer and descendant include-next proof demand.
   IncludeReplayProofResult EvaluateIncludeReplayCandidate(
@@ -773,14 +806,26 @@ private:
                                       bool followClosure) const;
 
   /// Return whether \p candidatePath holds exactly the bytes of the header the
-  /// producer opened through \p include, and that header carries a recorded
-  /// controlling macro.
+  /// producer opened through \p include, that header carries a recorded
+  /// controlling macro, and its include-once and skip state do not tell the
+  /// two files apart.
   ///
-  /// Equal bytes lex to equal tokens under equal macro state.  The macro is
-  /// what makes the copy interchangeable with the original in one compile:
-  /// a header whose whole text is guarded by it is deduplicated by the macro,
-  /// whichever file is entered, whereas `#pragma once` deduplicates by
-  /// physical file and would admit both copies.
+  /// Equal bytes lex to equal tokens under equal macro state, and the macro
+  /// deduplicates whichever copy is entered, but:
+  ///
+  ///   * Entered edge.  Include-once state belongs to one physical file, so a
+  ///     header the producer marked include-once (`onceOnly`) is refused:
+  ///     entering the copy leaves the original unmarked.
+  ///   * Skipped edge.  Entering the copy reproduces the skip only when its
+  ///     whole-file guard is closed, so the producer must have seen the macro
+  ///     defined at the skip (`skipControllingMacroDefined`).  Clang tests
+  ///     include-once state first, so a skip alone does not show that.
+  ///
+  /// A fact the producer did not record counts against the copy.  Equal
+  /// tokens also need the file's location to be unobserved; that is not
+  /// decided here but by `LookupContextObligationsAreProven()`, which requires
+  /// the producer's own file for every instance that searched for a file, so a
+  /// copy never discharges it.
   bool IsByteIdenticalGuardedCopy(const std::filesystem::path &candidatePath,
                                   const RefoldModel::IncludeItem &include) const;
 

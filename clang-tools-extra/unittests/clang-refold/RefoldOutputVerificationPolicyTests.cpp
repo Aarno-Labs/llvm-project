@@ -12,9 +12,10 @@
 // of the pipeline rather than of the shapes tried.  The verdict means the
 // finished assembly could not be preprocessed, and the refolder refuses to
 // emit such an assembly in the first place: materializing a header inlines
-// the includes nested inside it rather than relocating them unresolved, an
-// arm whose condition used `__has_include` is not source-replayable from a
-// relocated header at all (`cond_uses_has_include`), and an edit that would
+// the includes nested inside it rather than relocating them unresolved, a
+// header instance that searched for a file outside an include edge is not
+// source-replayable from a relocated header at all
+// (`observes_lookup_context`), and an edit that would
 // activate a preserved `#error` fails its macro-state obligation before any
 // text is written.  What remains are environmental failures -- a scratch file
 // that cannot be created, a header gone between production and verification

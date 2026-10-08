@@ -1,0 +1,1 @@
+int rchi_extra;

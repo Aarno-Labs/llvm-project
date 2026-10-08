@@ -292,6 +292,8 @@ StringRef toString(PragmaOnceGuardRejection rejection) {
     return "UnrepairableLineDrift";
   case PragmaOnceGuardRejection::UnauthorizableIncludeSite:
     return "UnauthorizableIncludeSite";
+  case PragmaOnceGuardRejection::SkipNotByControllingMacro:
+    return "SkipNotByControllingMacro";
   }
   return "Unknown";
 }
@@ -1520,6 +1522,14 @@ RefoldPragmaOnceGuardRewriter::StageSkippedIncludeControllingMacroGuardEdit(
         formatv("relocated include inc#{0} in '{1}' is not a skipped edge "
                 "with a recorded controlling macro",
                 include.id, ownerPath)
+            .str());
+  }
+  if (!include.skipControllingMacroDefined.value_or(false)) {
+    return PragmaOnceGuardEditResult::Reject(
+        PragmaOnceGuardRejection::SkipNotByControllingMacro,
+        formatv("relocated include inc#{0} in '{1}' was not skipped with "
+                "controlling macro '{2}' defined",
+                include.id, ownerPath, *include.controllingMacro)
             .str());
   }
   return StageIncludeMacroTestWrapper(include, *include.controllingMacro,

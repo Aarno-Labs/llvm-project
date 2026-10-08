@@ -1347,6 +1347,25 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
                               PP.getLastIncludeLookupProvenance());
       }
 
+      void FileSkipped(const FileEntryRef &SkippedFile,
+                       const Token &FilenameTok,
+                       SrcMgr::CharacteristicKind FileType) override {
+        (void)FilenameTok;
+        (void)FileType;
+        R->onIncludeSkipped(SkippedFile);
+      }
+
+      void EmbedDirective(SourceLocation HashLoc, StringRef FileName,
+                          bool IsAngled, OptionalFileEntryRef File,
+                          const LexEmbedParametersResult &Params) override {
+        R->onLookupObservation();
+      }
+
+      void HasEmbed(SourceLocation Loc, StringRef FileName, bool IsAngled,
+                    OptionalFileEntryRef File) override {
+        R->onLookupObservation();
+      }
+
       void MacroDefined(const Token &MacroNameTok,
                         const MacroDirective *MD) override {
         R->onMacroDefined(MacroNameTok, MD);

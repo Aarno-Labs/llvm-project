@@ -1010,11 +1010,20 @@ IncludeReplayProofContext::BuildCleanChildIncludeReplayDemand(
   const bool lineSensitiveDemandEnabled = lineDirs_.Enabled();
 
   for (const RefoldModel::IncludeItem &descendant : model_.GetIncludes()) {
-    if (descendant.id == includeId)
-      continue;
-    if (descendant.subkind != "#include_next")
+    // An entered instance without the producer's lookup fact is unknown, and
+    // counts as an observer.  A skipped edge enters nothing.
+    const bool observesLookupContext =
+        !descendant.skipControllingMacroDefined &&
+        descendant.observesLookupContext.value_or(true);
+    const bool isIncludeNext =
+        descendant.id != includeId && descendant.subkind == "#include_next";
+    if (!observesLookupContext && !isIncludeNext)
       continue;
     if (!model_.IncludeIsDescendantOrSelf(descendant.id, includeId))
+      continue;
+    if (observesLookupContext)
+      demand.lookupContextObservers.push_back(descendant.id);
+    if (!isIncludeNext)
       continue;
 
     IncludeNextObligation obligation;
@@ -1332,6 +1341,38 @@ bool IncludeReplayProofContext::IncludeNextObligationsAreProven(
   return true;
 }
 
+bool IncludeReplayProofContext::LookupContextObligationsAreProven(
+    const IncludeReplayCandidate &childCandidate,
+    const RefoldModel::IncludeItem &child,
+    const CleanChildIncludeReplayDemand &demand) const {
+  if (demand.lookupContextObservers.empty())
+    return true;
+
+  // A kept child is looked up from the output's main file, which has no
+  // cursor of its own to pass on, so the candidate's lookup is the one Clang
+  // will use.
+  if (!child.lookup ||
+      !IncludeReplayCandidateMatchesProducerLookup(childCandidate, child))
+    return false;
+
+  PreservedChildIncludeReplayResolver resolver(*this, child, childCandidate);
+  for (uint64_t observerId : demand.lookupContextObservers) {
+    // The resolver matches the producer's lookup at every edge from the child
+    // down to the observer, but it accepts an edge with no lookup record on
+    // physical identity alone, and such an edge would pass on whatever cursor
+    // it inherited.
+    const RefoldModel::IncludeItem *edge = model_.GetIncludeById(observerId);
+    while (edge && edge->id != child.id) {
+      if (!edge->lookup || !edge->parent)
+        return false;
+      edge = model_.GetIncludeById(*edge->parent);
+    }
+    if (!edge || !resolver.Replay(observerId))
+      return false;
+  }
+  return true;
+}
+
 IncludeReplayProofContext::IncludeReplayProofResult
 IncludeReplayProofContext::EvaluateIncludeReplayCandidate(
     const IncludeReplayCandidate &candidate,
@@ -1342,6 +1383,8 @@ IncludeReplayProofContext::EvaluateIncludeReplayCandidate(
       candidate.physicalPath, child, /*followClosure=*/true);
   result.sameIncludeNextStack =
       IncludeNextObligationsAreProven(candidate, child, demand);
+  result.sameLookupContext =
+      LookupContextObligationsAreProven(candidate, child, demand);
   if (demand.observesFileSpelling()) {
     // The producer's include-entry spelling is the target for __FILE__
     // preservation.  A demand without one proves nothing, so the observer
@@ -1659,6 +1702,8 @@ IncludeReplayProofContext::DirectIncludeNextOrdinaryRewriteRejectReason(
     return "entered-file-name-mismatch";
   if (!demand.includeNextObligations.empty() && !proof->sameIncludeNextStack)
     return "descendant-include-next-obligation-failed";
+  if (!demand.lookupContextObservers.empty() && !proof->sameLookupContext)
+    return "lookup-context-observer-not-reproduced";
 
   return "unresolved";
 }
@@ -1791,6 +1836,10 @@ IncludeReplayProofContext::PlanAngledOrdinaryChildReplay(
     plan.reason = "angled child include resolves to the same physical "
                   "file but does not prove descendant #include_next "
                   "resume-stack stability";
+  else if (!proof.sameLookupContext)
+    plan.reason = "angled child include does not re-enter the producer's "
+                  "file through the producer's lookup, which a file search "
+                  "in the subtree observes";
   else
     plan.reason = "angled child include resolves to the same physical "
                   "file but does not prove file-observer spelling "
@@ -1932,6 +1981,10 @@ IncludeReplayProofContext::PlanQuotedOrdinaryChildReplay(
         reason = "quoted operand resolves to the same physical file but "
                  "does not prove descendant #include_next resume-stack "
                  "stability";
+      else if (!proof.sameLookupContext)
+        reason = "quoted operand does not re-enter the producer's file "
+                 "through the producer's lookup, which a file search in "
+                 "the subtree observes";
       else
         reason = "quoted operand resolves to the same physical file but "
                  "does not prove file-observer spelling stability";
@@ -1992,6 +2045,10 @@ IncludeReplayProofContext::PlanQuotedOrdinaryChildReplay(
           firstRewriteFailure =
               "rewritten operand does not prove descendant #include_next "
               "resume-stack stability";
+        else if (!proof.sameLookupContext)
+          firstRewriteFailure =
+              "rewritten operand does not re-enter the producer's file "
+              "through the producer's lookup";
         else
           firstRewriteFailure =
               "rewritten operand does not prove file-observer spelling "
@@ -2052,6 +2109,14 @@ bool IncludeReplayProofContext::IsByteIdenticalGuardedCopy(
     const RefoldModel::IncludeItem &include) const {
   if (!include.controllingMacro || include.controllingMacro->empty())
     return false;
+  // The producer writes the skip fact on a skipped edge and the include-once
+  // fact on every other; a map without them proves nothing.
+  if (include.skipControllingMacroDefined) {
+    if (!*include.skipControllingMacroDefined)
+      return false;
+  } else if (include.onceOnly.value_or(true)) {
+    return false;
+  }
   const std::optional<std::filesystem::path> producerPath =
       producerPhysicalIncludePath(include);
   if (!producerPath)

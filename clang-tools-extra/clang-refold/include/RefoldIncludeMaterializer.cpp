@@ -1208,7 +1208,9 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
   // producer's header from the final output surface stays as written.  Any
   // other is wrapped in a test of the controlling macro Clang found defined
   // when it skipped the header, so it is never looked up.  A site whose
-  // skipped records do not all carry that one macro fails closed.  Sites the
+  // skipped records do not all carry that one macro, each seen defined at its
+  // skip, fails closed: an include-once header can be skipped with its macro
+  // undefined, and the test would then admit the directive.  Sites the
   // once-guard wrapper above reaches are left to it.
   {
     SmallVector<const RefoldModel::IncludeItem *, 8> skippedRecords;
@@ -1244,19 +1246,22 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
         continue;
 
       const RefoldModel::IncludeItem &representative = *site.front();
-      const bool macrosAgree =
+      const bool recordsAgree =
           llvm::all_of(site, [&](const RefoldModel::IncludeItem *record) {
             return record->controllingMacro ==
-                   representative.controllingMacro;
+                       representative.controllingMacro &&
+                   record->skipControllingMacroDefined ==
+                       representative.skipControllingMacroDefined;
           });
       PragmaOnceGuardEditResult guardResult =
-          macrosAgree
+          recordsAgree
               ? pragmaOnceGuards_.StageSkippedIncludeControllingMacroGuardEdit(
                     representative, headerPath, includeId, bytes, edits)
               : PragmaOnceGuardEditResult::Reject(
                     PragmaOnceGuardRejection::UnaccountedIncludeDirective,
-                    formatv("skipped include records at [{0}] in '{1}' name "
-                            "different controlling macros",
+                    formatv("skipped include records at [{0}] in '{1}' "
+                            "disagree on the controlling macro or on whether "
+                            "it was defined at the skip",
                             representative.siteB, headerPath)
                         .str());
       if (!guardResult.proven) {
@@ -1397,29 +1402,22 @@ RefoldIncludeMaterializer::MaterializedHeaderRequiresBRealizationReason(
   const uint64_t includeId = include.id;
 
   // A materialized header is replayed from the including surface, not from the
-  // header's original file.  Conditional operators such as __has_include
-  // perform quoted-header lookup relative to the file that contains the
-  // directive; moving that directive out of its original header can therefore
-  // flip the selected preprocessor branch even when ordinary macro state is
-  // otherwise closed.
+  // header's original file.  `__has_include`, `__has_include_next`,
+  // `__has_embed` and `#embed` search for a file beside the file that contains
+  // the directive, or from the search-chain entry it was found through; moving
+  // that directive out of its original header can therefore flip a selected
+  // branch or change embedded data even when ordinary macro state is otherwise
+  // closed.
   //
-  // The producer records `condUsesHasInclude` from Clang's actual evaluation,
-  // so it flags exactly the arms the preprocessor evaluated (the selected arm
-  // and any earlier arms whose condition was tested and failed) and catches
-  // macro-hidden or token-pasted operators a textual scan of `cond` would miss.
-  // Arms that follow the selected one are never evaluated, so they are never
-  // flagged -- which is sound, since they are unreachable under relocation when
-  // no evaluated arm used the operator.
-  for (const RefoldModel::CondGroup *group :
-       model_.GetCondGroups(headerPath, includeId)) {
-    if (!group)
-      continue;
-    for (const RefoldModel::CondArm &arm : group->arms) {
-      if (arm.condUsesHasInclude)
-        return "replay-context-sensitive conditional control in "
-               "materialized header";
-    }
-  }
+  // The producer records `observesLookupContext` per include instance from
+  // Clang's own callbacks, so it catches macro-hidden or token-pasted operators
+  // a textual scan would miss, and it does not depend on the instance's
+  // conditional groups having been measured.  An occurrence Clang skipped
+  // read nothing, so it carries the skip fact instead and observes nothing;
+  // any other whose record does not say is treated as observing.
+  if (!include.skipControllingMacroDefined &&
+      include.observesLookupContext.value_or(true))
+    return "replay-context-sensitive file search in materialized header";
 
   // __INCLUDE_LEVEL__ observes include-stack depth, not line/file state.  Once
   // an include owner is materialized, the source-spelled header bytes are

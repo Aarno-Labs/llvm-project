@@ -626,7 +626,7 @@ static constexpr const char *RefoldSchema = R"json(
         },
         "cond_uses_has_include": {
           "type": "boolean",
-          "description": "True iff the producer observed this arm's condition evaluate __has_include/__has_include_next. Optional; absent means false. Such arms are lookup-context sensitive and cannot be soundly source-replayed from a relocated (materialized) header."
+          "description": "True iff the producer observed this arm's condition evaluate __has_include/__has_include_next. Optional; absent means false. Audit metadata only: an arm is reported only when its group was measured, so it is not a complete record of the file searches an include instance made. The per-instance observes_lookup_context include field is that record."
         }
       },
       "dependentRequired": {
@@ -1341,6 +1341,18 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "string",
           "minLength": 1,
           "description": "Name of the macro whose #ifndef guards the entire contents of the file opened by this include edge, as recognized by HeaderSearch. Absent when the header has no such guard, including when it relies on #pragma once instead. A consumer that inlines this header's tokens rather than its source loses every directive the header contained, including this guard: the content is then present while the controlling macro stays undefined, so any later path back to the same physical file re-enters it. Defining this macro alongside such an inlined body restores the original skip behaviour. Resolved after the whole translation unit is lexed, because a header's guard is not known when its first inclusion is seen."
+        },
+        "once_only": {
+          "type": "boolean",
+          "description": "Whether HeaderSearch had marked the file opened by this include edge include-once (#pragma once, _Pragma(\"once\") or #import) by the end of the translation unit. Written on every include that opened a file, false included. Include-once state belongs to one physical file, so a different file with the same bytes does not share it. Absent means unknown."
+        },
+        "skip_controlling_macro_defined": {
+          "type": "boolean",
+          "description": "Present exactly on an include Clang skipped instead of entering: whether the opened file's controlling macro was defined at that moment. Clang tests include-once state before the controlling macro, so an include-once header can be skipped while its macro is undefined; only true proves that testing the macro reproduces the skip."
+        },
+        "observes_lookup_context": {
+          "type": "boolean",
+          "description": "Present on an include Clang entered, when the producer bound the entered instance to this item: whether, while reading the opened file in this instance, Clang searched for a file outside an include edge (__has_include, __has_include_next, __has_embed or #embed). Such a search starts beside the physical file or resumes from the search-chain entry the file was found through, so the instance's tokens are reproduced only by the same file found the same way. Absent means unknown."
         },
         "entered_file_spelling": {
           "type": "string",
