@@ -408,7 +408,7 @@ public:
       const RefoldMacroStandardArgsOnlyPatchBuilder::Dependencies &deps,
       const RefoldMacroOccurrenceReplay &occurrenceReplay);
 
-  bool Validate(uint32_t argIdx,
+  bool Validate(const RefoldModel::MacroInvocation &invocation, uint32_t argIdx,
                 llvm::ArrayRef<RefoldModel::PPArgSpan> standardArgSpans,
                 llvm::ArrayRef<OccObservation> observations,
                 llvm::ArrayRef<diffutils::Hunk> tokenHunks) const;
@@ -575,7 +575,8 @@ public:
       const RefoldMacroOccurrenceReplay &occurrenceReplay);
 
   /// Return whether `newArg` matches every repaired STANDARD occurrence.
-  bool Validate(uint32_t argIdx, llvm::StringRef newArg,
+  bool Validate(const RefoldModel::MacroInvocation &invocation, uint32_t argIdx,
+                llvm::StringRef newArg,
                 llvm::ArrayRef<RefoldModel::PPArgSpan> standardArgSpans,
                 llvm::ArrayRef<diffutils::Hunk> tokenHunks) const;
 

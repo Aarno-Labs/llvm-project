@@ -143,7 +143,34 @@ public:
       llvm::ArrayRef<RefoldModel::PPArgSpan> argSpans,
       std::pair<size_t, size_t> mappedEnv, const diffutils::Hunk &h) const;
 
+  /// Widen \p env, the B-token envelope of standard occurrence \p span of
+  /// \p m, to the boundary-preserving projection of \p span on each edge where
+  /// \p span abuts fixed replacement-list text of \p m.
+  ///
+  /// An args-only rewrite claims the whole expansion, and the literal-body
+  /// audit that admits it tiles that expansion as fixed text replayed verbatim
+  /// with each argument surface between, the surface projected with its
+  /// boundary insertions kept.  Fixed text cannot own an insertion, so B text
+  /// inserted where an occurrence meets it is part of the occurrence, and an
+  /// actual derived from a narrower envelope is not what the occurrence
+  /// became.  The narrower envelope is what the default trim produces when the
+  /// byte diff pairs the occurrence's first token with a later B token and
+  /// reports the B token the occurrence actually kept as part of that
+  /// insertion.  Edges abutting another argument surface, a nested
+  /// invocation's output, or the cover's edge are left alone: there the
+  /// insertion's owner is decided elsewhere.  The envelope only grows.
+  std::pair<size_t, size_t> WidenOccurrenceEnvelopeOverFixedBodyEdges(
+      const RefoldModel::MacroInvocation &m, const RefoldModel::PPArgSpan &span,
+      std::pair<size_t, size_t> env) const;
+
 private:
+  /// Return whether A token \p aTok is fixed replacement-list text of \p m:
+  /// inside one of its body spans, outside every argument, stringify and paste
+  /// span it records, and outside every surface an invocation nested in it
+  /// emits.  Without topology no token qualifies.
+  bool IsFixedBodyToken(const RefoldModel::MacroInvocation &m,
+                        uint64_t aTok) const;
+
   /// Return the trimmed actual of formal \p argIdx exactly as the producer
   /// recorded it at \p m's callsite, when that callsite is source text: a
   /// literal callee spelled outside every `#define`.  A call spelled inside a

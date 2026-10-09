@@ -23,6 +23,8 @@
 #include "support/RefoldLog.h"
 #include "support/StringUtils.h"
 
+#include "clang/Lex/Lexer.h"
+
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -183,6 +185,223 @@ std::pair<size_t, size_t> chooseArgumentAwareReplayBEnvelope(
   if (replayB.second < replayB.first)
     replayB.second = replayB.first;
   return replayB;
+}
+
+/// One piece of the expansion an args-only rewrite claims, in replay order:
+/// either the tokens the rewrite is known to produce there, or a surface whose
+/// tokens the audit does not derive and which may therefore be any run of B
+/// tokens.
+struct ClaimedExpansionPiece {
+  bool derived = false;
+  SmallVector<std::string, 16> spellings;
+};
+
+/// Return the token spellings of macro actual \p text in order, comments
+/// dropped as Clang drops them before substitution.  When \p namesMacro is
+/// non-null it is set if an identifier among them names a macro \p model
+/// records a directive for: such an actual's expansion is not its spelling.
+SmallVector<std::string, 16> lexActualSpellings(StringRef text,
+                                                const LangOptions &lang,
+                                                const RefoldModel &model,
+                                                bool *namesMacro = nullptr) {
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string lexBuf = text.str();
+  lexBuf.push_back('\0');
+  Lexer lexer(baseLoc, lang, lexBuf.data(), lexBuf.data(),
+              lexBuf.data() + text.size());
+  SmallVector<std::string, 16> spellings;
+  Token token;
+  while (true) {
+    lexer.LexFromRawLexer(token);
+    if (token.is(tok::eof))
+      break;
+    if (token.is(tok::comment))
+      continue;
+    const size_t offset =
+        token.getLocation().getRawEncoding() - baseLoc.getRawEncoding();
+    StringRef spelling = text.substr(offset, token.getLength());
+    if (namesMacro && token.is(tok::raw_identifier) &&
+        !model.GetMacroDirectivesByName(spelling).empty())
+      *namesMacro = true;
+    spellings.push_back(spelling.str());
+  }
+  return spellings;
+}
+
+/// Return the tokens argument surface \p elem expands to when the rewrite
+/// determines them: the surface is exactly a run of standard occurrences of
+/// formals in \p derivedActuals, and every other argument-dependent surface
+/// meeting it lies inside one of those occurrences.
+std::optional<SmallVector<std::string, 16>> derivedSurfaceSpellings(
+    const RefoldModel::MacroInvocation &m, const WholeEnvelopeReplayElem &elem,
+    ArrayRef<std::optional<SmallVector<std::string, 16>>> derivedActuals,
+    ArrayRef<TokenInterval> argumentDependentIntervals) {
+  SmallVector<const RefoldModel::PPArgSpan *, 4> occurrences;
+  for (const RefoldModel::PPArgSpan &span : m.argSpans)
+    if (span.kind == PPArgSpanKind::Standard &&
+        span.argIdx < derivedActuals.size() && derivedActuals[span.argIdx] &&
+        elem.aBegin <= span.begin && span.end <= elem.aEnd &&
+        span.begin < span.end)
+      occurrences.push_back(&span);
+  llvm::sort(occurrences, [](const auto *lhs, const auto *rhs) {
+    return std::tie(lhs->begin, lhs->end) < std::tie(rhs->begin, rhs->end);
+  });
+  occurrences.erase(std::unique(occurrences.begin(), occurrences.end(),
+                                [](const auto *lhs, const auto *rhs) {
+                                  return lhs->begin == rhs->begin &&
+                                         lhs->end == rhs->end;
+                                }),
+                    occurrences.end());
+
+  uint64_t cursor = elem.aBegin;
+  for (const RefoldModel::PPArgSpan *span : occurrences) {
+    if (span->begin != cursor)
+      return std::nullopt;
+    cursor = span->end;
+  }
+  if (occurrences.empty() || cursor != elem.aEnd)
+    return std::nullopt;
+
+  for (const TokenInterval &surface : argumentDependentIntervals) {
+    if (surface.end <= elem.aBegin || elem.aEnd <= surface.begin)
+      continue;
+    if (llvm::none_of(occurrences, [&](const RefoldModel::PPArgSpan *span) {
+          return span->begin <= surface.begin && surface.end <= span->end;
+        }))
+      return std::nullopt;
+  }
+
+  SmallVector<std::string, 16> spellings;
+  for (const RefoldModel::PPArgSpan *span : occurrences)
+    llvm::append_range(spellings, *derivedActuals[span->argIdx]);
+  return spellings;
+}
+
+/// Return whether B tokens `[lo, hi)` split, in order, into \p pieces, the
+/// split starting at one of \p starts and ending at one of \p ends: each
+/// derived piece exactly its spellings, every other piece any run of tokens.
+bool bTokensSplitIntoPieces(ArrayRef<PPTok> bToks, size_t lo, size_t hi,
+                            ArrayRef<size_t> starts, ArrayRef<size_t> ends,
+                            ArrayRef<ClaimedExpansionPiece> pieces) {
+  if (lo > hi || hi > bToks.size())
+    return false;
+  // `reach[p]` holds when the pieces so far can end at B token `lo + p`.
+  std::vector<char> reach(hi - lo + 1, 0);
+  for (size_t start : starts)
+    if (lo <= start && start <= hi)
+      reach[start - lo] = 1;
+
+  for (const ClaimedExpansionPiece &piece : pieces) {
+    std::vector<char> next(reach.size(), 0);
+    if (!piece.derived) {
+      auto first = llvm::find(reach, 1);
+      std::fill(next.begin() + (first - reach.begin()), next.end(), 1);
+    } else {
+      const size_t len = piece.spellings.size();
+      for (size_t p = 0; p + len < reach.size(); ++p) {
+        if (!reach[p])
+          continue;
+        bool matches = true;
+        for (size_t k = 0; k < len && matches; ++k)
+          matches = bToks[lo + p + k].spelling == piece.spellings[k];
+        if (matches)
+          next[p + len] = 1;
+      }
+    }
+    reach = std::move(next);
+  }
+  return llvm::any_of(ends, [&](size_t end) {
+    return lo <= end && end <= hi && reach[end - lo];
+  });
+}
+
+/// Return whether the expansion of an args-only rewrite reproduces the image
+/// of \p cover under the token diff wherever the rewrite determines it.
+///
+/// The rewrite determines the fixed text of the tiling \p elems and every
+/// argument surface built from standard occurrences of a formal it rewrote to
+/// an actual naming no macro: such an actual expands to its own tokens.  Other
+/// surfaces are left unconstrained, so a tiling that attributes repeated
+/// tokens differently from the audit is accepted when one exists.  The split
+/// covers the whole image, so a B token there that the rewrite does not
+/// produce fails.  The one exception is a pure token insertion at a cover edge
+/// held by fixed text: fixed text cannot own it, and its own hunk realizes it.
+bool rewrittenActualsReplayInB(
+    const RefoldMacroReplayStabilityValidator::Dependencies &deps,
+    const RefoldModel::MacroInvocation &m, StringRef baseInvText,
+    StringRef replacement, std::pair<uint64_t, uint64_t> cover,
+    ArrayRef<WholeEnvelopeReplayElem> elems,
+    ArrayRef<TokenInterval> argumentDependentIntervals) {
+  RefoldMacroActualLayout layout({&deps.lexLang});
+  std::optional<std::vector<std::pair<size_t, size_t>>> oldActuals =
+      layout.GetMacroInvocationFormalArgContentRanges(m, baseInvText);
+  std::optional<std::vector<std::pair<size_t, size_t>>> newActuals =
+      layout.GetMacroInvocationFormalArgContentRanges(m, replacement);
+  // Without both layouts no formal is known to be rewritten, and nothing is
+  // derived.
+  if (!oldActuals || !newActuals || oldActuals->size() != newActuals->size())
+    return true;
+
+  SmallVector<std::optional<SmallVector<std::string, 16>>, 8> derivedActuals(
+      newActuals->size());
+  bool anyDerivedActual = false;
+  for (size_t formal = 0; formal < newActuals->size(); ++formal) {
+    const auto [oldBegin, oldEnd] = (*oldActuals)[formal];
+    const auto [newBegin, newEnd] = (*newActuals)[formal];
+    bool newNamesMacro = false;
+    SmallVector<std::string, 16> oldSpellings = lexActualSpellings(
+        baseInvText.slice(oldBegin, oldEnd), deps.lexLang, deps.model);
+    SmallVector<std::string, 16> newSpellings =
+        lexActualSpellings(replacement.slice(newBegin, newEnd), deps.lexLang,
+                           deps.model, &newNamesMacro);
+    if (newNamesMacro || newSpellings == oldSpellings)
+      continue;
+    derivedActuals[formal] = std::move(newSpellings);
+    anyDerivedActual = true;
+  }
+  if (!anyDerivedActual)
+    return true;
+
+  SmallVector<ClaimedExpansionPiece, 32> pieces;
+  bool anyDerivedSurface = false;
+  for (const WholeEnvelopeReplayElem &elem : elems) {
+    ClaimedExpansionPiece &piece = pieces.emplace_back();
+    if (!elem.isArgumentDependent) {
+      piece.derived = true;
+      for (uint64_t aTok = elem.aBegin; aTok < elem.aEnd; ++aTok)
+        piece.spellings.push_back(deps.aToks[aTok].spelling);
+      continue;
+    }
+    if (std::optional<SmallVector<std::string, 16>> spellings =
+            derivedSurfaceSpellings(m, elem, derivedActuals,
+                                    argumentDependentIntervals)) {
+      piece.derived = true;
+      piece.spellings = std::move(*spellings);
+      anyDerivedSurface = true;
+    }
+  }
+  if (!anyDerivedSurface || pieces.empty())
+    return true;
+
+  // The expansion replaces the cover between neighbours that the hunks place,
+  // so it must reproduce the cover's image under the token diff.  The byte
+  // projection the patch records can disagree with it across repeated bytes.
+  std::optional<std::pair<size_t, size_t>> image =
+      deps.sourceMapper.MapATokRangeToBTokenEnvelopeByTokenDiff(cover.first,
+                                                                cover.second);
+  if (!image)
+    return false;
+  std::pair<size_t, size_t> withoutEdgeInsertions = *image;
+  deps.sourceMapper.TrimPureBoundaryInsertionsFromTokenEnvelope(
+      cover.first, cover.second, withoutEdgeInsertions);
+  SmallVector<size_t, 2> starts{image->first};
+  SmallVector<size_t, 2> ends{image->second};
+  if (!elems.front().isArgumentDependent)
+    starts.push_back(withoutEdgeInsertions.first);
+  if (!elems.back().isArgumentDependent)
+    ends.push_back(withoutEdgeInsertions.second);
+  return bTokensSplitIntoPieces(deps.bToks, image->first, image->second, starts,
+                                ends, pieces);
 }
 
 } // namespace
@@ -575,6 +794,23 @@ bool RefoldMacroReplayStabilityValidator::
         "text='{8}'",
         m.id, m.name, aCursor, cover->second, bCursor, replayB.second,
         wholeB->first, wholeB->second,
+        stringutils::showWsWithClip(patch.replacement, 220));
+    return false;
+  }
+
+  // The walk places every argument surface between fixed text that replays,
+  // but never looks inside one, so it admitted rewrites whose actuals do not
+  // expand to the B text there -- `M(+ pz - q)` for `2 * 2 * p + pz - q`
+  // under `#define M(x) 2 * x`.
+  if (!rewrittenActualsReplayInB(deps_, m, ctx.rootInvocationText,
+                                 patch.replacement, *cover, elems,
+                                 argumentDependentIntervals)) {
+    REFOLD_LOG_TRACE(
+        "macro/proof",
+        "suppress structure-preserving macro replay: inv id={0} name={1} "
+        "rewritten actuals do not replay the cover's token-diff image "
+        "cover=[{2},{3}) text='{4}'",
+        m.id, m.name, cover->first, cover->second,
         stringutils::showWsWithClip(patch.replacement, 220));
     return false;
   }

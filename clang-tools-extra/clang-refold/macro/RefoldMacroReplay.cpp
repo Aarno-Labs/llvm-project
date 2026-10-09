@@ -186,6 +186,57 @@ RefoldMacroOccurrenceReplay::GetOwnedPureInsertionBRangeForArgSpan(
   return std::nullopt;
 }
 
+bool RefoldMacroOccurrenceReplay::IsFixedBodyToken(
+    const RefoldModel::MacroInvocation &m, uint64_t aTok) const {
+  if (!deps_.macroTopology)
+    return false;
+  auto contains = [aTok](const auto &span) {
+    return span.begin <= aTok && aTok < span.end;
+  };
+  auto onArgumentSurface = [&](const RefoldModel::MacroInvocation &inv) {
+    return llvm::any_of(inv.argSpans, contains) ||
+           llvm::any_of(inv.stringifySpans, contains) ||
+           llvm::any_of(inv.pasteSpans, contains);
+  };
+  if (!llvm::any_of(m.bodySpans, contains) || onArgumentSurface(m))
+    return false;
+  // A nested invocation's cover is only the hull of its spans and can enclose
+  // fixed text of `m`; only the surfaces it emits are its own.
+  for (const RefoldModel::MacroInvocation *child :
+       deps_.macroTopology->MacroChildrenOf(m.id))
+    if (llvm::any_of(child->bodySpans, contains) || onArgumentSurface(*child))
+      return false;
+  return true;
+}
+
+std::pair<size_t, size_t>
+RefoldMacroOccurrenceReplay::WidenOccurrenceEnvelopeOverFixedBodyEdges(
+    const RefoldModel::MacroInvocation &m, const RefoldModel::PPArgSpan &span,
+    std::pair<size_t, size_t> env) const {
+  if (span.kind != PPArgSpanKind::Standard || span.begin >= span.end ||
+      !m.cover.IsValid())
+    return env;
+  const bool fixedBefore =
+      span.begin > m.cover.begin && IsFixedBodyToken(m, span.begin - 1);
+  const bool fixedAfter =
+      span.end < m.cover.end && IsFixedBodyToken(m, span.end);
+  if (!fixedBefore && !fixedAfter)
+    return env;
+
+  // The same projection the literal-body audit tiles argument surfaces with.
+  std::optional<std::pair<size_t, size_t>> kept =
+      deps_.sourceMapper
+          ->MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(span.begin,
+                                                                    span.end);
+  if (!kept)
+    return env;
+  if (fixedBefore)
+    env.first = std::min(env.first, kept->first);
+  if (fixedAfter)
+    env.second = std::max(env.second, kept->second);
+  return env;
+}
+
 std::optional<StringRef> RefoldMacroOccurrenceReplay::RecordedSourceActual(
     const RefoldModel::MacroInvocation &m, uint32_t argIdx) const {
   if (!m.invText || !deps_.macroTopology ||
@@ -587,6 +638,7 @@ bool RefoldMacroOccurrenceReplay::
       hi = static_cast<size_t>(std::clamp<uint64_t>(hi, lo, maxTok));
       bEnv = {lo, hi};
     }
+    bEnv = WidenOccurrenceEnvelopeOverFixedBodyEdges(m, s, *bEnv);
 
     StringRef tokText =
         deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();

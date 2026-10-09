@@ -1231,11 +1231,12 @@ RefoldMacroStandardArgsOnlyPatchBuilder::BuildStandardArgsOnlyPatch(
       return std::nullopt;
 
     const bool matchesAllOccurrences =
-        tupleForwarded ? tupleSliceConsistencyValidator.Validate(
-                             argIdx, standardArgSpans, occObservations, tokenHunks)
+        tupleForwarded
+            ? tupleSliceConsistencyValidator.Validate(
+                  m, argIdx, standardArgSpans, occObservations, tokenHunks)
         : replayedStandardArgSpanFormalIndices
             ? replayedFormalOccurrenceValidator.Validate(
-                  argIdx, finalNewArg, standardArgSpans, tokenHunks)
+                  m, argIdx, finalNewArg, standardArgSpans, tokenHunks)
             : occurrenceReplay.MacroArgReplacementMatchesAllOccurrencesInB(
                   m, argIdx, baseArgText, finalNewArg, tokenHunks);
 

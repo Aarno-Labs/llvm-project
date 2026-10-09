@@ -683,6 +683,15 @@ InvocationOccurrenceObservationCollector::Collect(const RefoldModel::MacroInvoca
         bEnv = std::make_pair(e0, e1);
     }
 
+    // B text inserted where the occurrence meets fixed replacement-list text
+    // belongs to the occurrence.  When that widens the envelope, the owned
+    // insertions above no longer describe everything new in it.
+    const std::pair<size_t, size_t> fixedBodyEnv =
+        occurrenceReplay_.WidenOccurrenceEnvelopeOverFixedBodyEdges(invocation,
+                                                                    sp, *bEnv);
+    const bool widenedOverFixedBody = fixedBodyEnv != *bEnv;
+    bEnv = fixedBodyEnv;
+
     // `oldText` is the original occurrence spelling. `bEnv` is the candidate
     // B spelling that should replace this occurrence after all relevant hunks
     // for the same formal have been incorporated.
@@ -708,7 +717,7 @@ InvocationOccurrenceObservationCollector::Collect(const RefoldModel::MacroInvoca
 
     std::optional<std::pair<uint64_t, uint64_t>> materializedNewTextRange;
     if (!occurrenceIsStringify[i] && ownedInsertionBRange &&
-        !contributedNonInsertionHunk) {
+        !contributedNonInsertionHunk && !widenedOverFixedBody) {
       if (auto insertedBytes = deps_.sourceMapper.BTokenRangeToByteRange(
               ownedInsertionBRange->first, ownedInsertionBRange->second)) {
         const char *sourceBegin = deps_.bSource.data();
@@ -854,10 +863,11 @@ TupleSliceConsistencyValidator::TupleSliceConsistencyValidator(
     const RefoldMacroOccurrenceReplay &occurrenceReplay)
     : deps_(deps), occurrenceReplay_(occurrenceReplay) {}
 
-bool TupleSliceConsistencyValidator::Validate(uint32_t argIdx,
-              llvm::ArrayRef<RefoldModel::PPArgSpan> standardArgSpans,
-              llvm::ArrayRef<OccObservation> observations,
-              llvm::ArrayRef<diffutils::Hunk> tokenHunks) const {
+bool TupleSliceConsistencyValidator::Validate(
+    const RefoldModel::MacroInvocation &invocation, uint32_t argIdx,
+    llvm::ArrayRef<RefoldModel::PPArgSpan> standardArgSpans,
+    llvm::ArrayRef<OccObservation> observations,
+    llvm::ArrayRef<diffutils::Hunk> tokenHunks) const {
   // Tuple-forwarded rewrites are slice-based: each old tuple element/slice
   // must consistently map to exactly one new spelling across all observations.
   llvm::StringMap<std::string> newTextByOld;
@@ -908,6 +918,9 @@ bool TupleSliceConsistencyValidator::Validate(uint32_t argIdx,
         hi = static_cast<size_t>(std::max<uint64_t>(hi, hk.bEnd));
       }
     }
+    std::tie(lo, hi) =
+        occurrenceReplay_.WidenOccurrenceEnvelopeOverFixedBodyEdges(
+            invocation, s, std::make_pair(lo, hi));
 
     // Apply the same narrow delimiter-closer repair used for the primary
     // observation path so validation compares equivalent envelopes.
@@ -932,9 +945,10 @@ ReplayedFormalOccurrenceValidator::ReplayedFormalOccurrenceValidator(
     : deps_(deps), occurrenceReplay_(occurrenceReplay) {}
 
 /// Return whether `newArg` matches every repaired STANDARD occurrence.
-bool ReplayedFormalOccurrenceValidator::Validate(uint32_t argIdx, StringRef newArg,
-              ArrayRef<RefoldModel::PPArgSpan> standardArgSpans,
-              ArrayRef<diffutils::Hunk> tokenHunks) const {
+bool ReplayedFormalOccurrenceValidator::Validate(
+    const RefoldModel::MacroInvocation &invocation, uint32_t argIdx,
+    StringRef newArg, ArrayRef<RefoldModel::PPArgSpan> standardArgSpans,
+    ArrayRef<diffutils::Hunk> tokenHunks) const {
   const uint64_t maxTok =
       deps_.bTokOff.empty() ? 0ULL
                             : static_cast<uint64_t>(deps_.bTokOff.size() - 1);
@@ -971,6 +985,9 @@ bool ReplayedFormalOccurrenceValidator::Validate(uint32_t argIdx, StringRef newA
 
     lo = static_cast<size_t>(std::clamp<uint64_t>(lo, 0ULL, maxTok));
     hi = static_cast<size_t>(std::clamp<uint64_t>(hi, lo, maxTok));
+    std::tie(lo, hi) =
+        occurrenceReplay_.WidenOccurrenceEnvelopeOverFixedBodyEdges(
+            invocation, s, std::make_pair(lo, hi));
 
     StringRef oldText = deps_.sourceMapper.SliceASource(s.begin, s.end).trim();
     auto grownEnv = maybeExtendRightBoundaryClosers(
