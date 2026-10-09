@@ -16,6 +16,12 @@
 #include "clang/Basic/TokenKinds.h"
 #include "clang/Lex/Lexer.h"
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
+
+#include <algorithm>
+#include <string>
+
 using namespace llvm;
 
 namespace clang {
@@ -308,6 +314,173 @@ bool refoldMacroActualSubrangeIsFreeStanding(StringRef actual, size_t begin,
   }
 
   return outerDepth == 0 && runDepth == 0;
+}
+
+namespace {
+
+/// One raw-lexer token of a spelling: its kind, its spelling, and its
+/// half-open byte range in that spelling.
+struct SpellingToken {
+  tok::TokenKind kind = tok::unknown;
+  std::string spelling;
+  size_t begin = 0;
+  size_t end = 0;
+};
+
+/// Raw-lex \p text into tokens, keeping comments only when \p keepComments.
+SmallVector<SpellingToken, 32>
+lexSpellingTokens(StringRef text, const LangOptions &lang, bool keepComments) {
+  SmallVector<SpellingToken, 32> tokens;
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string lexBuf = text.str();
+  lexBuf.push_back('\0');
+  const char *bufStart = lexBuf.data();
+  Lexer lexer(baseLoc, lang, bufStart, bufStart, bufStart + text.size());
+  lexer.SetCommentRetentionState(keepComments);
+  Token token;
+  while (true) {
+    lexer.LexFromRawLexer(token);
+    if (token.is(tok::eof))
+      break;
+    const size_t begin =
+        token.getLocation().getRawEncoding() - baseLoc.getRawEncoding();
+    const size_t end = std::min(begin + token.getLength(), text.size());
+    tokens.push_back(
+        {token.getKind(), text.slice(begin, end).str(), begin, end});
+  }
+  return tokens;
+}
+
+/// Return whether \p left and \p right, adjacent across an edit edge, spell an
+/// identifier followed by `(`: the shape that invokes a function-like macro.
+bool spellsCalleeBeforeArgumentList(const SpellingToken *left,
+                                    const SpellingToken *right) {
+  return left && right && left->kind == tok::raw_identifier &&
+         right->kind == tok::l_paren;
+}
+
+/// Return whether either edge of \p middle, placed between \p prefix and
+/// \p suffix, joins an identifier to a `(`.
+bool editEdgeSpellsInvocation(ArrayRef<SpellingToken> prefix,
+                              ArrayRef<SpellingToken> middle,
+                              ArrayRef<SpellingToken> suffix) {
+  const SpellingToken *prefixLast = prefix.empty() ? nullptr : &prefix.back();
+  const SpellingToken *suffixFirst = suffix.empty() ? nullptr : &suffix.front();
+  const SpellingToken *middleFirst =
+      middle.empty() ? suffixFirst : &middle.front();
+  const SpellingToken *middleLast =
+      middle.empty() ? prefixLast : &middle.back();
+  return spellsCalleeBeforeArgumentList(prefixLast, middleFirst) ||
+         spellsCalleeBeforeArgumentList(middleLast, suffixFirst);
+}
+
+/// Return whether \p tokens are parenthesis-balanced, and report through
+/// \p topLevelComma whether a comma appears outside every parenthesis they
+/// open.
+bool runIsParenBalanced(ArrayRef<SpellingToken> tokens, bool &topLevelComma) {
+  topLevelComma = false;
+  unsigned depth = 0;
+  for (const SpellingToken &token : tokens) {
+    if (token.kind == tok::l_paren) {
+      ++depth;
+    } else if (token.kind == tok::r_paren) {
+      if (depth == 0)
+        return false;
+      --depth;
+    } else if (token.kind == tok::comma && depth == 0) {
+      topLevelComma = true;
+    }
+  }
+  return depth == 0;
+}
+
+/// Return the depth of the parentheses \p tokens leave open.
+unsigned openParenDepth(ArrayRef<SpellingToken> tokens) {
+  unsigned depth = 0;
+  for (const SpellingToken &token : tokens) {
+    if (token.kind == tok::l_paren)
+      ++depth;
+    else if (token.kind == tok::r_paren && depth > 0)
+      --depth;
+  }
+  return depth;
+}
+
+/// Return whether two token sequences have the same kinds and spellings.
+bool sameTokenSpellings(ArrayRef<SpellingToken> lhs,
+                        ArrayRef<SpellingToken> rhs) {
+  if (lhs.size() != rhs.size())
+    return false;
+  for (size_t i = 0; i < lhs.size(); ++i)
+    if (lhs[i].kind != rhs[i].kind || lhs[i].spelling != rhs[i].spelling)
+      return false;
+  return true;
+}
+
+} // namespace
+
+bool refoldMacroActualRunReplacementPreservesInvocations(
+    StringRef actual, size_t begin, size_t end, StringRef replacement,
+    const LangOptions &lang) {
+  if (begin > end || end > actual.size())
+    return false;
+
+  // Widen the edit to whole tokens.  The bytes a widened edge crosses are
+  // carried into the replacement, so the edited text is the same.
+  size_t runBegin = begin;
+  size_t runEnd = end;
+  for (const SpellingToken &token :
+       lexSpellingTokens(actual, lang, /*keepComments=*/true)) {
+    const bool splitsBegin = token.begin < begin && begin < token.end;
+    const bool splitsEnd = token.begin < end && end < token.end;
+    if (!splitsBegin && !splitsEnd)
+      continue;
+    if (token.kind == tok::comment)
+      return false;
+    if (splitsBegin)
+      runBegin = token.begin;
+    if (splitsEnd)
+      runEnd = token.end;
+  }
+
+  const StringRef prefix = actual.take_front(runBegin);
+  const StringRef suffix = actual.drop_front(runEnd);
+  std::string newRun = actual.slice(runBegin, begin).str();
+  newRun += replacement;
+  newRun += actual.slice(end, runEnd);
+  const SmallVector<SpellingToken, 32> prefixTokens =
+      lexSpellingTokens(prefix, lang, /*keepComments=*/false);
+  const SmallVector<SpellingToken, 32> suffixTokens =
+      lexSpellingTokens(suffix, lang, /*keepComments=*/false);
+  const SmallVector<SpellingToken, 32> oldRunTokens = lexSpellingTokens(
+      actual.slice(runBegin, runEnd), lang, /*keepComments=*/false);
+  const SmallVector<SpellingToken, 32> newRunTokens =
+      lexSpellingTokens(newRun, lang, /*keepComments=*/false);
+
+  // The edited spelling must lex as its three pieces do apart: `PAREN` then
+  // `11` must not become `PAREN11`.
+  SmallVector<SpellingToken, 64> expected(prefixTokens.begin(),
+                                          prefixTokens.end());
+  expected.append(newRunTokens.begin(), newRunTokens.end());
+  expected.append(suffixTokens.begin(), suffixTokens.end());
+  if (!sameTokenSpellings(
+          lexSpellingTokens(prefix.str() + newRun + suffix.str(), lang,
+                            /*keepComments=*/false),
+          expected))
+    return false;
+
+  if (editEdgeSpellsInvocation(prefixTokens, oldRunTokens, suffixTokens) ||
+      editEdgeSpellsInvocation(prefixTokens, newRunTokens, suffixTokens))
+    return false;
+
+  const bool enclosed = openParenDepth(prefixTokens) > 0;
+  for (ArrayRef<SpellingToken> run : {ArrayRef<SpellingToken>(oldRunTokens),
+                                      ArrayRef<SpellingToken>(newRunTokens)}) {
+    bool topLevelComma = false;
+    if (!runIsParenBalanced(run, topLevelComma) || (enclosed && topLevelComma))
+      return false;
+  }
+  return true;
 }
 
 } // namespace refold

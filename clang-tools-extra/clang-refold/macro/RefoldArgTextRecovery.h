@@ -10,7 +10,10 @@
 //     actual;
 //   - the free predicate `refoldMacroActualSubrangeIsFreeStanding`, which
 //     decides whether a run of an actual's spelling lies outside every
-//     parenthesis of that actual; and
+//     parenthesis of that actual;
+//   - the free predicate `refoldMacroActualRunReplacementPreservesInvocations`,
+//     which decides whether an in-place edit of an actual's spelling leaves
+//     the invocations around it intact; and
 //   - the `RefoldArgTextRecovery` class, which inverts stringified literal
 //     tokens and recovers per-actual byte ranges from a raw invocation
 //     spelling.
@@ -61,6 +64,28 @@ bool refoldMacroActualHasTopLevelComma(llvm::StringRef text,
 bool refoldMacroActualSubrangeIsFreeStanding(llvm::StringRef actual,
                                              size_t begin, size_t end,
                                              const LangOptions &lang);
+
+/// Return true when replacing the bytes [\p begin, \p end) of the macro actual
+/// spelling \p actual with \p replacement leaves every macro invocation around
+/// the edit as it was.
+///
+/// The edit is first widened to whole raw tokens, carrying the bytes it
+/// crosses into the replacement, so the edited text is unchanged; an edge
+/// inside a comment fails, because that edit could not reach the preprocessed
+/// stream.  The edited text is then accepted only when:
+///   * no token on either side of the edit merges with the replacement;
+///   * no identifier on one side of an edit edge meets a `(` on the other,
+///     before or after the edit, so no invocation outside the edit gains or
+///     loses its argument list; and
+///   * the replaced and replacing runs are each parenthesis-balanced and,
+///     when a parenthesis of \p actual encloses the edit, free of commas at
+///     their own top level, so an enclosing invocation keeps the number and
+///     boundaries of its actuals.
+/// A comma at the top level of \p actual itself is left to the caller, which
+/// knows whether the formal it fills is variadic.
+bool refoldMacroActualRunReplacementPreservesInvocations(
+    llvm::StringRef actual, size_t begin, size_t end,
+    llvm::StringRef replacement, const LangOptions &lang);
 
 /// Recovers macro actual-argument spellings from textual surfaces that are not
 /// already represented by producer-owned model ranges.

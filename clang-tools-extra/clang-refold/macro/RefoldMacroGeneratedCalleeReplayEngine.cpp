@@ -593,6 +593,26 @@ bool generatedCalleeTextsTokenEquivalent(StringRef lhs, StringRef rhs,
   return true;
 }
 
+/// Replace bytes [begin, end) of `source` with `replacement` when the edit
+/// leaves every invocation around it intact.
+///
+/// The solvers below locate an old solved value inside a source actual or
+/// tuple element and edit it in place, keeping the bytes around it verbatim.
+/// They replay only the outer callee, so an occurrence inside a nested call's
+/// actuals is an edit of that call that nothing else proves: `10` -> `88, 99`
+/// in `APPLY(DEC, 10)` gives APPLY a third actual, and `(10)` -> `11` in
+/// `PAREN(10)` leaves `PAREN11`.  Each in-place edit is therefore admitted only
+/// through `refoldMacroActualRunReplacementPreservesInvocations`.
+std::optional<std::string>
+replaceSourceRunPreservingInvocations(StringRef source, size_t begin,
+                                      size_t end, StringRef replacement,
+                                      const clang::LangOptions &lexLang) {
+  if (!refoldMacroActualRunReplacementPreservesInvocations(
+          source, begin, end, replacement, lexLang))
+    return std::nullopt;
+  return stringutils::replaceRange(source.str(), begin, end, replacement);
+}
+
 /// Rewrites a uniquely matched solved token sequence inside source text.
 ///
 /// Generated-callee solving observes final expansion text, which may normalize
@@ -644,6 +664,18 @@ std::optional<std::string> rewriteSolvedExpansionTokenSequence(
                                           sourceToks[idx].end,
                                           newToks[j - 1].spelling);
   }
+
+  // The token-by-token rewrite is one in-place edit of the source run between
+  // the first and last matched token; it is held to the same invocation
+  // obligation as every other in-place edit.
+  const size_t runBegin = sourceToks[*matchBegin].begin;
+  const size_t runEnd = sourceToks[*matchBegin + oldToks.size() - 1].end;
+  const size_t keptSuffix = source.size() - runEnd;
+  if (!refoldMacroActualRunReplacementPreservesInvocations(
+          source, runBegin, runEnd,
+          StringRef(rewritten).slice(runBegin, rewritten.size() - keptSuffix),
+          lexLang))
+    return std::nullopt;
   return rewritten;
 }
 
@@ -671,8 +703,8 @@ std::optional<std::string> rewriteSourceActualFromSolvedExpansion(
   if (pos != StringRef::npos) {
     if (source.find(oldText, pos + 1) != StringRef::npos)
       return std::nullopt;
-    return stringutils::replaceRange(source.str(), pos, pos + oldText.size(),
-                                     newText);
+    return replaceSourceRunPreservingInvocations(
+        source, pos, pos + oldText.size(), newText, lexLang);
   }
 
   // The generated actual may wrap or paste the editable root contribution
@@ -698,9 +730,9 @@ std::optional<std::string> rewriteSourceActualFromSolvedExpansion(
       size_t middlePos = source.find(oldMiddle);
       if (middlePos != StringRef::npos &&
           source.find(oldMiddle, middlePos + 1) == StringRef::npos)
-        return stringutils::replaceRange(source.str(), middlePos,
-                                         middlePos + oldMiddle.size(),
-                                         newMiddle);
+        return replaceSourceRunPreservingInvocations(
+            source, middlePos, middlePos + oldMiddle.size(), newMiddle,
+            lexLang);
     }
   }
   return std::nullopt;
@@ -915,8 +947,8 @@ std::optional<std::string> rewriteTupleElementFromSolvedExpansion(
   if (source == oldText)
     return newText.str();
   if (auto loc = findUniqueTrimmedSubstring(source, oldText))
-    return stringutils::replaceRange(source.str(), loc->first, loc->second,
-                                     newText);
+    return replaceSourceRunPreservingInvocations(source, loc->first,
+                                                 loc->second, newText, lexLang);
   return std::nullopt;
 }
 

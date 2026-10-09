@@ -855,6 +855,12 @@ GeneratedLeafReplayResolver::TryStableRootScalarLeafRewrite(
       return std::nullopt;
     if (targetArgIdx)
       return std::nullopt;
+    // The leaf is edited in place, so the bytes around it must keep their
+    // invocations: `+` -> `,` in `ID(a + b)` would give ID a second actual,
+    // which the root-level comma check below cannot see.
+    if (!refoldMacroActualRunReplacementPreservesInvocations(
+            argText, pos, pos + oldLeaf.size(), newLeaf, deps_.lexLang))
+      return std::nullopt;
     std::string rewrittenArg = stringutils::replaceRange(
         argText.str(), pos, pos + oldLeaf.size(), newLeaf);
     if (!isMacroInvocationVariadicFormal(m, argIdx) &&
