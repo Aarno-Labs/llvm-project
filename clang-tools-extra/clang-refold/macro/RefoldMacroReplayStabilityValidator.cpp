@@ -214,10 +214,15 @@ bool RefoldMacroReplayStabilityValidator::
     return false;
   }
 
+  // Clang ends the invocation at the first `)` that closes its actual list.  A
+  // token after it -- left there by an actual carrying an unmatched `)` -- is
+  // not part of the invocation at all: the macro expands from a prefix of the
+  // actuals the candidate meant, and the rest is emitted after the expansion.
+  bool trailingTokens = false;
   auto parsedActuals =
       RefoldArgTextRecovery::LexMacroInvocationActualContentRanges(
-          patch.replacement, deps_.lexLang);
-  if (!parsedActuals) {
+          patch.replacement, deps_.lexLang, &trailingTokens);
+  if (!parsedActuals || trailingTokens) {
     REFOLD_LOG_TRACE("macro/proof",
                      "suppress structure-preserving macro replay: inv id={0} "
                      "name={1} replacement is not a complete macro invocation: "

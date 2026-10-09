@@ -117,9 +117,15 @@ public:
   /// This is for candidate invocation text that is not backed by the producer's
   /// `inv_arg_ranges`.  Argument collection follows preprocessor rules:
   /// nested parentheses protect commas, while brackets and braces do not.
+  ///
+  /// Collection stops at the parenthesis that closes the actual list, as
+  /// Clang's does.  When \p trailingTokens is non-null it is set to whether any
+  /// token follows that parenthesis; the returned ranges are the same either
+  /// way.
   static std::optional<std::vector<std::pair<size_t, size_t>>>
   LexMacroInvocationActualContentRanges(llvm::StringRef invText,
-                                        const LangOptions &lang);
+                                        const LangOptions &lang,
+                                        bool *trailingTokens = nullptr);
 
 private:
   const LangOptions &lexLang_;

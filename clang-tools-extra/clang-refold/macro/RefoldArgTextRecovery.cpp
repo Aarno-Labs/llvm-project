@@ -133,9 +133,19 @@ std::optional<std::string> RefoldArgTextRecovery::UnstringifyLiteralToArgText(
   return out;
 }
 
+/// Return whether \p lexer yields a token other than a comment before the end
+/// of its buffer.
+static bool lexerHasRemainingToken(Lexer &lexer) {
+  Token token;
+  do
+    lexer.LexFromRawLexer(token);
+  while (token.is(tok::comment));
+  return token.isNot(tok::eof);
+}
+
 std::optional<std::vector<std::pair<size_t, size_t>>>
 RefoldArgTextRecovery::LexMacroInvocationActualContentRanges(
-    StringRef invText, const LangOptions &lang) {
+    StringRef invText, const LangOptions &lang, bool *trailingTokens) {
   const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
   std::string lexBuf = invText.str();
   lexBuf.push_back('\0');
@@ -189,9 +199,10 @@ RefoldArgTextRecovery::LexMacroInvocationActualContentRanges(
 
     if (token.is(tok::r_paren)) {
       if (parenDepth == 0) {
-        if (!sawAnyTokenInCurrentActual && out.empty())
-          return out;
-        out.push_back(stringutils::trimWsRange(invText, argStart, off));
+        if (sawAnyTokenInCurrentActual || !out.empty())
+          out.push_back(stringutils::trimWsRange(invText, argStart, off));
+        if (trailingTokens)
+          *trailingTokens = lexerHasRemainingToken(lexer);
         return out;
       }
       --parenDepth;
