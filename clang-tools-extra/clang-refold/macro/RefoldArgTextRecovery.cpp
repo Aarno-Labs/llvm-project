@@ -251,5 +251,64 @@ bool refoldMacroActualHasTopLevelComma(StringRef text,
   }
 }
 
+bool refoldMacroActualSubrangeIsFreeStanding(StringRef actual, size_t begin,
+                                             size_t end,
+                                             const LangOptions &lang) {
+  if (begin > end || end > actual.size())
+    return false;
+
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string lexBuf = actual.str();
+  lexBuf.push_back('\0');
+  const char *bufStart = lexBuf.data();
+  const char *bufEnd = bufStart + actual.size();
+  Lexer lexer(baseLoc, lang, bufStart, bufStart, bufEnd);
+  lexer.SetCommentRetentionState(true);
+
+  // Depth of the parentheses open before `begin`, and of those opened inside
+  // the run.  The run is free-standing when the first is zero at `begin` and
+  // the second never closes a parenthesis it did not open and ends at zero.
+  unsigned outerDepth = 0;
+  unsigned runDepth = 0;
+  Token token;
+  while (true) {
+    lexer.LexFromRawLexer(token);
+    if (token.is(tok::eof))
+      break;
+
+    const unsigned raw = token.getLocation().getRawEncoding();
+    if (raw < baseLoc.getRawEncoding())
+      return false;
+    const size_t tokBegin = raw - baseLoc.getRawEncoding();
+    const size_t tokEnd = tokBegin + token.getLength();
+    if (tokEnd > actual.size())
+      return false;
+
+    // A comment is a token boundary like any other: a run boundary inside one
+    // is not a token boundary of the actual.
+    if ((tokBegin < begin && begin < tokEnd) ||
+        (tokBegin < end && end < tokEnd))
+      return false;
+
+    const bool inRun = begin <= tokBegin && tokEnd <= end && begin < end;
+    if (token.is(tok::l_paren)) {
+      if (inRun)
+        ++runDepth;
+      else if (tokEnd <= begin)
+        ++outerDepth;
+    } else if (token.is(tok::r_paren)) {
+      if (inRun) {
+        if (runDepth == 0)
+          return false;
+        --runDepth;
+      } else if (tokEnd <= begin && outerDepth > 0) {
+        --outerDepth;
+      }
+    }
+  }
+
+  return outerDepth == 0 && runDepth == 0;
+}
+
 } // namespace refold
 } // namespace clang

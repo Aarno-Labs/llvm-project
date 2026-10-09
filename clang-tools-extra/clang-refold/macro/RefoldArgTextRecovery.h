@@ -7,7 +7,10 @@
 // token ranges.  It exposes:
 //   - the free predicate `refoldMacroActualHasTopLevelComma`, which decides
 //     whether a candidate replacement would split a function-like macro
-//     actual; and
+//     actual;
+//   - the free predicate `refoldMacroActualSubrangeIsFreeStanding`, which
+//     decides whether a run of an actual's spelling lies outside every
+//     parenthesis of that actual; and
 //   - the `RefoldArgTextRecovery` class, which inverts stringified literal
 //     tokens and recovers per-actual byte ranges from a raw invocation
 //     spelling.
@@ -43,6 +46,21 @@ namespace refold {
 /// tokens so commas inside them cannot produce a false positive.
 bool refoldMacroActualHasTopLevelComma(llvm::StringRef text,
                                        const LangOptions &lang);
+
+/// Return true when the half-open byte range [\p begin, \p end) of the macro
+/// actual spelling \p actual is a run of whole raw tokens that no parenthesis
+/// of \p actual encloses.
+///
+/// Both ends must fall on token boundaries (a boundary inside a token, comment
+/// or literal fails), and every parenthesis the run closes must also open in
+/// it.  This is the lexical half of proving that the rest of \p actual can be
+/// kept verbatim around a replacement of the run: in a macro actual, a
+/// parenthesis enclosing the run that does not survive into the expansion was
+/// consumed by a function-like invocation, which would collect the replacement
+/// as its own actuals.
+bool refoldMacroActualSubrangeIsFreeStanding(llvm::StringRef actual,
+                                             size_t begin, size_t end,
+                                             const LangOptions &lang);
 
 /// Recovers macro actual-argument spellings from textual surfaces that are not
 /// already represented by producer-owned model ranges.

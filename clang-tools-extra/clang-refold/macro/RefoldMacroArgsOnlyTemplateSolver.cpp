@@ -320,7 +320,9 @@ private:
     // span.  It uses the producer byte projection exactly as before and is
     // admitted only after `BuildFromReplay` proves the old/new child expansion
     // bridge and validates that the rebuilt text changes producer callsite
-    // syntax solely inside formal slots.
+    // syntax solely inside formal slots.  It proves nothing about this
+    // invocation's body tokens, so a parent's child-expansion bridge does not
+    // accept a child rebuilt here.
     auto standardSpansOpt =
         solver_.GetCurrentLevelStandardArgSpansForInvocation(inv, formalRanges);
     if (!standardSpansOpt ||
@@ -358,8 +360,8 @@ private:
   ///
   /// This routine owns the source-syntax inversion shared by the complete
   /// template and projection-backed authorities.  Direct textual inversions,
-  /// unique substring replacement, and recursive child-expansion bridges are
-  /// accepted exactly as before; the final producer-slot transport check makes
+  /// unique free-standing substring replacement, and recursive child-expansion
+  /// bridges are accepted; the final producer-slot transport check makes
   /// the resulting source spelling a complete function-like invocation rather
   /// than merely a token partition of its expansion.
   std::optional<std::string> BuildFromReplay(
@@ -399,58 +401,61 @@ private:
       if (oldExpansion.empty() || newExpansion.empty())
         return std::nullopt;
 
+      // Source offsets of the trimmed formal spelling, shared by the in-place
+      // replacement guard and the child-expansion bridge below.
+      const uint64_t absTrimBegin = *inv.invB + argRange.first + trimLead;
+      const uint64_t absTrimEnd = *inv.invB + argRange.first + trimEnd;
+
       std::optional<std::string> replacement;
       if (oldExpansion == baseTrim) {
         replacement = newExpansion.str();
-      } else if (auto loc = findUniqueTrimmedSubstring(baseTrim, oldExpansion)) {
+      } else if (std::optional<std::pair<size_t, size_t>> loc =
+                     FindFreeStandingOldExpansion(inv, baseTrim, oldExpansion,
+                                                  absTrimBegin, absTrimEnd)) {
         replacement = stringutils::replaceRange(baseTrim.str(), loc->first,
                                                 loc->second, newExpansion);
       } else {
-        // The formal spelling does not directly contain its old expansion; it
-        // may contain a nested macro invocation whose expansion accounts for
-        // that text.  Preserve such a child only if replacing the child
-        // spelling with its proven old expansion reconstructs `oldExpansion`,
-        // and replacing it with its proven new expansion reconstructs
-        // `newExpansion`.
+        // The formal spelling does not contain its old expansion as a
+        // free-standing run; it may contain a nested macro invocation whose
+        // expansion accounts for that text.  Preserve such a child only if
+        // replacing the child spelling with its proven old expansion
+        // reconstructs `oldExpansion`, and replacing it with its proven new
+        // expansion reconstructs `newExpansion`.
+        //
+        // The new expansion substituted here is the B envelope of the child's
+        // cover, so the child's rebuilt spelling must be proven to re-expand
+        // to that envelope.  Only the complete fixed-body template proves it:
+        // it matches every body token of the child literally in B.  The
+        // projection fallback rewrites formal slots alone, so it would rebuild
+        // `PAREN("a")` as `PAREN("b")` for an edit to `"b"` that deleted the
+        // parentheses PAREN's body supplies.
         if (!inv.invFile)
           return std::nullopt;
 
         SmallVector<CurrentLevelChildSlotRewrite, 4> childSlots;
-
-        const uint64_t absTrimBegin = *inv.invB + argRange.first + trimLead;
-        const uint64_t absTrimEnd = *inv.invB + argRange.first + trimEnd;
 
         // Search lexical child invocations contained in this formal slot.
         // `callerMacroId` is honored when present, but absence of that edge is
         // not enough to accept a child; the file/range containment and the
         // expansion-bridge proof below still have to succeed.
         for (const auto &child : (*deps_.model).GetMacroInvocations()) {
-          if (child.id == inv.id || !child.invFile || !child.invB ||
-              !child.invE || !child.invText)
-            continue;
-          if (*child.invFile != *inv.invFile)
-            continue;
-          if (child.callerMacroId && *child.callerMacroId != inv.id)
-            continue;
-          if (*child.invB < absTrimBegin || *child.invE > absTrimEnd ||
-              *child.invE <= *child.invB)
+          std::optional<std::pair<size_t, size_t>> childRange =
+              ChildSpellingInFormalSlot(inv, child, absTrimBegin, absTrimEnd);
+          if (!childRange || !child.invText)
             continue;
 
           auto childExpansion =
               solver_.GetCurrentLevelExpansionTextForInvocation(child);
           if (!childExpansion)
             continue;
-          auto childNewSyntax = Build(child, depth + 1);
-          if (!childNewSyntax)
-            continue;
-
-          const uint64_t relB64 = *child.invB - absTrimBegin;
-          const uint64_t relE64 = *child.invE - absTrimBegin;
-          if (relE64 < relB64 || relE64 > baseTrim.size())
+          bool childEnvelopeReplayValidated = false;
+          auto childNewSyntax =
+              Build(child, depth + 1, &childEnvelopeReplayValidated);
+          if (!childNewSyntax || !childEnvelopeReplayValidated)
             continue;
 
           childSlots.push_back(CurrentLevelChildSlotRewrite{
-              static_cast<size_t>(relB64), static_cast<size_t>(relE64),
+              childRange->first, childRange->second,
               StringRef(childExpansion->first).trim().str(),
               StringRef(childExpansion->second).trim().str(),
               StringRef(*childNewSyntax).trim().str()});
@@ -567,6 +572,69 @@ private:
       return std::nullopt;
 
     return StringRef(rewritten).trim().str();
+  }
+
+  /// Return the byte interval of `child`'s spelling relative to the trimmed
+  /// formal slot [slotBegin, slotEnd) of `inv`, when `child` is a lexical
+  /// child invocation spelled wholly inside that slot.  `callerMacroId` is
+  /// honored when present, but its absence alone does not exclude a child.
+  static std::optional<std::pair<size_t, size_t>>
+  ChildSpellingInFormalSlot(const RefoldModel::MacroInvocation &inv,
+                            const RefoldModel::MacroInvocation &child,
+                            uint64_t slotBegin, uint64_t slotEnd) {
+    if (child.id == inv.id || !inv.invFile || !child.invFile || !child.invB ||
+        !child.invE)
+      return std::nullopt;
+    if (*child.invFile != *inv.invFile)
+      return std::nullopt;
+    if (child.callerMacroId && *child.callerMacroId != inv.id)
+      return std::nullopt;
+    if (*child.invB < slotBegin || *child.invE > slotEnd ||
+        *child.invE <= *child.invB)
+      return std::nullopt;
+    return std::make_pair(static_cast<size_t>(*child.invB - slotBegin),
+                          static_cast<size_t>(*child.invE - slotBegin));
+  }
+
+  /// Return the unique occurrence of `oldExpansion` in the trimmed formal
+  /// spelling `formal` of `inv`, which occupies source bytes
+  /// [slotBegin, slotEnd), when that occurrence can be replaced in place.
+  ///
+  /// Replacing the occurrence keeps every other byte of `formal` verbatim, so
+  /// it is admitted only when no invocation can collect the replacement as
+  /// its own actuals:
+  ///   * the occurrence is a free-standing run of whole tokens -- a
+  ///     parenthesis of `formal` enclosing it can only have been consumed by
+  ///     a function-like invocation, whether a lexical child or a call formed
+  ///     from a forwarded tuple; and
+  ///   * no recorded child invocation's spelling intersects it.
+  /// An occurrence that fails either test is part of a nested invocation's
+  /// spelling or actuals, so keeping the bytes around it does not keep that
+  /// invocation's expansion: in `ID("a")`, a comma in the new expansion would
+  /// split ID's single actual, which no check of this formal's own commas can
+  /// see, and replacing `("a")` in `PAREN("a")` with `"b"` leaves PAREN
+  /// uninvoked.  Such an edit is left to the child-expansion bridge, which
+  /// proves the child through its own rebuild, and otherwise to the other
+  /// args-only and whole-cover candidates.
+  std::optional<std::pair<size_t, size_t>>
+  FindFreeStandingOldExpansion(const RefoldModel::MacroInvocation &inv,
+                               StringRef formal, StringRef oldExpansion,
+                               uint64_t slotBegin, uint64_t slotEnd) const {
+    std::optional<std::pair<size_t, size_t>> loc =
+        findUniqueTrimmedSubstring(formal, oldExpansion);
+    if (!loc || !inv.invFile ||
+        !refoldMacroActualSubrangeIsFreeStanding(formal, loc->first,
+                                                 loc->second, (*deps_.lexLang)))
+      return std::nullopt;
+
+    for (const auto &child : (*deps_.model).GetMacroInvocations()) {
+      std::optional<std::pair<size_t, size_t>> childRange =
+          ChildSpellingInFormalSlot(inv, child, slotBegin, slotEnd);
+      if (childRange && childRange->first < loc->second &&
+          loc->first < childRange->second)
+        return std::nullopt;
+    }
+    return loc;
   }
 
   const RefoldMacroArgsOnlyTemplateSolver &solver_;
