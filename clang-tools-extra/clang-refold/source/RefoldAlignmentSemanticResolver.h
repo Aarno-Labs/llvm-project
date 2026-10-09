@@ -209,8 +209,8 @@ enum class StructureRepairScope : uint8_t {
   /// The window's preferred sub-rectangles were varied together with other
   /// windows' in one candidate set: the earliest window's own, and those of
   /// each later window that a terminal request of the earliest window's
-  /// declined realization meets.  Every window in the set records this scope
-  /// and the same candidate census.
+  /// declined realization meets.  Every window in the set records this scope,
+  /// the set itself, and the same candidate census and output key.
   JointAcrossWindows,
 };
 
@@ -251,6 +251,11 @@ struct AlignmentSemanticResolutionWitness {
   /// candidates combine the maps of, after narrowing to that scope.
   std::optional<StructureRepairScope> structureRepairScope;
   uint64_t variedSubRectangleCount = 0;
+  /// Set only for a `JointAcrossWindows` recovery: the ascending indices of
+  /// every certification window its joint repair committed, this one
+  /// included.  Each of them holds a witness recording this same set, and the
+  /// same candidate census and key, because one theorem committed them all.
+  std::vector<size_t> jointWindowIndices;
   /// Members of `candidateDomain`, and how many of them share the committed
   /// class; the rest were rejected.
   uint64_t candidateCount = 0;
@@ -305,11 +310,15 @@ struct AlignmentSemanticLedger {
 /// requires, match the certification window it names, and keep its anchor
 /// evidence inside that window.  A structure-respecting recovery must own a
 /// structure-preserving tie range equal to its window's A range, and every
-/// such range must belong to one.  Every semantic-witness-backed anchor must
-/// name an existing witness that records evidence for it, which places it
-/// inside that witness's window, and whose representative agrees with the
-/// production map.  The result describes the defect for a
-/// fatal diagnostic; any defect is an internal proof contradiction.
+/// such range must belong to one.  A joint recovery's window set must hold
+/// two or more ascending windows, its own among them, and each of them must
+/// hold a witness recording the same set, candidate census and key, so that no
+/// member of a joint theorem is missing or states a different one.  Every
+/// semantic-witness-backed anchor must name an existing witness that records
+/// evidence for it, which places it inside that witness's window, and whose
+/// representative agrees with the production map.  The result describes the
+/// defect for a fatal diagnostic; any defect is an internal proof
+/// contradiction.
 std::optional<std::string>
 findAlignmentSemanticLedgerDefect(const AlignmentSemanticLedger &ledger);
 
@@ -484,6 +493,9 @@ private:
     /// Each still needs a resolution of its own, holding its own window's
     /// anchor evidence.
     std::vector<JointRepairWindow> jointWindows;
+    /// The ascending indices of every window of a joint commit, this one
+    /// included, as its witness records them; empty unless committed jointly.
+    std::vector<size_t> jointWindowIndices;
   };
 
   /// Resolve the ambiguity inside one certification window.

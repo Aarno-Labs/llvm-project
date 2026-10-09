@@ -1488,12 +1488,19 @@ RefoldAlignmentSemanticResolver::Resolve() const {
     const std::vector<JointRepairWindow> jointWindows =
         std::move(resolution.jointWindows);
     resolution.jointWindows.clear();
+    if (!jointWindows.empty()) {
+      resolution.jointWindowIndices.push_back(windowIndex);
+      for (const JointRepairWindow &joint : jointWindows)
+        resolution.jointWindowIndices.push_back(joint.windowIndex);
+      llvm::sort(resolution.jointWindowIndices);
+    }
     committedWindows.push_back(std::move(resolution));
 
     // A joint repair chose each later window's anchors in the same simulation
     // and under the same theorem.  Each window still owes its own witness, with
     // evidence for its own anchors only, and its own tie range; it is recorded
-    // after this one because its choice was committed at this point.
+    // after this one because its choice was committed at this point.  The copy
+    // carries the census, key and joint window set the theorem shares.
     for (const JointRepairWindow &joint : jointWindows) {
       const diffutils::LcsCertificationWindow &jointWindow =
           deps_.coreAlignment.certificationWindows[joint.windowIndex];
@@ -1558,6 +1565,7 @@ RefoldAlignmentSemanticResolver::Resolve() const {
         resolution.candidateDomainCompletelyEnumerated;
     witness.structureRepairScope = resolution.structureRepairScope;
     witness.variedSubRectangleCount = resolution.variedSubRectangleCount;
+    witness.jointWindowIndices = resolution.jointWindowIndices;
     witness.candidateCount = resolution.enumeratedMapCount;
     witness.acceptedCandidateCount = resolution.acceptedMapCount;
     witness.rejectedCandidateCount = resolution.rejectedMapCount;
@@ -3163,12 +3171,69 @@ findWitnessTheoremDefect(const AlignmentSemanticResolutionWitness &witness) {
                    "it should not",
                    witness.witnessId, kindName)
         .str();
+  const bool joint =
+      witness.structureRepairScope == StructureRepairScope::JointAcrossWindows;
+  if (witness.jointWindowIndices.empty() == joint)
+    return formatv("alignment semantic witness {0} ({1}) has a joint window "
+                   "set exactly when its repair scope is not joint",
+                   witness.witnessId, kindName)
+        .str();
+  if (joint &&
+      (witness.jointWindowIndices.size() < 2 ||
+       !llvm::is_sorted(witness.jointWindowIndices) ||
+       std::adjacent_find(witness.jointWindowIndices.begin(),
+                          witness.jointWindowIndices.end()) !=
+           witness.jointWindowIndices.end() ||
+       !llvm::is_contained(witness.jointWindowIndices, witness.windowIndex)))
+    return formatv("alignment semantic witness {0} ({1}) has a joint window "
+                   "set that is not two or more ascending windows including "
+                   "its own",
+                   witness.witnessId, kindName)
+        .str();
   for (const AlignmentSemanticAnchorEvidence &evidence : witness.anchorEvidence)
     if (!witnessKindAdmitsBasis(witness.resolutionKind, evidence.basis))
       return formatv("alignment semantic witness {0} ({1}) records A-token {2} "
                      "under a basis its theorem does not establish",
                      witness.witnessId, kindName, evidence.aToken)
           .str();
+  return std::nullopt;
+}
+
+/// Return the first joint recovery in \p witnesses whose theorem another
+/// window of its set does not record: a window of the set with no witness, or
+/// one whose witness names a different set, candidate census or key.
+///
+/// One joint repair realizes one candidate set and commits every window of it
+/// from the same simulation, so each window's witness must state that one
+/// theorem.  Each witness must already have passed
+/// `findWitnessTheoremDefect()` and name a distinct window.
+std::optional<std::string> findJointRecoveryDefect(
+    ArrayRef<AlignmentSemanticResolutionWitness> witnesses) {
+  std::map<size_t, const AlignmentSemanticResolutionWitness *> byWindow;
+  for (const AlignmentSemanticResolutionWitness &witness : witnesses)
+    byWindow[witness.windowIndex] = &witness;
+  for (const AlignmentSemanticResolutionWitness &witness : witnesses) {
+    for (size_t member : witness.jointWindowIndices) {
+      const auto partner = byWindow.find(member);
+      if (partner == byWindow.end() ||
+          partner->second->jointWindowIndices != witness.jointWindowIndices)
+        return formatv("alignment semantic witness {0} is joint with "
+                       "certification window {1}, which holds no witness "
+                       "recording the same joint window set",
+                       witness.witnessId, member)
+            .str();
+      const AlignmentSemanticResolutionWitness &other = *partner->second;
+      if (other.candidateCount != witness.candidateCount ||
+          other.acceptedCandidateCount != witness.acceptedCandidateCount ||
+          other.rejectedCandidateCount != witness.rejectedCandidateCount ||
+          other.equivalenceKeyKind != witness.equivalenceKeyKind ||
+          other.equivalenceKey != witness.equivalenceKey)
+        return formatv("alignment semantic witnesses {0} and {1} of one joint "
+                       "repair disagree on its candidate census or key",
+                       witness.witnessId, other.witnessId)
+            .str();
+    }
+  }
   return std::nullopt;
 }
 
@@ -3271,6 +3336,10 @@ findAlignmentSemanticLedgerDefect(const AlignmentSemanticLedger &ledger) {
             .str();
     }
   }
+  if (std::optional<std::string> defect =
+          findJointRecoveryDefect(ledger.witnesses))
+    return defect;
+
   // Each structure-respecting recovery owns the tie range over its own
   // window, and the windows are distinct, so equal counts leave no range
   // without a recovery to answer for it.

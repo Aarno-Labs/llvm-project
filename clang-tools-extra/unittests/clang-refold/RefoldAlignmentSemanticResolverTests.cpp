@@ -201,6 +201,7 @@ TEST(RefoldAlignmentSemanticResolver, StructureRecoveryRecordsItsOwnTheorem) {
   EXPECT_EQ(witness.structureRepairScope,
             StructureRepairScope::AllPreferredSubRectangles);
   EXPECT_EQ(witness.variedSubRectangleCount, 1u);
+  EXPECT_TRUE(witness.jointWindowIndices.empty());
   EXPECT_EQ(witness.candidateCount, 1u);
   EXPECT_EQ(witness.acceptedCandidateCount, 1u);
   EXPECT_EQ(witness.equivalenceKey, "output of 3,4,5,6");
@@ -550,6 +551,7 @@ TEST(RefoldAlignmentSemanticResolver,
     EXPECT_EQ(witness.structureRepairScope,
               StructureRepairScope::JointAcrossWindows);
     EXPECT_EQ(witness.variedSubRectangleCount, 1u);
+    EXPECT_EQ(witness.jointWindowIndices, (std::vector<size_t>{0, 1}));
     EXPECT_EQ(witness.candidateCount, 1u);
     ASSERT_FALSE(witness.anchorEvidence.empty());
     for (const AlignmentSemanticAnchorEvidence &evidence :
@@ -620,6 +622,7 @@ TEST(RefoldAlignmentSemanticResolver,
   EXPECT_EQ(witness.windowIndex, 1u);
   EXPECT_EQ(witness.structureRepairScope,
             StructureRepairScope::AllPreferredSubRectangles);
+  EXPECT_TRUE(witness.jointWindowIndices.empty());
 
   AlignmentSelectionOverride selected;
   selected.selectedMap = resolution.selectedMap;

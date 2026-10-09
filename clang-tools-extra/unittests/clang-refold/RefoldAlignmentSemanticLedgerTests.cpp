@@ -141,6 +141,36 @@ void expectDefect(const std::optional<std::string> &defect,
 constexpr llvm::StringRef BasisDefect =
     "under a basis its theorem does not establish";
 
+/// The well-formed ledger with windows 1 and 2 committed by one joint
+/// structure-respecting recovery instead: both witnesses record the scope
+/// `JointAcrossWindows`, the window set {1, 2}, one candidate census and one
+/// key, and each owns the tie range over its own window.
+WellFormedLedger jointLedger() {
+  WellFormedLedger ledger;
+  ledger.witnesses[1] = ledger.makeWitness(
+      2, 1,
+      AlignmentSemanticResolutionKind::StructureRespectingTerminalRecovery,
+      AlignmentSemanticCandidateDomain::StructureRepairCandidates,
+      AlignmentSemanticEquivalenceKeyKind::ConcreteOutput,
+      AlignmentSemanticAnchorBasis::
+          StructureRespectingTerminalRecoveryRepresentative);
+  for (size_t index : {1, 2}) {
+    AlignmentSemanticResolutionWitness &witness = ledger.witnesses[index];
+    witness.structureRepairScope = StructureRepairScope::JointAcrossWindows;
+    witness.variedSubRectangleCount = 1;
+    witness.jointWindowIndices = {1, 2};
+  }
+  ledger.tieRanges = {{4, 8}, {8, 12}};
+  return ledger;
+}
+
+constexpr llvm::StringRef JointSetShapeDefect =
+    "is not two or more ascending windows including its own";
+constexpr llvm::StringRef JointPartnerDefect =
+    "which holds no witness recording the same joint window set";
+constexpr llvm::StringRef JointTheoremDefect =
+    "of one joint repair disagree on its candidate census or key";
+
 } // namespace
 
 TEST(RefoldAlignmentSemanticLedger, WellFormedLedgerHasNoDefect) {
@@ -268,4 +298,64 @@ TEST(RefoldAlignmentSemanticLedger, EveryTieRangeBelongsToARecovery) {
   WellFormedLedger ledger;
   ledger.tieRanges.push_back({0, 4});
   expectDefect(ledger.audit(), "one-to-one");
+}
+
+TEST(RefoldAlignmentSemanticLedger, JointRecoveryLedgerHasNoDefect) {
+  EXPECT_EQ(jointLedger().audit(), std::nullopt);
+}
+
+TEST(RefoldAlignmentSemanticLedger, OnlyAJointRecoveryHasAJointWindowSet) {
+  WellFormedLedger withSet;
+  withSet.witnesses[2].jointWindowIndices = {1, 2};
+  expectDefect(withSet.audit(), "joint window set exactly when");
+
+  WellFormedLedger withoutSet = jointLedger();
+  withoutSet.witnesses[1].jointWindowIndices.clear();
+  expectDefect(withoutSet.audit(), "joint window set exactly when");
+}
+
+TEST(RefoldAlignmentSemanticLedger, JointWindowSetHoldsItsOwnWindowAndAnother) {
+  WellFormedLedger alone = jointLedger();
+  alone.witnesses[1].jointWindowIndices = {1};
+  expectDefect(alone.audit(), JointSetShapeDefect);
+
+  WellFormedLedger descending = jointLedger();
+  descending.witnesses[1].jointWindowIndices = {2, 1};
+  expectDefect(descending.audit(), JointSetShapeDefect);
+
+  WellFormedLedger repeated = jointLedger();
+  repeated.witnesses[1].jointWindowIndices = {1, 1, 2};
+  expectDefect(repeated.audit(), JointSetShapeDefect);
+
+  WellFormedLedger withoutOwn = jointLedger();
+  withoutOwn.witnesses[1].jointWindowIndices = {0, 2};
+  expectDefect(withoutOwn.audit(), JointSetShapeDefect);
+}
+
+TEST(RefoldAlignmentSemanticLedger, EveryJointWindowHoldsAWitnessOfTheSet) {
+  // Window 1's witness is gone, its anchors left core-forced and its tie range
+  // dropped, so every other check passes and window 2's witness is the lone
+  // member of its joint theorem.
+  WellFormedLedger lone = jointLedger();
+  lone.witnesses.erase(lone.witnesses.begin() + 1);
+  for (size_t token = 5; token < 8; ++token)
+    lone.anchorProofs[token] = diffutils::LcsAnchorProof{
+        diffutils::LcsAnchorProofKind::CoreOptimalPathForced, 0};
+  lone.tieRanges = {{8, 12}};
+  expectDefect(lone.audit(), JointPartnerDefect);
+
+  WellFormedLedger otherSet = jointLedger();
+  otherSet.witnesses[2].jointWindowIndices = {0, 2};
+  expectDefect(otherSet.audit(), JointPartnerDefect);
+}
+
+TEST(RefoldAlignmentSemanticLedger, JointWitnessesShareOneCensusAndKey) {
+  WellFormedLedger otherKey = jointLedger();
+  otherKey.witnesses[2].equivalenceKey = "other key";
+  expectDefect(otherKey.audit(), JointTheoremDefect);
+
+  WellFormedLedger otherCensus = jointLedger();
+  otherCensus.witnesses[2].candidateCount = 4;
+  otherCensus.witnesses[2].rejectedCandidateCount = 3;
+  expectDefect(otherCensus.audit(), JointTheoremDefect);
 }
