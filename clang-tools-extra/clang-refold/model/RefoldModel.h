@@ -1445,15 +1445,18 @@ public:
   bool ArmRefIsSameOrNestedUnder(const ArmRef &candidate,
                                  uint64_t ancestorArmId) const;
 
-  /// Return the A-token hull of the tokens below `GetTokensCountA()` whose
-  /// `FindArmRefAtPP()` arm is \p armId or nested beneath it, as
-  /// `ArmRefIsSameOrNestedUnder()` decides, or std::nullopt when there are
-  /// none.
+  /// Return the A tokens produced while the preprocessor was inside the body
+  /// of arm \p armId, or std::nullopt when it produced none.
   ///
-  /// The hull runs from the first such token to one past the last, so every
-  /// one of them lies inside a range exactly when the hull does; tokens
-  /// strictly inside it need not belong to the arm.
-  std::optional<PPSpan> ArmOwnedPPHull(uint64_t armId) const;
+  /// That is the arm's own `CondArm::span`, which counts the tokens spelled in
+  /// its body in its include occurrence and so those of nested arms, together
+  /// with the cover of every entered `#include` whose directive lies in the
+  /// body of that same occurrence.  `CondArm::span` alone is not the arm's
+  /// extent: an `#include` at the start or end of the body produces tokens on
+  /// either side of it, and a child header's own conditionals do not name the
+  /// arm they were included from.  The body is preprocessed in one stretch, so
+  /// the hull of these runs is exactly the tokens the arm produced.
+  std::optional<PPSpan> ArmProducedPPSpan(uint64_t armId) const;
 
   // --- Slot queries ---
   /// Return all slots matching the supplied exact-match filters.
@@ -1547,10 +1550,8 @@ private:
   /// built on first use.  The pointers are into this model's own `conds_`.
   mutable std::vector<std::optional<ArmRef>> armRefByPPCache_;
   mutable bool armRefByPPCacheBuilt_ = false;
-  /// `ArmOwnedPPHull()` answers, keyed by arm id, built on first use; an arm
-  /// with no entry owns no A token.
-  mutable DenseMap<uint64_t, PPSpan> armOwnedPPHulls_;
-  mutable bool armOwnedPPHullsBuilt_ = false;
+  /// `ArmProducedPPSpan()` answers, keyed by arm id, filled per query.
+  mutable DenseMap<uint64_t, std::optional<PPSpan>> armProducedPPSpans_;
   /// `SummarizeTUOwnedTokens()` index over the A tokens below
   /// `tokensCountA_`, built on first use: prefix counts of TU-contributed and
   /// other-file mapped tokens, and bottom-up segment trees, leaf `pp` at
@@ -1583,10 +1584,6 @@ private:
   /// malformed parent cycle cannot loop.
   void AppendSameOrEnclosingArmIds(const ArmRef &candidate,
                                    SmallVectorImpl<uint64_t> &armIds) const;
-
-  /// Fill `armOwnedPPHulls_` from `FindArmRefAtPP()` over every A token below
-  /// `tokensCountA_`.
-  void BuildArmOwnedPPHulls() const;
 
   /// Fill the `SummarizeTUOwnedTokens()` index from `tokmap_`, letting a later
   /// entry for an A token replace an earlier one, as it does in `tokmapByPP_`.

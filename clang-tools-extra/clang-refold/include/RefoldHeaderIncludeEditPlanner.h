@@ -429,9 +429,9 @@ private:
                                          uint64_t materialBeginA,
                                          uint64_t materialEndA);
 
-  /// Returns whether a selected arm's effective PP material is fully consumed.
-  /// Effective ownership is preferred over direct spans when the model can map
-  /// tokens to nested conditional arms.
+  /// Returns whether a selected arm's effective PP material is fully consumed:
+  /// every token `RefoldModel::ArmProducedPPSpan()` attributes to it, those of
+  /// its nested arms and of the includes in its body included.
   bool HeaderSelectedArmEffectiveMaterialInside(const RefoldModel::CondArm &arm,
                                                 uint64_t materialBeginA,
                                                 uint64_t materialEndA) const;
@@ -737,8 +737,9 @@ private:
                                  llvm::StringRef replacement) const;
 
   /// Finds a selected-conditional begin boundary for an insertion, if valid.
-  /// The boundary is accepted only when the insertion is not explicitly owned
-  /// by that arm.
+  /// The boundary is accepted only when the gap begins everything the arm
+  /// produced, includes in its body counted, and the insertion is not
+  /// explicitly owned by that arm.
   std::optional<uint64_t>
   SelectedArmBeginBoundaryByte(const HeaderInsertionPlanningState &state) const;
 

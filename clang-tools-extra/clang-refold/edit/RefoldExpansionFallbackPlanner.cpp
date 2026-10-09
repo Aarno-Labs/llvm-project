@@ -2764,54 +2764,6 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
       return materialBeginA <= span.begin && span.end <= materialEndA;
     };
 
-    auto armIsSameOrNestedUnder = [&](const RefoldModel::ArmRef &candidate,
-                                      uint64_t ancestorArmId) -> bool {
-      if (!candidate.group || !candidate.arm)
-        return false;
-      if (candidate.arm->id == ancestorArmId)
-        return true;
-
-      // `RefoldModel::FindArmRefAtPP()` intentionally returns the innermost
-      // selected arm for a PP token.  When deciding whether an outer selected
-      // arm is completely consumed, tokens owned by nested selected arms still
-      // belong to the outer arm's effective material.  Walk parent-arm links
-      // from the innermost group back toward the TU and accept any descendant
-      // of the queried arm.
-      const RefoldModel::CondGroup *group = candidate.group;
-      while (group && group->parentArmId) {
-        if (*group->parentArmId == ancestorArmId)
-          return true;
-        std::optional<RefoldModel::ArmRef> parent =
-            model_.GetArmRefById(*group->parentArmId);
-        if (!parent || !parent->group)
-          break;
-        group = parent->group;
-      }
-      return false;
-    };
-
-    auto selectedArmEffectiveMaterialInside =
-        [&](const RefoldModel::CondArm &arm) -> bool {
-      bool sawEffectiveMaterial = false;
-      for (uint64_t pp = 0; pp < aToks_.size(); ++pp) {
-        std::optional<RefoldModel::ArmRef> owner = model_.FindArmRefAtPP(pp);
-        if (!owner || !armIsSameOrNestedUnder(*owner, arm.id))
-          continue;
-
-        sawEffectiveMaterial = true;
-        if (pp < materialBeginA || pp >= materialEndA)
-          return false;
-      }
-
-      // Prefer the effective ownership proof when it found material.  For older
-      // maps that cannot answer PP ownership, fall back to the recorded direct
-      // span so existing exact whole-arm closures keep their previous domain.
-      if (sawEffectiveMaterial)
-        return true;
-      return arm.span && arm.span->IsValid() &&
-             arm.span->begin < arm.span->end && ppSpanInsideMaterial(*arm.span);
-    };
-
     auto macroInvocationMaterialIsConsumed =
         [&](const RefoldModel::MacroInvocation &m,
             std::optional<uint64_t> sourceBeginBound = std::nullopt,
@@ -2878,7 +2830,12 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
       for (const RefoldModel::CondArm &arm : group.arms) {
         if (!arm.taken)
           continue;
-        if (selectedArmEffectiveMaterialInside(arm)) {
+        // Count everything the arm produced, nested arms and the includes in
+        // its body included: the group becomes one source piece with every
+        // directive in it.
+        const std::optional<RefoldModel::PPSpan> produced =
+            model_.ArmProducedPPSpan(arm.id);
+        if (produced && ppSpanInsideMaterial(*produced)) {
           consumesSelectedArm = true;
           break;
         }

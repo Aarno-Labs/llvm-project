@@ -2889,6 +2889,7 @@ void RefoldModel::BuildIndicesAndSort() {
   condGroupDepthCache_.clear();
   innermostIncludeByPPCache_.clear();
   innermostIncludeByPPCacheBuilt_ = false;
+  armProducedPPSpans_.clear();
   tuOwnedTokenIndexBuilt_ = false;
 
   condGroupById_.clear();
@@ -3418,35 +3419,40 @@ bool RefoldModel::ArmRefIsSameOrNestedUnder(const ArmRef &candidate,
   return llvm::is_contained(armIds, ancestorArmId);
 }
 
-void RefoldModel::BuildArmOwnedPPHulls() const {
-  // Tokens are visited in ascending order, so an arm's first token opens its
-  // hull and every later one moves the end.
-  armOwnedPPHulls_.clear();
-  SmallVector<uint64_t, 4> armIds;
-  for (uint64_t pp = 0; pp < tokensCountA_; ++pp) {
-    std::optional<ArmRef> owner = FindArmRefAtPP(pp);
-    if (!owner)
-      continue;
-    armIds.clear();
-    AppendSameOrEnclosingArmIds(*owner, armIds);
-    for (uint64_t armId : armIds) {
-      auto [it, inserted] =
-          armOwnedPPHulls_.try_emplace(armId, PPSpan{pp, pp + 1});
-      if (!inserted)
-        it->second.end = pp + 1;
+std::optional<RefoldModel::PPSpan>
+RefoldModel::ArmProducedPPSpan(uint64_t armId) const {
+  if (auto it = armProducedPPSpans_.find(armId);
+      it != armProducedPPSpans_.end())
+    return it->second;
+
+  std::optional<PPSpan> produced;
+  if (std::optional<ArmRef> ref = GetArmRefById(armId);
+      ref && ref->group && ref->arm) {
+    const CondGroup &group = *ref->group;
+    const CondArm &arm = *ref->arm;
+    if (arm.span && arm.span->IsValid())
+      produced = *arm.span;
+
+    // An include the arm ran is a direct child of the arm's own occurrence
+    // whose directive the arm's body holds; its cover already counts every
+    // include nested beneath it.  A skipped include carries no cover, and an
+    // include in an arm that was not taken was never entered.
+    for (const IncludeItem &inc : includes_) {
+      if (!inc.cover.IsValid() || inc.parent != group.parentIncludeId ||
+          !arm.ContainsByte(inc.siteB) ||
+          !refoldPathsEqual(inc.sitePath, group.file))
+        continue;
+      if (!produced) {
+        produced = PPSpan{inc.cover.begin, inc.cover.end};
+        continue;
+      }
+      produced->begin = std::min(produced->begin, inc.cover.begin);
+      produced->end = std::max(produced->end, inc.cover.end);
     }
   }
-  armOwnedPPHullsBuilt_ = true;
-}
 
-std::optional<RefoldModel::PPSpan>
-RefoldModel::ArmOwnedPPHull(uint64_t armId) const {
-  if (!armOwnedPPHullsBuilt_)
-    BuildArmOwnedPPHulls();
-  auto it = armOwnedPPHulls_.find(armId);
-  if (it == armOwnedPPHulls_.end())
-    return std::nullopt;
-  return it->second;
+  armProducedPPSpans_.try_emplace(armId, produced);
+  return produced;
 }
 
 std::optional<RefoldModel::ArmRef>

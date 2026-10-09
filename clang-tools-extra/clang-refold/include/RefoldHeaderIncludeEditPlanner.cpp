@@ -439,38 +439,14 @@ bool RefoldHeaderIncludeEditPlanner::PPSpanInsideHeaderMaterial(
 bool RefoldHeaderIncludeEditPlanner::HeaderSelectedArmEffectiveMaterialInside(
     const RefoldModel::CondArm &arm, uint64_t materialBeginA,
     uint64_t materialEndA) const {
-  // Tokens in nested selected arms still count as effective material of the
-  // outer arm.  Every one of them lies inside the material exactly when their
-  // hull does.  The model's hull covers the A tokens below its own count; the
-  // engine plans only once that count is the lexed one, and any other surface
-  // keeps the token-by-token scan.
-  bool sawEffectiveMaterial = false;
-  if (aToks_.size() == model_.GetTokensCountA()) {
-    if (std::optional<RefoldModel::PPSpan> hull =
-            model_.ArmOwnedPPHull(arm.id)) {
-      if (hull->begin < materialBeginA || hull->end > materialEndA)
-        return false;
-      sawEffectiveMaterial = true;
-    }
-  } else {
-    for (uint64_t pp = 0; pp < aToks_.size(); ++pp) {
-      std::optional<RefoldModel::ArmRef> owner = model_.FindArmRefAtPP(pp);
-      if (!owner || !model_.ArmRefIsSameOrNestedUnder(*owner, arm.id))
-        continue;
-
-      sawEffectiveMaterial = true;
-      if (pp < materialBeginA || pp >= materialEndA)
-        return false;
-    }
-  }
-
-  // Prefer effective PP ownership when the map can answer it, because the
-  // direct arm span may omit include- or macro-produced tokens controlled by
-  // this arm. Fall back to the direct span only for older/sparse maps.
-  if (sawEffectiveMaterial)
-    return true;
-  return arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end &&
-         PPSpanInsideHeaderMaterial(*arm.span, materialBeginA, materialEndA);
+  // The effective material counts nested arms and the includes in the body as
+  // well as the arm's spelled tokens: the group becomes one source piece with
+  // every directive in it, so an include in its body whose tokens lie outside
+  // the material would be carried along with it.
+  const std::optional<RefoldModel::PPSpan> produced =
+      model_.ArmProducedPPSpan(arm.id);
+  return produced &&
+         PPSpanInsideHeaderMaterial(*produced, materialBeginA, materialEndA);
 }
 
 std::string RefoldHeaderIncludeEditPlanner::PreservedGapPieceText(
@@ -2073,20 +2049,20 @@ RefoldHeaderIncludeEditPlanner::SelectedArmBeginBoundaryByte(
   auto rightArmRef = model_.FindArmRefAtPP(state.pos);
   if (!rightArmRef || !rightArmRef->group || !rightArmRef->arm)
     return std::nullopt;
-  if (!rightArmRef->arm->span)
-    return std::nullopt;
-  if (rightArmRef->arm->span->begin != state.pos)
-    return std::nullopt;
   if (!paths_.PathsEqual(rightArmRef->group->file, state.file))
     return std::nullopt;
   if (!rightArmRef->group->parentIncludeId ||
       *rightArmRef->group->parentIncludeId != state.include.id)
     return std::nullopt;
 
-  auto leftArmRef = (state.pos > 0) ? model_.FindArmRefAtPP(state.pos - 1)
-                                    : std::optional<RefoldModel::ArmRef>{};
-  if (leftArmRef && leftArmRef->arm &&
-      leftArmRef->arm->id == rightArmRef->arm->id)
+  // Text placed before the group precedes everything the group produced, and
+  // only the selected arm produced anything, so the group's start realizes
+  // the gap exactly when the arm's first produced token is the one at it.  The
+  // arm's spelled-token span would not establish that: an `#include` ahead of
+  // its first spelled token produces tokens before that one.
+  const std::optional<RefoldModel::PPSpan> produced =
+      model_.ArmProducedPPSpan(rightArmRef->arm->id);
+  if (!produced || produced->begin != state.pos)
     return std::nullopt;
 
   const bool explicitArmOwned =
