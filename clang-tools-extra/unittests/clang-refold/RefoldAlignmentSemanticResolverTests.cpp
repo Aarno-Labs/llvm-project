@@ -498,4 +498,133 @@ TEST(RefoldAlignmentSemanticResolver, LaterCommitIsTheReplayReference) {
   EXPECT_NE(recovery.equivalenceKey, finalOutput);
 }
 
+/// The structure shape at A `[0, 11)` followed by a second copy over distinct
+/// lexemes at A `[11, 22)`, with the seam between them.  The second copy's
+/// core-forced run is [13,20), its `#define`s sit at A gaps 14 and 18, and the
+/// one map straddling neither leaves [14,18) unmatched.
+ResolverHarness twoStructureShapes() {
+  std::vector<llvm::StringRef> a = StructureShapeA, b = StructureShapeB;
+  const std::vector<llvm::StringRef> secondA = {
+      "long", "w", ";", "extern", "long", "v", ";", "extern", "long", "u", ";"};
+  const std::vector<llvm::StringRef> secondB = {"long", "w", ";", "extern",
+                                                "long", "u", ";"};
+  a.insert(a.end(), secondA.begin(), secondA.end());
+  b.insert(b.end(), secondB.begin(), secondB.end());
+  ResolverHarness harness(a, b, /*candidateABoundaries=*/{11});
+  harness.protectedBoundaries = {3, 7, 14, 18};
+  return harness;
+}
+
+TEST(RefoldAlignmentSemanticResolver,
+     StructureRecoveryCommitsJointlyAcrossWindows) {
+  // Each copy's core-forced map requests terminal fallback wherever the other
+  // copy is realized, so a candidate is accepted only when both copies are at
+  // their preferred map.  Repairing either window alone leaves the other's
+  // request standing: before joint repair, neither window could commit.
+  ResolverHarness harness = twoStructureShapes();
+  ASSERT_EQ(harness.Core().certificationWindows.size(), 2u);
+  harness.simulate = [](const AlignmentSelectionOverride &selection) {
+    std::vector<std::optional<TokenRange>> requests;
+    const std::string first = unmatchedIn(selection, 0, 11);
+    const std::string second = unmatchedIn(selection, 11, 22);
+    if (first == "2,3,4,5,6,7,8")
+      requests.push_back(TokenRange{2, 9});
+    if (second == "13,14,15,16,17,18,19")
+      requests.push_back(TokenRange{13, 20});
+    if (!requests.empty())
+      return terminal(requests);
+    return accepted("output of " + first + " and " + second + "; ties " +
+                    tieRangesOf(selection));
+  };
+
+  const Resolution resolution = harness.Resolve();
+  ASSERT_TRUE(resolution.committedSemanticResolution);
+  ASSERT_EQ(resolution.witnesses.size(), 2u);
+  for (size_t windowIndex = 0; windowIndex < 2; ++windowIndex) {
+    const AlignmentSemanticResolutionWitness &witness =
+        resolution.witnesses[windowIndex];
+    EXPECT_EQ(witness.windowIndex, windowIndex);
+    EXPECT_EQ(
+        witness.resolutionKind,
+        AlignmentSemanticResolutionKind::StructureRespectingTerminalRecovery);
+    EXPECT_EQ(witness.structureRepairScope,
+              StructureRepairScope::JointAcrossWindows);
+    EXPECT_EQ(witness.variedSubRectangleCount, 1u);
+    EXPECT_EQ(witness.candidateCount, 1u);
+    ASSERT_FALSE(witness.anchorEvidence.empty());
+    for (const AlignmentSemanticAnchorEvidence &evidence :
+         witness.anchorEvidence) {
+      EXPECT_LE(witness.aBegin, evidence.aToken);
+      EXPECT_LT(evidence.aToken, witness.aEnd);
+    }
+  }
+  EXPECT_EQ(resolution.witnesses[0].equivalenceKey,
+            resolution.witnesses[1].equivalenceKey);
+
+  AlignmentSelectionOverride selected;
+  selected.selectedMap = resolution.selectedMap;
+  EXPECT_EQ(unmatchedIn(selected, 0, 11), "3,4,5,6");
+  EXPECT_EQ(unmatchedIn(selected, 11, 22), "14,15,16,17");
+
+  // Both windows settle their ties for structure, and the joint candidate was
+  // realized that way: its key is the final output production must replay.
+  const std::vector<TokenRange> bothWindows = {harness.WindowARange(0),
+                                               harness.WindowARange(1)};
+  EXPECT_EQ(resolution.structurePreservingTieRanges, bothWindows);
+  ASSERT_TRUE(resolution.replayReference.has_value());
+  EXPECT_EQ(resolution.replayReference->witnessId,
+            resolution.witnesses[1].witnessId);
+  EXPECT_EQ(resolution.replayReference->concreteOutputKey,
+            "output of 3,4,5,6 and 14,15,16,17; ties [0,11)[11,22)");
+}
+
+TEST(RefoldAlignmentSemanticResolver,
+     FailedRepairRealizesNoDeclineWithoutALaterWindow) {
+  // Every realization fails inside the only window.  The joint repair could
+  // vary only a later window, so the repair declines without paying for the
+  // decline configuration's realization.
+  ResolverHarness harness = structureShape();
+  harness.simulate = [](const AlignmentSelectionOverride &) {
+    return terminal({TokenRange{2, 9}});
+  };
+
+  const Resolution resolution = harness.Resolve();
+  EXPECT_FALSE(resolution.committedSemanticResolution);
+  EXPECT_TRUE(llvm::none_of(
+      harness.realized, [](const AlignmentSelectionOverride &selection) {
+        return unmatchedIn(selection, 0, 11) == "2,3,4,5,6,7,8";
+      }));
+}
+
+TEST(RefoldAlignmentSemanticResolver,
+     JointRepairNeedsTheEarlierWindowsOwnDeclineToFail) {
+  // Only the second copy's core-forced map requests terminal fallback.  The
+  // first window's candidates all inherit that request, but its own decline is
+  // admissible, so it must not commit the second window's repair for it: the
+  // second window repairs itself and the first keeps its core-forced map.
+  ResolverHarness harness = twoStructureShapes();
+  ASSERT_EQ(harness.Core().certificationWindows.size(), 2u);
+  harness.simulate = [](const AlignmentSelectionOverride &selection) {
+    const std::string first = unmatchedIn(selection, 0, 11);
+    const std::string second = unmatchedIn(selection, 11, 22);
+    if (second == "13,14,15,16,17,18,19")
+      return terminal({TokenRange{13, 20}});
+    return accepted("output of " + first + " and " + second);
+  };
+
+  const Resolution resolution = harness.Resolve();
+  ASSERT_TRUE(resolution.committedSemanticResolution);
+  ASSERT_EQ(resolution.witnesses.size(), 1u);
+  const AlignmentSemanticResolutionWitness &witness =
+      resolution.witnesses.front();
+  EXPECT_EQ(witness.windowIndex, 1u);
+  EXPECT_EQ(witness.structureRepairScope,
+            StructureRepairScope::AllPreferredSubRectangles);
+
+  AlignmentSelectionOverride selected;
+  selected.selectedMap = resolution.selectedMap;
+  EXPECT_EQ(unmatchedIn(selected, 0, 11), "2,3,4,5,6,7,8");
+  EXPECT_EQ(unmatchedIn(selected, 11, 22), "14,15,16,17");
+}
+
 } // namespace

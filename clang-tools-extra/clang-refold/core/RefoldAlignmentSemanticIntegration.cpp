@@ -720,6 +720,25 @@ static bool sourceOffsetEndsLine(StringRef bytes, uint64_t end) {
   return cursor == bytes.size() || bytes[cursor] == '\n';
 }
 
+/// Return the bytes of \p source strictly between the spellings of tokens
+/// \p left and \p right of a stream lexed from it, where token `i` begins at
+/// `offsets[i]` and ends at its spelling's length, clipped to the next token
+/// and to \p source as the token-diff planner clips its byte projection.
+/// Empty when the tokens are out of order or out of range.
+static StringRef bytesBetweenTokens(StringRef source, ArrayRef<PPTok> tokens,
+                                    ArrayRef<size_t> offsets, uint64_t left,
+                                    uint64_t right) {
+  if (left >= right || right >= tokens.size() || right >= offsets.size())
+    return StringRef();
+  const size_t leftBegin = std::min(offsets[left], source.size());
+  const size_t leftEnd = std::min({leftBegin + tokens[left].spelling.size(),
+                                   offsets[left + 1], source.size()});
+  const size_t rightBegin = std::min(offsets[right], source.size());
+  if (leftEnd > rightBegin)
+    return StringRef();
+  return source.slice(leftEnd, rightBegin);
+}
+
 std::optional<std::pair<uint64_t, uint64_t>>
 RefoldEngine::ATokenTUSourceRange(uint64_t aToken) const {
   const auto &tokmapByPP = model_.GetTokmapByPP();
@@ -818,6 +837,14 @@ void RefoldEngine::ResolveSemanticAlignment(
                 },
                 [this](uint64_t aBegin, uint64_t aEnd) {
                   return tokenDiffPlanner_->ARangeIsPlainSource(aBegin, aEnd);
+                },
+                [this](uint64_t aGap) {
+                  return bytesBetweenTokens(aSource_, aToks_, aTokOff_,
+                                            aGap - 1, aGap);
+                },
+                [this](uint64_t bLeft, uint64_t bRight) {
+                  return bytesBetweenTokens(bSource_, bToks_, bTokOff_, bLeft,
+                                            bRight);
                 }}});
     resolution = resolver.Resolve();
 

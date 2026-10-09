@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -158,8 +159,10 @@ enum class AlignmentSemanticResolutionKind : uint8_t {
   RequiredAnchorCarrierEquivalence,
   /// Declining the window was proved to request terminal fallback, and every
   /// accepted member of the structure-respecting repair's candidate set
-  /// produced one concrete output.  Asserts nothing about core-optimal maps
-  /// outside that candidate set; see
+  /// produced one concrete output.  Under `StructureRepairScope::
+  /// JointAcrossWindows` the decline is that of every window of the set
+  /// together, with a terminal request in each.  Asserts nothing about
+  /// core-optimal maps outside that candidate set; see
   /// `RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair()`.
   StructureRespectingTerminalRecovery,
 };
@@ -203,6 +206,12 @@ enum class StructureRepairScope : uint8_t {
   /// declined window's realization meets, because all of them together
   /// exceeded the realization budget.
   TerminalRequestIntersectingSubRectangles,
+  /// The window's preferred sub-rectangles were varied together with other
+  /// windows' in one candidate set: the earliest window's own, and those of
+  /// each later window that a terminal request of the earliest window's
+  /// declined realization meets.  Every window in the set records this scope
+  /// and the same candidate census.
+  JointAcrossWindows,
 };
 
 /// Which simulation key a witness's `equivalenceKey` holds.
@@ -258,10 +267,13 @@ struct AlignmentSemanticResolutionWitness {
 /// resolution.
 ///
 /// Windows are resolved in order, each simulated against the commits before
-/// it, with every later window at its core-forced anchors.  The simulation of
-/// the last committed window's representative therefore realized the final
-/// selection: the final map, and every structure-preserving tie range.  No
-/// earlier window's simulation did, whatever its theorem.  This holds that
+/// it, with every later window not yet committed at its core-forced anchors.
+/// A joint structure-respecting repair commits later windows together with
+/// the one being resolved, from one simulation, and is recorded at that point
+/// in the commit order.  No commit changes an earlier one, so the simulation of
+/// the last committed window's representative realized the final selection:
+/// the final map, and every structure-preserving tie range.  No earlier
+/// window's simulation did, whatever its theorem.  This holds that
 /// simulation's `concreteOutputEquivalenceKey`, which a
 /// `RequiredAnchorCarrierEquivalence` witness does not record as its own key.
 struct AlignmentSemanticReplayReference {
@@ -330,6 +342,15 @@ struct AlignmentSourceLayoutQueries {
   /// that does not resolve the window realizes it.  May be empty, in which
   /// case nothing is held.
   std::function<bool(uint64_t aBegin, uint64_t aEnd)> aRangeIsPlainSource;
+  /// The bytes of the A stream in A gap `aGap`, between the spellings of A
+  /// tokens `aGap - 1` and `aGap`; `aGap` is at least 1 and less than the A
+  /// token count.
+  std::function<llvm::StringRef(uint64_t aGap)> aGapBytes;
+  /// The bytes of the B stream between the spellings of B tokens `bLeft` and
+  /// `bRight`, where `bLeft < bRight`.  May be empty together with
+  /// `aGapBytes`, in which case the repair's byte-reproduction key prefers
+  /// nothing.
+  std::function<llvm::StringRef(uint64_t bLeft, uint64_t bRight)> bBytesBetween;
 };
 
 /// Exact semantic resolver for ambiguity left by the core LCS theorem.
@@ -403,7 +424,8 @@ public:
   /// Nothing here is skipped to save work. The only windows passed over are
   /// those the core theorem already determined completely, where resolution has
   /// no ambiguity to resolve and running it would return the same anchors after
-  /// paying for them.
+  /// paying for them, and those an earlier window's joint structure-respecting
+  /// repair already committed; see `SelectJointStructureRespectingRepair()`.
   ///
   /// Enumeration budgets are proof budgets only: exceeding one denies the
   /// commit rules that quantify over the refused set and cannot authorize a
@@ -412,6 +434,14 @@ public:
   ResolutionResult Resolve() const;
 
 private:
+  /// A later certification window that a joint structure-respecting repair
+  /// committed together with the window being resolved.
+  struct JointRepairWindow {
+    size_t windowIndex = 0;
+    /// That window's preferred sub-rectangles the joint candidates vary.
+    uint64_t variedSubRectangleCount = 0;
+  };
+
   /// Outcome of resolving the ambiguity inside one certification window.
   struct WindowResolution {
     bool committed = false;
@@ -449,6 +479,11 @@ private:
     uint64_t variedSubRectangleCount = 0;
     AlignmentSemanticEquivalenceKeyKind equivalenceKeyKind =
         AlignmentSemanticEquivalenceKeyKind::ConcreteOutput;
+    /// Later windows committed jointly with this one, by the same theorem and
+    /// from the same simulation; `selectedMap` already carries their choice.
+    /// Each still needs a resolution of its own, holding its own window's
+    /// anchor evidence.
+    std::vector<JointRepairWindow> jointWindows;
   };
 
   /// Resolve the ambiguity inside one certification window.
@@ -478,10 +513,15 @@ private:
   /// output; that is what lets an over-budget observational-irrelevance rule
   /// be retired once committing and declining are proved to emit the same
   /// output.
+  ///
+  /// \p unresolvedWindows holds, per certification window, whether it carries
+  /// ambiguity and is still to be resolved; it names the later windows the
+  /// structure-respecting repair may commit jointly with this one.
   WindowResolution
   ResolveCertificationWindow(size_t windowIndex,
                              llvm::ArrayRef<int64_t> baseMap,
-                             bool laterWindowCarriesAmbiguity) const;
+                             bool laterWindowCarriesAmbiguity,
+                             const std::vector<bool> &unresolvedWindows) const;
 
   /// Realize \p candidateMap through one complete planning simulation, reusing
   /// \p slot when it already holds this map's result.
@@ -532,6 +572,9 @@ private:
         StructureRepairScope::AllPreferredSubRectangles;
     /// Preferred sub-rectangles the candidates vary, after narrowing.
     uint64_t variedSubRectangleCount = 0;
+    /// Later windows the candidates also varied; empty unless `scope` is
+    /// `JointAcrossWindows`.
+    std::vector<JointRepairWindow> jointWindows;
   };
 
   /// Select the map a window commits when declining it is proved
@@ -549,19 +592,26 @@ private:
   /// The window is split at its forced anchors, exactly as enumeration splits
   /// it, and each sub-rectangle's optimal maps are enumerated up to the repair's
   /// own bound.  A sub-rectangle's runs of unmatched A tokens are its hunks, and
-  /// its maps are narrowed by five keys in order, each applied only where it
+  /// its maps are narrowed by six keys in order, each applied only where it
   /// expresses a preference:
   ///
   ///   1. the least set, under inclusion, of straddled protected boundaries;
   ///   2. every run begins and ends a source line;
   ///   3. the fewest runs;
   ///   4. the least set, under inclusion, of straddled preservable comments;
-  ///   5. every run of unmatched B tokens begins and ends a line of B.
+  ///   5. every run of unmatched B tokens begins and ends a line of B;
+  ///   6. the least set, under inclusion, of A gaps between two matched tokens
+  ///      whose bytes B does not reproduce between their partners, up to text
+  ///      inserted at one point.
   ///
   /// A boundary or comment gap is straddled when it lies strictly inside a
   /// run.  The first four keys read only what a map removes, so maps that
-  /// differ only in where they insert tie on all of them; the fifth reads the
-  /// line breaks the edit wrote into B, which the token alignment discards.
+  /// differ only in where they insert tie on all of them; the last two read
+  /// the bytes the edit wrote into B, which the token alignment discards.  The
+  /// sixth separates maps that slide an inserted block of whole lines across
+  /// a repeated line, as when B inserts a function ending in `}` after one:
+  /// matching A's `}` to the one B kept leaves the bytes after it where A had
+  /// them, while matching it to the inserted one does not.
   /// A sub-rectangle whose keys keep every map expresses no preference and
   /// stays at \p baseMap; the others vary over the maps they keep, and every
   /// combination is realized.  The window commits when those realizations
@@ -576,20 +626,85 @@ private:
   /// accepted output.  It applies only when every request names an A
   /// envelope; otherwise the decline's failure cannot be located.
   ///
+  /// When every combination requests terminal fallback, the failure may lie in
+  /// a later window still at its core-forced anchors, which no combination
+  /// here changes; `SelectJointStructureRespectingRepair()` then varies that
+  /// window too.  \p unresolvedWindows names the later windows it may vary.
+  ///
   /// It declines -- so the window keeps \p baseMap -- when no sub-rectangle
   /// expresses a preference, when one cannot be enumerated within the bound,
   /// when the combinations exceed the realization budget even so, when one is
-  /// proof-incomplete, when they accept zero or several outputs, or when
-  /// \p baseMap does not request terminal fallback.  The last check is what
-  /// confines the rule to windows whose decline is inadmissible.
+  /// proof-incomplete, when they accept several outputs, when they accept none
+  /// and the joint repair declines too, or when \p baseMap does not request
+  /// terminal fallback.  The last check is what confines the rule to windows
+  /// whose decline is inadmissible.
   ///
   /// Every combination is realized with the window's structural tiling ties
   /// settled in favour of preserved structure, which is how production will
   /// realize the committed map.  The decline configuration is realized as
   /// production would realize the decline, without that setting.
-  std::optional<StructureRespectingRepair>
-  SelectStructureRespectingRepair(size_t windowIndex,
-                                  llvm::ArrayRef<int64_t> baseMap) const;
+  std::optional<StructureRespectingRepair> SelectStructureRespectingRepair(
+      size_t windowIndex, llvm::ArrayRef<int64_t> baseMap,
+      const std::vector<bool> &unresolvedWindows) const;
+
+  /// Commit the structure-respecting repair of window \p windowIndex jointly
+  /// with later windows, after its own combinations \p ownCandidates, varying
+  /// its preferred sub-rectangles over A ranges \p ownVariedARanges, all
+  /// requested terminal fallback.
+  ///
+  /// Each window's repair realizes its candidates with every later window at
+  /// its core-forced anchors.  Two windows whose declines both request terminal
+  /// fallback therefore block each other: each one's candidates still carry
+  /// the other's terminal request, so neither accepts an output, and the run
+  /// reaches the whole-translation-unit carrier although a pair of preferred
+  /// maps would refold.  This realizes such windows together.
+  ///
+  /// \p declined is the realization of \p baseMap, which requested terminal
+  /// fallback.  Every one of its terminal requests must name an A envelope.
+  /// Some envelope must meet one of \p ownVariedARanges, so this window's own
+  /// decline is inadmissible and not just the later window's.  Each later
+  /// window that \p unresolvedWindows names and some envelope meets varies the
+  /// preferred sub-rectangles the envelopes meet, chosen by the same keys and
+  /// read against \p baseMap.  Every envelope must meet a varied
+  /// sub-rectangle, so no located failure lies where every candidate agrees
+  /// with the decline.
+  ///
+  /// The candidates are every combination of \p ownCandidates with those
+  /// sub-rectangles' kept maps, bounded by the realization budget with the
+  /// decline already paid for.  Each is realized with the structural tiling
+  /// ties of every window involved settled for preserved structure.  The
+  /// repair commits when they accept exactly one concrete output, and it
+  /// records the later windows in `jointWindows`.  It declines otherwise,
+  /// including when a later window it needs cannot be enumerated within the
+  /// repair bound or when a candidate is proof-incomplete.
+  std::optional<StructureRespectingRepair> SelectJointStructureRespectingRepair(
+      size_t windowIndex, llvm::ArrayRef<int64_t> baseMap,
+      llvm::ArrayRef<std::vector<int64_t>> ownCandidates,
+      llvm::ArrayRef<std::pair<uint64_t, uint64_t>> ownVariedARanges,
+      const AlignmentSemanticSimulationResult &declined,
+      const std::vector<bool> &unresolvedWindows) const;
+
+  /// What realizing a repair's candidates showed.
+  struct RepairRealization {
+    /// The accepted candidates, classed by concrete output, as indices into
+    /// the candidates.
+    std::map<std::string, std::vector<size_t>> outputClasses;
+    /// The A envelope of each terminal request the candidates that requested
+    /// terminal fallback made, in candidate and request order;
+    /// `std::nullopt` for a request naming none.
+    std::vector<std::optional<std::pair<uint64_t, uint64_t>>>
+        terminalRequestATokenRanges;
+  };
+
+  /// Realize every map of \p candidates for window \p windowIndex's repair,
+  /// with \p tieRanges settled for preserved structure.
+  ///
+  /// Returns `std::nullopt` when a candidate is proof-incomplete, or accepted
+  /// without a concrete-output key: either leaves the repair unable to show
+  /// that the classes it would compare are complete.
+  std::optional<RepairRealization> RealizeRepairCandidates(
+      size_t windowIndex, llvm::ArrayRef<std::vector<int64_t>> candidates,
+      llvm::ArrayRef<std::pair<uint64_t, uint64_t>> tieRanges) const;
 
   /// Return the translation unit's protected A boundaries, collecting them on
   /// first use.  Empty when no collector was supplied.

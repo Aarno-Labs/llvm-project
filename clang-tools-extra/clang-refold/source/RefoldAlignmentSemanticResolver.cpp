@@ -907,7 +907,77 @@ struct RepairMapFacts {
   std::vector<uint64_t> straddledComments;
   /// Every run of unmatched B tokens begins and ends a line of B.
   bool insertedLinesWhole = false;
+  /// Sorted A gaps between two matched A tokens whose bytes B does not
+  /// reproduce between their partners; see `collectUnreproducedGaps()`.
+  std::vector<uint64_t> unreproducedGaps;
 };
+
+/// Return whether \p bBytes holds \p aBytes with text inserted at one point:
+/// some prefix of \p aBytes begins \p bBytes and the rest of it ends
+/// \p bBytes, the two without overlap.  Equal bytes, with nothing inserted,
+/// are the case of an empty insertion.
+///
+/// Such a split exists exactly when the longest common prefix and the longest
+/// common suffix, the latter bounded by what the prefix leaves of \p aBytes,
+/// together cover \p aBytes.
+bool bytesReproduceAroundOneInsertion(StringRef aBytes, StringRef bBytes) {
+  if (bBytes.size() < aBytes.size())
+    return false;
+  size_t prefix = 0;
+  while (prefix < aBytes.size() && aBytes[prefix] == bBytes[prefix])
+    ++prefix;
+  size_t suffix = 0;
+  while (prefix + suffix < aBytes.size() &&
+         aBytes[aBytes.size() - 1 - suffix] ==
+             bBytes[bBytes.size() - 1 - suffix])
+    ++suffix;
+  return prefix + suffix == aBytes.size();
+}
+
+/// Return the B partner of A token \p aToken under a sub-rectangle map:
+/// \p localMap inside the sub-rectangle starting at \p aBegin, \p baseMap
+/// outside it.  Negative when the token is unmatched.
+int64_t partnerUnderSubRectangleMap(ArrayRef<int64_t> localMap, uint64_t aBegin,
+                                    ArrayRef<int64_t> baseMap,
+                                    uint64_t aToken) {
+  if (aToken >= aBegin && aToken - aBegin < localMap.size())
+    return localMap[aToken - aBegin];
+  return aToken < baseMap.size() ? baseMap[aToken] : -1;
+}
+
+/// Return the sorted A gaps a sub-rectangle map leaves between two matched A
+/// tokens whose bytes B does not reproduce between their two partners, up to
+/// text inserted at one point; see `bytesReproduceAroundOneInsertion()`.
+///
+/// \p localMap covers A tokens `[aBegin, aBegin + localMap.size())`, and the
+/// gaps read are those inside it and at its two ends; the tokens bounding it
+/// are read from \p baseMap.  A gap next to an unmatched token is not read:
+/// what B holds there depends on how the deletion is realized.  Empty when
+/// \p layout supplies no stream bytes.
+std::vector<uint64_t>
+collectUnreproducedGaps(const AlignmentSourceLayoutQueries &layout,
+                        ArrayRef<int64_t> localMap, uint64_t aBegin,
+                        ArrayRef<int64_t> baseMap) {
+  std::vector<uint64_t> unreproduced;
+  if (!layout.aGapBytes || !layout.bBytesBetween)
+    return unreproduced;
+  const uint64_t aEnd = aBegin + localMap.size();
+  for (uint64_t gap = std::max<uint64_t>(aBegin, 1);
+       gap <= aEnd && gap < baseMap.size(); ++gap) {
+    const int64_t left =
+        partnerUnderSubRectangleMap(localMap, aBegin, baseMap, gap - 1);
+    const int64_t right =
+        partnerUnderSubRectangleMap(localMap, aBegin, baseMap, gap);
+    if (left < 0 || right <= left)
+      continue;
+    if (!bytesReproduceAroundOneInsertion(
+            layout.aGapBytes(gap),
+            layout.bBytesBetween(static_cast<uint64_t>(left),
+                                 static_cast<uint64_t>(right))))
+      unreproduced.push_back(gap);
+  }
+  return unreproduced;
+}
 
 /// Narrow \p candidates to the members whose \p set is contained in every
 /// other member's, when such a least set exists; otherwise keep them all.
@@ -939,8 +1009,8 @@ std::vector<size_t> keepLeastByInclusion(
 /// The keys apply in order, each narrowing what the previous one kept, and a
 /// key that cannot tell the maps apart keeps them all: least straddled
 /// protected structure, then line-aligned runs, then fewest runs, then least
-/// straddled comments, then inserted text in whole lines of B.  See
-/// `SelectStructureRespectingRepair()`.
+/// straddled comments, then inserted text in whole lines of B, then least
+/// gap bytes B does not reproduce.  See `SelectStructureRespectingRepair()`.
 std::vector<size_t> selectPreferredRepairMaps(ArrayRef<RepairMapFacts> facts) {
   std::vector<size_t> kept(facts.size());
   for (size_t index = 0; index < facts.size(); ++index)
@@ -970,7 +1040,8 @@ std::vector<size_t> selectPreferredRepairMaps(ArrayRef<RepairMapFacts> facts) {
       wholeLines.push_back(index);
   if (!wholeLines.empty())
     kept = std::move(wholeLines);
-  return kept;
+
+  return keepLeastByInclusion(kept, facts, &RepairMapFacts::unreproducedGaps);
 }
 
 /// One forced-anchor sub-rectangle whose structure-respecting keys kept a
@@ -982,6 +1053,124 @@ struct PreferredSubRectangle {
 
   uint64_t aEnd() const { return aBegin + maps.front().size(); }
 };
+
+/// Return the sub-rectangles of certification window \p windowIndex whose
+/// structure-respecting keys keep a strict subset of their optimal maps, each
+/// with the maps kept; see
+/// `RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair()`.
+///
+/// \p oracle is the window's retained oracle, \p boundaries the protected A
+/// boundaries, and \p baseMap the map declining would keep.  Every layout query
+/// the keys read must be present.  Returns `std::nullopt` when a sub-rectangle
+/// cannot be enumerated within `MaxStructureRepairMapsPerSubRectangle`: the
+/// keys then cannot be applied to it, so the window expresses no preference.
+std::optional<std::vector<PreferredSubRectangle>> collectPreferredSubRectangles(
+    const RefoldAlignmentSemanticResolver::Dependencies &deps,
+    const diffutils::OptimalTokenAlignmentOracle &oracle, size_t windowIndex,
+    ArrayRef<int64_t> baseMap, ArrayRef<uint64_t> boundaries) {
+  const AlignmentSourceLayoutQueries &layout = deps.sourceLayout;
+  const diffutils::LcsCertificationWindow &window =
+      deps.coreAlignment.certificationWindows[windowIndex];
+
+  // Which B tokens the decline configuration matches, read past a
+  // sub-rectangle's edge, where every one of its maps agrees with it.  Without
+  // B's line facts the inserted-text key prefers nothing.
+  std::vector<bool> bMatchedByBase(deps.bLexemes.size(), false);
+  for (int64_t mapped : baseMap)
+    if (mapped >= 0 && static_cast<size_t>(mapped) < bMatchedByBase.size())
+      bMatchedByBase[static_cast<size_t>(mapped)] = true;
+  const bool bLinesKnown =
+      deps.bGapProvenance.size() == deps.bLexemes.size() + 1;
+
+  std::vector<PreferredSubRectangle> preferred;
+
+  // Split exactly where enumeration splits: every optimal map carries the
+  // forced anchors, so the sub-rectangles between them vary independently.
+  const std::vector<MatchAnchor> forcedAnchors =
+      collectForcedAnchors(deps.coreAlignment, window.aBegin, window.aEnd);
+  uint64_t aBegin = window.aBegin;
+  uint64_t bBegin = window.bBegin;
+  for (size_t anchorIndex = 0; anchorIndex <= forcedAnchors.size();
+       ++anchorIndex) {
+    const bool last = anchorIndex == forcedAnchors.size();
+    const uint64_t aEnd = last ? window.aEnd : forcedAnchors[anchorIndex].aToken;
+    const uint64_t bEnd = last ? window.bEnd : forcedAnchors[anchorIndex].bToken;
+    const uint64_t subABegin = aBegin;
+    const uint64_t subBBegin = bBegin;
+    if (!last) {
+      aBegin = forcedAnchors[anchorIndex].aToken + 1;
+      bBegin = forcedAnchors[anchorIndex].bToken + 1;
+    }
+    // Without both A and B tokens a sub-rectangle has one map, the empty one.
+    if (subABegin >= aEnd || subBBegin >= bEnd)
+      continue;
+
+    diffutils::OptimalLcsMapEnumeration enumeration =
+        oracle.EnumerateOptimalMapsForWindow(
+            subABegin - window.aBegin, aEnd - window.aBegin,
+            subBBegin - window.bBegin, bEnd - window.bBegin,
+            MaxStructureRepairMapsPerSubRectangle);
+    if (!enumeration.complete || enumeration.maps.empty()) {
+      REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                       "window {0}: sub-rectangle A=[{1},{2}) B=[{3},{4}) has "
+                       "more than {5} optimal maps or cannot be enumerated",
+                       windowIndex, subABegin, aEnd, subBBegin, bEnd,
+                       MaxStructureRepairMapsPerSubRectangle);
+      return std::nullopt;
+    }
+    if (enumeration.maps.size() == 1)
+      continue;
+    for (std::vector<int64_t> &map : enumeration.maps)
+      for (int64_t &mapped : map)
+        if (mapped >= 0)
+          mapped += static_cast<int64_t>(window.bBegin);
+
+    const std::vector<uint64_t> commentGaps =
+        layout.collectCommentGaps(subABegin, aEnd);
+    std::vector<RepairMapFacts> facts;
+    facts.reserve(enumeration.maps.size());
+    for (const std::vector<int64_t> &map : enumeration.maps) {
+      const std::vector<std::pair<uint64_t, uint64_t>> runs =
+          collectUnmatchedRuns(map, subABegin, baseMap);
+      RepairMapFacts mapFacts;
+      mapFacts.straddledStructure = collectStraddledGaps(runs, boundaries);
+      mapFacts.lineAligned = llvm::all_of(
+          runs, [&](const std::pair<uint64_t, uint64_t> &run) {
+            return layout.aTokenBeginsSourceLine(run.first) &&
+                   layout.aTokenEndsSourceLine(run.second - 1);
+          });
+      mapFacts.runCount = runs.size();
+      mapFacts.straddledComments = collectStraddledGaps(runs, commentGaps);
+      mapFacts.insertedLinesWhole =
+          bLinesKnown &&
+          llvm::all_of(
+              collectUnmatchedBRuns(map, subBBegin, bEnd, bMatchedByBase),
+              [&](const std::pair<uint64_t, uint64_t> &run) {
+                return deps.bGapProvenance[run.first].rightTokenStartsLine &&
+                       deps.bGapProvenance[run.second - 1].rightTokenEndsLine;
+              });
+      mapFacts.unreproducedGaps =
+          collectUnreproducedGaps(layout, map, subABegin, baseMap);
+      facts.push_back(std::move(mapFacts));
+    }
+
+    const std::vector<size_t> kept = selectPreferredRepairMaps(facts);
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "window {0}: sub-rectangle A=[{1},{2}) B=[{3},{4}) keeps "
+                     "{5} of its {6} optimal map(s) under the "
+                     "structure-respecting keys",
+                     windowIndex, subABegin, aEnd, subBBegin, bEnd, kept.size(),
+                     enumeration.maps.size());
+    if (kept.size() == enumeration.maps.size())
+      continue;
+    PreferredSubRectangle rectangle;
+    rectangle.aBegin = subABegin;
+    for (size_t index : kept)
+      rectangle.maps.push_back(std::move(enumeration.maps[index]));
+    preferred.push_back(std::move(rectangle));
+  }
+  return preferred;
+}
 
 /// Return how many combinations of kept maps \p rectangles realize, or
 /// `MaxGlobalSemanticCandidateMaps + 1` once the product exceeds it.
@@ -997,27 +1186,84 @@ size_t countRepairCombinations(ArrayRef<PreferredSubRectangle> rectangles) {
 }
 
 /// Return whether the repair may realize \p combinationCount combinations
-/// over \p aTokens, together with the decline configuration it also realizes.
-bool repairCombinationsWithinBudget(size_t combinationCount, size_t aTokens) {
+/// over \p aTokens, together with the decline configuration unless
+/// \p declineRealized says that realization has already been paid for.
+///
+/// The budget bounds the realizations a decision is about to spend.  Once the
+/// decline has been realized -- to locate its terminal requests -- charging it
+/// again would refuse two remaining combinations that the always-realized floor
+/// admits everywhere else.
+bool repairCombinationsWithinBudget(size_t combinationCount, size_t aTokens,
+                                    bool declineRealized) {
   return combinationCount <= MaxGlobalSemanticCandidateMaps &&
-         realizationWithinBudget(combinationCount + 1, aTokens);
+         realizationWithinBudget(combinationCount + (declineRealized ? 0 : 1),
+                                 aTokens);
+}
+
+/// Return every combination of one kept map per member of \p rectangles,
+/// each written over a copy of a member of \p partials.
+///
+/// The rectangles are disjoint, so the order they are applied in does not
+/// change the result; the combinations come out in the order the rectangles
+/// and their kept maps are listed.
+std::vector<std::vector<int64_t>>
+expandRepairCandidates(std::vector<std::vector<int64_t>> partials,
+                       ArrayRef<PreferredSubRectangle> rectangles) {
+  for (const PreferredSubRectangle &rectangle : rectangles) {
+    std::vector<std::vector<int64_t>> expanded;
+    for (const std::vector<int64_t> &partial : partials)
+      for (const std::vector<int64_t> &local : rectangle.maps) {
+        std::vector<int64_t> candidate = partial;
+        std::copy(local.begin(), local.end(),
+                  candidate.begin() + rectangle.aBegin);
+        expanded.push_back(std::move(candidate));
+      }
+    partials = std::move(expanded);
+  }
+  return partials;
 }
 
 /// Return whether the half-open A token envelope \p request, named by a
-/// terminal-fallback request, lies at least partly where \p rectangle's maps
-/// vary.
+/// terminal-fallback request, lies at least partly where maps varying the A
+/// tokens `[aBegin, aEnd)` vary.
 ///
-/// A sub-rectangle's maps vary its A tokens and the positions between them,
-/// including its two ends, which sit against the forced anchors bounding it.
-/// A non-empty envelope therefore meets it when the two half-open ranges
-/// overlap; an empty one, an insertion point, when it lies at either end or
-/// between.
+/// Such maps vary those A tokens and the positions between them, including the
+/// two ends, which sit against the matched tokens bounding them.  A non-empty
+/// envelope therefore meets them when the two half-open ranges overlap; an
+/// empty one, an insertion point, when it lies at either end or between.
+bool requestMeetsARange(std::pair<uint64_t, uint64_t> request, uint64_t aBegin,
+                        uint64_t aEnd) {
+  if (request.first == request.second)
+    return aBegin <= request.first && request.first <= aEnd;
+  return request.first < aEnd && aBegin < request.second;
+}
+
+/// Return whether \p request meets one of the half-open A ranges \p ranges;
+/// see `requestMeetsARange()`.
+bool requestMeetsSomeARange(std::pair<uint64_t, uint64_t> request,
+                            ArrayRef<std::pair<uint64_t, uint64_t>> ranges) {
+  for (const std::pair<uint64_t, uint64_t> &range : ranges)
+    if (requestMeetsARange(request, range.first, range.second))
+      return true;
+  return false;
+}
+
+/// Return whether some located envelope in \p requests meets the half-open A
+/// range `[aBegin, aEnd)`; see `requestMeetsARange()`.
+bool someRequestMeetsARange(
+    ArrayRef<std::optional<std::pair<uint64_t, uint64_t>>> requests,
+    uint64_t aBegin, uint64_t aEnd) {
+  for (const std::optional<std::pair<uint64_t, uint64_t>> &request : requests)
+    if (request && requestMeetsARange(*request, aBegin, aEnd))
+      return true;
+  return false;
+}
+
+/// Return whether \p request lies at least partly where \p rectangle's maps
+/// vary; see `requestMeetsARange()`.
 bool requestMeetsSubRectangle(std::pair<uint64_t, uint64_t> request,
                               const PreferredSubRectangle &rectangle) {
-  if (request.first == request.second)
-    return rectangle.aBegin <= request.first &&
-           request.first <= rectangle.aEnd();
-  return request.first < rectangle.aEnd() && rectangle.aBegin < request.second;
+  return requestMeetsARange(request, rectangle.aBegin, rectangle.aEnd());
 }
 
 /// Keep the members of \p rectangles that some envelope in \p requests meets.
@@ -1041,6 +1287,55 @@ std::optional<std::vector<PreferredSubRectangle>> keepSubRectanglesNamedBy(
         });
   });
   return rectangles;
+}
+
+/// The preferred sub-rectangles of one later certification window that a
+/// joint structure-respecting repair varies.
+struct JointRepairRectangles {
+  size_t windowIndex = 0;
+  std::vector<PreferredSubRectangle> rectangles;
+};
+
+/// Return the anchor evidence \p selectedMap owes in certification window
+/// \p window under \p basis: one record per A token of the window that it
+/// matches, other than at a core-forced anchor.
+///
+/// This is the evidence a committed window records for itself; a jointly
+/// committed window records it over its own range, from the same map.
+std::vector<AlignmentSemanticAnchorEvidence>
+collectWindowAnchorEvidence(const diffutils::CertifiedLcsResult &coreAlignment,
+                            const diffutils::LcsCertificationWindow &window,
+                            ArrayRef<int64_t> selectedMap,
+                            AlignmentSemanticAnchorBasis basis) {
+  std::vector<AlignmentSemanticAnchorEvidence> evidence;
+  const uint64_t aEnd = std::min<uint64_t>(window.aEnd, selectedMap.size());
+  for (uint64_t aToken = window.aBegin; aToken < aEnd; ++aToken) {
+    const int64_t bToken = selectedMap[aToken];
+    if (bToken < 0 || isForcedAnchor(coreAlignment, aToken, bToken))
+      continue;
+    evidence.push_back(AlignmentSemanticAnchorEvidence{
+        aToken, static_cast<uint64_t>(bToken), basis});
+  }
+  return evidence;
+}
+
+/// Return whether some envelope in \p requests may lie in a certification
+/// window after \p windowIndex that \p unresolvedWindows still names: it
+/// meets that window's A range, or it names no envelope and so could lie
+/// anywhere.
+bool someRequestMayLieInLaterWindow(
+    ArrayRef<std::optional<std::pair<uint64_t, uint64_t>>> requests,
+    ArrayRef<diffutils::LcsCertificationWindow> windows, size_t windowIndex,
+    const std::vector<bool> &unresolvedWindows) {
+  if (llvm::is_contained(requests, std::nullopt))
+    return true;
+  for (size_t later = windowIndex + 1;
+       later < windows.size() && later < unresolvedWindows.size(); ++later)
+    if (unresolvedWindows[later] &&
+        someRequestMeetsARange(requests, windows[later].aBegin,
+                               windows[later].aEnd))
+      return true;
+  return false;
 }
 
 [[maybe_unused]] std::string formatMapIndices(ArrayRef<size_t> indices) {
@@ -1097,6 +1392,12 @@ RefoldAlignmentSemanticResolver::Resolve() const {
       lastAmbiguousWindow = windowIndex;
   }
 
+  // Which windows carrying ambiguity are still to be resolved.  A window is
+  // struck as its own resolution starts, and a later one when a joint
+  // structure-respecting repair commits it early; only the windows still named
+  // here may be varied by a later joint repair.
+  std::vector<bool> unresolvedWindows = windowCarriesAmbiguity;
+
   for (size_t windowIndex = 0; windowIndex < windowCount; ++windowIndex) {
     // A window the core theorem already determined has one optimal map, so
     // resolution would recompute its quadratic pair facts only to return the
@@ -1110,10 +1411,22 @@ RefoldAlignmentSemanticResolver::Resolve() const {
           windowIndex);
       continue;
     }
+    // A window an earlier joint repair committed has its witness already; a
+    // second resolution would be a second theorem about one choice.
+    if (!unresolvedWindows[windowIndex]) {
+      REFOLD_LOG_DEBUG("lcs/semantic-resolver",
+                       "window {0} needs no resolution of its own: an earlier "
+                       "window's structure-respecting repair committed it "
+                       "jointly",
+                       windowIndex);
+      continue;
+    }
+    unresolvedWindows[windowIndex] = false;
 
     // Materialize this window's pair facts, resolve, then release them before
     // moving on. Holding every window's facts at once would reintroduce the
-    // complete-grid payload that partitioning exists to avoid.
+    // complete-grid payload that partitioning exists to avoid.  A joint repair
+    // holds a later window's facts as well, one at a time, while it reads them.
     if (deps_.retainWindowOracle)
       (void)deps_.retainWindowOracle(windowIndex);
     if (!deps_.coreAlignment.HasCompleteSemanticOracleForWindow(windowIndex)) {
@@ -1127,7 +1440,8 @@ RefoldAlignmentSemanticResolver::Resolve() const {
     ++windowsWithOracle;
     WindowResolution resolution = ResolveCertificationWindow(
         windowIndex, baseMap,
-        /*laterWindowCarriesAmbiguity=*/windowIndex < lastAmbiguousWindow);
+        /*laterWindowCarriesAmbiguity=*/windowIndex < lastAmbiguousWindow,
+        unresolvedWindows);
     if (deps_.releaseWindowOracle)
       deps_.releaseWindowOracle(windowIndex);
     if (!resolution.committed) {
@@ -1171,7 +1485,35 @@ RefoldAlignmentSemanticResolver::Resolve() const {
           deps_.coreAlignment.certificationWindows[windowIndex];
       committedTieRanges_.emplace_back(window.aBegin, window.aEnd);
     }
+    const std::vector<JointRepairWindow> jointWindows =
+        std::move(resolution.jointWindows);
+    resolution.jointWindows.clear();
     committedWindows.push_back(std::move(resolution));
+
+    // A joint repair chose each later window's anchors in the same simulation
+    // and under the same theorem.  Each window still owes its own witness, with
+    // evidence for its own anchors only, and its own tie range; it is recorded
+    // after this one because its choice was committed at this point.
+    for (const JointRepairWindow &joint : jointWindows) {
+      const diffutils::LcsCertificationWindow &jointWindow =
+          deps_.coreAlignment.certificationWindows[joint.windowIndex];
+      unresolvedWindows[joint.windowIndex] = false;
+      committedTieRanges_.emplace_back(jointWindow.aBegin, jointWindow.aEnd);
+      WindowResolution jointResolution = committedWindows.back();
+      jointResolution.windowIndex = joint.windowIndex;
+      jointResolution.anchorEvidence = collectWindowAnchorEvidence(
+          deps_.coreAlignment, jointWindow, jointResolution.selectedMap,
+          StructureRespectingRecoveryTheorem.representativeBasis);
+      jointResolution.variedSubRectangleCount = joint.variedSubRectangleCount;
+      REFOLD_LOG_DEBUG(
+          "lcs/semantic-resolver",
+          "window {0} committed {1} jointly with window {2}: "
+          "{3} anchor(s) proved",
+          joint.windowIndex, toString(jointResolution.resolutionKind),
+          windowIndex,
+          static_cast<uint64_t>(jointResolution.anchorEvidence.size()));
+      committedWindows.push_back(std::move(jointResolution));
+    }
   }
 
   if (committedWindows.empty()) {
@@ -1381,7 +1723,8 @@ RefoldAlignmentSemanticResolver::ProtectedABoundaries() const {
 
 std::optional<RefoldAlignmentSemanticResolver::StructureRespectingRepair>
 RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
-    size_t windowIndex, ArrayRef<int64_t> baseMap) const {
+    size_t windowIndex, ArrayRef<int64_t> baseMap,
+    const std::vector<bool> &unresolvedWindows) const {
   const diffutils::OptimalTokenAlignmentOracle *oracle =
       deps_.coreAlignment.GetSemanticOracleForWindow(windowIndex);
   const AlignmentSourceLayoutQueries &layout = deps_.sourceLayout;
@@ -1391,105 +1734,19 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
     return std::nullopt;
   const diffutils::LcsCertificationWindow &window =
       deps_.coreAlignment.certificationWindows[windowIndex];
-  const ArrayRef<uint64_t> boundaries = ProtectedABoundaries();
 
-  // Which B tokens the decline configuration matches, read past a
-  // sub-rectangle's edge, where every one of its maps agrees with it.  Without
-  // B's line facts the inserted-text key prefers nothing.
-  std::vector<bool> bMatchedByBase(deps_.bLexemes.size(), false);
-  for (int64_t mapped : baseMap)
-    if (mapped >= 0 && static_cast<size_t>(mapped) < bMatchedByBase.size())
-      bMatchedByBase[static_cast<size_t>(mapped)] = true;
-  const bool bLinesKnown =
-      deps_.bGapProvenance.size() == deps_.bLexemes.size() + 1;
-
-  std::vector<PreferredSubRectangle> preferred;
-
-  // Split exactly where enumeration splits: every optimal map carries the
-  // forced anchors, so the sub-rectangles between them vary independently.
-  const std::vector<MatchAnchor> forcedAnchors =
-      collectForcedAnchors(deps_.coreAlignment, window.aBegin, window.aEnd);
-  uint64_t aBegin = window.aBegin;
-  uint64_t bBegin = window.bBegin;
-  for (size_t anchorIndex = 0; anchorIndex <= forcedAnchors.size();
-       ++anchorIndex) {
-    const bool last = anchorIndex == forcedAnchors.size();
-    const uint64_t aEnd = last ? window.aEnd : forcedAnchors[anchorIndex].aToken;
-    const uint64_t bEnd = last ? window.bEnd : forcedAnchors[anchorIndex].bToken;
-    const uint64_t subABegin = aBegin;
-    const uint64_t subBBegin = bBegin;
-    if (!last) {
-      aBegin = forcedAnchors[anchorIndex].aToken + 1;
-      bBegin = forcedAnchors[anchorIndex].bToken + 1;
-    }
-    // Without both A and B tokens a sub-rectangle has one map, the empty one.
-    if (subABegin >= aEnd || subBBegin >= bEnd)
-      continue;
-
-    diffutils::OptimalLcsMapEnumeration enumeration =
-        oracle->EnumerateOptimalMapsForWindow(
-            subABegin - window.aBegin, aEnd - window.aBegin,
-            subBBegin - window.bBegin, bEnd - window.bBegin,
-            MaxStructureRepairMapsPerSubRectangle);
-    if (!enumeration.complete || enumeration.maps.empty()) {
-      REFOLD_LOG_TRACE("lcs/semantic-resolver",
-                       "window {0} has no structure-respecting repair: "
-                       "sub-rectangle A=[{1},{2}) B=[{3},{4}) has more than {5} "
-                       "optimal maps or cannot be enumerated",
-                       windowIndex, subABegin, aEnd, subBBegin, bEnd,
-                       MaxStructureRepairMapsPerSubRectangle);
-      return std::nullopt;
-    }
-    if (enumeration.maps.size() == 1)
-      continue;
-    for (std::vector<int64_t> &map : enumeration.maps)
-      for (int64_t &mapped : map)
-        if (mapped >= 0)
-          mapped += static_cast<int64_t>(window.bBegin);
-
-    const std::vector<uint64_t> commentGaps =
-        layout.collectCommentGaps(subABegin, aEnd);
-    std::vector<RepairMapFacts> facts;
-    facts.reserve(enumeration.maps.size());
-    for (const std::vector<int64_t> &map : enumeration.maps) {
-      const std::vector<std::pair<uint64_t, uint64_t>> runs =
-          collectUnmatchedRuns(map, subABegin, baseMap);
-      RepairMapFacts mapFacts;
-      mapFacts.straddledStructure = collectStraddledGaps(runs, boundaries);
-      mapFacts.lineAligned = llvm::all_of(
-          runs, [&](const std::pair<uint64_t, uint64_t> &run) {
-            return layout.aTokenBeginsSourceLine(run.first) &&
-                   layout.aTokenEndsSourceLine(run.second - 1);
-          });
-      mapFacts.runCount = runs.size();
-      mapFacts.straddledComments = collectStraddledGaps(runs, commentGaps);
-      mapFacts.insertedLinesWhole =
-          bLinesKnown &&
-          llvm::all_of(
-              collectUnmatchedBRuns(map, subBBegin, bEnd, bMatchedByBase),
-              [&](const std::pair<uint64_t, uint64_t> &run) {
-                return deps_.bGapProvenance[run.first].rightTokenStartsLine &&
-                       deps_.bGapProvenance[run.second - 1].rightTokenEndsLine;
-              });
-      facts.push_back(std::move(mapFacts));
-    }
-
-    const std::vector<size_t> kept = selectPreferredRepairMaps(facts);
+  std::optional<std::vector<PreferredSubRectangle>> collected =
+      collectPreferredSubRectangles(deps_, *oracle, windowIndex, baseMap,
+                                    ProtectedABoundaries());
+  if (!collected) {
     REFOLD_LOG_TRACE("lcs/semantic-resolver",
-                     "window {0}: sub-rectangle A=[{1},{2}) B=[{3},{4}) keeps "
-                     "{5} of its {6} optimal map(s) under the "
-                     "structure-respecting keys",
-                     windowIndex, subABegin, aEnd, subBBegin, bEnd, kept.size(),
-                     enumeration.maps.size());
-    if (kept.size() == enumeration.maps.size())
-      continue;
-    PreferredSubRectangle rectangle;
-    rectangle.aBegin = subABegin;
-    for (size_t index : kept)
-      rectangle.maps.push_back(std::move(enumeration.maps[index]));
-    preferred.push_back(std::move(rectangle));
+                     "window {0} has no structure-respecting repair: a "
+                     "sub-rectangle cannot be enumerated within the repair "
+                     "bound",
+                     windowIndex);
+    return std::nullopt;
   }
-
+  std::vector<PreferredSubRectangle> preferred = std::move(*collected);
   if (preferred.empty()) {
     REFOLD_LOG_TRACE("lcs/semantic-resolver",
                      "window {0} has no structure-respecting repair: no "
@@ -1504,7 +1761,8 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
   std::optional<AlignmentSemanticSimulationResult> declined;
   StructureRepairScope scope = StructureRepairScope::AllPreferredSubRectangles;
   if (!repairCombinationsWithinBudget(countRepairCombinations(preferred),
-                                      deps_.aLexemes.size())) {
+                                      deps_.aLexemes.size(),
+                                      /*declineRealized=*/false)) {
     REFOLD_LOG_DEBUG("lcs/semantic-resolver",
                      "window {0}: realizing its core-forced alignment as a "
                      "complete refold, to locate the terminal requests "
@@ -1526,7 +1784,8 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
                                  preferred);
     if (!named || named->empty() ||
         !repairCombinationsWithinBudget(countRepairCombinations(*named),
-                                        deps_.aLexemes.size())) {
+                                        deps_.aLexemes.size(),
+                                        /*declineRealized=*/true)) {
       REFOLD_LOG_TRACE(
           "lcs/semantic-resolver",
           "window {0} has no structure-respecting repair: its {1} preferred "
@@ -1549,18 +1808,8 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
     scope = StructureRepairScope::TerminalRequestIntersectingSubRectangles;
   }
 
-  std::vector<std::vector<int64_t>> candidates(1, baseMap.vec());
-  for (const PreferredSubRectangle &rectangle : preferred) {
-    std::vector<std::vector<int64_t>> expanded;
-    for (const std::vector<int64_t> &partial : candidates)
-      for (const std::vector<int64_t> &local : rectangle.maps) {
-        std::vector<int64_t> candidate = partial;
-        std::copy(local.begin(), local.end(),
-                  candidate.begin() + rectangle.aBegin);
-        expanded.push_back(std::move(candidate));
-      }
-    candidates = std::move(expanded);
-  }
+  std::vector<std::vector<int64_t>> candidates =
+      expandRepairCandidates({baseMap.vec()}, preferred);
   if (!everyMapIsMonotoneAndLexemeAgreeing(candidates, deps_.aLexemes,
                                            deps_.bLexemes))
     return std::nullopt;
@@ -1570,30 +1819,64 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
   // structure.  That is why realizations the other rules made, which settle
   // no tie, are not reused here.
   const std::pair<uint64_t, uint64_t> windowRange{window.aBegin, window.aEnd};
-  std::vector<std::optional<AlignmentSemanticSimulationResult>> realizations(
-      candidates.size());
-  std::map<std::string, std::vector<size_t>> outputClasses;
-  for (size_t index = 0; index < candidates.size(); ++index) {
-    const AlignmentSemanticSimulationResult &simulation =
-        RealizeCandidateMap(windowIndex, index, candidates.size(),
-                            candidates[index], realizations[index],
-                            ArrayRef(windowRange));
-    if (simulation.disposition ==
-        AlignmentSemanticSimulationDisposition::ProofIncomplete) {
+  std::optional<RepairRealization> realization =
+      RealizeRepairCandidates(windowIndex, candidates, ArrayRef(windowRange));
+  if (!realization)
+    return std::nullopt;
+  const std::map<std::string, std::vector<size_t>> &outputClasses =
+      realization->outputClasses;
+
+  // No combination accepted an output.  Each one differs from the decline only
+  // inside this window, so a failure they share may lie in a later window that
+  // is still at its core-forced anchors; the joint repair varies that window
+  // as well.  When no candidate's terminal request can lie in such a window,
+  // varying one cannot be what is missing, and the decline is not realized
+  // only to find that out.  Otherwise the joint repair reads the decline's
+  // terminal requests, so the decline is realized here if the budget check
+  // above did not already realize it.
+  if (outputClasses.empty()) {
+    if (!someRequestMayLieInLaterWindow(
+            realization->terminalRequestATokenRanges,
+            deps_.coreAlignment.certificationWindows, windowIndex,
+            unresolvedWindows)) {
       REFOLD_LOG_TRACE("lcs/semantic-resolver",
-                       "window {0} has no structure-respecting repair: "
-                       "preferred map {1} has incomplete proof",
-                       windowIndex, index);
+                       "window {0} has no structure-respecting repair: its {1} "
+                       "preferred map(s) realize no accepted output, and none "
+                       "of their terminal requests falls in a later window "
+                       "still to be resolved",
+                       windowIndex, candidates.size());
       return std::nullopt;
     }
-    if (simulation.disposition !=
-            AlignmentSemanticSimulationDisposition::Accepted ||
-        !simulation.accepted)
-      continue;
-    if (simulation.concreteOutputEquivalenceKey.empty())
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "window {0}: its {1} preferred map(s) realize no accepted "
+                     "output",
+                     windowIndex, candidates.size());
+    if (!declined) {
+      REFOLD_LOG_DEBUG("lcs/semantic-resolver",
+                       "window {0}: realizing its core-forced alignment as a "
+                       "complete refold, to locate the terminal requests "
+                       "declining makes",
+                       windowIndex);
+      declined.emplace(
+          Simulate(buildSimulationSelection(baseMap, deps_.coreAlignment)));
+    }
+    if (declined->disposition !=
+        AlignmentSemanticSimulationDisposition::TerminalFallback) {
+      REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                       "window {0} has no structure-respecting repair: its "
+                       "core-forced alignment {1}, so declining is admissible",
+                       windowIndex,
+                       describeSimulationDisposition(declined->disposition));
       return std::nullopt;
-    outputClasses[simulation.concreteOutputEquivalenceKey].push_back(index);
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> ownVariedARanges;
+    for (const PreferredSubRectangle &rectangle : preferred)
+      ownVariedARanges.emplace_back(rectangle.aBegin, rectangle.aEnd());
+    return SelectJointStructureRespectingRepair(windowIndex, baseMap,
+                                                candidates, ownVariedARanges,
+                                                *declined, unresolvedWindows);
   }
+
   if (outputClasses.size() != 1) {
     REFOLD_LOG_TRACE("lcs/semantic-resolver",
                      "window {0} has no structure-respecting repair: its {1} "
@@ -1639,10 +1922,223 @@ RefoldAlignmentSemanticResolver::SelectStructureRespectingRepair(
   return repair;
 }
 
+std::optional<RefoldAlignmentSemanticResolver::StructureRespectingRepair>
+RefoldAlignmentSemanticResolver::SelectJointStructureRespectingRepair(
+    size_t windowIndex, ArrayRef<int64_t> baseMap,
+    ArrayRef<std::vector<int64_t>> ownCandidates,
+    ArrayRef<std::pair<uint64_t, uint64_t>> ownVariedARanges,
+    const AlignmentSemanticSimulationResult &declined,
+    const std::vector<bool> &unresolvedWindows) const {
+  const ArrayRef<std::optional<std::pair<uint64_t, uint64_t>>> requests =
+      declined.terminalRequestATokenRanges;
+  if (requests.empty() || llvm::is_contained(requests, std::nullopt)) {
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "window {0} has no joint structure-respecting repair: a "
+                     "terminal request of its core-forced alignment cannot be "
+                     "located",
+                     windowIndex);
+    return std::nullopt;
+  }
+  if (llvm::none_of(
+          ownVariedARanges, [&](const std::pair<uint64_t, uint64_t> &range) {
+            return someRequestMeetsARange(requests, range.first, range.second);
+          })) {
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "window {0} has no joint structure-respecting repair: no "
+                     "terminal request of its core-forced alignment meets a "
+                     "sub-rectangle it varies, so its own decline is not shown "
+                     "inadmissible",
+                     windowIndex);
+    return std::nullopt;
+  }
+
+  // The later windows still to be resolved that a request falls in, each with
+  // the preferred sub-rectangles a request meets.  A window's sub-rectangles
+  // are read from its own oracle, held only while they are read.
+  std::vector<JointRepairRectangles> joint;
+  const ArrayRef<diffutils::LcsCertificationWindow> windows =
+      deps_.coreAlignment.certificationWindows;
+  for (size_t later = windowIndex + 1;
+       later < windows.size() && later < unresolvedWindows.size(); ++later) {
+    if (!unresolvedWindows[later] ||
+        !someRequestMeetsARange(requests, windows[later].aBegin,
+                                windows[later].aEnd))
+      continue;
+    if (deps_.retainWindowOracle)
+      (void)deps_.retainWindowOracle(later);
+    const diffutils::OptimalTokenAlignmentOracle *laterOracle =
+        deps_.coreAlignment.GetSemanticOracleForWindow(later);
+    std::optional<std::vector<PreferredSubRectangle>> laterPreferred;
+    if (laterOracle)
+      laterPreferred = collectPreferredSubRectangles(
+          deps_, *laterOracle, later, baseMap, ProtectedABoundaries());
+    if (deps_.releaseWindowOracle)
+      deps_.releaseWindowOracle(later);
+    if (!laterPreferred) {
+      REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                       "window {0} has no joint structure-respecting repair: "
+                       "later window {1}, which a terminal request of its "
+                       "core-forced alignment falls in, has no retained pair "
+                       "facts or a sub-rectangle that cannot be enumerated "
+                       "within the repair bound",
+                       windowIndex, later);
+      return std::nullopt;
+    }
+    std::optional<std::vector<PreferredSubRectangle>> named =
+        keepSubRectanglesNamedBy(requests, std::move(*laterPreferred));
+    if (!named || named->empty())
+      continue;
+    joint.push_back(JointRepairRectangles{later, std::move(*named)});
+  }
+  if (joint.empty()) {
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "window {0} has no joint structure-respecting repair: no "
+                     "terminal request of its core-forced alignment meets a "
+                     "preferred sub-rectangle of a later window still to be "
+                     "resolved",
+                     windowIndex);
+    return std::nullopt;
+  }
+
+  // A request no candidate varies the map around is one every candidate
+  // shares with the decline; realizing them would not move it.
+  std::vector<std::pair<uint64_t, uint64_t>> variedARanges(
+      ownVariedARanges.begin(), ownVariedARanges.end());
+  for (const JointRepairRectangles &laterWindow : joint)
+    for (const PreferredSubRectangle &rectangle : laterWindow.rectangles)
+      variedARanges.emplace_back(rectangle.aBegin, rectangle.aEnd());
+  for (const std::optional<std::pair<uint64_t, uint64_t>> &request : requests) {
+    if (!requestMeetsSomeARange(*request, variedARanges)) {
+      REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                       "window {0} has no joint structure-respecting repair: "
+                       "its core-forced alignment's terminal request at "
+                       "A=[{1},{2}) meets no sub-rectangle the joint "
+                       "candidates vary",
+                       windowIndex, request->first, request->second);
+      return std::nullopt;
+    }
+  }
+
+  // The decline was realized to locate the requests, so only the joint
+  // candidates remain to be paid for.
+  size_t combinationCount = ownCandidates.size();
+  for (const JointRepairRectangles &laterWindow : joint) {
+    const size_t laterCount = countRepairCombinations(laterWindow.rectangles);
+    combinationCount =
+        laterCount > MaxGlobalSemanticCandidateMaps / combinationCount
+            ? MaxGlobalSemanticCandidateMaps + 1
+            : combinationCount * laterCount;
+  }
+  std::vector<size_t> jointWindowIndices;
+  for (const JointRepairRectangles &laterWindow : joint)
+    jointWindowIndices.push_back(laterWindow.windowIndex);
+  if (!repairCombinationsWithinBudget(combinationCount, deps_.aLexemes.size(),
+                                      /*declineRealized=*/true)) {
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "window {0} has no joint structure-respecting repair: "
+                     "varied with later window(s) {1}, its candidates combine "
+                     "into more maps than the realization budget admits",
+                     windowIndex, formatMapIndices(jointWindowIndices));
+    return std::nullopt;
+  }
+
+  std::vector<std::vector<int64_t>> candidates(ownCandidates.begin(),
+                                               ownCandidates.end());
+  std::vector<std::pair<uint64_t, uint64_t>> tieRanges{
+      {windows[windowIndex].aBegin, windows[windowIndex].aEnd}};
+  for (const JointRepairRectangles &laterWindow : joint) {
+    candidates =
+        expandRepairCandidates(std::move(candidates), laterWindow.rectangles);
+    tieRanges.emplace_back(windows[laterWindow.windowIndex].aBegin,
+                           windows[laterWindow.windowIndex].aEnd);
+  }
+  if (!everyMapIsMonotoneAndLexemeAgreeing(candidates, deps_.aLexemes,
+                                           deps_.bLexemes))
+    return std::nullopt;
+
+  REFOLD_LOG_DEBUG("lcs/semantic-resolver",
+                   "window {0}: varying its preferred sub-rectangles jointly "
+                   "with later window(s) {1}, whose core-forced anchors its "
+                   "decline's terminal requests also fall in: {2} candidate "
+                   "map(s)",
+                   windowIndex, formatMapIndices(jointWindowIndices),
+                   candidates.size());
+  std::optional<RepairRealization> realization =
+      RealizeRepairCandidates(windowIndex, candidates, tieRanges);
+  if (!realization)
+    return std::nullopt;
+  const std::map<std::string, std::vector<size_t>> &outputClasses =
+      realization->outputClasses;
+  if (outputClasses.size() != 1) {
+    REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                     "window {0} has no joint structure-respecting repair: its "
+                     "{1} candidate map(s) realize {2} accepted output(s)",
+                     windowIndex, candidates.size(), outputClasses.size());
+    return std::nullopt;
+  }
+
+  const auto &onlyClass = *outputClasses.begin();
+  REFOLD_LOG_TRACE(
+      "lcs/semantic-resolver",
+      "window {0} committing joint structure-respecting repair with later "
+      "window(s) {1}: declining requests terminal fallback; {2} candidate "
+      "map(s), and their accepted members {3} realize one output",
+      windowIndex, formatMapIndices(jointWindowIndices), candidates.size(),
+      formatMapIndices(onlyClass.second));
+  StructureRespectingRepair repair;
+  repair.equivalenceKey = onlyClass.first;
+  repair.selectedMap = candidates[onlyClass.second.front()];
+  repair.candidateCount = candidates.size();
+  repair.classSize = onlyClass.second.size();
+  repair.scope = StructureRepairScope::JointAcrossWindows;
+  repair.variedSubRectangleCount = ownVariedARanges.size();
+  for (const JointRepairRectangles &laterWindow : joint)
+    repair.jointWindows.push_back(JointRepairWindow{
+        laterWindow.windowIndex,
+        static_cast<uint64_t>(laterWindow.rectangles.size())});
+  return repair;
+}
+
+std::optional<RefoldAlignmentSemanticResolver::RepairRealization>
+RefoldAlignmentSemanticResolver::RealizeRepairCandidates(
+    size_t windowIndex, ArrayRef<std::vector<int64_t>> candidates,
+    ArrayRef<std::pair<uint64_t, uint64_t>> tieRanges) const {
+  std::vector<std::optional<AlignmentSemanticSimulationResult>> realizations(
+      candidates.size());
+  RepairRealization realization;
+  for (size_t index = 0; index < candidates.size(); ++index) {
+    const AlignmentSemanticSimulationResult &simulation =
+        RealizeCandidateMap(windowIndex, index, candidates.size(),
+                            candidates[index], realizations[index], tieRanges);
+    if (simulation.disposition ==
+        AlignmentSemanticSimulationDisposition::ProofIncomplete) {
+      REFOLD_LOG_TRACE("lcs/semantic-resolver",
+                       "window {0} has no structure-respecting repair: "
+                       "preferred map {1} has incomplete proof",
+                       windowIndex, index);
+      return std::nullopt;
+    }
+    if (simulation.disposition ==
+        AlignmentSemanticSimulationDisposition::TerminalFallback)
+      llvm::append_range(realization.terminalRequestATokenRanges,
+                         simulation.terminalRequestATokenRanges);
+    if (simulation.disposition !=
+            AlignmentSemanticSimulationDisposition::Accepted ||
+        !simulation.accepted)
+      continue;
+    if (simulation.concreteOutputEquivalenceKey.empty())
+      return std::nullopt;
+    realization.outputClasses[simulation.concreteOutputEquivalenceKey]
+        .push_back(index);
+  }
+  return realization;
+}
+
 RefoldAlignmentSemanticResolver::WindowResolution
 RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
     size_t windowIndex, ArrayRef<int64_t> baseMap,
-    bool laterWindowCarriesAmbiguity) const {
+    bool laterWindowCarriesAmbiguity,
+    const std::vector<bool> &unresolvedWindows) const {
   // Every path that declines this window returns `result` rather than a fresh
   // value.  A commit is built and returned by `commitRealizationClass()`, so
   // `result` carries nothing but the enumeration census recorded below -- and
@@ -1876,17 +2372,21 @@ RefoldAlignmentSemanticResolver::ResolveCertificationWindow(
   // window's sub-rectangles itself and reuses whatever the rules realized.
   auto declineWindow = [&]() -> WindowResolution {
     std::optional<StructureRespectingRepair> repair =
-        SelectStructureRespectingRepair(windowIndex, baseMap);
+        SelectStructureRespectingRepair(windowIndex, baseMap,
+                                        unresolvedWindows);
     if (!repair)
       return result;
     // Every accepted candidate shares the class key, so it is also the
-    // selected map's own.
+    // selected map's own.  The evidence recorded here is this window's only;
+    // `Resolve()` records each joint window's own.
     WindowResolution committed = commitSelectedMap(
         StructureRespectingRecoveryTheorem, repair->equivalenceKey,
         repair->equivalenceKey, repair->selectedMap, repair->candidateCount,
         repair->classSize, ArrayRef<RequiredAnchor>());
     committed.structureRepairScope = repair->scope;
     committed.variedSubRectangleCount = repair->variedSubRectangleCount;
+    if (committed.committed)
+      committed.jointWindows = std::move(repair->jointWindows);
     return committed;
   };
 
