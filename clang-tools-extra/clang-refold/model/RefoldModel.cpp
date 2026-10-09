@@ -29,6 +29,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
@@ -2625,6 +2626,16 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
              mi.argRefs.size() != mi.invArgRanges.size())) {
           dropRawRefs = true;
         }
+
+        // An empty dependency set claims that no caller formal reaches the
+        // argument. Only a scan of a delimited argument can establish that,
+        // and dependencies are recorded for every argument or for none.
+        if (!dropRawRefs && !mi.argDeps.empty() &&
+            llvm::any_of(mi.invArgRanges,
+                         [](const MacroInvocation::OptByteRange &rng) {
+                           return !rng.first || !rng.second;
+                         }))
+          dropRawRefs = true;
 
         // Caller-param references are only valid if every referenced parameter
         // index exists in the resolved caller macro.

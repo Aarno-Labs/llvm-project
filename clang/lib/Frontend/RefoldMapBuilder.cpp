@@ -2836,6 +2836,18 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
     }
   }
 
+  // A macro expansion gives its whole replacement list one SLocEntry and each
+  // substituted actual its own, so a call whose name and closing parenthesis
+  // share a FileID was collected from one buffer. Unless that buffer is a
+  // substituted actual, a caller formal reaches the arguments only where the
+  // spelled text names it.
+  if (MI && MI->isFunctionLike()) {
+    const SourceLocation NameLoc = MacroNameTok.getLocation();
+    It.InvTextSpellsCallerSubstitutions =
+        SM.getFileID(NameLoc) == SM.getFileID(Range.getEnd()) &&
+        !SM.isMacroArgExpansion(NameLoc);
+  }
+
   // 2. Compute invocation argument byte ranges (inv_arg_ranges).
   //
   // Coordinate system: absolute byte offsets within inv_file (same space as
@@ -4922,10 +4934,13 @@ void RefoldMapBuilder::writeJSON() {
     //   * literals are tokenized as single tokens (so internal punctuation
     //     doesn't affect scanning), and
     //   * identifier rules match the language mode (C/C++).
+    //
+    // Returns nullopt when an identifier's raw spelling may differ from its
+    // name, so a caller formal named that way could be missed.
     auto collectCallerFormalDeps =
         [&Lang](llvm::StringRef Text,
                 const llvm::StringMap<uint32_t> &NameToIdx)
-        -> std::vector<uint32_t> {
+        -> std::optional<std::vector<uint32_t>> {
       llvm::SmallVector<uint32_t, 8> Deps;
 
       // Record each referenced formal at most once.
@@ -4937,7 +4952,7 @@ void RefoldMapBuilder::writeJSON() {
       };
 
       if (Text.empty())
-        return {};
+        return std::vector<uint32_t>();
 
       // Lex the snippet as raw source text so we can find identifier-like
       // mentions of caller formal names without needing AST structure.
@@ -4957,6 +4972,11 @@ void RefoldMapBuilder::writeJSON() {
         // Only identifiers can name caller formals.
         if (!(Tok.is(tok::identifier) || Tok.is(tok::raw_identifier)))
           continue;
+
+        // A line splice, trigraph or UCN makes the raw spelling differ from
+        // the identifier's name.
+        if (Tok.needsCleaning() || Tok.hasUCN())
+          return std::nullopt;
 
         // Recover the identifier spelling directly from the original text using
         // the raw-lexer byte offset, then map it to a caller formal index.
@@ -5038,7 +5058,13 @@ void RefoldMapBuilder::writeJSON() {
     // We compute these for each macro invocation Item that has:
     //   * a known caller macro (CallerMacroId), and
     //   * caller definition parameter names (DefParams), and
-    //   * invocation argument byte ranges (InvArgRanges) + inv_text.
+    //   * invocation argument byte ranges (InvArgRanges) + inv_text, and
+    //   * an inv_text that spells every caller substitution by name
+    //     (InvTextSpellsCallerSubstitutions).
+    //
+    // Consumers read an empty set as proof that no caller formal reaches the
+    // argument. An item is therefore recorded for every argument or for none:
+    // an unproven range or scan withholds the whole item.
     llvm::DenseMap<uint64_t, std::vector<std::vector<uint32_t>>> ArgDepsByID;
     llvm::DenseMap<uint64_t, std::vector<std::vector<Item::InvArgRef>>>
         ArgRefsByID;
@@ -5058,7 +5084,8 @@ void RefoldMapBuilder::writeJSON() {
       // Look up the caller Item (the macro invocation that produced *this*
       // one). We need its formal parameter list to build name→index mapping.
       const Item *Caller = ItemByID.lookup(CallerID);
-      if (!Caller || Caller->DefParams.empty() || It.InvArgRanges.empty())
+      if (!Caller || Caller->DefParams.empty() || It.InvArgRanges.empty() ||
+          !It.InvTextSpellsCallerSubstitutions)
         continue;
 
       // Build a map from caller formal parameter name -> parameter index.
@@ -5082,20 +5109,18 @@ void RefoldMapBuilder::writeJSON() {
 
       // For each argument range in the invocation, slice the corresponding text
       // out of inv_text and scan it for occurrences of caller formal names.
+      bool Proven = true;
       for (const auto &R : It.InvArgRanges) {
         // Validate all required spans:
         //  - argument begin/end must exist
         //  - invocation begin/end must exist
         //  - arg range must lie within invocation range
         //  - arg end must be >= arg begin
-        //
-        // If anything is off, record empty results for this arg and keep going.
         if (!R.first || !R.second || !It.InvBegin || !It.InvEnd ||
             *It.InvBegin > *R.first || *R.second > *It.InvEnd ||
             !(*R.second >= *R.first)) {
-          Deps.push_back({});
-          Refs.push_back({});
-          continue;
+          Proven = false;
+          break;
         }
 
         // Convert absolute byte offsets in inv_file -> relative byte offsets in
@@ -5110,9 +5135,8 @@ void RefoldMapBuilder::writeJSON() {
         // range must be represented by inv_text. Do not clamp malformed or
         // incomplete ranges and then emit references from a truncated slice.
         if (B > E || E > ArgText.size()) {
-          Deps.push_back({});
-          Refs.push_back({});
-          continue;
+          Proven = false;
+          break;
         }
 
         llvm::StringRef Slice = ArgText.slice(B, E);
@@ -5120,13 +5144,22 @@ void RefoldMapBuilder::writeJSON() {
         // collectCallerFormalDeps:
         //   returns stable (sorted) unique caller-formal indices referenced in
         //   Slice.
-        Deps.push_back(collectCallerFormalDeps(Slice, NameToIdx));
+        std::optional<std::vector<uint32_t>> ArgDeps =
+            collectCallerFormalDeps(Slice, NameToIdx);
+        if (!ArgDeps) {
+          Proven = false;
+          break;
+        }
+        Deps.push_back(std::move(*ArgDeps));
 
         // collectCallerFormalRefs:
         //   returns byte ranges in inv_text (BaseOff + local offsets) where
         //   each caller-formal name occurs, used for precise projection later.
+        //   It scans the identifiers collectCallerFormalDeps just accepted.
         Refs.push_back(collectCallerFormalRefs(Slice, B, NameToIdx));
       }
+      if (!Proven)
+        continue;
 
       // Store per-item results keyed by macro invocation item ID.
       ArgDepsByID.try_emplace(It.ID, std::move(Deps));

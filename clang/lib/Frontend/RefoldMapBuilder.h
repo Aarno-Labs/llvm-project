@@ -302,6 +302,14 @@ struct Item {
   // producer could not recover that argument spelling exactly.
   std::vector<std::optional<std::string>> UnexpandedArgTexts;
 
+  // True when the invocation was lexed, from its name through its closing
+  // parenthesis, out of one buffer that is not itself a substituted actual:
+  // a file, or the replacement list of the expansion that formed the call.
+  // Any substitution the immediate caller made into the arguments is then
+  // spelled in InvText as that caller formal's name, which is what the text
+  // scan behind InvArgDeps and InvArgRefs looks for.
+  bool InvTextSpellsCallerSubstitutions = false;
+
   // Macro nesting DAG + deterministic dependency edges for nested expansions:
   //
   // If this invocation occurs while expanding another macro, CallerMacroId
@@ -319,6 +327,10 @@ struct Item {
 
   std::optional<uint64_t> CallerMacroId;
   MacroCalleeOrigin CalleeOrigin;
+  // Recorded only when InvTextSpellsCallerSubstitutions holds and every
+  // argument range and formal-name scan is proven; otherwise empty, because an
+  // argument that names no caller formal is then unexplained rather than
+  // independent.
   std::vector<std::vector<uint32_t>> InvArgDeps;
 
   struct InvArgRef {

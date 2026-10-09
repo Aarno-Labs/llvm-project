@@ -954,7 +954,7 @@ static constexpr const char *RefoldSchema = R"json(
             },
             "uniqueItems": true
           },
-          "description": "For each argument in this invocation (in invocation order), the set of caller formal indices referenced in the raw argument text. This captures argument-text dependencies only; it does not describe higher-order callee-token provenance, which is recorded separately in callee_origin."
+          "description": "For each argument in this invocation (in invocation order), the set of caller formal indices referenced in the raw argument text. This captures argument-text dependencies only; it does not describe higher-order callee-token provenance, which is recorded separately in callee_origin. An empty set means no caller formal reaches the argument, so the field is emitted only when that scan is a proof: the call was lexed, name through closing parenthesis, from one buffer that is not a substituted actual (so inv_text spells every caller substitution by the formal's name), every inv_arg_ranges entry is non-null, and every identifier in the arguments is spelled without a line splice, trigraph or UCN. Otherwise arg_deps and arg_refs are both absent."
         },
         "arg_refs": {
           "type": [
@@ -987,7 +987,7 @@ static constexpr const char *RefoldSchema = R"json(
               }
             }
           },
-          "description": "Immediate-edge argument provenance in invocation order. For child argument i, arg_refs[i] is an ordered sequence of (caller_param_index, byte_begin, byte_end) triples identifying half-open byte slices [byte_begin,byte_end) within that child's raw argument spelling that came from formals of caller_macro_id. The indices therefore name only the immediate caller's formals; transitive root provenance must be composed by the consumer. This refines arg_deps for argument-text lifting and never describes the callee token."
+          "description": "Immediate-edge argument provenance in invocation order. For child argument i, arg_refs[i] is an ordered sequence of (caller_param_index, byte_begin, byte_end) triples identifying half-open byte slices [byte_begin,byte_end) within that child's raw argument spelling that came from formals of caller_macro_id. The indices therefore name only the immediate caller's formals; transitive root provenance must be composed by the consumer. This refines arg_deps for argument-text lifting and never describes the callee token. It is emitted exactly when arg_deps is."
         },
         "arg_tuple_refs": {
           "type": [
