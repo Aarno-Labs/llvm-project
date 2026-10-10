@@ -1,1 +1,1 @@
-int x; int g_x = 1;
+int x; int h_x;
