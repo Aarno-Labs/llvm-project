@@ -152,7 +152,9 @@ public:
   /// Attempt to construct an args-only macro patch from the solved template
   /// replay surface.  The recursive syntax repair and bounded DFS remain local
   /// to this helper so their mutable search state is not promoted to planner
-  /// fields.
+  /// fields.  A patch is returned only when producer provenance proves every
+  /// fixed body token of each rebuilt invocation independent of the formals
+  /// that invocation's rewrite changes.
   std::optional<MacroPatch> TryTemplateSolvedArgsOnlyPatch(
       const ArgsOnlyTemplateReplayContext &ctx) const;
 

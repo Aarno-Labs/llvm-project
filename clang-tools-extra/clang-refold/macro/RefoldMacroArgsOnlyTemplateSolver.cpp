@@ -8,6 +8,7 @@
 #include "macro/RefoldMacroArgsOnlyTemplateSolver.h"
 
 #include "macro/RefoldArgTextRecovery.h"
+#include "macro/RefoldMacroFormalDependenceProof.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroTopology.h"
@@ -197,6 +198,42 @@ buildInvocationRewriteWithRangeLocal(
   out.materializedOutputByteStart = *mappedBegin;
   out.materializedOutputByteEnd = *mappedEnd;
   return out;
+}
+
+/// Return whether no fixed token of \p invocation's template depends on a
+/// formal that \p replByFormal rewrites.
+///
+/// Both template authorities solve only the standard formal slots and match
+/// every `bodySpans` token literally against B, so a rebuilt invocation
+/// re-expands to B only if each of those tokens survives the rewrite.  The
+/// producer's body spans also hold tokens that descendant invocations derive
+/// from forwarded formals, such as a generated callee's stringification or
+/// paste.  Each body token therefore needs producer provenance proving it
+/// independent of the rewritten formals, and an unattributed token fails
+/// closed.  A root occurrence on a body token was not solved as a slot, so it
+/// counts as dependence.
+///
+/// \p formalRanges index \p invocationText, the spelling \p replByFormal
+/// rewrites.
+bool bodyTokensIgnoreRewrittenFormals(
+    const RefoldMacroArgsOnlyTemplateSolver::Dependencies &deps,
+    const RefoldModel::MacroInvocation &invocation, StringRef invocationText,
+    ArrayRef<std::pair<size_t, size_t>> formalRanges,
+    const DenseMap<uint32_t, std::string> &replByFormal) {
+  const SmallVector<uint32_t, 4> rewrittenFormals =
+      RefoldMacroFormalDependenceProof::RewrittenFormals(
+          invocationText, formalRanges, replByFormal, *deps.lexLang);
+  if (rewrittenFormals.empty())
+    return true;
+
+  SmallVector<uint64_t, 32> bodyTokens;
+  for (const RefoldModel::PPSpan &span : invocation.bodySpans)
+    for (uint64_t tok = span.begin; tok < span.end; ++tok)
+      bodyTokens.push_back(tok);
+  return RefoldMacroFormalDependenceProof({*deps.model, *deps.macroTopology})
+      .TokensIgnoreRewrittenFormals(
+          invocation, bodyTokens, rewrittenFormals,
+          RefoldMacroFormalDependenceProof::RootOccurrences::Observed);
 }
 
 /// Equality for producer argument-span records after canonical sorting.
@@ -525,6 +562,11 @@ private:
     }
 
     if (replByFormal.empty())
+      return std::nullopt;
+
+    // The slots above are proven; the fixed tokens around them are not.
+    if (!bodyTokensIgnoreRewrittenFormals(deps_, inv, *inv.invText,
+                                          formalRanges, replByFormal))
       return std::nullopt;
 
     // Apply formal-slot edits to the invocation spelling right-to-left, again
@@ -1405,7 +1447,9 @@ RefoldMacroArgsOnlyTemplateSolver::TryTemplateSolvedArgsOnlyPatch(
   // agree globally, while variadic/tuple-shaped occurrences may rewrite
   // individual top-level caller slices only when the slice metadata proves
   // the correspondence.
-  auto buildCandidateInvocation = [&](ArrayRef<std::pair<size_t, size_t>> sol)
+  auto buildCandidateInvocation =
+      [&](ArrayRef<std::pair<size_t, size_t>> sol,
+          DenseMap<uint32_t, std::string> &replByArg)
       -> std::optional<InvocationRewriteWithRangeLocal> {
     // Group template argument occurrences by the caller formal they came
     // from. Each group must collapse into one replacement for that formal.
@@ -1415,7 +1459,7 @@ RefoldMacroArgsOnlyTemplateSolver::TryTemplateSolvedArgsOnlyPatch(
         occByArg[elem.argIdx].push_back(elem.occurrenceOrdinal);
     }
 
-    DenseMap<uint32_t, std::string> replByArg;
+    replByArg.clear();
     bool changed = false;
 
     for (const auto &entry : occByArg) {
@@ -1557,13 +1601,16 @@ RefoldMacroArgsOnlyTemplateSolver::TryTemplateSolvedArgsOnlyPatch(
   // reconstruct the same invocation spelling. Otherwise the expansion surface
   // is underdetermined and this proof path fails closed.
   std::optional<InvocationRewriteWithRangeLocal> uniqueRewrite;
+  DenseMap<uint32_t, std::string> uniqueReplByArg;
   for (const auto &sol : solutions) {
+    DenseMap<uint32_t, std::string> replByArg;
     std::optional<InvocationRewriteWithRangeLocal> candidate =
-        buildCandidateInvocation(sol);
+        buildCandidateInvocation(sol, replByArg);
     if (!candidate)
       continue;
     if (!uniqueRewrite) {
       uniqueRewrite = std::move(*candidate);
+      uniqueReplByArg = std::move(replByArg);
       continue;
     }
     if (uniqueRewrite->text != candidate->text)
@@ -1577,6 +1624,12 @@ RefoldMacroArgsOnlyTemplateSolver::TryTemplateSolvedArgsOnlyPatch(
   }
 
   if (!uniqueRewrite)
+    return std::nullopt;
+
+  // The solution fixed every body element literally; prove each survives.
+  if (!bodyTokensIgnoreRewrittenFormals(
+          deps_, templateInvocation, templateBaseInvocationText,
+          templateInvocationArgRanges, uniqueReplByArg))
     return std::nullopt;
 
   MacroPatch patch{*templateInvocation.invB, *templateInvocation.invE,
