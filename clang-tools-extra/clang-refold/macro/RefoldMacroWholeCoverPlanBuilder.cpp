@@ -12,9 +12,14 @@
 #include "edit/RefoldBInsertionLedger.h"
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroTopology.h"
+#include "model/RefoldPathIdentity.h"
 #include "proof/RefoldSidebandReplayProof.h"
+#include "source/RefoldPreprocessingStructureIndex.h"
+#include "source/RefoldPreprocessingStructureIndexProvider.h"
 #include "source/RefoldSourceMapper.h"
+#include "support/RefoldLog.h"
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -133,8 +138,65 @@ RefoldMacroWholeCoverPlanBuilder::ComputeWholeCoverPlan(
     return std::nullopt;
   plan.clippedText = material->trim().str();
   ReplayProducedPragmaLines(m, keptSegment, material->trim(), plan);
+  plan.sourceEnd = ConsumedSourceEnd(m);
 
   return plan;
+}
+
+std::optional<uint64_t> RefoldMacroWholeCoverPlanBuilder::ConsumedSourceEnd(
+    const RefoldModel::MacroInvocation &m) const {
+  if (!m.invFile || !m.invB || !m.invE || *m.invE < *m.invB)
+    return std::nullopt;
+  const uint64_t callsiteBegin = *m.invB;
+  const uint64_t callsiteEnd = *m.invE;
+
+  // A call spelled in a replacement list is followed by more of that list,
+  // not by source its expansion could read; its descendants' envelopes end
+  // wherever the enclosing expansion's material was spelled.
+  if (deps_.topology.IsInvocationInsideDefineDirective(m))
+    return callsiteEnd;
+
+  // The producer ends a call's envelope at the file location of its closing
+  // parenthesis.  Its begin is no evidence here: a generated callee's name is
+  // recorded where its replacement list spells it.
+  uint64_t consumedEnd = callsiteEnd;
+  SmallVector<const RefoldModel::MacroInvocation *, 8> worklist{&m};
+  DenseSet<uint64_t> visited{m.id};
+  while (!worklist.empty()) {
+    const RefoldModel::MacroInvocation *parent = worklist.pop_back_val();
+    for (const RefoldModel::MacroInvocation *child :
+         deps_.topology.MacroChildrenOf(parent->id)) {
+      if (!visited.insert(child->id).second)
+        continue;
+      worklist.push_back(child);
+      if (!child->invFile || !child->invE ||
+          child->ownerIncludeId != m.ownerIncludeId ||
+          !deps_.pathIdentity.PathsEqual(*child->invFile, *m.invFile))
+        continue;
+      consumedEnd = std::max(consumedEnd, *child->invE);
+    }
+  }
+  if (consumedEnd == callsiteEnd)
+    return callsiteEnd;
+
+  // A directive or pragma operator there would be replaced along with the
+  // call text around it.
+  const RefoldPreprocessingStructureIndexProvider::LookupResult lookup =
+      deps_.structureIndexes.Get(*m.invFile, m.ownerIncludeId);
+  if (!lookup.HasIndex() || !lookup.index->IsProtectionCensusComplete() ||
+      consumedEnd > lookup.index->GetSourceSize() ||
+      lookup.index->HasOverlapping(callsiteEnd, consumedEnd)) {
+    REFOLD_LOG_TRACE("macro/whole-cover",
+                     "reject inv id={0} name={1} reason=unproven-consumed-"
+                     "source-suffix invBytes=[{2},{3}) consumedEnd={4}",
+                     m.id, m.name, callsiteBegin, callsiteEnd, consumedEnd);
+    return std::nullopt;
+  }
+  REFOLD_LOG_TRACE("macro/whole-cover",
+                   "widen inv id={0} name={1} invBytes=[{2},{3}) "
+                   "consumedEnd={4}",
+                   m.id, m.name, callsiteBegin, callsiteEnd, consumedEnd);
+  return consumedEnd;
 }
 
 void RefoldMacroWholeCoverPlanBuilder::ReplayProducedPragmaLines(

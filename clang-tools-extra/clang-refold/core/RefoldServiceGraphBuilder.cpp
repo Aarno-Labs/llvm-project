@@ -354,14 +354,15 @@ void RefoldEngine::BuildServiceGraph() {
       RefoldBInsertionLedger::Deps{bToks_, sourceMapper_, *ownerClassifier_,
                                    macroTopology_, macroBoundarySelector_});
 
-  // Whole-cover plan computation reads only the A->B source mapper and the
-  // B-insertion claim ledger.  It is deliberately constructed here, ahead of
-  // the macro patch planner and the text-edit assembler, because both of those
-  // consume plans.
+  // Whole-cover plan computation reads the A->B source mapper, the
+  // B-insertion claim ledger, and the structure of the source a realization
+  // replaces.  It is deliberately constructed here, ahead of the macro patch
+  // planner and the text-edit assembler, because both of those consume plans.
   wholeCoverPlanBuilder_ = std::make_unique<RefoldMacroWholeCoverPlanBuilder>(
       RefoldMacroWholeCoverPlanBuilder::Dependencies{
           sourceMapper_, *bInsertionLedger_, macroTopology_,
-          sidebandPragmaLinePairings_, bSource_});
+          sidebandPragmaLinePairings_, bSource_, pathIdentity_,
+          *preprocessingStructureIndexProvider_});
 
   counterStabilization_ = std::make_unique<RefoldCounterStabilization>(
       model_, aToks_, bToks_, macroTopology_, *ownerClassifier_);

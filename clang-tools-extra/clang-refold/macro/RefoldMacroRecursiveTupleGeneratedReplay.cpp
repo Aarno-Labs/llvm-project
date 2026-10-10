@@ -13,6 +13,7 @@
 
 #include "macro/RefoldMacroRecursiveTupleGeneratedReplay.h"
 
+#include "macro/RefoldMacroFormalDependenceProof.h"
 #include "macro/RefoldMacroGeneratedCalleeReplayEngine.h"
 #include "macro/RefoldMacroPatchProofCertifier.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
@@ -2118,6 +2119,18 @@ void appendFormalFootprint(
   appendMatching(invocation.pasteSpans);
 }
 
+/// What the terminal replay solver proved, in the form the element realizer
+/// consumes.
+struct SolvedTerminalReplay {
+  /// A-token surfaces, half-open, whose B image the replay of a terminal
+  /// definition with `newActuals` reproduces.
+  llvm::ArrayRef<std::pair<uint64_t, uint64_t>> surfaces;
+  /// Old terminal actuals, in terminal formal order.
+  llvm::ArrayRef<std::string> oldActuals;
+  /// Edited terminal actuals, in terminal formal order.
+  llvm::ArrayRef<std::string> newActuals;
+};
+
 /// Realizes root tuple elements the terminal replay solution does not cover,
 /// and certifies that the claimed root envelope contains no unexplained edit.
 ///
@@ -2134,7 +2147,8 @@ void appendFormalFootprint(
 ///
 ///   * *container* -- strictly contains another element, so it is explained by
 ///     the elements it contains and carries no obligation of its own;
-///   * *terminal actual* -- solved by the terminal replay solution;
+///   * *terminal actual* -- solved by the terminal replay solution inside
+///     the surfaces it replayed; any other copy must spell the solved actual;
 ///   * *substituted* -- reaches the expansion as a verbatim copy of the actual,
 ///     so its edited spelling is read from the edited stream through the
 ///     producer's own argument span; or
@@ -2144,17 +2158,21 @@ void appendFormalFootprint(
 /// An element that fits none of these fails closed.
 class RootTupleElementRealizer {
 public:
-  RootTupleElementRealizer(const RefoldSourceMapper &sourceMapper,
-                           const clang::LangOptions &lexLang)
-      : sourceMapper_(sourceMapper), lexLang_(lexLang) {}
+  RootTupleElementRealizer(
+      const RefoldSourceMapper &sourceMapper, const clang::LangOptions &lexLang,
+      RefoldMacroFormalDependenceProof::Dependencies dependenceDeps)
+      : sourceMapper_(sourceMapper), lexLang_(lexLang),
+        dependenceProof_(dependenceDeps) {}
 
   /// Realize the elements outside the terminal solution and certify coverage.
   ///
   /// Returns false when any element cannot be discharged or when the root
-  /// envelope contains an edited A token no accounted element explains.
+  /// envelope contains an A token the rewrite may change and no accounted
+  /// element explains.
   bool RealizeAndCertify(
       const RecursiveTupleGeneratedReplayRequest &request,
       const ComposedGeneratedCalleePath &path,
+      const SolvedTerminalReplay &terminal,
       llvm::SmallVectorImpl<RealizedRootTupleElement> &realized) const {
     if (!path.rootInvocation || path.elementBindings.empty())
       return false;
@@ -2189,14 +2207,15 @@ public:
       if (footprint.empty())
         continue;
 
-      if (!DischargeElement(path, binding, footprint, realized))
+      if (!DischargeElement(path, binding, footprint, terminal, realized))
         return false;
 
       for (const RefoldModel::PPArgSpan *span : footprint)
         accountedSpans.push_back({span->begin, span->end});
     }
 
-    return RootEnvelopeChangeIsAccounted(request, accountedSpans);
+    return RootEnvelopeChangeIsAccounted(request, path, terminal,
+                                         accountedSpans);
   }
 
 private:
@@ -2241,11 +2260,17 @@ private:
       const ComposedGeneratedCalleePath &path,
       const RootTupleElementBinding &binding,
       llvm::ArrayRef<const RefoldModel::PPArgSpan *> footprint,
+      const SolvedTerminalReplay &terminal,
       llvm::SmallVectorImpl<RealizedRootTupleElement> &realized) const {
     // Terminal actuals stay with the replay solver, which proves them by
-    // inverting the terminal replacement list rather than by reading B.
+    // inverting the terminal replacement list rather than by reading B.  It
+    // proves only the surfaces it replayed, though, and the producer
+    // attributes argument tokens by spelling location, so a copy of the actual
+    // made elsewhere in the expansion -- `x` in `FIRST PAIR` beside `ADD PAIR`
+    // -- lands in the terminal's argument spans too.
     if (IsTerminalActualElement(path, binding.slice))
-      return true;
+      return TerminalElementCopiesSpellSolvedActual(path, binding.slice,
+                                                    footprint, terminal);
 
     std::optional<std::string> oldActual = rootInvocationSourceSlice(
         *path.rootInvocation, binding.slice.absoluteByteBegin,
@@ -2269,6 +2294,97 @@ private:
         if (!ATokenSurvivesUnchanged(aTok))
           return false;
     return true;
+  }
+
+  /// Return whether every footprint span of the terminal-actual element
+  /// \p element that lies outside the solved replay surfaces re-expands to
+  /// what B spells there.
+  ///
+  /// The tuple edit gives the element the solved actual, so a span outside the
+  /// replayed surfaces is proven only when it is a verbatim copy of the
+  /// element and B spells the solved actual there; when the solution leaves
+  /// the element alone, the span must survive unchanged.  A stringified or
+  /// pasted span of an edited element is not a copy, so it fails, as does a
+  /// span that straddles a solved surface's edge.
+  bool TerminalElementCopiesSpellSolvedActual(
+      const ComposedGeneratedCalleePath &path,
+      const RootTupleSliceBinding &element,
+      llvm::ArrayRef<const RefoldModel::PPArgSpan *> footprint,
+      const SolvedTerminalReplay &terminal) const {
+    std::optional<std::pair<llvm::StringRef, llvm::StringRef>> oldAndNew;
+    for (const RootTupleSliceBinding &actual : path.actualSlices) {
+      if (actual.rootTuplePayloadByteBegin !=
+              element.rootTuplePayloadByteBegin ||
+          actual.rootTuplePayloadByteEnd != element.rootTuplePayloadByteEnd)
+        continue;
+      if (actual.generatedFormalIndex >= terminal.oldActuals.size() ||
+          actual.generatedFormalIndex >= terminal.newActuals.size())
+        return false;
+      const std::pair<llvm::StringRef, llvm::StringRef> solved{
+          llvm::StringRef(terminal.oldActuals[actual.generatedFormalIndex])
+              .trim(),
+          llvm::StringRef(terminal.newActuals[actual.generatedFormalIndex])
+              .trim()};
+      if (oldAndNew && *oldAndNew != solved)
+        return false;
+      oldAndNew = solved;
+    }
+    if (!oldAndNew)
+      return false;
+    const auto [oldActual, newActual] = *oldAndNew;
+
+    const llvm::SmallVector<std::string, 8> oldSpellings =
+        lexTokenSpellings(oldActual, lexLang_);
+    const llvm::SmallVector<std::string, 8> newSpellings =
+        lexTokenSpellings(newActual, lexLang_);
+    if (oldSpellings.empty() || newSpellings.empty())
+      return false;
+    const bool edited = oldSpellings != newSpellings;
+
+    for (const RefoldModel::PPArgSpan *span : footprint) {
+      if (InsideSolvedSurface(terminal, span->begin, span->end))
+        continue;
+      if (OverlapsSolvedSurface(terminal, span->begin, span->end))
+        return false;
+      if (!edited) {
+        for (uint64_t aTok = span->begin; aTok < span->end; ++aTok)
+          if (!ATokenSurvivesUnchanged(aTok))
+            return false;
+        continue;
+      }
+
+      if (span->kind != PPArgSpanKind::Standard ||
+          lexTokenSpellings(sourceMapper_.SliceASource(span->begin, span->end),
+                            lexLang_) != oldSpellings)
+        return false;
+      const std::optional<std::pair<size_t, size_t>> bEnvelope =
+          sourceMapper_.MapAToBTokenEnvelopeByPPArgSpan(*span);
+      if (!bEnvelope || bEnvelope->second <= bEnvelope->first)
+        return false;
+      if (lexTokenSpellings(
+              sourceMapper_.SliceBSource(bEnvelope->first, bEnvelope->second),
+              lexLang_) != newSpellings)
+        return false;
+    }
+    return true;
+  }
+
+  /// Return whether `[begin, end)` lies inside one solved replay surface.
+  static bool InsideSolvedSurface(const SolvedTerminalReplay &terminal,
+                                  uint64_t begin, uint64_t end) {
+    return llvm::any_of(
+        terminal.surfaces, [&](const std::pair<uint64_t, uint64_t> &surface) {
+          return surface.first <= begin && end <= surface.second;
+        });
+  }
+
+  /// Return whether `[begin, end)` shares a token with a solved replay surface.
+  static bool OverlapsSolvedSurface(const SolvedTerminalReplay &terminal,
+                                    uint64_t begin, uint64_t end) {
+    return llvm::any_of(terminal.surfaces,
+                        [&](const std::pair<uint64_t, uint64_t> &surface) {
+                          return begin < surface.second && surface.first < end;
+                        });
   }
 
   /// Record one realized element, requiring repeats to agree.
@@ -2352,16 +2468,26 @@ private:
                .trim();
   }
 
-  /// Certify that every edited A token in the root envelope is explained.
+  /// Certify that every A token in the root envelope the rewrite may change
+  /// is explained.
   ///
   /// The emitted patch claims the whole root whole-cover envelope, so the claim
   /// is honest only when each A token in it either belongs to an element this
   /// class discharged or survives into B unchanged.  A token that changed while
   /// lying outside every accounted element is precisely the failure the closing
   /// assembly verifier would otherwise have to catch after the fact.
+  ///
+  /// Surviving unchanged is not enough on its own: the token must also
+  /// re-expand unchanged.  Inside a solved replay surface the replay proves
+  /// that.  Elsewhere it holds only when nothing that produced the token
+  /// observes the root tuple formal -- `STR(PAIR)`, or the parentheses of a
+  /// second `PAIR`, re-expand with the edited elements however B spells them.
   bool RootEnvelopeChangeIsAccounted(
       const RecursiveTupleGeneratedReplayRequest &request,
+      const ComposedGeneratedCalleePath &path,
+      const SolvedTerminalReplay &terminal,
       llvm::ArrayRef<std::pair<uint64_t, uint64_t>> accountedSpans) const {
+    llvm::SmallVector<uint64_t, 32> unreplayedTokens;
     for (uint64_t aTok = request.wholeCoverATokens.first;
          aTok < request.wholeCoverATokens.second; ++aTok) {
       const bool accounted = llvm::any_of(
@@ -2372,12 +2498,18 @@ private:
         continue;
       if (!ATokenSurvivesUnchanged(aTok))
         return false;
+      if (!InsideSolvedSurface(terminal, aTok, aTok + 1))
+        unreplayedTokens.push_back(aTok);
     }
-    return true;
+    const uint32_t tupleFormal = path.rootTupleFormalIndex;
+    return dependenceProof_.TokensIgnoreRewrittenFormals(
+        request.rootInvocation, unreplayedTokens, {tupleFormal},
+        RefoldMacroFormalDependenceProof::RootOccurrences::Observed);
   }
 
   const RefoldSourceMapper &sourceMapper_;
   const clang::LangOptions &lexLang_;
+  RefoldMacroFormalDependenceProof dependenceProof_;
 };
 
 /// Solves the terminal generated-callee replay for a composed path.
@@ -2391,10 +2523,11 @@ class RecursiveTupleGeneratedReplaySolver {
 public:
   RecursiveTupleGeneratedReplaySolver(
       const RefoldMacroGeneratedCalleeReplayEngine &generatedCalleeReplayEngine,
-      const RefoldSourceMapper &sourceMapper,
-      const clang::LangOptions &lexLang)
+      const RefoldSourceMapper &sourceMapper, const clang::LangOptions &lexLang,
+      RefoldMacroFormalDependenceProof::Dependencies dependenceDeps)
       : generatedCalleeReplayEngine_(generatedCalleeReplayEngine),
-        sourceMapper_(sourceMapper), elementRealizer_(sourceMapper, lexLang) {}
+        sourceMapper_(sourceMapper),
+        elementRealizer_(sourceMapper, lexLang, dependenceDeps) {}
 
   /// Return the unique terminal replay solution for \p path, if provable.
   std::optional<RecursiveTupleGeneratedReplaySolution> Solve(
@@ -2520,7 +2653,12 @@ public:
     // Elements consumed by intermediate replacement lists are still open, and
     // the whole-cover claim is not yet honest, so discharge both before the
     // solution is allowed to leave this method.
-    if (!elementRealizer_.RealizeAndCertify(request, path,
+    llvm::SmallVector<std::pair<uint64_t, uint64_t>, 4> solvedSurfaces;
+    for (const auto &[invocationId, begin, end] : solvedReplaySurfaces)
+      solvedSurfaces.push_back({begin, end});
+    const SolvedTerminalReplay terminal{
+        solvedSurfaces, solution.oldSolvedActuals, solution.newSolvedActuals};
+    if (!elementRealizer_.RealizeAndCertify(request, path, terminal,
                                             solution.realizedElements))
       return std::nullopt;
     return solution;
@@ -2973,7 +3111,8 @@ RefoldMacroRecursiveTupleGeneratedReplay::BuildCandidate(
     return std::nullopt;
 
   RecursiveTupleGeneratedReplaySolver replaySolver(
-      deps_.generatedCalleeReplayEngine, deps_.sourceMapper, deps_.lexLang);
+      deps_.generatedCalleeReplayEngine, deps_.sourceMapper, deps_.lexLang,
+      {deps_.model, deps_.macroTopology});
   std::optional<RecursiveTupleGeneratedReplaySolution> replaySolution =
       replaySolver.Solve(request, *path);
   if (!replaySolution)

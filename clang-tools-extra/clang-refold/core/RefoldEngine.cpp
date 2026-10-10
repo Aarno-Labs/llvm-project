@@ -1343,10 +1343,10 @@ bool RefoldEngine::DispatchStructuralHunks(
                   wholeCoverPlan->covHiA, DescribeOwner(*failingOwner));
               wholeCoverPlan.reset();
             }
-            if (wholeCoverPlan) {
-              MacroPatch wholeCoverPatch{*invocation->invB, *invocation->invE,
-                                         wholeCoverPlan->clippedText,
-                                         invocation->id};
+            if (wholeCoverPlan && wholeCoverPlan->sourceEnd) {
+              MacroPatch wholeCoverPatch{
+                  *invocation->invB, *wholeCoverPlan->sourceEnd,
+                  wholeCoverPlan->clippedText, invocation->id};
               proofServices_->MacroPatchProofClassifier()
                   .CertifyMacroWholeCoverRealizationPatch(
                       wholeCoverPatch, *wholeCoverPlan, *invocation);
@@ -1366,7 +1366,7 @@ bool RefoldEngine::DispatchStructuralHunks(
                   "of already-given-up {2} at source=[{3},{4}) and refolding "
                   "the rest",
                   h.aStart, h.aEnd, DescribeOwner(*failingOwner),
-                  *invocation->invB, *invocation->invE);
+                  *invocation->invB, *wholeCoverPlan->sourceEnd);
               continue;
             }
           }
@@ -1585,7 +1585,7 @@ std::string RefoldEngine::FinalizeStructuralResult(
 
       std::optional<WholeCoverPlan> plan =
           macroPatchPlanner_->ComputeWholeCoverPlan(*site);
-      if (!plan) {
+      if (!plan || !plan->sourceEnd) {
         terminalSink_.RequestTerminalFallback(
             MakeTerminalFallbackProofFailure(
                 TerminalFallbackObligationKind::ProducerFactsAvailable,
@@ -1606,7 +1606,8 @@ std::string RefoldEngine::FinalizeStructuralResult(
       RefoldStructuralHunkDispatcher::MacroPatchStagingSlot stagingSlot =
           structuralHunkDispatcher.PrepareMacroPatchStagingSlot(*site);
 
-      MacroPatch patch{*invStart, *invEnd, plan->clippedText, site->id};
+      MacroPatch patch{*invStart, *plan->sourceEnd, plan->clippedText,
+                       site->id};
       if (stagingSlot.existingPatch)
         macroPatchPlanner_->CarryMacroPatchOwnerCertificate(
             patch, *stagingSlot.existingPatch);

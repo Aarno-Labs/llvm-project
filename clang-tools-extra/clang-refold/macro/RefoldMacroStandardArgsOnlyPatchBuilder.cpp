@@ -1268,6 +1268,25 @@ RefoldMacroStandardArgsOnlyPatchBuilder::BuildStandardArgsOnlyPatch(
       }
     }
 
+    // A tuple-forwarded rewrite proved its standard occurrences above slice by
+    // slice, each against the one tuple element it copies.  A stringified or
+    // pasted occurrence observes the whole actual instead, so judge those
+    // against the actual the callsite will spell.  The occurrence observations
+    // cannot stand in for this: they key each occurrence by its own old text,
+    // so `#PAIR` left at `"(x, z)"` sat beside `x -> y` and `z -> w` without
+    // contradicting the rebuilt `(y, w)`.
+    if (tupleForwarded &&
+        !occurrenceReplay
+             .MacroArgReplacementMatchesStringifyAndPasteOccurrencesInB(
+                 m, argIdx, baseArgText, finalNewArg, tokenHunks)) {
+      REFOLD_LOG_TRACE("macro/args-only",
+                       "reject inv id={0} name={1} "
+                       "reason=tuple-forwarded-actual-contradicts-observer "
+                       "argIdx={2} rebuiltArg='{3}'",
+                       m.id, m.name, argIdx, finalNewArg);
+      return std::nullopt;
+    }
+
     finalArgumentRewrites.Record(argIdx, std::move(finalNewArg),
                                   finalMaterializedRange, tupleForwarded);
   }

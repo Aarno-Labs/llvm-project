@@ -3401,7 +3401,7 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
     // B-side expansion at the call site.
     std::optional<WholeCoverPlan> wholePlan =
         MacroPatchPlanner().ComputeWholeCoverPlan(invocation);
-    if (!wholePlan) {
+    if (!wholePlan || !wholePlan->sourceEnd) {
       (void)CheckMacroStateTerminal(
           *definition, StateMutationKind::Consumed, "macro-definition-liveness",
           llvm::formatv("macro '{0}' invocation #{1} survives but definition "
@@ -3417,8 +3417,8 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
       continue;
     }
 
-    MacroPatch patch{*invocation.invB, *invocation.invE, wholePlan->clippedText,
-                     invocation.id};
+    MacroPatch patch{*invocation.invB, *wholePlan->sourceEnd,
+                     wholePlan->clippedText, invocation.id};
     MacroPatchProofClassifier().CertifyMacroWholeCoverRealizationPatch(
         patch, *wholePlan, invocation);
     MacroPatchPlanner().CertifyMacroPatchOwnerWitness(

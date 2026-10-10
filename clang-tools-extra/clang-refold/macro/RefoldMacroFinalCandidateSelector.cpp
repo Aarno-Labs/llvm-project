@@ -835,15 +835,19 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
       conflictingConcreteSubtreeWitnessForcesWholeCover ? 1 : 0,
       existingCallsitePatchAbsorbedByDirectCandidate ? 1 : 0);
 
-  if (wholeCoverPlan && wholeCoverCanReplaceInvocationSource) {
+  if (wholeCoverPlan && wholeCoverPlan->sourceEnd &&
+      wholeCoverCanReplaceInvocationSource) {
     // Whole-cover realization is added as another final candidate unless
     // a selectable structure-preserving candidate for the same root
     // already wins the named lattice tie-breaker above.  Function-like
     // realization also requires a real source callsite.  Producer pseudo-
     // invocations for generated callees, such as `ADD, (1, 2)`, are not
-    // syntactic callsites and cannot safely be replaced directly.
-    const WholeCoverCandidate wholeCoverCandidate{m, invStart, invEnd,
-                                                  *wholeCoverPlan};
+    // syntactic callsites and cannot safely be replaced directly.  The
+    // realization replaces every source byte the expansion consumed, which
+    // can run past the callsite.
+    const WholeCoverCandidate wholeCoverCandidate{
+        m, invStart, std::max(invEnd, *wholeCoverPlan->sourceEnd),
+        *wholeCoverPlan};
     MacroPatch patch =
         materializeWholeCoverPatch(deps_.proofCertifier, wholeCoverCandidate);
     const bool structureCandidateDominatesWholeCover =

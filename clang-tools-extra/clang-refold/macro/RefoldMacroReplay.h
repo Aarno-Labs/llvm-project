@@ -89,8 +89,8 @@ public:
   ///
   /// This is used when the caller performs pasted-token validation at a higher
   /// level, such as validating that a set of argument replacements reconstructs
-  /// the entire pasted token exactly.  STANDARD occurrences and, in strict
-  /// mode, STRINGIFY occurrences are still enforced.
+  /// the entire pasted token exactly.  STANDARD and STRINGIFY occurrences are
+  /// still enforced.
   bool MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
       const RefoldModel::MacroInvocation &m, uint32_t argIdx,
       llvm::StringRef baseArg, llvm::StringRef newArg,
@@ -112,10 +112,24 @@ public:
         OccurrenceSupportMode::AllowGraphSupport);
   }
 
+  /// Return whether \p newArg, the actual a rewrite spells for formal
+  /// \p argIdx of \p m, agrees with every stringified and pasted occurrence of
+  /// that formal in B.  Standard occurrences are not consulted.
+  ///
+  /// This is the check for a rewrite that proves its standard occurrences by
+  /// some other means.  A tuple-forwarded rewrite proves them slice by slice,
+  /// because each one copies only one tuple element, but `#` and `##` observe
+  /// the whole actual, so those occurrences are judged against \p newArg
+  /// exactly as `MacroArgReplacementMatchesAllOccurrencesInB` judges them.
+  bool MacroArgReplacementMatchesStringifyAndPasteOccurrencesInB(
+      const RefoldModel::MacroInvocation &m, uint32_t argIdx,
+      llvm::StringRef baseArg, llvm::StringRef newArg,
+      llvm::ArrayRef<diffutils::Hunk> tokenHunks) const;
+
   /// Core implementation for validating whether a proposed args-only rewrite
   /// of a macro parameter is consistent with the edited preprocessed stream B.
   ///
-  /// Evidence comes from STANDARD spans, strict-mode STRINGIFY spans, and
+  /// Evidence comes from STANDARD spans, STRINGIFY spans, and
   /// optionally PASTE spans.  The method is conservative: if an occurrence
   /// cannot be mapped or compared deterministically in the requested support
   /// mode, the candidate is rejected rather than guessed.
@@ -170,6 +184,22 @@ private:
   /// emits.  Without topology no token qualifies.
   bool IsFixedBodyToken(const RefoldModel::MacroInvocation &m,
                         uint64_t aTok) const;
+
+  /// Return whether \p newArg, as the actual of formal \p argIdx of \p m,
+  /// regenerates the literal B spells at every stringified occurrence of that
+  /// formal.  Relaxed mode also accepts an occurrence B left exactly as A
+  /// spelled it; strict mode does not.
+  bool StringifiedOccurrencesMatchReplacementInB(
+      const RefoldModel::MacroInvocation &m, uint32_t argIdx,
+      llvm::StringRef newArg, llvm::ArrayRef<diffutils::Hunk> tokenHunks) const;
+
+  /// Return whether the segment B spells at every pasted occurrence of formal
+  /// \p argIdx of \p m is the matching whole, prefix or suffix of \p newArg.
+  /// \p pasteOriginTrim is the actual A was expanded from, which classifies
+  /// each pasted A segment; an unclassified segment fails.
+  bool PastedOccurrencesMatchReplacementInB(
+      const RefoldModel::MacroInvocation &m, uint32_t argIdx,
+      llvm::StringRef pasteOriginTrim, llvm::StringRef newArg) const;
 
   /// Return the trimmed actual of formal \p argIdx exactly as the producer
   /// recorded it at \p m's callsite, when that callsite is source text: a

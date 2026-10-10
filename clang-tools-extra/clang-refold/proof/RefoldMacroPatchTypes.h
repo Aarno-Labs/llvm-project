@@ -267,6 +267,13 @@ struct WholeCoverPlan {
   bool adjustedRight = false;
   bool claimsClipped = false;
   std::string clippedText;
+  /// End of the physical source bytes, from the invocation's `invB`, that a
+  /// patch realizing this plan replaces.  It lies past `invE` when a call the
+  /// expansion generated is closed by source text after the invocation's own
+  /// closing parenthesis.  Unset when the invocation records no source range
+  /// or the consumed extent is not proven; no patch may then be built.  See
+  /// `RefoldMacroWholeCoverPlanBuilder::ConsumedSourceEnd`.
+  std::optional<uint64_t> sourceEnd;
   /// B byte ranges of the `#pragma` lines this invocation's expansion printed
   /// that `clippedText` replays verbatim; see
   /// `RefoldMacroWholeCoverPlanBuilder::ComputeWholeCoverPlan`.
