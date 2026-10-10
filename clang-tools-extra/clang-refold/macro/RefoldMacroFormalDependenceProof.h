@@ -31,6 +31,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -92,6 +93,28 @@ public:
                                uint64_t begin, uint64_t end,
                                llvm::ArrayRef<uint32_t> formals) const;
 
+  /// A root invocation's cover with, per token, whether a rewrite provably
+  /// keeps it.
+  struct CoverKeptTokens {
+    /// The root's whole A-token cover, half-open.
+    std::pair<uint64_t, uint64_t> cover;
+    /// `kept[i]` answers for A token `cover.first + i`.
+    llvm::SmallVector<bool, 64> kept;
+  };
+
+  /// Return which tokens of \p root's cover a rewrite of \p root that changes
+  /// only the actuals of \p rewrittenFormals provably re-expands with their A
+  /// spelling, or nullopt when the cover is unknown.
+  ///
+  /// A token is kept when it is independent of every rewritten formal,
+  /// counting the root's own occurrences; with no rewritten formal every token
+  /// is.  A token whose dependence is unknown may change and is not kept.
+  /// Being kept fixes a token's spelling, not its neighbours: material that a
+  /// rewritten formal produces may appear between two kept tokens.
+  std::optional<CoverKeptTokens>
+  CoverTokensKeptByRewrite(const RefoldModel::MacroInvocation &root,
+                           llvm::ArrayRef<uint32_t> rewrittenFormals) const;
+
   /// Return, ascending, the formals whose replacement in \p replByArgIdx is not
   /// token-equivalent to the actual spelled at \p argRanges in
   /// \p invocationText.
@@ -140,6 +163,35 @@ private:
     /// None of the above is proven.
     Unattributed,
   };
+
+  /// Every invocation other than the root that produced a token of the root's
+  /// cover, with its role, gathered once for all tokens of one query.
+  struct CoverAttributions {
+    /// The root's whole A-token cover, half-open.
+    std::pair<uint64_t, uint64_t> cover;
+    /// The invocations on the root's own caller chain.
+    llvm::SmallVector<uint64_t, 4> rootAncestors;
+    /// Each producing invocation with its role.
+    llvm::SmallVector<
+        std::pair<const RefoldModel::MacroInvocation *, CoverRole>, 16>
+        producers;
+    /// True when the root's expansion pasted anywhere, so a callee name may
+    /// be spelled from several actuals, which the opaque-edge resolution
+    /// cannot see.
+    bool expansionPastes = false;
+  };
+
+  /// Gather the invocations that produced tokens of \p root's cover, or
+  /// nullopt when the cover is unknown.
+  std::optional<CoverAttributions>
+  CollectCoverAttributions(const RefoldModel::MacroInvocation &root) const;
+
+  /// Return the root formals that the producers in \p attributions make cover
+  /// token \p tok depend on.
+  Dependence TokenDependence(const RefoldModel::MacroInvocation &root,
+                             const CoverAttributions &attributions,
+                             uint64_t tok, RootOccurrences rootOccurrences,
+                             bool countArgumentOccurrences) const;
 
   /// Classify \p inv, which produced tokens of \p root's cover.
   /// \p rootAncestors are the invocations on \p root's own caller chain.

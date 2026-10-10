@@ -170,6 +170,11 @@ RefoldStructuralHunkDispatcher::FindMacroPatchKeyByInvocationSpan(
 void RefoldStructuralHunkDispatcher::MergeMaterializedBTokenRangeFromSlot(
     MacroPatch &patch, const MacroPatchStagingSlot &slot,
     const diffutils::Hunk &hunk) const {
+  patch.materialized.stagedHunks =
+      slot.existingPatch ? slot.existingPatch->materialized.stagedHunks
+                         : std::vector<ATokenRange>{};
+  patch.materialized.stagedHunks.push_back(ATokenRange{hunk.aStart, hunk.aEnd});
+
   if (slot.existingPatch && slot.existingPatch->materialized.hasBTokenRange) {
     if (!patch.materialized.hasBTokenRange) {
       patch.materialized.hasBTokenRange = true;

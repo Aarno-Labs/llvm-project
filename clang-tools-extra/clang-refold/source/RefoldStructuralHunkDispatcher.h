@@ -116,7 +116,8 @@ public:
   MacroPatchByOwnerByMacroIdMap &MacroPatchMergeBucketsForPlanner();
 
   /// Merge the previous and current B-token materialization envelopes into the
-  /// candidate patch before it replaces the staged callsite slot.
+  /// candidate patch before it replaces the staged callsite slot, and record
+  /// \p hunk after the hunks already staged there.
   void MergeMaterializedBTokenRangeFromSlot(MacroPatch &patch,
                                             const MacroPatchStagingSlot &slot,
                                             const diffutils::Hunk &hunk) const;

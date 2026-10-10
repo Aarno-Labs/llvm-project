@@ -119,6 +119,11 @@ struct MaterializedSurface {
   uint64_t bTokStart = 0;
   /// Exclusive B-token index of the materialized surface envelope.
   uint64_t bTokEnd = 0;
+  /// A-token ranges of the hunks staged into this patch's callsite slot, in
+  /// staging order and including the hunk this patch was selected for.  The
+  /// slot holds one patch, so a patch that replaces this one must keep
+  /// realizing each of them; `bTokStart`/`bTokEnd` envelope their B side.
+  std::vector<ATokenRange> stagedHunks = {};
   /// True when `outputByteStart`/`outputByteEnd` name bytes in `replacement`.
   bool hasOutputByteRange = false;
   /// Inclusive byte offset inside the patch replacement text.

@@ -7,10 +7,12 @@
 #include "macro/RefoldMacroFinalCandidateSelector.h"
 
 #include "macro/RefoldMacroDAGSharedHelpers.h"
+#include "macro/RefoldMacroFormalDependenceProof.h"
 #include "macro/RefoldMacroPatchProofCertifier.h"
 #include "macro/RefoldMacroPatchReusePhase.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplayStabilityValidator.h"
+#include "macro/RefoldMacroRewriteRealizationProof.h"
 #include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
@@ -359,6 +361,42 @@ RefoldMacroFinalCandidateSelector::PrintedPragmaLinesOf(
   return lines;
 }
 
+std::optional<SmallVector<uint32_t, 4>>
+RefoldMacroFinalCandidateSelector::FormalsRespelledByPatch(
+    const RefoldModel::MacroInvocation &m, const MacroPatch &patch) const {
+  if (!m.invText)
+    return std::nullopt;
+  const auto originalRanges =
+      deps_.getMacroInvocationFormalArgContentRanges(m, *m.invText);
+  const auto patchRanges =
+      deps_.getMacroInvocationFormalArgContentRanges(m, patch.replacement);
+  if (!originalRanges || !patchRanges ||
+      originalRanges->size() != patchRanges->size())
+    return std::nullopt;
+
+  DenseMap<uint32_t, std::string> actualByFormal;
+  for (uint32_t formal = 0; formal < patchRanges->size(); ++formal) {
+    const auto [begin, end] = (*patchRanges)[formal];
+    actualByFormal[formal] =
+        StringRef(patch.replacement).slice(begin, end).str();
+  }
+  return RefoldMacroFormalDependenceProof::RewrittenFormals(
+      *m.invText, *originalRanges, actualByFormal, deps_.lexLang);
+}
+
+bool RefoldMacroFinalCandidateSelector::PatchCanRealizeStagedHunks(
+    const RefoldModel::MacroInvocation &m, const MacroPatch &patch,
+    ArrayRef<ATokenRange> stagedHunks) const {
+  const std::optional<SmallVector<uint32_t, 4>> respelled =
+      FormalsRespelledByPatch(m, patch);
+  if (!respelled)
+    return true;
+  return !RefoldMacroRewriteRealizationProof({deps_.model, deps_.topology,
+                                              deps_.aToks, deps_.bToks,
+                                              deps_.hunks})
+              .RewriteCannotRealize(m, *respelled, stagedHunks);
+}
+
 std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
     RefoldMacroWholeCoverPlanningContext &planningCtx) const {
   const RefoldModel::MacroInvocation &m = planningCtx.m;
@@ -602,6 +640,32 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
     }
   }
 
+  // The callsite slot holds one patch, so whatever is selected here replaces
+  // the patch that realized the hunks staged into the slot earlier.  Drop a
+  // structure-preserving candidate, fresh or reused, whose re-expansion
+  // provably cannot reproduce B where those hunks and this one were edited.
+  // A realization reproduces B over the cover and needs no such check.
+  SmallVector<ATokenRange, 4> stagedHunks = {ATokenRange{h.aStart, h.aEnd}};
+  for (const MacroPatch *slotPatch : {existingPatch, existingExpandedPatch})
+    if (slotPatch)
+      append_range(stagedHunks, slotPatch->materialized.stagedHunks);
+  for (std::optional<MacroPatch> *candidate :
+       {&argsOnlyCandidate, &dagRootCandidate}) {
+    if (!*candidate || !(*candidate)->proof.preservesInvocationStructure ||
+        PatchCanRealizeStagedHunks(m, **candidate, stagedHunks))
+      continue;
+    REFOLD_LOG_TRACE(
+        "macro/final-candidate",
+        "drop inv id={0} name={1} replacement='{2}': cannot realize "
+        "the staged hunks",
+        m.id, m.name,
+        stringutils::showWsWithClip((*candidate)->replacement, 220));
+    candidate->reset();
+  }
+  const bool existingPatchKeepsStagedHunks =
+      !existingPatch || !existingPatch->proof.preservesInvocationStructure ||
+      PatchCanRealizeStagedHunks(m, *existingPatch, stagedHunks);
+
   // Route every macro-level candidate through the common final selector.
   //
   // This prevents nested structure-preserving artifacts from bypassing the
@@ -623,12 +687,14 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
   //   the final selector without forcing a whole-cover plan.
   const bool canReuseExistingCallsiteNoOp =
       reuseExistingCallsitePatch &&
-      !conflictingConcreteSubtreeWitnessForcesWholeCover && existingPatch;
+      !conflictingConcreteSubtreeWitnessForcesWholeCover && existingPatch &&
+      existingPatchKeepsStagedHunks;
   const bool canReuseExistingCallsiteSkipWholeCover =
       !canReuseExistingCallsiteNoOp &&
       !existingCallsitePatchAbsorbedByDirectCandidate &&
       !conflictingConcreteSubtreeWitnessForcesWholeCover && existingPatch &&
-      existingIsCallsite && existingPatch->proof.preservesInvocationStructure &&
+      existingPatchKeepsStagedHunks && existingIsCallsite &&
+      existingPatch->proof.preservesInvocationStructure &&
       existingPatch->proof.proofRootMacroId == m.id && !baseInvText.empty() &&
       invocationSpanMatchesCallsitePrefix(baseInvText, m);
 

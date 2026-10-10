@@ -25,9 +25,12 @@
 #include "edit/RefoldPatchTypes.h"
 #include "macro/RefoldMacroOccurrenceProofValidator.h"
 #include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "proof/RefoldMacroPatchTypes.h"
+#include "source/RefoldDiffTypes.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstddef>
@@ -38,6 +41,8 @@
 #include <vector>
 
 namespace clang {
+class LangOptions;
+
 namespace refold {
 
 struct RefoldMacroWholeCoverPlanningContext;
@@ -92,6 +97,15 @@ public:
     std::function<std::optional<std::vector<std::pair<size_t, size_t>>>(
         const RefoldModel::MacroInvocation &, llvm::StringRef)>
         getMacroInvocationFormalArgContentRanges;
+
+    /// Language options used to compare actual spellings token by token.
+    const clang::LangOptions &lexLang;
+
+    /// The A and B token streams and the pass's token hunks, against which a
+    /// structure-preserving candidate's re-expansion is refuted.
+    llvm::ArrayRef<PPTok> aToks;
+    llvm::ArrayRef<PPTok> bToks;
+    llvm::ArrayRef<diffutils::Hunk> hunks;
   };
 
   explicit RefoldMacroFinalCandidateSelector(Dependencies deps);
@@ -115,6 +129,26 @@ private:
   /// so an unknown producer is never assumed absent.
   llvm::SmallVector<const SidebandPragmaLinePairing *, 2>
   PrintedPragmaLinesOf(const RefoldModel::MacroInvocation &m) const;
+
+  /// Return, ascending, the formals whose actual \p patch spells differently,
+  /// token by token, from \p m's original A-side spelling, or nullopt when
+  /// either spelling does not parse into \p m's formal slots.
+  std::optional<llvm::SmallVector<uint32_t, 4>>
+  FormalsRespelledByPatch(const RefoldModel::MacroInvocation &m,
+                          const MacroPatch &patch) const;
+
+  /// Return whether structure-preserving \p patch, emitted for \p m's
+  /// callsite slot, may still realize every hunk in \p stagedHunks.
+  ///
+  /// The slot holds one patch, so the selected patch replaces the one that
+  /// realized the hunks staged there earlier.  The answer is false only when
+  /// `RefoldMacroRewriteRealizationProof` refutes \p patch's re-expansion
+  /// against B; a patch it cannot model keeps relying on the proof that built
+  /// it.
+  bool
+  PatchCanRealizeStagedHunks(const RefoldModel::MacroInvocation &m,
+                             const MacroPatch &patch,
+                             llvm::ArrayRef<ATokenRange> stagedHunks) const;
 
   Dependencies deps_;
 };

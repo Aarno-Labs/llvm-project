@@ -226,7 +226,9 @@ RefoldMacroWholeCoverOrchestrator::RefoldMacroWholeCoverOrchestrator(
               -> std::optional<std::vector<std::pair<size_t, size_t>>> {
             return planner->GetMacroInvocationFormalArgContentRanges(m,
                                                                      invText);
-          }}) {}
+          },
+          *planner_->Deps().lexLang, planner_->Deps().aToks,
+          planner_->Deps().bToks, *planner_->Deps().abTokHunks}) {}
 
 // Whole-cover realization is admitted only by
 // RefoldMacroWholeCoverProof::MacroWholeCoverIsSelfContained(), which proves
