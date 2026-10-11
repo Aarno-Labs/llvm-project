@@ -1,4 +1,4 @@
-// RUN: %clang-refold-tester-verify-off args_only_formal_forwarded_to_generated_callee_without_provenance
+// RUN: %clang-refold-tester-verify-off args_only_formal_forwarded_to_generated_callee
 // An args-only rewrite is refused when an unchanged token comes from a
 // generated callee whose actual depends on the rewritten formal.
 //

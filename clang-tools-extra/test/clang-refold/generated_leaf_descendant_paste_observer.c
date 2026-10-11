@@ -1,4 +1,4 @@
-// RUN: %clang-refold-tester-verify-off generated_leaf_descendant_paste_observer_without_arg_provenance
+// RUN: %clang-refold-tester-verify-off generated_leaf_descendant_paste_observer
 // A generated-leaf rewrite is refused when an unchanged token comes from a
 // generated callee whose actual depends on the rewritten formal.
 //
@@ -12,4 +12,4 @@
 #define P(a) p_##a
 #define Q(a) q_##a
 #define CALL(f, g, a) int f(a); int g(a);
-int p_y; int q_x;
+CALL(P, Q, x)
