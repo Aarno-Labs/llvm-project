@@ -13,8 +13,9 @@
 // everything that observes them.  Each admission path proves the occurrences
 // it solved, but a token B left unchanged is admissible only when nothing that
 // produced it observes a rewritten formal.  The proof composes the producer's
-// edge-local facts -- root occurrence spans, descendant `arg_deps`, and callee
-// origins -- and fails closed wherever one of them is missing.
+// local facts -- root occurrence spans, descendant `arg_deps` or
+// `arg_token_deps`, and callee origins or callee substitution histories -- and
+// fails closed wherever one of them is missing.
 //
 //===----------------------------------------------------------------------===//
 
@@ -70,12 +71,13 @@ public:
   /// depends on a formal in \p rewrittenFormals.
   ///
   /// A token depends on the root formals its producer attributions name: root
-  /// occurrence spans (per \p rootOccurrences), the composed `arg_deps` of
-  /// every descendant occurrence that produced it, and the callee origin of
+  /// occurrence spans (per \p rootOccurrences), the composed `arg_deps` or
+  /// `arg_token_deps` of every descendant occurrence that produced it, and
+  /// the callee origin or callee substitution history of
   /// every descendant on its caller chain.  A descendant credited with no
-  /// token, whose output may hold the token, adds its callee origin when the
-  /// producer names the selecting root formals exactly.  An attribution the
-  /// producer did not record makes the token depend on every formal.
+  /// token, whose output may hold the token, adds its callee origin too.  An
+  /// attribution the producer did not record makes the token depend on every
+  /// formal.
   bool TokensIgnoreRewrittenFormals(const RefoldModel::MacroInvocation &root,
                                     llvm::ArrayRef<uint64_t> tokens,
                                     llvm::ArrayRef<uint32_t> rewrittenFormals,
@@ -209,31 +211,52 @@ private:
   bool SelectedOutsideRoot(const RefoldModel::MacroInvocation &inv,
                            llvm::ArrayRef<uint64_t> rootAncestors) const;
 
-  /// Return whether the callee of \p inv, and that of each caller up to
-  /// \p root, is replacement-list text or a `caller_param` edge whose formals
-  /// reach \p root through actuals that each spell exactly one formal of the
-  /// next caller, so that the root formals selecting \p inv are known
-  /// exactly.  Through any other actual, text-derived `arg_deps`
-  /// over-approximate them.
-  bool SelectionNamesRootFormalsExactly(
-      const RefoldModel::MacroInvocation &root,
-      const RefoldModel::MacroInvocation &inv) const;
-
   /// Return whether recorded `caller_macro_id` edges lead from \p inv to the
   /// invocation \p ancestorId.
   bool IsCallerDescendant(const RefoldModel::MacroInvocation &inv,
                           uint64_t ancestorId) const;
 
+  /// Return the invocation \p ancestorId when it is on \p inv's recorded
+  /// caller chain strictly below \p root, and null otherwise.
+  const RefoldModel::MacroInvocation *
+  AncestorBelowRoot(const RefoldModel::MacroInvocation &root,
+                    const RefoldModel::MacroInvocation &inv,
+                    uint64_t ancestorId) const;
+
   /// Add the root formals that formal \p formal of the descendant \p inv is
-  /// spelled from, composing `arg_deps` edge by edge up to \p root.
+  /// spelled from, composing up to \p root.  Each step reads text `arg_deps`,
+  /// which name the immediate caller's formals, or else `arg_token_deps`,
+  /// which name the formals of the invocation whose expansion held the
+  /// argument list.  That invocation must be \p root or on \p inv's caller
+  /// chain below it, whose selections the callers of this proof add, so a
+  /// step anywhere else makes \p dependence unknown.
   void AddFormalRootDependence(const RefoldModel::MacroInvocation &root,
                                const RefoldModel::MacroInvocation &inv,
                                uint32_t formal, Dependence &dependence) const;
+
+  /// Return the root formals that \p inv's callee name was substituted from,
+  /// read off the producer's `callee_subst` history of that token, or nullopt
+  /// when the history does not decide them.
+  ///
+  /// The history lists every substitution of the name, innermost first, and
+  /// the replacement list that spelled it, if one did.  When \p root
+  /// substituted it for a formal, the name is a token of that formal's
+  /// actual, so exactly that formal selects \p inv; when \p root, or an
+  /// invocation below it, spelled it, no root formal does.  Every step before
+  /// that one must be on \p inv's caller chain below \p root, so the
+  /// selections it passed through are the ones the callers of this proof
+  /// add.  A history that leaves the root's expansion, or ends in a file or
+  /// scratch-space spelling, decides nothing.
+  std::optional<llvm::SmallVector<uint32_t, 1>>
+  CalleeSubstRootFormals(const RefoldModel::MacroInvocation &root,
+                         const RefoldModel::MacroInvocation &inv) const;
 
   /// Add the root formals that select the callee of the descendant \p inv at
   /// its recorded caller edge.
   ///
   /// A literal callee is replacement-list text.  A `caller_param` callee
+  /// whose name's substitution history decides its root formals
+  /// (`CalleeSubstRootFormals`) adds exactly those; otherwise it
   /// composes through \p inv's caller, and a pasted callee names its root
   /// argument slices directly.  An opaque callee is only known to come from
   /// some macro argument.  It is resolved solely by
@@ -243,8 +266,9 @@ private:
   /// attributes a token to a root argument by its file location, which for
   /// \p inv's own replacement-list text is the file location of \p inv's
   /// callee name.  Without a paste that name is a verbatim token of the
-  /// attributed actual, so the attributing formals select \p inv.  Every other
-  /// opaque edge makes \p dependence unknown.
+  /// attributed actual, so the attributing formals select \p inv.  Any other
+  /// opaque edge adds the root formals its name's substitution history
+  /// decides, or else makes \p dependence unknown.
   void AddCalleeRootDependence(
       const RefoldModel::MacroInvocation &root,
       const RefoldModel::MacroInvocation &inv,

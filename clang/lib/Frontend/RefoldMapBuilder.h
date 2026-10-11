@@ -59,6 +59,7 @@
 #include <cstdint>
 #include <string>
 #include <optional>
+#include <tuple>
 #include <utility>
 
 using namespace llvm;
@@ -163,6 +164,25 @@ struct MacroCalleeOrigin {
   std::vector<uint32_t> CallerParamIndices;
   std::string Spelling;
   SmallVector<MacroCalleeOriginPart, 4> Parts;
+};
+
+/// Where one token came from, as the SourceManager records it: the macro
+/// invocation whose expansion substituted it for one of that invocation's
+/// formals, or whose replacement list spelled it.
+struct MacroTokenOrigin {
+  /// The invocation, by item id.
+  uint64_t MacroId = 0;
+  /// The formal of `MacroId` that the token was substituted for; absent when
+  /// the token is `MacroId`'s replacement-list text.
+  std::optional<uint32_t> ParamIndex;
+
+  bool operator==(const MacroTokenOrigin &Other) const {
+    return MacroId == Other.MacroId && ParamIndex == Other.ParamIndex;
+  }
+  bool operator<(const MacroTokenOrigin &Other) const {
+    return std::tie(MacroId, ParamIndex) <
+           std::tie(Other.MacroId, Other.ParamIndex);
+  }
 };
 
 /// Structural forwarding metadata for a callee argument derived from a slice
@@ -301,6 +321,38 @@ struct Item {
   // graph and callee origin have been finalized. A null entry means that the
   // producer could not recover that argument spelling exactly.
   std::vector<std::optional<std::string>> UnexpandedArgTexts;
+
+  // The macro this item expanded.  The Preprocessor owns it, so it stays
+  // valid through finalization, which reads its replacement list to place
+  // tokens that other invocations took from this expansion.
+  const MacroInfo *ExpandedMacro = nullptr;
+
+  // For a function-like invocation whose name a macro produced, captured
+  // while MacroArgs is available: the locations of each formal's unexpanded
+  // actual tokens, and of the `,` or `)` that ended each actual (the location
+  // Clang gives an actual's end marker).  Producer-internal: finalization
+  // derives ArgTokenDeps from them and then releases them.
+  std::vector<SmallVector<SourceLocation, 4>> UnexpandedArgTokenLocs;
+  std::vector<SourceLocation> ArgEndLocs;
+
+  /// Formal dependence of the actuals, derived from token locations rather
+  /// than from text: the invocation whose expansion held this call's argument
+  /// list, and for each formal of this invocation, the sorted formals of that
+  /// invocation whose substitution may supply or reshape its actual.
+  /// Recorded only when InvArgDeps are absent and every token of the argument
+  /// list came from that one expansion.
+  struct TokenDeps {
+    uint64_t MacroId = 0;
+    std::vector<std::vector<uint32_t>> Formals;
+  };
+  std::optional<TokenDeps> ArgTokenDeps;
+
+  /// The macro-argument substitutions the callee name token went through,
+  /// innermost first, followed by the replacement list that spelled it when
+  /// that is where it came from; only that final element names no formal.
+  /// Recorded only when the name went through at least one substitution and
+  /// each of them is proven.
+  std::vector<MacroTokenOrigin> CalleeSubstitutions;
 
   // True when the invocation was lexed, from its name through its closing
   // parenthesis, out of one buffer that is not itself a substituted actual:

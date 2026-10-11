@@ -948,6 +948,28 @@ static constexpr const char *RefoldSchema = R"json(
           "$ref": "#/$defs/CalleeOrigin",
           "description": "Producer-proven immediate-edge origin of the complete callee token for this invocation. literal_macro_name identifies a fixed replacement-list name; caller_param identifies direct contribution from formal(s) of caller_macro_id; paste and opaque retain their conservative meanings. Consumers may compose caller_param provenance through caller edges only when each required edge is independently proven."
         },
+        "callee_subst": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "macro_id"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "macro_id": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "param": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "description": "From schema 3.13. Token-location provenance of the callee name token: each macro-argument substitution it went through, innermost first, as the invocation whose expansion substituted it (macro_id) and the formal of that invocation it replaced (param); then, when the name was replacement-list text before its first substitution, a last element naming that invocation with no param. A spelling in a file or in scratch space (a pasted or builtin token) adds no last element. The substituting invocations need not be caller_macro_id or on its caller chain. Emitted only when the name went through at least one substitution and every substitution is proven; partial histories are never emitted."
+        },
         "def_params": {
           "type": "array",
           "items": {
@@ -999,6 +1021,32 @@ static constexpr const char *RefoldSchema = R"json(
             }
           },
           "description": "Immediate-edge argument provenance in invocation order. For child argument i, arg_refs[i] is an ordered sequence of (caller_param_index, byte_begin, byte_end) triples identifying half-open byte slices [byte_begin,byte_end) within that child's raw argument spelling that came from formals of caller_macro_id. The indices therefore name only the immediate caller's formals; transitive root provenance must be composed by the consumer. This refines arg_deps for argument-text lifting and never describes the callee token. It is emitted exactly when arg_deps is."
+        },
+        "arg_token_deps": {
+          "type": "object",
+          "required": [
+            "macro_id",
+            "formals"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "macro_id": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "formals": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "uniqueItems": true
+              }
+            }
+          },
+          "description": "From schema 3.13. Formal dependence of this invocation's actuals derived from token locations, not text: macro_id is the invocation whose expansion held the whole argument list (it need not be caller_macro_id), and formals[i], for formal i of this invocation (one entry per def_params entry, so a variadic tail is one entry), is the sorted set of formals of macro_id whose substitution may supply or reshape that actual. It counts every formal referenced in the actual's span of macro_id's replacement list, including one whose substitution produced no token, and a __VA_OPT__ group or a ', ## __VA_ARGS__' comma counts as a reference to the variadic formal where switching it would change the actual. For a variadic invocation it also counts top-level references before the actual, which can move its boundaries; for a fixed-arity invocation, a substitution that adds or removes a top-level comma yields a call Clang rejects, which this field does not describe. An empty set is a proof of independence. Emitted only when arg_deps is absent and every token of the argument list came from macro_id's expansion."
         },
         "arg_tuple_refs": {
           "type": [

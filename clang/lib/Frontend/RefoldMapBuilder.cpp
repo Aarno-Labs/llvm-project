@@ -1279,6 +1279,455 @@ static const Item *findItemByID(llvm::ArrayRef<Item> Items, uint64_t ID) {
   return nullptr;
 }
 
+/// Index macro invocation items by the start of their expansion, the
+/// location of the invoked name.  A start shared by two items maps to null,
+/// so a lookup never picks one of them.
+static llvm::DenseMap<SourceLocation::UIntTy, const Item *>
+indexMacroItemsByExpansionStart(llvm::ArrayRef<Item> Items) {
+  llvm::DenseMap<SourceLocation::UIntTy, const Item *> Index;
+  for (const Item &It : Items) {
+    if (It.Kind != IK_Macro || It.Loc.isInvalid())
+      continue;
+    auto [Slot, Inserted] = Index.try_emplace(It.Loc.getRawEncoding(), &It);
+    if (!Inserted)
+      Slot->second = nullptr;
+  }
+  return Index;
+}
+
+/// Return the invocation that recorded \p Loc as the start of its expansion.
+static const Item *macroItemExpandedAt(
+    SourceLocation Loc,
+    const llvm::DenseMap<SourceLocation::UIntTy, const Item *> &ByStart) {
+  if (Loc.isInvalid())
+    return nullptr;
+  return ByStart.lookup(Loc.getRawEncoding());
+}
+
+/// Write \p Origin as `{"macro_id": N, "param": K}`, without `param` for
+/// replacement-list text.
+static void writeMacroTokenOrigin(llvm::json::OStream &JO,
+                                  const MacroTokenOrigin &Origin) {
+  JO.object([&] {
+    JO.attribute("macro_id", Origin.MacroId);
+    if (Origin.ParamIndex)
+      JO.attribute("param", *Origin.ParamIndex);
+  });
+}
+
+/// A token's place in the replacement list of the expansion that produced it.
+struct ReplacementListPosition {
+  /// The invocation whose expansion produced the token.
+  const Item *Expansion = nullptr;
+  /// Index into the replacement list of `Expansion->ExpandedMacro`: the token
+  /// itself, or the parameter reference it was substituted for.
+  size_t Index = 0;
+  /// The formal the token was substituted for; absent for replacement-list
+  /// text.
+  std::optional<uint32_t> Param;
+};
+
+/// Return the index of the replacement-list token of \p MI spelled at
+/// \p DefLoc.
+static std::optional<size_t> replacementTokenIndex(const MacroInfo &MI,
+                                                   SourceLocation DefLoc) {
+  for (size_t I = 0, E = MI.getNumTokens(); I != E; ++I)
+    if (MI.getReplacementToken(I).getLocation() == DefLoc)
+      return I;
+  return std::nullopt;
+}
+
+/// Return the formal that replacement-list token \p Index of \p MI refers to.
+static std::optional<uint32_t> replacementTokenParam(const MacroInfo &MI,
+                                                     size_t Index) {
+  const IdentifierInfo *II = MI.getReplacementToken(Index).getIdentifierInfo();
+  const int Param = II ? MI.getParameterNum(II) : -1;
+  if (Param < 0)
+    return std::nullopt;
+  return static_cast<uint32_t>(Param);
+}
+
+/// Return where in a recorded expansion's replacement list the token at
+/// \p Loc came from, or nullopt when that is not proven.
+///
+/// A macro-argument expansion location records the parameter reference it
+/// replaced: its immediate expansion location is that reference, a token of
+/// one expansion's replacement list.  Any other macro location is
+/// replacement-list text when its spelling is a token of the definition of
+/// the expansion its immediate expansion range starts.  An expansion is
+/// identified by its start, and the replacement-list token by its spelling
+/// location in the definition, so file tokens and synthesized tokens
+/// (pasted, stringified, builtin) have no position.
+static std::optional<ReplacementListPosition> replacementListPosition(
+    SourceLocation Loc, const SourceManager &SM,
+    const llvm::DenseMap<SourceLocation::UIntTy, const Item *> &ByStart) {
+  if (!Loc.isMacroID())
+    return std::nullopt;
+  const bool Substituted = SM.isMacroArgExpansion(Loc);
+  const SourceLocation ListLoc =
+      Substituted ? SM.getImmediateExpansionRange(Loc).getBegin() : Loc;
+  if (!ListLoc.isMacroID() || SM.isMacroArgExpansion(ListLoc))
+    return std::nullopt;
+  const Item *Expansion = macroItemExpandedAt(
+      SM.getImmediateExpansionRange(ListLoc).getBegin(), ByStart);
+  if (!Expansion || !Expansion->ExpandedMacro)
+    return std::nullopt;
+  const MacroInfo &MI = *Expansion->ExpandedMacro;
+  const std::optional<size_t> Index =
+      replacementTokenIndex(MI, SM.getSpellingLoc(ListLoc));
+  if (!Index)
+    return std::nullopt;
+  ReplacementListPosition Position{Expansion, *Index, std::nullopt};
+  if (Substituted) {
+    Position.Param = replacementTokenParam(MI, *Index);
+    if (!Position.Param)
+      return std::nullopt;
+  }
+  return Position;
+}
+
+/// Return the expansion whose replacement list produced the token at \p Loc:
+/// as its text, by substitution, or by pasting or stringifying its tokens.
+///
+/// A pasted or stringified token is spelled in scratch space, and its
+/// immediate expansion range starts at an operand or operator of the
+/// replacement list that produced it.
+static const Item *producingExpansion(
+    SourceLocation Loc, const SourceManager &SM,
+    const llvm::DenseMap<SourceLocation::UIntTy, const Item *> &ByStart) {
+  while (Loc.isMacroID()) {
+    if (std::optional<ReplacementListPosition> Position =
+            replacementListPosition(Loc, SM, ByStart))
+      return Position->Expansion;
+    if (SM.isMacroArgExpansion(Loc) ||
+        !SM.isWrittenInScratchSpace(SM.getSpellingLoc(Loc)))
+      return nullptr;
+    const SourceLocation Next = SM.getImmediateExpansionRange(Loc).getBegin();
+    if (Next == Loc)
+      return nullptr;
+    Loc = Next;
+  }
+  return nullptr;
+}
+
+/// Return the provenance of the callee name token at \p NameLoc: each
+/// macro-argument substitution it went through, innermost first, then the
+/// replacement list that spelled it when that is where it came from.
+///
+/// Empty when the name went through no substitution or when one of them is
+/// not proven: a partial history would let a consumer miss the substitution
+/// that matters.  A spelling that is no replacement list (a file token, or a
+/// pasted or builtin one) is left off the end.
+static std::vector<MacroTokenOrigin> calleeSubstitutionHistory(
+    SourceLocation NameLoc, const SourceManager &SM,
+    const llvm::DenseMap<SourceLocation::UIntTy, const Item *> &ByStart) {
+  std::vector<MacroTokenOrigin> History;
+  SourceLocation Loc = NameLoc;
+  while (Loc.isMacroID() && SM.isMacroArgExpansion(Loc)) {
+    std::optional<ReplacementListPosition> Hop =
+        replacementListPosition(Loc, SM, ByStart);
+    if (!Hop)
+      return {};
+    History.push_back(MacroTokenOrigin{Hop->Expansion->ID, Hop->Param});
+    Loc = SM.getImmediateSpellingLoc(Loc);
+  }
+  if (History.empty())
+    return History;
+  if (std::optional<ReplacementListPosition> Spelled =
+          replacementListPosition(Loc, SM, ByStart))
+    History.push_back(MacroTokenOrigin{Spelled->Expansion->ID, std::nullopt});
+  return History;
+}
+
+/// Return whether replacement-list token \p Index of \p MI is `__VA_OPT__`.
+static bool isVaOptToken(const MacroInfo &MI, size_t Index) {
+  const Token &Tok = MI.getReplacementToken(Index);
+  return Tok.is(tok::identifier) &&
+         Tok.getIdentifierInfo()->getName() == "__VA_OPT__";
+}
+
+/// Return the formal that replacement-list token \p Index of \p MI makes the
+/// output depend on: a parameter reference, or `__VA_OPT__`, which tests the
+/// variadic formal.
+static std::optional<uint32_t> replacementTokenDependence(const MacroInfo &MI,
+                                                          size_t Index) {
+  if (std::optional<uint32_t> Param = replacementTokenParam(MI, Index))
+    return Param;
+  if (MI.isVariadic() && isVaOptToken(MI, Index))
+    return static_cast<uint32_t>(MI.getNumParams() - 1);
+  return std::nullopt;
+}
+
+/// A part of a replacement list, inside the argument list of a call it
+/// spells, that outputs a top-level `,` for some variadic actuals and nothing
+/// for others: a `__VA_OPT__(...)` group with a `,` at its own top level,
+/// output only for a non-empty variadic actual, or a `,` pasted to the
+/// variadic formal (`, ## __VA_ARGS__`), which Clang drops for an omitted
+/// variadic actual and, in some modes, an empty one.  The variadic actual
+/// alone switches its output.
+struct VariadicDelimiter {
+  /// First and last replacement-list positions of the part, inclusive.
+  size_t Begin = 0;
+  size_t End = 0;
+  /// Position of the first top-level `,` it outputs.
+  size_t Comma = 0;
+  /// Whether it can output a token before that `,`.
+  bool OutputsBeforeComma = false;
+};
+
+/// Replacement-list structure of the argument list `(` ... `)` at positions
+/// [Open, Close] of a call that one expansion spelled.
+struct ArgumentListShape {
+  /// Paren depth at each position, counting the list's own `(` as depth 1
+  /// and skipping the parentheses of `__VA_OPT__` groups, which are never
+  /// output.  Indexed from Open.
+  SmallVector<unsigned, 32> Depth;
+  SmallVector<VariadicDelimiter, 2> Delimiters;
+};
+
+/// Return the structure of \p MI's replacement list over the argument list
+/// [Open, Close], or nullopt when Close is not the `)` that closes the `(` at
+/// Open.
+static std::optional<ArgumentListShape>
+argumentListShape(const MacroInfo &MI, size_t Open, size_t Close) {
+  ArgumentListShape Shape;
+  SmallVector<bool, 32> GroupParen(Close + 1 - Open, false);
+  SmallVector<bool, 32> InGroup(Close + 1 - Open, false);
+  for (size_t I = Open; I < Close; ++I) {
+    if (!isVaOptToken(MI, I) || !MI.getReplacementToken(I + 1).is(tok::l_paren))
+      continue;
+    const bool Stringified =
+        I > 0 && MI.getReplacementToken(I - 1).is(tok::hash);
+    unsigned GroupDepth = 0;
+    std::optional<size_t> Comma;
+    for (size_t J = I + 1; J <= Close; ++J) {
+      const Token &Tok = MI.getReplacementToken(J);
+      if (Tok.is(tok::l_paren)) {
+        ++GroupDepth;
+      } else if (Tok.is(tok::r_paren) && --GroupDepth == 0) {
+        GroupParen[I + 1 - Open] = GroupParen[J - Open] = true;
+        std::fill(InGroup.begin() + (I - Open),
+                  InGroup.begin() + (J - Open) + 1, true);
+        // A stringified group outputs one string literal.
+        if (Comma && !Stringified)
+          Shape.Delimiters.push_back(
+              VariadicDelimiter{I, J, *Comma, *Comma > I + 2});
+        break;
+      } else if (Tok.is(tok::comma) && GroupDepth == 1 && !Comma) {
+        Comma = J;
+      }
+    }
+  }
+
+  unsigned Depth = 0;
+  for (size_t I = Open; I <= Close; ++I) {
+    const Token &Tok = MI.getReplacementToken(I);
+    if (!GroupParen[I - Open] && Tok.is(tok::l_paren))
+      ++Depth;
+    Shape.Depth.push_back(Depth);
+    if (!GroupParen[I - Open] && Tok.is(tok::r_paren) && --Depth == 0 &&
+        I != Close)
+      return std::nullopt;
+  }
+  if (Depth != 0)
+    return std::nullopt;
+
+  for (size_t I = Open + 1; I + 2 <= Close; ++I) {
+    if (Shape.Depth[I - Open] != 1 || InGroup[I - Open] ||
+        !MI.getReplacementToken(I).is(tok::comma) ||
+        !MI.getReplacementToken(I + 1).is(tok::hashhash) || !MI.isVariadic())
+      continue;
+    std::optional<uint32_t> Param = replacementTokenParam(MI, I + 2);
+    if (Param && *Param + 1 == MI.getNumParams())
+      Shape.Delimiters.push_back(VariadicDelimiter{I, I + 2, I, false});
+  }
+  return Shape;
+}
+
+/// Add to \p Formals the formals that the replacement-list positions
+/// (After, Before) of \p MI depend on.
+static void appendDependenceBetween(const MacroInfo &MI, size_t After,
+                                    size_t Before,
+                                    std::vector<uint32_t> &Formals) {
+  for (size_t I = After + 1; I < Before; ++I)
+    if (std::optional<uint32_t> Dependence = replacementTokenDependence(MI, I))
+      Formals.push_back(*Dependence);
+}
+
+/// Return the formal dependence of \p It's actuals from token locations, or
+/// nullopt when it is not proven.
+///
+/// The argument list must come from one expansion X: the callee name and each
+/// actual's ending `,` or `)` have replacement-list positions in X, and every
+/// actual token was produced by X.  Clang reads actuals unexpanded, so the
+/// tokens between two of those delimiters are X's output between the two
+/// replacement-list positions.  An actual then depends on each formal of X
+/// referenced in its span of the list, including one whose substitution
+/// produced no token, which no token location records.  When the whole list
+/// lies inside one substituted actual of X, every actual depends on that
+/// formal alone.
+///
+/// A span also holds parts of the list that only some variadic actuals
+/// output.  A `VariadicDelimiter` that output nothing in this expansion would
+/// end the actual at its `,` if switched on: the actual depends on the
+/// variadic formal only if the part outputs something before that `,` or the
+/// span continues after it, and never on what the part outputs after it.  One
+/// whose `,` ended the actual would, switched off, merge the material up to
+/// the next delimiter into the actual.  An actual output inside such a part
+/// exists only while it is on.
+///
+/// Two more dependences shape an actual without supplying it.  A reference
+/// between the name and `(` substituted nothing, or the call would not have
+/// formed, and counts for every actual.  For a variadic callee, a reference
+/// at the list's top level before an actual can supply a `,` that moves the
+/// actual's boundaries, as can a `VariadicDelimiter` there.  For a fixed-arity
+/// callee such a `,` would leave a call Clang rejects, which this fact does
+/// not describe.
+static std::optional<Item::TokenDeps> argumentTokenDeps(
+    const Item &It, const SourceManager &SM,
+    const llvm::DenseMap<SourceLocation::UIntTy, const Item *> &ByStart) {
+  const size_t NumFormals = It.DefParams.size();
+  if (NumFormals == 0 || It.UnexpandedArgTokenLocs.size() != NumFormals ||
+      It.ArgEndLocs.size() != NumFormals)
+    return std::nullopt;
+
+  const std::optional<ReplacementListPosition> Name =
+      replacementListPosition(It.CalleeLoc, SM, ByStart);
+  if (!Name)
+    return std::nullopt;
+  const Item &X = *Name->Expansion;
+  const MacroInfo &MI = *X.ExpandedMacro;
+
+  SmallVector<ReplacementListPosition, 4> Ends;
+  for (SourceLocation EndLoc : It.ArgEndLocs) {
+    std::optional<ReplacementListPosition> End =
+        replacementListPosition(EndLoc, SM, ByStart);
+    if (!End || End->Expansion != &X)
+      return std::nullopt;
+    Ends.push_back(*End);
+  }
+  for (const SmallVector<SourceLocation, 4> &Locs : It.UnexpandedArgTokenLocs)
+    for (SourceLocation Loc : Locs)
+      if (producingExpansion(Loc, SM, ByStart) != &X)
+        return std::nullopt;
+
+  Item::TokenDeps Deps{X.ID, std::vector<std::vector<uint32_t>>(NumFormals)};
+  const auto InsideNameActual = [&](const ReplacementListPosition &End) {
+    return End.Param && End.Index == Name->Index;
+  };
+  if (Name->Param && llvm::any_of(Ends, InsideNameActual)) {
+    if (!llvm::all_of(Ends, InsideNameActual))
+      return std::nullopt;
+    for (std::vector<uint32_t> &Formal : Deps.Formals)
+      Formal.push_back(*Name->Param);
+    return Deps;
+  }
+
+  const size_t NumTokens = MI.getNumTokens();
+  size_t Open = Name->Index + 1;
+  SmallVector<uint32_t, 2> Formation;
+  for (; Open < NumTokens && !MI.getReplacementToken(Open).is(tok::l_paren);
+       ++Open) {
+    std::optional<uint32_t> Param = replacementTokenParam(MI, Open);
+    if (!Param)
+      return std::nullopt;
+    Formation.push_back(*Param);
+  }
+  const size_t Close = Ends.back().Index;
+  if (Open >= Close || Ends.back().Param ||
+      !MI.getReplacementToken(Close).is(tok::r_paren))
+    return std::nullopt;
+  const std::optional<ArgumentListShape> Shape =
+      argumentListShape(MI, Open, Close);
+  if (!Shape)
+    return std::nullopt;
+  const auto DepthAt = [&](size_t I) { return Shape->Depth[I - Open]; };
+
+  // Formal K spans list positions [Lo[K], Ends[K].Index].  Adjacent spans
+  // share their delimiter, which belongs to both when it was substituted.
+  // Every actual but the last ends at a top-level `,`; the last, and any
+  // omitted after it, at the closing `)`.
+  SmallVector<size_t, 4> Lo;
+  for (size_t K = 0; K < NumFormals; ++K) {
+    Lo.push_back(K == 0 ? Open + 1 : Ends[K - 1].Index);
+    const ReplacementListPosition &End = Ends[K];
+    if (End.Index < Lo[K] ||
+        (End.Index != Close &&
+         (DepthAt(End.Index) != 1 ||
+          (!End.Param && !MI.getReplacementToken(End.Index).is(tok::comma)))))
+      return std::nullopt;
+  }
+  // Inside a variadic callee's last span a `,` ends no actual, so a part
+  // there is plain content of that actual.
+  const bool VariadicCallee = It.DefParams.back().Variadic;
+  SmallVector<VariadicDelimiter, 2> Delimiters;
+  for (const VariadicDelimiter &D : Shape->Delimiters)
+    if (!VariadicCallee || D.Comma <= Lo.back())
+      Delimiters.push_back(D);
+  const auto IsEnd = [&](size_t I) {
+    return llvm::any_of(Ends, [I](const ReplacementListPosition &End) {
+      return End.Index == I;
+    });
+  };
+  // A part whose `,` ended no actual output nothing here.
+  const auto SwitchedOffTail = [&](size_t I) {
+    return llvm::any_of(Delimiters, [&](const VariadicDelimiter &D) {
+      return !IsEnd(D.Comma) && D.Comma < I && I <= D.End;
+    });
+  };
+  const auto DelimiterToken = [&](size_t I) {
+    return llvm::any_of(
+        Delimiters, [I](const VariadicDelimiter &D) { return D.Begin == I; });
+  };
+  const uint32_t Variadic = MI.isVariadic() ? MI.getNumParams() - 1 : 0;
+
+  for (size_t K = 0; K < NumFormals; ++K) {
+    std::vector<uint32_t> &Formal = Deps.Formals[K];
+    const size_t Hi = Ends[K].Index;
+    for (size_t I = Lo[K]; I <= Hi; ++I) {
+      if (SwitchedOffTail(I) || DelimiterToken(I))
+        continue;
+      if (std::optional<uint32_t> Dependence =
+              replacementTokenDependence(MI, I))
+        Formal.push_back(*Dependence);
+    }
+    for (const VariadicDelimiter &D : Delimiters) {
+      if (!IsEnd(D.Comma)) {
+        if (Lo[K] <= D.Begin && D.Begin <= Hi &&
+            (D.OutputsBeforeComma || D.End + 1 < Hi || Ends[K].Param))
+          Formal.push_back(Variadic);
+        continue;
+      }
+      if (D.Comma == Hi) {
+        // The closing `)` always follows the part.
+        const ReplacementListPosition *Next = &Ends.back();
+        for (const ReplacementListPosition &End : Ends)
+          if (End.Index > D.End && End.Index < Next->Index)
+            Next = &End;
+        if (D.OutputsBeforeComma || D.End + 1 < Next->Index || Next->Param)
+          Formal.push_back(Variadic);
+        appendDependenceBetween(MI, D.End, Next->Index + 1, Formal);
+      }
+      if (Lo[K] <= D.End && D.Comma < Hi)
+        Formal.push_back(Variadic);
+    }
+    if (VariadicCallee) {
+      for (size_t I = Open + 1; I < Lo[K]; ++I)
+        if (DepthAt(I) == 1)
+          if (std::optional<uint32_t> Dependence =
+                  replacementTokenDependence(MI, I))
+            Formal.push_back(*Dependence);
+      for (const VariadicDelimiter &D : Delimiters)
+        if (D.Comma < Lo[K])
+          Formal.push_back(Variadic);
+    }
+    llvm::append_range(Formal, Formation);
+    llvm::sort(Formal);
+    Formal.erase(std::unique(Formal.begin(), Formal.end()), Formal.end());
+  }
+  return Deps;
+}
+
 static llvm::StringRef stripBalancedOuterParens(llvm::StringRef Text) {
   llvm::StringRef Cur = Text.trim();
   while (Cur.size() >= 2 && Cur.front() == '(' && Cur.back() == ')') {
@@ -2786,7 +3235,22 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
     for (unsigned I = 0; I != NumParams; ++I)
       It.UnexpandedArgTexts.push_back(
           getUnexpandedMacroArgText(Args, I, SM, PP.getLangOpts()));
+
+    // A call formed during another expansion has actuals whose spelling text
+    // need not name what substituted them; keep their token locations, which
+    // record it, for finalization.
+    if (Args && MacroNameTok.getLocation().isMacroID()) {
+      It.UnexpandedArgTokenLocs.resize(NumParams);
+      It.ArgEndLocs.reserve(NumParams);
+      for (unsigned I = 0; I != NumParams; ++I) {
+        const Token *T = Args->getUnexpArgument(I);
+        for (; T->isNot(tok::eof); ++T)
+          It.UnexpandedArgTokenLocs[I].push_back(T->getLocation());
+        It.ArgEndLocs.push_back(T->getLocation());
+      }
+    }
   }
+  It.ExpandedMacro = MI;
 
   It.Loc = Range.getBegin();
   It.ExpansionFrameId = ExpansionFrameId;
@@ -4703,7 +5167,7 @@ void RefoldMapBuilder::writeJSON() {
       PragmaItemsWithImage == PragmasEmittedIntoOutput;
 
   JO.object([&] {
-    JO.attribute("version", "3.12");
+    JO.attribute("version", "3.13");
     JO.attribute("pragma_images_complete", PragmaImagesComplete);
 
     const auto &PPO = PP.getPreprocessorOpts();
@@ -5352,6 +5816,29 @@ void RefoldMapBuilder::writeJSON() {
       } else if (Callee.CalleeLoc.isMacroID() &&
                  SM.isMacroArgExpansion(Callee.CalleeLoc)) {
         Callee.CalleeOrigin.Kind = MCO_Opaque;
+      }
+    }
+
+    // Token-location provenance.  Unlike callee_origin and arg_deps, which
+    // read the caller's callsite text, it names the invocation that
+    // substituted or spelled the tokens, which need not be the immediate
+    // caller, and needs no spelled callsite.  Argument dependence is recorded
+    // only where text arg_deps are absent.
+    {
+      const llvm::DenseMap<SourceLocation::UIntTy, const Item *> ByStart =
+          indexMacroItemsByExpansionStart(Items);
+      for (Item &It : Items) {
+        if (It.Kind != IK_Macro)
+          continue;
+        It.CalleeSubstitutions =
+            calleeSubstitutionHistory(It.CalleeLoc, SM, ByStart);
+        It.ArgTokenDeps.reset();
+        if (It.InvArgDeps.empty())
+          It.ArgTokenDeps = argumentTokenDeps(It, SM, ByStart);
+        It.UnexpandedArgTokenLocs.clear();
+        It.UnexpandedArgTokenLocs.shrink_to_fit();
+        It.ArgEndLocs.clear();
+        It.ArgEndLocs.shrink_to_fit();
       }
     }
 
@@ -6526,6 +7013,13 @@ void RefoldMapBuilder::writeJSON() {
               }
             });
 
+            if (!It.CalleeSubstitutions.empty()) {
+              JO.attributeArray("callee_subst", [&] {
+                for (const MacroTokenOrigin &Origin : It.CalleeSubstitutions)
+                  writeMacroTokenOrigin(JO, Origin);
+              });
+            }
+
             if (!It.InvArgDeps.empty()) {
               JO.attributeArray("arg_deps", [&] {
                 for (const auto &ArgDeps : It.InvArgDeps) {
@@ -6551,6 +7045,21 @@ void RefoldMapBuilder::writeJSON() {
                     }
                   });
                 }
+              });
+            }
+
+            if (It.ArgTokenDeps) {
+              JO.attributeObject("arg_token_deps", [&] {
+                JO.attribute("macro_id", It.ArgTokenDeps->MacroId);
+                JO.attributeArray("formals", [&] {
+                  for (const std::vector<uint32_t> &Formal :
+                       It.ArgTokenDeps->Formals) {
+                    JO.array([&] {
+                      for (uint32_t Dep : Formal)
+                        JO.value(Dep);
+                    });
+                  }
+                });
               });
             }
 

@@ -259,6 +259,9 @@ struct FatalRecordReader {
   uint32_t UInt32(StringRef key) const {
     return Read(key, asUInt32, "a uint32");
   }
+  uint64_t UInt64(StringRef key) const {
+    return Read(key, asUInt64, "a uint64");
+  }
   bool Bool(StringRef key) const { return Read(key, asBool, "a bool"); }
   const json::Array &Array(StringRef key) const {
     return *Read(key, asArray, "an array");
@@ -1755,6 +1758,44 @@ parseMacroInvocationItem(const json::Object &obj, const std::string &ctxItem) {
     }
   }
 
+  std::vector<RefoldModel::MacroTokenOrigin> calleeSubst;
+  if (auto substArr = asOptArray(obj, "callee_subst")) {
+    for (const json::Value &Elem : **substArr) {
+      FatalRecordReader hop = FatalRecordReader::At(
+          Elem, ctxItem, "callee_subst element", "callee_subst");
+      calleeSubst.push_back(RefoldModel::MacroTokenOrigin{
+          hop.UInt64("macro_id"),
+          asOptUInt32(hop.obj, "param", /*canBeNull=*/false)});
+    }
+  }
+
+  std::optional<RefoldModel::MacroArgTokenDeps> argTokenDeps;
+  if (const json::Value *depsVal = obj.get("arg_token_deps")) {
+    FatalRecordReader deps = FatalRecordReader::At(
+        *depsVal, ctxItem, "arg_token_deps", "arg_token_deps");
+    argTokenDeps.emplace();
+    argTokenDeps->macroId = deps.UInt64("macro_id");
+    for (const json::Value &Entry : deps.Array("formals")) {
+      auto aOrErr = asArray(Entry, ctxItem);
+      if (!aOrErr)
+        REFOLD_LOG_FATAL("model",
+                         "{0}: arg_token_deps.formals entry is not "
+                         "an array",
+                         ctxItem);
+      std::vector<uint32_t> formals;
+      for (const json::Value &Elem : **aOrErr) {
+        auto uOrErr = asUInt32(Elem, ctxItem);
+        if (!uOrErr)
+          REFOLD_LOG_FATAL("model",
+                           "{0}: arg_token_deps.formals element is not a "
+                           "uint32",
+                           ctxItem);
+        formals.push_back(*uOrErr);
+      }
+      argTokenDeps->formals.push_back(std::move(formals));
+    }
+  }
+
   MacroInvocation mi(/*id*/ id,
                      /*subkind*/ subkind,
                      /*name*/ name,
@@ -1784,6 +1825,8 @@ parseMacroInvocationItem(const json::Object &obj, const std::string &ctxItem) {
                      /*argTupleRefs*/ std::move(argTupleRefs));
   mi.useB = useB;
   mi.useE = useE;
+  mi.calleeSubst = std::move(calleeSubst);
+  mi.argTokenDeps = std::move(argTokenDeps);
 
   return mi;
 }
@@ -2541,6 +2584,44 @@ void RefoldModel::SanitizeMacroCallerGraph() {
   }
 }
 
+/// Return whether every invocation and formal \p mi's `callee_subst` names
+/// exists, every element but a last replacement-list one names a formal, and
+/// no invocation appears twice: a token is substituted once per expansion.
+static bool calleeSubstIsWellFormed(
+    const RefoldModel::MacroInvocation &mi,
+    const DenseMap<uint64_t, RefoldModel::MacroInvocation *> &macroById) {
+  DenseSet<uint64_t> seen;
+  for (size_t i = 0; i < mi.calleeSubst.size(); ++i) {
+    const RefoldModel::MacroTokenOrigin &hop = mi.calleeSubst[i];
+    const auto it = macroById.find(hop.macroId);
+    if (it == macroById.end() || hop.macroId == mi.id ||
+        !seen.insert(hop.macroId).second)
+      return false;
+    if (hop.param ? *hop.param >= it->second->defParams.size()
+                  : i + 1 != mi.calleeSubst.size())
+      return false;
+  }
+  return true;
+}
+
+/// Return whether \p mi's `arg_token_deps` has one entry per formal of
+/// \p mi and names only formals of an existing other invocation.
+static bool argTokenDepsAreWellFormed(
+    const RefoldModel::MacroInvocation &mi,
+    const DenseMap<uint64_t, RefoldModel::MacroInvocation *> &macroById) {
+  const auto it = macroById.find(mi.argTokenDeps->macroId);
+  if (it == macroById.end() || mi.argTokenDeps->macroId == mi.id ||
+      mi.argTokenDeps->formals.size() != mi.defParams.size())
+    return false;
+  const size_t numFormals = it->second->defParams.size();
+  return llvm::all_of(mi.argTokenDeps->formals,
+                      [numFormals](const std::vector<uint32_t> &formals) {
+                        return llvm::all_of(formals, [numFormals](uint32_t f) {
+                          return f < numFormals;
+                        });
+                      });
+}
+
 void RefoldModel::SanitizeMacroProofArtifacts() {
   // Build an id -> invocation lookup once so that per-invocation validation can
   // cheaply consult the caller macro when caller-relative proof metadata
@@ -2776,6 +2857,23 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
           mi.argTupleRefs.clear();
         }
       }
+    }
+
+    // ----- Token-location provenance (schema 3.13) -----
+    //
+    // Both records name the invocations they depend on directly rather than
+    // through caller edges, and neither is read from raw invocation text, so
+    // they survive the loss of either; each named invocation and formal must
+    // exist.
+    if (!mi.calleeSubst.empty() && !calleeSubstIsWellFormed(mi, macroById)) {
+      REFOLD_LOG_WARN("model", "dropping invalid callee_subst for macro id={0}",
+                      mi.id);
+      mi.calleeSubst.clear();
+    }
+    if (mi.argTokenDeps && !argTokenDepsAreWellFormed(mi, macroById)) {
+      REFOLD_LOG_WARN(
+          "model", "dropping invalid arg_token_deps for macro id={0}", mi.id);
+      mi.argTokenDeps.reset();
     }
 
     // ----- Caller-dependent provenance cleanup -----

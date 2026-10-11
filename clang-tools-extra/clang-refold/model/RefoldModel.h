@@ -685,6 +685,26 @@ public:
     std::vector<CalleeOriginPart> parts;
   };
 
+  /// Where a token came from, by its SourceManager location (schema 3.13): the
+  /// invocation whose expansion substituted it for formal `param`, or, with
+  /// no `param`, whose replacement list spelled it.
+  struct MacroTokenOrigin {
+    uint64_t macroId = 0;
+    std::optional<uint32_t> param;
+  };
+
+  /// Formal dependence of an invocation's actuals derived from token
+  /// locations (schema 3.13, `arg_token_deps`).
+  struct MacroArgTokenDeps {
+    /// The invocation whose expansion held the whole argument list; not
+    /// necessarily the immediate caller.
+    uint64_t macroId = 0;
+    /// Per formal of the invocation (a variadic tail is one formal), the
+    /// formals of `macroId` whose substitution may supply or reshape that
+    /// actual.  Empty means independent of every formal of `macroId`.
+    std::vector<std::vector<uint32_t>> formals;
+  };
+
   /// Producer record for one macro invocation instance.
   struct MacroInvocation {
     /// Stable producer id for this physical macro invocation.
@@ -745,6 +765,15 @@ public:
     std::vector<std::vector<InvArgRef>> argRefs;
     /// Root invocation tuple-element slices used by each formal.
     std::vector<std::vector<TupleArgRef>> argTupleRefs;
+    /// Every macro-argument substitution the callee name token went through,
+    /// innermost first, then the invocation whose replacement list spelled it
+    /// when it was replacement-list text (the only element without a
+    /// `param`).  Empty when the name went through no substitution or the
+    /// producer did not prove each one.
+    std::vector<MacroTokenOrigin> calleeSubst;
+    /// Token-location dependence of the actuals; present only when `argDeps`
+    /// is absent.
+    std::optional<MacroArgTokenDeps> argTokenDeps;
     /// Minimal half-open A-token cover for spans, argument spans, and body
     /// spans.
     PPCover cover;

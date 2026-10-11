@@ -103,55 +103,42 @@ bool mayProduceCoverToken(const RefoldModel::MacroInvocation &inv,
   });
 }
 
-/// Return the caller formals referenced by the actual bound to formal
-/// \p formal of \p inv, from the producer's edge-local `arg_deps`.
+/// The formals of one invocation that an actual of another depends on.
+struct ActualSource {
+  /// The invocation whose formals they are.
+  uint64_t macroId = 0;
+  SmallVector<uint32_t, 4> formals;
+};
+
+/// Return the formals that the actual bound to formal \p formal of \p inv
+/// depends on, with the invocation they belong to.
 ///
-/// `arg_deps` is indexed by actual, so a variadic formal collects every actual
-/// from its position on and an omitted variadic actual references nothing.
-/// Returns nullopt when the producer recorded no `arg_deps` for \p inv, or no
-/// entry for a non-variadic formal.
-std::optional<SmallVector<uint32_t, 4>>
-callerFormalsOfFormal(const RefoldModel::MacroInvocation &inv,
-                      uint32_t formal) {
-  if (inv.argDeps.empty())
+/// Text `arg_deps` name the immediate caller's formals and are indexed by
+/// actual, so a variadic formal collects every actual from its position on
+/// and an omitted variadic actual references nothing.  Without them,
+/// `arg_token_deps` name the formals of the invocation whose expansion held
+/// the argument list, per formal.  Returns nullopt when neither is recorded,
+/// or when text `arg_deps` lack an entry for a non-variadic formal.
+std::optional<ActualSource>
+actualSourceOfFormal(const RefoldModel::MacroInvocation &inv, uint32_t formal) {
+  if (inv.argDeps.empty()) {
+    if (!inv.argTokenDeps || formal >= inv.argTokenDeps->formals.size())
+      return std::nullopt;
+    ActualSource source{inv.argTokenDeps->macroId, {}};
+    append_range(source.formals, inv.argTokenDeps->formals[formal]);
+    return source;
+  }
+  if (!inv.callerMacroId)
     return std::nullopt;
   const bool variadic =
       formal < inv.defParams.size() && inv.defParams[formal].variadic;
   if (!variadic && formal >= inv.argDeps.size())
     return std::nullopt;
-  SmallVector<uint32_t, 4> callerFormals;
+  ActualSource source{*inv.callerMacroId, {}};
   const size_t end = variadic ? inv.argDeps.size() : size_t(formal) + 1;
   for (size_t actual = formal; actual < end; ++actual)
-    append_range(callerFormals, inv.argDeps[actual]);
-  return callerFormals;
-}
-
-/// Return the caller formal that the actual bound to formal \p formal of
-/// \p inv spells, when that actual is exactly one caller formal reference.
-///
-/// `arg_refs` slices are offsets into `inv_text`, as `inv_arg_ranges` are once
-/// `inv_b` is subtracted.
-std::optional<uint32_t>
-callerFormalSpelledAsActual(const RefoldModel::MacroInvocation &inv,
-                            uint32_t formal) {
-  if (formal >= inv.argRefs.size() || inv.argRefs[formal].size() != 1 ||
-      formal >= inv.invArgRanges.size() || !inv.invText || !inv.invB ||
-      (formal < inv.defParams.size() && inv.defParams[formal].variadic))
-    return std::nullopt;
-  const auto [begin, end] = inv.invArgRanges[formal];
-  if (!begin || !end || *begin < *inv.invB || *end < *begin ||
-      *end - *inv.invB > inv.invText->size())
-    return std::nullopt;
-  const size_t actualB = *begin - *inv.invB;
-  const size_t actualE = *end - *inv.invB;
-  const RefoldModel::InvArgRef &ref = inv.argRefs[formal].front();
-  // A slice of the actual as long as the trimmed actual is the trimmed actual.
-  if (ref.byteBegin < actualB || ref.byteBegin > ref.byteEnd ||
-      ref.byteEnd > actualE ||
-      ref.byteEnd - ref.byteBegin !=
-          inv.invText->slice(actualB, actualE).trim().size())
-    return std::nullopt;
-  return ref.callerParamIndex;
+    append_range(source.formals, inv.argDeps[actual]);
+  return source;
 }
 
 /// Return whether two invocations are spelled in one file of one include
@@ -269,44 +256,6 @@ RefoldMacroFormalDependenceProof::ClassifyCoverInvocation(
   return CoverRole::Unattributed;
 }
 
-bool RefoldMacroFormalDependenceProof::SelectionNamesRootFormalsExactly(
-    const RefoldModel::MacroInvocation &root,
-    const RefoldModel::MacroInvocation &inv) const {
-  const RefoldModel::MacroInvocation *cur = &inv;
-  for (size_t hops = 0, limit = deps_.model.GetMacroInvocations().size();
-       hops <= limit && cur->callerMacroId; ++hops) {
-    const RefoldModel::MacroInvocation *caller =
-        deps_.macroTopology.FindMacroInvocationById(*cur->callerMacroId);
-    if (!caller)
-      return false;
-    if (cur->calleeOrigin.kind == MacroCalleeOriginKind::CallerParam) {
-      for (uint32_t formal : cur->calleeOrigin.callerParamIndices) {
-        const RefoldModel::MacroInvocation *holder = caller;
-        for (size_t up = 0; holder->id != root.id && up <= limit; ++up) {
-          const std::optional<uint32_t> callerFormal =
-              callerFormalSpelledAsActual(*holder, formal);
-          if (!callerFormal || !holder->callerMacroId)
-            return false;
-          formal = *callerFormal;
-          holder = deps_.macroTopology.FindMacroInvocationById(
-              *holder->callerMacroId);
-          if (!holder)
-            return false;
-        }
-        if (holder->id != root.id)
-          return false;
-      }
-    } else if (cur->calleeOrigin.kind !=
-               MacroCalleeOriginKind::LiteralMacroName) {
-      return false;
-    }
-    if (caller->id == root.id)
-      return true;
-    cur = caller;
-  }
-  return false;
-}
-
 bool RefoldMacroFormalDependenceProof::SelectedOutsideRoot(
     const RefoldModel::MacroInvocation &inv,
     ArrayRef<uint64_t> rootAncestors) const {
@@ -325,6 +274,19 @@ bool RefoldMacroFormalDependenceProof::SelectedOutsideRoot(
   return false;
 }
 
+const RefoldModel::MacroInvocation *
+RefoldMacroFormalDependenceProof::AncestorBelowRoot(
+    const RefoldModel::MacroInvocation &root,
+    const RefoldModel::MacroInvocation &inv, uint64_t ancestorId) const {
+  if (ancestorId == root.id || !IsCallerDescendant(inv, ancestorId))
+    return nullptr;
+  const RefoldModel::MacroInvocation *ancestor =
+      deps_.macroTopology.FindMacroInvocationById(ancestorId);
+  if (!ancestor || !IsCallerDescendant(*ancestor, root.id))
+    return nullptr;
+  return ancestor;
+}
+
 void RefoldMacroFormalDependenceProof::AddFormalRootDependence(
     const RefoldModel::MacroInvocation &root,
     const RefoldModel::MacroInvocation &inv, uint32_t formal,
@@ -336,25 +298,47 @@ void RefoldMacroFormalDependenceProof::AddFormalRootDependence(
     const auto [cur, curFormal] = worklist.pop_back_val();
     if (!visited.insert({cur->id, curFormal}).second)
       continue;
-    std::optional<SmallVector<uint32_t, 4>> callerFormals =
-        callerFormalsOfFormal(*cur, curFormal);
-    if (!callerFormals || !cur->callerMacroId) {
+    std::optional<ActualSource> source = actualSourceOfFormal(*cur, curFormal);
+    if (!source) {
       dependence.known = false;
       return;
     }
-    if (*cur->callerMacroId == root.id) {
-      append_range(dependence.formals, *callerFormals);
+    if (source->macroId == root.id) {
+      append_range(dependence.formals, source->formals);
       continue;
     }
-    const RefoldModel::MacroInvocation *caller =
-        deps_.macroTopology.FindMacroInvocationById(*cur->callerMacroId);
-    if (!caller) {
+    // Composing further keeps to `inv`'s caller chain, whose selections the
+    // callers of this proof add.
+    const RefoldModel::MacroInvocation *holder =
+        AncestorBelowRoot(root, *cur, source->macroId);
+    if (!holder) {
       dependence.known = false;
       return;
     }
-    for (uint32_t callerFormal : *callerFormals)
-      worklist.push_back({caller, callerFormal});
+    for (uint32_t holderFormal : source->formals)
+      worklist.push_back({holder, holderFormal});
   }
+}
+
+std::optional<SmallVector<uint32_t, 1>>
+RefoldMacroFormalDependenceProof::CalleeSubstRootFormals(
+    const RefoldModel::MacroInvocation &root,
+    const RefoldModel::MacroInvocation &inv) const {
+  for (const RefoldModel::MacroTokenOrigin &hop : inv.calleeSubst) {
+    if (hop.macroId == root.id) {
+      SmallVector<uint32_t, 1> formals;
+      if (hop.param)
+        formals.push_back(*hop.param);
+      return formals;
+    }
+    // A substitution or spelling inside the root's expansion, by an
+    // invocation whose own selection the callers of this proof account for.
+    if (!AncestorBelowRoot(root, inv, hop.macroId))
+      return std::nullopt;
+    if (!hop.param)
+      return SmallVector<uint32_t, 1>();
+  }
+  return std::nullopt;
 }
 
 void RefoldMacroFormalDependenceProof::AddCalleeRootDependence(
@@ -367,6 +351,13 @@ void RefoldMacroFormalDependenceProof::AddCalleeRootDependence(
   case MacroCalleeOriginKind::LiteralMacroName:
     return;
   case MacroCalleeOriginKind::CallerParam: {
+    // Composing the caller's `arg_deps` over-approximates the selecting
+    // formals through an actual that names several of them.
+    if (std::optional<SmallVector<uint32_t, 1>> formals =
+            CalleeSubstRootFormals(root, inv)) {
+      append_range(dependence.formals, *formals);
+      return;
+    }
     if (origin.callerParamIndices.empty() || !inv.callerMacroId) {
       dependence.known = false;
       return;
@@ -402,10 +393,16 @@ void RefoldMacroFormalDependenceProof::AddCalleeRootDependence(
     }
     return;
   case MacroCalleeOriginKind::Opaque:
-    if (!opaqueSelectorRootFormals)
-      dependence.known = false;
-    else
+    if (opaqueSelectorRootFormals) {
       append_range(dependence.formals, *opaqueSelectorRootFormals);
+      return;
+    }
+    if (std::optional<SmallVector<uint32_t, 1>> formals =
+            CalleeSubstRootFormals(root, inv)) {
+      append_range(dependence.formals, *formals);
+      return;
+    }
+    dependence.known = false;
     return;
   }
 }
@@ -510,13 +507,9 @@ RefoldMacroFormalDependenceProof::TokenDependence(
       // passing it through from its arguments, as `F(v) v` does when a root
       // formal names `F`.  The token's own attributions carry what those
       // arguments observe, but not that the descendant was selected, so add
-      // its selection.  This is done only where the producer names the
-      // selecting root formals exactly: through structured actuals, text
-      // `arg_deps` over-approximate them, and an opaque or pasted callee has
-      // none, so such a descendant is still not seen here.
+      // its selection, which is unknown where the producer recorded none.
       const std::optional<uint64_t> anchor = uncreditedOutputAnchor(*inv);
-      if (role == CoverRole::Descendant && anchor && *anchor <= tok &&
-          SelectionNamesRootFormalsExactly(root, *inv))
+      if (role == CoverRole::Descendant && anchor && *anchor <= tok)
         descendants.push_back({inv, /*credited=*/false});
       continue;
     }
