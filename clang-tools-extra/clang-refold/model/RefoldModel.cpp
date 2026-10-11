@@ -1490,6 +1490,9 @@ parseMacroInvocationItem(const json::Object &obj, const std::string &ctxItem) {
   parseOptByteRanges("normalized_inv_arg_text_ranges",
                      normalizedInvArgTextRanges);
 
+  std::vector<MacroInvocation::OptByteRange> useArgRanges;
+  parseOptByteRanges("use_arg_ranges", useArgRanges);
+
   std::vector<PPArgSpan> argSpans;
   if (const json::Value *spansVal = obj.get("arg_spans")) {
     auto sp = parseSpans<PPArgSpan>(*spansVal, "macro.arg_spans",
@@ -1825,6 +1828,7 @@ parseMacroInvocationItem(const json::Object &obj, const std::string &ctxItem) {
                      /*argTupleRefs*/ std::move(argTupleRefs));
   mi.useB = useB;
   mi.useE = useE;
+  mi.useArgRanges = std::move(useArgRanges);
   mi.calleeSubst = std::move(calleeSubst);
   mi.argTokenDeps = std::move(argTokenDeps);
 
@@ -2622,6 +2626,27 @@ static bool argTokenDepsAreWellFormed(
                       });
 }
 
+/// Return whether \p mi's `use_arg_ranges` has one entry per formal of \p mi,
+/// each null or a non-empty range inside its use, in formal order without
+/// overlap, and not all null.
+static bool useArgRangesAreWellFormed(const RefoldModel::MacroInvocation &mi) {
+  if (mi.useArgRanges.size() != mi.defParams.size() || !mi.useB || !mi.useE)
+    return false;
+  uint64_t floor = *mi.useB;
+  bool any = false;
+  for (const RefoldModel::MacroInvocation::OptByteRange &range :
+       mi.useArgRanges) {
+    if (!range.first && !range.second)
+      continue;
+    if (!range.first || !range.second || *range.first < floor ||
+        *range.second <= *range.first || *range.second > *mi.useE)
+      return false;
+    floor = *range.second;
+    any = true;
+  }
+  return any;
+}
+
 void RefoldModel::SanitizeMacroProofArtifacts() {
   // Build an id -> invocation lookup once so that per-invocation validation can
   // cheaply consult the caller macro when caller-relative proof metadata
@@ -2874,6 +2899,13 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
       REFOLD_LOG_WARN(
           "model", "dropping invalid arg_token_deps for macro id={0}", mi.id);
       mi.argTokenDeps.reset();
+    }
+
+    // ----- Source-spelled actuals of a generated call (schema 3.14) -----
+    if (!mi.useArgRanges.empty() && !useArgRangesAreWellFormed(mi)) {
+      REFOLD_LOG_WARN(
+          "model", "dropping invalid use_arg_ranges for macro id={0}", mi.id);
+      mi.useArgRanges.clear();
     }
 
     // ----- Caller-dependent provenance cleanup -----

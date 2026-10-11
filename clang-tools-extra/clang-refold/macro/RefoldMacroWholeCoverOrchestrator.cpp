@@ -11,13 +11,18 @@
 #include "line-control/LineDirectiveInserter.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroDAGSharedHelpers.h"
+#include "macro/RefoldMacroFormalDependenceProof.h"
 #include "macro/RefoldMacroOccurrenceProofValidator.h"
 #include "macro/RefoldMacroPatchPlanner.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
+#include "macro/RefoldMacroStandardArgsOnlyPatchBuilder.h"
 #include "macro/RefoldMacroStateProof.h"
+#include "macro/RefoldMacroTopology.h"
 #include "macro/RefoldMacroTupleHelpers.h"
+#include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "macro/RefoldMacroWholeCoverPlanningContext.h"
+#include "model/RefoldPathIdentity.h"
 #include "proof/RefoldAcceptedResultRanker.h"
 #include "proof/RefoldMacroPatchProofClassifier.h"
 #include "proof/RefoldOwnerStateProof.h"
@@ -344,6 +349,98 @@ RefoldMacroWholeCoverOrchestrator::TryCounterLiteralWholeCoverPatch(
   return patch;
 }
 
+/// Return whether \p inv's caller chain reaches \p ancestorId.  A chain
+/// longer than the invocation count, or broken, does not.
+static bool isCallerDescendantOf(const RefoldMacroTopology &topology,
+                                 const RefoldModel::MacroInvocation &inv,
+                                 uint64_t ancestorId, size_t invocationCount) {
+  const RefoldModel::MacroInvocation *cur = &inv;
+  for (size_t hops = 0; hops <= invocationCount && cur->callerMacroId; ++hops) {
+    if (*cur->callerMacroId == ancestorId)
+      return true;
+    cur = topology.FindMacroInvocationById(*cur->callerMacroId);
+    if (!cur)
+      return false;
+  }
+  return false;
+}
+
+/// Return whether every A-token span \p inv records lies in the half-open
+/// \p cover; an invocation credited with no token must be anchored there.
+static bool
+invocationProvenanceInsideCover(const RefoldModel::MacroInvocation &inv,
+                                std::pair<uint64_t, uint64_t> cover) {
+  for (const RefoldModel::PPSpan &span : inv.spans)
+    if (span.begin < cover.first || span.end > cover.second)
+      return false;
+  for (const RefoldModel::PPSpan &span : inv.bodySpans)
+    if (span.begin < cover.first || span.end > cover.second)
+      return false;
+  for (const std::vector<RefoldModel::PPArgSpan> *spans :
+       {&inv.argSpans, &inv.stringifySpans, &inv.pasteSpans})
+    for (const RefoldModel::PPArgSpan &span : *spans)
+      if (span.begin < cover.first || span.end > cover.second)
+        return false;
+  return true;
+}
+
+/// Return whether the token hunk \p hunk edits the A-token range \p cover:
+/// it replaces or deletes a token of it, or inserts between two of its
+/// tokens.  An insertion at either edge is outside every token of the cover.
+static bool hunkEditsCover(const diffutils::Hunk &hunk,
+                           std::pair<uint64_t, uint64_t> cover) {
+  if (hunk.aStart == hunk.aEnd)
+    return cover.first < hunk.aStart && hunk.aStart < cover.second;
+  return hunk.aStart < cover.second && cover.first < hunk.aEnd;
+}
+
+/// Return whether `use_arg_ranges` locates formal \p formal of \p inv in
+/// source at or after \p suffixBegin.
+static bool actualSpelledInSuffix(const RefoldModel::MacroInvocation &inv,
+                                  uint32_t formal, uint64_t suffixBegin) {
+  return formal < inv.useArgRanges.size() && inv.useArgRanges[formal].first &&
+         *inv.useArgRanges[formal].first >= suffixBegin;
+}
+
+/// Return the standard and stringified occurrences of the formals of \p inv
+/// whose actuals `use_arg_ranges` locates at or after \p suffixBegin.
+static SmallVector<RefoldModel::PPArgSpan, 8>
+suffixActualOccurrences(const RefoldModel::MacroInvocation &inv,
+                        uint64_t suffixBegin) {
+  SmallVector<RefoldModel::PPArgSpan, 8> occurrences;
+  for (const std::vector<RefoldModel::PPArgSpan> *spans :
+       {&inv.argSpans, &inv.stringifySpans})
+    for (const RefoldModel::PPArgSpan &span : *spans)
+      if (actualSpelledInSuffix(inv, span.argIdx, suffixBegin))
+        occurrences.push_back(span);
+  return occurrences;
+}
+
+/// Return whether \p inv, a translation-unit invocation other than the one
+/// rewritten, has its name spelled in, or reads an actual from, the bytes
+/// `[begin, end)` of the translation unit \p tuPath.
+///
+/// `inv_b` is where a call's name was spelled, but `inv_e` is where its last
+/// token was, so the envelope of a call whose name a replacement list spelled
+/// says nothing about the bytes between.  A call whose name is spelled in an
+/// actual is expanded while that actual is, and is read nowhere else.
+static bool invocationReadsSourceIn(const RefoldModel::MacroInvocation &inv,
+                                    const RefoldPathIdentity &pathIdentity,
+                                    StringRef tuPath, uint64_t begin,
+                                    uint64_t end) {
+  if (inv.ownerIncludeId)
+    return false;
+  if (inv.invFile && inv.invB &&
+      pathIdentity.PathsEqual(*inv.invFile, tuPath) && begin <= *inv.invB &&
+      *inv.invB < end)
+    return true;
+  return llvm::any_of(inv.useArgRanges,
+                      [&](const RefoldModel::MacroInvocation::OptByteRange &r) {
+                        return r.first && r.second && *r.first < end &&
+                               begin < *r.second;
+                      });
+}
+
 std::optional<MacroPatch>
 RefoldMacroWholeCoverOrchestrator::TryRecursiveTupleGeneratedReplayFromCallerAncestor(
     const RefoldModel::MacroInvocation &invocation,
@@ -445,6 +542,246 @@ RefoldMacroWholeCoverOrchestrator::TryRecursiveTupleGeneratedReplayFromCallerAnc
   return uniqueCandidate;
 }
 
+/// Return whether \p text, an actual spelled from B, names a macro: one the
+/// unit defines or undefines anywhere, or one Clang provides.
+///
+/// B is fully expanded, so such a name is an identifier there.  Spelled in
+/// source as an actual it would be expanded when the actual is substituted,
+/// and the unit-wide macro-state audit does not judge a macro patch's
+/// payload, so the rewrite must not spell it at all.
+static bool actualNamesMacro(StringRef text, const RefoldModel &model,
+                             const clang::LangOptions &lexLang) {
+  SmallVector<RefoldLexBoundaryToken, 16> tokens;
+  refoldLexBoundaryTokens(text, lexLang, tokens);
+  for (const RefoldLexBoundaryToken &token : tokens) {
+    if (token.kind != tok::raw_identifier && token.kind != tok::identifier)
+      continue;
+    const StringRef name = token.spelling;
+    if (!model.GetMacroDirectivesByName(name).empty() ||
+        stringutils::isLineDirectiveSensitiveBuiltin(name) ||
+        llvm::is_contained({StringRef("__COUNTER__"),
+                            StringRef("__INCLUDE_LEVEL__"),
+                            StringRef("__TIMESTAMP__"), StringRef("__DATE__"),
+                            StringRef("__TIME__"), StringRef("_Pragma")},
+                           name))
+      return true;
+  }
+  return false;
+}
+
+/// Trace why the call-chain suffix theorem refused a hunk of \p root once a
+/// call reading source after the root's callsite was found for it.
+static void
+traceCallChainSuffixRefusal(const RefoldModel::MacroInvocation &root,
+                            uint64_t consumerId, StringRef reason) {
+  REFOLD_LOG_TRACE("macro/call-chain-suffix",
+                   "refuse root id={0} name={1} consumer id={2} reason={3}",
+                   root.id, root.name, consumerId, reason);
+}
+
+std::optional<MacroPatch>
+RefoldMacroWholeCoverOrchestrator::TryCallChainSuffixReplay(
+    const RefoldModel::MacroInvocation &root,
+    const diffutils::Hunk &hunk) const {
+  const RefoldMacroPatchPlanner::Dependencies &deps = planner_->Deps();
+  const RefoldModel &model = *deps.model;
+  const StringRef tuPath = model.GetSourcePath();
+
+  // The root's expansion forms the call, and the call reads source after the
+  // root's callsite; only a translation-unit root atop its chain is tried.
+  // An actual spelled inside the root's callsite is the root's own actual
+  // material, which its args-only and DAG proofs rewrite.
+  if (root.callerMacroId || root.ownerIncludeId || !root.invFile ||
+      !root.invE || !deps.pathIdentity->PathsEqual(*root.invFile, tuPath))
+    return std::nullopt;
+  const uint64_t suffixBegin = *root.invE;
+  if (deps.ownersMustExpand && deps.ownersMustExpand->contains(root.id))
+    return std::nullopt;
+  const std::optional<std::pair<uint64_t, uint64_t>> cover =
+      planner_->GetWholeCoverATokRange(root);
+  if (!cover || cover->first >= cover->second)
+    return std::nullopt;
+
+  // The one call, generated by the root, whose source-spelled actuals'
+  // occurrences hold the hunk.
+  const size_t invocationCount = model.GetMacroInvocations().size();
+  const RefoldModel::MacroInvocation *consumer = nullptr;
+  for (const RefoldModel::MacroInvocation &inv : model.GetMacroInvocations()) {
+    if (inv.useArgRanges.empty() || inv.ownerIncludeId ||
+        !isCallerDescendantOf(*deps.macroTopology, inv, root.id,
+                              invocationCount))
+      continue;
+    const SmallVector<RefoldModel::PPArgSpan, 8> occurrences =
+        suffixActualOccurrences(inv, suffixBegin);
+    SmallVector<char, 8> touched(occurrences.size(), 0);
+    if (occurrences.empty() ||
+        !deps.sourceMapper->HunkFullyWithinArgSpans(hunk, occurrences, touched))
+      continue;
+    if (consumer) {
+      traceCallChainSuffixRefusal(root, inv.id, "ambiguous-consumer");
+      return std::nullopt;
+    }
+    consumer = &inv;
+  }
+  if (!consumer)
+    return std::nullopt;
+
+  // The rewrite replaces only the consumer's actuals, so it must explain every
+  // edit to the root's cover, and the cover must hold every token the
+  // consumer's expansion produced: the dependence check below reads only the
+  // cover.
+  SmallVector<diffutils::Hunk, 8> coverHunks;
+  for (const diffutils::Hunk &h : *deps.abTokHunks)
+    if (hunkEditsCover(h, *cover))
+      coverHunks.push_back(trimCommonEdgeTokens(h, deps.aToks, deps.bToks));
+  for (const RefoldModel::MacroInvocation &inv : model.GetMacroInvocations())
+    if ((&inv == consumer ||
+         isCallerDescendantOf(*deps.macroTopology, inv, consumer->id,
+                              invocationCount)) &&
+        !invocationProvenanceInsideCover(inv, *cover)) {
+      traceCallChainSuffixRefusal(root, consumer->id,
+                                  "consumer-output-outside-cover");
+      return std::nullopt;
+    }
+
+  const std::string tuAbsPath = deps.lineDirs->ToAbsolutePath(tuPath);
+  ErrorOr<std::unique_ptr<MemoryBuffer>> tuBuffer =
+      MemoryBuffer::getFile(tuAbsPath);
+  if (!tuBuffer) {
+    traceCallChainSuffixRefusal(root, consumer->id, "unreadable-source");
+    return std::nullopt;
+  }
+  const StringRef tuText = (*tuBuffer)->getBuffer();
+
+  SmallVector<RefoldMacroStandardArgsOnlyPatchBuilder::SourceSpelledActual, 4>
+      actuals;
+  std::vector<std::pair<size_t, size_t>> actualRanges(
+      consumer->useArgRanges.size(), {0, 0});
+  for (uint32_t formal = 0; formal < consumer->useArgRanges.size(); ++formal) {
+    const RefoldModel::MacroInvocation::OptByteRange &range =
+        consumer->useArgRanges[formal];
+    if (!actualSpelledInSuffix(*consumer, formal, suffixBegin) || !range.second)
+      continue;
+    if (*range.second > tuText.size()) {
+      traceCallChainSuffixRefusal(root, consumer->id, "actual-past-source");
+      return std::nullopt;
+    }
+    actuals.push_back({formal, tuText.slice(*range.first, *range.second)});
+    actualRanges[formal] = {*range.first, *range.second};
+  }
+  const std::optional<DenseMap<uint32_t, std::string>> rewrites =
+      planner_->StandardArgsOnlyPatchBuilder().DeriveSourceActualRewrites(
+          *consumer, actuals, coverHunks);
+  if (!rewrites) {
+    traceCallChainSuffixRefusal(root, consumer->id, "actual-not-derived");
+    return std::nullopt;
+  }
+  const SmallVector<uint32_t, 4> rewritten =
+      RefoldMacroFormalDependenceProof::RewrittenFormals(
+          tuText, actualRanges, *rewrites, *deps.lexLang);
+  if (rewritten.empty()) {
+    traceCallChainSuffixRefusal(root, consumer->id, "no-actual-respelled");
+    return std::nullopt;
+  }
+
+  // A rewritten actual must still end where the old one did: one actual of
+  // the call, or a whole variadic tail, with nothing after its list.  Its
+  // tokens must reach the output as B spells them.
+  for (uint32_t formal : rewritten) {
+    if (actualNamesMacro(rewrites->lookup(formal), model, *deps.lexLang)) {
+      traceCallChainSuffixRefusal(root, consumer->id, "actual-names-macro");
+      return std::nullopt;
+    }
+    const std::string probe =
+        (consumer->name + "(" + rewrites->lookup(formal) + ")").str();
+    bool trailingTokens = false;
+    const std::optional<std::vector<std::pair<size_t, size_t>>> parsed =
+        RefoldArgTextRecovery::LexMacroInvocationActualContentRanges(
+            probe, *deps.lexLang, &trailingTokens);
+    if (!parsed || trailingTokens ||
+        (!isMacroInvocationVariadicFormal(*consumer, formal) &&
+         parsed->size() > 1)) {
+      traceCallChainSuffixRefusal(root, consumer->id, "actual-boundary-moved");
+      return std::nullopt;
+    }
+  }
+
+  // No other token of the cover may observe a rewritten formal.  The
+  // occurrences that do were replayed above.
+  SmallVector<uint64_t, 32> keptTokens;
+  for (uint64_t tok = cover->first; tok < cover->second; ++tok)
+    if (llvm::none_of(coverHunks, [tok](const diffutils::Hunk &h) {
+          return h.aStart <= tok && tok < h.aEnd;
+        }))
+      keptTokens.push_back(tok);
+  if (!RefoldMacroFormalDependenceProof({model, *deps.macroTopology})
+           .TokensInCoverIgnoreRewrittenFormals(
+               *consumer, *cover, keptTokens, rewritten,
+               RefoldMacroFormalDependenceProof::RootOccurrences::Validated)) {
+    traceCallChainSuffixRefusal(root, consumer->id,
+                                "cover-token-observes-rewrite");
+    return std::nullopt;
+  }
+
+  // The rewritten bytes are the consumer's alone and hold no structure.
+  const uint64_t patchBegin = actualRanges[rewritten.front()].first;
+  const uint64_t patchEnd = actualRanges[rewritten.back()].second;
+  for (const RefoldModel::MacroInvocation &inv : model.GetMacroInvocations())
+    if (&inv != consumer &&
+        invocationReadsSourceIn(inv, *deps.pathIdentity, tuPath, patchBegin,
+                                patchEnd)) {
+      traceCallChainSuffixRefusal(root, consumer->id,
+                                  "call-spelled-in-rewritten-bytes");
+      return std::nullopt;
+    }
+  if (!deps.wholeCoverPlanBuilder->SourceRangeHoldsNoStructure(
+          tuPath, std::nullopt, patchBegin, patchEnd)) {
+    traceCallChainSuffixRefusal(root, consumer->id,
+                                "structure-in-rewritten-bytes");
+    return std::nullopt;
+  }
+
+  std::string replacement;
+  uint64_t cursor = patchBegin;
+  for (uint32_t formal : rewritten) {
+    replacement += tuText.slice(cursor, actualRanges[formal].first);
+    replacement += rewrites->lookup(formal);
+    cursor = actualRanges[formal].second;
+  }
+  const uint64_t rewrittenOutputEnd = replacement.size();
+  MacroPatch patch{patchBegin, patchEnd, std::move(replacement), root.id};
+  planner_->ProofCertifier().CertifyInvocationRewriteMaterializedOutputRange(
+      patch, /*outputByteStart=*/0, rewrittenOutputEnd);
+  // The B tokens the patch realizes are the image of the root's whole cover,
+  // as for any rewrite that keeps the root's callsite.
+  const std::optional<std::pair<size_t, size_t>> bEnvelope =
+      deps.sourceMapper
+          ->MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+              cover->first, cover->second);
+  if (!bEnvelope || bEnvelope->first >= bEnvelope->second) {
+    traceCallChainSuffixRefusal(root, consumer->id, "no-b-envelope");
+    return std::nullopt;
+  }
+  patch.materialized.hasBTokenRange = true;
+  patch.materialized.bTokStart = bEnvelope->first;
+  patch.materialized.bTokEnd = bEnvelope->second;
+  MacroPatchProof proof =
+      makeMacroPatchProof(MacroPatchProofKind::CallChainSuffix,
+                          /*preservesInvocationStructure=*/true, root.id);
+  CallChainWitness callChainWitness;
+  callChainWitness.rootMacroId = root.id;
+  callChainWitness.callsiteMacroId = root.id;
+  proof.callChain = callChainWitness;
+  deps.macroPatchProofClassifier->SetMacroPatchProof(patch, std::move(proof));
+  REFOLD_LOG_TRACE("macro/call-chain-suffix",
+                   "accept root id={0} name={1} consumer id={2} name={3} "
+                   "bytes=[{4},{5}) replacement='{6}'",
+                   root.id, root.name, consumer->id, consumer->name, patchBegin,
+                   patchEnd,
+                   stringutils::showWsWithClip(patch.replacement, 220));
+  return patch;
+}
+
 std::optional<MacroPatch>
 RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
@@ -513,6 +850,11 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
       (*planner_->Deps().model).GetSourcePath(), h);
   const diffutils::Hunk hEff =
       trimCommonEdgeTokens(h, planner_->Deps().aToks, planner_->Deps().bToks);
+
+  // An edit to the actuals a call formed by this root's expansion read from
+  // source after the root's callsite is made there, keeping every callsite.
+  if (std::optional<MacroPatch> suffixPatch = TryCallChainSuffixReplay(m, hEff))
+    return suffixPatch;
 
   // Generated function-like callees can be represented by producer pseudo-
   // invocations whose source span is not a real callsite, for example
@@ -688,138 +1030,6 @@ RefoldMacroWholeCoverOrchestrator::BuildMacroInvocationPatchWholeCover(
           discoveryResult.directRootPreservationInadmissible;
       return dagLiftingPhase_.Run(planningCtx, discoveryResult);
     };
-
-    // Call-chain suffix patch: if this hunk's A-side PP tokens map to source
-    // bytes in the chained-call suffix immediately following this invocation
-    // (e.g. currying-style chains like GET_MATH(ADD)(10)(20)), patch those
-    // bytes directly. This preserves the call chain and avoids whole-cover
-    // expansion.
-    if (hasLiteralMacroCalleeOrigin(m) && m.invFile && m.invB && m.invE) {
-      std::string invAbs =
-          (*planner_->Deps().lineDirs).ToAbsolutePath(*m.invFile);
-      auto bufOrErr = MemoryBuffer::getFile(invAbs);
-      if (bufOrErr) {
-        std::unique_ptr<MemoryBuffer> buf = std::move(*bufOrErr);
-        StringRef invFileText = buf->getBuffer();
-        const uint64_t n = invFileText.size();
-        const uint64_t invEndAbs = *m.invE;
-        if (invEndAbs <= n) {
-          // Compute the source extent of the chained-call suffix after the
-          // macro invocation. Only tokens that map into this suffix are
-          // eligible for the local call-chain patch.
-          const uint64_t chainEndAbs =
-              extendChainedCallEnd(invFileText, invEndAbs, StringRef());
-          if (chainEndAbs > invEndAbs) {
-            const uint64_t aLen = h.aEnd - h.aStart;
-            const uint64_t bLen = h.bEnd - h.bStart;
-            if (aLen == bLen && aLen > 0) {
-              struct TokEdit {
-                uint64_t bAbs;
-                uint64_t eAbs;
-                std::string repl;
-              };
-              SmallVector<TokEdit, 8> tokEdits;
-              tokEdits.reserve(aLen);
-              uint64_t minB = std::numeric_limits<uint64_t>::max();
-              uint64_t maxE = 0;
-              bool ok = true;
-
-              // Re-map each changed A-side PP token back to its original source
-              // byte range. Every token must come from the same invocation file
-              // and lie wholly inside the chained-call suffix; otherwise this
-              // hunk is not a local suffix rewrite.
-              const auto &tokmapByPP =
-                  (*planner_->Deps().model).GetTokmapByPP();
-              for (uint64_t i = 0; i < aLen; ++i) {
-                const uint64_t ppIdx = h.aStart + i;
-                const uint64_t bTok = h.bStart + i;
-                auto it = tokmapByPP.find(ppIdx);
-                if (it == tokmapByPP.end()) {
-                  ok = false;
-                  break;
-                }
-                const RefoldModel::TokMapEntry &tm = it->second;
-                if ((*planner_->Deps().lineDirs).ToAbsolutePath(tm.file) !=
-                    invAbs) {
-                  ok = false;
-                  break;
-                }
-                if (tm.b < invEndAbs || tm.e > chainEndAbs) {
-                  ok = false;
-                  break;
-                }
-                if (tm.b > tm.e || tm.e > n) {
-                  ok = false;
-                  break;
-                }
-                StringRef repl = (*planner_->Deps().sourceMapper)
-                                     .SliceBSource(bTok, bTok + 1);
-                tokEdits.push_back(TokEdit{tm.b, tm.e, repl.str()});
-                minB = std::min(minB, tm.b);
-                maxE = std::max(maxE, tm.e);
-              }
-
-              if (ok && minB < maxE && maxE <= n) {
-                std::string covered = invFileText.slice(minB, maxE).str();
-
-                // Convert absolute source-token edits into offsets relative to
-                // the minimal covered suffix slice. The patch will replace only
-                // this local slice, not the whole root invocation.
-                SmallVector<TextEdit, 8> edits;
-                edits.reserve(tokEdits.size());
-                for (const auto &te : tokEdits)
-                  edits.push_back(TextEdit{te.bAbs - minB,
-                                           te.eAbs - minB,
-                                           te.repl,
-                                           std::nullopt,
-                                           std::nullopt,
-                                           {},
-                                           {},
-                                           {}});
-                llvm::sort(edits, [](const TextEdit &a, const TextEdit &b) {
-                  return a.start < b.start;
-                });
-
-                // Apply edits in source order. No line-directive resync is
-                // needed because this patch is confined to the chained-call
-                // suffix slice and preserves the surrounding invocation text.
-                std::string out;
-                out.reserve(covered.size());
-                uint64_t cur = 0;
-                for (const TextEdit &e : edits) {
-                  if (e.start < cur || e.end > covered.size()) {
-                    ok = false;
-                    break;
-                  }
-                  out.append(covered, cur, e.start - cur);
-                  out.append(e.text);
-                  cur = e.end;
-                }
-                if (ok) {
-                  out.append(covered, cur, covered.size() - cur);
-                  {
-                    MacroPatch patch{minB, maxE, std::move(out), m.id};
-                    MacroPatchProof proof = makeMacroPatchProof(
-                        MacroPatchProofKind::CallChainSuffix,
-                        /*preservesInvocationStructure=*/true, m.id);
-                    // This suffix patch rewrites the root invocation itself,
-                    // so the callsite and the proof root are the same macro.
-                    CallChainWitness callChainWitness;
-                    callChainWitness.rootMacroId = m.id;
-                    callChainWitness.callsiteMacroId = m.id;
-                    proof.callChain = callChainWitness;
-                    planner_->Deps()
-                        .macroPatchProofClassifier->SetMacroPatchProof(
-                            patch, std::move(proof));
-                    return patch;
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
 
     // Prefer the DAG result over a direct root args-only rewrite when both are
     // available: the DAG path has already proved a structure-preserving nested

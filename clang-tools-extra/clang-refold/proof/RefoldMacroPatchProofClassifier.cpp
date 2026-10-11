@@ -604,6 +604,7 @@ void RefoldMacroPatchProofClassifier::CertifyMacroWholeCoverRealizationPatch(
   patch.materialized.bTokStart = plan.bTokStart;
   patch.materialized.bTokEnd = plan.bTokEnd;
   patch.materialized.replayedPragmaLines = plan.replayedPragmaLines;
+  patch.materialized.replayedPragmaOperators = plan.replayedPragmaOperators;
   const OwnerRealizationResult ownerRealization =
       deps_.ownerRealizationProofBuilder.BuildMacroWholeCoverOwnerRealization(
           macro, plan);

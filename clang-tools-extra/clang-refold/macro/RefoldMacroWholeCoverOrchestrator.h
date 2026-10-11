@@ -115,6 +115,28 @@ private:
       const RefoldModel::MacroInvocation &invocation,
       const diffutils::Hunk &hunk) const;
 
+  /// Rewrite, in source, the actuals that a call formed by \p root's
+  /// expansion read from after \p root's callsite, when they alone explain
+  /// \p hunk and every other hunk touching \p root's cover.
+  ///
+  /// `#define CALL(f, a) int k = f(a` leaves `ADD(1` open, and in
+  /// `CALL(ADD, 1), 2);` the call reads `, 2)` from source, so `ADD`'s `b` is
+  /// the `2` there; a chain such as `PICK()(10)` is the same shape.  The
+  /// producer locates such an actual in `use_arg_ranges` and credits each
+  /// copy of it to its formal.  Admission requires that one such call explain
+  /// every hunk touching the root's cover through the occurrences of its
+  /// actuals located after the root's callsite; that each derived actual
+  /// replay every occurrence of its formal, stay one actual, and name no
+  /// macro; that no other cover token depend on a rewritten formal; and that
+  /// no other invocation and no preprocessing structure lie in the rewritten
+  /// bytes.  The patch covers only those bytes, keeping every callsite, under
+  /// a `CallChainSuffix` proof rooted at \p root.  Only a translation-unit
+  /// root atop its caller chain is tried; an actual inside its callsite is
+  /// left to the root's own args-only proofs.
+  std::optional<MacroPatch>
+  TryCallChainSuffixReplay(const RefoldModel::MacroInvocation &root,
+                           const diffutils::Hunk &hunk) const;
+
   const RefoldMacroPatchPlanner *planner_;
   RefoldMacroArgsOnlyWholeCoverPhase argsOnlyPhase_;
   RefoldMacroDAGLeafDiscoveryPhase dagLeafDiscoveryPhase_;

@@ -156,6 +156,12 @@ enum class ProtectedSourceEditAuthorityKind : uint8_t {
   /// (which the producer does not record for `once`).  Both therefore fail closed
   /// structurally rather than by convention.
   PragmaOnceGuardRewrite,
+  /// Removes an exact `_Pragma` operator spelled in the source a macro's whole
+  /// cover replaces past its callsite, whose printed `#pragma` line the cover
+  /// replays from B.  The operator's only effect is that line, so the edit
+  /// reproduces it; minted from the whole-cover plan's proof, never for an
+  /// operator whose pragma clang did not print.
+  ReplayedPrintedPragma,
 };
 
 /// Exact protected preprocessing interval authorized for one emitted edit.

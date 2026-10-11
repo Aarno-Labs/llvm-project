@@ -138,13 +138,13 @@ RefoldMacroWholeCoverPlanBuilder::ComputeWholeCoverPlan(
     return std::nullopt;
   plan.clippedText = material->trim().str();
   ReplayProducedPragmaLines(m, keptSegment, material->trim(), plan);
-  plan.sourceEnd = ConsumedSourceEnd(m);
+  plan.sourceEnd = ConsumedSourceEnd(m, plan);
 
   return plan;
 }
 
 std::optional<uint64_t> RefoldMacroWholeCoverPlanBuilder::ConsumedSourceEnd(
-    const RefoldModel::MacroInvocation &m) const {
+    const RefoldModel::MacroInvocation &m, WholeCoverPlan &plan) const {
   if (!m.invFile || !m.invB || !m.invE || *m.invE < *m.invB)
     return std::nullopt;
   const uint64_t callsiteBegin = *m.invB;
@@ -180,23 +180,87 @@ std::optional<uint64_t> RefoldMacroWholeCoverPlanBuilder::ConsumedSourceEnd(
     return callsiteEnd;
 
   // A directive or pragma operator there would be replaced along with the
-  // call text around it.
+  // call text around it, unless the realization prints the operator's pragma
+  // in its place.  Only translation-unit emission is licensed to remove such
+  // an operator.
+  const bool replayLicensed =
+      !m.ownerIncludeId &&
+      deps_.pathIdentity.PathsEqual(*m.invFile, deps_.model.GetSourcePath());
   const RefoldPreprocessingStructureIndexProvider::LookupResult lookup =
       deps_.structureIndexes.Get(*m.invFile, m.ownerIncludeId);
-  if (!lookup.HasIndex() || !lookup.index->IsProtectionCensusComplete() ||
-      consumedEnd > lookup.index->GetSourceSize() ||
-      lookup.index->HasOverlapping(callsiteEnd, consumedEnd)) {
+  const bool suffixProven =
+      lookup.HasIndex() && lookup.index->IsProtectionCensusComplete() &&
+      consumedEnd <= lookup.index->GetSourceSize() &&
+      llvm::all_of(lookup.index->FindOverlapping(callsiteEnd, consumedEnd),
+                   [&](const PreprocessingStructureInterval *interval) {
+                     return replayLicensed && callsiteEnd <= interval->begin &&
+                            interval->end <= consumedEnd &&
+                            SuffixPragmaOperatorIsReplayed(*interval, plan);
+                   });
+  if (!suffixProven) {
     REFOLD_LOG_TRACE("macro/whole-cover",
                      "reject inv id={0} name={1} reason=unproven-consumed-"
                      "source-suffix invBytes=[{2},{3}) consumedEnd={4}",
                      m.id, m.name, callsiteBegin, callsiteEnd, consumedEnd);
     return std::nullopt;
   }
+  for (const PreprocessingStructureInterval *interval :
+       lookup.index->FindOverlapping(callsiteEnd, consumedEnd))
+    plan.replayedPragmaOperators.push_back({interval->begin, interval->end});
   REFOLD_LOG_TRACE("macro/whole-cover",
                    "widen inv id={0} name={1} invBytes=[{2},{3}) "
-                   "consumedEnd={4}",
-                   m.id, m.name, callsiteBegin, callsiteEnd, consumedEnd);
+                   "consumedEnd={4} replayedPragmaOperators={5}",
+                   m.id, m.name, callsiteBegin, callsiteEnd, consumedEnd,
+                   plan.replayedPragmaOperators.size());
   return consumedEnd;
+}
+
+bool RefoldMacroWholeCoverPlanBuilder::SuffixPragmaOperatorIsReplayed(
+    const PreprocessingStructureInterval &interval,
+    const WholeCoverPlan &plan) const {
+  if (interval.kind != PreprocessingStructureKind::PragmaOperator ||
+      interval.modelKind != PreprocessingStructureModelKind::PragmaDirective ||
+      !interval.IsProducerBound())
+    return false;
+  const RefoldModel::PragmaDirective *record = nullptr;
+  for (const RefoldModel::PragmaDirective &pragma : deps_.model.GetPragmas())
+    if (pragma.id == *interval.modelItemId)
+      record = &pragma;
+  if (!record || !record->viaPragmaOperator || !record->HasEmittedImage())
+    return false;
+
+  // The B line the printed record survived as, which no other printed record
+  // shares.
+  const SidebandPragmaLinePairing *printedLine = nullptr;
+  for (const SidebandPragmaLinePairing &line :
+       deps_.sidebandPragmaLinePairings) {
+    if (line.aLineBegin > *record->ppByteBegin ||
+        *record->ppByteEnd > line.aLineEnd)
+      continue;
+    if (printedLine)
+      return false;
+    printedLine = &line;
+  }
+  if (!printedLine || !printedLine->bNormalTokenGap)
+    return false;
+  for (const RefoldModel::PragmaDirective &pragma : deps_.model.GetPragmas())
+    if (&pragma != record && pragma.HasEmittedImage() &&
+        printedLine->aLineBegin <= *pragma.ppByteBegin &&
+        *pragma.ppByteEnd <= printedLine->aLineEnd)
+      return false;
+  return llvm::is_contained(
+      plan.replayedPragmaLines,
+      std::make_pair(printedLine->bLineBegin, printedLine->bLineEnd));
+}
+
+bool RefoldMacroWholeCoverPlanBuilder::SourceRangeHoldsNoStructure(
+    StringRef path, std::optional<uint64_t> ownerIncludeId, uint64_t begin,
+    uint64_t end) const {
+  const RefoldPreprocessingStructureIndexProvider::LookupResult lookup =
+      deps_.structureIndexes.Get(path, ownerIncludeId);
+  return lookup.HasIndex() && lookup.index->IsProtectionCensusComplete() &&
+         end <= lookup.index->GetSourceSize() &&
+         !lookup.index->HasOverlapping(begin, end);
 }
 
 void RefoldMacroWholeCoverPlanBuilder::ReplayProducedPragmaLines(

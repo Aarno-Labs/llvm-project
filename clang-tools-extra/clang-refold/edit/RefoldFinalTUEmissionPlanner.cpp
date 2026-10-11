@@ -224,6 +224,15 @@ FinalTUEmissionContext::BuildTUMacroPatchEdit(const MacroPatch &patch,
   edit.lineControlPruneCandidates =
       std::move(resync.lineControlPruneCandidates);
   edit.replayedPragmaLines = patch.materialized.replayedPragmaLines;
+  // A `_Pragma` operator the whole cover removes past its callsite prints
+  // nothing but a line the replacement replays.
+  for (const auto &[operatorBegin, operatorEnd] :
+       patch.materialized.replayedPragmaOperators)
+    textEditCertifier_.AuthorizeExactProtectedSourceInterval(
+        edit, ProtectedSourceEditAuthorityKind::ReplayedPrintedPragma,
+        request_.tuPath, /*ownerIncludeId=*/std::nullopt, request_.tuBytes,
+        operatorBegin, operatorEnd,
+        {PreprocessingStructureKind::PragmaOperator});
 
   if (auto bRange =
           textEditAssembler_.MacroPatchMaterializedBByteRange(patch)) {

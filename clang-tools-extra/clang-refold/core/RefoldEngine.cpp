@@ -835,6 +835,42 @@ bool RefoldEngine::StageSidebandEdits(
       structuralHunkDispatcher);
 }
 
+/// Stage \p patch, built for hunk \p h at the owner \p slot was prepared for,
+/// under that owner: it carries the slot's owner certificate and the B tokens
+/// its earlier hunks staged.
+static void stageAcceptedMacroPatch(
+    const RefoldMacroPatchPlanner &planner,
+    RefoldStructuralHunkDispatcher &dispatcher,
+    const RefoldStructuralHunkDispatcher::MacroPatchStagingSlot &slot,
+    MacroPatch patch, const diffutils::Hunk &h, StringRef tuPath) {
+  const Owner currentPatchOwner = planner.NormalizeHunkOwnerForPatch(tuPath, h);
+  if (slot.existingPatch)
+    planner.CarryMacroPatchOwnerCertificate(patch, *slot.existingPatch);
+  dispatcher.MergeMaterializedBTokenRangeFromSlot(patch, slot, h);
+  planner.CertifyMacroPatchOwnerWitness(patch, currentPatchOwner);
+  patch.macroId = slot.patchKey;
+  dispatcher.StageMacroPatch(slot, std::move(patch));
+}
+
+std::optional<TextEdit> RefoldEngine::BuildBoundaryInsertionTUEdit(
+    const diffutils::Hunk &h, size_t hunkIndex, const Owner &owner,
+    StringRef tuPath, StringRef tuBytes) const {
+  if (owner.kind != OwnerKind::TU ||
+      !ownerClassifier_->HunkMapsToTU(h.aStart, h.aEnd, tuPath))
+    return std::nullopt;
+  const std::optional<TUByteSpanPlan> spanPlan =
+      tuAnchorProof_->PlanTUByteSpan(h.aStart, h.aEnd, tuPath);
+  if (!spanPlan)
+    return std::nullopt;
+  const std::pair<uint64_t, uint64_t> span = spanPlan->byteRange();
+  if (macroTopology_.SourceSpanSplitsInvocationUse(
+          /*ownerIncludeId=*/std::nullopt, span.first, span.second))
+    return std::nullopt;
+  return directTUEditBuilder_->Build(h, hunkIndex, /*isDel=*/false, tuPath,
+                                     tuBytes, span,
+                                     AcceptedPathKind::TUByteSpanMappedEdit);
+}
+
 bool RefoldEngine::DispatchStructuralHunks(
     StringRef tuPath, StringRef tuBytes, ArrayRef<diffutils::Hunk> hunks,
     RefoldStructuralHunkDispatcher &structuralHunkDispatcher) {
@@ -1081,6 +1117,9 @@ bool RefoldEngine::DispatchStructuralHunks(
     const RefoldModel::MacroInvocation *macroTarget =
         macroTopology_.SmallestCoveringPatchableMacro(h.aStart, h.aEnd,
                                                       owner.includeId);
+    // A pure insertion outside every cover is offered to an owner below only
+    // for a proof that keeps its callsite; see the release after the climb.
+    const bool boundaryOffered = !macroTarget && isIns;
     if (!macroTarget && isIns)
       macroTarget = macroBoundarySelector_.RightBoundaryVaOptActivationMacro(
           h.aStart, owner.includeId);
@@ -1093,6 +1132,11 @@ bool RefoldEngine::DispatchStructuralHunks(
     if (auto *m = macroTarget) {
       if (m->invB && m->invE) {
         bool appliedMacroPatch = false;
+        // A realization replacing an owner's callsite, held back for a
+        // boundary-offered insertion until the TU path has been asked.
+        std::optional<std::pair<
+            RefoldStructuralHunkDispatcher::MacroPatchStagingSlot, MacroPatch>>
+            heldRealization;
         for (const RefoldModel::MacroInvocation *target = m;
              target != nullptr;) {
           RefoldStructuralHunkDispatcher::MacroPatchStagingSlot stagingSlot =
@@ -1118,18 +1162,21 @@ bool RefoldEngine::DispatchStructuralHunks(
               break;
             }
 
-            const Owner currentPatchOwner =
-                macroPatchPlanner_->NormalizeHunkOwnerForPatch(tuPath, h);
-            if (stagingSlot.existingPatch)
-              macroPatchPlanner_->CarryMacroPatchOwnerCertificate(
-                  *updated, *stagingSlot.existingPatch);
-            structuralHunkDispatcher.MergeMaterializedBTokenRangeFromSlot(
-                *updated, stagingSlot, h);
-            macroPatchPlanner_->CertifyMacroPatchOwnerWitness(
-                *updated, currentPatchOwner);
-            updated->macroId = stagingSlot.patchKey;
-            structuralHunkDispatcher.StageMacroPatch(stagingSlot,
-                                                     std::move(*updated));
+            // The boundary was opened for a proof that keeps the callsite.  A
+            // realization replacing it inserts the B tokens beside the old
+            // output, which the TU path does too while keeping every call:
+            // after the source the expansion consumed, where the gap's next
+            // token is spelled.  `CALL(G, x)) = 1;` keeps both calls where
+            // the realization expanded them.
+            if (boundaryOffered &&
+                !updated->proof.preservesInvocationStructure) {
+              heldRealization.emplace(stagingSlot, std::move(*updated));
+              break;
+            }
+
+            stageAcceptedMacroPatch(*macroPatchPlanner_,
+                                    structuralHunkDispatcher, stagingSlot,
+                                    std::move(*updated), h, tuPath);
             appliedMacroPatch = true;
             break;
           }
@@ -1149,6 +1196,29 @@ bool RefoldEngine::DispatchStructuralHunks(
 
         if (appliedMacroPatch)
           continue;
+
+        if (heldRealization) {
+          if (std::optional<TextEdit> gapEdit =
+                  BuildBoundaryInsertionTUEdit(h, i, owner, tuPath, tuBytes)) {
+            REFOLD_LOG_TRACE("dispatch/boundary-insertion",
+                             "hunk #{0} A=[{1},{2}) realized at its TU gap "
+                             "instead of replacing macro #{3}",
+                             i, h.aStart, h.aEnd,
+                             heldRealization->second.macroId);
+            structuralHunkDispatcher.AddTUEdit(std::move(*gapEdit));
+            continue;
+          }
+          REFOLD_LOG_TRACE("dispatch/boundary-insertion",
+                           "hunk #{0} A=[{1},{2}) has no TU gap edit; keeping "
+                           "the realization of macro #{3}",
+                           i, h.aStart, h.aEnd,
+                           heldRealization->second.macroId);
+          stageAcceptedMacroPatch(*macroPatchPlanner_, structuralHunkDispatcher,
+                                  heldRealization->first,
+                                  std::move(heldRealization->second), h,
+                                  tuPath);
+          continue;
+        }
       }
     }
 

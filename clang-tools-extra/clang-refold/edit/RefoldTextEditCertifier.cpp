@@ -85,6 +85,8 @@ bool protectedSourceAuthorityAcceptsKind(
   case ProtectedSourceEditAuthorityKind::SidebandPragmaEdit:
     return kind == PreprocessingStructureKind::Pragma ||
            kind == PreprocessingStructureKind::PragmaOperator;
+  case ProtectedSourceEditAuthorityKind::ReplayedPrintedPragma:
+    return kind == PreprocessingStructureKind::PragmaOperator;
   case ProtectedSourceEditAuthorityKind::IncludeMaterialization:
   case ProtectedSourceEditAuthorityKind::IncludeDirectiveRewrite:
     return kind == PreprocessingStructureKind::Include ||
@@ -361,6 +363,9 @@ bool acceptedResultSupportsProtectedSourceAuthority(
   case ProtectedSourceEditAuthorityKind::IncludeOwnedMacroStateRepair:
     return AcceptedResultIsSpecializedTUCarrier(
         candidate, AcceptedPathKind::TUByteSpanConservativeEdit);
+  case ProtectedSourceEditAuthorityKind::ReplayedPrintedPragma:
+    return candidate.kind == AcceptedResultCandidateKind::MacroPatch &&
+           path == AcceptedPathKind::MacroWholeCoverRealization;
   case ProtectedSourceEditAuthorityKind::SidebandPragmaEdit:
     return AcceptedResultIsSpecializedTUCarrier(
                candidate, AcceptedPathKind::TUByteSpanConservativeEdit) ||

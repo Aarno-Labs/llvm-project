@@ -2585,6 +2585,25 @@ std::string RefoldMapBuilder::filePathForLocAbs(clang::SourceManager &SM,
   return std::string();
 }
 
+std::optional<uint32_t>
+RefoldMapBuilder::useArgIndexForLoc(const Item &MI, SourceLocation Loc) const {
+  if (MI.UseArgRanges.empty() || Loc.isInvalid())
+    return std::nullopt;
+  // A substituted token's file location is the spelling of the actual token it
+  // copies, through every substitution that carried it; any other token's is
+  // where the expansion that produced it was used.
+  const SourceLocation FileLoc = SM.getFileLoc(Loc);
+  if (SM.getFileID(FileLoc) != MI.UseFileID)
+    return std::nullopt;
+  const uint64_t Offset = SM.getFileOffset(FileLoc);
+  for (size_t I = 0; I < MI.UseArgRanges.size(); ++I) {
+    const auto &R = MI.UseArgRanges[I];
+    if (R.first && R.second && *R.first <= Offset && Offset < *R.second)
+      return static_cast<uint32_t>(I);
+  }
+  return std::nullopt;
+}
+
 std::optional<uint32_t> RefoldMapBuilder::argIndexForSpellingLoc(
     const Item &MI, SourceLocation Loc, SourceManager &Sm,
     const LangOptions &Lang, bool EmitAbsPaths) {
@@ -3356,6 +3375,43 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
       It.UseEnd = UseEndLoc.isValid() && SM.getFileID(UseEndLoc) == UseFID
                       ? SM.getFileOffset(UseEndLoc)
                       : SM.getBufferData(UseFID).size();
+
+      // A call formed during another expansion reads that expansion's
+      // remaining tokens and then the file.  An actual read wholly from the
+      // file is spelled there, inside the use, as plain source.
+      if (Args && MI && MI->isFunctionLike() &&
+          MacroNameTok.getLocation().isMacroID()) {
+        const unsigned NumParams = MI->getNumParams();
+        std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>>
+            Ranges(NumParams);
+        bool AnyRange = false;
+        for (unsigned I = 0; I != NumParams; ++I) {
+          const Token *First = Args->getUnexpArgument(I);
+          const Token *Last = nullptr;
+          bool FromFile = true;
+          for (const Token *T = First; T->isNot(tok::eof); ++T) {
+            const SourceLocation TokLoc = T->getLocation();
+            if (!TokLoc.isFileID() || SM.getFileID(TokLoc) != UseFID) {
+              FromFile = false;
+              break;
+            }
+            Last = T;
+          }
+          if (!FromFile || !Last)
+            continue;
+          const SourceLocation EndLoc =
+              Lexer::getLocForEndOfToken(Last->getLocation(), 0, SM, Lang);
+          if (EndLoc.isInvalid() || SM.getFileID(EndLoc) != UseFID)
+            continue;
+          Ranges[I] = {SM.getFileOffset(First->getLocation()),
+                       SM.getFileOffset(EndLoc)};
+          AnyRange = true;
+        }
+        if (AnyRange) {
+          It.UseArgRanges = std::move(Ranges);
+          It.UseFileID = UseFID;
+        }
+      }
     }
   }
 
@@ -4349,7 +4405,9 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
 
     if (SM.isMacroArgExpansion(L)) {
       if (It.Subkind == "func") {
-        auto ArgIndex = argIndexForSpellingLoc(It, L, SM, Lang, EmitAbsPaths);
+        std::optional<uint32_t> ArgIndex = useArgIndexForLoc(It, L);
+        if (!ArgIndex)
+          ArgIndex = argIndexForSpellingLoc(It, L, SM, Lang, EmitAbsPaths);
         if (ArgIndex)
           touchArgTokSpan(It.ArgSpans, TokIndex, *ArgIndex,
                           SM.getSpellingLoc(L).getRawEncoding());
@@ -4887,6 +4945,10 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
   // invocation (e.g., set_zero(..., BYTE4, ...)): the expanded token(s) are
   // primarily attributed to the inner macro item, but still need to be recorded
   // as argument tokens for the enclosing function-like macro.
+  //
+  // A token whose file location lies in a call's source-spelled actual reached
+  // the output through that call's argument collection, whichever invocation
+  // the token is primarily attributed to, so it is that formal's.
   if (ItemIdx && HasTokMap && L.isMacroID()) {
     for (size_t I = 0; I < Items.size(); ++I) {
       if (I == *ItemIdx)
@@ -4894,6 +4956,12 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
       Item &MI = Items[I];
       if (MI.Kind != IK_Macro)
         continue;
+      if (std::optional<uint32_t> UseArg = useArgIndexForLoc(MI, L)) {
+        touchSpanForItem(I, TokIndex);
+        touchArgTokSpan(MI.ArgSpans, TokIndex, *UseArg,
+                        SM.getSpellingLoc(L).getRawEncoding());
+        continue;
+      }
       if (!MI.InvBegin || !MI.InvEnd || !TokB || !TokE)
         continue;
       // Byte containment alone conflates inclusions: a header entered twice
@@ -5167,7 +5235,7 @@ void RefoldMapBuilder::writeJSON() {
       PragmaItemsWithImage == PragmasEmittedIntoOutput;
 
   JO.object([&] {
-    JO.attribute("version", "3.13");
+    JO.attribute("version", "3.14");
     JO.attribute("pragma_images_complete", PragmaImagesComplete);
 
     const auto &PPO = PP.getPreprocessorOpts();
@@ -6535,6 +6603,18 @@ void RefoldMapBuilder::writeJSON() {
             if (It.UseBegin && It.UseEnd && *It.UseEnd >= *It.UseBegin) {
               JO.attribute("use_b", *It.UseBegin);
               JO.attribute("use_e", *It.UseEnd);
+              if (!It.UseArgRanges.empty()) {
+                JO.attributeArray("use_arg_ranges", [&] {
+                  for (const auto &R : It.UseArgRanges) {
+                    JO.object([&] {
+                      JO.attribute("b", R.first ? llvm::json::Value(*R.first)
+                                                : llvm::json::Value(nullptr));
+                      JO.attribute("e", R.second ? llvm::json::Value(*R.second)
+                                                 : llvm::json::Value(nullptr));
+                    });
+                  }
+                });
+              }
             }
 
             if (!It.InvArgRanges.empty()) {

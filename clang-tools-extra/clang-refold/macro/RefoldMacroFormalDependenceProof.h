@@ -86,6 +86,25 @@ public:
                               /*countArgumentOccurrences=*/true);
   }
 
+  /// As `TokensIgnoreRewrittenFormals`, for tokens inside \p cover rather
+  /// than \p root's own cover, with every invocation that produced a token of
+  /// \p cover judged by its role relative to \p root.
+  ///
+  /// The producer credits a call formed during another expansion only with
+  /// the tokens attributed to it, so that call's own cover can stop short of
+  /// the output of the calls its expansion formed in turn.  A cover known to
+  /// hold that output, such as the cover of the invocation atop its caller
+  /// chain, lets each such token be judged.
+  bool
+  TokensInCoverIgnoreRewrittenFormals(const RefoldModel::MacroInvocation &root,
+                                      std::pair<uint64_t, uint64_t> cover,
+                                      llvm::ArrayRef<uint64_t> tokens,
+                                      llvm::ArrayRef<uint32_t> rewrittenFormals,
+                                      RootOccurrences rootOccurrences) const {
+    return TokensAvoidFormals(root, tokens, rewrittenFormals, rootOccurrences,
+                              /*countArgumentOccurrences=*/true, cover);
+  }
+
   /// Return whether no invocation that produced an A token of `[begin, end)`
   /// inside \p root's cover was selected, through its callee or an ancestor's,
   /// by a formal in \p formals.
@@ -135,14 +154,15 @@ public:
                           llvm::ArrayRef<diffutils::Hunk> hunks);
 
 private:
-  /// Shared body of `TokensIgnoreRewrittenFormals` and
-  /// `SelectionIgnoresFormals`; the latter does not count descendants'
-  /// argument occurrences.
-  bool TokensAvoidFormals(const RefoldModel::MacroInvocation &root,
-                          llvm::ArrayRef<uint64_t> tokens,
-                          llvm::ArrayRef<uint32_t> formals,
-                          RootOccurrences rootOccurrences,
-                          bool countArgumentOccurrences) const;
+  /// Shared body of `TokensIgnoreRewrittenFormals`,
+  /// `TokensInCoverIgnoreRewrittenFormals` and `SelectionIgnoresFormals`; the
+  /// last does not count descendants' argument occurrences.  \p cover
+  /// replaces \p root's own cover when given.
+  bool TokensAvoidFormals(
+      const RefoldModel::MacroInvocation &root, llvm::ArrayRef<uint64_t> tokens,
+      llvm::ArrayRef<uint32_t> formals, RootOccurrences rootOccurrences,
+      bool countArgumentOccurrences,
+      std::optional<std::pair<uint64_t, uint64_t>> cover = std::nullopt) const;
 
   /// Root formals that the producer's attributions of one A token depend on.
   struct Dependence {
@@ -186,10 +206,11 @@ private:
     bool expansionPastes = false;
   };
 
-  /// Gather the invocations that produced tokens of \p root's cover, or
-  /// nullopt when the cover is unknown.
-  std::optional<CoverAttributions>
-  CollectCoverAttributions(const RefoldModel::MacroInvocation &root) const;
+  /// Gather the invocations that produced tokens of \p cover, or of \p root's
+  /// own cover when none is given; nullopt when that cover is unknown.
+  std::optional<CoverAttributions> CollectCoverAttributions(
+      const RefoldModel::MacroInvocation &root,
+      std::optional<std::pair<uint64_t, uint64_t>> cover = std::nullopt) const;
 
   /// Return the root formals that the producers in \p attributions make cover
   /// token \p tok depend on.

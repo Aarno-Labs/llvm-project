@@ -445,9 +445,10 @@ RefoldMacroFormalDependenceProof::CoverTokensKeptByRewrite(
 
 std::optional<RefoldMacroFormalDependenceProof::CoverAttributions>
 RefoldMacroFormalDependenceProof::CollectCoverAttributions(
-    const RefoldModel::MacroInvocation &root) const {
-  const std::optional<std::pair<uint64_t, uint64_t>> cover =
-      RefoldMacroWholeCoverProof::GetWholeCoverATokRange(root);
+    const RefoldModel::MacroInvocation &root,
+    std::optional<std::pair<uint64_t, uint64_t>> cover) const {
+  if (!cover)
+    cover = RefoldMacroWholeCoverProof::GetWholeCoverATokRange(root);
   if (!cover)
     return std::nullopt;
 
@@ -570,11 +571,12 @@ RefoldMacroFormalDependenceProof::TokenDependence(
 bool RefoldMacroFormalDependenceProof::TokensAvoidFormals(
     const RefoldModel::MacroInvocation &root, ArrayRef<uint64_t> tokens,
     ArrayRef<uint32_t> rewrittenFormals, RootOccurrences rootOccurrences,
-    bool countArgumentOccurrences) const {
+    bool countArgumentOccurrences,
+    std::optional<std::pair<uint64_t, uint64_t>> cover) const {
   if (rewrittenFormals.empty() || tokens.empty())
     return true;
   const std::optional<CoverAttributions> attributions =
-      CollectCoverAttributions(root);
+      CollectCoverAttributions(root, cover);
   if (!attributions)
     return false;
 

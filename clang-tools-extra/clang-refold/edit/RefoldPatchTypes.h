@@ -113,6 +113,11 @@ struct MaterializedSurface {
   /// verbatim, because replacing the callsite removes the only source that
   /// printed them.  Dropped whenever the replacement text is rewritten.
   std::vector<std::pair<uint64_t, uint64_t>> replayedPragmaLines = {};
+  /// Source byte ranges of the `_Pragma` operators the replacement removes
+  /// past the callsite and whose printed lines it replays; each licenses the
+  /// emitted edit to consume exactly that operator.  Dropped with
+  /// `replayedPragmaLines`.
+  std::vector<std::pair<uint64_t, uint64_t>> replayedPragmaOperators = {};
   /// True when `bTokStart`/`bTokEnd` name a valid B-token interval.
   bool hasBTokenRange = false;
   /// Inclusive B-token index of the materialized surface envelope.
@@ -255,6 +260,7 @@ inline void invalidateMacroPatchReplacementByteProvenance(MacroPatch &patch) {
   patch.materialized.hasOutputByteRange = false;
   patch.materialized.replacementIsWhollyBPayload = false;
   patch.materialized.replayedPragmaLines.clear();
+  patch.materialized.replayedPragmaOperators.clear();
 }
 
 /// Specialized authority carried by an exact direct-header byte patch.

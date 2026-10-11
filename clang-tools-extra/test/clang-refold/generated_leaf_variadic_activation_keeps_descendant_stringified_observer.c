@@ -7,7 +7,8 @@
 // `FWD`, whose `__VA_ARGS__` substitution supplies `FIELD_OPT`'s variadic
 // actual although it produced no token.  The producer's `arg_token_deps` count
 // that empty substitution, so the unchanged literal depends on the rewritten
-// variadic actual and the invocation is expanded.  This used to emit
+// variadic actual and none is supplied: B's appended tokens are inserted in
+// source after the invocation instead.  This used to emit
 // `APPLY(FWD, FIELD_OPT, alpha, 10)`, which re-spells the literal as `"10"`.
 #define APPLY(F, G, X, ...) F(G, X, __VA_ARGS__)
 #define FWD(G, X, ...) G(X, __VA_ARGS__)

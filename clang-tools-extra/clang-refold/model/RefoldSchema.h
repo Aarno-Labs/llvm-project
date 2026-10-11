@@ -902,6 +902,13 @@ static constexpr const char *RefoldSchema = R"json(
           "minimum": 0,
           "description": "End byte offset (exclusive) of this call's use, in the same file instance as use_b: the end of the outermost expansion the call's last token came from. From schema 3.12."
         },
+        "use_arg_ranges": {
+          "type": "array",
+          "description": "From schema 3.14. For a call whose name a macro produced, one entry per def_params entry (a variadic tail is one entry): the half-open bytes, in the file instance of use_b/use_e, of an actual read wholly from that source, from the start of its first token to the end of its last; null endpoints for an actual that is empty or has a token a macro produced. Such an actual follows the expansion that formed the call, so this call's argument collection is the only reader of its bytes, and the producer credits a copy of one of its tokens to this formal in arg_spans whichever invocation it is primarily attributed to. Emitted with use_b/use_e and only when at least one entry is non-null.",
+          "items": {
+            "$ref": "#/$defs/OptByteRange"
+          }
+        },
         "inv_pp_byte_begin": {
           "type": "integer",
           "minimum": 0,

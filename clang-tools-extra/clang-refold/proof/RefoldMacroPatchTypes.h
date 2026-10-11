@@ -278,6 +278,11 @@ struct WholeCoverPlan {
   /// that `clippedText` replays verbatim; see
   /// `RefoldMacroWholeCoverPlanBuilder::ComputeWholeCoverPlan`.
   std::vector<std::pair<uint64_t, uint64_t>> replayedPragmaLines = {};
+  /// Source byte ranges of the `_Pragma` operators in `[invE, sourceEnd)`
+  /// whose printed lines `replayedPragmaLines` replays: the only structure a
+  /// patch realizing this plan may remove past the callsite.  See
+  /// `RefoldMacroWholeCoverPlanBuilder::SuffixPragmaOperatorIsReplayed`.
+  std::vector<std::pair<uint64_t, uint64_t>> replayedPragmaOperators = {};
 };
 
 enum class OccurrenceSupportMode {

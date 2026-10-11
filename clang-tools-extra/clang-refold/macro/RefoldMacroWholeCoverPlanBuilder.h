@@ -52,6 +52,7 @@ struct SidebandPragmaLinePairing;
 class RefoldBInsertionLedger;
 class RefoldPathIdentity;
 class RefoldPreprocessingStructureIndexProvider;
+struct PreprocessingStructureInterval;
 class RefoldSourceMapper;
 
 /// Computes the whole-cover replacement plan for a macro invocation, and
@@ -81,6 +82,8 @@ public:
     const RefoldPathIdentity &pathIdentity;
     /// Preprocessing structure of the source a widened realization replaces.
     const RefoldPreprocessingStructureIndexProvider &structureIndexes;
+    /// Producer records, for the `#pragma` a suffix `_Pragma` operator printed.
+    const RefoldModel &model;
   };
 
   explicit RefoldMacroWholeCoverPlanBuilder(Dependencies deps) : deps_(deps) {}
@@ -117,6 +120,14 @@ public:
                                          const WholeCoverPlan &plan,
                                          uint64_t rootMacroId);
 
+  /// Return whether the structure index of the \p ownerIncludeId instance of
+  /// \p path is complete and proves that the half-open source bytes
+  /// `[begin, end)` hold no preprocessing structure: no directive, no pragma
+  /// operator, and nothing else a byte edit there would remove.
+  bool SourceRangeHoldsNoStructure(llvm::StringRef path,
+                                   std::optional<uint64_t> ownerIncludeId,
+                                   uint64_t begin, uint64_t end) const;
+
 private:
   /// Return the end of the physical source bytes \p m's expansion consumed,
   /// or nullopt when \p m records no source range or the end is not proven.
@@ -134,11 +145,26 @@ private:
   /// parentheses: a token spelled there is discarded or lands in \p m's
   /// expansion, which the cover's B image realizes.  The end is accepted only
   /// when the structure index proves those bytes hold no preprocessing
-  /// structure, which the realization would otherwise remove.  An invocation
-  /// spelled inside a `#define` reads no source after itself, and keeps
-  /// `invE`.
+  /// structure the realization would remove: none at all, or only `_Pragma`
+  /// operators whose printed lines \p plan replays in their place (see
+  /// `SuffixPragmaOperatorIsReplayed`), which are recorded in
+  /// `plan.replayedPragmaOperators`.  An invocation spelled inside a
+  /// `#define` reads no source after itself, and keeps `invE`.
   std::optional<uint64_t>
-  ConsumedSourceEnd(const RefoldModel::MacroInvocation &m) const;
+  ConsumedSourceEnd(const RefoldModel::MacroInvocation &m,
+                    WholeCoverPlan &plan) const;
+
+  /// Return whether \p interval, structure in the source suffix a whole cover
+  /// replaces, is a `_Pragma` operator whose only effect \p plan reproduces.
+  ///
+  /// The operator must be bound to exactly one producer `#pragma` record that
+  /// clang printed, and the plan must replay the one B line that record's
+  /// printed A line survived as.  A pragma that changes preprocessor state is
+  /// consumed by its handler and never printed, so it fails here; so does an
+  /// operator the plan does not replay.
+  bool
+  SuffixPragmaOperatorIsReplayed(const PreprocessingStructureInterval &interval,
+                                 const WholeCoverPlan &plan) const;
 
   /// Make \p plan replay the surviving `#pragma` lines \p m's own expansion
   /// printed, and record them.

@@ -362,7 +362,7 @@ void RefoldEngine::BuildServiceGraph() {
       RefoldMacroWholeCoverPlanBuilder::Dependencies{
           sourceMapper_, *bInsertionLedger_, macroTopology_,
           sidebandPragmaLinePairings_, bSource_, pathIdentity_,
-          *preprocessingStructureIndexProvider_});
+          *preprocessingStructureIndexProvider_, model_});
 
   counterStabilization_ = std::make_unique<RefoldCounterStabilization>(
       model_, aToks_, bToks_, macroTopology_, *ownerClassifier_);

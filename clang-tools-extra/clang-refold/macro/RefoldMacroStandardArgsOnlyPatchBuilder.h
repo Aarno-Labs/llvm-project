@@ -192,6 +192,29 @@ public:
       const diffutils::Hunk &hunk, llvm::StringRef baseInvocationText,
       llvm::ArrayRef<std::pair<size_t, size_t>> invocationArgRanges) const;
 
+  /// One actual of an invocation located in source by the producer rather
+  /// than in its invocation text: the formal it binds, and its spelling.
+  struct SourceSpelledActual {
+    uint32_t formal = 0;
+    llvm::StringRef text;
+  };
+
+  /// Derive, for each formal among \p actuals whose occurrences \p hunks
+  /// edit, the one actual spelling every occurrence of that formal replays
+  /// in B.
+  ///
+  /// Each hunk must lie inside a standard or stringified occurrence of a
+  /// formal among \p actuals, so the result explains all of \p hunks.  Each
+  /// derived spelling must agree with every standard, stringified and pasted
+  /// occurrence of its formal, and must not hold a top-level comma unless the
+  /// formal is variadic.  Returns nullopt when a hunk or a formal fails; a
+  /// formal no hunk touches is absent from the result.  Invocation text is
+  /// not read, so the invocation need not have a canonical callsite.
+  std::optional<llvm::DenseMap<uint32_t, std::string>>
+  DeriveSourceActualRewrites(const RefoldModel::MacroInvocation &invocation,
+                             llvm::ArrayRef<SourceSpelledActual> actuals,
+                             llvm::ArrayRef<diffutils::Hunk> hunks) const;
+
 private:
   /// `BuildMacroInvocationPatchArgsOnly()` without consulting or recording the
   /// scope's failed builds.

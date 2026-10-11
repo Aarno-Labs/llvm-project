@@ -22,6 +22,7 @@
 #include "support/StringUtils.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
@@ -1000,6 +1001,88 @@ bool ReplayedFormalOccurrenceValidator::Validate(
   }
 
   return sawOccurrence;
+}
+
+std::optional<DenseMap<uint32_t, std::string>>
+RefoldMacroStandardArgsOnlyPatchBuilder::DeriveSourceActualRewrites(
+    const RefoldModel::MacroInvocation &invocation,
+    ArrayRef<SourceSpelledActual> actuals,
+    ArrayRef<diffutils::Hunk> hunks) const {
+  SmallVector<char, 8> located(invocation.defParams.size(), 0);
+  for (const SourceSpelledActual &actual : actuals) {
+    if (actual.formal >= located.size())
+      return std::nullopt;
+    located[actual.formal] = 1;
+  }
+
+  // Only the occurrences of a located actual's formal can explain a hunk.
+  TouchedFormalHunkCollection occurrences;
+  for (const auto &[spans, isStringify] :
+       {std::make_pair(&invocation.argSpans, false),
+        std::make_pair(&invocation.stringifySpans, true)}) {
+    for (const RefoldModel::PPArgSpan &span : *spans) {
+      if (span.argIdx >= located.size() || !located[span.argIdx])
+        continue;
+      occurrences.occurrences.push_back(span);
+      occurrences.occurrenceIsStringify.push_back(isStringify);
+    }
+  }
+  if (occurrences.occurrences.empty() || hunks.empty())
+    return std::nullopt;
+
+  // Every hunk seeds the formals it touches; the replay must explain the
+  // union of what the seeds collect.
+  const RefoldMacroOccurrenceReplay occurrenceReplay = OccurrenceReplay();
+  const TouchedFormalHunkCollector collector(deps_, occurrenceReplay,
+                                             envelopeCache_.get());
+  DenseMap<uint32_t, diffutils::Hunk> seedByFormal;
+  SmallVector<diffutils::Hunk, 8> tokenHunks;
+  for (const diffutils::Hunk &hunk : hunks) {
+    std::optional<TouchedFormalHunkCollection> collected = collector.Collect(
+        occurrences, invocation, hunk, invocation.defParams.size());
+    if (!collected)
+      return std::nullopt;
+    for (uint32_t formal = 0; formal < collected->touchedFormals.size();
+         ++formal)
+      if (collected->touchedFormals[formal])
+        seedByFormal.try_emplace(formal, hunk);
+    append_range(tokenHunks, collected->tokenHunks);
+  }
+  llvm::sort(tokenHunks, tokenHunkLess);
+  tokenHunks.erase(
+      std::unique(tokenHunks.begin(), tokenHunks.end(), sameTokenHunk),
+      tokenHunks.end());
+
+  const InvocationOccurrenceObservationCollector observer(deps_,
+                                                          occurrenceReplay);
+  DenseMap<uint32_t, std::string> rewrites;
+  for (const SourceSpelledActual &actual : actuals) {
+    auto seed = seedByFormal.find(actual.formal);
+    if (seed == seedByFormal.end())
+      continue;
+    std::optional<InvocationOccurrenceObservationSet> observed =
+        observer.Collect(
+            invocation, actual.formal, actual.text, occurrences.occurrences,
+            occurrences.occurrenceIsStringify, tokenHunks, seed->second);
+    // Occurrences that disagree would need a tuple-forwarding proof, which
+    // rewrites a caller's actual; there is none here.
+    if (!observed || observed->needTupleForwarding || !observed->unifiedNewArg)
+      return std::nullopt;
+    const std::string &newArg = *observed->unifiedNewArg;
+    const bool variadic =
+        isMacroInvocationVariadicFormal(invocation, actual.formal);
+    if (!variadic && replacementIntroducesTopLevelComma(newArg, deps_.lexLang))
+      return std::nullopt;
+    // A variadic tail owns no separator before it, so a spelling that starts
+    // with one would add an empty actual.
+    if (variadic && StringRef(newArg).trim().starts_with(","))
+      return std::nullopt;
+    if (!occurrenceReplay.MacroArgReplacementMatchesAllOccurrencesInB(
+            invocation, actual.formal, actual.text, newArg, tokenHunks))
+      return std::nullopt;
+    rewrites[actual.formal] = newArg;
+  }
+  return rewrites;
 }
 
 } // namespace refold

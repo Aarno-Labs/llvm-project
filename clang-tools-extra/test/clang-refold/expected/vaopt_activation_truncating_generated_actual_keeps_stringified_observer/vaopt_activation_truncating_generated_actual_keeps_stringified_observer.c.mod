@@ -9,8 +9,9 @@
 // depend on `FWD`'s variadic formal although the group outputs nothing
 // before its `,`.  B appends through the `__VA_OPT__` tail of the generated
 // callee but keeps `"alpha + 1"`, which the rewrite would re-spell as
-// `"alpha"`, so the invocation is expanded.
+// `"alpha"`, so no variadic actual is supplied and B's appended tokens are
+// inserted in source after the invocation.
 #define APPLY(F, G, X, ...) F(G, X, __VA_ARGS__)
 #define FWD(G, X, ...) G(X __VA_OPT__(, __VA_ARGS__) + 1)
 #define FIELD_OPT_STR(name, ...) #name __VA_OPT__(":" #__VA_ARGS__)
-const char *s = "alpha + 1" ":" "10";
+const char *s = APPLY(FWD, FIELD_OPT_STR, alpha) ":" "10" ;

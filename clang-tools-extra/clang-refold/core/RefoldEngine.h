@@ -1112,6 +1112,20 @@ private:
       StringRef tuPath, StringRef tuBytes, ArrayRef<diffutils::Hunk> hunks,
       RefoldStructuralHunkDispatcher &structuralHunkDispatcher);
 
+  /// Build the translation-unit byte edit that realizes pure insertion \p h at
+  /// its gap, as the truthful TU branch of `DispatchStructuralHunks` would:
+  /// for a TU-owned hunk whose gap maps to TU bytes inside no call's use.
+  ///
+  /// A boundary selector offers such an insertion to a macro owner for a proof
+  /// that keeps its callsite.  When the owner can only replace its callsite,
+  /// this edit realizes the same B tokens beside the old output and keeps
+  /// every call.
+  std::optional<TextEdit> BuildBoundaryInsertionTUEdit(const diffutils::Hunk &h,
+                                                       size_t hunkIndex,
+                                                       const Owner &owner,
+                                                       StringRef tuPath,
+                                                       StringRef tuBytes) const;
+
   /// Complete macro-state repair, include materialization, and final TU emission
   /// after all structural hunks have been dispatched.
   ///

@@ -11,7 +11,7 @@
 // RUN: %clang_cc1 -E -P --refold-map=%t/map.json %t/main.c -o %t/out.i
 // RUN: FileCheck --input-file=%t/map.json %s
 
-// CHECK: "version": "3.13",
+// CHECK: "version": "3.14",
 
 // A callee formed while another macro prescans its actual: `F(a1)` expands
 // while EVAL prescans `m(v)`, so DISPATCH, not the immediate caller EVAL,

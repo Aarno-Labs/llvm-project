@@ -448,6 +448,20 @@ struct Item {
   std::optional<uint64_t> UseBegin;
   std::optional<uint64_t> UseEnd;
 
+  /// For a call whose name a macro produced, the half-open byte range of each
+  /// formal's actual that was read wholly from the file instance `UseBegin`
+  /// indexes: from the start of the actual's first token to the end of its
+  /// last.  A null entry is an actual that is empty or has a token a macro
+  /// produced.  Empty unless at least one entry is set.
+  ///
+  /// Such an actual follows the expansion that formed the call, so its bytes
+  /// are read by this call's argument collection and by nothing else; a copy
+  /// of one of its tokens is a copy of this formal.
+  std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>>
+      UseArgRanges;
+  /// The file instance `UseArgRanges` index into; valid when they are set.
+  clang::FileID UseFileID;
+
   // --- New: include-site anchors and structure ---
   std::optional<uint64_t>
       SiteBegin; // byte offset of '#' in the directive's file
@@ -991,6 +1005,11 @@ class RefoldMapBuilder {
   std::optional<uint32_t>
   argIndexForSpellingLoc(const Item &MI, SourceLocation Loc, SourceManager &SM,
                          const LangOptions &Lang, bool EmitAbsPaths);
+
+  /// Return the formal of \p MI whose source-spelled actual (`UseArgRanges`)
+  /// holds the file location \p Loc resolves to, if any.
+  std::optional<uint32_t> useArgIndexForLoc(const Item &MI,
+                                            SourceLocation Loc) const;
 
   void addHeaderDecl(Item &Inc, StringRef Kind, StringRef Name,
                      StringRef HeaderFile, uint64_t HeaderB, uint64_t HeaderE,

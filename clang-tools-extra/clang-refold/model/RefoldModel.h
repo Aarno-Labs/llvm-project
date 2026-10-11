@@ -753,6 +753,13 @@ public:
     /// (schema 3.12): every byte of that instance the call read as a token,
     /// from where its name was used, not spelled, to its last token.
     std::optional<uint64_t> useB, useE;
+    /// For a call formed during another expansion (schema 3.14), indexed by
+    /// formal: the bytes of the `useB` instance holding an actual read wholly
+    /// from that source, from its first token's start to its last token's
+    /// end, or null.  Empty when no actual was.  Such an actual follows the
+    /// expansion that formed the call, so this call's argument collection is
+    /// the only reader of its bytes.
+    std::vector<OptByteRange> useArgRanges;
     /// Macro directive id whose definition was used for this invocation.
     std::optional<uint64_t> definitionDirectiveId;
     /// Parent macro invocation id for nested/generated invocations.

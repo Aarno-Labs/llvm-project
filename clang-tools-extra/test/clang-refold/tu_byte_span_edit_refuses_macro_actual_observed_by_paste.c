@@ -2,14 +2,13 @@
 // that no proven macro rewrite accounts for.
 //
 // B renames only `int x`.  `x` is CALL's actual `a`, which G also pastes into
-// the unchanged `g_x`, so the args-only rewrite is refused, and whole cover is
-// refused because G's `)` closes after the `_Pragma` in the consumed source.
-// The tokmap maps the edited `x` to its spelling in the actual, and the TU
-// byte-span path used to accept rewriting those bytes to `y`, which also
-// turns `g_x` into `g_y`.  Here a later composition failure happens to hide
-// that edit; with a `#define` in place of the `_Pragma`, which is not valid C,
-// it was the output.
-// The fold itself is not asserted: keeping the `_Pragma` inside a whole-cover
+// the unchanged `g_x`, so the args-only rewrite is refused.  Whole cover is
+// refused too: G's `)` closes after the `_Pragma` in the consumed source, and
+// a `push_macro` pragma changes preprocessor state and prints no line the
+// cover could replay in its place.  The tokmap maps the edited `x` to its
+// spelling in the actual, and the TU byte-span path used to accept rewriting
+// those bytes to `y`, which also turns `g_x` into `g_y`.
+// The fold itself is not asserted: keeping the `_Pragma` beside a whole-cover
 // replacement is a sound refold that is not implemented yet.
 //
 // RUN: rm -rf %t.dir && mkdir -p %t.dir && cp %s %t.dir/t.c
@@ -21,4 +20,4 @@
 // RUN: not grep 'accept owner realization evidence=TUByteSpan' log.txt
 #define G(v) g_##v
 #define CALL(f, a) int a; int f(a
-CALL(G, x) _Pragma("refold_marker") );
+CALL(G, x) _Pragma("push_macro(\"G\")") );
