@@ -2875,6 +2875,26 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
   if (!IncludeStack.empty() && IncludeStack.back())
     It.OwnerIncludeId = static_cast<uint64_t>(*IncludeStack.back());
 
+  // 3a. The use-site extent.  `[inv_b, inv_e)` starts where the name was
+  // spelled, which for a name a macro produced is its replacement list or a
+  // caller's actual; the expansion range starts where that name was used.
+  if (const PreprocessorLexer *FileLexer = PP.getCurrentFileLexer()) {
+    const FileID UseFID = FileLexer->getFileID();
+    if (It.OwnerIncludeId || UseFID == SM.getMainFileID()) {
+      const CharSourceRange Use = SM.getExpansionRange(Range);
+      const SourceLocation UseEndLoc =
+          Use.isTokenRange()
+              ? Lexer::getLocForEndOfToken(Use.getEnd(), 0, SM, Lang)
+              : Use.getEnd();
+      It.UseBegin = SM.getFileID(Use.getBegin()) == UseFID
+                        ? SM.getFileOffset(Use.getBegin())
+                        : 0;
+      It.UseEnd = UseEndLoc.isValid() && SM.getFileID(UseEndLoc) == UseFID
+                      ? SM.getFileOffset(UseEndLoc)
+                      : SM.getBufferData(UseFID).size();
+    }
+  }
+
   // 4. ATOMIC MOVE INTO COLLECTION
   // We determine the index before pushing.
   size_t NewIdx = Items.size();
@@ -4683,7 +4703,7 @@ void RefoldMapBuilder::writeJSON() {
       PragmaItemsWithImage == PragmasEmittedIntoOutput;
 
   JO.object([&] {
-    JO.attribute("version", "3.11");
+    JO.attribute("version", "3.12");
     JO.attribute("pragma_images_complete", PragmaImagesComplete);
 
     const auto &PPO = PP.getPreprocessorOpts();
@@ -6023,6 +6043,11 @@ void RefoldMapBuilder::writeJSON() {
                 *It.InvEnd >= *It.InvBegin) {
               JO.attribute("inv_b", *It.InvBegin);
               JO.attribute("inv_e", *It.InvEnd);
+            }
+
+            if (It.UseBegin && It.UseEnd && *It.UseEnd >= *It.UseBegin) {
+              JO.attribute("use_b", *It.UseBegin);
+              JO.attribute("use_e", *It.UseEnd);
             }
 
             if (!It.InvArgRanges.empty()) {

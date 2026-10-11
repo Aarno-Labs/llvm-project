@@ -1432,6 +1432,10 @@ parseMacroInvocationItem(const json::Object &obj, const std::string &ctxItem) {
       asOptUInt64(obj, "inv_pp_byte_begin");
   std::optional<uint64_t> invPPByteEnd = asOptUInt64(obj, "inv_pp_byte_end");
   std::optional<uint64_t> ownerIncludeId = asOptUInt64(obj, "owner_include_id");
+  std::optional<uint64_t> useB = asOptUInt64(obj, "use_b");
+  std::optional<uint64_t> useE = asOptUInt64(obj, "use_e");
+  if (useB.has_value() != useE.has_value() || (useB && *useE < *useB))
+    REFOLD_LOG_FATAL("model", "{0}: invalid use_b/use_e pair", ctxItem);
   std::optional<uint64_t> definitionDirectiveId =
       asOptUInt64(obj, "definition_directive_id",
                   /*canBeNull=*/true);
@@ -1778,6 +1782,8 @@ parseMacroInvocationItem(const json::Object &obj, const std::string &ctxItem) {
                      /*argDeps*/ std::move(argDeps),
                      /*argRefs*/ std::move(argRefs),
                      /*argTupleRefs*/ std::move(argTupleRefs));
+  mi.useB = useB;
+  mi.useE = useE;
 
   return mi;
 }

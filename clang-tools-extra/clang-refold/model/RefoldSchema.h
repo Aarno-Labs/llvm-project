@@ -71,6 +71,7 @@
 //       - optional origin partitioning within the expansion:
 //         arg_spans / stringify_spans / paste_spans / body_spans
 //       - invocation call-site bytes: inv_file, [inv_b, inv_e) (BYTES in file)
+//       - use-site bytes: [use_b, use_e) in the owner_include_id instance
 //       - optional invocation envelope in A output bytes:
 //         inv_pp_byte_begin / inv_pp_byte_end
 //       - owner_include_id: include instance that opened inv_file (when nested)
@@ -891,6 +892,16 @@ static constexpr const char *RefoldSchema = R"json(
           "minimum": 0,
           "description": "End byte offset (exclusive) of the invocation within 'inv_file' (elided if unknown)."
         },
+        "use_b": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Begin byte offset of this call's use, in the file instance being lexed when it expanded: the main file when owner_include_id is absent, otherwise that include instance. From schema 3.12. The use runs from the start of the outermost expansion the call's name came from, so unlike inv_b it is where the call was used even when its name was spelled in a replacement list or a caller's actual. Every token the call read from that file instance, name, parentheses and actuals alike, lies in [use_b, use_e); an endpoint in another file is bounded by the start or end of this one. Elided only when the use was in neither kind of instance."
+        },
+        "use_e": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "End byte offset (exclusive) of this call's use, in the same file instance as use_b: the end of the outermost expansion the call's last token came from. From schema 3.12."
+        },
         "inv_pp_byte_begin": {
           "type": "integer",
           "minimum": 0,
@@ -1024,6 +1035,12 @@ static constexpr const char *RefoldSchema = R"json(
         "inv_e": [
           "inv_b",
           "inv_file"
+        ],
+        "use_b": [
+          "use_e"
+        ],
+        "use_e": [
+          "use_b"
         ]
       },
       "description": "inv_b/inv_e are BYTES in the main source, not token indices."

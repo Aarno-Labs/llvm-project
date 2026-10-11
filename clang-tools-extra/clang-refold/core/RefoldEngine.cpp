@@ -1065,6 +1065,10 @@ bool RefoldEngine::DispatchStructuralHunks(
     const bool isIns = h.isInsertOnly();
     const bool isDel = h.isDeleteOnly();
 
+    // Set when the theorem-lattice tie-breaker proved this hunk's TU byte edit
+    // equivalent to an accepted args-only rewrite of the invocation it edits.
+    bool tuArgumentEditProven = false;
+
     // a) Segment-aware owner classification: this decides TU vs include vs “no
     // segment”.
     Owner owner = ownerClassifier_->ClassifyOwnerWithSegments(tuPath, h);
@@ -1110,6 +1114,7 @@ bool RefoldEngine::DispatchStructuralHunks(
             if (!stagingSlot.existingPatch &&
                 theoremLatticePrefersExactTUArgEditOverMacroArgsOnly(
                     *target, h, *updated)) {
+              tuArgumentEditProven = true;
               break;
             }
 
@@ -1203,6 +1208,19 @@ bool RefoldEngine::DispatchStructuralHunks(
     // header. So only treat it as TU when the hunk map says so.
     bool mapsToTU = ownerClassifier_->HunkMapsToTU(h.aStart, h.aEnd, tuPath);
 
+    // A TU byte edit proves only that the hunk's tokens map onto the bytes it
+    // replaces.  Bytes inside a macro call's use also feed that expansion
+    // wherever it uses them -- every occurrence of an actual, its stringified
+    // and pasted forms -- so the edit is an unproven rewrite of the
+    // invocation.  Only the tie-breaker above proves one, against an accepted
+    // macro rewrite; any other such edit is left to the fallbacks below.
+    const auto spanSplitsUnprovenCallsite =
+        [&](std::pair<uint64_t, uint64_t> span) {
+          return !tuArgumentEditProven &&
+                 macroTopology_.SourceSpanSplitsInvocationUse(
+                     /*ownerIncludeId=*/std::nullopt, span.first, span.second);
+        };
+
     if (owner.kind == OwnerKind::TU && !mapsToTU) {
       // Deterministic rule: TU ownership must be supported by provenance. If
       // tokmap-based evidence does not indicate TU ownership, do not force TU
@@ -1213,7 +1231,8 @@ bool RefoldEngine::DispatchStructuralHunks(
 
     if (mapsToTU) {
       if (auto spanPlan = tuAnchorProof_->PlanTUByteSpan(h.aStart, h.aEnd,
-                                                         tuPath)) { // [b,e)
+                                                         tuPath); // [b,e)
+          spanPlan && !spanSplitsUnprovenCallsite(spanPlan->byteRange())) {
         if (std::optional<TextEdit> directEdit = directTUEditBuilder_->Build(
                 h, i, isDel, tuPath, tuBytes, spanPlan->byteRange(),
                 AcceptedPathKind::TUByteSpanMappedEdit)) {
@@ -1279,7 +1298,8 @@ bool RefoldEngine::DispatchStructuralHunks(
     }
 
     if (auto spanPlan = tuAnchorProof_->PlanTUByteSpan(h.aStart, h.aEnd,
-                                                       tuPath)) { // [b, e)
+                                                       tuPath); // [b, e)
+        spanPlan && !spanSplitsUnprovenCallsite(spanPlan->byteRange())) {
       if (std::optional<TextEdit> directEdit = directTUEditBuilder_->Build(
               h, i, isDel, tuPath, tuBytes, spanPlan->byteRange(),
               AcceptedPathKind::TUByteSpanConservativeEdit)) {

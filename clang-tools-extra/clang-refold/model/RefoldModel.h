@@ -729,6 +729,10 @@ public:
     std::optional<uint64_t> invPPByteBegin, invPPByteEnd;
     /// Include instance that owns the invocation callsite, or nullopt for TU.
     std::optional<uint64_t> ownerIncludeId;
+    /// Half-open byte range of the call's use in the `ownerIncludeId` instance
+    /// (schema 3.12): every byte of that instance the call read as a token,
+    /// from where its name was used, not spelled, to its last token.
+    std::optional<uint64_t> useB, useE;
     /// Macro directive id whose definition was used for this invocation.
     std::optional<uint64_t> definitionDirectiveId;
     /// Parent macro invocation id for nested/generated invocations.

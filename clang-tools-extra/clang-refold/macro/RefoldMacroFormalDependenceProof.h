@@ -72,8 +72,10 @@ public:
   /// A token depends on the root formals its producer attributions name: root
   /// occurrence spans (per \p rootOccurrences), the composed `arg_deps` of
   /// every descendant occurrence that produced it, and the callee origin of
-  /// every descendant on its caller chain.  An attribution the producer did
-  /// not record makes the token depend on every formal.
+  /// every descendant on its caller chain.  A descendant credited with no
+  /// token, whose output may hold the token, adds its callee origin when the
+  /// producer names the selecting root formals exactly.  An attribution the
+  /// producer did not record makes the token depend on every formal.
   bool TokensIgnoreRewrittenFormals(const RefoldModel::MacroInvocation &root,
                                     llvm::ArrayRef<uint64_t> tokens,
                                     llvm::ArrayRef<uint32_t> rewrittenFormals,
@@ -151,9 +153,10 @@ private:
   /// Role of a non-root invocation that produced tokens of the root's cover.
   enum class CoverRole {
     /// Selected without the root's expansion: a caller-chain ancestor, a
-    /// callsite whose spelling contains the root's, or a literal callee whose
-    /// callers are literal up to a root ancestor or the translation unit.  Its
-    /// view of the cover is the root's own output, passed through.
+    /// callsite the root did not generate whose spelling contains the root's,
+    /// or a literal callee whose callers are literal up to a root ancestor or
+    /// the translation unit.  Its view of the cover is the root's own output,
+    /// passed through.
     Enclosing,
     /// Spelled inside one of the root's actuals, so its output reaches the
     /// cover only through the root's own argument occurrences.
@@ -205,6 +208,16 @@ private:
   /// so that nothing the root expands selects \p inv.
   bool SelectedOutsideRoot(const RefoldModel::MacroInvocation &inv,
                            llvm::ArrayRef<uint64_t> rootAncestors) const;
+
+  /// Return whether the callee of \p inv, and that of each caller up to
+  /// \p root, is replacement-list text or a `caller_param` edge whose formals
+  /// reach \p root through actuals that each spell exactly one formal of the
+  /// next caller, so that the root formals selecting \p inv are known
+  /// exactly.  Through any other actual, text-derived `arg_deps`
+  /// over-approximate them.
+  bool SelectionNamesRootFormalsExactly(
+      const RefoldModel::MacroInvocation &root,
+      const RefoldModel::MacroInvocation &inv) const;
 
   /// Return whether recorded `caller_macro_id` edges lead from \p inv to the
   /// invocation \p ancestorId.

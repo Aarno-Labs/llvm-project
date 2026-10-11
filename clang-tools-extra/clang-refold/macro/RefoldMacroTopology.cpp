@@ -233,6 +233,54 @@ void RefoldMacroTopology::BuildDefineDirectiveIndex() const {
   }
 }
 
+void RefoldMacroTopology::BuildInvocationUseIndex() const {
+  if (invocationUseIndexBuilt_)
+    return;
+  invocationUseIndexBuilt_ = true;
+
+  for (const RefoldModel::MacroInvocation &m : model_.GetMacroInvocations())
+    if (m.useB && m.useE && *m.useB < *m.useE)
+      invocationUseIndex_[m.ownerIncludeId].ranges.emplace_back(*m.useB,
+                                                                *m.useE);
+
+  for (auto &[owner, index] : invocationUseIndex_) {
+    llvm::sort(index.ranges);
+    uint64_t maxEnd = 0;
+    index.prefixMaxEnd.reserve(index.ranges.size());
+    for (const auto &range : index.ranges) {
+      maxEnd = std::max(maxEnd, range.second);
+      index.prefixMaxEnd.push_back(maxEnd);
+    }
+  }
+}
+
+bool RefoldMacroTopology::SourceSpanSplitsInvocationUse(
+    std::optional<uint64_t> ownerIncludeId, uint64_t begin,
+    uint64_t end) const {
+  BuildInvocationUseIndex();
+  const auto found = invocationUseIndex_.find(ownerIncludeId);
+  if (found == invocationUseIndex_.end())
+    return false;
+  const InvocationUseIndex &index = found->second;
+
+  // A range that starts before `begin` splits the span when it reaches past
+  // `begin`, which for a point means the point is strictly inside it.
+  const size_t firstAtBegin =
+      llvm::partition_point(index.ranges,
+                            [&](const std::pair<uint64_t, uint64_t> &range) {
+                              return range.first < begin;
+                            }) -
+      index.ranges.begin();
+  if (firstAtBegin > 0 && index.prefixMaxEnd[firstAtBegin - 1] > begin)
+    return true;
+  // A range that starts inside the span splits it when it ends past it.
+  for (size_t i = firstAtBegin;
+       i < index.ranges.size() && index.ranges[i].first < end; ++i)
+    if (index.ranges[i].second > end)
+      return true;
+  return false;
+}
+
 bool RefoldMacroTopology::IsInvocationInsideDefineDirective(
     const RefoldModel::MacroInvocation &m) const {
   // The answer reads only the record and the one-shot define index, so it is

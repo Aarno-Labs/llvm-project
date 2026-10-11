@@ -15,7 +15,7 @@
 // RUN: %clang_cc1 -E -P -I%t --refold-map=%t/map.json %t/tu.c -o %t/out.i
 // RUN: FileCheck --input-file=%t/map.json %s
 
-// CHECK:      "version": "3.11",
+// CHECK:      "version": "3.12",
 
 // CHECK:      "text": "#include \"plain.h\"\n",
 // CHECK:      "controlling_macro": "PLAIN_H",

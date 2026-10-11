@@ -383,6 +383,19 @@ struct Item {
   /// invocation-begin file location.
   clang::FileID InvFileID;
 
+  /// Half-open byte range of the call's use, in the file instance being lexed
+  /// when it expanded: the main file when `OwnerIncludeId` is absent,
+  /// otherwise that include instance.
+  ///
+  /// It runs from the start of the outermost expansion the call's name came
+  /// from to the end of the outermost expansion its last token came from, so
+  /// every token the call read from that file -- name, parentheses and actual
+  /// tokens alike -- lies inside it, wherever the name was spelled.  An
+  /// endpoint in another file is bounded by the start or end of this one.
+  /// Absent only when the use was in neither kind of instance.
+  std::optional<uint64_t> UseBegin;
+  std::optional<uint64_t> UseEnd;
+
   // --- New: include-site anchors and structure ---
   std::optional<uint64_t>
       SiteBegin; // byte offset of '#' in the directive's file

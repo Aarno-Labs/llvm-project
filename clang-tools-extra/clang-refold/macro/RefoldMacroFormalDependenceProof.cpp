@@ -64,6 +64,45 @@ bool invocationClaimsToken(const RefoldModel::MacroInvocation &inv,
   return !formals.empty();
 }
 
+/// Return the A token at or after which \p inv's output begins, when the
+/// producer credited \p inv with no token.
+///
+/// The producer opens an invocation's `spans` with an empty span at the
+/// printed-token index of its expansion callback, which precedes the printing
+/// of any of its output, and widens it only over tokens it attributes to that
+/// invocation.  An invocation that only passes its arguments through, such as
+/// `F(v) v` selected by a caller's formal, can keep the empty span while its
+/// whole output is credited to other invocations.  Its output is then some
+/// unknown run of tokens at or after the anchor, possibly none.
+std::optional<uint64_t>
+uncreditedOutputAnchor(const RefoldModel::MacroInvocation &inv) {
+  if (inv.spans.empty() ||
+      llvm::any_of(inv.spans, [](const RefoldModel::PPSpan &span) {
+        return span.begin < span.end;
+      }))
+    return std::nullopt;
+  uint64_t anchor = inv.spans.front().begin;
+  for (const RefoldModel::PPSpan &span : inv.spans)
+    anchor = std::min(anchor, span.begin);
+  return anchor;
+}
+
+/// Return whether \p inv may have produced a token of the half-open A-token
+/// range \p cover.
+///
+/// One credited with no token counts when its output could begin inside the
+/// cover.  A descendant is expanded after the root, and once the producer
+/// credits the root with a token the cover begins at the root's own anchor, so
+/// a descendant is never anchored before the cover.
+bool mayProduceCoverToken(const RefoldModel::MacroInvocation &inv,
+                          std::pair<uint64_t, uint64_t> cover) {
+  if (const std::optional<uint64_t> anchor = uncreditedOutputAnchor(inv))
+    return cover.first <= *anchor && *anchor < cover.second;
+  return llvm::any_of(inv.spans, [&](const RefoldModel::PPSpan &span) {
+    return span.begin < cover.second && cover.first < span.end;
+  });
+}
+
 /// Return the caller formals referenced by the actual bound to formal
 /// \p formal of \p inv, from the producer's edge-local `arg_deps`.
 ///
@@ -85,6 +124,34 @@ callerFormalsOfFormal(const RefoldModel::MacroInvocation &inv,
   for (size_t actual = formal; actual < end; ++actual)
     append_range(callerFormals, inv.argDeps[actual]);
   return callerFormals;
+}
+
+/// Return the caller formal that the actual bound to formal \p formal of
+/// \p inv spells, when that actual is exactly one caller formal reference.
+///
+/// `arg_refs` slices are offsets into `inv_text`, as `inv_arg_ranges` are once
+/// `inv_b` is subtracted.
+std::optional<uint32_t>
+callerFormalSpelledAsActual(const RefoldModel::MacroInvocation &inv,
+                            uint32_t formal) {
+  if (formal >= inv.argRefs.size() || inv.argRefs[formal].size() != 1 ||
+      formal >= inv.invArgRanges.size() || !inv.invText || !inv.invB ||
+      (formal < inv.defParams.size() && inv.defParams[formal].variadic))
+    return std::nullopt;
+  const auto [begin, end] = inv.invArgRanges[formal];
+  if (!begin || !end || *begin < *inv.invB || *end < *begin ||
+      *end - *inv.invB > inv.invText->size())
+    return std::nullopt;
+  const size_t actualB = *begin - *inv.invB;
+  const size_t actualE = *end - *inv.invB;
+  const RefoldModel::InvArgRef &ref = inv.argRefs[formal].front();
+  // A slice of the actual as long as the trimmed actual is the trimmed actual.
+  if (ref.byteBegin < actualB || ref.byteBegin > ref.byteEnd ||
+      ref.byteEnd > actualE ||
+      ref.byteEnd - ref.byteBegin !=
+          inv.invText->slice(actualB, actualE).trim().size())
+    return std::nullopt;
+  return ref.callerParamIndex;
 }
 
 /// Return whether two invocations are spelled in one file of one include
@@ -182,8 +249,14 @@ RefoldMacroFormalDependenceProof::CoverRole
 RefoldMacroFormalDependenceProof::ClassifyCoverInvocation(
     const RefoldModel::MacroInvocation &root, ArrayRef<uint64_t> rootAncestors,
     const RefoldModel::MacroInvocation &inv) const {
+  // A call the root's expansion generated was formed after the root's callsite
+  // was consumed, so that callsite is never inside its arguments.  Its
+  // `[inv_b, inv_e)` can still contain the callsite: the envelope runs from
+  // where its name was spelled, perhaps the root's replacement list, to its
+  // `)`, perhaps spelled in source after the root's callsite.
   if (llvm::is_contained(rootAncestors, inv.id) ||
-      callsiteInside(inv, root, inv.invB, inv.invE))
+      (callsiteInside(inv, root, inv.invB, inv.invE) &&
+       !IsCallerDescendant(inv, root.id)))
     return CoverRole::Enclosing;
   for (const RefoldModel::MacroInvocation::OptByteRange &actual :
        root.invArgRanges)
@@ -194,6 +267,44 @@ RefoldMacroFormalDependenceProof::ClassifyCoverInvocation(
   if (SelectedOutsideRoot(inv, rootAncestors))
     return CoverRole::Enclosing;
   return CoverRole::Unattributed;
+}
+
+bool RefoldMacroFormalDependenceProof::SelectionNamesRootFormalsExactly(
+    const RefoldModel::MacroInvocation &root,
+    const RefoldModel::MacroInvocation &inv) const {
+  const RefoldModel::MacroInvocation *cur = &inv;
+  for (size_t hops = 0, limit = deps_.model.GetMacroInvocations().size();
+       hops <= limit && cur->callerMacroId; ++hops) {
+    const RefoldModel::MacroInvocation *caller =
+        deps_.macroTopology.FindMacroInvocationById(*cur->callerMacroId);
+    if (!caller)
+      return false;
+    if (cur->calleeOrigin.kind == MacroCalleeOriginKind::CallerParam) {
+      for (uint32_t formal : cur->calleeOrigin.callerParamIndices) {
+        const RefoldModel::MacroInvocation *holder = caller;
+        for (size_t up = 0; holder->id != root.id && up <= limit; ++up) {
+          const std::optional<uint32_t> callerFormal =
+              callerFormalSpelledAsActual(*holder, formal);
+          if (!callerFormal || !holder->callerMacroId)
+            return false;
+          formal = *callerFormal;
+          holder = deps_.macroTopology.FindMacroInvocationById(
+              *holder->callerMacroId);
+          if (!holder)
+            return false;
+        }
+        if (holder->id != root.id)
+          return false;
+      }
+    } else if (cur->calleeOrigin.kind !=
+               MacroCalleeOriginKind::LiteralMacroName) {
+      return false;
+    }
+    if (caller->id == root.id)
+      return true;
+    cur = caller;
+  }
+  return false;
 }
 
 bool RefoldMacroFormalDependenceProof::SelectedOutsideRoot(
@@ -359,10 +470,7 @@ RefoldMacroFormalDependenceProof::CollectCoverAttributions(
       !root.pasteTokens.empty() || !root.pasteSpans.empty();
   for (const RefoldModel::MacroInvocation &inv :
        deps_.model.GetMacroInvocations()) {
-    if (inv.id == root.id ||
-        llvm::none_of(inv.spans, [&](const RefoldModel::PPSpan &span) {
-          return span.begin < cover->second && cover->first < span.end;
-        }))
+    if (inv.id == root.id || !mayProduceCoverToken(inv, *cover))
       continue;
     const CoverRole role =
         ClassifyCoverInvocation(root, attributions.rootAncestors, inv);
@@ -386,14 +494,32 @@ RefoldMacroFormalDependenceProof::TokenDependence(
   if (rootOccurrences == RootOccurrences::Observed)
     append_range(dependence.formals, rootFormals);
 
-  SmallVector<const RefoldModel::MacroInvocation *, 8> descendants;
+  // Each descendant that may have produced `tok`, and whether the producer
+  // credited it with `tok`.
+  SmallVector<std::pair<const RefoldModel::MacroInvocation *, bool>, 8>
+      descendants;
   for (const auto &[inv, role] : attributions.producers) {
     // Material spelled inside a root actual reaches the cover only through
     // the root's argument occurrences, so judge it by the tokens it claims;
     // its `spans` envelope can reach over the root's own replacement list.
-    if (role == CoverRole::ActualMaterial ? !invocationClaimsToken(*inv, tok)
-                                          : !spansContainToken(inv->spans, tok))
+    const bool claimed = role == CoverRole::ActualMaterial
+                             ? invocationClaimsToken(*inv, tok)
+                             : spansContainToken(inv->spans, tok);
+    if (!claimed) {
+      // A descendant credited with nothing may still have produced `tok` by
+      // passing it through from its arguments, as `F(v) v` does when a root
+      // formal names `F`.  The token's own attributions carry what those
+      // arguments observe, but not that the descendant was selected, so add
+      // its selection.  This is done only where the producer names the
+      // selecting root formals exactly: through structured actuals, text
+      // `arg_deps` over-approximate them, and an opaque or pasted callee has
+      // none, so such a descendant is still not seen here.
+      const std::optional<uint64_t> anchor = uncreditedOutputAnchor(*inv);
+      if (role == CoverRole::Descendant && anchor && *anchor <= tok &&
+          SelectionNamesRootFormalsExactly(root, *inv))
+        descendants.push_back({inv, /*credited=*/false});
       continue;
+    }
     switch (role) {
     case CoverRole::Enclosing:
       break;
@@ -401,7 +527,7 @@ RefoldMacroFormalDependenceProof::TokenDependence(
       dependence.known &= rootAttributed;
       break;
     case CoverRole::Descendant:
-      descendants.push_back(inv);
+      descendants.push_back({inv, /*credited=*/true});
       break;
     case CoverRole::Unattributed:
       dependence.known = false;
@@ -409,18 +535,18 @@ RefoldMacroFormalDependenceProof::TokenDependence(
     }
   }
 
-  for (const RefoldModel::MacroInvocation *inv : descendants) {
+  for (const auto &[inv, credited] : descendants) {
     SmallVector<uint32_t, 4> observed;
     appendFormalsObservedAtToken(*inv, tok, observed);
     if (countArgumentOccurrences)
       for (uint32_t formal : observed)
         AddFormalRootDependence(root, *inv, formal, dependence);
     const bool ownReplacementListToken =
-        observed.empty() &&
-        llvm::none_of(
-            descendants, [&](const RefoldModel::MacroInvocation *other) {
-              return other != inv && IsCallerDescendant(*other, inv->id);
-            });
+        credited && observed.empty() &&
+        llvm::none_of(descendants, [&](const auto &other) {
+          return other.first != inv &&
+                 IsCallerDescendant(*other.first, inv->id);
+        });
     // A resolved opaque edge is selected by the attributing root formals.
     // `Observed` already counts them, and under `Validated` the caller
     // replayed those very occurrences; only the selection query adds them.

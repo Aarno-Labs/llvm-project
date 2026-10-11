@@ -29,6 +29,7 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -93,6 +94,20 @@ public:
   /// extent.
   bool IsInvocationInsideDefineDirective(
       const RefoldModel::MacroInvocation &m) const;
+
+  /// True iff bytes `[begin, end)` of the file instance \p ownerIncludeId
+  /// (the main file when nullopt) hold part but not all of a recorded call's
+  /// use `[use_b, use_e)`; for `begin == end`, iff that point lies strictly
+  /// inside one.
+  ///
+  /// Such bytes are input to an expansion rather than text of their own:
+  /// rewriting them changes whatever the expansion makes of them, at every
+  /// occurrence of the actual they belong to.  The use, not `[inv_b, inv_e)`,
+  /// is the evidence: a call whose name a macro produced records `inv_b` where
+  /// the name was spelled, perhaps in a `#define` far before the call.  A map
+  /// before schema 3.12 records no use, and then no span splits one.
+  bool SourceSpanSplitsInvocationUse(std::optional<uint64_t> ownerIncludeId,
+                                     uint64_t begin, uint64_t end) const;
 
   /// True iff the byte range is wholly inside the selected producer arm.
   bool SourceRangeInsideConditionalArm(uint64_t condArmId, llvm::StringRef file,
@@ -206,6 +221,7 @@ private:
 
   void BuildMacroInvocationGraph();
   void BuildDefineDirectiveIndex() const;
+  void BuildInvocationUseIndex() const;
   bool ComputeInvocationInsideDefineDirective(
       const RefoldModel::MacroInvocation &m) const;
   std::string ToAbsolutePath(llvm::StringRef spelledPath) const;
@@ -237,6 +253,21 @@ private:
 
   /// True after the lazy #define containment index has been built for this run.
   mutable bool definesIndexBuilt_ = false;
+
+  /// Recorded uses of one file instance, sorted, with the running maximum of
+  /// their ends.
+  struct InvocationUseIndex {
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    std::vector<uint64_t> prefixMaxEnd;
+  };
+
+  /// Recorded uses keyed by include instance (nullopt for the main file), for
+  /// `SourceSpanSplitsInvocationUse()`.
+  mutable std::map<std::optional<uint64_t>, InvocationUseIndex>
+      invocationUseIndex_;
+
+  /// True after the lazy invocation use index has been built for this run.
+  mutable bool invocationUseIndexBuilt_ = false;
 
   /// `IsInvocationInsideDefineDirective()` answers indexed like
   /// `RefoldModel::GetMacroInvocations()`: 0 unknown, 1 outside, 2 inside.
