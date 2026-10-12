@@ -689,7 +689,10 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
                   MacroStatePatchReplayInput{
                       mp.invRange.begin, mp.invRange.end,
                       StringRef(mp.replacement),
-                      mp.materialized.replacementIsWhollyBPayload},
+                      mp.materialized.bPayload ? &*mp.materialized.bPayload
+                                               : nullptr,
+                      mp.proof.proofRootMacroId ? mp.proof.proofRootMacroId
+                                                : mp.macroId},
                   mpEnd, headerPath, includeId, StringRef(bytes),
                   macroStateStagedEditIntervals(edits))) {
         // Empty {0,0,""} is the local sentinel used by the stabilizer after

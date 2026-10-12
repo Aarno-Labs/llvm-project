@@ -254,6 +254,48 @@ std::optional<StringRef> RefoldMacroOccurrenceReplay::RecordedSourceActual(
   return m.invText->slice(begin, end).trim();
 }
 
+std::optional<std::pair<size_t, size_t>>
+RefoldMacroOccurrenceReplay::StandardOccurrenceBEnvelope(
+    const RefoldModel::MacroInvocation &m, const RefoldModel::PPArgSpan &span,
+    ArrayRef<diffutils::Hunk> tokenHunks) const {
+  std::optional<std::pair<size_t, size_t>> bEnv =
+      deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(span);
+  // If the argument was deleted entirely in B, the mapped envelope may be
+  // empty, but never inverted.
+  if (!bEnv || bEnv->second < bEnv->first)
+    return std::nullopt;
+
+  // Extend the B-envelope to account for hunks that touch this occurrence.
+  // This is required for insertions at the argument boundary (e.g. appending
+  // tokens).
+  if (!tokenHunks.empty()) {
+    const uint64_t maxTok =
+        deps_.bTokOff.empty() ? 0ULL
+                              : static_cast<uint64_t>(deps_.bTokOff.size() - 1);
+    size_t lo = bEnv->first;
+    size_t hi = bEnv->second;
+    for (const auto &h : tokenHunks) {
+      if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(span, m.argSpans,
+                                                             *bEnv, h)) {
+        lo = std::min(lo, owned->first);
+        hi = std::max(hi, owned->second);
+        continue;
+      }
+
+      const bool touches =
+          h.aStart != h.aEnd && h.aStart < span.end && h.aEnd > span.begin;
+      if (touches && h.bStart < h.bEnd) {
+        lo = static_cast<size_t>(std::min<uint64_t>(lo, h.bStart));
+        hi = static_cast<size_t>(std::max<uint64_t>(hi, h.bEnd));
+      }
+    }
+    lo = static_cast<size_t>(std::clamp<uint64_t>(lo, 0, maxTok));
+    hi = static_cast<size_t>(std::clamp<uint64_t>(hi, lo, maxTok));
+    bEnv = {lo, hi};
+  }
+  return WidenOccurrenceEnvelopeOverFixedBodyEdges(m, span, *bEnv);
+}
+
 bool RefoldMacroOccurrenceReplay::
     MacroArgReplacementMatchesAllOccurrencesInBImpl(
         const RefoldModel::MacroInvocation &m, uint32_t argIdx,
@@ -400,9 +442,6 @@ bool RefoldMacroOccurrenceReplay::
     }
   }
 
-  const uint64_t maxTok = deps_.bTokOff.empty()
-                              ? 0ULL
-                              : static_cast<uint64_t>(deps_.bTokOff.size() - 1);
   StringRef argTrim = newArg.trim();
   StringRef baseTrim = baseArg.trim();
 
@@ -472,46 +511,10 @@ bool RefoldMacroOccurrenceReplay::
              .SelectionIgnoresFormals(m, s.begin, s.end, {argIdx}))
       return false;
 
-    auto bEnv = deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(s);
+    std::optional<std::pair<size_t, size_t>> bEnv =
+        StandardOccurrenceBEnvelope(m, s, tokenHunks);
     if (!bEnv)
       return false;
-
-    // If the argument was deleted entirely in B, the mapped envelope may be
-    // empty. Accept this only when the replacement is also empty after
-    // trimming.
-    if (bEnv->second < bEnv->first)
-      return false;
-
-    // Extend the B-envelope to account for hunks that touch this occurrence.
-    // This is required for insertions at the argument boundary (e.g. appending
-    // tokens).
-    if (!tokenHunks.empty()) {
-      size_t lo = bEnv->first;
-      size_t hi = bEnv->second;
-      for (const auto &h : tokenHunks) {
-        if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(s, m.argSpans,
-                                                               *bEnv, h)) {
-          lo = std::min(lo, owned->first);
-          hi = std::max(hi, owned->second);
-          continue;
-        }
-
-        bool touches;
-        if (h.aStart == h.aEnd) {
-          touches = false;
-        } else {
-          touches = (h.aStart < s.end && h.aEnd > s.begin);
-        }
-        if (touches && h.bStart < h.bEnd) {
-          lo = static_cast<size_t>(std::min<uint64_t>(lo, h.bStart));
-          hi = static_cast<size_t>(std::max<uint64_t>(hi, h.bEnd));
-        }
-      }
-      lo = static_cast<size_t>(std::clamp<uint64_t>(lo, 0, maxTok));
-      hi = static_cast<size_t>(std::clamp<uint64_t>(hi, lo, maxTok));
-      bEnv = {lo, hi};
-    }
-    bEnv = WidenOccurrenceEnvelopeOverFixedBodyEdges(m, s, *bEnv);
 
     StringRef tokText =
         deps_.sourceMapper->SliceBSource(bEnv->first, bEnv->second).trim();

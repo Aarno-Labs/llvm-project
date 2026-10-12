@@ -13,6 +13,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPATCHTYPES_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDPATCHTYPES_H
 
+#include "edit/RefoldEditTypes.h"
 #include "model/RefoldModel.h"
 #include "proof/RefoldCandidateTypes.h"
 #include "proof/RefoldMacroPatchTypes.h"
@@ -136,27 +137,25 @@ struct MaterializedSurface {
   /// Exclusive byte offset inside the patch replacement text.
   uint64_t outputByteEnd = 0;
 
-  /// True when every byte of the patch replacement is B-derived payload.
+  /// The B tokens the replacement spells verbatim.
   ///
   /// A repair that rewrites the macro environment a replacement is
-  /// preprocessed under may reinterpret only B-derived bytes.  B is already
-  /// fully expanded, so a live definition named there is a spurious
-  /// re-expansion the repair removes; preserved source may instead *require*
-  /// that expansion, and rewriting its environment would silently change how it
-  /// preprocesses.
+  /// preprocessed under may reinterpret only these tokens and bytes the
+  /// certificate says preprocess as before.  B is already fully expanded, so a
+  /// live definition named here is a spurious re-expansion the repair removes;
+  /// preserved source may instead *require* that expansion.
   ///
   /// This is deliberately not `hasOutputByteRange`.  That range reports which
   /// replacement bytes correspond to the materialized B-token envelope, and a
   /// patch that preserves the original callsite spelling around an edited
   /// argument -- `ID(VAL)` for an edit that only changed the actual -- sets it
   /// to the whole replacement while the callsite spelling around the payload is
-  /// preserved source.  The two questions have opposite answers on exactly that
-  /// patch, so they get separate fields.
+  /// preserved source.
   ///
-  /// Set only where the fact is established: a realization built wholly from
-  /// B's own bytes.  Absence is missing evidence rather than permission, so
-  /// every unpartitioned path keeps failing closed.
-  bool replacementIsWhollyBPayload = false;
+  /// Set only where the fact is established: a whole cover built from B's own
+  /// tokens, or `RefoldMacroPatchPlanner::CertifyMacroPatchBPayload` for a
+  /// patch that keeps its callsite.  Absence is missing evidence.
+  std::optional<BPayloadTokenCertificate> bPayload = std::nullopt;
 };
 
 /// First-class macro whole-cover realization certificate.
@@ -258,7 +257,7 @@ inline const SubtreeCertificate &subtreeCertificateOf(const MacroPatch &patch) {
 /// preprocessed under, which must never outlive the text it was proved for.
 inline void invalidateMacroPatchReplacementByteProvenance(MacroPatch &patch) {
   patch.materialized.hasOutputByteRange = false;
-  patch.materialized.replacementIsWhollyBPayload = false;
+  patch.materialized.bPayload.reset();
   patch.materialized.replayedPragmaLines.clear();
   patch.materialized.replayedPragmaOperators.clear();
 }

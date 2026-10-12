@@ -1726,6 +1726,10 @@ std::string RefoldEngine::FinalizeStructuralResult(
   // flattens them deterministically before final include/TU emission.
   structuralHunkDispatcher.FinalizeMacroPatchBuckets(
       proofServices_->AcceptedCandidateBuilder());
+  for (auto &[owner, patches] :
+       structuralHunkDispatcher.FinalMacroPatchesByOwnerForMaterialization())
+    for (MacroPatch &patch : patches)
+      macroPatchPlanner_->CertifyMacroPatchBPayload(patch);
 
   if (!structuralHunkDispatcher.AppendLineObserverRealizationEdits(
           *lineObserverLayout_, tuPath, tuBytes))

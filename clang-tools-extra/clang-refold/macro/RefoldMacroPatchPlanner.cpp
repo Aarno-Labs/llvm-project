@@ -13,6 +13,7 @@
 
 #include "edit/RefoldBInsertionLedger.h"
 #include "macro/RefoldArgTextRecovery.h"
+#include "macro/RefoldMacroFormalDependenceProof.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
 #include "macro/RefoldMacroStateProof.h"
@@ -82,8 +83,7 @@ RefoldMacroPatchPlanner::RefoldMacroPatchPlanner(Dependencies deps)
           RefoldMacroReplayStabilityValidator::Dependencies{
               *deps_.model, *deps_.macroTopology, *deps_.sourceMapper,
               deps_.aToks, deps_.bToks, *deps_.lexLang, *deps_.pathIdentity,
-              *deps_.lineDirs, *deps_.macroStateProof,
-              subtreeReplayValidator_}),
+              *deps_.macroStateProof, subtreeReplayValidator_}),
       generatedCalleeReplayEngine_(
           RefoldMacroGeneratedCalleeReplayEngine::Dependencies{
               *deps_.model, *deps_.sourceMapper, *deps_.lexLang,
@@ -1434,6 +1434,184 @@ void RefoldMacroPatchPlanner::CertifyMacroPatchOwnerWitness(
       (hasCondArm && patch.ownerCert.condArm.armId != condArmId)) {
     patch.ownerCert.mixedWitness = true;
   }
+}
+
+/// Return \p text outside the half-open \p actuals, white space dropped and
+/// each actual marked, or nullopt when \p actuals does not lay \p text out.
+static std::optional<std::string>
+invocationTextOutsideActuals(StringRef text,
+                             ArrayRef<std::pair<size_t, size_t>> actuals) {
+  std::string outside;
+  size_t cursor = 0;
+  const auto appendSpelling = [&](StringRef piece) {
+    for (char c : piece)
+      if (!isSpace(c))
+        outside.push_back(c);
+  };
+  for (const auto &[begin, end] : actuals) {
+    if (begin < cursor || end < begin || end > text.size())
+      return std::nullopt;
+    appendSpelling(text.slice(cursor, begin));
+    outside.push_back('\0');
+    cursor = end;
+  }
+  appendSpelling(text.drop_front(cursor));
+  return outside;
+}
+
+/// Sort \p ranges and merge the ones that overlap or touch.
+static void
+mergeTokenRanges(SmallVectorImpl<std::pair<uint64_t, uint64_t>> &ranges) {
+  llvm::sort(ranges);
+  SmallVector<std::pair<uint64_t, uint64_t>, 8> merged;
+  for (const auto &range : ranges) {
+    if (!merged.empty() && range.first <= merged.back().second)
+      merged.back().second = std::max(merged.back().second, range.second);
+    else
+      merged.push_back(range);
+  }
+  ranges.assign(merged.begin(), merged.end());
+}
+
+std::optional<RefoldMacroPatchPlanner::RewrittenActualOccurrences>
+RefoldMacroPatchPlanner::CollectRewrittenActualOccurrences(
+    const MacroPatch &patch) const {
+  const RefoldModel::MacroInvocation *m =
+      deps_.macroTopology->FindMacroInvocationById(
+          patch.proof.proofRootMacroId);
+  if (!m || !m->invText || !m->invB || *m->invB != patch.invRange.begin)
+    return std::nullopt;
+  const StringRef replacement(patch.replacement);
+  std::optional<std::vector<std::pair<size_t, size_t>>> before =
+      GetMacroInvocationFormalArgContentRanges(*m, *m->invText);
+  std::optional<std::vector<std::pair<size_t, size_t>>> after =
+      GetMacroInvocationFormalArgContentRanges(*m, replacement);
+  if (!before || !after || before->size() != after->size() ||
+      invocationTextOutsideActuals(*m->invText, *before) !=
+          invocationTextOutsideActuals(replacement, *after))
+    return std::nullopt;
+
+  DenseMap<uint32_t, std::string> actualByFormal;
+  for (uint32_t formal = 0; formal < after->size(); ++formal)
+    actualByFormal[formal] =
+        replacement.slice((*after)[formal].first, (*after)[formal].second)
+            .str();
+  RewrittenActualOccurrences result;
+  result.formals = RefoldMacroFormalDependenceProof::RewrittenFormals(
+      *m->invText, *before, actualByFormal, *deps_.lexLang);
+
+  // An occurrence copies its actual where B spells that actual's tokens
+  // verbatim, and no callee there was selected by it.  A pasted occurrence
+  // forms new tokens instead, and a stringified one cannot hold a name.
+  const RefoldMacroFormalDependenceProof dependence(
+      {*deps_.model, *deps_.macroTopology});
+  result.verbatim = true;
+  for (uint32_t formal : result.formals) {
+    SmallVector<RefoldLexBoundaryToken, 16> actualTokens;
+    refoldLexBoundaryTokens(actualByFormal[formal], *deps_.lexLang,
+                            actualTokens);
+    std::vector<std::string> spellings;
+    for (const RefoldLexBoundaryToken &token : actualTokens)
+      spellings.push_back(token.spelling);
+    for (const auto &[spans, kind] :
+         {std::pair(ArrayRef<RefoldModel::PPArgSpan>(m->argSpans),
+                    PPArgSpanKind::Standard),
+          std::pair(ArrayRef<RefoldModel::PPArgSpan>(m->stringifySpans),
+                    PPArgSpanKind::Stringify),
+          std::pair(ArrayRef<RefoldModel::PPArgSpan>(m->pasteSpans),
+                    PPArgSpanKind::Paste)}) {
+      for (const RefoldModel::PPArgSpan &span : spans) {
+        if (span.argIdx != formal)
+          continue;
+        std::optional<std::pair<size_t, size_t>> envelope =
+            kind == PPArgSpanKind::Standard
+                ? OccurrenceReplay().StandardOccurrenceBEnvelope(
+                      *m, span, *deps_.abTokHunks)
+                : deps_.sourceMapper->MapAToBTokenEnvelopeByPPArgSpan(
+                      span, /*preserveBoundaryInsertions=*/true);
+        if (!envelope)
+          return std::nullopt;
+        result.bTokenRanges.emplace_back(envelope->first, envelope->second);
+        if (kind == PPArgSpanKind::Stringify)
+          continue;
+        result.verbatim = result.verbatim && kind == PPArgSpanKind::Standard &&
+                          span.kind == PPArgSpanKind::Standard &&
+                          TokenSpellingsEqualToB(spellings, envelope->first,
+                                                 envelope->second) &&
+                          dependence.SelectionIgnoresFormals(
+                              *m, span.begin, span.end, {formal});
+      }
+    }
+  }
+  // Nothing B left unchanged may depend on a rewritten actual either.
+  result.verbatim =
+      result.verbatim &&
+      dependence.TokensIgnoreRewrittenFormals(
+          *m,
+          RefoldMacroFormalDependenceProof::CoverTokensOutsideHunks(
+              *m, *deps_.abTokHunks),
+          result.formals,
+          RefoldMacroFormalDependenceProof::RootOccurrences::Validated);
+  mergeTokenRanges(result.bTokenRanges);
+  return result;
+}
+
+void RefoldMacroPatchPlanner::CertifyMacroPatchBPayload(
+    MacroPatch &patch) const {
+  MaterializedSurface &surface = patch.materialized;
+  if (surface.bPayload || !patch.proof.preservesInvocationStructure ||
+      !surface.hasBTokenRange || surface.bTokStart > surface.bTokEnd)
+    return;
+  const std::pair<uint64_t, uint64_t> envelope{surface.bTokStart,
+                                               surface.bTokEnd};
+
+  // A B token no A token stands for is spelled by the rewrite, since the
+  // definition and every untouched actual reproduce their A tokens.  So is
+  // every token an occurrence of a rewritten actual lands on, whatever A token
+  // the alignment matched it to.  Without the callsite's layout, every token
+  // of the envelope is.
+  SmallVector<std::pair<uint64_t, uint64_t>, 8> edited;
+  for (const diffutils::Hunk &hunk : *deps_.abTokHunks) {
+    const uint64_t begin = std::max<uint64_t>(hunk.bStart, envelope.first);
+    const uint64_t end = std::min<uint64_t>(hunk.bEnd, envelope.second);
+    if (begin < end)
+      edited.emplace_back(begin, end);
+  }
+  mergeTokenRanges(edited);
+  const std::optional<RewrittenActualOccurrences> occurrences =
+      CollectRewrittenActualOccurrences(patch);
+  SmallVector<std::pair<uint64_t, uint64_t>, 8> payload = edited;
+  if (occurrences)
+    payload.append(occurrences->bTokenRanges.begin(),
+                   occurrences->bTokenRanges.end());
+  else
+    payload.push_back(envelope);
+  mergeTokenRanges(payload);
+
+  // The rest of the replacement is the callsite it replaces, expanding as it
+  // did, when the rewritten actuals are copied verbatim and account for every
+  // edited token.
+  const auto insideOccurrence =
+      [&](const std::pair<uint64_t, uint64_t> &range) {
+        return llvm::any_of(occurrences->bTokenRanges,
+                            [&](const auto &occurrence) {
+                              return occurrence.first <= range.first &&
+                                     range.second <= occurrence.second;
+                            });
+      };
+  BPayloadTokenCertificate certificate;
+  certificate.bTokenRanges.assign(payload.begin(), payload.end());
+  certificate.rest = occurrences && occurrences->verbatim &&
+                             llvm::all_of(edited, insideOccurrence)
+                         ? BPayloadRest::ReplacedSource
+                         : BPayloadRest::Unproven;
+  REFOLD_LOG_TRACE("macro/b-payload",
+                   "certified B payload of the patch for inv id={0}: "
+                   "ranges={1} restIsReplacedSource={2}",
+                   patch.proof.proofRootMacroId,
+                   certificate.bTokenRanges.size(),
+                   certificate.rest == BPayloadRest::ReplacedSource ? 1 : 0);
+  surface.bPayload = std::move(certificate);
 }
 
 // === Whole-cover delegation seam ===

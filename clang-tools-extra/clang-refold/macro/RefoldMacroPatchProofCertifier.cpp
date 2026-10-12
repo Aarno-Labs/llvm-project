@@ -68,7 +68,8 @@ void RefoldMacroPatchProofCertifier::CertifyWholeCoverAcceptedCandidate(
   // one place that fact is known, so record the partition here: the whole
   // replacement is B-derived payload, and no byte of the original callsite
   // spelling survives in it.
-  patch.materialized.replacementIsWhollyBPayload = true;
+  patch.materialized.bPayload = BPayloadTokenCertificate{
+      {{plan.bTokStart, plan.bTokEnd}}, BPayloadRest::None};
 }
 
 void RefoldMacroPatchProofCertifier::SetArgsOnlyStandardProof(

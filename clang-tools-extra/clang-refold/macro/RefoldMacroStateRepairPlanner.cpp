@@ -226,6 +226,7 @@ public:
         tuBytes_(request.tuBytes),
         ownersMustExpand_(request.ownersMustExpand) {
     BuildDirectiveIndexOnce();
+    CertifyWhollyBPayloadEdits();
   }
 
   /// Runs the initial macro-state liveness repair phases over the staged final
@@ -482,23 +483,32 @@ private:
   bool ReplacementObservesPreservedDefinition(
       const TextEdit &edit, const RefoldModel::MacroDirective &definition,
       StringRef macroName) const;
-  /// Returns the B token index at which \p edit's payload begins: its direct
-  /// hunk's B start, or else the B token that begins exactly at its
-  /// materialized B byte begin.  Nothing when the edit records neither.
-  std::optional<uint64_t> EditPayloadBTokenBegin(const TextEdit &edit) const;
-  /// Returns the function-like definition that \p edit's payload would call,
-  /// or nullptr.
+  /// Certifies the payload of each edit not yet certified whose replacement is
+  /// wholly a slice of B: a mapped direct-TU edit, or an include realized from
+  /// B.  A macro patch is certified where it is built.
+  void CertifyWhollyBPayloadEdits();
+  /// Returns whether \p edit's certified B payload reads \p definition of
+  /// \p macroName; see
+  /// `RefoldMacroStateProof::CertifiedPayloadReadsDefinition`.
+  bool BPayloadReadsDefinition(const TextEdit &edit,
+                               const RefoldModel::MacroDirective &definition,
+                               StringRef macroName) const;
+  /// Returns whether changing, as \p change says, whether \p definition binds
+  /// \p macroName over all of \p edit's replacement could change how its
+  /// bytes other than a certified B payload preprocess.
   ///
-  /// B is fully expanded, so the B token just before the payload is an
-  /// identifier even when it names a function-like macro, and the `(` that
-  /// begins the payload is no argument list.  The refold reproduces that
-  /// token, from preserved source or a neighbouring payload, and when the
-  /// definition is bound where the payload lands the preprocessor applies it to
-  /// the payload's `(`.  When the source already had `(` at the edit's start,
-  /// the name was followed by it before the edit too, and whether the name is
-  /// applied does not change.
-  const RefoldModel::MacroDirective *
-  DefinitionCalledByReplacementStart(const TextEdit &edit) const;
+  /// A replacement that is wholly B payload has no such bytes.  One whose
+  /// other bytes re-spell the source it replaces, expanding as that source
+  /// did, is asked what `PreservedSourceObservesBindingChange` says of that
+  /// source.  Anything else is unproven and counts as observing.
+  bool ReplacementRestObservesBindingChange(
+      const TextEdit &edit, const RefoldModel::MacroDirective &definition,
+      StringRef macroName, CrossedBindingChange change) const;
+  /// Records that a repair left \p definition unbound wherever \p edit's B
+  /// payload is read.  The closing audit accepts nothing else as discharging
+  /// a payload read, so a repair that omits this fails closed.
+  void RecordPayloadUnbound(TextEdit &edit,
+                            const RefoldModel::MacroDirective &definition);
   /// Returns whether preserved translation-unit source in `[begin, end)` can
   /// observe \p macroName being undefined: it holds preprocessing structure,
   /// or a producer-recorded invocation of that name, or one whose caller chain
@@ -651,13 +661,9 @@ private:
   /// Advances consumed undef transitions before replacements that observe the
   /// prior definition state.
   void AdvancePreservedUndefsBeforeObservedReplacements();
-  /// Returns whether every byte of an edit's replacement is B-derived payload.
-  bool EditReplacementIsMappedBPayload(const TextEdit &edit) const;
-  /// Returns the offset at which a replacement reads a macro while that macro
-  /// is still bound, or nullopt when it never does.
-  std::optional<size_t> ReplacementReadsMacroWhileBound(
-      const TextEdit &edit, const RefoldModel::MacroDirective &definition,
-      StringRef macroName) const;
+  /// Returns whether an edit's replacement is wholly a TU or include slice of
+  /// B, judged by its accepted carriers.
+  bool EditReplacementIsSliceOfB(const TextEdit &edit) const;
   /// Repairs definitions required by surviving callsites after final TU edits.
   void RepairSurvivingDefinitionCallsites();
   /// Collects every definition consumed by a final TU edit that the recorded
@@ -1753,38 +1759,72 @@ bool MacroStateRepairContext::ReplacementObservesPreservedDefinition(
       .has_value();
 }
 
-std::optional<uint64_t>
-MacroStateRepairContext::EditPayloadBTokenBegin(const TextEdit &edit) const {
-  if (edit.directTUHunkBStart)
-    return edit.directTUHunkBStart;
-  if (!edit.materializedBByteBegin || deps_.bTokOff.empty())
-    return std::nullopt;
+void MacroStateRepairContext::CertifyWhollyBPayloadEdits() {
   // The offsets are ascending token starts followed by one end sentinel.
-  ArrayRef<size_t> starts = deps_.bTokOff.drop_back();
-  const auto it = llvm::lower_bound(starts, *edit.materializedBByteBegin);
-  if (it == starts.end() || *it != *edit.materializedBByteBegin)
-    return std::nullopt;
-  return static_cast<uint64_t>(it - starts.begin());
+  const ArrayRef<size_t> starts =
+      deps_.bTokOff.empty() ? ArrayRef<size_t>() : deps_.bTokOff.drop_back();
+  for (TextEdit &edit : tuEdits_) {
+    if (edit.bPayload || !EditReplacementIsSliceOfB(edit))
+      continue;
+    std::optional<std::pair<uint64_t, uint64_t>> tokens;
+    if (edit.directTUHunkBStart && edit.directTUHunkBEnd) {
+      tokens.emplace(*edit.directTUHunkBStart, *edit.directTUHunkBEnd);
+    } else if (edit.materializedBByteBegin && edit.materializedBByteEnd) {
+      const auto *first =
+          llvm::lower_bound(starts, *edit.materializedBByteBegin);
+      if (first != starts.end() && *first == *edit.materializedBByteBegin)
+        tokens.emplace(first - starts.begin(),
+                       llvm::lower_bound(starts, *edit.materializedBByteEnd) -
+                           starts.begin());
+    }
+    if (!tokens || tokens->first > tokens->second ||
+        tokens->second > deps_.bToks.size())
+      continue;
+    edit.bPayload = BPayloadRead{{{*tokens}, BPayloadRest::None}, edit.start};
+  }
 }
 
-const RefoldModel::MacroDirective *
-MacroStateRepairContext::DefinitionCalledByReplacementStart(
-    const TextEdit &edit) const {
-  const std::optional<uint64_t> payloadBegin = EditPayloadBTokenBegin(edit);
-  if (!payloadBegin || *payloadBegin == 0 ||
-      *payloadBegin >= deps_.bToks.size())
-    return nullptr;
-  const PPTok &name = deps_.bToks[*payloadBegin - 1];
-  if (name.kind != "raw_identifier" ||
-      deps_.bToks[*payloadBegin].spelling != "(")
-    return nullptr;
-  if (std::optional<RefoldLexBoundaryToken> original =
-          refoldFirstLexToken(tuBytes_.drop_front(edit.start), LexLang());
-      original && original->kind == tok::l_paren)
-    return nullptr;
-  const RefoldModel::MacroDirective *bound =
-      DefinitionBoundAtSourceOffsetForAudit(name.spelling, edit.start);
-  return bound && bound->functionLike ? bound : nullptr;
+bool MacroStateRepairContext::BPayloadReadsDefinition(
+    const TextEdit &edit, const RefoldModel::MacroDirective &definition,
+    StringRef macroName) const {
+  return edit.bPayload &&
+         MacroStateProof().CertifiedPayloadReadsDefinition(
+             edit.bPayload->certificate, definition, macroName);
+}
+
+bool MacroStateRepairContext::ReplacementRestObservesBindingChange(
+    const TextEdit &edit, const RefoldModel::MacroDirective &definition,
+    StringRef macroName, CrossedBindingChange change) const {
+  if (EditHasMacroPatchSurfaceInBMacroState(edit))
+    return false;
+  if (edit.bPayload && !edit.bPayload->restaged) {
+    switch (edit.bPayload->certificate.rest) {
+    case BPayloadRest::None:
+      return false;
+    case BPayloadRest::Unproven:
+      return true;
+    case BPayloadRest::ReplacedSource:
+      break;
+    }
+  } else if (!edit.bPayload &&
+             llvm::any_of(edit.acceptedResults, [](const auto &carrier) {
+               return carrier &&
+                      carrier->kind == AcceptedResultCandidateKind::MacroPatch;
+             })) {
+    // A rewritten callsite expands as its own proof says, which the
+    // producer's records of the original need not describe.
+    return true;
+  }
+  return PreservedSourceObservesBindingChange(
+      definition, macroName, edit.start, edit.end,
+      tuBytes_.drop_front(edit.end), change);
+}
+
+void MacroStateRepairContext::RecordPayloadUnbound(
+    TextEdit &edit, const RefoldModel::MacroDirective &definition) {
+  if (edit.bPayload &&
+      !llvm::is_contained(edit.bPayload->unboundDefinitionIds, definition.id))
+    edit.bPayload->unboundDefinitionIds.push_back(definition.id);
 }
 
 bool MacroStateRepairContext::PreservedSourceCanObserveMacroUndef(
@@ -2263,7 +2303,8 @@ void MacroStateRepairContext::RestageConservativeTUEdit(
   edit.lineControlPruneCandidates =
       std::move(resync.lineControlPruneCandidates);
   // The restaged text holds preserved source and directives beside any payload.
-  edit.replacementIsWhollyBPayload = false;
+  if (edit.bPayload)
+    edit.bPayload->restaged = true;
 
   // Restaging replaces the original direct-hunk carrier with a specialized
   // macro-state repair surface. Preserve independently discharged specialized
@@ -2387,9 +2428,16 @@ void MacroStateRepairContext::
       if (!previousDefinition)
         continue;
 
+      // A certified payload is asked what its B tokens read; a call it opens
+      // reads at its first byte.
       std::optional<size_t> firstObservationOffset =
           FirstReplacementObservationOffset(edit, *previousDefinition,
                                             undefRef.name);
+      if (edit.bPayload && !edit.bPayload->restaged)
+        firstObservationOffset =
+            BPayloadReadsDefinition(edit, *previousDefinition, undefRef.name)
+                ? std::optional<size_t>(firstObservationOffset.value_or(0))
+                : std::nullopt;
       if (!firstObservationOffset)
         continue;
 
@@ -2406,7 +2454,10 @@ void MacroStateRepairContext::
 
       if (PreservedSourceObservesBindingChange(
               *previousDefinition, undefRef.name, lineStart, edit.start,
-              ReplacementText, CrossedBindingChange::Unbound))
+              ReplacementText, CrossedBindingChange::Unbound) ||
+          ReplacementRestObservesBindingChange(edit, *previousDefinition,
+                                               undefRef.name,
+                                               CrossedBindingChange::Unbound))
         continue;
 
       StringRef carriedSuffix =
@@ -2453,6 +2504,7 @@ void MacroStateRepairContext::
       RestageConservativeTUEdit(edit, lineStart,
                                 undefTransition->interval.end, replacement,
                                 repairedTransitions);
+      RecordPayloadUnbound(edit, *previousDefinition);
 
       advancedDirectiveIds.insert(undefDirective.id);
       ++advancedCount;
@@ -2516,7 +2568,9 @@ MacroStateRepairContext::TryAdvanceConsumedUndefBeforeObservedReplacement(
   StringRef crossedPrefix = tuBytes_.slice(lineStart, edit.start);
   if (PreservedSourceObservesBindingChange(
           previousDefinition, macroName, lineStart, edit.start, ReplacementText,
-          CrossedBindingChange::Unbound))
+          CrossedBindingChange::Unbound) ||
+      ReplacementRestObservesBindingChange(edit, previousDefinition, macroName,
+                                           CrossedBindingChange::Unbound))
     return std::nullopt;
 
   std::string replacement;
@@ -2554,6 +2608,7 @@ MacroStateRepairContext::TryAdvanceConsumedUndefBeforeObservedReplacement(
   repairedTransitions.push_back(std::move(*provedTransition));
   RestageConservativeTUEdit(edit, lineStart, edit.end, replacement,
                             repairedTransitions);
+  RecordPayloadUnbound(edit, previousDefinition);
 
   REFOLD_LOG_WARN("macro/liveness",
                   "advancing consumed #undef before observed replacement: "
@@ -2705,15 +2760,13 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
       continue;
 
     // This partition rewrites the macro state seen by the entire replacement.
-    // That is justified only for a B-derived payload: B is already fully
-    // expanded, so a live definition named there would be a spurious
-    // re-expansion that the synthetic #undef removes.  When the replacement
-    // also carries preserved source, an observation may instead be an
-    // expansion the preserved source requires, and nothing records which
-    // replacement bytes are which.  Refuse rather than assume: undefining the
-    // macro would otherwise silently change how the preserved source
-    // preprocesses.
-    if (!EditReplacementIsMappedBPayload(edit))
+    // B is already fully expanded, so a live definition its payload reads is a
+    // spurious re-expansion that the synthetic #undef removes.  Any other
+    // replacement byte may instead be an expansion preserved source requires,
+    // so only a certified payload whose other bytes are accounted for
+    // qualifies, and only before another repair rewrote text around it.
+    if (!edit.bPayload || edit.bPayload->restaged ||
+        edit.bPayload->certificate.rest == BPayloadRest::Unproven)
       continue;
 
     const size_t editStart = static_cast<size_t>(edit.start);
@@ -2723,6 +2776,10 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
     if (lineStart > 0 && stringutils::isLineSplice(tuBytes_, lineStart - 1))
       continue;
     if (SourceRangeOverlapsFinalTUEditExcept(lineStart, edit.start, editIndex))
+      continue;
+    // A directive inside a call's arguments is not one the call can carry.
+    if (MacroTopology().SourceSpanSplitsInvocationUse(
+            /*ownerIncludeId=*/std::nullopt, lineStart, lineStart))
       continue;
 
     // A restore goes after the physical line the replacement ends on, so the
@@ -2740,13 +2797,14 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
                           : 1;
     }
     restoreSiteAvailable =
-        restoreSiteAvailable && !SourceRangeOverlapsFinalTUEditExcept(
-                                    edit.end, lineBreakEnd, editIndex);
+        restoreSiteAvailable &&
+        !SourceRangeOverlapsFinalTUEditExcept(edit.end, lineBreakEnd,
+                                              editIndex) &&
+        !MacroTopology().SourceSpanSplitsInvocationUse(
+            /*ownerIncludeId=*/std::nullopt, lineBreakEnd, lineBreakEnd);
 
     StringRef sameLinePrefix = tuBytes_.slice(lineStart, edit.start);
     StringRef ReplacementText(edit.text);
-    const RefoldModel::MacroDirective *calledByReplacementStart =
-        DefinitionCalledByReplacementStart(edit);
 
     SmallVector<SyntheticUndefCandidate, 4> candidates;
     for (const NamedMacroDirectiveRef &ref : plan_.namedMacroDirectives) {
@@ -2760,30 +2818,11 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
       // for one inside a forced include, bound from the unit's first byte.
       const RefoldModel::MacroDirective *bound =
           DefinitionBoundAtSourceOffsetForAudit(ref.name, lineStart);
-      if (bound != &definitionLocal)
+      if (bound != &definitionLocal ||
+          !BPayloadReadsDefinition(edit, definitionLocal, ref.name))
         continue;
       std::optional<MacroStateSourceTransition> transition =
           MacroStateSourceTransitionFor(definitionLocal);
-
-      // A payload that opens a call of the name before it observes the
-      // definition at its first byte.  The name itself is preserved output, so
-      // the prefix it belongs to is asked only what the producer recorded: an
-      // `#undef` placed before the line leaves it an identifier, as in B, and
-      // must change nothing else there.  A line that begins inside a call
-      // cannot take the `#undef` at all.
-      const bool callsName = &definitionLocal == calledByReplacementStart;
-      std::optional<size_t> firstObservationOffset =
-          callsName ? std::optional<size_t>(0)
-                    : FirstReplacementObservationOffset(edit, definitionLocal,
-                                                        ref.name);
-      if (!firstObservationOffset)
-        continue;
-      if (callsName &&
-          (MacroTopology().SourceSpanSplitsInvocationUse(
-               /*ownerIncludeId=*/std::nullopt, lineStart, lineStart) ||
-           PreservedSourceCanObserveMacroUndef(ref.name, lineStart,
-                                               edit.start)))
-        continue;
 
       // This synthetic partition is a first-order token repair: it is meant for
       // replacement payloads such as `M()` that would otherwise be re-expanded
@@ -2794,18 +2833,27 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
       // itself part of the owner proof.  Inserting an #undef before that
       // directive would be a gratuitous state mutation in the common
       // zero-token-gap case, and a stronger conditional-state tiling proof is
-      // needed for the remaining cases.
+      // needed for the remaining cases.  A read the text does not show, a
+      // call the payload opens, is at its first byte.
+      const size_t firstObservationOffset =
+          FirstReplacementObservationOffset(edit, definitionLocal, ref.name)
+              .value_or(0);
       if (TokenTextAnalysis().TextContainsDirectiveLine(
-              ReplacementText.take_front(*firstObservationOffset + 1)))
+              ReplacementText.take_front(firstObservationOffset + 1)))
         continue;
 
       // If the original same-line prefix needed the definition, placing a
       // synthetic #undef before the line would change preserved source before
       // the replacement.  It may need it without spelling the name, through
-      // another macro whose expansion reads it.
-      if (!callsName && PreservedSourceObservesBindingChange(
-                            definitionLocal, ref.name, lineStart, edit.start,
-                            ReplacementText, CrossedBindingChange::Unbound))
+      // another macro whose expansion reads it.  The prefix is judged against
+      // the source that followed it: a call the payload opens on a name the
+      // prefix ends with is the read being repaired, not one the prefix needs.
+      // Neither may the replacement's own bytes beside the payload.
+      if (PreservedSourceObservesBindingChange(
+              definitionLocal, ref.name, lineStart, edit.start,
+              tuBytes_.drop_front(edit.start), CrossedBindingChange::Unbound) ||
+          ReplacementRestObservesBindingChange(edit, definitionLocal, ref.name,
+                                               CrossedBindingChange::Unbound))
         continue;
 
       // Without a restore the name stays unbound for the rest of the unit.
@@ -2825,9 +2873,8 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
 
       // Prefer carrying the definition past the replacement when the crossed
       // pre-edit region is neutral: that proof adds no synthetic transition.
-      // A definition with no movable surface cannot be carried, and the carry
-      // repair does not see a call the payload opens.
-      if (!callsName && transition &&
+      // A definition with no movable surface cannot be carried.
+      if (transition &&
           !PreservedSourceObservesBindingChange(
               definitionLocal, ref.name, transition->interval.end, edit.start,
               ReplacementText, CrossedBindingChange::Unbound))
@@ -2886,6 +2933,7 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
                               replacement);
 
     for (const SyntheticUndefCandidate &candidate : candidates) {
+      RecordPayloadUnbound(edit, *candidate.definition);
       plan_.syntheticUndefPartitionedDefinitionIds.insert(
           candidate.definition->id);
       (void)CheckMacroStateRepaired(
@@ -2915,34 +2963,20 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
         synthesizedCount);
 }
 
-bool MacroStateRepairContext::EditReplacementIsMappedBPayload(
+bool MacroStateRepairContext::EditReplacementIsSliceOfB(
     const TextEdit &edit) const {
-  // The audit may only speak where it can attribute every byte it reads.  A
-  // mapped direct-TU edit is the one carrier whose replacement is the edited
-  // stream's own slice for the hunk and nothing else, so a macro name in it is
-  // already-expanded output that must not expand again.
+  // A payload may only be certified where every byte the audit reads is
+  // attributable.  A mapped direct-TU edit is the edited stream's own slice
+  // for the hunk and nothing else, and an include realized from B is a slice
+  // landing where the `#include` stood, under the TU's macro state there.
   //
-  // Every other carrier mixes.  A conservative direct-TU edit re-emits original
-  // source with a local rewrite -- the `_Pragma(#x)` argument fold re-emits
-  // `DIAG(message("bye"))`, whose `DIAG` is preserved spelling the accepted
-  // proof needs to expand.  A TU include closure folds preserved directives in
-  // beside the payload.  A line-observer realization splices original bytes
-  // around a synthetic `#line`.  In all of those an observation may be
-  // preserved source *requiring* the expansion, and no fact partitions the
-  // replacement's bytes, so accusing them would be a refusal on evidence this
-  // audit does not have.  That is the standing partition gap, not a hole opened
-  // here; the same gap already stops the synthetic-undef repair from acting on
-  // a closure edit.
-  //
-  // An include realized from B is the other: its replacement is a slice of the
-  // edited stream and nothing else, so a name in it is B's identifier too, and
-  // it lands where the `#include` stood, under the TU's macro state there.
-  //
-  // A translation-unit macro patch whose replacement carries the B-payload
-  // partition certificate is a third: a whole cover replaces the callsite, and
-  // every source byte its expansion consumed, with the cover's own B text.  A
-  // macro patch without the certificate may keep callsite spelling, as an
-  // args-only `ID(VAL)` does, and stays unattributable.
+  // Every other TU carrier mixes.  A conservative direct-TU edit re-emits
+  // original source with a local rewrite -- the `_Pragma(#x)` argument fold
+  // re-emits `DIAG(message("bye"))`, whose `DIAG` is preserved spelling the
+  // accepted proof needs to expand.  A TU include closure folds preserved
+  // directives in beside the payload.  A line-observer realization splices
+  // original bytes around a synthetic `#line`.  No fact partitions those
+  // replacements, so they stay uncertified.
   if (edit.acceptedResults.empty())
     return false;
   for (const auto &carrier : edit.acceptedResults) {
@@ -2952,183 +2986,46 @@ bool MacroStateRepairContext::EditReplacementIsMappedBPayload(
     const bool mappedTUSlice =
         carrier->kind == AcceptedResultCandidateKind::TUTextEdit &&
         path == AcceptedPathKind::TUByteSpanMappedEdit;
-    const bool includeSliceOfB =
-        path == AcceptedPathKind::IncludeRealizationInlineFromB;
-    const bool macroPatchOfB =
-        carrier->kind == AcceptedResultCandidateKind::MacroPatch &&
-        edit.replacementIsWhollyBPayload;
-    if (!mappedTUSlice && !includeSliceOfB && !macroPatchOfB)
+    if (!mappedTUSlice &&
+        path != AcceptedPathKind::IncludeRealizationInlineFromB)
       return false;
   }
   return true;
 }
 
-std::optional<size_t> MacroStateRepairContext::ReplacementReadsMacroWhileBound(
-    const TextEdit &edit, const RefoldModel::MacroDirective &definition,
-    StringRef macroName) const {
-  // Every repair that makes a name inert ahead of a payload does it the same
-  // way: it puts an `#undef` for that name into the replacement in front of the
-  // read.  The synthetic partition writes one; the undef-advance repair moves a
-  // preserved one there; a carried definition is re-emitted after the payload.
-  // Reading the emitted text answers the audit's actual question -- is the name
-  // still bound where the payload reads it -- for every repair at once, and
-  // cannot drift out of step with a repair that forgets to record itself in a
-  // ledger.
-  //
-  // Two kinds of mention have to be told apart.  A name inside a directive line
-  // is that directive's operand, not a payload read: the `#undef` performing the
-  // repair necessarily spells the name it removes.  A name outside one is a read,
-  // and it is a problem exactly when no `#undef` for that name precedes it.
-  if (macroName.empty())
-    return std::nullopt;
-
-  const StringRef text(edit.text);
-  const StringRef suffix = tuBytes_.drop_front(edit.end);
-  // Most bound definitions are named nowhere in a given replacement, and the
-  // first search below would say so; ask it before paying for the directive
-  // census, which has nothing to classify without a mention.
-  if (!MacroStateProof().FirstMacroStateObservationOffsetInText(
-          definition, macroName, text, suffix))
-    return std::nullopt;
-
-  const PreprocessingDirectiveScanResult scan =
-      scanPreprocessingDirectives(text, LexLang());
-  // An incomplete census proves nothing about what the replacement contains, so
-  // every mention stays a read and the audit keeps failing closed.
-  const bool censusComplete = scan.IsComplete();
-
-  auto directiveLineContaining =
-      [&](size_t offset) -> const PreprocessingDirectiveLine * {
-    if (!censusComplete)
-      return nullptr;
-    for (const PreprocessingDirectiveLine &line : scan.directives) {
-      if (line.IsValid() && offset >= line.begin && offset < line.end)
-        return &line;
-    }
-    return nullptr;
-  };
-
-  auto undefinesMacroBefore = [&](size_t offset) {
-    if (!censusComplete)
-      return false;
-    for (const PreprocessingDirectiveLine &line : scan.directives) {
-      if (!line.IsValid() || line.end > offset)
-        continue;
-      // An `#include` standing before the read brings in text this audit never
-      // examines, and that text may undefine the name -- a repair can neutralise
-      // a macro by moving the include that undefines it ahead of the payload.
-      // Not being able to see inside is a reason to stay silent, not a reason to
-      // accuse.
-      if (StringRef(line.keyword) == "include" ||
-          StringRef(line.keyword) == "include_next" ||
-          StringRef(line.keyword) == "import")
-        return true;
-      if (StringRef(line.keyword) != "undef")
-        continue;
-      // `#undef` takes exactly one identifier operand, so an exact identifier
-      // match inside the operand names this macro and nothing else.
-      if (TokenTextAnalysis()
-              .FirstRawIdentifierObservationOffsetInText(
-                  macroName, text.slice(line.introducerEnd, line.end))
-              .has_value())
-        return true;
-    }
-    return false;
-  };
-
-  size_t cursor = 0;
-  while (cursor <= text.size()) {
-    const std::optional<size_t> hit =
-        MacroStateProof().FirstMacroStateObservationOffsetInText(
-            definition, macroName, text.drop_front(cursor), suffix);
-    if (!hit)
-      return std::nullopt;
-    const size_t at = cursor + *hit;
-
-    if (const PreprocessingDirectiveLine *line = directiveLineContaining(at)) {
-      // Step past the whole directive line so its operand is not re-examined.
-      if (line->end <= at)
-        return at;
-      cursor = line->end;
-      continue;
-    }
-
-    if (undefinesMacroBefore(at))
-      return std::nullopt;
-    return at;
-  }
-  return std::nullopt;
-}
-
 void MacroStateRepairContext::RequireEveryObservedGapDefinitionRepaired() {
-  // Several repairs can neutralise a macro that is live where a replacement
-  // lands -- advancing a preserved `#undef` before it, synthesising one,
-  // carrying the definition past it, preserving a consumed `#undef` -- and each
-  // declines when its own obligations are unmet.  Each declined by simply moving
-  // on, and nobody asked what happens when they all do, so a payload no repair
-  // could reach was emitted under a macro environment B never had and the name
-  // expanded a second time.  Neither the payload's own proof nor the emission
-  // audit asks about macro liveness, so nothing downstream caught it; only
-  // `--verify-output`, which the tool leaves off by default, did.
+  // Several repairs can neutralise a macro that is live where a payload lands
+  // -- advancing a preserved `#undef` before it, synthesising one, carrying
+  // the definition past it, replaying a consumed `#undef` ahead of it -- and
+  // each declines when its own obligations are unmet.  Each declined by simply
+  // moving on, and nobody asked what happens when they all do, so a payload no
+  // repair could reach was emitted under a macro environment B never had and
+  // the name expanded a second time.  Neither the payload's own proof nor the
+  // emission audit asks about macro liveness, so nothing downstream caught it;
+  // only `--verify-output`, which the tool leaves off by default, did.
   //
   // Ask the question once more, after every repair phase has run, and fail
-  // closed on what is left.  Two things make the answer trustworthy rather than
-  // a re-derivation that drifts from the repairs:
-  //
-  //   * it reads the emitted replacement text, so a repair that neutralised the
-  //     name by putting an `#undef` in front of the read discharges the
-  //     obligation whether or not it recorded itself in a ledger; and
-  //   * it speaks only where every byte of the replacement is attributable to B
-  //     (`EditReplacementIsMappedBPayload`), because a name in preserved source
-  //     may be an expansion that source requires.
-  for (size_t editIndex = 0; editIndex < tuEdits_.size(); ++editIndex) {
-    const TextEdit &edit = tuEdits_[editIndex];
-    if (edit.start > edit.end || edit.end > tuBytes_.size())
+  // closed on what is left.  The reads are the certified payload's B tokens,
+  // which no repair changes, and only a repair that recorded unbinding the
+  // definition for this edit discharges one.  Restaging an edit for one name
+  // therefore hides none of its reads of another, and a name that only
+  // preserved source spells is never taken for a payload read.
+  for (const TextEdit &edit : tuEdits_) {
+    if (!edit.bPayload)
       continue;
-
-    if (!EditReplacementIsMappedBPayload(edit))
-      continue;
-    const RefoldModel::MacroDirective *calledByReplacementStart =
-        DefinitionCalledByReplacementStart(edit);
-
+    const BPayloadRead &payload = *edit.bPayload;
     for (const NamedMacroDirectiveRef &ref : plan_.namedMacroDirectives) {
       const RefoldModel::MacroDirective &definition = *ref.directive;
-      if (!definition.IsDefine())
-        continue;
-      // A synthetic undef/restore is per edit and sits in the replacement
-      // text, where the read check below sees it; skipping its definition
-      // here would also hide every other edit that reads the name.
-      if (plan_.carriedGapDefinitionIds.contains(definition.id) ||
-          plan_.preservedDefinitionDirectiveIds.contains(definition.id))
+      if (!definition.IsDefine() ||
+          llvm::is_contained(payload.unboundDefinitionIds, definition.id))
         continue;
 
-      // The name must actually be bound where the replacement lands.  A
+      // The name must actually be bound where the payload is read.  A
       // definition that a later `#undef` or redefinition has already displaced
       // binds nothing here and cannot be re-expanded.
-      if (DefinitionBoundAtSourceOffsetForAudit(ref.name, edit.start) !=
-          &definition)
-        continue;
-
-      // A payload opening a call of the name before it is an observation the
-      // replacement text cannot show, and no repair left this edit a B
-      // payload while removing it.
-      if (&definition == calledByReplacementStart) {
-        (void)CheckMacroStateTerminal(
-            definition, StateMutationKind::Consumed, "macro/liveness",
-            llvm::formatv(
-                "TU replacement [{0},{1}) begins with `(` after the "
-                "function-like macro name '{2}', whose definition #{3} is "
-                "active at that position, so the replacement would be read as "
-                "its arguments, and undefining it around the replacement's "
-                "line was not available",
-                edit.start, edit.end, ref.name, definition.id)
-                .str());
-        return;
-      }
-
-      const std::optional<size_t> boundReadOffset =
-          ReplacementReadsMacroWhileBound(edit, definition, ref.name);
-      if (!boundReadOffset)
+      if (DefinitionBoundAtSourceOffsetForAudit(
+              ref.name, payload.sourceOffset) != &definition ||
+          !BPayloadReadsDefinition(edit, definition, ref.name))
         continue;
 
       // A definition that expands to itself is a fixed point: the name survives
@@ -3138,22 +3035,15 @@ void MacroStateRepairContext::RequireEveryObservedGapDefinitionRepaired() {
               definition, ref.name, StringRef(edit.text)))
         continue;
 
-      // The definition's own directive bytes being consumed by this edit means
-      // the replacement carries the transition rather than observing across it,
-      // which the materialized-definition authorization proves separately.
-      if (definition.sitePath == Model().GetSourcePath() &&
-          definition.siteB >= edit.start && definition.siteE <= edit.end)
-        continue;
-
       (void)CheckMacroStateTerminal(
           definition, StateMutationKind::Consumed, "macro/liveness",
           llvm::formatv(
-              "TU replacement [{0},{1}) observes macro '{2}', whose definition "
-              "#{3} is active at that position, and neither carrying the "
-              "definition past the replacement nor undefining it before the "
-              "replacement was available",
+              "TU replacement [{0},{1}) reads macro '{2}' in its B payload, "
+              "where definition #{3} is active, and no repair left the name "
+              "unbound there",
               edit.start, edit.end, ref.name, definition.id)
-              .str());
+              .str(),
+          /*requireKnownObserver=*/true, payload.keptCallsiteInvocationId);
       return;
     }
   }
@@ -3204,8 +3094,10 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
       if (ActiveDefinitionAtSourceOffset(ref.name, edit.start) !=
           &directiveLocal)
         continue;
-      if (!ReplacementObservesPreservedDefinition(edit, directiveLocal,
-                                                  ref.name))
+      if (edit.bPayload && !edit.bPayload->restaged
+              ? !BPayloadReadsDefinition(edit, directiveLocal, ref.name)
+              : !ReplacementObservesPreservedDefinition(edit, directiveLocal,
+                                                        ref.name))
         continue;
       if (DirectCalleePatchRequiresDefinitionBeforeReplacement(
               edit, directiveLocal, ref.name))
@@ -3220,16 +3112,19 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
       delayedBoundary = boundary;
 
       // Only carry a gap definition when the B-side replacement is the first
-      // material that would observe the definition.  Macro-callsite edits whose
-      // emitted surface is kept in B's macro state are the important exception:
-      // the original source slice is itself the macro invocation, so it
-      // necessarily observes the old definition, while the accepted macro proof
-      // says the replacement wants to keep the emitted callsite surface under
-      // B's macro state.
+      // material that would observe the definition, and when no byte the
+      // replacement keeps from the original slice needs it.  Macro-callsite
+      // edits whose emitted surface is kept in B's macro state are the
+      // important exception: the original source slice is itself the macro
+      // invocation, so it necessarily observes the old definition, while the
+      // accepted macro proof says the replacement wants to keep the emitted
+      // callsite surface under B's macro state.
       if (!EditHasMacroPatchSurfaceInBMacroState(edit) &&
-          MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
-              directiveLocal, ref.name, tuBytes_.slice(edit.start, edit.end),
-              tuBytes_.drop_front(edit.end)))
+          (MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
+               directiveLocal, ref.name, tuBytes_.slice(edit.start, edit.end),
+               tuBytes_.drop_front(edit.end)) ||
+           ReplacementRestObservesBindingChange(edit, directiveLocal, ref.name,
+                                                CrossedBindingChange::Unbound)))
         continue;
 
       candidates.push_back(MacroStateGapCarryCandidate{
@@ -3348,8 +3243,8 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
                               repairedTransitions);
 
     for (const MacroStateGapCarryCandidate &candidate : candidates) {
+      RecordPayloadUnbound(edit, *candidate.directive);
       carriedDirectiveIds.insert(candidate.directive->id);
-      plan_.carriedGapDefinitionIds.insert(candidate.directive->id);
       ++carriedCount;
       REFOLD_LOG_WARN("macro/liveness",
                       "carrying observed gap #define after TU replacement: "
@@ -3892,8 +3787,32 @@ bool MacroStateRepairContext::ApplyQueuedMacroStatePreservations() {
       provedTransitions.push_back(std::move(*transition));
     }
 
+    // A consumed `#undef` replayed ahead of the whole replacement leaves its
+    // payload unbound from the definition the replacement began under.  So
+    // does one replayed inside a payload of B's own text, at the line start
+    // before the first read its text shows: the only read the text cannot show
+    // that could come earlier is a call the payload opens at its first byte.
+    for (const MacroStatePreservation &preservation : preservations) {
+      if (!edit.bPayload || !preservation.directive->IsUndef())
+        continue;
+      const bool replayedInsidePayload =
+          preservation.placement ==
+              MacroStatePreservationPlacement::InsideReplacement &&
+          edit.bPayload->certificate.rest == BPayloadRest::None &&
+          !MacroStateProof().CertifiedPayloadOpensCallOf(
+              edit.bPayload->certificate, preservation.directive->name);
+      if (preservation.placement !=
+              MacroStatePreservationPlacement::BeforeReplacement &&
+          !replayedInsidePayload)
+        continue;
+      if (const RefoldModel::MacroDirective *bound =
+              DefinitionBoundAtSourceOffsetForAudit(
+                  preservation.directive->name, edit.bPayload->sourceOffset))
+        RecordPayloadUnbound(edit, *bound);
+    }
     edit.text = std::move(repairedReplacement);
-    edit.replacementIsWhollyBPayload = false;
+    if (edit.bPayload)
+      edit.bPayload->restaged = true;
     for (const ProvenMacroStateSourceTransition &transition :
          provedTransitions) {
       if (!AuthorizeMacroStateSourceTransition(edit, transition))

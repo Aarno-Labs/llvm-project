@@ -19,7 +19,9 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROSTATEPROOF_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMACROSTATEPROOF_H
 
+#include "edit/RefoldEditTypes.h"
 #include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 #include "source/RefoldPreprocessingStructureIndex.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -109,13 +111,18 @@ struct MacroStatePatchReplayInput {
   uint64_t invEnd = 0;
   llvm::StringRef replacement;
 
-  /// True when every byte of `replacement` is B-derived payload, copied from
-  /// the patch's `MaterializedSurface::replacementIsWhollyBPayload`.
+  /// The B payload the patch certifies its replacement spells, or null.
   ///
-  /// The undefine/restore repair reinterprets the macro environment of the
-  /// replacement bytes, which is sound only over payload B already expanded.
-  /// Absence keeps that repair unavailable.
-  bool replacementIsWhollyBPayload = false;
+  /// Undefining a name around the replacement reinterprets every replacement
+  /// byte, which is sound only over payload B already expanded and over bytes
+  /// the certificate shows preprocess as the source they replace did.
+  /// Absence keeps that repair to what the replaced source itself allows.
+  const BPayloadTokenCertificate *bPayload = nullptr;
+
+  /// The invocation whose callsite the patch replaces, which fixes the macro
+  /// state its replacement is read under; see
+  /// `RefoldMacroStateProof::DefinitionBoundAtInvocation`.
+  uint64_t invocationId = 0;
 };
 
 /// Half-open interval for an edit already staged in the materialized header.
@@ -156,9 +163,41 @@ public:
   RefoldMacroStateProof(const RefoldModel &model,
                         const RefoldPathIdentity &paths,
                         const RefoldTokenTextAnalysis &tokenText,
-                        const RefoldOwnerStateProof &ownerStateProof)
+                        const RefoldOwnerStateProof &ownerStateProof,
+                        llvm::ArrayRef<PPTok> bToks)
       : model_(model), paths_(paths), tokenText_(tokenText),
-        ownerStateProof_(ownerStateProof) {}
+        ownerStateProof_(ownerStateProof), bToks_(bToks) {}
+
+  /// Returns whether the B tokens \p payload certifies read \p definition of
+  /// \p macroName: an object-like name anywhere among them, a function-like
+  /// one that B follows with `(`, or a `(` beginning a range right after the
+  /// name.
+  ///
+  /// B is fully expanded, so each such token is an identifier there, and the
+  /// refold reproduces the token B places next to it.  Where the definition is
+  /// bound, the preprocessor would expand the name, or apply it to that `(`,
+  /// on the refold's side only.  A `(` B shows after a function-like name is
+  /// counted even when the refold produces it from another macro, which keeps
+  /// the name from being called; that only asks for a repair not needed.
+  bool
+  CertifiedPayloadReadsDefinition(const BPayloadTokenCertificate &payload,
+                                  const RefoldModel::MacroDirective &definition,
+                                  llvm::StringRef macroName) const;
+  /// Returns whether a range of \p payload begins with `(` right after a B
+  /// token spelling \p macroName: a call the payload opens, which its own
+  /// text cannot show.
+  bool CertifiedPayloadOpensCallOf(const BPayloadTokenCertificate &payload,
+                                   llvm::StringRef macroName) const;
+  /// Returns the definition of \p macroName bound when Clang began expanding
+  /// invocation \p invocationId, nullptr when none was, or nullopt when a
+  /// `#pragma pop_macro` before it leaves that unknown.
+  ///
+  /// The producer numbers directives, pragmas and expansions in the order the
+  /// preprocessor met them, so the last directive for the name numbered below
+  /// the invocation is the one in force there, wherever it was spelled.
+  std::optional<const RefoldModel::MacroDirective *>
+  DefinitionBoundAtInvocation(uint64_t invocationId,
+                              llvm::StringRef macroName) const;
 
   /// Return the raw-token text analysis this service observes payloads with.
   const RefoldTokenTextAnalysis &TokenText() const { return tokenText_; }
@@ -318,6 +357,7 @@ private:
   const RefoldPathIdentity &paths_;
   const RefoldTokenTextAnalysis &tokenText_;
   const RefoldOwnerStateProof &ownerStateProof_;
+  llvm::ArrayRef<PPTok> bToks_;
 };
 
 } // namespace refold

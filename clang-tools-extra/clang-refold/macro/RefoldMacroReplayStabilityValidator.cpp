@@ -10,7 +10,6 @@
 
 #include "macro/RefoldMacroReplayStabilityValidator.h"
 
-#include "line-control/LineDirectiveInserter.h"
 #include "macro/RefoldArgTextRecovery.h"
 #include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroReplay.h"
@@ -28,7 +27,6 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FormatVariadic.h"
-#include "llvm/Support/MemoryBuffer.h"
 
 #include <algorithm>
 #include <optional>
@@ -965,77 +963,33 @@ bool RefoldMacroReplayStabilityValidator::
   if (deps_.pathIdentity.PathsEqual(*m.invFile, deps_.model.GetSourcePath()))
     return false;
 
-  // Decide whether this structure-preserving candidate would observe a
-  // specific active header directive if replayed at the current callsite.
-  // Use the shared macro-state observation proof so this header replay
-  // gate remains aligned with TU carry, include materialization, and
-  // unresolved-expansion fallback.
-
-  // Exact source interval for a macro-state directive in the header
-  // containing this invocation.  The interval is used only for ordering
-  // and active-state reconstruction in this admission check; movement is
-  // performed later by the materialization path.
-  using HeaderDirectivePiece = MacroStateDirectiveLineInterval;
-
-  // Lazily read the header bytes so directive intervals can be validated
-  // against the real file.  If the file cannot be read, this proof does
-  // not guess; it simply declines to suppress the candidate here and lets
-  // downstream validation/fallback handle the uncertainty.
-  std::optional<std::string> headerBytesStorage;
-  auto getHeaderBytes = [&]() -> std::optional<StringRef> {
-    if (headerBytesStorage)
-      return StringRef(*headerBytesStorage);
-    auto bufOrErr =
-        MemoryBuffer::getFile(deps_.lineDirs.ToAbsolutePath(m.invFile->str()));
-    if (!bufOrErr)
-      return std::nullopt;
-    const MemoryBuffer &mb = **bufOrErr;
-    headerBytesStorage.emplace(mb.getBufferStart(), mb.getBufferEnd());
-    return StringRef(*headerBytesStorage);
-  };
-
-  // Reconstruct the full directive interval and verify that it belongs to
-  // the same include owner and header file as the callsite. The shared
-  // helper owns macro-name-anchor reconstruction and exact-text
-  // validation against the lazily-read header bytes.
-  auto directiveInterval = [&](const RefoldModel::MacroDirective &directive)
-      -> std::optional<HeaderDirectivePiece> {
-    std::optional<StringRef> headerBytes = getHeaderBytes();
-    if (!headerBytes)
-      return std::nullopt;
-    return recoverMacroStateDirectiveLineInterval(deps_.pathIdentity, directive,
-                                                  *m.invFile, *headerBytes,
-                                                  m.ownerIncludeId);
-  };
-
-  // If any active header-owned definition would be observed by the
-  // replacement, this structure-preserving candidate is inadmissible.  It
-  // is not enough that the rewritten text is token-equivalent somewhere;
-  // it must be token-equivalent under the macro state at its final replay
-  // position.
+  // If a definition spelled in this header instance would be observed by the
+  // replacement where it is bound, this structure-preserving candidate is
+  // inadmissible: it is not enough that the rewritten text is
+  // token-equivalent somewhere; it must be token-equivalent under the macro
+  // state at its final replay position.  Processing order fixes which
+  // definition is bound there, a later `#undef` or `#define` for the name
+  // included, and a binding it leaves unknown counts as this one.  The shared
+  // observation proof keeps this gate aligned with TU carry, include
+  // materialization, and unresolved-expansion fallback.
   for (const auto &directive : deps_.model.GetMacroDirectives()) {
-    std::optional<HeaderDirectivePiece> piece = directiveInterval(directive);
-    if (!piece || piece->end > patch.invRange.begin)
+    if (!directive.IsDefine() || directive.ownerIncludeId != m.ownerIncludeId ||
+        !deps_.pathIdentity.PathsEqual(directive.sitePath, *m.invFile) ||
+        !deps_.macroStateProof
+             .FirstMacroStateObservationOffsetInText(directive, directive.name,
+                                                     patch.replacement)
+             .has_value())
       continue;
-    // A recovered interval means the header bytes were read, so the shared
-    // liveness proof can re-read them from the memoized storage.  A later
-    // `#undef` or `#define` for the same name cancels this definition.
-    if (!deps_.macroStateProof.DefinitionIsLiveAtOwnerByte(
-            directive, piece->name, *m.invFile, *getHeaderBytes(),
-            m.ownerIncludeId, patch.invRange.begin))
+    const std::optional<const RefoldModel::MacroDirective *> bound =
+        deps_.macroStateProof.DefinitionBoundAtInvocation(m.id, directive.name);
+    if (bound && *bound != &directive)
       continue;
-    if (deps_.macroStateProof
-            .FirstMacroStateObservationOffsetInText(directive, piece->name,
-                                                    patch.replacement)
-            .has_value()) {
-      REFOLD_LOG_TRACE(
-          "macro/proof",
-          "suppress structure-preserving macro replay: inv id={0} "
-          "name={1} replacement observes active header macro-state "
-          "directive #{2} '{3}' before callsite",
-          m.id, m.name, directive.id, piece->name);
-      return true;
-    }
+    REFOLD_LOG_TRACE("macro/proof",
+                     "suppress structure-preserving macro replay: inv id={0} "
+                     "name={1} replacement observes active header macro-state "
+                     "directive #{2} '{3}' before callsite",
+                     m.id, m.name, directive.id, directive.name);
+    return true;
   }
   return false;
 }

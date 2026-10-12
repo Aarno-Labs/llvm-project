@@ -226,6 +226,16 @@ public:
   void CertifyMacroPatchOwnerWitness(MacroPatch &patch,
                                      const Owner &owner) const;
 
+  /// Certify the B tokens a patch that keeps its callsite spells verbatim:
+  /// every B token of its envelope that no A token stands for, and every
+  /// token an occurrence of a rewritten actual lands on.  The rest of the
+  /// replacement is the replaced source only when the callsite around the
+  /// actuals is unchanged, B spells each rewritten actual verbatim at each of
+  /// its occurrences, nothing else depends on it, and those occurrences
+  /// account for every edited token.  Leaves a patch that already carries a
+  /// certificate, or does not keep its callsite, unchanged.
+  void CertifyMacroPatchBPayload(MacroPatch &patch) const;
+
   /// Build the final callsite patch for a macro invocation, preferring
   /// args-only preservation and falling back to proven whole-cover realization.
   std::optional<MacroPatch> BuildMacroInvocationPatchWholeCover(
@@ -287,6 +297,23 @@ public:
 private:
   RefoldMacroOccurrenceReplay OccurrenceReplay() const;
   RefoldMacroActualLayout ActualLayout() const;
+
+  /// The rewritten actuals of a callsite-keeping patch and where B holds
+  /// their occurrences.
+  struct RewrittenActualOccurrences {
+    /// Formals whose actual the patch rewrote, ascending.
+    llvm::SmallVector<uint32_t, 4> formals;
+    /// B-token envelopes of every occurrence of those formals, merged.
+    llvm::SmallVector<std::pair<uint64_t, uint64_t>, 8> bTokenRanges;
+    /// True when each occurrence copies its actual's tokens verbatim, selects
+    /// no callee, and no token B left unchanged depends on a rewritten actual.
+    bool verbatim = false;
+  };
+  /// Returns the rewritten actuals of \p patch, or nullopt when the patch is
+  /// not its root's callsite with only the contents of its actuals changed or
+  /// an occurrence has no B envelope.
+  std::optional<RewrittenActualOccurrences>
+  CollectRewrittenActualOccurrences(const MacroPatch &patch) const;
 
   /// Build a concrete rewritten invocation spelling from explicit per-formal
   /// replacements, preserving the materialized-output byte interval logic used

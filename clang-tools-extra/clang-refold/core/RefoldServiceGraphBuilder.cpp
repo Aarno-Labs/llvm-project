@@ -210,7 +210,7 @@ void RefoldEngine::BuildServiceGraph() {
       terminalSink_);
 
   macroStateProof_ = std::make_unique<RefoldMacroStateProof>(
-      model_, pathIdentity_, tokenTextAnalysis_, *ownerStateProof_);
+      model_, pathIdentity_, tokenTextAnalysis_, *ownerStateProof_, bToks_);
 
   if (tuSourceBytesOverride_) {
     tuSourceLoadError_.reset();

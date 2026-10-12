@@ -177,6 +177,16 @@ public:
       const RefoldModel::MacroInvocation &m, const RefoldModel::PPArgSpan &span,
       std::pair<size_t, size_t> env) const;
 
+  /// Return the B-token envelope of standard occurrence \p span of \p m: its
+  /// mapped envelope grown by the insertions it owns and the hunks of
+  /// \p tokenHunks that touch it, then over fixed replacement-list edges.
+  /// Occurrence replay requires B's text there to be the actual.  Nothing when
+  /// the occurrence does not map.
+  std::optional<std::pair<size_t, size_t>>
+  StandardOccurrenceBEnvelope(const RefoldModel::MacroInvocation &m,
+                              const RefoldModel::PPArgSpan &span,
+                              llvm::ArrayRef<diffutils::Hunk> tokenHunks) const;
+
 private:
   /// Return whether A token \p aTok is fixed replacement-list text of \p m:
   /// inside one of its body spans, outside every argument, stringify and paste

@@ -70,7 +70,8 @@ public:
     /// its owner's index bound the recorded extent.
     const RefoldPreprocessingStructureIndexProvider *structureIndexes = nullptr;
     /// Edited-stream tokens and their byte offsets (`bToks.size() + 1`
-    /// entries), for the B token a replacement's payload follows.
+    /// entries), for the tokens a certified payload spells and those beside
+    /// them.
     llvm::ArrayRef<PPTok> bToks;
     llvm::ArrayRef<size_t> bTokOff;
   };
@@ -113,13 +114,6 @@ public:
     llvm::StringMap<llvm::SmallVector<uint32_t, 2>> namedMacroDirectivesByName;
     llvm::DenseSet<uint64_t> preservedDefinitionDirectiveIds;
     llvm::DenseSet<uint64_t> syntheticUndefPartitionedDefinitionIds;
-    /// Definitions carried past an observing replacement.
-    ///
-    /// Recorded for the same reason as the synthetic-undef set: the closing
-    /// audit has to tell a definition whose observation was discharged from one
-    /// that no repair reached.  Without it a declining repair is
-    /// indistinguishable from a repair that was never needed.
-    llvm::DenseSet<uint64_t> carriedGapDefinitionIds;
     /// Suffix-stability witnesses of each macro-state transition this planner
     /// proved and authorized, one entry per transition.
     std::vector<std::vector<SuffixStabilityWitness>>

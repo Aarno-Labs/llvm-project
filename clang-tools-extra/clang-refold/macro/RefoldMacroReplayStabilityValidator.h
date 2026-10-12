@@ -47,7 +47,6 @@ class LangOptions;
 
 namespace refold {
 
-class LineDirectiveInserter;
 class RefoldMacroStateProof;
 class RefoldMacroSubtreeReplayValidator;
 class RefoldMacroTopology;
@@ -82,8 +81,6 @@ public:
     const clang::LangOptions &lexLang;
     /// Path identity for owner-include path comparison.
     const RefoldPathIdentity &pathIdentity;
-    /// Line-directive inserter for absolute-path resolution.
-    const LineDirectiveInserter &lineDirs;
     /// Macro-state proof service for directive-line recovery and
     /// replacement-observes-directive checks.
     RefoldMacroStateProof &macroStateProof;

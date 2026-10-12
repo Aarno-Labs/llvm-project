@@ -237,6 +237,45 @@ struct EliminatedProtectedConstruct {
   uint64_t end = 0;
 };
 
+/// What a replacement's bytes other than its B payload are.
+enum class BPayloadRest : uint8_t {
+  /// There are none: the replacement is B's own text.
+  None,
+  /// The original source the edit replaces, re-spelled and expanding exactly
+  /// as it did, so the producer's records of that source describe it.
+  ReplacedSource,
+  /// Nothing is established about them.
+  Unproven,
+};
+
+/// The B tokens a replacement spells verbatim.
+///
+/// B is fully expanded, so each of these tokens must survive preprocessing
+/// unchanged where the replacement is read; a macro name among them must stay
+/// an identifier.  The certificate is set only where it is established, and
+/// absence is missing evidence.
+struct BPayloadTokenCertificate {
+  /// Half-open B-token ranges, ascending and disjoint.
+  std::vector<std::pair<uint64_t, uint64_t>> bTokenRanges;
+  BPayloadRest rest = BPayloadRest::Unproven;
+};
+
+/// A B payload placed in the translation unit, and the macro-state repairs
+/// made for it.
+struct BPayloadRead {
+  BPayloadTokenCertificate certificate;
+  /// Source offset at which the payload is preprocessed: the edit's start
+  /// before any repair widened it.
+  uint64_t sourceOffset = 0;
+  /// The invocation whose callsite the replacement keeps, which the fallback
+  /// ladder may expand instead when no repair reaches the payload.
+  std::optional<uint64_t> keptCallsiteInvocationId = std::nullopt;
+  /// Set once a repair rewrote the edit's text around the payload.
+  bool restaged = false;
+  /// Definitions a repair left unbound wherever the payload is read.
+  std::vector<uint64_t> unboundDefinitionIds = {};
+};
+
 /// One byte edit selected for final source emission.
 struct TextEdit {
   /// Half-open TU source-byte range replaced by this edit.
@@ -345,15 +384,11 @@ struct TextEdit {
   /// `materializedBByteBegin`/`End` unset and still fails closed.
   bool materializesNoBPayload = false;
 
-  /// True when this edit was built from a macro patch whose replacement is
-  /// certified to be wholly B-derived payload
-  /// (`MaterializedSurface::replacementIsWhollyBPayload`), so a macro name in
-  /// `text` is B's identifier and never preserved source requiring its
-  /// expansion.  `text` may differ from that replacement only by synthetic
-  /// line-control directives.  Every other way of building an edit leaves it
-  /// unset, merging edits leaves it unset, and a repair that rewrites `text`
-  /// clears it, so absence is missing evidence.
-  bool replacementIsWhollyBPayload = false;
+  /// The B payload this edit's replacement spells, when certified.  `text` may
+  /// differ from the certified replacement only by synthetic line-control
+  /// directives.  Merging edits leaves it unset, and a repair that rewrites
+  /// `text` marks it restaged, so absence is missing evidence.
+  std::optional<BPayloadRead> bPayload = std::nullopt;
 };
 
 /// Replacement text produced while wrapping a materialized include together

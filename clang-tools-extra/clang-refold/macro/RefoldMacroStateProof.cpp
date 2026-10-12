@@ -313,6 +313,49 @@ bool RefoldMacroStateProof::SourceChunkObservesMacroStateDirectiveWhenCrossed(
       .has_value();
 }
 
+bool RefoldMacroStateProof::CertifiedPayloadReadsDefinition(
+    const BPayloadTokenCertificate &payload,
+    const RefoldModel::MacroDirective &definition, StringRef macroName) const {
+  if (definition.functionLike &&
+      CertifiedPayloadOpensCallOf(payload, macroName))
+    return true;
+  for (const auto &[begin, end] : payload.bTokenRanges)
+    for (uint64_t index = begin; index < end && index < bToks_.size(); ++index)
+      if (bToks_[index].kind == "raw_identifier" &&
+          bToks_[index].spelling == macroName &&
+          (!definition.functionLike ||
+           (index + 1 < bToks_.size() && bToks_[index + 1].spelling == "(")))
+        return true;
+  return false;
+}
+
+bool RefoldMacroStateProof::CertifiedPayloadOpensCallOf(
+    const BPayloadTokenCertificate &payload, StringRef macroName) const {
+  return llvm::any_of(payload.bTokenRanges, [&](const auto &range) {
+    return range.first > 0 && range.first < range.second &&
+           range.first < bToks_.size() &&
+           bToks_[range.first - 1].kind == "raw_identifier" &&
+           bToks_[range.first - 1].spelling == macroName &&
+           bToks_[range.first].spelling == "(";
+  });
+}
+
+std::optional<const RefoldModel::MacroDirective *>
+RefoldMacroStateProof::DefinitionBoundAtInvocation(uint64_t invocationId,
+                                                   StringRef macroName) const {
+  // `#pragma pop_macro` rebinds a name without a `#define` or `#undef`.
+  for (const RefoldModel::PragmaDirective &pragma : model_.GetPragmas())
+    if (pragma.id < invocationId && pragma.text.contains("pop_macro") &&
+        pragma.text.contains(("\"" + macroName + "\"").str()))
+      return std::nullopt;
+  const RefoldModel::MacroDirective *last = nullptr;
+  for (const RefoldModel::MacroDirective *directive :
+       model_.GetMacroDirectivesByName(macroName))
+    if (directive->id < invocationId && (!last || directive->id > last->id))
+      last = directive;
+  return last && last->IsDefine() ? last : nullptr;
+}
+
 bool RefoldMacroStateProof::InstanceRangeRecordsUndefObserver(
     StringRef path, uint64_t ownerIncludeId, StringRef macroName,
     uint64_t begin, uint64_t end) const {
@@ -447,47 +490,80 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
       mpEnd < mp.invEnd || mpEnd > bytes.size())
     return std::nullopt;
 
-  // Collect active #define lines that the B replacement would observe if
-  // emitted at the original invocation site.  Only movable whole directives
-  // become candidates; if an observed definition exists but cannot be moved,
-  // the proof fails closed below.
+  // Collect the definitions bound where the replacement is read that it would
+  // observe.  A replacement wholly made of B is asked what its text names and
+  // what its B tokens read, which covers a call the payload opens; one that
+  // keeps preserved callsite spelling is asked only about its B tokens, since
+  // that spelling may need the expansion it names.  Processing order fixes
+  // the binding wherever the definition was spelled.  One in this header
+  // instance may be carried past the replacement or bracketed around it; one
+  // bound from anywhere else -- the translation unit, another header, another
+  // inclusion of this one -- can only be bracketed.  An observed definition no
+  // repair can address fails closed: repairing the others would leave its read
+  // in place.
+  const bool keepsPreservedSpelling =
+      mp.bPayload && mp.bPayload->rest != BPayloadRest::None;
   SmallVector<MaterializedHeaderMacroStateDirectivePiece, 4> candidates;
-  bool observedUncarriedDefinition = false;
+  bool boundOutsideHeader = false;
+  bool observedUnrepairable = false;
   for (const auto &directive : model_.GetMacroDirectives()) {
     if (!directive.IsDefine())
       continue;
+    const bool observed =
+        (!keepsPreservedSpelling && ReplacementObservesMacroStateDirective(
+                                        directive, StringRef(mp.replacement),
+                                        /*unprovenObserves=*/false)) ||
+        (mp.bPayload && CertifiedPayloadReadsDefinition(*mp.bPayload, directive,
+                                                        directive.name));
+    if (!observed)
+      continue;
+    const std::optional<const RefoldModel::MacroDirective *> bound =
+        DefinitionBoundAtInvocation(mp.invocationId, directive.name);
+    if (bound && *bound != &directive)
+      continue;
     std::optional<MaterializedHeaderMacroStateDirectivePiece> piece =
         materializedHeaderMacroStateDirectiveInterval(directive);
-    if (!piece || piece->end > mp.invStart)
+    if (!bound || (piece && materializedHeaderRangeOverlapsStagedEdit(
+                                piece->begin, piece->end))) {
+      observedUnrepairable = true;
       continue;
-    if (!DefinitionIsLiveAtOwnerByte(directive, piece->name, headerPath, bytes,
-                                     std::optional<uint64_t>(includeId),
-                                     mp.invStart))
-      continue;
-    if (!ReplacementObservesMacroStateDirective(directive,
-                                                StringRef(mp.replacement),
-                                                /*unprovenObserves=*/false))
-      continue;
-
-    observedUncarriedDefinition = true;
-    if (materializedHeaderRangeOverlapsStagedEdit(piece->begin, piece->end))
-      continue;
-    candidates.push_back(std::move(*piece));
+    }
+    boundOutsideHeader = boundOutsideHeader || !piece;
+    candidates.push_back(
+        piece ? std::move(*piece)
+              : MaterializedHeaderMacroStateDirectivePiece{
+                    &directive, /*begin=*/0, /*end=*/0, directive.name});
   }
 
-  if (candidates.empty()) {
-    if (!observedUncarriedDefinition)
-      return std::nullopt;
+  if (candidates.empty() && !observedUnrepairable)
+    return std::nullopt;
+  if (observedUnrepairable) {
     (void)failMaterializedHeaderMacroState(
         materializedHeaderMacroStateBoundary(mp.invStart, mpEnd),
         StateMutationKind::Materialized,
-        llvm::formatv("include-owned macro patch in {0} observes active "
-                      "header macro state before [{1},{2}) but no movable "
-                      "definition line was proven",
+        llvm::formatv("include-owned macro patch in {0} observes macro state "
+                      "before [{1},{2}) that no repair can address",
                       headerPath, mp.invStart, mpEnd)
             .str());
     return StabilizedMaterializedHeaderMacroPatch{};
   }
+
+  // A repair that rebinds a name over the whole replacement must leave the
+  // replacement's bytes other than B payload reading what they read before.
+  // A patch keeping its callsite re-spells the callsite's own source there;
+  // an unproven rest counts as observing.  A patch with no certificate
+  // realizes the callsite rather than keeping it.
+  const auto replacementRestObserves =
+      [&](const MaterializedHeaderMacroStateDirectivePiece &candidate) {
+        if (!mp.bPayload || mp.bPayload->rest == BPayloadRest::None)
+          return false;
+        return mp.bPayload->rest == BPayloadRest::Unproven ||
+               SourceChunkObservesMacroStateDirectiveWhenCrossed(
+                   *candidate.directive, candidate.name,
+                   bytes.slice(mp.invStart, mpEnd), bytes.drop_front(mpEnd)) ||
+               InstanceRangeRecordsUndefObserver(
+                   headerPath, includeId, candidate.name, mp.invStart, mpEnd);
+      };
 
   // Emit carried directives in source order so the relative macro-state
   // transition order among multiple carried definitions is preserved.
@@ -498,23 +574,6 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
                  return lhs.begin < rhs.begin;
                return lhs.directive->id < rhs.directive->id;
              });
-
-  // Widen from the first carried directive through the completed invocation
-  // line.  The suffix after the invocation is consumed and replayed before the
-  // carried directives, which keeps the directives line-started after repair.
-  const uint64_t newStart = candidates.front().begin;
-  const uint64_t newEnd = materializedHeaderLineEndAfter(mpEnd);
-  if (newStart > mp.invStart || newEnd < mpEnd || newEnd > bytes.size() ||
-      materializedHeaderRangeOverlapsStagedEdit(newStart, newEnd)) {
-    (void)failMaterializedHeaderMacroState(
-        materializedHeaderMacroStateBoundary(newStart, newEnd),
-        StateMutationKind::WidenedIntoClosure,
-        llvm::formatv("include-owned macro patch in {0} cannot widen "
-                      "macro-state repair interval [{1},{2})",
-                      headerPath, newStart, newEnd)
-            .str());
-    return StabilizedMaterializedHeaderMacroPatch{};
-  }
 
   // Helper used while rebuilding the replacement to distinguish directive
   // bytes intentionally moved to the end from ordinary source bytes that must
@@ -605,7 +664,8 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
               *candidate.directive, candidate.name, sameLinePrefix,
               StringRef(mp.replacement)) ||
           InstanceRangeRecordsUndefObserver(
-              headerPath, includeId, candidate.name, lineStart, mp.invStart)) {
+              headerPath, includeId, candidate.name, lineStart, mp.invStart) ||
+          replacementRestObserves(candidate)) {
         return std::nullopt;
       }
       if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
@@ -668,7 +728,7 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
     // preserved callsite spelling that requires the name to expand -- an
     // args-only patch emitting `ID(VAL)` is exactly that -- so absence of the
     // certificate keeps this repair unavailable.
-    if (!mp.replacementIsWhollyBPayload)
+    if (!mp.bPayload || mp.bPayload->rest != BPayloadRest::None)
       return std::nullopt;
 
     // A directive inside the replacement may select an arm whose conditional
@@ -747,42 +807,59 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
     return stabilized;
   };
 
+  // Widen from the first carried directive through the completed invocation
+  // line.  The suffix after the invocation is consumed and replayed before the
+  // carried directives, which keeps the directives line-started after repair.
+  //
   // The replacement payload will be emitted before each carried definition,
   // and the original line suffix after the macro invocation must also remain
   // before those definitions so the directives still start on real directive
   // lines.  Therefore every byte crossed by each carried definition must be
   // proven non-observing for that definition.  Otherwise the macro-state move
-  // would change how preserved header source preprocesses.
+  // would change how preserved header source preprocesses, and the
+  // replacement is bracketed instead.  A definition bound outside this header
+  // instance has no line here to carry at all.
+  const uint64_t newStart =
+      boundOutsideHeader ? mp.invStart : candidates.front().begin;
+  const uint64_t newEnd = materializedHeaderLineEndAfter(mpEnd);
+  bool carryAvailable =
+      !boundOutsideHeader && newStart <= mp.invStart && newEnd >= mpEnd &&
+      newEnd <= bytes.size() &&
+      !materializedHeaderRangeOverlapsStagedEdit(newStart, newEnd);
   for (const auto &candidate : candidates) {
+    if (!carryAvailable)
+      break;
     std::string crossed;
     appendCrossedSourceExcludingCarried(crossed, candidate.end, mp.invStart);
     appendCrossedSourceExcludingCarried(crossed, mpEnd, newEnd);
     StringRef following = bytes.slice(mp.invStart, mpEnd);
-    if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
+    carryAvailable =
+        !SourceChunkObservesMacroStateDirectiveWhenCrossed(
             *candidate.directive, candidate.name, StringRef(crossed),
-            following) ||
-        InstanceRangeRecordsUndefObserver(headerPath, includeId, candidate.name,
-                                          candidate.end, mp.invStart) ||
-        InstanceRangeRecordsUndefObserver(headerPath, includeId, candidate.name,
-                                          mpEnd, newEnd)) {
-      if (std::optional<StabilizedMaterializedHeaderMacroPatch> undefRestore =
-              buildUndefRestoreAroundReplacementLine()) {
-        return undefRestore;
-      }
-      if (std::optional<StabilizedMaterializedHeaderMacroPatch> undefRestore =
-              buildUndefRestoreAroundBPayload()) {
-        return undefRestore;
-      }
-      (void)failMaterializedHeaderMacroState(
-          materializedHeaderMacroStateBoundary(candidate.begin, candidate.end),
-          StateMutationKind::MovedLater,
-          llvm::formatv("include-owned macro patch in {0} cannot carry "
-                        "#{1} for '{2}' across observing header source, and "
-                        "cannot undefine and restore it around the replacement",
-                        headerPath, candidate.directive->id, candidate.name)
-              .str());
-      return StabilizedMaterializedHeaderMacroPatch{};
-    }
+            following) &&
+        !InstanceRangeRecordsUndefObserver(headerPath, includeId,
+                                           candidate.name, candidate.end,
+                                           mp.invStart) &&
+        !InstanceRangeRecordsUndefObserver(headerPath, includeId,
+                                           candidate.name, mpEnd, newEnd) &&
+        !replacementRestObserves(candidate);
+  }
+  if (!carryAvailable) {
+    if (std::optional<StabilizedMaterializedHeaderMacroPatch> undefRestore =
+            buildUndefRestoreAroundReplacementLine())
+      return undefRestore;
+    if (std::optional<StabilizedMaterializedHeaderMacroPatch> undefRestore =
+            buildUndefRestoreAroundBPayload())
+      return undefRestore;
+    (void)failMaterializedHeaderMacroState(
+        materializedHeaderMacroStateBoundary(mp.invStart, mpEnd),
+        StateMutationKind::MovedLater,
+        llvm::formatv("include-owned macro patch in {0} can neither carry the "
+                      "definitions it observes past [{1},{2}) nor undefine "
+                      "and restore them around it",
+                      headerPath, mp.invStart, mpEnd)
+            .str());
+    return StabilizedMaterializedHeaderMacroPatch{};
   }
 
   // Rebuild the widened interval in the only order that preserves B's replay
