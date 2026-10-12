@@ -152,6 +152,17 @@ inline void certifyMacroPatchMaterializedBTokenRange(MacroPatch &patch,
   patch.materialized.bTokEnd = bTokEnd;
 }
 
+/// Certify a patch whose replacement is the material of the B tokens
+/// `[bTokBegin, bTokEnd)` and nothing else: the range is both the envelope it
+/// realizes and the whole B payload it spells.
+inline void certifyMacroPatchWhollyBTokens(MacroPatch &patch,
+                                           uint64_t bTokBegin,
+                                           uint64_t bTokEnd) {
+  certifyMacroPatchMaterializedBTokenRange(patch, bTokBegin, bTokEnd);
+  patch.materialized.bPayload =
+      BPayloadTokenCertificate{{{bTokBegin, bTokEnd}}, BPayloadRest::None};
+}
+
 /// Return true when a function-like macro formal is variadic.
 inline bool
 isMacroInvocationVariadicFormal(const RefoldModel::MacroInvocation &mi,

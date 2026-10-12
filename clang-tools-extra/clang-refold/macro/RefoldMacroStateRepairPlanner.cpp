@@ -3513,21 +3513,14 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
       continue;
     }
 
-    MacroPatch patch{*invocation.invB, *wholePlan->sourceEnd,
-                     wholePlan->clippedText, invocation.id};
-    MacroPatchProofClassifier().CertifyMacroWholeCoverRealizationPatch(
-        patch, *wholePlan, invocation);
-    MacroPatchPlanner().CertifyMacroPatchOwnerWitness(
-        patch, invocation.ownerIncludeId
-                   ? Owner::Include(*invocation.ownerIncludeId)
-                   : Owner::TU());
-
     // Reuse an existing physical-callsite key if one was already allocated for
     // the same byte interval. Otherwise use this invocation id as the stable
     // key for the forced whole-cover patch.
     RefoldStructuralHunkDispatcher::MacroPatchStagingSlot stagingSlot =
         dispatcher_.PrepareMacroPatchStagingSlot(invocation);
-    dispatcher_.StageMacroPatch(stagingSlot, std::move(patch));
+    dispatcher_.StageMacroPatch(
+        stagingSlot, MacroPatchPlanner().BuildCallsiteWholeCoverPatch(
+                         invocation, *wholePlan));
     ++forcedDefinitionLivenessPatches;
 
     REFOLD_LOG_WARN("macro/liveness",

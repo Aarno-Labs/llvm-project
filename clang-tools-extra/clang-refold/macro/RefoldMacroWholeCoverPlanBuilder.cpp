@@ -122,6 +122,8 @@ RefoldMacroWholeCoverPlanBuilder::ComputeWholeCoverPlan(
   const std::pair<size_t, size_t> &keptSegment = keptSegments.front();
   plan.claimsClipped = (keptSegment.first != plan.bTokStart ||
                         keptSegment.second != plan.bTokEnd);
+  plan.keptBTokStart = keptSegment.first;
+  plan.keptBTokEnd = keptSegment.second;
 
   // Materialize the kept segment from the bytes its B tokens occupy, not from
   // the first byte of the token that follows it.  The trailing trivia is not

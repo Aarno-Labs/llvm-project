@@ -71,13 +71,14 @@ public:
       const SelectedMacroSelectionCandidate &selectedCandidate,
       MacroPatch &selectedPatch) const;
 
-  /// Certify a whole-cover accepted candidate.  Whole-cover realization has
-  /// exactly one certifying operation, so this is the single entry point for
-  /// it: it installs the realization proof carrier and records the B-payload
-  /// partition together.
-  void CertifyWholeCoverAcceptedCandidate(
-      MacroPatch &patch, const WholeCoverPlan &plan,
-      const RefoldModel::MacroInvocation &invocation) const;
+  /// Build the patch realizing \p plan: it replaces `[invB, sourceEnd)` of
+  /// \p invocation with the plan's B material.  Whole-cover realization has
+  /// exactly one construction, so the replacement text, the realization proof
+  /// carrier and the B tokens that text spells are recorded together and
+  /// cannot describe different bytes.
+  MacroPatch
+  BuildWholeCoverPatch(const RefoldModel::MacroInvocation &invocation,
+                       const WholeCoverPlan &plan, uint64_t sourceEnd) const;
 
   /// Build and install the standard args-only macro proof on the patch,
   /// optionally enriched with a whole-envelope replay witness.

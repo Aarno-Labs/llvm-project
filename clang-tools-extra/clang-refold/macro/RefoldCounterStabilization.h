@@ -106,7 +106,7 @@ private:
 /// state-stability witness, and staged through the dispatcher under the
 /// coalesced physical-invocation-span key shared with normal hunk attribution.
 void applyForcedCounterPatches(
-    llvm::ArrayRef<ForcedMacroPatchRequest> forced, llvm::ArrayRef<PPTok> bToks,
+    llvm::ArrayRef<ForcedMacroPatchRequest> forced,
     const RefoldSourceMapper &sourceMapper,
     const RefoldMacroTopology &macroTopology,
     const RefoldMacroPatchPlanner &macroPatchPlanner,

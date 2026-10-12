@@ -226,6 +226,16 @@ public:
   void CertifyMacroPatchOwnerWitness(MacroPatch &patch,
                                      const Owner &owner) const;
 
+  /// Build the whole-cover patch that replaces \p invocation's callsite, and
+  /// every source byte its expansion consumed, with \p plan's B material,
+  /// owned by the invocation's translation unit or include.  A patch already
+  /// \p staged for the same callsite hands its owner certificate on.
+  /// \p plan must have a `sourceEnd`.
+  MacroPatch
+  BuildCallsiteWholeCoverPatch(const RefoldModel::MacroInvocation &invocation,
+                               const WholeCoverPlan &plan,
+                               const MacroPatch *staged = nullptr) const;
+
   /// Certify the B tokens a patch that keeps its callsite spells verbatim:
   /// every B token of its envelope that no A token stands for, and every
   /// token an occurrence of a rewritten actual lands on.  The rest of the

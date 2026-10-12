@@ -54,22 +54,20 @@ void RefoldMacroPatchProofCertifier::CertifySelectedFinalMacroCandidate(
       selectedCandidate.candidate.selectorOnly ? 1 : 0);
 }
 
-void RefoldMacroPatchProofCertifier::CertifyWholeCoverAcceptedCandidate(
-    MacroPatch &patch, const WholeCoverPlan &plan,
-    const RefoldModel::MacroInvocation &invocation) const {
-  // Whole-cover realization has a single certifying operation: it records the
-  // materialized B-token envelope, whole-cover diagnostics, proof kind, proof
-  // root, and owner-realization witness together.
+MacroPatch RefoldMacroPatchProofCertifier::BuildWholeCoverPatch(
+    const RefoldModel::MacroInvocation &invocation, const WholeCoverPlan &plan,
+    uint64_t sourceEnd) const {
+  MacroPatch patch{*invocation.invB, sourceEnd, plan.clippedText,
+                   invocation.id};
   deps_.macroPatchProofClassifier.CertifyMacroWholeCoverRealizationPatch(
       patch, plan, invocation);
 
-  // The whole-cover replacement is `WholeCoverPlan::clippedText`, which is the
-  // trimmed material of the cover's own B tokens and nothing else.  This is the
-  // one place that fact is known, so record the partition here: the whole
-  // replacement is B-derived payload, and no byte of the original callsite
-  // spelling survives in it.
+  // `clippedText` is the trimmed material of the plan's kept B tokens, plus
+  // any `#pragma` lines of B the expansion printed, and holds no byte of the
+  // callsite.
   patch.materialized.bPayload = BPayloadTokenCertificate{
-      {{plan.bTokStart, plan.bTokEnd}}, BPayloadRest::None};
+      {{plan.keptBTokStart, plan.keptBTokEnd}}, BPayloadRest::None};
+  return patch;
 }
 
 void RefoldMacroPatchProofCertifier::SetArgsOnlyStandardProof(

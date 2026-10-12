@@ -1436,6 +1436,20 @@ void RefoldMacroPatchPlanner::CertifyMacroPatchOwnerWitness(
   }
 }
 
+MacroPatch RefoldMacroPatchPlanner::BuildCallsiteWholeCoverPatch(
+    const RefoldModel::MacroInvocation &invocation, const WholeCoverPlan &plan,
+    const MacroPatch *staged) const {
+  MacroPatch patch =
+      ProofCertifier().BuildWholeCoverPatch(invocation, plan, *plan.sourceEnd);
+  if (staged)
+    CarryMacroPatchOwnerCertificate(patch, *staged);
+  CertifyMacroPatchOwnerWitness(patch,
+                                invocation.ownerIncludeId
+                                    ? Owner::Include(*invocation.ownerIncludeId)
+                                    : Owner::TU());
+  return patch;
+}
+
 /// Return \p text outside the half-open \p actuals, white space dropped and
 /// each actual marked, or nullopt when \p actuals does not lay \p text out.
 static std::optional<std::string>

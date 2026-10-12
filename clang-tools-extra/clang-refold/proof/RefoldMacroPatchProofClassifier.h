@@ -98,6 +98,9 @@ public:
   /// helper certifies the accepted patch as a first-class
   /// invocation-realization proof and copies the exact realization envelope
   /// derived by the whole-cover plan into the patch-local certificate fields.
+  /// Reached only through
+  /// `RefoldMacroPatchProofCertifier::BuildWholeCoverPatch`, which builds the
+  /// patch's text and B payload from the same plan.
   void CertifyMacroWholeCoverRealizationPatch(
       MacroPatch &patch, const WholeCoverPlan &plan,
       const RefoldModel::MacroInvocation &macro) const;

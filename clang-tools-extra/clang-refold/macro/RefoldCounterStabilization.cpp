@@ -12,6 +12,7 @@
 #include "macro/RefoldCounterStabilization.h"
 
 #include "macro/RefoldMacroPatchPlanner.h"
+#include "macro/RefoldMacroPlannerHelpers.h"
 #include "macro/RefoldMacroWholeCoverPlanBuilder.h"
 #include "proof/RefoldMacroPatchProofClassifier.h"
 #include "proof/RefoldOwnerStateProof.h"
@@ -485,8 +486,56 @@ RefoldCounterStabilization::ComputeForcedCounterPatchesFromExpandedMacros(
 
 // =================== Forced __COUNTER__ patch construction =================
 
+namespace {
+
+/// The B material a forced counter patch emits in place of its invocation.
+struct CounterReplacementSurface {
+  std::string text;
+  /// The B-token envelope the replacement realizes.
+  std::pair<uint64_t, uint64_t> envelope;
+  /// The B tokens `text` spells: the envelope, or the segment of it a whole
+  /// cover kept after boundary claims.
+  std::pair<uint64_t, uint64_t> spelled;
+};
+
+} // namespace
+
+/// The literal B prints for the `__COUNTER__` occurrence at A tokens
+/// `[aStart, aEnd)`.  It is tied to that occurrence, not to reusable
+/// macro-body text, and is realized from the bytes its B tokens occupy: the
+/// trivia after them can hold a printed `#pragma` line whose source operator
+/// still stands.
+static std::optional<CounterReplacementSurface>
+counterLiteralSurface(const RefoldSourceMapper &sourceMapper, uint64_t aStart,
+                      uint64_t aEnd) {
+  std::optional<std::pair<size_t, size_t>> bEnv =
+      sourceMapper.MapATokRangeAToBTokenEnvelope(aStart, aEnd);
+  if (!bEnv)
+    return std::nullopt;
+  std::optional<StringRef> material =
+      sourceMapper.SliceBTokenMaterial(bEnv->first, bEnv->second);
+  if (!material)
+    return std::nullopt;
+  const std::pair<uint64_t, uint64_t> range{bEnv->first, bEnv->second};
+  return CounterReplacementSurface{material->trim().str(), range, range};
+}
+
+/// The whole cover of an invocation whose expansion reads the counter, from
+/// the same plan every other whole-cover realization uses.
+static std::optional<CounterReplacementSurface>
+wholeCoverSurface(const RefoldMacroWholeCoverPlanBuilder &wholeCoverPlanBuilder,
+                  const RefoldModel::MacroInvocation &m) {
+  std::optional<WholeCoverPlan> plan =
+      wholeCoverPlanBuilder.ComputeWholeCoverPlan(m);
+  if (!plan)
+    return std::nullopt;
+  return CounterReplacementSurface{std::move(plan->clippedText),
+                                   {plan->bTokStart, plan->bTokEnd},
+                                   {plan->keptBTokStart, plan->keptBTokEnd}};
+}
+
 void applyForcedCounterPatches(
-    ArrayRef<ForcedMacroPatchRequest> forced, ArrayRef<PPTok> bToks,
+    ArrayRef<ForcedMacroPatchRequest> forced,
     const RefoldSourceMapper &sourceMapper,
     const RefoldMacroTopology &macroTopology,
     const RefoldMacroPatchPlanner &macroPatchPlanner,
@@ -494,51 +543,6 @@ void applyForcedCounterPatches(
     const RefoldMacroPatchProofClassifier &macroPatchProofClassifier,
     const RefoldOwnerStateProof &ownerStateProof,
     RefoldStructuralHunkDispatcher &structuralHunkDispatcher) {
-  struct CounterReplacementSurface {
-    std::string text;
-    uint64_t bTokStart = 0;
-    uint64_t bTokEnd = 0;
-  };
-
-  auto buildOccReplacement =
-      [&](uint64_t aStart,
-          uint64_t aEnd) -> std::optional<CounterReplacementSurface> {
-    // For __COUNTER__, the replacement is tied to the specific expanded
-    // occurrence, not to reusable macro-body text. Map that occurrence's
-    // A-token range into B and use the resulting B spelling directly.  Keep
-    // the B-token envelope together with the text so the accepted witness can
-    // prove target-PP identity without relying on the spelling preview.
-    auto bEnv = sourceMapper.MapATokRangeAToBTokenEnvelope(aStart, aEnd);
-    if (!bEnv)
-      return std::nullopt;
-    if (bEnv->second <= bEnv->first)
-      return std::nullopt;
-
-    CounterReplacementSurface surface;
-    surface.text =
-        sourceMapper.SliceBSource(bEnv->first, bEnv->second).trim().str();
-    surface.bTokStart = static_cast<uint64_t>(bEnv->first);
-    surface.bTokEnd = static_cast<uint64_t>(bEnv->second);
-    return surface;
-  };
-
-  auto deriveWholeCoverBTokenRange = [&](const RefoldModel::MacroInvocation &m)
-      -> std::optional<std::pair<uint64_t, uint64_t>> {
-    std::optional<std::pair<uint64_t, uint64_t>> cover =
-        macroPatchPlanner.GetWholeCoverATokRange(m);
-    if (!cover)
-      return std::nullopt;
-
-    std::optional<std::pair<size_t, size_t>> bEnv =
-        sourceMapper.MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
-            cover->first, cover->second);
-    if (!bEnv || bEnv->second <= bEnv->first || bEnv->second > bToks.size())
-      return std::nullopt;
-
-    return std::make_pair(static_cast<uint64_t>(bEnv->first),
-                          static_cast<uint64_t>(bEnv->second));
-  };
-
   for (const auto &req : forced) {
     const RefoldModel::MacroInvocation *pm = req.macro;
     if (!pm)
@@ -556,17 +560,13 @@ void applyForcedCounterPatches(
     if (!invStart || !invEnd || *invEnd < *invStart)
       continue;
 
-    std::optional<CounterReplacementSurface> counterSurface;
-    std::optional<std::string> nonCounterReplacement;
-    if (m.name == "__COUNTER__") {
-      counterSurface = buildOccReplacement(req.aStart, req.aEnd);
-    } else {
-      // Other forced counter-related requests use the normal whole-cover text
-      // builder so they remain aligned with whole macro invocation replay.
-      nonCounterReplacement =
-          wholeCoverPlanBuilder.BuildWholeCoverReplacementText(m);
-    }
-    if (!counterSurface && !nonCounterReplacement)
+    // Other forced counter-related requests realize the whole cover of the
+    // enclosing invocation, aligned with whole macro invocation replay.
+    std::optional<CounterReplacementSurface> surface =
+        m.name == "__COUNTER__"
+            ? counterLiteralSurface(sourceMapper, req.aStart, req.aEnd)
+            : wholeCoverSurface(wholeCoverPlanBuilder, m);
+    if (!surface)
       continue;
 
     // Coalesce by physical invocation span (inv_b/inv_e), matching the hunk
@@ -592,12 +592,8 @@ void applyForcedCounterPatches(
       if (event.macroInvocationId == 0)
         event = macroTopology.BuildCounterEventIdentity(
             m, /*occurrenceOrdinal=*/0, req.aStart, req.aEnd, m.ownerIncludeId);
-      if (!event.expectedBValue) {
-        if (counterSurface)
-          event.expectedBValue = counterSurface->text;
-        else if (nonCounterReplacement)
-          event.expectedBValue = *nonCounterReplacement;
-      }
+      if (!event.expectedBValue)
+        event.expectedBValue = surface->text;
       counterEventForWitness = event;
       const OwnerStateBoundary boundary =
           ownerStateProof.CounterStateBoundaryForEvent(event);
@@ -621,29 +617,14 @@ void applyForcedCounterPatches(
 
     // Install the forced patch under the coalesced physical-span key. If this
     // replaces a previous call-site-shaped patch, carry its owner certificate
-    // forward before certifying the current invocation owner.
-    std::optional<std::pair<uint64_t, uint64_t>> materializedBTokenRange;
-    if (counterSurface) {
-      materializedBTokenRange =
-          std::make_pair(counterSurface->bTokStart, counterSurface->bTokEnd);
-    } else if (nonCounterReplacement) {
-      // Enclosing macro materializations are whole-cover counter-stabilization
-      // repairs. Their target-PP proof is the exact B-token envelope of the
-      // whole macro expansion, not the replacement string constructed from it.
-      materializedBTokenRange = deriveWholeCoverBTokenRange(m);
-    }
-
-    std::string replacementText = counterSurface
-                                      ? std::move(counterSurface->text)
-                                      : std::move(*nonCounterReplacement);
-    MacroPatch patch{*invStart, *invEnd, std::move(replacementText)};
-    if (materializedBTokenRange &&
-        materializedBTokenRange->first <= materializedBTokenRange->second &&
-        materializedBTokenRange->second <= bToks.size()) {
-      patch.materialized.hasBTokenRange = true;
-      patch.materialized.bTokStart = materializedBTokenRange->first;
-      patch.materialized.bTokEnd = materializedBTokenRange->second;
-    }
+    // forward before certifying the current invocation owner.  The target-PP
+    // proof is the B-token envelope the surface realizes, and its payload the
+    // B tokens the text spells.
+    MacroPatch patch{*invStart, *invEnd, std::move(surface->text)};
+    certifyMacroPatchMaterializedBTokenRange(patch, surface->envelope.first,
+                                             surface->envelope.second);
+    patch.materialized.bPayload =
+        BPayloadTokenCertificate{{surface->spelled}, BPayloadRest::None};
     if (stagingSlot.existingPatch)
       macroPatchPlanner.CarryMacroPatchOwnerCertificate(
           patch, *stagingSlot.existingPatch);

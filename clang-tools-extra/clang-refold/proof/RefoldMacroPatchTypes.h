@@ -267,6 +267,10 @@ struct WholeCoverPlan {
   bool adjustedRight = false;
   bool claimsClipped = false;
   std::string clippedText;
+  /// The B tokens `clippedText` spells: the one segment of
+  /// `[bTokStart, bTokEnd)` that boundary claims left.
+  size_t keptBTokStart = 0;
+  size_t keptBTokEnd = 0;
   /// End of the physical source bytes, from the invocation's `invB`, that a
   /// patch realizing this plan replaces.  It lies past `invE` when a call the
   /// expansion generated is closed by source text after the invocation's own

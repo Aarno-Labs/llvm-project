@@ -1434,22 +1434,12 @@ bool RefoldEngine::DispatchStructuralHunks(
               wholeCoverPlan.reset();
             }
             if (wholeCoverPlan && wholeCoverPlan->sourceEnd) {
-              MacroPatch wholeCoverPatch{
-                  *invocation->invB, *wholeCoverPlan->sourceEnd,
-                  wholeCoverPlan->clippedText, invocation->id};
-              proofServices_->MacroPatchProofClassifier()
-                  .CertifyMacroWholeCoverRealizationPatch(
-                      wholeCoverPatch, *wholeCoverPlan, *invocation);
-              macroPatchPlanner_->CertifyMacroPatchOwnerWitness(
-                  wholeCoverPatch,
-                  invocation->ownerIncludeId
-                      ? Owner::Include(*invocation->ownerIncludeId)
-                      : Owner::TU());
               RefoldStructuralHunkDispatcher::MacroPatchStagingSlot slot =
                   structuralHunkDispatcher.PrepareMacroPatchStagingSlot(
                       *invocation);
               structuralHunkDispatcher.StageMacroPatch(
-                  slot, std::move(wholeCoverPatch));
+                  slot, macroPatchPlanner_->BuildCallsiteWholeCoverPatch(
+                            *invocation, *wholeCoverPlan));
               REFOLD_LOG_INFO(
                   "classify",
                   "hunk A=[{0},{1}) has no realization; emitting the expansion "
@@ -1565,9 +1555,8 @@ std::string RefoldEngine::FinalizeStructuralResult(
     forcedCounters.append(forcedCountersFromExpanded.begin(),
                           forcedCountersFromExpanded.end());
   if (!forcedCounters.empty())
-    applyForcedCounterPatches(forcedCounters, bToks_, sourceMapper_,
-                              macroTopology_, *macroPatchPlanner_,
-                              *wholeCoverPlanBuilder_,
+    applyForcedCounterPatches(forcedCounters, sourceMapper_, macroTopology_,
+                              *macroPatchPlanner_, *wholeCoverPlanBuilder_,
                               proofServices_->MacroPatchProofClassifier(),
                               *ownerStateProof_, structuralHunkDispatcher);
 
@@ -1696,17 +1685,9 @@ std::string RefoldEngine::FinalizeStructuralResult(
       RefoldStructuralHunkDispatcher::MacroPatchStagingSlot stagingSlot =
           structuralHunkDispatcher.PrepareMacroPatchStagingSlot(*site);
 
-      MacroPatch patch{*invStart, *plan->sourceEnd, plan->clippedText,
-                       site->id};
-      if (stagingSlot.existingPatch)
-        macroPatchPlanner_->CarryMacroPatchOwnerCertificate(
-            patch, *stagingSlot.existingPatch);
-      proofServices_->MacroPatchProofClassifier()
-          .CertifyMacroWholeCoverRealizationPatch(patch, *plan, *site);
-      macroPatchPlanner_->CertifyMacroPatchOwnerWitness(
-          patch, site->ownerIncludeId ? Owner::Include(*site->ownerIncludeId)
-                                      : Owner::TU());
-      structuralHunkDispatcher.StageMacroPatch(stagingSlot, std::move(patch));
+      structuralHunkDispatcher.StageMacroPatch(
+          stagingSlot, macroPatchPlanner_->BuildCallsiteWholeCoverPatch(
+                           *site, *plan, stagingSlot.existingPatch));
       ++forcedPredefinedObserverPatches;
     }
 

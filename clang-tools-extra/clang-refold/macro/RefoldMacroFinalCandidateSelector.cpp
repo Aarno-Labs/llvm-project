@@ -107,16 +107,6 @@ struct FinalMacroCandidateAdmissionContext {
   bool hasWholeCoverCandidate = false;
 };
 
-/// Whole-cover realization candidate before final theorem-lattice
-/// admission.  The plan was already computed by the whole-cover proof
-/// path; this carrier only names the source span and plan together.
-struct WholeCoverCandidate {
-  const RefoldModel::MacroInvocation &invocation;
-  uint64_t invocationStart = 0;
-  uint64_t invocationEnd = 0;
-  const WholeCoverPlan &plan;
-};
-
 /// Note which final-admission path contributed a candidate.  These flags
 /// are bookkeeping only; proof-lattice ranking remains authoritative.
 void noteFinalMacroCandidateOrigin(FinalMacroCandidateAdmissionContext &ctx,
@@ -320,19 +310,6 @@ selectPreferredFinalMacroCandidate(
   return ranker.SelectPreferredMacroSelectionCandidate(selectionCandidates);
 }
 
-/// Materialize one whole-cover realization candidate and attach its
-/// proof carrier.  The caller supplies the already-proven plan and
-/// invocation span; this helper only builds the emitted patch.
-MacroPatch
-materializeWholeCoverPatch(const RefoldMacroPatchProofCertifier &certifier,
-                           const WholeCoverCandidate &candidate) {
-  MacroPatch patch{candidate.invocationStart, candidate.invocationEnd,
-                   candidate.plan.clippedText, candidate.invocation.id};
-  certifier.CertifyWholeCoverAcceptedCandidate(patch, candidate.plan,
-                                               candidate.invocation);
-  return patch;
-}
-
 } // namespace
 
 RefoldMacroFinalCandidateSelector::RefoldMacroFinalCandidateSelector(
@@ -403,7 +380,6 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
   const diffutils::Hunk &h = planningCtx.h;
   const diffutils::Hunk &hEff = planningCtx.hEff;
   const StringRef baseInvText = planningCtx.baseInvText;
-  const uint64_t invStart = planningCtx.invStart;
   const uint64_t invEnd = planningCtx.invEnd;
 
   std::optional<MacroPatch> &argsOnlyCandidate = planningCtx.argsOnlyCandidate;
@@ -845,11 +821,8 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
     // syntactic callsites and cannot safely be replaced directly.  The
     // realization replaces every source byte the expansion consumed, which
     // can run past the callsite.
-    const WholeCoverCandidate wholeCoverCandidate{
-        m, invStart, std::max(invEnd, *wholeCoverPlan->sourceEnd),
-        *wholeCoverPlan};
-    MacroPatch patch =
-        materializeWholeCoverPatch(deps_.proofCertifier, wholeCoverCandidate);
+    MacroPatch patch = deps_.proofCertifier.BuildWholeCoverPatch(
+        m, *wholeCoverPlan, std::max(invEnd, *wholeCoverPlan->sourceEnd));
     const bool structureCandidateDominatesWholeCover =
         theoremLatticeStructureCandidateDominatesRealization(
             deps_.acceptedCandidateBuilder, deps_.acceptedResultRanker,

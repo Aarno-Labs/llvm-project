@@ -308,13 +308,8 @@ RefoldMacroWholeCoverOrchestrator::TryCounterLiteralWholeCoverPatch(
       counterWitness, "counter", detail, /*requireKnownObserver=*/false);
 
   MacroPatch patch{invocationStart, invocationEnd, std::move(*repl), m.id};
-  if (counterBTokenRange &&
-      counterBTokenRange->first <= counterBTokenRange->second &&
-      counterBTokenRange->second <= planner_->Deps().bToks.size()) {
-    patch.materialized.hasBTokenRange = true;
-    patch.materialized.bTokStart = counterBTokenRange->first;
-    patch.materialized.bTokEnd = counterBTokenRange->second;
-  }
+  certifyMacroPatchWhollyBTokens(patch, counterBTokenRange->first,
+                                 counterBTokenRange->second);
   MacroPatchProof proof =
       makeMacroPatchProof(MacroPatchProofKind::CounterLiteral,
                           /*preservesInvocationStructure=*/false, m.id);
