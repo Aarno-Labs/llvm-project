@@ -344,6 +344,16 @@ struct TextEdit {
   /// an edit that merely never reached a certifier keeps
   /// `materializedBByteBegin`/`End` unset and still fails closed.
   bool materializesNoBPayload = false;
+
+  /// True when this edit was built from a macro patch whose replacement is
+  /// certified to be wholly B-derived payload
+  /// (`MaterializedSurface::replacementIsWhollyBPayload`), so a macro name in
+  /// `text` is B's identifier and never preserved source requiring its
+  /// expansion.  `text` may differ from that replacement only by synthetic
+  /// line-control directives.  Every other way of building an edit leaves it
+  /// unset, merging edits leaves it unset, and a repair that rewrites `text`
+  /// clears it, so absence is missing evidence.
+  bool replacementIsWhollyBPayload = false;
 };
 
 /// Replacement text produced while wrapping a materialized include together

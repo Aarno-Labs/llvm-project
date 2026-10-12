@@ -38,6 +38,39 @@ using namespace llvm;
 namespace clang {
 namespace refold {
 
+namespace {
+
+/// Return true when an expanded realization staged in \p root's owner
+/// replaces source bytes that contain \p root's callsite `[invB, invE)`.
+///
+/// The patch need not be \p root's own: a whole cover replaces every byte its
+/// expansion consumed, so a callsite spelled in an actual of the covered call,
+/// or in source after its closing parenthesis that a call it generated read,
+/// disappears with it, and the replacement is B text.  A `__COUNTER__` read at
+/// that callsite has then left the replay-time counter sequence.  A patch that
+/// keeps its invocation's callsite spelling does not count.
+bool callsiteReplacedByExpandedPatch(
+    const RefoldMacroTopology &macroTopology,
+    const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
+        &macroPatchByOwnerByMacroId,
+    const RefoldModel::MacroInvocation &root) {
+  const auto oit = macroPatchByOwnerByMacroId.find(root.ownerIncludeId);
+  if (oit == macroPatchByOwnerByMacroId.end())
+    return false;
+  if (!root.invB || !root.invE)
+    return false;
+  for (const auto &kv : oit->second) {
+    const MacroPatch &patch = kv.second;
+    if (*root.invB < patch.invRange.begin || patch.invRange.end < *root.invE)
+      continue;
+    if (macroTopology.MacroPatchRemainsExpanded(patch))
+      return true;
+  }
+  return false;
+}
+
+} // namespace
+
 RefoldCounterStabilization::RefoldCounterStabilization(
     const RefoldModel &model, ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks,
     const RefoldMacroTopology &macroTopology,
@@ -394,40 +427,19 @@ RefoldCounterStabilization::ComputeForcedCounterPatchesFromExpandedMacros(
   if (filtered.empty())
     return {};
 
-  // Return true when the patch already selected for `root` is an expanded
-  // realization. Once one counter-bearing macro remains expanded, all following
-  // counter-bearing roots must also be forced to preserve counter sequencing.
-  auto hasExpandedPatchFor =
-      [&](const RefoldModel::MacroInvocation &root) -> bool {
-    const auto oit = macroPatchByOwnerByMacroId.find(root.ownerIncludeId);
-    if (oit == macroPatchByOwnerByMacroId.end())
-      return false;
-
-    const auto invStart = root.invB;
-    const auto invEnd = root.invE;
-    if (!invStart || !invEnd)
-      return false;
-
-    for (const auto &kv : oit->second) {
-      const MacroPatch &p = kv.second;
-      if (p.invRange.begin != *invStart || p.invRange.end != *invEnd)
-        continue;
-      if (macroTopology_.MacroPatchRemainsExpanded(p))
-        return true;
-    }
-    return false;
-  };
-
   // Find the first __COUNTER__ occurrence whose smallest patchable owner is
   // already going to remain expanded. That point starts the
-  // forced-stabilization suffix.
+  // forced-stabilization suffix: once one counter-bearing macro remains
+  // expanded, all following counter-bearing roots must also be forced to
+  // preserve counter sequencing.
   int firstExpandedIdx = -1;
   for (size_t i = 0; i < filtered.size(); ++i) {
     const auto *root = macroTopology_.SmallestCoveringPatchableMacro(
         filtered[i].aStart, filtered[i].aEnd, filtered[i].ownerIncludeId);
     if (!root || macroTopology_.IsInvocationInsideDefineDirective(*root))
       continue;
-    if (hasExpandedPatchFor(*root)) {
+    if (callsiteReplacedByExpandedPatch(macroTopology_,
+                                        macroPatchByOwnerByMacroId, *root)) {
       firstExpandedIdx = static_cast<int>(i);
       break;
     }
@@ -564,6 +576,13 @@ void applyForcedCounterPatches(
 
     // Preserve an existing non-callsite (already-expanded) replacement.
     if (stagingSlot.existingPatch && !stagingSlot.existingIsCallsite)
+      continue;
+
+    // An expanded realization around this callsite already removed its read
+    // from the counter sequence; a literal nested inside it would overlap it.
+    if (callsiteReplacedByExpandedPatch(
+            macroTopology,
+            structuralHunkDispatcher.MacroPatchMergeBucketsForPlanner(), m))
       continue;
 
     CounterEventIdentity counterEventForWitness;

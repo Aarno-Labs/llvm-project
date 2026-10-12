@@ -15,6 +15,7 @@
 
 #include "edit/RefoldEditTypes.h"
 #include "model/RefoldModel.h"
+#include "model/RefoldToken.h"
 
 #include "clang/Basic/LangOptions.h"
 
@@ -68,6 +69,10 @@ public:
     /// Source-owner indexes; a directive's bytes are re-emitted only where
     /// its owner's index bound the recorded extent.
     const RefoldPreprocessingStructureIndexProvider *structureIndexes = nullptr;
+    /// Edited-stream tokens and their byte offsets (`bToks.size() + 1`
+    /// entries), for the B token a replacement's payload follows.
+    llvm::ArrayRef<PPTok> bToks;
+    llvm::ArrayRef<size_t> bTokOff;
   };
 
   struct MacroStateRepairRequest {

@@ -465,6 +465,8 @@ void RefoldEngine::BuildServiceGraph() {
   repairDeps.terminalSink = &terminalSink_;
   repairDeps.lexLang = &lexLang_;
   repairDeps.structureIndexes = preprocessingStructureIndexProvider_.get();
+  repairDeps.bToks = bToks_;
+  repairDeps.bTokOff = bTokOff_;
   macroStateRepairPlanner_ =
       std::make_unique<RefoldMacroStateRepairPlanner>(std::move(repairDeps));
 

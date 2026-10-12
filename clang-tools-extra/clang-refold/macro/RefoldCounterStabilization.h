@@ -70,7 +70,9 @@ public:
   /// expanded.
   ///
   /// This catches the case where ordinary hunk attribution selected an expanded
-  /// macro realization whose expansion consumes `__COUNTER__`.  The first such
+  /// macro realization whose replaced source holds the callsite that consumes
+  /// `__COUNTER__`, whether that callsite is the realized invocation or one
+  /// spelled in its actuals or consumed source.  The first such
   /// already-expanded occurrence starts the same forced materialization suffix.
   llvm::SmallVector<ForcedMacroPatchRequest, 32>
   ComputeForcedCounterPatchesFromExpandedMacros(
