@@ -256,6 +256,22 @@ public:
       llvm::StringRef chunk,
       llvm::StringRef following = llvm::StringRef()) const;
 
+  /// Return whether the producer recorded, in `[begin, end)` of the include
+  /// instance \p ownerIncludeId of \p path, something that could observe
+  /// \p macroName being undefined there although the text does not spell it.
+  ///
+  /// That is a pragma, whose operand is a string the text scan does not read,
+  /// or an expansion of the name used there, which the source may reach
+  /// through another macro, as with `#define Y X` and `Y` spelled in the range.
+  /// The producer records every expansion, so an absent record proves the
+  /// range expanded the name nowhere.  An expansion of the name that the
+  /// instance recorded without a use extent counts wherever it is, since
+  /// nothing places it.
+  bool InstanceRangeRecordsUndefObserver(llvm::StringRef path,
+                                         uint64_t ownerIncludeId,
+                                         llvm::StringRef macroName,
+                                         uint64_t begin, uint64_t end) const;
+
   /// True iff \p definition is the macro-state directive that is live for
   /// \p macroName immediately before \p offset, and is a `#define`.
   ///

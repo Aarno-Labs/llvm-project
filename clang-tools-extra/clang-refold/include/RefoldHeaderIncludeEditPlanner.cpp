@@ -1611,11 +1611,14 @@ void RefoldHeaderIncludeEditPlanner::CollectHeaderMacroStateCarryCandidates(
     // Header materialization has the same placement-sensitive macro-state
     // invariant as TU gap carry. We may carry a definition after the
     // replacement only when the crossed original bytes do not themselves
-    // observe it.
+    // observe it, by spelling it or otherwise.
     if (macroStateProof_.SourceChunkObservesMacroStateDirectiveWhenCrossed(
             directive, piece->name,
             state.headerText.slice(piece->end, *state.startByte),
-            state.headerText.slice(*state.startByte, *state.endByte)))
+            state.headerText.slice(*state.startByte, *state.endByte)) ||
+        macroStateProof_.InstanceRangeRecordsUndefObserver(
+            state.file, state.include.id, piece->name, piece->end,
+            *state.startByte))
       continue;
 
     out.push_back(HeaderMacroStateCarryCandidate{&directive, piece->begin,
@@ -1645,7 +1648,10 @@ bool RefoldHeaderIncludeEditPlanner::HeaderMacroStateCarryCandidatesCanCross(
       if (prior.begin >= candidate.begin)
         break;
       if (macroStateProof_.SourceChunkObservesMacroStateDirectiveWhenCrossed(
-              *prior.directive, prior.name, crossed, following))
+              *prior.directive, prior.name, crossed, following) ||
+          macroStateProof_.InstanceRangeRecordsUndefObserver(
+              state.file, state.include.id, prior.name, cursor,
+              candidate.begin))
         return false;
     }
     cursor = candidate.end;
@@ -1679,7 +1685,10 @@ bool RefoldHeaderIncludeEditPlanner::HeaderMacroStateCarryTailIsNonObserving(
   StringRef following = state.headerText.drop_front(replacementTailEnd);
   for (const HeaderMacroStateCarryCandidate &candidate : candidates) {
     if (macroStateProof_.SourceChunkObservesMacroStateDirectiveWhenCrossed(
-            *candidate.directive, candidate.name, tail, following))
+            *candidate.directive, candidate.name, tail, following) ||
+        macroStateProof_.InstanceRangeRecordsUndefObserver(
+            state.file, state.include.id, candidate.name, *state.endByte,
+            replacementTailEnd))
       return false;
   }
   return true;

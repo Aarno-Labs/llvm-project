@@ -120,6 +120,17 @@ enum class MacroStateTransitionDisposition : uint8_t {
   Materialized,
 };
 
+/// How a repair changes the binding of a macro name over preserved source that
+/// it moves a macro-state transition across.
+enum class CrossedBindingChange : uint8_t {
+  /// Bound in A, unbound after the repair: a `#define` carried past the source,
+  /// or an `#undef` synthesized or advanced before it.
+  Unbound,
+  /// Unbound in A, bound after the repair: a consumed `#undef` delayed past the
+  /// source.
+  Bound,
+};
+
 StringRef macroStateTransitionDispositionName(
     MacroStateTransitionDisposition disposition) {
   switch (disposition) {
@@ -491,14 +502,29 @@ private:
   /// Returns whether preserved translation-unit source in `[begin, end)` can
   /// observe \p macroName being undefined: it holds preprocessing structure,
   /// or a producer-recorded invocation of that name, or one whose caller chain
-  /// leaves the model, has a call or use extent there.
+  /// leaves the model, has a call or use extent there.  With \p macroName
+  /// absent, an invocation of any name counts.
   ///
   /// The producer records every expansion, including one another expansion
   /// produced, so an absent record proves no byte of the range expanded the
   /// name.  Undefining it before those bytes then changes nothing they
   /// preprocess to, and only directives could see the change otherwise.
-  bool PreservedSourceCanObserveMacroUndef(StringRef macroName, uint64_t begin,
-                                           uint64_t end) const;
+  bool PreservedSourceCanObserveMacroUndef(std::optional<StringRef> macroName,
+                                           uint64_t begin, uint64_t end) const;
+  /// Returns whether preserved translation-unit source in `[begin, end)` could
+  /// preprocess differently once a repair changes, as \p change says, whether
+  /// \p definition binds \p macroName over it.
+  ///
+  /// The text scan sees only spellings of the name, plus a function-like call
+  /// split across `end` into \p following.  A read through another macro, as
+  /// with `#define Y X` and `Y` spelled in the range, never spells the name, so
+  /// the producer's records answer as well.  When the name becomes unbound, A
+  /// must not have expanded it there.  When it becomes bound, A expanded it
+  /// nowhere there, and any recorded expansion in the range could produce it.
+  bool PreservedSourceObservesBindingChange(
+      const RefoldModel::MacroDirective &definition, StringRef macroName,
+      uint64_t begin, uint64_t end, StringRef following,
+      CrossedBindingChange change) const;
   /// Finds the replacement line start that precedes a macro observation.
   std::optional<size_t>
   ReplacementLineStartBeforeObservation(StringRef replacement,
@@ -557,10 +583,11 @@ private:
       MacroStatePreservationPlacement placement) const;
 
   /// Computes a delayed macro-state boundary after an edit when the source
-  /// suffix can safely carry the directive line.
+  /// suffix can safely carry the directive line.  \p change says how delaying
+  /// the transition changes the binding of \p macroName over that suffix.
   std::optional<uint64_t> DelayedTransitionBoundaryAfterEdit(
       size_t editIndex, const RefoldModel::MacroDirective &definition,
-      StringRef macroName) const;
+      StringRef macroName, CrossedBindingChange change) const;
   /// Attempts to move a consumed undef before an observed replacement that
   /// depends on the previous live definition.
   std::optional<MacroStatePreservationPlacement>
@@ -570,7 +597,9 @@ private:
       const RefoldModel::MacroDirective &previousDefinition,
       size_t firstObservationOffset);
   /// Attempts to widen an edit to a delayed boundary that preserves macro-state
-  /// liveness without creating an extra directive line.
+  /// liveness without creating an extra directive line.  The transition
+  /// delayed is a consumed `#undef`, so \p definition stays bound over the
+  /// source the edit absorbs.
   bool TryWidenEditToDelayedMacroStateBoundary(
       size_t editIndex, const RefoldModel::MacroDirective &definition,
       StringRef macroName);
@@ -1759,7 +1788,7 @@ MacroStateRepairContext::DefinitionCalledByReplacementStart(
 }
 
 bool MacroStateRepairContext::PreservedSourceCanObserveMacroUndef(
-    StringRef macroName, uint64_t begin, uint64_t end) const {
+    std::optional<StringRef> macroName, uint64_t begin, uint64_t end) const {
   if (begin >= end)
     return false;
   const RefoldPreprocessingStructureIndexProvider::LookupResult lookup =
@@ -1776,7 +1805,7 @@ bool MacroStateRepairContext::PreservedSourceCanObserveMacroUndef(
   };
   for (const RefoldModel::MacroInvocation &invocation :
        Model().GetMacroInvocations()) {
-    if (invocation.name != macroName)
+    if (macroName && invocation.name != *macroName)
       continue;
     for (const RefoldModel::MacroInvocation *link = &invocation; link;) {
       if (!link->ownerIncludeId && link->invFile &&
@@ -1794,6 +1823,26 @@ bool MacroStateRepairContext::PreservedSourceCanObserveMacroUndef(
     }
   }
   return false;
+}
+
+bool MacroStateRepairContext::PreservedSourceObservesBindingChange(
+    const RefoldModel::MacroDirective &definition, StringRef macroName,
+    uint64_t begin, uint64_t end, StringRef following,
+    CrossedBindingChange change) const {
+  if (begin >= end)
+    return false;
+  if (end > tuBytes_.size())
+    return true;
+  if (MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
+          definition, macroName, tuBytes_.slice(begin, end), following))
+    return true;
+  switch (change) {
+  case CrossedBindingChange::Unbound:
+    return PreservedSourceCanObserveMacroUndef(macroName, begin, end);
+  case CrossedBindingChange::Bound:
+    return PreservedSourceCanObserveMacroUndef(std::nullopt, begin, end);
+  }
+  llvm_unreachable("unknown crossed binding change");
 }
 
 std::optional<size_t>
@@ -2237,7 +2286,7 @@ void MacroStateRepairContext::RestageConservativeTUEdit(
 std::optional<uint64_t>
 MacroStateRepairContext::DelayedTransitionBoundaryAfterEdit(
     size_t editIndex, const RefoldModel::MacroDirective &definition,
-    StringRef macroName) const {
+    StringRef macroName, CrossedBindingChange change) const {
   if (editIndex >= tuEdits_.size())
     return std::nullopt;
   const TextEdit &edit = tuEdits_[editIndex];
@@ -2267,8 +2316,9 @@ MacroStateRepairContext::DelayedTransitionBoundaryAfterEdit(
     return std::nullopt;
 
   StringRef carriedSuffix = tuBytes_.slice(edit.end, lineEnd);
-  if (MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
-          definition, macroName, carriedSuffix, tuBytes_.drop_front(lineEnd)))
+  if (PreservedSourceObservesBindingChange(
+          definition, macroName, edit.end, lineEnd,
+          tuBytes_.drop_front(lineEnd), change))
     return std::nullopt;
 
   TextEdit boundaryEdit = edit;
@@ -2354,16 +2404,18 @@ void MacroStateRepairContext::
               ReplacementText.drop_front(*firstObservationOffset)))
         continue;
 
-      if (MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
-              *previousDefinition, undefRef.name, crossedPrefix,
-              ReplacementText))
+      if (PreservedSourceObservesBindingChange(
+              *previousDefinition, undefRef.name, lineStart, edit.start,
+              ReplacementText, CrossedBindingChange::Unbound))
         continue;
 
       StringRef carriedSuffix =
           tuBytes_.slice(edit.end, undefTransition->interval.begin);
-      if (MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
-              *previousDefinition, undefRef.name, carriedSuffix,
-              tuBytes_.drop_front(undefTransition->interval.begin)))
+      if (PreservedSourceObservesBindingChange(
+              *previousDefinition, undefRef.name, edit.end,
+              undefTransition->interval.begin,
+              tuBytes_.drop_front(undefTransition->interval.begin),
+              CrossedBindingChange::Unbound))
         continue;
 
       if (undefTransition->text.empty()) {
@@ -2462,8 +2514,9 @@ MacroStateRepairContext::TryAdvanceConsumedUndefBeforeObservedReplacement(
     return std::nullopt;
 
   StringRef crossedPrefix = tuBytes_.slice(lineStart, edit.start);
-  if (MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
-          previousDefinition, macroName, crossedPrefix, ReplacementText))
+  if (PreservedSourceObservesBindingChange(
+          previousDefinition, macroName, lineStart, edit.start, ReplacementText,
+          CrossedBindingChange::Unbound))
     return std::nullopt;
 
   std::string replacement;
@@ -2519,8 +2572,8 @@ bool MacroStateRepairContext::TryWidenEditToDelayedMacroStateBoundary(
     return false;
 
   TextEdit &edit = tuEdits_[editIndex];
-  std::optional<uint64_t> boundary =
-      DelayedTransitionBoundaryAfterEdit(editIndex, definition, macroName);
+  std::optional<uint64_t> boundary = DelayedTransitionBoundaryAfterEdit(
+      editIndex, definition, macroName, CrossedBindingChange::Bound);
   if (!boundary)
     return false;
   if (*boundary == edit.end)
@@ -2691,9 +2744,7 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
                                     edit.end, lineBreakEnd, editIndex);
 
     StringRef sameLinePrefix = tuBytes_.slice(lineStart, edit.start);
-    StringRef sameLineSuffix = tuBytes_.slice(edit.end, lineEnd);
     StringRef ReplacementText(edit.text);
-    StringRef untouchedSuffix = tuBytes_.drop_front(edit.end);
     const RefoldModel::MacroDirective *calledByReplacementStart =
         DefinitionCalledByReplacementStart(edit);
 
@@ -2750,26 +2801,26 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
 
       // If the original same-line prefix needed the definition, placing a
       // synthetic #undef before the line would change preserved source before
-      // the replacement.
-      if (!callsName &&
-          MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
-              definitionLocal, ref.name, sameLinePrefix, ReplacementText))
+      // the replacement.  It may need it without spelling the name, through
+      // another macro whose expansion reads it.
+      if (!callsName && PreservedSourceObservesBindingChange(
+                            definitionLocal, ref.name, lineStart, edit.start,
+                            ReplacementText, CrossedBindingChange::Unbound))
         continue;
 
       // Without a restore the name stays unbound for the rest of the unit.
-      // The scan counts any directive in the suffix as an observer, since it
-      // cannot see through an `#include` or into a `push_macro` operand.  With
-      // a restore, only the rest of the replacement's line lands between the
-      // #undef and the restore, so that must not need the definition.
-      const bool needsRestore =
-          MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
-              definitionLocal, ref.name, untouchedSuffix, StringRef());
-      if (needsRestore &&
-          (!restoreSiteAvailable ||
-           MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
-               definitionLocal, ref.name, sameLineSuffix, StringRef()) ||
-           (callsName &&
-            PreservedSourceCanObserveMacroUndef(ref.name, edit.end, lineEnd))))
+      // Any directive in the suffix counts as an observer, since neither the
+      // scan nor the producer's expansion records see through an `#include`
+      // or into a `push_macro` operand.  With a restore, only the rest of the
+      // replacement's line lands between the #undef and the restore, so that
+      // must not need the definition.
+      const bool needsRestore = PreservedSourceObservesBindingChange(
+          definitionLocal, ref.name, edit.end, tuBytes_.size(), StringRef(),
+          CrossedBindingChange::Unbound);
+      if (needsRestore && (!restoreSiteAvailable ||
+                           PreservedSourceObservesBindingChange(
+                               definitionLocal, ref.name, edit.end, lineEnd,
+                               StringRef(), CrossedBindingChange::Unbound)))
         continue;
 
       // Prefer carrying the definition past the replacement when the crossed
@@ -2777,10 +2828,9 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
       // A definition with no movable surface cannot be carried, and the carry
       // repair does not see a call the payload opens.
       if (!callsName && transition &&
-          !MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
-              definitionLocal, ref.name,
-              tuBytes_.slice(transition->interval.end, edit.start),
-              ReplacementText))
+          !PreservedSourceObservesBindingChange(
+              definitionLocal, ref.name, transition->interval.end, edit.start,
+              ReplacementText, CrossedBindingChange::Unbound))
         continue;
 
       std::string restoreText;
@@ -3162,7 +3212,7 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
         continue;
 
       std::optional<uint64_t> boundary = DelayedTransitionBoundaryAfterEdit(
-          editIndex, directiveLocal, ref.name);
+          editIndex, directiveLocal, ref.name, CrossedBindingChange::Unbound);
       if (!boundary)
         continue;
       if (delayedBoundary && *delayedBoundary != *boundary)
@@ -3209,10 +3259,11 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
           continue;
         if (other.interval.begin > edit.start)
           break;
-        StringRef chunk = tuBytes_.slice(cursor, other.interval.begin);
         StringRef following = tuBytes_.slice(other.interval.begin, edit.start);
-        if (MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
-                *candidate.directive, candidate.name, chunk, following)) {
+        if (PreservedSourceObservesBindingChange(
+                *candidate.directive, candidate.name, cursor,
+                other.interval.begin, following,
+                CrossedBindingChange::Unbound)) {
           admissible = false;
           break;
         }
@@ -3220,14 +3271,12 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
       }
       if (!admissible)
         break;
-      if (cursor < edit.start) {
-        StringRef chunk = tuBytes_.slice(cursor, edit.start);
-        if (MacroStateProof().SourceChunkObservesMacroStateDirectiveWhenCrossed(
-                *candidate.directive, candidate.name, chunk,
-                StringRef(edit.text))) {
-          admissible = false;
-          break;
-        }
+      if (cursor < edit.start &&
+          PreservedSourceObservesBindingChange(
+              *candidate.directive, candidate.name, cursor, edit.start,
+              StringRef(edit.text), CrossedBindingChange::Unbound)) {
+        admissible = false;
+        break;
       }
     }
     if (!admissible)

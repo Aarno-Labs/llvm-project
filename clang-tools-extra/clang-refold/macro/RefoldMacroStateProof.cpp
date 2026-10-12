@@ -313,6 +313,35 @@ bool RefoldMacroStateProof::SourceChunkObservesMacroStateDirectiveWhenCrossed(
       .has_value();
 }
 
+bool RefoldMacroStateProof::InstanceRangeRecordsUndefObserver(
+    StringRef path, uint64_t ownerIncludeId, StringRef macroName,
+    uint64_t begin, uint64_t end) const {
+  if (begin >= end)
+    return false;
+  const auto meetsRange = [&](uint64_t extentBegin, uint64_t extentEnd) {
+    return extentBegin < end && begin < std::max(extentEnd, extentBegin + 1);
+  };
+  // A pragma record without an owner comes from a map too old to bind it to
+  // one inclusion, so it is taken to be in every inclusion of its file.
+  for (const RefoldModel::PragmaDirective &pragma : model_.GetPragmas()) {
+    if (pragma.ownerIncludeId && *pragma.ownerIncludeId != ownerIncludeId)
+      continue;
+    if (paths_.PathsEqual(pragma.sitePath, path) &&
+        meetsRange(pragma.siteB, pragma.siteE))
+      return true;
+  }
+  for (const RefoldModel::MacroInvocation &invocation :
+       model_.GetMacroInvocations()) {
+    if (invocation.name != macroName ||
+        invocation.ownerIncludeId != ownerIncludeId)
+      continue;
+    if (!invocation.useB || !invocation.useE ||
+        meetsRange(*invocation.useB, *invocation.useE))
+      return true;
+  }
+  return false;
+}
+
 bool RefoldMacroStateProof::DefinitionIsLiveAtOwnerByte(
     const RefoldModel::MacroDirective &definition, StringRef macroName,
     StringRef expectedPath, StringRef fileBytes,
@@ -571,15 +600,19 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
 
       // The prefix is preprocessed after the `#undef` and the suffix before the
       // restore, so both see the name undefined where they originally saw it
-      // defined.  Neither may observe it.
+      // defined.  Neither may observe it, by spelling it or otherwise.
       if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
               *candidate.directive, candidate.name, sameLinePrefix,
-              StringRef(mp.replacement))) {
+              StringRef(mp.replacement)) ||
+          InstanceRangeRecordsUndefObserver(
+              headerPath, includeId, candidate.name, lineStart, mp.invStart)) {
         return std::nullopt;
       }
       if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
               *candidate.directive, candidate.name, sameLineSuffix,
-              StringRef())) {
+              StringRef()) ||
+          InstanceRangeRecordsUndefObserver(
+              headerPath, includeId, candidate.name, mpEnd, restoreEnd)) {
         return std::nullopt;
       }
     }
@@ -727,7 +760,11 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
     StringRef following = bytes.slice(mp.invStart, mpEnd);
     if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
             *candidate.directive, candidate.name, StringRef(crossed),
-            following)) {
+            following) ||
+        InstanceRangeRecordsUndefObserver(headerPath, includeId, candidate.name,
+                                          candidate.end, mp.invStart) ||
+        InstanceRangeRecordsUndefObserver(headerPath, includeId, candidate.name,
+                                          mpEnd, newEnd)) {
       if (std::optional<StabilizedMaterializedHeaderMacroPatch> undefRestore =
               buildUndefRestoreAroundReplacementLine()) {
         return undefRestore;
