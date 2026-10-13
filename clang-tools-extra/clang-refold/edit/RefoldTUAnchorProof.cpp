@@ -320,10 +320,45 @@ RefoldTUAnchorProof::RefoldTUAnchorProof(const RefoldTheoremAudit &theoremAudit,
           RefoldProofSummaryBuilder::Dependencies{deps.bTokens}),
       deps_(std::move(deps)) {
   DenseSet<uint64_t> seenPP;
-  for (const RefoldModel::TokMapEntry &entry : deps_.model.GetTokmap()) {
+  ArrayRef<RefoldModel::TokMapEntry> tokmap = deps_.model.GetTokmap();
+  for (size_t index = 0; index < tokmap.size(); ++index) {
+    const RefoldModel::TokMapEntry &entry = tokmap[index];
     if (!seenPP.insert(entry.pp).second)
       duplicateTokmapPP_.insert(entry.pp);
+    // Every entry is kept, duplicates included: a token any entry spells
+    // inside an interval is one the interval's replacement may remove.
+    if (deps_.model.TokmapEntryIsTUOwned(index) && entry.b < entry.e) {
+      tuSpellingsByByte_.push_back({entry.b, entry.e, entry.pp});
+      longestTUSpelling_ = std::max(longestTUSpelling_, entry.e - entry.b);
+    }
   }
+  llvm::sort(tuSpellingsByByte_,
+             [](const TUTokenSpelling &lhs, const TUTokenSpelling &rhs) {
+               return std::tie(lhs.begin, lhs.end, lhs.pp) <
+                      std::tie(rhs.begin, rhs.end, rhs.pp);
+             });
+}
+
+bool RefoldTUAnchorProof::ReplacedSourceSpellsOnlyEnvelope(uint64_t a0,
+                                                           uint64_t a1,
+                                                           uint64_t begin,
+                                                           uint64_t end) const {
+  // A spelling overlapping `[begin, end)` starts after `begin - longest`.
+  const uint64_t scanBegin =
+      begin > longestTUSpelling_ ? begin - longestTUSpelling_ : 0;
+  auto spelling =
+      llvm::partition_point(tuSpellingsByByte_, [&](const TUTokenSpelling &s) {
+        return s.begin < scanBegin;
+      });
+  for (; spelling != tuSpellingsByByte_.end() && spelling->begin < end;
+       ++spelling) {
+    if (spelling->end <= begin)
+      continue;
+    if (spelling->pp < a0 || a1 <= spelling->pp || spelling->begin < begin ||
+        end < spelling->end)
+      return false;
+  }
+  return true;
 }
 
 AcceptedResultCandidate RefoldTUAnchorProof::BuildAcceptedTUAnchorCandidate(
@@ -1519,7 +1554,10 @@ RefoldTUAnchorProof::PlanTUByteSpan(uint64_t a0, uint64_t a1,
     // repeating group is one invocation's self-contained whole cover and this
     // envelope consumes all of it; a partially consumed expansion still falls
     // through to the refusal below.  Prove it at the group's first repetition
-    // and consume the rest of the proven cover by index.
+    // and consume the rest of the proven cover by index.  An envelope holding
+    // a single token of an expansion repeats nothing and is admitted here: the
+    // span is then a fragment, which `ReplacedSourceSpellsOnlyEnvelope()`
+    // tells apart before any edit built on it is planned.
     if (entry.b == previousBegin && entry.e == previousEnd) {
       if (pp >= repeatedSpellingGroupEnd) {
         const std::optional<std::pair<uint64_t, uint64_t>> wholeCover =

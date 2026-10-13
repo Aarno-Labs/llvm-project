@@ -1531,6 +1531,12 @@ std::string RefoldEngine::FinalizeStructuralResult(
     return std::string();
   }
 
+  // Direct TU edits that split one macro expansion compose here, so the
+  // macro-state planner certifies, repairs and audits the text that is
+  // emitted rather than fragments of it.
+  if (!textEditAssembler_->ComposeDirectTUFragments(tuEdits, tuBytes, tuPath))
+    return std::string();
+
   // Repair macro-state liveness after TU-level source edits.  The planner
   // owns the directive index, final TU edit interval queries, include ancestry
   // checks, proof witnesses, and conservative TU edit mutations used by all

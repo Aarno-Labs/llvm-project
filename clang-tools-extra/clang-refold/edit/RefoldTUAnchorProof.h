@@ -446,6 +446,20 @@ public:
   bool ValidateOrdinaryDirectTUEnvelope(llvm::StringRef tuPath,
                                         uint64_t begin, uint64_t end) const;
 
+  /// Return whether replacing translation-unit source `[begin, end)` removes
+  /// only A tokens of `[a0, a1)`: every A token whose producer spelling
+  /// overlaps the interval lies in `[a0, a1)` and is spelled wholly inside it.
+  ///
+  /// An expansion's tokens all carry their invocation's spelling, so source
+  /// that replaces a callsite removes every token of its expansion.
+  /// `PlanTUByteSpan()` proves the converse direction only -- each token of the
+  /// envelope is spelled inside its span -- and a span whose envelope holds one
+  /// token of an expansion consumes the whole callsite.  The B tokens that
+  /// replace such a span then stand for that one token alone, and the rest of
+  /// the expansion is dropped.
+  bool ReplacedSourceSpellsOnlyEnvelope(uint64_t a0, uint64_t a1,
+                                        uint64_t begin, uint64_t end) const;
+
 private:
   /// Collect the exact macro transitions a direct-TU envelope defers to the
   /// specialized repair planner.
@@ -491,6 +505,19 @@ private:
   /// Duplicate entries make the physical spelling ambiguous even when the
   /// model's DenseMap retained one deterministic last writer.
   llvm::DenseSet<uint64_t> duplicateTokmapPP_;
+
+  /// One translation-unit producer spelling of an A token.
+  struct TUTokenSpelling {
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    uint64_t pp = 0;
+  };
+
+  /// Every nonempty translation-unit spelling in the producer tokmap, ordered
+  /// by `begin`, and the longest of them, so that the spellings overlapping a
+  /// byte interval are one bounded scan.
+  std::vector<TUTokenSpelling> tuSpellingsByByte_;
+  uint64_t longestTUSpelling_ = 0;
 
   const RefoldTheoremAudit &theoremAudit_;
   RefoldProofSummaryBuilder proofSummaryBuilder_;

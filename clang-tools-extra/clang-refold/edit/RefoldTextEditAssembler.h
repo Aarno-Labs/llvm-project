@@ -194,6 +194,25 @@ public:
   std::optional<std::pair<uint64_t, uint64_t>>
   MacroPatchMaterializedBByteRange(const MacroPatch &patch) const;
 
+  /// \brief Compose the direct TU-hunk edits that cannot be emitted as built.
+  ///
+  /// A direct edit whose hunk holds only some tokens of a macro expansion
+  /// replaces the invocation's whole spelling
+  /// (`RefoldTUAnchorProof::ReplacedSourceSpellsOnlyEnvelope`), and two such
+  /// fragments of one expansion overlap.  Neither is sound alone.  The smallest
+  /// run of consecutive direct hunks containing them whose source and B
+  /// envelopes are mutually closed replaces them with one edit realizing
+  /// exactly the run's B tokens.
+  ///
+  /// This runs before macro-state planning, so a composed edit is certified,
+  /// repaired and audited like every other TU edit, and no B text reaches the
+  /// output unaudited.  An overlap among edits that are each sound alone is
+  /// left to the applicator.  Returns false, with the terminal fallback
+  /// requested, when a fragment has no closed composition.
+  bool ComposeDirectTUFragments(std::vector<TextEdit> &tuEdits,
+                                llvm::StringRef tuBytes,
+                                llvm::StringRef tuPath) const;
+
   /// \brief Apply a set of TextEdits to originalFileText, producing the final
   /// refolded text for a single file while preserving __LINE__ transparency via
   /// pending resync.
@@ -265,6 +284,32 @@ public:
           std::nullopt) const;
 
 private:
+  struct ClosedTURealizationCandidate;
+
+  /// Return whether a direct TU-hunk edit replaces source that spells A tokens
+  /// outside its own hunk, so it can be emitted only inside a composition.
+  bool DirectTUEditIsFragment(const TextEdit &edit) const;
+
+  /// Return the closed realization of the consecutive direct hunks
+  /// `[firstHunk, lastHunk]`, or nullopt.  It is admitted only when every hunk
+  /// of the run has a direct edit, the B envelopes are ordered, the run's
+  /// combined span re-proves inside the union of the edits' sources, no other
+  /// edit intrudes, and the A↔B token maps keep every stable token crossing
+  /// either envelope inside the opposite one.
+  std::optional<ClosedTURealizationCandidate>
+  CheckClosedTURealizationCandidate(llvm::ArrayRef<TextEdit> edits,
+                                    uint64_t firstHunk, uint64_t lastHunk,
+                                    llvm::StringRef tuPath) const;
+
+  /// Replace the direct edits of \p cluster, and any direct neighbours the
+  /// smallest closed run around them needs, with that run's closed
+  /// realization.  Returns false, leaving \p edits unchanged, when the cluster
+  /// holds an edit of another kind or no run around it is closed.
+  bool TryComposeClosedTURealization(std::vector<TextEdit> &edits,
+                                     llvm::ArrayRef<size_t> cluster,
+                                     llvm::StringRef tuBytes,
+                                     llvm::StringRef tuPath) const;
+
   /// Reject a preserved-gap audit at the common theorem/fallback boundary.
   bool RejectPreservedStructuralGapAudit(llvm::StringRef emissionStage,
                                          llvm::StringRef detail) const;

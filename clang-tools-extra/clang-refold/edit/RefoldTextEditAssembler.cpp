@@ -1425,6 +1425,391 @@ RefoldTextEditAssembler::MacroPatchMaterializedBByteRange(
   return std::nullopt;
 }
 
+/// A run of consecutive direct TU hunks proven closed in source-byte and
+/// B-token space, with the direct edits it absorbs.
+struct RefoldTextEditAssembler::ClosedTURealizationCandidate {
+  uint64_t sourceBegin = std::numeric_limits<uint64_t>::max();
+  uint64_t sourceEnd = 0;
+  uint64_t aBegin = 0;
+  uint64_t aEnd = 0;
+  uint64_t bBegin = std::numeric_limits<uint64_t>::max();
+  uint64_t bEnd = 0;
+  std::optional<TUInsertionAnchor> insertionAnchor;
+  SmallVector<size_t, 16> editIndices;
+};
+
+/// Return the index of the direct TU edit realizing hunk \p hunkIndex.
+static std::optional<size_t> findDirectEditForHunk(ArrayRef<TextEdit> edits,
+                                                   uint64_t hunkIndex) {
+  for (size_t index = 0; index < edits.size(); ++index)
+    if (edits[index].directTUHunkIndex &&
+        *edits[index].directTUHunkIndex == hunkIndex)
+      return index;
+  return std::nullopt;
+}
+
+/// Return the edit indices of \p edits ordered by source range, ties by index.
+static SmallVector<size_t, 32> editsInSourceOrder(ArrayRef<TextEdit> edits) {
+  SmallVector<size_t, 32> order(edits.size());
+  for (size_t index = 0; index < edits.size(); ++index)
+    order[index] = index;
+  llvm::stable_sort(order, [&](size_t lhs, size_t rhs) {
+    return std::tie(edits[lhs].start, edits[lhs].end) <
+           std::tie(edits[rhs].start, edits[rhs].end);
+  });
+  return order;
+}
+
+/// Return the positions `[begin, end)` in \p order of the edits whose source
+/// intervals overlap \p seed's, transitively.  A zero-width insertion at an
+/// interval's boundary does not overlap it; one strictly inside does.
+static std::pair<size_t, size_t> overlapClusterAround(ArrayRef<TextEdit> edits,
+                                                      ArrayRef<size_t> order,
+                                                      size_t seed) {
+  size_t begin = seed;
+  size_t end = seed + 1;
+  uint64_t coverBegin = edits[order[seed]].start;
+  uint64_t coverEnd = edits[order[seed]].end;
+  while (begin > 0 && edits[order[begin - 1]].end > coverBegin) {
+    --begin;
+    coverBegin = std::min(coverBegin, edits[order[begin]].start);
+  }
+  while (end < order.size() && edits[order[end]].start < coverEnd) {
+    coverEnd = std::max(coverEnd, edits[order[end]].end);
+    ++end;
+  }
+  return {begin, end};
+}
+
+bool RefoldTextEditAssembler::DirectTUEditIsFragment(
+    const TextEdit &edit) const {
+  return edit.isDirectTUHunkEdit && edit.directTUHunkAStart &&
+         edit.directTUHunkAEnd && edit.start < edit.end &&
+         !tuAnchorProof_.ReplacedSourceSpellsOnlyEnvelope(
+             *edit.directTUHunkAStart, *edit.directTUHunkAEnd, edit.start,
+             edit.end);
+}
+
+std::optional<RefoldTextEditAssembler::ClosedTURealizationCandidate>
+RefoldTextEditAssembler::CheckClosedTURealizationCandidate(
+    ArrayRef<TextEdit> edits, uint64_t firstHunk, uint64_t lastHunk,
+    StringRef tuPath) const {
+  ClosedTURealizationCandidate candidate;
+
+  // The closure is defined over a contiguous hunk run, so every hunk in the
+  // run must already have a direct TU edit that can be absorbed.
+  for (uint64_t hunkIndex = firstHunk; hunkIndex <= lastHunk; ++hunkIndex) {
+    std::optional<size_t> editIndex = findDirectEditForHunk(edits, hunkIndex);
+    if (!editIndex)
+      return std::nullopt;
+    candidate.editIndices.push_back(*editIndex);
+    if (hunkIndex == std::numeric_limits<uint64_t>::max())
+      break;
+  }
+
+  // Build the source byte envelope and B-token envelope for the selected
+  // direct edits. The B intervals must appear in order; otherwise a single
+  // replacement would not preserve the token-order proof for the hunk run.
+  std::optional<uint64_t> previousBEnd;
+  for (size_t editIndex : candidate.editIndices) {
+    const TextEdit &edit = edits[editIndex];
+    if (!edit.isDirectTUHunkEdit || !edit.directTUHunkBStart ||
+        !edit.directTUHunkBEnd)
+      return std::nullopt;
+    if (previousBEnd && *edit.directTUHunkBStart < *previousBEnd)
+      return std::nullopt;
+    previousBEnd = edit.directTUHunkBEnd;
+    candidate.sourceBegin = std::min(candidate.sourceBegin, edit.start);
+    candidate.sourceEnd = std::max(candidate.sourceEnd, edit.end);
+    candidate.bBegin = std::min(candidate.bBegin, *edit.directTUHunkBStart);
+    candidate.bEnd = std::max(candidate.bEnd, *edit.directTUHunkBEnd);
+  }
+
+  // The synthesized replacement must cover a real source byte interval and a
+  // real B-token interval.
+  if (candidate.sourceBegin >= candidate.sourceEnd)
+    return std::nullopt;
+  if (candidate.bBegin >= candidate.bEnd ||
+      candidate.bEnd > static_cast<uint64_t>(bToks_.size()))
+    return std::nullopt;
+
+  // Re-run PlanTUByteSpan() over the complete A-token run represented by
+  // the synthesized candidate.  This is the shared proof boundary for exact
+  // mappings, source monotonicity/nonoverlap, and authorized internal gaps;
+  // checking only the already-planned fragments would leave the bytes between
+  // them unaudited.  Independently proved boundary extensions may make the
+  // actual source envelope wider, but it must contain the combined base span.
+  const diffutils::Hunk &firstHunkRecord =
+      abTokHunks_[static_cast<size_t>(firstHunk)];
+  const diffutils::Hunk &lastHunkRecord =
+      abTokHunks_[static_cast<size_t>(lastHunk)];
+  std::optional<TUByteSpanPlan> combinedBaseSpan =
+      tuAnchorProof_.PlanTUByteSpan(firstHunkRecord.aStart, lastHunkRecord.aEnd,
+                                    tuPath);
+  if (!combinedBaseSpan ||
+      candidate.sourceBegin > combinedBaseSpan->tuByteBegin ||
+      combinedBaseSpan->tuByteEnd > candidate.sourceEnd)
+    return std::nullopt;
+  candidate.aBegin = firstHunkRecord.aStart;
+  candidate.aEnd = lastHunkRecord.aEnd;
+  candidate.insertionAnchor = combinedBaseSpan->insertionAnchor;
+
+  // The closure synthesizes a wider direct TU edit from several fragments. Its
+  // ordinary-token closure checks below do not authorize preprocessing state.
+  // Validate the actual envelope so it contains at most complete
+  // producer-bound macro-transition evidence for the macro-state repair
+  // planner, which runs after this composition; any additional or unbound
+  // structure rejects the candidate.
+  if (!tuAnchorProof_.ValidateDirectTUEnvelope(tuPath, candidate.sourceBegin,
+                                               candidate.sourceEnd))
+    return std::nullopt;
+
+  // The closure may compose only the selected hunk-run edits. Any other edit
+  // that overlaps the source envelope, including a zero-width insertion
+  // inside it, would need a separate composition law and is rejected here.
+  for (size_t editIndex = 0; editIndex < edits.size(); ++editIndex) {
+    if (llvm::is_contained(candidate.editIndices, editIndex))
+      continue;
+    const TextEdit &edit = edits[editIndex];
+    const bool nonZeroOverlap =
+        edit.start < candidate.sourceEnd && candidate.sourceBegin < edit.end;
+    const bool interiorInsertion = edit.start == edit.end &&
+                                   candidate.sourceBegin < edit.start &&
+                                   edit.start < candidate.sourceEnd;
+    if (nonZeroOverlap || interiorInsertion)
+      return std::nullopt;
+  }
+
+  auto sourceTokenSpan =
+      [&](uint64_t aTok) -> std::optional<std::pair<uint64_t, uint64_t>> {
+    if (std::optional<TUByteSpanPlan> span =
+            tuAnchorProof_.PlanTUByteSpan(aTok, aTok + 1, tuPath))
+      return span->byteRange();
+    return std::nullopt;
+  };
+
+  // A-side closure: every A token whose source bytes overlap the candidate
+  // must be wholly contained by the candidate source interval. If that token
+  // has a stable B mate, that B mate must also lie inside the candidate
+  // replacement envelope.
+  for (uint64_t aTok = 0; aTok < static_cast<uint64_t>(aToks_.size()); ++aTok) {
+    std::optional<std::pair<uint64_t, uint64_t>> span = sourceTokenSpan(aTok);
+    if (!span)
+      continue;
+
+    const bool overlapsSource = span->first < candidate.sourceEnd &&
+                                candidate.sourceBegin < span->second;
+    if (!overlapsSource)
+      continue;
+
+    if (span->first < candidate.sourceBegin ||
+        candidate.sourceEnd < span->second)
+      return std::nullopt;
+
+    if (aTok < static_cast<uint64_t>(abTokMapA2B_.size())) {
+      const int64_t mappedB = abTokMapA2B_[static_cast<size_t>(aTok)];
+      if (mappedB >= 0 && (static_cast<uint64_t>(mappedB) < candidate.bBegin ||
+                           static_cast<uint64_t>(mappedB) >= candidate.bEnd))
+        return std::nullopt;
+    }
+  }
+
+  // B-side closure: every stable B token emitted by the replacement must map
+  // back to an A token wholly contained by the source interval. This prevents
+  // the synthesized edit from duplicating or moving stable outside tokens.
+  for (uint64_t bTok = candidate.bBegin; bTok < candidate.bEnd; ++bTok) {
+    if (bTok >= static_cast<uint64_t>(abTokMapB2A_.size()))
+      return std::nullopt;
+    const int64_t mappedA = abTokMapB2A_[static_cast<size_t>(bTok)];
+    if (mappedA < 0)
+      continue;
+
+    std::optional<std::pair<uint64_t, uint64_t>> span =
+        sourceTokenSpan(static_cast<uint64_t>(mappedA));
+    if (!span || span->first < candidate.sourceBegin ||
+        candidate.sourceEnd < span->second)
+      return std::nullopt;
+  }
+
+  return candidate;
+}
+
+bool RefoldTextEditAssembler::TryComposeClosedTURealization(
+    std::vector<TextEdit> &edits, ArrayRef<size_t> cluster, StringRef tuBytes,
+    StringRef tuPath) const {
+  // Closed realization depends on both token-map directions: A tokens inside
+  // the source interval must map into the B envelope, and stable B tokens in
+  // the B envelope must map back into the source interval.
+  if (abTokMapA2B_.empty() || abTokMapB2A_.empty())
+    return false;
+
+  // Every edit in the cluster must be a direct TU-hunk edit. Mixed edit
+  // classes would require a separate composition law, so fail closed.
+  std::optional<uint64_t> hunkMin;
+  std::optional<uint64_t> hunkMax;
+  for (size_t index : cluster) {
+    const TextEdit &edit = edits[index];
+    if (!edit.isDirectTUHunkEdit || !edit.directTUHunkIndex)
+      return false;
+    hunkMin = hunkMin ? std::min(*hunkMin, *edit.directTUHunkIndex)
+                      : *edit.directTUHunkIndex;
+    hunkMax = hunkMax ? std::max(*hunkMax, *edit.directTUHunkIndex)
+                      : *edit.directTUHunkIndex;
+  }
+  if (!hunkMin || !hunkMax)
+    return false;
+
+  // Expand to the maximal contiguous run of direct TU hunks available around
+  // the cluster. The search below starts with the minimal cluster-covering
+  // run and widens only as needed to find a closed realization.
+  uint64_t directLo = *hunkMin;
+  while (directLo > 0 && findDirectEditForHunk(edits, directLo - 1))
+    --directLo;
+  uint64_t directHi = *hunkMax;
+  while (directHi + 1 < static_cast<uint64_t>(abTokHunks_.size()) &&
+         findDirectEditForHunk(edits, directHi + 1))
+    ++directHi;
+
+  // Prefer the smallest closed hunk run that contains the cluster.  This keeps
+  // the synthesized TU edit as local as possible while still allowing widening
+  // when closure requires adjacent direct hunks.
+  std::optional<ClosedTURealizationCandidate> best;
+  const uint64_t minWidth = *hunkMax - *hunkMin + 1;
+  const uint64_t maxWidth = directHi - directLo + 1;
+  for (uint64_t width = minWidth; width <= maxWidth && !best; ++width) {
+    for (uint64_t first = directLo; first + width - 1 <= directHi; ++first) {
+      const uint64_t last = first + width - 1;
+      if (first > *hunkMin || last < *hunkMax)
+        continue;
+      best = CheckClosedTURealizationCandidate(edits, first, last, tuPath);
+      if (best)
+        break;
+    }
+  }
+  if (!best)
+    return false;
+
+  // Materialize exactly the proven B-token envelope, then apply the same
+  // line-resync machinery used by ordinary emitted edits.
+  StringRef replacement = refoldSliceExactTokenCoverage(
+      bTokOff_, bToks_, bSource_, best->bBegin, best->bEnd);
+  ResyncOutcome ro = lineObserverLayout_.ApplyResyncOrPend(
+      tuBytes, best->sourceBegin, best->sourceEnd, replacement, tuPath,
+      /*ownerIncludeId=*/std::nullopt);
+  TextEdit closure{best->sourceBegin,
+                   best->sourceEnd,
+                   std::move(ro.text),
+                   std::move(ro.pending),
+                   std::nullopt,
+                   {},
+                   {},
+                   {}};
+  closure.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
+  textEditCertifier_.CertifyTextEditMaterializedBTokenRange(
+      closure, best->bBegin, best->bEnd);
+  // The replacement is the run's B slice, around which resync adds only
+  // synthetic line control.
+  textEditCertifier_.CertifyTextEditBPayload(
+      closure, {{{best->bBegin, best->bEnd}}, BPayloadRest::None},
+      closure.start, closure.end);
+  const diffutils::Hunk closedHunk{best->aBegin, best->aEnd, best->bBegin,
+                                   best->bEnd};
+  TUByteSpanPlan closedSpan(best->aBegin, best->aEnd, best->sourceBegin,
+                            best->sourceEnd, best->insertionAnchor);
+  for (size_t editIndex : best->editIndices)
+    appendUniqueProtectedSourceAuthorizations(closure, edits[editIndex]);
+  textEditCertifier_.AttachAcceptedResultCarrier(
+      closure,
+      acceptedCandidateBuilder_.BuildAcceptedTUTextEditCandidate(
+          AcceptedPathKind::TUByteSpanConservativeEdit, closedHunk, closedSpan,
+          /*structuralBinding=*/nullptr, replacement));
+  REFOLD_LOG_TRACE("edits/compose",
+                   "composed {0} direct TU edit(s) into source=[{1},{2}) "
+                   "A=[{3},{4}) B=[{5},{6})",
+                   best->editIndices.size(), closure.start, closure.end,
+                   best->aBegin, best->aEnd, best->bBegin, best->bEnd);
+
+  // The closure takes the place of the first absorbed edit, so edits it does
+  // not touch keep their relative order.
+  const size_t slot = *llvm::min_element(best->editIndices);
+  std::vector<TextEdit> composed;
+  composed.reserve(edits.size() - best->editIndices.size() + 1);
+  for (size_t index = 0; index < edits.size(); ++index) {
+    if (index == slot)
+      composed.push_back(std::move(closure));
+    else if (!llvm::is_contained(best->editIndices, index))
+      composed.push_back(std::move(edits[index]));
+  }
+  edits = std::move(composed);
+  return true;
+}
+
+bool RefoldTextEditAssembler::ComposeDirectTUFragments(
+    std::vector<TextEdit> &tuEdits, StringRef tuBytes, StringRef tuPath) const {
+  // Each composition removes at least one edit, so the restarts terminate.
+  for (bool composed = true; composed;) {
+    composed = false;
+    const SmallVector<size_t, 32> order = editsInSourceOrder(tuEdits);
+    uint64_t cursor = 0;
+    for (size_t position = 0; position < order.size(); ++position) {
+      const TextEdit &edit = tuEdits[order[position]];
+      // An identical duplicate is one replacement written twice; the
+      // applicator collapses it.
+      const TextEdit *previous =
+          position == 0 ? nullptr : &tuEdits[order[position - 1]];
+      const bool duplicatesPrevious =
+          previous && previous->start == edit.start &&
+          previous->end == edit.end && previous->text == edit.text;
+      const bool overlapsPrevious =
+          previous && edit.start < cursor && !duplicatesPrevious;
+      if (!overlapsPrevious && !DirectTUEditIsFragment(edit)) {
+        cursor = std::max(cursor, edit.end);
+        continue;
+      }
+
+      const auto [clusterBegin, clusterEnd] =
+          overlapClusterAround(tuEdits, order, position);
+      const SmallVector<size_t, 8> cluster(order.begin() + clusterBegin,
+                                           order.begin() + clusterEnd);
+      if (TryComposeClosedTURealization(tuEdits, cluster, tuBytes, tuPath)) {
+        composed = true;
+        break;
+      }
+
+      // An overlap among edits that are each sound alone is left to the
+      // applicator, which may discharge or refuses it.  A fragment is never
+      // sound alone: it would drop the rest of the expansion it splits.
+      for (size_t index : cluster) {
+        const TextEdit &fragment = tuEdits[index];
+        if (!DirectTUEditIsFragment(fragment))
+          continue;
+        terminalSink_.RequestTerminalFallback(
+            MakeTerminalFallbackProofFailure(
+                TerminalFallbackObligationKind::OwnerClosedCover,
+                TerminalFallbackFailureReason::NoOwnerClosedCover,
+                TerminalFallbackFailureContext::ForHunkTokenEnvelope(
+                    fragment.directTUHunkIndex.value_or(index),
+                    *fragment.directTUHunkAStart, *fragment.directTUHunkAEnd,
+                    fragment.directTUHunkBStart.value_or(0),
+                    fragment.directTUHunkBEnd.value_or(0))),
+            "edits/compose",
+            llvm::formatv("direct TU edit [{0},{1}) for A=[{2},{3}) replaces "
+                          "source that spells A tokens outside its hunk, and "
+                          "no closed run of direct hunks contains it",
+                          fragment.start, fragment.end,
+                          *fragment.directTUHunkAStart,
+                          *fragment.directTUHunkAEnd)
+                .str());
+        return false;
+      }
+      for (size_t at = clusterBegin; at < clusterEnd; ++at)
+        cursor = std::max(cursor, tuEdits[order[at]].end);
+      position = clusterEnd - 1;
+    }
+  }
+  return true;
+}
+
 std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     StringRef originalFileText, ArrayRef<TextEdit> edits,
     DenseSet<uint64_t> *appliedExpandedMacroRootIds, StringRef emissionOwner,
@@ -1592,7 +1977,9 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     // Non-zero span duplicates must be identical to compose safely. Choosing
     // an arbitrary writer for the same replaced byte range is not a proof; if
     // two producers disagree about the replacement payload, fail closed and let
-    // the caller select the explicit terminal fallback path.
+    // the caller select the explicit terminal fallback path.  Direct TU-hunk
+    // fragments of one replacement were composed before planning
+    // (`ComposeDirectTUFragments`), so nothing here is rebuilt from B.
     const TextEdit *first = ordered[i].e;
     bool payloadsAgree = true;
     for (size_t k = i + 1; k < j; ++k) {
@@ -1603,143 +1990,6 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     }
 
     if (!payloadsAgree) {
-      auto tryMergeDirectDuplicateFragments = [&]() -> std::optional<TextEdit> {
-        SmallVector<const TextEdit *, 8> fragments;
-        fragments.reserve(j - i);
-
-        // This merge is only valid for duplicate fragments that still have a
-        // direct one-to-one TU hunk witness. Anything synthesized, macro-owned,
-        // include-owned, or missing hunk provenance must stay on the normal
-        // composition path.
-        for (size_t k = i; k < j; ++k) {
-          const TextEdit &edit = *ordered[k].e;
-          if (!edit.isDirectTUHunkEdit || !edit.directTUHunkIndex ||
-              !edit.directTUHunkAStart || !edit.directTUHunkAEnd ||
-              !edit.directTUHunkBStart || !edit.directTUHunkBEnd)
-            return std::nullopt;
-          fragments.push_back(&edit);
-        }
-
-        // Reconstruct the original hunk order before proving adjacency. The
-        // duplicate group is ordered by emitted byte span, which is not enough
-        // to prove that the B-side replacement interval is contiguous.
-        sort(fragments, [](const TextEdit *lhs, const TextEdit *rhs) {
-          return *lhs->directTUHunkIndex < *rhs->directTUHunkIndex;
-        });
-
-        // Adjacent duplicate fragments may be collapsed only when they form one
-        // uninterrupted run in both the A token hunks and B token hunks. This
-        // prevents merging unrelated fragments that merely overlap the same
-        // emitted byte span.
-        for (size_t k = 1; k < fragments.size(); ++k) {
-          const TextEdit &prev = *fragments[k - 1];
-          const TextEdit &cur = *fragments[k];
-
-          if (*cur.directTUHunkIndex != *prev.directTUHunkIndex + 1)
-            return std::nullopt;
-          if (*cur.directTUHunkAStart != *prev.directTUHunkAEnd)
-            return std::nullopt;
-          if (*cur.directTUHunkBStart != *prev.directTUHunkBEnd)
-            return std::nullopt;
-        }
-
-        // Re-prove the complete A-token run before composing the fragments.
-        // Individual PlanTUByteSpan() witnesses do not establish that bytes
-        // between adjacent hunks are trivia; the combined query discharges the
-        // exact-mapping, ordering, overlap, and internal-gap obligations for the
-        // complete token envelope.  The final emitted range may be wider only
-        // because a constituent carried an independently proved boundary
-        // extension, so it must contain the combined base span.
-        std::optional<TUByteSpanPlan> combinedBaseSpan =
-            tuAnchorProof_.PlanTUByteSpan(
-                *fragments.front()->directTUHunkAStart,
-                *fragments.back()->directTUHunkAEnd, emissionOwner);
-        if (!combinedBaseSpan || s > combinedBaseSpan->tuByteBegin ||
-            combinedBaseSpan->tuByteEnd > t) {
-          return std::nullopt;
-        }
-
-        // Merging still recreates one larger physical source edit. Re-run the
-        // preprocessing-state firewall over that actual envelope. Complete
-        // producer-bound macro transitions may remain only as provisional
-        // evidence for the later repair planner; this merge creates no source
-        // authority and may absorb no other directive or pragma operator.
-        if (!tuAnchorProof_.ValidateDirectTUEnvelope(emissionOwner, s, t)) {
-          return std::nullopt;
-        }
-
-        // The merged replacement is exactly the contiguous B-token envelope
-        // covered by the duplicate fragment run.
-        const uint64_t bBegin = *fragments.front()->directTUHunkBStart;
-        const uint64_t bEnd = *fragments.back()->directTUHunkBEnd;
-        if (bBegin >= bEnd || bEnd > static_cast<uint64_t>(bToks_.size()))
-          return std::nullopt;
-
-        StringRef replacement = refoldSliceExactTokenCoverage(
-            bTokOff_, bToks_, bSource_, bBegin, bEnd);
-        if (replacement.empty())
-          return std::nullopt;
-
-        // Apply normal resync handling to the whole duplicate byte span, rather
-        // than preserving each fragment's already-conflicting local resync.
-        ResyncOutcome ro = lineObserverLayout_.ApplyResyncOrPend(
-            originalFileText, s, t, replacement, emissionOwner, ownerIncludeId);
-        TextEdit merged{
-            s,  t, std::move(ro.text), std::move(ro.pending), std::nullopt, {},
-            {}, {}};
-        merged.lineControlPruneCandidates =
-            std::move(ro.lineControlPruneCandidates);
-        textEditCertifier_.CertifyTextEditMaterializedBTokenRange(merged,
-                                                                  bBegin, bEnd);
-
-        // Preserve existing proof carriers from the fragments. If the fragments
-        // carry macro-root provenance, they must all agree on the same root.
-        for (const TextEdit *fragment : fragments) {
-          if (fragment->expandedMacroRootId) {
-            if (merged.expandedMacroRootId &&
-                *merged.expandedMacroRootId != *fragment->expandedMacroRootId)
-              return std::nullopt;
-            merged.expandedMacroRootId = fragment->expandedMacroRootId;
-          }
-          merged.acceptedResults.insert(merged.acceptedResults.end(),
-                                        fragment->acceptedResults.begin(),
-                                        fragment->acceptedResults.end());
-          appendUniqueProtectedSourceAuthorizations(merged, *fragment);
-        }
-
-        // Add a carrier for the actual emitted merged surface so the final
-        // proof gate can reason about this replacement as one conservative TU
-        // edit. The synthetic hunk is not manufactured proof: its A/B envelopes
-        // are the already-validated contiguous fragment union, and the final
-        // span retains only specialized capabilities already discharged by the
-        // absorbed fragments; direct span planning contributes none.
-        const diffutils::Hunk mergedHunk{
-            *fragments.front()->directTUHunkAStart,
-            *fragments.back()->directTUHunkAEnd, bBegin, bEnd};
-        TUByteSpanPlan mergedSpan(mergedHunk.aStart, mergedHunk.aEnd, s,
-                                  t, combinedBaseSpan->insertionAnchor);
-        textEditCertifier_.AttachAcceptedResultCarrier(
-            merged, acceptedCandidateBuilder_.BuildAcceptedTUTextEditCandidate(
-                        AcceptedPathKind::TUByteSpanConservativeEdit,
-                        mergedHunk, mergedSpan,
-                        /*structuralBinding=*/nullptr, replacement));
-
-        return merged;
-      };
-
-      // Split token-LCS frontiers can produce several direct TU hunk fragments
-      // for the same original byte span. If those fragments are adjacent in
-      // both A-token and B-token space, they are not competing writers: they
-      // are one replacement that was fragmented before byte emission. Rebuild
-      // that replacement from the closed B-token interval; otherwise keep the
-      // existing fail-closed duplicate-edit policy.
-      if (std::optional<TextEdit> mergedDirectDuplicate =
-              tryMergeDirectDuplicateFragments()) {
-        norm.push_back(std::move(*mergedDirectDuplicate));
-        i = j;
-        continue;
-      }
-
       terminalSink_.RequestTerminalFallback(
           MakeTerminalFallbackProofFailure(
               TerminalFallbackObligationKind::EmissionEditSetComposable,
@@ -1873,392 +2123,11 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     i = j;
   }
 
-  auto sortNormalizedTextEdits = [](SmallVectorImpl<TextEdit> &items) {
-    sort(items, [](const TextEdit &a, const TextEdit &b) {
-      if (a.start != b.start)
-        return a.start < b.start;
-      return a.end < b.end;
-    });
-  };
-
-  auto findDirectEditForHunk =
-      [&](uint64_t hunkIndex) -> std::optional<size_t> {
-    for (size_t idx = 0; idx < norm.size(); ++idx) {
-      const TextEdit &edit = norm[idx];
-      if (edit.directTUHunkIndex && *edit.directTUHunkIndex == hunkIndex)
-        return idx;
-    }
-    return std::nullopt;
-  };
-
-  auto sourceTokenSpan =
-      [&](uint64_t aTok) -> std::optional<std::pair<uint64_t, uint64_t>> {
-    if (aTok >= static_cast<uint64_t>(aToks_.size()))
-      return std::nullopt;
-    if (auto span =
-            tuAnchorProof_.PlanTUByteSpan(aTok, aTok + 1, emissionOwner))
-      return span->byteRange();
-    return std::nullopt;
-  };
-
-  struct ClosedTURealizationCandidate {
-    uint64_t firstHunk = 0;
-    uint64_t lastHunk = 0;
-    uint64_t sourceBegin = 0;
-    uint64_t sourceEnd = 0;
-    uint64_t aBegin = 0;
-    uint64_t aEnd = 0;
-    uint64_t bBegin = 0;
-    uint64_t bEnd = 0;
-    std::optional<TUInsertionAnchor> insertionAnchor;
-    SmallVector<size_t, 16> editIndices;
-  };
-
-  // Validate that a contiguous run of direct TU-hunk edits can be replaced by
-  // one closed TU realization. The candidate is accepted only when every hunk
-  // in the run has a direct edit, the source/B envelopes are monotone and
-  // non-empty, no independent edit intrudes into the source interval, and the
-  // A↔B token map proves that all stable tokens crossing either envelope stay
-  // inside the corresponding opposite envelope.
-  auto checkClosedTURealizationCandidate =
-      [&](uint64_t firstHunk, uint64_t lastHunk,
-          ClosedTURealizationCandidate &candidate) -> bool {
-    candidate = ClosedTURealizationCandidate{};
-    candidate.firstHunk = firstHunk;
-    candidate.lastHunk = lastHunk;
-
-    // The closure is defined over a contiguous hunk run, so every hunk in the
-    // run must already have a direct TU edit that can be absorbed.
-    for (uint64_t hunkIndex = firstHunk; hunkIndex <= lastHunk; ++hunkIndex) {
-      std::optional<size_t> editIndex = findDirectEditForHunk(hunkIndex);
-      if (!editIndex)
-        return false;
-      candidate.editIndices.push_back(*editIndex);
-      if (hunkIndex == std::numeric_limits<uint64_t>::max())
-        break;
-    }
-
-    candidate.sourceBegin = std::numeric_limits<uint64_t>::max();
-    candidate.sourceEnd = 0;
-    candidate.bBegin = std::numeric_limits<uint64_t>::max();
-    candidate.bEnd = 0;
-
-    // Build the source byte envelope and B-token envelope for the selected
-    // direct edits. The B intervals must appear in order; otherwise a single
-    // replacement would not preserve the token-order proof for the hunk run.
-    std::optional<uint64_t> previousBEnd;
-    for (size_t editIndex : candidate.editIndices) {
-      const TextEdit &edit = norm[editIndex];
-      if (!edit.isDirectTUHunkEdit || !edit.directTUHunkBStart ||
-          !edit.directTUHunkBEnd)
-        return false;
-      if (previousBEnd && *edit.directTUHunkBStart < *previousBEnd)
-        return false;
-      previousBEnd = edit.directTUHunkBEnd;
-      candidate.sourceBegin = std::min(candidate.sourceBegin, edit.start);
-      candidate.sourceEnd = std::max(candidate.sourceEnd, edit.end);
-      candidate.bBegin = std::min(candidate.bBegin, *edit.directTUHunkBStart);
-      candidate.bEnd = std::max(candidate.bEnd, *edit.directTUHunkBEnd);
-    }
-
-    // The synthesized replacement must cover a real source byte interval and a
-    // real B-token interval.
-    if (candidate.sourceBegin == std::numeric_limits<uint64_t>::max() ||
-        candidate.sourceBegin >= candidate.sourceEnd)
-      return false;
-    if (candidate.bBegin == std::numeric_limits<uint64_t>::max() ||
-        candidate.bBegin >= candidate.bEnd ||
-        candidate.bEnd > static_cast<uint64_t>(bToks_.size()))
-      return false;
-
-    // Re-run PlanTUByteSpan() over the complete A-token run represented by
-    // the synthesized candidate.  This is the shared proof boundary for exact
-    // mappings, source monotonicity/nonoverlap, and authorized internal gaps;
-    // checking only the already-planned fragments would leave the bytes between
-    // them unaudited.  Independently proved boundary extensions may make the
-    // actual source envelope wider, but it must contain the combined base span.
-    const diffutils::Hunk &firstHunkRecord =
-        abTokHunks_[static_cast<size_t>(firstHunk)];
-    const diffutils::Hunk &lastHunkRecord =
-        abTokHunks_[static_cast<size_t>(lastHunk)];
-    std::optional<TUByteSpanPlan> combinedBaseSpan =
-        tuAnchorProof_.PlanTUByteSpan(firstHunkRecord.aStart,
-                                      lastHunkRecord.aEnd, emissionOwner);
-    if (!combinedBaseSpan ||
-        candidate.sourceBegin > combinedBaseSpan->tuByteBegin ||
-        combinedBaseSpan->tuByteEnd > candidate.sourceEnd) {
-      return false;
-    }
-    candidate.aBegin = firstHunkRecord.aStart;
-    candidate.aEnd = lastHunkRecord.aEnd;
-    candidate.insertionAnchor = combinedBaseSpan->insertionAnchor;
-
-    // This path deliberately synthesizes a wider direct TU edit from several
-    // already-planned fragments. Its ordinary-token closure checks below do
-    // not authorize preprocessing state. Validate the actual envelope so it
-    // contains at most complete producer-bound macro-transition evidence for
-    // the later repair planner; any additional or unbound structure rejects
-    // the candidate.
-    if (!tuAnchorProof_.ValidateDirectTUEnvelope(
-            emissionOwner, candidate.sourceBegin, candidate.sourceEnd)) {
-      return false;
-    }
-
-    auto candidateContainsEdit = [&](size_t editIndex) {
-      for (size_t candidateEditIndex : candidate.editIndices) {
-        if (candidateEditIndex == editIndex)
-          return true;
-      }
-      return false;
-    };
-
-    // The closure may compose only the selected hunk-run edits. Any other edit
-    // that overlaps the source envelope, including a zero-width insertion
-    // inside it, would need a separate composition law and is rejected here.
-    for (size_t editIndex = 0; editIndex < norm.size(); ++editIndex) {
-      if (candidateContainsEdit(editIndex))
-        continue;
-      const TextEdit &edit = norm[editIndex];
-      const bool nonZeroOverlap =
-          edit.start < candidate.sourceEnd && candidate.sourceBegin < edit.end;
-      const bool interiorInsertion = edit.start == edit.end &&
-                                     candidate.sourceBegin < edit.start &&
-                                     edit.start < candidate.sourceEnd;
-      if (nonZeroOverlap || interiorInsertion)
-        return false;
-    }
-
-    // A-side closure: every A token whose source bytes overlap the candidate
-    // must be wholly contained by the candidate source interval. If that token
-    // has a stable B mate, that B mate must also lie inside the candidate
-    // replacement envelope.
-    for (uint64_t aTok = 0; aTok < static_cast<uint64_t>(aToks_.size());
-         ++aTok) {
-      std::optional<std::pair<uint64_t, uint64_t>> span = sourceTokenSpan(aTok);
-      if (!span)
-        continue;
-
-      const bool overlapsSource = span->first < candidate.sourceEnd &&
-                                  candidate.sourceBegin < span->second;
-      if (!overlapsSource)
-        continue;
-
-      if (span->first < candidate.sourceBegin ||
-          candidate.sourceEnd < span->second)
-        return false;
-
-      if (aTok < static_cast<uint64_t>(abTokMapA2B_.size())) {
-        const int64_t mappedB = abTokMapA2B_[static_cast<size_t>(aTok)];
-        if (mappedB >= 0 &&
-            (static_cast<uint64_t>(mappedB) < candidate.bBegin ||
-             static_cast<uint64_t>(mappedB) >= candidate.bEnd))
-          return false;
-      }
-    }
-
-    // B-side closure: every stable B token emitted by the replacement must map
-    // back to an A token wholly contained by the source interval. This prevents
-    // the synthesized edit from duplicating or moving stable outside tokens.
-    for (uint64_t bTok = candidate.bBegin; bTok < candidate.bEnd; ++bTok) {
-      if (bTok >= static_cast<uint64_t>(abTokMapB2A_.size()))
-        return false;
-      const int64_t mappedA = abTokMapB2A_[static_cast<size_t>(bTok)];
-      if (mappedA < 0)
-        continue;
-
-      std::optional<std::pair<uint64_t, uint64_t>> span =
-          sourceTokenSpan(static_cast<uint64_t>(mappedA));
-      if (!span || span->first < candidate.sourceBegin ||
-          candidate.sourceEnd < span->second)
-        return false;
-    }
-
-    return true;
-  };
-
-  // Try to replace an uncomposable cluster of overlapping direct TU-hunk edits
-  // with one conservative closed TU realization. The synthesized edit is
-  // accepted only if a contiguous direct-hunk run can be proven closed in both
-  // source-byte space and B-token space by the A↔B token maps.
-  auto tryBuildClosedTURealization = [&](size_t overlapIndex,
-                                         TextEdit &closure) -> bool {
-    // Closed realization depends on both token-map directions: A tokens inside
-    // the source interval must map into the B envelope, and stable B tokens in
-    // the B envelope must map back into the source interval.
-    if (abTokMapA2B_.empty() || abTokMapB2A_.empty())
-      return false;
-
-    // Start from the overlap point and collect the full source-overlap cluster
-    // around it. The cluster determines the minimum set of direct edits that
-    // must be absorbed by the synthesized closure.
-    size_t clusterBegin = overlapIndex == 0 ? 0 : overlapIndex - 1;
-    uint64_t coverBegin = norm[clusterBegin].start;
-    uint64_t coverEnd = norm[clusterBegin].end;
-    while (clusterBegin > 0) {
-      const TextEdit &prev = norm[clusterBegin - 1];
-      if (prev.end <= coverBegin)
-        break;
-      --clusterBegin;
-      coverBegin = std::min(coverBegin, prev.start);
-      coverEnd = std::max(coverEnd, prev.end);
-    }
-
-    size_t clusterEnd = overlapIndex + 1;
-    if (overlapIndex < norm.size()) {
-      coverBegin = std::min(coverBegin, norm[overlapIndex].start);
-      coverEnd = std::max(coverEnd, norm[overlapIndex].end);
-    }
-    while (clusterEnd < norm.size()) {
-      const TextEdit &next = norm[clusterEnd];
-      if (next.start >= coverEnd)
-        break;
-      coverBegin = std::min(coverBegin, next.start);
-      coverEnd = std::max(coverEnd, next.end);
-      ++clusterEnd;
-    }
-
-    // Every edit in the overlap cluster must be a direct TU-hunk edit. Mixed
-    // edit classes would require a separate composition law, so fail closed.
-    std::optional<uint64_t> hunkMin;
-    std::optional<uint64_t> hunkMax;
-    for (size_t i = clusterBegin; i < clusterEnd; ++i) {
-      const TextEdit &edit = norm[i];
-      if (!edit.isDirectTUHunkEdit || !edit.directTUHunkIndex)
-        return false;
-      hunkMin = hunkMin ? std::min(*hunkMin, *edit.directTUHunkIndex)
-                        : *edit.directTUHunkIndex;
-      hunkMax = hunkMax ? std::max(*hunkMax, *edit.directTUHunkIndex)
-                        : *edit.directTUHunkIndex;
-    }
-    if (!hunkMin || !hunkMax)
-      return false;
-
-    // Expand to the maximal contiguous run of direct TU hunks available around
-    // the cluster. The search below starts with the minimal cluster-covering
-    // run and widens only as needed to find a closed realization.
-    uint64_t directLo = *hunkMin;
-    while (directLo > 0 && findDirectEditForHunk(directLo - 1))
-      --directLo;
-
-    uint64_t directHi = *hunkMax;
-    while (directHi + 1 < static_cast<uint64_t>(abTokHunks_.size()) &&
-           findDirectEditForHunk(directHi + 1))
-      ++directHi;
-
-    // Prefer the smallest closed hunk run that contains the overlap cluster.
-    // This keeps the synthesized TU edit as local as possible while still
-    // allowing widening when closure requires adjacent direct hunks.
-    std::optional<ClosedTURealizationCandidate> best;
-    const uint64_t minWidth = *hunkMax - *hunkMin + 1;
-    const uint64_t maxWidth = directHi - directLo + 1;
-    for (uint64_t width = minWidth; width <= maxWidth; ++width) {
-      bool searchedAnyAtThisWidth = false;
-      for (uint64_t first = directLo; first + width - 1 <= directHi; ++first) {
-        const uint64_t last = first + width - 1;
-        if (first > *hunkMin || last < *hunkMax)
-          continue;
-        searchedAnyAtThisWidth = true;
-
-        ClosedTURealizationCandidate candidate;
-        if (checkClosedTURealizationCandidate(first, last, candidate)) {
-          best = std::move(candidate);
-          break;
-        }
-      }
-      if (best || !searchedAnyAtThisWidth)
-        break;
-    }
-    if (!best)
-      return false;
-
-    // Materialize exactly the proven B-token envelope, then apply the same
-    // line-resync machinery used by ordinary emitted edits.
-    StringRef replacement = refoldSliceExactTokenCoverage(
-        bTokOff_, bToks_, bSource_, best->bBegin, best->bEnd);
-    ResyncOutcome ro = lineObserverLayout_.ApplyResyncOrPend(
-        originalFileText, best->sourceBegin, best->sourceEnd, replacement,
-        emissionOwner, ownerIncludeId);
-    closure = TextEdit{best->sourceBegin,
-                       best->sourceEnd,
-                       std::move(ro.text),
-                       std::move(ro.pending),
-                       std::nullopt,
-                       {},
-                       {},
-                       {}};
-    closure.lineControlPruneCandidates =
-        std::move(ro.lineControlPruneCandidates);
-    textEditCertifier_.CertifyTextEditMaterializedBTokenRange(
-        closure, best->bBegin, best->bEnd);
-    const diffutils::Hunk closedHunk{best->aBegin, best->aEnd, best->bBegin,
-                                      best->bEnd};
-    TUByteSpanPlan closedSpan(best->aBegin, best->aEnd,
-                              best->sourceBegin, best->sourceEnd,
-                              best->insertionAnchor);
-    for (size_t editIndex : best->editIndices)
-      appendUniqueProtectedSourceAuthorizations(closure, norm[editIndex]);
-    textEditCertifier_.AttachAcceptedResultCarrier(
-        closure, acceptedCandidateBuilder_.BuildAcceptedTUTextEditCandidate(
-                     AcceptedPathKind::TUByteSpanConservativeEdit, closedHunk,
-                     closedSpan,
-                     /*structuralBinding=*/nullptr, replacement));
-
-    // Replace the absorbed direct edits with the single closed realization and
-    // re-sort so downstream application sees a normal non-overlapping edit set.
-    SmallVector<TextEdit, 32> resolved;
-    resolved.reserve(norm.size() - best->editIndices.size() + 1);
-    auto shouldRemove = [&](size_t editIndex) {
-      for (size_t candidateEditIndex : best->editIndices) {
-        if (candidateEditIndex == editIndex)
-          return true;
-      }
-      return false;
-    };
-    for (size_t i = 0; i < norm.size(); ++i) {
-      if (!shouldRemove(i))
-        resolved.push_back(std::move(norm[i]));
-    }
-    resolved.push_back(std::move(closure));
-    sortNormalizedTextEdits(resolved);
-    norm = std::move(resolved);
-
-    return true;
-  };
-
   // Remove edits the emitted bytes cannot contain before looking for an
   // overlap.  A subsumed edit is not an overlap to be resolved: its bytes are
   // replaced wholesale by the edit containing it, so it has no effect on the
   // output and no composition question to answer.
   dropSubsumedNormalizedTextEdits(norm, emissionOwner, lexLang_);
-
-  // Some token-LCS tie choices can split one logical B-side TU realization
-  // around stable punctuation tokens. If the resulting direct TU hunk edits
-  // overlap after lexical widening, first try to replace the minimal enclosing
-  // direct-hunk run by one source/B-token-closed realization. This is not a
-  // merge heuristic: it is accepted only when the A→B and B→A token maps prove
-  // that the source interval and replacement interval are mutually closed.
-  for (;;) {
-    uint64_t cursor = 0;
-    bool changed = false;
-    for (size_t editIndex = 0; editIndex < norm.size(); ++editIndex) {
-      const TextEdit &edit = norm[editIndex];
-      if (edit.end < edit.start || edit.end > originalFileText.size())
-        break;
-      if (edit.start < cursor) {
-        TextEdit closure;
-        if (tryBuildClosedTURealization(editIndex, closure)) {
-          changed = true;
-          break;
-        }
-        changed = false;
-        editIndex = norm.size();
-        break;
-      }
-      cursor = edit.end;
-    }
-    if (!changed)
-      break;
-  }
 
   // The byte-edit emission boundary is proof-gated. By the time an edit
   // reaches this function, every non-terminal artifact it composes must
