@@ -225,12 +225,12 @@ FinalTUEmissionContext::BuildTUMacroPatchEdit(const MacroPatch &patch,
       std::move(resync.lineControlPruneCandidates);
   // Resync adds only synthetic line-control directives, which carry no macro
   // read, so the payload certificate still describes the edit's text.
-  if (patch.materialized.bPayload)
-    edit.bPayload = BPayloadRead{
-        *patch.materialized.bPayload, patch.invRange.begin, patchEnd,
-        patch.proof.preservesInvocationStructure
-            ? std::optional<uint64_t>(patch.proof.proofRootMacroId)
-            : std::nullopt};
+  if (patch.materialized.bPayload) {
+    textEditCertifier_.CertifyTextEditBPayload(
+        edit, *patch.materialized.bPayload, patch.invRange.begin, patchEnd);
+    if (patch.proof.preservesInvocationStructure)
+      edit.bPayload->keptCallsiteInvocationId = patch.proof.proofRootMacroId;
+  }
   edit.replayedPragmaLines = patch.materialized.replayedPragmaLines;
   // A `_Pragma` operator the whole cover removes past its callsite prints
   // nothing but a line the replacement replays.

@@ -3108,6 +3108,11 @@ RefoldTextEditAssembler::BuildDirectTUHunkTextEdit(
   if (plan->materializedBByteBegin && plan->materializedBByteEnd)
     textEditCertifier_.CertifyTextEditMaterializedBByteRange(
         edit, *plan->materializedBByteBegin, *plan->materializedBByteEnd);
+  // The replacement is the hunk's own B slice, around which resync adds only
+  // synthetic line control.
+  textEditCertifier_.CertifyTextEditBPayload(
+      edit, {{{plan->hunk.bStart, plan->hunk.bEnd}}, BPayloadRest::None},
+      edit.start, edit.end);
   AcceptedResultCandidate candidate =
       acceptedCandidateBuilder_.BuildAcceptedTUTextEditCandidate(
           plan->acceptedPath, plan->hunk, plan->span,

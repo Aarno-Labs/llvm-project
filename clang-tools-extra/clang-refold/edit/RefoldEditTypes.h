@@ -262,6 +262,12 @@ struct BPayloadTokenCertificate {
 
 /// A B payload placed in the translation unit, and the macro-state repairs
 /// made for it.
+///
+/// The realizer that builds an edit's replacement states this, through
+/// `RefoldTextEditCertifier::CertifyTextEditBPayload`.  With a `None` rest,
+/// `[sourceOffset, sourceEnd)` less `respelledInside` is the source B's text
+/// replaces, and every other byte of the edit's range is source the
+/// replacement re-spells in place.
 struct BPayloadRead {
   BPayloadTokenCertificate certificate;
   /// Source offset at which the payload is preprocessed: the edit's start
@@ -270,6 +276,10 @@ struct BPayloadRead {
   /// The edit's end before any repair widened it.  A repair widens an edit
   /// only by re-spelling the source beside `[sourceOffset, sourceEnd)`.
   uint64_t sourceEnd = 0;
+  /// Source inside `[sourceOffset, sourceEnd)` the replacement re-spells in
+  /// place between B's text, such as a directive a closure keeps where it
+  /// stood: half-open, ascending and disjoint.
+  std::vector<std::pair<uint64_t, uint64_t>> respelledInside = {};
   /// The invocation whose callsite the replacement keeps, which the fallback
   /// ladder may expand instead when no repair reaches the payload.
   std::optional<uint64_t> keptCallsiteInvocationId = std::nullopt;
@@ -387,10 +397,13 @@ struct TextEdit {
   /// `materializedBByteBegin`/`End` unset and still fails closed.
   bool materializesNoBPayload = false;
 
-  /// The B payload this edit's replacement spells, when certified.  `text` may
-  /// differ from the certified replacement only by synthetic line-control
-  /// directives.  Merging edits leaves it unset, and a repair that rewrites
-  /// `text` marks it restaged, so absence is missing evidence.
+  /// The B payload this edit's replacement spells.  Every translation-unit
+  /// realizer certifies it where it builds `text`, and `text` may add to what
+  /// the certificate states only synthetic line-control and once-guard
+  /// directives.  A repair that rewrites `text` marks it restaged, and merging
+  /// edits after the macro-state audit leaves it unset, so absence is missing
+  /// evidence: the macro-state planner refuses a translation-unit edit without
+  /// it.
   std::optional<BPayloadRead> bPayload = std::nullopt;
 };
 

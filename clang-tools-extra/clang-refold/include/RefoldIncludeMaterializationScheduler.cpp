@@ -1124,9 +1124,10 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
         sidebandPragmaEdits_, include->id,
         static_cast<uint64_t>(request_.bSource.size()));
 
-  if (auto bEnv =
-          includeInsertionPlanner_.ResolveIncludeRealizationBTokenEnvelope(
-              include->cover.begin, include->cover.end)) {
+  const std::optional<std::pair<uint64_t, uint64_t>> bEnv =
+      includeInsertionPlanner_.ResolveIncludeRealizationBTokenEnvelope(
+          include->cover.begin, include->cover.end);
+  if (bEnv) {
     textEditCertifier_.CertifyTextEditMaterializedBTokenRange(edit, bEnv->first,
                                                               bEnv->second);
   } else if (sidebandBRange) {
@@ -1144,6 +1145,20 @@ bool RefoldIncludeMaterializationScheduler::StageTURootIncludeExpansionEdit(
     // B image.
     textEditCertifier_.CertifyTextEditMaterializesNoBPayload(edit);
   }
+
+  // A body realized from B is the include's own B slice, behind any replayed
+  // definitions.  Any other body is header source, read under state no
+  // translation-unit record describes; B text in it belongs to header edits,
+  // which this certificate does not speak for.
+  const bool realizedFromB =
+      bEnv && acceptedIt != includeExpansionAcceptedResults_.end() &&
+      acceptedIt->second.proofSummary.inventory.currentPath ==
+          AcceptedPathKind::IncludeRealizationInlineFromB;
+  textEditCertifier_.CertifyTextEditBPayload(
+      edit,
+      realizedFromB ? BPayloadTokenCertificate{{*bEnv}, BPayloadRest::None}
+                    : BPayloadTokenCertificate{{}, BPayloadRest::Unproven},
+      siteBegin, siteEnd);
 
   // Preserve the accepted-result proof produced by the include materializer
   // when available; otherwise certify the edit as include materialized

@@ -218,6 +218,22 @@ public:
                                               uint64_t bTokBegin,
                                               uint64_t bTokEnd) const;
 
+  /// Certify the B payload \p edit's replacement spells: the B tokens
+  /// `certificate` names, preprocessed where `[sourceOffset, sourceEnd)` stood.
+  ///
+  /// Only the realizer that builds a replacement knows which of its bytes it
+  /// copied from B, so each translation-unit realizer states it here when it
+  /// builds the text.  The macro-state planner refuses a translation-unit edit
+  /// that reaches it without a certificate instead of inferring one from the
+  /// carrier's path.  With a `None` rest, every byte of the edit's own range
+  /// outside `[sourceOffset, sourceEnd)`, and every interval of
+  /// \p respelledInside, is source the replacement re-spells verbatim at its
+  /// own position.  Empty token ranges are dropped.
+  void CertifyTextEditBPayload(
+      TextEdit &edit, BPayloadTokenCertificate certificate,
+      uint64_t sourceOffset, uint64_t sourceEnd,
+      std::vector<std::pair<uint64_t, uint64_t>> respelledInside = {}) const;
+
   /// Certify a TextEdit with the materialized ranges witnessed by a sideband
   /// edit proof. The complete sideband proof binds the emitted replacement
   /// payload to its raw-B byte provenance, so TU sideband emission should

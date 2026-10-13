@@ -329,6 +329,10 @@ static std::optional<LineObserverRightClosure> extendLineObserverRightClosure(
     StringRef bGap = bSource.slice(closure.bEnd, nextBBegin);
     if (bGap.contains('\n') || bGap.contains('\r'))
       return closure;
+    // The gap is copied as layout, so a B token in it would be spelled
+    // unaccounted for.
+    if (!bGap.trim().empty())
+      return std::nullopt;
 
     const uint64_t lineBegin = physicalLineBegin(ownerBytes, nextEntry.b);
     const uint64_t lineEnd =
@@ -593,7 +597,9 @@ buildLineObserverSourceSpelledPrefix(
     if (constructBBegin < bCursor || constructBBegin > bSource.size())
       return std::nullopt;
     StringRef bGap = bSource.slice(bCursor, constructBBegin);
-    if (bGap.contains('\n') || bGap.contains('\r'))
+    // Only B's whitespace is copied between source constructs; a B token in a
+    // gap would be spelled unaccounted for.
+    if (bGap.contains('\n') || bGap.contains('\r') || !bGap.trim().empty())
       return std::nullopt;
 
     result.text += bGap;
@@ -610,7 +616,8 @@ buildLineObserverSourceSpelledPrefix(
 
   if (!ownerBytes.slice(cursor, sourceLimit).trim().empty())
     return std::nullopt;
-  if (bLimit < bCursor || bLimit > bSource.size())
+  if (bLimit < bCursor || bLimit > bSource.size() ||
+      !bSource.slice(bCursor, bLimit).trim().empty())
     return std::nullopt;
   result.text += bSource.slice(bCursor, bLimit);
   return result;
@@ -708,6 +715,13 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
       return false;
     textEditCertifier_.CertifyTextEditMaterializedBByteRange(edit, prevBEnd,
                                                              initialBEnd);
+    // B's line from the previous token through the observer replaces the
+    // source up to the observer's end; the extension re-spells what follows.
+    textEditCertifier_.CertifyTextEditBPayload(
+        edit,
+        {{{ownLineMerge->prevBTok + 1, observerTokens->lastBTok + 1}},
+         BPayloadRest::None},
+        editBegin, sourceLineEnd);
     textEditCertifier_.AttachAcceptedResultCarrier(
         edit,
         acceptedCandidateBuilder_.BuildAcceptedSpecializedTUTextEditCandidate(
@@ -828,6 +842,10 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
       return false;
     textEditCertifier_.CertifyTextEditMaterializedBByteRange(
         edit, collapsedGap->leftBEnd, firstObserverBBegin);
+    // Every byte but the synthetic `#line` is source re-spelled in place, with
+    // only B's whitespace between constructs.
+    textEditCertifier_.CertifyTextEditBPayload(edit, {{}, BPayloadRest::None},
+                                               editBegin, editBegin);
     textEditCertifier_.AttachAcceptedResultCarrier(
         edit,
         acceptedCandidateBuilder_.BuildAcceptedSpecializedTUTextEditCandidate(

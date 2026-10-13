@@ -226,7 +226,6 @@ public:
         tuBytes_(request.tuBytes),
         ownersMustExpand_(request.ownersMustExpand) {
     BuildDirectiveIndexOnce();
-    CertifyWhollyBPayloadEdits();
   }
 
   /// Runs the initial macro-state liveness repair phases over the staged final
@@ -310,10 +309,12 @@ private:
   /// Finds the final TU edit that fully contains a source interval, if any.
   std::optional<size_t> FinalTUEditContainingInterval(uint64_t begin,
                                                       uint64_t end) const;
-  /// Returns whether the final TU edit containing `[begin, end)` re-spells it:
-  /// a repair widened the edit over that source beside its wholly-B payload,
-  /// so the source is emitted verbatim and expands as it did.
-  bool FinalTUEditRespellsInterval(uint64_t begin, uint64_t end) const;
+  /// Returns whether the final TU edit containing `[begin, end)` realizes that
+  /// source from B: its certified payload replaces the source with B's own
+  /// text.  Source an edit contains otherwise is re-spelled, or emitted in a
+  /// way no certificate states, so a callsite there still reads its
+  /// definitions.
+  bool FinalTUEditRealizesIntervalFromB(uint64_t begin, uint64_t end) const;
   /// Returns whether a source range overlaps a final TU edit other than the
   /// explicitly excluded edit index.
   bool SourceRangeOverlapsFinalTUEditExcept(uint64_t begin, uint64_t end,
@@ -483,14 +484,6 @@ private:
   std::optional<size_t> FirstReplacementObservationOffset(
       const TextEdit &edit, const RefoldModel::MacroDirective &definition,
       StringRef macroName) const;
-  /// Returns whether replacement text observes the preserved definition state.
-  bool ReplacementObservesPreservedDefinition(
-      const TextEdit &edit, const RefoldModel::MacroDirective &definition,
-      StringRef macroName) const;
-  /// Certifies the payload of each edit not yet certified whose replacement is
-  /// wholly a slice of B: a mapped direct-TU edit, or an include realized from
-  /// B.  A macro patch is certified where it is built.
-  void CertifyWhollyBPayloadEdits();
   /// Returns whether \p edit's certified B payload reads \p definition of
   /// \p macroName; see
   /// `RefoldMacroStateProof::CertifiedPayloadReadsDefinition`.
@@ -503,10 +496,11 @@ private:
   /// certified B payload preprocess.
   ///
   /// A wholly-B payload re-spells none of the source it replaces, so only the
-  /// source a repair widened the edit over beside it is asked.  A replacement
+  /// source re-spelled in place beside or inside it is asked.  A replacement
   /// whose other bytes re-spell the source it replaces, expanding as that
   /// source did, is asked what `PreservedSourceObservesBindingChange` says of
-  /// that source.  Anything else is unproven and counts as observing.
+  /// that source.  Anything else, an uncertified replacement included, is
+  /// unproven and counts as observing.
   bool ReplacementRestObservesBindingChange(
       const TextEdit &edit, const RefoldModel::MacroDirective &definition,
       StringRef macroName, CrossedBindingChange change, uint64_t begin,
@@ -691,9 +685,6 @@ private:
   /// Advances consumed undef transitions before replacements that observe the
   /// prior definition state.
   void AdvancePreservedUndefsBeforeObservedReplacements();
-  /// Returns whether an edit's replacement is wholly a TU or include slice of
-  /// B, judged by its accepted carriers.
-  bool EditReplacementIsSliceOfB(const TextEdit &edit) const;
   /// Repairs definitions required by surviving callsites after final TU edits.
   void RepairSurvivingDefinitionCallsites();
   /// Collects every definition consumed by a final TU edit that the recorded
@@ -866,16 +857,33 @@ MacroStateRepairContext::FinalTUEditContainingInterval(uint64_t begin,
   return std::nullopt;
 }
 
-bool MacroStateRepairContext::FinalTUEditRespellsInterval(uint64_t begin,
-                                                          uint64_t end) const {
+/// Return the parts of \p edit's range its replacement re-spells in place,
+/// given a certified payload with a `None` rest: the source beside the B
+/// payload's own, and the pieces the payload keeps inside it.
+static SmallVector<std::pair<uint64_t, uint64_t>, 4>
+respelledSourceOfWhollyBEdit(const TextEdit &edit) {
+  const BPayloadRead &payload = *edit.bPayload;
+  SmallVector<std::pair<uint64_t, uint64_t>, 4> respelled;
+  respelled.emplace_back(edit.start, payload.sourceOffset);
+  respelled.append(payload.respelledInside.begin(),
+                   payload.respelledInside.end());
+  respelled.emplace_back(payload.sourceEnd, edit.end);
+  return respelled;
+}
+
+bool MacroStateRepairContext::FinalTUEditRealizesIntervalFromB(
+    uint64_t begin, uint64_t end) const {
   std::optional<size_t> editIndex = FinalTUEditContainingInterval(begin, end);
   if (!editIndex)
     return false;
   const TextEdit &edit = tuEdits_[*editIndex];
   return edit.bPayload &&
          edit.bPayload->certificate.rest == BPayloadRest::None &&
-         (end <= edit.bPayload->sourceOffset ||
-          edit.bPayload->sourceEnd <= begin);
+         llvm::none_of(respelledSourceOfWhollyBEdit(edit),
+                       [&](const auto &piece) {
+                         return SourceIntervalsOverlap(begin, end, piece.first,
+                                                       piece.second);
+                       });
 }
 
 bool MacroStateRepairContext::SourceRangeOverlapsFinalTUEditExcept(
@@ -1653,8 +1661,7 @@ bool MacroStateRepairContext::PhysicalCallsiteIsMaterialized(
     return true;
 
   if (PathIdentity().PathsEqual(*invocation.invFile, tuPath_)) {
-    return FinalTUEditContainingInterval(*invocation.invB, *invocation.invE) &&
-           !FinalTUEditRespellsInterval(*invocation.invB, *invocation.invE);
+    return FinalTUEditRealizesIntervalFromB(*invocation.invB, *invocation.invE);
   }
 
   const RefoldModel::IncludeItem *inc =
@@ -1794,39 +1801,6 @@ MacroStateRepairContext::FirstReplacementObservationOffset(
       tuBytes_.drop_front(edit.end));
 }
 
-bool MacroStateRepairContext::ReplacementObservesPreservedDefinition(
-    const TextEdit &edit, const RefoldModel::MacroDirective &definition,
-    StringRef macroName) const {
-  return FirstReplacementObservationOffset(edit, definition, macroName)
-      .has_value();
-}
-
-void MacroStateRepairContext::CertifyWhollyBPayloadEdits() {
-  // The offsets are ascending token starts followed by one end sentinel.
-  const ArrayRef<size_t> starts =
-      deps_.bTokOff.empty() ? ArrayRef<size_t>() : deps_.bTokOff.drop_back();
-  for (TextEdit &edit : tuEdits_) {
-    if (edit.bPayload || !EditReplacementIsSliceOfB(edit))
-      continue;
-    std::optional<std::pair<uint64_t, uint64_t>> tokens;
-    if (edit.directTUHunkBStart && edit.directTUHunkBEnd) {
-      tokens.emplace(*edit.directTUHunkBStart, *edit.directTUHunkBEnd);
-    } else if (edit.materializedBByteBegin && edit.materializedBByteEnd) {
-      const auto *first =
-          llvm::lower_bound(starts, *edit.materializedBByteBegin);
-      if (first != starts.end() && *first == *edit.materializedBByteBegin)
-        tokens.emplace(first - starts.begin(),
-                       llvm::lower_bound(starts, *edit.materializedBByteEnd) -
-                           starts.begin());
-    }
-    if (!tokens || tokens->first > tokens->second ||
-        tokens->second > deps_.bToks.size())
-      continue;
-    edit.bPayload =
-        BPayloadRead{{{*tokens}, BPayloadRest::None}, edit.start, edit.end};
-  }
-}
-
 bool MacroStateRepairContext::BPayloadReadsDefinition(
     const TextEdit &edit, const RefoldModel::MacroDirective &definition,
     StringRef macroName) const {
@@ -1841,27 +1815,20 @@ bool MacroStateRepairContext::ReplacementRestObservesBindingChange(
     uint64_t end) const {
   if (EditHasMacroPatchSurfaceInBMacroState(edit))
     return false;
-  if (edit.bPayload && edit.bPayload->certificate.rest == BPayloadRest::None) {
-    const uint64_t frontEnd = std::min(end, edit.bPayload->sourceOffset);
-    const uint64_t backBegin = std::max(begin, edit.bPayload->sourceEnd);
-    return PreservedSourceObservesBindingChange(
-               definition, macroName, begin, frontEnd,
-               tuBytes_.drop_front(frontEnd), change) ||
-           PreservedSourceObservesBindingChange(
-               definition, macroName, backBegin, end, tuBytes_.drop_front(end),
-               change);
-  }
-  if (edit.bPayload
-          ? edit.bPayload->certificate.rest == BPayloadRest::Unproven &&
-                !edit.bPayload->restaged
-          : llvm::any_of(edit.acceptedResults, [](const auto &carrier) {
-              return carrier &&
-                     carrier->kind == AcceptedResultCandidateKind::MacroPatch;
-            }))
-    // An unproven rest observes, and so does a rewritten callsite: it expands
-    // as its own proof says, which the producer's records of the original need
-    // not describe.
+  // An uncertified replacement, and an unproven rest no repair rewrote, could
+  // read anything.
+  if (!edit.bPayload ||
+      (edit.bPayload->certificate.rest == BPayloadRest::Unproven &&
+       !edit.bPayload->restaged))
     return true;
+  if (edit.bPayload->certificate.rest == BPayloadRest::None)
+    return llvm::any_of(
+        respelledSourceOfWhollyBEdit(edit), [&](const auto &piece) {
+          const uint64_t pieceEnd = std::min(end, piece.second);
+          return PreservedSourceObservesBindingChange(
+              definition, macroName, std::max(begin, piece.first), pieceEnd,
+              tuBytes_.drop_front(pieceEnd), change);
+        });
   return PreservedSourceObservesBindingChange(definition, macroName, begin, end,
                                               tuBytes_.drop_front(end), change);
 }
@@ -2035,7 +2002,7 @@ bool MacroStateRepairContext::
         StringRef macroName) const {
   if (!definition.IsDefine())
     return false;
-  if (!ReplacementObservesPreservedDefinition(edit, definition, macroName))
+  if (!FirstReplacementObservationOffset(edit, definition, macroName))
     return false;
 
   for (const auto &carrier : edit.acceptedResults) {
@@ -3036,36 +3003,6 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
         synthesizedCount);
 }
 
-bool MacroStateRepairContext::EditReplacementIsSliceOfB(
-    const TextEdit &edit) const {
-  // A payload may only be certified where every byte the audit reads is
-  // attributable.  A mapped direct-TU edit is the edited stream's own slice
-  // for the hunk and nothing else, and an include realized from B is a slice
-  // landing where the `#include` stood, under the TU's macro state there.
-  //
-  // Every other TU carrier mixes.  A conservative direct-TU edit re-emits
-  // original source with a local rewrite -- the `_Pragma(#x)` argument fold
-  // re-emits `DIAG(message("bye"))`, whose `DIAG` is preserved spelling the
-  // accepted proof needs to expand.  A TU include closure folds preserved
-  // directives in beside the payload.  A line-observer realization splices
-  // original bytes around a synthetic `#line`.  No fact partitions those
-  // replacements, so they stay uncertified.
-  if (edit.acceptedResults.empty())
-    return false;
-  for (const auto &carrier : edit.acceptedResults) {
-    if (!carrier)
-      return false;
-    const AcceptedPathKind path = carrier->proofSummary.inventory.currentPath;
-    const bool mappedTUSlice =
-        carrier->kind == AcceptedResultCandidateKind::TUTextEdit &&
-        path == AcceptedPathKind::TUByteSpanMappedEdit;
-    if (!mappedTUSlice &&
-        path != AcceptedPathKind::IncludeRealizationInlineFromB)
-      return false;
-  }
-  return true;
-}
-
 void MacroStateRepairContext::RequireEveryObservedGapDefinitionRepaired() {
   // Several repairs can neutralise a macro that is live where a payload lands
   // -- advancing a preserved `#undef` before it, synthesising one, carrying
@@ -3083,9 +3020,23 @@ void MacroStateRepairContext::RequireEveryObservedGapDefinitionRepaired() {
   // definition for this edit discharges one.  Restaging an edit for one name
   // therefore hides none of its reads of another, and a name that only
   // preserved source spells is never taken for a payload read.
+  //
+  // Every translation-unit realizer certifies the text it builds, so an edit
+  // without a certificate came from a path that never said which of its bytes
+  // are B's; nothing can audit it, and it fails closed.
   for (const TextEdit &edit : tuEdits_) {
-    if (!edit.bPayload)
-      continue;
+    if (!edit.bPayload) {
+      TerminalSink().RequestTerminalFallback(
+          MakeTerminalFallbackProofFailure(
+              TerminalFallbackObligationKind::MacroStateStabilizable,
+              TerminalFallbackFailureReason::MacroStateNotStabilizable),
+          "macro/liveness",
+          llvm::formatv("TU replacement [{0},{1}) carries no B-payload "
+                        "certificate, so its macro reads cannot be audited",
+                        edit.start, edit.end)
+              .str());
+      return;
+    }
     const BPayloadRead &payload = *edit.bPayload;
     for (const NamedMacroDirectiveRef &ref : plan_.namedMacroDirectives) {
       const RefoldModel::MacroDirective &definition = *ref.directive;
@@ -3169,8 +3120,8 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
         continue;
       if (edit.bPayload && !edit.bPayload->restaged
               ? !BPayloadReadsDefinition(edit, directiveLocal, ref.name)
-              : !ReplacementObservesPreservedDefinition(edit, directiveLocal,
-                                                        ref.name))
+              : !FirstReplacementObservationOffset(edit, directiveLocal,
+                                                   ref.name))
         continue;
       if (DirectCalleePatchRequiresDefinitionBeforeReplacement(
               edit, directiveLocal, ref.name))
@@ -3369,7 +3320,9 @@ bool MacroStateRepairContext::InvocationCallsiteSurvivesTUEdits(
   if (!PathIdentity().PathsEqual(*invocation.invFile, tuPath_))
     return false;
   return !IntervalOverlapsFinalTUEdit(*invocation.invB, *invocation.invE) ||
-         FinalTUEditRespellsInterval(*invocation.invB, *invocation.invE);
+         (FinalTUEditContainingInterval(*invocation.invB, *invocation.invE) &&
+          !FinalTUEditRealizesIntervalFromB(*invocation.invB,
+                                            *invocation.invE));
 }
 
 const RefoldModel::MacroDirective *
@@ -3568,10 +3521,10 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
 
     // If the #define cannot be safely preserved, the only structural repair is
     // to remove this call site's dependency on that macro state by emitting the
-    // B-side expansion at the call site.  A callsite a widened edit re-spells
-    // is emitted verbatim by that edit, so no patch can replace it.
+    // B-side expansion at the call site.  A callsite inside an edit is emitted
+    // by that edit, so no patch can replace it.
     std::optional<WholeCoverPlan> wholePlan =
-        FinalTUEditRespellsInterval(*invocation.invB, *invocation.invE)
+        FinalTUEditContainingInterval(*invocation.invB, *invocation.invE)
             ? std::nullopt
             : MacroPatchPlanner().ComputeWholeCoverPlan(invocation);
     if (!wholePlan || !wholePlan->sourceEnd) {

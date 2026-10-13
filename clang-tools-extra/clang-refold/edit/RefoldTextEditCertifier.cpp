@@ -1261,6 +1261,37 @@ void RefoldTextEditCertifier::CertifyTextEditMaterializedBTokenRange(
   CertifyTextEditMaterializedBByteRange(edit, bytes->first, bytes->second);
 }
 
+/// Return whether \p ranges are half-open, ascending, disjoint and inside
+/// `[low, high]`.
+static bool rangesAscendWithin(ArrayRef<std::pair<uint64_t, uint64_t>> ranges,
+                               uint64_t low, uint64_t high) {
+  for (const auto &[begin, end] : ranges) {
+    if (begin < low || end < begin || high < end)
+      return false;
+    low = end;
+  }
+  return true;
+}
+
+void RefoldTextEditCertifier::CertifyTextEditBPayload(
+    TextEdit &edit, BPayloadTokenCertificate certificate, uint64_t sourceOffset,
+    uint64_t sourceEnd,
+    std::vector<std::pair<uint64_t, uint64_t>> respelledInside) const {
+  llvm::erase_if(certificate.bTokenRanges,
+                 [](const auto &range) { return range.first == range.second; });
+  if (!rangesAscendWithin(certificate.bTokenRanges, 0, bToks_.size()) ||
+      sourceOffset < edit.start || sourceEnd < sourceOffset ||
+      edit.end < sourceEnd ||
+      !rangesAscendWithin(respelledInside, sourceOffset, sourceEnd))
+    REFOLD_LOG_FATAL("edit-map",
+                     "invalid B payload certificate for edit at source=[{0},"
+                     "{1}): payload source=[{2},{3}) bToks={4}",
+                     edit.start, edit.end, sourceOffset, sourceEnd,
+                     bToks_.size());
+  edit.bPayload = BPayloadRead{std::move(certificate), sourceOffset, sourceEnd,
+                               std::move(respelledInside)};
+}
+
 void RefoldTextEditCertifier::CertifyTextEditMaterializedBReplayProof(
     TextEdit &edit, const SidebandPragmaEdit &sideband) const {
   const std::pair<uint64_t, uint64_t> bRange =

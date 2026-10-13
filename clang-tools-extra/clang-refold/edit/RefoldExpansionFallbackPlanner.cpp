@@ -3828,6 +3828,10 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
   // line(s) so any required physical-line compensation lands after copied
   // suffix lines such as `};` instead of inside the realized replacement
   // itself.
+  //
+  // Source appended after the B material -- trivia, a zero-token piece -- now
+  // expands after all of it, where no producer record describes it.
+  bool relocatesSource = replacement != rawReplacement;
   uint64_t closureSourceEnd = sourceEnd;
   std::string padded = refoldPadAtBoundaries(
       tuBytes, static_cast<size_t>(sourceBegin),
@@ -3849,6 +3853,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
     // the directive standalone rather than gluing it onto the preceding source
     // line.
     bool keepsSourceSpelling = mixedSourceLineDirectiveRespelling.has_value();
+    relocatesSource |= keepsSourceSpelling;
     if (keepsSourceSpelling &&
         textMayChangePreprocessorState(padded, lexLang_)) {
       keepsSourceSpelling = false;
@@ -4071,6 +4076,19 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
     edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
   textEditCertifier_.CertifyTextEditMaterializedBTokenRange(
       edit, bEnvelope->first, bEnvelope->second);
+  // A preserved directive keeps its place among the B material, and an
+  // absorbed suffix line lies past `sourceEnd`; both are re-spelled in place.
+  // A relocated piece, or a `#line` kept with its spelling, leaves the rest
+  // unproven.
+  std::vector<std::pair<uint64_t, uint64_t>> directivesInPlace;
+  for (const TUPositionPreservedDirective &directive :
+       mixedPositionPreservedTUDirectives)
+    directivesInPlace.emplace_back(directive.emitBegin, directive.emitEnd);
+  textEditCertifier_.CertifyTextEditBPayload(
+      edit,
+      {{{bMaterialBegin, bMaterialEnd}},
+       relocatesSource ? BPayloadRest::Unproven : BPayloadRest::None},
+      sourceBegin, sourceEnd, std::move(directivesInPlace));
   if (!textEditCertifier_.AuthorizeCompleteProtectedSourceClosure(
           edit, ProtectedSourceEditAuthorityKind::TUIncludeClosure, tuPath,
           std::nullopt, tuBytes, sourceBegin, closureSourceEnd,

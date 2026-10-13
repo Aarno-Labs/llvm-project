@@ -2676,6 +2676,13 @@ bool appendSidebandPragmaSourceEdits(
           std::min<uint64_t>(static_cast<uint64_t>(foldedReplacement.size()),
                              static_cast<uint64_t>(edit.text.size())));
     }
+    // A pragma line is not an ordinary B token, so no form spells one.  A
+    // replay, an operator fold or a deletion replaces the whole site with B's
+    // pragma; the argument fold re-spells the invocation around B's pragma
+    // text, whose expansion no producer record describes.
+    textEditCertifier.CertifyTextEditBPayload(
+        edit, {{}, argFold ? BPayloadRest::Unproven : BPayloadRest::None},
+        sourceRange.first, sourceRange.second);
     textEditCertifier.AttachAcceptedResultCarrier(
         edit,
         acceptedCandidateBuilder.BuildAcceptedSpecializedTUTextEditCandidate(

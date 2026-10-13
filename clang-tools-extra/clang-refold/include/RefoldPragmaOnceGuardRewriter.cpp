@@ -1611,6 +1611,10 @@ PragmaOnceGuardEditResult RefoldPragmaOnceGuardRewriter::
             .str());
   }
 
+  // The directive is re-spelled where it stood, inside a guard no source
+  // reads, so the edit spells no B token.
+  deps_.textEditCertifier.CertifyTextEditBPayload(
+      edit, {{}, BPayloadRest::None}, siteBegin, siteBegin);
   deps_.textEditCertifier.AttachAcceptedResultCarrier(
       edit,
       deps_.acceptedCandidateBuilder.BuildAcceptedIncludeRealizationCandidate(
