@@ -267,6 +267,9 @@ struct BPayloadRead {
   /// Source offset at which the payload is preprocessed: the edit's start
   /// before any repair widened it.
   uint64_t sourceOffset = 0;
+  /// The edit's end before any repair widened it.  A repair widens an edit
+  /// only by re-spelling the source beside `[sourceOffset, sourceEnd)`.
+  uint64_t sourceEnd = 0;
   /// The invocation whose callsite the replacement keeps, which the fallback
   /// ladder may expand instead when no repair reaches the payload.
   std::optional<uint64_t> keptCallsiteInvocationId = std::nullopt;

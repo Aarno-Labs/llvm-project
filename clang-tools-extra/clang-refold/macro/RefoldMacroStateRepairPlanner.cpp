@@ -310,6 +310,10 @@ private:
   /// Finds the final TU edit that fully contains a source interval, if any.
   std::optional<size_t> FinalTUEditContainingInterval(uint64_t begin,
                                                       uint64_t end) const;
+  /// Returns whether the final TU edit containing `[begin, end)` re-spells it:
+  /// a repair widened the edit over that source beside its wholly-B payload,
+  /// so the source is emitted verbatim and expands as it did.
+  bool FinalTUEditRespellsInterval(uint64_t begin, uint64_t end) const;
   /// Returns whether a source range overlaps a final TU edit other than the
   /// explicitly excluded edit index.
   bool SourceRangeOverlapsFinalTUEditExcept(uint64_t begin, uint64_t end,
@@ -494,16 +498,26 @@ private:
                                const RefoldModel::MacroDirective &definition,
                                StringRef macroName) const;
   /// Returns whether changing, as \p change says, whether \p definition binds
-  /// \p macroName over all of \p edit's replacement could change how its
-  /// bytes other than a certified B payload preprocess.
+  /// \p macroName over the bytes of \p edit's replacement that stand for its
+  /// source in `[begin, end)` could change how those of them other than a
+  /// certified B payload preprocess.
   ///
-  /// A replacement that is wholly B payload has no such bytes.  One whose
-  /// other bytes re-spell the source it replaces, expanding as that source
-  /// did, is asked what `PreservedSourceObservesBindingChange` says of that
-  /// source.  Anything else is unproven and counts as observing.
+  /// A wholly-B payload re-spells none of the source it replaces, so only the
+  /// source a repair widened the edit over beside it is asked.  A replacement
+  /// whose other bytes re-spell the source it replaces, expanding as that
+  /// source did, is asked what `PreservedSourceObservesBindingChange` says of
+  /// that source.  Anything else is unproven and counts as observing.
   bool ReplacementRestObservesBindingChange(
       const TextEdit &edit, const RefoldModel::MacroDirective &definition,
-      StringRef macroName, CrossedBindingChange change) const;
+      StringRef macroName, CrossedBindingChange change, uint64_t begin,
+      uint64_t end) const;
+  /// The same question over all of \p edit's replacement.
+  bool ReplacementRestObservesBindingChange(
+      const TextEdit &edit, const RefoldModel::MacroDirective &definition,
+      StringRef macroName, CrossedBindingChange change) const {
+    return ReplacementRestObservesBindingChange(edit, definition, macroName,
+                                                change, edit.start, edit.end);
+  }
   /// Records that a repair left \p definition unbound wherever \p edit's B
   /// payload is read.  The closing audit accepts nothing else as discharging
   /// a payload read, so a repair that omits this fails closed.
@@ -613,6 +627,22 @@ private:
   bool TryWidenEditToDelayedMacroStateBoundary(
       size_t editIndex, const RefoldModel::MacroDirective &definition,
       StringRef macroName);
+  /// Returns whether replaying \p directive, consumed by \p edit, at
+  /// \p placement moves it across replacement bytes that re-spell source
+  /// observing the change in whether \p changedDefinition binds \p macroName.
+  ///
+  /// A repair that widened the edit re-spells the source it absorbed beside a
+  /// wholly-B payload, and any other replacement may re-spell any of the
+  /// source it replaces.  Re-spelled bytes keep their macro state only on the
+  /// side of the directive they stood on.  A placement before the replacement
+  /// moves the transition ahead of the source in front of the directive, one
+  /// after it moves the transition behind the source after the directive, and
+  /// one inside it may do either.  A null \p changedDefinition counts as
+  /// observed.
+  bool ReplayCrossesObservingRespelledSource(
+      const TextEdit &edit, const RefoldModel::MacroDirective &directive,
+      const RefoldModel::MacroDirective *changedDefinition, StringRef macroName,
+      MacroStatePreservationPlacement placement) const;
   /// Queues a macro-state directive preservation for an edit when proof and
   /// placement constraints allow it.
   std::optional<MacroStatePreservationPlacement>
@@ -834,6 +864,18 @@ MacroStateRepairContext::FinalTUEditContainingInterval(uint64_t begin,
       return editIndex;
   }
   return std::nullopt;
+}
+
+bool MacroStateRepairContext::FinalTUEditRespellsInterval(uint64_t begin,
+                                                          uint64_t end) const {
+  std::optional<size_t> editIndex = FinalTUEditContainingInterval(begin, end);
+  if (!editIndex)
+    return false;
+  const TextEdit &edit = tuEdits_[*editIndex];
+  return edit.bPayload &&
+         edit.bPayload->certificate.rest == BPayloadRest::None &&
+         (end <= edit.bPayload->sourceOffset ||
+          edit.bPayload->sourceEnd <= begin);
 }
 
 bool MacroStateRepairContext::SourceRangeOverlapsFinalTUEditExcept(
@@ -1611,8 +1653,8 @@ bool MacroStateRepairContext::PhysicalCallsiteIsMaterialized(
     return true;
 
   if (PathIdentity().PathsEqual(*invocation.invFile, tuPath_)) {
-    return FinalTUEditContainingInterval(*invocation.invB, *invocation.invE)
-        .has_value();
+    return FinalTUEditContainingInterval(*invocation.invB, *invocation.invE) &&
+           !FinalTUEditRespellsInterval(*invocation.invB, *invocation.invE);
   }
 
   const RefoldModel::IncludeItem *inc =
@@ -1780,7 +1822,8 @@ void MacroStateRepairContext::CertifyWhollyBPayloadEdits() {
     if (!tokens || tokens->first > tokens->second ||
         tokens->second > deps_.bToks.size())
       continue;
-    edit.bPayload = BPayloadRead{{{*tokens}, BPayloadRest::None}, edit.start};
+    edit.bPayload =
+        BPayloadRead{{{*tokens}, BPayloadRest::None}, edit.start, edit.end};
   }
 }
 
@@ -1794,30 +1837,33 @@ bool MacroStateRepairContext::BPayloadReadsDefinition(
 
 bool MacroStateRepairContext::ReplacementRestObservesBindingChange(
     const TextEdit &edit, const RefoldModel::MacroDirective &definition,
-    StringRef macroName, CrossedBindingChange change) const {
+    StringRef macroName, CrossedBindingChange change, uint64_t begin,
+    uint64_t end) const {
   if (EditHasMacroPatchSurfaceInBMacroState(edit))
     return false;
-  if (edit.bPayload && !edit.bPayload->restaged) {
-    switch (edit.bPayload->certificate.rest) {
-    case BPayloadRest::None:
-      return false;
-    case BPayloadRest::Unproven:
-      return true;
-    case BPayloadRest::ReplacedSource:
-      break;
-    }
-  } else if (!edit.bPayload &&
-             llvm::any_of(edit.acceptedResults, [](const auto &carrier) {
-               return carrier &&
-                      carrier->kind == AcceptedResultCandidateKind::MacroPatch;
-             })) {
-    // A rewritten callsite expands as its own proof says, which the
-    // producer's records of the original need not describe.
-    return true;
+  if (edit.bPayload && edit.bPayload->certificate.rest == BPayloadRest::None) {
+    const uint64_t frontEnd = std::min(end, edit.bPayload->sourceOffset);
+    const uint64_t backBegin = std::max(begin, edit.bPayload->sourceEnd);
+    return PreservedSourceObservesBindingChange(
+               definition, macroName, begin, frontEnd,
+               tuBytes_.drop_front(frontEnd), change) ||
+           PreservedSourceObservesBindingChange(
+               definition, macroName, backBegin, end, tuBytes_.drop_front(end),
+               change);
   }
-  return PreservedSourceObservesBindingChange(
-      definition, macroName, edit.start, edit.end,
-      tuBytes_.drop_front(edit.end), change);
+  if (edit.bPayload
+          ? edit.bPayload->certificate.rest == BPayloadRest::Unproven &&
+                !edit.bPayload->restaged
+          : llvm::any_of(edit.acceptedResults, [](const auto &carrier) {
+              return carrier &&
+                     carrier->kind == AcceptedResultCandidateKind::MacroPatch;
+            }))
+    // An unproven rest observes, and so does a rewritten callsite: it expands
+    // as its own proof says, which the producer's records of the original need
+    // not describe.
+    return true;
+  return PreservedSourceObservesBindingChange(definition, macroName, begin, end,
+                                              tuBytes_.drop_front(end), change);
 }
 
 void MacroStateRepairContext::RecordPayloadUnbound(
@@ -2649,6 +2695,33 @@ bool MacroStateRepairContext::TryWidenEditToDelayedMacroStateBoundary(
   return true;
 }
 
+bool MacroStateRepairContext::ReplayCrossesObservingRespelledSource(
+    const TextEdit &edit, const RefoldModel::MacroDirective &directive,
+    const RefoldModel::MacroDirective *changedDefinition, StringRef macroName,
+    MacroStatePreservationPlacement placement) const {
+  std::optional<MacroStateSourceTransition> source =
+      MacroStateSourceTransitionFor(directive);
+  if (!changedDefinition || !source)
+    return true;
+
+  // A `#define` placed early binds the name over source that saw it unbound;
+  // an `#undef` placed early unbinds it over source that saw it bound.
+  const CrossedBindingChange early = directive.IsDefine()
+                                         ? CrossedBindingChange::Bound
+                                         : CrossedBindingChange::Unbound;
+  const CrossedBindingChange late = directive.IsDefine()
+                                        ? CrossedBindingChange::Unbound
+                                        : CrossedBindingChange::Bound;
+  return (placement != MacroStatePreservationPlacement::AfterReplacement &&
+          ReplacementRestObservesBindingChange(edit, *changedDefinition,
+                                               macroName, early, edit.start,
+                                               source->interval.begin)) ||
+         (placement != MacroStatePreservationPlacement::BeforeReplacement &&
+          ReplacementRestObservesBindingChange(edit, *changedDefinition,
+                                               macroName, late,
+                                               source->interval.end, edit.end));
+}
+
 std::optional<MacroStatePreservationPlacement>
 MacroStateRepairContext::TryQueueMacroStateDirectivePreservation(
     size_t editIndex, const RefoldModel::MacroDirective &directive,
@@ -2674,11 +2747,19 @@ MacroStateRepairContext::TryQueueMacroStateDirectivePreservation(
       edit.start == 0 || tuBytes_[edit.start - 1] == '\n';
   const bool beforePlacementWouldExposeDefine =
       directive.IsDefine() && replacementObservesDefinition;
-  if (editStartsAtPhysicalBOL && !beforePlacementWouldExposeDefine) {
-    macroStatePreservationsByEdit_[editIndex].push_back(MacroStatePreservation{
-        &directive, MacroStatePreservationPlacement::BeforeReplacement});
-    return MacroStatePreservationPlacement::BeforeReplacement;
-  }
+  const auto crosses = [&](MacroStatePreservationPlacement placement) {
+    return ReplayCrossesObservingRespelledSource(
+        edit, directive, definitionObservedByReplacement, macroName, placement);
+  };
+  const auto queue = [&](MacroStatePreservationPlacement placement,
+                         size_t replacementOffset = 0) {
+    macroStatePreservationsByEdit_[editIndex].push_back(
+        MacroStatePreservation{&directive, placement, replacementOffset});
+    return placement;
+  };
+  if (editStartsAtPhysicalBOL && !beforePlacementWouldExposeDefine &&
+      !crosses(MacroStatePreservationPlacement::BeforeReplacement))
+    return queue(MacroStatePreservationPlacement::BeforeReplacement);
 
   if (!MacroStateDirectiveCanBeDelayedAfterEdit(edit, directive))
     return std::nullopt;
@@ -2689,13 +2770,10 @@ MacroStateRepairContext::TryQueueMacroStateDirectivePreservation(
     std::optional<size_t> insertionOffset =
         ReplacementLineStartBeforeObservation(StringRef(edit.text),
                                               *firstObservationOffset);
-    if (insertionOffset) {
-      macroStatePreservationsByEdit_[editIndex].push_back(
-          MacroStatePreservation{
-              &directive, MacroStatePreservationPlacement::InsideReplacement,
-              *insertionOffset});
-      return MacroStatePreservationPlacement::InsideReplacement;
-    }
+    if (insertionOffset &&
+        !crosses(MacroStatePreservationPlacement::InsideReplacement))
+      return queue(MacroStatePreservationPlacement::InsideReplacement,
+                   *insertionOffset);
 
     return TryAdvanceConsumedUndefBeforeObservedReplacement(
         editIndex, directive, macroName, *definitionObservedByReplacement,
@@ -2710,13 +2788,10 @@ MacroStateRepairContext::TryQueueMacroStateDirectivePreservation(
         ReplacementLineStartAfterFinalObservation(
             edit, *definitionObservedByReplacement, macroName,
             *firstObservationOffset);
-    if (insertionOffset) {
-      macroStatePreservationsByEdit_[editIndex].push_back(
-          MacroStatePreservation{
-              &directive, MacroStatePreservationPlacement::InsideReplacement,
-              *insertionOffset});
-      return MacroStatePreservationPlacement::InsideReplacement;
-    }
+    if (insertionOffset &&
+        !crosses(MacroStatePreservationPlacement::InsideReplacement))
+      return queue(MacroStatePreservationPlacement::InsideReplacement,
+                   *insertionOffset);
   }
 
   if (directive.IsUndef() && !replacementObservesDefinition &&
@@ -2725,12 +2800,10 @@ MacroStateRepairContext::TryQueueMacroStateDirectivePreservation(
         editIndex, *definitionObservedByReplacement, macroName);
   }
 
-  if (!ReplacementSuffixBoundaryAllowsDirectiveLine(edit))
+  if (!ReplacementSuffixBoundaryAllowsDirectiveLine(edit) ||
+      crosses(MacroStatePreservationPlacement::AfterReplacement))
     return std::nullopt;
-
-  macroStatePreservationsByEdit_[editIndex].push_back(MacroStatePreservation{
-      &directive, MacroStatePreservationPlacement::AfterReplacement});
-  return MacroStatePreservationPlacement::AfterReplacement;
+  return queue(MacroStatePreservationPlacement::AfterReplacement);
 }
 
 // Insert a synthetic #undef at the start of a replacement's line when the
@@ -3295,7 +3368,8 @@ bool MacroStateRepairContext::InvocationCallsiteSurvivesTUEdits(
     return false;
   if (!PathIdentity().PathsEqual(*invocation.invFile, tuPath_))
     return false;
-  return !IntervalOverlapsFinalTUEdit(*invocation.invB, *invocation.invE);
+  return !IntervalOverlapsFinalTUEdit(*invocation.invB, *invocation.invE) ||
+         FinalTUEditRespellsInterval(*invocation.invB, *invocation.invE);
 }
 
 const RefoldModel::MacroDirective *
@@ -3494,9 +3568,12 @@ void MacroStateRepairContext::RepairSurvivingDefinitionCallsites() {
 
     // If the #define cannot be safely preserved, the only structural repair is
     // to remove this call site's dependency on that macro state by emitting the
-    // B-side expansion at the call site.
+    // B-side expansion at the call site.  A callsite a widened edit re-spells
+    // is emitted verbatim by that edit, so no patch can replace it.
     std::optional<WholeCoverPlan> wholePlan =
-        MacroPatchPlanner().ComputeWholeCoverPlan(invocation);
+        FinalTUEditRespellsInterval(*invocation.invB, *invocation.invE)
+            ? std::nullopt
+            : MacroPatchPlanner().ComputeWholeCoverPlan(invocation);
     if (!wholePlan || !wholePlan->sourceEnd) {
       (void)CheckMacroStateTerminal(
           *definition, StateMutationKind::Consumed, "macro-definition-liveness",
