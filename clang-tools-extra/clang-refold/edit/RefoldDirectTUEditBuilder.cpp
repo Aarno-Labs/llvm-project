@@ -201,14 +201,6 @@ std::optional<TextEdit> RefoldDirectTUEditBuilder::Build(
       !stringutils::isWs(repl.front()))
     repl.insert(repl.begin(), ' ');
 
-  // On the left, let refoldPadAtBoundaries add a space only when no replaced
-  // TU gap already supplied whitespace; on the right, always allow padding if
-  // the replacement would otherwise glue to the following TU text.
-  std::string padded = refoldPadAtBoundaries(
-      tuBytes, static_cast<size_t>(span.first),
-      static_cast<size_t>(span.second), std::move(repl),
-      /*allowLeft*/ !replacingGap, /*allowRight*/ true, deps_.lexLang);
-
   const bool skipLocalResync =
       tuInsertionBeforeMaterializedInclude(
           deps_.tuAnchorProof, deps_.model, deps_.sidebandPragmaEdits, h,
@@ -217,13 +209,13 @@ std::optional<TextEdit> RefoldDirectTUEditBuilder::Build(
       deps_.lineControlProof.TUInsertionCanDeferResyncToConditionalJoin(
           advancedOverSourceLineControlPrefix, tuPath, span.second);
 
-  ResyncOutcome ro =
-      skipLocalResync ? ResyncOutcome(padded, std::nullopt)
-                      : deps_.lineObserverLayout.ApplyResyncOrPend(
-                            tuBytes, span.first, span.second, padded, tuPath);
+  ResyncOutcome ro = skipLocalResync
+                         ? ResyncOutcome(repl, std::nullopt)
+                         : deps_.lineObserverLayout.ApplyResyncOrPend(
+                               tuBytes, span.first, span.second, repl, tuPath);
   return deps_.textEditAssembler.BuildDirectTUHunkTextEdit(
-      h, hunkIndex, span, std::move(ro), StringRef(padded), rawTUStart,
-      rawTUEnd, materializedBByteBegin, materializedBByteEnd, acceptedPath,
+      h, hunkIndex, span, std::move(ro), StringRef(repl), rawTUStart, rawTUEnd,
+      materializedBByteBegin, materializedBByteEnd, acceptedPath,
       std::move(insertionAnchorAdjustment));
 }
 

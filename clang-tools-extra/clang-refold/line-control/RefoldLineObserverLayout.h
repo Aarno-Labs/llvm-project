@@ -20,6 +20,8 @@
 #include "model/RefoldModel.h"
 #include "model/RefoldToken.h"
 
+#include "clang/Basic/LangOptions.h"
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -60,13 +62,14 @@ public:
       const RefoldOwnerStateProof &ownerStateProof,
       const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
       const RefoldTextEditCertifier &textEditCertifier,
-      const LineDirectiveInserter &lineDirs)
+      const LineDirectiveInserter &lineDirs, const clang::LangOptions &lexLang)
       : model_(model), bSource_(bSource), aToks_(aToks), bToks_(bToks),
         bTokOff_(bTokOff), abTokMapA2B_(abTokMapA2B), abTokMapB2A_(abTokMapB2A),
         paths_(paths), lineControlProof_(lineControlProof),
         ownerStateProof_(ownerStateProof),
         acceptedCandidateBuilder_(acceptedCandidateBuilder),
-        textEditCertifier_(textEditCertifier), lineDirs_(lineDirs) {}
+        textEditCertifier_(textEditCertifier), lineDirs_(lineDirs),
+        lexLang_(lexLang) {}
 
   /// Append TU-local materialization edits for preserved source-spelled
   /// `__LINE__` observers whose B-side layout cannot be represented by legal
@@ -143,6 +146,7 @@ private:
   const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder_;
   const RefoldTextEditCertifier &textEditCertifier_;
   const LineDirectiveInserter &lineDirs_;
+  const clang::LangOptions &lexLang_;
 };
 
 } // namespace refold

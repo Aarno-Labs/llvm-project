@@ -155,75 +155,65 @@ inline bool refoldNeedsLexicalSeparator(const RefoldLexBoundaryToken &left,
   return false;
 }
 
-/// Add boundary padding spaces only when needed to preserve lexical
-/// tokenization.
+/// Return the offsets among `seams` where `text` needs one separating space
+/// to keep the tokens on the two sides of each seam apart.
 ///
-/// Adds at most one space on the left and/or right edge of `text` so that, when
-/// `text` replaces `base[start,end)`, tokens do not glue across the replacement
-/// boundary.  Existing whitespace at either edge of `text`, or immediate
-/// boundary whitespace already present in `base`, counts as already separated.
-/// Callers can also suppress either side explicitly with `allowLeft` and
-/// `allowRight`, for example when preserving an existing source gap.
-///
-/// Decisions are deterministic and local: the helper compares Clang raw-lexing
-/// with and without a single inserted boundary space and pads only when
-/// omitting the space would change tokenization.  This is lexical hygiene only;
-/// callers must already have proven that the surrounding TU/include/macro
-/// replacement is valid.
-inline std::string refoldPadAtBoundaries(llvm::StringRef base, size_t start,
-                                         size_t end, std::string text,
-                                         bool allowLeft, bool allowRight,
-                                         const LangOptions &lang) {
-  const auto f = stringutils::firstNonWsIdx(text);
-  const auto l = stringutils::lastNonWsIdx(text);
-
-  // Empty or whitespace-only replacements have no token edge that can glue to
-  // the surrounding owner text.
-  if (!f || !l)
-    return text;
-
-  // If the replacement already carries whitespace on an edge, that side is
-  // already separated.  Never add a second synthetic padding space there.
-  const bool hasLeadingWs = (*f > 0);
-  const bool hasTrailingWs = (*l + 1 < text.size());
-
-  std::optional<RefoldLexBoundaryToken> textFirstTok =
-      refoldFirstLexToken(llvm::StringRef(text), lang);
-  std::optional<RefoldLexBoundaryToken> textLastTok =
-      refoldLastLexToken(llvm::StringRef(text), lang);
-
-  const std::optional<char> leftChar =
-      (start > 0 && start <= base.size()) ? std::optional<char>(base[start - 1])
-                                          : std::nullopt;
-  const std::optional<char> rightChar =
-      (end < base.size()) ? std::optional<char>(base[end]) : std::nullopt;
-
-  bool addLeftSpace = false;
-  if (allowLeft && !hasLeadingWs && start > 0 && start <= base.size() &&
-      textFirstTok && (!leftChar || !stringutils::isWs(*leftChar))) {
-    if (std::optional<RefoldLexBoundaryToken> leftTok =
-            refoldLastLexToken(base.take_front(start), lang)) {
-      addLeftSpace = refoldNeedsLexicalSeparator(*leftTok, *textFirstTok, lang);
+/// `seams` are sorted byte offsets into `text`, each a token boundary of the
+/// pieces it joins.  Clang lexes `text` by maximal munch, so where nothing
+/// separates two pieces, spellings that combine (`p`+`t`, `+`+`+`, `/`+`*`)
+/// become one token or comment that straddles the seam.  The raw lexer, with
+/// comments retained, finds each such straddle.  A space at the seam splits
+/// it there and can change only what follows, so lexing resumes at that seam
+/// as if the space were present.
+inline llvm::SmallVector<uint64_t, 4>
+refoldSeamsNeedingSeparator(const std::string &text,
+                            llvm::ArrayRef<uint64_t> seams,
+                            const LangOptions &lang) {
+  llvm::SmallVector<uint64_t, 4> separated;
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  const char *bufStart = text.c_str();
+  size_t nextSeam = 0;
+  size_t resumeAt = 0;
+  while (nextSeam < seams.size()) {
+    Lexer lexer(baseLoc, lang, bufStart, bufStart + resumeAt,
+                bufStart + text.size());
+    lexer.SetCommentRetentionState(true);
+    Token token;
+    bool straddled = false;
+    while (!straddled && nextSeam < seams.size()) {
+      lexer.LexFromRawLexer(token);
+      if (token.is(tok::eof))
+        return separated;
+      const size_t begin = refoldTokenOffsetFromBase(token, baseLoc);
+      while (nextSeam < seams.size() && seams[nextSeam] <= begin)
+        ++nextSeam;
+      if (nextSeam < seams.size() &&
+          seams[nextSeam] < begin + token.getLength()) {
+        resumeAt = seams[nextSeam++];
+        separated.push_back(resumeAt);
+        straddled = true;
+      }
     }
   }
+  return separated;
+}
 
-  bool addRightSpace = false;
-  if (allowRight && !hasTrailingWs && end < base.size() && textLastTok &&
-      (!rightChar || !stringutils::isWs(*rightChar))) {
-    if (std::optional<RefoldLexBoundaryToken> rightTok =
-            refoldFirstLexToken(base.drop_front(end), lang)) {
-      addRightSpace =
-          refoldNeedsLexicalSeparator(*textLastTok, *rightTok, lang);
-    }
-  }
-
-  if (addLeftSpace)
-    text.insert(0, 1, ' ');
-
-  if (addRightSpace)
-    text.push_back(' ');
-
-  return text;
+/// Append `piece` to `text`, with one space between them when the last token
+/// of `text` and the first token of `piece` would otherwise lex as one.
+///
+/// For a repair that re-spells source beside an edit's text: the join is a
+/// token boundary of both sides, as `refoldSeamsNeedingSeparator` requires.
+inline void refoldAppendLexicallySeparated(std::string &text,
+                                           llvm::StringRef piece,
+                                           const LangOptions &lang) {
+  const uint64_t seam = text.size();
+  text.append(piece.data(), piece.size());
+  if (seam == 0 || seam == text.size() || stringutils::isWs(text[seam - 1]) ||
+      stringutils::isWs(text[seam]))
+    return;
+  const uint64_t seams[] = {seam};
+  if (!refoldSeamsNeedingSeparator(text, seams, lang).empty())
+    text.insert(seam, 1, ' ');
 }
 
 /// Slice the exact byte coverage of tokens [startTok,endTok).

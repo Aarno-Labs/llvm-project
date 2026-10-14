@@ -657,6 +657,14 @@ private:
   void RestageConservativeTUEdit(
       TextEdit &edit, uint64_t start, uint64_t end, StringRef replacement,
       ArrayRef<ProvenMacroStateSourceTransition> repairedTransitions = {});
+  /// Append `edit`'s text, then the source from its end to `suffixEnd`, to
+  /// `replacement`, which holds whatever the widened edit emits before the old
+  /// edit's start.  A repair widening an edit re-spells source beside its text,
+  /// so the old seams become joins inside the new text; each stays a token
+  /// boundary, as the applicator keeps every edit seam.
+  void AppendEditTextWithRespelledSuffix(std::string &replacement,
+                                         const TextEdit &edit,
+                                         uint64_t suffixEnd) const;
   /// Structural-segment key a repaired edit inherits from the direct-TU
   /// carrier its repair replaced.
   struct InheritedStructuralSegmentKey {
@@ -2337,6 +2345,13 @@ void MacroStateRepairContext::RestageConservativeTUEdit(
   PromoteToSpecializedMacroStateRepairCarrier(edit);
 }
 
+void MacroStateRepairContext::AppendEditTextWithRespelledSuffix(
+    std::string &replacement, const TextEdit &edit, uint64_t suffixEnd) const {
+  refoldAppendLexicallySeparated(replacement, edit.text, LexLang());
+  refoldAppendLexicallySeparated(
+      replacement, tuBytes_.slice(edit.end, suffixEnd), LexLang());
+}
+
 std::optional<uint64_t>
 MacroStateRepairContext::DelayedTransitionBoundaryAfterEdit(
     size_t editIndex, const RefoldModel::MacroDirective &definition,
@@ -2493,8 +2508,8 @@ void MacroStateRepairContext::
                           ReplacementText.size() + carriedSuffix.size());
       replacement += undefTransition->text;
       replacement.append(crossedPrefix.begin(), crossedPrefix.end());
-      replacement.append(ReplacementText.begin(), ReplacementText.end());
-      replacement.append(carriedSuffix.begin(), carriedSuffix.end());
+      AppendEditTextWithRespelledSuffix(replacement, edit,
+                                        undefTransition->interval.begin);
 
       const uint64_t oldStart = edit.start;
       const uint64_t oldEnd = edit.end;
@@ -2595,7 +2610,7 @@ MacroStateRepairContext::TryAdvanceConsumedUndefBeforeObservedReplacement(
                       ReplacementText.size());
   replacement += directiveText;
   replacement.append(crossedPrefix.begin(), crossedPrefix.end());
-  replacement.append(ReplacementText.begin(), ReplacementText.end());
+  AppendEditTextWithRespelledSuffix(replacement, edit, edit.end);
 
   std::optional<MacroStateSourceTransition> undefTransition =
       MacroStateSourceTransitionFor(undefDirective);
@@ -2649,8 +2664,8 @@ bool MacroStateRepairContext::TryWidenEditToDelayedMacroStateBoundary(
   if (*boundary < edit.end || *boundary > tuBytes_.size())
     return false;
 
-  std::string replacement = edit.text;
-  replacement.append(tuBytes_.begin() + edit.end, tuBytes_.begin() + *boundary);
+  std::string replacement;
+  AppendEditTextWithRespelledSuffix(replacement, edit, *boundary);
 
   const uint64_t oldEnd = edit.end;
   RestageConservativeTUEdit(edit, edit.start, *boundary, replacement);
@@ -2957,10 +2972,9 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
     std::string replacement;
     replacement += undefPrefix;
     replacement.append(sameLinePrefix.begin(), sameLinePrefix.end());
-    replacement.append(ReplacementText.begin(), ReplacementText.end());
+    AppendEditTextWithRespelledSuffix(replacement, edit,
+                                      restores ? lineBreakEnd : editEnd);
     if (restores) {
-      replacement.append(tuBytes_.begin() + editEnd,
-                         tuBytes_.begin() + lineBreakEnd);
       if (replacement.back() != '\n')
         replacement.push_back('\n');
       for (const SyntheticUndefCandidate &candidate : candidates)
@@ -3221,9 +3235,7 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
 
     replacement.append(tuBytes_.begin() + cursor,
                        tuBytes_.begin() + edit.start);
-    replacement.append(edit.text);
-    replacement.append(tuBytes_.begin() + edit.end,
-                       tuBytes_.begin() + *delayedBoundary);
+    AppendEditTextWithRespelledSuffix(replacement, edit, *delayedBoundary);
     if (!replacement.empty() && replacement.back() == '\\')
       continue;
     if (!replacement.empty() && replacement.back() != '\n')

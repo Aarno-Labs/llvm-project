@@ -703,6 +703,52 @@ void appendUniqueProtectedSourceAuthorizations(TextEdit &destination,
     appendUniqueProtectedSourceAuthorization(destination, authorization);
 }
 
+/// Return where the output of applying `edits`, a validated non-overlapping
+/// edit set of `original` in source order, needs one separating space, as
+/// offsets into that output assembled without separators or line resyncs.
+///
+/// Every realizer replaces whole source tokens with whole B tokens, and each
+/// edit's proof reasons about the tokens of its text and of the bytes around
+/// it.  An edit seam -- where its text meets copied source or another edit's
+/// text -- is therefore a token boundary of both sides, and the output must lex
+/// that way.  Only a seam between two non-white-space bytes can join tokens,
+/// so the output is lexed only when one exists.
+SmallVector<uint64_t, 4> seamsNeedingLexicalSeparator(StringRef original,
+                                                      ArrayRef<TextEdit> edits,
+                                                      const LangOptions &lang) {
+  std::string assembled;
+  assembled.reserve(original.size());
+  SmallVector<uint64_t, 32> seams;
+  uint64_t cursor = 0;
+  for (const TextEdit &edit : edits) {
+    assembled.append(original.slice(cursor, edit.start));
+    seams.push_back(assembled.size());
+    assembled.append(edit.text);
+    seams.push_back(assembled.size());
+    cursor = edit.end;
+  }
+  assembled.append(original.drop_front(cursor));
+  llvm::erase_if(seams, [&](uint64_t seam) {
+    return seam == 0 || seam >= assembled.size() ||
+           stringutils::isWs(assembled[seam - 1]) ||
+           stringutils::isWs(assembled[seam]);
+  });
+  seams.erase(std::unique(seams.begin(), seams.end()), seams.end());
+  if (seams.empty())
+    return {};
+  return refoldSeamsNeedingSeparator(assembled, seams, lang);
+}
+
+/// Emit the separating space `seams[next]` names once the output assembled
+/// without separators has reached it at `unseparatedOffset`.
+void appendSeamSeparator(SmallString<0> &out, ArrayRef<uint64_t> seams,
+                         size_t &next, uint64_t unseparatedOffset) {
+  if (next < seams.size() && seams[next] == unseparatedOffset) {
+    out.push_back(' ');
+    ++next;
+  }
+}
+
 } // namespace
 
 bool RefoldTextEditAssembler::AuditAcceptedEditProofs(
@@ -2193,6 +2239,19 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
     validatedCursor = e.end;
   }
 
+  // Keep every edit seam a token boundary of the output: where the text on
+  // the two sides of a seam would lex as one token, emit a space between them.
+  // The space lies outside every edit's text, so no edit map row covers it.
+  const SmallVector<uint64_t, 4> separatedSeams =
+      seamsNeedingLexicalSeparator(originalFileText, norm, lexLang_);
+  for (uint64_t seam : separatedSeams)
+    REFOLD_LOG_TRACE("edits/apply",
+                     "separating tokens joined across an edit seam at "
+                     "unseparated output offset {0} in {1}",
+                     seam, emissionOwner);
+  size_t nextSeparator = 0;
+  uint64_t unseparatedOffset = 0;
+
   // Assemble the final file by copying original slices between the normalized
   // edits and splicing each replacement at its staged byte range.
   SmallString<0> out;
@@ -2209,6 +2268,8 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
         out, originalFileText, cursor, e.start, std::move(pending),
         sourceMappingOwner, ownerIncludeId, lineControlPruneCandidates,
         lineControlSourceMappings);
+    unseparatedOffset += e.start - cursor;
+    appendSeamSeparator(out, separatedSeams, nextSeparator, unseparatedOffset);
 
     // Record expanded macro roots that actually made it into the emitted text.
     // Counter stabilization uses this to force later __COUNTER__-sensitive
@@ -2218,6 +2279,8 @@ std::string RefoldTextEditAssembler::ApplyTextEditsWithPendingResync(
 
     const uint64_t emittedBegin = static_cast<uint64_t>(out.size());
     out.append(e.text);
+    unseparatedOffset += e.text.size();
+    appendSeamSeparator(out, separatedSeams, nextSeparator, unseparatedOffset);
     if (lineControlPruneCandidates)
       appendShiftedLineControlPruneCandidates(*lineControlPruneCandidates,
                                               e.lineControlPruneCandidates,

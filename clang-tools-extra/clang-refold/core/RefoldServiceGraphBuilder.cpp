@@ -425,7 +425,7 @@ void RefoldEngine::BuildServiceGraph() {
       model_, bSource_, aToks_, bToks_, bTokOff_, abTokMapA2B_, abTokMapB2A_,
       pathIdentity_, lineControlProof_, *ownerStateProof_,
       proofServices_->AcceptedCandidateBuilder(), *textEditCertifier_,
-      lineDirs_);
+      lineDirs_, lexLang_);
 
   // The assembler owns final byte-application behavior.  Theorem/audit policy
   // is injected as RefoldTheoremAudit, and newline-drift resync is the

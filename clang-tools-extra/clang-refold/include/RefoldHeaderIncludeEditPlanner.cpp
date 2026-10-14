@@ -1722,10 +1722,12 @@ RefoldHeaderIncludeEditPlanner::BuildCarriedHeaderMacroStateRewrite(
 
   carriedReplacement.append(state.headerText.begin() + cursor,
                             state.headerText.begin() + *state.startByte);
-  carriedReplacement += state.replacement;
+  refoldAppendLexicallySeparated(carriedReplacement, state.replacement,
+                                 lexLang_);
   if (replacementTailEnd > *state.endByte) {
-    carriedReplacement.append(state.headerText.begin() + *state.endByte,
-                              state.headerText.begin() + replacementTailEnd);
+    refoldAppendLexicallySeparated(
+        carriedReplacement,
+        state.headerText.slice(*state.endByte, replacementTailEnd), lexLang_);
   } else if (!carriedReplacement.empty() && carriedReplacement.back() != '\n') {
     carriedReplacement.push_back('\n');
   }
@@ -1958,11 +1960,7 @@ bool RefoldHeaderIncludeEditPlanner::CommitInsertCandidate(
     const HeaderInsertionPlanningState &state,
     const SelectedInsertAnchorCandidate &selected) const {
   const InsertAnchorCandidate &candidate = selected.anchor;
-  std::string text = refoldPadAtBoundaries(
-      state.headerText, static_cast<size_t>(candidate.anchorByte),
-      static_cast<size_t>(candidate.anchorByte),
-      state.materialInsertBytes.str(), /*allowLeft=*/true, /*allowRight=*/true,
-      lexLang_);
+  std::string text = state.materialInsertBytes.str();
 
   const bool needsLocalResync =
       InsertionNeedsLocalResync(state, candidate, text);

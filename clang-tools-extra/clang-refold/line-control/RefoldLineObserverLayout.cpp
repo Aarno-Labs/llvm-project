@@ -17,6 +17,7 @@
 #include "model/RefoldPathIdentity.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldOwnerStateProof.h"
+#include "source/TokenTextHelpers.h"
 #include "support/StringUtils.h"
 
 #include "llvm/Support/FormatVariadic.h"
@@ -699,7 +700,8 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
     // moved onto the same B line; expanding them to their PP token spelling
     // would validate, but would be a less faithful refolding.
     std::string replacement = bSource_.slice(prevBEnd, initialBEnd).str();
-    replacement += ownLineClosure.sourceSpelledExtension;
+    refoldAppendLexicallySeparated(
+        replacement, ownLineClosure.sourceSpelledExtension, lexLang_);
     if (replacement.empty())
       continue;
 
@@ -828,7 +830,8 @@ bool RefoldLineObserverLayout::AppendTURealizationEdits(
       continue;
     replacement += lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
     replacement += tuBytes.slice(observerLineBegin, observerConstructEnd);
-    replacement += closure->sourceSpelledExtension;
+    refoldAppendLexicallySeparated(replacement, closure->sourceSpelledExtension,
+                                   lexLang_);
 
     TextEdit edit{editBegin,    editEnd, replacement, std::nullopt,
                   std::nullopt, {},      {},          {}};
@@ -957,7 +960,8 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
     // spelling.  This lets an adjacent macro call stay source-spelled while
     // still closing the full B physical line around the observer.
     std::string replacement = bSource_.slice(prevBEnd, initialBEnd).str();
-    replacement += ownLineClosure.sourceSpelledExtension;
+    refoldAppendLexicallySeparated(
+        replacement, ownLineClosure.sourceSpelledExtension, lexLang_);
 
     IncludePatch patch{include,     std::move(replacement),
                        patchAStart, patchAEnd,
@@ -1085,7 +1089,8 @@ bool RefoldLineObserverLayout::AppendIncludeRealizationEdits(
     replacement += lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
     replacement +=
         headerBytes.slice(observerLineBegin, observerConstructEnd).str();
-    replacement += closure->sourceSpelledExtension;
+    refoldAppendLexicallySeparated(replacement, closure->sourceSpelledExtension,
+                                   lexLang_);
 
     const uint64_t patchAStart = collapsedGap->rightATok;
     const uint64_t patchAEnd = closure->lastATok + 1;

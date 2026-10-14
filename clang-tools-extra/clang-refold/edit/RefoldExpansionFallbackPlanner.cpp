@@ -3833,10 +3833,6 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
   // expands after all of it, where no producer record describes it.
   bool relocatesSource = replacement != rawReplacement;
   uint64_t closureSourceEnd = sourceEnd;
-  std::string padded = refoldPadAtBoundaries(
-      tuBytes, static_cast<size_t>(sourceBegin),
-      static_cast<size_t>(closureSourceEnd), std::move(replacement),
-      /*allowLeft=*/true, /*allowRight=*/true, lexLang_);
 
   const bool emitsSourceLineDirectiveResume = lineDirs_.Enabled() &&
                                               mixedSourceLineDirectiveResume &&
@@ -3855,7 +3851,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
     bool keepsSourceSpelling = mixedSourceLineDirectiveRespelling.has_value();
     relocatesSource |= keepsSourceSpelling;
     if (keepsSourceSpelling &&
-        textMayChangePreprocessorState(padded, lexLang_)) {
+        textMayChangePreprocessorState(replacement, lexLang_)) {
       keepsSourceSpelling = false;
       REFOLD_LOG_TRACE("fallback",
                        "TU/include closure re-expressing source #line gap=[{0},"
@@ -3864,11 +3860,11 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
                        mixedSourceLineDirectiveRespelling->gapBegin,
                        mixedSourceLineDirectiveRespelling->gapEnd);
     }
-    if (padded.empty()) {
+    if (replacement.empty()) {
       if (!lineDirectiveStartsAtPrefix(tuBytes, sourceBegin))
-        padded.push_back('\n');
-    } else if (padded.back() != '\n') {
-      padded.push_back('\n');
+        replacement.push_back('\n');
+    } else if (replacement.back() != '\n') {
+      replacement.push_back('\n');
     }
 
     if (keepsSourceSpelling) {
@@ -3882,8 +3878,9 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
         gapText = gapText.drop_front(2);
       else if (gapText.starts_with("\n") || gapText.starts_with("\r"))
         gapText = gapText.drop_front(1);
-      padded.append(gapText.begin(), gapText.end());
-      padded.append(mixedSourceLineDirectiveRespelling->trailingNewlines, '\n');
+      replacement.append(gapText.begin(), gapText.end());
+      replacement.append(mixedSourceLineDirectiveRespelling->trailingNewlines,
+                         '\n');
       REFOLD_LOG_TRACE(
           "fallback",
           "TU/include closure kept source #line spelling gap=[{0},{1}) "
@@ -3892,7 +3889,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
           mixedSourceLineDirectiveRespelling->gapEnd,
           mixedSourceLineDirectiveRespelling->trailingNewlines);
     } else {
-      padded +=
+      replacement +=
           formatSourceLineDirectiveGapResume(*mixedSourceLineDirectiveResume);
       REFOLD_LOG_TRACE(
           "fallback",
@@ -3911,7 +3908,7 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
   // line(s) by absorbing those exact source bytes into the same TU edit.
   const size_t origNl =
       stringutils::countNewlines(tuBytes, sourceBegin, closureSourceEnd);
-  const size_t initialReplNl = stringutils::countNewlines(padded);
+  const size_t initialReplNl = stringutils::countNewlines(replacement);
   if (!emitsSourceLineDirectiveResume && origNl > initialReplNl) {
     size_t remainingPadNl = origNl - initialReplNl;
 
@@ -3961,23 +3958,24 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
 
           // The sink may start in the middle of a physical source line, for
           // example after the TU/include closure consumed the leading token of
-          // `int between = 0;`.  In that case `padded` already contains the
-          // B-side spelling and any B-side separator after that token, while
-          // `line` begins with the original source separator before the next
-          // token.  Keeping both separators manufactures visible whitespace
-          // such as `int  between`.  Collapse exactly one copied horizontal
-          // source byte only when the sink is a same-line continuation and the
-          // replacement already ends in horizontal whitespace.  Remaining
-          // source whitespace, if any, is preserved byte-for-byte.
+          // `int between = 0;`.  In that case `replacement` already contains
+          // the B-side spelling and any B-side separator after that token,
+          // while `line` begins with the original source separator before the
+          // next token.  Keeping both separators manufactures visible
+          // whitespace such as `int  between`.  Collapse exactly one copied
+          // horizontal source byte only when the sink is a same-line
+          // continuation and the replacement already ends in horizontal
+          // whitespace.  Remaining source whitespace, if any, is preserved
+          // byte-for-byte.
           if (lineBegin > 0 && tuBytes[lineBegin - 1] != '\n' &&
-              tuBytes[lineBegin - 1] != '\r' && !padded.empty() &&
-              stringutils::isNonNewlineWs(padded.back()) &&
+              tuBytes[lineBegin - 1] != '\r' && !replacement.empty() &&
+              stringutils::isNonNewlineWs(replacement.back()) &&
               !copiedLine.empty() &&
               stringutils::isNonNewlineWs(copiedLine.front())) {
             copiedLine = copiedLine.drop_front();
           }
 
-          padded.append(copiedLine.begin(), copiedLine.end());
+          refoldAppendLexicallySeparated(replacement, copiedLine, lexLang_);
           closureSourceEnd = lineEnd;
 
           // Re-emitting one untouched trailing line verbatim moves the eventual
@@ -4027,14 +4025,14 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
     }
 
     if (remainingPadNl > 0)
-      padded.append(remainingPadNl, '\n');
+      replacement.append(remainingPadNl, '\n');
 
     REFOLD_LOG_TRACE(
         "fallback",
         "TU include-closure newline pad: source=[{0},{1}) origNl={2} "
         "replNl={3} physicalPadNl={4} finalSourceEnd={5} result='{6}'",
         sourceBegin, sourceEnd, origNl, initialReplNl, remainingPadNl,
-        closureSourceEnd, stringutils::showWsWithClip(padded, 120));
+        closureSourceEnd, stringutils::showWsWithClip(replacement, 120));
   }
 
   // The reactivation repair owns the closure end while it widens, and returns
@@ -4051,17 +4049,17 @@ RefoldExpansionFallbackPlanner::BuildTUIncludeClosureEdit(
   REFOLD_LOG_DEBUG(
       "fallback",
       "TU include-closure accepted: includes=[{0},{1}] source=[{2},{3}) "
-      "A=[{4},{5}) B=[{6},{7}) evidence={8} raw='{9}' padded='{10}'",
+      "A=[{4},{5}) B=[{6},{7}) evidence={8} raw='{9}' replacement='{10}'",
       first->id, last->id, sourceBegin, closureSourceEnd, materialBeginA,
       materialEndA, bEnvelope->first, bEnvelope->second, evidenceKind,
       stringutils::showWsWithClip(rawReplacement, 120),
-      stringutils::showWsWithClip(padded, 120));
+      stringutils::showWsWithClip(replacement, 120));
 
   ResyncOutcome ro = emitsSourceLineDirectiveResume
-                         ? ResyncOutcome(padded, std::nullopt)
+                         ? ResyncOutcome(replacement, std::nullopt)
                          : lineObserverLayout_.ApplyResyncOrPend(
-                               tuBytes, sourceBegin, closureSourceEnd, padded,
-                               tuPath, std::nullopt);
+                               tuBytes, sourceBegin, closureSourceEnd,
+                               replacement, tuPath, std::nullopt);
   TextEdit edit{sourceBegin,
                 closureSourceEnd,
                 std::move(ro.text),
