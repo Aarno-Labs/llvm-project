@@ -228,7 +228,8 @@ public:
   /// carrier's path.  With a `None` rest, every byte of the edit's own range
   /// outside `[sourceOffset, sourceEnd)`, and every interval of
   /// \p respelledInside, is source the replacement re-spells verbatim at its
-  /// own position.  Empty token ranges are dropped.
+  /// own position.  An empty token range is kept: it is where text with no B
+  /// token of its own joins the B tokens beside it.
   void CertifyTextEditBPayload(
       TextEdit &edit, BPayloadTokenCertificate certificate,
       uint64_t sourceOffset, uint64_t sourceEnd,

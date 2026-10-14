@@ -255,7 +255,9 @@ enum class BPayloadRest : uint8_t {
 /// an identifier.  The certificate is set only where it is established, and
 /// absence is missing evidence.
 struct BPayloadTokenCertificate {
-  /// Half-open B-token ranges, ascending and disjoint.
+  /// Half-open B-token ranges, ascending and disjoint.  An empty range marks
+  /// a seam: text with no B token of its own, such as a deletion, joins the B
+  /// tokens on either side of it.
   std::vector<std::pair<uint64_t, uint64_t>> bTokenRanges;
   BPayloadRest rest = BPayloadRest::Unproven;
 };

@@ -1277,8 +1277,6 @@ void RefoldTextEditCertifier::CertifyTextEditBPayload(
     TextEdit &edit, BPayloadTokenCertificate certificate, uint64_t sourceOffset,
     uint64_t sourceEnd,
     std::vector<std::pair<uint64_t, uint64_t>> respelledInside) const {
-  llvm::erase_if(certificate.bTokenRanges,
-                 [](const auto &range) { return range.first == range.second; });
   if (!rangesAscendWithin(certificate.bTokenRanges, 0, bToks_.size()) ||
       sourceOffset < edit.start || sourceEnd < sourceOffset ||
       edit.end < sourceEnd ||

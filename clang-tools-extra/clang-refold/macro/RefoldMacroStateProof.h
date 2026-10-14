@@ -164,9 +164,10 @@ public:
                         const RefoldPathIdentity &paths,
                         const RefoldTokenTextAnalysis &tokenText,
                         const RefoldOwnerStateProof &ownerStateProof,
+                        llvm::ArrayRef<PPTok> aToks,
                         llvm::ArrayRef<PPTok> bToks)
       : model_(model), paths_(paths), tokenText_(tokenText),
-        ownerStateProof_(ownerStateProof), bToks_(bToks) {}
+        ownerStateProof_(ownerStateProof), aToks_(aToks), bToks_(bToks) {}
 
   /// Returns whether the B tokens \p payload certifies read \p definition of
   /// \p macroName: an object-like name anywhere among them, a function-like
@@ -186,8 +187,51 @@ public:
   /// Returns whether a range of \p payload begins with `(` right after a B
   /// token spelling \p macroName: a call the payload opens, which its own
   /// text cannot show.
+  ///
+  /// The range may be empty.  A replacement with no B token of its own, such
+  /// as a deletion, joins the B tokens on either side of it, and the `(` after
+  /// that seam is then preserved text the replacement newly places after the
+  /// name.
   bool CertifiedPayloadOpensCallOf(const BPayloadTokenCertificate &payload,
                                    llvm::StringRef macroName) const;
+  /// Returns the name of a recorded `#define` that \p text spells and that
+  /// would not survive its own expansion, or nullopt when there is none.  A
+  /// definition in \p carriedPastText is exempt when it is its name's only
+  /// recorded definition, since nothing then binds the name there.
+  ///
+  /// This is the header path's read of B text it places in a materialized
+  /// header body, where no translation-unit certificate speaks for it.  It is
+  /// deliberately blind to where the text lands: a name defined later,
+  /// undefined earlier, or function-like with no following `(` is still
+  /// reported.  Over-reporting costs completeness only.
+  std::optional<llvm::StringRef> RecordedMacroNamedInHeaderBText(
+      llvm::StringRef text,
+      llvm::ArrayRef<const RefoldModel::MacroDirective *> carriedPastText = {})
+      const;
+  /// Returns the name a seam at token index \p seam of \p toks joins to `(`,
+  /// when some recorded `#define` of that name is function-like.
+  ///
+  /// B is fully expanded, so wherever B shows such a name followed by `(` the
+  /// name is an identifier.  Where the original source had something between
+  /// the two -- a token, a directive line, or the end of a file -- a seam the
+  /// refold makes there joins them, and the preprocessor would apply a live
+  /// definition to that `(` on the refold's side only.  Like
+  /// `RecordedMacroNamedInHeaderBText`, this is blind to where the definition
+  /// is bound, for the header path to refuse what it cannot repair.
+  std::optional<llvm::StringRef>
+  RecordedFunctionLikeMacroCalledAt(llvm::ArrayRef<PPTok> toks,
+                                    uint64_t seam) const;
+  /// Returns whether moving the line of \p directive elsewhere could join a
+  /// recorded function-like macro's name to `(`.
+  ///
+  /// A directive line yields no A token, so A shows the tokens of its file
+  /// and inclusion on either side of it adjacent, and the line alone may be
+  /// what kept a name before it from taking a `(` after it.  A repair that
+  /// carries or advances the line leaves those tokens to meet
+  /// (`RecordedFunctionLikeMacroCalledAt` over A).  An inclusion the model
+  /// does not record leaves the tokens unknown, which counts as joining.
+  bool MovingDirectiveLineCouldOpenCall(
+      const RefoldModel::MacroDirective &directive) const;
   /// Returns the definition of \p macroName bound when Clang began expanding
   /// invocation \p invocationId, nullptr when none was, or nullopt when a
   /// `#pragma pop_macro` before it leaves that unknown.
@@ -311,26 +355,6 @@ public:
                                          llvm::StringRef macroName,
                                          uint64_t begin, uint64_t end) const;
 
-  /// True iff \p definition is the macro-state directive that is live for
-  /// \p macroName immediately before \p offset, and is a `#define`.
-  ///
-  /// This is the carry proof's admission rule, shared by header include edits,
-  /// materialized-header patch stabilization, and replay stability: carrying or
-  /// re-emitting a *shadowed* definition would synthesize a macro state that
-  /// never existed at that point, so only the live one is admissible.  A later
-  /// `#undef` for the same name therefore also rejects, because it wins the
-  /// selection below and is not a `#define`.
-  ///
-  /// Liveness is decided over the same owner-restricted intervals
-  /// recoverMacroStateDirectiveLineInterval admits: candidates ending after
-  /// \p offset, naming another macro, or lacking a recoverable interval do not
-  /// participate.  The last directive to end wins, with the greater directive
-  /// id as a deterministic tie-breaker for equal endpoints.
-  bool DefinitionIsLiveAtOwnerByte(
-      const RefoldModel::MacroDirective &definition, llvm::StringRef macroName,
-      llvm::StringRef expectedPath, llvm::StringRef fileBytes,
-      std::optional<uint64_t> requiredOwnerIncludeId, uint64_t offset) const;
-
   /// Stabilize an include-owned macro patch against the macro state at its
   /// final replay position.
   ///
@@ -357,6 +381,7 @@ private:
   const RefoldPathIdentity &paths_;
   const RefoldTokenTextAnalysis &tokenText_;
   const RefoldOwnerStateProof &ownerStateProof_;
+  llvm::ArrayRef<PPTok> aToks_;
   llvm::ArrayRef<PPTok> bToks_;
 };
 

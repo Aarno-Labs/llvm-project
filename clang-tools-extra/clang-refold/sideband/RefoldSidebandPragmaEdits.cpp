@@ -23,6 +23,7 @@
 #include "proof/RefoldTerminalProofSink.h"
 #include "source/DiffAlgorithms.h"
 #include "source/RefoldPreprocessingDirectiveScanner.h"
+#include "source/RefoldSourceMapper.h"
 #include "source/RefoldStructuralHunkDispatcher.h"
 #include "support/RefoldLog.h"
 #include "support/StringUtils.h"
@@ -2502,6 +2503,7 @@ bool appendSidebandPragmaSourceEdits(
     llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     const RefoldModel &model, llvm::StringRef tuPath, llvm::StringRef tuBytes,
     const RefoldPathIdentity &pathIdentity,
+    const RefoldSourceMapper &sourceMapper,
     const RefoldTextEditCertifier &textEditCertifier,
     const RefoldLineObserverLayout &lineObserverLayout,
     const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
@@ -2679,10 +2681,18 @@ bool appendSidebandPragmaSourceEdits(
     // A pragma line is not an ordinary B token, so no form spells one.  A
     // replay, an operator fold or a deletion replaces the whole site with B's
     // pragma; the argument fold re-spells the invocation around B's pragma
-    // text, whose expansion no producer record describes.
+    // text, whose expansion no producer record describes.  A deletion also
+    // removes the line or operator that stood between the B tokens on either
+    // side of the site, so it joins them at the B token after the site.
+    BPayloadTokenCertificate certificate{
+        {}, argFold ? BPayloadRest::Unproven : BPayloadRest::None};
+    if (deletesSite) {
+      const uint64_t seam =
+          sourceMapper.BTokIndexCeil(sideband.MaterializedBByteRange().first);
+      certificate.bTokenRanges.emplace_back(seam, seam);
+    }
     textEditCertifier.CertifyTextEditBPayload(
-        edit, {{}, argFold ? BPayloadRest::Unproven : BPayloadRest::None},
-        sourceRange.first, sourceRange.second);
+        edit, std::move(certificate), sourceRange.first, sourceRange.second);
     textEditCertifier.AttachAcceptedResultCarrier(
         edit,
         acceptedCandidateBuilder.BuildAcceptedSpecializedTUTextEditCandidate(

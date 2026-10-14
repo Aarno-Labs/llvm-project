@@ -2494,7 +2494,8 @@ void MacroStateRepairContext::
               *previousDefinition, undefRef.name, edit.end,
               undefTransition->interval.begin,
               tuBytes_.drop_front(undefTransition->interval.begin),
-              CrossedBindingChange::Unbound))
+              CrossedBindingChange::Unbound) ||
+          MacroStateProof().MovingDirectiveLineCouldOpenCall(undefDirective))
         continue;
 
       if (undefTransition->text.empty()) {
@@ -2928,11 +2929,13 @@ void MacroStateRepairContext::SynthesizeUndefBeforeObservedGapDefinitions() {
 
       // Prefer carrying the definition past the replacement when the crossed
       // pre-edit region is neutral: that proof adds no synthetic transition.
-      // A definition with no movable surface cannot be carried.
+      // A definition with no movable surface cannot be carried, nor one whose
+      // line keeps a call from forming where it stands.
       if (transition &&
           !PreservedSourceObservesBindingChange(
               definitionLocal, ref.name, transition->interval.end, edit.start,
-              ReplacementText, CrossedBindingChange::Unbound))
+              ReplacementText, CrossedBindingChange::Unbound) &&
+          !MacroStateProof().MovingDirectiveLineCouldOpenCall(definitionLocal))
         continue;
 
       std::string restoreText;
@@ -3163,6 +3166,8 @@ void MacroStateRepairContext::CarryObservedGapDefinitionsAfterReplacements() {
                tuBytes_.drop_front(edit.end)) ||
            ReplacementRestObservesBindingChange(edit, directiveLocal, ref.name,
                                                 CrossedBindingChange::Unbound)))
+        continue;
+      if (MacroStateProof().MovingDirectiveLineCouldOpenCall(directiveLocal))
         continue;
 
       candidates.push_back(MacroStateGapCarryCandidate{

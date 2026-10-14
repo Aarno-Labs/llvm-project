@@ -221,6 +221,20 @@ private:
                                    llvm::StringRef headerPath,
                                    llvm::StringRef headerLoadPath) const;
 
+  /// Returns why \p child, realized from B, cannot be spliced into the source
+  /// body of its parent, or nullopt when it can or was not realized from B.
+  ///
+  /// The body is header source, which no translation-unit certificate reads,
+  /// so B text in it gets the header path's reads: every recorded macro name
+  /// it spells (`RefoldMacroStateProof::RecordedMacroNamedInHeaderBText`) and
+  /// a call its first seam opens
+  /// (`RefoldMacroStateProof::RecordedFunctionLikeMacroCalledAt`).  The caller
+  /// then realizes the parent from B as well.
+  std::optional<std::string> RealizedChildReadsRecordedMacro(
+      const RefoldModel::IncludeItem &child,
+      const llvm::DenseMap<uint64_t, AcceptedResultCandidate>
+          &includeExpansionAcceptedResults) const;
+
   /// Returns the producer-B realization reason for an unsafe copied header, if
   /// any.  The policy rejects source-spelled relocation when builtins or
   /// conditional control would observe a different replay context.

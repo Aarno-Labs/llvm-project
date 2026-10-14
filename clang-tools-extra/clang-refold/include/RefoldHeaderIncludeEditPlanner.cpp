@@ -1596,13 +1596,6 @@ void RefoldHeaderIncludeEditPlanner::CollectHeaderMacroStateCarryCandidates(
     if (HeaderRangeOverlapsStagedEdit(state.plan.edits, piece->begin,
                                       piece->end))
       continue;
-    // The carry proof applies only to the definition that is live at the
-    // replacement start.  Re-emitting a shadowed definition after the B
-    // payload would synthesize a macro state that never existed here.
-    if (!macroStateProof_.DefinitionIsLiveAtOwnerByte(
-            directive, piece->name, state.file, state.headerText,
-            std::optional<uint64_t>(state.include.id), *state.startByte))
-      continue;
     if (!macroStateProof_.ReplacementObservesMacroStateDirective(
             directive, StringRef(state.replacement),
             /*unparseableObserves=*/false))
@@ -1611,14 +1604,17 @@ void RefoldHeaderIncludeEditPlanner::CollectHeaderMacroStateCarryCandidates(
     // Header materialization has the same placement-sensitive macro-state
     // invariant as TU gap carry. We may carry a definition after the
     // replacement only when the crossed original bytes do not themselves
-    // observe it, by spelling it or otherwise.
+    // observe it, by spelling it or otherwise.  A directive line there
+    // observes, so this is also what makes the carried definition the one
+    // live at the replacement: no other transition of the name lies between.
     if (macroStateProof_.SourceChunkObservesMacroStateDirectiveWhenCrossed(
             directive, piece->name,
             state.headerText.slice(piece->end, *state.startByte),
             state.headerText.slice(*state.startByte, *state.endByte)) ||
         macroStateProof_.InstanceRangeRecordsUndefObserver(
             state.file, state.include.id, piece->name, piece->end,
-            *state.startByte))
+            *state.startByte) ||
+        macroStateProof_.MovingDirectiveLineCouldOpenCall(directive))
       continue;
 
     out.push_back(HeaderMacroStateCarryCandidate{&directive, piece->begin,
@@ -2389,37 +2385,26 @@ RefoldHeaderIncludeEditPlanner::PlaceAmongPrintedPragmas(
   return placement;
 }
 
-std::optional<StringRef>
-RefoldHeaderIncludeEditPlanner::RecordedMacroNamedByHeaderPayload(
-    StringRef payload,
-    ArrayRef<HeaderMacroStateCarryCandidate> carriedPastPayload) const {
-  SmallVector<StringRef, 16> identifiers;
-  macroStateProof_.TokenText().CollectRawIdentifiersInText(payload,
-                                                           identifiers);
-  const DenseSet<StringRef> spelled(identifiers.begin(), identifiers.end());
-  for (const RefoldModel::MacroDirective &directive :
-       model_.GetMacroDirectives()) {
-    if (!directive.IsDefine() || directive.name.empty() ||
-        !spelled.contains(directive.name))
-      continue;
-    if (macroStateProof_.SelfReferentialDefinitionIsUnobservableInText(
-            directive, directive.name, payload))
-      continue;
-    // A carried definition no longer precedes the payload.  That leaves the
-    // name unbound there only when it is the name's sole definition.
-    if (llvm::any_of(carriedPastPayload,
-                     [&](const HeaderMacroStateCarryCandidate &carried) {
-                       return carried.directive == &directive;
-                     }) &&
-        llvm::count_if(model_.GetMacroDirectives(),
-                       [&](const RefoldModel::MacroDirective &other) {
-                         return other.IsDefine() &&
-                                other.name == directive.name;
-                       }) == 1)
-      continue;
-    return StringRef(directive.name);
+bool RefoldHeaderIncludeEditPlanner::HeaderEditReadsRecordedMacro(
+    IncludeTextEditPlan &plan, StringRef file, std::optional<uint64_t> bSeam,
+    StringRef bText,
+    ArrayRef<const RefoldModel::MacroDirective *> carriedPastText) const {
+  StringRef read = "names";
+  std::optional<StringRef> name =
+      macroStateProof_.RecordedMacroNamedInHeaderBText(bText, carriedPastText);
+  if (!name && bSeam) {
+    read = "opens a call of";
+    name = macroStateProof_.RecordedFunctionLikeMacroCalledAt(bToks_, *bSeam);
   }
-  return std::nullopt;
+  if (!name)
+    return false;
+  plan.requiresIncludeRealization = true;
+  plan.realizationReason =
+      llvm::formatv("a header edit's B text in {0} {1} macro '{2}', which the "
+                    "header path cannot prove unbound where it lands",
+                    file, read, *name)
+          .str();
+  return true;
 }
 
 bool RefoldHeaderIncludeEditPlanner::PlanPureInsertionPatch(
@@ -2428,16 +2413,9 @@ bool RefoldHeaderIncludeEditPlanner::PlanPureInsertionPatch(
   // refold must keep one.  No stage audits a header edit for that, and the
   // definitions live at a header byte include the TU's as well as the
   // header's own, so refuse any payload naming a recorded definition.
-  if (std::optional<StringRef> name =
-          RecordedMacroNamedByHeaderPayload(state.materialInsertBytes)) {
-    state.plan.requiresIncludeRealization = true;
-    state.plan.realizationReason =
-        llvm::formatv("INSERT: B payload in {0} names macro '{1}', which a "
-                      "header edit cannot prove unbound where it lands",
-                      state.file, *name)
-            .str();
+  if (HeaderEditReadsRecordedMacro(state.plan, state.file, std::nullopt,
+                                   state.materialInsertBytes))
     return false;
-  }
 
   // A surviving pragma line of this header at the insertion's gap fixes which
   // side of it the payload goes on, and no other anchor knows that.  When the
@@ -2613,19 +2591,14 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
                     {},
                     {},
                     {}};
-      if (p.directHeaderByteAuthority ==
-              DirectHeaderByteEditAuthorityKind::None &&
-          !isDelete)
-        if (std::optional<StringRef> name =
-                RecordedMacroNamedByHeaderPayload(p.insertBytes)) {
-          plan.requiresIncludeRealization = true;
-          plan.realizationReason =
-              llvm::formatv("direct B payload in {0} names macro '{1}', which "
-                            "a header edit cannot prove unbound where it lands",
-                            file, *name)
-                  .str();
-          return plan;
-        }
+      if (HeaderEditReadsRecordedMacro(
+              plan, file, p.bStart,
+              p.directHeaderByteAuthority ==
+                          DirectHeaderByteEditAuthorityKind::None &&
+                      !isDelete
+                  ? StringRef(p.insertBytes)
+                  : StringRef()))
+        return plan;
 
       bool sourceAuthorityAccepted = false;
       switch (p.directHeaderByteAuthority) {
@@ -2765,6 +2738,11 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
         }
       }
     }
+
+    // Every kind joins the B text before its B range to what that range
+    // begins with; the text itself is read once the kind has built it.
+    if (HeaderEditReadsRecordedMacro(plan, file, materialBStart, StringRef()))
+      return plan;
 
     if (isInsert) {
       // INSERT: interpret the normalized A-position as "before the next token"
@@ -2919,17 +2897,14 @@ RefoldHeaderIncludeEditPlanner::Compute(const IncludeEdits &ie,
     // The replace counterpart of the insertion obligation in
     // `PlanPureInsertionPatch`: every name the B payload spells must be unbound
     // where it lands.
-    if (!isDelete)
-      if (std::optional<StringRef> name = RecordedMacroNamedByHeaderPayload(
-              replacement, carriedHeaderMacroStateTransitions)) {
-        plan.requiresIncludeRealization = true;
-        plan.realizationReason =
-            llvm::formatv("B payload in {0} names macro '{1}', which a header "
-                          "edit cannot prove unbound where it lands",
-                          file, *name)
-                .str();
-        return plan;
-      }
+    SmallVector<const RefoldModel::MacroDirective *, 4> carriedDefinitions;
+    for (const HeaderMacroStateCarryCandidate &carried :
+         carriedHeaderMacroStateTransitions)
+      carriedDefinitions.push_back(carried.directive);
+    if (!isDelete &&
+        HeaderEditReadsRecordedMacro(plan, file, std::nullopt, replacement,
+                                     carriedDefinitions))
+      return plan;
 
     if (!headerGapPreservations.empty()) {
       // Emit preserved gap pieces after the B-derived payload. That keeps

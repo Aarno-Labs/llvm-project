@@ -688,19 +688,6 @@ private:
   std::optional<HeaderPrintedPragmaPlacement>
   PlaceAmongPrintedPragmas(const HeaderInsertionPlanningState &state) const;
 
-  /// Return the name of a recorded `#define` that \p payload spells and that
-  /// would not survive its own expansion, or std::nullopt when there is none.
-  /// A definition in \p carriedPastPayload is exempt when it is its name's
-  /// only recorded definition, since nothing then binds the name there.
-  ///
-  /// This is deliberately blind to where the payload lands: a name defined
-  /// later, undefined earlier, or function-like with no following `(` is still
-  /// reported.  Over-reporting costs completeness only.
-  std::optional<llvm::StringRef> RecordedMacroNamedByHeaderPayload(
-      llvm::StringRef payload,
-      llvm::ArrayRef<HeaderMacroStateCarryCandidate> carriedPastPayload = {})
-      const;
-
   std::optional<SelectedInsertAnchorCandidate>
   SelectBestInsertCandidate(llvm::ArrayRef<InsertAnchorCandidate> candidates,
                             const IncludePatch &patch) const;
@@ -776,6 +763,20 @@ private:
   bool AppendSecondaryInsertionAnchors(
       const HeaderInsertionPlanningState &state,
       llvm::SmallVectorImpl<InsertAnchorCandidate> &candidates) const;
+
+  /// Marks \p plan for include realization and returns true when a header
+  /// edit's B text would not survive where it lands: \p bText spells a
+  /// recorded macro (`RefoldMacroStateProof::RecordedMacroNamedInHeaderBText`,
+  /// with \p carriedPastText exempt as there), or the edit's B range, begun
+  /// at B token \p bSeam, joins a recorded function-like macro's name to `(`
+  /// (`RefoldMacroStateProof::RecordedFunctionLikeMacroCalledAt`).  No later
+  /// stage audits B text in a materialized header body, so these reads are
+  /// the header path's to make, and refusing realizes the include from B.
+  bool HeaderEditReadsRecordedMacro(
+      IncludeTextEditPlan &plan, llvm::StringRef file,
+      std::optional<uint64_t> bSeam, llvm::StringRef bText,
+      llvm::ArrayRef<const RefoldModel::MacroDirective *> carriedPastText = {})
+      const;
 
   /// Plans and commits a pure include-local insertion if any anchor wins.
   /// On failure, the plan is marked for explicit include realization.

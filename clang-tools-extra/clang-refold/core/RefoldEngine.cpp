@@ -830,7 +830,7 @@ bool RefoldEngine::StageSidebandEdits(
   // sideband replay bytes from ordinary hunk replacements.
   return appendSidebandPragmaSourceEdits(
       sidebandPragmaEdits_, model_, tuPath, tuBytes, pathIdentity_,
-      *textEditCertifier_, *lineObserverLayout_,
+      sourceMapper_, *textEditCertifier_, *lineObserverLayout_,
       proofServices_->AcceptedCandidateBuilder(), terminalSink_, lexLang_,
       structuralHunkDispatcher);
 }

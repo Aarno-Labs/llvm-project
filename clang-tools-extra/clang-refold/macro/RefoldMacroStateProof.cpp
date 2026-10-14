@@ -20,6 +20,7 @@
 #include "support/RefoldLog.h"
 #include "support/StringUtils.h"
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -329,15 +330,86 @@ bool RefoldMacroStateProof::CertifiedPayloadReadsDefinition(
   return false;
 }
 
+/// Return the identifier \p toks places right before \p seam when the token at
+/// \p seam is `(`: the name a seam there joins to that parenthesis.
+static std::optional<StringRef> nameJoinedToParenAt(ArrayRef<PPTok> toks,
+                                                    uint64_t seam) {
+  if (seam == 0 || seam >= toks.size() ||
+      toks[seam - 1].kind != "raw_identifier" || toks[seam].spelling != "(")
+    return std::nullopt;
+  return StringRef(toks[seam - 1].spelling);
+}
+
 bool RefoldMacroStateProof::CertifiedPayloadOpensCallOf(
     const BPayloadTokenCertificate &payload, StringRef macroName) const {
   return llvm::any_of(payload.bTokenRanges, [&](const auto &range) {
-    return range.first > 0 && range.first < range.second &&
-           range.first < bToks_.size() &&
-           bToks_[range.first - 1].kind == "raw_identifier" &&
-           bToks_[range.first - 1].spelling == macroName &&
-           bToks_[range.first].spelling == "(";
+    return nameJoinedToParenAt(bToks_, range.first) == macroName;
   });
+}
+
+std::optional<StringRef> RefoldMacroStateProof::RecordedMacroNamedInHeaderBText(
+    StringRef text,
+    ArrayRef<const RefoldModel::MacroDirective *> carriedPastText) const {
+  SmallVector<StringRef, 16> identifiers;
+  tokenText_.CollectRawIdentifiersInText(text, identifiers);
+  const DenseSet<StringRef> spelled(identifiers.begin(), identifiers.end());
+  for (const RefoldModel::MacroDirective &directive :
+       model_.GetMacroDirectives()) {
+    if (!directive.IsDefine() || directive.name.empty() ||
+        !spelled.contains(directive.name))
+      continue;
+    if (SelfReferentialDefinitionIsUnobservableInText(directive, directive.name,
+                                                      text))
+      continue;
+    // A carried definition no longer precedes the text.  That leaves the name
+    // unbound there only when it is the name's sole definition.
+    if (llvm::is_contained(carriedPastText, &directive) &&
+        llvm::count_if(model_.GetMacroDirectives(),
+                       [&](const RefoldModel::MacroDirective &other) {
+                         return other.IsDefine() &&
+                                other.name == directive.name;
+                       }) == 1)
+      continue;
+    return StringRef(directive.name);
+  }
+  return std::nullopt;
+}
+
+std::optional<StringRef>
+RefoldMacroStateProof::RecordedFunctionLikeMacroCalledAt(ArrayRef<PPTok> toks,
+                                                         uint64_t seam) const {
+  std::optional<StringRef> name = nameJoinedToParenAt(toks, seam);
+  if (!name || llvm::none_of(model_.GetMacroDirectivesByName(*name),
+                             [](const RefoldModel::MacroDirective *directive) {
+                               return directive->IsFunctionLikeDefine();
+                             }))
+    return std::nullopt;
+  return name;
+}
+
+bool RefoldMacroStateProof::MovingDirectiveLineCouldOpenCall(
+    const RefoldModel::MacroDirective &directive) const {
+  const RefoldModel::IncludeItem *owner =
+      directive.ownerIncludeId
+          ? model_.GetIncludeById(*directive.ownerIncludeId)
+          : nullptr;
+  if (directive.ownerIncludeId && !owner)
+    return true;
+  // The first A token of the directive's file and inclusion spelled after its
+  // line; the token before it in A is the one the line followed.
+  std::optional<uint64_t> after;
+  ArrayRef<RefoldModel::TokMapEntry> tokmap = model_.GetTokmap();
+  for (size_t index = 0; index < tokmap.size(); ++index) {
+    const RefoldModel::TokMapEntry &entry = tokmap[index];
+    if (entry.b < directive.directiveLineE || (after && entry.pp >= *after))
+      continue;
+    if (owner ? entry.pp < owner->cover.begin || entry.pp >= owner->cover.end ||
+                    !paths_.PathsEqual(entry.file, directive.sitePath)
+              : !model_.TokmapEntryIsTUOwned(index))
+      continue;
+    after = entry.pp;
+  }
+  return after && RecordedFunctionLikeMacroCalledAt(aToks_, *after);
 }
 
 std::optional<const RefoldModel::MacroDirective *>
@@ -383,29 +455,6 @@ bool RefoldMacroStateProof::InstanceRangeRecordsUndefObserver(
       return true;
   }
   return false;
-}
-
-bool RefoldMacroStateProof::DefinitionIsLiveAtOwnerByte(
-    const RefoldModel::MacroDirective &definition, StringRef macroName,
-    StringRef expectedPath, StringRef fileBytes,
-    std::optional<uint64_t> requiredOwnerIncludeId, uint64_t offset) const {
-  const RefoldModel::MacroDirective *active = nullptr;
-  uint64_t activeEnd = 0;
-  for (const auto &candidate : model_.GetMacroDirectives()) {
-    std::optional<MacroStateDirectiveLineInterval> piece =
-        recoverMacroStateDirectiveLineInterval(
-            paths_, candidate, expectedPath, fileBytes, requiredOwnerIncludeId);
-    if (!piece || piece->end > offset)
-      continue;
-    if (StringRef(piece->name) != macroName)
-      continue;
-    if (!active || piece->end > activeEnd ||
-        (piece->end == activeEnd && candidate.id > active->id)) {
-      active = &candidate;
-      activeEnd = piece->end;
-    }
-  }
-  return active == &definition && definition.IsDefine();
 }
 
 std::optional<StabilizedMaterializedHeaderMacroPatch>
@@ -842,7 +891,8 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
                                            mp.invStart) &&
         !InstanceRangeRecordsUndefObserver(headerPath, includeId,
                                            candidate.name, mpEnd, newEnd) &&
-        !replacementRestObserves(candidate);
+        !replacementRestObserves(candidate) &&
+        !MovingDirectiveLineCouldOpenCall(*candidate.directive);
   }
   if (!carryAvailable) {
     if (std::optional<StabilizedMaterializedHeaderMacroPatch> undefRestore =

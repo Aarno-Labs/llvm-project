@@ -607,6 +607,24 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
          sideband.OwnsTrailingReplayBlankLine()) ||
         lineControlProof_.OwnerSuffixHasLineStateSensitiveBuiltin(
             includeId, headerPath, sourceRange.second);
+    // A deletion removes the line or operator that stood between the B
+    // tokens on either side of the site, as a header edit's seam does.
+    if (sideband.ReplacementText().empty())
+      if (std::optional<StringRef> name =
+              macroStateProof_.RecordedFunctionLikeMacroCalledAt(
+                  bToks_, sourceMapper_.BTokIndexCeil(
+                              sideband.MaterializedBByteRange().first))) {
+        (void)TryRecordInlineIncludeRealizationFromB(
+            *inc,
+            llvm::formatv("deleting sideband pragma site [{0},{1}) joins "
+                          "function-like macro '{2}' to '('",
+                          sourceRange.first, sourceRange.second, *name)
+                .str(),
+            includeExpansion, includeExpansionStartLineNos,
+            includeExpansionAcceptedResults, ancestorArmIdAtIncludeSite);
+        return;
+      }
+
     // B deletes the pragma, not the comments on its site; keep them.  They
     // are not B text, so the certified replay ranges below do not cover them.
     const std::string replacement =
@@ -1066,6 +1084,14 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
                                             ancestorArmIdAtIncludeSite),
           ownersMustExpand);
 
+      if (std::optional<std::string> reason = RealizedChildReadsRecordedMacro(
+              *child, includeExpansionAcceptedResults)) {
+        (void)TryRecordInlineIncludeRealizationFromB(
+            *inc, *reason, includeExpansion, includeExpansionStartLineNos,
+            includeExpansionAcceptedResults, ancestorArmIdAtIncludeSite);
+        return;
+      }
+
       const auto &childText = includeExpansion[child->id];
       // A directive without a recorded extent is a degenerate site: replacing
       // less than all of it would leave its continuation behind.
@@ -1415,6 +1441,19 @@ RefoldIncludeMaterializer::MaterializedHeaderRequiresBRealizationReason(
       include.observesLookupContext.value_or(true))
     return "replay-context-sensitive file search in materialized header";
 
+  // Inlining deletes the `#include` line before the header's first token and
+  // the end of file after its last, and Clang forms no call across either.
+  // A function-like macro's name on one side and `(` on the other would then
+  // meet in the copied text; B, realized whole, is audited where it lands.
+  if (include.cover.IsValid())
+    for (uint64_t seam : {include.cover.begin, include.cover.end})
+      if (std::optional<StringRef> name =
+              macroStateProof_.RecordedFunctionLikeMacroCalledAt(aToks_, seam))
+        return llvm::formatv("inlining joins function-like macro '{0}' to "
+                             "'(' across the include boundary",
+                             *name)
+            .str();
+
   // __INCLUDE_LEVEL__ observes include-stack depth, not line/file state.  Once
   // an include owner is materialized, the source-spelled header bytes are
   // replayed from the flattened parent/TU surface instead of being entered by
@@ -1554,6 +1593,41 @@ RefoldIncludeMaterializer::MaterializedHeaderRequiresBRealizationReason(
     return "__BASE_FILE__ observer in materialized header";
   }
 
+  return std::nullopt;
+}
+
+std::optional<std::string>
+RefoldIncludeMaterializer::RealizedChildReadsRecordedMacro(
+    const RefoldModel::IncludeItem &child,
+    const DenseMap<uint64_t, AcceptedResultCandidate>
+        &includeExpansionAcceptedResults) const {
+  auto accepted = includeExpansionAcceptedResults.find(child.id);
+  if (accepted == includeExpansionAcceptedResults.end() ||
+      accepted->second.proofSummary.inventory.currentPath !=
+          AcceptedPathKind::IncludeRealizationInlineFromB)
+    return std::nullopt;
+  const std::optional<std::pair<size_t, size_t>> bEnv =
+      includeInsertionPlanner_.ResolveIncludeRealizationBTokenEnvelope(
+          child.cover.begin, child.cover.end);
+  if (!bEnv)
+    return llvm::formatv("child inc#{0} realized from B has no B envelope",
+                         child.id)
+        .str();
+  // The text's last token is among the names read, so its own seam with the
+  // parent text after it needs no second test.
+  if (std::optional<StringRef> name =
+          macroStateProof_.RecordedMacroNamedInHeaderBText(
+              sourceMapper_.SliceBSource(bEnv->first, bEnv->second)))
+    return llvm::formatv("child inc#{0} realized from B names macro '{1}'",
+                         child.id, *name)
+        .str();
+  if (std::optional<StringRef> name =
+          macroStateProof_.RecordedFunctionLikeMacroCalledAt(bToks_,
+                                                             bEnv->first))
+    return llvm::formatv("child inc#{0} realized from B joins function-like "
+                         "macro '{1}' to '('",
+                         child.id, *name)
+        .str();
   return std::nullopt;
 }
 

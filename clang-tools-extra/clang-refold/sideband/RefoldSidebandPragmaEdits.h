@@ -42,6 +42,7 @@ class RefoldLineObserverLayout;
 class RefoldModel;
 class RefoldPathIdentity;
 class RefoldAcceptedCandidateBuilder;
+class RefoldSourceMapper;
 class RefoldStructuralHunkDispatcher;
 class RefoldTUAnchorProof;
 class RefoldTerminalProofSink;
@@ -152,6 +153,7 @@ bool appendSidebandPragmaSourceEdits(
     llvm::ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     const RefoldModel &model, llvm::StringRef tuPath, llvm::StringRef tuBytes,
     const RefoldPathIdentity &pathIdentity,
+    const RefoldSourceMapper &sourceMapper,
     const RefoldTextEditCertifier &textEditCertifier,
     const RefoldLineObserverLayout &lineObserverLayout,
     const RefoldAcceptedCandidateBuilder &acceptedCandidateBuilder,
