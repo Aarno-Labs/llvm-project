@@ -141,7 +141,9 @@ public:
                   return beginsLine.count(aToken) != 0;
                 },
                 [this](uint64_t aToken) { return endsLine.count(aToken) != 0; },
-                [](uint64_t, uint64_t) { return std::vector<uint64_t>(); }}});
+                [](uint64_t, uint64_t) { return std::vector<uint64_t>(); },
+                /*aRangeIsPlainSource=*/{}, /*aGapBytes=*/{},
+                /*bBytesBetween=*/{}}});
     return resolver.Resolve();
   }
 

@@ -537,7 +537,7 @@ RefoldMacroFormalDependenceProof::TokenDependence(
         AddFormalRootDependence(root, *inv, formal, dependence);
     const bool ownReplacementListToken =
         credited && observed.empty() &&
-        llvm::none_of(descendants, [&](const auto &other) {
+        llvm::none_of(descendants, [&, inv = inv](const auto &other) {
           return other.first != inv &&
                  IsCallerDescendant(*other.first, inv->id);
         });
