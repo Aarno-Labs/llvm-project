@@ -316,15 +316,120 @@ RefoldMacroDAGTextPrimitives::GetExpansionTextCandidates(
   return out;
 }
 
+bool RefoldMacroDAGTextPrimitives::LexicalChildHasObservedForm(
+    const RefoldModel::MacroInvocation &child) const {
+  // A nonempty trimmed raw invocation is always an exact observed form, and
+  // every A-side expansion candidate is already trimmed and nonempty, so each
+  // of them is one as well.  The literal forms are added only beside those.
+  if (child.invText && !StringRef(*child.invText).trim().empty())
+    return true;
+  return !GetExpansionTextCandidates(child, /*fromB=*/false).empty();
+}
+
+LexicalChildPlaceholder
+RefoldMacroDAGTextPrimitives::BuildLexicalChildPlaceholder(
+    const RefoldModel::MacroInvocation &cand, uint64_t relBegin,
+    uint64_t relEnd) const {
+  auto olds = GetExpansionTextCandidates(cand, /*fromB=*/false);
+  auto news = GetExpansionTextCandidates(cand, /*fromB=*/true);
+
+  SmallVector<WrapperChainCertificate, 4> forms;
+
+  auto addObservedForm = [&](WrapperChainKind kind,
+                             WrapperObservedSource source, StringRef text,
+                             StringRef logicalInput) {
+    std::string observed = text.trim().str();
+    std::string logical = logicalInput.trim().str();
+    if (observed.empty() || logical.empty())
+      return;
+
+    if (kind == WrapperChainKind::StringLiteral ||
+        kind == WrapperChainKind::WideStringLiteral) {
+      auto canon = stringutils::canonicalizeStringifyInversePayload(logical);
+      if (!canon || StringRef(*canon).trim() != StringRef(logical).trim())
+        return;
+      logical = std::move(*canon);
+    }
+
+    for (const auto &existing : forms) {
+      if (existing.kind == kind && existing.observedOldText == observed &&
+          existing.logicalInputText == logical)
+        return;
+    }
+
+    forms.push_back(WrapperChainCertificate{kind, source, std::move(observed),
+                                            std::move(logical)});
+  };
+
+  for (StringRef oldText : olds) {
+    StringRef trimmed = oldText.trim();
+    addObservedForm(WrapperChainKind::Exact,
+                    WrapperObservedSource::ChildExpansion, trimmed, trimmed);
+    addObservedForm(WrapperChainKind::StringLiteral,
+                    WrapperObservedSource::ChildExpansion,
+                    stringutils::quoteCStringLiteral(trimmed), trimmed);
+    addObservedForm(
+        WrapperChainKind::WideStringLiteral,
+        WrapperObservedSource::ChildExpansion,
+        (Twine("L") + stringutils::quoteCStringLiteral(trimmed)).str(),
+        trimmed);
+  }
+
+  if (cand.invText) {
+    const std::string rawInvocation = StringRef(*cand.invText).trim().str();
+    if (!rawInvocation.empty()) {
+      addObservedForm(WrapperChainKind::Exact,
+                      WrapperObservedSource::ChildRawInvocation,
+                      rawInvocation, rawInvocation);
+      addObservedForm(WrapperChainKind::StringLiteral,
+                      WrapperObservedSource::ChildRawInvocation,
+                      stringutils::quoteCStringLiteral(rawInvocation),
+                      rawInvocation);
+      addObservedForm(
+          WrapperChainKind::WideStringLiteral,
+          WrapperObservedSource::ChildRawInvocation,
+          (Twine("L") + stringutils::quoteCStringLiteral(rawInvocation))
+              .str(),
+          rawInvocation);
+    }
+  }
+
+  LexicalChildPlaceholder ph;
+  ph.relBegin = relBegin;
+  ph.relEnd = relEnd;
+  ph.child = &cand;
+  ph.observedForms = std::move(forms);
+  ph.newExpansionCandidates = std::move(news);
+  if (cand.invText)
+    ph.rawInvocationText = StringRef(*cand.invText).trim().str();
+  return ph;
+}
+
+namespace {
+
+/// One invocation spelled inside a trimmed parent argument, located before
+/// its observed forms are built.
+struct LexicalChildSpan {
+  uint64_t relBegin = 0;
+  uint64_t relEnd = 0;
+  const RefoldModel::MacroInvocation *child = nullptr;
+};
+
+} // namespace
+
 SmallVector<LexicalChildPlaceholder, 4>
 RefoldMacroDAGTextPrimitives::GetTopLevelLexicalChildrenInArg(
     const RefoldModel::MacroInvocation &parent, uint32_t parentFormal) const {
-  SmallVector<LexicalChildPlaceholder, 8> cands;
-
   auto argInfo = GetTrimmedInvocationArgInfo(parent, parentFormal);
   if (!argInfo || !parent.invFile)
     return SmallVector<LexicalChildPlaceholder, 4>{};
 
+  // Which children are top-level depends only on their byte ranges and on
+  // whether each has an observed form at all; a child without one never
+  // shadows its descendants.  So the children are selected first, and the
+  // forms -- whose B side replays each child's whole-cover plan -- are built
+  // only for the ones selected rather than for every nested descendant.
+  SmallVector<LexicalChildSpan, 8> cands;
   for (const auto &cand : deps_.model.GetMacroInvocations()) {
     if (cand.id == parent.id || !cand.invFile || !cand.invB || !cand.invE)
       continue;
@@ -333,88 +438,14 @@ RefoldMacroDAGTextPrimitives::GetTopLevelLexicalChildrenInArg(
     if (*cand.invB < argInfo->absTrimBegin ||
         *cand.invE > argInfo->absTrimEnd || *cand.invE <= *cand.invB)
       continue;
-
-    auto olds = GetExpansionTextCandidates(cand, /*fromB=*/false);
-    auto news = GetExpansionTextCandidates(cand, /*fromB=*/true);
-
-    SmallVector<WrapperChainCertificate, 4> forms;
-
-    auto addObservedForm = [&](WrapperChainKind kind,
-                               WrapperObservedSource source, StringRef text,
-                               StringRef logicalInput) {
-      std::string observed = text.trim().str();
-      std::string logical = logicalInput.trim().str();
-      if (observed.empty() || logical.empty())
-        return;
-
-      if (kind == WrapperChainKind::StringLiteral ||
-          kind == WrapperChainKind::WideStringLiteral) {
-        auto canon = stringutils::canonicalizeStringifyInversePayload(logical);
-        if (!canon || StringRef(*canon).trim() != StringRef(logical).trim())
-          return;
-        logical = std::move(*canon);
-      }
-
-      for (const auto &existing : forms) {
-        if (existing.kind == kind && existing.observedOldText == observed &&
-            existing.logicalInputText == logical)
-          return;
-      }
-
-      forms.push_back(WrapperChainCertificate{kind, source, std::move(observed),
-                                              std::move(logical)});
-    };
-
-    for (StringRef oldText : olds) {
-      StringRef trimmed = oldText.trim();
-      addObservedForm(WrapperChainKind::Exact,
-                      WrapperObservedSource::ChildExpansion, trimmed, trimmed);
-      addObservedForm(WrapperChainKind::StringLiteral,
-                      WrapperObservedSource::ChildExpansion,
-                      stringutils::quoteCStringLiteral(trimmed), trimmed);
-      addObservedForm(
-          WrapperChainKind::WideStringLiteral,
-          WrapperObservedSource::ChildExpansion,
-          (Twine("L") + stringutils::quoteCStringLiteral(trimmed)).str(),
-          trimmed);
-    }
-
-    if (cand.invText) {
-      const std::string rawInvocation = StringRef(*cand.invText).trim().str();
-      if (!rawInvocation.empty()) {
-        addObservedForm(WrapperChainKind::Exact,
-                        WrapperObservedSource::ChildRawInvocation,
-                        rawInvocation, rawInvocation);
-        addObservedForm(WrapperChainKind::StringLiteral,
-                        WrapperObservedSource::ChildRawInvocation,
-                        stringutils::quoteCStringLiteral(rawInvocation),
-                        rawInvocation);
-        addObservedForm(
-            WrapperChainKind::WideStringLiteral,
-            WrapperObservedSource::ChildRawInvocation,
-            (Twine("L") + stringutils::quoteCStringLiteral(rawInvocation))
-                .str(),
-            rawInvocation);
-      }
-    }
-
-    if (forms.empty())
+    if (!LexicalChildHasObservedForm(cand))
       continue;
-
-    LexicalChildPlaceholder ph;
-    ph.relBegin = *cand.invB - argInfo->absTrimBegin;
-    ph.relEnd = *cand.invE - argInfo->absTrimBegin;
-    ph.child = &cand;
-    ph.observedForms = std::move(forms);
-    ph.newExpansionCandidates = std::move(news);
-    if (cand.invText)
-      ph.rawInvocationText = StringRef(*cand.invText).trim().str();
-
-    cands.push_back(std::move(ph));
+    cands.push_back(LexicalChildSpan{*cand.invB - argInfo->absTrimBegin,
+                                     *cand.invE - argInfo->absTrimBegin,
+                                     &cand});
   }
 
-  llvm::sort(cands, [](const LexicalChildPlaceholder &a,
-                       const LexicalChildPlaceholder &b) {
+  llvm::sort(cands, [](const LexicalChildSpan &a, const LexicalChildSpan &b) {
     if (a.relBegin != b.relBegin)
       return a.relBegin < b.relBegin;
     return a.relEnd > b.relEnd;
@@ -436,7 +467,8 @@ RefoldMacroDAGTextPrimitives::GetTopLevelLexicalChildrenInArg(
     }
 
     if (!contained)
-      top.push_back(cand);
+      top.push_back(BuildLexicalChildPlaceholder(*cand.child, cand.relBegin,
+                                                 cand.relEnd));
   }
 
   return top;

@@ -722,29 +722,13 @@ bool RefoldTUAnchorProof::IsPPGapAtSelectedConditionalArmExit(
   return true;
 }
 
-std::optional<uint64_t> RefoldTUAnchorProof::AnchorToExactSlotBoundaryFromPPGap(
-    StringRef tuPath, uint64_t ppGap, TUAnchorWitness *witness,
-    AcceptedResultCandidate *acceptedCandidate) const {
-  // Build the normalized accepted carrier at the exact proof site. Callers that
-  // only query anchoring still exercise the same proof-discharge/audit path as
-  // callers that immediately emit the accepted TU insertion.
-  auto recordAcceptedAnchorCandidate =
-      [&](AcceptedPathKind path, const TUAnchorWitness &anchorWitness) {
-        AcceptedResultCandidate candidate =
-            BuildAcceptedTUAnchorCandidate(path, anchorWitness);
-        if (acceptedCandidate)
-          *acceptedCandidate = candidate;
-      };
+ArrayRef<RefoldTUAnchorProof::ExactSlotBoundary>
+RefoldTUAnchorProof::ExactSlotBoundaries(StringRef tuPath) const {
+  auto [cached, inserted] = exactSlotBoundaries_.try_emplace(tuPath);
+  if (!inserted)
+    return cached->second;
 
-  struct Cand {
-    uint64_t pp;
-    uint64_t tuByte;
-    const RefoldModel::Slot *slot;
-
-    Cand(uint64_t pp, uint64_t tuByte, const RefoldModel::Slot *slot)
-        : pp(pp), tuByte(tuByte), slot(slot) {}
-  };
-
+  std::vector<ExactSlotBoundary> &candidates = cached->second;
   auto bufOrErr = MemoryBuffer::getFile(deps_.lineDirs.ToAbsolutePath(tuPath));
   if (!bufOrErr) {
     REFOLD_LOG_FATAL("slot/anchor", "unable to read TU: {0}", tuPath);
@@ -792,7 +776,6 @@ std::optional<uint64_t> RefoldTUAnchorProof::AnchorToExactSlotBoundaryFromPPGap(
     return byte;
   };
 
-  std::vector<Cand> candidates;
   for (const auto &slot : deps_.model.FindSlots(tuPath, std::nullopt,
                                                 std::nullopt, std::nullopt)) {
     if (!slot->pp)
@@ -804,13 +787,34 @@ std::optional<uint64_t> RefoldTUAnchorProof::AnchorToExactSlotBoundaryFromPPGap(
                    "after_last_include", "arm_begin", "arm_end", true)
             .Default(false);
     if (isBoundary)
-      candidates.emplace_back(*slot->pp, adjustSlot(slot), slot);
+      candidates.push_back(
+          ExactSlotBoundary{*slot->pp, adjustSlot(slot), slot});
   }
 
+  return candidates;
+}
+
+std::optional<uint64_t> RefoldTUAnchorProof::AnchorToExactSlotBoundaryFromPPGap(
+    StringRef tuPath, uint64_t ppGap, TUAnchorWitness *witness,
+    AcceptedResultCandidate *acceptedCandidate) const {
+  // Build the normalized accepted carrier at the exact proof site. Callers that
+  // only query anchoring still exercise the same proof-discharge/audit path as
+  // callers that immediately emit the accepted TU insertion.
+  auto recordAcceptedAnchorCandidate =
+      [&](AcceptedPathKind path, const TUAnchorWitness &anchorWitness) {
+        AcceptedResultCandidate candidate =
+            BuildAcceptedTUAnchorCandidate(path, anchorWitness);
+        if (acceptedCandidate)
+          *acceptedCandidate = candidate;
+      };
+
+  // Every boundary slot of this path, adjusted to its TU byte; only the gap
+  // test below depends on `ppGap`.
+  ArrayRef<ExactSlotBoundary> candidates = ExactSlotBoundaries(tuPath);
   if (candidates.empty())
     return std::nullopt;
 
-  std::vector<const Cand *> exact;
+  std::vector<const ExactSlotBoundary *> exact;
   for (const auto &candidate : candidates) {
     if (candidate.pp == ppGap)
       exact.push_back(&candidate);
@@ -837,7 +841,7 @@ std::optional<uint64_t> RefoldTUAnchorProof::AnchorToExactSlotBoundaryFromPPGap(
     return 100;
   };
 
-  const Cand *best = nullptr;
+  const ExactSlotBoundary *best = nullptr;
   for (const auto *candidate : exact) {
     if (!best) {
       best = candidate;
@@ -893,6 +897,165 @@ RefoldTUAnchorProof::IncludeIdCoveringPPIndex(uint64_t pp) const {
   }
 
   return bestId;
+}
+
+std::optional<uint64_t> RefoldTUAnchorProof::InferCollapsedPPGap(
+    const RefoldModel::IncludeItem &include, StringRef tuPath) const {
+  // A zero-token include has no PP range of its own.  It can still be tied
+  // to a concrete PP gap when the nearest PP-producing material before and
+  // after the directive agree on the same boundary.  This is a bracketing
+  // proof, not a nearest-neighbor guess: disagreement means the zero-token
+  // owner lies in a PP interval with real material, so the TU anchor is not
+  // uniquely determined here.
+  uint64_t leftGap = 0;
+  uint64_t rightGap = deps_.model.GetTokensCountA();
+
+  // This walks every token in the translation unit, so the per-entry test has
+  // to be cheap.  The model settles TU ownership for each entry when the map
+  // is loaded, which answers exactly this question without canonicalizing two
+  // path spellings per token.  That precomputed answer is against the model's
+  // own source path, so use it only when this really is that file; a caller
+  // planning against some other path still gets the direct comparison.
+  const ArrayRef<RefoldModel::TokMapEntry> tokmap = deps_.model.GetTokmap();
+  const bool tuPathIsModelSource =
+      deps_.pathIdentity.PathsEqual(tuPath, deps_.model.GetSourcePath());
+  for (std::size_t entryIndex = 0; entryIndex < tokmap.size(); ++entryIndex) {
+    const RefoldModel::TokMapEntry &entry = tokmap[entryIndex];
+    const bool entryIsTUOwned =
+        tuPathIsModelSource
+            ? deps_.model.TokmapEntryIsTUOwned(entryIndex)
+            : deps_.pathIdentity.PathsEqual(entry.file, tuPath);
+    if (!entryIsTUOwned)
+      continue;
+    if (entry.e <= include.siteB)
+      leftGap = std::max(leftGap, entry.pp + 1);
+    if (entry.b >= include.siteE)
+      rightGap = std::min(rightGap, entry.pp);
+  }
+
+  for (const auto &other : deps_.model.GetIncludes()) {
+    if (&other == &include || other.parent ||
+        !deps_.pathIdentity.PathsEqual(other.sitePath, tuPath) ||
+        !other.cover.IsValid())
+      continue;
+    if (other.siteE <= include.siteB)
+      leftGap = std::max(leftGap, other.cover.end);
+    if (other.siteB >= include.siteE)
+      rightGap = std::min(rightGap, other.cover.begin);
+  }
+
+  if (leftGap != rightGap)
+    return std::nullopt;
+  return leftGap;
+}
+
+/// Return the first producer slot of \p kind in \p tuPath scoped to include
+/// \p includeId, or null when there is none.
+static const RefoldModel::Slot *firstIncludeSlot(const RefoldModel &model,
+                                                 StringRef tuPath,
+                                                 StringRef kind,
+                                                 uint64_t includeId) {
+  std::vector<const RefoldModel::Slot *> slots =
+      model.FindSlots(tuPath, kind, includeId, std::nullopt);
+  return slots.empty() ? nullptr : slots.front();
+}
+
+ArrayRef<RefoldTUAnchorProof::ZeroTokenIncludeBoundary>
+RefoldTUAnchorProof::ZeroTokenIncludeBoundaries(StringRef tuPath) const {
+  auto [cached, inserted] = zeroTokenIncludeBoundaries_.try_emplace(tuPath);
+  if (!inserted)
+    return cached->second;
+
+  std::vector<ZeroTokenIncludeBoundary> &boundaries = cached->second;
+  for (const auto &include : deps_.model.GetIncludes()) {
+    // This proof is deliberately limited to top-level TU include directives
+    // whose expansion produced no normal PP tokens.  Non-empty includes have
+    // token/cover evidence and must use the ordinary include/TU ownership
+    // paths; nested zero-token includes need their parent owner to host the
+    // insertion rather than a TU byte edit.
+    if (include.parent ||
+        !deps_.pathIdentity.PathsEqual(include.sitePath, tuPath) ||
+        include.cover.IsValid())
+      continue;
+
+    const RefoldModel::Slot *beforeSlot =
+        firstIncludeSlot(deps_.model, tuPath, "before_include", include.id);
+    const RefoldModel::Slot *afterSlot =
+        firstIncludeSlot(deps_.model, tuPath, "after_include", include.id);
+    if (!beforeSlot || !afterSlot)
+      continue;
+
+    // The source slots must name the concrete include directive line.  This
+    // keeps the proof tied to producer-recorded source structure instead of
+    // merely trusting an include item that lacks PP cover.
+    if (beforeSlot->b != include.siteB || afterSlot->b != include.siteE)
+      continue;
+
+    std::optional<uint64_t> collapsedPPGap =
+        InferCollapsedPPGap(include, tuPath);
+    if (!collapsedPPGap)
+      continue;
+
+    boundaries.push_back(ZeroTokenIncludeBoundary{&include, beforeSlot,
+                                                  afterSlot, *collapsedPPGap});
+  }
+  return boundaries;
+}
+
+const DenseMap<uint64_t, const RefoldModel::MacroInvocation *> &
+RefoldTUAnchorProof::MacroInvocationsById() const {
+  if (!macroInvocationsById_) {
+    macroInvocationsById_.emplace();
+    macroInvocationsById_->reserve(deps_.model.GetMacroInvocations().size());
+    for (const auto &mi : deps_.model.GetMacroInvocations())
+      (*macroInvocationsById_)[mi.id] = &mi;
+  }
+  return *macroInvocationsById_;
+}
+
+/// Add \p invocation to \p index under the begin of every span in \p spans,
+/// at most once per begin.
+static void indexArgLikeBegins(
+    DenseMap<uint64_t, SmallVector<const RefoldModel::MacroInvocation *, 2>>
+        &index,
+    const RefoldModel::MacroInvocation &invocation,
+    ArrayRef<RefoldModel::PPArgSpan> spans) {
+  for (const RefoldModel::PPArgSpan &span : spans) {
+    SmallVector<const RefoldModel::MacroInvocation *, 2> &atBegin =
+        index[span.begin];
+    // Invocations are indexed in model order, so a repeat of this one under
+    // the same begin can only be the last entry.
+    if (atBegin.empty() || atBegin.back() != &invocation)
+      atBegin.push_back(&invocation);
+  }
+}
+
+const RefoldTUAnchorProof::ArgLikeBeginIndex &
+RefoldTUAnchorProof::ArgLikeBegins(StringRef tuPath) const {
+  auto [cached, inserted] = argLikeBegins_.try_emplace(tuPath);
+  if (!inserted)
+    return cached->second;
+
+  ArgLikeBeginIndex &index = cached->second;
+  for (const auto &m : deps_.model.GetMacroInvocations()) {
+    // Only consider real TU-side invocations with stable byte-space
+    // provenance. Ignore invocations inside macro definitions, since those do
+    // not denote a concrete callsite insertion point in TU source.
+    if (!m.invFile || !m.invB || !m.invE || !m.invText)
+      continue;
+    if (!deps_.pathIdentity.PathsEqual(*m.invFile, tuPath))
+      continue;
+    if (deps_.macroTopology.IsInvocationInsideDefineDirective(m))
+      continue;
+
+    // Treat argument, stringify, and paste projection starts as "arg-like"
+    // begins. If the PP gap lands exactly on one of these begins, the outer
+    // callsite begin can serve as a truthful TU insertion anchor.
+    indexArgLikeBegins(index.invocationsByBegin, m, m.argSpans);
+    indexArgLikeBegins(index.invocationsByBegin, m, m.stringifySpans);
+    indexArgLikeBegins(index.invocationsByBegin, m, m.pasteSpans);
+  }
+  return index;
 }
 
 std::optional<TUInsertionAnchor>
@@ -992,116 +1155,24 @@ RefoldTUAnchorProof::FindProvableTUInsertionAnchor(
 
   auto zeroTokenIncludeBoundaryAnchor =
       [&]() -> std::optional<TUInsertionAnchor> {
-    struct ZeroTokenIncludeBoundaryCandidate {
-      const RefoldModel::IncludeItem *include = nullptr;
-      const RefoldModel::Slot *beforeSlot = nullptr;
-      const RefoldModel::Slot *afterSlot = nullptr;
-      uint64_t inferredPPGap = 0;
-    };
-
-    auto firstExactSlot = [&](StringRef kind,
-                              uint64_t includeId) -> const RefoldModel::Slot * {
-      std::vector<const RefoldModel::Slot *> slots =
-          deps_.model.FindSlots(tuPath, kind, includeId, std::nullopt);
-      return slots.empty() ? nullptr : slots.front();
-    };
-
-    auto inferCollapsedPPGap = [&](const RefoldModel::IncludeItem &include)
-        -> std::optional<uint64_t> {
-      // A zero-token include has no PP range of its own.  It can still be tied
-      // to a concrete PP gap when the nearest PP-producing material before and
-      // after the directive agree on the same boundary.  This is a bracketing
-      // proof, not a nearest-neighbor guess: disagreement means the zero-token
-      // owner lies in a PP interval with real material, so the TU anchor is not
-      // uniquely determined here.
-      uint64_t leftGap = 0;
-      uint64_t rightGap = deps_.model.GetTokensCountA();
-
-      // This walks every token in the translation unit, and it runs once per
-      // insertion anchored here, so the per-entry test has to be cheap.  The
-      // model settles TU ownership for each entry when the map is loaded, which
-      // answers exactly this question without canonicalizing two path spellings
-      // per token.  That precomputed answer is against the model's own source
-      // path, so use it only when this really is that file; a caller planning
-      // against some other path still gets the direct comparison.
-      const ArrayRef<RefoldModel::TokMapEntry> tokmap = deps_.model.GetTokmap();
-      const bool tuPathIsModelSource =
-          deps_.pathIdentity.PathsEqual(tuPath, deps_.model.GetSourcePath());
-      for (std::size_t entryIndex = 0; entryIndex < tokmap.size();
-           ++entryIndex) {
-        const RefoldModel::TokMapEntry &entry = tokmap[entryIndex];
-        const bool entryIsTUOwned =
-            tuPathIsModelSource
-                ? deps_.model.TokmapEntryIsTUOwned(entryIndex)
-                : deps_.pathIdentity.PathsEqual(entry.file, tuPath);
-        if (!entryIsTUOwned)
-          continue;
-        if (entry.e <= include.siteB)
-          leftGap = std::max(leftGap, entry.pp + 1);
-        if (entry.b >= include.siteE)
-          rightGap = std::min(rightGap, entry.pp);
-      }
-
-      for (const auto &other : deps_.model.GetIncludes()) {
-        if (&other == &include || other.parent ||
-            !deps_.pathIdentity.PathsEqual(other.sitePath, tuPath) ||
-            !other.cover.IsValid())
-          continue;
-        if (other.siteE <= include.siteB)
-          leftGap = std::max(leftGap, other.cover.end);
-        if (other.siteB >= include.siteE)
-          rightGap = std::min(rightGap, other.cover.begin);
-      }
-
-      if (leftGap != rightGap)
-        return std::nullopt;
-      return leftGap;
-    };
-
-    SmallVector<ZeroTokenIncludeBoundaryCandidate, 4> candidates;
-    for (const auto &include : deps_.model.GetIncludes()) {
-      // This proof is deliberately limited to top-level TU include directives
-      // whose expansion produced no normal PP tokens.  Non-empty includes have
-      // token/cover evidence and must use the ordinary include/TU ownership
-      // paths; nested zero-token includes need their parent owner to host the
-      // insertion rather than a TU byte edit.
-      if (include.parent ||
-          !deps_.pathIdentity.PathsEqual(include.sitePath, tuPath) ||
-          include.cover.IsValid())
-        continue;
-
-      const RefoldModel::Slot *beforeSlot =
-          firstExactSlot("before_include", include.id);
-      const RefoldModel::Slot *afterSlot =
-          firstExactSlot("after_include", include.id);
-      if (!beforeSlot || !afterSlot)
-        continue;
-
-      // The source slots must name the concrete include directive line.  This
-      // keeps the proof tied to producer-recorded source structure instead of
-      // merely trusting an include item that lacks PP cover.
-      if (beforeSlot->b != include.siteB || afterSlot->b != include.siteE)
-        continue;
-
-      std::optional<uint64_t> inferredPPGap = inferCollapsedPPGap(include);
-      if (!inferredPPGap || *inferredPPGap != pp)
-        continue;
-
-      candidates.push_back(ZeroTokenIncludeBoundaryCandidate{
-          &include, beforeSlot, afterSlot, *inferredPPGap});
-    }
+    // Only the gap test depends on `pp`; see `ZeroTokenIncludeBoundaries()`.
+    SmallVector<const ZeroTokenIncludeBoundary *, 4> candidates;
+    for (const ZeroTokenIncludeBoundary &boundary :
+         ZeroTokenIncludeBoundaries(tuPath))
+      if (boundary.collapsedPPGap == pp)
+        candidates.push_back(&boundary);
 
     if (candidates.empty())
       return std::nullopt;
 
-    llvm::sort(candidates, [](const ZeroTokenIncludeBoundaryCandidate &lhs,
-                              const ZeroTokenIncludeBoundaryCandidate &rhs) {
-      if (lhs.beforeSlot->b != rhs.beforeSlot->b)
-        return lhs.beforeSlot->b < rhs.beforeSlot->b;
-      return lhs.include->id < rhs.include->id;
+    llvm::sort(candidates, [](const ZeroTokenIncludeBoundary *lhs,
+                              const ZeroTokenIncludeBoundary *rhs) {
+      if (lhs->beforeSlot->b != rhs->beforeSlot->b)
+        return lhs->beforeSlot->b < rhs->beforeSlot->b;
+      return lhs->include->id < rhs->include->id;
     });
 
-    const ZeroTokenIncludeBoundaryCandidate &best = candidates.front();
+    const ZeroTokenIncludeBoundary &best = *candidates.front();
     TUAnchorWitness zeroTokenWitness;
     zeroTokenWitness.evidence = TUAnchorEvidenceKind::ZeroTokenIncludeBoundary;
     zeroTokenWitness.hasPPGap = true;
@@ -1144,47 +1215,15 @@ RefoldTUAnchorProof::FindProvableTUInsertionAnchor(
   // one exists, lift it to the outermost matching caller so the returned anchor
   // is the stable callsite-begin byte for wrapper/deferred-expansion shapes.
   auto exactArgLikeBeginAnchor = [&]() -> std::optional<TUInsertionAnchor> {
-    SmallVector<const RefoldModel::MacroInvocation *, 8> cands;
-    DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invById;
-    invById.reserve(deps_.model.GetMacroInvocations().size());
-    for (const auto &mi : deps_.model.GetMacroInvocations())
-      invById[mi.id] = &mi;
-
-    auto appendIfExactBegin = [&](const RefoldModel::MacroInvocation &m,
-                                  auto &&spans) {
-      for (const auto &sp : spans) {
-        if (sp.begin == pp) {
-          cands.push_back(&m);
-          break;
-        }
-      }
-    };
-
-    for (const auto &m : deps_.model.GetMacroInvocations()) {
-      // Only consider real TU-side invocations with stable byte-space
-      // provenance. Ignore invocations inside macro definitions, since those do
-      // not denote a concrete callsite insertion point in TU source.
-      if (!m.invFile || !m.invB || !m.invE || !m.invText)
-        continue;
-      if (!deps_.pathIdentity.PathsEqual(*m.invFile, tuPath))
-        continue;
-      if (deps_.macroTopology.IsInvocationInsideDefineDirective(m))
-        continue;
-
-      // Treat argument, stringify, and paste projection starts as "arg-like"
-      // begins. If the PP gap lands exactly on one of these begins, the outer
-      // callsite begin can serve as a truthful TU insertion anchor.
-      appendIfExactBegin(m, m.argSpans);
-      if (!cands.empty() && cands.back() == &m)
-        continue;
-      appendIfExactBegin(m, m.stringifySpans);
-      if (!cands.empty() && cands.back() == &m)
-        continue;
-      appendIfExactBegin(m, m.pasteSpans);
-    }
-
-    if (cands.empty())
+    // The TU-side invocations whose argument, stringify, or paste projection
+    // starts exactly at this PP gap; see `ArgLikeBegins()`.
+    const ArgLikeBeginIndex &argLikeBegins = ArgLikeBegins(tuPath);
+    const auto atGap = argLikeBegins.invocationsByBegin.find(pp);
+    if (atGap == argLikeBegins.invocationsByBegin.end())
       return std::nullopt;
+    ArrayRef<const RefoldModel::MacroInvocation *> cands = atGap->second;
+    const DenseMap<uint64_t, const RefoldModel::MacroInvocation *> &invById =
+        MacroInvocationsById();
 
     SmallDenseSet<uint64_t, 8> candIds;
     for (const auto *m : cands)

@@ -225,6 +225,17 @@ public:
                                   uint32_t parentFormal) const;
 
 private:
+  /// Return whether `GetTopLevelLexicalChildrenInArg` would record at least
+  /// one observed wrapper form for \p child, without building any.
+  bool
+  LexicalChildHasObservedForm(const RefoldModel::MacroInvocation &child) const;
+
+  /// Build the placeholder for the child invocation \p cand spelled at
+  /// `[relBegin, relEnd)` of a trimmed parent argument.
+  LexicalChildPlaceholder
+  BuildLexicalChildPlaceholder(const RefoldModel::MacroInvocation &cand,
+                               uint64_t relBegin, uint64_t relEnd) const;
+
   Dependencies deps_;
 };
 

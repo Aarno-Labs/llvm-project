@@ -404,6 +404,19 @@ std::optional<std::vector<std::vector<int64_t>>> enumerateMapsThroughAnchors(
   }
   for (size_t subWindow = 0; subWindow < subWindowMaps.size(); ++subWindow) {
     const uint64_t subABegin = subWindowABegins[subWindow];
+    // A sub-rectangle with exactly one optimal map multiplies nothing, so
+    // writing it into every global map in place yields the same maps in the
+    // same order that copying each one would.  Most sub-rectangles between
+    // forced anchors are like this, and each copy is a whole-stream map.
+    if (subWindowMaps[subWindow].size() == 1) {
+      const std::vector<int64_t> &local = subWindowMaps[subWindow].front();
+      for (std::vector<int64_t> &base : globalMaps) {
+        if (static_cast<size_t>(subABegin) + local.size() > base.size())
+          return std::nullopt;
+        llvm::copy(local, base.begin() + static_cast<size_t>(subABegin));
+      }
+      continue;
+    }
     std::vector<std::vector<int64_t>> expanded;
     expanded.reserve(globalMaps.size() * subWindowMaps[subWindow].size());
     for (const std::vector<int64_t> &base : globalMaps) {

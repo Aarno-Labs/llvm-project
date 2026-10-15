@@ -29,7 +29,10 @@
 #include "source/RefoldPreprocessingStructureIndex.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
@@ -500,6 +503,81 @@ private:
   /// zero-width TU insertion from being proved through a PP gap that lies
   /// inside an include expansion.
   std::optional<uint64_t> IncludeIdCoveringPPIndex(uint64_t pp) const;
+
+  /// One producer boundary slot of a TU path that names a PP gap, with the TU
+  /// byte an insertion at that gap anchors to.
+  struct ExactSlotBoundary {
+    uint64_t pp = 0;
+    uint64_t tuByte = 0;
+    const RefoldModel::Slot *slot = nullptr;
+  };
+
+  /// Return every boundary slot of \p tuPath that names a PP gap, in
+  /// `RefoldModel::FindSlots()` order, each adjusted to its anchoring TU byte.
+  ///
+  /// Nothing here depends on the gap being anchored, and every query used to
+  /// re-read the TU and re-filter every producer slot by path, so the list is
+  /// built once per TU path and only filtered by gap at each query.
+  llvm::ArrayRef<ExactSlotBoundary>
+  ExactSlotBoundaries(llvm::StringRef tuPath) const;
+
+  /// One top-level, zero-token `#include` spelled in a TU path, whose producer
+  /// `before_include`/`after_include` slots name its directive line and whose
+  /// bracketing PP-bearing material collapses it to a single PP gap.
+  struct ZeroTokenIncludeBoundary {
+    const RefoldModel::IncludeItem *include = nullptr;
+    const RefoldModel::Slot *beforeSlot = nullptr;
+    const RefoldModel::Slot *afterSlot = nullptr;
+    uint64_t collapsedPPGap = 0;
+  };
+
+  /// Return every zero-token include boundary of \p tuPath, in include order.
+  ///
+  /// Nothing here depends on the PP gap being anchored, and every call used to
+  /// walk the whole tokmap once per such include, so the list is built once
+  /// per TU path and only filtered by gap at each query.
+  llvm::ArrayRef<ZeroTokenIncludeBoundary>
+  ZeroTokenIncludeBoundaries(llvm::StringRef tuPath) const;
+
+  /// Return the PP gap that the material bracketing the zero-token include
+  /// \p include collapses it to in \p tuPath, or nullopt when the nearest
+  /// PP-bearing material on its two sides disagrees.
+  std::optional<uint64_t>
+  InferCollapsedPPGap(const RefoldModel::IncludeItem &include,
+                      llvm::StringRef tuPath) const;
+
+  /// TU-side macro invocations of one TU path that may host an arg-like-begin
+  /// anchor, indexed by every PP gap at which one of their argument,
+  /// stringify, or paste spans begins.
+  struct ArgLikeBeginIndex {
+    /// Invocations whose spans begin at each gap, in model order, each listed
+    /// once per gap.
+    llvm::DenseMap<uint64_t,
+                   llvm::SmallVector<const RefoldModel::MacroInvocation *, 2>>
+        invocationsByBegin;
+  };
+
+  /// Return the arg-like-begin index of \p tuPath, building it on first use.
+  ///
+  /// Which invocations qualify is a fact about the model and the path alone,
+  /// so it is decided once per TU path rather than by a walk over every
+  /// invocation at each query.
+  const ArgLikeBeginIndex &ArgLikeBegins(llvm::StringRef tuPath) const;
+
+  /// Every macro invocation by id, the last record winning for a repeated id.
+  const llvm::DenseMap<uint64_t, const RefoldModel::MacroInvocation *> &
+  MacroInvocationsById() const;
+
+  /// Lazily built per-TU-path caches for `FindProvableTUInsertionAnchor()`.
+  /// They read only the immutable model and path identity, so they are exact
+  /// for the lifetime of this service.
+  mutable llvm::StringMap<std::vector<ExactSlotBoundary>> exactSlotBoundaries_;
+  mutable llvm::StringMap<std::vector<ZeroTokenIncludeBoundary>>
+      zeroTokenIncludeBoundaries_;
+  mutable llvm::StringMap<ArgLikeBeginIndex> argLikeBegins_;
+  mutable std::optional<
+      llvm::DenseMap<uint64_t, const RefoldModel::MacroInvocation *>>
+      macroInvocationsById_;
 
   /// A-token coordinates that occur more than once in the producer tokmap.
   /// Duplicate entries make the physical spelling ambiguous even when the
