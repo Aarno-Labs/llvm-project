@@ -464,19 +464,10 @@ public:
                                         uint64_t begin, uint64_t end) const;
 
 private:
-  /// Collect the exact macro transitions a direct-TU envelope defers to the
-  /// specialized repair planner.
-  ///
-  /// The returned intervals are evidence only. The query rejects partial
-  /// macro lines and every unrelated protected construct; a `_Pragma` token
-  /// nested wholly inside one collected macro replacement is the only nested
-  /// interval admitted by the same physical transition.
-  bool CollectDirectTUMacroRepairEvidence(
-      uint64_t begin, uint64_t end,
-      std::vector<const PreprocessingStructureInterval *> &intervals) const;
-
   /// Collect the exact macro-repair evidence in an envelope, accepting an
-  /// empty evidence set when the envelope contains no protected structure.
+  /// empty evidence set when the envelope contains no protected structure;
+  /// any other envelope is decided by the structure index's
+  /// `CollectMacroStateRepairEvidence()`.
   bool CollectDirectTUMacroRepairEvidenceOrEmpty(
       uint64_t begin, uint64_t end,
       std::vector<const PreprocessingStructureInterval *> &intervals) const;

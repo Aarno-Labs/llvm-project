@@ -327,6 +327,20 @@ public:
       uint64_t begin, uint64_t end,
       std::vector<const PreprocessingStructureInterval *> &intervals) const;
 
+  /// Collect the exact macro transitions a direct source envelope `[begin,end)`
+  /// defers to the specialized macro-state repair planner, and prove they are
+  /// the only protected structure the envelope overlaps.
+  ///
+  /// The returned intervals are evidence only, in source order. The query
+  /// rejects partial macro lines, an envelope with no macro transition, and
+  /// every unrelated protected construct -- a conditional, include, pragma,
+  /// line control, or unknown directive; a `_Pragma` token nested wholly
+  /// inside one collected macro replacement is the only nested interval
+  /// admitted by the same physical transition.
+  bool CollectMacroStateRepairEvidence(
+      uint64_t begin, uint64_t end,
+      std::vector<const PreprocessingStructureInterval *> &intervals) const;
+
   /// Return the source spelling of a recorded `#define` or `#undef`, from its
   /// `#` through the end of its logical line, when this index bound the
   /// directive's producer-recorded extent.

@@ -435,61 +435,14 @@ AcceptedResultCandidate RefoldTUAnchorProof::BuildAcceptedTUAnchorCandidate(
   return candidate;
 }
 
-bool RefoldTUAnchorProof::CollectDirectTUMacroRepairEvidence(
-    uint64_t begin, uint64_t end,
-    std::vector<const PreprocessingStructureInterval *> &intervals) const {
-  const RefoldPreprocessingStructureIndex &structure =
-      deps_.preprocessingStructureIndex;
-  if (!structure.CollectExactMacroStateIntervals(begin, end, intervals) ||
-      intervals.empty()) {
-    return false;
-  }
-
-  llvm::sort(intervals,
-             [](const PreprocessingStructureInterval *lhs,
-                const PreprocessingStructureInterval *rhs) {
-               if (lhs->begin != rhs->begin)
-                 return lhs->begin < rhs->begin;
-               if (lhs->end != rhs->end)
-                 return lhs->end < rhs->end;
-               if (lhs->kind != rhs->kind)
-                 return lhs->kind < rhs->kind;
-               return lhs->modelItemId < rhs->modelItemId;
-             });
-
-  // The structure-index query intentionally reports macro evidence without
-  // interpreting other overlapping intervals. Recheck the complete overlap
-  // set here so a provisional direct carrier cannot use one exact macro line to
-  // absorb a conditional, include, pragma, line-control, or unknown directive.
-  // A `_Pragma` token wholly nested in the replacement list is part of that
-  // exact physical macro transition and is the sole admitted nested interval.
-  for (const PreprocessingStructureInterval *interval :
-       structure.FindOverlapping(begin, end)) {
-    if (llvm::is_contained(intervals, interval))
-      continue;
-
-    const bool nestedPragmaOperator =
-        interval->kind == PreprocessingStructureKind::PragmaOperator &&
-        llvm::any_of(intervals,
-                     [&](const PreprocessingStructureInterval *macro) {
-                       return macro->begin <= interval->begin &&
-                              interval->end <= macro->end;
-                     });
-    if (!nestedPragmaOperator) {
-      intervals.clear();
-      return false;
-    }
-  }
-  return true;
-}
-
 bool RefoldTUAnchorProof::CollectDirectTUMacroRepairEvidenceOrEmpty(
     uint64_t begin, uint64_t end,
     std::vector<const PreprocessingStructureInterval *> &intervals) const {
   intervals.clear();
   if (!deps_.preprocessingStructureIndex.HasOverlapping(begin, end))
     return true;
-  return CollectDirectTUMacroRepairEvidence(begin, end, intervals);
+  return deps_.preprocessingStructureIndex.CollectMacroStateRepairEvidence(
+      begin, end, intervals);
 }
 
 bool RefoldTUAnchorProof::RangeHoldsOnlyPrintedPragmas(uint64_t begin,
@@ -657,7 +610,7 @@ bool RefoldTUAnchorProof::ProveDirectTUGapWithMacroRepairEvidence(
     return true;
 
   std::vector<const PreprocessingStructureInterval *> macroIntervals;
-  if (!CollectDirectTUMacroRepairEvidence(begin, end, macroIntervals))
+  if (!structure.CollectMacroStateRepairEvidence(begin, end, macroIntervals))
     return false;
 
   uint64_t coveredEnd = begin;
@@ -696,7 +649,7 @@ bool RefoldTUAnchorProof::ValidateDirectTUEnvelope(
     return true;
 
   std::vector<const PreprocessingStructureInterval *> macroIntervals;
-  return CollectDirectTUMacroRepairEvidence(begin, end, macroIntervals);
+  return structure.CollectMacroStateRepairEvidence(begin, end, macroIntervals);
 }
 
 bool RefoldTUAnchorProof::IsPPGapAtSelectedConditionalArmExit(

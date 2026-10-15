@@ -1245,6 +1245,52 @@ bool RefoldPreprocessingStructureIndex::CollectExactMacroStateIntervals(
   return true;
 }
 
+bool RefoldPreprocessingStructureIndex::CollectMacroStateRepairEvidence(
+    uint64_t begin, uint64_t end,
+    std::vector<const PreprocessingStructureInterval *> &intervals) const {
+  if (!CollectExactMacroStateIntervals(begin, end, intervals) ||
+      intervals.empty()) {
+    return false;
+  }
+
+  llvm::sort(intervals,
+             [](const PreprocessingStructureInterval *lhs,
+                const PreprocessingStructureInterval *rhs) {
+               if (lhs->begin != rhs->begin)
+                 return lhs->begin < rhs->begin;
+               if (lhs->end != rhs->end)
+                 return lhs->end < rhs->end;
+               if (lhs->kind != rhs->kind)
+                 return lhs->kind < rhs->kind;
+               return lhs->modelItemId < rhs->modelItemId;
+             });
+
+  // The collection above intentionally reports macro evidence without
+  // interpreting other overlapping intervals. Recheck the complete overlap
+  // set here so a provisional direct carrier cannot use one exact macro line to
+  // absorb a conditional, include, pragma, line-control, or unknown directive.
+  // A `_Pragma` token wholly nested in the replacement list is part of that
+  // exact physical macro transition and is the sole admitted nested interval.
+  for (const PreprocessingStructureInterval *interval :
+       FindOverlapping(begin, end)) {
+    if (llvm::is_contained(intervals, interval))
+      continue;
+
+    const bool nestedPragmaOperator =
+        interval->kind == PreprocessingStructureKind::PragmaOperator &&
+        llvm::any_of(intervals,
+                     [&](const PreprocessingStructureInterval *macro) {
+                       return macro->begin <= interval->begin &&
+                              interval->end <= macro->end;
+                     });
+    if (!nestedPragmaOperator) {
+      intervals.clear();
+      return false;
+    }
+  }
+  return true;
+}
+
 std::optional<StringRef>
 RefoldPreprocessingStructureIndex::BoundMacroStateDirectiveSourceText(
     const RefoldModel::MacroDirective &directive, StringRef sourceBytes) const {

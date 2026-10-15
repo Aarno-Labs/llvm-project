@@ -1129,7 +1129,7 @@ public:
     case HunkRealizerKind::TU: {
       std::optional<OwnerSourceRange> source = MappedTUSourceRangeForTokens(
           spellings, candidate.aStart, candidate.aEnd);
-      if (!source)
+      if (!source || TUSegmentSwallowsUnconsumableStructure(*source))
         return false;
       candidate.owner = Owner::TU();
       candidate.source = std::move(*source);
@@ -3566,6 +3566,37 @@ private:
     if (!sawTU || sourceBegin > sourceEnd)
       return std::nullopt;
     return OwnerSourceRange::From(deps_.tuPath, sourceBegin, sourceEnd);
+  }
+
+  /// Return whether the TU source envelope \p source of a token segment is
+  /// proven to overlap protected structure that no direct TU edit may consume.
+  ///
+  /// The classifier realizes an emitted TU segment as one direct edit of this
+  /// envelope, and `RefoldTUAnchorProof::PlanTUByteSpan()` admits an envelope
+  /// only when the protected structure it overlaps is exact macro-state repair
+  /// evidence.  An envelope that swallows a conditional, include, pragma,
+  /// line-control, or unknown directive therefore has no realization, so the
+  /// segment is refused here by admissibility, just as a macro segment that
+  /// does not realize its invocation's whole cover is.  Offering it to the
+  /// search lets it tie with, or undercut, the partition that keeps the
+  /// directive in place as a preserved gap: when a deletion spans an `#endif`
+  /// between two declarations that each spell `NULL`, carving out any one
+  /// `NULL` as a macro segment makes the partition mixed, and a TU segment
+  /// spanning the `#endif` then completes it at lower cost.
+  ///
+  /// Passing this check is necessary, not sufficient: every emitted segment is
+  /// still revalidated by the ordinary classifier, and an envelope whose
+  /// structure cannot be read is left to that revalidation.
+  bool
+  TUSegmentSwallowsUnconsumableStructure(const OwnerSourceRange &source) const {
+    const RefoldPreprocessingStructureIndex *structureIndex =
+        GetStructureIndexForSource(source);
+    if (!structureIndex ||
+        !structureIndex->HasOverlapping(source.begin, source.end))
+      return false;
+    std::vector<const PreprocessingStructureInterval *> evidence;
+    return !structureIndex->CollectMacroStateRepairEvidence(
+        source.begin, source.end, evidence);
   }
 
   bool SourceSiteMatchesGap(const OwnerSourceRange &gap, StringRef file,
