@@ -158,9 +158,8 @@ std::optional<uint64_t> RefoldMacroWholeCoverPlanBuilder::ConsumedSourceEnd(
   if (deps_.topology.IsInvocationInsideDefineDirective(m))
     return callsiteEnd;
 
-  // The producer ends a call's envelope at the file location of its closing
-  // parenthesis.  Its begin is no evidence here: a generated callee's name is
-  // recorded where its replacement list spells it.
+  // A call's use lies in the file instance its `ownerIncludeId` names, and a
+  // call used in another instance read nothing from this one.
   uint64_t consumedEnd = callsiteEnd;
   SmallVector<const RefoldModel::MacroInvocation *, 8> worklist{&m};
   DenseSet<uint64_t> visited{m.id};
@@ -171,11 +170,8 @@ std::optional<uint64_t> RefoldMacroWholeCoverPlanBuilder::ConsumedSourceEnd(
       if (!visited.insert(child->id).second)
         continue;
       worklist.push_back(child);
-      if (!child->invFile || !child->invE ||
-          child->ownerIncludeId != m.ownerIncludeId ||
-          !deps_.pathIdentity.PathsEqual(*child->invFile, *m.invFile))
-        continue;
-      consumedEnd = std::max(consumedEnd, *child->invE);
+      if (child->useE && child->ownerIncludeId == m.ownerIncludeId)
+        consumedEnd = std::max(consumedEnd, *child->useE);
     }
   }
   if (consumedEnd == callsiteEnd)

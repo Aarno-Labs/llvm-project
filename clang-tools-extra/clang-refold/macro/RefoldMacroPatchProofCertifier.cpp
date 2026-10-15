@@ -55,9 +55,9 @@ void RefoldMacroPatchProofCertifier::CertifySelectedFinalMacroCandidate(
 }
 
 MacroPatch RefoldMacroPatchProofCertifier::BuildWholeCoverPatch(
-    const RefoldModel::MacroInvocation &invocation, const WholeCoverPlan &plan,
-    uint64_t sourceEnd) const {
-  MacroPatch patch{*invocation.invB, sourceEnd, plan.clippedText,
+    const RefoldModel::MacroInvocation &invocation,
+    const WholeCoverPlan &plan) const {
+  MacroPatch patch{*invocation.invB, *plan.sourceEnd, plan.clippedText,
                    invocation.id};
   deps_.macroPatchProofClassifier.CertifyMacroWholeCoverRealizationPatch(
       patch, plan, invocation);

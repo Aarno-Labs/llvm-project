@@ -491,6 +491,8 @@ namespace {
 /// The B material a forced counter patch emits in place of its invocation.
 struct CounterReplacementSurface {
   std::string text;
+  /// The end of the source `text` replaces from the invocation's `invB`.
+  uint64_t sourceEnd = 0;
   /// The B-token envelope the replacement realizes.
   std::pair<uint64_t, uint64_t> envelope;
   /// The B tokens `text` spells: the envelope, or the segment of it a whole
@@ -507,7 +509,7 @@ struct CounterReplacementSurface {
 /// still stands.
 static std::optional<CounterReplacementSurface>
 counterLiteralSurface(const RefoldSourceMapper &sourceMapper, uint64_t aStart,
-                      uint64_t aEnd) {
+                      uint64_t aEnd, uint64_t invEnd) {
   std::optional<std::pair<size_t, size_t>> bEnv =
       sourceMapper.MapATokRangeAToBTokenEnvelope(aStart, aEnd);
   if (!bEnv)
@@ -517,19 +519,22 @@ counterLiteralSurface(const RefoldSourceMapper &sourceMapper, uint64_t aStart,
   if (!material)
     return std::nullopt;
   const std::pair<uint64_t, uint64_t> range{bEnv->first, bEnv->second};
-  return CounterReplacementSurface{material->trim().str(), range, range};
+  return CounterReplacementSurface{material->trim().str(), invEnd, range,
+                                   range};
 }
 
 /// The whole cover of an invocation whose expansion reads the counter, from
-/// the same plan every other whole-cover realization uses.
+/// the same plan every other whole-cover realization uses: it replaces the
+/// callsite and all the source the expansion read.
 static std::optional<CounterReplacementSurface>
 wholeCoverSurface(const RefoldMacroWholeCoverPlanBuilder &wholeCoverPlanBuilder,
                   const RefoldModel::MacroInvocation &m) {
   std::optional<WholeCoverPlan> plan =
       wholeCoverPlanBuilder.ComputeWholeCoverPlan(m);
-  if (!plan)
+  if (!plan || !plan->sourceEnd)
     return std::nullopt;
   return CounterReplacementSurface{std::move(plan->clippedText),
+                                   *plan->sourceEnd,
                                    {plan->bTokStart, plan->bTokEnd},
                                    {plan->keptBTokStart, plan->keptBTokEnd}};
 }
@@ -564,7 +569,7 @@ void applyForcedCounterPatches(
     // enclosing invocation, aligned with whole macro invocation replay.
     std::optional<CounterReplacementSurface> surface =
         m.name == "__COUNTER__"
-            ? counterLiteralSurface(sourceMapper, req.aStart, req.aEnd)
+            ? counterLiteralSurface(sourceMapper, req.aStart, req.aEnd, *invEnd)
             : wholeCoverSurface(wholeCoverPlanBuilder, m);
     if (!surface)
       continue;
@@ -620,7 +625,7 @@ void applyForcedCounterPatches(
     // forward before certifying the current invocation owner.  The target-PP
     // proof is the B-token envelope the surface realizes, and its payload the
     // B tokens the text spells.
-    MacroPatch patch{*invStart, *invEnd, std::move(surface->text)};
+    MacroPatch patch{*invStart, surface->sourceEnd, std::move(surface->text)};
     certifyMacroPatchMaterializedBTokenRange(patch, surface->envelope.first,
                                              surface->envelope.second);
     patch.materialized.bPayload =

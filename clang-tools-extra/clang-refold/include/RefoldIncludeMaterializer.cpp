@@ -26,7 +26,6 @@
 #include "line-control/RefoldLineObserverLayout.h"
 #include "line-control/SourceLineDirectiveHelpers.h"
 #include "macro/RefoldMacroStateProof.h"
-#include "macro/RefoldMacroTupleHelpers.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldNeutralityProof.h"
 #include "proof/RefoldOwnerStateProof.h"
@@ -696,10 +695,8 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
   if (auto it = macroPatchesByOwner.find(includeId);
       it != macroPatchesByOwner.end()) {
     for (const auto &mp : it->second) {
-      uint64_t mpEnd = extendChainedCallEnd(StringRef(bytes), mp.invRange.end,
-                                            mp.replacement);
       uint64_t editStart = mp.invRange.begin;
-      uint64_t editEnd = mpEnd;
+      uint64_t editEnd = mp.invRange.end;
       std::string editReplacement = mp.replacement;
       std::vector<MacroStateDirectiveLineInterval> movedMacroStateTransitions;
       if (std::optional<StabilizedMaterializedHeaderMacroPatch> stabilized =
@@ -711,7 +708,7 @@ void RefoldIncludeMaterializer::MaterializeIncludeExpansion(
                                                : nullptr,
                       mp.proof.proofRootMacroId ? mp.proof.proofRootMacroId
                                                 : mp.macroId},
-                  mpEnd, headerPath, includeId, StringRef(bytes),
+                  headerPath, includeId, StringRef(bytes),
                   macroStateStagedEditIntervals(edits))) {
         // Empty {0,0,""} is the local sentinel used by the stabilizer after
         // it has requested terminal fallback.  Stop materializing this include

@@ -380,7 +380,6 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
   const diffutils::Hunk &h = planningCtx.h;
   const diffutils::Hunk &hEff = planningCtx.hEff;
   const StringRef baseInvText = planningCtx.baseInvText;
-  const uint64_t invEnd = planningCtx.invEnd;
 
   std::optional<MacroPatch> &argsOnlyCandidate = planningCtx.argsOnlyCandidate;
   std::optional<MacroPatch> &dagRootCandidate = planningCtx.dagRootCandidate;
@@ -821,8 +820,8 @@ std::optional<MacroPatch> RefoldMacroFinalCandidateSelector::Run(
     // syntactic callsites and cannot safely be replaced directly.  The
     // realization replaces every source byte the expansion consumed, which
     // can run past the callsite.
-    MacroPatch patch = deps_.proofCertifier.BuildWholeCoverPatch(
-        m, *wholeCoverPlan, std::max(invEnd, *wholeCoverPlan->sourceEnd));
+    MacroPatch patch =
+        deps_.proofCertifier.BuildWholeCoverPatch(m, *wholeCoverPlan);
     const bool structureCandidateDominatesWholeCover =
         theoremLatticeStructureCandidateDominatesRealization(
             deps_.acceptedCandidateBuilder, deps_.acceptedResultRanker,

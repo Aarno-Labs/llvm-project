@@ -459,9 +459,8 @@ bool RefoldMacroStateProof::InstanceRangeRecordsUndefObserver(
 
 std::optional<StabilizedMaterializedHeaderMacroPatch>
 RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
-    MacroStatePatchReplayInput mp, uint64_t mpEnd, StringRef headerPath,
-    uint64_t includeId, StringRef bytes,
-    ArrayRef<MacroStateStagedEditInterval> stagedEdits) const {
+    MacroStatePatchReplayInput mp, StringRef headerPath, uint64_t includeId,
+    StringRef bytes, ArrayRef<MacroStateStagedEditInterval> stagedEdits) const {
   using MaterializedHeaderMacroStateDirectivePiece =
       MacroStateDirectiveLineInterval;
 
@@ -535,8 +534,7 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
     return p;
   };
 
-  if (mp.invStart > mp.invEnd || mp.invEnd > bytes.size() ||
-      mpEnd < mp.invEnd || mpEnd > bytes.size())
+  if (mp.invStart > mp.invEnd || mp.invEnd > bytes.size())
     return std::nullopt;
 
   // Collect the definitions bound where the replacement is read that it would
@@ -588,11 +586,11 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
     return std::nullopt;
   if (observedUnrepairable) {
     (void)failMaterializedHeaderMacroState(
-        materializedHeaderMacroStateBoundary(mp.invStart, mpEnd),
+        materializedHeaderMacroStateBoundary(mp.invStart, mp.invEnd),
         StateMutationKind::Materialized,
         llvm::formatv("include-owned macro patch in {0} observes macro state "
                       "before [{1},{2}) that no repair can address",
-                      headerPath, mp.invStart, mpEnd)
+                      headerPath, mp.invStart, mp.invEnd)
             .str());
     return StabilizedMaterializedHeaderMacroPatch{};
   }
@@ -609,9 +607,11 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
         return mp.bPayload->rest == BPayloadRest::Unproven ||
                SourceChunkObservesMacroStateDirectiveWhenCrossed(
                    *candidate.directive, candidate.name,
-                   bytes.slice(mp.invStart, mpEnd), bytes.drop_front(mpEnd)) ||
-               InstanceRangeRecordsUndefObserver(
-                   headerPath, includeId, candidate.name, mp.invStart, mpEnd);
+                   bytes.slice(mp.invStart, mp.invEnd),
+                   bytes.drop_front(mp.invEnd)) ||
+               InstanceRangeRecordsUndefObserver(headerPath, includeId,
+                                                 candidate.name, mp.invStart,
+                                                 mp.invEnd);
       };
 
   // Emit carried directives in source order so the relative macro-state
@@ -684,8 +684,8 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
         stringutils::isLineSplice(bytes, static_cast<size_t>(lineStart) - 1))
       return std::nullopt;
 
-    const uint64_t restoreEnd = materializedHeaderLineEndAfter(mpEnd);
-    if (restoreEnd < mpEnd || restoreEnd > bytes.size())
+    const uint64_t restoreEnd = materializedHeaderLineEndAfter(mp.invEnd);
+    if (restoreEnd < mp.invEnd || restoreEnd > bytes.size())
       return std::nullopt;
     if (materializedHeaderRangeOverlapsStagedEdit(lineStart, restoreEnd))
       return std::nullopt;
@@ -698,7 +698,7 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
       return std::nullopt;
 
     const StringRef sameLinePrefix = bytes.slice(lineStart, mp.invStart);
-    const StringRef sameLineSuffix = bytes.slice(mpEnd, restoreEnd);
+    const StringRef sameLineSuffix = bytes.slice(mp.invEnd, restoreEnd);
 
     for (const auto &candidate : candidates) {
       // The definition must be complete before the repaired line, or the
@@ -721,7 +721,7 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
               *candidate.directive, candidate.name, sameLineSuffix,
               StringRef()) ||
           InstanceRangeRecordsUndefObserver(
-              headerPath, includeId, candidate.name, mpEnd, restoreEnd)) {
+              headerPath, includeId, candidate.name, mp.invEnd, restoreEnd)) {
         return std::nullopt;
       }
     }
@@ -731,7 +731,7 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
       replacement += (Twine("#undef ") + candidate.name + "\n").str();
     replacement.append(bytes.begin() + lineStart, bytes.begin() + mp.invStart);
     replacement += mp.replacement;
-    replacement.append(bytes.begin() + mpEnd, bytes.begin() + restoreEnd);
+    replacement.append(bytes.begin() + mp.invEnd, bytes.begin() + restoreEnd);
     if (!replacement.empty() && replacement.back() != '\n')
       replacement.push_back('\n');
     // Restore in source order, so several definitions re-establish the same
@@ -800,14 +800,14 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
     if (lineStart > 0 &&
         stringutils::isLineSplice(bytes, static_cast<size_t>(lineStart) - 1))
       return std::nullopt;
-    const uint64_t enclosingLineEnd = materializedHeaderLineEndAfter(mpEnd);
-    if (enclosingLineEnd < mpEnd || enclosingLineEnd > bytes.size())
+    const uint64_t enclosingLineEnd = materializedHeaderLineEndAfter(mp.invEnd);
+    if (enclosingLineEnd < mp.invEnd || enclosingLineEnd > bytes.size())
       return std::nullopt;
     if (tokenText_.TextContainsDirectiveLine(
             bytes.slice(lineStart, enclosingLineEnd)))
       return std::nullopt;
 
-    if (materializedHeaderRangeOverlapsStagedEdit(mp.invStart, mpEnd))
+    if (materializedHeaderRangeOverlapsStagedEdit(mp.invStart, mp.invEnd))
       return std::nullopt;
 
     for (const auto &candidate : candidates) {
@@ -817,10 +817,10 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
         return std::nullopt;
     }
 
-    // Source outside `[mp.invStart, mpEnd)` is untouched and keeps the macro
-    // state it originally had: the prefix is preprocessed before the `#undef`
-    // and the suffix after the restore.  Neither is asked for anything, which
-    // is what lets a line carry both readings of the name.
+    // Source outside `[mp.invStart, mp.invEnd)` is untouched and keeps the
+    // macro state it originally had: the prefix is preprocessed before the
+    // `#undef` and the suffix after the restore.  Neither is asked for
+    // anything, which is what lets a line carry both readings of the name.
     std::string replacement;
     replacement.push_back('\n');
     for (const auto &candidate : candidates)
@@ -839,19 +839,19 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
 
     for (const auto &candidate : candidates) {
       (void)widenMaterializedHeaderMacroState(
-          materializedHeaderMacroStateBoundary(mp.invStart, mpEnd),
+          materializedHeaderMacroStateBoundary(mp.invStart, mp.invEnd),
           StateMutationKind::WidenedIntoClosure,
           llvm::formatv("include-owned macro patch in {0} undefines '{1}' "
                         "(#{2}) across B-derived replay payload [{3},{4}) and "
                         "restores it immediately after",
                         headerPath, candidate.name, candidate.directive->id,
-                        mp.invStart, mpEnd)
+                        mp.invStart, mp.invEnd)
               .str());
     }
 
     StabilizedMaterializedHeaderMacroPatch stabilized;
     stabilized.start = mp.invStart;
-    stabilized.end = mpEnd;
+    stabilized.end = mp.invEnd;
     stabilized.replacement = std::move(replacement);
     return stabilized;
   };
@@ -870,9 +870,9 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
   // instance has no line here to carry at all.
   const uint64_t newStart =
       boundOutsideHeader ? mp.invStart : candidates.front().begin;
-  const uint64_t newEnd = materializedHeaderLineEndAfter(mpEnd);
+  const uint64_t newEnd = materializedHeaderLineEndAfter(mp.invEnd);
   bool carryAvailable =
-      !boundOutsideHeader && newStart <= mp.invStart && newEnd >= mpEnd &&
+      !boundOutsideHeader && newStart <= mp.invStart && newEnd >= mp.invEnd &&
       newEnd <= bytes.size() &&
       !materializedHeaderRangeOverlapsStagedEdit(newStart, newEnd);
   for (const auto &candidate : candidates) {
@@ -880,8 +880,8 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
       break;
     std::string crossed;
     appendCrossedSourceExcludingCarried(crossed, candidate.end, mp.invStart);
-    appendCrossedSourceExcludingCarried(crossed, mpEnd, newEnd);
-    StringRef following = bytes.slice(mp.invStart, mpEnd);
+    appendCrossedSourceExcludingCarried(crossed, mp.invEnd, newEnd);
+    StringRef following = bytes.slice(mp.invStart, mp.invEnd);
     carryAvailable =
         !SourceChunkObservesMacroStateDirectiveWhenCrossed(
             *candidate.directive, candidate.name, StringRef(crossed),
@@ -890,7 +890,7 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
                                            candidate.name, candidate.end,
                                            mp.invStart) &&
         !InstanceRangeRecordsUndefObserver(headerPath, includeId,
-                                           candidate.name, mpEnd, newEnd) &&
+                                           candidate.name, mp.invEnd, newEnd) &&
         !replacementRestObserves(candidate) &&
         !MovingDirectiveLineCouldOpenCall(*candidate.directive);
   }
@@ -902,12 +902,12 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
             buildUndefRestoreAroundBPayload())
       return undefRestore;
     (void)failMaterializedHeaderMacroState(
-        materializedHeaderMacroStateBoundary(mp.invStart, mpEnd),
+        materializedHeaderMacroStateBoundary(mp.invStart, mp.invEnd),
         StateMutationKind::MovedLater,
         llvm::formatv("include-owned macro patch in {0} can neither carry the "
                       "definitions it observes past [{1},{2}) nor undefine "
                       "and restore them around it",
-                      headerPath, mp.invStart, mpEnd)
+                      headerPath, mp.invStart, mp.invEnd)
             .str());
     return StabilizedMaterializedHeaderMacroPatch{};
   }
@@ -925,7 +925,7 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
   // later surviving source sees those definitions restored.
   std::string replacement;
   replacement.reserve((mp.invStart - newStart) + mp.replacement.size() +
-                      (newEnd - mpEnd) + candidates.size() * 32);
+                      (newEnd - mp.invEnd) + candidates.size() * 32);
   uint64_t cursor = newStart;
   for (const auto &candidate : candidates) {
     if (!isCarriedDirectiveInterval(candidate.begin, candidate.end) ||
@@ -944,7 +944,7 @@ RefoldMacroStateProof::StabilizeMaterializedHeaderMacroPatchReplay(
   }
   replacement.append(bytes.begin() + cursor, bytes.begin() + mp.invStart);
   replacement += mp.replacement;
-  replacement.append(bytes.begin() + mpEnd, bytes.begin() + newEnd);
+  replacement.append(bytes.begin() + mp.invEnd, bytes.begin() + newEnd);
   if (!replacement.empty() && replacement.back() != '\n')
     replacement.push_back('\n');
   for (const auto &candidate : candidates) {

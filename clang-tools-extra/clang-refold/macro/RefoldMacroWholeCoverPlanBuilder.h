@@ -132,16 +132,23 @@ private:
   /// Return the end of the physical source bytes \p m's expansion consumed,
   /// or nullopt when \p m records no source range or the end is not proven.
   ///
-  /// It is `invE` unless a call the expansion generates is closed by source
-  /// text after \p m's closing parenthesis: `#define CALL(f, a) int f(a`
-  /// leaves `G(x` open, and `CALL(G, x))` reads the second `)` to close it.
-  /// The cover's B image already holds everything that call produced, so a
-  /// realization that stops at `invE` leaves the consumed `)` behind.
+  /// It is `invE` unless a call the expansion forms reads source text after
+  /// \p m's closing parenthesis: `#define CALL(f, a) int f(a` leaves `G(x`
+  /// open, and `CALL(G, x))` reads the second `)` to close it; `GET(TW)(10)`
+  /// with `#define GET(k) DO_##k` forms `DO_TW(10)`, whose name no source
+  /// spells.  The cover's B image already holds everything such a call
+  /// produced, so a realization that stops at `invE` leaves what it read
+  /// behind.
   ///
-  /// The end is the largest `inv_e` among \p m's descendants spelled in
-  /// \p m's own file instance.  Rescanning \p m's expansion reads source
-  /// tokens only to complete a call it has already begun, so the bytes from
-  /// `invE` to there are a contiguous run of such calls' arguments and
+  /// The end is the largest use end (`use_e`) among \p m's descendants used
+  /// in \p m's own file instance.  A call's caller is the expansion whose
+  /// rescan formed it, so those descendants are exactly the calls \p m's
+  /// expansion formed, and the producer bounds every source token a call
+  /// read by its use.  A descendant's `inv_e` is no such bound: a call whose
+  /// name a macro produced records none, and one spelled in a formed call's
+  /// actual ends before that call's `)`.  Rescanning \p m's expansion reads
+  /// source tokens only to complete a call it has already begun, so the bytes
+  /// from `invE` to there are a contiguous run of such calls' arguments and
   /// parentheses: a token spelled there is discarded or lands in \p m's
   /// expansion, which the cover's B image realizes.  The end is accepted only
   /// when the structure index proves those bytes hold no preprocessing

@@ -11,7 +11,6 @@
 #include "line-control/RefoldLineControlProof.h"
 #include "line-control/RefoldLineObserverLayout.h"
 #include "macro/RefoldMacroTopology.h"
-#include "macro/RefoldMacroTupleHelpers.h"
 #include "model/RefoldModel.h"
 #include "proof/RefoldAcceptedCandidateBuilder.h"
 #include "proof/RefoldTerminalProofSink.h"
@@ -68,16 +67,19 @@ private:
   /// Converts finalized TU-owned macro patches into concrete TU byte edits.
   void StageTUMacroPatchEdits();
 
-  /// Returns whether \p Patch is contained in an already accepted TU macro
+  /// Returns whether \p patch is contained in an already accepted TU macro
   /// interval, while preserving the original fail-fast check for partial
   /// overlap in accepted-interval order.
   bool MacroPatchIsShadowedByAccepted(
-      const MacroPatch &patch, uint64_t patchEnd,
+      const MacroPatch &patch,
       llvm::ArrayRef<std::pair<uint64_t, uint64_t>> acceptedRanges) const;
 
-  /// Creates the concrete TU text edit for one accepted TU macro patch.
-  TextEdit BuildTUMacroPatchEdit(const MacroPatch &patch,
-                                 uint64_t patchEnd) const;
+  /// Creates the concrete TU text edit for one accepted TU macro patch.  It
+  /// replaces exactly the patch's `invRange`: a patch that realizes its
+  /// invocation's expansion was built over all the source that expansion
+  /// read, and one that keeps its callsite leaves what follows the callsite
+  /// for the callsite to read again.
+  TextEdit BuildTUMacroPatchEdit(const MacroPatch &patch) const;
 
   /// Runs the post-macro-edit macro-state carry pass and then lowers realized
   /// TU-root include expansions into TU edits.
@@ -171,32 +173,31 @@ void FinalTUEmissionContext::StageTUMacroPatchEdits() {
 
   llvm::SmallVector<std::pair<uint64_t, uint64_t>, 16> accepted;
   for (const MacroPatch &patch : tuMacroPatches) {
-    const uint64_t patchEnd = extendChainedCallEnd(
-        request_.tuBytes, patch.invRange.end, patch.replacement);
-
-    if (MacroPatchIsShadowedByAccepted(patch, patchEnd, accepted))
+    if (MacroPatchIsShadowedByAccepted(patch, accepted))
       continue;
 
-    accepted.push_back({patch.invRange.begin, patchEnd});
-    structuralHunkDispatcher_.AddTUEdit(BuildTUMacroPatchEdit(patch, patchEnd));
+    accepted.push_back({patch.invRange.begin, patch.invRange.end});
+    structuralHunkDispatcher_.AddTUEdit(BuildTUMacroPatchEdit(patch));
   }
 }
 
 bool FinalTUEmissionContext::MacroPatchIsShadowedByAccepted(
-    const MacroPatch &patch, uint64_t patchEnd,
+    const MacroPatch &patch,
     llvm::ArrayRef<std::pair<uint64_t, uint64_t>> acceptedRanges) const {
   for (const auto &accepted : acceptedRanges) {
-    if (patch.invRange.begin >= accepted.first && patchEnd <= accepted.second)
+    if (patch.invRange.begin >= accepted.first &&
+        patch.invRange.end <= accepted.second)
       return true;
 
     // Partial overlaps should never occur (macro invocation sites are either
     // disjoint or nested). If they do, fail fast rather than producing
     // order-dependent behavior.
-    if (patch.invRange.begin < accepted.second && accepted.first < patchEnd) {
+    if (patch.invRange.begin < accepted.second &&
+        accepted.first < patch.invRange.end) {
       REFOLD_LOG_FATAL("macro/tu",
                        "overlapping TU macro patches: mp=[{0},{1}) "
                        "acc=[{2},{3})",
-                       patch.invRange.begin, patchEnd, accepted.first,
+                       patch.invRange.begin, patch.invRange.end, accepted.first,
                        accepted.second);
     }
   }
@@ -204,15 +205,14 @@ bool FinalTUEmissionContext::MacroPatchIsShadowedByAccepted(
 }
 
 TextEdit
-FinalTUEmissionContext::BuildTUMacroPatchEdit(const MacroPatch &patch,
-                                              uint64_t patchEnd) const {
+FinalTUEmissionContext::BuildTUMacroPatchEdit(const MacroPatch &patch) const {
   ResyncOutcome resync = lineObserverLayout_.ApplyResyncOrPend(
-      request_.tuBytes, patch.invRange.begin, patchEnd, patch.replacement,
-      request_.tuPath);
+      request_.tuBytes, patch.invRange.begin, patch.invRange.end,
+      patch.replacement, request_.tuPath);
 
   TextEdit edit{
       patch.invRange.begin,
-      patchEnd,
+      patch.invRange.end,
       std::move(resync.text),
       std::move(resync.pending),
       macroTopology_.MacroPatchRemainsExpanded(patch)
@@ -227,7 +227,8 @@ FinalTUEmissionContext::BuildTUMacroPatchEdit(const MacroPatch &patch,
   // read, so the payload certificate still describes the edit's text.
   if (patch.materialized.bPayload) {
     textEditCertifier_.CertifyTextEditBPayload(
-        edit, *patch.materialized.bPayload, patch.invRange.begin, patchEnd);
+        edit, *patch.materialized.bPayload, patch.invRange.begin,
+        patch.invRange.end);
     if (patch.proof.preservesInvocationStructure)
       edit.bPayload->keptCallsiteInvocationId = patch.proof.proofRootMacroId;
   }

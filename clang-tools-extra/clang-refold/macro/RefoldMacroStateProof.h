@@ -107,6 +107,8 @@ enum class PayloadIdentifierExpansionPolicy {
 /// callers adapt MacroPatch into this narrow input instead of giving this
 /// service edit-assembly authority.
 struct MacroStatePatchReplayInput {
+  /// The source the patch replaces: its `invRange`, which for a realization of
+  /// the expansion runs past the callsite over all the source it read.
   uint64_t invStart = 0;
   uint64_t invEnd = 0;
   llvm::StringRef replacement;
@@ -371,9 +373,8 @@ public:
   /// rewrite is needed, or records the missing proof obligation.
   std::optional<StabilizedMaterializedHeaderMacroPatch>
   StabilizeMaterializedHeaderMacroPatchReplay(
-      MacroStatePatchReplayInput patch, uint64_t patchEnd,
-      llvm::StringRef headerPath, uint64_t includeId,
-      llvm::StringRef materializedHeaderBytes,
+      MacroStatePatchReplayInput patch, llvm::StringRef headerPath,
+      uint64_t includeId, llvm::StringRef materializedHeaderBytes,
       llvm::ArrayRef<MacroStateStagedEditInterval> stagedEdits) const;
 
 private:

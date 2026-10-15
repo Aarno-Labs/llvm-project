@@ -1439,8 +1439,7 @@ void RefoldMacroPatchPlanner::CertifyMacroPatchOwnerWitness(
 MacroPatch RefoldMacroPatchPlanner::BuildCallsiteWholeCoverPatch(
     const RefoldModel::MacroInvocation &invocation, const WholeCoverPlan &plan,
     const MacroPatch *staged) const {
-  MacroPatch patch =
-      ProofCertifier().BuildWholeCoverPatch(invocation, plan, *plan.sourceEnd);
+  MacroPatch patch = ProofCertifier().BuildWholeCoverPatch(invocation, plan);
   if (staged)
     CarryMacroPatchOwnerCertificate(patch, *staged);
   CertifyMacroPatchOwnerWitness(patch,

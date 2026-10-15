@@ -71,14 +71,16 @@ public:
       const SelectedMacroSelectionCandidate &selectedCandidate,
       MacroPatch &selectedPatch) const;
 
-  /// Build the patch realizing \p plan: it replaces `[invB, sourceEnd)` of
-  /// \p invocation with the plan's B material.  Whole-cover realization has
-  /// exactly one construction, so the replacement text, the realization proof
-  /// carrier and the B tokens that text spells are recorded together and
-  /// cannot describe different bytes.
+  /// Build the patch realizing \p plan: it replaces `[invB, plan.sourceEnd)`
+  /// of \p invocation, the callsite and every source byte its expansion read,
+  /// with the plan's B material.  Whole-cover realization has exactly one
+  /// construction, so the replaced source, the replacement text, the
+  /// realization proof carrier and the B tokens that text spells are recorded
+  /// together and cannot describe different bytes.  \p plan must have a
+  /// `sourceEnd`.
   MacroPatch
   BuildWholeCoverPatch(const RefoldModel::MacroInvocation &invocation,
-                       const WholeCoverPlan &plan, uint64_t sourceEnd) const;
+                       const WholeCoverPlan &plan) const;
 
   /// Build and install the standard args-only macro proof on the patch,
   /// optionally enriched with a whole-envelope replay witness.
